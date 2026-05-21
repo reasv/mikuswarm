@@ -1,0 +1,11 @@
+node_modules/
+dist/
+native/target/
+native/*.node
+npm/*.node
+config/90-local.toml
+*.db
+*.db-shm
+*.db-wal
+debug/
+msg-attach/

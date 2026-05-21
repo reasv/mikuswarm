@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/matrix-core"]
+resolver = "2"

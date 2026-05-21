@@ -1,0 +1,36 @@
+{
+  "name": "mikuswarm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm build:native && tsc --noEmit",
+    "build:native": "napi build --platform --manifest-path native/crates/matrix-core/Cargo.toml --js-package-name mikuswarm --output-dir npm",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "latest",
+    "@earendil-works/pi-ai": "latest",
+    "@sinclair/typebox": "latest",
+    "better-sqlite3": "latest",
+    "nanoid": "latest",
+    "sharp": "latest",
+    "smol-toml": "latest",
+    "tsx": "latest"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "latest",
+    "@types/better-sqlite3": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  },
+  "packageManager": "pnpm@10.11.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild",
+      "sharp"
+    ]
+  }
+}

@@ -1,0 +1,51 @@
+[app]
+name = "mikuswarm"
+data_dir = "./var"
+log_level = "info"
+context_dump_dir = "./debug/context"
+
+[agent.sessions]
+max_concurrent = 3
+max_concurrent_dm = 1
+forced_completion_retries = 3
+
+[agent.system]
+prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
+
+[models.default]
+id = "glm"
+provider = "anthropic"
+endpoint = "${LLM_GATEWAY_URL}"
+api_key = "${LLM_GATEWAY_API_KEY}"
+multimodal = true
+max_tokens = 4096
+
+[context.tiers]
+rich_target_tokens = 4000
+rich_max_tokens = 8000
+compact_target_tokens = 16000
+compact_max_tokens = 24000
+
+[context.images]
+caption_multimodal = true
+max_bytes = 1153434
+max_width = 1280
+max_height = 720
+
+[storage]
+database_path = "./var/mikuswarm.db"
+
+[matrix]
+enabled = false
+trigger_hold_ms = 900
+
+[matrix.accounts.miku]
+homeserver = "${MATRIX_HOMESERVER}"
+access_token = "${MATRIX_ACCESS_TOKEN}"
+user_id = "${MATRIX_USER_ID}"
+device_id = "${MATRIX_DEVICE_ID}"
+store_path = "./var/matrix/miku"
+
+[matrix.rooms]
+join = []
+mention_names = ["miku"]
