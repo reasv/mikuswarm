@@ -104,15 +104,11 @@ export class ContextBuilder {
     const blocks: ImageBlock[] = [];
     for (const { eventId, attachment } of images) {
       const input = await readFile(attachment.localPath!);
-      const output = await sharp(input)
-        .resize({
-          width: this.config.context.images.max_width,
-          height: this.config.context.images.max_height,
-          fit: "inside",
-          withoutEnlargement: true,
-        })
-        .jpeg({ quality: 82 })
-        .toBuffer();
+      const output = await encodeImageForContext(input, {
+        maxWidth: this.config.context.images.max_width,
+        maxHeight: this.config.context.images.max_height,
+        maxBytes: this.config.context.images.max_bytes,
+      });
       blocks.push({
         eventId,
         attachmentId: attachment.id,
@@ -157,6 +153,48 @@ export class ContextBuilder {
       );
     return lookback ? imageAttachments(lookback).map((attachment) => ({ eventId: lookback.id, attachment })) : [];
   }
+}
+
+export interface ImageEncodingOptions {
+  maxWidth: number;
+  maxHeight: number;
+  maxBytes: number;
+}
+
+export async function encodeImageForContext(
+  input: Buffer,
+  options: ImageEncodingOptions,
+): Promise<Buffer> {
+  const metadata = await sharp(input).metadata();
+  let width = Math.min(metadata.width ?? options.maxWidth, options.maxWidth);
+  let height = Math.min(metadata.height ?? options.maxHeight, options.maxHeight);
+  let best: Buffer | undefined;
+
+  for (;;) {
+    for (const quality of [82, 72, 62, 52, 42, 35]) {
+      const output = await sharp(input)
+        .resize({
+          width: Math.round(width),
+          height: Math.round(height),
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality, mozjpeg: true })
+        .toBuffer();
+      best = output;
+      if (output.byteLength <= options.maxBytes) return output;
+    }
+    if (width <= 64 || height <= 64) break;
+    width *= 0.75;
+    height *= 0.75;
+    width = Math.max(width, 64);
+    height = Math.max(height, 64);
+  }
+
+  if (!best) {
+    throw new Error("Unable to encode image for context");
+  }
+  throw new Error(`Unable to encode image within ${options.maxBytes} bytes; smallest attempt was ${best.byteLength} bytes`);
 }
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {

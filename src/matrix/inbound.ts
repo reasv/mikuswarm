@@ -1,7 +1,7 @@
 import { nanoid } from "nanoid";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { MatrixInboundEvent } from "./native-types.js";
+import type { MatrixInboundEvent, MatrixMessageSummary } from "./native-types.js";
 import type { MatrixNativeClient } from "./native-client.js";
 import type {
   AttachmentMeta,
@@ -81,6 +81,13 @@ export function normalizeMatrixInboundEvent(
     timelineKey,
     event: canonical,
     trigger,
+    outboundTarget: {
+      provider: "matrix",
+      timelineKey,
+      accountId: context.accountId,
+      roomId: event.roomId,
+      threadId: event.threadRootId,
+    },
   };
 }
 
@@ -139,36 +146,7 @@ async function resolveAttachments(
   await mkdir(context.attachmentDir, { recursive: true });
   return Promise.all(
     attachments.map(async (attachment) => {
-      try {
-        const downloaded = context.client!.downloadMedia({
-          roomId: event.roomId,
-          eventId: event.eventId,
-        });
-        const extension = extensionFor(downloaded.contentType, downloaded.filename ?? attachment.filename);
-        const filename = `${safePart(event.eventId)}-${safePart(attachment.id)}${extension}`;
-        const localPath = path.join(context.attachmentDir!, filename);
-        await writeFile(localPath, Buffer.from(downloaded.dataBase64, "base64"));
-        return {
-          ...attachment,
-          filename: downloaded.filename ?? attachment.filename,
-          mimeType: downloaded.contentType ?? attachment.mimeType,
-          mediaType: downloaded.kind,
-          localPath,
-          processing: {
-            downloaded: true,
-            captioned: false,
-          },
-        };
-      } catch (error) {
-        return {
-          ...attachment,
-          processing: {
-            ...attachment.processing,
-            downloaded: false,
-            error: error instanceof Error ? error.message : String(error),
-          },
-        };
-      }
+      return downloadAttachment(event.roomId, event.eventId, attachment, context);
     }),
   );
 }
@@ -187,10 +165,78 @@ async function resolveReplyContext(
       sender: { id: summary.sender },
       body: summary.body,
       timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+      attachments: await resolveReplyAttachments(event.roomId, summary, context),
     };
   } catch {
     return { externalId: event.replyToId };
   }
+}
+
+async function resolveReplyAttachments(
+  roomId: string,
+  summary: MatrixMessageSummary,
+  context: MatrixInboundContext,
+): Promise<AttachmentMeta[] | undefined> {
+  const mediaType = mediaTypeForMsgtype(summary.msgtype);
+  if (!mediaType || !context.client || !context.attachmentDir) return undefined;
+  const base: AttachmentMeta = {
+    id: `${summary.eventId}:media:0`,
+    filename: summary.body,
+    mediaType,
+    processing: {
+      downloaded: false,
+      captioned: false,
+    },
+  };
+  await mkdir(context.attachmentDir, { recursive: true });
+  const resolved = await downloadAttachment(roomId, summary.eventId, base, context);
+  return [resolved];
+}
+
+async function downloadAttachment(
+  roomId: string,
+  eventId: string,
+  attachment: AttachmentMeta,
+  context: MatrixInboundContext,
+): Promise<AttachmentMeta> {
+  try {
+    const downloaded = context.client!.downloadMedia({
+      roomId,
+      eventId,
+    });
+    const extension = extensionFor(downloaded.contentType, downloaded.filename ?? attachment.filename);
+    const filename = `${safePart(eventId)}-${safePart(attachment.id)}${extension}`;
+    const localPath = path.join(context.attachmentDir!, filename);
+    await writeFile(localPath, Buffer.from(downloaded.dataBase64, "base64"));
+    return {
+      ...attachment,
+      filename: downloaded.filename ?? attachment.filename,
+      mimeType: downloaded.contentType ?? attachment.mimeType,
+      mediaType: downloaded.kind,
+      localPath,
+      processing: {
+        downloaded: true,
+        captioned: false,
+      },
+    };
+  } catch (error) {
+    return {
+      ...attachment,
+      processing: {
+        ...attachment.processing,
+        downloaded: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+function mediaTypeForMsgtype(msgtype?: string): AttachmentMeta["mediaType"] | undefined {
+  if (msgtype === "m.image") return "image";
+  if (msgtype === "m.video") return "video";
+  if (msgtype === "m.audio") return "audio";
+  if (msgtype === "m.file") return "file";
+  return undefined;
 }
 
 async function resolveLinkPreviews(

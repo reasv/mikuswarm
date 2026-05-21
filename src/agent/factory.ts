@@ -1,8 +1,8 @@
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { type Model } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
-import { dumpBuiltContext, type ContextBuilder } from "../context/index.js";
+import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { streamLlmGateway } from "./llm-gateway.js";
@@ -24,7 +24,7 @@ export class AgentSessionFactory {
         model,
         tools,
       },
-      transformContext: async () => {
+      transformContext: async (messages) => {
         const built = await this.options.contextBuilder.build({
           timelineKey: session.timelineKey,
           trigger: session.trigger.event,
@@ -37,28 +37,7 @@ export class AgentSessionFactory {
           built,
           session.trigger.event.id,
         ).catch(() => undefined);
-        return built.messages.map((message) => {
-          if (message.type === "runtimeInstructions") {
-            return {
-              type: "runtimeInstructions",
-              content: message.content,
-              imageBlocks: message.imageBlocks,
-            };
-          }
-          if (message.type === "chatEvent") {
-            return {
-              type: "chatEvent",
-              role: message.role === "assistant" ? "assistant" : "user",
-              content: message.content,
-              imageBlocks: message.imageBlocks,
-            };
-          }
-          return {
-            role: "user",
-            content: message.content,
-            timestamp: Date.now(),
-          };
-        });
+        return buildAgentContextMessages(built, messages);
       },
       convertToLlm,
       streamFn: streamLlmGateway as any,
@@ -68,6 +47,50 @@ export class AgentSessionFactory {
       sessionId: session.timelineKey,
     });
   }
+}
+
+export function buildAgentContextMessages(
+  built: BuiltContext,
+  liveMessages: AgentMessage[] = [],
+): AgentMessage[] {
+  const baseMessages = built.messages.flatMap((message): AgentMessage[] => {
+    if (message.type === "system") return [];
+    if (message.type === "runtimeInstructions") {
+      return [
+        {
+          type: "runtimeInstructions",
+          content: message.content,
+          imageBlocks: message.imageBlocks,
+        },
+      ];
+    }
+    if (message.type === "chatEvent") {
+      return [
+        {
+          type: "chatEvent",
+          role: message.role === "assistant" ? "assistant" : "user",
+          content: message.content,
+          imageBlocks: message.imageBlocks,
+        },
+      ];
+    }
+    return [];
+  });
+
+  return [...baseMessages, ...liveMessages.filter(isLiveRuntimeMessage)];
+}
+
+function isLiveRuntimeMessage(message: AgentMessage): boolean {
+  const typed = message as any;
+  if (!typed || typeof typed !== "object") return false;
+  if (typed.type === "interjection") return true;
+  if (typed.type === "chatEvent" || typed.type === "runtimeInstructions") return false;
+  if (typed.role === "toolResult") return true;
+  if (typed.role === "user") return true;
+  if (typed.role === "assistant") {
+    return Array.isArray(typed.content) && typed.content.some((block: any) => block?.type === "toolCall");
+  }
+  return false;
 }
 
 export function createModel(config: AppConfig): Model<"anthropic-messages"> {

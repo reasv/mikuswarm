@@ -99,6 +99,7 @@ export interface InboundChatEvent {
   timelineKey: string;
   event: CanonicalChatEvent;
   trigger?: TriggerInfo;
+  outboundTarget?: OutboundTarget;
 }
 
 export interface OutboundTarget {

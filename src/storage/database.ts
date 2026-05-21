@@ -147,7 +147,14 @@ export class Storage {
       db.prepare(
         `update timeline_events
          set external_id = @externalId,
+             timeline_key = @timelineKey,
+             provider = @provider,
+             role = @role,
+             sender_id = @senderId,
+             sender_display_name = @senderDisplayName,
              body = @body,
+             timestamp = @timestamp,
+             received_at = @receivedAt,
              agent_session_id = @agentSessionId,
              event_json = @eventJson,
              updated_at = @updatedAt
@@ -155,7 +162,14 @@ export class Storage {
       ).run({
         id,
         externalId: updated.externalId ?? null,
+        timelineKey: updated.timelineKey,
+        provider: updated.provider,
+        role: updated.role,
+        senderId: updated.sender.id,
+        senderDisplayName: updated.sender.displayName ?? null,
         body: updated.body,
+        timestamp: updated.timestamp,
+        receivedAt: updated.receivedAt,
         agentSessionId: updated.agentSessionId ?? null,
         eventJson: JSON.stringify(updated),
         updatedAt: Date.now(),

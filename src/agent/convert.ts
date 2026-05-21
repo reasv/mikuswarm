@@ -18,6 +18,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
       if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
         return [message as Message];
       }
+      if (message.role === "system") return [];
       return [];
     }
     if (message.type === "runtimeInstructions") {

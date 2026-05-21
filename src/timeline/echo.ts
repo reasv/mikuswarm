@@ -20,16 +20,26 @@ export class AssistantEchoResolver {
   }
 
   private findLocalAssistantEvent(event: CanonicalChatEvent): CanonicalChatEvent | undefined {
-    return this.store
+    const candidates = this.store
       .query({ timelineKey: event.timelineKey, limit: 100 })
       .reverse()
-      .find(
-        (candidate) =>
-          candidate.role === "assistant" &&
-          candidate.sender.isSelf &&
-          !candidate.externalId &&
-          candidate.body.trim() === event.body.trim(),
-      );
+      .filter((candidate) => candidate.role === "assistant" && candidate.sender.isSelf);
+
+    if (event.externalId) {
+      const byExternalId = candidates.find((candidate) => candidate.externalId === event.externalId);
+      if (byExternalId) return byExternalId;
+    }
+
+    const normalizedBody = normalizeBody(event.body);
+    return candidates.find(
+      (candidate) =>
+        !candidate.externalId &&
+        normalizeBody(candidate.body) === normalizedBody &&
+        Math.abs(candidate.timestamp - event.timestamp) <= 5 * 60 * 1000,
+    );
   }
 }
 
+function normalizeBody(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}

@@ -117,7 +117,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const session = sessions.createPlaceholder(inbound);
     sessions.markRunning(session.id);
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey });
-    const target = outboundTargetFromTimeline(inbound.timelineKey);
+    const target = inbound.outboundTarget ?? outboundTargetFromTimeline(inbound.timelineKey);
     const sentMessages: string[] = [];
     const tools = [
       createSendMessageTool({
@@ -211,7 +211,7 @@ function createBasicCaptioner() {
   };
 }
 
-function outboundTargetFromTimeline(timelineKey: string) {
+export function outboundTargetFromTimeline(timelineKey: string) {
   const parts = timelineKey.split(":");
   const accountId = parts[1];
   const roomIndex = parts.indexOf("room");
