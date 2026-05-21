@@ -2,7 +2,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Model } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
-import type { ContextBuilder } from "../context/index.js";
+import { dumpBuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { streamLlmGateway } from "./llm-gateway.js";
@@ -30,6 +30,13 @@ export class AgentSessionFactory {
           trigger: session.trigger.event,
           activeSessions: this.options.getActiveSessions(session.timelineKey),
         });
+        await dumpBuiltContext(
+          this.options.config.app.context_dump_dir,
+          session.timelineKey,
+          session.id,
+          built,
+          session.trigger.event.id,
+        ).catch(() => undefined);
         return built.messages.map((message) => {
           if (message.type === "runtimeInstructions") {
             return {

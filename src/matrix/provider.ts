@@ -151,28 +151,11 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     }
 
     if (existing) {
-      clearTimeout(existing.timer);
-      existing.event.trigger = {
-        ...existing.event.trigger!,
-        groupedEventIds: [...(existing.event.trigger?.groupedEventIds ?? []), inbound.event.id],
-      };
-      existing.event.event.trigger = existing.event.trigger;
+      this.flushPendingTrigger(key);
     }
 
     const holdStartedAt = Date.now();
-    const timer = setTimeout(() => {
-      const pending = this.pendingTriggers.get(key);
-      if (!pending) return;
-      this.pendingTriggers.delete(key);
-      const holdEndedAt = Date.now();
-      pending.event.trigger = {
-        ...pending.event.trigger!,
-        holdStartedAt,
-        holdEndedAt,
-      };
-      pending.event.event.trigger = pending.event.trigger;
-      this.emit(pending.event);
-    }, this.config.trigger_hold_ms);
+    const timer = setTimeout(() => this.flushPendingTrigger(key), this.config.trigger_hold_ms);
 
     const pendingEvent: InboundChatEvent = {
       ...inbound,
@@ -191,6 +174,19 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       },
     };
     this.pendingTriggers.set(key, { event: pendingEvent, timer });
+  }
+
+  private flushPendingTrigger(key: string): void {
+    const pending = this.pendingTriggers.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingTriggers.delete(key);
+    pending.event.trigger = {
+      ...pending.event.trigger!,
+      holdEndedAt: Date.now(),
+    };
+    pending.event.event.trigger = pending.event.trigger;
+    this.emit(pending.event);
   }
 
   private emit(event: InboundChatEvent): void {

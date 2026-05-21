@@ -5,12 +5,6 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
   return messages.flatMap((raw) => {
     const message = raw as any;
     if (!message || typeof message !== "object") return [];
-    if ("role" in message) {
-      if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
-        return [message as Message];
-      }
-      return [];
-    }
     if (message.type === "chatEvent") {
       return [
         {
@@ -19,6 +13,12 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
           timestamp: Date.now(),
         } as Message,
       ];
+    }
+    if ("role" in message) {
+      if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+        return [message as Message];
+      }
+      return [];
     }
     if (message.type === "runtimeInstructions") {
       return [

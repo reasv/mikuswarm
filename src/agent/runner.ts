@@ -26,47 +26,54 @@ export class SessionRunner {
 
   async run(agent: Agent, session: AgentSessionRecord, maxRetries: number): Promise<SessionRunResult> {
     let retries = 0;
-    await this.options.provider?.setTyping(this.options.target!, true);
-    agent.subscribe((event) => {
-      if (event.type === "message_update" && this.options.provider && this.options.target) {
-        void this.options.provider.setTyping(this.options.target, true);
-      }
-    });
-    await agent.prompt({
-      type: "chatEvent",
-      role: "user",
-      content: session.trigger.event.body,
-      event: session.trigger.event,
-    });
-    await agent.waitForIdle();
-
-    let text = extractLastAssistantText(agent.state.messages);
-    while (!text.trim() && retries < maxRetries) {
-      retries += 1;
-      await forceCompletion(agent);
-      await agent.waitForIdle();
-      text = extractLastAssistantText(agent.state.messages);
-    }
-
-    const stripped = stripThinkingContamination(text);
-    const noReply = /^\s*NO_REPLY\s*$/.test(stripped);
-    const finalText = stripped.replace(/\bNO_REPLY\b/g, "").trim();
-    if (!noReply && finalText && !wasAlreadySent(finalText, this.options.sentMessages ?? [])) {
+    try {
       if (this.options.provider && this.options.target) {
-        await this.options.provider.send(this.options.target, {
-          body: finalText,
-          agentSessionId: session.id,
-        });
+        await this.options.provider.setTyping(this.options.target, true);
       }
-      await this.store.append(createAssistantTimelineEvent(session, finalText));
+      agent.subscribe((event) => {
+        if (event.type === "message_update" && this.options.provider && this.options.target) {
+          void this.options.provider.setTyping(this.options.target, true);
+        }
+      });
+      await agent.prompt({
+        type: "chatEvent",
+        role: "user",
+        content: session.trigger.event.body,
+        event: session.trigger.event,
+      });
+      await agent.waitForIdle();
+
+      let text = extractLastAssistantText(agent.state.messages);
+      while (!text.trim() && retries < maxRetries) {
+        retries += 1;
+        await forceCompletion(agent);
+        await agent.waitForIdle();
+        text = extractLastAssistantText(agent.state.messages);
+      }
+
+      const stripped = stripThinkingContamination(text);
+      const noReply = /^\s*NO_REPLY\s*$/.test(stripped);
+      const finalText = stripped.replace(/\bNO_REPLY\b/g, "").trim();
+      if (!noReply && finalText && !wasAlreadySent(finalText, this.options.sentMessages ?? [])) {
+        if (this.options.provider && this.options.target) {
+          await this.options.provider.send(this.options.target, {
+            body: finalText,
+            agentSessionId: session.id,
+          });
+        }
+        await this.store.append(createAssistantTimelineEvent(session, finalText));
+      }
+      return {
+        sessionId: session.id,
+        text: finalText,
+        noReply: noReply || !finalText,
+        retries,
+      };
+    } finally {
+      if (this.options.provider && this.options.target) {
+        await this.options.provider.setTyping(this.options.target, false).catch(() => undefined);
+      }
     }
-    await this.options.provider?.setTyping(this.options.target!, false);
-    return {
-      sessionId: session.id,
-      text: finalText,
-      noReply: noReply || !finalText,
-      retries,
-    };
   }
 }
 

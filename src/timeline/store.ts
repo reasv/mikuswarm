@@ -41,14 +41,17 @@ export class TimelineStore {
       const rows = db
         .prepare(
           `select event_json
-           from timeline_events
-           where ${clauses.join(" and ")}
-           order by timestamp asc, received_at asc, id asc
-           limit @limit`,
+           from (
+             select event_json, timestamp, received_at, id
+             from timeline_events
+             where ${clauses.join(" and ")}
+             order by timestamp desc, received_at desc, id desc
+             limit @limit
+           )
+           order by timestamp asc, received_at asc, id asc`,
         )
         .all(params) as Array<{ event_json: string }>;
       return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
     });
   }
 }
-

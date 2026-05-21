@@ -114,10 +114,14 @@ export class Storage {
       db
         .prepare(
           `select event_json
-           from timeline_events
-           where timeline_key = ?
-           order by timestamp asc, received_at asc, id asc
-           limit ?`,
+           from (
+             select event_json, timestamp, received_at, id
+             from timeline_events
+             where timeline_key = ?
+             order by timestamp desc, received_at desc, id desc
+             limit ?
+           )
+           order by timestamp asc, received_at asc, id asc`,
         )
         .all(timelineKey, limit) as Array<{ event_json: string }>,
     );

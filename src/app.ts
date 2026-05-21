@@ -63,14 +63,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (steerReplyToActiveSession(inbound)) return;
     background.processNonTriggerEvent(inbound.event);
     if (!inbound.trigger) return;
-    const prepared = await background.prepareTriggerEvent(inbound.event);
-    inbound.event = prepared;
+    await prepareTriggerMedia(inbound);
     const decision = triggerCoordinator.accept(inbound);
     if (decision.action !== "spawn") {
       logger.info("trigger_queued", { timelineKey: inbound.timelineKey, action: decision.action });
       return;
     }
     launchSession(inbound, routed.duplicate);
+  }
+
+  async function prepareTriggerMedia(inbound: InboundChatEvent): Promise<void> {
+    const prepared = await background.prepareTriggerEvent(inbound.event);
+    inbound.event = prepared;
+    inbound.trigger = prepared.trigger ?? inbound.trigger;
+
+    for (const eventId of inbound.trigger?.groupedEventIds ?? []) {
+      if (eventId === inbound.event.id) continue;
+      const grouped = timeline.getById(eventId);
+      if (grouped) await background.prepareTriggerEvent(grouped);
+    }
   }
 
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
@@ -205,12 +216,16 @@ function outboundTargetFromTimeline(timelineKey: string) {
   const accountId = parts[1];
   const roomIndex = parts.indexOf("room");
   const dmIndex = parts.indexOf("dm");
-  const roomId = roomIndex >= 0 ? parts.slice(roomIndex + 1).join(":") : undefined;
+  const threadIndex = parts.indexOf("thread");
+  const roomEnd = threadIndex >= 0 ? threadIndex : parts.length;
+  const roomId = roomIndex >= 0 ? parts.slice(roomIndex + 1, roomEnd).join(":") : undefined;
   const userId = dmIndex >= 0 ? parts.slice(dmIndex + 1).join(":") : undefined;
+  const threadId = threadIndex >= 0 ? parts.slice(threadIndex + 1).join(":") : undefined;
   return {
     provider: "matrix",
     timelineKey,
     accountId,
     roomId: roomId || userId,
+    threadId,
   };
 }
