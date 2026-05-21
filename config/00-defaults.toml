@@ -13,12 +13,12 @@ forced_completion_retries = 3
 prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 
 [models.default]
-id = "glm"
+id = "claude-opus-4-7"
 provider = "anthropic"
 endpoint = "${LLM_GATEWAY_URL}"
 api_key = "${LLM_GATEWAY_API_KEY}"
 multimodal = true
-max_tokens = 4096
+max_tokens = 16384
 
 [context.tiers]
 rich_target_tokens = 4000
@@ -42,6 +42,8 @@ trigger_hold_ms = 900
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"
 access_token = "${MATRIX_ACCESS_TOKEN}"
+password = "${MATRIX_PASSWORD}"
+recovery_key = "${MATRIX_RECOVERY_KEY}"
 user_id = "${MATRIX_USER_ID}"
 device_id = "${MATRIX_DEVICE_ID}"
 store_path = "./var/matrix/miku"

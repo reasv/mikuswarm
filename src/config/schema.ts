@@ -11,7 +11,9 @@ const ModelSchema = Type.Object({
 
 const MatrixAccountSchema = Type.Object({
   homeserver: Type.String(),
-  access_token: Type.String(),
+  access_token: Type.Optional(Type.String()),
+  password: Type.Optional(Type.String()),
+  recovery_key: Type.Optional(Type.String()),
   user_id: Type.String(),
   device_id: Type.Optional(Type.String()),
   store_path: Type.String(),
@@ -69,4 +71,3 @@ export const AppConfigSchema = Type.Object({
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
-

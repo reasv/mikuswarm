@@ -1,0 +1,12 @@
+{
+  "accountId": "miku",
+  "homeserver": "https://matrix.example.com",
+  "authMode": "password",
+  "userId": "@miku:example.com",
+  "deviceId": "iNTRI9hOGa",
+  "accessToken": "mct_FWVrt7SQk4XoEhd5yH4BX1kL5AJH8L_XDrhr1",
+  "refreshToken": null,
+  "syncToken": "s210725_1075470_216417_551900_1861_10_19053_16642_0_31_2",
+  "createdAt": "2026-05-21T20:18:02.686355820Z",
+  "updatedAt": "2026-05-21T20:59:35.074735792Z"
+}

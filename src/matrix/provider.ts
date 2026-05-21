@@ -179,7 +179,11 @@ function toNativeConfig(
     accountId,
     homeserver: account.homeserver,
     userId: account.user_id,
-    auth: { mode: "accessToken", accessToken: account.access_token },
+    auth:
+      account.access_token && account.access_token.length > 0
+        ? { mode: "accessToken", accessToken: account.access_token }
+        : { mode: "password", password: account.password ?? "" },
+    recoveryKey: account.recovery_key,
     deviceName: account.device_id,
     initialSyncLimit: 20,
     encryptionEnabled: true,

@@ -2,6 +2,7 @@ import { Value } from "@sinclair/typebox/value";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { parse } from "smol-toml";
+import { loadDotEnv, type EnvLoadOptions } from "./env.js";
 import { AppConfigSchema, type AppConfig } from "./schema.js";
 import { registerSecret } from "./redaction.js";
 
@@ -52,7 +53,15 @@ function formatValidationErrors(config: unknown): string {
     .join("; ");
 }
 
-export async function loadConfig(configDir: string): Promise<AppConfig> {
+export interface ConfigLoadOptions {
+  env?: EnvLoadOptions | false;
+}
+
+export async function loadConfig(configDir: string, options: ConfigLoadOptions = {}): Promise<AppConfig> {
+  if (options.env !== false) {
+    await loadDotEnv(options.env);
+  }
+
   const entries = await readdir(configDir, { withFileTypes: true });
   const files = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".toml"))
@@ -80,4 +89,3 @@ export async function loadConfig(configDir: string): Promise<AppConfig> {
   const config = Value.Decode(AppConfigSchema, merged);
   return config;
 }
-

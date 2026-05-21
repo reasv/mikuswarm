@@ -1,4 +1,5 @@
 export { loadConfig } from "./loader.js";
+export { loadDotEnv, parseDotEnv, type EnvLoadOptions, type EnvLoadResult } from "./env.js";
 export type { AppConfig } from "./schema.js";
 export {
   redactSecrets,
