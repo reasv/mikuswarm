@@ -17,7 +17,7 @@ export class BackgroundProcessor {
   async prepareTriggerEvent(event: CanonicalChatEvent): Promise<CanonicalChatEvent> {
     if (!event.attachments?.length || !this.options.captioner) return event;
     const captions = await this.options.captioner(event);
-    const updated = { ...event, generatedCaptions: captions };
+    const updated = applyCaptions(event, captions);
     await this.store.enrich(event.id, () => updated);
     return updated;
   }
@@ -31,10 +31,28 @@ export class BackgroundProcessor {
     ]).then(async (captions) => {
       if (captions.length === 0) return;
       await this.store.enrich(event.id, (current) => ({
-        ...current,
-        generatedCaptions: captions,
+        ...applyCaptions(current, captions),
       }));
     });
   }
 }
 
+function applyCaptions(event: CanonicalChatEvent, captions: CaptionResult[]): CanonicalChatEvent {
+  const byAttachment = new Map(captions.map((caption) => [caption.attachmentId, caption]));
+  return {
+    ...event,
+    generatedCaptions: captions,
+    attachments: event.attachments?.map((attachment) => {
+      const caption = byAttachment.get(attachment.id);
+      if (!caption || caption.status !== "complete") return attachment;
+      return {
+        ...attachment,
+        caption: caption.text,
+        processing: {
+          ...attachment.processing,
+          captioned: true,
+        },
+      };
+    }),
+  };
+}

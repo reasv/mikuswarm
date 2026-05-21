@@ -8,6 +8,7 @@ export interface SendMessageToolContext {
   target: OutboundTarget;
   timeline: TimelineStore;
   agentSessionId: string;
+  recordSentMessage?: (message: string) => void;
 }
 
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
@@ -21,6 +22,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
     }),
     execute: async (_toolCallId, params) => {
       const args = params as { message: string; html?: string };
+      context.recordSentMessage?.(args.message);
       const receipt = await context.provider.send(context.target, {
         body: args.message,
         htmlBody: args.html,
@@ -47,4 +49,3 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
     },
   };
 }
-

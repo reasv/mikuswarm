@@ -100,11 +100,9 @@ export class ContextBuilder {
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {
     const multimodal = this.config.models.default?.multimodal ?? false;
     if (!multimodal) return [];
-    const images = (trigger.attachments ?? []).filter(
-      (attachment) => attachment.mediaType === "image" && attachment.localPath,
-    );
+    const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
-    for (const attachment of images) {
+    for (const { eventId, attachment } of images) {
       const input = await readFile(attachment.localPath!);
       const output = await sharp(input)
         .resize({
@@ -116,7 +114,7 @@ export class ContextBuilder {
         .jpeg({ quality: 82 })
         .toBuffer();
       blocks.push({
-        eventId: trigger.id,
+        eventId,
         attachmentId: attachment.id,
         mediaType: "image/jpeg",
         dataBase64: output.toString("base64"),
@@ -124,6 +122,45 @@ export class ContextBuilder {
     }
     return blocks;
   }
+
+  private selectImageAttachments(
+    trigger: CanonicalChatEvent,
+  ): Array<{ eventId: string; attachment: NonNullable<CanonicalChatEvent["attachments"]>[number] }> {
+    const triggerImages = imageAttachments(trigger).map((attachment) => ({ eventId: trigger.id, attachment }));
+    if (triggerImages.length > 0) return triggerImages;
+
+    const replyImages = (trigger.replyTo?.attachments ?? [])
+      .filter((attachment) => attachment.mediaType === "image" && attachment.localPath)
+      .map((attachment) => ({ eventId: trigger.replyTo?.externalId ?? trigger.id, attachment }));
+    if (replyImages.length > 0) return replyImages;
+
+    for (const eventId of trigger.trigger?.groupedEventIds ?? []) {
+      if (eventId === trigger.id) continue;
+      const event = this.store.getById(eventId);
+      const groupedImages = event ? imageAttachments(event).map((attachment) => ({ eventId: event.id, attachment })) : [];
+      if (groupedImages.length > 0) return groupedImages;
+    }
+
+    const lookback = this.store
+      .query({
+        timelineKey: trigger.timelineKey,
+        toTimestamp: trigger.timestamp,
+        fromTimestamp: trigger.timestamp - Math.max(5_000, this.config.matrix.trigger_hold_ms * 2),
+        limit: 50,
+      })
+      .reverse()
+      .find(
+        (event) =>
+          event.id !== trigger.id &&
+          event.sender.id === trigger.sender.id &&
+          imageAttachments(event).length > 0,
+      );
+    return lookback ? imageAttachments(lookback).map((attachment) => ({ eventId: lookback.id, attachment })) : [];
+  }
+}
+
+function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {
+  return (event.attachments ?? []).filter((attachment) => attachment.mediaType === "image" && attachment.localPath);
 }
 
 function renderRuntimeInstructions(options: BuildContextOptions): string {

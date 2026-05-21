@@ -1,4 +1,5 @@
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import type { AppConfig } from "../config/index.js";
 import type {
   ChatProvider,
@@ -76,6 +77,28 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
   async send(target: OutboundTarget, message: OutboundMessage): Promise<DeliveryReceipt> {
     const account = this.resolveAccount(target);
     if (!target.roomId) throw new Error("Matrix outbound target requires roomId");
+    if (message.attachments?.length) {
+      let externalId: string | undefined;
+      for (const [index, attachment] of message.attachments.entries()) {
+        if (!attachment.localPath) throw new Error(`Outbound attachment has no localPath: ${attachment.id}`);
+        const data = await readFile(attachment.localPath);
+        const result = account.client.uploadMedia({
+          roomId: target.roomId,
+          filename: attachment.filename ?? path.basename(attachment.localPath),
+          contentType: attachment.mimeType ?? "application/octet-stream",
+          dataBase64: data.toString("base64"),
+          caption: index === 0 && message.body ? message.body : undefined,
+          threadId: target.threadId,
+        });
+        externalId = result.messageId;
+      }
+      return {
+        provider: this.id,
+        target,
+        externalId,
+        deliveredAt: Date.now(),
+      };
+    }
     const result = account.client.sendMessage({
       roomId: target.roomId,
       text: message.body,
@@ -112,16 +135,28 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
 
   private emitWithTriggerHold(inbound: InboundChatEvent): void {
     this.emit({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
-    if (!inbound.trigger || !this.config) return;
+    if (!this.config) return;
 
     const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
     const existing = this.pendingTriggers.get(key);
+    if (!inbound.trigger) {
+      if (existing) {
+        existing.event.trigger = {
+          ...existing.event.trigger!,
+          groupedEventIds: [...(existing.event.trigger?.groupedEventIds ?? []), inbound.event.id],
+        };
+        existing.event.event.trigger = existing.event.trigger;
+      }
+      return;
+    }
+
     if (existing) {
       clearTimeout(existing.timer);
-      existing.event.event.trigger = {
+      existing.event.trigger = {
         ...existing.event.trigger!,
         groupedEventIds: [...(existing.event.trigger?.groupedEventIds ?? []), inbound.event.id],
       };
+      existing.event.event.trigger = existing.event.trigger;
     }
 
     const holdStartedAt = Date.now();

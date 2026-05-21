@@ -1,4 +1,5 @@
 import { nanoid } from "nanoid";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { InboundChatEvent } from "../types.js";
 
 export type AgentSessionStatus = "created" | "running" | "completed" | "discarded";
@@ -15,6 +16,7 @@ export interface AgentSessionRecord {
 
 export class SessionManager {
   private readonly sessions = new Map<string, AgentSessionRecord>();
+  private readonly agents = new Map<string, Agent>();
   private readonly byTimeline = new Map<string, Set<string>>();
 
   createPlaceholder(trigger: InboundChatEvent): AgentSessionRecord {
@@ -41,6 +43,7 @@ export class SessionManager {
   }
 
   markCompleted(sessionId: string): void {
+    this.agents.delete(sessionId);
     this.update(sessionId, (session) => ({
       ...session,
       status: "completed",
@@ -49,6 +52,7 @@ export class SessionManager {
   }
 
   markDiscarded(sessionId: string): void {
+    this.agents.delete(sessionId);
     this.update(sessionId, (session) => ({
       ...session,
       status: "discarded",
@@ -58,6 +62,24 @@ export class SessionManager {
 
   get(sessionId: string): AgentSessionRecord | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  attachAgent(sessionId: string, agent: Agent): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    this.agents.set(sessionId, agent);
+  }
+
+  getAgent(sessionId: string): Agent | undefined {
+    return this.agents.get(sessionId);
+  }
+
+  steer(sessionId: string, message: AgentMessage): boolean {
+    const session = this.sessions.get(sessionId);
+    const agent = this.agents.get(sessionId);
+    if (!session || !agent || session.status !== "running") return false;
+    agent.steer(message);
+    return true;
   }
 
   activeForTimeline(timelineKey: string): AgentSessionRecord[] {
@@ -75,4 +97,3 @@ export class SessionManager {
     this.sessions.set(sessionId, updater(session));
   }
 }
-

@@ -1,4 +1,5 @@
 import { Agent } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Model } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import type { ContextBuilder } from "../context/index.js";
@@ -15,13 +16,13 @@ export interface AgentFactoryOptions {
 export class AgentSessionFactory {
   constructor(private readonly options: AgentFactoryOptions) {}
 
-  create(session: AgentSessionRecord): Agent {
+  create(session: AgentSessionRecord, tools: AgentTool[] = []): Agent {
     const model = createModel(this.options.config);
     return new Agent({
       initialState: {
         systemPrompt: this.options.config.agent.system.prompt,
         model,
-        tools: [],
+        tools,
       },
       transformContext: async () => {
         const built = await this.options.contextBuilder.build({
