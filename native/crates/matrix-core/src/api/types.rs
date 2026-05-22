@@ -211,6 +211,7 @@ pub struct MatrixMessageSummaryRequest {
 pub struct MatrixSendRequest {
     pub room_id: String,
     pub text: String,
+    pub html: Option<String>,
     pub reply_to_id: Option<String>,
     pub thread_id: Option<String>,
 }

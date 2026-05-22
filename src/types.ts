@@ -54,7 +54,6 @@ export interface LinkPreviewMeta {
 export interface MentionInfo {
   mentionedUserIds: string[];
   mentionedSelf?: boolean;
-  displayMentions?: string[];
 }
 
 export interface ReactionInfo {

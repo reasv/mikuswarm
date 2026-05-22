@@ -35,6 +35,41 @@ test("assistant echo enriches local sends with matching external id instead of a
   });
 });
 
+test("assistant echo matches by external id across DM self-echo timeline mismatch", async () => {
+  await withTimeline(async (timeline) => {
+    await timeline.append({
+      ...assistantEvent({
+        id: "assistant:s1:$server-event",
+        externalId: "$server-event",
+        body: "already sent",
+        timestamp: 1_000,
+      }),
+      timelineKey: "matrix:miku:dm:@alice:example.org",
+      agentSessionId: "s1",
+    });
+
+    const result = await new AssistantEchoResolver(timeline).ingestOwnEcho({
+      ...assistantEvent({
+        id: "matrix:miku:$server-event",
+        externalId: "$server-event",
+        body: "already sent",
+        timestamp: 2_000,
+      }),
+      timelineKey: "matrix:miku:dm:@miku:example.org",
+      sender: { id: "@miku:example.org", displayName: "Miku", isSelf: true },
+    });
+
+    const humanDmEvents = timeline.query({ timelineKey: "matrix:miku:dm:@alice:example.org", limit: 10 });
+    const selfDmEvents = timeline.query({ timelineKey: "matrix:miku:dm:@miku:example.org", limit: 10 });
+
+    assert.equal(result, "enriched");
+    assert.equal(humanDmEvents.length, 1);
+    assert.equal(selfDmEvents.length, 0);
+    assert.equal(humanDmEvents[0]?.id, "assistant:s1:$server-event");
+    assert.equal(humanDmEvents[0]?.timestamp, 2_000);
+  });
+});
+
 test("timeline enrichment keeps query columns in sync with event json", async () => {
   await withTimeline(async (timeline) => {
     await timeline.append(

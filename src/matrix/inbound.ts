@@ -15,7 +15,6 @@ import type {
 export interface MatrixInboundContext {
   accountId: string;
   selfUserId: string;
-  mentionNames: string[];
   attachmentDir?: string;
   client?: MatrixNativeClient;
 }
@@ -68,9 +67,6 @@ export function normalizeMatrixInboundEvent(
     mentions: {
       mentionedUserIds: event.mentions?.userIds ?? [],
       mentionedSelf,
-      displayMentions: context.mentionNames.filter((name) =>
-        event.body.toLowerCase().includes(`@${name.toLowerCase()}`),
-      ),
     },
     threadId: event.threadRootId,
     trigger,
@@ -132,9 +128,7 @@ function detectTrigger(
 }
 
 function isMentioningSelf(event: MatrixInboundEvent, context: MatrixInboundContext): boolean {
-  if (event.mentions?.userIds?.includes(context.selfUserId)) return true;
-  const body = event.body.toLowerCase();
-  return context.mentionNames.some((name) => body.includes(`@${name.toLowerCase()}`));
+  return event.mentions?.userIds?.includes(context.selfUserId) ?? false;
 }
 
 async function resolveAttachments(

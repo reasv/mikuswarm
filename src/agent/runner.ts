@@ -55,13 +55,17 @@ export class SessionRunner {
       const noReply = /^\s*NO_REPLY\s*$/.test(stripped);
       const finalText = stripped.replace(/\bNO_REPLY\b/g, "").trim();
       if (!noReply && finalText && !wasAlreadySent(finalText, this.options.sentMessages ?? [])) {
+        let deliveredExternalId: string | undefined;
+        let deliveredAt = Date.now();
         if (this.options.provider && this.options.target) {
-          await this.options.provider.send(this.options.target, {
+          const receipt = await this.options.provider.send(this.options.target, {
             body: finalText,
             agentSessionId: session.id,
           });
+          deliveredExternalId = receipt.externalId;
+          deliveredAt = receipt.deliveredAt;
         }
-        await this.store.append(createAssistantTimelineEvent(session, finalText));
+        await this.store.append(createAssistantTimelineEvent(session, finalText, deliveredAt, deliveredExternalId));
       }
       return {
         sessionId: session.id,
@@ -112,9 +116,15 @@ export function stripThinkingContamination(text: string): string {
     .trim();
 }
 
-function createAssistantTimelineEvent(session: AgentSessionRecord, body: string): CanonicalChatEvent {
+function createAssistantTimelineEvent(
+  session: AgentSessionRecord,
+  body: string,
+  timestamp: number,
+  externalId?: string,
+): CanonicalChatEvent {
   return {
-    id: `assistant:${session.id}:${Date.now()}`,
+    id: `assistant:${session.id}:${externalId ?? timestamp}`,
+    externalId,
     timelineKey: session.timelineKey,
     provider: session.trigger.provider,
     agentSessionId: session.id,
@@ -125,7 +135,7 @@ function createAssistantTimelineEvent(session: AgentSessionRecord, body: string)
       isSelf: true,
     },
     body,
-    timestamp: Date.now(),
+    timestamp,
     receivedAt: Date.now(),
   };
 }

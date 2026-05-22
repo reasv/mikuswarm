@@ -10,7 +10,6 @@ export type {
 } from "./messages.js";
 export { convertToLlm } from "./convert.js";
 export { AgentSessionFactory, createModel, type AgentFactoryOptions } from "./factory.js";
-export { streamLlmGateway } from "./llm-gateway.js";
 export {
   SessionRunner,
   extractLastAssistantText,

@@ -363,6 +363,7 @@ impl MatrixCoreService {
             config,
             &room,
             request.text.clone(),
+            request.html.clone(),
             request.reply_to_id.as_deref(),
             request.thread_id.as_deref(),
         ))?;
@@ -882,15 +883,19 @@ async fn build_message_content(
     config: &MatrixClientConfig,
     room: &Room,
     text: String,
+    html: Option<String>,
     reply_to_id: Option<&str>,
     thread_id: Option<&str>,
 ) -> MatrixResult<RoomMessageEventContent> {
-    let formatted = emoji::render_text_with_custom_emoji(
-        config,
-        &text,
-        Some(room.room_id().as_str()),
-        Utc::now().timestamp_millis(),
-    )?;
+    let formatted = match html {
+        Some(value) => Some(value),
+        None => emoji::render_text_with_custom_emoji(
+            config,
+            &text,
+            Some(room.room_id().as_str()),
+            Utc::now().timestamp_millis(),
+        )?,
+    };
     let reply = media::build_reply(reply_to_id, thread_id)?;
     if let Some(reply) = reply {
         let base = match formatted {
@@ -1641,9 +1646,26 @@ async fn initial_sync(
         Some(stored_session),
         Some(response.next_batch.clone()),
     )?;
+    auto_join_invited_rooms(client, shared).await;
     refresh_diagnostics(shared, client, config, &stored_session).await;
     shared.set_sync_state(MatrixSyncState::Ready);
     Ok(response.next_batch)
+}
+
+async fn auto_join_invited_rooms(client: &Client, shared: &Arc<SharedState>) {
+    for room in client.invited_rooms() {
+        let room_id = room.room_id().to_string();
+        match room.join().await {
+            Ok(()) => shared.push_lifecycle(
+                NativeLifecycleStage::StartSync,
+                format!("auto-joined invited room {room_id}"),
+            ),
+            Err(err) => shared.push_lifecycle(
+                NativeLifecycleStage::StartSync,
+                format!("failed to auto-join invited room {room_id}: {err}"),
+            ),
+        }
+    }
 }
 
 async fn refresh_diagnostics(
@@ -1702,6 +1724,7 @@ async fn run_sync_loop(
                 ) {
                     stored_session = updated_session;
                 }
+                auto_join_invited_rooms(&client, &shared).await;
                 refresh_diagnostics(&shared, &client, &config, &stored_session).await;
                 shared.set_sync_state(MatrixSyncState::Ready);
             }

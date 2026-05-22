@@ -137,6 +137,15 @@ export class Storage {
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
 
+  getTimelineEventByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select event_json from timeline_events where provider = ? and external_id = ? limit 1`)
+        .get(provider, externalId) as { event_json: string } | undefined,
+    );
+    return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
+  }
+
   updateTimelineEvent(id: string, updater: (event: CanonicalChatEvent) => CanonicalChatEvent): Promise<void> {
     return this.write((db) => {
       const row = db

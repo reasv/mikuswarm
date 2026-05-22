@@ -23,6 +23,10 @@ export class TimelineStore {
     return this.storage.getTimelineEventById(eventId);
   }
 
+  getByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
+    return this.storage.getTimelineEventByExternalId(provider, externalId);
+  }
+
   query(query: TimelineQuery): CanonicalChatEvent[] {
     return this.storage.read((db) => {
       const clauses = ["timeline_key = @timelineKey"];

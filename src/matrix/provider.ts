@@ -102,6 +102,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     const result = account.client.sendMessage({
       roomId: target.roomId,
       text: message.body,
+      html: message.htmlBody,
       threadId: target.threadId,
     });
     return {
@@ -125,7 +126,6 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       const inbound = await processMatrixInboundEvent(nativeEvent.event, {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
-        mentionNames: this.config?.rooms.mention_names ?? [],
         attachmentDir: path.join("msg-attach", "matrix", account.accountId),
         client: account.client,
       });

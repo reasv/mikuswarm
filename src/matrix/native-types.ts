@@ -89,6 +89,7 @@ export type MatrixNativeDiagnostics = {
 export type MatrixSendRequest = {
   roomId: string;
   text: string;
+  html?: string;
   replyToId?: string;
   threadId?: string;
 };
@@ -383,4 +384,3 @@ export type MatrixListEmojiRequest = {
   limit?: number;
   nowMs?: number;
 };
-

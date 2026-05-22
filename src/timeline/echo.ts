@@ -20,6 +20,11 @@ export class AssistantEchoResolver {
   }
 
   private findLocalAssistantEvent(event: CanonicalChatEvent): CanonicalChatEvent | undefined {
+    if (event.externalId) {
+      const byExternalId = this.store.getByExternalId(event.provider, event.externalId);
+      if (byExternalId?.role === "assistant" && byExternalId.sender.isSelf) return byExternalId;
+    }
+
     const candidates = this.store
       .query({ timelineKey: event.timelineKey, limit: 100 })
       .reverse()

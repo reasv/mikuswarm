@@ -47,7 +47,3 @@ recovery_key = "${MATRIX_RECOVERY_KEY}"
 user_id = "${MATRIX_USER_ID}"
 device_id = "${MATRIX_DEVICE_ID}"
 store_path = "./var/matrix/miku"
-
-[matrix.rooms]
-join = []
-mention_names = ["miku"]

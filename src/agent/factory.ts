@@ -1,11 +1,10 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
-import { type Model } from "@earendil-works/pi-ai";
+import { streamSimple, type Model } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
-import { streamLlmGateway } from "./llm-gateway.js";
 
 export interface AgentFactoryOptions {
   config: AppConfig;
@@ -40,7 +39,7 @@ export class AgentSessionFactory {
         return buildAgentContextMessages(built, messages);
       },
       convertToLlm,
-      streamFn: streamLlmGateway as any,
+      streamFn: streamSimple,
       getApiKey: () => this.options.config.models.default.api_key,
       onPayload: (payload) => payload,
       steeringMode: "one-at-a-time",

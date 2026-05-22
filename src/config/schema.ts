@@ -63,10 +63,6 @@ export const AppConfigSchema = Type.Object({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
-    rooms: Type.Object({
-      join: Type.Array(Type.String()),
-      mention_names: Type.Array(Type.String()),
-    }),
   }),
 });
 
