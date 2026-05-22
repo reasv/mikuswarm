@@ -1,52 +1,47 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { TimelineStore } from "../timeline/index.js";
+import { runRipgrep, runTextEditorCommand } from "./file.js";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 
 export interface MemoryToolContext {
   workspaceRoot: string;
-  timeline: TimelineStore;
-  timelineKey: string;
+  now?: Date;
 }
 
 export function createSearchMemoryTool(context: MemoryToolContext): AgentTool {
   return {
     name: "search_memory",
     label: "Search memory",
-    description: "Search recent stored timeline events for the current chat.",
+    description: "Search workspace daily memory markdown files with ripgrep.",
     parameters: Type.Object({
-      query: Type.String(),
-      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
+      pattern: Type.String(),
+      glob: Type.Optional(Type.Array(Type.String())),
+      case_sensitive: Type.Optional(Type.Boolean()),
+      context_lines: Type.Optional(Type.Number({ minimum: 0, maximum: 10 })),
+      max_results: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as { query: string; limit?: number };
-      const terms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
-      const matches = context.timeline
-        .query({ timelineKey: context.timelineKey, limit: 2000 })
-        .filter((event) => {
-          const haystack = [
-            event.body,
-            event.sender.displayName,
-            event.sender.id,
-            ...(event.attachments ?? []).map((attachment) => `${attachment.filename ?? ""} ${attachment.caption ?? ""}`),
-            ...(event.generatedCaptions ?? []).map((caption) => caption.text),
-          ]
-            .join(" ")
-            .toLowerCase();
-          return terms.every((term) => haystack.includes(term));
-        })
-        .slice(-(args.limit ?? 10));
-      const text = matches
-        .map(
-          (event) =>
-            `[${new Date(event.timestamp).toISOString()}] ${event.sender.displayName ?? event.sender.id}: ${event.body}`,
-        )
-        .join("\n");
+      const args = params as {
+        pattern: string;
+        glob?: string[];
+        case_sensitive?: boolean;
+        context_lines?: number;
+        max_results?: number;
+      };
+      await ensureMemoryDirectory(context.workspaceRoot);
+      const result = await runRipgrep(context.workspaceRoot, {
+        pattern: args.pattern,
+        path: "memory",
+        glob: args.glob ?? ["*.md"],
+        case_sensitive: args.case_sensitive,
+        context_lines: args.context_lines,
+        max_results: args.max_results,
+      });
       return {
-        content: [{ type: "text", text: text || "No matching timeline events." }],
-        details: { count: matches.length, query: args.query },
+        content: [{ type: "text", text: result.text }],
+        details: result.details,
       };
     },
   };
@@ -55,28 +50,63 @@ export function createSearchMemoryTool(context: MemoryToolContext): AgentTool {
 export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
   return {
     name: "write_memory",
-    label: "Write memory",
-    description: "Append a durable markdown note to the current chat memory file.",
+    label: "Daily memory editor",
+    description: "View and edit today's daily memory markdown file in the workspace memory folder.",
     parameters: Type.Object({
-      note: Type.String(),
-      file: Type.Optional(Type.String()),
+      command: Type.Union([
+        Type.Literal("view"),
+        Type.Literal("str_replace"),
+        Type.Literal("insert"),
+      ]),
+      view_range: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
+      old_str: Type.Optional(Type.String()),
+      new_str: Type.Optional(Type.String()),
+      file_text: Type.Optional(Type.String()),
+      insert_line: Type.Optional(Type.Number({ minimum: 0 })),
+      insert_text: Type.Optional(Type.String()),
+      max_characters: Type.Optional(Type.Number({ minimum: 1, maximum: 500_000 })),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as { note: string; file?: string };
-      const memoryPath = resolveWorkspacePath(context.workspaceRoot, args.file ?? "memory/miku-memory.md");
-      await mkdir(path.dirname(memoryPath), { recursive: true });
-      let existing = "";
-      try {
-        existing = await readFile(memoryPath, "utf8");
-      } catch {
-        existing = "# Miku Memory\n";
-      }
-      const entry = `\n\n## ${new Date().toISOString()}\n\n${args.note.trim()}\n`;
-      await writeFile(memoryPath, `${existing.trimEnd()}${entry}`, "utf8");
+      const memoryPath = await ensureDailyMemoryFile(context.workspaceRoot, context.now ?? new Date());
+      const relativePath = workspaceRelative(context.workspaceRoot, memoryPath);
+      const args = params as {
+        command: "view" | "str_replace" | "insert";
+        view_range?: [number, number];
+        old_str?: string;
+        new_str?: string;
+        file_text?: string;
+        insert_line?: number;
+        insert_text?: string;
+        max_characters?: number;
+      };
+      const result = await runTextEditorCommand(context.workspaceRoot, { ...args, path: relativePath } as any);
       return {
-        content: [{ type: "text", text: `memory written to ${workspaceRelative(context.workspaceRoot, memoryPath)}` }],
-        details: { path: workspaceRelative(context.workspaceRoot, memoryPath) },
+        content: [{ type: "text", text: result.text }],
+        details: { ...result.details, memoryPath: relativePath },
       };
     },
   };
+}
+
+export function createDailyMemoryEditorTool(context: MemoryToolContext): AgentTool {
+  return createWriteMemoryTool(context);
+}
+
+async function ensureMemoryDirectory(workspaceRoot: string): Promise<string> {
+  const memoryDir = resolveWorkspacePath(workspaceRoot, "memory");
+  await mkdir(memoryDir, { recursive: true });
+  return memoryDir;
+}
+
+async function ensureDailyMemoryFile(workspaceRoot: string, now: Date): Promise<string> {
+  const date = now.toISOString().slice(0, 10);
+  const memoryDir = await ensureMemoryDirectory(workspaceRoot);
+  const memoryPath = path.join(memoryDir, `${date}.md`);
+  try {
+    await stat(memoryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await writeFile(memoryPath, `# ${date} Daily Memory\n`, "utf8");
+  }
+  return memoryPath;
 }

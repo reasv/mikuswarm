@@ -17,3 +17,5 @@ config/90-local.toml
 debug/
 msg-attach/
 var/matrix/
+workspaces/*
+!workspaces/.gitpreserve

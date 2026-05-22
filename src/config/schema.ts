@@ -59,6 +59,9 @@ export const AppConfigSchema = Type.Object({
   storage: Type.Object({
     database_path: Type.String(),
   }),
+  workspace: Type.Object({
+    root_dir: Type.String(),
+  }),
   matrix: Type.Object({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),

@@ -1,4 +1,5 @@
 import sharp from "sharp";
+import { mkdir } from "node:fs/promises";
 import type { AppConfig } from "./config/index.js";
 import { createLogger } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
@@ -16,12 +17,12 @@ import {
   createDanbooruTool,
   createDelegateToSessionTool,
   createDescribeMediaTool,
-  createReadFileTool,
   createSearchMemoryTool,
+  createSearchFilesTool,
   createSendMessageTool,
+  createTextEditorTool,
   createWebFetchTool,
   createWebSearchTool,
-  createWriteFileTool,
   createWriteMemoryTool,
 } from "./tools/index.js";
 import type { CaptionResult, CanonicalChatEvent, InboundChatEvent } from "./types.js";
@@ -37,7 +38,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);
   const sessions = new SessionManager();
-  const workspaceRoot = process.cwd();
+  const workspaceRoot = config.workspace.root_dir;
+  await mkdir(workspaceRoot, { recursive: true });
   const background = new BackgroundProcessor(timeline, { captioner: createBasicCaptioner() });
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(timeline, config);
@@ -137,11 +139,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
       createWebFetchTool(),
       createWebSearchTool(),
-      createReadFileTool({ workspaceRoot }),
-      createWriteFileTool({ workspaceRoot }),
+      createTextEditorTool({ workspaceRoot }),
+      createSearchFilesTool({ workspaceRoot }),
       createDescribeMediaTool({ workspaceRoot }),
-      createSearchMemoryTool({ workspaceRoot, timeline, timelineKey: inbound.timelineKey }),
-      createWriteMemoryTool({ workspaceRoot, timeline, timelineKey: inbound.timelineKey }),
+      createSearchMemoryTool({ workspaceRoot }),
+      createWriteMemoryTool({ workspaceRoot }),
       createDanbooruTool({ workspaceRoot }),
     ];
     const agent = factory.create(session, tools);

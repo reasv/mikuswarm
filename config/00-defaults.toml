@@ -35,6 +35,9 @@ max_height = 720
 [storage]
 database_path = "./var/mikuswarm.db"
 
+[workspace]
+root_dir = "./workspaces/miku"
+
 [matrix]
 enabled = false
 trigger_hold_ms = 900
