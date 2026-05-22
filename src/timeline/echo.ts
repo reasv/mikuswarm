@@ -26,7 +26,7 @@ export class AssistantEchoResolver {
     }
 
     const candidates = this.store
-      .query({ timelineKey: event.timelineKey, limit: 100 })
+      .query({ timelineKey: event.timelineKey, limit: 1000 })
       .reverse()
       .filter((candidate) => candidate.role === "assistant" && candidate.sender.isSelf);
 
@@ -36,12 +36,14 @@ export class AssistantEchoResolver {
     }
 
     const normalizedBody = normalizeBody(event.body);
-    return candidates.find(
+    if (!normalizedBody) return undefined;
+    const fuzzyMatches = candidates.filter(
       (candidate) =>
         !candidate.externalId &&
         normalizeBody(candidate.body) === normalizedBody &&
         Math.abs(candidate.timestamp - event.timestamp) <= 5 * 60 * 1000,
     );
+    return fuzzyMatches.length === 1 ? fuzzyMatches[0] : undefined;
   }
 }
 

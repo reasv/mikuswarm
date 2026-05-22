@@ -22,12 +22,12 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
     }),
     execute: async (_toolCallId, params) => {
       const args = params as { message: string; html?: string };
-      context.recordSentMessage?.(args.message);
       const receipt = await context.provider.send(context.target, {
         body: args.message,
         htmlBody: args.html,
         agentSessionId: context.agentSessionId,
       });
+      context.recordSentMessage?.(args.message);
       const event: CanonicalChatEvent = {
         id: `assistant:${context.agentSessionId}:${receipt.externalId ?? Date.now()}`,
         externalId: receipt.externalId,

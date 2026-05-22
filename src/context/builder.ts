@@ -1,4 +1,3 @@
-import sharp from "sharp";
 import { readFile } from "node:fs/promises";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
@@ -16,6 +15,7 @@ export interface ContextMessage {
   tier?: "compact" | "rich" | "runtime" | "system";
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
+  timestamp?: number;
 }
 
 export interface ImageBlock {
@@ -53,6 +53,7 @@ export class ContextBuilder {
       id: event.id,
       role: event.role,
       content: renderRichMessage(event),
+      timestamp: event.timestamp,
     }));
     const turns = buildTurns(rendered);
     const compacted = compactTurns(
@@ -67,6 +68,7 @@ export class ContextBuilder {
       content: turn.content,
       tier: turn.tier,
       tokenEstimate: turn.tokenEstimate,
+      timestamp: turn.timestamp,
     }));
     const runtime = renderRuntimeInstructions(options);
     const imageBlocks = await this.selectImageBlocks(options.trigger);
@@ -108,7 +110,8 @@ export class ContextBuilder {
         maxWidth: this.config.context.images.max_width,
         maxHeight: this.config.context.images.max_height,
         maxBytes: this.config.context.images.max_bytes,
-      });
+      }).catch(() => undefined);
+      if (!output) continue;
       blocks.push({
         eventId,
         attachmentId: attachment.id,
@@ -164,7 +167,8 @@ export interface ImageEncodingOptions {
 export async function encodeImageForContext(
   input: Buffer,
   options: ImageEncodingOptions,
-): Promise<Buffer> {
+): Promise<Buffer | undefined> {
+  const sharp = (await import("sharp")).default;
   const metadata = await sharp(input).metadata();
   let width = Math.min(metadata.width ?? options.maxWidth, options.maxWidth);
   let height = Math.min(metadata.height ?? options.maxHeight, options.maxHeight);
@@ -194,7 +198,7 @@ export async function encodeImageForContext(
   if (!best) {
     throw new Error("Unable to encode image for context");
   }
-  throw new Error(`Unable to encode image within ${options.maxBytes} bytes; smallest attempt was ${best.byteLength} bytes`);
+  return best.byteLength <= options.maxBytes ? best : undefined;
 }
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {
@@ -209,7 +213,7 @@ function renderRuntimeInstructions(options: BuildContextOptions): string {
     )
     .join("\n");
   return `<runtime>
-Current time: ${(options.now ?? new Date()).toISOString()}
+Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
 Current timeline: ${escapeXml(options.timelineKey)}
 Trigger event: ${escapeXml(options.trigger.id)}
 

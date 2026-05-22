@@ -19,6 +19,18 @@ endpoint = "${LLM_GATEWAY_URL}"
 api_key = "${LLM_GATEWAY_API_KEY}"
 multimodal = true
 max_tokens = 16384
+reasoning = true
+context_window = 128000
+
+[models.default.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+[models.default.compat]
+supports_cache_control_on_tools = false
+supports_long_cache_retention = false
 
 [context.tiers]
 rich_target_tokens = 4000

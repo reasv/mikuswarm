@@ -107,6 +107,7 @@ export interface OutboundTarget {
   accountId?: string;
   roomId?: string;
   threadId?: string;
+  replyToId?: string;
 }
 
 export interface OutboundMessage {
@@ -120,6 +121,7 @@ export interface DeliveryReceipt {
   provider: string;
   target: OutboundTarget;
   externalId?: string;
+  externalIds?: string[];
   deliveredAt: number;
 }
 

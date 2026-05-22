@@ -88,10 +88,6 @@ export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
   };
 }
 
-export function createDailyMemoryEditorTool(context: MemoryToolContext): AgentTool {
-  return createWriteMemoryTool(context);
-}
-
 async function ensureMemoryDirectory(workspaceRoot: string): Promise<string> {
   const memoryDir = resolveWorkspacePath(workspaceRoot, "memory");
   await mkdir(memoryDir, { recursive: true });

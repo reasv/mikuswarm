@@ -1,4 +1,3 @@
-import sharp from "sharp";
 import { mkdir } from "node:fs/promises";
 import type { AppConfig } from "./config/index.js";
 import { createLogger } from "./observability/index.js";
@@ -40,10 +39,32 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const sessions = new SessionManager();
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
-  const background = new BackgroundProcessor(timeline, { captioner: createBasicCaptioner() });
+  const background = new BackgroundProcessor(timeline, {
+    captioner: createBasicCaptioner(),
+    onError: (error, context) =>
+      logger.warn("background_processing_error", {
+        ...context,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+  });
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(timeline, config);
-  const provider = new MatrixProvider();
+  const provider = new MatrixProvider({
+    onError: (error, context) =>
+      logger.error("matrix_provider_error", {
+        ...context,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    onNativeEvent: (event, context) =>
+      logger.info("matrix_native_event", {
+        ...context,
+        type: event.type,
+        state: "state" in event ? event.state : undefined,
+        stage: "stage" in event ? event.stage : undefined,
+      }),
+  });
+  const activeRuns = new Set<Promise<void>>();
+  let draining = false;
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -57,14 +78,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
 
   async function handleInbound(inbound: InboundChatEvent): Promise<void> {
+    if (draining) return;
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
       return;
     }
     const routed = await router.route(inbound);
     if (steerReplyToActiveSession(inbound)) return;
-    background.processNonTriggerEvent(inbound.event);
-    if (!inbound.trigger) return;
+    if (!inbound.trigger) {
+      background.processNonTriggerEvent(inbound.event);
+      return;
+    }
     await prepareTriggerMedia(inbound);
     const decision = triggerCoordinator.accept(inbound);
     if (decision.action !== "spawn") {
@@ -150,7 +174,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     sessions.attachAgent(session.id, agent);
     const runner = new SessionRunner(timeline, { provider, target, sentMessages });
 
-    void runner
+    const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries)
       .then((result) => {
         sessions.markCompleted(session.id);
@@ -168,24 +192,40 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       })
       .finally(() => {
+        activeRuns.delete(run);
+        if (draining) return;
         const next = triggerCoordinator.complete(session.timelineKey);
         if (next) launchSession(next, true);
       });
+    activeRuns.add(run);
   }
 
   await provider.start(config.matrix);
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
+      draining = true;
       await provider.stop();
+      triggerCoordinator.clear();
+      await waitForRuns(activeRuns, 5_000);
+      await storage.waitForIdle();
       storage.close();
       logger.info("runtime_stopped");
     },
   };
 }
 
+async function waitForRuns(runs: Set<Promise<void>>, timeoutMs: number): Promise<void> {
+  if (runs.size === 0) return;
+  await Promise.race([
+    Promise.allSettled([...runs]),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
 function createBasicCaptioner() {
   return async (event: CanonicalChatEvent): Promise<CaptionResult[]> => {
+    const sharp = (await import("sharp")).default;
     const results: CaptionResult[] = [];
     for (const attachment of event.attachments ?? []) {
       if (!attachment.localPath || attachment.mediaType !== "image") continue;

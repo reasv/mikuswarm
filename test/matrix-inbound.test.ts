@@ -26,7 +26,7 @@ test("Matrix direct events keep dm timeline identity and exact outbound room tar
     client: inertClient(),
   });
 
-  assert.equal(inbound.timelineKey, "matrix:miku:dm:@alice:example.org");
+  assert.equal(inbound.timelineKey, "matrix:miku:dm:!room:example.org");
   assert.equal(inbound.outboundTarget?.roomId, "!room:example.org");
   assert.equal(inbound.outboundTarget?.accountId, "miku");
   assert.equal(inbound.trigger?.type, "dm");
@@ -138,7 +138,7 @@ test("Matrix direct self echoes keep the room target even when timeline identity
     client: inertClient(),
   });
 
-  assert.equal(inbound.timelineKey, "matrix:miku:dm:@miku:example.org");
+  assert.equal(inbound.timelineKey, "matrix:miku:dm:!dm:example.org");
   assert.equal(inbound.outboundTarget?.roomId, "!dm:example.org");
   assert.equal(inbound.trigger, undefined);
 });

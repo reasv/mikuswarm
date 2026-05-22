@@ -30,18 +30,22 @@ export class SessionRunner {
       if (this.options.provider && this.options.target) {
         await this.options.provider.setTyping(this.options.target, true);
       }
-      agent.subscribe((event) => {
+      const unsubscribe = agent.subscribe((event) => {
         if (event.type === "message_update" && this.options.provider && this.options.target) {
           void this.options.provider.setTyping(this.options.target, true);
         }
       });
-      await agent.prompt({
-        type: "chatEvent",
-        role: "user",
-        content: session.trigger.event.body,
-        event: session.trigger.event,
-      });
-      await agent.waitForIdle();
+      try {
+        await agent.prompt({
+          type: "chatEvent",
+          role: "user",
+          content: session.trigger.event.body,
+          event: session.trigger.event,
+        });
+        await agent.waitForIdle();
+      } finally {
+        if (typeof unsubscribe === "function") unsubscribe();
+      }
 
       let text = extractLastAssistantText(agent.state.messages);
       while (!text.trim() && retries < maxRetries) {
@@ -53,7 +57,7 @@ export class SessionRunner {
 
       const stripped = stripThinkingContamination(text);
       const noReply = /^\s*NO_REPLY\s*$/.test(stripped);
-      const finalText = stripped.replace(/\bNO_REPLY\b/g, "").trim();
+      const finalText = noReply ? "" : stripped.trim();
       if (!noReply && finalText && !wasAlreadySent(finalText, this.options.sentMessages ?? [])) {
         let deliveredExternalId: string | undefined;
         let deliveredAt = Date.now();

@@ -52,7 +52,7 @@ export function buildAgentContextMessages(
   built: BuiltContext,
   liveMessages: AgentMessage[] = [],
 ): AgentMessage[] {
-  const baseMessages = built.messages.flatMap((message): AgentMessage[] => {
+    const baseMessages = built.messages.flatMap((message): AgentMessage[] => {
     if (message.type === "system") return [];
     if (message.type === "runtimeInstructions") {
       return [
@@ -60,6 +60,7 @@ export function buildAgentContextMessages(
           type: "runtimeInstructions",
           content: message.content,
           imageBlocks: message.imageBlocks,
+          timestamp: message.timestamp,
         },
       ];
     }
@@ -70,6 +71,7 @@ export function buildAgentContextMessages(
           role: message.role === "assistant" ? "assistant" : "user",
           content: message.content,
           imageBlocks: message.imageBlocks,
+          timestamp: message.timestamp,
         },
       ];
     }
@@ -100,14 +102,21 @@ export function createModel(config: AppConfig): Model<"anthropic-messages"> {
     api: "anthropic-messages",
     provider: model.provider,
     baseUrl: model.endpoint,
-    reasoning: false,
+    reasoning: model.reasoning ?? true,
     input: model.multimodal ? ["text", "image"] : ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128_000,
+    cost: {
+      input: model.cost?.input ?? 0,
+      output: model.cost?.output ?? 0,
+      cacheRead: model.cost?.cache_read ?? 0,
+      cacheWrite: model.cost?.cache_write ?? 0,
+    },
+    contextWindow: model.context_window ?? 128_000,
     maxTokens: model.max_tokens,
     compat: {
-      supportsCacheControlOnTools: false,
-      supportsLongCacheRetention: false,
+      supportsCacheControlOnTools: model.compat?.supports_cache_control_on_tools ?? false,
+      supportsLongCacheRetention: model.compat?.supports_long_cache_retention ?? false,
+      supportsEagerToolInputStreaming: model.compat?.supports_eager_tool_input_streaming,
+      sendSessionAffinityHeaders: model.compat?.send_session_affinity_headers,
     },
   };
 }

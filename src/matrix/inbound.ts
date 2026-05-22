@@ -21,7 +21,7 @@ export interface MatrixInboundContext {
 
 export function timelineKeyForMatrixEvent(accountId: string, event: MatrixInboundEvent): string {
   if (event.chatType === "direct") {
-    return `matrix:${accountId}:dm:${event.senderId}`;
+    return `matrix:${accountId}:dm:${event.roomId}`;
   }
   if (event.threadRootId) {
     return `matrix:${accountId}:room:${event.roomId}:thread:${event.threadRootId}`;
@@ -83,6 +83,7 @@ export function normalizeMatrixInboundEvent(
       accountId: context.accountId,
       roomId: event.roomId,
       threadId: event.threadRootId,
+      replyToId: event.eventId,
     },
   };
 }

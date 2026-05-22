@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -88,6 +88,37 @@ test("ripgrep search is scoped to the workspace", async () => {
         }),
       /escapes workspace/,
     );
+  });
+});
+
+test("workspace guard rejects symlink traversal outside workspace", async () => {
+  await withWorkspace(async (workspace) => {
+    const outside = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-outside-"));
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "secret", "utf8");
+      await symlink(outside, path.join(workspace, "linked-outside"), "dir");
+      await mkdir(path.join(workspace, "safe"), { recursive: true });
+
+      await assert.rejects(
+        () =>
+          runTextEditorCommand(workspace, {
+            command: "view",
+            path: "linked-outside/secret.txt",
+          }),
+        /escapes workspace/,
+      );
+      await assert.rejects(
+        () =>
+          runTextEditorCommand(workspace, {
+            command: "create",
+            path: "linked-outside/new.txt",
+            file_text: "nope",
+          }),
+        /escapes workspace/,
+      );
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
 

@@ -7,6 +7,20 @@ const ModelSchema = Type.Object({
   api_key: Type.String(),
   multimodal: Type.Boolean(),
   max_tokens: Type.Number({ minimum: 1 }),
+  reasoning: Type.Optional(Type.Boolean()),
+  context_window: Type.Optional(Type.Number({ minimum: 1 })),
+  cost: Type.Optional(Type.Object({
+    input: Type.Number({ minimum: 0 }),
+    output: Type.Number({ minimum: 0 }),
+    cache_read: Type.Number({ minimum: 0 }),
+    cache_write: Type.Number({ minimum: 0 }),
+  })),
+  compat: Type.Optional(Type.Object({
+    supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
+    supports_long_cache_retention: Type.Optional(Type.Boolean()),
+    supports_eager_tool_input_streaming: Type.Optional(Type.Boolean()),
+    send_session_affinity_headers: Type.Optional(Type.Boolean()),
+  })),
 });
 
 const MatrixAccountSchema = Type.Object({

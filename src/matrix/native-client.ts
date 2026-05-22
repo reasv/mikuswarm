@@ -95,63 +95,63 @@ export class MatrixNativeClient {
   }
 
   resolveTarget(request: MatrixResolveTargetRequest): MatrixResolveTargetResult {
-    return JSON.parse(this.#client.resolveTarget(JSON.stringify(request))) as MatrixResolveTargetResult;
+    return parseNativeJson(this.#client.resolveTarget(JSON.stringify(request)), "resolveTarget");
   }
 
   joinRoom(request: MatrixJoinRequest): MatrixJoinResult {
-    return JSON.parse(this.#client.joinRoom(JSON.stringify(request))) as MatrixJoinResult;
+    return parseNativeJson(this.#client.joinRoom(JSON.stringify(request)), "joinRoom");
   }
 
   readMessages(request: MatrixReadMessagesRequest): MatrixReadMessagesResult {
-    return JSON.parse(this.#client.readMessages(JSON.stringify(request))) as MatrixReadMessagesResult;
+    return parseNativeJson(this.#client.readMessages(JSON.stringify(request)), "readMessages");
   }
 
   messageSummary(request: MatrixMessageSummaryRequest): MatrixMessageSummary | null {
-    return JSON.parse(this.#client.messageSummary(JSON.stringify(request))) as MatrixMessageSummary | null;
+    return parseNativeJson(this.#client.messageSummary(JSON.stringify(request)), "messageSummary");
   }
 
   editMessage(request: MatrixEditMessageRequest): MatrixEditMessageResult {
-    return JSON.parse(this.#client.editMessage(JSON.stringify(request))) as MatrixEditMessageResult;
+    return parseNativeJson(this.#client.editMessage(JSON.stringify(request)), "editMessage");
   }
 
   deleteMessage(request: MatrixDeleteMessageRequest): MatrixDeleteMessageResult {
-    return JSON.parse(this.#client.deleteMessage(JSON.stringify(request))) as MatrixDeleteMessageResult;
+    return parseNativeJson(this.#client.deleteMessage(JSON.stringify(request)), "deleteMessage");
   }
 
   pinMessage(request: MatrixPinMessageRequest): MatrixPinsResult {
-    return JSON.parse(this.#client.pinMessage(JSON.stringify(request))) as MatrixPinsResult;
+    return parseNativeJson(this.#client.pinMessage(JSON.stringify(request)), "pinMessage");
   }
 
   unpinMessage(request: MatrixPinMessageRequest): MatrixPinsResult {
-    return JSON.parse(this.#client.unpinMessage(JSON.stringify(request))) as MatrixPinsResult;
+    return parseNativeJson(this.#client.unpinMessage(JSON.stringify(request)), "unpinMessage");
   }
 
   listPins(request: MatrixListPinsRequest): MatrixPinsResult {
-    return JSON.parse(this.#client.listPins(JSON.stringify(request))) as MatrixPinsResult;
+    return parseNativeJson(this.#client.listPins(JSON.stringify(request)), "listPins");
   }
 
   memberInfo(request: MatrixMemberInfoRequest): MatrixMemberInfo {
-    return JSON.parse(this.#client.memberInfo(JSON.stringify(request))) as MatrixMemberInfo;
+    return parseNativeJson(this.#client.memberInfo(JSON.stringify(request)), "memberInfo");
   }
 
   channelInfo(request: MatrixChannelInfoRequest): MatrixChannelInfo {
-    return JSON.parse(this.#client.channelInfo(JSON.stringify(request))) as MatrixChannelInfo;
+    return parseNativeJson(this.#client.channelInfo(JSON.stringify(request)), "channelInfo");
   }
 
   uploadMedia(request: MatrixUploadMediaRequest): MatrixUploadMediaResult {
-    return JSON.parse(this.#client.uploadMedia(JSON.stringify(request))) as MatrixUploadMediaResult;
+    return parseNativeJson(this.#client.uploadMedia(JSON.stringify(request)), "uploadMedia");
   }
 
   downloadMedia(request: MatrixDownloadMediaRequest): MatrixDownloadMediaResult {
-    return JSON.parse(this.#client.downloadMedia(JSON.stringify(request))) as MatrixDownloadMediaResult;
+    return parseNativeJson(this.#client.downloadMedia(JSON.stringify(request)), "downloadMedia");
   }
 
   reactMessage(request: MatrixReactRequest): MatrixReactResult {
-    return JSON.parse(this.#client.reactMessage(JSON.stringify(request))) as MatrixReactResult;
+    return parseNativeJson(this.#client.reactMessage(JSON.stringify(request)), "reactMessage");
   }
 
   listReactions(request: MatrixListReactionsRequest): MatrixReactionSummary[] {
-    return JSON.parse(this.#client.listReactions(JSON.stringify(request))) as MatrixReactionSummary[];
+    return parseNativeJson(this.#client.listReactions(JSON.stringify(request)), "listReactions");
   }
 
   recordCustomEmojiUsage(request: MatrixEmojiUsageRequest): void {
@@ -159,14 +159,26 @@ export class MatrixNativeClient {
   }
 
   listKnownShortcodes(request: MatrixListEmojiRequest = {}): string[] {
-    return JSON.parse(this.#client.listKnownShortcodes(JSON.stringify(request))) as string[];
+    return parseNativeJson(this.#client.listKnownShortcodes(JSON.stringify(request)), "listKnownShortcodes");
   }
 
   resolveLinkPreviews(request: MatrixResolveLinkPreviewsRequest): MatrixLinkPreviewResult {
-    return JSON.parse(this.#client.resolveLinkPreviews(JSON.stringify(request))) as MatrixLinkPreviewResult;
+    return parseNativeJson(this.#client.resolveLinkPreviews(JSON.stringify(request)), "resolveLinkPreviews");
   }
 
   setTyping(request: MatrixTypingRequest): void {
     this.#client.setTyping(JSON.stringify(request));
   }
+}
+
+function parseNativeJson<T>(payload: string, operation: string): T {
+  const parsed = JSON.parse(payload) as unknown;
+  if (isRecord(parsed) && typeof parsed.error === "string") {
+    throw new Error(`Matrix native ${operation} failed: ${parsed.error}`);
+  }
+  return parsed as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

@@ -10,7 +10,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
         {
           role: message.role,
           content: contentWithImages(message.content, message.imageBlocks),
-          timestamp: Date.now(),
+          timestamp: message.timestamp ?? message.event?.timestamp ?? Date.now(),
         } as Message,
       ];
     }
@@ -26,7 +26,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
         {
           role: "user",
           content: contentWithImages(message.content, message.imageBlocks),
-          timestamp: Date.now(),
+          timestamp: message.timestamp ?? Date.now(),
         },
       ];
     }

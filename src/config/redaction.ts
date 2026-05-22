@@ -15,11 +15,9 @@ export function registeredSecrets(): string[] {
 }
 
 export function redactSecrets(input: string): string {
-  let output = input;
-  for (const secret of registeredSecrets()) {
-    output = output.split(secret).join("[REDACTED]");
-  }
-  return output;
+  const secrets = registeredSecrets();
+  if (secrets.length === 0) return input;
+  return input.replace(new RegExp(secrets.map(escapeRegExp).join("|"), "g"), "[REDACTED]");
 }
 
 export function redactValue<T>(value: T): T {
@@ -41,3 +39,6 @@ export function resetRedactionRegistry(): void {
   redactedValues.clear();
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

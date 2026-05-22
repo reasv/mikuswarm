@@ -30,7 +30,7 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
     .map((attachment) => ` [attachment: ${attachment.filename ?? attachment.id}${attachment.localPath ? ` ${attachment.localPath}` : ""}${attachment.caption ? ` caption=${truncate(attachment.caption, 300)}` : ""}]`)
     .join("");
   const links = (event.linkPreviews ?? [])
-    .map((preview) => ` [link: ${preview.title ?? preview.url} - ${truncate(preview.description ?? "", 1000)}]`)
+    .map((preview) => ` [link: ${preview.title ?? preview.url} — ${truncate(preview.description ?? "", 1000)}]`)
     .join("");
   return `[${time}] ${senderLabel(event)}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${links}`;
 }
@@ -90,4 +90,3 @@ function escapeXml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
 }
-

@@ -31,48 +31,18 @@ export function compactTurns(
   const compactedMessageIds: string[] = [];
   const droppedMessageIds: string[] = [];
 
-  while (sumTokens(rich) > config.rich_max_tokens && rich.length > 1) {
-    const turn = rich.shift();
-    if (!turn) break;
-    const compactContent = turn.messageIds
-      .map((id) => eventById.get(id))
-      .filter((event): event is CanonicalChatEvent => Boolean(event))
-      .map(compactRenderer)
-      .join("\n");
-    compact.push({
-      ...turn,
-      tier: "compact",
-      content: compactContent,
-      tokenEstimate: estimateTokens(compactContent),
-    });
-    compactedMessageIds.push(...turn.messageIds);
-    while (sumTokens(rich) > config.rich_target_tokens && rich.length > 1) {
-      const extra = rich.shift();
-      if (!extra) break;
-      const extraContent = extra.messageIds
-        .map((id) => eventById.get(id))
-        .filter((event): event is CanonicalChatEvent => Boolean(event))
-        .map(compactRenderer)
-        .join("\n");
-      compact.push({
-        ...extra,
-        tier: "compact",
-        content: extraContent,
-        tokenEstimate: estimateTokens(extraContent),
-      });
-      compactedMessageIds.push(...extra.messageIds);
-    }
+  if (sumTokens(rich) > config.rich_max_tokens && rich.length > 1) {
+    do {
+      moveBoundaryUnit(rich, compact, eventById, compactRenderer, compactedMessageIds);
+    } while (sumTokens(rich) > config.rich_target_tokens && rich.length > 1);
   }
 
-  while (sumTokens(compact) > config.compact_max_tokens && compact.length > 1) {
-    const dropped = compact.shift();
-    if (!dropped) break;
-    droppedMessageIds.push(...dropped.messageIds);
-    while (sumTokens(compact) > config.compact_target_tokens && compact.length > 1) {
-      const extra = compact.shift();
-      if (!extra) break;
-      droppedMessageIds.push(...extra.messageIds);
-    }
+  if (sumTokens(compact) > config.compact_max_tokens && compact.length > 1) {
+    do {
+      const dropped = compact.shift();
+      if (!dropped) break;
+      droppedMessageIds.push(...dropped.messageIds);
+    } while (sumTokens(compact) > config.compact_target_tokens && compact.length > 1);
   }
 
   return {
@@ -88,3 +58,39 @@ function sumTokens(turns: TieredTurn[]): number {
   return turns.reduce((sum, turn) => sum + turn.tokenEstimate, 0);
 }
 
+function moveBoundaryUnit(
+  rich: TieredTurn[],
+  compact: TieredTurn[],
+  eventById: Map<string, CanonicalChatEvent>,
+  compactRenderer: (event: CanonicalChatEvent) => string,
+  compactedMessageIds: string[],
+): void {
+  const first = rich.shift();
+  if (!first) return;
+  pushCompact(first, compact, eventById, compactRenderer, compactedMessageIds);
+
+  if (first.role === "user" && rich[0]?.role === "assistant") {
+    pushCompact(rich.shift()!, compact, eventById, compactRenderer, compactedMessageIds);
+  }
+}
+
+function pushCompact(
+  turn: TieredTurn,
+  compact: TieredTurn[],
+  eventById: Map<string, CanonicalChatEvent>,
+  compactRenderer: (event: CanonicalChatEvent) => string,
+  compactedMessageIds: string[],
+): void {
+  const compactContent = turn.messageIds
+    .map((id) => eventById.get(id))
+    .filter((event): event is CanonicalChatEvent => Boolean(event))
+    .map(compactRenderer)
+    .join("\n");
+  compact.push({
+    ...turn,
+    tier: "compact",
+    content: compactContent,
+    tokenEstimate: estimateTokens(compactContent),
+  });
+  compactedMessageIds.push(...turn.messageIds);
+}

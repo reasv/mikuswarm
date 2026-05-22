@@ -9,7 +9,6 @@ import { registerSecret } from "./redaction.js";
 type PlainObject = Record<string, unknown>;
 
 const SECRET_KEY_RE = /(api[_-]?key|token|password|secret|access[_-]?token)/i;
-const ENV_RE = /\$\{([A-Z_][A-Z0-9_]*)\}/g;
 
 function isPlainObject(value: unknown): value is PlainObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -19,16 +18,23 @@ function shallowMergeByTopLevel(configs: PlainObject[]): PlainObject {
   return Object.assign({}, ...configs);
 }
 
-function substituteEnv(value: unknown): unknown {
+function substituteEnv(value: unknown, missing = new Set<string>()): unknown {
   if (typeof value === "string") {
-    return value.replace(ENV_RE, (_, name: string) => process.env[name] ?? "");
+    return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, name: string) => {
+      const replacement = process.env[name];
+      if (replacement === undefined) {
+        missing.add(name);
+        return "";
+      }
+      return replacement;
+    });
   }
   if (Array.isArray(value)) {
-    return value.map((child) => substituteEnv(child));
+    return value.map((child) => substituteEnv(child, missing));
   }
   if (isPlainObject(value)) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, child]) => [key, substituteEnv(child)]),
+      Object.entries(value).map(([key, child]) => [key, substituteEnv(child, missing)]),
     );
   }
   return value;
@@ -79,7 +85,11 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
     parsed.push(parse(text) as PlainObject);
   }
 
-  const merged = substituteEnv(shallowMergeByTopLevel(parsed));
+  const missingEnv = new Set<string>();
+  const merged = substituteEnv(shallowMergeByTopLevel(parsed), missingEnv);
+  if (missingEnv.size > 0) {
+    throw new Error(`Missing environment variables referenced by config: ${[...missingEnv].sort().join(", ")}`);
+  }
   registerSecretsByKey(merged);
 
   if (!Value.Check(AppConfigSchema, merged)) {

@@ -2,16 +2,24 @@ import type { MatrixNativeDiagnostics, MatrixNativeEvent, MatrixSendResult } fro
 
 export function decodeNativeEvents(payload: string): MatrixNativeEvent[] {
   const parsed = JSON.parse(payload) as unknown;
-  if (!Array.isArray(parsed)) return [];
+  assertNoNativeError(parsed, "pollEvents");
+  if (!Array.isArray(parsed)) throw new Error("Matrix native pollEvents returned non-array payload");
   return parsed.map((event) => decodeNativeEvent(event));
 }
 
 export function decodeNativeDiagnostics(payload: string): MatrixNativeDiagnostics {
-  return JSON.parse(payload) as MatrixNativeDiagnostics;
+  const parsed = JSON.parse(payload) as unknown;
+  assertNoNativeError(parsed, "diagnostics");
+  return parsed as MatrixNativeDiagnostics;
 }
 
 export function decodeSendResult(payload: string): MatrixSendResult {
-  return JSON.parse(payload) as MatrixSendResult;
+  const parsed = JSON.parse(payload) as unknown;
+  assertNoNativeError(parsed, "sendMessage");
+  if (!isRecord(parsed) || typeof parsed.messageId !== "string") {
+    throw new Error("Matrix native sendMessage returned invalid payload");
+  }
+  return parsed as MatrixSendResult;
 }
 
 function decodeNativeEvent(payload: unknown): MatrixNativeEvent {
@@ -38,3 +46,8 @@ function readString(record: Record<string, unknown>, key: string): string | unde
   return typeof value === "string" ? value : undefined;
 }
 
+function assertNoNativeError(value: unknown, operation: string): void {
+  if (isRecord(value) && typeof value.error === "string") {
+    throw new Error(`Matrix native ${operation} failed: ${value.error}`);
+  }
+}

@@ -43,21 +43,21 @@ export class SessionManager {
   }
 
   markCompleted(sessionId: string): void {
-    this.agents.delete(sessionId);
     this.update(sessionId, (session) => ({
       ...session,
       status: "completed",
       completedAt: Date.now(),
     }));
+    this.evict(sessionId);
   }
 
   markDiscarded(sessionId: string): void {
-    this.agents.delete(sessionId);
     this.update(sessionId, (session) => ({
       ...session,
       status: "discarded",
       completedAt: Date.now(),
     }));
+    this.evict(sessionId);
   }
 
   get(sessionId: string): AgentSessionRecord | undefined {
@@ -95,5 +95,15 @@ export class SessionManager {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
     this.sessions.set(sessionId, updater(session));
+  }
+
+  private evict(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    this.agents.delete(sessionId);
+    this.sessions.delete(sessionId);
+    if (!session) return;
+    const ids = this.byTimeline.get(session.timelineKey);
+    ids?.delete(sessionId);
+    if (ids?.size === 0) this.byTimeline.delete(session.timelineKey);
   }
 }

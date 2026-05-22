@@ -18,6 +18,7 @@ test("context image encoding honors configured byte budget", async () => {
     maxBytes: 75_000,
   });
 
+  assert.ok(encoded);
   const metadata = await sharp(encoded).metadata();
   assert.equal(encoded.byteLength <= 75_000, true);
   assert.equal(metadata.format, "jpeg");

@@ -194,6 +194,12 @@ export class Storage {
     this.db.close();
   }
 
+  async waitForIdle(): Promise<void> {
+    while (this.draining || this.queue.length > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
   private drainQueue(): void {
     if (this.draining) return;
     this.draining = true;

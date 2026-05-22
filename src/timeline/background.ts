@@ -6,6 +6,7 @@ export type Captioner = (event: CanonicalChatEvent) => Promise<CaptionResult[]>;
 export interface BackgroundProcessingOptions {
   captioner?: Captioner;
   nonTriggerTimeoutMs?: number;
+  onError?: (error: unknown, context: { eventId: string; phase: "trigger" | "non-trigger" }) => void;
 }
 
 export class BackgroundProcessor {
@@ -18,7 +19,7 @@ export class BackgroundProcessor {
     if (!event.attachments?.length || !this.options.captioner) return event;
     const captions = await this.options.captioner(event);
     const updated = applyCaptions(event, captions);
-    await this.store.enrich(event.id, () => updated);
+    await this.store.enrich(event.id, (current) => applyCaptions(current, captions));
     return updated;
   }
 
@@ -33,7 +34,7 @@ export class BackgroundProcessor {
       await this.store.enrich(event.id, (current) => ({
         ...applyCaptions(current, captions),
       }));
-    });
+    }).catch((error) => this.options.onError?.(error, { eventId: event.id, phase: "non-trigger" }));
   }
 }
 

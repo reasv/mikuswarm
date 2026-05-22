@@ -51,6 +51,11 @@ export class TriggerCoordinator {
     return this.queues.get(timelineKey)?.length ?? 0;
   }
 
+  clear(): void {
+    this.activeByTimeline.clear();
+    this.queues.clear();
+  }
+
   private limitFor(timelineKey: string): number {
     return isDmTimeline(timelineKey) ? this.config.max_concurrent_dm : this.config.max_concurrent;
   }
