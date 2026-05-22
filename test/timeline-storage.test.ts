@@ -107,6 +107,31 @@ test("timeline enrichment keeps query columns in sync with event json", async ()
   });
 });
 
+test("context queries start at persisted retained compaction cursor", async () => {
+  await withTimeline(async (timeline) => {
+    await timeline.append(assistantEvent({ id: "old", body: "old", timestamp: 1_000 }));
+    await timeline.append(assistantEvent({ id: "rich-start", body: "rich start", timestamp: 2_000 }));
+    await timeline.append(assistantEvent({ id: "new", body: "new", timestamp: 3_000 }));
+    await timeline.saveCompactionState({
+      schemaVersion: 1,
+      timelineKey: "matrix:miku:room:!room",
+      compactStartEventId: null,
+      richStartEventId: "rich-start",
+      updatedAt: 4_000,
+    });
+
+    const events = timeline.queryForContext(
+      "matrix:miku:room:!room",
+      timeline.getCompactionState("matrix:miku:room:!room"),
+    );
+
+    assert.deepEqual(
+      events.map((event) => event.id),
+      ["rich-start", "new"],
+    );
+  });
+});
+
 async function withTimeline(run: (timeline: TimelineStore) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-storage-"));
   const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });

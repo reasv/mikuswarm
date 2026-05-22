@@ -3,10 +3,9 @@ import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
-import { compactTurns } from "./compaction.js";
+import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
-import { buildTurns, type RenderedMessage } from "./turns.js";
 
 export interface ContextMessage {
   type: "system" | "chatEvent" | "runtimeInstructions";
@@ -47,21 +46,21 @@ export class ContextBuilder {
   ) {}
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
-    const events = this.store.query({ timelineKey: options.timelineKey, limit: 1000 });
-    const eventById = new Map(events.map((event) => [event.id, event]));
-    const rendered: RenderedMessage[] = events.map((event) => ({
-      id: event.id,
-      role: event.role,
-      content: renderRichMessage(event),
-      timestamp: event.timestamp,
-    }));
-    const turns = buildTurns(rendered);
-    const compacted = compactTurns(
-      turns,
+    const compactionState = this.store.getCompactionState(options.timelineKey);
+    const events = this.store.queryForContext(options.timelineKey, compactionState);
+    const compacted = compactTimelineEvents(
+      events,
+      renderRichMessage,
       renderCompactMessage,
-      eventById,
       this.config.context.tiers,
+      {
+        timelineKey: options.timelineKey,
+        state: compactionState,
+      },
     );
+    if (compacted.stateChanged && compacted.state) {
+      await this.store.saveCompactionState(compacted.state);
+    }
     const chatMessages: ContextMessage[] = compacted.turns.map((turn) => ({
       type: "chatEvent",
       role: turn.role,

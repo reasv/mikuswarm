@@ -30,6 +30,14 @@ export interface TimelineEventRow {
   updated_at: number;
 }
 
+export interface TimelineCompactionState {
+  schemaVersion: 1;
+  timelineKey: string;
+  compactStartEventId: string | null;
+  richStartEventId: string | null;
+  updatedAt: number;
+}
+
 export class Storage {
   readonly db: Database.Database;
   private readonly queue: Array<WriteJob<any>> = [];
@@ -128,6 +136,49 @@ export class Storage {
     return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
   }
 
+  getTimelineEventsForContext(
+    timelineKey: string,
+    retainedStartEventId: string | null | undefined,
+    limit = 1000,
+  ): CanonicalChatEvent[] {
+    if (!retainedStartEventId) return this.getTimelineEvents(timelineKey, limit);
+
+    const cursor = this.read((db) =>
+      db
+        .prepare(
+          `select timestamp, received_at, id
+           from timeline_events
+           where timeline_key = ? and id = ?`,
+        )
+        .get(timelineKey, retainedStartEventId) as
+        | { timestamp: number; received_at: number; id: string }
+        | undefined,
+    );
+    if (!cursor) return this.getTimelineEvents(timelineKey, limit);
+
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select event_json
+           from timeline_events
+           where timeline_key = @timelineKey
+             and (
+               timestamp > @timestamp
+               or (timestamp = @timestamp and received_at > @receivedAt)
+               or (timestamp = @timestamp and received_at = @receivedAt and id >= @id)
+             )
+           order by timestamp asc, received_at asc, id asc`,
+        )
+        .all({
+          timelineKey,
+          timestamp: cursor.timestamp,
+          receivedAt: cursor.received_at,
+          id: cursor.id,
+        }) as Array<{ event_json: string }>,
+    );
+    return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+  }
+
   getTimelineEventById(id: string): CanonicalChatEvent | undefined {
     const row = this.read((db) =>
       db
@@ -135,6 +186,38 @@ export class Storage {
         .get(id) as { event_json: string } | undefined,
     );
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
+  }
+
+  getTimelineCompactionState(timelineKey: string): TimelineCompactionState | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select state_json from timeline_compaction_state where timeline_key = ?`)
+        .get(timelineKey) as { state_json: string } | undefined,
+    );
+    return row ? (JSON.parse(row.state_json) as TimelineCompactionState) : undefined;
+  }
+
+  saveTimelineCompactionState(state: TimelineCompactionState): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into timeline_compaction_state (
+          timeline_key, compact_start_event_id, rich_start_event_id, state_json, updated_at
+        ) values (
+          @timelineKey, @compactStartEventId, @richStartEventId, @stateJson, @updatedAt
+        )
+        on conflict(timeline_key) do update set
+          compact_start_event_id = excluded.compact_start_event_id,
+          rich_start_event_id = excluded.rich_start_event_id,
+          state_json = excluded.state_json,
+          updated_at = excluded.updated_at`,
+      ).run({
+        timelineKey: state.timelineKey,
+        compactStartEventId: state.compactStartEventId,
+        richStartEventId: state.richStartEventId,
+        stateJson: JSON.stringify(state),
+        updatedAt: state.updatedAt,
+      });
+    });
   }
 
   getTimelineEventByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
@@ -252,6 +335,14 @@ create index if not exists idx_timeline_events_external
 create table if not exists metadata (
   key text primary key,
   value text not null,
+  updated_at integer not null
+);
+
+create table if not exists timeline_compaction_state (
+  timeline_key text primary key,
+  compact_start_event_id text,
+  rich_start_event_id text,
+  state_json text not null,
   updated_at integer not null
 );
 `;

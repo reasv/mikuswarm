@@ -6,7 +6,7 @@ export {
   type RenderTier,
 } from "./renderer.js";
 export { buildTurns, type ContextTurn, type RenderedMessage } from "./turns.js";
-export { compactTurns, type CompactionResult, type TieredTurn } from "./compaction.js";
+export { compactTimelineEvents, type CompactionResult, type TieredTurn } from "./compaction.js";
 export {
   ContextBuilder,
   type BuiltContext,

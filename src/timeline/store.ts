@@ -1,4 +1,4 @@
-import type { Storage } from "../storage/index.js";
+import type { Storage, TimelineCompactionState } from "../storage/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 export interface TimelineQuery {
@@ -57,5 +57,21 @@ export class TimelineStore {
         .all(params) as Array<{ event_json: string }>;
       return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
     });
+  }
+
+  queryForContext(timelineKey: string, state?: TimelineCompactionState): CanonicalChatEvent[] {
+    return this.storage.getTimelineEventsForContext(
+      timelineKey,
+      state?.compactStartEventId ?? state?.richStartEventId,
+      1000,
+    );
+  }
+
+  getCompactionState(timelineKey: string): TimelineCompactionState | undefined {
+    return this.storage.getTimelineCompactionState(timelineKey);
+  }
+
+  saveCompactionState(state: TimelineCompactionState): Promise<void> {
+    return this.storage.saveTimelineCompactionState(state);
   }
 }

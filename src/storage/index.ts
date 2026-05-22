@@ -1,1 +1,6 @@
-export { Storage, type StorageOptions, type TimelineEventRow } from "./database.js";
+export {
+  Storage,
+  type StorageOptions,
+  type TimelineCompactionState,
+  type TimelineEventRow,
+} from "./database.js";

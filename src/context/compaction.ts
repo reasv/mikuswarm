@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config/index.js";
+import type { TimelineCompactionState } from "../storage/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { estimateTokens } from "./tokens.js";
 import type { ContextTurn } from "./turns.js";
@@ -14,83 +15,182 @@ export interface CompactionResult {
   richTokens: number;
   compactedMessageIds: string[];
   droppedMessageIds: string[];
+  state?: TimelineCompactionState;
+  stateChanged: boolean;
 }
 
-export function compactTurns(
-  richTurns: ContextTurn[],
+export interface CompactTimelineOptions {
+  timelineKey: string;
+  state?: TimelineCompactionState;
+  now?: number;
+}
+
+type PreparedEvent = {
+  event: CanonicalChatEvent;
+  richContent: string;
+  richTokens: number;
+  compactContent: string;
+  compactTokens: number;
+};
+
+export function compactTimelineEvents(
+  events: CanonicalChatEvent[],
+  richRenderer: (event: CanonicalChatEvent) => string,
   compactRenderer: (event: CanonicalChatEvent) => string,
-  eventById: Map<string, CanonicalChatEvent>,
   config: AppConfig["context"]["tiers"],
+  options: CompactTimelineOptions,
 ): CompactionResult {
-  let rich: TieredTurn[] = richTurns.map((turn) => ({
-    ...turn,
-    tier: "rich",
-    tokenEstimate: estimateTokens(turn.content),
-  }));
-  let compact: TieredTurn[] = [];
-  const compactedMessageIds: string[] = [];
-  const droppedMessageIds: string[] = [];
+  const prepared = events.map((event) => {
+    const richContent = richRenderer(event);
+    const compactContent = compactRenderer(event);
+    return {
+      event,
+      richContent,
+      richTokens: estimateTokens(richContent),
+      compactContent,
+      compactTokens: estimateTokens(compactContent),
+    };
+  });
+  const initial = resolveBoundaryIndexes(prepared, options.state);
+  let compactStartIndex = initial.compactStartIndex;
+  let richStartIndex = initial.richStartIndex;
+  let compactTokens = sumCompactTokens(prepared, compactStartIndex, richStartIndex);
+  let richTokens = sumRichTokens(prepared, richStartIndex);
+  const originallyCompacted = new Set(
+    prepared.slice(compactStartIndex, richStartIndex).map((item) => item.event.id),
+  );
+  const originallyDropped = new Set(prepared.slice(0, compactStartIndex).map((item) => item.event.id));
 
-  if (sumTokens(rich) > config.rich_max_tokens && rich.length > 1) {
+  if (richTokens > config.rich_max_tokens && richStartIndex < prepared.length - 1) {
     do {
-      moveBoundaryUnit(rich, compact, eventById, compactRenderer, compactedMessageIds);
-    } while (sumTokens(rich) > config.rich_target_tokens && rich.length > 1);
+      const moved = prepared[richStartIndex];
+      if (!moved) break;
+      richTokens -= moved.richTokens;
+      compactTokens += moved.compactTokens;
+      richStartIndex += 1;
+    } while (richTokens > config.rich_target_tokens && richStartIndex < prepared.length - 1);
   }
 
-  if (sumTokens(compact) > config.compact_max_tokens && compact.length > 1) {
+  if (compactTokens > config.compact_max_tokens && compactStartIndex < richStartIndex - 1) {
     do {
-      const dropped = compact.shift();
+      const dropped = prepared[compactStartIndex];
       if (!dropped) break;
-      droppedMessageIds.push(...dropped.messageIds);
-    } while (sumTokens(compact) > config.compact_target_tokens && compact.length > 1);
+      compactTokens -= dropped.compactTokens;
+      compactStartIndex += 1;
+    } while (compactTokens > config.compact_target_tokens && compactStartIndex < richStartIndex - 1);
   }
+
+  const compacted = prepared.slice(compactStartIndex, richStartIndex);
+  const rich = prepared.slice(richStartIndex);
+  const dropped = prepared.slice(0, compactStartIndex);
+  const nextState = buildState(
+    options.timelineKey,
+    prepared,
+    compactStartIndex,
+    richStartIndex,
+    options.state,
+    options.now,
+  );
+  const stateChanged =
+    initial.invalid ||
+    nextState.compactStartEventId !== (options.state?.compactStartEventId ?? null) ||
+    nextState.richStartEventId !== (options.state?.richStartEventId ?? null);
 
   return {
-    turns: [...compact, ...rich],
-    compactTokens: sumTokens(compact),
-    richTokens: sumTokens(rich),
-    compactedMessageIds,
-    droppedMessageIds,
+    turns: buildTieredTurns([
+      ...compacted.map((item) => ({ item, tier: "compact" as const })),
+      ...rich.map((item) => ({ item, tier: "rich" as const })),
+    ]),
+    compactTokens,
+    richTokens,
+    compactedMessageIds: compacted
+      .map((item) => item.event.id)
+      .filter((id) => !originallyCompacted.has(id)),
+    droppedMessageIds: dropped
+      .map((item) => item.event.id)
+      .filter((id) => !originallyDropped.has(id)),
+    state: stateChanged || options.state ? nextState : undefined,
+    stateChanged,
   };
 }
 
-function sumTokens(turns: TieredTurn[]): number {
-  return turns.reduce((sum, turn) => sum + turn.tokenEstimate, 0);
-}
-
-function moveBoundaryUnit(
-  rich: TieredTurn[],
-  compact: TieredTurn[],
-  eventById: Map<string, CanonicalChatEvent>,
-  compactRenderer: (event: CanonicalChatEvent) => string,
-  compactedMessageIds: string[],
-): void {
-  const first = rich.shift();
-  if (!first) return;
-  pushCompact(first, compact, eventById, compactRenderer, compactedMessageIds);
-
-  if (first.role === "user" && rich[0]?.role === "assistant") {
-    pushCompact(rich.shift()!, compact, eventById, compactRenderer, compactedMessageIds);
+function resolveBoundaryIndexes(
+  events: PreparedEvent[],
+  state?: TimelineCompactionState,
+): { compactStartIndex: number; richStartIndex: number; invalid: boolean } {
+  if (events.length === 0 || !state) {
+    return { compactStartIndex: 0, richStartIndex: 0, invalid: false };
   }
+
+  const indexById = new Map(events.map((item, index) => [item.event.id, index]));
+  const compactStartIndex = state.compactStartEventId
+    ? indexById.get(state.compactStartEventId)
+    : 0;
+  const richStartIndex = state.richStartEventId ? indexById.get(state.richStartEventId) : 0;
+  if (compactStartIndex === undefined || richStartIndex === undefined) {
+    return { compactStartIndex: 0, richStartIndex: 0, invalid: true };
+  }
+  if (compactStartIndex > richStartIndex) {
+    return { compactStartIndex: 0, richStartIndex: 0, invalid: true };
+  }
+  return { compactStartIndex, richStartIndex, invalid: false };
 }
 
-function pushCompact(
-  turn: TieredTurn,
-  compact: TieredTurn[],
-  eventById: Map<string, CanonicalChatEvent>,
-  compactRenderer: (event: CanonicalChatEvent) => string,
-  compactedMessageIds: string[],
-): void {
-  const compactContent = turn.messageIds
-    .map((id) => eventById.get(id))
-    .filter((event): event is CanonicalChatEvent => Boolean(event))
-    .map(compactRenderer)
-    .join("\n");
-  compact.push({
-    ...turn,
-    tier: "compact",
-    content: compactContent,
-    tokenEstimate: estimateTokens(compactContent),
-  });
-  compactedMessageIds.push(...turn.messageIds);
+function buildState(
+  timelineKey: string,
+  events: PreparedEvent[],
+  compactStartIndex: number,
+  richStartIndex: number,
+  previous?: TimelineCompactionState,
+  now = Date.now(),
+): TimelineCompactionState {
+  const compactStartEventId =
+    compactStartIndex < richStartIndex ? events[compactStartIndex]?.event.id ?? null : null;
+  const richStartEventId = events[richStartIndex]?.event.id ?? null;
+  const unchanged =
+    previous &&
+    previous.compactStartEventId === compactStartEventId &&
+    previous.richStartEventId === richStartEventId;
+  return {
+    schemaVersion: 1,
+    timelineKey,
+    compactStartEventId,
+    richStartEventId,
+    updatedAt: unchanged ? previous.updatedAt : now,
+  };
+}
+
+function buildTieredTurns(
+  events: Array<{ item: PreparedEvent; tier: "compact" | "rich" }>,
+): TieredTurn[] {
+  const turns: TieredTurn[] = [];
+  for (const { item, tier } of events) {
+    const content = tier === "compact" ? item.compactContent : item.richContent;
+    const tokenEstimate = tier === "compact" ? item.compactTokens : item.richTokens;
+    const previous = turns.at(-1);
+    if (previous && previous.role === item.event.role && previous.tier === tier) {
+      previous.messageIds.push(item.event.id);
+      previous.content = `${previous.content}\n\n---\n\n${content}`;
+      previous.timestamp = item.event.timestamp;
+      previous.tokenEstimate += tokenEstimate + estimateTokens("\n\n---\n\n");
+    } else {
+      turns.push({
+        role: item.event.role,
+        tier,
+        messageIds: [item.event.id],
+        content,
+        timestamp: item.event.timestamp,
+        tokenEstimate,
+      });
+    }
+  }
+  return turns;
+}
+
+function sumCompactTokens(events: PreparedEvent[], start: number, end: number): number {
+  return events.slice(start, end).reduce((sum, item) => sum + item.compactTokens, 0);
+}
+
+function sumRichTokens(events: PreparedEvent[], start: number): number {
+  return events.slice(start).reduce((sum, item) => sum + item.richTokens, 0);
 }
