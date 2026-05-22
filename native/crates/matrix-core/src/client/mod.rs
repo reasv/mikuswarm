@@ -1240,7 +1240,18 @@ async fn message_summary_internal(
         .ok_or_else(|| MatrixError::State(format!("room {room_id} is not known to the client")))?;
     let event_id = EventId::parse(event_id.trim())?.to_owned();
     let event = room.load_or_fetch_event(&event_id, None).await?;
-    Ok(events::summarize_timeline_event(&event))
+    let mut summary = events::summarize_timeline_event(&event);
+    if let Some(summary) = summary.as_mut() {
+        if let Ok(user_id) = UserId::parse(summary.sender.as_str()) {
+            summary.sender_name = room
+                .get_member_no_sync(&user_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|member| member.name().to_string());
+        }
+    }
+    Ok(summary)
 }
 
 async fn download_media_internal(

@@ -4,7 +4,7 @@ import { redactSecrets } from "../config/redaction.js";
 
 export interface ContextDumpMessage {
   role: string;
-  tier?: "system" | "compact" | "rich" | "runtime" | "trigger";
+  tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger";
   tokenEstimate?: number;
   content: unknown;
 }
@@ -31,10 +31,10 @@ function safeFilename(value: string): string {
 
 export async function writeContextDump(dumpDir: string, dump: ContextDump): Promise<string> {
   await mkdir(dumpDir, { recursive: true });
-  const fileName = `${safeFilename(dump.timelineKey)}.${safeFilename(dump.sessionId)}.json`;
+  const stamp = safeFilename(dump.createdAt);
+  const fileName = `${safeFilename(dump.timelineKey)}.${safeFilename(dump.sessionId)}.${stamp}.json`;
   const filePath = path.join(dumpDir, fileName);
   const serialized = `${redactSecrets(JSON.stringify(dump, null, 2))}\n`;
   await writeFile(filePath, serialized, "utf8");
   return filePath;
 }
-

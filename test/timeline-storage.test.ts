@@ -132,6 +132,51 @@ test("context queries start at persisted retained compaction cursor", async () =
   });
 });
 
+test("context cursor queries respect limit", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-storage-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  try {
+    const timeline = new TimelineStore(storage);
+    for (let index = 0; index < 5; index += 1) {
+      await timeline.append(assistantEvent({ id: `event-${index}`, body: `body ${index}`, timestamp: 1_000 + index }));
+    }
+
+    const events = storage.getTimelineEventsForContext("matrix:miku:room:!room", "event-1", 2);
+    assert.deepEqual(
+      events.map((event: CanonicalChatEvent) => event.id),
+      ["event-1", "event-2"],
+    );
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("append upsert preserves original created_at", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-storage-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  try {
+    const event = assistantEvent({ id: "same", body: "first", timestamp: 1_000 });
+    await storage.appendTimelineEvent(event);
+    const createdAt = storage.read((db) =>
+      (db.prepare("select created_at from timeline_events where id = ?").get("same") as { created_at: number }).created_at,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    await storage.appendTimelineEvent({ ...event, body: "second" });
+    const row = storage.read((db) =>
+      db.prepare("select created_at, body from timeline_events where id = ?").get("same") as {
+        created_at: number;
+        body: string;
+      },
+    );
+    assert.equal(row.created_at, createdAt);
+    assert.equal(row.body, "second");
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function withTimeline(run: (timeline: TimelineStore) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-storage-"));
   const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });

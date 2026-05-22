@@ -5,7 +5,7 @@ import { estimateTokens } from "./tokens.js";
 import type { ContextTurn } from "./turns.js";
 
 export interface TieredTurn extends ContextTurn {
-  tier: "compact" | "rich";
+  tier: "compact" | "rich" | "mixed";
   tokenEstimate: number;
 }
 
@@ -168,11 +168,12 @@ function buildTieredTurns(
     const content = tier === "compact" ? item.compactContent : item.richContent;
     const tokenEstimate = tier === "compact" ? item.compactTokens : item.richTokens;
     const previous = turns.at(-1);
-    if (previous && previous.role === item.event.role && previous.tier === tier) {
+    if (previous && previous.role === item.event.role) {
       previous.messageIds.push(item.event.id);
       previous.content = `${previous.content}\n\n---\n\n${content}`;
       previous.timestamp = item.event.timestamp;
       previous.tokenEstimate += tokenEstimate + estimateTokens("\n\n---\n\n");
+      if (previous.tier !== tier) previous.tier = "mixed";
     } else {
       turns.push({
         role: item.event.role,

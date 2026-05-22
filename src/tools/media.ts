@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
+import sharp from "sharp";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 
 export interface MediaToolContext {
@@ -20,7 +21,6 @@ export function createDescribeMediaTool(context: MediaToolContext): AgentTool {
       const args = params as { path: string; include_image?: boolean };
       const absolute = resolveWorkspacePath(context.workspaceRoot, args.path);
       const input = await readFile(absolute);
-      const sharp = (await import("sharp")).default;
       const metadata = await sharp(input).metadata();
       const lines = [
         `File: ${workspaceRelative(context.workspaceRoot, absolute)}`,

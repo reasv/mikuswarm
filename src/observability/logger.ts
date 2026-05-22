@@ -33,12 +33,12 @@ export function createLogger(
   function emit(level: LogLevel, message: string, fields: Record<string, unknown> = {}): void {
     if (LEVELS[level] < LEVELS[minimumLevel]) return;
     const record: LogRecord = {
+      ...baseFields,
+      ...fields,
       time: new Date().toISOString(),
       level,
       component,
       message,
-      ...baseFields,
-      ...fields,
     };
     const redacted = redactValue(record);
     const line = JSON.stringify(redacted);
@@ -63,4 +63,3 @@ export function createLogger(
       }),
   };
 }
-

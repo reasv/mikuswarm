@@ -1,4 +1,5 @@
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
+import { escapeXml } from "./xml.js";
 
 export type RenderTier = "rich" | "compact";
 
@@ -25,7 +26,7 @@ export function renderRichMessage(event: CanonicalChatEvent): string {
 
 export function renderCompactMessage(event: CanonicalChatEvent): string {
   const time = compactTime(event.timestamp);
-  const reply = event.replyTo?.sender ? ` (> ${event.replyTo.sender.displayName ?? event.replyTo.sender.id})` : "";
+  const reply = event.replyTo ? compactReply(event.replyTo) : "";
   const attachments = (event.attachments ?? [])
     .map((attachment) => ` [attachment: ${attachment.filename ?? attachment.id}${attachment.localPath ? ` ${attachment.localPath}` : ""}${attachment.caption ? ` caption=${truncate(attachment.caption, 300)}` : ""}]`)
     .join("");
@@ -33,6 +34,13 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
     .map((preview) => ` [link: ${preview.title ?? preview.url} — ${truncate(preview.description ?? "", 1000)}]`)
     .join("");
   return `[${time}] ${senderLabel(event)}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${links}`;
+}
+
+function compactReply(reply: ReplyContext): string {
+  const sender = reply.sender ? reply.sender.displayName ?? reply.sender.id : "unknown";
+  const time = reply.timestamp ? ` ${compactTime(reply.timestamp)}` : "";
+  const body = reply.body ? `: ${truncate(normalizeWhitespace(reply.body), 4096)}` : "";
+  return ` (> ${sender}${time}${body})`;
 }
 
 function renderReply(reply: ReplyContext): string {
@@ -80,13 +88,7 @@ function normalizeWhitespace(value: string): string {
 }
 
 function truncate(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max - 1)}...`;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+  if (value.length <= max) return value;
+  if (max <= 3) return ".".repeat(max);
+  return `${value.slice(0, max - 3)}...`;
 }

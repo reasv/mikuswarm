@@ -2,7 +2,7 @@ import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { runRipgrep, runTextEditorCommand } from "./file.js";
+import { runRipgrep, runTextEditorCommand, type TextEditorArgs } from "./file.js";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 
 export interface MemoryToolContext {
@@ -61,7 +61,6 @@ export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
       view_range: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
       old_str: Type.Optional(Type.String()),
       new_str: Type.Optional(Type.String()),
-      file_text: Type.Optional(Type.String()),
       insert_line: Type.Optional(Type.Number({ minimum: 0 })),
       insert_text: Type.Optional(Type.String()),
       max_characters: Type.Optional(Type.Number({ minimum: 1, maximum: 500_000 })),
@@ -74,17 +73,52 @@ export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
         view_range?: [number, number];
         old_str?: string;
         new_str?: string;
-        file_text?: string;
         insert_line?: number;
         insert_text?: string;
         max_characters?: number;
       };
-      const result = await runTextEditorCommand(context.workspaceRoot, { ...args, path: relativePath } as any);
+      const result = await runTextEditorCommand(context.workspaceRoot, memoryEditorArgs(relativePath, args));
       return {
         content: [{ type: "text", text: result.text }],
         details: { ...result.details, memoryPath: relativePath },
       };
     },
+  };
+}
+
+function memoryEditorArgs(
+  relativePath: string,
+  args: {
+    command: "view" | "str_replace" | "insert";
+    view_range?: [number, number];
+    old_str?: string;
+    new_str?: string;
+    insert_line?: number;
+    insert_text?: string;
+    max_characters?: number;
+  },
+): TextEditorArgs {
+  if (args.command === "view") {
+    return {
+      command: "view",
+      path: relativePath,
+      view_range: args.view_range,
+      max_characters: args.max_characters,
+    };
+  }
+  if (args.command === "str_replace") {
+    return {
+      command: "str_replace",
+      path: relativePath,
+      old_str: args.old_str,
+      new_str: args.new_str,
+    };
+  }
+  return {
+    command: "insert",
+    path: relativePath,
+    insert_line: args.insert_line,
+    insert_text: args.insert_text,
   };
 }
 

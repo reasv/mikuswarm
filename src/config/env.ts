@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { parse as parseDotenv } from "dotenv";
 
 export interface EnvLoadOptions {
   cwd?: string;
@@ -37,26 +38,5 @@ export async function loadDotEnv(options: EnvLoadOptions = {}): Promise<EnvLoadR
 }
 
 export function parseDotEnv(text: string): Record<string, string> {
-  const values: Record<string, string> = {};
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    values[key] = parseEnvValue(line.slice(eq + 1).trim());
-  }
-  return values;
+  return parseDotenv(text);
 }
-
-function parseEnvValue(value: string): string {
-  if (
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1);
-  }
-  return value;
-}
-

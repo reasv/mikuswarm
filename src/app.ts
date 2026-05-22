@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import sharp from "sharp";
 import type { AppConfig } from "./config/index.js";
 import { createLogger } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
@@ -62,9 +63,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         state: "state" in event ? event.state : undefined,
         stage: "stage" in event ? event.stage : undefined,
       }),
+    onDiagnostics: (diagnostics, context) =>
+      logger.info("matrix_diagnostics", {
+        ...context,
+        verificationState: diagnostics.verificationState,
+        keyBackupState: diagnostics.keyBackupState,
+        syncState: diagnostics.syncState,
+        lastSuccessfulSyncAt: diagnostics.lastSuccessfulSyncAt,
+        lastSuccessfulDecryptionAt: diagnostics.lastSuccessfulDecryptionAt,
+      }),
   });
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
+  let stopPromise: Promise<void> | undefined;
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -92,7 +103,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     await prepareTriggerMedia(inbound);
     const decision = triggerCoordinator.accept(inbound);
     if (decision.action !== "spawn") {
-      logger.info("trigger_queued", { timelineKey: inbound.timelineKey, action: decision.action });
+      logger.info("trigger_not_spawned", {
+        timelineKey: inbound.timelineKey,
+        action: decision.action,
+        reason: decision.reason,
+        queueLength: decision.queueLength,
+      });
       return;
     }
     launchSession(inbound, routed.duplicate);
@@ -115,16 +131,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!replyExternalId) return false;
     const activeIds = new Set(sessions.activeForTimeline(inbound.timelineKey).map((session) => session.id));
     if (activeIds.size === 0) return false;
-    const target = timeline
-      .query({ timelineKey: inbound.timelineKey, limit: 200 })
-      .reverse()
-      .find(
-        (event) =>
-          event.externalId === replyExternalId &&
-          event.agentSessionId &&
-          activeIds.has(event.agentSessionId),
-      );
-    if (!target?.agentSessionId) return false;
+    const target = timeline.getByExternalId(inbound.provider, replyExternalId);
+    if (target?.timelineKey !== inbound.timelineKey) return false;
+    if (!target?.agentSessionId || !activeIds.has(target.agentSessionId)) return false;
     const ok = sessions.steer(target.agentSessionId, {
       type: "interjection",
       content: renderRichMessage(inbound.event),
@@ -143,7 +152,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const session = sessions.createPlaceholder(inbound);
     sessions.markRunning(session.id);
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey });
-    const target = inbound.outboundTarget ?? outboundTargetFromTimeline(inbound.timelineKey);
+    const target = inbound.outboundTarget;
+    if (!target) {
+      sessions.markDiscarded(session.id);
+      logger.error("session_missing_outbound_target", {
+        sessionId: session.id,
+        timelineKey: session.timelineKey,
+        provider: inbound.provider,
+      });
+      const next = triggerCoordinator.complete(session.timelineKey);
+      if (next && !draining) launchSession(next, true);
+      return;
+    }
     const sentMessages: string[] = [];
     const tools = [
       createSendMessageTool({
@@ -189,6 +209,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         logger.error("session_failed", {
           sessionId: session.id,
           error: error instanceof Error ? error.message : String(error),
+          cause: error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined,
         });
       })
       .finally(() => {
@@ -204,28 +225,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
-      draining = true;
-      await provider.stop();
-      triggerCoordinator.clear();
-      await waitForRuns(activeRuns, 5_000);
-      await storage.waitForIdle();
-      storage.close();
-      logger.info("runtime_stopped");
+      stopPromise ??= (async () => {
+        draining = true;
+        await provider.stop();
+        triggerCoordinator.clear();
+        await waitForRuns(activeRuns);
+        await storage.waitForIdle();
+        storage.close();
+        logger.info("runtime_stopped");
+      })();
+      return stopPromise;
     },
   };
 }
 
-async function waitForRuns(runs: Set<Promise<void>>, timeoutMs: number): Promise<void> {
+async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
-  await Promise.race([
-    Promise.allSettled([...runs]),
-    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
-  ]);
+  await Promise.allSettled([...runs]);
 }
 
 function createBasicCaptioner() {
   return async (event: CanonicalChatEvent): Promise<CaptionResult[]> => {
-    const sharp = (await import("sharp")).default;
     const results: CaptionResult[] = [];
     for (const attachment of event.attachments ?? []) {
       if (!attachment.localPath || attachment.mediaType !== "image") continue;
@@ -250,24 +270,5 @@ function createBasicCaptioner() {
       }
     }
     return results;
-  };
-}
-
-export function outboundTargetFromTimeline(timelineKey: string) {
-  const parts = timelineKey.split(":");
-  const accountId = parts[1];
-  const roomIndex = parts.indexOf("room");
-  const dmIndex = parts.indexOf("dm");
-  const threadIndex = parts.indexOf("thread");
-  const roomEnd = threadIndex >= 0 ? threadIndex : parts.length;
-  const roomId = roomIndex >= 0 ? parts.slice(roomIndex + 1, roomEnd).join(":") : undefined;
-  const userId = dmIndex >= 0 ? parts.slice(dmIndex + 1).join(":") : undefined;
-  const threadId = threadIndex >= 0 ? parts.slice(threadIndex + 1).join(":") : undefined;
-  return {
-    provider: "matrix",
-    timelineKey,
-    accountId,
-    roomId: roomId || userId,
-    threadId,
   };
 }

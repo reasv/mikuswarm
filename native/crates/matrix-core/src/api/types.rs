@@ -193,6 +193,7 @@ pub struct MatrixMessageRelatesTo {
 pub struct MatrixMessageSummary {
     pub event_id: String,
     pub sender: String,
+    pub sender_name: Option<String>,
     pub body: String,
     pub msgtype: Option<String>,
     pub timestamp: DateTime<Utc>,

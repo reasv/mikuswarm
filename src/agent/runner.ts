@@ -12,6 +12,17 @@ export interface SessionRunResult {
   retries: number;
 }
 
+export class SessionRunnerError extends Error {
+  constructor(
+    message: string,
+    readonly phase: "prompt" | "wait" | "force_completion" | "delivery",
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "SessionRunnerError";
+  }
+}
+
 export interface SessionRunnerOptions {
   provider?: ChatProvider;
   target?: OutboundTarget;
@@ -36,13 +47,13 @@ export class SessionRunner {
         }
       });
       try {
-        await agent.prompt({
+        await promptAgent(agent, {
           type: "chatEvent",
           role: "user",
           content: session.trigger.event.body,
           event: session.trigger.event,
         });
-        await agent.waitForIdle();
+        await waitForAgentIdle(agent);
       } finally {
         if (typeof unsubscribe === "function") unsubscribe();
       }
@@ -51,7 +62,7 @@ export class SessionRunner {
       while (!text.trim() && retries < maxRetries) {
         retries += 1;
         await forceCompletion(agent);
-        await agent.waitForIdle();
+        await waitForAgentIdle(agent);
         text = extractLastAssistantText(agent.state.messages);
       }
 
@@ -62,14 +73,19 @@ export class SessionRunner {
         let deliveredExternalId: string | undefined;
         let deliveredAt = Date.now();
         if (this.options.provider && this.options.target) {
-          const receipt = await this.options.provider.send(this.options.target, {
-            body: finalText,
-            agentSessionId: session.id,
-          });
+          const receipt = await this.options.provider
+            .send(this.options.target, {
+              body: finalText,
+              agentSessionId: session.id,
+            })
+            .catch((error) => {
+              throw new SessionRunnerError("Agent response delivery failed", "delivery", { cause: error });
+            });
           deliveredExternalId = receipt.externalId;
           deliveredAt = receipt.deliveredAt;
         }
         await this.store.append(createAssistantTimelineEvent(session, finalText, deliveredAt, deliveredExternalId));
+        this.options.sentMessages?.push(finalText);
       }
       return {
         sessionId: session.id,
@@ -86,19 +102,34 @@ export class SessionRunner {
 }
 
 async function forceCompletion(agent: Agent): Promise<void> {
-  try {
-    await agent.continue();
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("Cannot continue from message role: assistant")) {
-      await agent.prompt({
-        role: "user",
-        content: "Your previous turn ended without visible text. Produce the final chat response now, or exactly NO_REPLY.",
-        timestamp: Date.now(),
-      });
-      return;
-    }
-    throw error;
+  if (lastMessageRole(agent.state.messages) === "assistant") {
+    await promptAgent(agent, {
+      role: "user",
+      content: "Your previous turn ended without visible text. Produce the final chat response now, or exactly NO_REPLY.",
+      timestamp: Date.now(),
+    });
+    return;
   }
+  await agent.continue().catch((error) => {
+    throw new SessionRunnerError("Agent forced completion failed", "force_completion", { cause: error });
+  });
+}
+
+async function promptAgent(agent: Agent, message: unknown): Promise<void> {
+  await agent.prompt(message as any).catch((error) => {
+    throw new SessionRunnerError("Agent prompt failed", "prompt", { cause: error });
+  });
+}
+
+async function waitForAgentIdle(agent: Agent): Promise<void> {
+  await agent.waitForIdle().catch((error) => {
+    throw new SessionRunnerError("Agent waitForIdle failed", "wait", { cause: error });
+  });
+}
+
+function lastMessageRole(messages: unknown[]): string | undefined {
+  const last = messages.at(-1) as { role?: unknown } | undefined;
+  return typeof last?.role === "string" ? last.role : undefined;
 }
 
 export function extractLastAssistantText(messages: unknown[]): string {
@@ -115,8 +146,7 @@ export function extractLastAssistantText(messages: unknown[]): string {
 
 export function stripThinkingContamination(text: string): string {
   return text
-    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
-    .replace(/<antThinking>[\s\S]*?<\/antThinking>/gi, "")
+    .replace(/<(?:thinking|antThinking|reasoning|thoughts?|internal_reasoning)>[\s\S]*?<\/(?:thinking|antThinking|reasoning|thoughts?|internal_reasoning)>/gi, "")
     .trim();
 }
 

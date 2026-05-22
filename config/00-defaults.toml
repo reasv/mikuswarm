@@ -7,6 +7,7 @@ context_dump_dir = "./debug/context"
 [agent.sessions]
 max_concurrent = 3
 max_concurrent_dm = 1
+max_queued_per_timeline = 10000
 forced_completion_retries = 3
 
 [agent.system]

@@ -157,7 +157,7 @@ async function resolveReplyContext(
     const timestamp = Date.parse(summary.timestamp);
     return {
       externalId: summary.eventId,
-      sender: { id: summary.sender },
+      sender: { id: summary.sender, displayName: summary.senderName },
       body: summary.body,
       timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
       attachments: await resolveReplyAttachments(event.roomId, summary, context),

@@ -19,6 +19,7 @@ interface AccountRuntime {
   accountId: string;
   client: MatrixNativeClient;
   selfUserId: string;
+  attachmentDir: string;
   pollTimer?: NodeJS.Timeout;
 }
 
@@ -30,6 +31,7 @@ interface PendingTrigger {
 export interface MatrixProviderOptions {
   onError?: (error: unknown, context: { accountId?: string; phase: string }) => void;
   onNativeEvent?: (event: Exclude<MatrixNativeEvent, { type: "inbound" }>, context: { accountId: string }) => void;
+  onDiagnostics?: (diagnostics: ReturnType<MatrixNativeClient["start"]>, context: { accountId: string }) => void;
 }
 
 export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
@@ -56,14 +58,16 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     if (!config.enabled) return;
     for (const [accountId, account] of Object.entries(config.accounts)) {
       const client = new MatrixNativeClient();
-      client.start(toNativeConfig(accountId, account));
+      const diagnostics = client.start(toNativeConfig(accountId, account));
       const runtime: AccountRuntime = {
         accountId,
         client,
         selfUserId: account.user_id,
+        attachmentDir: path.join(path.resolve(account.store_path), "msg-attach"),
       };
-      runtime.pollTimer = setInterval(() => this.schedulePoll(runtime), 250);
       this.accounts.set(accountId, runtime);
+      this.options.onDiagnostics?.(diagnostics, { accountId });
+      this.schedulePoll(runtime);
     }
   }
 
@@ -74,7 +78,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     }
     this.pendingTriggers.clear();
     for (const account of this.accounts.values()) {
-      if (account.pollTimer) clearInterval(account.pollTimer);
+      if (account.pollTimer) clearTimeout(account.pollTimer);
     }
     await Promise.allSettled([...this.activePolls]);
     for (const account of this.accounts.values()) account.client.stop();
@@ -90,8 +94,19 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     const account = this.resolveAccount(target);
     if (!target.roomId) throw new Error("Matrix outbound target requires roomId");
     if (message.attachments?.length) {
-      let externalId: string | undefined;
       const externalIds: string[] = [];
+      let primaryExternalId: string | undefined;
+      if (message.body.trim()) {
+        const textResult = account.client.sendMessage({
+          roomId: target.roomId,
+          text: message.body,
+          html: message.htmlBody,
+          threadId: target.threadId,
+          ...(target.replyToId ? { replyToId: target.replyToId } : {}),
+        });
+        primaryExternalId = textResult.messageId;
+        externalIds.push(textResult.messageId);
+      }
       for (const [index, attachment] of message.attachments.entries()) {
         if (!attachment.localPath) throw new Error(`Outbound attachment has no localPath: ${attachment.id}`);
         const data = await readFile(attachment.localPath);
@@ -100,17 +115,17 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
           filename: attachment.filename ?? path.basename(attachment.localPath),
           contentType: attachment.mimeType ?? "application/octet-stream",
           dataBase64: data.toString("base64"),
-          caption: index === 0 && message.body ? message.body : undefined,
+          caption: !primaryExternalId && index === 0 && message.body ? message.body : undefined,
           threadId: target.threadId,
-          replyToId: target.replyToId,
+          replyToId: primaryExternalId ? undefined : target.replyToId,
         });
-        externalId = result.messageId;
+        primaryExternalId ??= result.messageId;
         externalIds.push(result.messageId);
       }
       return {
         provider: this.id,
         target,
-        externalId,
+        externalId: primaryExternalId,
         externalIds,
         deliveredAt: Date.now(),
       };
@@ -148,7 +163,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       const inbound = await processMatrixInboundEvent(nativeEvent.event, {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
-        attachmentDir: path.join("msg-attach", "matrix", account.accountId),
+        attachmentDir: account.attachmentDir,
         client: account.client,
       });
       this.emitWithTriggerHold(inbound);
@@ -157,10 +172,15 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
 
   private schedulePoll(account: AccountRuntime): void {
     if (this.stopped) return;
-    const poll = this.poll(account)
-      .catch((error) => this.options.onError?.(error, { accountId: account.accountId, phase: "poll" }))
-      .finally(() => this.activePolls.delete(poll));
-    this.activePolls.add(poll);
+    account.pollTimer = setTimeout(() => {
+      const poll = this.poll(account)
+        .catch((error) => this.options.onError?.(error, { accountId: account.accountId, phase: "poll" }))
+        .finally(() => {
+          this.activePolls.delete(poll);
+          this.schedulePoll(account);
+        });
+      this.activePolls.add(poll);
+    }, 250);
   }
 
   private emitWithTriggerHold(inbound: InboundChatEvent): void {

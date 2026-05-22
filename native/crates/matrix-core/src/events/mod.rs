@@ -365,6 +365,7 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
     Some(MatrixMessageSummary {
         event_id,
         sender,
+        sender_name: None,
         body: readable_body(content),
         msgtype,
         timestamp,

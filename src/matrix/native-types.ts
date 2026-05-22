@@ -167,6 +167,7 @@ export type MatrixMessageRelatesTo = {
 export type MatrixMessageSummary = {
   eventId: string;
   sender: string;
+  senderName?: string;
   body: string;
   msgtype?: string;
   timestamp: string;

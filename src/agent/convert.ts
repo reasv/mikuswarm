@@ -8,7 +8,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
     if (message.type === "chatEvent") {
       return [
         {
-          role: message.role,
+          role: "user",
           content: contentWithImages(message.content, message.imageBlocks),
           timestamp: message.timestamp ?? message.event?.timestamp ?? Date.now(),
         } as Message,

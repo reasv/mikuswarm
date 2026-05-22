@@ -3,6 +3,9 @@ import { Type } from "@earendil-works/pi-ai";
 import { lookup } from "node:dns/promises";
 import net from "node:net";
 
+const WEB_FETCH_SECURITY_NOTE =
+  "Blocks localhost/private IPs before each request and redirect. DNS is not pinned, so this is defense-in-depth rather than a complete SSRF sandbox.";
+
 export function createWebFetchTool(): AgentTool {
   return {
     name: "web_fetch",
@@ -23,7 +26,13 @@ export function createWebFetchTool(): AgentTool {
       const maxChars = args.max_chars ?? 50_000;
       return {
         content: [{ type: "text", text: text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text }],
-        details: { url, status: response.status, contentType, truncated: text.length > maxChars },
+        details: {
+          url,
+          status: response.status,
+          contentType,
+          truncated: text.length > maxChars,
+          securityNote: WEB_FETCH_SECURITY_NOTE,
+        },
       };
     },
   };
@@ -46,6 +55,16 @@ export function createWebSearchTool(): AgentTool {
       if (!response.ok) throw new Error(`Search failed with HTTP ${response.status}`);
       const html = await response.text();
       const results = parseDuckDuckGoResults(html).slice(0, args.limit ?? 5);
+      if (html.trim() && results.length === 0) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          component: "mikuswarm.web_search",
+          message: "duckduckgo_parse_returned_no_results",
+          time: new Date().toISOString(),
+          query: args.query,
+          responseBytes: Buffer.byteLength(html),
+        }));
+      }
       return {
         content: [
           {
@@ -55,7 +74,11 @@ export function createWebSearchTool(): AgentTool {
               : "No search results parsed.",
           },
         ],
-        details: { query: args.query, results },
+        details: {
+          query: args.query,
+          results,
+          warning: html.trim() && results.length === 0 ? "DuckDuckGo HTML parsing returned no results." : undefined,
+        },
       };
     },
   };
@@ -87,7 +110,7 @@ async function guardedFetch(url: string, redirects = 0): Promise<Response> {
 async function assertPublicHttpUrl(value: string): Promise<void> {
   const url = new URL(value);
   if (url.username || url.password) throw new Error("URLs with credentials are not supported.");
-  const host = url.hostname.toLowerCase();
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host.endsWith(".localhost")) {
     throw new Error("Local addresses are blocked.");
   }
@@ -111,7 +134,13 @@ function isBlockedAddress(address: string): boolean {
 
 function normalizeIp(address: string): string {
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  return mapped?.[1] ?? address;
+  if (mapped?.[1]) return mapped[1];
+  const hexMapped = /^(?:0*:)*ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(address);
+  if (!hexMapped) return address;
+  const high = Number.parseInt(hexMapped[1]!, 16);
+  const low = Number.parseInt(hexMapped[2]!, 16);
+  if (!Number.isInteger(high) || !Number.isInteger(low)) return address;
+  return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
 }
 
 function isBlockedIpv4(address: string): boolean {

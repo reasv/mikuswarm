@@ -78,7 +78,7 @@ export function createSearchFilesTool(context: FileToolContext): AgentTool {
   };
 }
 
-type TextEditorArgs =
+export type TextEditorArgs =
   | {
       command: "view";
       path: string;

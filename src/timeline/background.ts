@@ -18,9 +18,7 @@ export class BackgroundProcessor {
   async prepareTriggerEvent(event: CanonicalChatEvent): Promise<CanonicalChatEvent> {
     if (!event.attachments?.length || !this.options.captioner) return event;
     const captions = await this.options.captioner(event);
-    const updated = applyCaptions(event, captions);
-    await this.store.enrich(event.id, (current) => applyCaptions(current, captions));
-    return updated;
+    return this.store.enrich(event.id, (current) => applyCaptions(current, captions));
   }
 
   processNonTriggerEvent(event: CanonicalChatEvent): void {

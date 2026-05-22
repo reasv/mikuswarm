@@ -49,6 +49,7 @@ export const AppConfigSchema = Type.Object({
     sessions: Type.Object({
       max_concurrent: Type.Number({ minimum: 1 }),
       max_concurrent_dm: Type.Number({ minimum: 1 }),
+      max_queued_per_timeline: Type.Optional(Type.Number({ minimum: 1 })),
       forced_completion_retries: Type.Number({ minimum: 0 }),
     }),
     system: Type.Object({

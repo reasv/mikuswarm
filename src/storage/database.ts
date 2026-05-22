@@ -69,7 +69,12 @@ export class Storage {
   }
 
   read<T>(run: (db: Database.Database) => T): T {
+    if (this.closed) throw new Error("Storage is closed");
     return run(this.db);
+  }
+
+  readAndWrite<T>(run: (db: Database.Database) => T): Promise<T> {
+    return this.write((db) => db.transaction(() => run(db))());
   }
 
   appendTimelineEvent(event: CanonicalChatEvent): Promise<void> {
@@ -97,6 +102,7 @@ export class Storage {
           received_at = excluded.received_at,
           agent_session_id = excluded.agent_session_id,
           event_json = excluded.event_json,
+          created_at = timeline_events.created_at,
           updated_at = excluded.updated_at`,
       ).run({
         id: event.id,
@@ -167,13 +173,15 @@ export class Storage {
                or (timestamp = @timestamp and received_at > @receivedAt)
                or (timestamp = @timestamp and received_at = @receivedAt and id >= @id)
              )
-           order by timestamp asc, received_at asc, id asc`,
+           order by timestamp asc, received_at asc, id asc
+           limit @limit`,
         )
         .all({
           timelineKey,
           timestamp: cursor.timestamp,
           receivedAt: cursor.received_at,
           id: cursor.id,
+          limit,
         }) as Array<{ event_json: string }>,
     );
     return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
@@ -229,7 +237,10 @@ export class Storage {
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
 
-  updateTimelineEvent(id: string, updater: (event: CanonicalChatEvent) => CanonicalChatEvent): Promise<void> {
+  updateTimelineEvent(
+    id: string,
+    updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
+  ): Promise<CanonicalChatEvent> {
     return this.write((db) => {
       const row = db
         .prepare(`select event_json from timeline_events where id = ?`)
@@ -266,6 +277,7 @@ export class Storage {
         eventJson: JSON.stringify(updated),
         updatedAt: Date.now(),
       });
+      return updated;
     });
   }
 

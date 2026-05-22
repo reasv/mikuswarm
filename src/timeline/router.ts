@@ -11,12 +11,12 @@ export class TimelineRouter {
   constructor(private readonly store: TimelineStore) {}
 
   async route(inbound: InboundChatEvent): Promise<RoutedTimelineEvent> {
-    const existing = this.store.getById(inbound.event.id);
-    if (!existing) {
-      await this.store.append(inbound.event);
+    const routed = await this.store.appendIfMissing(inbound.event);
+    if (!routed.duplicate) {
       return { timelineKey: inbound.timelineKey, inbound, duplicate: false };
     }
 
+    const existing = routed.event;
     if (inbound.trigger && !existing.trigger) {
       await this.store.enrich(inbound.event.id, (event) => ({
         ...event,

@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import sharp from "sharp";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
 import type { CanonicalChatEvent } from "../types.js";
@@ -6,12 +7,13 @@ import type { TimelineStore } from "../timeline/index.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
+import { escapeXml } from "./xml.js";
 
 export interface ContextMessage {
   type: "system" | "chatEvent" | "runtimeInstructions";
   role: "user" | "assistant" | "system";
   content: string;
-  tier?: "compact" | "rich" | "runtime" | "system";
+  tier?: "compact" | "rich" | "mixed" | "runtime" | "system";
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
   timestamp?: number;
@@ -167,7 +169,6 @@ export async function encodeImageForContext(
   input: Buffer,
   options: ImageEncodingOptions,
 ): Promise<Buffer | undefined> {
-  const sharp = (await import("sharp")).default;
   const metadata = await sharp(input).metadata();
   let width = Math.min(metadata.width ?? options.maxWidth, options.maxWidth);
   let height = Math.min(metadata.height ?? options.maxHeight, options.maxHeight);
@@ -208,7 +209,7 @@ function renderRuntimeInstructions(options: BuildContextOptions): string {
   const sessions = options.activeSessions
     .map(
       (session) =>
-        `<session id="${session.id}" started="${new Date(session.createdAt).toISOString()}" triggered_by="${escapeXml(session.trigger.event.body.slice(0, 160))}"/>`,
+        `<session id="${session.id}" started="${new Date(session.createdAt).toISOString()}" triggered_by="${escapeXml((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
     )
     .join("\n");
   return `<runtime>
@@ -220,12 +221,4 @@ Trigger event: ${escapeXml(options.trigger.id)}
 ${sessions}
 </active_sessions>
 </runtime>`;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
 }

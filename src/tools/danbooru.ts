@@ -4,6 +4,8 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 
+const MAX_DANBOORU_ASSET_BYTES = 256 * 1024 * 1024;
+
 type DanbooruPost = {
   id: number;
   tag_string?: string;
@@ -50,9 +52,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const assetUrl = selectAssetUrl(post, args.variant ?? (action === "preview" ? "preview" : "original"));
       if (!assetUrl) throw new Error(`Post ${post.id} has no usable asset URL.`);
       if (action === "preview") {
-        const response = await fetch(assetUrl);
-        if (!response.ok) throw new Error(`Preview fetch failed with HTTP ${response.status}`);
-        const buffer = Buffer.from(await response.arrayBuffer());
+        const { response, buffer } = await fetchDanbooruAsset(assetUrl, "Preview");
         return {
           content: [
             { type: "text", text: summarizePost(post) },
@@ -61,9 +61,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
           details: { post, assetUrl },
         };
       }
-      const response = await fetch(assetUrl);
-      if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
-      const buffer = Buffer.from(await response.arrayBuffer());
+      const { response, buffer } = await fetchDanbooruAsset(assetUrl, "Download");
       const subdir = args.output_subdir ?? "downloads/danbooru";
       const outputDir = resolveWorkspacePath(context.workspaceRoot, subdir);
       await mkdir(outputDir, { recursive: true });
@@ -76,6 +74,29 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       };
     },
   };
+}
+
+async function fetchDanbooruAsset(
+  assetUrl: string,
+  operation: "Preview" | "Download",
+): Promise<{ response: Response; buffer: Buffer }> {
+  const response = await fetch(assetUrl, { headers: { "user-agent": "mikuswarm/0.1" } });
+  if (!response.ok) throw new Error(`${operation} failed with HTTP ${response.status}`);
+  const length = parseContentLength(response.headers.get("content-length"));
+  if (length !== undefined && length > MAX_DANBOORU_ASSET_BYTES) {
+    throw new Error(`${operation} exceeds Danbooru asset size limit (${length} > ${MAX_DANBOORU_ASSET_BYTES} bytes)`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > MAX_DANBOORU_ASSET_BYTES) {
+    throw new Error(`${operation} exceeds Danbooru asset size limit (${buffer.length} > ${MAX_DANBOORU_ASSET_BYTES} bytes)`);
+  }
+  return { response, buffer };
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 async function searchDanbooru(tags: string[], limit: number) {

@@ -18,4 +18,11 @@ test("web_fetch blocks local addresses", async () => {
       }),
     /Local addresses are blocked/,
   );
+  await assert.rejects(
+    () =>
+      tool.execute("tool-3", {
+        url: "http://[::ffff:7f00:1]/",
+      }),
+    /Local or private address is blocked/,
+  );
 });

@@ -11,6 +11,7 @@ export interface TriggerDecision {
   action: "spawn" | "queued" | "ignored";
   inbound?: InboundChatEvent;
   queueLength?: number;
+  reason?: string;
 }
 
 export class TriggerCoordinator {
@@ -28,6 +29,10 @@ export class TriggerCoordinator {
       return { action: "spawn", inbound };
     }
     const queue = this.queues.get(inbound.timelineKey) ?? [];
+    const maxQueued = this.config.max_queued_per_timeline ?? 10_000;
+    if (queue.length >= maxQueued) {
+      return { action: "ignored", reason: "queue_full", queueLength: queue.length };
+    }
     queue.push({ inbound, queuedAt: Date.now() });
     this.queues.set(inbound.timelineKey, queue);
     return { action: "queued", queueLength: queue.length };

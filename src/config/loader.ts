@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse } from "smol-toml";
 import { loadDotEnv, type EnvLoadOptions } from "./env.js";
 import { AppConfigSchema, type AppConfig } from "./schema.js";
-import { registerSecret } from "./redaction.js";
+import { registerSecret, resetRedactionRegistry } from "./redaction.js";
 
 type PlainObject = Record<string, unknown>;
 
@@ -20,7 +20,7 @@ function shallowMergeByTopLevel(configs: PlainObject[]): PlainObject {
 
 function substituteEnv(value: unknown, missing = new Set<string>()): unknown {
   if (typeof value === "string") {
-    return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, name: string) => {
+    return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => {
       const replacement = process.env[name];
       if (replacement === undefined) {
         missing.add(name);
@@ -82,7 +82,12 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   for (const file of files) {
     const fullPath = path.join(configDir, file);
     const text = await readFile(fullPath, "utf8");
-    parsed.push(parse(text) as PlainObject);
+    try {
+      parsed.push(parse(text) as PlainObject);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to parse TOML config ${fullPath}: ${message}`, { cause: error });
+    }
   }
 
   const missingEnv = new Set<string>();
@@ -90,12 +95,12 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   if (missingEnv.size > 0) {
     throw new Error(`Missing environment variables referenced by config: ${[...missingEnv].sort().join(", ")}`);
   }
-  registerSecretsByKey(merged);
-
   if (!Value.Check(AppConfigSchema, merged)) {
     throw new Error(`Invalid config: ${formatValidationErrors(merged)}`);
   }
 
   const config = Value.Decode(AppConfigSchema, merged);
+  resetRedactionRegistry();
+  registerSecretsByKey(config);
   return config;
 }

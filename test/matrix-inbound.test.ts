@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -39,6 +39,7 @@ test("Matrix reply context downloads media attachments for replied-to media even
       messageSummary: () => ({
         eventId: "$image",
         sender: "@alice:example.org",
+        senderName: "Alice",
         body: "picture.jpg",
         msgtype: "m.image",
         timestamp: new Date(500).toISOString(),
@@ -74,9 +75,73 @@ test("Matrix reply context downloads media attachments for replied-to media even
     });
 
     assert.equal(inbound.event.replyTo?.externalId, "$image");
+    assert.equal(inbound.event.replyTo?.sender?.displayName, "Alice");
     assert.equal(inbound.event.replyTo?.attachments?.length, 1);
     assert.equal(inbound.event.replyTo?.attachments?.[0]?.mediaType, "image");
     assert.match(inbound.event.replyTo?.attachments?.[0]?.localPath ?? "", /_image-_image_media_0\.jpg$/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Matrix provider preserves body text separately when sending attachments", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-send-"));
+  try {
+    const filePath = path.join(dir, "image.jpg");
+    await writeFile(filePath, "fake-image");
+    const sends: unknown[] = [];
+    const uploads: unknown[] = [];
+    const provider = new MatrixProvider();
+    (provider as any).accounts.set("miku", {
+      accountId: "miku",
+      selfUserId: "@miku:example.org",
+      client: {
+        sendMessage: (request: unknown) => {
+          sends.push(request);
+          return { roomId: "!room:example.org", messageId: "$text" };
+        },
+        uploadMedia: (request: unknown) => {
+          uploads.push(request);
+          return { roomId: "!room:example.org", messageId: "$media" };
+        },
+      },
+    });
+
+    const receipt = await provider.send(
+      {
+        provider: "matrix",
+        timelineKey: "matrix:miku:room:!room:example.org",
+        accountId: "miku",
+        roomId: "!room:example.org",
+        replyToId: "$reply",
+      },
+      {
+        body: "body text",
+        attachments: [
+          {
+            id: "a1",
+            mediaType: "image",
+            mimeType: "image/jpeg",
+            filename: "image.jpg",
+            localPath: filePath,
+          },
+        ],
+      },
+    );
+
+    assert.equal(receipt.externalId, "$text");
+    assert.deepEqual(receipt.externalIds, ["$text", "$media"]);
+    assert.deepEqual(sends, [
+      {
+        roomId: "!room:example.org",
+        text: "body text",
+        html: undefined,
+        threadId: undefined,
+        replyToId: "$reply",
+      },
+    ]);
+    assert.equal((uploads[0] as any).caption, undefined);
+    assert.equal((uploads[0] as any).replyToId, undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

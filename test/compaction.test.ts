@@ -17,8 +17,8 @@ test("compaction advances rich boundary by event, not same-role turn", () => {
     renderRichMessage,
     renderCompactMessage,
     {
-      rich_max_tokens: 180,
-      rich_target_tokens: 60,
+      rich_max_tokens: 100,
+      rich_target_tokens: 80,
       compact_max_tokens: 10_000,
       compact_target_tokens: 9_000,
     },
@@ -31,8 +31,7 @@ test("compaction advances rich boundary by event, not same-role turn", () => {
   assert.deepEqual(
     result.turns.map((turn) => [turn.tier, turn.role, turn.messageIds]),
     [
-      ["compact", "user", ["u1"]],
-      ["rich", "user", ["u2"]],
+      ["mixed", "user", ["u1", "u2"]],
       ["rich", "assistant", ["a1"]],
     ],
   );
