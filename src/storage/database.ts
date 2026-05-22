@@ -188,15 +188,20 @@ export class Storage {
 
   close(): void {
     this.closed = true;
-    if (this.queue.length > 0) {
-      throw new Error("Cannot close storage while write queue is not empty");
-    }
+    this.rejectPendingWrites();
     this.db.close();
   }
 
   async waitForIdle(): Promise<void> {
-    while (this.draining || this.queue.length > 0) {
+    while (!this.closed && (this.draining || this.queue.length > 0)) {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  private rejectPendingWrites(): void {
+    while (this.queue.length > 0) {
+      const job = this.queue.shift();
+      job?.reject(new Error("Storage is closed"));
     }
   }
 
