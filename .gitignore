@@ -19,3 +19,4 @@ msg-attach/
 var/matrix/
 workspaces/*
 !workspaces/.gitpreserve
+/tmp/
