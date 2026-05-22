@@ -241,7 +241,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
 async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
-  await Promise.allSettled([...runs]);
+  const timeout = new Promise<void>((resolve) => setTimeout(resolve, 10_000));
+  await Promise.race([Promise.allSettled([...runs]), timeout]);
 }
 
 function createBasicCaptioner() {
