@@ -140,11 +140,7 @@ impl MatrixCoreClient {
         let result = send_message_internal(&client, &config, &request)
             .await
             .map_err(to_napi_error)?;
-        {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+        if let Ok(inner) = self.inner.lock() {
             inner.record_outbound(
                 &result.room_id,
                 &result.message_id,
