@@ -53,6 +53,7 @@ export class CaptionWorkerPool {
 
   notifyNewWork(): void {
     if (this.wakeResolve) {
+      if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = undefined; }
       this.wakeResolve();
       this.wakeResolve = undefined;
     }
@@ -84,8 +85,13 @@ export class CaptionWorkerPool {
     if (claimed.length === 0) {
       await new Promise<void>((resolve) => {
         this.wakeResolve = resolve;
-        this.schedulePoll(2000);
+        this.pollTimer = setTimeout(() => {
+          this.wakeResolve = undefined;
+          resolve();
+        }, 2000);
       });
+      if (!this.running) return;
+      this.schedulePoll(0);
       return;
     }
 
@@ -120,6 +126,7 @@ export class CaptionWorkerPool {
     const maxRetries = this.options.config.max_retries ?? 2;
 
     if (count >= maxRetries) {
+      this.failureCounts.delete(assetId);
       await this.options.storage.setCaptionStatus(
         assetId, "failed",
         error instanceof Error ? error.message : String(error),

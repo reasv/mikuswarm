@@ -203,15 +203,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         resolve();
         return;
       }
+      const onComplete = () => {
+        clearTimeout(timer);
+        resolve();
+      };
       const timer = setTimeout(() => {
-        enrichmentEmitter.removeAllListeners(`complete:${eventId}`);
+        enrichmentEmitter.removeListener(`complete:${eventId}`, onComplete);
         logger.warn("enrichment_timeout", { eventId, timeoutMs });
         resolve();
       }, timeoutMs);
-      enrichmentEmitter.once(`complete:${eventId}`, () => {
-        clearTimeout(timer);
-        resolve();
-      });
+      enrichmentEmitter.once(`complete:${eventId}`, onComplete);
     });
   }
 

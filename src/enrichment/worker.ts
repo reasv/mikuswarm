@@ -154,11 +154,13 @@ export class EnrichmentWorker {
       }
 
       const timestamp = Date.parse(summary.timestamp);
+      const senderUsername = extractUsername(summary.sender);
       result.replyContext = {
         event_id: event.id,
         reply_external_id: summary.eventId,
         sender_id: summary.sender,
         sender_display_name: summary.senderName ?? null,
+        sender_username: senderUsername,
         body: summary.body,
         timestamp: Number.isFinite(timestamp) ? timestamp : null,
         created_at: Date.now(),
@@ -260,12 +262,20 @@ export class EnrichmentWorker {
       }
 
       const mediaRole = context === "message" ? "preview_media" : "reply_preview_media";
+      const urlToPreviewId = new Map<string, string>();
+      for (const lp of result.linkPreviews) {
+        if (lp.event_id === eventId && lp.context === context) {
+          urlToPreviewId.set(lp.url, lp.id);
+        }
+      }
+
       for (const media of previewResult.media) {
         const data = Buffer.from(media.dataBase64, "base64");
         const asset: MediaAssetRow = {
           id: nanoid(),
           event_id: eventId,
           role: mediaRole,
+          link_preview_id: urlToPreviewId.get(media.sourceUrl) ?? null,
           media_type: inferMediaType(media.contentType),
           mime_type: media.contentType ?? null,
           original_filename: media.filename ?? null,
@@ -391,4 +401,11 @@ function urlFilename(url: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function extractUsername(userId: string): string | null {
+  if (!userId.startsWith("@")) return null;
+  const colonIndex = userId.indexOf(":");
+  if (colonIndex < 0) return null;
+  return userId.slice(1, colonIndex);
 }

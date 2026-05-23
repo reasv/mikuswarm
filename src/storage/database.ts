@@ -77,6 +77,7 @@ export interface MediaAssetRow {
   caption?: string | null;
   caption_model?: string | null;
   caption_status: string;
+  caption_error?: string | null;
   download_status: string;
   download_error?: string | null;
   created_at: number;
@@ -447,14 +448,14 @@ export class Storage {
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
           original_filename, detected_content, detected_metadata_json,
-          caption, caption_model, caption_status, download_status,
-          download_error, created_at
+          caption, caption_model, caption_status, caption_error,
+          download_status, download_error, created_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
           @originalFilename, @detectedContent, @detectedMetadataJson,
-          @caption, @captionModel, @captionStatus, @downloadStatus,
-          @downloadError, @createdAt
+          @caption, @captionModel, @captionStatus, @captionError,
+          @downloadStatus, @downloadError, @createdAt
         )`,
       ).run({
         id: row.id,
@@ -475,6 +476,7 @@ export class Storage {
         caption: row.caption ?? null,
         captionModel: row.caption_model ?? null,
         captionStatus: row.caption_status,
+        captionError: row.caption_error ?? null,
         downloadStatus: row.download_status,
         downloadError: row.download_error ?? null,
         createdAt: row.created_at,
@@ -491,6 +493,10 @@ export class Storage {
     },
   ): Promise<void> {
     return this.readAndWrite((db) => {
+      db.prepare(`delete from media_assets where event_id = ?`).run(eventId);
+      db.prepare(`delete from link_previews where event_id = ?`).run(eventId);
+      db.prepare(`delete from reply_contexts where event_id = ?`).run(eventId);
+
       if (result.replyContext) {
         db.prepare(
           `insert or replace into reply_contexts (
@@ -545,14 +551,14 @@ export class Storage {
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
           original_filename, detected_content, detected_metadata_json,
-          caption, caption_model, caption_status, download_status,
-          download_error, created_at
+          caption, caption_model, caption_status, caption_error,
+          download_status, download_error, created_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
           @originalFilename, @detectedContent, @detectedMetadataJson,
-          @caption, @captionModel, @captionStatus, @downloadStatus,
-          @downloadError, @createdAt
+          @caption, @captionModel, @captionStatus, @captionError,
+          @downloadStatus, @downloadError, @createdAt
         )`,
       );
       for (const ma of result.mediaAssets) {
@@ -575,6 +581,7 @@ export class Storage {
           caption: ma.caption ?? null,
           captionModel: ma.caption_model ?? null,
           captionStatus: ma.caption_status,
+          captionError: ma.caption_error ?? null,
           downloadStatus: ma.download_status,
           downloadError: ma.download_error ?? null,
           createdAt: ma.created_at,
@@ -596,34 +603,39 @@ export class Storage {
       return { replyContexts: new Map(), linkPreviews: new Map(), mediaAssets: new Map() };
     }
     return this.read((db) => {
-      const placeholders = eventIds.map(() => "?").join(", ");
-
       const replyContexts = new Map<string, ReplyContextRow>();
-      const rcRows = db.prepare(
-        `select * from reply_contexts where event_id in (${placeholders})`,
-      ).all(...eventIds) as ReplyContextRow[];
-      for (const row of rcRows) replyContexts.set(row.event_id, row);
-
       const linkPreviews = new Map<string, LinkPreviewRow[]>();
-      const lpRows = db.prepare(
-        `select * from link_previews where event_id in (${placeholders})
-         order by event_id, context, preview_index`,
-      ).all(...eventIds) as LinkPreviewRow[];
-      for (const row of lpRows) {
-        const list = linkPreviews.get(row.event_id) ?? [];
-        list.push(row);
-        linkPreviews.set(row.event_id, list);
-      }
-
       const mediaAssets = new Map<string, MediaAssetRow[]>();
-      const maRows = db.prepare(
-        `select * from media_assets where event_id in (${placeholders})
-         order by event_id, role, source_index`,
-      ).all(...eventIds) as MediaAssetRow[];
-      for (const row of maRows) {
-        const list = mediaAssets.get(row.event_id) ?? [];
-        list.push(row);
-        mediaAssets.set(row.event_id, list);
+
+      const batchSize = 500;
+      for (let i = 0; i < eventIds.length; i += batchSize) {
+        const batch = eventIds.slice(i, i + batchSize);
+        const placeholders = batch.map(() => "?").join(", ");
+
+        const rcRows = db.prepare(
+          `select * from reply_contexts where event_id in (${placeholders})`,
+        ).all(...batch) as ReplyContextRow[];
+        for (const row of rcRows) replyContexts.set(row.event_id, row);
+
+        const lpRows = db.prepare(
+          `select * from link_previews where event_id in (${placeholders})
+           order by event_id, context, preview_index`,
+        ).all(...batch) as LinkPreviewRow[];
+        for (const row of lpRows) {
+          const list = linkPreviews.get(row.event_id) ?? [];
+          list.push(row);
+          linkPreviews.set(row.event_id, list);
+        }
+
+        const maRows = db.prepare(
+          `select * from media_assets where event_id in (${placeholders})
+           order by event_id, role, source_index`,
+        ).all(...batch) as MediaAssetRow[];
+        for (const row of maRows) {
+          const list = mediaAssets.get(row.event_id) ?? [];
+          list.push(row);
+          mediaAssets.set(row.event_id, list);
+        }
       }
 
       return { replyContexts, linkPreviews, mediaAssets };
@@ -673,7 +685,7 @@ export class Storage {
   setCaptionStatus(assetId: string, status: string, error?: string): Promise<void> {
     return this.write((db) => {
       db.prepare(
-        `update media_assets set caption_status = ?${error ? ", download_error = ?" : ""} where id = ?`,
+        `update media_assets set caption_status = ?${error ? ", caption_error = ?" : ""} where id = ?`,
       ).run(...(error ? [status, error, assetId] : [status, assetId]));
     });
   }
@@ -691,14 +703,20 @@ export class Storage {
   countPendingCaptions(eventIds: string[]): number {
     if (eventIds.length === 0) return 0;
     return this.read((db) => {
-      const placeholders = eventIds.map(() => "?").join(", ");
-      const row = db.prepare(
-        `select count(*) as remaining from media_assets
-         where event_id in (${placeholders})
-           and caption_status in ('pending', 'processing')
-           and media_type = 'image'`,
-      ).get(...eventIds) as { remaining: number };
-      return row.remaining;
+      let total = 0;
+      const batchSize = 500;
+      for (let i = 0; i < eventIds.length; i += batchSize) {
+        const batch = eventIds.slice(i, i + batchSize);
+        const placeholders = batch.map(() => "?").join(", ");
+        const row = db.prepare(
+          `select count(*) as remaining from media_assets
+           where event_id in (${placeholders})
+             and caption_status in ('pending', 'processing')
+             and media_type = 'image'`,
+        ).get(...batch) as { remaining: number };
+        total += row.remaining;
+      }
+      return total;
     });
   }
 
@@ -768,7 +786,8 @@ create table if not exists timeline_events (
   received_at integer not null,
   agent_session_id text,
   event_json text not null,
-  enrichment_status text not null default 'pending',
+  enrichment_status text not null default 'pending'
+    check(enrichment_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
   trigger_group_id text,
   created_at integer not null,
   updated_at integer not null
@@ -852,8 +871,11 @@ create table if not exists media_assets (
   detected_metadata_json text,
   caption text,
   caption_model text,
-  caption_status text not null default 'pending',
-  download_status text not null default 'pending',
+  caption_status text not null default 'pending'
+    check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
+  caption_error text,
+  download_status text not null default 'complete'
+    check(download_status in ('complete', 'failed')),
   download_error text,
   created_at integer not null
 );
@@ -879,5 +901,11 @@ function runMigrations(db: Database.Database): void {
   }
   if (!columnNames.has("trigger_group_id")) {
     db.exec(`alter table timeline_events add column trigger_group_id text`);
+  }
+
+  const maColumns = db.prepare("pragma table_info(media_assets)").all() as Array<{ name: string }>;
+  const maColumnNames = new Set(maColumns.map((c) => c.name));
+  if (!maColumnNames.has("caption_error")) {
+    db.exec(`alter table media_assets add column caption_error text`);
   }
 }

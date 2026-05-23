@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import sharp from "sharp";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { Storage, MediaAssetRow, LinkPreviewRow, ReplyContextRow } from "../storage/index.js";
+import { resizeImageBuffer } from "../captioning/image-resize.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
@@ -294,36 +294,8 @@ export async function encodeImageForContext(
   input: Buffer,
   options: ImageEncodingOptions,
 ): Promise<Buffer | undefined> {
-  const metadata = await sharp(input).metadata();
-  let width = Math.min(metadata.width ?? options.maxWidth, options.maxWidth);
-  let height = Math.min(metadata.height ?? options.maxHeight, options.maxHeight);
-  let best: Buffer | undefined;
-
-  for (;;) {
-    for (const quality of [82, 72, 62, 52, 42, 35]) {
-      const output = await sharp(input)
-        .resize({
-          width: Math.round(width),
-          height: Math.round(height),
-          fit: "inside",
-          withoutEnlargement: true,
-        })
-        .jpeg({ quality, mozjpeg: true })
-        .toBuffer();
-      best = output;
-      if (output.byteLength <= options.maxBytes) return output;
-    }
-    if (width <= 64 || height <= 64) break;
-    width *= 0.75;
-    height *= 0.75;
-    width = Math.max(width, 64);
-    height = Math.max(height, 64);
-  }
-
-  if (!best) {
-    throw new Error("Unable to encode image for context");
-  }
-  return best.byteLength <= options.maxBytes ? best : undefined;
+  const result = await resizeImageBuffer(input, options);
+  return result?.data;
 }
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {

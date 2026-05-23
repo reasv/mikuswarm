@@ -47,6 +47,7 @@ export class EnrichmentWorkerPool {
 
   notifyNewEvent(_eventId: string): void {
     if (this.wakeResolve) {
+      if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = undefined; }
       this.wakeResolve();
       this.wakeResolve = undefined;
     }
@@ -77,8 +78,13 @@ export class EnrichmentWorkerPool {
     if (claimed.length === 0) {
       await new Promise<void>((resolve) => {
         this.wakeResolve = resolve;
-        this.schedulePoll(1000);
+        this.pollTimer = setTimeout(() => {
+          this.wakeResolve = undefined;
+          resolve();
+        }, 1000);
       });
+      if (!this.running) return;
+      this.schedulePoll(0);
       return;
     }
 
@@ -127,6 +133,7 @@ export class EnrichmentWorkerPool {
     const maxRetries = this.options.config.max_retries ?? 3;
 
     if (count >= maxRetries) {
+      this.failureCounts.delete(eventId);
       await this.options.storage.setEnrichmentStatus(
         eventId, "failed",
         error instanceof Error ? error.message : String(error),

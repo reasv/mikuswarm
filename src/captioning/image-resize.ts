@@ -12,6 +12,24 @@ export async function resizeImageForInference(options: ResizeOptions): Promise<{
   mediaType: string;
 }> {
   const input = await sharp(options.inputPath).toBuffer();
+  const result = await resizeImageBuffer(input, {
+    maxWidth: options.maxWidth,
+    maxHeight: options.maxHeight,
+    maxBytes: options.maxBytes,
+  });
+  return result ?? { data: await fallbackResize(input), mediaType: "image/jpeg" };
+}
+
+export interface ResizeBufferOptions {
+  maxWidth: number;
+  maxHeight: number;
+  maxBytes: number;
+}
+
+export async function resizeImageBuffer(
+  input: Buffer,
+  options: ResizeBufferOptions,
+): Promise<{ data: Buffer; mediaType: string } | undefined> {
   const metadata = await sharp(input).metadata();
   let width = Math.min(metadata.width ?? options.maxWidth, options.maxWidth);
   let height = Math.min(metadata.height ?? options.maxHeight, options.maxHeight);
@@ -38,9 +56,12 @@ export async function resizeImageForInference(options: ResizeOptions): Promise<{
     height = Math.max(height, 64);
   }
 
-  const last = await sharp(input)
+  return undefined;
+}
+
+async function fallbackResize(input: Buffer): Promise<Buffer> {
+  return sharp(input)
     .resize({ width: 64, height: 64, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 35, mozjpeg: true })
     .toBuffer();
-  return { data: last, mediaType: "image/jpeg" };
 }
