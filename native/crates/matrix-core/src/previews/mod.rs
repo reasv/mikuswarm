@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        MatrixClientConfig, MatrixLinkPreviewMedia, MatrixLinkPreviewResult,
+        MatrixLinkPreviewMedia, MatrixLinkPreviewResult,
         MatrixLinkPreviewSource, MatrixLinkPreviewSourceKind, MatrixResolveLinkPreviewsRequest,
     },
     MatrixError, MatrixResult,
@@ -100,7 +100,7 @@ struct FxTwitterStatusResponse {
 }
 
 pub async fn resolve_link_previews(
-    config: &MatrixClientConfig,
+    homeserver: &str,
     access_token: &str,
     request: &MatrixResolveLinkPreviewsRequest,
 ) -> MatrixResult<MatrixLinkPreviewResult> {
@@ -150,7 +150,7 @@ pub async fn resolve_link_previews(
         }
 
         let Some(preview) =
-            fetch_synapse_preview(&client, config, access_token, &parsed_url).await?
+            fetch_synapse_preview(&client, homeserver, access_token, &parsed_url).await?
         else {
             continue;
         };
@@ -168,7 +168,7 @@ pub async fn resolve_link_previews(
         });
         if include_images {
             media.extend(
-                resolve_synapse_preview_media(&client, config, access_token, &preview, max_bytes)
+                resolve_synapse_preview_media(&client, homeserver, access_token, &preview, max_bytes)
                     .await?,
             );
         }
@@ -247,14 +247,14 @@ fn build_synapse_preview_text(url: &Url, preview: &Value) -> Option<String> {
 
 async fn fetch_synapse_preview(
     client: &Client,
-    config: &MatrixClientConfig,
+    homeserver: &str,
     access_token: &str,
     url: &Url,
 ) -> MatrixResult<Option<Value>> {
     for path in SYNAPSE_PREVIEW_PATHS {
         let mut endpoint = Url::parse(&format!(
             "{}{path}",
-            config.homeserver.trim_end_matches('/')
+            homeserver.trim_end_matches('/')
         ))
         .map_err(|err| MatrixError::State(format!("invalid preview endpoint: {err}")))?;
         endpoint.query_pairs_mut().append_pair("url", url.as_str());
@@ -463,7 +463,7 @@ fn format_fxtwitter_tweet(tweet: &FxTwitterTweet, heading: &str) -> Option<Strin
 
 async fn resolve_synapse_preview_media(
     client: &Client,
-    config: &MatrixClientConfig,
+    homeserver: &str,
     access_token: &str,
     preview: &Value,
     max_bytes: usize,
@@ -475,7 +475,7 @@ async fn resolve_synapse_preview_media(
     if raw_image.starts_with("mxc://") {
         if let Some(media) = download_mxc_media(
             client,
-            config,
+            homeserver,
             access_token,
             &raw_image,
             max_bytes,
@@ -565,7 +565,7 @@ async fn download_external_image(
 
 async fn download_mxc_media(
     client: &Client,
-    config: &MatrixClientConfig,
+    homeserver: &str,
     access_token: &str,
     mxc_url: &str,
     max_bytes: usize,
@@ -577,7 +577,7 @@ async fn download_mxc_media(
     for path in MEDIA_DOWNLOAD_PATHS {
         let endpoint = format!(
             "{}{path}/{server_name}/{media_id}",
-            config.homeserver.trim_end_matches('/'),
+            homeserver.trim_end_matches('/'),
         );
         let response = client
             .get(&endpoint)
@@ -639,35 +639,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::api::{MatrixAuthConfig, MatrixClientConfig, MatrixStateLayout};
-
-    fn sample_config(homeserver: &str) -> MatrixClientConfig {
-        MatrixClientConfig {
-            account_id: "default".to_string(),
-            homeserver: homeserver.to_string(),
-            user_id: "@bot:example.org".to_string(),
-            auth: MatrixAuthConfig::Password {
-                password: "secret".to_string(),
-            },
-            recovery_key: None,
-            device_name: None,
-            initial_sync_limit: 50,
-            encryption_enabled: true,
-            default_thread_replies: "inbound".to_string(),
-            reply_to_mode: "off".to_string(),
-            state_layout: MatrixStateLayout {
-                root_dir: "/tmp".to_string(),
-                session_file: "/tmp/session.json".to_string(),
-                sdk_store_dir: "/tmp/sdk".to_string(),
-                crypto_store_dir: "/tmp/crypto".to_string(),
-                media_cache_dir: "/tmp/media".to_string(),
-                emoji_catalog_file: "/tmp/emoji.json".to_string(),
-                reactions_file: "/tmp/reactions.json".to_string(),
-                logs_dir: "/tmp/logs".to_string(),
-            },
-            room_overrides: Default::default(),
-        }
-    }
 
     #[test]
     fn extracts_x_status_urls_from_known_hosts() {
@@ -710,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_synapse_preview_blocks_and_media() {
         let server = MockServer::start().await;
-        let config = sample_config(&server.uri());
+        let homeserver = server.uri();
         Mock::given(method("GET"))
             .and(path("/_matrix/media/v3/preview_url"))
             .and(query_param("url", "https://example.com/post"))
@@ -738,7 +709,7 @@ mod tests {
             .await;
 
         let result = resolve_link_previews(
-            &config,
+            &homeserver,
             "matrix-token",
             &MatrixResolveLinkPreviewsRequest {
                 body_text: "check https://example.com/post".to_string(),
@@ -787,9 +758,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = sample_config("https://matrix.example.org");
         let result = resolve_link_previews(
-            &config,
+            "https://matrix.example.org",
             "matrix-token",
             &MatrixResolveLinkPreviewsRequest {
                 body_text: "check https://fixupx.com/alice/status/1234567890".to_string(),

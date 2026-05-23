@@ -363,14 +363,14 @@ impl MatrixCoreClient {
     pub async fn resolve_link_previews(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixResolveLinkPreviewsRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let (config, access_token) = {
+        let (homeserver, access_token) = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
             inner.link_preview_context().map_err(to_napi_error)?
         };
-        let result = previews::resolve_link_previews(&config, &access_token, &request)
+        let result = previews::resolve_link_previews(&homeserver, &access_token, &request)
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))

@@ -615,18 +615,22 @@ impl MatrixCoreService {
 
     pub(crate) fn link_preview_context(
         &self,
-    ) -> MatrixResult<(MatrixClientConfig, String)> {
-        let config = self
+    ) -> MatrixResult<(String, String)> {
+        if !self.running {
+            return Err(MatrixError::State("client is not running".to_string()));
+        }
+        let homeserver = self
             .config
             .as_ref()
             .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?
+            .homeserver
             .clone();
         let access_token = self
             .client()?
             .session_tokens()
             .map(|tokens| tokens.access_token)
             .ok_or_else(|| MatrixError::State("matrix session is unavailable".to_string()))?;
-        Ok((config, access_token))
+        Ok((homeserver, access_token))
     }
 }
 
