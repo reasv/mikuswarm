@@ -52,6 +52,7 @@ export class SessionRunner {
           role: "user",
           content: session.trigger.event.body,
           event: session.trigger.event,
+          timestamp: session.trigger.event.timestamp,
         });
         await waitForAgentIdle(agent);
       } finally {

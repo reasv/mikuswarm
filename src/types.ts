@@ -3,7 +3,6 @@ export type ChatRole = "user" | "assistant";
 export interface SenderInfo {
   id: string;
   displayName?: string;
-  username?: string;
   isSelf?: boolean;
 }
 

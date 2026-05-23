@@ -126,7 +126,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
       if (needsEnrichment(inbound.event)) {
-        const resolvedEvent = timeline.getByExternalId(inbound.provider, inbound.event.externalId!) ?? inbound.event;
+        const resolvedEvent = (inbound.event.externalId != null ? timeline.getByExternalId(inbound.provider, inbound.event.externalId) : undefined) ?? inbound.event;
         await timeline.setEnrichmentStatus(resolvedEvent.id, "pending");
         enrichmentPool.notifyNewEvent(resolvedEvent.id);
       }

@@ -35,7 +35,6 @@ export interface ReplyContextRow {
   reply_external_id?: string | null;
   sender_id?: string | null;
   sender_display_name?: string | null;
-  sender_username?: string | null;
   body?: string | null;
   html_body?: string | null;
   timestamp?: number | null;
@@ -394,17 +393,16 @@ export class Storage {
       db.prepare(
         `insert or replace into reply_contexts (
           event_id, reply_external_id, sender_id, sender_display_name,
-          sender_username, body, html_body, timestamp, created_at
+          body, html_body, timestamp, created_at
         ) values (
           @eventId, @replyExternalId, @senderId, @senderDisplayName,
-          @senderUsername, @body, @htmlBody, @timestamp, @createdAt
+          @body, @htmlBody, @timestamp, @createdAt
         )`,
       ).run({
         eventId: row.event_id,
         replyExternalId: row.reply_external_id ?? null,
         senderId: row.sender_id ?? null,
         senderDisplayName: row.sender_display_name ?? null,
-        senderUsername: row.sender_username ?? null,
         body: row.body ?? null,
         htmlBody: row.html_body ?? null,
         timestamp: row.timestamp ?? null,
@@ -501,17 +499,16 @@ export class Storage {
         db.prepare(
           `insert or replace into reply_contexts (
             event_id, reply_external_id, sender_id, sender_display_name,
-            sender_username, body, html_body, timestamp, created_at
+            body, html_body, timestamp, created_at
           ) values (
             @eventId, @replyExternalId, @senderId, @senderDisplayName,
-            @senderUsername, @body, @htmlBody, @timestamp, @createdAt
+            @body, @htmlBody, @timestamp, @createdAt
           )`,
         ).run({
           eventId: result.replyContext.event_id,
           replyExternalId: result.replyContext.reply_external_id ?? null,
           senderId: result.replyContext.sender_id ?? null,
           senderDisplayName: result.replyContext.sender_display_name ?? null,
-          senderUsername: result.replyContext.sender_username ?? null,
           body: result.replyContext.body ?? null,
           htmlBody: result.replyContext.html_body ?? null,
           timestamp: result.replyContext.timestamp ?? null,
