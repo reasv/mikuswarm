@@ -27,8 +27,12 @@ use crate::{
         MatrixTypingRequest, MatrixUploadMediaRequest,
     },
     client::{
-        download_media_internal, member_info_internal, message_summary_internal,
-        MatrixCoreService,
+        channel_info_internal, delete_message_internal, download_media_internal,
+        edit_message_internal, join_room_internal, list_pins_internal, list_reactions_internal,
+        member_info_internal, message_summary_internal, pin_message_internal,
+        react_message_internal, read_messages_internal, resolve_target_internal,
+        send_message_internal, set_typing_internal, unpin_message_internal,
+        upload_media_internal, MatrixCoreService,
     },
 };
 
@@ -117,110 +121,204 @@ impl MatrixCoreClient {
     }
 
     #[napi(js_name = "sendMessage")]
-    pub fn send_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn send_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixSendRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.send_message(request).map_err(to_napi_error)?;
+        let (client, config) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            (
+                inner.client().map_err(to_napi_error)?,
+                inner.config_clone().map_err(to_napi_error)?,
+            )
+        };
+        let result = send_message_internal(&client, &config, &request)
+            .await
+            .map_err(to_napi_error)?;
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            inner.record_outbound(
+                &result.room_id,
+                &result.message_id,
+                request.thread_id.as_deref(),
+                request.reply_to_id.as_deref(),
+            );
+        }
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "resolveTarget")]
-    pub fn resolve_target(&self, request_json: String) -> napi::Result<String> {
+    pub async fn resolve_target(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixResolveTargetRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.resolve_target(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = resolve_target_internal(
+            &client,
+            &request.target,
+            request.create_dm.unwrap_or(true),
+        )
+        .await
+        .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "joinRoom")]
-    pub fn join_room(&self, request_json: String) -> napi::Result<String> {
+    pub async fn join_room(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixJoinRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.join_room(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = join_room_internal(&client, &request.target)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "readMessages")]
-    pub fn read_messages(&self, request_json: String) -> napi::Result<String> {
+    pub async fn read_messages(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixReadMessagesRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.read_messages(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = read_messages_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "editMessage")]
-    pub fn edit_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn edit_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixEditMessageRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.edit_message(request).map_err(to_napi_error)?;
+        let (client, config) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            (
+                inner.client().map_err(to_napi_error)?,
+                inner.config_clone().map_err(to_napi_error)?,
+            )
+        };
+        let result = edit_message_internal(&client, &config, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "deleteMessage")]
-    pub fn delete_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn delete_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixDeleteMessageRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.delete_message(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = delete_message_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "pinMessage")]
-    pub fn pin_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn pin_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixPinMessageRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.pin_message(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = pin_message_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "unpinMessage")]
-    pub fn unpin_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn unpin_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixPinMessageRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.unpin_message(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = unpin_message_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "listPins")]
-    pub fn list_pins(&self, request_json: String) -> napi::Result<String> {
+    pub async fn list_pins(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixListPinsRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.list_pins(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = list_pins_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
@@ -265,26 +363,42 @@ impl MatrixCoreClient {
     }
 
     #[napi(js_name = "channelInfo")]
-    pub fn channel_info(&self, request_json: String) -> napi::Result<String> {
+    pub async fn channel_info(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixChannelInfoRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.channel_info(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = channel_info_internal(&client, &request.room_id)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "uploadMedia")]
-    pub fn upload_media(&self, request_json: String) -> napi::Result<String> {
+    pub async fn upload_media(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixUploadMediaRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.upload_media(request).map_err(to_napi_error)?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = upload_media_internal(&client, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
@@ -309,26 +423,51 @@ impl MatrixCoreClient {
     }
 
     #[napi(js_name = "reactMessage")]
-    pub fn react_message(&self, request_json: String) -> napi::Result<String> {
+    pub async fn react_message(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixReactRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.react_message(request).map_err(to_napi_error)?;
+        let (client, config, sender_id) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            let client = inner.client().map_err(to_napi_error)?;
+            let config = inner.config_clone().map_err(to_napi_error)?;
+            let sender_id = client
+                .user_id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| inner.diagnostics().user_id);
+            (client, config, sender_id)
+        };
+        let result = react_message_internal(&client, &config, &request, &sender_id)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
     #[napi(js_name = "listReactions")]
-    pub fn list_reactions(&self, request_json: String) -> napi::Result<String> {
+    pub async fn list_reactions(&self, request_json: String) -> napi::Result<String> {
         let request: MatrixListReactionsRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        let result = inner.list_reactions(request).map_err(to_napi_error)?;
+        let (client, config) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            (
+                inner.client().map_err(to_napi_error)?,
+                inner.config_clone().map_err(to_napi_error)?,
+            )
+        };
+        let result = list_reactions_internal(&client, &config, &request)
+            .await
+            .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
     }
 
@@ -377,13 +516,21 @@ impl MatrixCoreClient {
     }
 
     #[napi(js_name = "setTyping")]
-    pub fn set_typing(&self, request_json: String) -> napi::Result<()> {
+    pub async fn set_typing(&self, request_json: String) -> napi::Result<()> {
         let request: MatrixTypingRequest = serde_json::from_str(&request_json)
             .map_err(|err| napi::Error::from_reason(err.to_string()))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
-        inner.set_typing(request).map_err(to_napi_error)
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        set_typing_internal(&client, &request.room_id, request.typing)
+            .await
+            .map_err(to_napi_error)
     }
 }

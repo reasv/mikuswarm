@@ -98,7 +98,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       const externalIds: string[] = [];
       let primaryExternalId: string | undefined;
       if (message.body.trim()) {
-        const textResult = account.client.sendMessage({
+        const textResult = await account.client.sendMessage({
           roomId: target.roomId,
           text: message.body,
           html: message.htmlBody,
@@ -111,7 +111,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       for (const [index, attachment] of message.attachments.entries()) {
         if (!attachment.localPath) throw new Error(`Outbound attachment has no localPath: ${attachment.id}`);
         const data = await readFile(attachment.localPath);
-        const result = account.client.uploadMedia({
+        const result = await account.client.uploadMedia({
           roomId: target.roomId,
           filename: attachment.filename ?? path.basename(attachment.localPath),
           contentType: attachment.mimeType ?? "application/octet-stream",
@@ -138,7 +138,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       threadId: target.threadId,
       ...(target.replyToId ? { replyToId: target.replyToId } : {}),
     };
-    const result = account.client.sendMessage(request);
+    const result = await account.client.sendMessage(request);
     return {
       provider: this.id,
       target,
@@ -150,7 +150,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
   async setTyping(target: OutboundTarget, typing: boolean): Promise<void> {
     const account = this.resolveAccount(target);
     if (!target.roomId) throw new Error("Matrix typing target requires roomId");
-    account.client.setTyping({ roomId: target.roomId, typing });
+    await account.client.setTyping({ roomId: target.roomId, typing });
   }
 
   getEnrichmentCapabilities(accountId: string): EnrichmentCapabilities {

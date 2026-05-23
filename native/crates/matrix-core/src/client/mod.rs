@@ -32,18 +32,18 @@ use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 
 use crate::{
     api::{
-        MatrixAuthConfig, MatrixChannelInfo, MatrixChannelInfoRequest, MatrixClientConfig,
+        MatrixAuthConfig, MatrixChannelInfo, MatrixClientConfig,
         MatrixCustomEmojiUsageRequest, MatrixDeleteMessageRequest, MatrixDeleteMessageResult,
         MatrixDiagnostics, MatrixDownloadMediaResult,
-        MatrixEditMessageRequest, MatrixEditMessageResult, MatrixJoinRequest, MatrixJoinResult,
+        MatrixEditMessageRequest, MatrixEditMessageResult, MatrixJoinResult,
         MatrixKeyBackupState, MatrixListEmojiRequest,
         MatrixListPinsRequest, MatrixListReactionsRequest, MatrixMemberInfo,
         MatrixMessageSummary,
         MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult, MatrixReactRequest,
         MatrixReactResult, MatrixReactionSummary, MatrixReadMessagesRequest,
-        MatrixReadMessagesResult, MatrixResolveTargetRequest,
+        MatrixReadMessagesResult,
         MatrixResolveTargetResult, MatrixSendRequest, MatrixSendResult, MatrixSyncState,
-        MatrixTypingRequest, MatrixUploadMediaRequest, MatrixUploadMediaResult,
+        MatrixUploadMediaRequest, MatrixUploadMediaResult,
         MatrixVerificationState, NativeLifecycleStage, StoredSession,
     },
     auth::session,
@@ -347,217 +347,6 @@ impl MatrixCoreService {
         self.shared.poll_events()
     }
 
-    pub fn send_message(&mut self, request: MatrixSendRequest) -> MatrixResult<MatrixSendResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
-        let (room, resolved_target) = self
-            .runtime
-            .block_on(resolve_room_for_send(&client, &request.room_id))?;
-        let content = self.runtime.block_on(build_message_content(
-            config,
-            &room,
-            request.text.clone(),
-            request.html.clone(),
-            request.reply_to_id.as_deref(),
-            request.thread_id.as_deref(),
-        ))?;
-        let response = self.runtime.block_on(async { room.send(content).await })?;
-        let now = Utc::now();
-
-        self.shared.update_diagnostics(|diagnostics| {
-            diagnostics.last_successful_sync_at = Some(now);
-        });
-        self.shared
-            .events
-            .lock()
-            .expect("matrix event queue mutex poisoned")
-            .push_back(MatrixNativeEvent::Outbound {
-                room_id: resolved_target.resolved_room_id.clone(),
-                message_id: response.event_id.to_string(),
-                thread_id: request.thread_id.clone(),
-                reply_to_id: request.reply_to_id.clone(),
-                at: now,
-            });
-
-        Ok(MatrixSendResult {
-            room_id: resolved_target.resolved_room_id,
-            message_id: response.event_id.to_string(),
-            thread_id: request.thread_id,
-        })
-    }
-
-    pub fn resolve_target(
-        &self,
-        request: MatrixResolveTargetRequest,
-    ) -> MatrixResult<MatrixResolveTargetResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime.block_on(resolve_target_internal(
-            &client,
-            &request.target,
-            request.create_dm.unwrap_or(true),
-        ))
-    }
-
-    pub fn join_room(&mut self, request: MatrixJoinRequest) -> MatrixResult<MatrixJoinResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let result = self
-            .runtime
-            .block_on(join_room_internal(&client, &request.target))?;
-        Ok(result)
-    }
-
-    pub fn read_messages(
-        &self,
-        request: MatrixReadMessagesRequest,
-    ) -> MatrixResult<MatrixReadMessagesResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime
-            .block_on(read_messages_internal(&client, &request))
-    }
-
-    pub fn edit_message(
-        &mut self,
-        request: MatrixEditMessageRequest,
-    ) -> MatrixResult<MatrixEditMessageResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
-        self.runtime
-            .block_on(edit_message_internal(&client, config, &request))
-    }
-
-    pub fn delete_message(
-        &mut self,
-        request: MatrixDeleteMessageRequest,
-    ) -> MatrixResult<MatrixDeleteMessageResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime
-            .block_on(delete_message_internal(&client, &request))
-    }
-
-    pub fn pin_message(
-        &mut self,
-        request: MatrixPinMessageRequest,
-    ) -> MatrixResult<MatrixPinsResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime
-            .block_on(pin_message_internal(&client, &request))
-    }
-
-    pub fn unpin_message(
-        &mut self,
-        request: MatrixPinMessageRequest,
-    ) -> MatrixResult<MatrixPinsResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime
-            .block_on(unpin_message_internal(&client, &request))
-    }
-
-    pub fn list_pins(&self, request: MatrixListPinsRequest) -> MatrixResult<MatrixPinsResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime.block_on(list_pins_internal(&client, &request))
-    }
-
-    pub fn channel_info(
-        &self,
-        request: MatrixChannelInfoRequest,
-    ) -> MatrixResult<MatrixChannelInfo> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime
-            .block_on(channel_info_internal(&client, &request.room_id))
-    }
-
-    pub fn upload_media(
-        &mut self,
-        request: MatrixUploadMediaRequest,
-    ) -> MatrixResult<MatrixUploadMediaResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let (room, resolved_target) = self
-            .runtime
-            .block_on(resolve_room_for_send(&client, &request.room_id))?;
-        let message_id = self
-            .runtime
-            .block_on(media::upload_media(&room, &request))?;
-        Ok(MatrixUploadMediaResult {
-            room_id: resolved_target.resolved_room_id,
-            message_id,
-            filename: request.filename,
-            content_type: request.content_type,
-        })
-    }
-
-    pub fn react_message(
-        &mut self,
-        request: MatrixReactRequest,
-    ) -> MatrixResult<MatrixReactResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
-        let sender_id = self
-            .client()?
-            .user_id()
-            .map(|user_id| user_id.to_string())
-            .unwrap_or_else(|| self.shared.diagnostics().user_id);
-        self.runtime.block_on(react_message_internal(
-            &client, config, &request, &sender_id,
-        ))
-    }
-
-    pub fn list_reactions(
-        &self,
-        request: MatrixListReactionsRequest,
-    ) -> MatrixResult<Vec<MatrixReactionSummary>> {
-        let client = self.client()?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
-        self.runtime
-            .block_on(list_reactions_internal(&client, config, &request))
-    }
 
     pub fn record_custom_emoji_usage(
         &self,
@@ -579,19 +368,6 @@ impl MatrixCoreService {
             .as_ref()
             .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
         emoji::list_shortcodes(config, &request)
-    }
-
-    pub fn set_typing(&mut self, request: MatrixTypingRequest) -> MatrixResult<()> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        let (room, _) = self
-            .runtime
-            .block_on(resolve_room_for_send(&client, &request.room_id))?;
-        self.runtime
-            .block_on(async { room.typing_notice(request.typing).await })?;
-        Ok(())
     }
 
     fn release_client(&self, client: Client) {
@@ -631,6 +407,36 @@ impl MatrixCoreService {
             .map(|tokens| tokens.access_token)
             .ok_or_else(|| MatrixError::State("matrix session is unavailable".to_string()))?;
         Ok((homeserver, access_token))
+    }
+
+    pub(crate) fn config_clone(&self) -> MatrixResult<MatrixClientConfig> {
+        self.config
+            .clone()
+            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))
+    }
+
+    pub(crate) fn record_outbound(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        thread_id: Option<&str>,
+        reply_to_id: Option<&str>,
+    ) {
+        let now = Utc::now();
+        self.shared.update_diagnostics(|diagnostics| {
+            diagnostics.last_successful_sync_at = Some(now);
+        });
+        self.shared
+            .events
+            .lock()
+            .expect("matrix event queue mutex poisoned")
+            .push_back(MatrixNativeEvent::Outbound {
+                room_id: room_id.to_string(),
+                message_id: message_id.to_string(),
+                thread_id: thread_id.map(str::to_string),
+                reply_to_id: reply_to_id.map(str::to_string),
+                at: now,
+            });
     }
 }
 
@@ -749,7 +555,7 @@ fn normalize_target(raw: &str) -> MatrixResult<String> {
     Ok(value)
 }
 
-async fn resolve_target_internal(
+pub(crate) async fn resolve_target_internal(
     client: &Client,
     target: &str,
     create_dm: bool,
@@ -892,7 +698,7 @@ fn build_message_edit_content(
     })
 }
 
-async fn join_room_internal(client: &Client, target: &str) -> MatrixResult<MatrixJoinResult> {
+pub(crate) async fn join_room_internal(client: &Client, target: &str) -> MatrixResult<MatrixJoinResult> {
     let normalized = normalize_target(target)?;
     if normalized.starts_with('@') {
         let resolved = resolve_target_internal(client, target, true).await?;
@@ -926,7 +732,7 @@ async fn join_room_internal(client: &Client, target: &str) -> MatrixResult<Matri
     })
 }
 
-async fn read_messages_internal(
+pub(crate) async fn read_messages_internal(
     client: &Client,
     request: &MatrixReadMessagesRequest,
 ) -> MatrixResult<MatrixReadMessagesResult> {
@@ -983,7 +789,7 @@ async fn read_messages_internal(
     })
 }
 
-async fn edit_message_internal(
+pub(crate) async fn edit_message_internal(
     client: &Client,
     config: &MatrixClientConfig,
     request: &MatrixEditMessageRequest,
@@ -1012,7 +818,7 @@ async fn edit_message_internal(
     })
 }
 
-async fn delete_message_internal(
+pub(crate) async fn delete_message_internal(
     client: &Client,
     request: &MatrixDeleteMessageRequest,
 ) -> MatrixResult<MatrixDeleteMessageResult> {
@@ -1083,7 +889,7 @@ async fn update_pins_internal(
     })
 }
 
-async fn pin_message_internal(
+pub(crate) async fn pin_message_internal(
     client: &Client,
     request: &MatrixPinMessageRequest,
 ) -> MatrixResult<MatrixPinsResult> {
@@ -1099,7 +905,7 @@ async fn pin_message_internal(
     .await
 }
 
-async fn unpin_message_internal(
+pub(crate) async fn unpin_message_internal(
     client: &Client,
     request: &MatrixPinMessageRequest,
 ) -> MatrixResult<MatrixPinsResult> {
@@ -1112,7 +918,7 @@ async fn unpin_message_internal(
     .await
 }
 
-async fn list_pins_internal(
+pub(crate) async fn list_pins_internal(
     client: &Client,
     request: &MatrixListPinsRequest,
 ) -> MatrixResult<MatrixPinsResult> {
@@ -1163,7 +969,7 @@ pub(crate) async fn member_info_internal(
     })
 }
 
-async fn channel_info_internal(client: &Client, room_id: &str) -> MatrixResult<MatrixChannelInfo> {
+pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> MatrixResult<MatrixChannelInfo> {
     let room_id: OwnedRoomId = RoomId::parse(room_id.trim())?.to_owned();
     let room = client
         .get_room(&room_id)
@@ -1186,6 +992,53 @@ async fn channel_info_internal(client: &Client, room_id: &str) -> MatrixResult<M
         is_direct: room.is_direct().await.unwrap_or(false),
         member_count: Some(room.clone_info().active_members_count() as u64),
     })
+}
+
+pub(crate) async fn send_message_internal(
+    client: &Client,
+    config: &MatrixClientConfig,
+    request: &MatrixSendRequest,
+) -> MatrixResult<MatrixSendResult> {
+    let (room, resolved_target) = resolve_room_for_send(client, &request.room_id).await?;
+    let content = build_message_content(
+        config,
+        &room,
+        request.text.clone(),
+        request.html.clone(),
+        request.reply_to_id.as_deref(),
+        request.thread_id.as_deref(),
+    )
+    .await?;
+    let response = room.send(content).await?;
+    Ok(MatrixSendResult {
+        room_id: resolved_target.resolved_room_id,
+        message_id: response.event_id.to_string(),
+        thread_id: request.thread_id.clone(),
+    })
+}
+
+pub(crate) async fn upload_media_internal(
+    client: &Client,
+    request: &MatrixUploadMediaRequest,
+) -> MatrixResult<MatrixUploadMediaResult> {
+    let (room, resolved_target) = resolve_room_for_send(client, &request.room_id).await?;
+    let message_id = media::upload_media(&room, request).await?;
+    Ok(MatrixUploadMediaResult {
+        room_id: resolved_target.resolved_room_id,
+        message_id,
+        filename: request.filename.clone(),
+        content_type: request.content_type.clone(),
+    })
+}
+
+pub(crate) async fn set_typing_internal(
+    client: &Client,
+    room_id: &str,
+    typing: bool,
+) -> MatrixResult<()> {
+    let (room, _) = resolve_room_for_send(client, room_id).await?;
+    room.typing_notice(typing).await?;
+    Ok(())
 }
 
 pub(crate) async fn message_summary_internal(
@@ -1238,7 +1091,7 @@ struct MatrixReactionEvent {
     timestamp_ms: i64,
 }
 
-async fn react_message_internal(
+pub(crate) async fn react_message_internal(
     client: &Client,
     config: &MatrixClientConfig,
     request: &MatrixReactRequest,
@@ -1313,7 +1166,7 @@ async fn react_message_internal(
     })
 }
 
-async fn list_reactions_internal(
+pub(crate) async fn list_reactions_internal(
     client: &Client,
     config: &MatrixClientConfig,
     request: &MatrixListReactionsRequest,

@@ -45,26 +45,26 @@ type NativeBindingClient = {
   stop(): void;
   pollEvents(): string;
   diagnostics(): string;
-  sendMessage(requestJson: string): string;
-  resolveTarget(requestJson: string): string;
-  joinRoom(requestJson: string): string;
-  readMessages(requestJson: string): string;
+  sendMessage(requestJson: string): Promise<string>;
+  resolveTarget(requestJson: string): Promise<string>;
+  joinRoom(requestJson: string): Promise<string>;
+  readMessages(requestJson: string): Promise<string>;
   messageSummary(requestJson: string): Promise<string>;
-  editMessage(requestJson: string): string;
-  deleteMessage(requestJson: string): string;
-  pinMessage(requestJson: string): string;
-  unpinMessage(requestJson: string): string;
-  listPins(requestJson: string): string;
+  editMessage(requestJson: string): Promise<string>;
+  deleteMessage(requestJson: string): Promise<string>;
+  pinMessage(requestJson: string): Promise<string>;
+  unpinMessage(requestJson: string): Promise<string>;
+  listPins(requestJson: string): Promise<string>;
   memberInfo(requestJson: string): Promise<string>;
-  channelInfo(requestJson: string): string;
-  uploadMedia(requestJson: string): string;
+  channelInfo(requestJson: string): Promise<string>;
+  uploadMedia(requestJson: string): Promise<string>;
   downloadMedia(requestJson: string): Promise<string>;
-  reactMessage(requestJson: string): string;
-  listReactions(requestJson: string): string;
+  reactMessage(requestJson: string): Promise<string>;
+  listReactions(requestJson: string): Promise<string>;
   recordCustomEmojiUsage(requestJson: string): void;
   listKnownShortcodes(requestJson: string): string;
   resolveLinkPreviews(requestJson: string): Promise<string>;
-  setTyping(requestJson: string): void;
+  setTyping(requestJson: string): Promise<void>;
 };
 
 export class MatrixNativeClient {
@@ -90,68 +90,68 @@ export class MatrixNativeClient {
     return decodeNativeEvents(this.#client.pollEvents());
   }
 
-  sendMessage(request: MatrixSendRequest): MatrixSendResult {
-    return decodeSendResult(this.#client.sendMessage(JSON.stringify(request)));
+  async sendMessage(request: MatrixSendRequest): Promise<MatrixSendResult> {
+    return decodeSendResult(await this.#client.sendMessage(JSON.stringify(request)));
   }
 
-  resolveTarget(request: MatrixResolveTargetRequest): MatrixResolveTargetResult {
-    return parseNativeJson(this.#client.resolveTarget(JSON.stringify(request)), "resolveTarget");
+  async resolveTarget(request: MatrixResolveTargetRequest): Promise<MatrixResolveTargetResult> {
+    return parseNativeJson(await this.#client.resolveTarget(JSON.stringify(request)), "resolveTarget");
   }
 
-  joinRoom(request: MatrixJoinRequest): MatrixJoinResult {
-    return parseNativeJson(this.#client.joinRoom(JSON.stringify(request)), "joinRoom");
+  async joinRoom(request: MatrixJoinRequest): Promise<MatrixJoinResult> {
+    return parseNativeJson(await this.#client.joinRoom(JSON.stringify(request)), "joinRoom");
   }
 
-  readMessages(request: MatrixReadMessagesRequest): MatrixReadMessagesResult {
-    return parseNativeJson(this.#client.readMessages(JSON.stringify(request)), "readMessages");
+  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+    return parseNativeJson(await this.#client.readMessages(JSON.stringify(request)), "readMessages");
   }
 
   async messageSummary(request: MatrixMessageSummaryRequest): Promise<MatrixMessageSummary | null> {
     return parseNativeJson(await this.#client.messageSummary(JSON.stringify(request)), "messageSummary");
   }
 
-  editMessage(request: MatrixEditMessageRequest): MatrixEditMessageResult {
-    return parseNativeJson(this.#client.editMessage(JSON.stringify(request)), "editMessage");
+  async editMessage(request: MatrixEditMessageRequest): Promise<MatrixEditMessageResult> {
+    return parseNativeJson(await this.#client.editMessage(JSON.stringify(request)), "editMessage");
   }
 
-  deleteMessage(request: MatrixDeleteMessageRequest): MatrixDeleteMessageResult {
-    return parseNativeJson(this.#client.deleteMessage(JSON.stringify(request)), "deleteMessage");
+  async deleteMessage(request: MatrixDeleteMessageRequest): Promise<MatrixDeleteMessageResult> {
+    return parseNativeJson(await this.#client.deleteMessage(JSON.stringify(request)), "deleteMessage");
   }
 
-  pinMessage(request: MatrixPinMessageRequest): MatrixPinsResult {
-    return parseNativeJson(this.#client.pinMessage(JSON.stringify(request)), "pinMessage");
+  async pinMessage(request: MatrixPinMessageRequest): Promise<MatrixPinsResult> {
+    return parseNativeJson(await this.#client.pinMessage(JSON.stringify(request)), "pinMessage");
   }
 
-  unpinMessage(request: MatrixPinMessageRequest): MatrixPinsResult {
-    return parseNativeJson(this.#client.unpinMessage(JSON.stringify(request)), "unpinMessage");
+  async unpinMessage(request: MatrixPinMessageRequest): Promise<MatrixPinsResult> {
+    return parseNativeJson(await this.#client.unpinMessage(JSON.stringify(request)), "unpinMessage");
   }
 
-  listPins(request: MatrixListPinsRequest): MatrixPinsResult {
-    return parseNativeJson(this.#client.listPins(JSON.stringify(request)), "listPins");
+  async listPins(request: MatrixListPinsRequest): Promise<MatrixPinsResult> {
+    return parseNativeJson(await this.#client.listPins(JSON.stringify(request)), "listPins");
   }
 
   async memberInfo(request: MatrixMemberInfoRequest): Promise<MatrixMemberInfo> {
     return parseNativeJson(await this.#client.memberInfo(JSON.stringify(request)), "memberInfo");
   }
 
-  channelInfo(request: MatrixChannelInfoRequest): MatrixChannelInfo {
-    return parseNativeJson(this.#client.channelInfo(JSON.stringify(request)), "channelInfo");
+  async channelInfo(request: MatrixChannelInfoRequest): Promise<MatrixChannelInfo> {
+    return parseNativeJson(await this.#client.channelInfo(JSON.stringify(request)), "channelInfo");
   }
 
-  uploadMedia(request: MatrixUploadMediaRequest): MatrixUploadMediaResult {
-    return parseNativeJson(this.#client.uploadMedia(JSON.stringify(request)), "uploadMedia");
+  async uploadMedia(request: MatrixUploadMediaRequest): Promise<MatrixUploadMediaResult> {
+    return parseNativeJson(await this.#client.uploadMedia(JSON.stringify(request)), "uploadMedia");
   }
 
   async downloadMedia(request: MatrixDownloadMediaRequest): Promise<MatrixDownloadMediaResult> {
     return parseNativeJson(await this.#client.downloadMedia(JSON.stringify(request)), "downloadMedia");
   }
 
-  reactMessage(request: MatrixReactRequest): MatrixReactResult {
-    return parseNativeJson(this.#client.reactMessage(JSON.stringify(request)), "reactMessage");
+  async reactMessage(request: MatrixReactRequest): Promise<MatrixReactResult> {
+    return parseNativeJson(await this.#client.reactMessage(JSON.stringify(request)), "reactMessage");
   }
 
-  listReactions(request: MatrixListReactionsRequest): MatrixReactionSummary[] {
-    return parseNativeJson(this.#client.listReactions(JSON.stringify(request)), "listReactions");
+  async listReactions(request: MatrixListReactionsRequest): Promise<MatrixReactionSummary[]> {
+    return parseNativeJson(await this.#client.listReactions(JSON.stringify(request)), "listReactions");
   }
 
   recordCustomEmojiUsage(request: MatrixEmojiUsageRequest): void {
@@ -166,8 +166,8 @@ export class MatrixNativeClient {
     return parseNativeJson(await this.#client.resolveLinkPreviews(JSON.stringify(request)), "resolveLinkPreviews");
   }
 
-  setTyping(request: MatrixTypingRequest): void {
-    this.#client.setTyping(JSON.stringify(request));
+  async setTyping(request: MatrixTypingRequest): Promise<void> {
+    await this.#client.setTyping(JSON.stringify(request));
   }
 }
 
