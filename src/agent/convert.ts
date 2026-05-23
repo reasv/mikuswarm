@@ -1,19 +1,50 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
+
+const STUB_USAGE: Usage = {
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 export function convertToLlm(messages: AgentMessage[]): Message[] {
   return messages.flatMap((raw) => {
     const message = raw as any;
     if (!message || typeof message !== "object") return [];
+
     if (message.type === "chatEvent") {
+      if (message.role === "assistant") {
+        return [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: message.content } as TextContent],
+            api: "anthropic-messages",
+            provider: "synthetic",
+            model: "history",
+            usage: STUB_USAGE,
+            stopReason: "stop",
+            timestamp: message.timestamp ?? Date.now(),
+          } as AssistantMessage,
+        ];
+      }
       return [
         {
           role: "user",
           content: contentWithImages(message.content, message.imageBlocks),
-          timestamp: message.timestamp ?? message.event?.timestamp ?? Date.now(),
+          timestamp: message.timestamp ?? Date.now(),
         } as Message,
       ];
     }
+
+    if (message.type === "triggerGroup") {
+      return [
+        {
+          role: "user",
+          content: contentWithImages(message.content, message.imageBlocks),
+          timestamp: message.timestamp ?? Date.now(),
+        } as Message,
+      ];
+    }
+
     if ("role" in message) {
       if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
         return [message as Message];
@@ -21,6 +52,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
       if (message.role === "system") return [];
       return [];
     }
+
     if (message.type === "runtimeInstructions") {
       return [
         {
@@ -30,6 +62,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
         },
       ];
     }
+
     if (message.type === "interjection") {
       return [
         {
@@ -39,6 +72,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
         },
       ];
     }
+
     return [];
   });
 }

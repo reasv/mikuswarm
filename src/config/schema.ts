@@ -47,6 +47,7 @@ const CaptioningSchema = Type.Object({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
+  caption_assistant_messages: Type.Optional(Type.Boolean()),
   caption_model: Type.Optional(Type.String()),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
@@ -104,6 +105,7 @@ export const AppConfigSchema = Type.Object({
   matrix: Type.Object({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),
+    trigger_group_lookback_ms: Type.Optional(Type.Number({ minimum: 0 })),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
   }),
   enrichment: Type.Optional(EnrichmentSchema),

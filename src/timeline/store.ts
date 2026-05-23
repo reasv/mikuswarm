@@ -152,6 +152,10 @@ export class TimelineStore {
     return this.storage.saveTimelineCompactionState(state);
   }
 
+  setEnrichmentStatus(eventId: string, status: string): Promise<void> {
+    return this.storage.setEnrichmentStatus(eventId, status);
+  }
+
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
     return this.storage.setTriggerGroup(triggerEventId, eventIds);
   }

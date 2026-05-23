@@ -27,6 +27,9 @@ export interface AttachmentMeta {
   localPath?: string;
   remoteUrl?: string;
   caption?: string;
+  isCharacterCard?: boolean;
+  cardName?: string;
+  isImageBlock?: boolean;
   processing?: {
     downloaded?: boolean;
     captioned?: boolean;
@@ -41,6 +44,7 @@ export interface ReplyContext {
   htmlBody?: string;
   timestamp?: number;
   attachments?: AttachmentMeta[];
+  linkedMedia?: AttachmentMeta[];
   linkPreviews?: LinkPreviewMeta[];
 }
 
@@ -48,7 +52,6 @@ export interface LinkPreviewMeta {
   url: string;
   title?: string;
   description?: string;
-  imagePath?: string;
   media?: AttachmentMeta[];
   sourceKind?: string;
   fetchedAt?: number;
@@ -87,6 +90,7 @@ export interface CanonicalChatEvent {
   timestamp: number;
   receivedAt: number;
   attachments?: AttachmentMeta[];
+  linkedMedia?: AttachmentMeta[];
   replyTo?: ReplyContext;
   linkPreviews?: LinkPreviewMeta[];
   mentions?: MentionInfo;

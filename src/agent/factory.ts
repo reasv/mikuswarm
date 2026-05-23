@@ -54,6 +54,16 @@ export function buildAgentContextMessages(
 ): AgentMessage[] {
     const baseMessages = built.messages.flatMap((message): AgentMessage[] => {
     if (message.type === "system") return [];
+    if (message.type === "triggerGroup") {
+      return [
+        {
+          type: "triggerGroup",
+          content: message.content,
+          imageBlocks: message.imageBlocks,
+          timestamp: message.timestamp,
+        },
+      ];
+    }
     if (message.type === "runtimeInstructions") {
       return [
         {
@@ -85,7 +95,7 @@ function isLiveRuntimeMessage(message: AgentMessage): boolean {
   const typed = message as any;
   if (!typed || typeof typed !== "object") return false;
   if (typed.type === "interjection") return true;
-  if (typed.type === "chatEvent" || typed.type === "runtimeInstructions") return false;
+  if (typed.type === "chatEvent" || typed.type === "runtimeInstructions" || typed.type === "triggerGroup") return false;
   if (typed.role === "toolResult") return true;
   if (typed.role === "user") return true;
   if (typed.role === "assistant") {

@@ -12,10 +12,10 @@ import { estimateTokens } from "./tokens.js";
 import { escapeXml } from "./xml.js";
 
 export interface ContextMessage {
-  type: "system" | "chatEvent" | "runtimeInstructions";
+  type: "system" | "chatEvent" | "runtimeInstructions" | "triggerGroup";
   role: "user" | "assistant" | "system";
   content: string;
-  tier?: "compact" | "rich" | "mixed" | "runtime" | "system";
+  tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger";
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
   timestamp?: number;
@@ -51,13 +51,17 @@ export class ContextBuilder {
   ) {}
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
+    const triggerGroupIds = this.resolveTriggerGroupIds(options.trigger);
     const compactionState = this.store.getCompactionState(options.timelineKey);
     let events = this.store.queryForContext(options.timelineKey, compactionState);
 
     events = this.hydrateEvents(events);
 
+    const timelineEvents = events.filter((e) => !triggerGroupIds.has(e.id));
+    const triggerEvents = events.filter((e) => triggerGroupIds.has(e.id));
+
     const compacted = compactTimelineEvents(
-      events,
+      timelineEvents,
       renderRichMessage,
       renderCompactMessage,
       this.config.context.tiers,
@@ -69,6 +73,12 @@ export class ContextBuilder {
     if (compacted.stateChanged && compacted.state) {
       await this.store.saveCompactionState(compacted.state);
     }
+
+    const imageBlocks = await this.selectImageBlocks(options.trigger);
+    const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
+
+    this.markImageBlocks(triggerEvents, imageBlockIds);
+
     const chatMessages: ContextMessage[] = compacted.turns.map((turn) => ({
       type: "chatEvent",
       role: turn.role,
@@ -77,8 +87,11 @@ export class ContextBuilder {
       tokenEstimate: turn.tokenEstimate,
       timestamp: turn.timestamp,
     }));
+
     const runtime = renderRuntimeInstructions(options);
-    const imageBlocks = await this.selectImageBlocks(options.trigger);
+    const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");
+    const finalUserContent = `<system>\n${runtime}\n</system>\n\n${triggerContent}`;
+
     const messages: ContextMessage[] = [
       {
         type: "system",
@@ -89,11 +102,11 @@ export class ContextBuilder {
       },
       ...chatMessages,
       {
-        type: "runtimeInstructions",
+        type: "triggerGroup",
         role: "user",
-        content: runtime,
-        tier: "runtime",
-        tokenEstimate: estimateTokens(runtime),
+        content: finalUserContent,
+        tier: "trigger",
+        tokenEstimate: estimateTokens(finalUserContent),
         imageBlocks,
       },
     ];
@@ -104,6 +117,45 @@ export class ContextBuilder {
       richTokens: compacted.richTokens,
       imageBlocks,
     };
+  }
+
+  private resolveTriggerGroupIds(trigger: CanonicalChatEvent): Set<string> {
+    const ids = new Set<string>();
+    ids.add(trigger.id);
+    for (const id of trigger.trigger?.groupedEventIds ?? []) {
+      ids.add(id);
+    }
+    return ids;
+  }
+
+  private markImageBlocks(events: CanonicalChatEvent[], imageBlockIds: Set<string>): void {
+    if (imageBlockIds.size === 0) return;
+    for (const event of events) {
+      for (const a of event.attachments ?? []) {
+        if (imageBlockIds.has(a.id)) a.isImageBlock = true;
+      }
+      for (const m of event.linkedMedia ?? []) {
+        if (imageBlockIds.has(m.id)) m.isImageBlock = true;
+      }
+      for (const lp of event.linkPreviews ?? []) {
+        for (const m of lp.media ?? []) {
+          if (imageBlockIds.has(m.id)) m.isImageBlock = true;
+        }
+      }
+      if (event.replyTo) {
+        for (const a of event.replyTo.attachments ?? []) {
+          if (imageBlockIds.has(a.id)) a.isImageBlock = true;
+        }
+        for (const m of event.replyTo.linkedMedia ?? []) {
+          if (imageBlockIds.has(m.id)) m.isImageBlock = true;
+        }
+        for (const lp of event.replyTo.linkPreviews ?? []) {
+          for (const m of lp.media ?? []) {
+            if (imageBlockIds.has(m.id)) m.isImageBlock = true;
+          }
+        }
+      }
+    }
   }
 
   private hydrateEvents(events: CanonicalChatEvent[]): CanonicalChatEvent[] {
@@ -217,9 +269,19 @@ function mergeEnrichmentIntoEvent(
     merged.attachments = attachmentAssets.map(mediaAssetToAttachmentMeta);
   }
 
+  const linkedMediaAssets = mediaAssets
+    .filter((a) => a.role === "linked_media")
+    .sort((a, b) => (a.source_index ?? 0) - (b.source_index ?? 0));
+  if (linkedMediaAssets.length > 0) {
+    merged.linkedMedia = linkedMediaAssets.map(mediaAssetToAttachmentMeta);
+  }
+
   if (replyContext) {
     const replyAttachments = mediaAssets
       .filter((a) => a.role === "reply_attachment")
+      .sort((a, b) => (a.source_index ?? 0) - (b.source_index ?? 0));
+    const replyLinkedMedia = mediaAssets
+      .filter((a) => a.role === "reply_linked_media")
       .sort((a, b) => (a.source_index ?? 0) - (b.source_index ?? 0));
     const replyLinkPreviews = linkPreviews
       .filter((lp) => lp.context === "reply")
@@ -231,12 +293,12 @@ function mergeEnrichmentIntoEvent(
       sender: replyContext.sender_id ? {
         id: replyContext.sender_id,
         displayName: replyContext.sender_display_name ?? undefined,
-        username: replyContext.sender_username ?? undefined,
       } : undefined,
       body: replyContext.body ?? undefined,
       htmlBody: replyContext.html_body ?? undefined,
       timestamp: replyContext.timestamp ?? undefined,
       attachments: replyAttachments.length > 0 ? replyAttachments.map(mediaAssetToAttachmentMeta) : undefined,
+      linkedMedia: replyLinkedMedia.length > 0 ? replyLinkedMedia.map(mediaAssetToAttachmentMeta) : undefined,
       linkPreviews: replyLinkPreviews.length > 0
         ? replyLinkPreviews.map((lp) => linkPreviewRowToMeta(lp, replyPreviewMedia))
         : undefined,
@@ -255,7 +317,7 @@ function mergeEnrichmentIntoEvent(
 }
 
 function mediaAssetToAttachmentMeta(asset: MediaAssetRow): AttachmentMeta {
-  return {
+  const meta: AttachmentMeta = {
     id: asset.id,
     filename: asset.original_filename ?? undefined,
     mimeType: asset.mime_type ?? undefined,
@@ -270,6 +332,16 @@ function mediaAssetToAttachmentMeta(asset: MediaAssetRow): AttachmentMeta {
       captioned: asset.caption_status === "complete",
     },
   };
+  if (asset.detected_content) {
+    meta.isCharacterCard = true;
+    if (asset.detected_metadata_json) {
+      try {
+        const parsed = JSON.parse(asset.detected_metadata_json);
+        if (parsed.cardName) meta.cardName = parsed.cardName;
+      } catch { /* ignore */ }
+    }
+  }
+  return meta;
 }
 
 function linkPreviewRowToMeta(lp: LinkPreviewRow, allMedia: MediaAssetRow[]): LinkPreviewMeta {
@@ -309,13 +381,11 @@ function renderRuntimeInstructions(options: BuildContextOptions): string {
         `<session id="${session.id}" started="${new Date(session.createdAt).toISOString()}" triggered_by="${escapeXml((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
     )
     .join("\n");
-  return `<runtime>
-Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
+  return `Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
 Current timeline: ${escapeXml(options.timelineKey)}
 Trigger event: ${escapeXml(options.trigger.id)}
 
 <active_sessions>
 ${sessions}
-</active_sessions>
-</runtime>`;
+</active_sessions>`;
 }

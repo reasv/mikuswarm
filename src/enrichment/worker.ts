@@ -154,13 +154,11 @@ export class EnrichmentWorker {
       }
 
       const timestamp = Date.parse(summary.timestamp);
-      const senderUsername = extractUsername(summary.sender);
       result.replyContext = {
         event_id: event.id,
         reply_external_id: summary.eventId,
         sender_id: summary.sender,
         sender_display_name: summary.senderName ?? null,
-        sender_username: senderUsername,
         body: summary.body,
         timestamp: Number.isFinite(timestamp) ? timestamp : null,
         created_at: Date.now(),
@@ -403,9 +401,3 @@ function urlFilename(url: string): string | undefined {
   }
 }
 
-function extractUsername(userId: string): string | null {
-  if (!userId.startsWith("@")) return null;
-  const colonIndex = userId.indexOf(":");
-  if (colonIndex < 0) return null;
-  return userId.slice(1, colonIndex);
-}

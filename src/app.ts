@@ -125,6 +125,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (draining) return;
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
+      if (needsEnrichment(inbound.event)) {
+        const resolvedEvent = timeline.getByExternalId(inbound.provider, inbound.event.externalId!) ?? inbound.event;
+        await timeline.setEnrichmentStatus(resolvedEvent.id, "pending");
+        enrichmentPool.notifyNewEvent(resolvedEvent.id);
+      }
       return;
     }
 
@@ -161,18 +166,32 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const groupIds = new Set(inbound.trigger?.groupedEventIds ?? []);
     groupIds.add(triggerEventId);
 
+    const lookbackMs = config.matrix.trigger_group_lookback_ms ?? 20_000;
     const lookback = timeline.query({
       timelineKey: inbound.timelineKey,
       toTimestamp: inbound.event.timestamp,
-      fromTimestamp: inbound.event.timestamp - Math.max(5_000, config.matrix.trigger_hold_ms * 2),
+      fromTimestamp: inbound.event.timestamp - lookbackMs,
       limit: 50,
     });
-    for (const event of lookback.reverse()) {
+
+    let attachmentEventIndex = -1;
+    for (let i = lookback.length - 1; i >= 0; i--) {
+      const event = lookback[i];
       if (event.id === triggerEventId) continue;
       if (event.sender.id !== inbound.event.sender.id) continue;
-      if (!event.attachments?.length) continue;
-      groupIds.add(event.id);
-      break;
+      if (event.attachments?.length) {
+        attachmentEventIndex = i;
+        break;
+      }
+    }
+
+    if (attachmentEventIndex >= 0) {
+      for (let i = attachmentEventIndex; i < lookback.length; i++) {
+        const event = lookback[i];
+        if (event.id === triggerEventId) continue;
+        if (event.sender.id !== inbound.event.sender.id) continue;
+        groupIds.add(event.id);
+      }
     }
 
     const allIds = [...groupIds];

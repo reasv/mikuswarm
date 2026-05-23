@@ -53,7 +53,15 @@ root_dir = "./workspaces/miku"
 
 [matrix]
 enabled = false
-trigger_hold_ms = 900
+trigger_hold_ms = 2000
+trigger_group_lookback_ms = 20000
+
+[enrichment]
+trigger_wait_timeout_ms = 30000
+
+[captioning]
+trigger_wait_timeout_ms = 45000
+caption_assistant_messages = false
 
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"

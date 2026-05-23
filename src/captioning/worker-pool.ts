@@ -6,6 +6,7 @@ export interface CaptionConfig {
   worker_count?: number;
   inference_concurrency?: number;
   caption_all?: boolean;
+  caption_assistant_messages?: boolean;
   caption_model?: string;
   trigger_wait_timeout_ms?: number;
   max_retries?: number;
@@ -81,7 +82,8 @@ export class CaptionWorkerPool {
     }
 
     const captionAll = this.options.config.caption_all ?? false;
-    const claimed = await this.options.storage.claimPendingCaptions(available, captionAll);
+    const captionAssistant = captionAll || (this.options.config.caption_assistant_messages ?? false);
+    const claimed = await this.options.storage.claimPendingCaptions(available, captionAll, captionAssistant);
     if (claimed.length === 0) {
       await new Promise<void>((resolve) => {
         this.wakeResolve = resolve;

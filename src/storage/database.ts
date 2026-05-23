@@ -642,7 +642,7 @@ export class Storage {
     });
   }
 
-  claimPendingCaptions(limit: number, captionAll: boolean): Promise<MediaAssetRow[]> {
+  claimPendingCaptions(limit: number, captionAll: boolean, captionAssistantMessages = false): Promise<MediaAssetRow[]> {
     return this.write((db) => {
       const rows = db.prepare(
         `select ma.* from media_assets ma
@@ -650,12 +650,12 @@ export class Storage {
          where ma.caption_status = 'pending'
            and ma.download_status = 'complete'
            and ma.media_type = 'image'
-           and (te.trigger_group_id is not null or ? = 1)
+           and (te.trigger_group_id is not null or ? = 1 or (te.role = 'assistant' and ? = 1))
          order by
            case when te.trigger_group_id is not null then 0 else 1 end,
            te.timestamp desc
          limit ?`,
-      ).all(captionAll ? 1 : 0, limit) as MediaAssetRow[];
+      ).all(captionAll ? 1 : 0, captionAssistantMessages ? 1 : 0, limit) as MediaAssetRow[];
 
       if (rows.length === 0) return [];
 

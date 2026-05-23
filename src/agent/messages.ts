@@ -8,6 +8,14 @@ export interface ChatEventMessage {
   content: string;
   event?: CanonicalChatEvent;
   imageBlocks?: ImageBlock[];
+  timestamp?: number;
+}
+
+export interface TriggerGroupMessage {
+  type: "triggerGroup";
+  content: string;
+  imageBlocks?: ImageBlock[];
+  timestamp?: number;
 }
 
 export interface RuntimeInstructionsMessage {
@@ -24,6 +32,7 @@ export interface InterjectionMessage {
 declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     chatEvent: ChatEventMessage;
+    triggerGroup: TriggerGroupMessage;
     runtimeInstructions: RuntimeInstructionsMessage;
     interjection: InterjectionMessage;
   }
