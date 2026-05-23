@@ -24,9 +24,9 @@ Matrix sync → normalizeMatrixInboundEvent (NO I/O, field mapping only)
   → trigger fires → resolve trigger group (hold + lookback) → persist trigger_group_id
 
 Enrichment workers (configurable concurrency, e.g. 3):
-  Continuously poll DB for status='pending', most recent first
+  Continuously poll DB for enrichment_status='pending', most recent first
   → claim event (status → 'processing')
-  → execute enrichment job (all work for one message):
+  → execute enrichment job (all fetching/downloading for one message):
       1. Download attachments via provider callback → save to workspace msg-attach/
       2. Resolve reply context via provider callback (messageSummary)
       3. Download reply attachments via provider callback → save to workspace
@@ -35,15 +35,32 @@ Enrichment workers (configurable concurrency, e.g. 3):
       6. Download all preview media → save to workspace
       7. Extract and download linked media from body and reply body → save to workspace
       8. Detect character cards on all image assets (unconditional, no LLM)
-      9. If message is in a trigger group (or config says caption all):
-         run inference captioning on eligible media via concurrency-limited inference client
-  → atomic write: all results to enrichment tables + flip status → 'complete'
+  → set caption_status on each media asset: 'pending' if eligible (image with successful
+    download), 'skipped' otherwise (non-image, failed download)
+  → atomic write: all results to enrichment tables + flip enrichment_status → 'complete'
   → emit 'enrichment:complete:{eventId}' in-process notification
-  If error → status → 'failed', record error + attempt count
+  If error → enrichment_status → 'failed', record error + attempt count
+  NOTE: enrichment workers NEVER do captioning/inference.
+
+Caption workers (configurable concurrency, e.g. 2):
+  Continuously poll DB for media_assets with:
+    caption_status = 'pending' AND download_status = 'complete' AND media_type = 'image'
+    AND (event is in a trigger group OR config says caption_all)
+  → prioritize trigger-group media over non-trigger-group media
+  → within same priority, most-recent-first
+  → claim asset (caption_status → 'processing')
+  → resize image ephemerally for inference
+  → call captioning model via concurrency-limited inference client
+  → update media_asset row: caption, caption_model, caption_status → 'complete' or 'failed'
+  → emit 'caption:complete:{eventId}' in-process notification
+  If error → caption_status → 'failed', record error
 
 Trigger path:
-  → trigger fires → subscribe to enrichment completion for trigger event + grouped events
-  → once all complete (or timeout) → launch agent session
+  → trigger fires → resolve trigger group, persist trigger_group_id on all group events
+  → (caption workers now see those events' media assets as eligible)
+  → await enrichment_status = 'complete' for all group events (or timeout)
+  → await caption_status != 'pending' for all group image assets (or timeout)
+  → launch agent session
 
 Agent session / context build:
   → query timeline events
@@ -143,10 +160,14 @@ CREATE TABLE IF NOT EXISTS media_assets (
   caption TEXT,
   caption_model TEXT,
   caption_status TEXT NOT NULL DEFAULT 'pending',
-  -- 'pending' | 'complete' | 'failed' | 'skipped'
-  -- 'pending' if inference hasn't been attempted yet (non-trigger-group by default)
-  -- 'skipped' if not eligible (non-image, or config says skip)
-  -- Written at enrichment completion time. Not updated incrementally.
+  -- 'pending' | 'processing' | 'complete' | 'failed' | 'skipped'
+  -- 'pending': eligible for captioning, waiting for a caption worker to pick it up.
+  --   Set by enrichment worker for images with successful downloads.
+  -- 'processing': claimed by a caption worker, inference in progress.
+  -- 'complete': captioning succeeded, caption text is populated.
+  -- 'failed': captioning was attempted but failed.
+  -- 'skipped': not eligible (non-image, failed download, etc.).
+  -- Set at enrichment completion time. Updated later by caption workers.
   download_status TEXT NOT NULL DEFAULT 'pending',
   -- 'complete' | 'failed'
   -- Written at enrichment completion time.
@@ -160,6 +181,10 @@ CREATE INDEX IF NOT EXISTS idx_media_assets_event
 CREATE INDEX IF NOT EXISTS idx_media_assets_preview
   ON media_assets(link_preview_id)
   WHERE link_preview_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_media_assets_caption_eligible
+  ON media_assets(caption_status, download_status, media_type)
+  WHERE caption_status IN ('pending', 'processing');
 ```
 
 #### New `link_previews` table
@@ -384,13 +409,19 @@ This is a new module. It contains:
 src/enrichment/
   index.ts           — exports
   worker-pool.ts     — EnrichmentWorkerPool: manages N workers, polls DB
-  worker.ts          — EnrichmentWorker: processes one message
+  worker.ts          — EnrichmentWorker: processes one message (NO inference)
   fetch-client.ts    — ConcurrencyLimitedFetchClient: shared HTTP fetcher
-  inference-client.ts — ConcurrencyLimitedInferenceClient: shared captioning client
-  media.ts           — file saving, filename generation, image resizing for inference
+  media.ts           — file saving, filename generation
   linked-media.ts    — extracting media URLs from message body text
   card-detect.ts     — character card detection (non-inference, reads PNG metadata/EXIF)
   types.ts           — EnrichmentResult, MediaAssetRow, LinkPreviewRow, etc.
+
+src/captioning/
+  index.ts           — exports
+  worker-pool.ts     — CaptionWorkerPool: manages N workers, polls media_assets in DB
+  worker.ts          — CaptionWorker: captions one media asset
+  inference-client.ts — ConcurrencyLimitedInferenceClient: shared captioning client
+  image-resize.ts    — ephemeral image resizing for inference (sharp-based)
 ```
 
 #### 5.1 EnrichmentWorkerPool (`worker-pool.ts`)
@@ -401,7 +432,6 @@ interface EnrichmentWorkerPoolOptions {
   timeline: TimelineStore;
   providerCapabilities: Map<string, EnrichmentCapabilities>;
   fetchClient: ConcurrencyLimitedFetchClient;
-  inferenceClient: ConcurrencyLimitedInferenceClient;
   workspaceRoot: string;
   config: EnrichmentConfig;
   onComplete?: (eventId: string) => void;
@@ -439,7 +469,7 @@ UPDATE timeline_events SET enrichment_status = 'pending'
 
 #### 5.2 EnrichmentWorker (`worker.ts`)
 
-Processes a single event. All work runs asynchronously. At the end, writes all results atomically.
+Processes a single event. All work runs asynchronously. At the end, writes all results atomically. **The enrichment worker never does captioning/inference** — that is handled by the separate caption worker pool (section 5.8).
 
 ```typescript
 class EnrichmentWorker {
@@ -484,17 +514,16 @@ class EnrichmentWorker {
       }
     }
 
-    // --- Phase 3: Inference (conditional on trigger group membership or config) ---
+    // --- Phase 3: Set caption eligibility on media assets ---
 
-    const runInference = event.trigger_group_id != null || this.config.caption_all_messages;
-    if (runInference) {
-      await this.runCaptioning(result.mediaAssets);
-    } else {
-      // Mark all as 'skipped' (they can be captioned on demand by the agent later)
-      for (const asset of result.mediaAssets) {
-        if (asset.caption_status === 'pending') {
-          asset.caption_status = 'skipped';
-        }
+    for (const asset of result.mediaAssets) {
+      if (asset.media_type === 'image' && asset.download_status === 'complete') {
+        // Eligible for captioning — leave as 'pending'.
+        // Caption workers will pick these up based on trigger group membership.
+        asset.caption_status = 'pending';
+      } else {
+        // Non-image or failed download — skip captioning entirely.
+        asset.caption_status = 'skipped';
       }
     }
 
@@ -512,7 +541,7 @@ However, 1d/1e/1f depend on 1b (reply context must be resolved first to get the 
                  ┌─ 1a. download attachments ─┐
     start ───────┤                             ├──── 1e. linked media (body) ───┐
                  ├─ 1b. resolve reply ─────────┤                               │
-                 │        │                    ├──── 1f. linked media (reply) ──┼─ 2. card detect ─ 3. inference ─ 4. write
+                 │        │                    ├──── 1f. linked media (reply) ──┼─ 2. card detect ─ 3. set caption status ─ 4. write
                  │        └─ 1d. reply         │                               │
                  │            link previews ────┘                               │
                  └─ 1c. message link previews ─────────────────────────────────┘
@@ -546,39 +575,9 @@ class ConcurrencyLimitedFetchClient {
 }
 ```
 
-#### 5.4 ConcurrencyLimitedInferenceClient (`inference-client.ts`)
+#### 5.4 Note on Inference
 
-A shared client for inference tasks (currently: image captioning). Limits concurrency to control cost and API load.
-
-```typescript
-interface InferenceClientOptions {
-  maxConcurrency: number;  // e.g. 2
-  captionModel: ModelConfig; // which model to use, endpoint, API key
-  imageResize: {
-    maxWidth: number;
-    maxHeight: number;
-    maxBytes: number;
-  };
-}
-
-class ConcurrencyLimitedInferenceClient {
-  caption(params: {
-    imagePath: string;    // absolute path to the original stored file
-    mediaType: string;    // mime type
-    filename: string;     // for context in the prompt
-  }): Promise<{
-    caption: string;
-    model: string;
-  }>;
-  // Reads the image from disk, resizes it according to imageResize config
-  // (the stored file is always the original, unmodified — resizing is
-  // ephemeral, only for the inference request), sends to the captioning
-  // model, returns the caption text.
-  // Internally limits concurrency.
-}
-```
-
-Image resizing for inference uses the same `sharp`-based pipeline as the current `encodeImageForContext()` but with configurable parameters from the inference client's config. The original file on disk is never modified.
+The enrichment worker pool does **not** contain or use an inference client. All captioning/inference work is handled by the separate caption worker pool (section 5.8), which has its own `ConcurrencyLimitedInferenceClient` in `src/captioning/`.
 
 #### 5.5 Media File Handling (`media.ts`)
 
@@ -606,25 +605,11 @@ async function saveMediaToWorkspace(params: {
   // 4. Return workspace-relative path: 'msg-attach/X7QK4R2TBMVNE.png'
   //    and absolute path for internal use
 }
-
-// Image resizing for inference (ephemeral, not persisted)
-async function resizeImageForInference(params: {
-  inputPath: string;  // absolute path to original stored file
-  maxWidth: number;
-  maxHeight: number;
-  maxBytes: number;
-}): Promise<{ data: Buffer; mediaType: string }> {
-  // Same algorithm as current encodeImageForContext():
-  // - Read from disk
-  // - Resize to fit within maxWidth x maxHeight
-  // - Encode as JPEG with mozjpeg, iterating quality [82, 72, 62, 52, 42, 35]
-  // - Scale down further if needed
-  // - Returns buffer + 'image/jpeg'
-  // The file on disk is NOT modified.
-}
 ```
 
 The base32 prefix length (8 bytes → 13 chars) keeps filenames short for context tokens while providing adequate collision resistance (2^64 space).
+
+Note: image resizing for inference lives in `src/captioning/image-resize.ts` (section 5.8), not here. Downloaded media is always stored as the exact original — resizing is always ephemeral.
 
 #### 5.6 Linked Media Extraction (`linked-media.ts`)
 
@@ -659,6 +644,171 @@ async function detectCharacterCard(absolutePath: string): Promise<{
 ```
 
 This runs unconditionally on all image assets since it's purely local I/O with no cost.
+
+### 5.8 Caption System (`src/captioning/`)
+
+Captioning is a **separate, symmetric DB-driven worker pool** that runs independently from enrichment. It uses the same pattern as the enrichment worker pool — polling the DB for eligible work — but operates on individual `media_assets` rows rather than `timeline_events`.
+
+#### CaptionWorkerPool (`src/captioning/worker-pool.ts`)
+
+```typescript
+interface CaptionWorkerPoolOptions {
+  storage: Storage;
+  inferenceClient: ConcurrencyLimitedInferenceClient;
+  workspaceRoot: string;
+  config: CaptionConfig;
+  onComplete?: (eventId: string) => void;
+  onError?: (assetId: string, error: unknown) => void;
+  logger: Logger;
+}
+
+class CaptionWorkerPool {
+  private running = false;
+  private activeWorkers = new Set<Promise<void>>();
+
+  start(): void;
+  // Begins the polling loop. At each tick:
+  // 1. Query DB for eligible uncaptioned media assets (see SQL below)
+  // 2. Claim each by setting caption_status='processing' (compare-and-swap)
+  // 3. Spawn a CaptionWorker for each claimed asset
+  // 4. When a worker completes, check for more work
+  // Poll interval: 500ms when there was work, 2000ms when idle.
+  // (Caption work is less latency-sensitive than enrichment.)
+
+  stop(): Promise<void>;
+  // Set running=false, await all active workers
+
+  notifyNewWork(): void;
+  // Called when trigger_group_id is assigned to events, making their
+  // media assets newly eligible. Wakes the poll loop immediately.
+}
+```
+
+**Eligibility query:**
+
+The caption worker pool polls for media assets that are eligible for captioning. An asset is eligible when:
+1. `caption_status = 'pending'` (enrichment marked it as eligible)
+2. `download_status = 'complete'` (the file is on disk)
+3. `media_type = 'image'` (only images are captioned)
+4. The event is in a trigger group **OR** config `caption_all` is true
+
+Trigger-group media is prioritized over non-trigger-group media. Within the same priority tier, most-recent-first.
+
+```sql
+SELECT ma.id, ma.event_id, ma.local_path, ma.mime_type, ma.original_filename,
+       te.trigger_group_id
+FROM media_assets ma
+JOIN timeline_events te ON ma.event_id = te.id
+WHERE ma.caption_status = 'pending'
+  AND ma.download_status = 'complete'
+  AND ma.media_type = 'image'
+  AND (te.trigger_group_id IS NOT NULL OR :caption_all = 1)
+ORDER BY
+  CASE WHEN te.trigger_group_id IS NOT NULL THEN 0 ELSE 1 END,
+  te.timestamp DESC
+LIMIT :worker_count
+```
+
+Add index for this query:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_media_assets_caption_eligible
+  ON media_assets(caption_status, download_status, media_type)
+  WHERE caption_status IN ('pending', 'processing');
+```
+
+**Stale claim recovery:** On startup, reset any assets stuck in `caption_status = 'processing'`:
+
+```sql
+UPDATE media_assets SET caption_status = 'pending'
+  WHERE caption_status = 'processing';
+```
+
+#### CaptionWorker (`src/captioning/worker.ts`)
+
+Processes a single media asset. Reads the image, resizes it ephemerally for inference, sends to the captioning model, and updates the DB row.
+
+```typescript
+class CaptionWorker {
+  async process(asset: MediaAssetRow): Promise<void> {
+    const absolutePath = path.join(this.workspaceRoot, asset.local_path);
+
+    // 1. Resize image ephemerally for inference
+    const resized = await resizeImageForInference({
+      inputPath: absolutePath,
+      maxWidth: this.config.image_resize.max_width,
+      maxHeight: this.config.image_resize.max_height,
+      maxBytes: this.config.image_resize.max_bytes,
+    });
+
+    // 2. Call captioning model
+    const result = await this.inferenceClient.caption({
+      imageData: resized.data,
+      mediaType: resized.mediaType,
+      filename: asset.original_filename ?? path.basename(asset.local_path),
+    });
+
+    // 3. Update media_asset row
+    await this.storage.write((db) => {
+      db.prepare(`
+        UPDATE media_assets
+        SET caption = ?, caption_model = ?, caption_status = 'complete'
+        WHERE id = ?
+      `).run(result.caption, result.model, asset.id);
+    });
+
+    // 4. Emit completion notification (for trigger path awaiting)
+    this.onComplete?.(asset.event_id);
+  }
+}
+```
+
+On error, the asset's `caption_status` is set to `'failed'` with the error recorded. The asset is not retried automatically — failed captions are treated as absent during context build.
+
+#### ConcurrencyLimitedInferenceClient (`src/captioning/inference-client.ts`)
+
+A shared client for inference tasks (currently: image captioning). Limits concurrency to control cost and API load.
+
+```typescript
+interface InferenceClientOptions {
+  maxConcurrency: number;  // e.g. 2
+  captionModel: ModelConfig; // which model to use, endpoint, API key
+}
+
+class ConcurrencyLimitedInferenceClient {
+  caption(params: {
+    imageData: Buffer;    // already-resized image data (ephemeral)
+    mediaType: string;    // mime type of the resized image
+    filename: string;     // for context in the captioning prompt
+  }): Promise<{
+    caption: string;
+    model: string;
+  }>;
+  // Sends the pre-resized image to the captioning model and returns
+  // the caption text. Internally limits concurrency via FIFO queue.
+}
+```
+
+#### Image Resizing for Inference (`src/captioning/image-resize.ts`)
+
+```typescript
+async function resizeImageForInference(params: {
+  inputPath: string;  // absolute path to original stored file
+  maxWidth: number;
+  maxHeight: number;
+  maxBytes: number;
+}): Promise<{ data: Buffer; mediaType: string }> {
+  // Same algorithm as current encodeImageForContext():
+  // - Read from disk
+  // - Resize to fit within maxWidth x maxHeight
+  // - Encode as JPEG with mozjpeg, iterating quality [82, 72, 62, 52, 42, 35]
+  // - Scale down further if needed
+  // - Returns buffer + 'image/jpeg'
+  // The file on disk is NOT modified.
+}
+```
+
+This is also used by the context builder for image block preparation (section 8). The same function, potentially with different config values (caption resize settings vs. context image settings).
 
 ### 6. Atomic Persistence (`worker.ts`)
 
@@ -705,14 +855,26 @@ async function prepareTriggerMedia(inbound: InboundChatEvent): Promise<void> {
 
 #### After
 
-```typescript
-async function awaitTriggerEnrichment(inbound: InboundChatEvent): Promise<void> {
-  const eventIds = inbound.trigger?.groupedEventIds ?? [inbound.event.id];
-  const timeoutMs = config.enrichment?.trigger_wait_timeout_ms ?? 30_000;
+The trigger path is now pure awaiting on DB state — it doesn't do any enrichment or captioning work itself. It just waits for the worker pools to finish processing the trigger group's events and media.
 
+```typescript
+async function awaitTriggerReadiness(inbound: InboundChatEvent): Promise<void> {
+  const eventIds = inbound.trigger?.groupedEventIds ?? [inbound.event.id];
+  const enrichmentTimeoutMs = config.enrichment?.trigger_wait_timeout_ms ?? 30_000;
+  const captionTimeoutMs = config.captioning?.trigger_wait_timeout_ms ?? 45_000;
+
+  // Step 1: Await enrichment completion for all trigger group events.
+  // Enrichment must complete first because caption workers need the
+  // downloaded media assets that enrichment produces.
   await Promise.all(
-    eventIds.map((eventId) => awaitEnrichmentComplete(eventId, timeoutMs))
+    eventIds.map((eventId) => awaitEnrichmentComplete(eventId, enrichmentTimeoutMs))
   );
+
+  // Step 2: Await caption completion for all trigger group image assets.
+  // After enrichment, media_assets rows exist with caption_status='pending'.
+  // The caption workers are already processing them (they became eligible
+  // when trigger_group_id was set). We just need to wait for them to finish.
+  await awaitCaptionsComplete(eventIds, captionTimeoutMs);
 }
 
 function awaitEnrichmentComplete(eventId: string, timeoutMs: number): Promise<void> {
@@ -721,9 +883,37 @@ function awaitEnrichmentComplete(eventId: string, timeoutMs: number): Promise<vo
   // 3. Race against setTimeout(timeoutMs)
   // 4. If timeout: log warning, proceed anyway (agent gets unenriched data for that event)
 }
+
+async function awaitCaptionsComplete(eventIds: string[], timeoutMs: number): Promise<void> {
+  // 1. Query: are there any media_assets for these events with
+  //    caption_status = 'pending' or caption_status = 'processing'?
+  //
+  //    SELECT COUNT(*) as remaining FROM media_assets
+  //    WHERE event_id IN (?, ?, ...)
+  //      AND caption_status IN ('pending', 'processing')
+  //      AND media_type = 'image'
+  //
+  // 2. If remaining = 0, return immediately (all done or none exist)
+  // 3. Otherwise, subscribe to captionEmitter events and re-check after each
+  // 4. Race against setTimeout(timeoutMs)
+  // 5. If timeout: log warning, proceed anyway (agent gets uncaptioned images,
+  //    which is fine — captions are supplementary, not required)
+}
 ```
 
-The `BackgroundProcessor` class is removed entirely. Its functionality is replaced by the enrichment worker pool.
+The flow from the trigger firing through to session launch:
+
+```
+Trigger fires
+  → resolve trigger group (hold + lookback), persist trigger_group_id on all group events
+  → (caption workers now see those events' media assets as eligible, start processing)
+  → notify caption worker pool of new work
+  → await enrichment_status = 'complete' for all group events (or timeout)
+  → await caption_status != 'pending' for all group image assets (or timeout)
+  → launch agent session
+```
+
+The `BackgroundProcessor` class is removed entirely. Its functionality is replaced by the enrichment and caption worker pools.
 
 ### 8. Context Builder Changes (`src/context/builder.ts`)
 
@@ -911,21 +1101,28 @@ export interface LinkPreviewMeta {
 
 ### 11. Config Changes (`src/config/schema.ts`)
 
-Add enrichment configuration:
+Add enrichment and captioning configuration as **separate** config sections (reflecting their architectural independence):
 
 ```typescript
 const EnrichmentSchema = Type.Object({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),         // default: 3
   fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),    // default: 6
   fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),  // default: 10_000
-  inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),// default: 2
-  caption_all_messages: Type.Optional(Type.Boolean()),              // default: false
-  caption_model: Type.Optional(Type.String()),                      // model key from models config
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })), // default: 30_000
   max_download_bytes: Type.Optional(Type.Number({ minimum: 0 })),   // default: 50_000_000 (50MB)
   max_previews_per_message: Type.Optional(Type.Number({ minimum: 0 })), // default: 3
+});
+
+const CaptioningSchema = Type.Object({
+  worker_count: Type.Optional(Type.Number({ minimum: 1 })),         // default: 2
+  inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),// default: 2
+  caption_all: Type.Optional(Type.Boolean()),                       // default: false
+  // When false (default): only caption media from events in a trigger group.
+  // When true: caption all eligible image media, regardless of trigger group membership.
+  caption_model: Type.Optional(Type.String()),                      // model key from models config
+  trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })), // default: 45_000
   image_resize: Type.Optional(Type.Object({
-    // Settings for resizing images for inference (captioning, agent image blocks).
+    // Settings for resizing images for inference (captioning).
     // Stored files are ALWAYS the original, unmodified. Resizing is ephemeral.
     max_width: Type.Optional(Type.Number({ minimum: 1 })),          // default: 1280
     max_height: Type.Optional(Type.Number({ minimum: 1 })),         // default: 720
@@ -937,13 +1134,16 @@ const EnrichmentSchema = Type.Object({
 Add to AppConfigSchema:
 ```typescript
 enrichment: Type.Optional(EnrichmentSchema),
+captioning: Type.Optional(CaptioningSchema),
 ```
+
+Note: image resizing for context-build (agent image blocks) remains under the existing `context.images` config. The `captioning.image_resize` controls the separate resize parameters for inference/captioning. These may differ — for example, captioning might use larger images for better descriptions while context images are more aggressively compressed for token savings.
 
 ### 12. Application Lifecycle Changes (`src/app.ts`)
 
 #### Startup
 
-Add enrichment system initialization after timeline store creation:
+Add enrichment and captioning system initialization after timeline store creation:
 
 ```typescript
 // Create shared clients
@@ -954,27 +1154,35 @@ const fetchClient = new ConcurrencyLimitedFetchClient({
 });
 
 const inferenceClient = new ConcurrencyLimitedInferenceClient({
-  maxConcurrency: config.enrichment?.inference_concurrency ?? 2,
-  captionModel: config.models[config.enrichment?.caption_model ?? 'default'],
-  imageResize: {
-    maxWidth: config.enrichment?.image_resize?.max_width ?? 1280,
-    maxHeight: config.enrichment?.image_resize?.max_height ?? 720,
-    maxBytes: config.enrichment?.image_resize?.max_bytes ?? 1_048_576,
-  },
+  maxConcurrency: config.captioning?.inference_concurrency ?? 2,
+  captionModel: config.models[config.captioning?.caption_model ?? 'default'],
 });
 
+// Event emitters for trigger path awaiting
 const enrichmentEmitter = new EventEmitter();
+const captionEmitter = new EventEmitter();
 
+// Enrichment worker pool — downloads, link previews, reply resolution
 const enrichmentPool = new EnrichmentWorkerPool({
   storage,
   timeline,
   providerCapabilities: new Map(), // populated after provider.start()
   fetchClient,
-  inferenceClient,
   workspaceRoot,
   config: config.enrichment ?? {},
   onComplete: (eventId) => enrichmentEmitter.emit(`complete:${eventId}`),
   onError: (eventId, error) => logger.error('enrichment_failed', { eventId, error: String(error) }),
+  logger,
+});
+
+// Caption worker pool — image captioning via inference
+const captionPool = new CaptionWorkerPool({
+  storage,
+  inferenceClient,
+  workspaceRoot,
+  config: config.captioning ?? {},
+  onComplete: (eventId) => captionEmitter.emit(`complete:${eventId}`),
+  onError: (assetId, error) => logger.error('caption_failed', { assetId, error: String(error) }),
   logger,
 });
 
@@ -987,14 +1195,16 @@ for (const [accountId, _] of Object.entries(config.matrix.accounts)) {
 }
 
 enrichmentPool.start();
+captionPool.start();
 ```
 
 #### Shutdown
 
 ```typescript
-enrichmentPool.stop();  // await active workers
-fetchClient.stop();     // reject queued requests
-inferenceClient.stop(); // reject queued requests
+captionPool.stop();     // await active caption workers
+enrichmentPool.stop();  // await active enrichment workers
+fetchClient.stop();     // reject queued fetch requests
+inferenceClient.stop(); // reject queued inference requests
 ```
 
 #### handleInbound changes
@@ -1020,14 +1230,18 @@ async function handleInbound(inbound: InboundChatEvent): Promise<void> {
 
   if (!inbound.trigger) return; // Non-trigger: enrichment runs in background, no session
 
-  // Resolve trigger group (hold + lookback) and persist
+  // Resolve trigger group (hold + lookback) and persist trigger_group_id
+  // This makes the group's media assets visible to caption workers.
   await resolveTriggerGroup(inbound);
+
+  // Notify caption pool that trigger group media is now eligible
+  captionPool.notifyNewWork();
 
   const decision = triggerCoordinator.accept(inbound);
   if (decision.action !== "spawn") { /* log, return */ }
 
-  // Await enrichment for all trigger group events
-  await awaitTriggerEnrichment(inbound);
+  // Await BOTH enrichment and captioning for all trigger group events
+  await awaitTriggerReadiness(inbound);
 
   launchSession(inbound, routed.duplicate);
 }
@@ -1037,7 +1251,7 @@ async function handleInbound(inbound: InboundChatEvent): Promise<void> {
 
 - `src/timeline/background.ts` — `BackgroundProcessor` class. Replaced by enrichment worker pool.
 - The `prepareTriggerEvent` / `processNonTriggerEvent` / `Captioner` type — all replaced.
-- `createBasicCaptioner()` in `app.ts` — replaced by inference client.
+- `createBasicCaptioner()` in `app.ts` — replaced by `CaptionWorkerPool` + `ConcurrencyLimitedInferenceClient`.
 
 ### 14. NAPI Changes Required (Rust native module)
 
@@ -1078,9 +1292,10 @@ This is a large change. Recommended implementation order:
 **Phase A: Schema + Storage (no behavioral change)**
 1. Add new columns to `timeline_events` (`enrichment_status`, `trigger_group_id`)
 2. Create new tables (`reply_contexts`, `media_assets`, `link_previews`)
-3. Add storage methods for reading/writing enrichment data
-4. Add `hydrateForRendering()` query method
-5. Set all existing events to `enrichment_status = 'skipped'` in migration
+3. Add `caption_status` index on `media_assets` for caption worker polling
+4. Add storage methods for reading/writing enrichment data
+5. Add `hydrateForRendering()` query method
+6. Set all existing events to `enrichment_status = 'skipped'` in migration
 
 **Phase B: NAPI async conversion**
 1. Convert `download_media`, `message_summary`, `resolve_link_previews`, `member_info` to async NAPI
@@ -1090,27 +1305,34 @@ This is a large change. Recommended implementation order:
 
 **Phase C: Enrichment system core**
 1. Implement `ConcurrencyLimitedFetchClient`
-2. Implement `ConcurrencyLimitedInferenceClient` (initially with sharp-only captioning, then LLM)
-3. Implement `EnrichmentWorker` with all enrichment logic
-4. Implement `EnrichmentWorkerPool`
-5. Implement media file handling (filename generation, saving)
-6. Implement linked media extraction
-7. Port character card detection from OpenClaw
+2. Implement `EnrichmentWorker` with all enrichment logic (NO inference)
+3. Implement `EnrichmentWorkerPool`
+4. Implement media file handling (filename generation, saving)
+5. Implement linked media extraction
+6. Port character card detection from OpenClaw
 
-**Phase D: Integration**
+**Phase D: Caption system**
+1. Implement `ConcurrencyLimitedInferenceClient` (initially with sharp-only metadata, then LLM)
+2. Implement `CaptionWorker`
+3. Implement `CaptionWorkerPool`
+4. Implement `resizeImageForInference()`
+5. Wire into `app.ts` startup/shutdown
+
+**Phase E: Integration**
 1. Strip `processMatrixInboundEvent()` down to `normalizeMatrixInboundEvent()` only
 2. Wire enrichment pool into `app.ts` startup
-3. Change `handleInbound` to the new flow (persist bare event → trigger group resolution → await enrichment → launch session)
+3. Change `handleInbound` to the new flow (persist bare event → trigger group resolution → notify caption pool → await enrichment + captions → launch session)
 4. Remove `BackgroundProcessor`
 5. Update context builder to hydrate events from enrichment tables
 6. Update renderer for reply link previews and preview media
 7. Update image block selection to use trigger group from DB
 
-**Phase E: Config + polish**
+**Phase F: Config + polish**
 1. Add enrichment config schema
-2. Add config for image resizing (inference vs context)
-3. Wire config through
-4. Add defaults to `00-defaults.toml`
-5. Update ARCHITECTURE.md
+2. Add captioning config schema (separate section)
+3. Add config for image resizing (captioning vs context — separate parameters)
+4. Wire config through
+5. Add defaults to `00-defaults.toml`
+6. Update ARCHITECTURE.md
 
-Each phase can be tested independently. Phase B is the riskiest (Rust changes); everything else is TypeScript.
+Each phase can be tested independently. Phase B is the riskiest (Rust changes); everything else is TypeScript. Phases C and D can be developed in parallel since they are independent systems.
