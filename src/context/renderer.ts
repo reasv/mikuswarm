@@ -37,20 +37,26 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
 }
 
 function compactReply(reply: ReplyContext): string {
-  const sender = reply.sender ? reply.sender.displayName ?? reply.sender.id : "unknown";
+  const sender = reply.sender ? replySenderLabel(reply.sender) : "unknown";
   const time = reply.timestamp ? ` ${compactTime(reply.timestamp)}` : "";
   const body = reply.body ? `: ${truncate(normalizeWhitespace(reply.body), 4096)}` : "";
   return ` (> ${sender}${time}${body})`;
 }
 
 function renderReply(reply: ReplyContext): string {
+  const senderText = reply.sender
+    ? (reply.sender.displayName && reply.sender.username && reply.sender.displayName !== reply.sender.username
+        ? `${reply.sender.displayName} (${reply.sender.username})`
+        : reply.sender.displayName ?? reply.sender.id)
+    : undefined;
   const attrs = [
-    reply.sender ? ["sender", reply.sender.displayName ?? reply.sender.id] : undefined,
+    senderText ? ["sender", senderText] : undefined,
     reply.timestamp ? ["time", new Date(reply.timestamp).toISOString()] : undefined,
     reply.externalId ? ["external_id", reply.externalId] : undefined,
   ].filter(Boolean) as string[][];
   const attachments = (reply.attachments ?? []).map(renderAttachment).join("\n\n");
-  return `<reply_to ${attrs.map(([key, value]) => `${key}="${escapeXml(value)}"`).join(" ")}>\n${escapeXml(reply.body ?? "")}${attachments ? `\n\n${attachments}` : ""}\n</reply_to>`;
+  const previews = (reply.linkPreviews ?? []).map(renderLinkPreview).join("\n\n");
+  return `<reply_to ${attrs.map(([key, value]) => `${key}="${escapeXml(value)}"`).join(" ")}>\n${escapeXml(reply.body ?? "")}${attachments ? `\n\n${attachments}` : ""}${previews ? `\n\n${previews}` : ""}\n</reply_to>`;
 }
 
 function renderAttachment(attachment: AttachmentMeta): string {
@@ -70,13 +76,21 @@ function renderLinkPreview(preview: LinkPreviewMeta): string {
     ["url", preview.url],
     preview.title ? ["title", preview.title] : undefined,
   ].filter(Boolean) as string[][];
-  return `<link_preview ${attrs.map(([key, value]) => `${key}="${escapeXml(value)}"`).join(" ")}>\n${escapeXml(preview.description ?? "")}\n</link_preview>`;
+  const mediaBlocks = (preview.media ?? []).map(renderAttachment).join("\n\n");
+  return `<link_preview ${attrs.map(([key, value]) => `${key}="${escapeXml(value)}"`).join(" ")}>\n${escapeXml(preview.description ?? "")}${mediaBlocks ? `\n\n${mediaBlocks}` : ""}\n</link_preview>`;
 }
 
 function senderLabel(event: CanonicalChatEvent): string {
   return event.sender.displayName && event.sender.displayName !== event.sender.id
     ? `${event.sender.displayName} (${event.sender.id})`
     : event.sender.id;
+}
+
+function replySenderLabel(sender: NonNullable<ReplyContext["sender"]>): string {
+  if (sender.displayName && sender.username && sender.displayName !== sender.username) {
+    return `${sender.displayName} (${sender.username})`;
+  }
+  return sender.displayName ?? sender.id;
 }
 
 function compactTime(timestamp: number): string {

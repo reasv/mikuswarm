@@ -1,12 +1,12 @@
+import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
-import sharp from "sharp";
 import type { AppConfig } from "./config/index.js";
 import { createLogger } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
 import { Storage } from "./storage/index.js";
 import {
   AssistantEchoResolver,
-  BackgroundProcessor,
+  needsEnrichment,
   TimelineRouter,
   TimelineStore,
   TriggerCoordinator,
@@ -25,7 +25,9 @@ import {
   createWebSearchTool,
   createWriteMemoryTool,
 } from "./tools/index.js";
-import type { CaptionResult, CanonicalChatEvent, InboundChatEvent } from "./types.js";
+import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
+import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
+import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient } from "./captioning/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -40,16 +42,47 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const sessions = new SessionManager();
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
-  const background = new BackgroundProcessor(timeline, {
-    captioner: createBasicCaptioner(),
-    onError: (error, context) =>
-      logger.warn("background_processing_error", {
-        ...context,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-  });
+
   const echo = new AssistantEchoResolver(timeline);
-  const contextBuilder = new ContextBuilder(timeline, config);
+  const contextBuilder = new ContextBuilder(timeline, config, storage);
+
+  const fetchClient = new ConcurrencyLimitedFetchClient({
+    maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
+    timeoutMs: config.enrichment?.fetch_timeout_ms ?? 10_000,
+    maxResponseBytes: config.enrichment?.max_download_bytes ?? 50_000_000,
+  });
+
+  const inferenceClient = new ConcurrencyLimitedInferenceClient({
+    maxConcurrency: config.captioning?.inference_concurrency ?? 2,
+  });
+
+  const enrichmentEmitter = new EventEmitter();
+  const captionEmitter = new EventEmitter();
+
+  const enrichmentPool = new EnrichmentWorkerPool({
+    storage,
+    timeline,
+    providerCapabilities: new Map(),
+    fetchClient,
+    workspaceRoot,
+    config: config.enrichment ?? {},
+    onComplete: (eventId) => enrichmentEmitter.emit(`complete:${eventId}`),
+    onError: (eventId, error) =>
+      logger.error("enrichment_failed", { eventId, error: error instanceof Error ? error.message : String(error) }),
+    logger,
+  });
+
+  const captionPool = new CaptionWorkerPool({
+    storage,
+    inferenceClient,
+    workspaceRoot,
+    config: config.captioning ?? {},
+    onComplete: (eventId) => captionEmitter.emit(`complete:${eventId}`),
+    onError: (assetId, error) =>
+      logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
+    logger,
+  });
+
   const provider = new MatrixProvider({
     onError: (error, context) =>
       logger.error("matrix_provider_error", {
@@ -94,13 +127,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       await echo.ingestOwnEcho(inbound.event);
       return;
     }
-    const routed = await router.route(inbound);
+
+    const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
+    const routed = await router.route(inbound, enrichmentStatus);
     if (steerReplyToActiveSession(inbound)) return;
-    if (!inbound.trigger) {
-      background.processNonTriggerEvent(inbound.event);
-      return;
+
+    if (enrichmentStatus === "pending") {
+      enrichmentPool.notifyNewEvent(inbound.event.id);
     }
-    await prepareTriggerMedia(inbound);
+
+    if (!inbound.trigger) return;
+
+    await resolveTriggerGroup(inbound);
+    captionPool.notifyNewWork();
+
     const decision = triggerCoordinator.accept(inbound);
     if (decision.action !== "spawn") {
       logger.info("trigger_not_spawned", {
@@ -111,19 +151,104 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
       return;
     }
+
+    await awaitTriggerReadiness(inbound);
     launchSession(inbound, routed.duplicate);
   }
 
-  async function prepareTriggerMedia(inbound: InboundChatEvent): Promise<void> {
-    const prepared = await background.prepareTriggerEvent(inbound.event);
-    inbound.event = prepared;
-    inbound.trigger = prepared.trigger ?? inbound.trigger;
+  async function resolveTriggerGroup(inbound: InboundChatEvent): Promise<void> {
+    const triggerEventId = inbound.event.id;
+    const groupIds = new Set(inbound.trigger?.groupedEventIds ?? []);
+    groupIds.add(triggerEventId);
 
-    for (const eventId of inbound.trigger?.groupedEventIds ?? []) {
-      if (eventId === inbound.event.id) continue;
-      const grouped = timeline.getById(eventId);
-      if (grouped) await background.prepareTriggerEvent(grouped);
+    const lookback = timeline.query({
+      timelineKey: inbound.timelineKey,
+      toTimestamp: inbound.event.timestamp,
+      fromTimestamp: inbound.event.timestamp - Math.max(5_000, config.matrix.trigger_hold_ms * 2),
+      limit: 50,
+    });
+    for (const event of lookback.reverse()) {
+      if (event.id === triggerEventId) continue;
+      if (event.sender.id !== inbound.event.sender.id) continue;
+      if (!event.attachments?.length) continue;
+      groupIds.add(event.id);
+      break;
     }
+
+    const allIds = [...groupIds];
+    inbound.trigger = { ...inbound.trigger!, groupedEventIds: allIds };
+    inbound.event.trigger = inbound.trigger;
+    await timeline.setTriggerGroup(triggerEventId, allIds);
+  }
+
+  async function awaitTriggerReadiness(inbound: InboundChatEvent): Promise<void> {
+    const eventIds = inbound.trigger?.groupedEventIds ?? [inbound.event.id];
+    const enrichmentTimeoutMs = config.enrichment?.trigger_wait_timeout_ms ?? 30_000;
+    const captionTimeoutMs = config.captioning?.trigger_wait_timeout_ms ?? 45_000;
+
+    await Promise.all(
+      eventIds.map((eventId) => awaitEnrichmentComplete(eventId, enrichmentTimeoutMs)),
+    );
+    await awaitCaptionsComplete(eventIds, captionTimeoutMs);
+  }
+
+  function awaitEnrichmentComplete(eventId: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const event = storage.getTimelineEventById(eventId);
+      if (!event) { resolve(); return; }
+      const row = storage.read((db) =>
+        db.prepare(`select enrichment_status from timeline_events where id = ?`).get(eventId) as { enrichment_status: string } | undefined,
+      );
+      if (row && row.enrichment_status !== "pending" && row.enrichment_status !== "processing") {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        enrichmentEmitter.removeAllListeners(`complete:${eventId}`);
+        logger.warn("enrichment_timeout", { eventId, timeoutMs });
+        resolve();
+      }, timeoutMs);
+      enrichmentEmitter.once(`complete:${eventId}`, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  async function awaitCaptionsComplete(eventIds: string[], timeoutMs: number): Promise<void> {
+    const remaining = storage.countPendingCaptions(eventIds);
+    if (remaining === 0) return;
+
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        logger.warn("caption_timeout", { eventIds, timeoutMs });
+        resolve();
+      }, timeoutMs);
+
+      const check = () => {
+        const left = storage.countPendingCaptions(eventIds);
+        if (left === 0) {
+          cleanup();
+          resolve();
+        }
+      };
+
+      const listeners: Array<{ event: string; fn: () => void }> = [];
+      for (const eventId of eventIds) {
+        const event = `complete:${eventId}`;
+        const fn = () => check();
+        captionEmitter.on(event, fn);
+        listeners.push({ event, fn });
+      }
+
+      function cleanup() {
+        clearTimeout(timer);
+        for (const { event, fn } of listeners) {
+          captionEmitter.removeListener(event, fn);
+        }
+      }
+    });
   }
 
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
@@ -222,6 +347,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   await provider.start(config.matrix);
+
+  for (const accountId of Object.keys(config.matrix.accounts)) {
+    enrichmentPool.options.providerCapabilities.set(
+      `matrix:${accountId}`,
+      provider.getEnrichmentCapabilities(accountId),
+    );
+  }
+
+  await enrichmentPool.start();
+  await captionPool.start();
+
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
@@ -229,6 +365,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         draining = true;
         await provider.stop();
         triggerCoordinator.clear();
+        await captionPool.stop();
+        await enrichmentPool.stop();
+        fetchClient.stop();
+        inferenceClient.stop();
         await waitForRuns(activeRuns);
         await storage.waitForIdle();
         storage.close();
@@ -243,33 +383,4 @@ async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 10_000));
   await Promise.race([Promise.allSettled([...runs]), timeout]);
-}
-
-function createBasicCaptioner() {
-  return async (event: CanonicalChatEvent): Promise<CaptionResult[]> => {
-    const results: CaptionResult[] = [];
-    for (const attachment of event.attachments ?? []) {
-      if (!attachment.localPath || attachment.mediaType !== "image") continue;
-      try {
-        const metadata = await sharp(attachment.localPath).metadata();
-        results.push({
-          attachmentId: attachment.id,
-          text: `Image file ${attachment.filename ?? attachment.id}; format ${metadata.format ?? "unknown"}, ${metadata.width ?? "?"}x${metadata.height ?? "?"}.`,
-          model: "sharp-metadata",
-          generatedAt: Date.now(),
-          status: "complete",
-        });
-      } catch (error) {
-        results.push({
-          attachmentId: attachment.id,
-          text: "",
-          model: "sharp-metadata",
-          generatedAt: Date.now(),
-          status: "failed",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    return results;
-  };
 }

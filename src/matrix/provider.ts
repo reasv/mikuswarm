@@ -11,7 +11,8 @@ import type {
 } from "../types.js";
 import { MatrixNativeClient } from "./native-client.js";
 import type { MatrixNativeConfig, MatrixNativeEvent } from "./native-types.js";
-import { processMatrixInboundEvent } from "./inbound.js";
+import { normalizeMatrixInboundEvent } from "./inbound.js";
+import type { EnrichmentCapabilities } from "../enrichment/index.js";
 
 type Handler = (event: InboundChatEvent) => void;
 
@@ -152,6 +153,36 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     account.client.setTyping({ roomId: target.roomId, typing });
   }
 
+  getEnrichmentCapabilities(accountId: string): EnrichmentCapabilities {
+    const account = this.accounts.get(accountId);
+    if (!account) throw new Error(`Matrix account not running: ${accountId}`);
+    const client = account.client;
+
+    return {
+      async downloadMedia(params) {
+        const result = client.downloadMedia(params);
+        return {
+          data: Buffer.from(result.dataBase64, "base64"),
+          contentType: result.contentType,
+          filename: result.filename,
+          kind: result.kind,
+        };
+      },
+      async messageSummary(params) {
+        const result = client.messageSummary(params);
+        return result;
+      },
+      async resolveLinkPreviews(params) {
+        const result = client.resolveLinkPreviews(params);
+        return result;
+      },
+      async memberInfo(params) {
+        const result = client.memberInfo(params);
+        return { displayName: result.displayName };
+      },
+    };
+  }
+
   private async poll(account: AccountRuntime): Promise<void> {
     if (this.stopped) return;
     const events = account.client.pollEvents();
@@ -160,11 +191,9 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
         this.options.onNativeEvent?.(nativeEvent, { accountId: account.accountId });
         continue;
       }
-      const inbound = await processMatrixInboundEvent(nativeEvent.event, {
+      const inbound = normalizeMatrixInboundEvent(nativeEvent.event, {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
-        attachmentDir: account.attachmentDir,
-        client: account.client,
       });
       this.emitWithTriggerHold(inbound);
     }

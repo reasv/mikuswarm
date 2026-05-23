@@ -30,6 +30,58 @@ export interface TimelineEventRow {
   updated_at: number;
 }
 
+export interface ReplyContextRow {
+  event_id: string;
+  reply_external_id?: string | null;
+  sender_id?: string | null;
+  sender_display_name?: string | null;
+  sender_username?: string | null;
+  body?: string | null;
+  html_body?: string | null;
+  timestamp?: number | null;
+  created_at: number;
+}
+
+export interface LinkPreviewRow {
+  id: string;
+  event_id: string;
+  context: string;
+  url: string;
+  title?: string | null;
+  description?: string | null;
+  site_name?: string | null;
+  source_kind?: string | null;
+  preview_index: number;
+  fetched_at?: number | null;
+  fetch_status: string;
+  error?: string | null;
+  created_at: number;
+}
+
+export interface MediaAssetRow {
+  id: string;
+  event_id: string;
+  role: string;
+  source_index?: number | null;
+  link_preview_id?: string | null;
+  local_path?: string | null;
+  mime_type?: string | null;
+  media_type: string;
+  size_bytes?: number | null;
+  width?: number | null;
+  height?: number | null;
+  duration_seconds?: number | null;
+  original_filename?: string | null;
+  detected_content?: string | null;
+  detected_metadata_json?: string | null;
+  caption?: string | null;
+  caption_model?: string | null;
+  caption_status: string;
+  download_status: string;
+  download_error?: string | null;
+  created_at: number;
+}
+
 export interface TimelineCompactionState {
   schemaVersion: 1;
   timelineKey: string;
@@ -56,6 +108,7 @@ export class Storage {
       writer.pragma("journal_mode = WAL");
       writer.pragma("foreign_keys = ON");
       writer.exec(SCHEMA);
+      runMigrations(writer);
     });
     return storage;
   }
@@ -77,18 +130,18 @@ export class Storage {
     return this.write((db) => db.transaction(() => run(db))());
   }
 
-  appendTimelineEvent(event: CanonicalChatEvent): Promise<void> {
+  appendTimelineEvent(event: CanonicalChatEvent, enrichmentStatus?: string): Promise<void> {
     return this.write((db) => {
       const now = Date.now();
       db.prepare(
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          event_json, created_at, updated_at
+          event_json, enrichment_status, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @eventJson, @createdAt, @updatedAt
+          @eventJson, @enrichmentStatus, @createdAt, @updatedAt
         )
         on conflict(id) do update set
           external_id = excluded.external_id,
@@ -102,6 +155,7 @@ export class Storage {
           received_at = excluded.received_at,
           agent_session_id = excluded.agent_session_id,
           event_json = excluded.event_json,
+          enrichment_status = excluded.enrichment_status,
           created_at = timeline_events.created_at,
           updated_at = excluded.updated_at`,
       ).run({
@@ -117,6 +171,7 @@ export class Storage {
         receivedAt: event.receivedAt,
         agentSessionId: event.agentSessionId ?? null,
         eventJson: JSON.stringify(event),
+        enrichmentStatus: enrichmentStatus ?? "pending",
         createdAt: now,
         updatedAt: now,
       });
@@ -281,6 +336,386 @@ export class Storage {
     });
   }
 
+  claimPendingEnrichment(limit: number): Promise<string[]> {
+    return this.write((db) => {
+      const rows = db.prepare(
+        `select id from timeline_events
+         where enrichment_status = 'pending'
+         order by timestamp desc
+         limit ?`,
+      ).all(limit) as Array<{ id: string }>;
+      if (rows.length === 0) return [];
+      const update = db.prepare(
+        `update timeline_events set enrichment_status = 'processing', updated_at = ?
+         where id = ? and enrichment_status = 'pending'`,
+      );
+      const now = Date.now();
+      const claimed: string[] = [];
+      for (const row of rows) {
+        const result = update.run(now, row.id);
+        if (result.changes > 0) claimed.push(row.id);
+      }
+      return claimed;
+    });
+  }
+
+  setEnrichmentStatus(eventId: string, status: string, error?: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update timeline_events set enrichment_status = ?, updated_at = ? where id = ?`,
+      ).run(status, Date.now(), eventId);
+    });
+  }
+
+  resetStaleEnrichment(): Promise<number> {
+    return this.write((db) => {
+      const result = db.prepare(
+        `update timeline_events set enrichment_status = 'pending'
+         where enrichment_status = 'processing'`,
+      ).run();
+      return result.changes;
+    });
+  }
+
+  setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) return Promise.resolve();
+    return this.write((db) => {
+      const placeholders = eventIds.map(() => "?").join(", ");
+      db.prepare(
+        `update timeline_events set trigger_group_id = ?, updated_at = ?
+         where id in (${placeholders})`,
+      ).run(triggerEventId, Date.now(), ...eventIds);
+    });
+  }
+
+  insertReplyContext(row: ReplyContextRow): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert or replace into reply_contexts (
+          event_id, reply_external_id, sender_id, sender_display_name,
+          sender_username, body, html_body, timestamp, created_at
+        ) values (
+          @eventId, @replyExternalId, @senderId, @senderDisplayName,
+          @senderUsername, @body, @htmlBody, @timestamp, @createdAt
+        )`,
+      ).run({
+        eventId: row.event_id,
+        replyExternalId: row.reply_external_id ?? null,
+        senderId: row.sender_id ?? null,
+        senderDisplayName: row.sender_display_name ?? null,
+        senderUsername: row.sender_username ?? null,
+        body: row.body ?? null,
+        htmlBody: row.html_body ?? null,
+        timestamp: row.timestamp ?? null,
+        createdAt: row.created_at,
+      });
+    });
+  }
+
+  insertLinkPreview(row: LinkPreviewRow): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert or replace into link_previews (
+          id, event_id, context, url, title, description, site_name,
+          source_kind, preview_index, fetched_at, fetch_status, error, created_at
+        ) values (
+          @id, @eventId, @context, @url, @title, @description, @siteName,
+          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error, @createdAt
+        )`,
+      ).run({
+        id: row.id,
+        eventId: row.event_id,
+        context: row.context,
+        url: row.url,
+        title: row.title ?? null,
+        description: row.description ?? null,
+        siteName: row.site_name ?? null,
+        sourceKind: row.source_kind ?? null,
+        previewIndex: row.preview_index,
+        fetchedAt: row.fetched_at ?? null,
+        fetchStatus: row.fetch_status,
+        error: row.error ?? null,
+        createdAt: row.created_at,
+      });
+    });
+  }
+
+  insertMediaAsset(row: MediaAssetRow): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert or replace into media_assets (
+          id, event_id, role, source_index, link_preview_id, local_path,
+          mime_type, media_type, size_bytes, width, height, duration_seconds,
+          original_filename, detected_content, detected_metadata_json,
+          caption, caption_model, caption_status, download_status,
+          download_error, created_at
+        ) values (
+          @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
+          @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
+          @originalFilename, @detectedContent, @detectedMetadataJson,
+          @caption, @captionModel, @captionStatus, @downloadStatus,
+          @downloadError, @createdAt
+        )`,
+      ).run({
+        id: row.id,
+        eventId: row.event_id,
+        role: row.role,
+        sourceIndex: row.source_index ?? null,
+        linkPreviewId: row.link_preview_id ?? null,
+        localPath: row.local_path ?? null,
+        mimeType: row.mime_type ?? null,
+        mediaType: row.media_type,
+        sizeBytes: row.size_bytes ?? null,
+        width: row.width ?? null,
+        height: row.height ?? null,
+        durationSeconds: row.duration_seconds ?? null,
+        originalFilename: row.original_filename ?? null,
+        detectedContent: row.detected_content ?? null,
+        detectedMetadataJson: row.detected_metadata_json ?? null,
+        caption: row.caption ?? null,
+        captionModel: row.caption_model ?? null,
+        captionStatus: row.caption_status,
+        downloadStatus: row.download_status,
+        downloadError: row.download_error ?? null,
+        createdAt: row.created_at,
+      });
+    });
+  }
+
+  persistEnrichmentResults(
+    eventId: string,
+    result: {
+      replyContext: ReplyContextRow | null;
+      linkPreviews: LinkPreviewRow[];
+      mediaAssets: MediaAssetRow[];
+    },
+  ): Promise<void> {
+    return this.readAndWrite((db) => {
+      if (result.replyContext) {
+        db.prepare(
+          `insert or replace into reply_contexts (
+            event_id, reply_external_id, sender_id, sender_display_name,
+            sender_username, body, html_body, timestamp, created_at
+          ) values (
+            @eventId, @replyExternalId, @senderId, @senderDisplayName,
+            @senderUsername, @body, @htmlBody, @timestamp, @createdAt
+          )`,
+        ).run({
+          eventId: result.replyContext.event_id,
+          replyExternalId: result.replyContext.reply_external_id ?? null,
+          senderId: result.replyContext.sender_id ?? null,
+          senderDisplayName: result.replyContext.sender_display_name ?? null,
+          senderUsername: result.replyContext.sender_username ?? null,
+          body: result.replyContext.body ?? null,
+          htmlBody: result.replyContext.html_body ?? null,
+          timestamp: result.replyContext.timestamp ?? null,
+          createdAt: result.replyContext.created_at,
+        });
+      }
+
+      const insertPreview = db.prepare(
+        `insert or replace into link_previews (
+          id, event_id, context, url, title, description, site_name,
+          source_kind, preview_index, fetched_at, fetch_status, error, created_at
+        ) values (
+          @id, @eventId, @context, @url, @title, @description, @siteName,
+          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error, @createdAt
+        )`,
+      );
+      for (const lp of result.linkPreviews) {
+        insertPreview.run({
+          id: lp.id,
+          eventId: lp.event_id,
+          context: lp.context,
+          url: lp.url,
+          title: lp.title ?? null,
+          description: lp.description ?? null,
+          siteName: lp.site_name ?? null,
+          sourceKind: lp.source_kind ?? null,
+          previewIndex: lp.preview_index,
+          fetchedAt: lp.fetched_at ?? null,
+          fetchStatus: lp.fetch_status,
+          error: lp.error ?? null,
+          createdAt: lp.created_at,
+        });
+      }
+
+      const insertAsset = db.prepare(
+        `insert or replace into media_assets (
+          id, event_id, role, source_index, link_preview_id, local_path,
+          mime_type, media_type, size_bytes, width, height, duration_seconds,
+          original_filename, detected_content, detected_metadata_json,
+          caption, caption_model, caption_status, download_status,
+          download_error, created_at
+        ) values (
+          @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
+          @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
+          @originalFilename, @detectedContent, @detectedMetadataJson,
+          @caption, @captionModel, @captionStatus, @downloadStatus,
+          @downloadError, @createdAt
+        )`,
+      );
+      for (const ma of result.mediaAssets) {
+        insertAsset.run({
+          id: ma.id,
+          eventId: ma.event_id,
+          role: ma.role,
+          sourceIndex: ma.source_index ?? null,
+          linkPreviewId: ma.link_preview_id ?? null,
+          localPath: ma.local_path ?? null,
+          mimeType: ma.mime_type ?? null,
+          mediaType: ma.media_type,
+          sizeBytes: ma.size_bytes ?? null,
+          width: ma.width ?? null,
+          height: ma.height ?? null,
+          durationSeconds: ma.duration_seconds ?? null,
+          originalFilename: ma.original_filename ?? null,
+          detectedContent: ma.detected_content ?? null,
+          detectedMetadataJson: ma.detected_metadata_json ?? null,
+          caption: ma.caption ?? null,
+          captionModel: ma.caption_model ?? null,
+          captionStatus: ma.caption_status,
+          downloadStatus: ma.download_status,
+          downloadError: ma.download_error ?? null,
+          createdAt: ma.created_at,
+        });
+      }
+
+      db.prepare(
+        `update timeline_events set enrichment_status = 'complete', updated_at = ? where id = ?`,
+      ).run(Date.now(), eventId);
+    });
+  }
+
+  getEnrichmentData(eventIds: string[]): {
+    replyContexts: Map<string, ReplyContextRow>;
+    linkPreviews: Map<string, LinkPreviewRow[]>;
+    mediaAssets: Map<string, MediaAssetRow[]>;
+  } {
+    if (eventIds.length === 0) {
+      return { replyContexts: new Map(), linkPreviews: new Map(), mediaAssets: new Map() };
+    }
+    return this.read((db) => {
+      const placeholders = eventIds.map(() => "?").join(", ");
+
+      const replyContexts = new Map<string, ReplyContextRow>();
+      const rcRows = db.prepare(
+        `select * from reply_contexts where event_id in (${placeholders})`,
+      ).all(...eventIds) as ReplyContextRow[];
+      for (const row of rcRows) replyContexts.set(row.event_id, row);
+
+      const linkPreviews = new Map<string, LinkPreviewRow[]>();
+      const lpRows = db.prepare(
+        `select * from link_previews where event_id in (${placeholders})
+         order by event_id, context, preview_index`,
+      ).all(...eventIds) as LinkPreviewRow[];
+      for (const row of lpRows) {
+        const list = linkPreviews.get(row.event_id) ?? [];
+        list.push(row);
+        linkPreviews.set(row.event_id, list);
+      }
+
+      const mediaAssets = new Map<string, MediaAssetRow[]>();
+      const maRows = db.prepare(
+        `select * from media_assets where event_id in (${placeholders})
+         order by event_id, role, source_index`,
+      ).all(...eventIds) as MediaAssetRow[];
+      for (const row of maRows) {
+        const list = mediaAssets.get(row.event_id) ?? [];
+        list.push(row);
+        mediaAssets.set(row.event_id, list);
+      }
+
+      return { replyContexts, linkPreviews, mediaAssets };
+    });
+  }
+
+  claimPendingCaptions(limit: number, captionAll: boolean): Promise<MediaAssetRow[]> {
+    return this.write((db) => {
+      const rows = db.prepare(
+        `select ma.* from media_assets ma
+         join timeline_events te on ma.event_id = te.id
+         where ma.caption_status = 'pending'
+           and ma.download_status = 'complete'
+           and ma.media_type = 'image'
+           and (te.trigger_group_id is not null or ? = 1)
+         order by
+           case when te.trigger_group_id is not null then 0 else 1 end,
+           te.timestamp desc
+         limit ?`,
+      ).all(captionAll ? 1 : 0, limit) as MediaAssetRow[];
+
+      if (rows.length === 0) return [];
+
+      const update = db.prepare(
+        `update media_assets set caption_status = 'processing'
+         where id = ? and caption_status = 'pending'`,
+      );
+      const claimed: MediaAssetRow[] = [];
+      for (const row of rows) {
+        const result = update.run(row.id);
+        if (result.changes > 0) claimed.push({ ...row, caption_status: "processing" });
+      }
+      return claimed;
+    });
+  }
+
+  updateCaptionResult(assetId: string, caption: string, model: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update media_assets
+         set caption = ?, caption_model = ?, caption_status = 'complete'
+         where id = ?`,
+      ).run(caption, model, assetId);
+    });
+  }
+
+  setCaptionStatus(assetId: string, status: string, error?: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update media_assets set caption_status = ?${error ? ", download_error = ?" : ""} where id = ?`,
+      ).run(...(error ? [status, error, assetId] : [status, assetId]));
+    });
+  }
+
+  resetStaleCaptions(): Promise<number> {
+    return this.write((db) => {
+      const result = db.prepare(
+        `update media_assets set caption_status = 'pending'
+         where caption_status = 'processing'`,
+      ).run();
+      return result.changes;
+    });
+  }
+
+  countPendingCaptions(eventIds: string[]): number {
+    if (eventIds.length === 0) return 0;
+    return this.read((db) => {
+      const placeholders = eventIds.map(() => "?").join(", ");
+      const row = db.prepare(
+        `select count(*) as remaining from media_assets
+         where event_id in (${placeholders})
+           and caption_status in ('pending', 'processing')
+           and media_type = 'image'`,
+      ).get(...eventIds) as { remaining: number };
+      return row.remaining;
+    });
+  }
+
+  getMediaAssetsForTriggerGroup(triggerEventId: string): MediaAssetRow[] {
+    return this.read((db) => {
+      return db.prepare(
+        `select ma.* from media_assets ma
+         where ma.event_id in (
+           select id from timeline_events where trigger_group_id = ?
+         )
+         and ma.media_type = 'image'
+         and ma.download_status = 'complete'
+         order by ma.event_id, ma.role, ma.source_index`,
+      ).all(triggerEventId) as MediaAssetRow[];
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -333,6 +768,8 @@ create table if not exists timeline_events (
   received_at integer not null,
   agent_session_id text,
   event_json text not null,
+  enrichment_status text not null default 'pending',
+  trigger_group_id text,
   created_at integer not null,
   updated_at integer not null
 );
@@ -343,6 +780,14 @@ create index if not exists idx_timeline_events_timeline_time
 create index if not exists idx_timeline_events_external
   on timeline_events(provider, external_id)
   where external_id is not null;
+
+create index if not exists idx_timeline_events_enrichment
+  on timeline_events(enrichment_status, timestamp desc)
+  where enrichment_status in ('pending', 'processing');
+
+create index if not exists idx_timeline_events_trigger_group
+  on timeline_events(trigger_group_id)
+  where trigger_group_id is not null;
 
 create table if not exists metadata (
   key text primary key,
@@ -357,4 +802,82 @@ create table if not exists timeline_compaction_state (
   state_json text not null,
   updated_at integer not null
 );
+
+create table if not exists reply_contexts (
+  event_id text primary key references timeline_events(id) on delete cascade,
+  reply_external_id text,
+  sender_id text,
+  sender_display_name text,
+  sender_username text,
+  body text,
+  html_body text,
+  timestamp integer,
+  created_at integer not null
+);
+
+create table if not exists link_previews (
+  id text primary key,
+  event_id text not null references timeline_events(id) on delete cascade,
+  context text not null,
+  url text not null,
+  title text,
+  description text,
+  site_name text,
+  source_kind text,
+  preview_index integer not null,
+  fetched_at integer,
+  fetch_status text not null,
+  error text,
+  created_at integer not null
+);
+
+create index if not exists idx_link_previews_event
+  on link_previews(event_id, context, preview_index);
+
+create table if not exists media_assets (
+  id text primary key,
+  event_id text not null references timeline_events(id) on delete cascade,
+  role text not null,
+  source_index integer,
+  link_preview_id text references link_previews(id) on delete cascade,
+  local_path text,
+  mime_type text,
+  media_type text not null,
+  size_bytes integer,
+  width integer,
+  height integer,
+  duration_seconds real,
+  original_filename text,
+  detected_content text,
+  detected_metadata_json text,
+  caption text,
+  caption_model text,
+  caption_status text not null default 'pending',
+  download_status text not null default 'pending',
+  download_error text,
+  created_at integer not null
+);
+
+create index if not exists idx_media_assets_event
+  on media_assets(event_id, role, source_index);
+
+create index if not exists idx_media_assets_preview
+  on media_assets(link_preview_id)
+  where link_preview_id is not null;
+
+create index if not exists idx_media_assets_caption_eligible
+  on media_assets(caption_status, download_status, media_type)
+  where caption_status in ('pending', 'processing');
 `;
+
+function runMigrations(db: Database.Database): void {
+  const columns = db.prepare("pragma table_info(timeline_events)").all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((c) => c.name));
+
+  if (!columnNames.has("enrichment_status")) {
+    db.exec(`alter table timeline_events add column enrichment_status text not null default 'skipped'`);
+  }
+  if (!columnNames.has("trigger_group_id")) {
+    db.exec(`alter table timeline_events add column trigger_group_id text`);
+  }
+}

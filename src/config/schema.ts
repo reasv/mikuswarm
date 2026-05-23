@@ -33,6 +33,30 @@ const MatrixAccountSchema = Type.Object({
   store_path: Type.String(),
 });
 
+const EnrichmentSchema = Type.Object({
+  worker_count: Type.Optional(Type.Number({ minimum: 1 })),
+  fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
+  fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  max_download_bytes: Type.Optional(Type.Number({ minimum: 0 })),
+  max_previews_per_message: Type.Optional(Type.Number({ minimum: 0 })),
+  max_retries: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
+const CaptioningSchema = Type.Object({
+  worker_count: Type.Optional(Type.Number({ minimum: 1 })),
+  inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
+  caption_all: Type.Optional(Type.Boolean()),
+  caption_model: Type.Optional(Type.String()),
+  trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  max_retries: Type.Optional(Type.Number({ minimum: 0 })),
+  image_resize: Type.Optional(Type.Object({
+    max_width: Type.Optional(Type.Number({ minimum: 1 })),
+    max_height: Type.Optional(Type.Number({ minimum: 1 })),
+    max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  })),
+});
+
 export const AppConfigSchema = Type.Object({
   app: Type.Object({
     name: Type.String(),
@@ -82,6 +106,8 @@ export const AppConfigSchema = Type.Object({
     trigger_hold_ms: Type.Number({ minimum: 0 }),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
   }),
+  enrichment: Type.Optional(EnrichmentSchema),
+  captioning: Type.Optional(CaptioningSchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

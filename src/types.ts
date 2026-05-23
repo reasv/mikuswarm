@@ -41,6 +41,7 @@ export interface ReplyContext {
   htmlBody?: string;
   timestamp?: number;
   attachments?: AttachmentMeta[];
+  linkPreviews?: LinkPreviewMeta[];
 }
 
 export interface LinkPreviewMeta {
@@ -48,6 +49,8 @@ export interface LinkPreviewMeta {
   title?: string;
   description?: string;
   imagePath?: string;
+  media?: AttachmentMeta[];
+  sourceKind?: string;
   fetchedAt?: number;
 }
 

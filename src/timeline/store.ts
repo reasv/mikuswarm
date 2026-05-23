@@ -9,18 +9,25 @@ export interface TimelineQuery {
   toTimestamp?: number;
 }
 
+export function needsEnrichment(event: CanonicalChatEvent): boolean {
+  if (event.attachments && event.attachments.length > 0) return true;
+  if (event.replyTo?.externalId) return true;
+  if (event.body.includes("http")) return true;
+  return false;
+}
+
 export class TimelineStore {
   constructor(private readonly storage: Storage) {}
 
-  append(event: CanonicalChatEvent): Promise<void> {
-    return this.storage.appendTimelineEvent(event);
+  append(event: CanonicalChatEvent, enrichmentStatus?: string): Promise<void> {
+    return this.storage.appendTimelineEvent(event, enrichmentStatus);
   }
 
   enrich(eventId: string, updater: (event: CanonicalChatEvent) => CanonicalChatEvent): Promise<CanonicalChatEvent> {
     return this.storage.updateTimelineEvent(eventId, updater);
   }
 
-  appendIfMissing(event: CanonicalChatEvent): Promise<{ event: CanonicalChatEvent; duplicate: boolean }> {
+  appendIfMissing(event: CanonicalChatEvent, enrichmentStatus?: string): Promise<{ event: CanonicalChatEvent; duplicate: boolean }> {
     return this.storage.readAndWrite((db) => {
       const existing = db
         .prepare(`select event_json from timeline_events where id = ?`)
@@ -33,13 +40,13 @@ export class TimelineStore {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          event_json, created_at, updated_at
+          event_json, enrichment_status, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @eventJson, @createdAt, @updatedAt
+          @eventJson, @enrichmentStatus, @createdAt, @updatedAt
         )`,
-      ).run(timelineEventParams(event, now));
+      ).run({ ...timelineEventParams(event, now), enrichmentStatus: enrichmentStatus ?? "pending" });
       return { event, duplicate: false };
     });
   }
@@ -53,13 +60,13 @@ export class TimelineStore {
           `insert into timeline_events (
             id, external_id, timeline_key, provider, role, sender_id,
             sender_display_name, body, timestamp, received_at, agent_session_id,
-            event_json, created_at, updated_at
+            event_json, enrichment_status, created_at, updated_at
           ) values (
             @id, @externalId, @timelineKey, @provider, @role, @senderId,
             @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-            @eventJson, @createdAt, @updatedAt
+            @eventJson, @enrichmentStatus, @createdAt, @updatedAt
           )`,
-        ).run(timelineEventParams(event, now));
+        ).run({ ...timelineEventParams(event, now), enrichmentStatus: "skipped" });
         return "appended";
       }
 
@@ -143,6 +150,10 @@ export class TimelineStore {
 
   saveCompactionState(state: TimelineCompactionState): Promise<void> {
     return this.storage.saveTimelineCompactionState(state);
+  }
+
+  setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
+    return this.storage.setTriggerGroup(triggerEventId, eventIds);
   }
 }
 

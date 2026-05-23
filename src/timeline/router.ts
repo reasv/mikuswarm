@@ -10,8 +10,8 @@ export interface RoutedTimelineEvent {
 export class TimelineRouter {
   constructor(private readonly store: TimelineStore) {}
 
-  async route(inbound: InboundChatEvent): Promise<RoutedTimelineEvent> {
-    const routed = await this.store.appendIfMissing(inbound.event);
+  async route(inbound: InboundChatEvent, enrichmentStatus?: string): Promise<RoutedTimelineEvent> {
+    const routed = await this.store.appendIfMissing(inbound.event, enrichmentStatus);
     if (!routed.duplicate) {
       return { timelineKey: inbound.timelineKey, inbound, duplicate: false };
     }
