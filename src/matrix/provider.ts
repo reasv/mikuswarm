@@ -160,7 +160,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
 
     return {
       async downloadMedia(params) {
-        const result = client.downloadMedia(params);
+        const result = await client.downloadMedia(params);
         return {
           data: Buffer.from(result.dataBase64, "base64"),
           contentType: result.contentType,
@@ -169,15 +169,13 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
         };
       },
       async messageSummary(params) {
-        const result = client.messageSummary(params);
-        return result;
+        return await client.messageSummary(params);
       },
       async resolveLinkPreviews(params) {
-        const result = client.resolveLinkPreviews(params);
-        return result;
+        return await client.resolveLinkPreviews(params);
       },
       async memberInfo(params) {
-        const result = client.memberInfo(params);
+        const result = await client.memberInfo(params);
         return { displayName: result.displayName };
       },
     };

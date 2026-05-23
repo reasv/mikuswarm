@@ -9,21 +9,21 @@ export declare class MatrixCoreClient {
   resolveTarget(requestJson: string): string;
   joinRoom(requestJson: string): string;
   readMessages(requestJson: string): string;
-  messageSummary(requestJson: string): string;
+  messageSummary(requestJson: string): Promise<string>;
   editMessage(requestJson: string): string;
   deleteMessage(requestJson: string): string;
   pinMessage(requestJson: string): string;
   unpinMessage(requestJson: string): string;
   listPins(requestJson: string): string;
-  memberInfo(requestJson: string): string;
+  memberInfo(requestJson: string): Promise<string>;
   channelInfo(requestJson: string): string;
   uploadMedia(requestJson: string): string;
-  downloadMedia(requestJson: string): string;
+  downloadMedia(requestJson: string): Promise<string>;
   reactMessage(requestJson: string): string;
   listReactions(requestJson: string): string;
   recordCustomEmojiUsage(requestJson: string): void;
   listKnownShortcodes(requestJson: string): string;
-  resolveLinkPreviews(requestJson: string): string;
+  resolveLinkPreviews(requestJson: string): Promise<string>;
   setTyping(requestJson: string): void;
 }
 

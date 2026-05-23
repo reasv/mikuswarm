@@ -34,20 +34,20 @@ use crate::{
     api::{
         MatrixAuthConfig, MatrixChannelInfo, MatrixChannelInfoRequest, MatrixClientConfig,
         MatrixCustomEmojiUsageRequest, MatrixDeleteMessageRequest, MatrixDeleteMessageResult,
-        MatrixDiagnostics, MatrixDownloadMediaRequest, MatrixDownloadMediaResult,
+        MatrixDiagnostics, MatrixDownloadMediaResult,
         MatrixEditMessageRequest, MatrixEditMessageResult, MatrixJoinRequest, MatrixJoinResult,
-        MatrixKeyBackupState, MatrixLinkPreviewResult, MatrixListEmojiRequest,
+        MatrixKeyBackupState, MatrixListEmojiRequest,
         MatrixListPinsRequest, MatrixListReactionsRequest, MatrixMemberInfo,
-        MatrixMemberInfoRequest, MatrixMessageSummary, MatrixMessageSummaryRequest,
+        MatrixMessageSummary,
         MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult, MatrixReactRequest,
         MatrixReactResult, MatrixReactionSummary, MatrixReadMessagesRequest,
-        MatrixReadMessagesResult, MatrixResolveLinkPreviewsRequest, MatrixResolveTargetRequest,
+        MatrixReadMessagesResult, MatrixResolveTargetRequest,
         MatrixResolveTargetResult, MatrixSendRequest, MatrixSendResult, MatrixSyncState,
         MatrixTypingRequest, MatrixUploadMediaRequest, MatrixUploadMediaResult,
         MatrixVerificationState, NativeLifecycleStage, StoredSession,
     },
     auth::session,
-    crypto, emoji, events, media, previews, reactions, state, sync, MatrixError, MatrixResult,
+    crypto, emoji, events, media, reactions, state, sync, MatrixError, MatrixResult,
 };
 
 struct SharedState {
@@ -490,33 +490,6 @@ impl MatrixCoreService {
         self.runtime.block_on(list_pins_internal(&client, &request))
     }
 
-    pub fn member_info(&self, request: MatrixMemberInfoRequest) -> MatrixResult<MatrixMemberInfo> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime.block_on(member_info_internal(
-            &client,
-            &request.room_id,
-            &request.user_id,
-        ))
-    }
-
-    pub fn message_summary(
-        &self,
-        request: MatrixMessageSummaryRequest,
-    ) -> MatrixResult<Option<MatrixMessageSummary>> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime.block_on(message_summary_internal(
-            &client,
-            &request.room_id,
-            &request.event_id,
-        ))
-    }
-
     pub fn channel_info(
         &self,
         request: MatrixChannelInfoRequest,
@@ -549,21 +522,6 @@ impl MatrixCoreService {
             filename: request.filename,
             content_type: request.content_type,
         })
-    }
-
-    pub fn download_media(
-        &self,
-        request: MatrixDownloadMediaRequest,
-    ) -> MatrixResult<MatrixDownloadMediaResult> {
-        if !self.running {
-            return Err(MatrixError::State("client is not running".to_string()));
-        }
-        let client = self.client()?;
-        self.runtime.block_on(download_media_internal(
-            &client,
-            &request.room_id,
-            &request.event_id,
-        ))
     }
 
     pub fn react_message(
@@ -623,26 +581,6 @@ impl MatrixCoreService {
         emoji::list_shortcodes(config, &request)
     }
 
-    pub fn resolve_link_previews(
-        &self,
-        request: MatrixResolveLinkPreviewsRequest,
-    ) -> MatrixResult<MatrixLinkPreviewResult> {
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?;
-        let access_token = self
-            .client()?
-            .session_tokens()
-            .map(|tokens| tokens.access_token)
-            .ok_or_else(|| MatrixError::State("matrix session is unavailable".to_string()))?;
-        self.runtime.block_on(previews::resolve_link_previews(
-            config,
-            &access_token,
-            &request,
-        ))
-    }
-
     pub fn set_typing(&mut self, request: MatrixTypingRequest) -> MatrixResult<()> {
         if !self.running {
             return Err(MatrixError::State("client is not running".to_string()));
@@ -662,13 +600,33 @@ impl MatrixCoreService {
         });
     }
 
-    fn client(&self) -> MatrixResult<Client> {
+    pub(crate) fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub(crate) fn client(&self) -> MatrixResult<Client> {
         self.client_slot
             .lock()
             .expect("matrix client slot mutex poisoned")
             .as_ref()
             .cloned()
             .ok_or_else(|| MatrixError::State("client is not initialized".to_string()))
+    }
+
+    pub(crate) fn link_preview_context(
+        &self,
+    ) -> MatrixResult<(MatrixClientConfig, String)> {
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| MatrixError::State("client config is unavailable".to_string()))?
+            .clone();
+        let access_token = self
+            .client()?
+            .session_tokens()
+            .map(|tokens| tokens.access_token)
+            .ok_or_else(|| MatrixError::State("matrix session is unavailable".to_string()))?;
+        Ok((config, access_token))
     }
 }
 
@@ -1171,7 +1129,7 @@ async fn list_pins_internal(
     })
 }
 
-async fn member_info_internal(
+pub(crate) async fn member_info_internal(
     client: &Client,
     room_id: &str,
     user_id: &str,
@@ -1226,7 +1184,7 @@ async fn channel_info_internal(client: &Client, room_id: &str) -> MatrixResult<M
     })
 }
 
-async fn message_summary_internal(
+pub(crate) async fn message_summary_internal(
     client: &Client,
     room_id: &str,
     event_id: &str,
@@ -1254,7 +1212,7 @@ async fn message_summary_internal(
     Ok(summary)
 }
 
-async fn download_media_internal(
+pub(crate) async fn download_media_internal(
     client: &Client,
     room_id: &str,
     event_id: &str,

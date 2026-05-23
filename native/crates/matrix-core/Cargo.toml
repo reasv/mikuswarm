@@ -13,7 +13,7 @@ chrono = { version = "0.4.41", features = ["clock", "serde"] }
 emojis = "0.8.0"
 matrix-sdk = { version = "0.16.0", default-features = false, features = ["bundled-sqlite", "e2e-encryption", "sqlite", "rustls-tls"] }
 mime = "0.3.17"
-napi = { version = "2.16.17", default-features = false, features = ["napi8"] }
+napi = { version = "2.16.17", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "2.16.13"
 regex = "1.11.1"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
