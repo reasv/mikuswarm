@@ -109,7 +109,7 @@ Stores the resolved snapshot of the message being replied to. One per event (at 
 
 ```sql
 CREATE TABLE IF NOT EXISTS reply_contexts (
-  event_id TEXT PRIMARY KEY,
+  event_id TEXT PRIMARY KEY REFERENCES timeline_events(id) ON DELETE CASCADE,
   reply_external_id TEXT,
   sender_id TEXT,
   sender_display_name TEXT,
@@ -128,7 +128,7 @@ Tracks every downloaded media file: message attachments, reply attachments, link
 ```sql
 CREATE TABLE IF NOT EXISTS media_assets (
   id TEXT PRIMARY KEY,
-  event_id TEXT NOT NULL,
+  event_id TEXT NOT NULL REFERENCES timeline_events(id) ON DELETE CASCADE,
   role TEXT NOT NULL,
   -- 'attachment'           direct attachment on this message
   -- 'reply_attachment'     attachment on the replied-to message
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
   -- 'reply_linked_media'   same, from the replied-to message body
   source_index INTEGER,
   -- Ordering within this role for this event (attachment 0, 1, ...; preview_media 0, 1, ...)
-  link_preview_id TEXT,
+  link_preview_id TEXT REFERENCES link_previews(id) ON DELETE CASCADE,
   -- FK to link_previews.id. Set for preview_media / reply_preview_media roles.
   -- NULL for attachments and linked_media.
   local_path TEXT,
@@ -194,7 +194,7 @@ Stores fetched link preview metadata. The link preview's media (OG images, tweet
 ```sql
 CREATE TABLE IF NOT EXISTS link_previews (
   id TEXT PRIMARY KEY,
-  event_id TEXT NOT NULL,
+  event_id TEXT NOT NULL REFERENCES timeline_events(id) ON DELETE CASCADE,
   context TEXT NOT NULL,
   -- 'message' = link in the message body
   -- 'reply'   = link in the replied-to message body
@@ -442,13 +442,23 @@ interface EnrichmentWorkerPoolOptions {
 class EnrichmentWorkerPool {
   private running = false;
   private activeWorkers = new Set<Promise<void>>();
+  private failureCounts = new Map<string, number>();
+  // In-memory map of eventId → number of failed attempts this session.
+  // When a worker fails (crashes or throws), the count is incremented.
+  // Once it reaches config.max_retries, the event is marked 'failed' permanently.
+  // This map is not persisted — on restart, counts reset and stale 'processing'
+  // items get one fresh round of retries.
 
   start(): void;
   // Begins the polling loop. At each tick:
   // 1. Query DB for events with enrichment_status='pending', ordered by timestamp DESC, limit = workerCount
   // 2. Claim each by setting status='processing' (compare-and-swap in a transaction)
   // 3. Spawn an EnrichmentWorker for each claimed event
-  // 4. When a worker completes, check for more work
+  // 4. When a worker fails:
+  //    a. Increment failureCounts for that eventId
+  //    b. If count >= config.max_retries: set enrichment_status='failed', record error
+  //    c. Otherwise: set enrichment_status='pending' (will be retried on next poll)
+  // 5. When a worker completes, check for more work
   // Poll interval: 100ms when there was work, 1000ms when idle.
 
   stop(): Promise<void>;
@@ -665,13 +675,20 @@ interface CaptionWorkerPoolOptions {
 class CaptionWorkerPool {
   private running = false;
   private activeWorkers = new Set<Promise<void>>();
+  private failureCounts = new Map<string, number>();
+  // In-memory map of assetId → number of failed attempts this session.
+  // Same semantics as EnrichmentWorkerPool.failureCounts.
 
   start(): void;
   // Begins the polling loop. At each tick:
   // 1. Query DB for eligible uncaptioned media assets (see SQL below)
   // 2. Claim each by setting caption_status='processing' (compare-and-swap)
   // 3. Spawn a CaptionWorker for each claimed asset
-  // 4. When a worker completes, check for more work
+  // 4. When a worker fails:
+  //    a. Increment failureCounts for that assetId
+  //    b. If count >= config.max_retries: set caption_status='failed', record error
+  //    c. Otherwise: set caption_status='pending' (will be retried on next poll)
+  // 5. When a worker completes, check for more work
   // Poll interval: 500ms when there was work, 2000ms when idle.
   // (Caption work is less latency-sensitive than enrichment.)
 
@@ -763,7 +780,7 @@ class CaptionWorker {
 }
 ```
 
-On error, the asset's `caption_status` is set to `'failed'` with the error recorded. The asset is not retried automatically — failed captions are treated as absent during context build.
+On error, the worker pool increments the in-memory failure count for that asset. If the count is below `max_retries`, `caption_status` is set back to `'pending'` for retry. If the count reaches `max_retries`, `caption_status` is set to `'failed'` with the error recorded. Failed captions are treated as absent during context build.
 
 #### ConcurrencyLimitedInferenceClient (`src/captioning/inference-client.ts`)
 
@@ -817,17 +834,22 @@ The enrichment worker writes all results in a single DB transaction:
 ```typescript
 async persistResults(eventId: string, result: EnrichmentResult): Promise<void> {
   await this.storage.readAndWrite((db) => {
+    // Insertion order matters for FK constraints:
+    // reply_contexts and link_previews reference timeline_events (already exists).
+    // media_assets references both timeline_events and link_previews,
+    // so link_previews must be inserted before media_assets.
+
     // 1. Insert reply_context (if any)
     if (result.replyContext) {
       db.prepare(`INSERT INTO reply_contexts (...) VALUES (...)`).run({ ... });
     }
 
-    // 2. Insert all link_previews
+    // 2. Insert all link_previews (before media_assets, which may reference them)
     for (const preview of result.linkPreviews) {
       db.prepare(`INSERT INTO link_previews (...) VALUES (...)`).run({ ... });
     }
 
-    // 3. Insert all media_assets
+    // 3. Insert all media_assets (after link_previews due to FK on link_preview_id)
     for (const asset of result.mediaAssets) {
       db.prepare(`INSERT INTO media_assets (...) VALUES (...)`).run({ ... });
     }
@@ -839,7 +861,7 @@ async persistResults(eventId: string, result: EnrichmentResult): Promise<void> {
 }
 ```
 
-If the transaction fails, the status remains `'processing'`. On restart, it gets reset to `'pending'` and retried.
+If the transaction fails, the worker pool increments the in-memory failure count for that event. If the count is below `max_retries`, the status is set back to `'pending'` for retry. If the count reaches `max_retries`, the status is set to `'failed'` permanently. On restart, any stale `'processing'` statuses are reset to `'pending'` and failure counts start fresh.
 
 ### 7. Trigger Path Changes (`src/app.ts`)
 
@@ -1111,6 +1133,10 @@ const EnrichmentSchema = Type.Object({
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })), // default: 30_000
   max_download_bytes: Type.Optional(Type.Number({ minimum: 0 })),   // default: 50_000_000 (50MB)
   max_previews_per_message: Type.Optional(Type.Number({ minimum: 0 })), // default: 3
+  max_retries: Type.Optional(Type.Number({ minimum: 0 })),          // default: 3
+  // Maximum number of times a failed enrichment job is retried within a single
+  // app session. Tracked in-memory; restarting the app resets counts.
+  // Once exceeded, the event is marked enrichment_status='failed' permanently.
 });
 
 const CaptioningSchema = Type.Object({
@@ -1121,6 +1147,10 @@ const CaptioningSchema = Type.Object({
   // When true: caption all eligible image media, regardless of trigger group membership.
   caption_model: Type.Optional(Type.String()),                      // model key from models config
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })), // default: 45_000
+  max_retries: Type.Optional(Type.Number({ minimum: 0 })),          // default: 2
+  // Maximum number of times a failed caption job is retried within a single
+  // app session. Lower default than enrichment since caption failures are
+  // typically deterministic (bad image, model error) rather than transient.
   image_resize: Type.Optional(Type.Object({
     // Settings for resizing images for inference (captioning).
     // Stored files are ALWAYS the original, unmodified. Resizing is ephemeral.
