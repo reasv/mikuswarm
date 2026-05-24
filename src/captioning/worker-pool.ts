@@ -1,25 +1,19 @@
 import type { Storage } from "../storage/index.js";
 import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
+import type { MediaModality } from "./describe.js";
 import { CaptionWorker } from "./worker.js";
 
 export interface CaptionConfig {
   worker_count?: number;
-  inference_concurrency?: number;
   caption_all?: boolean;
   caption_assistant_messages?: boolean;
-  caption_model?: string;
   trigger_wait_timeout_ms?: number;
   max_retries?: number;
-  image_resize?: {
-    max_width?: number;
-    max_height?: number;
-    max_bytes?: number;
-  };
 }
 
 export interface CaptionWorkerPoolOptions {
   storage: Storage;
-  inferenceClient: ConcurrencyLimitedInferenceClient;
+  clients: Map<MediaModality, ConcurrencyLimitedInferenceClient>;
   workspaceRoot: string;
   config: CaptionConfig;
   onComplete?: (eventId: string) => void;
@@ -99,7 +93,7 @@ export class CaptionWorkerPool {
 
     const worker = new CaptionWorker({
       storage: this.options.storage,
-      inferenceClient: this.options.inferenceClient,
+      clients: this.options.clients,
       workspaceRoot: this.options.workspaceRoot,
     });
 

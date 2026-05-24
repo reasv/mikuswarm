@@ -646,7 +646,7 @@ export class Storage {
          join timeline_events te on ma.event_id = te.id
          where ma.caption_status = 'pending'
            and ma.download_status = 'complete'
-           and ma.media_type = 'image'
+           and ma.media_type in ('image', 'video', 'audio')
            and (te.trigger_group_id is not null or ? = 1 or (te.role = 'assistant' and ? = 1))
          order by
            case when te.trigger_group_id is not null then 0 else 1 end,
@@ -709,7 +709,7 @@ export class Storage {
           `select count(*) as remaining from media_assets
            where event_id in (${placeholders})
              and caption_status in ('pending', 'processing')
-             and media_type = 'image'`,
+             and media_type in ('image', 'video', 'audio')`,
         ).get(...batch) as { remaining: number };
         total += row.remaining;
       }
@@ -724,7 +724,7 @@ export class Storage {
          where ma.event_id in (
            select id from timeline_events where trigger_group_id = ?
          )
-         and ma.media_type = 'image'
+         and ma.media_type in ('image', 'video', 'audio')
          and ma.download_status = 'complete'
          order by ma.event_id, ma.role, ma.source_index`,
       ).all(triggerEventId) as MediaAssetRow[];

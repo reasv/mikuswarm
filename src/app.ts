@@ -16,7 +16,7 @@ import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import {
   createDanbooruTool,
   createDelegateToSessionTool,
-  createImageTool,
+  createMediaTool,
   createSearchMemoryTool,
   createSearchFilesTool,
   createSendMessageTool,
@@ -27,7 +27,7 @@ import {
 } from "./tools/index.js";
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
-import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient } from "./captioning/index.js";
+import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -53,25 +53,62 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
 
   const captioningConfig = config.captioning ?? {};
-  const captionModelConfig = {
-    id: captioningConfig.model?.id ?? "google/gemini-2.5-flash-preview",
+  const sharedModel = {
+    id: captioningConfig.model?.id ?? "google/gemini-3.5-flash",
     endpoint: captioningConfig.model?.endpoint ?? config.models.default.endpoint,
     api_key: captioningConfig.model?.api_key ?? config.models.default.api_key,
-    max_chars: captioningConfig.model?.max_chars ?? 500,
-  };
-  const captionPrompt = captioningConfig.prompt ?? "Describe the image.";
-  const captionResize = {
-    maxWidth: captioningConfig.image_resize?.max_width ?? 1280,
-    maxHeight: captioningConfig.image_resize?.max_height ?? 720,
-    maxBytes: captioningConfig.image_resize?.max_bytes ?? 1_048_576,
   };
 
-  const inferenceClient = new ConcurrencyLimitedInferenceClient({
-    maxConcurrency: captioningConfig.inference_concurrency ?? 2,
-    model: captionModelConfig,
-    prompt: captionPrompt,
-    resize: captionResize,
-  });
+  function resolveModalityModel(modalityConfig?: { model?: { id?: string; endpoint?: string; api_key?: string } }) {
+    return {
+      id: modalityConfig?.model?.id ?? sharedModel.id,
+      endpoint: modalityConfig?.model?.endpoint ?? sharedModel.endpoint,
+      api_key: modalityConfig?.model?.api_key ?? sharedModel.api_key,
+    };
+  }
+
+  const imageConfig = captioningConfig.image ?? {};
+  const videoConfig = captioningConfig.video ?? {};
+  const audioConfig = captioningConfig.audio ?? {};
+
+  const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
+    ["image", new ConcurrencyLimitedInferenceClient({
+      modality: "image",
+      model: resolveModalityModel(imageConfig),
+      prompt: imageConfig.prompt ?? "Describe the image.",
+      maxChars: imageConfig.max_chars ?? 500,
+      maxConcurrency: imageConfig.concurrency,
+      resize: {
+        maxWidth: imageConfig.resize?.max_width ?? 1280,
+        maxHeight: imageConfig.resize?.max_height ?? 720,
+        maxBytes: imageConfig.resize?.max_bytes ?? 1_048_576,
+      },
+    })],
+    ["video", new ConcurrencyLimitedInferenceClient({
+      modality: "video",
+      model: resolveModalityModel(videoConfig),
+      prompt: videoConfig.prompt ?? "Describe the video.",
+      maxChars: videoConfig.max_chars ?? 500,
+      maxConcurrency: videoConfig.concurrency,
+      maxBytes: videoConfig.max_bytes,
+      timeoutMs: videoConfig.timeout_ms,
+    })],
+    ["audio", new ConcurrencyLimitedInferenceClient({
+      modality: "audio",
+      model: resolveModalityModel(audioConfig),
+      prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
+      maxChars: audioConfig.max_chars ?? 2000,
+      maxConcurrency: audioConfig.concurrency,
+      maxBytes: audioConfig.max_bytes,
+      timeoutMs: audioConfig.timeout_ms,
+    })],
+  ]);
+
+  const defaultPrompts = new Map<MediaModality, string>([
+    ["image", imageConfig.prompt ?? "Describe the image."],
+    ["video", videoConfig.prompt ?? "Describe the video."],
+    ["audio", audioConfig.prompt ?? "Transcribe and describe the audio."],
+  ]);
 
   const enrichmentEmitter = new EventEmitter();
   const captionEmitter = new EventEmitter();
@@ -91,7 +128,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   const captionPool = new CaptionWorkerPool({
     storage,
-    inferenceClient,
+    clients: captionClients,
     workspaceRoot,
     config: config.captioning ?? {},
     onComplete: (eventId) => captionEmitter.emit(`complete:${eventId}`),
@@ -347,10 +384,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createWebSearchTool(),
       createTextEditorTool({ workspaceRoot }),
       createSearchFilesTool({ workspaceRoot }),
-      createImageTool({
+      createMediaTool({
         workspaceRoot,
-        inferenceClient,
-        defaultPrompt: captionPrompt,
+        clients: captionClients,
+        defaultPrompts,
         modelHasVision: config.models.default.multimodal,
       }),
       createSearchMemoryTool({ workspaceRoot }),
@@ -410,7 +447,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await captionPool.stop();
         await enrichmentPool.stop();
         fetchClient.stop();
-        inferenceClient.stop();
+        for (const client of captionClients.values()) client.stop();
         await waitForRuns(activeRuns);
         await storage.waitForIdle();
         storage.close();

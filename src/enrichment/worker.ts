@@ -62,8 +62,9 @@ export class EnrichmentWorker {
       }
     }
 
+    const captionableTypes = ["image", "video", "audio"];
     for (const asset of result.mediaAssets) {
-      if (asset.media_type === "image" && asset.download_status === "complete") {
+      if (captionableTypes.includes(asset.media_type) && asset.download_status === "complete") {
         asset.caption_status = "pending";
       } else {
         asset.caption_status = "skipped";

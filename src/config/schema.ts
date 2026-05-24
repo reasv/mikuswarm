@@ -47,23 +47,40 @@ const CaptioningModelSchema = Type.Object({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
-  max_chars: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
-const CaptioningSchema = Type.Object({
+const ImageResizeSchema = Type.Object({
+  max_width: Type.Optional(Type.Number({ minimum: 1 })),
+  max_height: Type.Optional(Type.Number({ minimum: 1 })),
+  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+});
+
+const ModalityConfigSchema = Type.Object({
   prompt: Type.Optional(Type.String()),
+  max_chars: Type.Optional(Type.Number({ minimum: 1 })),
+  concurrency: Type.Optional(Type.Number({ minimum: 1 })),
+  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  model: Type.Optional(CaptioningModelSchema),
+});
+
+const ImageModalitySchema = Type.Intersect([
+  ModalityConfigSchema,
+  Type.Object({
+    resize: Type.Optional(ImageResizeSchema),
+  }),
+]);
+
+const CaptioningSchema = Type.Object({
   model: Type.Optional(CaptioningModelSchema),
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
-  inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
   caption_assistant_messages: Type.Optional(Type.Boolean()),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
-  image_resize: Type.Optional(Type.Object({
-    max_width: Type.Optional(Type.Number({ minimum: 1 })),
-    max_height: Type.Optional(Type.Number({ minimum: 1 })),
-    max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
-  })),
+  image: Type.Optional(ImageModalitySchema),
+  video: Type.Optional(ModalityConfigSchema),
+  audio: Type.Optional(ModalityConfigSchema),
 });
 
 export const AppConfigSchema = Type.Object({
