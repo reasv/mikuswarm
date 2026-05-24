@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -110,71 +111,84 @@ async fn download_media_from_message(
     client: &matrix_sdk::Client,
     room_id: &str,
     event_id: &str,
+    output_path: &str,
     msgtype: &MessageType,
 ) -> MatrixResult<Option<MatrixDownloadMediaResult>> {
-    let result =
-        match msgtype {
-            MessageType::Audio(content) => {
-                client.media().get_file(content, true).await?.map(|data| {
-                    MatrixDownloadMediaResult {
-                        room_id: room_id.to_string(),
-                        event_id: event_id.to_string(),
-                        kind: MatrixMediaKind::Audio,
-                        body: content.caption().map(ToOwned::to_owned),
-                        filename: Some(content.filename().to_string()),
-                        content_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-                        data_base64: STANDARD.encode(data),
-                    }
-                })
-            }
-            MessageType::File(content) => {
-                client.media().get_file(content, true).await?.map(|data| {
-                    MatrixDownloadMediaResult {
-                        room_id: room_id.to_string(),
-                        event_id: event_id.to_string(),
-                        kind: MatrixMediaKind::File,
-                        body: content.caption().map(ToOwned::to_owned),
-                        filename: Some(content.filename().to_string()),
-                        content_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-                        data_base64: STANDARD.encode(data),
-                    }
-                })
-            }
-            MessageType::Image(content) => {
-                client.media().get_file(content, true).await?.map(|data| {
-                    MatrixDownloadMediaResult {
-                        room_id: room_id.to_string(),
-                        event_id: event_id.to_string(),
-                        kind: MatrixMediaKind::Image,
-                        body: content.caption().map(ToOwned::to_owned),
-                        filename: Some(content.filename().to_string()),
-                        content_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-                        data_base64: STANDARD.encode(data),
-                    }
-                })
-            }
-            MessageType::Video(content) => {
-                client.media().get_file(content, true).await?.map(|data| {
-                    MatrixDownloadMediaResult {
-                        room_id: room_id.to_string(),
-                        event_id: event_id.to_string(),
-                        kind: MatrixMediaKind::Video,
-                        body: content.caption().map(ToOwned::to_owned),
-                        filename: Some(content.filename().to_string()),
-                        content_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-                        data_base64: STANDARD.encode(data),
-                    }
-                })
-            }
-            _ => None,
-        };
-    Ok(result)
+    let (kind, body, filename, content_type, data) = match msgtype {
+        MessageType::Audio(content) => {
+            let Some(data) = client.media().get_file(content, true).await? else {
+                return Ok(None);
+            };
+            (
+                MatrixMediaKind::Audio,
+                content.caption().map(ToOwned::to_owned),
+                Some(content.filename().to_string()),
+                content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                data,
+            )
+        }
+        MessageType::File(content) => {
+            let Some(data) = client.media().get_file(content, true).await? else {
+                return Ok(None);
+            };
+            (
+                MatrixMediaKind::File,
+                content.caption().map(ToOwned::to_owned),
+                Some(content.filename().to_string()),
+                content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                data,
+            )
+        }
+        MessageType::Image(content) => {
+            let Some(data) = client.media().get_file(content, true).await? else {
+                return Ok(None);
+            };
+            (
+                MatrixMediaKind::Image,
+                content.caption().map(ToOwned::to_owned),
+                Some(content.filename().to_string()),
+                content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                data,
+            )
+        }
+        MessageType::Video(content) => {
+            let Some(data) = client.media().get_file(content, true).await? else {
+                return Ok(None);
+            };
+            (
+                MatrixMediaKind::Video,
+                content.caption().map(ToOwned::to_owned),
+                Some(content.filename().to_string()),
+                content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                data,
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    let resolved = PathBuf::from(output_path);
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let size_bytes = data.len() as u64;
+    std::fs::write(&resolved, &data)?;
+
+    Ok(Some(MatrixDownloadMediaResult {
+        room_id: room_id.to_string(),
+        event_id: event_id.to_string(),
+        kind,
+        body,
+        filename,
+        content_type,
+        size_bytes,
+    }))
 }
 
 pub async fn download_media(
     client: &matrix_sdk::Client,
     room: &Room,
     event_id: &EventId,
+    output_path: &str,
 ) -> MatrixResult<MatrixDownloadMediaResult> {
     let event = room.load_or_fetch_event(event_id, None).await?;
     let raw = event.into_raw();
@@ -204,6 +218,7 @@ pub async fn download_media(
         client,
         room.room_id().as_str(),
         event_id.as_str(),
+        output_path,
         &message_event.content.msgtype,
     )
     .await?

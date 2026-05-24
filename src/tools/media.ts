@@ -1,5 +1,5 @@
-import { readFile, unlink } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -32,9 +32,10 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
       prompt: Type.Optional(Type.String({ description: "Custom prompt describing what to analyze." })),
       media: Type.Optional(Type.String({ description: "Single media path or URL." })),
       media_items: Type.Optional(Type.Array(Type.String(), { description: "Multiple media paths or URLs (up to 20)." })),
+      start_time: Type.Optional(Type.Number({ description: "Start time in seconds for video/audio analysis. Defaults to 0.", minimum: 0 })),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as { prompt?: string; media?: string; media_items?: string[] };
+      const args = params as { prompt?: string; media?: string; media_items?: string[]; start_time?: number };
 
       const candidates: string[] = [];
       if (args.media) candidates.push(args.media);
@@ -60,13 +61,16 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
           }
           const prompt = args.prompt ?? context.defaultPrompts.get(modality) ?? "Describe this media.";
           const result = await client.caption({
-            data: loaded.data,
+            filePath: loaded.path,
             mimeType: loaded.mimeType,
             filename: source,
             prompt,
+            startTime: args.start_time,
+            context: "tool",
           });
           const label = unique.length > 1 ? `[${source}]\n` : "";
           results.push(`${label}${result.caption}`);
+          if (loaded.cleanup) await loaded.cleanup();
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
           results.push(`[${source}]\nError: ${msg}`);
@@ -82,8 +86,9 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
 }
 
 interface LoadedMedia {
-  data: Buffer;
+  path: string;
   mimeType: string;
+  cleanup?: () => Promise<void>;
 }
 
 const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
@@ -103,35 +108,38 @@ async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: n
       throw new Error(`Media too large: Content-Length ${contentLength} exceeds ${maxFetchBytes} byte limit`);
     }
 
-    // Stream to a temp file — enforce size limit during streaming to protect both memory and disk
     const tmpPath = join(tmpdir(), `miku-media-fetch-${randomBytes(8).toString("hex")}`);
-    try {
-      if (!response.body) throw new Error("Failed to read response body");
-      const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
-      let totalBytes = 0;
-      const sizeGuard = new Transform({
-        transform(chunk: Buffer, _encoding, callback) {
-          totalBytes += chunk.byteLength;
-          if (totalBytes > maxFetchBytes) {
-            callback(new Error(`Media too large: exceeded ${maxFetchBytes} byte limit during download`));
-          } else {
-            callback(null, chunk);
-          }
-        },
-      });
-      await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
+    if (!response.body) throw new Error("Failed to read response body");
+    const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+    let totalBytes = 0;
+    const sizeGuard = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        totalBytes += chunk.byteLength;
+        if (totalBytes > maxFetchBytes) {
+          callback(new Error(`Media too large: exceeded ${maxFetchBytes} byte limit during download`));
+        } else {
+          callback(null, chunk);
+        }
+      },
+    });
 
-      const data = await readFile(tmpPath);
-      return { data, mimeType };
-    } finally {
+    try {
+      await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
+    } catch (error) {
       await unlink(tmpPath).catch(() => {});
+      throw error;
     }
+
+    return {
+      path: tmpPath,
+      mimeType,
+      cleanup: async () => { await unlink(tmpPath).catch(() => {}); },
+    };
   }
 
   const absolute = resolveWorkspacePath(workspaceRoot, source);
-  const data = await readFile(absolute);
   const mimeType = mimeFromExtension(source);
-  return { data, mimeType };
+  return { path: absolute, mimeType };
 }
 
 function inferModality(mimeType: string, source: string): MediaModality {

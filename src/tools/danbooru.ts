@@ -1,10 +1,13 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { readFile, rename, mkdir } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Readable, Transform } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
-
-const MAX_DANBOORU_ASSET_BYTES = 256 * 1024 * 1024;
 
 type DanbooruPost = {
   id: number;
@@ -21,6 +24,7 @@ type DanbooruPost = {
 
 export interface DanbooruToolContext {
   workspaceRoot: string;
+  downloadSizeLimit: number;
 }
 
 export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
@@ -52,51 +56,61 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const assetUrl = selectAssetUrl(post, args.variant ?? (action === "preview" ? "preview" : "original"));
       if (!assetUrl) throw new Error(`Post ${post.id} has no usable asset URL.`);
       if (action === "preview") {
-        const { response, buffer } = await fetchDanbooruAsset(assetUrl, "Preview");
+        const tmpPath = await streamDownload(assetUrl, context.downloadSizeLimit);
+        const buffer = await readFile(tmpPath);
+        const { unlink } = await import("node:fs/promises");
+        await unlink(tmpPath).catch(() => {});
         return {
           content: [
             { type: "text", text: summarizePost(post) },
-            { type: "image", data: buffer.toString("base64"), mimeType: response.headers.get("content-type") ?? "image/jpeg" },
+            { type: "image", data: buffer.toString("base64"), mimeType: "image/jpeg" },
           ],
           details: { post, assetUrl },
         };
       }
-      const { response, buffer } = await fetchDanbooruAsset(assetUrl, "Download");
+      const tmpPath = await streamDownload(assetUrl, context.downloadSizeLimit);
       const subdir = args.output_subdir ?? "downloads/danbooru";
       const outputDir = resolveWorkspacePath(context.workspaceRoot, subdir);
       await mkdir(outputDir, { recursive: true });
-      const filename = `danbooru-${post.id}.${post.file_ext ?? extensionFromContentType(response.headers.get("content-type"))}`;
+      const filename = `danbooru-${post.id}.${post.file_ext ?? "jpg"}`;
       const outputPath = path.join(outputDir, filename);
-      await writeFile(outputPath, buffer);
+      await rename(tmpPath, outputPath);
+      const { stat } = await import("node:fs/promises");
+      const fileStat = await stat(outputPath);
       return {
         content: [{ type: "text", text: `${summarizePost(post)}\nSaved: ${workspaceRelative(context.workspaceRoot, outputPath)}` }],
-        details: { post, assetUrl, path: workspaceRelative(context.workspaceRoot, outputPath), bytes: buffer.length },
+        details: { post, assetUrl, path: workspaceRelative(context.workspaceRoot, outputPath), bytes: fileStat.size },
       };
     },
   };
 }
 
-async function fetchDanbooruAsset(
-  assetUrl: string,
-  operation: "Preview" | "Download",
-): Promise<{ response: Response; buffer: Buffer }> {
-  const response = await fetch(assetUrl, { headers: { "user-agent": "mikuswarm/0.1" } });
-  if (!response.ok) throw new Error(`${operation} failed with HTTP ${response.status}`);
-  const length = parseContentLength(response.headers.get("content-length"));
-  if (length !== undefined && length > MAX_DANBOORU_ASSET_BYTES) {
-    throw new Error(`${operation} exceeds Danbooru asset size limit (${length} > ${MAX_DANBOORU_ASSET_BYTES} bytes)`);
-  }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_DANBOORU_ASSET_BYTES) {
-    throw new Error(`${operation} exceeds Danbooru asset size limit (${buffer.length} > ${MAX_DANBOORU_ASSET_BYTES} bytes)`);
-  }
-  return { response, buffer };
-}
+async function streamDownload(url: string, maxBytes: number): Promise<string> {
+  const response = await fetch(url, { headers: { "user-agent": "mikuswarm/0.1" } });
+  if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
 
-function parseContentLength(value: string | null): number | undefined {
-  if (!value) return undefined;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+  const contentLength = response.headers.get("content-length");
+  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+    throw new Error(`Asset too large: Content-Length ${contentLength} exceeds ${maxBytes} byte limit`);
+  }
+
+  if (!response.body) throw new Error("No response body");
+  const tmpPath = path.join(tmpdir(), `miku-danbooru-${randomBytes(8).toString("hex")}`);
+  const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+  let totalBytes = 0;
+  const sizeGuard = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        callback(new Error(`Asset too large: exceeded ${maxBytes} byte limit during download`));
+      } else {
+        callback(null, chunk);
+      }
+    },
+  });
+
+  await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
+  return tmpPath;
 }
 
 async function searchDanbooru(tags: string[], limit: number) {
@@ -135,11 +149,4 @@ function selectAssetUrl(post: DanbooruPost, variant: "original" | "sample" | "pr
 
 function summarizePost(post: DanbooruPost): string {
   return `Post ${post.id} rating=${post.rating ?? "?"} score=${post.score ?? "?"} size=${post.image_width ?? "?"}x${post.image_height ?? "?"}\nTags: ${post.tag_string ?? ""}`;
-}
-
-function extensionFromContentType(contentType: string | null): string {
-  if (contentType === "image/png") return "png";
-  if (contentType === "image/gif") return "gif";
-  if (contentType === "image/webp") return "webp";
-  return "jpg";
 }

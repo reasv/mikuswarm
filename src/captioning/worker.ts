@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
@@ -35,11 +34,11 @@ export class CaptionWorker {
       throw new Error(`No inference client configured for modality: ${modality}`);
     }
 
-    const data = await readFile(absolutePath);
     const result = await client.caption({
-      data,
+      filePath: absolutePath,
       mimeType: asset.mime_type ?? mimeTypeDefault(modality),
       filename: asset.original_filename ?? path.basename(asset.local_path!),
+      context: "pipeline",
     });
 
     await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
@@ -53,9 +52,10 @@ export class CaptionWorker {
       if (converted) {
         try {
           const result = await videoClient.caption({
-            data: converted.data,
+            filePath: converted.path,
             mimeType: converted.mimeType,
             filename: asset.original_filename ?? path.basename(asset.local_path!),
+            context: "pipeline",
           });
           await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
           return asset.event_id;
@@ -74,13 +74,23 @@ export class CaptionWorker {
     }
 
     const firstFrame = await extractFirstFrame(absolutePath);
-    const result = await imageClient.caption({
-      data: firstFrame,
-      mimeType: "image/jpeg",
-      filename: asset.original_filename ?? path.basename(asset.local_path!),
-    });
+    const { writeFile, unlink } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { randomBytes } = await import("node:crypto");
+    const tmpPath = path.join(tmpdir(), `miku-frame-${randomBytes(8).toString("hex")}.jpg`);
+    await writeFile(tmpPath, firstFrame);
 
-    await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
-    return asset.event_id;
+    try {
+      const result = await imageClient.caption({
+        filePath: tmpPath,
+        mimeType: "image/jpeg",
+        filename: asset.original_filename ?? path.basename(asset.local_path!),
+        context: "pipeline",
+      });
+      await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
+      return asset.event_id;
+    } finally {
+      await unlink(tmpPath).catch(() => {});
+    }
   }
 }

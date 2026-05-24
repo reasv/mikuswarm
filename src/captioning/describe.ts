@@ -1,5 +1,3 @@
-import { resizeImageBuffer, type ResizeBufferOptions } from "./image-resize.js";
-
 export type MediaModality = "image" | "video" | "audio";
 
 export interface CaptionModelConfig {
@@ -15,7 +13,6 @@ export interface DescribeMediaOptions {
   prompt: string;
   model: CaptionModelConfig;
   maxChars: number;
-  resize?: ResizeBufferOptions;
   timeoutMs?: number;
 }
 
@@ -24,45 +21,14 @@ export interface DescribeMediaResult {
   model: string;
 }
 
-export interface DescribeImageOptions {
-  imageData: Buffer;
-  prompt: string;
-  model: CaptionModelConfig;
-  maxChars: number;
-  resize?: ResizeBufferOptions;
-}
-
-export type DescribeImageResult = DescribeMediaResult;
-
-export async function describeImage(options: DescribeImageOptions): Promise<DescribeImageResult> {
-  return describeMedia({
-    modality: "image",
-    data: options.imageData,
-    mimeType: "image/jpeg",
-    prompt: options.prompt,
-    model: options.model,
-    maxChars: options.maxChars,
-    resize: options.resize,
-  });
-}
-
 export async function describeMedia(options: DescribeMediaOptions): Promise<DescribeMediaResult> {
   const promptWithLimit = `${options.prompt} Respond in at most ${options.maxChars} characters.`;
   const contentBlocks: unknown[] = [{ type: "text", text: promptWithLimit }];
 
   if (options.modality === "image") {
-    let data = options.data;
-    let mimeType = options.mimeType;
-    if (options.resize) {
-      const resized = await resizeImageBuffer(data, options.resize);
-      if (resized) {
-        data = resized.data;
-        mimeType = resized.mediaType;
-      }
-    }
     contentBlocks.push({
       type: "image_url",
-      image_url: { url: `data:${mimeType};base64,${data.toString("base64")}` },
+      image_url: { url: `data:${options.mimeType};base64,${options.data.toString("base64")}` },
     });
   } else if (options.modality === "video") {
     contentBlocks.push({

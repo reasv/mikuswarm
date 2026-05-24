@@ -1,5 +1,15 @@
+import { readFile } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
-import type { ResizeBufferOptions } from "./image-resize.js";
+import {
+  processImageForInference,
+  processVideoForInference,
+  processAudioForInference,
+  cleanupProcessedImage,
+  type ImageProcessingOptions,
+  type VideoProcessingOptions,
+  type AudioProcessingOptions,
+  type ProcessedMedia,
+} from "../media/index.js";
 
 export interface InferenceClientOptions {
   modality: MediaModality;
@@ -7,16 +17,19 @@ export interface InferenceClientOptions {
   prompt: string;
   maxChars: number;
   maxConcurrency?: number;
-  resize?: ResizeBufferOptions;
+  imageProcessing?: ImageProcessingOptions;
+  videoProcessing?: VideoProcessingOptions;
+  audioProcessing?: AudioProcessingOptions;
   timeoutMs?: number;
-  maxBytes?: number;
 }
 
 export interface CaptionRequest {
-  data: Buffer;
+  filePath: string;
   mimeType: string;
   filename: string;
   prompt?: string;
+  startTime?: number;
+  context?: "tool" | "pipeline";
 }
 
 export interface CaptionResponse {
@@ -42,12 +55,6 @@ export class ConcurrencyLimitedInferenceClient {
   async caption(request: CaptionRequest): Promise<CaptionResponse> {
     if (this.stopped) throw new Error("InferenceClient is stopped");
 
-    if (this.options.maxBytes && request.data.byteLength > this.options.maxBytes) {
-      throw new Error(
-        `Media too large: ${request.data.byteLength} bytes exceeds ${this.options.maxBytes} limit`,
-      );
-    }
-
     const limit = this.options.maxConcurrency;
     if (limit == null || this.active < limit) {
       return this.doCaption(request);
@@ -68,17 +75,47 @@ export class ConcurrencyLimitedInferenceClient {
   private async doCaption(request: CaptionRequest): Promise<CaptionResponse> {
     this.active++;
     try {
+      let processed: ProcessedMedia | undefined;
+      let data: Buffer;
+      let mimeType = request.mimeType;
+
+      if (this.options.modality === "image" && this.options.imageProcessing) {
+        processed = await processImageForInference(request.filePath, this.options.imageProcessing);
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
+        await cleanupProcessedImage(processed);
+      } else if (this.options.modality === "video" && this.options.videoProcessing) {
+        const videoOpts = { ...this.options.videoProcessing };
+        if (request.startTime != null) videoOpts.startTime = request.startTime;
+        processed = await processVideoForInference(request.filePath, videoOpts);
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
+      } else if (this.options.modality === "audio" && this.options.audioProcessing) {
+        const audioOpts = { ...this.options.audioProcessing };
+        if (request.startTime != null) audioOpts.startTime = request.startTime;
+        processed = await processAudioForInference(request.filePath, audioOpts);
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
+      } else {
+        data = await readFile(request.filePath);
+      }
+
       const result = await describeMedia({
         modality: this.options.modality,
-        data: request.data,
-        mimeType: request.mimeType,
+        data,
+        mimeType,
         prompt: request.prompt ?? this.options.prompt,
         model: this.options.model,
         maxChars: this.options.maxChars,
-        resize: this.options.resize,
         timeoutMs: this.options.timeoutMs,
       });
-      return { caption: result.text, model: result.model };
+
+      let caption = result.text;
+      if (processed?.truncated && processed.processedRange && processed.totalDuration) {
+        caption = formatTruncationWarning(caption, processed, request.context ?? "pipeline");
+      }
+
+      return { caption, model: result.model };
     } finally {
       this.active--;
       this.processQueue();
@@ -92,4 +129,23 @@ export class ConcurrencyLimitedInferenceClient {
       this.doCaption(item.request).then(item.resolve, item.reject);
     }
   }
+}
+
+function formatTruncationWarning(caption: string, processed: ProcessedMedia, context: "tool" | "pipeline"): string {
+  const [start, end] = processed.processedRange!;
+  const total = processed.totalDuration!;
+  const startFmt = formatTimestamp(start);
+  const endFmt = formatTimestamp(end);
+  const totalFmt = formatTimestamp(total);
+
+  if (context === "tool") {
+    return `Warning: media duration is ${totalFmt}. Only ${startFmt}-${endFmt} was processed (duration limit). Use start_time to analyze a different segment.\n\n${caption}`;
+  }
+  return `${caption}\n[processed ${startFmt}-${endFmt} of ${totalFmt} total; duration limit]`;
+}
+
+function formatTimestamp(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }

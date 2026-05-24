@@ -1,4 +1,4 @@
-import { readFile, unlink } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -17,7 +17,7 @@ export async function isAnimatedImage(filePath: string): Promise<boolean> {
 }
 
 export interface ConversionResult {
-  data: Buffer;
+  path: string;
   mimeType: string;
   cleanup: () => Promise<void>;
 }
@@ -44,9 +44,8 @@ export async function convertAnimatedToVideo(filePath: string): Promise<Conversi
         .run();
     });
 
-    const data = await readFile(outPath);
     return {
-      data,
+      path: outPath,
       mimeType: "video/mp4",
       cleanup: async () => { await unlink(outPath).catch(() => {}); },
     };

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
@@ -46,7 +47,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(timeline, config, storage);
 
-  const downloadSizeLimit = config.app.download_size_limit ?? 1_073_741_824;
+  const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
+  const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
   const fetchClient = new ConcurrencyLimitedFetchClient({
     maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
@@ -72,6 +74,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const imageConfig = captioningConfig.image ?? {};
   const videoConfig = captioningConfig.video ?? {};
   const audioConfig = captioningConfig.audio ?? {};
+  const mediaImageConfig = config.media?.image ?? {};
+  const mediaVideoConfig = config.media?.video ?? {};
+  const mediaAudioConfig = config.media?.audio ?? {};
 
   const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
     ["image", new ConcurrencyLimitedInferenceClient({
@@ -80,10 +85,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
       maxConcurrency: imageConfig.concurrency,
-      resize: {
-        maxWidth: imageConfig.resize?.max_width ?? 1280,
-        maxHeight: imageConfig.resize?.max_height ?? 720,
-        maxBytes: imageConfig.resize?.max_bytes ?? 1_048_576,
+      imageProcessing: {
+        maxTotalPixels: mediaImageConfig.max_total_pixels ?? 921_600,
+        maxTotalPixelsHard: mediaImageConfig.max_total_pixels_hard ?? 1_843_200,
+        minShortestSide: mediaImageConfig.min_shortest_side ?? 480,
+        maxBytes: mediaImageConfig.max_bytes ?? 1_048_576,
       },
     })],
     ["video", new ConcurrencyLimitedInferenceClient({
@@ -92,8 +98,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
       maxConcurrency: videoConfig.concurrency,
-      maxBytes: videoConfig.max_bytes,
       timeoutMs: videoConfig.timeout_ms,
+      videoProcessing: {
+        maxResolution: mediaVideoConfig.max_resolution ?? 480,
+        maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
+        maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
+        gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
+        cachePath: mediaCachePath,
+      },
     })],
     ["audio", new ConcurrencyLimitedInferenceClient({
       modality: "audio",
@@ -101,8 +113,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxConcurrency: audioConfig.concurrency,
-      maxBytes: audioConfig.max_bytes,
       timeoutMs: audioConfig.timeout_ms,
+      audioProcessing: {
+        maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
+        maxDurationSeconds: mediaAudioConfig.max_duration_seconds ?? 300,
+      },
     })],
   ]);
 
@@ -395,7 +410,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
-      createDanbooruTool({ workspaceRoot }),
+      createDanbooruTool({ workspaceRoot, downloadSizeLimit }),
     ];
     const agent = factory.create(session, tools);
     sessions.attachAgent(session.id, agent);

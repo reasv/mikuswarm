@@ -3,7 +3,6 @@ name = "mikuswarm"
 data_dir = "./var"
 log_level = "info"
 context_dump_dir = "./debug/context"
-download_size_limit = 1073741824
 
 [agent.sessions]
 max_concurrent = 3
@@ -40,11 +39,24 @@ rich_max_tokens = 8000
 compact_target_tokens = 16000
 compact_max_tokens = 24000
 
-[context.images]
-caption_multimodal = true
-max_bytes = 1153434
-max_width = 1280
-max_height = 720
+[media]
+download_size_limit = 1073741824
+
+[media.image]
+max_total_pixels = 921600
+max_total_pixels_hard = 1843200
+min_shortest_side = 480
+max_bytes = 1048576
+
+[media.video]
+max_resolution = 480
+max_bytes = 52428800
+max_duration_seconds = 120
+gpu_acceleration = false
+
+[media.audio]
+max_bytes = 20971520
+max_duration_seconds = 300
 
 [storage]
 database_path = "./var/mikuswarm.db"
@@ -77,23 +89,16 @@ prompt = "Describe the image."
 max_chars = 500
 concurrency = 2
 
-[captioning.image.resize]
-max_width = 1280
-max_height = 720
-max_bytes = 1048576
-
 [captioning.video]
 prompt = "Describe the video."
 max_chars = 500
 concurrency = 1
-max_bytes = 52428800
 timeout_ms = 120000
 
 [captioning.audio]
 prompt = "Transcribe and describe the audio."
 max_chars = 2000
 concurrency = 1
-max_bytes = 20971520
 timeout_ms = 60000
 
 [matrix.accounts.miku]

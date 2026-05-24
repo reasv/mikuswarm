@@ -162,7 +162,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       async downloadMedia(params) {
         const result = await client.downloadMedia(params);
         return {
-          data: Buffer.from(result.dataBase64, "base64"),
+          sizeBytes: result.sizeBytes,
           contentType: result.contentType,
           filename: result.filename,
           kind: result.kind,

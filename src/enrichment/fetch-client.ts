@@ -1,7 +1,20 @@
+import { createWriteStream } from "node:fs";
+import { unlink, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Readable, Transform } from "node:stream";
+
 export interface FetchClientOptions {
   maxConcurrency: number;
   timeoutMs: number;
   maxResponseBytes: number;
+}
+
+export interface FetchOptions {
+  maxBytes?: number;
+  outputPath?: string;
 }
 
 export class ConcurrencyLimitedFetchClient {
@@ -10,19 +23,19 @@ export class ConcurrencyLimitedFetchClient {
     resolve: (value: FetchResult) => void;
     reject: (reason: unknown) => void;
     url: string;
-    maxBytes?: number;
+    options?: FetchOptions;
   }> = [];
   private stopped = false;
 
   constructor(private readonly options: FetchClientOptions) {}
 
-  async fetch(url: string, options?: { maxBytes?: number }): Promise<FetchResult> {
+  async fetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     if (this.stopped) throw new Error("FetchClient is stopped");
     if (this.active < this.options.maxConcurrency) {
-      return this.doFetch(url, options?.maxBytes);
+      return this.doFetch(url, options);
     }
     return new Promise<FetchResult>((resolve, reject) => {
-      this.queue.push({ resolve, reject, url, maxBytes: options?.maxBytes });
+      this.queue.push({ resolve, reject, url, options });
     });
   }
 
@@ -34,7 +47,7 @@ export class ConcurrencyLimitedFetchClient {
     }
   }
 
-  private async doFetch(url: string, maxBytes?: number): Promise<FetchResult> {
+  private async doFetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     this.active++;
     try {
       const controller = new AbortController();
@@ -45,27 +58,43 @@ export class ConcurrencyLimitedFetchClient {
           redirect: "follow",
           headers: { "User-Agent": "MikuAgent/1.0" },
         });
-        const limit = maxBytes ?? this.options.maxResponseBytes;
-        const chunks: Uint8Array[] = [];
-        let totalBytes = 0;
+
+        const limit = options?.maxBytes ?? this.options.maxResponseBytes;
+        const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);
+
         if (!response.body) {
           return {
-            data: Buffer.alloc(0),
+            path: outputPath,
+            sizeBytes: 0,
             contentType: response.headers.get("content-type") ?? undefined,
             finalUrl: response.url,
             statusCode: response.status,
           };
         }
-        for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-          totalBytes += chunk.byteLength;
-          if (totalBytes > limit) {
-            controller.abort();
-            throw new Error(`Response exceeded ${limit} bytes`);
-          }
-          chunks.push(chunk);
+
+        const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+        let totalBytes = 0;
+        const sizeGuard = new Transform({
+          transform(chunk: Buffer, _encoding, callback) {
+            totalBytes += chunk.byteLength;
+            if (totalBytes > limit) {
+              callback(new Error(`Response exceeded ${limit} bytes`));
+            } else {
+              callback(null, chunk);
+            }
+          },
+        });
+
+        try {
+          await pipeline(nodeStream, sizeGuard, createWriteStream(outputPath));
+        } catch (error) {
+          await unlink(outputPath).catch(() => {});
+          throw error;
         }
+
         return {
-          data: Buffer.concat(chunks),
+          path: outputPath,
+          sizeBytes: totalBytes,
           contentType: response.headers.get("content-type") ?? undefined,
           finalUrl: response.url,
           statusCode: response.status,
@@ -82,13 +111,14 @@ export class ConcurrencyLimitedFetchClient {
   private processQueue(): void {
     while (this.queue.length > 0 && this.active < this.options.maxConcurrency) {
       const item = this.queue.shift()!;
-      this.doFetch(item.url, item.maxBytes).then(item.resolve, item.reject);
+      this.doFetch(item.url, item.options).then(item.resolve, item.reject);
     }
   }
 }
 
 export interface FetchResult {
-  data: Buffer;
+  path: string;
+  sizeBytes: number;
   contentType?: string;
   finalUrl: string;
   statusCode: number;

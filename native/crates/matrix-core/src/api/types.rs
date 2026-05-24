@@ -385,6 +385,7 @@ pub struct MatrixUploadMediaResult {
 pub struct MatrixDownloadMediaRequest {
     pub room_id: String,
     pub event_id: String,
+    pub output_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,7 +397,7 @@ pub struct MatrixDownloadMediaResult {
     pub body: Option<String>,
     pub filename: Option<String>,
     pub content_type: Option<String>,
-    pub data_base64: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

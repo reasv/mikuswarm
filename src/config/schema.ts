@@ -33,6 +33,32 @@ const MatrixAccountSchema = Type.Object({
   store_path: Type.String(),
 });
 
+const MediaImageSchema = Type.Object({
+  max_total_pixels: Type.Optional(Type.Number({ minimum: 1 })),
+  max_total_pixels_hard: Type.Optional(Type.Number({ minimum: 1 })),
+  min_shortest_side: Type.Optional(Type.Number({ minimum: 1 })),
+  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+});
+
+const MediaVideoSchema = Type.Object({
+  max_resolution: Type.Optional(Type.Number({ minimum: 1 })),
+  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
+  gpu_acceleration: Type.Optional(Type.Boolean()),
+});
+
+const MediaAudioSchema = Type.Object({
+  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
+});
+
+const MediaSchema = Type.Object({
+  download_size_limit: Type.Optional(Type.Number({ minimum: 1 })),
+  image: Type.Optional(MediaImageSchema),
+  video: Type.Optional(MediaVideoSchema),
+  audio: Type.Optional(MediaAudioSchema),
+});
+
 const EnrichmentSchema = Type.Object({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
@@ -49,27 +75,13 @@ const CaptioningModelSchema = Type.Object({
   api_key: Type.String({ minLength: 1 }),
 });
 
-const ImageResizeSchema = Type.Object({
-  max_width: Type.Optional(Type.Number({ minimum: 1 })),
-  max_height: Type.Optional(Type.Number({ minimum: 1 })),
-  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
-});
-
 const ModalityConfigSchema = Type.Object({
   prompt: Type.Optional(Type.String()),
   max_chars: Type.Optional(Type.Number({ minimum: 1 })),
   concurrency: Type.Optional(Type.Number({ minimum: 1 })),
-  max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   model: Type.Optional(CaptioningModelSchema),
 });
-
-const ImageModalitySchema = Type.Intersect([
-  ModalityConfigSchema,
-  Type.Object({
-    resize: Type.Optional(ImageResizeSchema),
-  }),
-]);
 
 const CaptioningSchema = Type.Object({
   model: Type.Optional(CaptioningModelSchema),
@@ -78,7 +90,7 @@ const CaptioningSchema = Type.Object({
   caption_assistant_messages: Type.Optional(Type.Boolean()),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
-  image: Type.Optional(ImageModalitySchema),
+  image: Type.Optional(ModalityConfigSchema),
   video: Type.Optional(ModalityConfigSchema),
   audio: Type.Optional(ModalityConfigSchema),
 });
@@ -94,7 +106,6 @@ export const AppConfigSchema = Type.Object({
       Type.Literal("error"),
     ]),
     context_dump_dir: Type.String(),
-    download_size_limit: Type.Optional(Type.Number({ minimum: 1 })),
   }),
   agent: Type.Object({
     sessions: Type.Object({
@@ -115,13 +126,8 @@ export const AppConfigSchema = Type.Object({
       compact_target_tokens: Type.Number({ minimum: 1 }),
       compact_max_tokens: Type.Number({ minimum: 1 }),
     }),
-    images: Type.Object({
-      caption_multimodal: Type.Boolean(),
-      max_bytes: Type.Number({ minimum: 1 }),
-      max_width: Type.Number({ minimum: 1 }),
-      max_height: Type.Number({ minimum: 1 }),
-    }),
   }),
+  media: Type.Optional(MediaSchema),
   storage: Type.Object({
     database_path: Type.String(),
   }),

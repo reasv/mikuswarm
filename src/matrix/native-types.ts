@@ -274,6 +274,7 @@ export type MatrixUploadMediaResult = {
 export type MatrixDownloadMediaRequest = {
   roomId: string;
   eventId: string;
+  outputPath: string;
 };
 
 export type MatrixDownloadMediaResult = {
@@ -283,7 +284,7 @@ export type MatrixDownloadMediaResult = {
   body?: string;
   filename?: string;
   contentType?: string;
-  dataBase64: string;
+  sizeBytes: number;
 };
 
 export type MatrixLinkPreviewSource = {

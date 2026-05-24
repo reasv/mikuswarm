@@ -5,7 +5,7 @@ import type { AgentSessionRecord } from "../agent/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { Storage, MediaAssetRow, LinkPreviewRow, ReplyContextRow } from "../storage/index.js";
-import { resizeImageBuffer } from "../captioning/image-resize.js";
+import { processImageForInference, cleanupProcessedImage, type ImageProcessingOptions } from "../media/index.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
@@ -179,25 +179,30 @@ export class ContextBuilder {
     if (!multimodal) return [];
     const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
+    const imageOpts: ImageProcessingOptions = {
+      maxTotalPixels: this.config.media?.image?.max_total_pixels ?? 921_600,
+      maxTotalPixelsHard: this.config.media?.image?.max_total_pixels_hard ?? 1_843_200,
+      minShortestSide: this.config.media?.image?.min_shortest_side ?? 480,
+      maxBytes: this.config.media?.image?.max_bytes ?? 1_048_576,
+    };
     for (const { eventId, attachment } of images) {
       if (!attachment.localPath) continue;
       const absPath = attachment.localPath.startsWith("/")
         ? attachment.localPath
         : path.join(this.config.workspace.root_dir, attachment.localPath);
-      const input = await readFile(absPath).catch(() => undefined);
-      if (!input) continue;
-      const output = await encodeImageForContext(input, {
-        maxWidth: this.config.context.images.max_width,
-        maxHeight: this.config.context.images.max_height,
-        maxBytes: this.config.context.images.max_bytes,
-      }).catch(() => undefined);
-      if (!output) continue;
-      blocks.push({
-        eventId,
-        attachmentId: attachment.id,
-        mediaType: "image/jpeg",
-        dataBase64: output.toString("base64"),
-      });
+      try {
+        const processed = await processImageForInference(absPath, imageOpts);
+        const data = await readFile(processed.path);
+        await cleanupProcessedImage(processed);
+        blocks.push({
+          eventId,
+          attachmentId: attachment.id,
+          mediaType: "image/jpeg",
+          dataBase64: data.toString("base64"),
+        });
+      } catch {
+        continue;
+      }
     }
     return blocks;
   }
@@ -354,20 +359,6 @@ function linkPreviewRowToMeta(lp: LinkPreviewRow, allMedia: MediaAssetRow[]): Li
     media: media.length > 0 ? media.map(mediaAssetToAttachmentMeta) : undefined,
     fetchedAt: lp.fetched_at ?? undefined,
   };
-}
-
-export interface ImageEncodingOptions {
-  maxWidth: number;
-  maxHeight: number;
-  maxBytes: number;
-}
-
-export async function encodeImageForContext(
-  input: Buffer,
-  options: ImageEncodingOptions,
-): Promise<Buffer | undefined> {
-  const result = await resizeImageBuffer(input, options);
-  return result?.data;
 }
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {

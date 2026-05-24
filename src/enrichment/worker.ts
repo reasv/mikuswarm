@@ -3,7 +3,7 @@ import type { CanonicalChatEvent } from "../types.js";
 import type { MediaAssetRow, LinkPreviewRow, ReplyContextRow, Storage } from "../storage/index.js";
 import type { EnrichmentCapabilities, EnrichmentResult } from "./types.js";
 import type { ConcurrencyLimitedFetchClient } from "./fetch-client.js";
-import { saveMediaToWorkspace } from "./media.js";
+import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 import { extractLinkedMediaUrls } from "./linked-media.js";
 import { detectCharacterCard } from "./card-detect.js";
 import path from "node:path";
@@ -106,17 +106,20 @@ export class EnrichmentWorker {
       };
 
       try {
+        const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
         const downloaded = await this.options.capabilities.downloadMedia({
           roomId,
           eventId: event.externalId ?? event.id,
+          outputPath: tempPath,
         });
-        const saved = await saveMediaToWorkspace({
-          data: downloaded.data,
+        const saved = await moveFileToWorkspace({
+          sourcePath: tempPath,
           workspaceRoot: this.options.workspaceRoot,
           originalFilename: downloaded.filename ?? attachment.filename,
           contentType: downloaded.contentType ?? attachment.mimeType,
         });
         asset.local_path = saved.localPath;
+        asset.size_bytes = downloaded.sizeBytes;
         asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
         asset.media_type = downloaded.kind || attachment.mediaType;
         asset.download_status = "complete";
@@ -199,17 +202,20 @@ export class EnrichmentWorker {
     };
 
     try {
+      const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
       const downloaded = await this.options.capabilities.downloadMedia({
         roomId,
         eventId: summary.eventId,
+        outputPath: tempPath,
       });
-      const saved = await saveMediaToWorkspace({
-        data: downloaded.data,
+      const saved = await moveFileToWorkspace({
+        sourcePath: tempPath,
         workspaceRoot: this.options.workspaceRoot,
         originalFilename: downloaded.filename ?? summary.body,
         contentType: downloaded.contentType,
       });
       asset.local_path = saved.localPath;
+      asset.size_bytes = downloaded.sizeBytes;
       asset.mime_type = downloaded.contentType ?? null;
       asset.media_type = downloaded.kind || mediaType;
       asset.download_status = "complete";
@@ -335,8 +341,8 @@ export class EnrichmentWorker {
           result.mediaAssets.push(asset);
           return;
         }
-        const saved = await saveMediaToWorkspace({
-          data: fetched.data,
+        const saved = await moveFileToWorkspace({
+          sourcePath: fetched.path,
           workspaceRoot: this.options.workspaceRoot,
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
@@ -344,7 +350,7 @@ export class EnrichmentWorker {
         asset.local_path = saved.localPath;
         asset.mime_type = fetched.contentType ?? null;
         asset.download_status = "complete";
-        asset.size_bytes = fetched.data.byteLength;
+        asset.size_bytes = fetched.sizeBytes;
         if (fetched.contentType) {
           asset.media_type = inferMediaType(fetched.contentType);
         }
