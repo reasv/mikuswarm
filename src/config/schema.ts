@@ -94,6 +94,7 @@ export const AppConfigSchema = Type.Object({
       Type.Literal("error"),
     ]),
     context_dump_dir: Type.String(),
+    download_size_limit: Type.Optional(Type.Number({ minimum: 1 })),
   }),
   agent: Type.Object({
     sessions: Type.Object({

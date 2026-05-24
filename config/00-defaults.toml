@@ -3,6 +3,7 @@ name = "mikuswarm"
 data_dir = "./var"
 log_level = "info"
 context_dump_dir = "./debug/context"
+download_size_limit = 1073741824
 
 [agent.sessions]
 max_concurrent = 3

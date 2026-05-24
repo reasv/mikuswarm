@@ -1,4 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Readable, Transform } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
@@ -10,6 +16,7 @@ export interface MediaToolContext {
   clients: Map<MediaModality, ConcurrencyLimitedInferenceClient>;
   defaultPrompts: Map<MediaModality, string>;
   modelHasVision: boolean;
+  maxFetchBytes: number;
 }
 
 export function createMediaTool(context: MediaToolContext): AgentTool {
@@ -44,7 +51,7 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
       const results: string[] = [];
       for (const source of unique) {
         try {
-          const loaded = await loadMedia(context.workspaceRoot, source);
+          const loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes);
           const modality = inferModality(loaded.mimeType, source);
           const client = context.clients.get(modality);
           if (!client) {
@@ -79,11 +86,9 @@ interface LoadedMedia {
   mimeType: string;
 }
 
-const MAX_FETCH_BYTES = 100 * 1024 * 1024; // 100 MB
-
 const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
 
-async function loadMedia(workspaceRoot: string, source: string): Promise<LoadedMedia> {
+async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number): Promise<LoadedMedia> {
   if (isUrl(source)) {
     const response = await fetch(source);
     if (!response.ok) throw new Error(`Failed to fetch media: HTTP ${response.status}`);
@@ -94,26 +99,33 @@ async function loadMedia(workspaceRoot: string, source: string): Promise<LoadedM
     }
 
     const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > MAX_FETCH_BYTES) {
-      throw new Error(`Media too large: Content-Length ${contentLength} exceeds ${MAX_FETCH_BYTES} byte limit`);
+    if (contentLength && parseInt(contentLength, 10) > maxFetchBytes) {
+      throw new Error(`Media too large: Content-Length ${contentLength} exceeds ${maxFetchBytes} byte limit`);
     }
 
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error("Failed to read response body");
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalBytes += value.byteLength;
-      if (totalBytes > MAX_FETCH_BYTES) {
-        reader.cancel();
-        throw new Error(`Media too large: exceeded ${MAX_FETCH_BYTES} byte limit during download`);
-      }
-      chunks.push(value);
-    }
+    // Stream to a temp file — enforce size limit during streaming to protect both memory and disk
+    const tmpPath = join(tmpdir(), `miku-media-fetch-${randomBytes(8).toString("hex")}`);
+    try {
+      if (!response.body) throw new Error("Failed to read response body");
+      const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+      let totalBytes = 0;
+      const sizeGuard = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          totalBytes += chunk.byteLength;
+          if (totalBytes > maxFetchBytes) {
+            callback(new Error(`Media too large: exceeded ${maxFetchBytes} byte limit during download`));
+          } else {
+            callback(null, chunk);
+          }
+        },
+      });
+      await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
 
-    return { data: Buffer.concat(chunks), mimeType };
+      const data = await readFile(tmpPath);
+      return { data, mimeType };
+    } finally {
+      await unlink(tmpPath).catch(() => {});
+    }
   }
 
   const absolute = resolveWorkspacePath(workspaceRoot, source);

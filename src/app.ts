@@ -46,10 +46,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(timeline, config, storage);
 
+  const downloadSizeLimit = config.app.download_size_limit ?? 1_073_741_824;
+
   const fetchClient = new ConcurrencyLimitedFetchClient({
     maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
     timeoutMs: config.enrichment?.fetch_timeout_ms ?? 10_000,
-    maxResponseBytes: config.enrichment?.max_download_bytes ?? 50_000_000,
+    maxResponseBytes: config.enrichment?.max_download_bytes ?? downloadSizeLimit,
   });
 
   const captioningConfig = config.captioning ?? {};
@@ -389,6 +391,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         clients: captionClients,
         defaultPrompts,
         modelHasVision: config.models.default.multimodal,
+        maxFetchBytes: downloadSizeLimit,
       }),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
