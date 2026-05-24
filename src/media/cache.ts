@@ -27,6 +27,7 @@ export class MediaCache {
   }
 
   async evictIfNeeded(maxBytes: number, targetBytes: number): Promise<void> {
+    const effectiveTarget = Math.min(targetBytes, maxBytes);
     let files: string[];
     try {
       files = await readdir(this.cacheDir);
@@ -50,7 +51,7 @@ export class MediaCache {
 
     entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const entry of entries) {
-      if (totalSize <= targetBytes) break;
+      if (totalSize <= effectiveTarget) break;
       await unlink(entry.path).catch(() => {});
       totalSize -= entry.size;
     }

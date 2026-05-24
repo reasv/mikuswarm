@@ -58,8 +58,12 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
           await unlink(fetched.path).catch(() => {});
           throw new Error(`Download failed with HTTP ${fetched.statusCode}`);
         }
-        const buffer = await readFile(fetched.path);
-        await unlink(fetched.path).catch(() => {});
+        let buffer: Buffer;
+        try {
+          buffer = await readFile(fetched.path);
+        } finally {
+          await unlink(fetched.path).catch(() => {});
+        }
         return {
           content: [
             { type: "text", text: summarizePost(post) },

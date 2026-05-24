@@ -102,7 +102,12 @@ export async function processVideoForInference(
       if (segmentStat.size > options.maxBytes) {
         await unlink(segmentPath).catch(() => {});
         const reducedPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
-        await reencodeWithBitrate(ffmpeg, inputPath, reducedPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
+        try {
+          await reencodeWithBitrate(ffmpeg, inputPath, reducedPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
+        } catch (error) {
+          await unlink(reducedPath).catch(() => {});
+          throw error;
+        }
         const reducedStat = await stat(reducedPath);
         return {
           path: reducedPath,
