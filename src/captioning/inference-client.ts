@@ -1,13 +1,19 @@
+import { describeImage, type CaptionModelConfig } from "./describe.js";
+import type { ResizeBufferOptions } from "./image-resize.js";
+
 export interface InferenceClientOptions {
   maxConcurrency: number;
-  // TODO: wire to actual captioning model config when ready
-  captionModel?: { id: string; endpoint: string; api_key: string };
+  model: CaptionModelConfig;
+  prompt: string;
+  resize: ResizeBufferOptions;
 }
 
 export interface CaptionRequest {
   imageData: Buffer;
   mediaType: string;
   filename: string;
+  /** Override the default prompt for this request (used by the image tool). */
+  prompt?: string;
 }
 
 export interface CaptionResponse {
@@ -47,12 +53,13 @@ export class ConcurrencyLimitedInferenceClient {
   private async doCaption(request: CaptionRequest): Promise<CaptionResponse> {
     this.active++;
     try {
-      // TODO: replace with actual model inference call
-      // For now, generate metadata-based caption as placeholder
-      return {
-        caption: `Image file ${request.filename}; ${request.mediaType}, ${request.imageData.byteLength} bytes.`,
-        model: "placeholder",
-      };
+      const result = await describeImage({
+        imageData: request.imageData,
+        prompt: request.prompt ?? this.options.prompt,
+        model: this.options.model,
+        resize: this.options.resize,
+      });
+      return { caption: result.text, model: result.model };
     } finally {
       this.active--;
       this.processQueue();

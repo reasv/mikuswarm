@@ -10,6 +10,6 @@ export {
   createWriteMemoryTool,
   type MemoryToolContext,
 } from "./memory.js";
-export { createDescribeMediaTool, type MediaToolContext } from "./media.js";
+export { createImageTool, type ImageToolContext } from "./media.js";
 export { createWebFetchTool, createWebSearchTool } from "./web.js";
 export { createDanbooruTool, type DanbooruToolContext } from "./danbooru.js";

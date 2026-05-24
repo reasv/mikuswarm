@@ -43,12 +43,20 @@ const EnrichmentSchema = Type.Object({
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
+const CaptioningModelSchema = Type.Object({
+  id: Type.String({ minLength: 1 }),
+  endpoint: Type.String({ minLength: 1 }),
+  api_key: Type.String({ minLength: 1 }),
+  max_chars: Type.Optional(Type.Number({ minimum: 1 })),
+});
+
 const CaptioningSchema = Type.Object({
+  prompt: Type.Optional(Type.String()),
+  model: Type.Optional(CaptioningModelSchema),
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   inference_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
   caption_assistant_messages: Type.Optional(Type.Boolean()),
-  caption_model: Type.Optional(Type.String()),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
   image_resize: Type.Optional(Type.Object({

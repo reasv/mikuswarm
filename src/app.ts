@@ -16,7 +16,7 @@ import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import {
   createDanbooruTool,
   createDelegateToSessionTool,
-  createDescribeMediaTool,
+  createImageTool,
   createSearchMemoryTool,
   createSearchFilesTool,
   createSendMessageTool,
@@ -52,8 +52,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     maxResponseBytes: config.enrichment?.max_download_bytes ?? 50_000_000,
   });
 
+  const captioningConfig = config.captioning ?? {};
+  const captionModelConfig = {
+    id: captioningConfig.model?.id ?? "google/gemini-2.5-flash-preview",
+    endpoint: captioningConfig.model?.endpoint ?? config.models.default.endpoint,
+    api_key: captioningConfig.model?.api_key ?? config.models.default.api_key,
+    max_chars: captioningConfig.model?.max_chars ?? 500,
+  };
+  const captionPrompt = captioningConfig.prompt ?? "Describe the image.";
+  const captionResize = {
+    maxWidth: captioningConfig.image_resize?.max_width ?? 1280,
+    maxHeight: captioningConfig.image_resize?.max_height ?? 720,
+    maxBytes: captioningConfig.image_resize?.max_bytes ?? 1_048_576,
+  };
+
   const inferenceClient = new ConcurrencyLimitedInferenceClient({
-    maxConcurrency: config.captioning?.inference_concurrency ?? 2,
+    maxConcurrency: captioningConfig.inference_concurrency ?? 2,
+    model: captionModelConfig,
+    prompt: captionPrompt,
+    resize: captionResize,
   });
 
   const enrichmentEmitter = new EventEmitter();
@@ -330,7 +347,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createWebSearchTool(),
       createTextEditorTool({ workspaceRoot }),
       createSearchFilesTool({ workspaceRoot }),
-      createDescribeMediaTool({ workspaceRoot }),
+      createImageTool({
+        workspaceRoot,
+        inferenceClient,
+        defaultPrompt: captionPrompt,
+        modelHasVision: config.models.default.multimodal,
+      }),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
       createDanbooruTool({ workspaceRoot }),

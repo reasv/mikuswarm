@@ -60,8 +60,24 @@ trigger_group_lookback_ms = 20000
 trigger_wait_timeout_ms = 30000
 
 [captioning]
-trigger_wait_timeout_ms = 45000
+prompt = "Describe the image."
+worker_count = 2
+inference_concurrency = 2
+caption_all = false
 caption_assistant_messages = false
+trigger_wait_timeout_ms = 45000
+max_retries = 2
+
+[captioning.model]
+id = "google/gemini-2.5-flash-preview"
+endpoint = "${LLM_GATEWAY_URL}/openrouter"
+api_key = "${LLM_GATEWAY_API_KEY}"
+max_chars = 500
+
+[captioning.image_resize]
+max_width = 1280
+max_height = 720
+max_bytes = 1048576
 
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"

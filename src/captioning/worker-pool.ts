@@ -101,11 +101,6 @@ export class CaptionWorkerPool {
       storage: this.options.storage,
       inferenceClient: this.options.inferenceClient,
       workspaceRoot: this.options.workspaceRoot,
-      imageResize: {
-        maxWidth: this.options.config.image_resize?.max_width ?? 1280,
-        maxHeight: this.options.config.image_resize?.max_height ?? 720,
-        maxBytes: this.options.config.image_resize?.max_bytes ?? 1_048_576,
-      },
     });
 
     for (const asset of claimed) {
