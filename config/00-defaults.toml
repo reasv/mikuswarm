@@ -53,6 +53,7 @@ max_resolution = 480
 max_bytes = 52428800
 max_duration_seconds = 120
 gpu_acceleration = false
+x264_preset = "veryfast"
 
 [media.audio]
 max_bytes = 20971520

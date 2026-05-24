@@ -7,7 +7,7 @@ export interface EnrichmentResult {
 }
 
 export interface EnrichmentCapabilities {
-  downloadMedia(params: { roomId: string; eventId: string; outputPath: string }): Promise<{
+  downloadMedia(params: { roomId: string; eventId: string; outputPath: string; sizeLimit?: number }): Promise<{
     sizeBytes: number;
     contentType?: string;
     filename?: string;

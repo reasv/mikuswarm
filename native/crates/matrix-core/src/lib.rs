@@ -412,7 +412,7 @@ impl MatrixCoreClient {
             }
             inner.client().map_err(to_napi_error)?
         };
-        let result = download_media_internal(&client, &request.room_id, &request.event_id, &request.output_path)
+        let result = download_media_internal(&client, &request.room_id, &request.event_id, &request.output_path, request.size_limit)
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))

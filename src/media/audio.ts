@@ -15,6 +15,9 @@ export async function processAudioForInference(
   }
 
   const probe = await probeMedia(ffmpeg, inputPath);
+  if (probe.duration <= 0) {
+    throw new Error("Could not determine media duration");
+  }
   const totalDuration = probe.duration;
   const startTime = options.startTime ?? 0;
   const effectiveDuration = Math.min(
@@ -60,9 +63,12 @@ function runAudioEncode(
   bitrate: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
+    let cmd = ffmpeg(inputPath);
+    if (startTime > 0) {
+      cmd = (cmd as unknown as { seekInput(t: number): typeof cmd }).seekInput(startTime);
+    }
+    cmd
       .outputOptions([
-        "-ss", String(startTime),
         "-t", String(duration),
         "-c:a", "aac",
         "-b:a", String(bitrate),

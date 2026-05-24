@@ -28,8 +28,8 @@ export async function processImageForInference(
   }
 
   const fallback = await sharp(inputPath)
-    .resize({ width: 64, height: 64, fit: "inside", withoutEnlargement: true })
-    .jpeg({ quality: 35, mozjpeg: true })
+    .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
+    .jpeg({ quality: 60, mozjpeg: true })
     .toBuffer();
   const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
   await writeFile(tmpPath, fallback);
@@ -96,11 +96,11 @@ async function compressToFit(
         return output;
       }
     }
-    if (width <= 64 || height <= 64) break;
+    if (width <= 512 || height <= 512) break;
     width *= 0.75;
     height *= 0.75;
-    width = Math.max(width, 64);
-    height = Math.max(height, 64);
+    width = Math.max(width, 512);
+    height = Math.max(height, 512);
   }
 
   return undefined;

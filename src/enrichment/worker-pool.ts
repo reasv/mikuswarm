@@ -11,6 +11,7 @@ export interface EnrichmentWorkerPoolOptions {
   providerCapabilities: Map<string, EnrichmentCapabilities>;
   fetchClient: ConcurrencyLimitedFetchClient;
   workspaceRoot: string;
+  downloadSizeLimit?: number;
   config: EnrichmentConfig;
   onComplete?: (eventId: string) => void;
   onError?: (eventId: string, error: unknown) => void;
@@ -121,6 +122,7 @@ export class EnrichmentWorkerPool {
       fetchClient: this.options.fetchClient,
       workspaceRoot: this.options.workspaceRoot,
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
+      downloadSizeLimit: this.options.downloadSizeLimit,
     });
 
     await worker.process(event);

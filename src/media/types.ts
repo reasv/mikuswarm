@@ -11,6 +11,7 @@ export interface VideoProcessingOptions {
   maxDurationSeconds: number;
   startTime?: number;
   gpuAcceleration: boolean;
+  x264Preset: string;
   cachePath: string;
 }
 

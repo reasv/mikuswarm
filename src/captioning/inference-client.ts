@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
 import {
   processImageForInference,
@@ -90,12 +90,14 @@ export class ConcurrencyLimitedInferenceClient {
         processed = await processVideoForInference(request.filePath, videoOpts);
         data = await readFile(processed.path);
         mimeType = processed.mimeType;
+        await unlink(processed.path).catch(() => {});
       } else if (this.options.modality === "audio" && this.options.audioProcessing) {
         const audioOpts = { ...this.options.audioProcessing };
         if (request.startTime != null) audioOpts.startTime = request.startTime;
         processed = await processAudioForInference(request.filePath, audioOpts);
         data = await readFile(processed.path);
         mimeType = processed.mimeType;
+        await unlink(processed.path).catch(() => {});
       } else {
         data = await readFile(request.filePath);
       }

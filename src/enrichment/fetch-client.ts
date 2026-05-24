@@ -78,6 +78,7 @@ export class ConcurrencyLimitedFetchClient {
           transform(chunk: Buffer, _encoding, callback) {
             totalBytes += chunk.byteLength;
             if (totalBytes > limit) {
+              controller.abort();
               callback(new Error(`Response exceeded ${limit} bytes`));
             } else {
               callback(null, chunk);

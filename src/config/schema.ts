@@ -45,6 +45,7 @@ const MediaVideoSchema = Type.Object({
   max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
   gpu_acceleration: Type.Optional(Type.Boolean()),
+  x264_preset: Type.Optional(Type.String()),
 });
 
 const MediaAudioSchema = Type.Object({

@@ -104,6 +104,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
         maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
         gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
+        x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
         cachePath: mediaCachePath,
       },
     })],
@@ -136,6 +137,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     providerCapabilities: new Map(),
     fetchClient,
     workspaceRoot,
+    downloadSizeLimit,
     config: config.enrichment ?? {},
     onComplete: (eventId) => enrichmentEmitter.emit(`complete:${eventId}`),
     onError: (eventId, error) =>

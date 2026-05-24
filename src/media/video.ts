@@ -9,6 +9,16 @@ type FfmpegCommand = (input?: string) => import("fluent-ffmpeg").FfmpegCommand;
 
 let cachedFfmpeg: FfmpegCommand | null | undefined;
 let ffmpegWarned = false;
+const cacheInstances = new Map<string, MediaCache>();
+
+function getCache(cachePath: string): MediaCache {
+  let cache = cacheInstances.get(cachePath);
+  if (!cache) {
+    cache = new MediaCache(cachePath);
+    cacheInstances.set(cachePath, cache);
+  }
+  return cache;
+}
 
 export async function processVideoForInference(
   inputPath: string,
@@ -20,6 +30,9 @@ export async function processVideoForInference(
   }
 
   const probe = await probeMedia(ffmpeg, inputPath);
+  if (probe.duration <= 0) {
+    throw new Error("Could not determine media duration");
+  }
   const totalDuration = probe.duration;
   const startTime = options.startTime ?? 0;
   const effectiveDuration = Math.min(
@@ -28,51 +41,54 @@ export async function processVideoForInference(
   );
   const truncated = (totalDuration - startTime) > options.maxDurationSeconds;
 
-  const cache = new MediaCache(options.cachePath);
+  const cache = getCache(options.cachePath);
   await cache.init();
 
   const fileHash = await hashFile(inputPath);
   let convertedPath = await cache.get(fileHash);
 
   if (!convertedPath) {
-    convertedPath = await encodeVideo(ffmpeg, inputPath, probe, options);
-    await cache.put(fileHash, convertedPath);
-    await unlink(convertedPath).catch(() => {});
-    convertedPath = await cache.get(fileHash);
-    if (!convertedPath) throw new Error("Cache write failed");
+    const tempEncoded = await encodeVideo(ffmpeg, inputPath, probe, options);
+    convertedPath = await cache.put(fileHash, tempEncoded);
+    await unlink(tempEncoded).catch(() => {});
   }
 
   const segmentPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
 
-  if (startTime > 0 || truncated) {
-    await extractSegment(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration);
-  } else {
-    await copyFile(convertedPath, segmentPath);
-  }
+  try {
+    if (startTime > 0 || truncated) {
+      await extractSegment(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration);
+    } else {
+      await copyFile(convertedPath, segmentPath);
+    }
 
-  const segmentStat = await stat(segmentPath);
-  if (segmentStat.size > options.maxBytes) {
-    await unlink(segmentPath).catch(() => {});
-    const reducedPath = await reencodeWithBitrate(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration, options.maxBytes);
-    const reducedStat = await stat(reducedPath);
+    const segmentStat = await stat(segmentPath);
+    if (segmentStat.size > options.maxBytes) {
+      await unlink(segmentPath).catch(() => {});
+      const reducedPath = await reencodeWithBitrate(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
+      const reducedStat = await stat(reducedPath);
+      return {
+        path: reducedPath,
+        mimeType: "video/mp4",
+        sizeBytes: reducedStat.size,
+        truncated,
+        processedRange: [startTime, startTime + effectiveDuration],
+        totalDuration,
+      };
+    }
+
     return {
-      path: reducedPath,
+      path: segmentPath,
       mimeType: "video/mp4",
-      sizeBytes: reducedStat.size,
+      sizeBytes: segmentStat.size,
       truncated,
       processedRange: [startTime, startTime + effectiveDuration],
       totalDuration,
     };
+  } catch (error) {
+    await unlink(segmentPath).catch(() => {});
+    throw error;
   }
-
-  return {
-    path: segmentPath,
-    mimeType: "video/mp4",
-    sizeBytes: segmentStat.size,
-    truncated,
-    processedRange: [startTime, startTime + effectiveDuration],
-    totalDuration,
-  };
 }
 
 interface ProbeResult {
@@ -114,10 +130,12 @@ async function encodeVideo(
     : "scale=trunc(iw/2)*2:trunc(ih/2)*2";
 
   const encoder = options.gpuAcceleration ? "h264_nvenc" : "libx264";
+  const preset = encoder === "libx264" ? ["-preset", options.x264Preset] : [];
 
   try {
     await runFfmpeg(ffmpeg, inputPath, outPath, [
       "-c:v", encoder,
+      ...preset,
       "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
       "-vf", scaleFilter,
@@ -130,6 +148,7 @@ async function encodeVideo(
       await unlink(outPath).catch(() => {});
       await runFfmpeg(ffmpeg, inputPath, outPath, [
         "-c:v", "libx264",
+        "-preset", options.x264Preset,
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-vf", scaleFilter,
@@ -150,11 +169,10 @@ async function extractSegment(
   duration: number,
 ): Promise<void> {
   await runFfmpeg(ffmpeg, inputPath, outputPath, [
-    "-ss", String(startTime),
     "-t", String(duration),
     "-c", "copy",
     "-movflags", "+faststart",
-  ]);
+  ], startTime);
 }
 
 async function reencodeWithBitrate(
@@ -164,14 +182,15 @@ async function reencodeWithBitrate(
   startTime: number,
   duration: number,
   maxBytes: number,
+  x264Preset: string,
 ): Promise<string> {
   const targetBitrate = Math.floor((maxBytes * 8) / duration * 0.9);
   const videoBitrate = Math.max(100_000, targetBitrate - 128_000);
 
   await runFfmpeg(ffmpeg, inputPath, outputPath, [
-    "-ss", String(startTime),
     "-t", String(duration),
     "-c:v", "libx264",
+    "-preset", x264Preset,
     "-b:v", String(videoBitrate),
     "-maxrate", String(Math.floor(videoBitrate * 1.5)),
     "-bufsize", String(videoBitrate * 2),
@@ -179,7 +198,7 @@ async function reencodeWithBitrate(
     "-movflags", "+faststart",
     "-c:a", "aac",
     "-b:a", "128k",
-  ]);
+  ], startTime);
   return outputPath;
 }
 
@@ -188,9 +207,14 @@ function runFfmpeg(
   inputPath: string,
   outputPath: string,
   outputOptions: string[],
+  seekInput?: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
+    let cmd = ffmpeg(inputPath);
+    if (seekInput != null && seekInput > 0) {
+      cmd = (cmd as unknown as { seekInput(t: number): typeof cmd }).seekInput(seekInput);
+    }
+    cmd
       .outputOptions(outputOptions)
       .output(outputPath)
       .on("end", () => resolve())

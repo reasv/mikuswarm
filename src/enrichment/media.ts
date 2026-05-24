@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, writeFile, rename, unlink } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, writeFile, rename, copyFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { hashFile } from "../media/cache.js";
 
 export function generateMediaFilename(data: Buffer, originalFilename?: string, contentType?: string): string {
   const hash = createHash("sha256").update(data).digest();
@@ -18,13 +18,8 @@ export function generateMediaFilenameFromHash(hashPrefix: Buffer, originalFilena
 }
 
 export async function hashFileForMedia(filePath: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(filePath);
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("end", () => resolve(hash.digest()));
-    stream.on("error", reject);
-  });
+  const hex = await hashFile(filePath);
+  return Buffer.from(hex, "hex");
 }
 
 export async function saveMediaToWorkspace(params: {
@@ -58,15 +53,23 @@ export async function moveFileToWorkspace(params: {
   if (existsSync(absolutePath)) {
     await unlink(params.sourcePath).catch(() => {});
   } else {
-    await rename(params.sourcePath, absolutePath);
+    try {
+      await rename(params.sourcePath, absolutePath);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+        await copyFile(params.sourcePath, absolutePath);
+        await unlink(params.sourcePath).catch(() => {});
+      } else {
+        throw err;
+      }
+    }
   }
   const localPath = `msg-attach/${filename}`;
   return { localPath, absolutePath };
 }
 
 export function generateTempDownloadPath(workspaceRoot: string): string {
-  const hash = createHash("sha256").update(String(Date.now()) + String(Math.random())).digest("hex").slice(0, 16);
-  return path.join(workspaceRoot, "msg-attach", `.tmp-${hash}`);
+  return path.join(workspaceRoot, "msg-attach", `.tmp-${randomBytes(8).toString("hex")}`);
 }
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";

@@ -386,6 +386,7 @@ pub struct MatrixDownloadMediaRequest {
     pub room_id: String,
     pub event_id: String,
     pub output_path: String,
+    pub size_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

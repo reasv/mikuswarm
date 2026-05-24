@@ -160,7 +160,12 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
 
     return {
       async downloadMedia(params) {
-        const result = await client.downloadMedia(params);
+        const result = await client.downloadMedia({
+          roomId: params.roomId,
+          eventId: params.eventId,
+          outputPath: params.outputPath,
+          sizeLimit: params.sizeLimit,
+        });
         return {
           sizeBytes: result.sizeBytes,
           contentType: result.contentType,

@@ -1074,13 +1074,14 @@ pub(crate) async fn download_media_internal(
     room_id: &str,
     event_id: &str,
     output_path: &str,
+    size_limit: Option<u64>,
 ) -> MatrixResult<MatrixDownloadMediaResult> {
     let room_id: OwnedRoomId = RoomId::parse(room_id.trim())?.to_owned();
     let event_id = matrix_sdk::ruma::EventId::parse(event_id.trim())?;
     let room = client
         .get_room(&room_id)
         .ok_or_else(|| MatrixError::State(format!("room {room_id} is not known to the client")))?;
-    media::download_media(client, &room, &event_id, output_path).await
+    media::download_media(client, &room, &event_id, output_path, size_limit).await
 }
 
 #[derive(Debug)]

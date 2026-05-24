@@ -14,6 +14,7 @@ export interface EnrichmentWorkerOptions {
   fetchClient: ConcurrencyLimitedFetchClient;
   workspaceRoot: string;
   maxPreviewsPerMessage: number;
+  downloadSizeLimit?: number;
 }
 
 export class EnrichmentWorker {
@@ -111,6 +112,7 @@ export class EnrichmentWorker {
           roomId,
           eventId: event.externalId ?? event.id,
           outputPath: tempPath,
+          sizeLimit: this.options.downloadSizeLimit,
         });
         const saved = await moveFileToWorkspace({
           sourcePath: tempPath,
@@ -207,6 +209,7 @@ export class EnrichmentWorker {
         roomId,
         eventId: summary.eventId,
         outputPath: tempPath,
+        sizeLimit: this.options.downloadSizeLimit,
       });
       const saved = await moveFileToWorkspace({
         sourcePath: tempPath,

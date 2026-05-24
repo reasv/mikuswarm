@@ -275,6 +275,7 @@ export type MatrixDownloadMediaRequest = {
   roomId: string;
   eventId: string;
   outputPath: string;
+  sizeLimit?: number;
 };
 
 export type MatrixDownloadMediaResult = {

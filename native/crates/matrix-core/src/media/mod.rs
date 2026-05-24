@@ -107,15 +107,31 @@ fn parse_thumbnail(thumbnail: &MatrixUploadMediaThumbnail) -> MatrixResult<Thumb
     })
 }
 
+fn check_declared_size(declared: Option<u64>, limit: Option<u64>) -> MatrixResult<()> {
+    if let (Some(limit), Some(declared)) = (limit, declared) {
+        if declared > limit {
+            return Err(MatrixError::State(format!(
+                "media size ({declared} bytes) exceeds download limit ({limit} bytes)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn download_media_from_message(
     client: &matrix_sdk::Client,
     room_id: &str,
     event_id: &str,
     output_path: &str,
     msgtype: &MessageType,
+    size_limit: Option<u64>,
 ) -> MatrixResult<Option<MatrixDownloadMediaResult>> {
     let (kind, body, filename, content_type, data) = match msgtype {
         MessageType::Audio(content) => {
+            check_declared_size(
+                content.info.as_ref().and_then(|info| info.size.map(u64::from)),
+                size_limit,
+            )?;
             let Some(data) = client.media().get_file(content, true).await? else {
                 return Ok(None);
             };
@@ -128,6 +144,10 @@ async fn download_media_from_message(
             )
         }
         MessageType::File(content) => {
+            check_declared_size(
+                content.info.as_ref().and_then(|info| info.size.map(u64::from)),
+                size_limit,
+            )?;
             let Some(data) = client.media().get_file(content, true).await? else {
                 return Ok(None);
             };
@@ -140,6 +160,10 @@ async fn download_media_from_message(
             )
         }
         MessageType::Image(content) => {
+            check_declared_size(
+                content.info.as_ref().and_then(|info| info.size.map(u64::from)),
+                size_limit,
+            )?;
             let Some(data) = client.media().get_file(content, true).await? else {
                 return Ok(None);
             };
@@ -152,6 +176,10 @@ async fn download_media_from_message(
             )
         }
         MessageType::Video(content) => {
+            check_declared_size(
+                content.info.as_ref().and_then(|info| info.size.map(u64::from)),
+                size_limit,
+            )?;
             let Some(data) = client.media().get_file(content, true).await? else {
                 return Ok(None);
             };
@@ -189,6 +217,7 @@ pub async fn download_media(
     room: &Room,
     event_id: &EventId,
     output_path: &str,
+    size_limit: Option<u64>,
 ) -> MatrixResult<MatrixDownloadMediaResult> {
     let event = room.load_or_fetch_event(event_id, None).await?;
     let raw = event.into_raw();
@@ -220,6 +249,7 @@ pub async fn download_media(
         event_id.as_str(),
         output_path,
         &message_event.content.msgtype,
+        size_limit,
     )
     .await?
     .ok_or_else(|| {

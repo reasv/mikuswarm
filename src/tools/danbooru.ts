@@ -1,4 +1,4 @@
-import { readFile, rename, mkdir } from "node:fs/promises";
+import { readFile, rename, mkdir, unlink, stat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -56,26 +56,25 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const assetUrl = selectAssetUrl(post, args.variant ?? (action === "preview" ? "preview" : "original"));
       if (!assetUrl) throw new Error(`Post ${post.id} has no usable asset URL.`);
       if (action === "preview") {
-        const tmpPath = await streamDownload(assetUrl, context.downloadSizeLimit);
-        const buffer = await readFile(tmpPath);
-        const { unlink } = await import("node:fs/promises");
-        await unlink(tmpPath).catch(() => {});
+        const downloaded = await streamDownload(assetUrl, context.downloadSizeLimit);
+        const buffer = await readFile(downloaded.path);
+        await unlink(downloaded.path).catch(() => {});
         return {
           content: [
             { type: "text", text: summarizePost(post) },
-            { type: "image", data: buffer.toString("base64"), mimeType: "image/jpeg" },
+            { type: "image", data: buffer.toString("base64"), mimeType: downloaded.contentType ?? mimeFromUrl(assetUrl) },
           ],
           details: { post, assetUrl },
         };
       }
-      const tmpPath = await streamDownload(assetUrl, context.downloadSizeLimit);
+      const downloaded = await streamDownload(assetUrl, context.downloadSizeLimit);
       const subdir = args.output_subdir ?? "downloads/danbooru";
       const outputDir = resolveWorkspacePath(context.workspaceRoot, subdir);
       await mkdir(outputDir, { recursive: true });
-      const filename = `danbooru-${post.id}.${post.file_ext ?? "jpg"}`;
+      const ext = post.file_ext ?? extFromUrl(assetUrl) ?? extFromContentType(downloaded.contentType) ?? "jpg";
+      const filename = `danbooru-${post.id}.${ext}`;
       const outputPath = path.join(outputDir, filename);
-      await rename(tmpPath, outputPath);
-      const { stat } = await import("node:fs/promises");
+      await rename(downloaded.path, outputPath);
       const fileStat = await stat(outputPath);
       return {
         content: [{ type: "text", text: `${summarizePost(post)}\nSaved: ${workspaceRelative(context.workspaceRoot, outputPath)}` }],
@@ -85,12 +84,19 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
   };
 }
 
-async function streamDownload(url: string, maxBytes: number): Promise<string> {
-  const response = await fetch(url, { headers: { "user-agent": "mikuswarm/0.1" } });
+interface StreamDownloadResult {
+  path: string;
+  contentType?: string;
+}
+
+async function streamDownload(url: string, maxBytes: number): Promise<StreamDownloadResult> {
+  const controller = new AbortController();
+  const response = await fetch(url, { headers: { "user-agent": "mikuswarm/0.1" }, signal: controller.signal });
   if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
 
   const contentLength = response.headers.get("content-length");
   if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+    controller.abort();
     throw new Error(`Asset too large: Content-Length ${contentLength} exceeds ${maxBytes} byte limit`);
   }
 
@@ -102,6 +108,7 @@ async function streamDownload(url: string, maxBytes: number): Promise<string> {
     transform(chunk: Buffer, _encoding, callback) {
       totalBytes += chunk.byteLength;
       if (totalBytes > maxBytes) {
+        controller.abort();
         callback(new Error(`Asset too large: exceeded ${maxBytes} byte limit during download`));
       } else {
         callback(null, chunk);
@@ -109,8 +116,40 @@ async function streamDownload(url: string, maxBytes: number): Promise<string> {
     },
   });
 
-  await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
-  return tmpPath;
+  try {
+    await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
+  } catch (error) {
+    await unlink(tmpPath).catch(() => {});
+    throw error;
+  }
+  return { path: tmpPath, contentType: response.headers.get("content-type") ?? undefined };
+}
+
+function extFromUrl(url: string): string | undefined {
+  try {
+    const pathname = new URL(url).pathname;
+    const match = pathname.match(/\.(\w+)$/);
+    return match ? match[1] : undefined;
+  } catch { return undefined; }
+}
+
+function extFromContentType(ct?: string): string | undefined {
+  if (!ct) return undefined;
+  const mime = ct.split(";")[0].trim().toLowerCase();
+  const map: Record<string, string> = {
+    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+    "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm",
+  };
+  return map[mime];
+}
+
+function mimeFromUrl(url: string): string {
+  const ext = extFromUrl(url);
+  const map: Record<string, string> = {
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+    gif: "image/gif", webp: "image/webp",
+  };
+  return (ext && map[ext]) ?? "image/jpeg";
 }
 
 async function searchDanbooru(tags: string[], limit: number) {

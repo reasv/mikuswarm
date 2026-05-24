@@ -95,16 +95,19 @@ const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
 
 async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number): Promise<LoadedMedia> {
   if (isUrl(source)) {
-    const response = await fetch(source);
+    const controller = new AbortController();
+    const response = await fetch(source, { signal: controller.signal });
     if (!response.ok) throw new Error(`Failed to fetch media: HTTP ${response.status}`);
     const mimeType = response.headers.get("content-type")?.split(";")[0]?.trim() ?? "application/octet-stream";
 
     if (!ALLOWED_MEDIA_PREFIXES.some((p) => mimeType.startsWith(p)) && mimeType !== "application/octet-stream") {
+      controller.abort();
       throw new Error(`URL returned non-media content-type: ${mimeType}`);
     }
 
     const contentLength = response.headers.get("content-length");
     if (contentLength && parseInt(contentLength, 10) > maxFetchBytes) {
+      controller.abort();
       throw new Error(`Media too large: Content-Length ${contentLength} exceeds ${maxFetchBytes} byte limit`);
     }
 
@@ -116,6 +119,7 @@ async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: n
       transform(chunk: Buffer, _encoding, callback) {
         totalBytes += chunk.byteLength;
         if (totalBytes > maxFetchBytes) {
+          controller.abort();
           callback(new Error(`Media too large: exceeded ${maxFetchBytes} byte limit during download`));
         } else {
           callback(null, chunk);
