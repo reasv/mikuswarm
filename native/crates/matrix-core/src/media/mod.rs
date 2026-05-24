@@ -194,11 +194,19 @@ async fn download_media_from_message(
         _ => return Ok(None),
     };
 
+    let size_bytes = data.len() as u64;
+    if let Some(limit) = size_limit {
+        if size_bytes > limit {
+            return Err(MatrixError::State(format!(
+                "downloaded media size ({size_bytes} bytes) exceeds download limit ({limit} bytes)"
+            )));
+        }
+    }
+
     let resolved = PathBuf::from(output_path);
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let size_bytes = data.len() as u64;
     std::fs::write(&resolved, &data)?;
 
     Ok(Some(MatrixDownloadMediaResult {

@@ -41,53 +41,91 @@ export async function processVideoForInference(
   );
   const truncated = (totalDuration - startTime) > options.maxDurationSeconds;
 
-  const cache = getCache(options.cachePath);
-  await cache.init();
+  const shouldCacheFull = totalDuration <= options.maxDurationSeconds * 2;
 
-  const fileHash = await hashFile(inputPath);
-  let convertedPath = await cache.get(fileHash);
+  if (shouldCacheFull) {
+    const cache = getCache(options.cachePath);
+    await cache.init();
 
-  if (!convertedPath) {
-    const tempEncoded = await encodeVideo(ffmpeg, inputPath, probe, options);
-    convertedPath = await cache.put(fileHash, tempEncoded);
-    await unlink(tempEncoded).catch(() => {});
-  }
+    const fileHash = await hashFile(inputPath);
+    let convertedPath = await cache.get(fileHash);
 
-  const segmentPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
-
-  try {
-    if (startTime > 0 || truncated) {
-      await extractSegment(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration);
-    } else {
-      await copyFile(convertedPath, segmentPath);
+    if (!convertedPath) {
+      const tempEncoded = await encodeVideo(ffmpeg, inputPath, probe, options);
+      convertedPath = await cache.put(fileHash, tempEncoded);
+      await unlink(tempEncoded).catch(() => {});
+      await cache.evictIfNeeded(options.cacheMaxBytes, options.cacheTargetBytes);
     }
 
-    const segmentStat = await stat(segmentPath);
-    if (segmentStat.size > options.maxBytes) {
-      await unlink(segmentPath).catch(() => {});
-      const reducedPath = await reencodeWithBitrate(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
-      const reducedStat = await stat(reducedPath);
+    const segmentPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
+
+    try {
+      if (startTime > 0 || truncated) {
+        await extractSegment(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration);
+      } else {
+        await copyFile(convertedPath, segmentPath);
+      }
+
+      const segmentStat = await stat(segmentPath);
+      if (segmentStat.size > options.maxBytes) {
+        await unlink(segmentPath).catch(() => {});
+        const reducedPath = await reencodeWithBitrate(ffmpeg, convertedPath, segmentPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
+        const reducedStat = await stat(reducedPath);
+        return {
+          path: reducedPath,
+          mimeType: "video/mp4",
+          sizeBytes: reducedStat.size,
+          truncated,
+          processedRange: [startTime, startTime + effectiveDuration],
+          totalDuration,
+        };
+      }
+
       return {
-        path: reducedPath,
+        path: segmentPath,
         mimeType: "video/mp4",
-        sizeBytes: reducedStat.size,
+        sizeBytes: segmentStat.size,
         truncated,
         processedRange: [startTime, startTime + effectiveDuration],
         totalDuration,
       };
+    } catch (error) {
+      await unlink(segmentPath).catch(() => {});
+      throw error;
     }
+  } else {
+    const segmentPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
+    try {
+      await encodeVideoSegment(ffmpeg, inputPath, probe, options, startTime, effectiveDuration, segmentPath);
 
-    return {
-      path: segmentPath,
-      mimeType: "video/mp4",
-      sizeBytes: segmentStat.size,
-      truncated,
-      processedRange: [startTime, startTime + effectiveDuration],
-      totalDuration,
-    };
-  } catch (error) {
-    await unlink(segmentPath).catch(() => {});
-    throw error;
+      const segmentStat = await stat(segmentPath);
+      if (segmentStat.size > options.maxBytes) {
+        await unlink(segmentPath).catch(() => {});
+        const reducedPath = join(tmpdir(), `miku-vid-seg-${randomBytes(8).toString("hex")}.mp4`);
+        await reencodeWithBitrate(ffmpeg, inputPath, reducedPath, startTime, effectiveDuration, options.maxBytes, options.x264Preset);
+        const reducedStat = await stat(reducedPath);
+        return {
+          path: reducedPath,
+          mimeType: "video/mp4",
+          sizeBytes: reducedStat.size,
+          truncated,
+          processedRange: [startTime, startTime + effectiveDuration],
+          totalDuration,
+        };
+      }
+
+      return {
+        path: segmentPath,
+        mimeType: "video/mp4",
+        sizeBytes: segmentStat.size,
+        truncated,
+        processedRange: [startTime, startTime + effectiveDuration],
+        totalDuration,
+      };
+    } catch (error) {
+      await unlink(segmentPath).catch(() => {});
+      throw error;
+    }
   }
 }
 
@@ -158,6 +196,57 @@ async function encodeVideo(
       return outPath;
     }
     throw error;
+  }
+}
+
+async function encodeVideoSegment(
+  ffmpeg: FfmpegCommand,
+  inputPath: string,
+  probe: ProbeResult,
+  options: VideoProcessingOptions,
+  startTime: number,
+  duration: number,
+  outputPath: string,
+): Promise<void> {
+  const shortSide = Math.min(probe.width, probe.height);
+  const needsScale = shortSide > options.maxResolution && shortSide > 0;
+
+  const scaleFilter = needsScale
+    ? probe.height <= probe.width
+      ? `scale=-2:${options.maxResolution}`
+      : `scale=${options.maxResolution}:-2`
+    : "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+
+  const encoder = options.gpuAcceleration ? "h264_nvenc" : "libx264";
+  const preset = encoder === "libx264" ? ["-preset", options.x264Preset] : [];
+
+  try {
+    await runFfmpeg(ffmpeg, inputPath, outputPath, [
+      "-t", String(duration),
+      "-c:v", encoder,
+      ...preset,
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      "-vf", scaleFilter,
+      "-c:a", "aac",
+      "-b:a", "128k",
+    ], startTime);
+  } catch (error) {
+    if (options.gpuAcceleration) {
+      await unlink(outputPath).catch(() => {});
+      await runFfmpeg(ffmpeg, inputPath, outputPath, [
+        "-t", String(duration),
+        "-c:v", "libx264",
+        "-preset", options.x264Preset,
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-vf", scaleFilter,
+        "-c:a", "aac",
+        "-b:a", "128k",
+      ], startTime);
+    } else {
+      throw error;
+    }
   }
 }
 

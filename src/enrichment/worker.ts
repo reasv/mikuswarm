@@ -1,4 +1,5 @@
 import { nanoid } from "nanoid";
+import { unlink } from "node:fs/promises";
 import type { CanonicalChatEvent } from "../types.js";
 import type { MediaAssetRow, LinkPreviewRow, ReplyContextRow, Storage } from "../storage/index.js";
 import type { EnrichmentCapabilities, EnrichmentResult } from "./types.js";
@@ -339,6 +340,7 @@ export class EnrichmentWorker {
       try {
         const fetched = await this.options.fetchClient.fetch(url);
         if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+          await unlink(fetched.path).catch(() => {});
           asset.download_status = "failed";
           asset.download_error = `HTTP ${fetched.statusCode}`;
           result.mediaAssets.push(asset);

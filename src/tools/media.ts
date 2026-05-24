@@ -1,15 +1,10 @@
-import { createWriteStream } from "node:fs";
 import { unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { randomBytes } from "node:crypto";
-import { pipeline } from "node:stream/promises";
-import { Readable, Transform } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
 import type { ConcurrencyLimitedInferenceClient } from "../captioning/inference-client.js";
 import type { MediaModality } from "../captioning/describe.js";
+import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
 
 export interface MediaToolContext {
   workspaceRoot: string;
@@ -17,6 +12,7 @@ export interface MediaToolContext {
   defaultPrompts: Map<MediaModality, string>;
   modelHasVision: boolean;
   maxFetchBytes: number;
+  fetchClient: ConcurrencyLimitedFetchClient;
 }
 
 export function createMediaTool(context: MediaToolContext): AgentTool {
@@ -52,7 +48,7 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
       const results: string[] = [];
       for (const source of unique) {
         try {
-          const loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes);
+          const loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient);
           const modality = inferModality(loaded.mimeType, source);
           const client = context.clients.get(modality);
           if (!client) {
@@ -93,51 +89,22 @@ interface LoadedMedia {
 
 const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
 
-async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number): Promise<LoadedMedia> {
+async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number, fetchClient: ConcurrencyLimitedFetchClient): Promise<LoadedMedia> {
   if (isUrl(source)) {
-    const controller = new AbortController();
-    const response = await fetch(source, { signal: controller.signal });
-    if (!response.ok) throw new Error(`Failed to fetch media: HTTP ${response.status}`);
-    const mimeType = response.headers.get("content-type")?.split(";")[0]?.trim() ?? "application/octet-stream";
-
-    if (!ALLOWED_MEDIA_PREFIXES.some((p) => mimeType.startsWith(p)) && mimeType !== "application/octet-stream") {
-      controller.abort();
+    const fetched = await fetchClient.fetch(source, { maxBytes: maxFetchBytes });
+    if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+      await unlink(fetched.path).catch(() => {});
+      throw new Error(`Failed to fetch media: HTTP ${fetched.statusCode}`);
+    }
+    const mimeType = fetched.contentType?.split(";")[0]?.trim() ?? "application/octet-stream";
+    if (!ALLOWED_MEDIA_PREFIXES.some(p => mimeType.startsWith(p)) && mimeType !== "application/octet-stream") {
+      await unlink(fetched.path).catch(() => {});
       throw new Error(`URL returned non-media content-type: ${mimeType}`);
     }
-
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > maxFetchBytes) {
-      controller.abort();
-      throw new Error(`Media too large: Content-Length ${contentLength} exceeds ${maxFetchBytes} byte limit`);
-    }
-
-    const tmpPath = join(tmpdir(), `miku-media-fetch-${randomBytes(8).toString("hex")}`);
-    if (!response.body) throw new Error("Failed to read response body");
-    const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
-    let totalBytes = 0;
-    const sizeGuard = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        totalBytes += chunk.byteLength;
-        if (totalBytes > maxFetchBytes) {
-          controller.abort();
-          callback(new Error(`Media too large: exceeded ${maxFetchBytes} byte limit during download`));
-        } else {
-          callback(null, chunk);
-        }
-      },
-    });
-
-    try {
-      await pipeline(nodeStream, sizeGuard, createWriteStream(tmpPath));
-    } catch (error) {
-      await unlink(tmpPath).catch(() => {});
-      throw error;
-    }
-
     return {
-      path: tmpPath,
+      path: fetched.path,
       mimeType,
-      cleanup: async () => { await unlink(tmpPath).catch(() => {}); },
+      cleanup: async () => { await unlink(fetched.path).catch(() => {}); },
     };
   }
 

@@ -1,3 +1,5 @@
+import { readdir, unlink } from "node:fs/promises";
+import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
@@ -36,6 +38,20 @@ export class EnrichmentWorkerPool {
     if (resetCount > 0) {
       this.options.logger.info("enrichment_reset_stale", { count: resetCount });
     }
+
+    const attachDir = path.join(this.options.workspaceRoot, "msg-attach");
+    const tmpFiles = await readdir(attachDir).catch(() => [] as string[]);
+    let tmpCleaned = 0;
+    for (const f of tmpFiles) {
+      if (f.startsWith(".tmp-")) {
+        await unlink(path.join(attachDir, f)).catch(() => {});
+        tmpCleaned++;
+      }
+    }
+    if (tmpCleaned > 0) {
+      this.options.logger.info("enrichment_cleanup_orphaned_tmp", { count: tmpCleaned });
+    }
+
     this.schedulePoll(100);
   }
 

@@ -53,7 +53,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const fetchClient = new ConcurrencyLimitedFetchClient({
     maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
     timeoutMs: config.enrichment?.fetch_timeout_ms ?? 10_000,
-    maxResponseBytes: config.enrichment?.max_download_bytes ?? downloadSizeLimit,
+    maxResponseBytes: downloadSizeLimit,
   });
 
   const captioningConfig = config.captioning ?? {};
@@ -106,6 +106,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
         x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
         cachePath: mediaCachePath,
+        cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
+        cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
       },
     })],
     ["audio", new ConcurrencyLimitedInferenceClient({
@@ -409,10 +411,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         defaultPrompts,
         modelHasVision: config.models.default.multimodal,
         maxFetchBytes: downloadSizeLimit,
+        fetchClient,
       }),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
-      createDanbooruTool({ workspaceRoot, downloadSizeLimit }),
+      createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient }),
     ];
     const agent = factory.create(session, tools);
     sessions.attachAgent(session.id, agent);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, mkdir, copyFile } from "node:fs/promises";
+import { access, mkdir, copyFile, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 export class MediaCache {
@@ -24,6 +24,36 @@ export class MediaCache {
     const dest = this.pathForHash(hash);
     await copyFile(sourcePath, dest);
     return dest;
+  }
+
+  async evictIfNeeded(maxBytes: number, targetBytes: number): Promise<void> {
+    let files: string[];
+    try {
+      files = await readdir(this.cacheDir);
+    } catch {
+      return;
+    }
+    const mp4Files = files.filter(f => f.endsWith(".mp4"));
+    const entries: Array<{ path: string; size: number; mtimeMs: number }> = [];
+    let totalSize = 0;
+    for (const f of mp4Files) {
+      const filePath = join(this.cacheDir, f);
+      try {
+        const s = await stat(filePath);
+        entries.push({ path: filePath, size: s.size, mtimeMs: s.mtimeMs });
+        totalSize += s.size;
+      } catch {
+        // file may have been removed concurrently
+      }
+    }
+    if (totalSize <= maxBytes) return;
+
+    entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const entry of entries) {
+      if (totalSize <= targetBytes) break;
+      await unlink(entry.path).catch(() => {});
+      totalSize -= entry.size;
+    }
   }
 
   private pathForHash(hash: string): string {

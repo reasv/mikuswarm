@@ -46,6 +46,8 @@ const MediaVideoSchema = Type.Object({
   max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
   gpu_acceleration: Type.Optional(Type.Boolean()),
   x264_preset: Type.Optional(Type.String()),
+  cache_max_bytes: Type.Optional(Type.Number({ minimum: 0 })),
+  cache_target_bytes: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
 const MediaAudioSchema = Type.Object({
@@ -65,7 +67,6 @@ const EnrichmentSchema = Type.Object({
   fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
-  max_download_bytes: Type.Optional(Type.Number({ minimum: 0 })),
   max_previews_per_message: Type.Optional(Type.Number({ minimum: 0 })),
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
 });

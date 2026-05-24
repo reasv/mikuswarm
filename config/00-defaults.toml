@@ -54,6 +54,8 @@ max_bytes = 52428800
 max_duration_seconds = 120
 gpu_acceleration = false
 x264_preset = "veryfast"
+cache_max_bytes = 21474836480
+cache_target_bytes = 16106127360
 
 [media.audio]
 max_bytes = 20971520

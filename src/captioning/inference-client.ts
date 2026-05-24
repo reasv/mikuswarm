@@ -81,23 +81,32 @@ export class ConcurrencyLimitedInferenceClient {
 
       if (this.options.modality === "image" && this.options.imageProcessing) {
         processed = await processImageForInference(request.filePath, this.options.imageProcessing);
-        data = await readFile(processed.path);
-        mimeType = processed.mimeType;
-        await cleanupProcessedImage(processed);
+        try {
+          data = await readFile(processed.path);
+          mimeType = processed.mimeType;
+        } finally {
+          await cleanupProcessedImage(processed);
+        }
       } else if (this.options.modality === "video" && this.options.videoProcessing) {
         const videoOpts = { ...this.options.videoProcessing };
         if (request.startTime != null) videoOpts.startTime = request.startTime;
         processed = await processVideoForInference(request.filePath, videoOpts);
-        data = await readFile(processed.path);
-        mimeType = processed.mimeType;
-        await unlink(processed.path).catch(() => {});
+        try {
+          data = await readFile(processed.path);
+          mimeType = processed.mimeType;
+        } finally {
+          await unlink(processed.path).catch(() => {});
+        }
       } else if (this.options.modality === "audio" && this.options.audioProcessing) {
         const audioOpts = { ...this.options.audioProcessing };
         if (request.startTime != null) audioOpts.startTime = request.startTime;
         processed = await processAudioForInference(request.filePath, audioOpts);
-        data = await readFile(processed.path);
-        mimeType = processed.mimeType;
-        await unlink(processed.path).catch(() => {});
+        try {
+          data = await readFile(processed.path);
+          mimeType = processed.mimeType;
+        } finally {
+          await unlink(processed.path).catch(() => {});
+        }
       } else {
         data = await readFile(request.filePath);
       }

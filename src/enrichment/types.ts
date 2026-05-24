@@ -54,7 +54,6 @@ export interface EnrichmentConfig {
   fetch_concurrency?: number;
   fetch_timeout_ms?: number;
   trigger_wait_timeout_ms?: number;
-  max_download_bytes?: number;
   max_previews_per_message?: number;
   max_retries?: number;
 }

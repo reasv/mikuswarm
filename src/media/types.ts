@@ -13,6 +13,8 @@ export interface VideoProcessingOptions {
   gpuAcceleration: boolean;
   x264Preset: string;
   cachePath: string;
+  cacheMaxBytes: number;
+  cacheTargetBytes: number;
 }
 
 export interface AudioProcessingOptions {
