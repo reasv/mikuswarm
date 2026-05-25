@@ -1,4 +1,4 @@
-import { unlink } from "node:fs/promises";
+import { open, unlink } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
@@ -50,7 +50,11 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
         let loaded: LoadedMedia | undefined;
         try {
           loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient);
-          const modality = inferModality(loaded.mimeType, source);
+          const modality = await inferModality(loaded.mimeType, source, loaded.path);
+          if (!modality) {
+            results.push(`[${source}]\nError: could not determine media type`);
+            continue;
+          }
           const client = context.clients.get(modality);
           if (!client) {
             results.push(`[${source}]\nError: no inference client configured for ${modality}`);
@@ -115,7 +119,7 @@ async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: n
   return { path: absolute, mimeType };
 }
 
-function inferModality(mimeType: string, source: string): MediaModality {
+function inferModalityFromMimeOrExt(mimeType: string, source: string): MediaModality | null {
   const mime = mimeType.split(";")[0].trim().toLowerCase();
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
@@ -124,7 +128,44 @@ function inferModality(mimeType: string, source: string): MediaModality {
   if (ext && ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "tiff"].includes(ext)) return "image";
   if (ext && ["mp4", "webm", "mov", "mkv", "avi"].includes(ext)) return "video";
   if (ext && ["mp3", "ogg", "wav", "flac", "aac", "m4a", "opus", "wma"].includes(ext)) return "audio";
-  return "image";
+  return null;
+}
+
+async function inferModalityFromMagicBytes(filePath: string): Promise<MediaModality | null> {
+  let fh;
+  try {
+    fh = await open(filePath, "r");
+    const buf = Buffer.alloc(12);
+    await fh.read(buf, 0, 12, 0);
+
+    if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return "image"; // JPEG
+    if (buf[0] === 0x89 && buf.subarray(1, 4).toString() === "PNG") return "image"; // PNG
+    if (buf.subarray(0, 4).toString() === "GIF8") return "image"; // GIF
+    if (buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WEBP") return "image"; // WebP
+    if (buf.subarray(4, 8).toString() === "ftyp") {
+      const brand = buf.subarray(8, 12).toString();
+      if (brand === "avif" || brand === "avis") return "image"; // AVIF
+      if (brand === "M4A " || brand === "M4B ") return "audio"; // M4A
+      return "video"; // MP4/MOV/etc
+    }
+    if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return "video"; // Matroska/WebM
+    if (buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "AVI ") return "video"; // AVI
+    if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return "audio"; // MP3 (ID3 tag)
+    if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return "audio"; // MP3 (sync word)
+    if (buf.subarray(0, 4).toString() === "OggS") return "audio"; // Ogg
+    if (buf.subarray(0, 4).toString() === "fLaC") return "audio"; // FLAC
+    if (buf.subarray(0, 4).toString() === "RIFF" && buf.subarray(8, 12).toString() === "WAVE") return "audio"; // WAV
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await fh?.close();
+  }
+}
+
+async function inferModality(mimeType: string, source: string, filePath: string): Promise<MediaModality | null> {
+  return inferModalityFromMimeOrExt(mimeType, source) ?? await inferModalityFromMagicBytes(filePath);
 }
 
 function mimeFromExtension(path: string): string {

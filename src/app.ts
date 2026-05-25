@@ -84,12 +84,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       model: resolveModalityModel(imageConfig),
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
+      maxTokens: imageConfig.max_tokens ?? 2048,
       maxConcurrency: imageConfig.concurrency,
       imageProcessing: {
         maxTotalPixels: mediaImageConfig.max_total_pixels ?? 921_600,
         maxTotalPixelsHard: mediaImageConfig.max_total_pixels_hard ?? 1_843_200,
         minShortestSide: mediaImageConfig.min_shortest_side ?? 480,
         maxBytes: mediaImageConfig.max_bytes ?? 1_048_576,
+        mozjpeg: mediaImageConfig.mozjpeg ?? true,
       },
     })],
     ["video", new ConcurrencyLimitedInferenceClient({
@@ -97,6 +99,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       model: resolveModalityModel(videoConfig),
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
+      maxTokens: videoConfig.max_tokens ?? 2048,
       maxConcurrency: videoConfig.concurrency,
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
@@ -115,6 +118,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       model: resolveModalityModel(audioConfig),
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
+      maxTokens: audioConfig.max_tokens ?? 4096,
       maxConcurrency: audioConfig.concurrency,
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {

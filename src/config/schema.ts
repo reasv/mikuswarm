@@ -38,6 +38,7 @@ const MediaImageSchema = Type.Object({
   max_total_pixels_hard: Type.Optional(Type.Number({ minimum: 1 })),
   min_shortest_side: Type.Optional(Type.Number({ minimum: 1 })),
   max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  mozjpeg: Type.Optional(Type.Boolean()),
 });
 
 const MediaVideoSchema = Type.Object({
@@ -80,6 +81,7 @@ const CaptioningModelSchema = Type.Object({
 const ModalityConfigSchema = Type.Object({
   prompt: Type.Optional(Type.String()),
   max_chars: Type.Optional(Type.Number({ minimum: 1 })),
+  max_tokens: Type.Optional(Type.Number({ minimum: 1 })),
   concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   model: Type.Optional(CaptioningModelSchema),

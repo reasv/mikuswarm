@@ -47,6 +47,7 @@ max_total_pixels = 921600
 max_total_pixels_hard = 1843200
 min_shortest_side = 480
 max_bytes = 1048576
+mozjpeg = true
 
 [media.video]
 max_resolution = 480

@@ -13,6 +13,7 @@ export interface DescribeMediaOptions {
   prompt: string;
   model: CaptionModelConfig;
   maxChars: number;
+  maxTokens: number;
   timeoutMs?: number;
 }
 
@@ -46,7 +47,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
   const body = {
     model: options.model.id,
     messages: [{ role: "user", content: contentBlocks }],
-    max_tokens: 2048,
+    max_tokens: options.maxTokens,
   };
 
   const controller = new AbortController();

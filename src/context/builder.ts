@@ -184,6 +184,7 @@ export class ContextBuilder {
       maxTotalPixelsHard: this.config.media?.image?.max_total_pixels_hard ?? 1_843_200,
       minShortestSide: this.config.media?.image?.min_shortest_side ?? 480,
       maxBytes: this.config.media?.image?.max_bytes ?? 1_048_576,
+      mozjpeg: this.config.media?.image?.mozjpeg ?? true,
     };
     for (const { eventId, attachment } of images) {
       if (!attachment.localPath) continue;

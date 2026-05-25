@@ -16,6 +16,7 @@ export interface InferenceClientOptions {
   model: CaptionModelConfig;
   prompt: string;
   maxChars: number;
+  maxTokens: number;
   maxConcurrency?: number;
   imageProcessing?: ImageProcessingOptions;
   videoProcessing?: VideoProcessingOptions;
@@ -118,6 +119,7 @@ export class ConcurrencyLimitedInferenceClient {
         prompt: request.prompt ?? this.options.prompt,
         model: this.options.model,
         maxChars: this.options.maxChars,
+        maxTokens: this.options.maxTokens,
         timeoutMs: this.options.timeoutMs,
       });
 

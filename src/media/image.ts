@@ -15,7 +15,8 @@ export async function processImageForInference(
 
   const { width, height } = computeTargetDimensions(origWidth, origHeight, options);
 
-  const result = await compressToFit(inputPath, width, height, options.maxBytes);
+  const useMozjpeg = options.mozjpeg;
+  const result = await compressToFit(inputPath, width, height, options.maxBytes, useMozjpeg);
   if (result) {
     const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
     await writeFile(tmpPath, result);
@@ -29,7 +30,7 @@ export async function processImageForInference(
 
   const fallback = await sharp(inputPath)
     .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
-    .jpeg({ quality: 60, mozjpeg: true })
+    .jpeg({ quality: 60, mozjpeg: useMozjpeg })
     .toBuffer();
   const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
   await writeFile(tmpPath, fallback);
@@ -77,6 +78,7 @@ async function compressToFit(
   targetWidth: number,
   targetHeight: number,
   maxBytes: number,
+  mozjpeg: boolean,
 ): Promise<Buffer | undefined> {
   let width = targetWidth;
   let height = targetHeight;
@@ -90,17 +92,17 @@ async function compressToFit(
           fit: "inside",
           withoutEnlargement: true,
         })
-        .jpeg({ quality, mozjpeg: true })
+        .jpeg({ quality, mozjpeg })
         .toBuffer();
       if (output.byteLength <= maxBytes) {
         return output;
       }
     }
-    if (width <= 512 || height <= 512) break;
+    if (width <= 1 || height <= 1) break;
     width *= 0.75;
     height *= 0.75;
-    width = Math.max(width, 512);
-    height = Math.max(height, 512);
+    width = Math.max(width, 1);
+    height = Math.max(height, 1);
   }
 
   return undefined;

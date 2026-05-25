@@ -3,6 +3,7 @@ export interface ImageProcessingOptions {
   maxTotalPixelsHard: number;
   minShortestSide: number;
   maxBytes: number;
+  mozjpeg: boolean;
 }
 
 export interface VideoProcessingOptions {
