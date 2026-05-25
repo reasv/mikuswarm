@@ -15,10 +15,16 @@ import {
 import { AgentSessionFactory, SessionManager, SessionRunner } from "./agent/index.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import {
+  createChannelInfoTool,
   createDanbooruTool,
+  createDeleteMessageTool,
   createDelegateToSessionTool,
+  createEditMessageTool,
   createEmojiListTool,
+  createListReactionsTool,
   createMediaTool,
+  createMemberInfoTool,
+  createPinsTool,
   createReactTool,
   createSearchMemoryTool,
   createSearchFilesTool,
@@ -411,6 +417,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(roomId ? [
         createEmojiListTool({ client: provider.getClient(target), roomId }),
         createReactTool({ client: provider.getClient(target), roomId }),
+        createEditMessageTool({ client: provider.getClient(target), roomId }),
+        createDeleteMessageTool({ client: provider.getClient(target), roomId }),
+        createPinsTool({ client: provider.getClient(target), roomId }),
+        createListReactionsTool({ client: provider.getClient(target), roomId }),
+        createMemberInfoTool({ client: provider.getClient(target), roomId }),
+        createChannelInfoTool({ client: provider.getClient(target), roomId }),
       ] : []),
       createWebFetchTool(),
       createWebSearchTool(),

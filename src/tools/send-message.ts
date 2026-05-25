@@ -11,6 +11,7 @@ import type { ChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta }
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
 import { assertPublicHttpUrl } from "./ssrf.js";
+import { chunkMarkdownText } from "./chunk.js";
 
 export interface SendMessageToolContext {
   provider: ChatProvider;
@@ -78,29 +79,45 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       }
 
       try {
-        const receipt = await context.provider.send(effectiveTarget, {
-          body,
-          htmlBody,
-          attachments,
-          agentSessionId: context.agentSessionId,
-        });
-        const event: CanonicalChatEvent = {
-          id: `assistant:${context.agentSessionId}:${receipt.externalId ?? Date.now()}`,
-          externalId: receipt.externalId,
-          timelineKey: context.target.timelineKey,
-          provider: context.provider.id,
-          agentSessionId: context.agentSessionId,
-          role: "assistant",
-          sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
-          body: args.message,
-          htmlBody,
-          timestamp: receipt.deliveredAt,
-          receivedAt: Date.now(),
-        };
-        await context.timeline.append(event);
+        const chunks = chunkMarkdownText(body, 4000);
+        const eventIds: string[] = [];
+
+        for (let i = 0; i < chunks.length; i++) {
+          const chunkTarget: OutboundTarget = { ...effectiveTarget };
+          if (i > 0) {
+            delete chunkTarget.replyToId;
+          }
+
+          const receipt = await context.provider.send(chunkTarget, {
+            body: chunks[i],
+            htmlBody: chunks.length === 1 ? htmlBody : undefined,
+            attachments: i === 0 ? attachments : undefined,
+            agentSessionId: context.agentSessionId,
+          });
+
+          const event: CanonicalChatEvent = {
+            id: `assistant:${context.agentSessionId}:${receipt.externalId ?? Date.now()}:${i}`,
+            externalId: receipt.externalId,
+            timelineKey: context.target.timelineKey,
+            provider: context.provider.id,
+            agentSessionId: context.agentSessionId,
+            role: "assistant",
+            sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
+            body: chunks[i],
+            htmlBody: chunks.length === 1 ? htmlBody : undefined,
+            timestamp: receipt.deliveredAt,
+            receivedAt: Date.now(),
+          };
+          await context.timeline.append(event);
+          if (receipt.externalId) eventIds.push(receipt.externalId);
+        }
+
+        const summary = eventIds.length === 1
+          ? `sent: ${eventIds[0]}`
+          : `sent ${eventIds.length} chunks: ${eventIds.join(", ")}`;
         return {
-          content: [{ type: "text", text: `sent: ${receipt.externalId ?? "local"}` }],
-          details: receipt,
+          content: [{ type: "text", text: summary }],
+          details: { eventIds },
           terminate: isFinal,
         };
       } catch (err) {
