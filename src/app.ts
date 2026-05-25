@@ -391,8 +391,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
     const sentMessages: string[] = [];
-    const client = provider.getClient(target);
-    const roomId = target.roomId ?? "";
+    const roomId = target.roomId;
     const tools = [
       createSendMessageTool({
         provider,
@@ -411,8 +410,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             content,
           }),
       }),
-      createEmojiListTool({ client, roomId }),
-      createReactTool({ client, roomId }),
+      ...(roomId ? [
+        createEmojiListTool({ client: provider.getClient(target), roomId }),
+        createReactTool({ client: provider.getClient(target), roomId }),
+      ] : []),
       createWebFetchTool(),
       createWebSearchTool(),
       createTextEditorTool({ workspaceRoot }),

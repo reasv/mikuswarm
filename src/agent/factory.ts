@@ -1,6 +1,6 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
-import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
+import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
@@ -10,12 +10,26 @@ const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
   void completeSimple(model, context, options).then(
     (message) => {
-      stream.push({ type: "done", reason: "stop", message });
+      const reason = message.stopReason === "toolUse" ? "toolUse"
+        : message.stopReason === "length" ? "length"
+        : "stop";
+      stream.push({ type: "done", reason, message });
       stream.end(message);
     },
     (err) => {
-      stream.push({ type: "error", reason: "error", error: err });
-      stream.end();
+      const errorMessage: AssistantMessage = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider ?? "unknown",
+        model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "error",
+        errorMessage: err instanceof Error ? err.message : String(err),
+        timestamp: Date.now(),
+      };
+      stream.push({ type: "error", reason: "error", error: errorMessage });
+      stream.end(errorMessage);
     },
   );
   return stream;

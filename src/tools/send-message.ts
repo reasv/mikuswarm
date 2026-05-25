@@ -1,5 +1,10 @@
-import { stat } from "node:fs/promises";
+import { stat, unlink, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
@@ -26,7 +31,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       html: Type.Optional(Type.String({ description: "Optional HTML body. If omitted and message contains :shortcode: patterns, HTML is generated automatically." })),
       is_reply: Type.Boolean({ description: "Whether this message is an explicit reply to another message. Set to false for standalone messages." }),
       reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
-      media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) to send as media attachment." })),
+      media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),
     }),
     execute: async (_toolCallId, params) => {
       const args = params as {
@@ -55,10 +60,12 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       const htmlBody = args.html;
 
       let attachments: AttachmentMeta[] | undefined;
+      let tempPath: string | undefined;
       if (args.media?.trim()) {
         try {
           const mediaResult = await resolveMedia(args.media.trim(), context);
-          attachments = [mediaResult];
+          attachments = [mediaResult.attachment];
+          tempPath = mediaResult.tempPath;
         } catch (err) {
           return {
             content: [{ type: "text", text: `error: failed to resolve media "${args.media}": ${err instanceof Error ? err.message : String(err)}` }],
@@ -102,6 +109,8 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
           };
         }
         throw err;
+      } finally {
+        if (tempPath) await unlink(tempPath).catch(() => {});
       }
     },
   };
@@ -110,10 +119,14 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
 async function resolveMedia(
   mediaRef: string,
   context: SendMessageToolContext,
-): Promise<AttachmentMeta> {
+): Promise<{ attachment: AttachmentMeta; tempPath?: string }> {
   const maxBytes = context.mediaMaxBytes ?? 50 * 1024 * 1024;
 
-  const localPath = resolveWorkspacePath(mediaRef, context.workspaceRoot ?? ".");
+  if (/^https?:\/\//i.test(mediaRef)) {
+    return downloadMediaUrl(mediaRef, maxBytes);
+  }
+
+  const localPath = resolveWorkspacePath(context.workspaceRoot ?? ".", mediaRef);
   const stats = await stat(localPath);
   if (stats.size > maxBytes) {
     throw new Error(`file exceeds size limit (${stats.size} > ${maxBytes} bytes)`);
@@ -123,13 +136,91 @@ async function resolveMedia(
   const mimeType = guessMimeType(filename);
 
   return {
-    id: `outbound:${Date.now()}:${filename}`,
-    filename,
-    mimeType,
-    mediaType: classifyMediaType(mimeType),
-    sizeBytes: stats.size,
-    localPath,
+    attachment: {
+      id: `outbound:${Date.now()}:${filename}`,
+      filename,
+      mimeType,
+      mediaType: classifyMediaType(mimeType),
+      sizeBytes: stats.size,
+      localPath,
+    },
   };
+}
+
+async function downloadMediaUrl(
+  url: string,
+  maxBytes: number,
+): Promise<{ attachment: AttachmentMeta; tempPath: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await globalThis.fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: { "User-Agent": "MikuAgent/1.0" },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get("content-type") ?? undefined;
+    const urlPath = new URL(response.url).pathname;
+    const filename = path.basename(urlPath) || "download";
+
+    const tempPath = path.join(tmpdir(), `miku-media-${randomBytes(8).toString("hex")}-${filename}`);
+
+    if (!response.body) {
+      await writeFile(tempPath, Buffer.alloc(0));
+      const mimeType = contentType?.split(";")[0]?.trim() ?? guessMimeType(filename);
+      return {
+        attachment: {
+          id: `outbound:${Date.now()}:${filename}`,
+          filename,
+          mimeType,
+          mediaType: classifyMediaType(mimeType),
+          sizeBytes: 0,
+          localPath: tempPath,
+        },
+        tempPath,
+      };
+    }
+
+    const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+    let totalBytes = 0;
+    const sizeGuard = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        totalBytes += chunk.byteLength;
+        if (totalBytes > maxBytes) {
+          controller.abort();
+          callback(new Error(`download exceeds size limit (${maxBytes} bytes)`));
+        } else {
+          callback(null, chunk);
+        }
+      },
+    });
+
+    try {
+      await pipeline(nodeStream, sizeGuard, createWriteStream(tempPath));
+    } catch (err) {
+      await unlink(tempPath).catch(() => {});
+      throw err;
+    }
+
+    const mimeType = contentType?.split(";")[0]?.trim() ?? guessMimeType(filename);
+    return {
+      attachment: {
+        id: `outbound:${Date.now()}:${filename}`,
+        filename,
+        mimeType,
+        mediaType: classifyMediaType(mimeType),
+        sizeBytes: totalBytes,
+        localPath: tempPath,
+      },
+      tempPath,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function guessMimeType(filename: string): string {

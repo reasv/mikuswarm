@@ -342,7 +342,6 @@ async function maybeBuildThumbnail(
     const metadata = await sharp(data, { animated: true }).metadata();
     if (!metadata.format || !metadata.width || !metadata.height) return undefined;
     const animated = (metadata.pages ?? 1) > 1;
-    const height = metadata.pageHeight ?? metadata.height;
 
     for (const quality of THUMBNAIL_QUALITY_CANDIDATES) {
       const pipeline = sharp(data, { animated }).rotate().resize({
