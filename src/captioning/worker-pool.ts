@@ -56,7 +56,9 @@ export class CaptionWorkerPool {
 
   private schedulePoll(delayMs: number): void {
     if (!this.running) return;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined;
       void this.poll().catch((error) =>
         this.options.logger.error("caption_poll_error", {
           error: error instanceof Error ? error.message : String(error),

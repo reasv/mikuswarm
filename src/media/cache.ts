@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, mkdir, copyFile, readdir, stat, unlink } from "node:fs/promises";
+import { access, mkdir, copyFile, readdir, stat, unlink, rename } from "node:fs/promises";
 import { join } from "node:path";
 
 export class MediaCache {
@@ -13,7 +13,7 @@ export class MediaCache {
   async get(hash: string): Promise<string | null> {
     const path = this.pathForHash(hash);
     try {
-      await access(path);
+      await stat(path);
       return path;
     } catch {
       return null;
@@ -22,7 +22,14 @@ export class MediaCache {
 
   async put(hash: string, sourcePath: string): Promise<string> {
     const dest = this.pathForHash(hash);
-    await copyFile(sourcePath, dest);
+    const tmpDest = join(this.cacheDir, `.tmp-${randomBytes(8).toString("hex")}.mp4`);
+    try {
+      await copyFile(sourcePath, tmpDest);
+      await rename(tmpDest, dest);
+    } catch (error) {
+      await unlink(tmpDest).catch(() => {});
+      throw error;
+    }
     return dest;
   }
 
@@ -62,9 +69,10 @@ export class MediaCache {
   }
 }
 
-export async function hashFile(filePath: string): Promise<string> {
+export async function hashFile(filePath: string, extraKey?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash("sha256");
+    if (extraKey) hash.update(extraKey);
     const stream = createReadStream(filePath);
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("end", () => resolve(hash.digest("hex")));

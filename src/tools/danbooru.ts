@@ -1,4 +1,4 @@
-import { readFile, rename, mkdir, unlink, stat } from "node:fs/promises";
+import { readFile, rename, copyFile, mkdir, unlink, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
@@ -83,7 +83,16 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const ext = post.file_ext ?? extFromUrl(assetUrl) ?? extFromContentType(fetched.contentType) ?? "jpg";
       const filename = `danbooru-${post.id}.${ext}`;
       const outputPath = path.join(outputDir, filename);
-      await rename(fetched.path, outputPath);
+      try {
+        await rename(fetched.path, outputPath);
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+          await copyFile(fetched.path, outputPath);
+          await unlink(fetched.path).catch(() => {});
+        } else {
+          throw err;
+        }
+      }
       const fileStat = await stat(outputPath);
       return {
         content: [{ type: "text", text: `${summarizePost(post)}\nSaved: ${workspaceRelative(context.workspaceRoot, outputPath)}` }],

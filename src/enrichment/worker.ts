@@ -107,8 +107,8 @@ export class EnrichmentWorker {
         created_at: Date.now(),
       };
 
+      const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
       try {
-        const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
         const downloaded = await this.options.capabilities.downloadMedia({
           roomId,
           eventId: event.externalId ?? event.id,
@@ -128,6 +128,7 @@ export class EnrichmentWorker {
         asset.download_status = "complete";
         if (downloaded.filename) asset.original_filename = downloaded.filename;
       } catch (error) {
+        await unlink(tempPath).catch(() => {});
         asset.download_status = "failed";
         asset.download_error = error instanceof Error ? error.message : String(error);
       }
@@ -204,8 +205,8 @@ export class EnrichmentWorker {
       created_at: Date.now(),
     };
 
+    const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
     try {
-      const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
       const downloaded = await this.options.capabilities.downloadMedia({
         roomId,
         eventId: summary.eventId,
@@ -224,6 +225,7 @@ export class EnrichmentWorker {
       asset.media_type = downloaded.kind || mediaType;
       asset.download_status = "complete";
     } catch (error) {
+      await unlink(tempPath).catch(() => {});
       asset.download_status = "failed";
       asset.download_error = error instanceof Error ? error.message : String(error);
     }
@@ -337,10 +339,13 @@ export class EnrichmentWorker {
         created_at: Date.now(),
       };
 
+      let fetchedPath: string | undefined;
       try {
         const fetched = await this.options.fetchClient.fetch(url);
+        fetchedPath = fetched.path;
         if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
           await unlink(fetched.path).catch(() => {});
+          fetchedPath = undefined;
           asset.download_status = "failed";
           asset.download_error = `HTTP ${fetched.statusCode}`;
           result.mediaAssets.push(asset);
@@ -352,6 +357,7 @@ export class EnrichmentWorker {
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
         });
+        fetchedPath = undefined;
         asset.local_path = saved.localPath;
         asset.mime_type = fetched.contentType ?? null;
         asset.download_status = "complete";
@@ -360,6 +366,7 @@ export class EnrichmentWorker {
           asset.media_type = inferMediaType(fetched.contentType);
         }
       } catch (error) {
+        if (fetchedPath) await unlink(fetchedPath).catch(() => {});
         asset.download_status = "failed";
         asset.download_error = error instanceof Error ? error.message : String(error);
       }

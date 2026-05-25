@@ -193,11 +193,12 @@ export class ContextBuilder {
       try {
         const processed = await processImageForInference(absPath, imageOpts);
         const data = await readFile(processed.path);
+        const mimeType = processed.mimeType;
         await cleanupProcessedImage(processed);
         blocks.push({
           eventId,
           attachmentId: attachment.id,
-          mediaType: "image/jpeg",
+          mediaType: mimeType,
           dataBase64: data.toString("base64"),
         });
       } catch {

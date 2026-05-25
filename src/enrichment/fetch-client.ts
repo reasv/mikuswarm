@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { unlink, stat } from "node:fs/promises";
+import { unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -63,6 +63,7 @@ export class ConcurrencyLimitedFetchClient {
         const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);
 
         if (!response.body) {
+          await writeFile(outputPath, Buffer.alloc(0));
           return {
             path: outputPath,
             sizeBytes: 0,

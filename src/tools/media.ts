@@ -47,8 +47,9 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
 
       const results: string[] = [];
       for (const source of unique) {
+        let loaded: LoadedMedia | undefined;
         try {
-          const loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient);
+          loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient);
           const modality = inferModality(loaded.mimeType, source);
           const client = context.clients.get(modality);
           if (!client) {
@@ -66,10 +67,11 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
           });
           const label = unique.length > 1 ? `[${source}]\n` : "";
           results.push(`${label}${result.caption}`);
-          if (loaded.cleanup) await loaded.cleanup();
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
           results.push(`[${source}]\nError: ${msg}`);
+        } finally {
+          if (loaded?.cleanup) await loaded.cleanup();
         }
       }
 

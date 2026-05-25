@@ -112,8 +112,8 @@ function audioFormatFromMime(mimeType: string): string {
     "audio/m4a": "m4a",
     "audio/aiff": "aiff",
     "audio/x-aiff": "aiff",
-    "audio/webm": "ogg",
-    "audio/opus": "ogg",
+    "audio/webm": "webm",
+    "audio/opus": "opus",
   };
   return map[mime] ?? "wav";
 }

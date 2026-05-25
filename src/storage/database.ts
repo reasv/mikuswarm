@@ -359,11 +359,26 @@ export class Storage {
     });
   }
 
-  setEnrichmentStatus(eventId: string, status: string, error?: string): Promise<void> {
+  setEnrichmentStatus(eventId: string, status: string, error?: string, retries?: number): Promise<void> {
     return this.write((db) => {
-      db.prepare(
-        `update timeline_events set enrichment_status = ?, updated_at = ? where id = ?`,
-      ).run(status, Date.now(), eventId);
+      if (retries != null) {
+        db.prepare(
+          `update timeline_events set enrichment_status = ?, enrichment_retries = ?, updated_at = ? where id = ?`,
+        ).run(status, retries, Date.now(), eventId);
+      } else {
+        db.prepare(
+          `update timeline_events set enrichment_status = ?, updated_at = ? where id = ?`,
+        ).run(status, Date.now(), eventId);
+      }
+    });
+  }
+
+  getEnrichmentRetries(eventId: string): number {
+    return this.read((db) => {
+      const row = db.prepare(
+        `select enrichment_retries from timeline_events where id = ?`,
+      ).get(eventId) as { enrichment_retries: number } | undefined;
+      return row?.enrichment_retries ?? 0;
     });
   }
 
@@ -785,6 +800,7 @@ create table if not exists timeline_events (
   event_json text not null,
   enrichment_status text not null default 'pending'
     check(enrichment_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
+  enrichment_retries integer not null default 0,
   trigger_group_id text,
   created_at integer not null,
   updated_at integer not null
@@ -898,6 +914,9 @@ function runMigrations(db: Database.Database): void {
   }
   if (!columnNames.has("trigger_group_id")) {
     db.exec(`alter table timeline_events add column trigger_group_id text`);
+  }
+  if (!columnNames.has("enrichment_retries")) {
+    db.exec(`alter table timeline_events add column enrichment_retries integer not null default 0`);
   }
 
   const maColumns = db.prepare("pragma table_info(media_assets)").all() as Array<{ name: string }>;

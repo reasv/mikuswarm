@@ -1,4 +1,4 @@
-import { readdir, unlink } from "node:fs/promises";
+import { mkdir, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
@@ -23,7 +23,6 @@ export interface EnrichmentWorkerPoolOptions {
 export class EnrichmentWorkerPool {
   private running = false;
   private readonly activeWorkers = new Set<Promise<void>>();
-  private readonly failureCounts = new Map<string, number>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
   readonly options: EnrichmentWorkerPoolOptions;
@@ -40,6 +39,7 @@ export class EnrichmentWorkerPool {
     }
 
     const attachDir = path.join(this.options.workspaceRoot, "msg-attach");
+    await mkdir(attachDir, { recursive: true });
     const tmpFiles = await readdir(attachDir).catch(() => [] as string[]);
     let tmpCleaned = 0;
     for (const f of tmpFiles) {
@@ -72,7 +72,9 @@ export class EnrichmentWorkerPool {
 
   private schedulePoll(delayMs: number): void {
     if (!this.running) return;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined;
       void this.poll().catch((error) =>
         this.options.logger.error("enrichment_poll_error", {
           error: error instanceof Error ? error.message : String(error),
@@ -146,19 +148,18 @@ export class EnrichmentWorkerPool {
   }
 
   private async handleWorkerError(eventId: string, error: unknown): Promise<void> {
-    const count = (this.failureCounts.get(eventId) ?? 0) + 1;
-    this.failureCounts.set(eventId, count);
+    const count = this.options.storage.getEnrichmentRetries(eventId) + 1;
     const maxRetries = this.options.config.max_retries ?? 3;
 
     if (count >= maxRetries) {
-      this.failureCounts.delete(eventId);
       await this.options.storage.setEnrichmentStatus(
         eventId, "failed",
         error instanceof Error ? error.message : String(error),
+        count,
       );
       this.options.onError?.(eventId, error);
     } else {
-      await this.options.storage.setEnrichmentStatus(eventId, "pending");
+      await this.options.storage.setEnrichmentStatus(eventId, "pending", undefined, count);
     }
   }
 

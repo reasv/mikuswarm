@@ -205,9 +205,9 @@ async fn download_media_from_message(
 
     let resolved = PathBuf::from(output_path);
     if let Some(parent) = resolved.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(&resolved, &data)?;
+    tokio::fs::write(&resolved, &data).await?;
 
     Ok(Some(MatrixDownloadMediaResult {
         room_id: room_id.to_string(),

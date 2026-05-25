@@ -15,12 +15,14 @@ export interface VideoProcessingOptions {
   cachePath: string;
   cacheMaxBytes: number;
   cacheTargetBytes: number;
+  timeoutMs?: number;
 }
 
 export interface AudioProcessingOptions {
   maxBytes: number;
   maxDurationSeconds: number;
   startTime?: number;
+  timeoutMs?: number;
 }
 
 export interface ProcessedMedia {
