@@ -429,7 +429,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         createCreatePollTool({ client: provider.getClient(target), roomId }),
         createPollVoteTool({ client: provider.getClient(target), roomId }),
       ] : []),
-      createSetProfileTool({ client: provider.getClient(target) }),
+      createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
       createWebSearchTool(),
       createTextEditorTool({ workspaceRoot }),

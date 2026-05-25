@@ -3,9 +3,11 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MatrixNativeClient } from "../matrix/native-client.js";
 import { assertPublicHttpUrl } from "./ssrf.js";
+import { resolveWorkspacePath } from "./workspace.js";
 
 export interface SetProfileToolContext {
   client: MatrixNativeClient;
+  workspaceRoot?: string;
 }
 
 const MAX_AVATAR_BYTES = 10 * 1024 * 1024;
@@ -83,31 +85,58 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
               };
             }
 
-            let buf: Buffer;
+            const chunks: Buffer[] = [];
+            let totalBytes = 0;
+            const reader = response.body?.getReader();
+            if (!reader) {
+              clearTimeout(timeout);
+              return { content: [{ type: "text", text: "error: avatar response has no body" }], details: null };
+            }
             try {
-              buf = Buffer.from(await response.arrayBuffer());
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                totalBytes += value.byteLength;
+                if (totalBytes > MAX_AVATAR_BYTES) {
+                  reader.cancel();
+                  clearTimeout(timeout);
+                  return { content: [{ type: "text", text: `error: avatar exceeds 10 MB limit` }], details: null };
+                }
+                chunks.push(Buffer.from(value));
+              }
             } finally {
               clearTimeout(timeout);
             }
-            if (buf.byteLength > MAX_AVATAR_BYTES) {
-              return {
-                content: [{ type: "text", text: `error: avatar exceeds 10 MB limit (${buf.byteLength} bytes)` }],
-                details: null,
-              };
-            }
+            const buf = Buffer.concat(chunks);
             avatarDataBase64 = buf.toString("base64");
             avatarContentType = response.headers.get("content-type")?.split(";")[0]?.trim() ?? "image/png";
           } else {
-            const stats = await stat(source);
+            if (!context.workspaceRoot) {
+              return {
+                content: [{ type: "text", text: "error: local file paths are not supported without a configured workspace root" }],
+                details: null,
+              };
+            }
+            let resolvedPath: string;
+            try {
+              resolvedPath = resolveWorkspacePath(context.workspaceRoot, source);
+            } catch (pathErr) {
+              const msg = pathErr instanceof Error ? pathErr.message : String(pathErr);
+              return {
+                content: [{ type: "text", text: `error: invalid avatar path: ${msg}` }],
+                details: null,
+              };
+            }
+            const stats = await stat(resolvedPath);
             if (stats.size > MAX_AVATAR_BYTES) {
               return {
                 content: [{ type: "text", text: `error: avatar exceeds 10 MB limit (${stats.size} bytes)` }],
                 details: null,
               };
             }
-            const buf = await readFile(source);
+            const buf = await readFile(resolvedPath);
             avatarDataBase64 = buf.toString("base64");
-            avatarContentType = guessImageType(source);
+            avatarContentType = guessImageType(resolvedPath);
           }
         }
 
