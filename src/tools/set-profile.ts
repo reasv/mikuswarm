@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MatrixNativeClient } from "../matrix/native-client.js";
+import { assertPublicHttpUrl } from "./ssrf.js";
 
 export interface SetProfileToolContext {
   client: MatrixNativeClient;
@@ -38,17 +39,56 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
           if (source.startsWith("mxc://")) {
             avatarUrl = source;
           } else if (/^https?:\/\//i.test(source)) {
-            const response = await globalThis.fetch(source, {
-              headers: { "User-Agent": "MikuAgent/1.0" },
-              redirect: "follow",
-            });
+            try {
+              await assertPublicHttpUrl(source);
+            } catch (ssrfErr) {
+              const msg = ssrfErr instanceof Error ? ssrfErr.message : String(ssrfErr);
+              return {
+                content: [{ type: "text", text: `error: avatar URL blocked: ${msg}` }],
+                details: null,
+              };
+            }
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 30_000);
+            let response: Response;
+            try {
+              response = await globalThis.fetch(source, {
+                headers: { "User-Agent": "MikuAgent/1.0" },
+                redirect: "follow",
+                signal: controller.signal,
+              });
+            } catch (fetchErr) {
+              clearTimeout(timeout);
+              const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+              return {
+                content: [{ type: "text", text: `error: avatar download failed: ${msg}` }],
+                details: null,
+              };
+            }
             if (!response.ok) {
+              clearTimeout(timeout);
               return {
                 content: [{ type: "text", text: `error: avatar download failed: HTTP ${response.status}` }],
                 details: null,
               };
             }
-            const buf = Buffer.from(await response.arrayBuffer());
+
+            const declaredLength = Number(response.headers.get("content-length"));
+            if (Number.isFinite(declaredLength) && declaredLength > MAX_AVATAR_BYTES) {
+              clearTimeout(timeout);
+              return {
+                content: [{ type: "text", text: `error: avatar exceeds 10 MB limit (${declaredLength} bytes)` }],
+                details: null,
+              };
+            }
+
+            let buf: Buffer;
+            try {
+              buf = Buffer.from(await response.arrayBuffer());
+            } finally {
+              clearTimeout(timeout);
+            }
             if (buf.byteLength > MAX_AVATAR_BYTES) {
               return {
                 content: [{ type: "text", text: `error: avatar exceeds 10 MB limit (${buf.byteLength} bytes)` }],

@@ -42,7 +42,8 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
           const lines = result.events.map((ev) => {
             const name = ev.senderName ?? ev.sender;
             const body = ev.body.length > 100 ? ev.body.slice(0, 100) + "…" : ev.body;
-            return `[${ev.eventId}] ${name}: ${body} (${ev.timestamp})`;
+            const time = new Date(/^\d+$/.test(ev.timestamp) ? Number(ev.timestamp) : ev.timestamp).toISOString();
+            return `[${ev.eventId}] ${name}: ${body} (${time})`;
           });
           return {
             content: [{ type: "text", text: lines.join("\n") }],

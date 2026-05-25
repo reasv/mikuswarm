@@ -26,6 +26,8 @@ export interface AttachmentMeta {
   localPath?: string;
   remoteUrl?: string;
   caption?: string;
+  asVoice?: boolean;
+  durationMs?: number;
   isCharacterCard?: boolean;
   cardName?: string;
   isImageBlock?: boolean;

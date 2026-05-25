@@ -1810,11 +1810,8 @@ pub(crate) async fn create_poll_internal(
         "org.matrix.msc1767.text": fallback,
     });
 
-    let reply = media::build_reply(request.reply_to_id.as_deref(), request.thread_id.as_deref())?;
-    if let Some(reply) = reply {
-        content["m.relates_to"] = json!({
-            "m.in_reply_to": { "event_id": reply.event_id.to_string() }
-        });
+    if let Some(relates_to) = media::build_relates_to(request.reply_to_id.as_deref(), request.thread_id.as_deref())? {
+        content["m.relates_to"] = relates_to;
     }
 
     let response = room.send_raw("m.poll.start", content).await?;

@@ -13,6 +13,9 @@ import { resolveWorkspacePath } from "./workspace.js";
 import { assertPublicHttpUrl } from "./ssrf.js";
 import { chunkMarkdownText } from "./chunk.js";
 
+/** Safe content budget for body + formatted_body within Matrix's 65 536-byte event limit. */
+const MATRIX_MAX_CONTENT_BYTES = 60_000;
+
 export interface SendMessageToolContext {
   provider: ChatProvider;
   target: OutboundTarget;
@@ -33,6 +36,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       is_reply: Type.Boolean({ description: "Whether this message is an explicit reply to another message. Set to false for standalone messages." }),
       reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
       media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),
+      as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })),
       final: Type.Optional(Type.Boolean({ description: "Whether this is the final message of your turn. Defaults to true. Set to false only when you intend to do more work and send additional messages after this one." })),
     }),
     execute: async (_toolCallId, params) => {
@@ -42,6 +46,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         is_reply: boolean;
         reply_to_id?: string;
         media?: string;
+        as_voice?: boolean;
         final?: boolean;
       };
       const isFinal = args.final !== false;
@@ -68,6 +73,9 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       if (args.media?.trim()) {
         try {
           const mediaResult = await resolveMedia(args.media.trim(), context);
+          if (args.as_voice) {
+            mediaResult.attachment.asVoice = true;
+          }
           attachments = [mediaResult.attachment];
           tempPath = mediaResult.tempPath;
         } catch (err) {
@@ -79,6 +87,50 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       }
 
       try {
+        // When custom HTML is provided, skip chunking — send as a single message.
+        if (htmlBody) {
+          const combinedBytes =
+            Buffer.byteLength(body, "utf8") + Buffer.byteLength(htmlBody, "utf8");
+          if (combinedBytes > MATRIX_MAX_CONTENT_BYTES) {
+            return {
+              content: [{
+                type: "text",
+                text: `error: message with custom HTML is too large to send as a single event (${combinedBytes} bytes exceeds ${MATRIX_MAX_CONTENT_BYTES}-byte limit). To fix this, shorten the message, remove the html parameter to allow automatic chunking, or split into multiple send_message calls manually.`,
+              }],
+              details: null,
+            };
+          }
+
+          const receipt = await context.provider.send(effectiveTarget, {
+            body,
+            htmlBody,
+            attachments,
+            agentSessionId: context.agentSessionId,
+          });
+
+          const event: CanonicalChatEvent = {
+            id: `assistant:${context.agentSessionId}:${receipt.externalId ?? Date.now()}:0`,
+            externalId: receipt.externalId,
+            timelineKey: context.target.timelineKey,
+            provider: context.provider.id,
+            agentSessionId: context.agentSessionId,
+            role: "assistant",
+            sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
+            body,
+            htmlBody,
+            timestamp: receipt.deliveredAt,
+            receivedAt: Date.now(),
+          };
+          await context.timeline.append(event);
+
+          return {
+            content: [{ type: "text", text: `sent: ${receipt.externalId ?? "local"}` }],
+            details: { eventIds: receipt.externalId ? [receipt.externalId] : [] },
+            terminate: isFinal,
+          };
+        }
+
+        // No custom HTML — chunk the plaintext message as before.
         const chunks = chunkMarkdownText(body, 4000);
         const eventIds: string[] = [];
 
@@ -90,7 +142,6 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
 
           const receipt = await context.provider.send(chunkTarget, {
             body: chunks[i],
-            htmlBody: chunks.length === 1 ? htmlBody : undefined,
             attachments: i === 0 ? attachments : undefined,
             agentSessionId: context.agentSessionId,
           });
@@ -104,12 +155,11 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             role: "assistant",
             sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
             body: chunks[i],
-            htmlBody: chunks.length === 1 ? htmlBody : undefined,
             timestamp: receipt.deliveredAt,
             receivedAt: Date.now(),
           };
           await context.timeline.append(event);
-          if (receipt.externalId) eventIds.push(receipt.externalId);
+          eventIds.push(receipt.externalId!);
         }
 
         const summary = eventIds.length === 1

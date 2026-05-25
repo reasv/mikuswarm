@@ -124,6 +124,8 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
           caption: !primaryExternalId && index === 0 && message.body ? message.body : undefined,
           threadId: target.threadId,
           replyToId: primaryExternalId ? undefined : target.replyToId,
+          asVoice: attachment.asVoice,
+          durationMs: attachment.durationMs,
         });
         primaryExternalId ??= result.messageId;
         externalIds.push(result.messageId);

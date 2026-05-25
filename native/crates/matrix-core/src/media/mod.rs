@@ -15,6 +15,8 @@ use matrix_sdk::{
     Room,
 };
 
+use serde_json::{json, Value};
+
 use crate::{
     api::{MatrixDownloadMediaResult, MatrixMediaKind, MatrixUploadMediaRequest, MatrixUploadMediaThumbnail},
     MatrixError, MatrixResult,
@@ -48,6 +50,47 @@ pub fn build_reply(
             event_id: parse_event_id(thread_id, "thread_id")?,
             enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
         })),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Build `m.relates_to` JSON for use with `room.send_raw()`.
+///
+/// Unlike [`build_reply`] which returns a [`Reply`] for the SDK's
+/// `AttachmentConfig`, this function produces the raw JSON value needed when
+/// constructing event content manually (voice messages, polls, etc.).
+pub(crate) fn build_relates_to(
+    reply_to_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> MatrixResult<Option<Value>> {
+    let reply_to = reply_to_id.map(str::trim).filter(|v| !v.is_empty());
+    let thread = thread_id.map(str::trim).filter(|v| !v.is_empty());
+
+    match (reply_to, thread) {
+        (Some(reply_id), Some(thread_root)) => {
+            // Reply within a thread
+            Ok(Some(json!({
+                "rel_type": "m.thread",
+                "event_id": thread_root,
+                "is_falling_back": false,
+                "m.in_reply_to": { "event_id": reply_id }
+            })))
+        }
+        (None, Some(thread_root)) => {
+            // Post to thread (no specific reply)
+            Ok(Some(json!({
+                "rel_type": "m.thread",
+                "event_id": thread_root,
+                "is_falling_back": true,
+                "m.in_reply_to": { "event_id": thread_root }
+            })))
+        }
+        (Some(reply_id), None) => {
+            // Plain reply, no thread
+            Ok(Some(json!({
+                "m.in_reply_to": { "event_id": reply_id }
+            })))
+        }
         (None, None) => Ok(None),
     }
 }
@@ -93,8 +136,6 @@ async fn upload_voice_media(
     content_type: &mime::Mime,
     data: Vec<u8>,
 ) -> MatrixResult<String> {
-    use serde_json::json;
-
     let size_bytes = data.len() as u64;
     let upload_response = room
         .client()
@@ -122,11 +163,8 @@ async fn upload_voice_media(
         content["org.matrix.msc1767.audio"] = json!({ "duration": duration_ms });
     }
 
-    let reply = build_reply(request.reply_to_id.as_deref(), request.thread_id.as_deref())?;
-    if let Some(reply) = reply {
-        content["m.relates_to"] = json!({
-            "m.in_reply_to": { "event_id": reply.event_id.to_string() }
-        });
+    if let Some(relates_to) = build_relates_to(request.reply_to_id.as_deref(), request.thread_id.as_deref())? {
+        content["m.relates_to"] = relates_to;
     }
 
     let response = room

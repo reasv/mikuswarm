@@ -28,7 +28,7 @@ export function chunkMarkdownText(text: string, limit = DEFAULT_LIMIT): string[]
       chunk = openFence + "\n" + chunk;
     }
 
-    const fenceState = trackFences(chunk, openFence);
+    const fenceState = trackFences(candidate.slice(0, splitIdx), openFence);
     if (fenceState.insideFence) {
       chunk += "\n" + fenceState.closeMarker!;
       openFence = fenceState.reopenMarker!;
@@ -97,7 +97,7 @@ function trackFences(chunk: string, initialFence: string | null): FenceState {
   for (const line of lines) {
     const match = FENCE_PATTERN.exec(line.trim());
     if (match) {
-      if (inside && currentMarker && line.trim().startsWith(currentMarker[0])) {
+      if (inside && currentMarker && match[1][0] === currentMarker[0] && match[1].length >= currentMarker.length) {
         inside = false;
         currentMarker = null;
       } else if (!inside) {
@@ -108,7 +108,7 @@ function trackFences(chunk: string, initialFence: string | null): FenceState {
   }
 
   if (inside && currentMarker) {
-    const closeMarker = currentMarker[0].repeat(currentMarker.length);
+    const closeMarker = currentMarker;
     return {
       insideFence: true,
       closeMarker,
