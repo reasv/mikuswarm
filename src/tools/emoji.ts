@@ -13,12 +13,13 @@ export function createEmojiListTool(context: EmojiToolContext): AgentTool {
     label: "List custom emoji",
     description: "List available custom emoji shortcodes. These can be used in messages as :shortcode: and in reactions.",
     parameters: Type.Object({
+      room_id: Type.Optional(Type.String({ description: "Room ID to list emoji for. Defaults to the current room." })),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200, description: "Max number of shortcodes to return. Default 50." })),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as { limit?: number };
+      const args = params as { room_id?: string; limit?: number };
       const shortcodes = context.client.listKnownShortcodes({
-        roomId: context.roomId,
+        roomId: args.room_id ?? context.roomId,
         limit: args.limit ?? 50,
       });
       if (shortcodes.length === 0) {
