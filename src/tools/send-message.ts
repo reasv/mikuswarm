@@ -159,7 +159,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             receivedAt: Date.now(),
           };
           await context.timeline.append(event);
-          eventIds.push(receipt.externalId!);
+          eventIds.push(receipt.externalId ?? "local");
         }
 
         const summary = eventIds.length === 1

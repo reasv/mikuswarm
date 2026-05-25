@@ -23,6 +23,7 @@ export function chunkMarkdownText(text: string, limit = DEFAULT_LIMIT): string[]
     const splitIdx = findSplitPoint(candidate, openFence);
     let chunk = candidate.slice(0, splitIdx);
     let advance = splitIdx;
+    if (advance <= 0) advance = Math.min(remaining.length, limit);
 
     if (openFence) {
       chunk = openFence + "\n" + chunk;
