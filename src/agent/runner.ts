@@ -60,7 +60,8 @@ export class SessionRunner {
         await waitForAgentIdle(agent);
       }
 
-      const noReply = isExplicitNoReply(agent.state.messages) && sentMessages.length === 0;
+      const terminallyValid = isTerminallyValid(agent.state.messages, sentMessages);
+      const noReply = !terminallyValid || (isExplicitNoReply(agent.state.messages) && sentMessages.length === 0);
       return {
         sessionId: session.id,
         noReply,
@@ -130,7 +131,7 @@ export function stripThinkingContamination(text: string): string {
 
 function extractTextFromBlocks(blocks: Array<{ type: string; text?: string }>): string {
   return blocks
-    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .filter((block): block is { type: "text"; text: string } => block?.type === "text")
     .map((block) => block.text)
     .join("");
 }
@@ -149,12 +150,14 @@ export function isTerminallyValid(messages: unknown[], sentMessages: string[]): 
   const blocks = last.content as Array<{ type: string; name?: string; text?: string }>;
   if (!blocks.length) return false;
 
-  const lastBlock = blocks.at(-1)!;
-  if (lastBlock.type === "toolCall" && lastBlock.name === "send_message") return true;
-
   if (isExplicitNoReply(messages)) return true;
 
   if (sentMessages.length > 0) {
+    const hasTerminatingSend = blocks.some(
+      (block) => block.type === "toolCall" && block.name === "send_message",
+    );
+    if (hasTerminatingSend) return true;
+
     const text = extractTextFromBlocks(blocks).trim();
     if (!text || /^\s*NO_REPLY\s*$/.test(text)) return true;
   }

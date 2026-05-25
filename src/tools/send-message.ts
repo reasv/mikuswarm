@@ -33,6 +33,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       is_reply: Type.Boolean({ description: "Whether this message is an explicit reply to another message. Set to false for standalone messages." }),
       reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
       media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),
+      final: Type.Optional(Type.Boolean({ description: "Whether this is the final message of your turn. Defaults to true. Set to false only when you intend to do more work and send additional messages after this one." })),
     }),
     execute: async (_toolCallId, params) => {
       const args = params as {
@@ -41,7 +42,9 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         is_reply: boolean;
         reply_to_id?: string;
         media?: string;
+        final?: boolean;
       };
+      const isFinal = args.final !== false;
 
       if (args.is_reply && !args.reply_to_id?.trim()) {
         return {
@@ -100,6 +103,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         return {
           content: [{ type: "text", text: `sent: ${receipt.externalId ?? "local"}` }],
           details: receipt,
+          terminate: isFinal,
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
