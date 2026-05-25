@@ -1,6 +1,8 @@
 import path from "node:path";
 import { readFile } from "node:fs/promises";
+import sharp from "sharp";
 import type { AppConfig } from "../config/index.js";
+import type { MatrixUploadMediaThumbnail } from "./native-types.js";
 import type {
   ChatProvider,
   DeliveryReceipt,
@@ -12,6 +14,7 @@ import type {
 import { MatrixNativeClient } from "./native-client.js";
 import type { MatrixNativeConfig, MatrixNativeEvent } from "./native-types.js";
 import { normalizeMatrixInboundEvent } from "./inbound.js";
+import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
 
 type Handler = (event: InboundChatEvent) => void;
@@ -111,11 +114,13 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       for (const [index, attachment] of message.attachments.entries()) {
         if (!attachment.localPath) throw new Error(`Outbound attachment has no localPath: ${attachment.id}`);
         const data = await readFile(attachment.localPath);
+        const thumbnail = await maybeBuildThumbnail(data, attachment.mimeType);
         const result = await account.client.uploadMedia({
           roomId: target.roomId,
           filename: attachment.filename ?? path.basename(attachment.localPath),
           contentType: attachment.mimeType ?? "application/octet-stream",
           dataBase64: data.toString("base64"),
+          thumbnail,
           caption: !primaryExternalId && index === 0 && message.body ? message.body : undefined,
           threadId: target.threadId,
           replyToId: primaryExternalId ? undefined : target.replyToId,
@@ -194,6 +199,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
         this.options.onNativeEvent?.(nativeEvent, { accountId: account.accountId });
         continue;
       }
+      recordInboundEmojiUsage(account.client, nativeEvent.event);
       const inbound = normalizeMatrixInboundEvent(nativeEvent.event, {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
@@ -275,6 +281,10 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     for (const handler of this.handlers) handler(event);
   }
 
+  getClient(target: OutboundTarget): MatrixNativeClient {
+    return this.resolveAccount(target).client;
+  }
+
   private resolveAccount(target: OutboundTarget): AccountRuntime {
     const accountId = target.accountId ?? target.timelineKey.split(":")[1];
     const account = this.accounts.get(accountId);
@@ -314,4 +324,56 @@ function toNativeConfig(
     },
     roomOverrides: {},
   };
+}
+
+const THUMBNAIL_MIN_SOURCE_BYTES = 10_000;
+const THUMBNAIL_MAX_EDGE = 800;
+const THUMBNAIL_MAX_BYTES = 64_000;
+const THUMBNAIL_QUALITY_CANDIDATES = [75, 50, 30];
+
+async function maybeBuildThumbnail(
+  data: Buffer,
+  mimeType?: string,
+): Promise<MatrixUploadMediaThumbnail | undefined> {
+  if (!mimeType?.startsWith("image/")) return undefined;
+  if (data.length < THUMBNAIL_MIN_SOURCE_BYTES) return undefined;
+
+  try {
+    const metadata = await sharp(data, { animated: true }).metadata();
+    if (!metadata.format || !metadata.width || !metadata.height) return undefined;
+    const animated = (metadata.pages ?? 1) > 1;
+    const height = metadata.pageHeight ?? metadata.height;
+
+    for (const quality of THUMBNAIL_QUALITY_CANDIDATES) {
+      const pipeline = sharp(data, { animated }).rotate().resize({
+        width: THUMBNAIL_MAX_EDGE,
+        height: THUMBNAIL_MAX_EDGE,
+        fit: "inside",
+        withoutEnlargement: true,
+      });
+      const output = await pipeline.webp({
+        quality,
+        alphaQuality: quality,
+        effort: 4,
+        ...(animated ? { loop: 0 } : {}),
+      }).toBuffer();
+
+      if (output.length <= THUMBNAIL_MAX_BYTES) {
+        const outMeta = await sharp(output, { animated }).metadata();
+        const outWidth = outMeta.width;
+        const outHeight = outMeta.pageHeight ?? outMeta.height;
+        if (!outWidth || !outHeight) return undefined;
+        return {
+          dataBase64: output.toString("base64"),
+          contentType: "image/webp",
+          width: outWidth,
+          height: outHeight,
+          sizeBytes: output.length,
+        };
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }

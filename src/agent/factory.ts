@@ -1,10 +1,25 @@
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
-import { streamSimple, type Model } from "@earendil-works/pi-ai";
+import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
+
+const wrapCompleteAsStream: StreamFn = (model, context, options) => {
+  const stream = createAssistantMessageEventStream();
+  void completeSimple(model, context, options).then(
+    (message) => {
+      stream.push({ type: "done", reason: "stop", message });
+      stream.end(message);
+    },
+    (err) => {
+      stream.push({ type: "error", reason: "error", error: err });
+      stream.end();
+    },
+  );
+  return stream;
+};
 
 export interface AgentFactoryOptions {
   config: AppConfig;
@@ -17,6 +32,8 @@ export class AgentSessionFactory {
 
   create(session: AgentSessionRecord, tools: AgentTool[] = []): Agent {
     const model = createModel(this.options.config);
+    const modelConfig = this.options.config.models.default;
+    const streamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
     return new Agent({
       initialState: {
         systemPrompt: this.options.config.agent.system.prompt,
@@ -39,8 +56,8 @@ export class AgentSessionFactory {
         return buildAgentContextMessages(built, messages);
       },
       convertToLlm,
-      streamFn: streamSimple,
-      getApiKey: () => this.options.config.models.default.api_key,
+      streamFn,
+      getApiKey: () => modelConfig.api_key,
       onPayload: (payload) => payload,
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,

@@ -29,6 +29,8 @@ export interface SessionRunnerOptions {
   sentMessages?: string[];
 }
 
+const TYPING_KEEPALIVE_MS = 4_000;
+
 export class SessionRunner {
   constructor(
     private readonly store: TimelineStore,
@@ -37,27 +39,25 @@ export class SessionRunner {
 
   async run(agent: Agent, session: AgentSessionRecord, maxRetries: number): Promise<SessionRunResult> {
     let retries = 0;
+    let typingInterval: NodeJS.Timeout | undefined;
     try {
       if (this.options.provider && this.options.target) {
         await this.options.provider.setTyping(this.options.target, true);
+        const provider = this.options.provider;
+        const target = this.options.target;
+        typingInterval = setInterval(() => {
+          void provider.setTyping(target, true).catch(() => undefined);
+        }, TYPING_KEEPALIVE_MS);
       }
-      const unsubscribe = agent.subscribe((event) => {
-        if (event.type === "message_update" && this.options.provider && this.options.target) {
-          void this.options.provider.setTyping(this.options.target, true);
-        }
+
+      await promptAgent(agent, {
+        type: "chatEvent",
+        role: "user",
+        content: session.trigger.event.body,
+        event: session.trigger.event,
+        timestamp: session.trigger.event.timestamp,
       });
-      try {
-        await promptAgent(agent, {
-          type: "chatEvent",
-          role: "user",
-          content: session.trigger.event.body,
-          event: session.trigger.event,
-          timestamp: session.trigger.event.timestamp,
-        });
-        await waitForAgentIdle(agent);
-      } finally {
-        if (typeof unsubscribe === "function") unsubscribe();
-      }
+      await waitForAgentIdle(agent);
 
       let text = extractLastAssistantText(agent.state.messages);
       while (!text.trim() && retries < maxRetries) {
@@ -95,6 +95,7 @@ export class SessionRunner {
         retries,
       };
     } finally {
+      if (typingInterval) clearInterval(typingInterval);
       if (this.options.provider && this.options.target) {
         await this.options.provider.setTyping(this.options.target, false).catch(() => undefined);
       }

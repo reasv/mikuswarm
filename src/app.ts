@@ -17,7 +17,9 @@ import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import {
   createDanbooruTool,
   createDelegateToSessionTool,
+  createEmojiListTool,
   createMediaTool,
+  createReactTool,
   createSearchMemoryTool,
   createSearchFilesTool,
   createSendMessageTool,
@@ -389,12 +391,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
     const sentMessages: string[] = [];
+    const client = provider.getClient(target);
+    const roomId = target.roomId ?? "";
     const tools = [
       createSendMessageTool({
         provider,
         target,
         timeline,
         agentSessionId: session.id,
+        workspaceRoot,
+        mediaMaxBytes: downloadSizeLimit,
         recordSentMessage: (message) => sentMessages.push(message),
       }),
       createDelegateToSessionTool({
@@ -405,6 +411,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             content,
           }),
       }),
+      createEmojiListTool({ client, roomId }),
+      createReactTool({ client, roomId }),
       createWebFetchTool(),
       createWebSearchTool(),
       createTextEditorTool({ workspaceRoot }),

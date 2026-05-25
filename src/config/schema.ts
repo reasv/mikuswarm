@@ -15,6 +15,7 @@ const ModelSchema = Type.Object({
     cache_read: Type.Number({ minimum: 0 }),
     cache_write: Type.Number({ minimum: 0 }),
   })),
+  streaming: Type.Optional(Type.Boolean()),
   compat: Type.Optional(Type.Object({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
