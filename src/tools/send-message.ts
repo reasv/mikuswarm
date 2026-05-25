@@ -10,6 +10,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
+import { assertPublicHttpUrl } from "./ssrf.js";
 
 export interface SendMessageToolContext {
   provider: ChatProvider;
@@ -151,6 +152,7 @@ async function downloadMediaUrl(
   url: string,
   maxBytes: number,
 ): Promise<{ attachment: AttachmentMeta; tempPath: string }> {
+  await assertPublicHttpUrl(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
@@ -161,6 +163,11 @@ async function downloadMediaUrl(
     });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      throw new Error(`declared content-length ${declaredLength} exceeds size limit (${maxBytes} bytes)`);
     }
 
     const contentType = response.headers.get("content-type") ?? undefined;

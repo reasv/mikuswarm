@@ -335,7 +335,7 @@ async function maybeBuildThumbnail(
   data: Buffer,
   mimeType?: string,
 ): Promise<MatrixUploadMediaThumbnail | undefined> {
-  if (!mimeType?.startsWith("image/")) return undefined;
+  if (!mimeType?.startsWith("image/") || mimeType === "image/svg+xml") return undefined;
   if (data.length < THUMBNAIL_MIN_SOURCE_BYTES) return undefined;
 
   try {

@@ -48,9 +48,11 @@ export function recordInboundEmojiUsage(
   if (!formattedBody) return;
   const emoji = extractCustomEmojiUsageFromFormattedBody(formattedBody);
   if (emoji.length === 0) return;
+  const observedAtMs = Date.parse(event.timestamp);
+  if (!Number.isFinite(observedAtMs)) return;
   client.recordCustomEmojiUsage({
     roomId: event.roomId,
-    observedAtMs: Date.parse(event.timestamp),
+    observedAtMs,
     emoji,
   });
 }
