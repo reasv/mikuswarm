@@ -432,7 +432,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     ];
     const agent = factory.create(session, tools);
     sessions.attachAgent(session.id, agent);
-    const runner = new SessionRunner(timeline, { provider, target, sentMessages });
+    const runner = new SessionRunner({ provider, target, sentMessages });
 
     const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries)

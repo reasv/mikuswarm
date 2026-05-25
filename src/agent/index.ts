@@ -14,6 +14,7 @@ export {
   SessionRunner,
   extractLastAssistantText,
   stripThinkingContamination,
+  isTerminallyValid,
+  isExplicitNoReply,
   type SessionRunResult,
 } from "./runner.js";
-export { normalizeForDedupe, wasAlreadySent } from "./dedupe.js";

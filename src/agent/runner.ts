@@ -1,13 +1,10 @@
 import type { Agent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { CanonicalChatEvent, ChatProvider, OutboundTarget } from "../types.js";
-import type { TimelineStore } from "../timeline/index.js";
+import type { ChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord } from "./session-manager.js";
-import { wasAlreadySent } from "./dedupe.js";
 
 export interface SessionRunResult {
   sessionId: string;
-  text: string;
   noReply: boolean;
   retries: number;
 }
@@ -15,7 +12,7 @@ export interface SessionRunResult {
 export class SessionRunnerError extends Error {
   constructor(
     message: string,
-    readonly phase: "prompt" | "wait" | "force_completion" | "delivery",
+    readonly phase: "prompt" | "wait" | "force_completion",
     options?: { cause?: unknown },
   ) {
     super(message, options);
@@ -32,10 +29,7 @@ export interface SessionRunnerOptions {
 const TYPING_KEEPALIVE_MS = 4_000;
 
 export class SessionRunner {
-  constructor(
-    private readonly store: TimelineStore,
-    private readonly options: SessionRunnerOptions = {},
-  ) {}
+  constructor(private readonly options: SessionRunnerOptions = {}) {}
 
   async run(agent: Agent, session: AgentSessionRecord, maxRetries: number): Promise<SessionRunResult> {
     let retries = 0;
@@ -59,39 +53,17 @@ export class SessionRunner {
       });
       await waitForAgentIdle(agent);
 
-      let text = extractLastAssistantText(agent.state.messages);
-      while (!text.trim() && retries < maxRetries) {
+      const sentMessages = this.options.sentMessages ?? [];
+      while (!isTerminallyValid(agent.state.messages, sentMessages) && retries < maxRetries) {
         retries += 1;
         await forceCompletion(agent);
         await waitForAgentIdle(agent);
-        text = extractLastAssistantText(agent.state.messages);
       }
 
-      const stripped = stripThinkingContamination(text);
-      const noReply = /^\s*NO_REPLY\s*$/.test(stripped);
-      const finalText = noReply ? "" : stripped.trim();
-      if (!noReply && finalText && !wasAlreadySent(finalText, this.options.sentMessages ?? [])) {
-        let deliveredExternalId: string | undefined;
-        let deliveredAt = Date.now();
-        if (this.options.provider && this.options.target) {
-          const receipt = await this.options.provider
-            .send(this.options.target, {
-              body: finalText,
-              agentSessionId: session.id,
-            })
-            .catch((error) => {
-              throw new SessionRunnerError("Agent response delivery failed", "delivery", { cause: error });
-            });
-          deliveredExternalId = receipt.externalId;
-          deliveredAt = receipt.deliveredAt;
-        }
-        await this.store.append(createAssistantTimelineEvent(session, finalText, deliveredAt, deliveredExternalId));
-        this.options.sentMessages?.push(finalText);
-      }
+      const noReply = isExplicitNoReply(agent.state.messages) && sentMessages.length === 0;
       return {
         sessionId: session.id,
-        text: finalText,
-        noReply: noReply || !finalText,
+        noReply,
         retries,
       };
     } finally {
@@ -107,7 +79,11 @@ async function forceCompletion(agent: Agent): Promise<void> {
   if (lastMessageRole(agent.state.messages) === "assistant") {
     await promptAgent(agent, {
       role: "user",
-      content: "Your previous turn ended without visible text. Produce the final chat response now, or exactly NO_REPLY.",
+      content:
+        "Your turn ended without sending a message. You must end every turn by either:\n" +
+        "- Calling send_message with your response, OR\n" +
+        "- Outputting exactly NO_REPLY if you have nothing to say.\n\n" +
+        "Text you write outside of send_message is not visible to users.",
       timestamp: Date.now(),
     });
     return;
@@ -152,26 +128,42 @@ export function stripThinkingContamination(text: string): string {
     .trim();
 }
 
-function createAssistantTimelineEvent(
-  session: AgentSessionRecord,
-  body: string,
-  timestamp: number,
-  externalId?: string,
-): CanonicalChatEvent {
-  return {
-    id: `assistant:${session.id}:${externalId ?? timestamp}`,
-    externalId,
-    timelineKey: session.timelineKey,
-    provider: session.trigger.provider,
-    agentSessionId: session.id,
-    role: "assistant",
-    sender: {
-      id: "mikuswarm",
-      displayName: "Miku",
-      isSelf: true,
-    },
-    body,
-    timestamp,
-    receivedAt: Date.now(),
-  };
+function extractTextFromBlocks(blocks: Array<{ type: string; text?: string }>): string {
+  return blocks
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("");
 }
+
+function findLastAssistantMessage(messages: unknown[]): Partial<AssistantMessage> | undefined {
+  for (const message of [...messages].reverse()) {
+    const candidate = message as Partial<AssistantMessage>;
+    if (candidate.role === "assistant" && Array.isArray(candidate.content)) return candidate;
+  }
+  return undefined;
+}
+
+export function isTerminallyValid(messages: unknown[], sentMessages: string[]): boolean {
+  const last = findLastAssistantMessage(messages);
+  if (!last) return false;
+  const blocks = last.content as Array<{ type: string; name?: string; text?: string }>;
+  if (!blocks.length) return false;
+
+  const lastBlock = blocks.at(-1)!;
+  if (lastBlock.type === "toolCall" && lastBlock.name === "send_message") return true;
+
+  if (isExplicitNoReply(messages)) return true;
+
+  if (sentMessages.length > 0) {
+    const text = extractTextFromBlocks(blocks).trim();
+    if (!text || /^\s*NO_REPLY\s*$/.test(text)) return true;
+  }
+
+  return false;
+}
+
+export function isExplicitNoReply(messages: unknown[]): boolean {
+  const text = extractLastAssistantText(messages).trim();
+  return /^\s*NO_REPLY\s*$/.test(text);
+}
+
