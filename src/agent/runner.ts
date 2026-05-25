@@ -23,7 +23,6 @@ export class SessionRunnerError extends Error {
 export interface SessionRunnerOptions {
   provider?: ChatProvider;
   target?: OutboundTarget;
-  sentMessages?: string[];
 }
 
 const TYPING_KEEPALIVE_MS = 4_000;
@@ -53,15 +52,13 @@ export class SessionRunner {
       });
       await waitForAgentIdle(agent);
 
-      const sentMessages = this.options.sentMessages ?? [];
-      while (!isTerminallyValid(agent.state.messages, sentMessages) && retries < maxRetries) {
+      while (!isTerminallyValid(agent.state.messages) && retries < maxRetries) {
         retries += 1;
         await forceCompletion(agent);
         await waitForAgentIdle(agent);
       }
 
-      const terminallyValid = isTerminallyValid(agent.state.messages, sentMessages);
-      const noReply = !terminallyValid || (isExplicitNoReply(agent.state.messages) && sentMessages.length === 0);
+      const noReply = !isTerminallyValid(agent.state.messages) || isExplicitNoReply(agent.state.messages);
       return {
         sessionId: session.id,
         noReply,
@@ -78,13 +75,19 @@ export class SessionRunner {
 
 async function forceCompletion(agent: Agent): Promise<void> {
   if (lastMessageRole(agent.state.messages) === "assistant") {
-    await promptAgent(agent, {
-      role: "user",
-      content:
-        "Your turn ended without sending a message. You must end every turn by either:\n" +
+    const alreadySent = hasSendMessageCall(agent.state.messages);
+    const content = alreadySent
+      ? "You already sent a message but your turn did not end cleanly. Either:\n" +
+        "- Call send_message again with your follow-up (it will end your turn by default), OR\n" +
+        "- Output exactly NO_REPLY if you have nothing more to say.\n\n" +
+        "Text you write outside of send_message is not visible to users."
+      : "Your turn ended without sending a message. You must end every turn by either:\n" +
         "- Calling send_message with your response, OR\n" +
         "- Outputting exactly NO_REPLY if you have nothing to say.\n\n" +
-        "Text you write outside of send_message is not visible to users.",
+        "Text you write outside of send_message is not visible to users.";
+    await promptAgent(agent, {
+      role: "user",
+      content,
       timestamp: Date.now(),
     });
     return;
@@ -136,6 +139,15 @@ function extractTextFromBlocks(blocks: Array<{ type: string; text?: string }>): 
     .join("");
 }
 
+function hasSendMessageCall(messages: unknown[]): boolean {
+  for (const message of messages) {
+    const candidate = message as Partial<AssistantMessage>;
+    if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) continue;
+    if (candidate.content.some((b: any) => b?.type === "toolCall" && b?.name === "send_message")) return true;
+  }
+  return false;
+}
+
 function findLastAssistantMessage(messages: unknown[]): Partial<AssistantMessage> | undefined {
   for (const message of [...messages].reverse()) {
     const candidate = message as Partial<AssistantMessage>;
@@ -144,29 +156,19 @@ function findLastAssistantMessage(messages: unknown[]): Partial<AssistantMessage
   return undefined;
 }
 
-export function isTerminallyValid(messages: unknown[], sentMessages: string[]): boolean {
+export function isTerminallyValid(messages: unknown[]): boolean {
   const last = findLastAssistantMessage(messages);
   if (!last) return false;
   const blocks = last.content as Array<{ type: string; name?: string; text?: string }>;
   if (!blocks.length) return false;
 
-  if (isExplicitNoReply(messages)) return true;
-
-  if (sentMessages.length > 0) {
-    const hasTerminatingSend = blocks.some(
-      (block) => block.type === "toolCall" && block.name === "send_message",
-    );
-    if (hasTerminatingSend) return true;
-
-    const text = extractTextFromBlocks(blocks).trim();
-    if (!text || /^\s*NO_REPLY\s*$/.test(text)) return true;
-  }
+  if (extractTextFromBlocks(blocks).trim() === "NO_REPLY") return true;
+  if (blocks.some((b) => b.type === "toolCall" && b.name === "send_message")) return true;
 
   return false;
 }
 
 export function isExplicitNoReply(messages: unknown[]): boolean {
-  const text = extractLastAssistantText(messages).trim();
-  return /^\s*NO_REPLY\s*$/.test(text);
+  return extractLastAssistantText(messages).trim() === "NO_REPLY";
 }
 

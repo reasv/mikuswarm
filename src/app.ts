@@ -390,7 +390,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       if (next && !draining) launchSession(next, true);
       return;
     }
-    const sentMessages: string[] = [];
     const roomId = target.roomId;
     const tools = [
       createSendMessageTool({
@@ -400,7 +399,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         agentSessionId: session.id,
         workspaceRoot,
         mediaMaxBytes: downloadSizeLimit,
-        recordSentMessage: (message) => sentMessages.push(message),
       }),
       createDelegateToSessionTool({
         currentEvent: inbound.event,
@@ -432,7 +430,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     ];
     const agent = factory.create(session, tools);
     sessions.attachAgent(session.id, agent);
-    const runner = new SessionRunner({ provider, target, sentMessages });
+    const runner = new SessionRunner({ provider, target });
 
     const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries)

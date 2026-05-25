@@ -19,7 +19,6 @@ export interface SendMessageToolContext {
   agentSessionId: string;
   workspaceRoot?: string;
   mediaMaxBytes?: number;
-  recordSentMessage?: (message: string) => void;
 }
 
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
@@ -85,7 +84,6 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
           attachments,
           agentSessionId: context.agentSessionId,
         });
-        context.recordSentMessage?.(args.message);
         const event: CanonicalChatEvent = {
           id: `assistant:${context.agentSessionId}:${receipt.externalId ?? Date.now()}`,
           externalId: receipt.externalId,
