@@ -58,7 +58,8 @@ export class SessionRunner {
         await waitForAgentIdle(agent);
       }
 
-      const noReply = !isTerminallyValid(agent.state.messages) || isExplicitNoReply(agent.state.messages);
+      const noReply = !isTerminallyValid(agent.state.messages) ||
+        (isExplicitNoReply(agent.state.messages) && !hasSendMessageCall(agent.state.messages));
       return {
         sessionId: session.id,
         noReply,
