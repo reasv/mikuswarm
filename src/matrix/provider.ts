@@ -326,10 +326,13 @@ function toNativeConfig(
   };
 }
 
-const THUMBNAIL_MIN_SOURCE_BYTES = 10_000;
-const THUMBNAIL_MAX_EDGE = 800;
-const THUMBNAIL_MAX_BYTES = 64_000;
-const THUMBNAIL_QUALITY_CANDIDATES = [75, 50, 30];
+const THUMBNAIL_MIN_SOURCE_BYTES = 100_000;
+const THUMBNAIL_LONG_EDGE = 512;
+const THUMBNAIL_MAX_BYTES_STATIC = 1_200_000;
+const THUMBNAIL_MAX_BYTES_ANIMATED = 6_000_000;
+const THUMBNAIL_SCALE_CANDIDATES = [1, 0.75, 0.5];
+const THUMBNAIL_QUALITY_CANDIDATES_STATIC = [75, 60, 45];
+const THUMBNAIL_QUALITY_CANDIDATES_ANIMATED = [65, 50, 35];
 
 async function maybeBuildThumbnail(
   data: Buffer,
@@ -341,34 +344,40 @@ async function maybeBuildThumbnail(
   try {
     const metadata = await sharp(data, { animated: true }).metadata();
     if (!metadata.format || !metadata.width || !metadata.height) return undefined;
+    const sourceHeight = metadata.pageHeight ?? metadata.height;
     const animated = (metadata.pages ?? 1) > 1;
+    const maxBytes = animated ? THUMBNAIL_MAX_BYTES_ANIMATED : THUMBNAIL_MAX_BYTES_STATIC;
+    const qualityCandidates = animated ? THUMBNAIL_QUALITY_CANDIDATES_ANIMATED : THUMBNAIL_QUALITY_CANDIDATES_STATIC;
 
-    for (const quality of THUMBNAIL_QUALITY_CANDIDATES) {
-      const pipeline = sharp(data, { animated }).rotate().resize({
-        width: THUMBNAIL_MAX_EDGE,
-        height: THUMBNAIL_MAX_EDGE,
-        fit: "inside",
-        withoutEnlargement: true,
-      });
-      const output = await pipeline.webp({
-        quality,
-        alphaQuality: quality,
-        effort: 4,
-        ...(animated ? { loop: 0 } : {}),
-      }).toBuffer();
+    for (const scale of THUMBNAIL_SCALE_CANDIDATES) {
+      const targetEdge = Math.round(THUMBNAIL_LONG_EDGE * scale);
+      for (const quality of qualityCandidates) {
+        const output = await sharp(data, { animated }).rotate().resize({
+          width: targetEdge,
+          height: targetEdge,
+          fit: "inside",
+          withoutEnlargement: true,
+        }).webp({
+          quality,
+          alphaQuality: quality,
+          effort: 4,
+          ...(animated ? { loop: 0 } : {}),
+        }).toBuffer();
 
-      if (output.length <= THUMBNAIL_MAX_BYTES) {
-        const outMeta = await sharp(output, { animated }).metadata();
-        const outWidth = outMeta.width;
-        const outHeight = outMeta.pageHeight ?? outMeta.height;
-        if (!outWidth || !outHeight) return undefined;
-        return {
-          dataBase64: output.toString("base64"),
-          contentType: "image/webp",
-          width: outWidth,
-          height: outHeight,
-          sizeBytes: output.length,
-        };
+        if (output.length >= data.length) return undefined;
+        if (output.length <= maxBytes) {
+          const outMeta = await sharp(output, { animated }).metadata();
+          const outWidth = outMeta.width;
+          const outHeight = outMeta.pageHeight ?? outMeta.height;
+          if (!outWidth || !outHeight) return undefined;
+          return {
+            dataBase64: output.toString("base64"),
+            contentType: "image/webp",
+            width: outWidth,
+            height: outHeight,
+            sizeBytes: output.length,
+          };
+        }
       }
     }
     return undefined;
