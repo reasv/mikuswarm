@@ -369,6 +369,8 @@ pub struct MatrixUploadMediaRequest {
     pub caption: Option<String>,
     pub reply_to_id: Option<String>,
     pub thread_id: Option<String>,
+    pub as_voice: Option<bool>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +563,62 @@ pub struct MatrixListEmojiRequest {
     pub room_id: Option<String>,
     pub limit: Option<usize>,
     pub now_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixSetProfileRequest {
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub avatar_data_base64: Option<String>,
+    pub avatar_content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixSetProfileResult {
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixPollAnswer {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixCreatePollRequest {
+    pub room_id: String,
+    pub question: String,
+    pub answers: Vec<MatrixPollAnswer>,
+    pub max_selections: Option<u32>,
+    pub reply_to_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixCreatePollResult {
+    pub room_id: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixPollVoteRequest {
+    pub room_id: String,
+    pub poll_event_id: String,
+    pub answer_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixPollVoteResult {
+    pub room_id: String,
+    pub event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

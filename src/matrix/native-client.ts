@@ -2,6 +2,8 @@ import { NativeMatrixCoreClient } from "./native-binding.js";
 import type {
   MatrixChannelInfo,
   MatrixChannelInfoRequest,
+  MatrixCreatePollRequest,
+  MatrixCreatePollResult,
   MatrixDeleteMessageRequest,
   MatrixDeleteMessageResult,
   MatrixDownloadMediaRequest,
@@ -24,6 +26,8 @@ import type {
   MatrixNativeEvent,
   MatrixPinsResult,
   MatrixPinMessageRequest,
+  MatrixPollVoteRequest,
+  MatrixPollVoteResult,
   MatrixReactRequest,
   MatrixReactResult,
   MatrixReactionSummary,
@@ -34,6 +38,8 @@ import type {
   MatrixResolveTargetResult,
   MatrixSendRequest,
   MatrixSendResult,
+  MatrixSetProfileRequest,
+  MatrixSetProfileResult,
   MatrixTypingRequest,
   MatrixUploadMediaRequest,
   MatrixUploadMediaResult,
@@ -65,6 +71,9 @@ type NativeBindingClient = {
   listKnownShortcodes(requestJson: string): string;
   resolveLinkPreviews(requestJson: string): Promise<string>;
   setTyping(requestJson: string): Promise<void>;
+  setProfile(requestJson: string): Promise<string>;
+  createPoll(requestJson: string): Promise<string>;
+  pollVote(requestJson: string): Promise<string>;
 };
 
 export class MatrixNativeClient {
@@ -168,6 +177,18 @@ export class MatrixNativeClient {
 
   async setTyping(request: MatrixTypingRequest): Promise<void> {
     await this.#client.setTyping(JSON.stringify(request));
+  }
+
+  async setProfile(request: MatrixSetProfileRequest): Promise<MatrixSetProfileResult> {
+    return parseNativeJson(await this.#client.setProfile(JSON.stringify(request)), "setProfile");
+  }
+
+  async createPoll(request: MatrixCreatePollRequest): Promise<MatrixCreatePollResult> {
+    return parseNativeJson(await this.#client.createPoll(JSON.stringify(request)), "createPoll");
+  }
+
+  async pollVote(request: MatrixPollVoteRequest): Promise<MatrixPollVoteResult> {
+    return parseNativeJson(await this.#client.pollVote(JSON.stringify(request)), "pollVote");
   }
 }
 

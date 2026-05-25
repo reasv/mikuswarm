@@ -21,3 +21,6 @@ export { createPinsTool, type PinsToolContext } from "./pins.js";
 export { createListReactionsTool, type ListReactionsToolContext } from "./list-reactions.js";
 export { createMemberInfoTool, type MemberInfoToolContext } from "./member-info.js";
 export { createChannelInfoTool, type ChannelInfoToolContext } from "./channel-info.js";
+export { createSetProfileTool, type SetProfileToolContext } from "./set-profile.js";
+export { createCreatePollTool, type CreatePollToolContext } from "./create-poll.js";
+export { createPollVoteTool, type PollVoteToolContext } from "./poll-vote.js";

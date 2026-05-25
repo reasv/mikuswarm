@@ -1,8 +1,11 @@
 use std::{
     collections::VecDeque,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+use base64::Engine as _;
 
 use chrono::Utc;
 use matrix_sdk::{
@@ -33,17 +36,20 @@ use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 use crate::{
     api::{
         MatrixAuthConfig, MatrixChannelInfo, MatrixClientConfig,
+        MatrixCreatePollRequest, MatrixCreatePollResult,
         MatrixCustomEmojiUsageRequest, MatrixDeleteMessageRequest, MatrixDeleteMessageResult,
         MatrixDiagnostics, MatrixDownloadMediaResult,
         MatrixEditMessageRequest, MatrixEditMessageResult, MatrixJoinResult,
         MatrixKeyBackupState, MatrixListEmojiRequest,
         MatrixListPinsRequest, MatrixListReactionsRequest, MatrixMemberInfo,
         MatrixMessageSummary,
-        MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult, MatrixReactRequest,
-        MatrixReactResult, MatrixReactionSummary, MatrixReadMessagesRequest,
-        MatrixReadMessagesResult,
-        MatrixResolveTargetResult, MatrixSendRequest, MatrixSendResult, MatrixSyncState,
-        MatrixUploadMediaRequest, MatrixUploadMediaResult,
+        MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult,
+        MatrixPollVoteRequest, MatrixPollVoteResult,
+        MatrixReactRequest, MatrixReactResult, MatrixReactionSummary,
+        MatrixReadMessagesRequest, MatrixReadMessagesResult,
+        MatrixResolveTargetResult, MatrixSendRequest, MatrixSendResult,
+        MatrixSetProfileRequest, MatrixSetProfileResult,
+        MatrixSyncState, MatrixUploadMediaRequest, MatrixUploadMediaResult,
         MatrixVerificationState, NativeLifecycleStage, StoredSession,
     },
     auth::session,
@@ -1718,6 +1724,126 @@ async fn reauthenticate_client(
         ),
     );
     Ok((replacement_client, replacement_session))
+}
+
+pub(crate) async fn set_profile_internal(
+    client: &Client,
+    request: &MatrixSetProfileRequest,
+) -> MatrixResult<MatrixSetProfileResult> {
+    let account = client.account();
+    let mut result_name: Option<String> = None;
+    let mut result_avatar: Option<String> = None;
+
+    if let Some(name) = &request.display_name {
+        let name = name.trim();
+        if name.is_empty() {
+            account.set_display_name(None).await?;
+        } else {
+            account.set_display_name(Some(name)).await?;
+            result_name = Some(name.to_string());
+        }
+    }
+
+    if let Some(data_b64) = &request.avatar_data_base64 {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64.trim())
+            .map_err(|err| MatrixError::State(format!("invalid base64 avatar data: {err}")))?;
+        let content_type_str = request
+            .avatar_content_type
+            .as_deref()
+            .unwrap_or("image/png");
+        let content_type = mime::Mime::from_str(content_type_str).map_err(|err| {
+            MatrixError::State(format!("invalid avatar content type {content_type_str}: {err}"))
+        })?;
+        let response = client.media().upload(&content_type, data, None).await?;
+        account
+            .set_avatar_url(Some(&response.content_uri))
+            .await?;
+        result_avatar = Some(response.content_uri.to_string());
+    } else if let Some(mxc_url) = &request.avatar_url {
+        let uri = matrix_sdk::ruma::OwnedMxcUri::from(mxc_url.as_str());
+        account.set_avatar_url(Some(&uri)).await?;
+        result_avatar = Some(mxc_url.clone());
+    }
+
+    Ok(MatrixSetProfileResult {
+        display_name: result_name,
+        avatar_url: result_avatar,
+    })
+}
+
+pub(crate) async fn create_poll_internal(
+    client: &Client,
+    request: &MatrixCreatePollRequest,
+) -> MatrixResult<MatrixCreatePollResult> {
+    let (room, resolved_target) = resolve_room_for_send(client, &request.room_id).await?;
+    let max_selections = request.max_selections.unwrap_or(1);
+
+    let answers: Vec<Value> = request
+        .answers
+        .iter()
+        .map(|a| json!({ "id": a.id, "m.text": a.text }))
+        .collect();
+
+    let fallback_lines: Vec<String> = request
+        .answers
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("{}. {}", i + 1, a.text))
+        .collect();
+    let fallback = format!("{}\n{}", request.question, fallback_lines.join("\n"));
+
+    let mut content = json!({
+        "m.poll.start": {
+            "question": { "m.text": request.question },
+            "kind": "m.poll.disclosed",
+            "max_selections": max_selections,
+            "answers": answers,
+        },
+        "org.matrix.msc3381.v2.poll.start": {
+            "question": { "m.text": request.question },
+            "kind": "org.matrix.msc3381.v2.poll.disclosed",
+            "max_selections": max_selections,
+            "answers": answers,
+        },
+        "m.text": fallback,
+        "org.matrix.msc1767.text": fallback,
+    });
+
+    let reply = media::build_reply(request.reply_to_id.as_deref(), request.thread_id.as_deref())?;
+    if let Some(reply) = reply {
+        content["m.relates_to"] = json!({
+            "m.in_reply_to": { "event_id": reply.event_id.to_string() }
+        });
+    }
+
+    let response = room.send_raw("m.poll.start", content).await?;
+    Ok(MatrixCreatePollResult {
+        room_id: resolved_target.resolved_room_id,
+        event_id: response.event_id.to_string(),
+    })
+}
+
+pub(crate) async fn poll_vote_internal(
+    client: &Client,
+    request: &MatrixPollVoteRequest,
+) -> MatrixResult<MatrixPollVoteResult> {
+    let (room, resolved_target) = resolve_room_for_send(client, &request.room_id).await?;
+
+    let content = json!({
+        "m.poll.response": { "answers": request.answer_ids },
+        "org.matrix.msc3381.poll.response": { "answers": request.answer_ids },
+        "m.relates_to": {
+            "rel_type": "m.reference",
+            "event_id": request.poll_event_id,
+        },
+    });
+
+    let response = room.send_raw("m.poll.response", content).await?;
+    Ok(MatrixPollVoteResult {
+        room_id: resolved_target.resolved_room_id,
+        event_id: response.event_id.to_string(),
+    })
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {

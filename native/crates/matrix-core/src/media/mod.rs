@@ -62,6 +62,11 @@ pub async fn upload_media(room: &Room, request: &MatrixUploadMediaRequest) -> Ma
     let data = STANDARD
         .decode(request.data_base64.trim())
         .map_err(|err| MatrixError::State(format!("invalid base64 media payload: {err}")))?;
+
+    if request.as_voice.unwrap_or(false) {
+        return upload_voice_media(room, request, &content_type, data).await;
+    }
+
     let thumbnail = request
         .thumbnail
         .as_ref()
@@ -78,6 +83,54 @@ pub async fn upload_media(room: &Room, request: &MatrixUploadMediaRequest) -> Ma
         .reply(reply);
     let response = room
         .send_attachment(&request.filename, &content_type, data, config)
+        .await?;
+    Ok(response.event_id.to_string())
+}
+
+async fn upload_voice_media(
+    room: &Room,
+    request: &MatrixUploadMediaRequest,
+    content_type: &mime::Mime,
+    data: Vec<u8>,
+) -> MatrixResult<String> {
+    use serde_json::json;
+
+    let size_bytes = data.len() as u64;
+    let upload_response = room
+        .client()
+        .media()
+        .upload(content_type, data, None)
+        .await?;
+    let mxc_url = upload_response.content_uri.to_string();
+
+    let mut info = json!({
+        "mimetype": content_type.to_string(),
+        "size": size_bytes,
+    });
+    if let Some(duration_ms) = request.duration_ms {
+        info["duration"] = json!(duration_ms);
+    }
+
+    let mut content = json!({
+        "msgtype": "m.audio",
+        "body": "Voice message",
+        "url": mxc_url,
+        "info": info,
+        "org.matrix.msc3245.voice": {},
+    });
+    if let Some(duration_ms) = request.duration_ms {
+        content["org.matrix.msc1767.audio"] = json!({ "duration": duration_ms });
+    }
+
+    let reply = build_reply(request.reply_to_id.as_deref(), request.thread_id.as_deref())?;
+    if let Some(reply) = reply {
+        content["m.relates_to"] = json!({
+            "m.in_reply_to": { "event_id": reply.event_id.to_string() }
+        });
+    }
+
+    let response = room
+        .send_raw("m.room.message", content)
         .await?;
     Ok(response.event_id.to_string())
 }

@@ -2,7 +2,8 @@ pub mod types;
 
 pub use types::{
     MatrixAuthConfig, MatrixChannelInfo, MatrixChannelInfoRequest, MatrixChatType,
-    MatrixClientConfig, MatrixCustomEmojiCatalogEntry, MatrixCustomEmojiRef,
+    MatrixClientConfig, MatrixCreatePollRequest, MatrixCreatePollResult,
+    MatrixCustomEmojiCatalogEntry, MatrixCustomEmojiRef,
     MatrixCustomEmojiRoomStats, MatrixCustomEmojiUsageRequest, MatrixDeleteMessageRequest,
     MatrixDeleteMessageResult, MatrixDiagnostics, MatrixDownloadMediaRequest,
     MatrixDownloadMediaResult, MatrixEditMessageRequest, MatrixEditMessageResult,
@@ -12,10 +13,12 @@ pub use types::{
     MatrixListPinsRequest, MatrixListReactionsRequest, MatrixMediaKind, MatrixMemberInfo,
     MatrixMemberInfoRequest, MatrixMessageRelatesTo, MatrixMessageSummary,
     MatrixMessageSummaryRequest, MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult,
+    MatrixPollVoteRequest, MatrixPollVoteResult,
     MatrixReactRequest, MatrixReactResult, MatrixReactionInfo, MatrixReactionKeyKind,
     MatrixReactionSummary, MatrixReadMessagesRequest, MatrixReadMessagesResult,
     MatrixResolveLinkPreviewsRequest, MatrixResolveTargetRequest, MatrixResolveTargetResult,
-    MatrixSendRequest, MatrixSendResult, MatrixStateLayout, MatrixSyncState, MatrixTypingRequest,
+    MatrixSendRequest, MatrixSendResult, MatrixSetProfileRequest, MatrixSetProfileResult,
+    MatrixStateLayout, MatrixSyncState, MatrixTypingRequest,
     MatrixUploadMediaRequest, MatrixUploadMediaResult, MatrixUploadMediaThumbnail,
     MatrixVerificationState,
     NativeLifecycleStage, StoredSession,

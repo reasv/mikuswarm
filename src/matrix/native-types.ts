@@ -262,6 +262,8 @@ export type MatrixUploadMediaRequest = {
   caption?: string;
   replyToId?: string;
   threadId?: string;
+  asVoice?: boolean;
+  durationMs?: number;
 };
 
 export type MatrixUploadMediaResult = {
@@ -386,4 +388,46 @@ export type MatrixListEmojiRequest = {
   roomId?: string;
   limit?: number;
   nowMs?: number;
+};
+
+export type MatrixSetProfileRequest = {
+  displayName?: string;
+  avatarUrl?: string;
+  avatarDataBase64?: string;
+  avatarContentType?: string;
+};
+
+export type MatrixSetProfileResult = {
+  displayName?: string;
+  avatarUrl?: string;
+};
+
+export type MatrixPollAnswer = {
+  id: string;
+  text: string;
+};
+
+export type MatrixCreatePollRequest = {
+  roomId: string;
+  question: string;
+  answers: MatrixPollAnswer[];
+  maxSelections?: number;
+  replyToId?: string;
+  threadId?: string;
+};
+
+export type MatrixCreatePollResult = {
+  roomId: string;
+  eventId: string;
+};
+
+export type MatrixPollVoteRequest = {
+  roomId: string;
+  pollEventId: string;
+  answerIds: string[];
+};
+
+export type MatrixPollVoteResult = {
+  roomId: string;
+  eventId: string;
 };
