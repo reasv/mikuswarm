@@ -84,6 +84,10 @@ This prevents the agent from calling `send_message` with `final: false` in an in
 
 ## Current state
 
-The runner implementation (explicit send) is complete. The system prompt has NOT been updated. The agent currently works under the old prompt contract, and the runner's force-continuation loop compensates for non-compliance. This works but wastes retries and adds latency.
+**Done.** The workspace-driven prompt system is implemented and the explicit send contract is fully covered in the agent's prompts:
 
-This document should be revisited when defining the prompt changes. Update the "Current state" section after the prompt work is done.
+- **AGENTS.md** (system prompt): "Turn Model (Critical)" section explains the explicit send contract, `final` parameter, `NO_REPLY`, and the text-is-scratchpad rule as the first major section.
+- **TAIL.md** (satellite block): "Send Contract Reminder" repeats the core rules near the end of context, reinforcing the contract right before the agent acts.
+- **Force-continuation prompt**: handled by the runner (unchanged).
+
+The contract is taught twice — once in the system prompt (high priority, early) and once in the tail (recency bias, near the trigger). This matches the design requirements from this document.
