@@ -20,3 +20,4 @@ var/matrix/
 workspaces/*
 !workspaces/.gitpreserve
 /tmp/
+tmp/
