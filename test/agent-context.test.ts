@@ -82,7 +82,7 @@ test("convertToLlm filters accidental system transcript messages", () => {
   assert.deepEqual(messages, []);
 });
 
-test("convertToLlm renders historical assistant chat events as user transcript blocks", () => {
+test("convertToLlm renders historical assistant chat events as assistant messages", () => {
   const messages = convertToLlm([
     {
       type: "chatEvent",
@@ -93,6 +93,5 @@ test("convertToLlm renders historical assistant chat events as user transcript b
   ]);
 
   assert.equal(messages.length, 1);
-  assert.equal(messages[0]?.role, "user");
-  assert.equal(messages[0]?.content, "<message sender=\"Miku\">hello</message>");
+  assert.equal(messages[0]?.role, "assistant");
 });

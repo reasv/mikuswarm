@@ -11,7 +11,7 @@ export function createChannelInfoTool(context: ChannelInfoToolContext): AgentToo
   return {
     name: "channel_info",
     label: "Channel info",
-    description: "Get information about the current room including its name, aliases, member count, and type.",
+    description: "Get information about the current room (or a specific room by ID) including its name, aliases, member count, and type.",
     parameters: Type.Object({
       room_id: Type.Optional(Type.String({ description: "Room ID to query. Defaults to the current room." })),
     }),
