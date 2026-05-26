@@ -10,6 +10,8 @@ import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
 import { escapeXml } from "./xml.js";
+import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
+import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
 
 export interface ContextMessage {
   type: "system" | "chatEvent" | "runtimeInstructions" | "triggerGroup";
@@ -32,6 +34,9 @@ export interface BuildContextOptions {
   timelineKey: string;
   trigger: CanonicalChatEvent;
   activeSessions: AgentSessionRecord[];
+  workspace: WorkspaceContent;
+  sessionType?: SessionTypeConfig;
+  fallbackPrompt?: string;
   now?: Date;
 }
 
@@ -88,17 +93,18 @@ export class ContextBuilder {
       timestamp: turn.timestamp,
     }));
 
-    const runtime = renderRuntimeInstructions(options);
+    const systemPrompt = renderSystemPrompt(options.workspace, options.fallbackPrompt);
+    const satellite = renderSatelliteBlock(options, options.workspace, options.sessionType);
     const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");
-    const finalUserContent = `<system>\n${runtime}\n</system>\n\n${triggerContent}`;
+    const finalUserContent = `<system>\n${satellite}\n</system>\n\n${triggerContent}`;
 
     const messages: ContextMessage[] = [
       {
         type: "system",
         role: "system",
-        content: this.config.agent.system.prompt,
+        content: systemPrompt,
         tier: "system",
-        tokenEstimate: estimateTokens(this.config.agent.system.prompt),
+        tokenEstimate: estimateTokens(systemPrompt),
       },
       ...chatMessages,
       {
@@ -367,18 +373,3 @@ function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatE
   return (event.attachments ?? []).filter((attachment) => attachment.mediaType === "image" && attachment.localPath);
 }
 
-function renderRuntimeInstructions(options: BuildContextOptions): string {
-  const sessions = options.activeSessions
-    .map(
-      (session) =>
-        `<session id="${session.id}" started="${new Date(session.createdAt).toISOString()}" triggered_by="${escapeXml((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
-    )
-    .join("\n");
-  return `Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
-Current timeline: ${escapeXml(options.timelineKey)}
-Trigger event: ${escapeXml(options.trigger.id)}
-
-<active_sessions>
-${sessions}
-</active_sessions>`;
-}

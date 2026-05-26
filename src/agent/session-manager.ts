@@ -7,6 +7,7 @@ export type AgentSessionStatus = "created" | "running" | "completed" | "discarde
 export interface AgentSessionRecord {
   id: string;
   timelineKey: string;
+  sessionType: string;
   status: AgentSessionStatus;
   trigger: InboundChatEvent;
   createdAt: number;
@@ -19,10 +20,11 @@ export class SessionManager {
   private readonly agents = new Map<string, Agent>();
   private readonly byTimeline = new Map<string, Set<string>>();
 
-  createPlaceholder(trigger: InboundChatEvent): AgentSessionRecord {
+  createPlaceholder(trigger: InboundChatEvent, sessionType: string = "default"): AgentSessionRecord {
     const record: AgentSessionRecord = {
       id: `s-${nanoid(10)}`,
       timelineKey: trigger.timelineKey,
+      sessionType,
       status: "created",
       trigger,
       createdAt: Date.now(),

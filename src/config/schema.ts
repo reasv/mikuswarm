@@ -1,5 +1,19 @@
 import { Type, type Static } from "@sinclair/typebox";
 
+const SessionTypeSchema = Type.Object({
+  workspace_files: Type.Optional(Type.Array(Type.String())),
+  tail_file: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  session_instruction: Type.Optional(Type.String()),
+  tools: Type.Optional(Type.Array(Type.String())),
+  skills: Type.Optional(
+    Type.Union([
+      Type.Literal("all"),
+      Type.Literal("none"),
+      Type.Array(Type.String()),
+    ]),
+  ),
+});
+
 const ModelSchema = Type.Object({
   id: Type.String({ minLength: 1 }),
   provider: Type.String({ minLength: 1 }),
@@ -120,8 +134,9 @@ export const AppConfigSchema = Type.Object({
       forced_completion_retries: Type.Number({ minimum: 0 }),
     }),
     system: Type.Object({
-      prompt: Type.String(),
+      fallback_prompt: Type.Optional(Type.String()),
     }),
+    session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
   }),
   models: Type.Record(Type.String(), ModelSchema),
   context: Type.Object({

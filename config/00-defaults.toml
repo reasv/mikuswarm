@@ -11,7 +11,7 @@ max_queued_per_timeline = 10000
 forced_completion_retries = 3
 
 [agent.system]
-prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
+fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 
 [models.default]
 id = "claude-opus-4-7"

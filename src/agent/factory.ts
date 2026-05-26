@@ -5,6 +5,8 @@ import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
+import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
+import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
@@ -44,21 +46,53 @@ export interface AgentFactoryOptions {
 export class AgentSessionFactory {
   constructor(private readonly options: AgentFactoryOptions) {}
 
-  create(session: AgentSessionRecord, tools: AgentTool[] = []): Agent {
+  /**
+   * Resolve the SessionTypeConfig for a given session type name.
+   */
+  resolveSessionType(sessionType: string): SessionTypeConfig | undefined {
+    const types = this.options.config.agent.session_types;
+    if (!types) return undefined;
+    return types[sessionType] ?? types["default"];
+  }
+
+  /**
+   * Create an Agent for the given session.
+   *
+   * Loads workspace content from disk (workspace files, tail instructions, skills)
+   * and assembles the system prompt from it. The workspace content is also passed
+   * to the context builder so the satellite block can be rendered at build time.
+   */
+  async create(session: AgentSessionRecord, tools: AgentTool[] = []): Promise<Agent> {
     const model = createModel(this.options.config);
     const modelConfig = this.options.config.models.default;
     const streamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    const workspaceRoot = this.options.config.workspace.root_dir;
+    const sessionTypeConfig = this.resolveSessionType(session.sessionType);
+    const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
+
+    // Load workspace files from disk at session creation time
+    const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
+
+    // Filter tools if the session type specifies a tool allowlist
+    const filteredTools = filterTools(tools, sessionTypeConfig);
+
+    // Build the system prompt from workspace content
+    const systemPrompt = renderSystemPrompt(workspace, fallbackPrompt);
+
     return new Agent({
       initialState: {
-        systemPrompt: this.options.config.agent.system.prompt,
+        systemPrompt,
         model,
-        tools,
+        tools: filteredTools,
       },
       transformContext: async (messages) => {
         const built = await this.options.contextBuilder.build({
           timelineKey: session.timelineKey,
           trigger: session.trigger.event,
           activeSessions: this.options.getActiveSessions(session.timelineKey),
+          workspace,
+          sessionType: sessionTypeConfig,
+          fallbackPrompt,
         });
         await dumpBuiltContext(
           this.options.config.app.context_dump_dir,
@@ -77,6 +111,16 @@ export class AgentSessionFactory {
       sessionId: session.timelineKey,
     });
   }
+}
+
+/**
+ * Filter tools based on session type config.
+ * When no tool allowlist is specified, all tools are returned.
+ */
+function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig): AgentTool[] {
+  if (!sessionType?.tools) return tools;
+  const allowed = new Set(sessionType.tools);
+  return tools.filter((tool) => allowed.has(tool.name));
 }
 
 export function buildAgentContextMessages(

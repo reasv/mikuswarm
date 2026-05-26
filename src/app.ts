@@ -248,7 +248,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
 
     await awaitTriggerReadiness(inbound);
-    launchSession(inbound, routed.duplicate);
+    await launchSession(inbound, routed.duplicate);
   }
 
   async function resolveTriggerGroup(inbound: InboundChatEvent): Promise<void> {
@@ -383,7 +383,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return ok;
   }
 
-  function launchSession(inbound: InboundChatEvent, duplicate: boolean): void {
+  async function launchSession(inbound: InboundChatEvent, duplicate: boolean): Promise<void> {
     const session = sessions.createPlaceholder(inbound);
     sessions.markRunning(session.id);
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey });
@@ -446,7 +446,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createWriteMemoryTool({ workspaceRoot }),
       createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient }),
     ];
-    const agent = factory.create(session, tools);
+    let agent;
+    try {
+      agent = await factory.create(session, tools);
+    } catch (error) {
+      sessions.markDiscarded(session.id);
+      logger.error("session_factory_failed", {
+        sessionId: session.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      const next = triggerCoordinator.complete(session.timelineKey);
+      if (next && !draining) launchSession(next, true);
+      return;
+    }
     sessions.attachAgent(session.id, agent);
     const runner = new SessionRunner({ provider, target });
 
