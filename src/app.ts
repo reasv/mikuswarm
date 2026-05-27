@@ -454,6 +454,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
       createWebSearchTool(),
+      // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.
+      // Clamps in resolveMaxCharacters (50KB–512KB) bound the impact, so a mismatch only shifts the cap within those limits.
       createTextEditorTool({ workspaceRoot, contextWindowTokens: config.models.default.context_window }),
       createSearchFilesTool({ workspaceRoot }),
       createMediaTool({

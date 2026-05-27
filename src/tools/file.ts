@@ -18,7 +18,7 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
   return {
     name: "str_replace_based_edit_tool",
     label: "Text editor",
-    description: "View, create, and edit text files in the workspace using Claude's str_replace editor commands.",
+    description: "View, create, and edit text files in the workspace using Claude's str_replace editor commands. For str_replace, pass either a single old_str/new_str pair or an edits array; the edits array applies multiple replacements sequentially with all-or-nothing semantics (if any edit fails to match, the file is left unchanged).",
     parameters: Type.Object({
       command: Type.Union([
         Type.Literal("view"),
@@ -31,9 +31,9 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
       old_str: Type.Optional(Type.String()),
       new_str: Type.Optional(Type.String()),
       edits: Type.Optional(Type.Array(Type.Object({
-        old_str: Type.String(),
-        new_str: Type.Optional(Type.String()),
-      }))),
+        old_str: Type.String({ description: "Exact substring to find in the current file content. Must match exactly once at the time this edit runs (after previous edits in the batch have been applied)." }),
+        new_str: Type.Optional(Type.String({ description: "Replacement text. Omit or set to empty string to delete the matched text." })),
+      }, { description: "A single str_replace edit." }), { description: "Ordered list of str_replace edits applied sequentially. All-or-nothing: if any edit's old_str does not match, no changes are written to disk." })),
       file_text: Type.Optional(Type.String()),
       insert_line: Type.Optional(Type.Number({ minimum: 0 })),
       insert_text: Type.Optional(Type.String()),
@@ -132,8 +132,9 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
     const maxCharacters = args.max_characters ?? resolveMaxCharacters(options?.contextWindowTokens);
     const truncated = numbered.length > maxCharacters;
     const hasExplicitRange = args.view_range !== undefined;
+    const lastVisibleLine = truncated ? countLines(numbered, maxCharacters, selected.startLine) : selected.endLine;
     const continuationHint = truncated && !hasExplicitRange
-      ? `\n[Showing lines ${selected.startLine}-${countLines(numbered, maxCharacters, selected.startLine)}. Use view_range to continue.]`
+      ? `\n[Showing lines ${selected.startLine}-${lastVisibleLine}. Use view_range to continue.]`
       : truncated ? "\n[truncated]" : "";
     return {
       text: truncated ? `${numbered.slice(0, maxCharacters)}${continuationHint}` : numbered,
@@ -141,7 +142,7 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
         command: args.command,
         path: workspaceRelative(workspaceRoot, absolute),
         startLine: selected.startLine,
-        endLine: selected.endLine,
+        endLine: lastVisibleLine,
         truncated,
       },
     };
@@ -175,7 +176,7 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
       const { old_str, new_str } = edits[i];
       const newStr = new_str ?? "";
       const first = current.indexOf(old_str);
-      if (first < 0) throw mismatchError(relPath, old_str, current, i, edits.length);
+      if (first < 0) throw mismatchError(relPath, old_str, content, i, edits.length);
       const second = current.indexOf(old_str, first + old_str.length);
       if (second >= 0) throw new Error(`old_str matched more than once${edits.length > 1 ? ` (edit ${i + 1}/${edits.length})` : ""}`);
       current = `${current.slice(0, first)}${newStr}${current.slice(first + old_str.length)}`;
@@ -280,27 +281,34 @@ const CHARS_PER_TOKEN = 4;
 const ADAPTIVE_CONTEXT_SHARE = 0.2;
 
 function normalizeEdits(args: { old_str?: string; new_str?: string; edits?: Array<{ old_str: string; new_str?: string }> }): Array<{ old_str: string; new_str?: string }> {
-  if (args.edits && args.edits.length > 0) return args.edits;
+  if (args.edits && args.edits.length > 0) {
+    if (args.old_str !== undefined || args.new_str !== undefined) {
+      throw new Error("Pass either edits or old_str/new_str, not both");
+    }
+    return args.edits;
+  }
   if (args.old_str !== undefined) return [{ old_str: args.old_str, new_str: args.new_str }];
   throw new Error("str_replace requires old_str or edits");
 }
 
 function mismatchError(relPath: string, oldStr: string, currentContent: string, editIndex: number, totalEdits: number): Error {
   const indexHint = totalEdits > 1 ? ` (edit ${editIndex + 1}/${totalEdits})` : "";
-  const snippet = currentContent.length <= MISMATCH_HINT_LIMIT
-    ? currentContent
-    : `${currentContent.slice(0, MISMATCH_HINT_LIMIT)}\n... (truncated)`;
+  const snippet = currentContent.length > MISMATCH_HINT_LIMIT
+    ? `[file is ${currentContent.length} chars; call view to inspect]`
+    : currentContent;
   return new Error(`old_str was not found in ${relPath}${indexHint}\nCurrent file contents:\n${snippet}`);
 }
 
 function resolveMaxCharacters(contextWindowTokens?: number): number {
-  if (typeof contextWindowTokens !== "number" || contextWindowTokens <= 0) return DEFAULT_MAX_CHARACTERS;
-  const fromContext = Math.floor(contextWindowTokens * CHARS_PER_TOKEN * ADAPTIVE_CONTEXT_SHARE);
+  if (!Number.isFinite(contextWindowTokens) || (contextWindowTokens as number) <= 0) {
+    return DEFAULT_MAX_CHARACTERS;
+  }
+  const fromContext = Math.floor((contextWindowTokens as number) * CHARS_PER_TOKEN * ADAPTIVE_CONTEXT_SHARE);
   return Math.max(MIN_ADAPTIVE_BUDGET, Math.min(MAX_ADAPTIVE_BUDGET, fromContext));
 }
 
 function countLines(numbered: string, maxChars: number, startLine: number): number {
   const truncated = numbered.slice(0, maxChars);
-  const lineCount = truncated.split(/\r?\n/).length;
-  return startLine + lineCount - 1;
+  const completeLines = (truncated.match(/\n/g) ?? []).length;
+  return startLine + completeLines - 1;
 }

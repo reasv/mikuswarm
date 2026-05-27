@@ -216,6 +216,84 @@ test("batch edits fail on first mismatch with edit index", async () => {
   });
 });
 
+test("mid-batch mismatch snippet shows original on-disk content, not post-edit state", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "batch-snippet.txt",
+      file_text: "alpha\nbeta\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "batch-snippet.txt",
+          edits: [
+            { old_str: "alpha", new_str: "one" },
+            { old_str: "missing", new_str: "two" },
+          ],
+        }),
+      (err: Error) => {
+        // The snippet must reflect the ORIGINAL file (still contains "alpha"),
+        // not the in-memory state after edit 1 applied (which would contain "one").
+        assert.match(err.message, /alpha/);
+        assert.ok(!err.message.includes("one\nbeta"), "snippet should not contain post-edit-1 state");
+        return true;
+      },
+    );
+  });
+});
+
+test("mismatch snippet is replaced with a hint for large files", async () => {
+  await withWorkspace(async (workspace) => {
+    // Build a file well over the 800-char MISMATCH_HINT_LIMIT.
+    const big = "x".repeat(2000);
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "big-mismatch.txt",
+      file_text: big,
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "big-mismatch.txt",
+          old_str: "nope",
+          new_str: "replacement",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /\[file is 2000 chars; call view to inspect\]/);
+        // Must not include an 800-char dump of the file.
+        assert.ok(!err.message.includes("x".repeat(800)), "should not include a positional dump");
+        return true;
+      },
+    );
+  });
+});
+
+test("str_replace rejects passing both edits and old_str", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "both.txt",
+      file_text: "alpha\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "both.txt",
+          old_str: "alpha",
+          new_str: "beta",
+          edits: [{ old_str: "alpha", new_str: "gamma" }],
+        }),
+      /Pass either edits or old_str\/new_str, not both/,
+    );
+    // File must be unchanged.
+    assert.equal(await readFile(path.join(workspace, "both.txt"), "utf8"), "alpha\n");
+  });
+});
+
 test("adaptive paging truncates large files with continuation hint", async () => {
   await withWorkspace(async (workspace) => {
     const bigContent = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}`).join("\n");
@@ -232,6 +310,27 @@ test("adaptive paging truncates large files with continuation hint", async () =>
     );
     assert.match(result.text, /Use view_range to continue/);
     assert.equal(result.details.truncated, true);
+
+    // The hint must declare an exact line range. Numbered lines look like
+    // "<n>: line <n>"; the budget is 50000 chars at the min clamp. We require:
+    //   1. The hint references "Showing lines 1-<endLine>".
+    //   2. <endLine> equals details.endLine (set to the last fully-visible line).
+    //   3. <endLine> is strictly less than the file's line count (i.e. the
+    //      hint does not overstate progress as the old off-by-one bug did).
+    const hintMatch = result.text.match(/Showing lines (\d+)-(\d+)\. Use view_range to continue/);
+    assert.ok(hintMatch, "expected exact line range in continuation hint");
+    const hintStart = Number(hintMatch[1]);
+    const hintEnd = Number(hintMatch[2]);
+    assert.equal(hintStart, 1);
+    assert.equal(hintEnd, result.details.endLine, "details.endLine must match hint last line");
+    assert.ok(hintEnd < 5000, "hint must not claim to have shown the whole file");
+
+    // The last visible line in the output must be exactly hintEnd — i.e. all
+    // numbered lines through hintEnd appear in full, and hintEnd+1 does not.
+    const expectedLastLine = `${hintEnd}: line ${hintEnd}`;
+    assert.ok(result.text.includes(expectedLastLine), `expected last fully-visible line ${expectedLastLine}`);
+    const overshootLine = `${hintEnd + 1}: line ${hintEnd + 1}`;
+    assert.ok(!result.text.includes(overshootLine), `line ${hintEnd + 1} should not be fully visible`);
   });
 });
 
