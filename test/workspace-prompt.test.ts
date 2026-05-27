@@ -444,3 +444,352 @@ describe("full integration: load workspace and render", () => {
     assert.ok(satellite.includes("Reply to the user."));
   });
 });
+
+// =============================================================================
+// T1: Empty AGENTS.md file on disk with fallback prompt
+// =============================================================================
+
+describe("workspace loader — empty AGENTS.md fallback", () => {
+  it("uses fallback prompt when AGENTS.md exists but is empty", async () => {
+    await writeFile(path.join(tmpDir, "AGENTS.md"), "");
+    await writeFile(path.join(tmpDir, "SOUL.md"), "personality");
+
+    const workspace = await loadWorkspace(tmpDir);
+    // Empty string is loaded into files map
+    assert.equal(workspace.files.get("AGENTS.md"), "");
+
+    // renderSystemPrompt should use fallback because empty string is falsy
+    const prompt = renderSystemPrompt(workspace, "Fallback instructions for empty file");
+    assert.ok(prompt.includes("Fallback instructions for empty file"),
+      "fallback should be used when AGENTS.md is empty string");
+    assert.ok(prompt.includes('source="AGENTS.md"'),
+      "tag should still attribute source to AGENTS.md");
+  });
+});
+
+// =============================================================================
+// T2: SKILL.md with Windows \r\n line endings
+// =============================================================================
+
+describe("skills scanner — Windows line endings", () => {
+  it("parses SKILL.md with \\r\\n line endings correctly", async () => {
+    const skillDir = path.join(tmpDir, "skills", "crlf-skill");
+    await mkdir(skillDir, { recursive: true });
+    // Build content with \r\n line endings throughout
+    const content = "---\r\nname: crlf-skill\r\ndescription: A skill with CRLF\r\n---\r\n\r\nBody with CRLF line endings.\r\nSecond line.";
+    await writeFile(path.join(skillDir, "SKILL.md"), content);
+
+    const index = await scanSkills(tmpDir);
+    assert.equal(index.listed.length, 1);
+    const skill = index.listed[0];
+    // Name should not have trailing \r
+    assert.equal(skill.name, "crlf-skill");
+    assert.ok(!skill.name.includes("\r"), "name should not contain \\r");
+    // Description should not have trailing \r
+    assert.equal(skill.description, "A skill with CRLF");
+    assert.ok(!skill.description.includes("\r"), "description should not contain \\r");
+    assert.equal(skill.path, "skills/crlf-skill/SKILL.md");
+  });
+
+  it("inlines always_loaded skill with \\r\\n line endings", async () => {
+    const skillDir = path.join(tmpDir, "skills", "crlf-inlined");
+    await mkdir(skillDir, { recursive: true });
+    const content = "---\r\nname: crlf-inlined\r\ndescription: Inlined CRLF skill\r\nalways_loaded: true\r\n---\r\n\r\nInlined body content.";
+    await writeFile(path.join(skillDir, "SKILL.md"), content);
+
+    const index = await scanSkills(tmpDir);
+    assert.equal(index.inlined.length, 1);
+    const skill = index.inlined[0];
+    assert.equal(skill.name, "crlf-inlined");
+    assert.equal(skill.description, "Inlined CRLF skill");
+    assert.ok(skill.content !== undefined, "content should be populated");
+    // Content should not have leading \r\n artifacts
+    assert.ok(!skill.content!.startsWith("\r"), "body should not start with \\r");
+  });
+});
+
+// =============================================================================
+// T3: Frontmatter description containing colons
+// =============================================================================
+
+describe("skills scanner — colons in description", () => {
+  it("parses quoted description with colons correctly", async () => {
+    const skillDir = path.join(tmpDir, "skills", "colon-quoted");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      `---\nname: colon-quoted\ndescription: "Value with: colons: inside"\n---\n\nBody.`,
+    );
+
+    const index = await scanSkills(tmpDir);
+    assert.equal(index.listed.length, 1);
+    assert.equal(index.listed[0].description, "Value with: colons: inside");
+  });
+
+  it("parses unquoted description with colons correctly (first colon splits)", async () => {
+    const skillDir = path.join(tmpDir, "skills", "colon-unquoted");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      `---\nname: colon-unquoted\ndescription: Value with: colons\n---\n\nBody.`,
+    );
+
+    const index = await scanSkills(tmpDir);
+    assert.equal(index.listed.length, 1);
+    // First colon splits key from value; rest is part of value
+    assert.equal(index.listed[0].description, "Value with: colons");
+  });
+});
+
+// =============================================================================
+// T4: Skill directory name differs from frontmatter name
+// =============================================================================
+
+describe("skills scanner — directory vs frontmatter name", () => {
+  it("uses frontmatter name for skill name, directory name for path", async () => {
+    const skillDir = path.join(tmpDir, "skills", "foo-dir");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      `---\nname: bar-skill\ndescription: Different name than directory\n---\n\nContent.`,
+    );
+
+    const index = await scanSkills(tmpDir);
+    assert.equal(index.listed.length, 1);
+    assert.equal(index.listed[0].name, "bar-skill");
+    assert.equal(index.listed[0].path, "skills/foo-dir/SKILL.md");
+  });
+});
+
+// =============================================================================
+// T5: filenameToTag with unusual filenames (tested indirectly via renderSystemPrompt)
+// =============================================================================
+
+describe("system prompt rendering — filenameToTag edge cases", () => {
+  it("converts custom filenames to valid XML tags", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ["CUSTOM-NOTES.md", "Custom notes content."],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes("<custom_notes"), "CUSTOM-NOTES.md should produce tag 'custom_notes'");
+    assert.ok(prompt.includes("</custom_notes>"));
+    assert.ok(prompt.includes('source="CUSTOM-NOTES.md"'));
+    assert.ok(prompt.includes("Custom notes content."));
+  });
+
+  it("prefixes digit-leading filenames with ws_", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ["404.md", "Not found content."],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes("<ws_404"), "404.md should produce tag 'ws_404'");
+    assert.ok(prompt.includes("</ws_404>"));
+    assert.ok(prompt.includes('source="404.md"'));
+  });
+
+  it("uses ws_unknown for filenames that reduce to empty after stripping", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ["__.md", "Underscores only content."],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes("<ws_unknown"), "__.md should produce tag 'ws_unknown'");
+    assert.ok(prompt.includes("</ws_unknown>"));
+    assert.ok(prompt.includes('source="__.md"'));
+  });
+});
+
+// =============================================================================
+// T6: XML attribute escaping with special characters
+// =============================================================================
+
+describe("system prompt rendering — XML attribute escaping", () => {
+  it("escapes special characters in workspace file source attributes", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ['FILE"WITH<SPECIAL>&CHARS.md', "Content with special filename."],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes('source="FILE&quot;WITH&lt;SPECIAL&gt;&amp;CHARS.md"'),
+      "special chars in filename should be escaped in source attribute");
+    assert.ok(prompt.includes("Content with special filename."));
+  });
+
+  it("escapes special characters in skill name and description attributes", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: {
+        listed: [
+          {
+            name: 'skill"with<special>',
+            description: "A skill with <tags> & \"quotes\"",
+            path: "skills/test/SKILL.md",
+            alwaysLoaded: false,
+          },
+        ],
+        inlined: [],
+      },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes('name="skill&quot;with&lt;special&gt;"'),
+      "skill name with special chars should be escaped");
+    // Description is element content, not an attribute — quotes are not escaped
+    assert.ok(prompt.includes('A skill with &lt;tags&gt; &amp; "quotes"'),
+      "skill description should escape XML entities in element content");
+  });
+
+  it("escapes special characters in inlined skill attributes", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: {
+        listed: [],
+        inlined: [
+          {
+            name: 'inline"skill',
+            description: "test",
+            path: 'skills/a&b/SKILL.md',
+            alwaysLoaded: true,
+            content: "Inlined content.",
+          },
+        ],
+      },
+    };
+
+    const prompt = renderSystemPrompt(workspace);
+    assert.ok(prompt.includes('name="inline&quot;skill"'),
+      "inlined skill name should be escaped");
+    assert.ok(prompt.includes('source="skills/a&amp;b/SKILL.md"'),
+      "inlined skill path should be escaped");
+  });
+});
+
+// =============================================================================
+// T7: Trigger body truncation at 160 characters
+// =============================================================================
+
+describe("satellite block rendering — trigger body truncation", () => {
+  it("truncates trigger body to 160 characters in active sessions", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const longBody = "A".repeat(200);
+    const input = makeRuntimeInput({
+      activeSessions: [{
+        id: "s-trunc",
+        createdAt: Date.parse("2026-05-26T13:00:00.000Z"),
+        trigger: { event: { body: longBody } },
+      }],
+    });
+
+    const satellite = renderSatelliteBlock(input, workspace);
+    assert.ok(satellite.includes('id="s-trunc"'));
+
+    // The triggered_by attribute should contain at most 160 chars of the body
+    const truncated = "A".repeat(160);
+    assert.ok(satellite.includes(`triggered_by="${truncated}"`),
+      "triggered_by should be truncated to 160 characters");
+    // Should NOT contain the full 200-char body
+    assert.ok(!satellite.includes(`triggered_by="${longBody}"`),
+      "triggered_by should not contain the full 200-char body");
+  });
+
+  it("does not truncate trigger body at or under 160 characters", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const exactBody = "B".repeat(160);
+    const input = makeRuntimeInput({
+      activeSessions: [{
+        id: "s-exact",
+        createdAt: Date.parse("2026-05-26T13:00:00.000Z"),
+        trigger: { event: { body: exactBody } },
+      }],
+    });
+
+    const satellite = renderSatelliteBlock(input, workspace);
+    assert.ok(satellite.includes(`triggered_by="${exactBody}"`),
+      "160-char body should not be truncated");
+  });
+});
+
+// =============================================================================
+// T8: Path traversal attempt blocked in workspace_files
+// =============================================================================
+
+describe("workspace loader — path traversal protection", () => {
+  it("blocks workspace_files with path traversal", async () => {
+    await writeFile(path.join(tmpDir, "AGENTS.md"), "legit content");
+
+    // Create a file at a path that traversal would reach
+    const parentFile = path.join(tmpDir, "..", "traversal-target.md");
+    let parentFileCreated = false;
+    try {
+      await writeFile(parentFile, "SECRET CONTENT");
+      parentFileCreated = true;
+    } catch {
+      // If we can't write there, we still test that loadWorkspace doesn't error
+    }
+
+    try {
+      const result = await loadWorkspace(tmpDir, {
+        workspace_files: ["AGENTS.md", "../../traversal-target.md"],
+      });
+
+      // AGENTS.md should be loaded normally
+      assert.ok(result.files.has("AGENTS.md"), "legitimate file should load");
+      assert.equal(result.files.get("AGENTS.md"), "legit content");
+
+      // Traversal path should NOT be loaded
+      assert.ok(!result.files.has("../../traversal-target.md"),
+        "traversal path should not be loaded");
+      assert.ok(!result.files.has("traversal-target.md"),
+        "traversal target should not appear under any key");
+
+      // Verify no file content from the traversal target leaked
+      for (const [, content] of result.files) {
+        assert.ok(!content.includes("SECRET CONTENT"),
+          "traversal target content should not appear in any loaded file");
+      }
+    } finally {
+      // Clean up the parent file we created
+      if (parentFileCreated) {
+        await rm(parentFile, { force: true });
+      }
+    }
+  });
+
+  it("blocks tail_file with path traversal", async () => {
+    const result = await loadWorkspace(tmpDir, {
+      tail_file: "../../../etc/passwd",
+    });
+    assert.equal(result.tailContent, null,
+      "tail content should be null when path traversal is blocked");
+  });
+});
