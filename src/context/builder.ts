@@ -9,7 +9,6 @@ import { processImageForInference, cleanupProcessedImage, type ImageProcessingOp
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
-import { escapeXml } from "./xml.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
 

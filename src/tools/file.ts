@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
+import { isNodeError } from "../types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -141,7 +142,7 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
       await stat(absolute);
       throw new Error(`File already exists: ${args.path}`);
     } catch (error) {
-      if (error instanceof Error && !("code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) {
+      if (!(isNodeError(error) && error.code === "ENOENT")) {
         throw error;
       }
     }

@@ -1,16 +1,16 @@
-import type { CanonicalChatEvent } from "../types.js";
+import type { CanonicalChatEvent, InboundChatEvent } from "../types.js";
+import type { AgentSessionRecord } from "../agent/session-manager.js";
 
 /**
  * Input for rendering the satellite block's runtime state section.
+ *
+ * `activeSessions` uses a Pick of AgentSessionRecord to stay coupled with the
+ * canonical session record type, avoiding silent structural drift.
  */
 export interface SatelliteRuntimeInput {
   timelineKey: string;
   trigger: CanonicalChatEvent;
-  activeSessions: Array<{
-    id: string;
-    createdAt: number;
-    trigger: { event: { body: string } };
-  }>;
+  activeSessions: Array<Pick<AgentSessionRecord, "id" | "createdAt" | "trigger">>;
   now?: Date;
 }
 
@@ -46,12 +46,9 @@ export interface SkillIndex {
   inlined: SkillMeta[];
 }
 
-/**
- * Resolved session type configuration used during workspace loading and context building.
- */
-export function isNodeError(err: unknown): err is NodeJS.ErrnoException {
-  return err instanceof Error && "code" in err;
-}
+// Re-export isNodeError from shared types for backward compatibility.
+// Consumers that import from workspace/types.ts continue to work.
+export { isNodeError } from "../types.js";
 
 export interface SessionTypeConfig {
   /** Which workspace files to load. When undefined, all default files are loaded. */

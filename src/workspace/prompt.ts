@@ -1,4 +1,5 @@
 import type { WorkspaceContent, SessionTypeConfig, SatelliteRuntimeInput } from "./types.js";
+import { escapeXml, escapeAttr } from "../context/xml.js";
 
 /**
  * Tag name mapping for workspace files.
@@ -33,12 +34,13 @@ export function renderSystemPrompt(
 ): string {
   const sections: string[] = [];
 
-  // Inject AGENTS.md fallback into a local copy of the files map if needed.
-  // This unifies the two cases (missing key vs empty content) into a single path.
+  // Inject AGENTS.md fallback when the file is missing or empty.
+  // An empty AGENTS.md on disk is treated the same as a missing one — the
+  // fallback prompt provides a minimal instruction set in either case.
   let files = workspace.files;
   if (fallbackPrompt) {
     const existing = files.get("AGENTS.md");
-    if (!existing) {
+    if (existing === undefined || existing === "") {
       files = new Map(files);
       files.set("AGENTS.md", fallbackPrompt);
     }
@@ -174,17 +176,3 @@ function filenameToTag(filename: string): string {
   return tag;
 }
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeAttr(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}

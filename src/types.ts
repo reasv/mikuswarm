@@ -1,3 +1,11 @@
+/**
+ * Type guard for Node.js system errors (ENOENT, EACCES, etc.).
+ * Checks that the value is an Error with a `code` property.
+ */
+export function isNodeError(err: unknown): err is NodeJS.ErrnoException {
+  return err instanceof Error && "code" in err;
+}
+
 export type ChatRole = "user" | "assistant";
 
 export interface SenderInfo {
