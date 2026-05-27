@@ -11,6 +11,7 @@ const execFileAsync = promisify(execFile);
 
 export interface FileToolContext {
   workspaceRoot: string;
+  contextWindowTokens?: number;
 }
 
 export function createTextEditorTool(context: FileToolContext): AgentTool {
@@ -29,6 +30,10 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
       view_range: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
       old_str: Type.Optional(Type.String()),
       new_str: Type.Optional(Type.String()),
+      edits: Type.Optional(Type.Array(Type.Object({
+        old_str: Type.String(),
+        new_str: Type.Optional(Type.String()),
+      }))),
       file_text: Type.Optional(Type.String()),
       insert_line: Type.Optional(Type.Number({ minimum: 0 })),
       insert_text: Type.Optional(Type.String()),
@@ -36,7 +41,9 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
     }),
     execute: async (_toolCallId, params) => {
       const args = params as TextEditorArgs;
-      const result = await runTextEditorCommand(context.workspaceRoot, args);
+      const result = await runTextEditorCommand(context.workspaceRoot, args, {
+        contextWindowTokens: context.contextWindowTokens,
+      });
       return {
         content: [{ type: "text", text: result.text }],
         details: result.details,
@@ -91,6 +98,7 @@ export type TextEditorArgs =
       path: string;
       old_str?: string;
       new_str?: string;
+      edits?: Array<{ old_str: string; new_str?: string }>;
     }
   | {
       command: "create";
@@ -104,7 +112,7 @@ export type TextEditorArgs =
       insert_text?: string;
     };
 
-export async function runTextEditorCommand(workspaceRoot: string, args: TextEditorArgs) {
+export async function runTextEditorCommand(workspaceRoot: string, args: TextEditorArgs, options?: { contextWindowTokens?: number }) {
   const absolute = resolveWorkspacePath(workspaceRoot, args.path);
   if (args.command === "view") {
     const info = await stat(absolute);
@@ -121,10 +129,14 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
     const content = await readFile(absolute, "utf8");
     const selected = selectLineRange(content, args.view_range);
     const numbered = addLineNumbers(selected.text, selected.startLine);
-    const maxCharacters = args.max_characters ?? 100_000;
+    const maxCharacters = args.max_characters ?? resolveMaxCharacters(options?.contextWindowTokens);
     const truncated = numbered.length > maxCharacters;
+    const hasExplicitRange = args.view_range !== undefined;
+    const continuationHint = truncated && !hasExplicitRange
+      ? `\n[Showing lines ${selected.startLine}-${countLines(numbered, maxCharacters, selected.startLine)}. Use view_range to continue.]`
+      : truncated ? "\n[truncated]" : "";
     return {
-      text: truncated ? `${numbered.slice(0, maxCharacters)}\n[truncated]` : numbered,
+      text: truncated ? `${numbered.slice(0, maxCharacters)}${continuationHint}` : numbered,
       details: {
         command: args.command,
         path: workspaceRelative(workspaceRoot, absolute),
@@ -156,17 +168,22 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
 
   const content = await readFile(absolute, "utf8");
   if (args.command === "str_replace") {
-    if (args.old_str === undefined) throw new Error("str_replace requires old_str");
-    const newStr = args.new_str ?? "";
-    const first = content.indexOf(args.old_str);
-    if (first < 0) throw new Error("old_str was not found");
-    const second = content.indexOf(args.old_str, first + args.old_str.length);
-    if (second >= 0) throw new Error("old_str matched more than once");
-    const updated = `${content.slice(0, first)}${newStr}${content.slice(first + args.old_str.length)}`;
-    await writeFile(absolute, updated, "utf8");
+    const edits = normalizeEdits(args);
+    const relPath = workspaceRelative(workspaceRoot, absolute);
+    let current = content;
+    for (let i = 0; i < edits.length; i++) {
+      const { old_str, new_str } = edits[i];
+      const newStr = new_str ?? "";
+      const first = current.indexOf(old_str);
+      if (first < 0) throw mismatchError(relPath, old_str, current, i, edits.length);
+      const second = current.indexOf(old_str, first + old_str.length);
+      if (second >= 0) throw new Error(`old_str matched more than once${edits.length > 1 ? ` (edit ${i + 1}/${edits.length})` : ""}`);
+      current = `${current.slice(0, first)}${newStr}${current.slice(first + old_str.length)}`;
+    }
+    await writeFile(absolute, current, "utf8");
     return {
-      text: `updated ${workspaceRelative(workspaceRoot, absolute)}`,
-      details: { command: args.command, path: workspaceRelative(workspaceRoot, absolute), replacements: 1 },
+      text: `updated ${relPath}`,
+      details: { command: args.command, path: relPath, replacements: edits.length },
     };
   }
 
@@ -253,4 +270,37 @@ function insertAfterLine(content: string, insertLine: number, insertText: string
   const insertLines = insertText.split(/\r?\n/);
   const next = [...lines.slice(0, insertLine), ...insertLines, ...lines.slice(insertLine)];
   return next.join("\n");
+}
+
+const MISMATCH_HINT_LIMIT = 800;
+const DEFAULT_MAX_CHARACTERS = 100_000;
+const MIN_ADAPTIVE_BUDGET = 50_000;
+const MAX_ADAPTIVE_BUDGET = 512_000;
+const CHARS_PER_TOKEN = 4;
+const ADAPTIVE_CONTEXT_SHARE = 0.2;
+
+function normalizeEdits(args: { old_str?: string; new_str?: string; edits?: Array<{ old_str: string; new_str?: string }> }): Array<{ old_str: string; new_str?: string }> {
+  if (args.edits && args.edits.length > 0) return args.edits;
+  if (args.old_str !== undefined) return [{ old_str: args.old_str, new_str: args.new_str }];
+  throw new Error("str_replace requires old_str or edits");
+}
+
+function mismatchError(relPath: string, oldStr: string, currentContent: string, editIndex: number, totalEdits: number): Error {
+  const indexHint = totalEdits > 1 ? ` (edit ${editIndex + 1}/${totalEdits})` : "";
+  const snippet = currentContent.length <= MISMATCH_HINT_LIMIT
+    ? currentContent
+    : `${currentContent.slice(0, MISMATCH_HINT_LIMIT)}\n... (truncated)`;
+  return new Error(`old_str was not found in ${relPath}${indexHint}\nCurrent file contents:\n${snippet}`);
+}
+
+function resolveMaxCharacters(contextWindowTokens?: number): number {
+  if (typeof contextWindowTokens !== "number" || contextWindowTokens <= 0) return DEFAULT_MAX_CHARACTERS;
+  const fromContext = Math.floor(contextWindowTokens * CHARS_PER_TOKEN * ADAPTIVE_CONTEXT_SHARE);
+  return Math.max(MIN_ADAPTIVE_BUDGET, Math.min(MAX_ADAPTIVE_BUDGET, fromContext));
+}
+
+function countLines(numbered: string, maxChars: number, startLine: number): number {
+  const truncated = numbered.slice(0, maxChars);
+  const lineCount = truncated.split(/\r?\n/).length;
+  return startLine + lineCount - 1;
 }

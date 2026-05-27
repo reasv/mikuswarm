@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { createSearchMemoryTool, createWriteMemoryTool } from "../src/tools/memory.js";
 import { runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
+import { createReadImageTool } from "../src/tools/read-image.js";
 
 test("text editor tool views, replaces, inserts, and creates within workspace", async () => {
   await withWorkspace(async (workspace) => {
@@ -143,6 +144,155 @@ test("daily memory editor is forced to memory/YYYY-MM-DD.md and memory search us
       pattern: "remembered",
     });
     assert.match(result.content[0]?.text ?? "", /memory\/2026-05-22\.md:2:- remembered fact/);
+  });
+});
+
+test("str_replace includes file contents in mismatch error", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "hint.txt",
+      file_text: "actual content here\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "hint.txt",
+          old_str: "nonexistent text",
+          new_str: "replacement",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str was not found in hint\.txt/);
+        assert.match(err.message, /actual content here/);
+        return true;
+      },
+    );
+  });
+});
+
+test("batch edits apply multiple replacements in one call", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "batch.txt",
+      file_text: "alpha\nbeta\ngamma\n",
+    });
+    const result = await runTextEditorCommand(workspace, {
+      command: "str_replace",
+      path: "batch.txt",
+      edits: [
+        { old_str: "alpha", new_str: "one" },
+        { old_str: "beta", new_str: "two" },
+        { old_str: "gamma", new_str: "three" },
+      ],
+    });
+    assert.equal(result.details.replacements, 3);
+    assert.equal(await readFile(path.join(workspace, "batch.txt"), "utf8"), "one\ntwo\nthree\n");
+  });
+});
+
+test("batch edits fail on first mismatch with edit index", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "batch-fail.txt",
+      file_text: "alpha\nbeta\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "batch-fail.txt",
+          edits: [
+            { old_str: "alpha", new_str: "one" },
+            { old_str: "missing", new_str: "two" },
+          ],
+        }),
+      /edit 2\/2/,
+    );
+    // First edit should not have been persisted since we fail atomically
+    assert.equal(await readFile(path.join(workspace, "batch-fail.txt"), "utf8"), "alpha\nbeta\n");
+  });
+});
+
+test("adaptive paging truncates large files with continuation hint", async () => {
+  await withWorkspace(async (workspace) => {
+    const bigContent = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}`).join("\n");
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "big.txt",
+      file_text: bigContent,
+    });
+    // contextWindowTokens=10000 → budget = 10000*4*0.2 = 8000, clamped to min 50000
+    const result = await runTextEditorCommand(
+      workspace,
+      { command: "view", path: "big.txt" },
+      { contextWindowTokens: 10000 },
+    );
+    assert.match(result.text, /Use view_range to continue/);
+    assert.equal(result.details.truncated, true);
+  });
+});
+
+test("adaptive paging does not affect explicit view_range", async () => {
+  await withWorkspace(async (workspace) => {
+    const bigContent = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}`).join("\n");
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "big2.txt",
+      file_text: bigContent,
+    });
+    const result = await runTextEditorCommand(
+      workspace,
+      { command: "view", path: "big2.txt", view_range: [1, 5] },
+      { contextWindowTokens: 10000 },
+    );
+    assert.ok(!result.text.includes("Use view_range to continue"));
+    assert.equal(result.details.truncated, false);
+  });
+});
+
+test("read_image returns image content block for valid image", async () => {
+  await withWorkspace(async (workspace) => {
+    // 1x1 red PNG
+    const pngData = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    await writeFile(path.join(workspace, "test.png"), pngData);
+
+    const tool = createReadImageTool({ workspaceRoot: workspace });
+    const result = await tool.execute("t1", { path: "test.png" });
+
+    assert.equal(result.content.length, 2);
+    assert.equal(result.content[0].type, "text");
+    assert.match((result.content[0] as { text: string }).text, /image\/png/);
+    assert.equal(result.content[1].type, "image");
+    const img = result.content[1] as { type: "image"; data: string; mimeType: string };
+    assert.equal(img.mimeType, "image/png");
+    assert.ok(img.data.length > 0);
+  });
+});
+
+test("read_image rejects non-image files", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "notes.txt"), "hello", "utf8");
+    const tool = createReadImageTool({ workspaceRoot: workspace });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "notes.txt" }),
+      /Unsupported image format/,
+    );
+  });
+});
+
+test("read_image rejects workspace escape", async () => {
+  await withWorkspace(async (workspace) => {
+    const tool = createReadImageTool({ workspaceRoot: workspace });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "../outside.png" }),
+      /escapes workspace/,
+    );
   });
 });
 
