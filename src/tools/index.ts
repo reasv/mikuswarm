@@ -19,6 +19,7 @@ export { createEditMessageTool, type EditMessageToolContext } from "./edit-messa
 export { createDeleteMessageTool, type DeleteMessageToolContext } from "./delete-message.js";
 export { createPinsTool, type PinsToolContext } from "./pins.js";
 export { createListReactionsTool, type ListReactionsToolContext } from "./list-reactions.js";
+export { createReadMessagesTool, type ReadMessagesToolContext } from "./read-messages.js";
 export { createMemberInfoTool, type MemberInfoToolContext } from "./member-info.js";
 export { createChannelInfoTool, type ChannelInfoToolContext } from "./channel-info.js";
 export { createSetProfileTool, type SetProfileToolContext } from "./set-profile.js";
