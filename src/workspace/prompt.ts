@@ -33,27 +33,26 @@ export function renderSystemPrompt(
 ): string {
   const sections: string[] = [];
 
+  // Inject AGENTS.md fallback into a local copy of the files map if needed.
+  // This unifies the two cases (missing key vs empty content) into a single path.
+  let files = workspace.files;
+  if (fallbackPrompt) {
+    const existing = files.get("AGENTS.md");
+    if (!existing) {
+      files = new Map(files);
+      files.set("AGENTS.md", fallbackPrompt);
+    }
+  }
+
   // Resolve ordered file list: known files first, then any extras in alphabetical order
-  const orderedFiles = resolveFileOrder(workspace.files);
+  const orderedFiles = resolveFileOrder(files);
 
   for (const filename of orderedFiles) {
-    let content = workspace.files.get(filename)!;
-
-    // Apply fallback for AGENTS.md
-    if (filename === "AGENTS.md" && !content && fallbackPrompt) {
-      content = fallbackPrompt;
-    }
-
+    const content = files.get(filename)!;
     if (!content) continue;
 
     const tagName = FILE_TAG_MAP[filename] ?? filenameToTag(filename);
     sections.push(`<${tagName} source="${escapeAttr(filename)}">\n${content}\n</${tagName}>`);
-  }
-
-  // Handle case where AGENTS.md doesn't exist but fallback is available
-  if (!workspace.files.has("AGENTS.md") && fallbackPrompt) {
-    const tagName = FILE_TAG_MAP["AGENTS.md"]!;
-    sections.unshift(`<${tagName} source="AGENTS.md">\n${fallbackPrompt}\n</${tagName}>`);
   }
 
   // Inlined skills (always_loaded: true)
@@ -127,13 +126,13 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
     )
     .join("\n");
 
+  const sessionsBlock = sessions
+    ? `\n\n<active_sessions>\n${sessions}\n</active_sessions>`
+    : "";
+
   return `Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
 Current timeline: ${escapeXml(options.timelineKey)}
-Trigger event: ${escapeXml(options.trigger.id)}
-
-<active_sessions>
-${sessions}
-</active_sessions>`;
+Trigger event: ${escapeXml(options.trigger.id)}${sessionsBlock}`;
 }
 
 /**
@@ -166,11 +165,13 @@ function resolveFileOrder(files: Map<string, string>): string[] {
  * Strips extension, lowercases, replaces non-alphanumeric with underscore.
  */
 function filenameToTag(filename: string): string {
-  return filename
+  let tag = filename
     .replace(/\.[^.]+$/, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_|_$/g, "");
+  if (!tag || /^[0-9]/.test(tag)) tag = `ws_${tag || "unknown"}`;
+  return tag;
 }
 
 function escapeXml(str: string): string {

@@ -396,7 +396,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         provider: inbound.provider,
       });
       const next = triggerCoordinator.complete(session.timelineKey);
-      if (next && !draining) launchSession(next, true);
+      if (next && !draining) void launchSession(next, true).catch((error) => {
+        logger.error("queued_session_launch_failed", {
+          timelineKey: next.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       return;
     }
     const roomId = target.roomId;
@@ -456,7 +461,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         error: error instanceof Error ? error.message : String(error),
       });
       const next = triggerCoordinator.complete(session.timelineKey);
-      if (next && !draining) launchSession(next, true);
+      if (next && !draining) void launchSession(next, true).catch((error) => {
+        logger.error("queued_session_launch_failed", {
+          timelineKey: next.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       return;
     }
     sessions.attachAgent(session.id, agent);
@@ -484,7 +494,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         activeRuns.delete(run);
         if (draining) return;
         const next = triggerCoordinator.complete(session.timelineKey);
-        if (next) launchSession(next, true);
+        if (next) void launchSession(next, true).catch((error) => {
+          logger.error("queued_session_launch_failed", {
+            timelineKey: next.timelineKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
       });
     activeRuns.add(run);
   }

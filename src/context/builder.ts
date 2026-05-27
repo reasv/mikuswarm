@@ -93,6 +93,10 @@ export class ContextBuilder {
       timestamp: turn.timestamp,
     }));
 
+    // NOTE: System prompt is rendered identically here and in AgentSessionFactory.create().
+    // Both are required: the factory's version sets initialState.systemPrompt (used by
+    // pi-agent-core on every API call), and this one populates the system message in
+    // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(options.workspace, options.fallbackPrompt);
     const satellite = renderSatelliteBlock(options, options.workspace, options.sessionType);
     const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");

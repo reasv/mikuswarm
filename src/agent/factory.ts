@@ -76,7 +76,10 @@ export class AgentSessionFactory {
     // Filter tools if the session type specifies a tool allowlist
     const filteredTools = filterTools(tools, sessionTypeConfig);
 
-    // Build the system prompt from workspace content
+    // NOTE: System prompt is rendered identically here and in ContextBuilder.build().
+    // Both are required: this one sets initialState.systemPrompt (used by pi-agent-core
+    // on every API call), and the builder's version populates the system message in
+    // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(workspace, fallbackPrompt);
 
     return new Agent({
