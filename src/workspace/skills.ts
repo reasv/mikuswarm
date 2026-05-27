@@ -22,9 +22,9 @@ export async function scanSkills(
   }
 
   const skillsDir = path.join(workspaceRoot, "skills");
-  let entries: string[];
+  let dirEntries: import("node:fs").Dirent[];
   try {
-    entries = await readdir(skillsDir);
+    dirEntries = await readdir(skillsDir, { withFileTypes: true });
   } catch (err: unknown) {
     if (!(isNodeError(err) && err.code === "ENOENT")) {
       console.warn(`[workspace] Failed to read skills directory: ${skillsDir}`, isNodeError(err) ? err.code : err);
@@ -32,20 +32,29 @@ export async function scanSkills(
     return { listed: [], inlined: [] };
   }
 
+  // Filter to directories only and sort by name for deterministic ordering
+  const dirs = dirEntries.filter((e) => e.isDirectory()).sort((a, b) => a.name.localeCompare(b.name));
+
+  // Read all SKILL.md files in parallel, preserving sort order
+  const readResults = await Promise.all(
+    dirs.map(async (entry) => {
+      const skillFilePath = path.join(skillsDir, entry.name, "SKILL.md");
+      try {
+        return { dirName: entry.name, raw: await readFile(skillFilePath, "utf-8") };
+      } catch (err: unknown) {
+        if (!(isNodeError(err) && err.code === "ENOENT")) {
+          console.warn(`[workspace] Failed to read skill file: ${skillFilePath}`, isNodeError(err) ? err.code : err);
+        }
+        return { dirName: entry.name, raw: null };
+      }
+    }),
+  );
+
   const listed: SkillMeta[] = [];
   const inlined: SkillMeta[] = [];
 
-  for (const entry of entries.sort()) {
-    const skillFilePath = path.join(skillsDir, entry, "SKILL.md");
-    let raw: string;
-    try {
-      raw = await readFile(skillFilePath, "utf-8");
-    } catch (err: unknown) {
-      if (!(isNodeError(err) && err.code === "ENOENT")) {
-        console.warn(`[workspace] Failed to read skill file: ${skillFilePath}`, isNodeError(err) ? err.code : err);
-      }
-      continue;
-    }
+  for (const { dirName, raw } of readResults) {
+    if (raw === null) continue;
 
     const parsed = parseFrontmatter(raw);
     if (!parsed) continue;
@@ -59,7 +68,7 @@ export async function scanSkills(
     if (Array.isArray(filter) && !filter.includes(name)) continue;
 
     const alwaysLoaded = frontmatter.always_loaded === true;
-    const relativePath = path.posix.join("skills", entry, "SKILL.md");
+    const relativePath = path.posix.join("skills", dirName, "SKILL.md");
 
     const meta: SkillMeta = {
       name,

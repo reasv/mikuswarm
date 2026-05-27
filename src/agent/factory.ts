@@ -120,7 +120,7 @@ export class AgentSessionFactory {
  * Filter tools based on session type config.
  * When no tool allowlist is specified, all tools are returned.
  */
-function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig): AgentTool[] {
+export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig): AgentTool[] {
   if (!sessionType?.tools) return tools;
   const allowed = new Set(sessionType.tools);
   return tools.filter((tool) => allowed.has(tool.name));

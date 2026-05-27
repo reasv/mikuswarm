@@ -6,8 +6,11 @@ import os from "node:os";
 import { loadWorkspace } from "../src/workspace/loader.js";
 import { renderSystemPrompt, renderSatelliteBlock } from "../src/workspace/prompt.js";
 import { scanSkills } from "../src/workspace/skills.js";
+import { filterTools, AgentSessionFactory } from "../src/agent/factory.js";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { WorkspaceContent, SatelliteRuntimeInput, SessionTypeConfig } from "../src/workspace/types.js";
 import type { CanonicalChatEvent } from "../src/types.js";
+import type { AppConfig } from "../src/config/index.js";
 
 let tmpDir: string;
 
@@ -792,5 +795,206 @@ describe("workspace loader — path traversal protection", () => {
     });
     assert.equal(result.tailContent, null,
       "tail content should be null when path traversal is blocked");
+  });
+});
+
+// =============================================================================
+// T9: renderSystemPrompt consistency — same inputs always produce same output
+// =============================================================================
+
+describe("renderSystemPrompt consistency", () => {
+  it("produces identical output for the same workspace + fallback in all cases", () => {
+    // Case 1: With workspace files, no fallback
+    const ws1: WorkspaceContent = {
+      files: new Map([
+        ["AGENTS.md", "Main instructions"],
+        ["SOUL.md", "I am Miku"],
+        ["TOOLS.md", "Tool notes"],
+      ]),
+      tailContent: "tail",
+      skills: {
+        listed: [
+          { name: "skill-a", description: "Skill A", path: "skills/a/SKILL.md", alwaysLoaded: false },
+        ],
+        inlined: [
+          { name: "skill-b", description: "Skill B", path: "skills/b/SKILL.md", alwaysLoaded: true, content: "Inlined B" },
+        ],
+      },
+    };
+    assert.equal(renderSystemPrompt(ws1), renderSystemPrompt(ws1),
+      "same workspace should produce identical output on repeated calls");
+
+    // Case 2: With fallback, no AGENTS.md
+    const ws2: WorkspaceContent = {
+      files: new Map([["SOUL.md", "I am Miku"]]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+    assert.equal(
+      renderSystemPrompt(ws2, "Fallback prompt"),
+      renderSystemPrompt(ws2, "Fallback prompt"),
+      "same workspace + fallback should produce identical output",
+    );
+
+    // Case 3: Empty workspace, no fallback
+    const ws3: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+    assert.equal(renderSystemPrompt(ws3), renderSystemPrompt(ws3),
+      "empty workspace should produce identical output");
+
+    // Case 4: Only skills, no files
+    const ws4: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: {
+        listed: [
+          { name: "only-skill", description: "The only skill", path: "skills/only/SKILL.md", alwaysLoaded: false },
+        ],
+        inlined: [],
+      },
+    };
+    assert.equal(renderSystemPrompt(ws4), renderSystemPrompt(ws4),
+      "skills-only workspace should produce identical output");
+
+    // Case 5: AGENTS.md exists but is empty — fallback should activate
+    const ws5: WorkspaceContent = {
+      files: new Map([["AGENTS.md", ""]]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+    const r5a = renderSystemPrompt(ws5, "Fallback");
+    const r5b = renderSystemPrompt(ws5, "Fallback");
+    assert.equal(r5a, r5b,
+      "empty AGENTS.md + fallback should produce identical output");
+    assert.ok(r5a.includes("Fallback"),
+      "fallback should be used when AGENTS.md is empty");
+  });
+
+  it("same workspace produces same output regardless of Map insertion order", () => {
+    // Maps iterate in insertion order. Verify renderSystemPrompt uses canonical
+    // ordering, not Map iteration order.
+    const wsA: WorkspaceContent = {
+      files: new Map([
+        ["TOOLS.md", "Tool notes"],
+        ["AGENTS.md", "Instructions"],
+        ["SOUL.md", "Identity"],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+    const wsB: WorkspaceContent = {
+      files: new Map([
+        ["AGENTS.md", "Instructions"],
+        ["SOUL.md", "Identity"],
+        ["TOOLS.md", "Tool notes"],
+      ]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+    assert.equal(renderSystemPrompt(wsA), renderSystemPrompt(wsB),
+      "output should be identical regardless of Map insertion order");
+  });
+});
+
+// =============================================================================
+// T10: filterTools allowlist behavior
+// =============================================================================
+
+describe("filterTools", () => {
+  function makeTool(name: string): AgentTool {
+    return { name } as AgentTool;
+  }
+
+  const allTools = [makeTool("send_message"), makeTool("search_files"), makeTool("write_memory")];
+
+  it("returns all tools when no session type is provided", () => {
+    const result = filterTools(allTools);
+    assert.equal(result.length, 3);
+    assert.deepEqual(result.map((t) => t.name), ["send_message", "search_files", "write_memory"]);
+  });
+
+  it("returns all tools when session type has no tools allowlist", () => {
+    const result = filterTools(allTools, { session_instruction: "do stuff" });
+    assert.equal(result.length, 3);
+  });
+
+  it("filters to only matching tools when session type specifies tools list", () => {
+    const result = filterTools(allTools, { tools: ["send_message", "write_memory"] });
+    assert.equal(result.length, 2);
+    assert.deepEqual(result.map((t) => t.name), ["send_message", "write_memory"]);
+  });
+
+  it("returns no tools when session type specifies empty tools list", () => {
+    const result = filterTools(allTools, { tools: [] });
+    assert.equal(result.length, 0);
+  });
+
+  it("ignores tool names in allowlist that do not match any tool", () => {
+    const result = filterTools(allTools, { tools: ["nonexistent_tool"] });
+    assert.equal(result.length, 0);
+  });
+});
+
+// =============================================================================
+// T11: resolveSessionType fallback cascade
+// =============================================================================
+
+describe("resolveSessionType", () => {
+  function makeFactory(sessionTypes?: Record<string, SessionTypeConfig>): AgentSessionFactory {
+    const config = {
+      agent: { session_types: sessionTypes },
+    } as unknown as AppConfig;
+    return new AgentSessionFactory({
+      config,
+      contextBuilder: {} as any,
+      getActiveSessions: () => [],
+    });
+  }
+
+  it("returns the requested session type when it exists", () => {
+    const factory = makeFactory({
+      default: { session_instruction: "default instruction" },
+      summarize: { session_instruction: "summarize instruction", tools: ["write_summary"] },
+    });
+    const result = factory.resolveSessionType("summarize");
+    assert.ok(result);
+    assert.equal(result.session_instruction, "summarize instruction");
+    assert.deepEqual(result.tools, ["write_summary"]);
+  });
+
+  it("falls back to 'default' when requested type is missing", () => {
+    const factory = makeFactory({
+      default: { session_instruction: "default instruction" },
+    });
+    const result = factory.resolveSessionType("nonexistent");
+    assert.ok(result);
+    assert.equal(result.session_instruction, "default instruction");
+  });
+
+  it("returns undefined when neither requested type nor 'default' exists", () => {
+    const factory = makeFactory({
+      summarize: { session_instruction: "summarize" },
+    });
+    const result = factory.resolveSessionType("nonexistent");
+    assert.equal(result, undefined);
+  });
+
+  it("returns undefined when no session_types at all", () => {
+    const factory = makeFactory(undefined);
+    const result = factory.resolveSessionType("default");
+    assert.equal(result, undefined);
+  });
+
+  it("returns the 'default' type when explicitly requested", () => {
+    const factory = makeFactory({
+      default: { session_instruction: "default" },
+      other: { session_instruction: "other" },
+    });
+    const result = factory.resolveSessionType("default");
+    assert.ok(result);
+    assert.equal(result.session_instruction, "default");
   });
 });
