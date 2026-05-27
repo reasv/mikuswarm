@@ -32,7 +32,16 @@ export class McpClientPool {
   }
 
   async start(): Promise<void> {
+    const validKey = /^[a-z][a-z0-9-]*$/;
     for (const [name, config] of Object.entries(this.options.servers)) {
+      if (!validKey.test(name)) {
+        this.logger.error("mcp_server_invalid_key", {
+          server: name,
+          error: "Server key must match /^[a-z][a-z0-9-]*$/ (lowercase, no underscores)",
+        });
+        continue;
+      }
+
       if (config.headers) {
         for (const value of Object.values(config.headers)) {
           registerSecret(value);

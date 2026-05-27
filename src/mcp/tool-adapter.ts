@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { Tool as McpToolDef } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, type CallToolResult, type Tool as McpToolDef } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "../observability/logger.js";
 
 export function adaptMcpTool(
@@ -26,30 +26,31 @@ export function adaptMcpTool(
       signal,
     ): Promise<AgentToolResult<unknown>> => {
       try {
+        // CallToolResultSchema validates at runtime, so the cast is safe
         const result = await client.callTool(
           { name: toolDef.name, arguments: (params ?? {}) as Record<string, unknown> },
-          undefined,
+          CallToolResultSchema,
           { signal },
-        );
+        ) as CallToolResult;
 
         if (result.isError) {
-          const errorText = (result.content as { type: string; text?: string }[])
-            .filter((c) => c.type === "text" && c.text)
-            .map((c) => c.text)
+          const errorText = result.content
+            .filter((c) => c.type === "text" && "text" in c)
+            .map((c) => (c as { text: string }).text)
             .join("\n") || "MCP tool returned an error";
           throw new Error(errorText);
         }
 
-        const content = (result.content as { type: string; text?: string; data?: string; mimeType?: string }[]).map(
+        const content = result.content.map(
           (block) => {
             if (block.type === "text") {
-              return { type: "text" as const, text: block.text! };
+              return { type: "text" as const, text: block.text ?? "" };
             }
             if (block.type === "image") {
               return {
                 type: "image" as const,
-                data: block.data!,
-                mimeType: block.mimeType!,
+                data: block.data ?? "",
+                mimeType: block.mimeType ?? "application/octet-stream",
               };
             }
             return { type: "text" as const, text: JSON.stringify(block) };
