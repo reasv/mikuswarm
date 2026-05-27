@@ -1,5 +1,5 @@
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
-import { escapeXml } from "./xml.js";
+import { escapeAttr, escapeXml } from "./xml.js";
 
 export type RenderTier = "rich" | "compact";
 
@@ -51,7 +51,7 @@ function buildMessageAttrs(event: CanonicalChatEvent): string {
   if (event.mentions?.mentionedSelf) pairs.push(["mentions_you", "true"]);
   if (event.externalId) pairs.push(["external_id", event.externalId]);
   if (event.agentSessionId) pairs.push(["agent_session_id", event.agentSessionId]);
-  return pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  return pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
 }
 
 function renderReply(reply: ReplyContext): string {
@@ -70,7 +70,7 @@ function renderReply(reply: ReplyContext): string {
   for (const m of reply.linkedMedia ?? []) innerParts.push(renderLinkedMedia(m));
   for (const lp of reply.linkPreviews ?? []) innerParts.push(renderLinkPreview(lp));
 
-  const attrStr = pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   return `<reply_to ${attrStr}>\n${innerParts.join("\n\n")}\n</reply_to>`;
 }
 
@@ -85,7 +85,7 @@ function renderAttachment(attachment: AttachmentMeta): string {
   if (attachment.cardName) pairs.push(["card_name", truncate(attachment.cardName, MAX_DISPLAY_NAME)]);
   if (attachment.isImageBlock) pairs.push(["image_block", "true"]);
 
-  const attrStr = pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   if (attachment.caption) {
     return `<attachment ${attrStr}>\n[caption: ${escapeXml(attachment.caption)}]\n</attachment>`;
   }
@@ -101,7 +101,7 @@ function renderLinkedMedia(media: AttachmentMeta): string {
   if (media.localPath) pairs.push(["path", media.localPath]);
   if (media.isImageBlock) pairs.push(["image_block", "true"]);
 
-  const attrStr = pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   if (media.caption) {
     return `<linked_media ${attrStr}>\n[caption: ${escapeXml(media.caption)}]\n</linked_media>`;
   }
@@ -117,7 +117,7 @@ function renderLinkPreview(preview: LinkPreviewMeta): string {
   const innerParts: string[] = [escapeXml(preview.description ?? "")];
   for (const m of preview.media ?? []) innerParts.push(renderPreviewMedia(m));
 
-  const attrStr = pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   return `<link_preview ${attrStr}>\n${innerParts.join("\n\n")}\n</link_preview>`;
 }
 
@@ -129,7 +129,7 @@ function renderPreviewMedia(media: AttachmentMeta): string {
   if (media.localPath) pairs.push(["path", media.localPath]);
   if (media.isImageBlock) pairs.push(["image_block", "true"]);
 
-  const attrStr = pairs.map(([k, v]) => `${k}="${escapeXml(v)}"`).join(" ");
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   if (media.caption) {
     return `<preview_media ${attrStr}>\n[caption: ${escapeXml(media.caption)}]\n</preview_media>`;
   }
