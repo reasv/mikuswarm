@@ -71,7 +71,7 @@ describe("workspace loader", () => {
     await writeFile(path.join(tmpDir, "SOUL.md"), "personality");
     await writeFile(path.join(tmpDir, "TOOLS.md"), "tools");
 
-    const result = await loadWorkspace(tmpDir, { workspaceFiles: ["AGENTS.md"] });
+    const result = await loadWorkspace(tmpDir, { workspace_files: ["AGENTS.md"] });
     assert.equal(result.files.size, 1);
     assert.equal(result.files.has("AGENTS.md"), true);
     assert.equal(result.files.has("SOUL.md"), false);
@@ -80,7 +80,7 @@ describe("workspace loader", () => {
   it("suppresses tail when session type sets tail_file to null", async () => {
     await writeFile(path.join(tmpDir, "TAIL.md"), "tail content");
 
-    const result = await loadWorkspace(tmpDir, { tailFile: null });
+    const result = await loadWorkspace(tmpDir, { tail_file: null });
     assert.equal(result.tailContent, null);
   });
 
@@ -88,7 +88,7 @@ describe("workspace loader", () => {
     await writeFile(path.join(tmpDir, "TAIL.md"), "default tail");
     await writeFile(path.join(tmpDir, "TAIL_SUMMARIZE.md"), "summarize tail");
 
-    const result = await loadWorkspace(tmpDir, { tailFile: "TAIL_SUMMARIZE.md" });
+    const result = await loadWorkspace(tmpDir, { tail_file: "TAIL_SUMMARIZE.md" });
     assert.equal(result.tailContent, "summarize tail");
   });
 
@@ -364,7 +364,7 @@ describe("satellite block rendering", () => {
     };
 
     const sessionType: SessionTypeConfig = {
-      sessionInstruction: "Summarize the messages above.",
+      session_instruction: "Summarize the messages above.",
     };
 
     const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace, sessionType);
@@ -380,7 +380,7 @@ describe("satellite block rendering", () => {
     };
 
     const sessionType: SessionTypeConfig = {
-      sessionInstruction: "Session task here.",
+      session_instruction: "Session task here.",
     };
 
     const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace, sessionType);
@@ -401,7 +401,7 @@ describe("satellite block rendering", () => {
     };
 
     const sessionType: SessionTypeConfig = {
-      tailFile: "TAIL_CUSTOM.md",
+      tail_file: "TAIL_CUSTOM.md",
     };
 
     const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace, sessionType);
@@ -435,7 +435,7 @@ describe("full integration: load workspace and render", () => {
 
     const workspace = await loadWorkspace(tmpDir);
     const sessionType: SessionTypeConfig = {
-      sessionInstruction: "Reply to the user.",
+      session_instruction: "Reply to the user.",
     };
 
     const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace, sessionType);

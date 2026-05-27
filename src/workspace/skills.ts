@@ -25,7 +25,10 @@ export async function scanSkills(
   let entries: string[];
   try {
     entries = await readdir(skillsDir);
-  } catch {
+  } catch (err: unknown) {
+    if (!(isNodeError(err) && err.code === "ENOENT")) {
+      console.warn(`[workspace] Failed to read skills directory: ${skillsDir}`, isNodeError(err) ? err.code : err);
+    }
     return { listed: [], inlined: [] };
   }
 
@@ -37,7 +40,10 @@ export async function scanSkills(
     let raw: string;
     try {
       raw = await readFile(skillFilePath, "utf-8");
-    } catch {
+    } catch (err: unknown) {
+      if (!(isNodeError(err) && err.code === "ENOENT")) {
+        console.warn(`[workspace] Failed to read skill file: ${skillFilePath}`, isNodeError(err) ? err.code : err);
+      }
       continue;
     }
 
@@ -71,6 +77,10 @@ export async function scanSkills(
   }
 
   return { listed, inlined };
+}
+
+function isNodeError(err: unknown): err is NodeJS.ErrnoException {
+  return err instanceof Error && "code" in err;
 }
 
 interface ParsedFrontmatter {

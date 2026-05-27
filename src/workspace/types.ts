@@ -51,11 +51,11 @@ export interface SkillIndex {
  */
 export interface SessionTypeConfig {
   /** Which workspace files to load. When undefined, all default files are loaded. */
-  workspaceFiles?: string[];
+  workspace_files?: string[];
   /** Tail instructions file path relative to workspace root. null suppresses tail entirely. */
-  tailFile?: string | null;
+  tail_file?: string | null;
   /** Session-specific instruction text for the satellite block. */
-  sessionInstruction?: string;
+  session_instruction?: string;
   /** Which tools to provide. When undefined, all tools are provided. */
   tools?: string[];
   /** Which skills to surface. "all" = all, "none" = none, string[] = named subset. */

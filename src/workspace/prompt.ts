@@ -97,7 +97,7 @@ export function renderSatelliteBlock(
 
   // Part 2: Tail instructions
   if (workspace.tailContent) {
-    const sourceFile = sessionType?.tailFile ?? "TAIL.md";
+    const sourceFile = sessionType?.tail_file ?? "TAIL.md";
     // Only add source attr if it's a real file (not suppressed)
     if (typeof sourceFile === "string") {
       parts.push(
@@ -107,9 +107,9 @@ export function renderSatelliteBlock(
   }
 
   // Part 3: Session instruction
-  if (sessionType?.sessionInstruction) {
+  if (sessionType?.session_instruction) {
     parts.push(
-      `<session_instruction>\n${sessionType.sessionInstruction}\n</session_instruction>`,
+      `<session_instruction>\n${sessionType.session_instruction}\n</session_instruction>`,
     );
   }
 
