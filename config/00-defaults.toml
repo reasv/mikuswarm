@@ -4,6 +4,9 @@ data_dir = "./var"
 log_level = "info"
 context_dump_dir = "./debug/context"
 
+[agent]
+disabled_tools = ["web_fetch", "web_search"]
+
 [agent.sessions]
 max_concurrent = 3
 max_concurrent_dm = 1

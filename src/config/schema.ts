@@ -78,6 +78,19 @@ const MediaSchema = Type.Object({
   audio: Type.Optional(MediaAudioSchema),
 });
 
+const McpServerSchema = Type.Object({
+  url: Type.String({ minLength: 1 }),
+  transport: Type.Optional(Type.Union([
+    Type.Literal("streamable-http"),
+    Type.Literal("sse"),
+  ])),
+  headers: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
+
+const McpSchema = Type.Object({
+  servers: Type.Record(Type.String(), McpServerSchema),
+});
+
 const EnrichmentSchema = Type.Object({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
@@ -137,6 +150,7 @@ export const AppConfigSchema = Type.Object({
       fallback_prompt: Type.Optional(Type.String()),
     }),
     session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
+    disabled_tools: Type.Optional(Type.Array(Type.String())),
   }),
   models: Type.Intersect([
     Type.Object({ default: ModelSchema }),
@@ -163,6 +177,7 @@ export const AppConfigSchema = Type.Object({
     trigger_group_lookback_ms: Type.Optional(Type.Number({ minimum: 0 })),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
   }),
+  mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   captioning: Type.Optional(CaptioningSchema),
 });

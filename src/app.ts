@@ -41,6 +41,7 @@ import {
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
+import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -205,6 +206,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     contextBuilder,
     getActiveSessions: (timelineKey) => sessions.activeForTimeline(timelineKey),
   });
+
+  const disabledTools = new Set(config.agent.disabled_tools ?? []);
+
+  const mcpPool = new McpClientPool({
+    servers: config.mcp?.servers ?? {},
+    logger: logger.child("mcp"),
+  });
+  await mcpPool.start();
+  const mcpTools = mcpPool.getEntries().flatMap((entry) =>
+    adaptMcpTools(entry.name, entry.tools, entry.client, logger.child("mcp")),
+  );
 
   provider.subscribe((inbound) => {
     void handleInbound(inbound).catch((error) => {
@@ -454,7 +466,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
       createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient }),
-    ];
+      ...mcpTools,
+    ].filter((t) => !disabledTools.has(t.name));
     let agent;
     try {
       agent = await factory.create(session, tools);
@@ -533,6 +546,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         triggerCoordinator.clear();
         await captionPool.stop();
         await enrichmentPool.stop();
+        await mcpPool.stop();
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();
         await waitForRuns(activeRuns);
