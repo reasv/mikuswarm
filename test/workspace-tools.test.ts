@@ -352,6 +352,8 @@ test("adaptive paging does not affect explicit view_range", async () => {
   });
 });
 
+const TEST_MAX_IMAGE_BYTES = 3_932_160;
+
 test("read_image returns image content block for valid image", async () => {
   await withWorkspace(async (workspace) => {
     // 1x1 red PNG
@@ -361,7 +363,7 @@ test("read_image returns image content block for valid image", async () => {
     );
     await writeFile(path.join(workspace, "test.png"), pngData);
 
-    const tool = createReadImageTool({ workspaceRoot: workspace });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
     const result = await tool.execute("t1", { path: "test.png" });
 
     assert.equal(result.content.length, 2);
@@ -377,7 +379,7 @@ test("read_image returns image content block for valid image", async () => {
 test("read_image rejects non-image files", async () => {
   await withWorkspace(async (workspace) => {
     await writeFile(path.join(workspace, "notes.txt"), "hello", "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
     await assert.rejects(
       () => tool.execute("t1", { path: "notes.txt" }),
       /Unsupported image format/,
@@ -387,10 +389,77 @@ test("read_image rejects non-image files", async () => {
 
 test("read_image rejects workspace escape", async () => {
   await withWorkspace(async (workspace) => {
-    const tool = createReadImageTool({ workspaceRoot: workspace });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
     await assert.rejects(
       () => tool.execute("t1", { path: "../outside.png" }),
       /escapes workspace/,
+    );
+  });
+});
+
+test("read_image rejects files exceeding the configured size limit", async () => {
+  await withWorkspace(async (workspace) => {
+    // Use a small limit so the test stays fast and doesn't depend on the default value.
+    const limit = 4096;
+    const filePath = path.join(workspace, "huge.png");
+    // Write a file one byte over the limit. The bytes don't need to be a valid PNG —
+    // the size check runs before any decode.
+    await writeFile(filePath, Buffer.alloc(limit + 1));
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: limit });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "huge.png" }),
+      /Image too large/,
+    );
+  });
+});
+
+test("read_image rejects non-regular files (e.g. directories)", async () => {
+  await withWorkspace(async (workspace) => {
+    // A directory named like an image file should be rejected by the isFile() check,
+    // not read as if it were a regular file.
+    await mkdir(path.join(workspace, "weird.png"));
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "weird.png" }),
+      /Not a regular file/,
+    );
+  });
+});
+
+test("read_image rasterizes SVG to PNG", async () => {
+  await withWorkspace(async (workspace) => {
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="red" />
+  <circle cx="50" cy="50" r="30" fill="blue" />
+</svg>
+`;
+    await writeFile(path.join(workspace, "vector.svg"), svg, "utf8");
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const result = await tool.execute("t1", { path: "vector.svg" });
+
+    assert.equal(result.content.length, 2);
+    assert.equal(result.content[0].type, "text");
+    assert.match((result.content[0] as { text: string }).text, /image\/png/);
+    assert.equal(result.content[1].type, "image");
+    const img = result.content[1] as { type: "image"; data: string; mimeType: string };
+    // SVG must be substituted for PNG — providers reject image/svg+xml.
+    assert.equal(img.mimeType, "image/png");
+    // Decoded payload should be a valid PNG (starts with the PNG magic bytes).
+    const decoded = Buffer.from(img.data, "base64");
+    assert.deepEqual(decoded.subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  });
+});
+
+test("read_image surfaces a clean error for malformed SVG", async () => {
+  await withWorkspace(async (workspace) => {
+    await writeFile(path.join(workspace, "broken.svg"), "this is not svg at all", "utf8");
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "broken.svg" }),
+      /Failed to rasterize SVG/,
     );
   });
 });

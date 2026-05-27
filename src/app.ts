@@ -466,7 +466,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         maxFetchBytes: downloadSizeLimit,
         fetchClient,
       }),
-      ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot })] : []),
+      ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
       createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient }),
@@ -567,4 +567,21 @@ async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 10_000));
   await Promise.race([Promise.allSettled([...runs]), timeout]);
+}
+
+/**
+ * Resolve the effective max raw-image byte limit for the `read_image` tool by
+ * combining the per-model `image_input_bytes` setting (default 3.75 MB → ~5 MB
+ * base64, safely under Anthropic's per-image cap) with any tighter global media
+ * limits.
+ */
+function resolveReadImageMaxBytes(config: AppConfig): number {
+  const DEFAULT_PER_MODEL = 3_932_160; // 3.75 MB; ≈5 MB after base64 inflation.
+  const perModel = config.models.default.image_input_bytes ?? DEFAULT_PER_MODEL;
+  const candidates = [
+    perModel,
+    config.media?.image?.max_bytes,
+    config.media?.download_size_limit,
+  ].filter((v): v is number => typeof v === "number");
+  return Math.min(...candidates);
 }

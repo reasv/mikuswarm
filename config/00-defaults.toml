@@ -25,6 +25,8 @@ multimodal = true
 max_tokens = 16384
 reasoning = true
 context_window = 128000
+# 3.75 MB raw → ~5 MB base64, under Anthropic's per-image inline cap.
+image_input_bytes = 3932160
 
 [models.default.cost]
 input = 0

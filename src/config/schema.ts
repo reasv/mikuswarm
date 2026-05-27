@@ -23,6 +23,7 @@ const ModelSchema = Type.Object({
   max_tokens: Type.Number({ minimum: 1 }),
   reasoning: Type.Optional(Type.Boolean()),
   context_window: Type.Optional(Type.Number({ minimum: 1 })),
+  image_input_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   cost: Type.Optional(Type.Object({
     input: Type.Number({ minimum: 0 }),
     output: Type.Number({ minimum: 0 }),
