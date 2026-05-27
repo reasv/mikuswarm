@@ -401,6 +401,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           timelineKey: next.timelineKey,
           error: error instanceof Error ? error.message : String(error),
         });
+        // Release the per-timeline slot so future triggers aren't permanently blocked
+        triggerCoordinator.complete(next.timelineKey);
       });
       return;
     }
@@ -466,6 +468,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           timelineKey: next.timelineKey,
           error: error instanceof Error ? error.message : String(error),
         });
+        // Release the per-timeline slot so future triggers aren't permanently blocked
+        triggerCoordinator.complete(next.timelineKey);
       });
       return;
     }
@@ -499,6 +503,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             timelineKey: next.timelineKey,
             error: error instanceof Error ? error.message : String(error),
           });
+          // Release the per-timeline slot so future triggers aren't permanently blocked
+          triggerCoordinator.complete(next.timelineKey);
         });
       });
     activeRuns.add(run);

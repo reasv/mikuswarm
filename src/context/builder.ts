@@ -13,7 +13,7 @@ import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js"
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
 
 export interface ContextMessage {
-  type: "system" | "chatEvent" | "runtimeInstructions" | "triggerGroup";
+  type: "system" | "chatEvent" | "triggerGroup";
   role: "user" | "assistant" | "system";
   content: string;
   tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger";

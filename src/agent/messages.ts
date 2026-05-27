@@ -18,12 +18,6 @@ export interface TriggerGroupMessage {
   timestamp?: number;
 }
 
-export interface RuntimeInstructionsMessage {
-  type: "runtimeInstructions";
-  content: string;
-  imageBlocks?: ImageBlock[];
-}
-
 export interface InterjectionMessage {
   type: "interjection";
   content: string;
@@ -33,7 +27,6 @@ declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     chatEvent: ChatEventMessage;
     triggerGroup: TriggerGroupMessage;
-    runtimeInstructions: RuntimeInstructionsMessage;
     interjection: InterjectionMessage;
   }
 }

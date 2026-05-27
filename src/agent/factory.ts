@@ -142,16 +142,6 @@ export function buildAgentContextMessages(
         },
       ];
     }
-    if (message.type === "runtimeInstructions") {
-      return [
-        {
-          type: "runtimeInstructions",
-          content: message.content,
-          imageBlocks: message.imageBlocks,
-          timestamp: message.timestamp,
-        },
-      ];
-    }
     if (message.type === "chatEvent") {
       return [
         {
@@ -173,7 +163,7 @@ function isLiveRuntimeMessage(message: AgentMessage): boolean {
   const typed = message as any;
   if (!typed || typeof typed !== "object") return false;
   if (typed.type === "interjection") return true;
-  if (typed.type === "chatEvent" || typed.type === "runtimeInstructions" || typed.type === "triggerGroup") return false;
+  if (typed.type === "chatEvent" || typed.type === "triggerGroup") return false;
   if (typed.role === "toolResult") return true;
   if (typed.role === "user") return true;
   if (typed.role === "assistant") {

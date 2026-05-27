@@ -53,16 +53,6 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
       return [];
     }
 
-    if (message.type === "runtimeInstructions") {
-      return [
-        {
-          role: "user",
-          content: contentWithImages(message.content, message.imageBlocks),
-          timestamp: message.timestamp ?? Date.now(),
-        },
-      ];
-    }
-
     if (message.type === "interjection") {
       return [
         {

@@ -22,15 +22,8 @@ test("agent context keeps timeline base and preserves live runtime messages", ()
         tier: "rich",
         tokenEstimate: 1,
       },
-      {
-        type: "runtimeInstructions",
-        role: "user",
-        content: "<runtime/>",
-        tier: "runtime",
-        tokenEstimate: 1,
-      },
     ],
-    tokenEstimate: 3,
+    tokenEstimate: 2,
     compactTokens: 0,
     richTokens: 1,
     imageBlocks: [],
@@ -62,7 +55,7 @@ test("agent context keeps timeline base and preserves live runtime messages", ()
 
   assert.deepEqual(
     messages.map((message) => (message as any).type ?? (message as any).role),
-    ["chatEvent", "runtimeInstructions", "toolResult", "interjection", "user"],
+    ["chatEvent", "toolResult", "interjection", "user"],
   );
 
   const llmMessages = convertToLlm(messages);

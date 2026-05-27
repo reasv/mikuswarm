@@ -138,7 +138,10 @@ export const AppConfigSchema = Type.Object({
     }),
     session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
   }),
-  models: Type.Record(Type.String(), ModelSchema),
+  models: Type.Intersect([
+    Type.Object({ default: ModelSchema }),
+    Type.Record(Type.String(), ModelSchema),
+  ]),
   context: Type.Object({
     tiers: Type.Object({
       rich_target_tokens: Type.Number({ minimum: 1 }),
