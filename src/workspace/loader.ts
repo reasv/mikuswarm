@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { WorkspaceContent, SessionTypeConfig } from "./types.js";
+import { isNodeError, type WorkspaceContent, type SessionTypeConfig } from "./types.js";
 import { scanSkills } from "./skills.js";
 
 /**
@@ -88,6 +88,3 @@ async function readFileSafe(filePath: string): Promise<string | null> {
   }
 }
 
-function isNodeError(err: unknown): err is NodeJS.ErrnoException {
-  return err instanceof Error && "code" in err;
-}

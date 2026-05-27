@@ -49,6 +49,10 @@ export interface SkillIndex {
 /**
  * Resolved session type configuration used during workspace loading and context building.
  */
+export function isNodeError(err: unknown): err is NodeJS.ErrnoException {
+  return err instanceof Error && "code" in err;
+}
+
 export interface SessionTypeConfig {
   /** Which workspace files to load. When undefined, all default files are loaded. */
   workspace_files?: string[];

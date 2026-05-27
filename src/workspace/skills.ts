@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { SkillIndex, SkillMeta } from "./types.js";
+import { isNodeError, type SkillIndex, type SkillMeta } from "./types.js";
 
 /**
  * Scan the skills directory and return skill metadata.
@@ -79,9 +79,6 @@ export async function scanSkills(
   return { listed, inlined };
 }
 
-function isNodeError(err: unknown): err is NodeJS.ErrnoException {
-  return err instanceof Error && "code" in err;
-}
 
 interface ParsedFrontmatter {
   frontmatter: Record<string, unknown>;
