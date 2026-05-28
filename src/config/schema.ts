@@ -23,6 +23,11 @@ const ModelSchema = Type.Object({
   max_tokens: Type.Number({ minimum: 1 }),
   reasoning: Type.Optional(Type.Boolean()),
   context_window: Type.Optional(Type.Number({ minimum: 1 })),
+  // Cap on the base64-encoded image payload shipped to the provider, NOT raw
+  // file bytes. Raw bytes inflate ~4/3 in base64 (formula
+  // `4 * ceil(rawBytes / 3)`). Used by `read_image` and by the danbooru
+  // `preview` action's inline emission. Anthropic's per-image inline cap is
+  // 5 MB base64 — values up to that ceiling are safe.
   image_input_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   cost: Type.Optional(Type.Object({
     input: Type.Number({ minimum: 0 }),

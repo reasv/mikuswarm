@@ -3,6 +3,7 @@ export {
   conditionImageBufferForInference,
   computeTargetDimensions,
   cleanupProcessedImage,
+  containsEmbeddedRasterDataUri,
   SVG_MAX_INPUT_PIXELS,
 } from "./image.js";
 export { processVideoForInference } from "./video.js";

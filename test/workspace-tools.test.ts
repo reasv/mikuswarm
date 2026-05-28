@@ -898,21 +898,103 @@ test("read_image rejects workspace escape", async () => {
   });
 });
 
-test("read_image rejects files exceeding the configured size limit", async () => {
+test("read_image rejects files whose base64 payload exceeds image_input_bytes", async () => {
   await withWorkspace(async (workspace) => {
-    // Use a small limit so the test stays fast and doesn't depend on the default value.
+    // The cap is measured against the base64-encoded payload, not raw bytes.
+    // base64(N raw bytes) = 4 * ceil(N / 3). Pick a raw size that's safely
+    // under the cap interpreted-as-raw but over the cap interpreted-as-base64.
+    // limit = 4096 (base64), so the raw-byte budget is ceil(limit * 3 / 4) =
+    // 3072. Writing 3100 raw bytes is under the old raw-byte check but over
+    // the base64 check (4 * ceil(3100 / 3) = 4136 > 4096).
     const limit = 4096;
     const filePath = path.join(workspace, "huge.png");
-    // Write a file one byte over the limit. The bytes don't need to be a valid PNG —
-    // the size check runs before any decode.
-    await writeFile(filePath, Buffer.alloc(limit + 1));
+    await writeFile(filePath, Buffer.alloc(3100));
 
     const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: limit });
     await assert.rejects(
       () => tool.execute("t1", { path: "huge.png" }),
-      /Image too large/,
+      /Image base64 size.*exceeds image_input_bytes/,
     );
   });
+});
+
+test("read_image accepts a file whose base64 payload is exactly at the cap", async () => {
+  await withWorkspace(async (workspace) => {
+    // base64(3 raw bytes) = 4. Build a real PNG, then derive the cap from its
+    // actual size: cap = base64 size of the file's raw bytes. The check is
+    // `base64(raw) > cap` so equality must pass.
+    const pngBytes = await sharp({
+      create: { width: 1, height: 1, channels: 4, background: { r: 1, g: 2, b: 3, alpha: 1 } },
+    }).png().toBuffer();
+    await writeFile(path.join(workspace, "boundary.png"), pngBytes);
+    const exactCap = 4 * Math.ceil(pngBytes.byteLength / 3);
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: exactCap });
+    const result = await tool.execute("t1", { path: "boundary.png" });
+    assert.equal(result.content.length, 2);
+    assert.equal((result.content[1] as { type: string }).type, "image");
+  });
+});
+
+test("read_image refuses SVGs containing embedded data: URI rasters", async () => {
+  await withWorkspace(async (workspace) => {
+    // <image href="data:image/png;base64,..."> is decoded by librsvg against
+    // the inner raster's own dimensions, so SVG_MAX_INPUT_PIXELS does not
+    // bound it — a ~10 KB SVG can carry a gigapixel raster. Conservative
+    // refusal: any data:image/... reference is rejected.
+    const svgWithDataUri =
+      `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="blue"/>
+  <image x="0" y="0" width="100" height="100" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="/>
+</svg>`;
+    await writeFile(path.join(workspace, "embed.svg"), svgWithDataUri, "utf8");
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "embed.svg" }),
+      /embedded data: URI raster/,
+    );
+
+    // Also rejects xlink:href variant.
+    const svgXlink =
+      `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="blue"/>
+  <image xlink:href="data:image/jpeg;base64,/9j/4AAQSkZJRg=="/>
+</svg>`;
+    await writeFile(path.join(workspace, "embed-xlink.svg"), svgXlink, "utf8");
+    await assert.rejects(
+      () => tool.execute("t1", { path: "embed-xlink.svg" }),
+      /embedded data: URI raster/,
+    );
+  });
+});
+
+test("read_image still rasterizes plain SVGs without embedded data: URIs", async () => {
+  // Boundary check for the embed gate — a vanilla SVG must still work.
+  await withWorkspace(async (workspace) => {
+    const svg = `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50" width="50" height="50">
+  <circle cx="25" cy="25" r="20" fill="green"/>
+</svg>`;
+    await writeFile(path.join(workspace, "plain.svg"), svg, "utf8");
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const result = await tool.execute("t1", { path: "plain.svg" });
+    assert.equal((result.content[1] as { type: string; mimeType: string }).mimeType, "image/png");
+  });
+});
+
+test("read_image description does not direct the agent to web_fetch", async () => {
+  // Documentation lock: web_fetch returns text/JSON, not raw image bytes the
+  // read_image tool can attach. Description must not recommend it.
+  const tool = createReadImageTool({ workspaceRoot: "/tmp", maxImageBytes: TEST_MAX_IMAGE_BYTES });
+  assert.ok(typeof tool.description === "string");
+  assert.equal(
+    tool.description.includes("web_fetch"),
+    false,
+    `read_image description still mentions web_fetch: ${tool.description}`,
+  );
 });
 
 test("read_image rejects non-regular files (e.g. directories)", async () => {

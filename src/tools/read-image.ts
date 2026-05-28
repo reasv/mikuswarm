@@ -4,12 +4,30 @@ import sharp from "sharp";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
-import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
+import { SVG_MAX_INPUT_PIXELS, containsEmbeddedRasterDataUri } from "../media/index.js";
 
 export interface ReadImageToolContext {
   workspaceRoot: string;
-  /** Max bytes for the image payload sent to the model (raw, before base64). */
+  /** Max bytes for the image payload sent to the model, measured as the base64-encoded size. */
   maxImageBytes: number;
+}
+
+/**
+ * Cap on bytes we'll string-convert from a buffer for SVG embed scanning.
+ * Anything past a few MB is either an SVG bomb itself or carries a giant
+ * inline data: blob — either way unfit for rasterization. See
+ * `containsEmbeddedRasterDataUri` in `src/media/image.ts` for full rationale.
+ */
+const SVG_SCAN_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Compute the base64-encoded byte size for a raw byte count. Inline image
+ * payloads ship as base64, so the size that actually counts against the
+ * model's per-image budget is the encoded size, not the raw size. Formula:
+ * `4 * ceil(rawBytes / 3)`.
+ */
+function base64ByteSize(rawBytes: number): number {
+  return 4 * Math.ceil(rawBytes / 3);
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -32,10 +50,26 @@ function isPixelLimitError(error: unknown): boolean {
 }
 
 /**
- * Rasterize an SVG buffer to PNG, downscaling if needed so the result fits under maxBytes.
- * Tries decreasing pixel density values until the output fits, then a final hard-cap resize.
+ * Rasterize an SVG buffer to PNG, downscaling if needed so the resulting
+ * payload (measured as base64-encoded bytes) fits under maxBase64Bytes. Tries
+ * decreasing pixel density values until the output fits, then a final
+ * hard-cap resize.
+ *
+ * Refuses outright if the SVG embeds a raster via a `data:image/...` URI:
+ * librsvg/Cairo decode embedded rasters against their own dimensions, so
+ * `SVG_MAX_INPUT_PIXELS` (which gates the outer canvas) does not bound them.
+ * A ~10 KB SVG can otherwise carry a gigapixel raster.
  */
-async function rasterizeSvgToPng(buffer: Buffer, maxBytes: number, relPath: string): Promise<Buffer> {
+async function rasterizeSvgToPng(buffer: Buffer, maxBase64Bytes: number, relPath: string): Promise<Buffer> {
+  // Gate embedded `<image href="data:image/...">` references up front. We
+  // string-convert the buffer (capped) and scan for the data URI pattern; on a
+  // hit, refuse rather than letting librsvg materialize the inner raster.
+  const scanSlice = buffer.byteLength > SVG_SCAN_MAX_BYTES ? buffer.subarray(0, SVG_SCAN_MAX_BYTES) : buffer;
+  if (containsEmbeddedRasterDataUri(scanSlice.toString("utf8"))) {
+    throw new Error(
+      `Refusing to rasterize SVG ${relPath} containing embedded data: URI raster — strip the inline image and retry.`,
+    );
+  }
   // Try a sequence of decreasing densities. 144 is a good default for SVGs with CSS units;
   // halving roughly quarters the byte size each step.
   const densities = [144, 96, 72, 48];
@@ -56,7 +90,7 @@ async function rasterizeSvgToPng(buffer: Buffer, maxBytes: number, relPath: stri
       // leaking sharp's internal libvips message.
       throw new Error(`Failed to rasterize SVG ${relPath}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (png.byteLength <= maxBytes) return png;
+    if (base64ByteSize(png.byteLength) <= maxBase64Bytes) return png;
   }
   // Density chain produced output but none fit. Fall back to a fixed-width resize.
   let png: Buffer;
@@ -73,9 +107,10 @@ async function rasterizeSvgToPng(buffer: Buffer, maxBytes: number, relPath: stri
     }
     throw new Error(`Failed to rasterize SVG ${relPath}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (png.byteLength <= maxBytes) return png;
+  const finalBase64Size = base64ByteSize(png.byteLength);
+  if (finalBase64Size <= maxBase64Bytes) return png;
   throw new Error(
-    `Rasterized SVG ${relPath} is ${(png.byteLength / (1024 * 1024)).toFixed(1)}MB after downscaling, exceeds limit ${(maxBytes / (1024 * 1024)).toFixed(1)}MB`,
+    `Rasterized SVG ${relPath} base64 size ${(finalBase64Size / (1024 * 1024)).toFixed(1)}MB after downscaling exceeds limit ${(maxBase64Bytes / (1024 * 1024)).toFixed(1)}MB`,
   );
 }
 
@@ -122,7 +157,7 @@ export function createReadImageTool(context: ReadImageToolContext): AgentTool {
     description:
       `Read an image file from the workspace (${SUPPORTED_EXT_LIST}; .svg is rasterized to PNG before being sent to the model) and attach it directly to your context. ` +
       "Use this instead of `media` when you want to look at the image yourself rather than get a textual caption. " +
-      "Workspace paths only — for URLs use `web_fetch` first. " +
+      "Workspace paths only. To inspect an image from a URL, save it to the workspace via the `media` tool or download it explicitly first. " +
       "Images already attached to the current user message are visible without calling any tool. " +
       "Subject to a per-model image-size limit (rejects oversized files; SVG rasterization is downscaled to fit when possible).",
     parameters: Type.Object({
@@ -143,10 +178,15 @@ export function createReadImageTool(context: ReadImageToolContext): AgentTool {
       if (!info.isFile()) {
         throw new Error(`Not a regular file: ${relPath}`);
       }
+      // The cap is on the base64-encoded inline payload, not the raw file
+      // size: providers measure their per-image budget against the encoded
+      // bytes shipped over the wire. Raw bytes inflate ~4/3 in base64, so a
+      // file just under the raw limit can still overshoot the encoded limit.
       const maxBytes = context.maxImageBytes;
-      if (info.size > maxBytes) {
+      const statBase64Size = base64ByteSize(info.size);
+      if (statBase64Size > maxBytes) {
         throw new Error(
-          `Image too large: ${(info.size / (1024 * 1024)).toFixed(1)}MB (limit: ${(maxBytes / (1024 * 1024)).toFixed(1)}MB)`,
+          `Image base64 size ${(statBase64Size / (1024 * 1024)).toFixed(1)}MB exceeds image_input_bytes ${(maxBytes / (1024 * 1024)).toFixed(1)}MB`,
         );
       }
 
@@ -155,9 +195,10 @@ export function createReadImageTool(context: ReadImageToolContext): AgentTool {
       // stat() and readFile() where a controlled writer could grow the file.
       // The bound also matters because everything downstream (base64 inflate,
       // SVG rasterize) is sized off this buffer.
-      if (raw.byteLength > maxBytes) {
+      const rawBase64Size = base64ByteSize(raw.byteLength);
+      if (rawBase64Size > maxBytes) {
         throw new Error(
-          `Image too large: ${(raw.byteLength / (1024 * 1024)).toFixed(1)}MB (limit: ${(maxBytes / (1024 * 1024)).toFixed(1)}MB)`,
+          `Image base64 size ${(rawBase64Size / (1024 * 1024)).toFixed(1)}MB exceeds image_input_bytes ${(maxBytes / (1024 * 1024)).toFixed(1)}MB`,
         );
       }
 

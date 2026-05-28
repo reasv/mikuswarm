@@ -203,10 +203,13 @@ export interface DanbooruToolContext {
    */
   downloadSizeLimit: number;
   /**
-   * Per-image byte cap for the inline base64 emission path (`preview`). The
-   * fetched bytes are conditioned through `conditionImageBufferForInference`
-   * to land under this ceiling before being sent to the model. Derived from
-   * the default model's `image_input_bytes` setting.
+   * Per-image byte cap for the inline base64 emission path (`preview`),
+   * measured as the base64-encoded payload (NOT raw bytes). Fetched bytes are
+   * conditioned through `conditionImageBufferForInference` to land under this
+   * ceiling before being sent to the model. The conditioning pipeline targets
+   * raw output bytes, so the budget is converted to a raw target via
+   * `raw = floor(base64 * 3 / 4)` at the call site. Derived from the default
+   * model's `image_input_bytes` setting.
    */
   inlineImageMaxBytes: number;
   /**
@@ -514,9 +517,14 @@ async function executePreview(input: {
   // (resize + re-encode to JPEG) with `maxBytes` set to the per-image
   // ceiling. This is the explicit operator guidance: inline image paths
   // never just gate size — they always try to compress/convert to fit.
+  //
+  // `inlineImageMaxBytes` is a base64-encoded byte budget (what providers
+  // measure), but `ImageProcessingOptions.maxBytes` is the raw output JPEG
+  // size the conditioning loop targets. Convert: raw = floor(base64 * 3 / 4).
+  const rawByteBudget = Math.floor((input.context.inlineImageMaxBytes * 3) / 4);
   const inlineOptions: ImageProcessingOptions = {
     ...input.context.inferenceImageOptions,
-    maxBytes: input.context.inlineImageMaxBytes,
+    maxBytes: rawByteBudget,
   };
   let conditioned: { buffer: Buffer; mimeType: string; sizeBytes: number };
   try {

@@ -607,15 +607,19 @@ async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
 }
 
 /**
- * Resolve the effective max raw-image byte limit for the `read_image` tool from
- * the per-model `image_input_bytes` setting (default 3.75 MB → ~5 MB base64,
- * safely under Anthropic's per-image cap), bounded by `media.download_size_limit`
+ * Resolve the effective max image byte limit for the `read_image` tool from
+ * the per-model `image_input_bytes` setting. The cap is measured against the
+ * base64-encoded payload (what actually ships to the provider), not the raw
+ * file size — raw bytes inflate ~4/3 in base64 (formula `4 * ceil(rawBytes /
+ * 3)`), and providers (Anthropic, OpenAI, etc.) enforce their per-image
+ * budget against the encoded payload. Default 5 MB base64 ≈ 3.75 MB raw,
+ * safely under Anthropic's per-image cap. Bounded by `media.download_size_limit`
  * as a sanity ceiling. `media.image.max_bytes` is intentionally NOT consulted
  * here — that setting is the captioning pipeline's re-encode target (~1 MB),
- * not an upper bound on raw images delivered to the model.
+ * not an upper bound on images delivered to the model.
  */
 function resolveReadImageMaxBytes(config: AppConfig): number {
-  const DEFAULT_PER_MODEL = 3_932_160; // 3.75 MB; ≈5 MB after base64 inflation.
+  const DEFAULT_PER_MODEL = 5_242_880; // 5 MB base64 (≈ 3.75 MB raw before encoding).
   const perModel = config.models.default.image_input_bytes ?? DEFAULT_PER_MODEL;
   const candidates = [
     perModel,

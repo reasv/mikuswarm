@@ -23,6 +23,7 @@ test("image processing honors configured pixel budget and byte limit", async () 
       maxTotalPixelsHard: 1_843_200,
       minShortestSide: 480,
       maxBytes: 75_000,
+      mozjpeg: true,
     });
 
     const metadata = await sharp(result.path).metadata();
@@ -32,6 +33,37 @@ test("image processing honors configured pixel budget and byte limit", async () 
     await unlink(result.path).catch(() => {});
   } finally {
     await unlink(tmpPath).catch(() => {});
+  }
+});
+
+test("captioning image pipeline refuses SVGs with embedded data: URI rasters", async () => {
+  // librsvg/Cairo decode `<image href="data:image/...">` payloads against the
+  // inner raster's own dimensions, so the outer SVG_MAX_INPUT_PIXELS budget
+  // does not bound them. Conservative refusal: any data:image/... reference
+  // in the SVG source must be rejected by the captioning pipeline before
+  // sharp is asked to rasterize it.
+  const dir = await mkdtemp(join(tmpdir(), "miku-svg-embed-"));
+  try {
+    const svg =
+      `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="blue"/>
+  <image x="0" y="0" width="100" height="100" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="/>
+</svg>`;
+    const svgPath = join(dir, "embed.svg");
+    await writeFile(svgPath, svg, "utf8");
+    await assert.rejects(
+      () => processImageForInference(svgPath, {
+        maxTotalPixels: 921_600,
+        maxTotalPixelsHard: 1_843_200,
+        minShortestSide: 480,
+        maxBytes: 75_000,
+        mozjpeg: false,
+      }),
+      /embedded data: URI raster/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

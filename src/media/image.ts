@@ -20,6 +20,60 @@ import type { ImageProcessingOptions, ProcessedMedia } from "./types.js";
  */
 export const SVG_MAX_INPUT_PIXELS = 25_000_000;
 
+/**
+ * Cap on bytes we'll string-convert from a buffer for SVG embed scanning. SVG
+ * source files are XML — anything past a few hundred KB is either a payload
+ * vector itself (e.g. an SVG bomb with millions of nested elements) or carrying
+ * a giant inline data: blob. Either way, we don't need to scan past the cap to
+ * make a refusal decision — at this size, the SVG is unfit for rasterization
+ * regardless.
+ */
+const SVG_SCAN_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Scan an SVG source for `<image>` references that embed a raster via a
+ * `data:image/...;base64,...` URI. librsvg/Cairo decode those rasters against
+ * their own dimensions, not the outer SVG viewBox — so `SVG_MAX_INPUT_PIXELS`
+ * (which gates the outer canvas) does not bound them. A ~10 KB SVG can carry a
+ * gigapixel raster this way. Conservative refusal: any `data:image/...`
+ * reference is rejected regardless of declared size — agents rarely need SVGs
+ * with embedded rasters, and the operator agreed this is the safe call.
+ *
+ * The regex is tolerant of: case, single/double-quoted attribute values, the
+ * `xlink:` namespace prefix, whitespace around `=`, and arbitrary attribute
+ * order on the `<image>` element.
+ */
+export function containsEmbeddedRasterDataUri(svgSource: string): boolean {
+  // Match any (xlink:)?href attribute on an <image> element whose value starts
+  // with "data:image/" (case-insensitive). We scan for href= patterns inside
+  // an <image ...> tag region rather than parsing XML — fast and sufficient.
+  // Pattern explanation:
+  //   <image\b           start of an <image> element
+  //   [^>]*?             any attributes up to the href
+  //   (xlink:)?href      href or xlink:href
+  //   \s*=\s*            tolerate whitespace around =
+  //   ['"]?              optional quote (some parsers accept unquoted)
+  //   \s*data:image/     the embedded-raster data URI prefix
+  const re = /<image\b[^>]*?(?:xlink:)?href\s*=\s*['"]?\s*data:image\//i;
+  return re.test(svgSource);
+}
+
+/**
+ * Read up to `SVG_SCAN_MAX_BYTES` of `buffer` as UTF-8 and check for an
+ * embedded raster data URI. Buffers larger than the cap are still scanned for
+ * the first chunk — if a payload exists, it almost certainly appears within
+ * the first few MB (an embedded base64 raster pushes the SVG well past that
+ * size). The cap exists to bound string allocation, not to defeat the check.
+ */
+function svgBufferContainsEmbeddedRasterDataUri(buffer: Buffer): boolean {
+  const slice = buffer.byteLength > SVG_SCAN_MAX_BYTES ? buffer.subarray(0, SVG_SCAN_MAX_BYTES) : buffer;
+  // Decode lossy: SVGs are XML so should be ASCII-clean in the attribute
+  // region we care about; even if the file contains binary trailing junk
+  // (rare), `toString("utf8")` will not throw.
+  const source = slice.toString("utf8");
+  return containsEmbeddedRasterDataUri(source);
+}
+
 export async function processImageForInference(
   inputPath: string,
   options: ImageProcessingOptions,
@@ -57,6 +111,15 @@ export async function conditionImageBufferForInference(
   options: ImageProcessingOptions,
 ): Promise<{ buffer: Buffer; mimeType: string; sizeBytes: number; truncated: boolean }> {
   const metadata = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS }).metadata();
+  // SVG-specific gate: librsvg/Cairo decode `<image href="data:image/...">`
+  // payloads against the inner raster's own dimensions, not the SVG canvas,
+  // so SVG_MAX_INPUT_PIXELS does not bound them. Conservative refusal — see
+  // `containsEmbeddedRasterDataUri` for rationale.
+  if (metadata.format === "svg" && svgBufferContainsEmbeddedRasterDataUri(input)) {
+    throw new Error(
+      "Refusing to rasterize SVG containing embedded data: URI raster — strip the inline image and retry.",
+    );
+  }
   const origWidth = metadata.width ?? 1;
   const origHeight = metadata.height ?? 1;
 
