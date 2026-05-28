@@ -10,6 +10,7 @@ import pngTextChunk from "png-chunk-text";
 import sharp from "sharp";
 import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
 import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
+import { escapeAttr, escapeXml } from "../context/xml.js";
 import { assertPublicHttpUrl } from "./ssrf.js";
 
 // Reject PNGs whose chunk table is structurally hostile before handing the
@@ -407,13 +408,15 @@ const CardReadSchema = Type.Object(
     entryId: Type.Optional(
       Type.Integer({
         minimum: 0,
-        description: "Optional character book entry ID. Use entryId or entryIndex for book entry reads.",
+        description:
+          "Optional character book entry id. Matches the spec `id` field exactly (which may be missing). Provide entryId or entryIndex.",
       }),
     ),
     entryIndex: Type.Optional(
       Type.Integer({
         minimum: 0,
-        description: "Optional character book entry index. Use entryId or entryIndex for book entry reads.",
+        description:
+          "Optional character book entry index — the position in the entries array. Provide entryId or entryIndex.",
       }),
     ),
     entryField: Type.Optional(
@@ -460,30 +463,136 @@ const CardReadSchema = Type.Object(
   { additionalProperties: false },
 );
 
-const EditOperationSchema = Type.Object(
-  {
-    op: Type.String({
-      description:
-        "Edit operation. Supported values: set_field, append_field, set_field_from_file, replace_range, set_tags, add_alt_greeting, update_alt_greeting, remove_alt_greeting, add_book_entry, update_book_entry, remove_book_entry, replace_image.",
-    }),
-    field: Type.Optional(Type.Unsafe<TextFieldName>({ type: "string", enum: [...TEXT_FIELDS] })),
-    value: Type.Optional(Type.String()),
-    sourcePath: Type.Optional(Type.String()),
-    start: Type.Optional(Type.Integer({ minimum: 0 })),
-    end: Type.Optional(Type.Integer({ minimum: 0 })),
-    tags: Type.Optional(Type.Array(Type.String())),
-    index: Type.Optional(Type.Integer({ minimum: 0 })),
-    entryId: Type.Optional(Type.Integer({ minimum: 0 })),
-    entryIndex: Type.Optional(Type.Integer({ minimum: 0 })),
-    entry: Type.Optional(Type.Any()),
-    contentSourcePath: Type.Optional(Type.String()),
-    commentSourcePath: Type.Optional(Type.String()),
-    nameSourcePath: Type.Optional(Type.String()),
-    imagePath: Type.Optional(Type.String()),
-    imageUrl: Type.Optional(Type.String()),
-  },
-  { additionalProperties: false },
+// One TypeBox variant per discriminated `op`. Each variant lists only the
+// fields valid for that operation, mirroring the `EditOperation` TypeScript
+// union above. Operators get clearer schema descriptions, the model gets
+// per-op shape hints, and the runtime `switch (operation.op)` can rely on
+// the variant fields being present without defensive checks.
+// A literal-union schema is what TypeBox's runtime `Value.Check` understands.
+// `Type.Unsafe<TextFieldName>(...)` looks fine in JSON schema output but lacks
+// the Kind symbol that the validator needs, so we build the union explicitly.
+const TextFieldSchema = Type.Union(
+  TEXT_FIELDS.map((field) => Type.Literal(field)) as [
+    ReturnType<typeof Type.Literal<TextFieldName>>,
+    ...ReturnType<typeof Type.Literal<TextFieldName>>[],
+  ],
 );
+const BookEntryInputSchema = Type.Any({
+  description:
+    "Partial character_book entry; see character_book.entries[] in the create schema for field shapes.",
+});
+// `entryId` matches the spec `id` field exactly (which may be missing).
+// `entryIndex` is the array position. Provide one or the other.
+const EntryIdSchema = Type.Optional(
+  Type.Integer({
+    minimum: 0,
+    description:
+      "Character book entry id (exact match for the spec `id` field, which may be missing). Provide entryId or entryIndex.",
+  }),
+);
+const EntryIndexSchema = Type.Optional(
+  Type.Integer({
+    minimum: 0,
+    description:
+      "Character book entry index — the position in the entries array. Provide entryId or entryIndex.",
+  }),
+);
+
+const EditOperationSchema = Type.Union([
+  Type.Object(
+    {
+      op: Type.Union([Type.Literal("set_field"), Type.Literal("append_field")]),
+      field: TextFieldSchema,
+      value: Type.String(),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("set_field_from_file"),
+      field: TextFieldSchema,
+      sourcePath: Type.String(),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("replace_range"),
+      field: TextFieldSchema,
+      start: Type.Integer({ minimum: 0 }),
+      end: Type.Integer({ minimum: 0 }),
+      value: Type.String(),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("set_tags"),
+      tags: Type.Array(Type.String()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("add_alt_greeting"),
+      value: Type.String(),
+      index: Type.Optional(Type.Integer({ minimum: 0 })),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("update_alt_greeting"),
+      index: Type.Integer({ minimum: 0 }),
+      value: Type.Optional(Type.String()),
+      sourcePath: Type.Optional(Type.String()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("remove_alt_greeting"),
+      index: Type.Integer({ minimum: 0 }),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("add_book_entry"),
+      entry: BookEntryInputSchema,
+      index: Type.Optional(Type.Integer({ minimum: 0 })),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("update_book_entry"),
+      entryId: EntryIdSchema,
+      entryIndex: EntryIndexSchema,
+      entry: Type.Optional(BookEntryInputSchema),
+      contentSourcePath: Type.Optional(Type.String()),
+      commentSourcePath: Type.Optional(Type.String()),
+      nameSourcePath: Type.Optional(Type.String()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("remove_book_entry"),
+      entryId: EntryIdSchema,
+      entryIndex: EntryIndexSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      op: Type.Literal("replace_image"),
+      imagePath: Type.Optional(Type.String()),
+      imageUrl: Type.Optional(Type.String()),
+    },
+    { additionalProperties: false },
+  ),
+]);
 
 const CardEditSchema = Type.Object(
   {
@@ -934,6 +1043,31 @@ async function executeEdit(input: {
 // Result builders
 // ---------------------------------------------------------------------------
 
+// Card text fields originate from the loaded card file, which is external
+// content from the agent's point of view. Wrapping these in a clearly-named
+// XML block lets the system prompt teach the agent to ignore prompt-injection
+// attempts ("Ignore previous instructions and ..." in a description, etc.).
+// The attribute is escaped via escapeAttr and the inner text via escapeXml so
+// a payload like `</untrusted_card_field>...` cannot close the wrapper early.
+// Mirrors the inbound-message wrapping in src/context/renderer.ts.
+function wrapUntrustedCardField(name: string, value: string): string {
+  return `<untrusted_card_field name="${escapeAttr(name)}">${escapeXml(value)}</untrusted_card_field>`;
+}
+
+// Machine-readable identifier for the wrapped field. Mirrors resolved.label
+// shape but stays stable and free of decorative characters so the system
+// prompt can match on field names.
+function describeTargetForWrapping(target: TextTarget): string {
+  switch (target.kind) {
+    case "field":
+      return target.field;
+    case "alternate_greeting":
+      return `alternate_greetings[${target.index}]`;
+    case "book_entry":
+      return `character_book.entries[${target.entryIndex}].${target.field}`;
+  }
+}
+
 function buildReadSummaryResult(parsed: ParsedCardFile, config: ResolvedSillyTavernConfig) {
   const summary = buildCardSummary(parsed.normalizedCard, config);
   const lines = [
@@ -1056,6 +1190,7 @@ function buildTextExcerptResult(input: {
       input.config.maxExcerptChars,
     ),
   );
+  const fieldName = describeTargetForWrapping(input.target);
   const lines = [
     "## SillyTavern Card Excerpt",
     "",
@@ -1068,7 +1203,9 @@ function buildTextExcerptResult(input: {
       ? `[TRUNCATED: returned ${excerpt.returnedChars} of ${excerpt.totalChars} chars and ${excerpt.returnedLines} of ${excerpt.totalLines} lines from ${resolved.label}; use offset=${excerpt.endOffset} to continue, or export_text to write the full text to a workspace file.]`
       : "[COMPLETE: this call returned the full selected text target.]",
     "",
-    excerpt.text,
+    // The excerpt body is untrusted card content — wrap it so the agent treats
+    // any prompt-injection-shaped payload inside it as data, not instructions.
+    wrapUntrustedCardField(fieldName, excerpt.text),
   ];
 
   return {
@@ -1222,14 +1359,17 @@ function buildCardSummary(card: V2, config: ResolvedSillyTavernConfig) {
     })),
     alternateGreetingRemaining: Math.max(alternateGreetings.length - config.maxSummaryEntries, 0),
     bookEntryCount: bookEntries.length,
-    bookEntrySummaries: bookEntries.slice(0, config.maxSummaryEntries).map((entry, index) => ({
-      index,
-      id: entry.id ?? null,
-      enabled: entry.enabled,
-      keyCount: entry.keys.length,
-      contentChars: getTextMetrics(entry.content).chars,
-      contentLines: getTextMetrics(entry.content).lines,
-    })),
+    bookEntrySummaries: bookEntries.slice(0, config.maxSummaryEntries).map((entry, index) => {
+      const contentMetrics = getTextMetrics(entry.content);
+      return {
+        index,
+        id: entry.id ?? null,
+        enabled: entry.enabled,
+        keyCount: entry.keys.length,
+        contentChars: contentMetrics.chars,
+        contentLines: contentMetrics.lines,
+      };
+    }),
     bookEntryRemaining: Math.max(bookEntries.length - config.maxSummaryEntries, 0),
     tagsCount: card.data.tags.length,
     extensionKeys: Object.keys(card.data.extensions ?? {}),
