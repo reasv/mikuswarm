@@ -5,7 +5,7 @@ import type { AgentSessionRecord } from "../agent/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { Storage, MediaAssetRow, LinkPreviewRow, ReplyContextRow } from "../storage/index.js";
-import { processImageForInference, cleanupProcessedImage, type ImageProcessingOptions } from "../media/index.js";
+import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
@@ -188,13 +188,7 @@ export class ContextBuilder {
     if (!multimodal) return [];
     const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
-    const imageOpts: ImageProcessingOptions = {
-      maxTotalPixels: this.config.media?.image?.max_total_pixels ?? 921_600,
-      maxTotalPixelsHard: this.config.media?.image?.max_total_pixels_hard ?? 1_843_200,
-      minShortestSide: this.config.media?.image?.min_shortest_side ?? 480,
-      maxBytes: this.config.media?.image?.max_bytes ?? 1_048_576,
-      mozjpeg: this.config.media?.image?.mozjpeg ?? true,
-    };
+    const imageOpts = buildInferenceImageOptions(this.config.media?.image);
     for (const { eventId, attachment } of images) {
       if (!attachment.localPath) continue;
       const absPath = attachment.localPath.startsWith("/")

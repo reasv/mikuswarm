@@ -4,7 +4,34 @@ import { mkdtemp, writeFile, unlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
-import { processImageForInference } from "../src/media/index.js";
+import { processImageForInference, buildInferenceImageOptions } from "../src/media/index.js";
+
+test("buildInferenceImageOptions returns documented defaults when the config slice is empty/undefined", () => {
+  const undef = buildInferenceImageOptions(undefined);
+  const empty = buildInferenceImageOptions({});
+  const expected = {
+    maxTotalPixels: 921_600,
+    maxTotalPixelsHard: 1_843_200,
+    minShortestSide: 480,
+    maxBytes: 1_048_576,
+    mozjpeg: true,
+  };
+  assert.deepEqual(undef, expected);
+  assert.deepEqual(empty, expected);
+});
+
+test("buildInferenceImageOptions overrides only the fields the slice supplies", () => {
+  const options = buildInferenceImageOptions({
+    max_total_pixels: 500_000,
+    mozjpeg: false,
+  });
+  assert.equal(options.maxTotalPixels, 500_000);
+  assert.equal(options.mozjpeg, false);
+  // unspecified fields keep documented defaults
+  assert.equal(options.maxTotalPixelsHard, 1_843_200);
+  assert.equal(options.minShortestSide, 480);
+  assert.equal(options.maxBytes, 1_048_576);
+});
 
 test("image processing honors configured pixel budget and byte limit", async () => {
   const width = 1024;

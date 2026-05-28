@@ -21,6 +21,34 @@ import type { ImageProcessingOptions, ProcessedMedia } from "./types.js";
 export const SVG_MAX_INPUT_PIXELS = 25_000_000;
 
 /**
+ * Build the canonical `ImageProcessingOptions` from the `media.image` config
+ * slice (shape mirrors `MediaImageSchema`). Single source of truth for every
+ * inference-image conditioning call site — the captioning pool, the danbooru
+ * `preview` action, and the trigger-context image-block builder all consume
+ * the same defaults via this helper. Callers that need a different `maxBytes`
+ * (e.g. the per-image inline cap) override that single field after the call.
+ */
+export function buildInferenceImageOptions(
+  imageConfig:
+    | {
+        max_total_pixels?: number;
+        max_total_pixels_hard?: number;
+        min_shortest_side?: number;
+        max_bytes?: number;
+        mozjpeg?: boolean;
+      }
+    | undefined,
+): ImageProcessingOptions {
+  return {
+    maxTotalPixels: imageConfig?.max_total_pixels ?? 921_600,
+    maxTotalPixelsHard: imageConfig?.max_total_pixels_hard ?? 1_843_200,
+    minShortestSide: imageConfig?.min_shortest_side ?? 480,
+    maxBytes: imageConfig?.max_bytes ?? 1_048_576,
+    mozjpeg: imageConfig?.mozjpeg ?? true,
+  };
+}
+
+/**
  * Cap on bytes we'll string-convert from a buffer for SVG embed scanning. SVG
  * source files are XML — anything past a few hundred KB is either a payload
  * vector itself (e.g. an SVG bomb with millions of nested elements) or carrying

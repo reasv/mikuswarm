@@ -47,7 +47,7 @@ import {
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
-import type { ImageProcessingOptions } from "./media/index.js";
+import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 
 export interface MikuAgentRuntime {
@@ -98,18 +98,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const mediaVideoConfig = config.media?.video ?? {};
   const mediaAudioConfig = config.media?.audio ?? {};
 
-  // Shared inference-image conditioning options. Reused by the captioning
-  // pool and by inline preview paths (e.g. danbooru `preview`) so all inline
-  // image emissions go through the same compress/convert pipeline. Callers
-  // that need a different `maxBytes` (e.g. the per-image cap) override that
-  // single field; everything else (pixel budget, mozjpeg) stays uniform.
-  const inferenceImageOptions: ImageProcessingOptions = {
-    maxTotalPixels: mediaImageConfig.max_total_pixels ?? 921_600,
-    maxTotalPixelsHard: mediaImageConfig.max_total_pixels_hard ?? 1_843_200,
-    minShortestSide: mediaImageConfig.min_shortest_side ?? 480,
-    maxBytes: mediaImageConfig.max_bytes ?? 1_048_576,
-    mozjpeg: mediaImageConfig.mozjpeg ?? true,
-  };
+  // Shared inference-image conditioning options. Single source of truth via
+  // buildInferenceImageOptions — also consumed by ContextBuilder's
+  // selectImageBlocks so the captioning pool, danbooru preview, and trigger
+  // image-block path all use the same defaults.
+  const inferenceImageOptions = buildInferenceImageOptions(mediaImageConfig);
 
   const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
     ["image", new ConcurrencyLimitedInferenceClient({
