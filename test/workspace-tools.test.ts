@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import sharp from "sharp";
 import { createSearchMemoryTool, createWriteMemoryTool } from "../src/tools/memory.js";
 import { runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
 import { createReadImageTool } from "../src/tools/read-image.js";
@@ -455,12 +456,149 @@ test("read_image rasterizes SVG to PNG", async () => {
 
 test("read_image surfaces a clean error for malformed SVG", async () => {
   await withWorkspace(async (workspace) => {
-    await writeFile(path.join(workspace, "broken.svg"), "this is not svg at all", "utf8");
+    // Sniffs as SVG (starts with "<svg") but is structurally invalid XML —
+    // forces the rasterizer to throw and exercise the catch path in
+    // rasterizeSvgToPng.
+    await writeFile(path.join(workspace, "broken.svg"), "<svg this is not valid xml", "utf8");
     const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
     await assert.rejects(
       () => tool.execute("t1", { path: "broken.svg" }),
       /Failed to rasterize SVG/,
     );
+  });
+});
+
+test("read_image rejects files whose magic bytes don't match the extension", async () => {
+  await withWorkspace(async (workspace) => {
+    // JPEG magic bytes in a file named .png — providers would reject with an
+    // opaque error; the tool should catch this up front.
+    const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+    await writeFile(path.join(workspace, "mislabeled.png"), jpegBytes);
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "mislabeled.png" }),
+      /does not match extension/,
+    );
+  });
+});
+
+test("read_image rejects files whose bytes don't sniff as any supported format", async () => {
+  await withWorkspace(async (workspace) => {
+    // Plain text bytes in a file named .png — neither JPEG, PNG, GIF, WebP, nor SVG.
+    await writeFile(path.join(workspace, "junk.png"), "hello world, not an image", "utf8");
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "junk.png" }),
+      /Could not determine image format/,
+    );
+  });
+});
+
+test("read_image rejects SVGs whose rasterization would exceed the pixel budget", async () => {
+  await withWorkspace(async (workspace) => {
+    // Crafted SVG with a huge viewBox. At density=144 this would rasterize to
+    // ~40000x40000 (~1.6 GP) — far past the 25 MP limitInputPixels budget; at
+    // density=48 it would still be ~13000x13000 (~169 MP). All four densities
+    // should hit the pixel cap and the fallback resize should also be refused.
+    const svg = `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20000 20000" width="20000" height="20000"><rect width="20000" height="20000" fill="red"/></svg>`;
+    await writeFile(path.join(workspace, "huge.svg"), svg, "utf8");
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    await assert.rejects(
+      () => tool.execute("t1", { path: "huge.svg" }),
+      /too complex to rasterize/,
+    );
+  });
+});
+
+test("read_image rejects symlinks that escape the workspace", async () => {
+  await withWorkspace(async (workspace) => {
+    const outside = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-outside-img-"));
+    try {
+      // A real PNG sitting outside the workspace.
+      const pngData = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+        "base64",
+      );
+      const realPng = path.join(outside, "secret.png");
+      await writeFile(realPng, pngData);
+      // Symlink inside the workspace pointing to the outside file.
+      await symlink(realPng, path.join(workspace, "linked.png"), "file");
+
+      const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+      await assert.rejects(
+        () => tool.execute("t1", { path: "linked.png" }),
+        /escapes workspace/,
+      );
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+test("read_image SVG rasterization does not follow file:// references (regression for librsvg sandbox)", async () => {
+  // sharp + bundled librsvg should refuse to load external resources from
+  // buffer-mode SVGs (no base URI → only data: URIs allowed). If a future
+  // sharp/libvips upgrade regresses this behavior, this test catches it.
+  // We construct an SVG that, IF the reference were followed, would paint a
+  // 50x50 red square in the upper-left corner of the raster from the canary
+  // PNG. We then assert the raster's top-left pixels are NOT pure red.
+  await withWorkspace(async (workspace) => {
+    const canaryDir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-svg-canary-"));
+    try {
+      // Build a 50x50 pure-red PNG using sharp directly.
+      const canaryPng = await sharp({
+        create: { width: 50, height: 50, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 1 } },
+      }).png().toBuffer();
+      const canaryPath = path.join(canaryDir, "canary.png");
+      await writeFile(canaryPath, canaryPng);
+
+      // Two SVGs, both attempting to embed the canary via different reference
+      // styles. The host background is pure blue (0,0,255) — if librsvg's
+      // sandbox holds, the entire output is blue. If it leaks, the upper-left
+      // 50x50 region becomes red.
+      const svgs = [
+        // file:// scheme with xlink:href (classic XXE-style image ref).
+        `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="rgb(0,0,255)"/>
+  <image x="0" y="0" width="50" height="50" xlink:href="file://${canaryPath}"/>
+</svg>`,
+        // file:// scheme with plain href (SVG 2 style).
+        `<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" fill="rgb(0,0,255)"/>
+  <image x="0" y="0" width="50" height="50" href="file://${canaryPath}"/>
+</svg>`,
+      ];
+
+      for (let idx = 0; idx < svgs.length; idx++) {
+        const svgPath = path.join(workspace, `exfil-${idx}.svg`);
+        await writeFile(svgPath, svgs[idx], "utf8");
+
+        const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+        const result = await tool.execute("t1", { path: `exfil-${idx}.svg` });
+        const img = result.content[1] as { type: "image"; data: string; mimeType: string };
+        assert.equal(img.mimeType, "image/png");
+
+        // Decode the rendered PNG back to raw pixels and count pure-red ones.
+        // Even a partial leak would produce a meaningful count; a fully-blocked
+        // load produces zero.
+        const png = Buffer.from(img.data, "base64");
+        const raw = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+        let redPixels = 0;
+        const { data, info } = raw;
+        for (let i = 0; i < data.length; i += info.channels) {
+          if (data[i] === 255 && data[i + 1] === 0 && data[i + 2] === 0) redPixels++;
+        }
+        assert.equal(
+          redPixels,
+          0,
+          `SVG #${idx} leaked ${redPixels} red pixels — librsvg sandbox may have regressed; review and lock down before shipping`,
+        );
+      }
+    } finally {
+      await rm(canaryDir, { recursive: true, force: true });
+    }
   });
 });
 
