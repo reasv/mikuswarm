@@ -181,6 +181,26 @@ export const AppConfigSchema = Type.Object({
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   captioning: Type.Optional(CaptioningSchema),
+  sillytavern: Type.Optional(Type.Object({
+    output_subdir: Type.Optional(Type.String()),
+    export_subdir: Type.Optional(Type.String()),
+    default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
+    max_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
+    max_summary_entries: Type.Optional(Type.Number({ minimum: 1 })),
+  })),
+  user_profiles: Type.Optional(Type.Object({
+    root_dir: Type.Optional(Type.String()),
+    default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
+    max_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
+  })),
+  danbooru: Type.Optional(Type.Object({
+    base_url: Type.Optional(Type.String()),
+    login: Type.Optional(Type.String()),
+    api_key: Type.Optional(Type.String()),
+    max_regular_tags: Type.Optional(Type.Number({ minimum: 1 })),
+    default_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+    download_subdir: Type.Optional(Type.String()),
+  })),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

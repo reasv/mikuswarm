@@ -14,6 +14,17 @@ export { createMediaTool, type MediaToolContext } from "./media.js";
 export { createReadImageTool, type ReadImageToolContext } from "./read-image.js";
 export { createWebFetchTool, createWebSearchTool } from "./web.js";
 export { createDanbooruTool, type DanbooruToolContext } from "./danbooru.js";
+export {
+  createUserProfileReadTool,
+  createUserProfileEditTool,
+  type UserProfileToolContext,
+} from "./user-profile.js";
+export {
+  createSillyTavernCardCreateTool,
+  createSillyTavernCardReadTool,
+  createSillyTavernCardEditTool,
+  type SillyTavernCardToolContext,
+} from "./sillytavern-card.js";
 export { createEmojiListTool, type EmojiToolContext } from "./emoji.js";
 export { createReactTool, type ReactToolContext } from "./react.js";
 export { createEditMessageTool, type EditMessageToolContext } from "./edit-message.js";

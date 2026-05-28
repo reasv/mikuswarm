@@ -110,6 +110,24 @@ max_chars = 2000
 concurrency = 1
 timeout_ms = 60000
 
+[sillytavern]
+output_subdir = "cards/sillytavern"
+export_subdir = "exports/sillytavern"
+default_excerpt_chars = 2000
+max_excerpt_chars = 4000
+max_summary_entries = 20
+
+[user_profiles]
+root_dir = "users"
+default_excerpt_chars = 1600
+max_excerpt_chars = 6000
+
+[danbooru]
+base_url = "https://danbooru.donmai.us"
+max_regular_tags = 2
+default_limit = 20
+download_subdir = "downloads/danbooru"
+
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"
 access_token = "${MATRIX_ACCESS_TOKEN}"
