@@ -234,6 +234,7 @@ const UserProfileEditSchema = Type.Object(
 // ---------------------------------------------------------------------------
 
 export function createUserProfileReadTool(context: UserProfileToolContext): AgentTool {
+  validateUserProfileExcerptBounds(context);
   return {
     name: "user_profile_read",
     label: "User Profile Read",
@@ -250,6 +251,7 @@ export function createUserProfileReadTool(context: UserProfileToolContext): Agen
 }
 
 export function createUserProfileEditTool(context: UserProfileToolContext): AgentTool {
+  validateUserProfileExcerptBounds(context);
   return {
     name: "user_profile_edit",
     label: "User Profile Edit",
@@ -263,6 +265,16 @@ export function createUserProfileEditTool(context: UserProfileToolContext): Agen
         params: rawParams as UserProfileEditParams,
       }),
   };
+}
+
+function validateUserProfileExcerptBounds(context: UserProfileToolContext): void {
+  const defaultExcerptChars = context.config?.default_excerpt_chars ?? 1600;
+  const maxExcerptChars = context.config?.max_excerpt_chars ?? 6000;
+  if (maxExcerptChars < defaultExcerptChars) {
+    throw new Error(
+      "user_profiles.max_excerpt_chars must be >= user_profiles.default_excerpt_chars.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,18 @@ export interface FetchClientOptions {
  */
 export function buildProxyDispatcher(httpProxyUrl: string | undefined): Dispatcher | undefined {
   if (!httpProxyUrl) return undefined;
-  return new ProxyAgent(httpProxyUrl);
+  const trimmed = httpProxyUrl.trim();
+  if (trimmed.length === 0) return undefined;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error("network.http_proxy_url must be a valid URL.");
+  }
+  if (!/^https?:$/.test(url.protocol)) {
+    throw new Error("network.http_proxy_url must use http or https.");
+  }
+  return new ProxyAgent(trimmed);
 }
 
 export interface FetchOptions {

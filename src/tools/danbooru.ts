@@ -4,7 +4,11 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
-import { buildProxyDispatcher, type ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import {
+  buildProxyDispatcher,
+  type ConcurrencyLimitedFetchClient,
+  type FetchResult,
+} from "../enrichment/fetch-client.js";
 import type { Dispatcher } from "undici";
 import {
   conditionImageBufferForInference,
@@ -372,14 +376,22 @@ const DanbooruToolSchema = Type.Object(
 
 export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
   const defaultOrder = normalizeConfiguredDefaultOrder(context.config?.default_order);
+  const login = normalizeCredential(context.config?.login);
+  const apiKey = normalizeCredential(context.config?.api_key);
+  if ((login && !apiKey) || (!login && apiKey)) {
+    throw new Error(
+      "danbooru.login and danbooru.api_key must be configured together.",
+    );
+  }
+  const baseUrl = normalizeConfiguredBaseUrl(context.config?.base_url);
   const config: DanbooruConfig = {
-    baseUrl: context.config?.base_url ?? "https://danbooru.donmai.us",
+    baseUrl,
     maxRegularTags: context.config?.max_regular_tags ?? 2,
     defaultLimit: context.config?.default_limit ?? DEFAULT_SEARCH_LIMIT,
     defaultOrder,
     downloadSubdir: context.config?.download_subdir ?? "downloads/danbooru",
-    login: context.config?.login,
-    apiKey: context.config?.api_key,
+    login,
+    apiKey,
   };
 
   const authHeader = buildAuthHeader(config);
@@ -505,13 +517,11 @@ async function executePreview(input: {
   const fetched = await input.context.fetchClient.fetch(assetUrl, {
     maxBytes: input.context.downloadSizeLimit,
   });
-  if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
-    await fs.unlink(fetched.path).catch(() => {});
-    throw new Error(`Preview fetch failed with HTTP ${fetched.statusCode}`);
-  }
-
   let rawBuffer: Buffer;
   try {
+    if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+      throw new Error(await buildAssetFetchError("Preview fetch", fetched));
+    }
     rawBuffer = await fs.readFile(fetched.path);
   } finally {
     await fs.unlink(fetched.path).catch(() => {});
@@ -627,13 +637,11 @@ async function executeDownload(input: {
   const fetched = await input.context.fetchClient.fetch(assetUrl, {
     maxBytes: input.context.downloadSizeLimit,
   });
-  if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
-    await fs.unlink(fetched.path).catch(() => {});
-    throw new Error(`Download fetch failed with HTTP ${fetched.statusCode}`);
-  }
-
   let buffer: Buffer;
   try {
+    if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+      throw new Error(await buildAssetFetchError("Download fetch", fetched));
+    }
     buffer = await fs.readFile(fetched.path);
   } finally {
     await fs.unlink(fetched.path).catch(() => {});
@@ -798,6 +806,46 @@ async function buildDanbooruHttpError(response: DanbooruFetchResponse): Promise<
     detail = "";
   }
   return `Danbooru request failed with HTTP ${response.status}${detail}.`;
+}
+
+/**
+ * The binary fetch path writes the response body to a temp file before we get
+ * a chance to inspect it. When the status is non-2xx that body is usually a
+ * small JSON or text error payload; read it from disk so we can surface
+ * Danbooru's `reason` (or a snippet of the text) instead of a bare HTTP code.
+ *
+ * Caller is responsible for unlinking `fetched.path` — keep the same
+ * finally-block cleanup pattern that protected the previous bare-throw site.
+ */
+export async function buildAssetFetchError(
+  label: string,
+  fetched: FetchResult,
+): Promise<string> {
+  let detail = "";
+  try {
+    const body = await fs.readFile(fetched.path);
+    const contentType = (fetched.contentType ?? "").toLowerCase();
+    if (contentType.includes("application/json")) {
+      try {
+        const json = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        const reason = typeof json.reason === "string" ? json.reason : undefined;
+        if (reason) {
+          detail = ` (${reason})`;
+        }
+      } catch {
+        // Fall through to text snippet below.
+      }
+    }
+    if (!detail) {
+      const text = body.toString("utf8").trim();
+      if (text) {
+        detail = ` (${text.slice(0, 200)})`;
+      }
+    }
+  } catch {
+    detail = "";
+  }
+  return `${label} failed with HTTP ${fetched.statusCode}${detail}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1136,29 @@ function normalizeConfiguredDefaultOrder(value: string | undefined): DanbooruOrd
     );
   }
   return value as DanbooruOrder;
+}
+
+function normalizeCredential(value: string | undefined): string | undefined {
+  if (value == null) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeConfiguredBaseUrl(value: string | undefined): string {
+  const DEFAULT = "https://danbooru.donmai.us";
+  if (value == null) return DEFAULT;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return DEFAULT;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error("danbooru.base_url must be a valid URL.");
+  }
+  if (!/^https?:$/.test(url.protocol)) {
+    throw new Error("danbooru.base_url must use http or https.");
+  }
+  return url.toString().replace(/\/+$/, "");
 }
 
 function normalizeOptionalPage(page: string | undefined): string | undefined {
