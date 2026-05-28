@@ -47,6 +47,7 @@ import {
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
+import type { ImageProcessingOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 
 export interface MikuAgentRuntime {
@@ -97,6 +98,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const mediaVideoConfig = config.media?.video ?? {};
   const mediaAudioConfig = config.media?.audio ?? {};
 
+  // Shared inference-image conditioning options. Reused by the captioning
+  // pool and by inline preview paths (e.g. danbooru `preview`) so all inline
+  // image emissions go through the same compress/convert pipeline. Callers
+  // that need a different `maxBytes` (e.g. the per-image cap) override that
+  // single field; everything else (pixel budget, mozjpeg) stays uniform.
+  const inferenceImageOptions: ImageProcessingOptions = {
+    maxTotalPixels: mediaImageConfig.max_total_pixels ?? 921_600,
+    maxTotalPixelsHard: mediaImageConfig.max_total_pixels_hard ?? 1_843_200,
+    minShortestSide: mediaImageConfig.min_shortest_side ?? 480,
+    maxBytes: mediaImageConfig.max_bytes ?? 1_048_576,
+    mozjpeg: mediaImageConfig.mozjpeg ?? true,
+  };
+
   const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
     ["image", new ConcurrencyLimitedInferenceClient({
       modality: "image",
@@ -105,13 +119,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
       maxConcurrency: imageConfig.concurrency,
-      imageProcessing: {
-        maxTotalPixels: mediaImageConfig.max_total_pixels ?? 921_600,
-        maxTotalPixelsHard: mediaImageConfig.max_total_pixels_hard ?? 1_843_200,
-        minShortestSide: mediaImageConfig.min_shortest_side ?? 480,
-        maxBytes: mediaImageConfig.max_bytes ?? 1_048_576,
-        mozjpeg: mediaImageConfig.mozjpeg ?? true,
-      },
+      imageProcessing: inferenceImageOptions,
     })],
     ["video", new ConcurrencyLimitedInferenceClient({
       modality: "video",
@@ -474,7 +482,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
-      createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient, config: config.danbooru }),
+      createDanbooruTool({
+        workspaceRoot,
+        downloadSizeLimit,
+        inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+        inferenceImageOptions,
+        fetchClient,
+        config: config.danbooru,
+      }),
       createUserProfileReadTool({
         workspaceRoot,
         provider: inbound.provider,

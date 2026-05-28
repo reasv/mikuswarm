@@ -1,9 +1,14 @@
 import fs from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import {
+  conditionImageBufferForInference,
+  type ImageProcessingOptions,
+} from "../media/index.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -123,6 +128,7 @@ type DanbooruPost = {
   score: number;
   fav_count: number;
   file_ext?: string | null;
+  file_size?: number | null;
   image_width?: number | null;
   image_height?: number | null;
   tag_string?: string;
@@ -134,7 +140,7 @@ type DanbooruPost = {
   file_url?: string | null;
   large_file_url?: string | null;
   preview_file_url?: string | null;
-  created_at?: string;
+  created_at?: string | null;
   source?: string | null;
 };
 
@@ -190,7 +196,25 @@ type DanbooruFetchResponse = {
 
 export interface DanbooruToolContext {
   workspaceRoot: string;
+  /**
+   * Hard fetch ceiling — refuses to download responses larger than this.
+   * The `download` action keeps this as its only size gate (we never want to
+   * resize bytes we are saving to disk).
+   */
   downloadSizeLimit: number;
+  /**
+   * Per-image byte cap for the inline base64 emission path (`preview`). The
+   * fetched bytes are conditioned through `conditionImageBufferForInference`
+   * to land under this ceiling before being sent to the model. Derived from
+   * the default model's `image_input_bytes` setting.
+   */
+  inlineImageMaxBytes: number;
+  /**
+   * Sharp resize options for the inline preview path. Mirrors the captioning
+   * pool's image conditioning so the inline path applies the same compress/
+   * convert pipeline (re-encode to JPEG, downscale on overflow).
+   */
+  inferenceImageOptions: ImageProcessingOptions;
   fetchClient: ConcurrencyLimitedFetchClient;
   config?: {
     base_url?: string;
@@ -346,6 +370,29 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
 
   const authHeader = buildAuthHeader(config);
 
+  if (authHeader) {
+    // Refuse to send Basic credentials over plaintext HTTP. The operator may
+    // have misconfigured `base_url` (e.g. `http://danbooru.donmai.us`), in
+    // which case the login/api_key would be sent in cleartext on every
+    // request. Surface the misconfiguration loudly at tool construction
+    // rather than after credentials have already leaked on the wire.
+    let parsed: URL;
+    try {
+      parsed = new URL(config.baseUrl);
+    } catch {
+      throw new Error(
+        `Danbooru base_url is not a valid URL: ${config.baseUrl}. Cannot send Basic credentials safely.`,
+      );
+    }
+    if (parsed.protocol === "http:") {
+      throw new Error(
+        `Refusing to send Basic credentials over plaintext HTTP. ` +
+          `Danbooru base_url is "${config.baseUrl}" — set it to an https:// URL ` +
+          `or remove the danbooru.login / danbooru.api_key settings.`,
+      );
+    }
+  }
+
   return {
     name: "danbooru",
     label: "Danbooru",
@@ -444,25 +491,45 @@ async function executePreview(input: {
     throw new Error(`Preview fetch failed with HTTP ${fetched.statusCode}`);
   }
 
-  let buffer: Buffer;
+  let rawBuffer: Buffer;
   try {
-    buffer = await fs.readFile(fetched.path);
+    rawBuffer = await fs.readFile(fetched.path);
   } finally {
     await fs.unlink(fetched.path).catch(() => {});
   }
 
-  const mimeType = resolveImageMimeType({
+  const sourceMimeType = resolveImageMimeType({
     assetUrl,
     contentType: fetched.contentType,
     post,
   });
-  if (!mimeType) {
+  if (!sourceMimeType) {
     return textError(
       `Post #${postId} ${variant} asset is not an image that can be returned inline to the model.`,
     );
   }
 
+  // Inline emission must always fit under the per-image byte cap. Route the
+  // fetched bytes through the same conditioning pipeline used by captioning
+  // (resize + re-encode to JPEG) with `maxBytes` set to the per-image
+  // ceiling. This is the explicit operator guidance: inline image paths
+  // never just gate size — they always try to compress/convert to fit.
+  const inlineOptions: ImageProcessingOptions = {
+    ...input.context.inferenceImageOptions,
+    maxBytes: input.context.inlineImageMaxBytes,
+  };
+  let conditioned: { buffer: Buffer; mimeType: string; sizeBytes: number };
+  try {
+    conditioned = await conditionImageBufferForInference(rawBuffer, inlineOptions);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return textError(
+      `Post #${postId} ${variant} asset could not be conditioned for inline preview: ${detail}`,
+    );
+  }
+
   const pageUrl = buildPostUrl(input.config, post.id);
+  const conditionedKb = (conditioned.sizeBytes / 1024).toFixed(1);
   const text = [
     "## Danbooru Preview",
     "",
@@ -471,7 +538,8 @@ async function executePreview(input: {
     "How this worked:",
     `- fetched metadata from \`/posts/${post.id}.json\``,
     `- selected the ${variant} asset URL`,
-    `- fetched the binary asset`,
+    `- fetched the binary asset (source type: ${sourceMimeType})`,
+    `- re-encoded to ${conditioned.mimeType} at ${conditionedKb} KB to fit the per-image cap`,
     `- returned the asset as an inline image block in the tool result`,
     "",
     "Useful URLs:",
@@ -484,14 +552,20 @@ async function executePreview(input: {
   return {
     content: [
       { type: "text" as const, text },
-      { type: "image" as const, data: buffer.toString("base64"), mimeType },
+      {
+        type: "image" as const,
+        data: conditioned.buffer.toString("base64"),
+        mimeType: conditioned.mimeType,
+      },
     ],
     details: {
       action: "preview",
       post: summarizePost(post, input.config),
       variant,
       assetUrl,
-      mimeType,
+      sourceMimeType,
+      mimeType: conditioned.mimeType,
+      inlineSizeBytes: conditioned.sizeBytes,
       pageUrl,
     },
   };
@@ -585,6 +659,21 @@ async function executeDownload(input: {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/** Identifier for outbound Danbooru requests. Surfaced in `User-Agent`. */
+const DANBOORU_USER_AGENT = "MikuAgent/0.1 (mikuswarm)";
+/**
+ * Per-request timeout for Danbooru JSON calls. The endpoint is fast in
+ * practice; if it stalls past this we'd rather fail the tool call than block
+ * a session indefinitely.
+ */
+const DANBOORU_FETCH_TIMEOUT_MS = 30_000;
+/**
+ * Response-body byte cap for `/posts.json` and `/posts/<id>.json`. Even at
+ * `limit=200` the JSON is well under 1 MiB, so 4 MiB leaves comfortable
+ * headroom while refusing pathological payloads.
+ */
+const DANBOORU_FETCH_MAX_BYTES = 4 * 1024 * 1024;
+
 async function fetchJson<T>(
   baseUrl: string,
   pathname: string,
@@ -593,17 +682,65 @@ async function fetchJson<T>(
 ): Promise<T> {
   const url = new URL(pathname, baseUrl);
   url.search = params.toString();
-  const response = await globalThis.fetch(url, {
-    method: "GET",
-    headers: {
-      accept: "application/json",
-      ...(authHeader ? { authorization: authHeader } : {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(await buildDanbooruHttpError(response));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DANBOORU_FETCH_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await globalThis.fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        accept: "application/json",
+        "user-agent": DANBOORU_USER_AGENT,
+        ...(authHeader ? { authorization: authHeader } : {}),
+      },
+    });
+  } catch (error) {
+    clearTimeout(timeout);
+    if ((error as { name?: string })?.name === "AbortError") {
+      throw new Error(
+        `Danbooru request timed out after ${DANBOORU_FETCH_TIMEOUT_MS}ms: ${url.pathname}`,
+      );
+    }
+    throw error;
   }
-  return (await response.json()) as T;
+  try {
+    if (!response.ok) {
+      throw new Error(await buildDanbooruHttpError(response));
+    }
+    // Pre-flight: refuse early when the server declared an oversized body.
+    const declared = Number(response.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > DANBOORU_FETCH_MAX_BYTES) {
+      throw new Error(
+        `Danbooru response too large: declared content-length ${declared} > ${DANBOORU_FETCH_MAX_BYTES} bytes.`,
+      );
+    }
+    // Read the body with a running byte counter so a server that lies about
+    // (or omits) content-length still can't blow the budget.
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return (await response.json()) as T;
+    }
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > DANBOORU_FETCH_MAX_BYTES) {
+        controller.abort();
+        throw new Error(
+          `Danbooru response exceeded ${DANBOORU_FETCH_MAX_BYTES} bytes; aborting.`,
+        );
+      }
+      chunks.push(value);
+    }
+    const combined = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+    return JSON.parse(combined.toString("utf8")) as T;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function buildAuthHeader(config: DanbooruConfig): string | undefined {
@@ -655,11 +792,17 @@ function buildSearchQuery(
   const excludeTags = normalizeTagTerms(params.excludeTags, true);
   const extraTerms = normalizeFreeformTerms(params.extraTerms);
   validateExtraTerms(extraTerms);
-  const regularTagCount = includeTags.length + excludeTags.length;
+  // `extraTerms` are arbitrary Danbooru search terms (e.g. `score:>100`).
+  // Each entry contributes one term to the final query, so it must count
+  // against the same budget as `includeTags` / `excludeTags` — otherwise a
+  // caller could route an unlimited number of tag-equivalent expressions
+  // through `extraTerms` and bypass the regular-tag cap entirely.
+  const regularTagCount = includeTags.length + excludeTags.length + extraTerms.length;
   if (regularTagCount > config.maxRegularTags) {
     throw new Error(
-      `This workspace is configured for at most ${config.maxRegularTags} regular tags per search. ` +
-        `Reduce includeTags/excludeTags or raise max_regular_tags if your account tier allows more.`,
+      `This workspace is configured for at most ${config.maxRegularTags} regular tags per search ` +
+        `(includeTags + excludeTags + extraTerms). ` +
+        `Reduce these or raise max_regular_tags if your account tier allows more.`,
     );
   }
 
@@ -753,8 +896,13 @@ function buildSearchOutput(input: {
       .slice(0, 12)
       .join(" ");
     lines.push(
-      `- #${post.id} | rating=${post.rating} | score=${post.score} | favs=${post.fav_count} | ${post.image_width ?? "?"}x${post.image_height ?? "?"} | ext=${post.file_ext ?? "?"}`,
+      `- #${post.id} | rating=${post.rating} | score=${post.score} | favs=${post.fav_count} | ${post.image_width ?? "?"}x${post.image_height ?? "?"} | ext=${post.file_ext ?? "?"} | size=${formatFileSize(post.file_size)} | created=${post.created_at ?? "?"}`,
     );
+    if (post.source) {
+      // `source` is uploader-controlled text — surface verbatim so the agent
+      // sees it as data, never feed it into any fetcher.
+      lines.push(`  source: ${post.source}`);
+    }
     if (generalTags) {
       lines.push(`  tags: ${generalTags}`);
     }
@@ -778,6 +926,12 @@ function summarizePost(post: DanbooruPost, config: DanbooruConfig) {
     width: post.image_width ?? null,
     height: post.image_height ?? null,
     fileExt: post.file_ext ?? null,
+    fileSize: post.file_size ?? null,
+    createdAt: post.created_at ?? null,
+    // `source` is uploader-controlled free text. Surface it verbatim in
+    // tool output as data only — never feed it back into `fetchClient` or
+    // any other URL-consuming path.
+    source: post.source ?? null,
     previewUrl: post.preview_file_url ?? null,
     sampleUrl: post.large_file_url ?? null,
     originalUrl: post.file_url ?? null,
@@ -790,6 +944,15 @@ function buildPostUrl(config: DanbooruConfig, postId: number): string {
 
 function formatList(values: readonly string[]): string {
   return values.length > 0 ? values.map((value) => `\`${value}\``).join(", ") : "(none)";
+}
+
+function formatFileSize(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) {
+    return "?";
+  }
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 // ---------------------------------------------------------------------------
@@ -818,11 +981,40 @@ function normalizeFreeformTerms(values: readonly string[] | undefined): string[]
     .filter(Boolean);
 }
 
+/**
+ * Metatag keys that the structured `DanbooruToolParams` fields are the sole
+ * source of. Allowing them through `extraTerms` would let a caller inject a
+ * second `rating:` / `order:` / `limit:` term after the validated one,
+ * which Danbooru happily accepts and which would silently override the
+ * structured selection. Comparison is case-insensitive (Danbooru is).
+ */
+const RESERVED_METATAG_KEYS: ReadonlySet<string> = new Set(["rating", "order", "limit"]);
+
 function validateExtraTerms(values: readonly string[]): void {
   for (const value of values) {
-    if (!value.includes(":")) {
+    if (/\s/.test(value)) {
+      // Joining the final query with spaces means one entry containing
+      // whitespace would silently become N tag terms after Danbooru parses
+      // it — bypassing both the metatag-only check and the per-term length
+      // limit. Reject up front.
+      throw new Error(
+        `extraTerms entries must not contain whitespace. Pass each term as its own array element: "${value}"`,
+      );
+    }
+    // A metatag may be negated with a leading `-` (e.g. `-rating:e`). Strip
+    // it for the key-overlap check so the structured-field carve-out
+    // catches both polarities.
+    const unsigned = value.startsWith("-") ? value.slice(1) : value;
+    const colonIndex = unsigned.indexOf(":");
+    if (colonIndex <= 0) {
       throw new Error(
         `extraTerms only supports Danbooru metatags, not plain tags. Move "${value}" into includeTags or excludeTags.`,
+      );
+    }
+    const key = unsigned.slice(0, colonIndex).toLowerCase();
+    if (RESERVED_METATAG_KEYS.has(key)) {
+      throw new Error(
+        `extraTerms must not set "${key}:" — use the structured ${key === "rating" ? "includeRatings/excludeRatings" : key} field instead. Offending term: "${value}"`,
       );
     }
   }
@@ -911,6 +1103,14 @@ function resolveOutputSubdir(outputSubdir: string | undefined, config: DanbooruC
   return portable;
 }
 
+/**
+ * Cap on collision-suffix retries. The previous unbounded loop could spin
+ * indefinitely under sustained concurrent calls into the same directory;
+ * after this many attempts we fall back to a random nonce to break the
+ * spiral while still avoiding a clobber.
+ */
+const DOWNLOAD_COLLISION_RETRY_CAP = 100;
+
 async function writeDownload(input: {
   dir: string;
   fileName: string | undefined;
@@ -920,27 +1120,79 @@ async function writeDownload(input: {
 }): Promise<string> {
   const ext = inferExtension(input.fileName, input.post, input.assetUrl);
   const preferredBase = sanitizeFileBaseName(input.fileName) ?? `danbooru-${input.post.id}`;
-  let filePath = path.join(input.dir, `${preferredBase}.${ext}`);
-  let suffix = 1;
 
-  while (await fileExists(filePath)) {
-    filePath = path.join(input.dir, `${preferredBase}-${suffix}.${ext}`);
-    suffix += 1;
+  // Use `fs.open(path, "wx")` (exclusive create) so the existence check and
+  // the create are a single atomic syscall — two concurrent downloads of
+  // the same post can no longer pick the same suffix between the `exists`
+  // check and the `writeFile`. `EEXIST` means another writer beat us to
+  // that suffix; bump and retry.
+  let suffix = 0;
+  for (let attempt = 0; attempt <= DOWNLOAD_COLLISION_RETRY_CAP; attempt++) {
+    const candidate =
+      suffix === 0
+        ? path.join(input.dir, `${preferredBase}.${ext}`)
+        : path.join(input.dir, `${preferredBase}-${suffix}.${ext}`);
+    try {
+      const handle = await fs.open(candidate, "wx");
+      try {
+        await handle.writeFile(input.buffer);
+      } finally {
+        await handle.close();
+      }
+      return candidate;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== "EEXIST") throw error;
+      suffix += 1;
+    }
   }
 
-  await fs.writeFile(filePath, input.buffer);
-  return filePath;
+  // We hit the retry cap. Append a random nonce so we still find a free
+  // name in one shot instead of looping forever; the nonce also keeps the
+  // base name human-recognizable for the operator.
+  const nonce = randomBytes(6).toString("hex");
+  const fallback = path.join(input.dir, `${preferredBase}-${nonce}.${ext}`);
+  const handle = await fs.open(fallback, "wx");
+  try {
+    await handle.writeFile(input.buffer);
+  } finally {
+    await handle.close();
+  }
+  return fallback;
 }
+
+/**
+ * Allow-list of file extensions an agent-supplied `filename` is permitted to
+ * carry. Anything outside this set silently falls back to the post's
+ * `file_ext` so a hostile prompt can't coerce a Danbooru download into a
+ * `.html` / `.exe` / `.bat` blob on disk by passing a misleading name.
+ *
+ * Mirrors Danbooru's documented set of acceptable upload formats.
+ */
+const ALLOWED_FILENAME_EXTENSIONS: ReadonlySet<string> = new Set([
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "mp4",
+  "webm",
+  "zip",
+  "swf",
+]);
 
 function inferExtension(
   explicitFileName: string | undefined,
   post: DanbooruPost,
   assetUrl: string,
 ): string {
-  const explicitExt = explicitFileName ? path.extname(explicitFileName).replace(/^\./, "") : "";
-  if (explicitExt) {
-    return explicitExt.toLowerCase();
+  const explicitExt = explicitFileName ? path.extname(explicitFileName).replace(/^\./, "").toLowerCase() : "";
+  if (explicitExt && ALLOWED_FILENAME_EXTENSIONS.has(explicitExt)) {
+    return explicitExt;
   }
+  // Explicit extension was either absent or not in the allow-list. Fall
+  // through to the post-derived defaults so a misleading `filename`
+  // (e.g. "owned.html") can't dictate the on-disk extension.
   const postExt = (post.file_ext ?? "").trim();
   if (postExt) {
     return postExt.toLowerCase();
@@ -965,15 +1217,6 @@ function sanitizeFileBaseName(value: string | undefined): string | undefined {
   const base = path.basename(raw, path.extname(raw));
   const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return cleaned || undefined;
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function resolveImageMimeType(input: {

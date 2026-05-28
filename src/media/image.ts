@@ -33,34 +33,52 @@ export async function processImageForInference(
   // `data:`, closing that exfiltration channel. The single read also
   // replaces what was previously three independent reads of the same file.
   const buffer = await readFile(inputPath);
+  const conditioned = await conditionImageBufferForInference(buffer, options);
+  const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
+  await writeFile(tmpPath, conditioned.buffer);
+  return {
+    path: tmpPath,
+    mimeType: conditioned.mimeType,
+    sizeBytes: conditioned.sizeBytes,
+    truncated: conditioned.truncated,
+  };
+}
 
-  const metadata = await sharp(buffer, { limitInputPixels: SVG_MAX_INPUT_PIXELS }).metadata();
+/**
+ * In-memory variant of {@link processImageForInference}. Iteratively re-encodes
+ * the input buffer (resizing as needed) until it fits under
+ * `options.maxBytes`, returning the conditioned JPEG bytes plus metadata. Used
+ * for paths that emit base64 inline (e.g. the danbooru `preview` action) so
+ * the inline payload always lands under the per-image cap without a tmp-file
+ * detour.
+ */
+export async function conditionImageBufferForInference(
+  input: Buffer,
+  options: ImageProcessingOptions,
+): Promise<{ buffer: Buffer; mimeType: string; sizeBytes: number; truncated: boolean }> {
+  const metadata = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS }).metadata();
   const origWidth = metadata.width ?? 1;
   const origHeight = metadata.height ?? 1;
 
   const { width, height } = computeTargetDimensions(origWidth, origHeight, options);
 
   const useMozjpeg = options.mozjpeg;
-  const result = await compressToFit(buffer, width, height, options.maxBytes, useMozjpeg);
+  const result = await compressToFit(input, width, height, options.maxBytes, useMozjpeg);
   if (result) {
-    const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
-    await writeFile(tmpPath, result);
     return {
-      path: tmpPath,
+      buffer: result,
       mimeType: "image/jpeg",
       sizeBytes: result.byteLength,
       truncated: false,
     };
   }
 
-  const fallback = await sharp(buffer, { limitInputPixels: SVG_MAX_INPUT_PIXELS })
+  const fallback = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS })
     .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 60, mozjpeg: useMozjpeg })
     .toBuffer();
-  const tmpPath = join(tmpdir(), `miku-img-${randomBytes(8).toString("hex")}.jpg`);
-  await writeFile(tmpPath, fallback);
   return {
-    path: tmpPath,
+    buffer: fallback,
     mimeType: "image/jpeg",
     sizeBytes: fallback.byteLength,
     truncated: false,
