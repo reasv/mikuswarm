@@ -199,7 +199,11 @@ export const AppConfigSchema = Type.Object({
     api_key: Type.Optional(Type.String()),
     max_regular_tags: Type.Optional(Type.Number({ minimum: 1 })),
     default_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+    default_order: Type.Optional(Type.String()),
     download_subdir: Type.Optional(Type.String()),
+  })),
+  network: Type.Optional(Type.Object({
+    http_proxy_url: Type.Optional(Type.String()),
   })),
 });
 

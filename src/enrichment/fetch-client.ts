@@ -5,11 +5,24 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
+import { ProxyAgent, type Dispatcher } from "undici";
 
 export interface FetchClientOptions {
   maxConcurrency: number;
   timeoutMs: number;
   maxResponseBytes: number;
+  httpProxyUrl?: string;
+}
+
+/**
+ * Build a ProxyAgent dispatcher from an http(s) proxy URL, or return undefined
+ * when no proxy is configured. Exported so other HTTP callers (e.g. the
+ * danbooru tool's JSON metadata fetch) can share the same proxy as the
+ * binary-fetch path without each one rebuilding the agent.
+ */
+export function buildProxyDispatcher(httpProxyUrl: string | undefined): Dispatcher | undefined {
+  if (!httpProxyUrl) return undefined;
+  return new ProxyAgent(httpProxyUrl);
 }
 
 export interface FetchOptions {
@@ -26,8 +39,11 @@ export class ConcurrencyLimitedFetchClient {
     options?: FetchOptions;
   }> = [];
   private stopped = false;
+  private readonly dispatcher: Dispatcher | undefined;
 
-  constructor(private readonly options: FetchClientOptions) {}
+  constructor(private readonly options: FetchClientOptions) {
+    this.dispatcher = buildProxyDispatcher(options.httpProxyUrl);
+  }
 
   async fetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     if (this.stopped) throw new Error("FetchClient is stopped");
@@ -57,7 +73,10 @@ export class ConcurrencyLimitedFetchClient {
           signal: controller.signal,
           redirect: "follow",
           headers: { "User-Agent": "MikuAgent/1.0" },
-        });
+          // Node's native fetch is built on undici and accepts a dispatcher
+          // here at runtime, but the type is not in the lib.dom Request init.
+          ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
+        } as RequestInit);
 
         const limit = options?.maxBytes ?? this.options.maxResponseBytes;
         const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);

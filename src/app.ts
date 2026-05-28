@@ -73,6 +73,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
     timeoutMs: config.enrichment?.fetch_timeout_ms ?? 10_000,
     maxResponseBytes: downloadSizeLimit,
+    httpProxyUrl: config.network?.http_proxy_url,
   });
 
   const captioningConfig = config.captioning ?? {};
@@ -474,7 +475,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
       createWriteMemoryTool({ workspaceRoot }),
-      createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient, config: config.danbooru }),
+      createDanbooruTool({ workspaceRoot, downloadSizeLimit, fetchClient, httpProxyUrl: config.network?.http_proxy_url, config: config.danbooru }),
       createUserProfileReadTool({
         workspaceRoot,
         provider: inbound.provider,

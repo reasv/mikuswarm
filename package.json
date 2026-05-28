@@ -26,7 +26,8 @@
     "png-chunks-extract": "^1.0.0",
     "sharp": "0.34.5",
     "smol-toml": "1.6.1",
-    "tsx": "4.22.3"
+    "tsx": "4.22.3",
+    "undici": "^7.25.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.6.2",

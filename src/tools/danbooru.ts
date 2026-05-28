@@ -3,7 +3,8 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
-import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import { buildProxyDispatcher, type ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import type { Dispatcher } from "undici";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -142,6 +143,7 @@ type DanbooruConfig = {
   baseUrl: string;
   maxRegularTags: number;
   defaultLimit: number;
+  defaultOrder?: DanbooruOrder;
   downloadSubdir: string;
   login?: string;
   apiKey?: string;
@@ -192,12 +194,19 @@ export interface DanbooruToolContext {
   workspaceRoot: string;
   downloadSizeLimit: number;
   fetchClient: ConcurrencyLimitedFetchClient;
+  /**
+   * Optional http(s) proxy URL applied to JSON metadata requests in this
+   * tool. Binary asset fetches go through `fetchClient`, which is configured
+   * with the same URL at app startup.
+   */
+  httpProxyUrl?: string;
   config?: {
     base_url?: string;
     login?: string;
     api_key?: string;
     max_regular_tags?: number;
     default_limit?: number;
+    default_order?: string;
     download_subdir?: string;
   };
 }
@@ -335,16 +344,19 @@ const DanbooruToolSchema = Type.Object(
 // ---------------------------------------------------------------------------
 
 export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
+  const defaultOrder = normalizeConfiguredDefaultOrder(context.config?.default_order);
   const config: DanbooruConfig = {
     baseUrl: context.config?.base_url ?? "https://danbooru.donmai.us",
     maxRegularTags: context.config?.max_regular_tags ?? 2,
     defaultLimit: context.config?.default_limit ?? DEFAULT_SEARCH_LIMIT,
+    defaultOrder,
     downloadSubdir: context.config?.download_subdir ?? "downloads/danbooru",
     login: context.config?.login,
     apiKey: context.config?.api_key,
   };
 
   const authHeader = buildAuthHeader(config);
+  const dispatcher = buildProxyDispatcher(context.httpProxyUrl);
 
   return {
     name: "danbooru",
@@ -361,14 +373,14 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const action = params.action ?? "search";
 
       if (action === "download") {
-        return executeDownload({ context, config, authHeader, params });
+        return executeDownload({ context, config, authHeader, dispatcher, params });
       }
 
       if (action === "preview") {
-        return executePreview({ context, config, authHeader, params });
+        return executePreview({ context, config, authHeader, dispatcher, params });
       }
 
-      return executeSearch({ config, authHeader, params });
+      return executeSearch({ config, authHeader, dispatcher, params });
     },
   };
 }
@@ -380,6 +392,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
 async function executeSearch(input: {
   config: DanbooruConfig;
   authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
   params: DanbooruToolParams;
 }) {
   const query = buildSearchQuery(input.params, input.config);
@@ -396,6 +409,7 @@ async function executeSearch(input: {
     "/posts.json",
     searchParams,
     input.authHeader,
+    input.dispatcher,
   );
   const lines = buildSearchOutput({ query, posts, config: input.config });
 
@@ -421,6 +435,7 @@ async function executePreview(input: {
   context: DanbooruToolContext;
   config: DanbooruConfig;
   authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
   params: DanbooruToolParams;
 }) {
   const postId = resolveTargetPostId(input.params, "preview");
@@ -429,6 +444,7 @@ async function executePreview(input: {
     `/posts/${postId}.json`,
     new URLSearchParams(),
     input.authHeader,
+    input.dispatcher,
   );
   const variant = input.params.previewVariant ?? "preview";
   const assetUrl = resolveDownloadUrl(post, variant);
@@ -505,6 +521,7 @@ async function executeDownload(input: {
   context: DanbooruToolContext;
   config: DanbooruConfig;
   authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
   params: DanbooruToolParams;
 }) {
   const postId = resolveTargetPostId(input.params, "download");
@@ -513,6 +530,7 @@ async function executeDownload(input: {
     `/posts/${postId}.json`,
     new URLSearchParams(),
     input.authHeader,
+    input.dispatcher,
   );
   const variant = input.params.downloadVariant ?? "original";
   const assetUrl = resolveDownloadUrl(post, variant);
@@ -590,6 +608,7 @@ async function fetchJson<T>(
   pathname: string,
   params: URLSearchParams,
   authHeader: string | undefined,
+  dispatcher: Dispatcher | undefined,
 ): Promise<T> {
   const url = new URL(pathname, baseUrl);
   url.search = params.toString();
@@ -599,7 +618,9 @@ async function fetchJson<T>(
       accept: "application/json",
       ...(authHeader ? { authorization: authHeader } : {}),
     },
-  });
+    // Node's native fetch (undici) accepts `dispatcher` at runtime.
+    ...(dispatcher ? { dispatcher } : {}),
+  } as RequestInit);
   if (!response.ok) {
     throw new Error(await buildDanbooruHttpError(response));
   }
@@ -666,7 +687,7 @@ function buildSearchQuery(
   const includeRatings = normalizeRatings(params.includeRatings);
   const excludeRatings = normalizeRatings(params.excludeRatings);
   validateRatingSelections(includeRatings, excludeRatings);
-  const order = params.order;
+  const order = params.order ?? config.defaultOrder;
   const queryTerms = [
     ...includeTags,
     ...excludeTags.map((tag) => `-${tag}`),
@@ -856,6 +877,16 @@ function ratingToShortCode(rating: string): string {
     default:
       throw new Error(`Unsupported Danbooru rating: ${rating}`);
   }
+}
+
+function normalizeConfiguredDefaultOrder(value: string | undefined): DanbooruOrder | undefined {
+  if (!value) return undefined;
+  if (!(DANBOORU_ORDERS as readonly string[]).includes(value)) {
+    throw new Error(
+      `danbooru.default_order must be one of the supported Danbooru order values, got "${value}".`,
+    );
+  }
+  return value as DanbooruOrder;
 }
 
 function normalizeOptionalPage(page: string | undefined): string | undefined {
