@@ -9,6 +9,22 @@ import encodePngChunks from "png-chunks-encode";
 import pngTextChunk from "png-chunk-text";
 import sharp from "sharp";
 import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
+import { assertPublicHttpUrl } from "./ssrf.js";
+
+// Reject PNGs whose chunk table is structurally hostile before handing the
+// buffer to png-chunks-extract. That library pre-allocates a Uint8Array sized
+// by the declared length without bounds-checking; a malformed PNG declaring a
+// 4 GiB chunk would trigger a multi-gigabyte allocation. We cap individual
+// declared chunk lengths at 16 MiB and require that the running sum of declared
+// chunk records (length field + name + data + CRC) stays within the buffer.
+const PNG_MAX_CHUNK_DATA_LENGTH = 16 * 1024 * 1024;
+
+// Hard ceiling for `*_from_file` text inputs. Text fields in SillyTavern cards
+// are typically a few KB; 1 MiB is generous enough for unusual cases while
+// still preventing a single workspace file from being slurped wholesale into
+// model context.
+const TEXT_INPUT_FILE_MAX_BYTES = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Context
@@ -1423,12 +1439,21 @@ function backfillLooseV2Card(rawCard: unknown): unknown {
 // ---------------------------------------------------------------------------
 
 function decodeCardFromPng(buffer: Buffer): unknown {
+  validatePngChunkSizes(buffer);
   const chunks = extractPngChunks(new Uint8Array(buffer));
   for (const chunk of chunks) {
     if (chunk.name !== "tEXt") {
       continue;
     }
-    const decoded = pngTextChunk.decode(Buffer.from(chunk.data));
+    let decoded: { keyword: string; text: string };
+    try {
+      decoded = pngTextChunk.decode(Buffer.from(chunk.data));
+    } catch {
+      // A malformed tEXt chunk elsewhere in the file must not prevent us from
+      // finding the chara chunk we actually care about. Skip undecodable
+      // chunks and keep searching.
+      continue;
+    }
     if (decoded.keyword !== "chara") {
       continue;
     }
@@ -1443,16 +1468,65 @@ function decodeCardFromPng(buffer: Buffer): unknown {
 }
 
 function embedCardIntoPng(pngBuffer: Buffer, card: V2): Buffer {
+  validatePngChunkSizes(pngBuffer);
   const chunks = extractPngChunks(new Uint8Array(pngBuffer)).filter((chunk) => {
     if (chunk.name !== "tEXt") {
       return true;
     }
-    const decoded = pngTextChunk.decode(Buffer.from(chunk.data));
-    return decoded.keyword !== "chara";
+    // A tEXt chunk that fails to decode is, by definition, not the `chara`
+    // chunk we want to strip. Preserve it rather than throwing — otherwise
+    // a single malformed sibling chunk would block every edit.
+    try {
+      const decoded = pngTextChunk.decode(Buffer.from(chunk.data));
+      return decoded.keyword !== "chara";
+    } catch {
+      return true;
+    }
   });
   const payload = Buffer.from(JSON.stringify(card), "utf8").toString("base64");
   chunks.splice(chunks.length - 1, 0, pngTextChunk.encode("chara", payload));
   return Buffer.from(encodePngChunks(chunks));
+}
+
+// Pre-validate a PNG's chunk table before handing it to png-chunks-extract.
+// That library reads each chunk's declared length and immediately allocates a
+// Uint8Array of that size with no bounds check, so a 100-byte hostile PNG
+// declaring `length = 0xFFFFFFFF` would request a 4 GiB allocation. We walk
+// the table the same way the library does (read 4-byte big-endian length,
+// then skip 4-byte name + data + 4-byte CRC) and reject:
+//   - any single declared chunk-data length above 16 MiB
+//   - any chunk whose record would extend past the buffer end
+function validatePngChunkSizes(buffer: Buffer): void {
+  if (buffer.length < PNG_SIGNATURE.length + 12) {
+    // Not enough bytes for even a single chunk header + CRC; let
+    // png-chunks-extract surface the underlying decode error.
+    return;
+  }
+  let offset = PNG_SIGNATURE.length;
+  while (offset + 8 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    if (length > PNG_MAX_CHUNK_DATA_LENGTH) {
+      throw new Error(
+        `Refusing to parse PNG with oversized chunk declaration (${length} bytes > ${PNG_MAX_CHUNK_DATA_LENGTH} cap).`,
+      );
+    }
+    // record = 4-byte length + 4-byte name + N-byte data + 4-byte CRC
+    const recordEnd = offset + 4 + 4 + length + 4;
+    if (recordEnd > buffer.length) {
+      throw new Error(
+        "Refusing to parse PNG with oversized chunk declaration (chunk extends past end of buffer).",
+      );
+    }
+    const name =
+      String.fromCharCode(buffer[offset + 4]!) +
+      String.fromCharCode(buffer[offset + 5]!) +
+      String.fromCharCode(buffer[offset + 6]!) +
+      String.fromCharCode(buffer[offset + 7]!);
+    offset = recordEnd;
+    if (name === "IEND") {
+      break;
+    }
+  }
 }
 
 function isPngBuffer(buffer: Buffer): boolean {
@@ -1523,6 +1597,10 @@ async function loadImageSource(input: {
     sourceDescription = `workspace/local path \`${toWorkspaceRelativePath(input.workspaceRoot, absolutePath)}\``;
   } else {
     const url = requireString(input.imageUrl ?? "", "imageUrl");
+    // Block SSRF before any network call: same pattern as web_fetch /
+    // set-profile / send-message. Prevents AWS metadata, RFC1918, and
+    // localhost:<port> from being reachable via imageUrl.
+    await assertPublicHttpUrl(url);
     const fetched = await input.fetchClient.fetch(url, { maxBytes: input.downloadSizeLimit });
     if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
       await unlink(fetched.path).catch(() => {});
@@ -1536,7 +1614,11 @@ async function loadImageSource(input: {
     sourceDescription = `URL \`${input.imageUrl}\`${fetched.contentType ? ` (${fetched.contentType})` : ""}`;
   }
 
-  const pipeline = sharp(buffer, { animated: false });
+  // limitInputPixels caps librsvg/libvips rasterization. Without it, a
+  // crafted SVG can demand multi-gigabyte rasters even though the source
+  // buffer is tiny. Reuse the same constant the read_image and captioning
+  // pipelines already enforce.
+  const pipeline = sharp(buffer, { animated: false, limitInputPixels: SVG_MAX_INPUT_PIXELS });
   const metadata = await pipeline.metadata();
   if (!metadata.format) {
     throw new Error("The provided image could not be decoded.");
@@ -1722,11 +1804,27 @@ function resolveReadablePath(workspaceRoot: string, rawPath: string): string {
   if (!rawPath || typeof rawPath !== "string") {
     throw new Error("A non-empty file path is required.");
   }
-  return path.resolve(path.isAbsolute(rawPath) ? rawPath : path.join(workspaceRoot, rawPath));
+  // Mirror the write-side guard: reject absolute paths and `..` traversal,
+  // then resolve under workspaceRoot and re-check containment. Before this,
+  // any caller of `resolveReadablePath` (loadCardFile, loadImageSource,
+  // readTextInputFile, and every *_from_file edit op) could read arbitrary
+  // files via `/etc/passwd` or `../../something`.
+  const portable = normalizeWorkspaceOutputPath(rawPath);
+  const absolutePath = path.resolve(workspaceRoot, portable);
+  assertPathInsideWorkspace(workspaceRoot, absolutePath);
+  return absolutePath;
 }
 
 async function readTextInputFile(workspaceRoot: string, rawPath: string): Promise<string> {
   const absolutePath = resolveReadablePath(workspaceRoot, rawPath);
+  // Stat first so we refuse oversized text fields without ever buffering them.
+  // Card text fields are typically a few KB; 1 MiB is a generous ceiling.
+  const stats = await fs.stat(absolutePath);
+  if (stats.size > TEXT_INPUT_FILE_MAX_BYTES) {
+    throw new Error(
+      `Text input file ${rawPath} is ${stats.size} bytes, exceeding the ${TEXT_INPUT_FILE_MAX_BYTES}-byte limit.`,
+    );
+  }
   return fs.readFile(absolutePath, "utf8");
 }
 
