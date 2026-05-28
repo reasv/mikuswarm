@@ -9,6 +9,7 @@ import encodePngChunks from "png-chunks-encode";
 import pngTextChunk from "png-chunk-text";
 import sharp from "sharp";
 import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import { buildAssetFetchError } from "./danbooru.js";
 import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
 import { escapeAttr, escapeXml } from "../context/xml.js";
 import { assertPublicHttpUrl } from "./ssrf.js";
@@ -53,11 +54,18 @@ type ResolvedSillyTavernConfig = {
 };
 
 function resolveConfig(context: SillyTavernCardToolContext): ResolvedSillyTavernConfig {
+  const defaultExcerptChars = context.config?.default_excerpt_chars ?? 2000;
+  const maxExcerptChars = context.config?.max_excerpt_chars ?? 4000;
+  if (maxExcerptChars < defaultExcerptChars) {
+    throw new Error(
+      "sillytavern.max_excerpt_chars must be >= sillytavern.default_excerpt_chars.",
+    );
+  }
   return {
     outputSubdir: context.config?.output_subdir ?? "cards/sillytavern",
     exportSubdir: context.config?.export_subdir ?? "exports/sillytavern",
-    defaultExcerptChars: context.config?.default_excerpt_chars ?? 2000,
-    maxExcerptChars: context.config?.max_excerpt_chars ?? 4000,
+    defaultExcerptChars,
+    maxExcerptChars,
     maxSummaryEntries: context.config?.max_summary_entries ?? 20,
   };
 }
@@ -1742,11 +1750,10 @@ async function loadImageSource(input: {
     // localhost:<port> from being reachable via imageUrl.
     await assertPublicHttpUrl(url);
     const fetched = await input.fetchClient.fetch(url, { maxBytes: input.downloadSizeLimit });
-    if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
-      await unlink(fetched.path).catch(() => {});
-      throw new Error(`Image fetch failed with HTTP ${fetched.statusCode}`);
-    }
     try {
+      if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+        throw new Error(await buildAssetFetchError("Image fetch", fetched));
+      }
       buffer = await fs.readFile(fetched.path);
     } finally {
       await unlink(fetched.path).catch(() => {});
