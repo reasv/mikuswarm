@@ -132,12 +132,37 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
     const maxCharacters = args.max_characters ?? resolveMaxCharacters(options?.contextWindowTokens);
     const truncated = numbered.length > maxCharacters;
     const hasExplicitRange = args.view_range !== undefined;
-    const lastVisibleLine = truncated ? countLines(numbered, maxCharacters, selected.startLine) : selected.endLine;
-    const continuationHint = truncated && !hasExplicitRange
-      ? `\n[Showing lines ${selected.startLine}-${lastVisibleLine}. Use view_range to continue.]`
-      : truncated ? "\n[truncated]" : "";
+    let displayedText: string;
+    let lastVisibleLine: number;
+    let continuationHint: string;
+    if (truncated) {
+      const rawSlice = numbered.slice(0, maxCharacters);
+      const completeLines = (rawSlice.match(/\n/g) ?? []).length;
+      if (completeLines >= 1) {
+        // Slice back to the last newline so the visible region matches the
+        // advertised range exactly — no dangling mid-line fragment past the
+        // last advertised line.
+        const lastNewline = rawSlice.lastIndexOf("\n");
+        displayedText = rawSlice.slice(0, lastNewline);
+        lastVisibleLine = selected.startLine + completeLines - 1;
+        continuationHint = hasExplicitRange
+          ? "\n[truncated]"
+          : `\n[Showing lines ${selected.startLine}-${lastVisibleLine}. Use view_range to continue.]`;
+      } else {
+        // Budget can't even fit a single complete line — emit the partial
+        // fragment with a plain truncation marker. Floor endLine at startLine
+        // so details.endLine never falls below details.startLine.
+        displayedText = rawSlice;
+        lastVisibleLine = selected.startLine;
+        continuationHint = "\n[truncated]";
+      }
+    } else {
+      displayedText = numbered;
+      lastVisibleLine = selected.endLine;
+      continuationHint = "";
+    }
     return {
-      text: truncated ? `${numbered.slice(0, maxCharacters)}${continuationHint}` : numbered,
+      text: `${displayedText}${continuationHint}`,
       details: {
         command: args.command,
         path: workspaceRelative(workspaceRoot, absolute),
@@ -304,11 +329,9 @@ function resolveMaxCharacters(contextWindowTokens?: number): number {
     return DEFAULT_MAX_CHARACTERS;
   }
   const fromContext = Math.floor((contextWindowTokens as number) * CHARS_PER_TOKEN * ADAPTIVE_CONTEXT_SHARE);
-  return Math.max(MIN_ADAPTIVE_BUDGET, Math.min(MAX_ADAPTIVE_BUDGET, fromContext));
-}
-
-function countLines(numbered: string, maxChars: number, startLine: number): number {
-  const truncated = numbered.slice(0, maxChars);
-  const completeLines = (truncated.match(/\n/g) ?? []).length;
-  return startLine + completeLines - 1;
+  // Apply the MIN_ADAPTIVE_BUDGET floor only when the context's share is at
+  // least half of it — otherwise the floor would blow a small-context model's
+  // entire window on a single tool result. Always cap at MAX_ADAPTIVE_BUDGET.
+  const floored = fromContext * 2 >= MIN_ADAPTIVE_BUDGET ? Math.max(MIN_ADAPTIVE_BUDGET, fromContext) : fromContext;
+  return Math.max(1, Math.min(MAX_ADAPTIVE_BUDGET, floored));
 }

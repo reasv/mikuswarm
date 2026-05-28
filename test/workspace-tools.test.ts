@@ -303,17 +303,19 @@ test("adaptive paging truncates large files with continuation hint", async () =>
       path: "big.txt",
       file_text: bigContent,
     });
-    // contextWindowTokens=10000 → budget = 10000*4*0.2 = 8000, clamped to min 50000
+    // contextWindowTokens=80000 → fromContext = 80000*4*0.2 = 64000 chars,
+    // which is above MIN_ADAPTIVE_BUDGET so resolveMaxCharacters returns
+    // 64000. The file is ~78000 chars numbered, so this triggers truncation.
     const result = await runTextEditorCommand(
       workspace,
       { command: "view", path: "big.txt" },
-      { contextWindowTokens: 10000 },
+      { contextWindowTokens: 80000 },
     );
     assert.match(result.text, /Use view_range to continue/);
     assert.equal(result.details.truncated, true);
 
     // The hint must declare an exact line range. Numbered lines look like
-    // "<n>: line <n>"; the budget is 50000 chars at the min clamp. We require:
+    // "<n>: line <n>"; we require:
     //   1. The hint references "Showing lines 1-<endLine>".
     //   2. <endLine> equals details.endLine (set to the last fully-visible line).
     //   3. <endLine> is strictly less than the file's line count (i.e. the
@@ -332,6 +334,146 @@ test("adaptive paging truncates large files with continuation hint", async () =>
     assert.ok(result.text.includes(expectedLastLine), `expected last fully-visible line ${expectedLastLine}`);
     const overshootLine = `${hintEnd + 1}: line ${hintEnd + 1}`;
     assert.ok(!result.text.includes(overshootLine), `line ${hintEnd + 1} should not be fully visible`);
+  });
+});
+
+test("adaptive paging trims mid-line fragments so visible region matches advertised range", async () => {
+  // Regression: pre-fix, slicing at maxCharacters could leave a partial
+  // "<N>: " prefix for the next line past the advertised last line, e.g.
+  // "…3263: line 3263\n3264: " with hint "Showing lines 1-3263". The displayed
+  // tail past the last \n must be stripped so the visible region matches the
+  // advertised range exactly.
+  await withWorkspace(async (workspace) => {
+    const bigContent = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n");
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "midcut.txt",
+      file_text: bigContent,
+    });
+    // Choose max_characters that lands in the middle of a numbered line.
+    // Numbered lines are "1: line 1\n" (10 chars) ... "10: line 10\n" (12 chars).
+    // 25 chars puts us mid-line at line 3 ("1: line 1\n2: line 2\n3: lin")
+    // which has 2 newlines → completeLines=2 → lastVisibleLine=2.
+    const result = await runTextEditorCommand(workspace, {
+      command: "view",
+      path: "midcut.txt",
+      max_characters: 25,
+    });
+    assert.equal(result.details.truncated, true);
+    assert.equal(result.details.endLine, 2, "endLine must be the last fully-visible line");
+    // The dangling "3: lin" fragment must be removed from the visible body.
+    // The text is everything up to the last \n, plus the continuation hint.
+    // It must end with "2: line 2" (the last complete line) before the hint.
+    assert.ok(
+      result.text.includes("1: line 1\n2: line 2"),
+      `expected complete lines 1-2 before truncation hint; got ${JSON.stringify(result.text)}`,
+    );
+    assert.ok(
+      !result.text.includes("3: lin"),
+      `partial line 3 fragment must be stripped; got ${JSON.stringify(result.text)}`,
+    );
+  });
+});
+
+test("adaptive paging handles max_characters too small to fit even one line", async () => {
+  // Regression for #4: countLines previously returned startLine-1 when the
+  // truncated prefix contained zero newlines, producing "Showing lines 1-0…"
+  // and details.endLine < details.startLine. The fix is to floor endLine at
+  // startLine and fall back to a plain [truncated] marker.
+  await withWorkspace(async (workspace) => {
+    const content = "first line that is reasonably long\nsecond\nthird\n";
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "tiny.txt",
+      file_text: content,
+    });
+    const result = await runTextEditorCommand(workspace, {
+      command: "view",
+      path: "tiny.txt",
+      max_characters: 1,
+    });
+    assert.equal(result.details.truncated, true);
+    assert.equal(result.details.startLine, 1);
+    // endLine floored at startLine — never less than startLine.
+    assert.ok(
+      result.details.endLine >= result.details.startLine,
+      `endLine (${result.details.endLine}) must not be less than startLine (${result.details.startLine})`,
+    );
+    assert.equal(result.details.endLine, 1, "endLine should be floored at startLine for zero-complete-lines");
+    // Should NOT emit a "Showing lines 1-0" hint. Should emit plain [truncated].
+    assert.ok(
+      !/Showing lines/.test(result.text),
+      `must not advertise a line range when no complete line fits; got ${JSON.stringify(result.text)}`,
+    );
+    assert.match(result.text, /\[truncated\]/);
+  });
+});
+
+test("adaptive paging: explicit view_range truncated by max_characters reports last visible line in details.endLine", async () => {
+  // Regression for #6: pins the post-change semantics where an explicit
+  // view_range=[1,N] truncated by max_characters reports details.endLine as
+  // the last visible line, not the requested end.
+  await withWorkspace(async (workspace) => {
+    const bigContent = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join("\n");
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "explicit-trunc.txt",
+      file_text: bigContent,
+    });
+    // Request lines 1-100 but cap at 40 chars. Numbered lines: "1: line 1\n"
+    // (10 chars), "2: line 2\n" (10 chars), "3: line 3\n" (10 chars),
+    // "4: line 4\n" (10 chars) = 40 chars exactly, "5: line 5\n" (10 chars)
+    // pushes total past 40 → truncates. 40 chars includes through line 4's
+    // newline → completeLines=4, lastVisibleLine=4.
+    const result = await runTextEditorCommand(workspace, {
+      command: "view",
+      path: "explicit-trunc.txt",
+      view_range: [1, 100],
+      max_characters: 40,
+    });
+    assert.equal(result.details.truncated, true);
+    assert.equal(result.details.startLine, 1);
+    // details.endLine must report the last visible line (4), NOT the requested
+    // end (100). This is the new, intended semantics — pinned by this test.
+    assert.equal(result.details.endLine, 4, "details.endLine must be the last visible line, not the requested end");
+    // Explicit range gets a plain [truncated] marker (no "Use view_range to continue"
+    // since the caller already chose a range).
+    assert.match(result.text, /\[truncated\]/);
+    assert.ok(!/Use view_range to continue/.test(result.text), "explicit range should not get continuation hint");
+  });
+});
+
+test("adaptive paging respects small context windows instead of clamping to a floor", async () => {
+  // Regression for #7: previously MIN_ADAPTIVE_BUDGET (50_000 chars ~ 12.5k
+  // tokens) was applied as a hard floor regardless of context size, which
+  // could blow a small model's entire context window on a single tool result.
+  // The fix only applies the floor when fromContext * 2 >= MIN_ADAPTIVE_BUDGET.
+  await withWorkspace(async (workspace) => {
+    // Build a file whose numbered output is between fromContext and
+    // MIN_ADAPTIVE_BUDGET so the floor's behavior is observable. At 10000
+    // tokens, fromContext = 10000 * 4 * 0.2 = 8000 chars; the old behavior
+    // would clamp to 50000, the new behavior keeps it at 8000.
+    const lines = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}`);
+    const bigContent = lines.join("\n");
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "small-context.txt",
+      file_text: bigContent,
+    });
+    const result = await runTextEditorCommand(
+      workspace,
+      { command: "view", path: "small-context.txt" },
+      { contextWindowTokens: 10000 },
+    );
+    assert.equal(result.details.truncated, true);
+    // Strip the continuation hint to measure the visible body length.
+    const bodyOnly = result.text.replace(/\n\[Showing lines [^\]]+\]$/, "").replace(/\n\[truncated\]$/, "");
+    assert.ok(
+      bodyOnly.length <= 8000,
+      `body length (${bodyOnly.length}) must be capped at fromContext (8000) for a 10000-token model, not raised to MIN_ADAPTIVE_BUDGET`,
+    );
+    // Sanity: it should still emit some content (more than zero lines).
+    assert.ok(result.details.endLine >= 1);
   });
 });
 
