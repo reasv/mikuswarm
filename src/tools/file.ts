@@ -18,7 +18,8 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
   return {
     name: "str_replace_based_edit_tool",
     label: "Text editor",
-    description: "View, create, and edit text files in the workspace using Claude's str_replace editor commands. For str_replace, pass either a single old_str/new_str pair or an edits array; the edits array applies multiple replacements sequentially with all-or-nothing semantics (if any edit fails to match, the file is left unchanged).",
+    description: "View, create, and edit text files in the workspace using Claude's str_replace editor commands. For str_replace, pass either a single old_str/new_str pair or an edits array; the edits array applies multiple replacements sequentially with all-or-nothing semantics (if any edit fails to match, the file is left unchanged). Edits in the batch apply against the in-progress buffer: an earlier edit's new_str is visible to later edits' old_str matches. For swap-style transforms (A→B and B→A in the same file), use separate calls or include enough surrounding context to make each match unique.",
+    executionMode: "sequential",
     parameters: Type.Object({
       command: Type.Union([
         Type.Literal("view"),
@@ -274,6 +275,13 @@ function selectLineRange(content: string, range?: [number, number]) {
   const startLine = range?.[0] ?? 1;
   const requestedEnd = range?.[1] ?? -1;
   if (startLine < 1) throw new Error("view_range start must be >= 1");
+  // Refuse a start past EOF: silently returning would yield an empty slice and
+  // an endLine < startLine after Math.min, which is internally inconsistent and
+  // confuses the agent into thinking the file is shorter than it is. Throwing
+  // a specific message lets the model retry with a valid range.
+  if (startLine > lines.length) {
+    throw new Error(`view_range.start (${startLine}) is past end of file (${lines.length} lines)`);
+  }
   const endLine = requestedEnd === -1 ? lines.length : requestedEnd;
   if (endLine < startLine) throw new Error("view_range end must be >= start or -1");
   return {
@@ -339,7 +347,14 @@ function mismatchSnippet(currentContent: string): string {
 
 function mismatchError(relPath: string, oldStr: string, currentContent: string, editIndex: number, totalEdits: number): Error {
   const indexHint = totalEdits > 1 ? ` (edit ${editIndex + 1}/${totalEdits})` : "";
-  return new Error(`old_str was not found in ${relPath}${indexHint}\nCurrent file contents:\n${mismatchSnippet(currentContent)}`);
+  // CRLF hint: the `view` command splits on /\r?\n/ so what the model "saw" has
+  // no \r, but str_replace matches byte-for-byte. If the on-disk file is CRLF
+  // and the supplied old_str is LF, the match silently fails. Surfacing this
+  // up front saves a round trip.
+  const crlfHint = currentContent.includes("\r") && !oldStr.includes("\r")
+    ? "\n(file uses CRLF line endings; include \\r\\n in old_str)"
+    : "";
+  return new Error(`old_str was not found in ${relPath}${indexHint}${crlfHint}\nCurrent file contents:\n${mismatchSnippet(currentContent)}`);
 }
 
 function duplicateMatchError(relPath: string, currentContent: string, editIndex: number, totalEdits: number): Error {

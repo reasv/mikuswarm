@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import sharp from "sharp";
 import { createSearchMemoryTool, createWriteMemoryTool } from "../src/tools/memory.js";
-import { runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
+import { createTextEditorTool, runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
 import { createReadImageTool } from "../src/tools/read-image.js";
 
 test("text editor tool views, replaces, inserts, and creates within workspace", async () => {
@@ -469,6 +469,158 @@ test("single-edit dup-match error does not include the 'earlier edit' hint", asy
       },
     );
   });
+});
+
+test("view throws a specific error when view_range.start is past end of file", async () => {
+  // Regression for #18: previously selectLineRange let startLine > lines.length
+  // through, then Math.min'd endLine down to lines.length, producing an
+  // inconsistent { startLine: 100, endLine: 3 } range and a silently empty
+  // body. The fix surfaces a clear error so the model can pick a valid range.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "short.txt",
+      file_text: "a\nb\nc\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "view",
+          path: "short.txt",
+          view_range: [100, -1],
+        }),
+      (err: Error) => {
+        // Message must mention both the requested start and the file's actual
+        // line count so the model can correct itself.
+        assert.match(err.message, /view_range\.start \(100\) is past end of file \(4 lines\)/);
+        return true;
+      },
+    );
+  });
+});
+
+test("batch edits: swap-style transforms surface dup-match because edits chain", async () => {
+  // Pins documented batch-edit semantics for #19: edits apply sequentially
+  // against the in-progress buffer. Edit 1 (A→B) turns "AB" into "BB"; edit 2
+  // (B→A) then sees two B's and dup-matches. A future change that silently
+  // makes swap-style transforms "just work" without updating the tool
+  // description would break this test.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "swap.txt",
+      file_text: "AB",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "swap.txt",
+          edits: [
+            { old_str: "A", new_str: "B" },
+            { old_str: "B", new_str: "A" },
+          ],
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str matched more than once/);
+        assert.match(err.message, /edit 2\/2/);
+        // The prior-edit hint must surface because an earlier edit caused the dup.
+        assert.match(err.message, /earlier edit/i);
+        return true;
+      },
+    );
+    // All-or-nothing: file must be unchanged.
+    assert.equal(await readFile(path.join(workspace, "swap.txt"), "utf8"), "AB");
+  });
+});
+
+test("batch edits: cascading transforms (foo→bar→baz) dup-match because edit 2 sees both bars", async () => {
+  // Companion to the swap test: pins that edit 2's match is computed against
+  // the in-progress buffer (which now contains TWO "bar"s). This is the
+  // documented behavior — a separate call or more context per match is needed.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "cascade.txt",
+      file_text: "foo bar",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "cascade.txt",
+          edits: [
+            { old_str: "foo", new_str: "bar" },
+            { old_str: "bar", new_str: "baz" },
+          ],
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str matched more than once/);
+        assert.match(err.message, /edit 2\/2/);
+        return true;
+      },
+    );
+    assert.equal(await readFile(path.join(workspace, "cascade.txt"), "utf8"), "foo bar");
+  });
+});
+
+test("str_replace mismatch error includes a CRLF hint when the file is CRLF but old_str is LF", async () => {
+  // Regression for #20: view splits on /\r?\n/ so what the model "saw" has no
+  // \r, but str_replace is byte-exact. A multi-line LF old_str will silently
+  // miss against a CRLF file. The hint prods the model to retry with \r\n.
+  await withWorkspace(async (workspace) => {
+    // Write CRLF directly via the underlying fs (the editor's `create` would
+    // accept the string verbatim, but being explicit is clearer).
+    await writeFile(path.join(workspace, "crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n", "utf8");
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "crlf.txt",
+          // LF-only old_str matching two lines — would match if the file were LF.
+          old_str: "alpha\nbeta",
+          new_str: "replaced",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str was not found in crlf\.txt/);
+        assert.match(err.message, /CRLF line endings/);
+        assert.match(err.message, /include \\r\\n in old_str/);
+        return true;
+      },
+    );
+  });
+});
+
+test("str_replace mismatch error omits the CRLF hint for plain LF files", async () => {
+  // Sanity check: the CRLF hint must NOT appear when the file is LF-only.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "lf.txt",
+      file_text: "alpha\nbeta\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "lf.txt",
+          old_str: "nope",
+          new_str: "x",
+        }),
+      (err: Error) => {
+        assert.ok(!/CRLF/.test(err.message), "LF-only file must not surface a CRLF hint");
+        return true;
+      },
+    );
+  });
+});
+
+test("text editor tool declares executionMode: sequential", async () => {
+  // Pins #D: str_replace mutates a file by index, so parallel str_replace
+  // calls against the same file would race and lose writes silently. The tool
+  // must flag itself as sequential so the agent runtime serializes calls.
+  const tool = createTextEditorTool({ workspaceRoot: "/tmp/unused-for-metadata-check" });
+  assert.equal(tool.executionMode, "sequential");
 });
 
 test("create reports a workspace-relative path in 'File already exists'", async () => {
