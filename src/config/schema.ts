@@ -192,6 +192,11 @@ export const AppConfigSchema = Type.Object({
     root_dir: Type.Optional(Type.String()),
     default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
     max_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
+    // When false, `user_profile_read`/`user_profile_edit` reject explicit
+    // targets that don't match the trigger sender's (provider, sender_id).
+    // Defaults to true to preserve the previous behavior where the agent can
+    // record notes about other room members on the requester's behalf.
+    allow_cross_user_targets: Type.Optional(Type.Boolean()),
   })),
   danbooru: Type.Optional(Type.Object({
     base_url: Type.Optional(Type.String()),

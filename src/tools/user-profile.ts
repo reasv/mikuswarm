@@ -17,6 +17,7 @@ export interface UserProfileToolContext {
     root_dir?: string;
     default_excerpt_chars?: number;
     max_excerpt_chars?: number;
+    allow_cross_user_targets?: boolean;
   };
 }
 
@@ -119,6 +120,31 @@ const DEFAULT_SECTIONS = [
 ] as const;
 
 const SECTION_SET = new Set<string>(DEFAULT_SECTIONS);
+
+// Zero-width space (U+200B). Prepended to body lines that start with `# ` on
+// write so the section-heading parser ignores them when the file is re-read.
+// Stripped from each line on read so the round-tripped body matches the input.
+const HEADING_ESCAPE_CHAR = "​";
+
+// In-process mutex keyed by canonical absolute path. The agent is a single
+// Node process, so a JS-level lock is sufficient to serialize concurrent
+// `executeUserProfileEdit` calls targeting the same profile. Combined with the
+// temp-and-rename write below, this prevents read-modify-write races between
+// two parallel edits to the same file.
+const profileWriteLocks = new Map<string, Promise<unknown>>();
+
+async function withProfileWriteLock<T>(canonicalPath: string, task: () => Promise<T>): Promise<T> {
+  const prev = profileWriteLocks.get(canonicalPath) ?? Promise.resolve();
+  const next = prev.then(task, task);
+  profileWriteLocks.set(canonicalPath, next);
+  try {
+    return await next;
+  } finally {
+    if (profileWriteLocks.get(canonicalPath) === next) {
+      profileWriteLocks.delete(canonicalPath);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Parameter schemas
@@ -382,51 +408,77 @@ async function executeUserProfileEdit(input: {
     context: input.context,
     target: input.params.target,
   });
-  const resolvedPath = await resolveUserProfilePath({
-    workspaceRoot,
-    rootDir: input.context.config?.root_dir ?? "users",
-    target,
-  });
   const operations = Array.isArray(input.params.operations) ? input.params.operations : [];
   if (operations.length === 0) {
     throw new Error("operations must contain at least one edit.");
   }
 
-  if (!resolvedPath.exists && input.params.createIfMissing === false) {
-    throw new Error(`No profile exists for ${target.provider}:${target.senderId}.`);
-  }
+  // Resolve once outside the lock to determine the canonical path key. The
+  // path is deterministic from (workspaceRoot, rootDir, target), so the lock
+  // key is stable even if another writer creates the file concurrently.
+  const initialResolved = await resolveUserProfilePath({
+    workspaceRoot,
+    rootDir: input.context.config?.root_dir ?? "users",
+    target,
+  });
+  const lockKey = initialResolved.absolutePath;
 
-  const now = new Date().toISOString();
-  const existing = resolvedPath.exists
-    ? parseUserProfileDocument(await fs.readFile(resolvedPath.absolutePath, "utf8"), target)
-    : createEmptyUserProfileDocument(target, now);
-  const beforeSections = new Map(existing.sections);
-  applyUserProfileOperations(existing, operations, now);
-
-  await fs.mkdir(path.dirname(resolvedPath.absolutePath), { recursive: true });
-  await fs.writeFile(resolvedPath.absolutePath, renderUserProfileDocument(existing), "utf8");
-
-  const changedSections = collectChangedSections(beforeSections, existing.sections);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text:
-          `## User Profile Updated\n` +
-          `Target: ${target.provider}:${target.senderId}\n` +
-          `Path: \`${resolvedPath.workspacePath}\`\n` +
-          `Changed sections: ${changedSections.length > 0 ? changedSections.join(", ") : "(metadata only)"}`,
-      },
-    ],
-    details: {
-      action: resolvedPath.exists ? "updated" : "created",
+  return withProfileWriteLock(lockKey, async () => {
+    // Re-resolve inside the lock so we see any file created by a concurrent
+    // writer that finished between the outer resolve and our turn.
+    const resolvedPath = await resolveUserProfilePath({
+      workspaceRoot,
+      rootDir: input.context.config?.root_dir ?? "users",
       target,
-      path: resolvedPath.workspacePath,
-      metadata: existing.metadata,
-      changedSections,
-      operationsApplied: operations.map((operation) => operation.op),
-    },
-  };
+    });
+
+    if (!resolvedPath.exists && input.params.createIfMissing === false) {
+      throw new Error(`No profile exists for ${target.provider}:${target.senderId}.`);
+    }
+
+    const now = new Date().toISOString();
+    const existing = resolvedPath.exists
+      ? parseUserProfileDocument(await fs.readFile(resolvedPath.absolutePath, "utf8"), target)
+      : createEmptyUserProfileDocument(target, now);
+    const beforeSections = new Map(existing.sections);
+    applyUserProfileOperations(existing, operations, now);
+
+    await fs.mkdir(path.dirname(resolvedPath.absolutePath), { recursive: true });
+    // Atomic write: write to a sibling temp file, then rename. `rename` is
+    // atomic on the same filesystem, so concurrent readers either see the
+    // pre-edit content or the post-edit content — never a partial write.
+    const tempPath = `${resolvedPath.absolutePath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await fs.writeFile(tempPath, renderUserProfileDocument(existing), "utf8");
+      await fs.rename(tempPath, resolvedPath.absolutePath);
+    } catch (error) {
+      // Best-effort cleanup of the temp file on failure.
+      await fs.unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+
+    const changedSections = collectChangedSections(beforeSections, existing.sections);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text:
+            `## User Profile Updated\n` +
+            `Target: ${target.provider}:${target.senderId}\n` +
+            `Path: \`${resolvedPath.workspacePath}\`\n` +
+            `Changed sections: ${changedSections.length > 0 ? changedSections.join(", ") : "(metadata only)"}`,
+        },
+      ],
+      details: {
+        action: resolvedPath.exists ? "updated" : "created",
+        target,
+        path: resolvedPath.workspacePath,
+        metadata: existing.metadata,
+        changedSections,
+        operationsApplied: operations.map((operation) => operation.op),
+      },
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +508,16 @@ function resolveUserProfileTarget(input: {
   const senderId = normalizeOptionalText(input.target?.senderId);
   if (!provider || !senderId) {
     throw new Error("explicit targets require provider and senderId.");
+  }
+  const allowCrossUser = input.context.config?.allow_cross_user_targets ?? true;
+  if (!allowCrossUser) {
+    const triggerProvider = normalizeProvider(input.context.provider);
+    const triggerSenderId = normalizeOptionalText(input.context.senderId);
+    if (provider !== triggerProvider || senderId !== triggerSenderId) {
+      throw new Error(
+        "cross-user user_profile targets are disabled (set user_profiles.allow_cross_user_targets = true to enable).",
+      );
+    }
   }
   return {
     provider,
@@ -542,7 +604,8 @@ function createEmptyUserProfileDocument(
     aliases: [target.senderId],
     createdAt: now,
     updatedAt: now,
-    version: 1,
+    // Bumped to 1 on first save by `applyUserProfileOperations`.
+    version: 0,
   };
   const sections = new Map<string, string>();
   for (const section of DEFAULT_SECTIONS) {
@@ -608,11 +671,40 @@ function renderUserProfileDocument(document: UserProfileDocument): string {
 
   const sectionNames = orderedSectionNames(document.sections);
   const renderedSections = sectionNames.map((section) => {
-    const text = (document.sections.get(section) ?? "").trim();
+    const text = encodeSectionBodyForWrite((document.sections.get(section) ?? "").trim());
     return `# ${section}\n\n${text}`;
   });
 
   return `${metadataLines.join("\n")}${renderedSections.join("\n\n")}\n`;
+}
+
+// Escape body lines that would otherwise be picked up as ATX headings by the
+// section parser (which splits on `^# ...$`). We prepend a zero-width space
+// before the `#`, then strip it back out on read. The result is invisible in
+// rendered Markdown but the line is no longer a heading. See issue #15.
+function encodeSectionBodyForWrite(body: string): string {
+  if (!body) {
+    return "";
+  }
+  return body
+    .split("\n")
+    .map((line) => (/^#\s+/.test(line) ? `${HEADING_ESCAPE_CHAR}${line}` : line))
+    .join("\n");
+}
+
+const ESCAPED_HEADING_PREFIX_PATTERN = new RegExp(`^${HEADING_ESCAPE_CHAR}#\\s+`);
+
+function decodeSectionBodyFromRead(body: string): string {
+  if (!body || !body.includes(HEADING_ESCAPE_CHAR)) {
+    return body;
+  }
+  // Only strip the escape when it is the first character of a line AND
+  // immediately precedes `#` followed by whitespace. We must NOT touch
+  // zero-width spaces embedded mid-line in user content.
+  return body
+    .split("\n")
+    .map((line) => (ESCAPED_HEADING_PREFIX_PATTERN.test(line) ? line.slice(1) : line))
+    .join("\n");
 }
 
 function applyUserProfileOperations(
@@ -682,7 +774,12 @@ function applyUserProfileOperations(
     deriveProviderUsername(document.metadata.provider, document.metadata.senderId);
   document.metadata.aliases = uniqueStrings([document.metadata.senderId, ...document.metadata.aliases]);
   document.metadata.updatedAt = now;
-  document.metadata.version = 1;
+  // Monotonic version counter — useful for log traceability and downstream
+  // observers that want to detect "did anyone edit this since I last read it".
+  // Combined with the in-process mutex in `executeUserProfileEdit`, this
+  // guarantees that two sequential edits land as version+1 and version+2.
+  const currentVersion = typeof document.metadata.version === "number" ? document.metadata.version : 0;
+  document.metadata.version = currentVersion + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,20 +822,36 @@ async function findExistingUserProfilePath(params: {
   if (!(await pathExists(rootAbsolutePath))) {
     return undefined;
   }
-  const candidates = await listMarkdownFiles(rootAbsolutePath);
+
+  // Restrict the scan to direct children of `users/<provider>/`. Markdown files
+  // in sibling directories (e.g. `users/notes/`) or in deeper subdirectories
+  // (e.g. `users/matrix/sub/user.md`) are NOT eligible for lookup. This bounds
+  // both the scan cost and the prompt-injection surface — a malicious file
+  // planted outside `users/<target.provider>/` cannot hijack a profile lookup.
+  const providerDirAbsolutePath = path.resolve(rootAbsolutePath, params.target.provider);
+  if (!(await pathExists(providerDirAbsolutePath))) {
+    return undefined;
+  }
+  const candidates = await listProviderMarkdownFiles(providerDirAbsolutePath);
+
   const legacyRelativePath = buildLegacyMatrixWorkspacePath(params.rootDir, params.target);
   const legacyAbsolutePath = legacyRelativePath
     ? path.resolve(params.workspaceRoot, legacyRelativePath)
     : undefined;
+
+  // The legacy Matrix layout (`users/<localpart>__<homeserver>.md`) lives at
+  // the `users/` root, NOT under `users/matrix/`. Honour it explicitly so the
+  // one-time migration path still works without re-introducing the recursive
+  // scan.
+  if (legacyAbsolutePath && (await pathExists(legacyAbsolutePath))) {
+    return {
+      absolutePath: legacyAbsolutePath,
+      workspacePath: toWorkspaceRelativePath(params.workspaceRoot, legacyAbsolutePath),
+      exists: true,
+    };
+  }
+
   for (const absolutePath of candidates) {
-    const relativePath = toWorkspaceRelativePath(params.workspaceRoot, absolutePath);
-    if (legacyAbsolutePath && absolutePath === legacyAbsolutePath) {
-      return {
-        absolutePath,
-        workspacePath: relativePath,
-        exists: true,
-      };
-    }
     const raw = await fs.readFile(absolutePath, "utf8");
     const parsed = parseUserProfileFrontmatter(raw).metadata;
     if (
@@ -747,7 +860,7 @@ async function findExistingUserProfilePath(params: {
     ) {
       return {
         absolutePath,
-        workspacePath: relativePath,
+        workspacePath: toWorkspaceRelativePath(params.workspaceRoot, absolutePath),
         exists: true,
       };
     }
@@ -755,22 +868,18 @@ async function findExistingUserProfilePath(params: {
   return undefined;
 }
 
-async function listMarkdownFiles(rootAbsolutePath: string): Promise<string[]> {
+async function listProviderMarkdownFiles(providerDirAbsolutePath: string): Promise<string[]> {
   const discovered: string[] = [];
-  const entries = await fs.readdir(rootAbsolutePath, { withFileTypes: true });
+  const entries = await fs.readdir(providerDirAbsolutePath, { withFileTypes: true });
   for (const entry of entries) {
-    const absolutePath = path.join(rootAbsolutePath, entry.name);
-    if (entry.isDirectory()) {
-      discovered.push(...(await listMarkdownFiles(absolutePath)));
-      continue;
-    }
+    // Direct children only — no recursion into subdirectories.
     if (!entry.isFile() || !entry.name.endsWith(".md")) {
       continue;
     }
     if (entry.name === "README.md" || entry.name === "_TEMPLATE.md") {
       continue;
     }
-    discovered.push(absolutePath);
+    discovered.push(path.join(providerDirAbsolutePath, entry.name));
   }
   return discovered.sort();
 }
@@ -872,7 +981,7 @@ function parseUserProfileSections(raw: string): Map<string, string> {
     const headingMatch = line.match(/^#\s+(.+?)\s*$/);
     if (headingMatch) {
       if (currentSection) {
-        sections.set(currentSection, normalizeSectionBody(buffer.join("\n")));
+        sections.set(currentSection, decodeSectionBodyFromRead(normalizeSectionBody(buffer.join("\n"))));
       }
       currentSection = normalizeSectionName(headingMatch[1]);
       buffer = [];
@@ -883,7 +992,7 @@ function parseUserProfileSections(raw: string): Map<string, string> {
     }
   }
   if (currentSection) {
-    sections.set(currentSection, normalizeSectionBody(buffer.join("\n")));
+    sections.set(currentSection, decodeSectionBodyFromRead(normalizeSectionBody(buffer.join("\n"))));
   }
   return sections;
 }
@@ -929,7 +1038,7 @@ function normalizeOptionalText(value: unknown): string | undefined {
 }
 
 function normalizeVersion(value: unknown): number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 1;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 function normalizeAliases(value: unknown, senderId: string): string[] {
@@ -951,6 +1060,15 @@ function normalizeSectionName(value: unknown): string | undefined {
   const trimmed = normalizeOptionalText(value);
   if (!trimmed) {
     return undefined;
+  }
+  // Section names may not contain newlines or `#` — both would corrupt the
+  // markdown representation. We reject up front so callers see a clear error
+  // instead of a silently mangled section heading.
+  if (/[\r\n]/.test(trimmed)) {
+    throw new Error("section name must not contain newlines.");
+  }
+  if (trimmed.includes("#")) {
+    throw new Error("section name must not contain '#'.");
   }
   if (SECTION_SET.has(trimmed)) {
     return trimmed;

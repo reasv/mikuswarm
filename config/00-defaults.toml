@@ -121,6 +121,11 @@ max_summary_entries = 20
 root_dir = "users"
 default_excerpt_chars = 1600
 max_excerpt_chars = 6000
+# When false, explicit cross-user targets (e.g. `user_profile_read` with a
+# target.senderId that differs from the trigger sender) are rejected. Default
+# true preserves the existing behavior — the agent can record notes about
+# other room members on the requester's behalf.
+allow_cross_user_targets = true
 
 [danbooru]
 base_url = "https://danbooru.donmai.us"
