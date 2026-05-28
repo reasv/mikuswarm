@@ -178,7 +178,7 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
     if (text === undefined) throw new Error("create requires file_text");
     try {
       await stat(absolute);
-      throw new Error(`File already exists: ${args.path}`);
+      throw new Error(`File already exists: ${workspaceRelative(workspaceRoot, absolute)}`);
     } catch (error) {
       if (!(isNodeError(error) && error.code === "ENOENT")) {
         throw error;
@@ -203,7 +203,7 @@ export async function runTextEditorCommand(workspaceRoot: string, args: TextEdit
       const first = current.indexOf(old_str);
       if (first < 0) throw mismatchError(relPath, old_str, content, i, edits.length);
       const second = current.indexOf(old_str, first + old_str.length);
-      if (second >= 0) throw new Error(`old_str matched more than once${edits.length > 1 ? ` (edit ${i + 1}/${edits.length})` : ""}`);
+      if (second >= 0) throw duplicateMatchError(relPath, current, i, edits.length);
       current = `${current.slice(0, first)}${newStr}${current.slice(first + old_str.length)}`;
     }
     await writeFile(absolute, current, "utf8");
@@ -306,22 +306,53 @@ const CHARS_PER_TOKEN = 4;
 const ADAPTIVE_CONTEXT_SHARE = 0.2;
 
 function normalizeEdits(args: { old_str?: string; new_str?: string; edits?: Array<{ old_str: string; new_str?: string }> }): Array<{ old_str: string; new_str?: string }> {
-  if (args.edits && args.edits.length > 0) {
+  // `edits` being defined is an explicit choice — even an empty array means
+  // "I'm using the batch form". Reject mixing the two forms regardless of
+  // length, and reject the empty array with a specific message.
+  if (args.edits !== undefined) {
     if (args.old_str !== undefined || args.new_str !== undefined) {
       throw new Error("Pass either edits or old_str/new_str, not both");
     }
+    if (args.edits.length < 1) {
+      throw new Error("edits must contain at least one edit");
+    }
+    for (let i = 0; i < args.edits.length; i++) {
+      if (args.edits[i].old_str === "") {
+        const indexHint = args.edits.length > 1 ? ` (edit ${i + 1}/${args.edits.length})` : "";
+        throw new Error(`old_str must not be empty${indexHint}`);
+      }
+    }
     return args.edits;
   }
-  if (args.old_str !== undefined) return [{ old_str: args.old_str, new_str: args.new_str }];
+  if (args.old_str !== undefined) {
+    if (args.old_str === "") throw new Error("old_str must not be empty");
+    return [{ old_str: args.old_str, new_str: args.new_str }];
+  }
   throw new Error("str_replace requires old_str or edits");
+}
+
+function mismatchSnippet(currentContent: string): string {
+  return currentContent.length > MISMATCH_HINT_LIMIT
+    ? `[file is ${currentContent.length} chars; call view to inspect]`
+    : currentContent;
 }
 
 function mismatchError(relPath: string, oldStr: string, currentContent: string, editIndex: number, totalEdits: number): Error {
   const indexHint = totalEdits > 1 ? ` (edit ${editIndex + 1}/${totalEdits})` : "";
-  const snippet = currentContent.length > MISMATCH_HINT_LIMIT
-    ? `[file is ${currentContent.length} chars; call view to inspect]`
-    : currentContent;
-  return new Error(`old_str was not found in ${relPath}${indexHint}\nCurrent file contents:\n${snippet}`);
+  return new Error(`old_str was not found in ${relPath}${indexHint}\nCurrent file contents:\n${mismatchSnippet(currentContent)}`);
+}
+
+function duplicateMatchError(relPath: string, currentContent: string, editIndex: number, totalEdits: number): Error {
+  const indexHint = totalEdits > 1 ? ` (edit ${editIndex + 1}/${totalEdits})` : "";
+  // When this is a later batch edit, an earlier edit may have introduced the
+  // second match. Surface the in-progress buffer (post prior edits) so the
+  // agent can see what the file actually looks like at this point.
+  const priorEditHint = totalEdits > 1 && editIndex > 0
+    ? "\nThis edit ran after earlier edits in the batch; an earlier replacement may have introduced the duplicate match."
+    : "";
+  return new Error(
+    `old_str matched more than once in ${relPath}${indexHint}${priorEditHint}\nCurrent file contents:\n${mismatchSnippet(currentContent)}`,
+  );
 }
 
 function resolveMaxCharacters(contextWindowTokens?: number): number {

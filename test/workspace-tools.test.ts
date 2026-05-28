@@ -295,6 +295,212 @@ test("str_replace rejects passing both edits and old_str", async () => {
   });
 });
 
+test("str_replace rejects edits with both forms even when edits is empty", async () => {
+  // Regression for #8: `edits` being defined is an explicit choice — passing
+  // both forms must error regardless of `edits.length`. Previously an empty
+  // `edits: []` was treated as "no batch present" and silently fell through to
+  // the single-edit path, which was inconsistent.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "both-empty.txt",
+      file_text: "alpha\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "both-empty.txt",
+          old_str: "alpha",
+          new_str: "beta",
+          edits: [],
+        }),
+      /Pass either edits or old_str\/new_str, not both/,
+    );
+    // File must be unchanged.
+    assert.equal(await readFile(path.join(workspace, "both-empty.txt"), "utf8"), "alpha\n");
+  });
+});
+
+test("str_replace rejects an empty edits array with a specific message", async () => {
+  // Regression for #8: `edits: []` alone (no old_str/new_str) must produce a
+  // specific error about the empty array, not the generic "requires old_str or
+  // edits" message that pre-fix code threw.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "empty-edits.txt",
+      file_text: "alpha\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "empty-edits.txt",
+          edits: [],
+        }),
+      /edits must contain at least one edit/,
+    );
+    // File must be unchanged.
+    assert.equal(await readFile(path.join(workspace, "empty-edits.txt"), "utf8"), "alpha\n");
+  });
+});
+
+test("str_replace rejects empty old_str up front, not as a duplicate match", async () => {
+  // Regression for #9: empty old_str used to fall through to the loop where
+  // indexOf("") returned 0 twice and produced a misleading "matched more than
+  // once" error. The fix is to reject it up front with a clear message.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "empty-old.txt",
+      file_text: "alpha\nbeta\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "empty-old.txt",
+          old_str: "",
+          new_str: "prefix",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str must not be empty/);
+        // The misleading dup-match message must NOT appear.
+        assert.ok(!/matched more than once/.test(err.message), "must not surface the misleading dup-match error");
+        return true;
+      },
+    );
+    assert.equal(await readFile(path.join(workspace, "empty-old.txt"), "utf8"), "alpha\nbeta\n");
+  });
+});
+
+test("str_replace rejects empty old_str inside an edits batch with an edit index", async () => {
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "empty-old-batch.txt",
+      file_text: "alpha\nbeta\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "empty-old-batch.txt",
+          edits: [
+            { old_str: "alpha", new_str: "one" },
+            { old_str: "", new_str: "X" },
+          ],
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str must not be empty/);
+        assert.match(err.message, /edit 2\/2/);
+        return true;
+      },
+    );
+    assert.equal(await readFile(path.join(workspace, "empty-old-batch.txt"), "utf8"), "alpha\nbeta\n");
+  });
+});
+
+test("batch dup-match error hints at prior edits and shows in-progress buffer", async () => {
+  // Regression for #10: when an earlier edit introduces a new occurrence of a
+  // later edit's old_str, the dup-match error should (a) note that an earlier
+  // edit may have caused the duplication, and (b) include a snippet of the
+  // in-progress buffer (after prior edits applied) so the agent can see what
+  // the file actually looks like at this point.
+  await withWorkspace(async (workspace) => {
+    // Original file has exactly one "target". Edit 1 introduces a second
+    // "target". Edit 2's old_str="target" then matches twice in the buffer.
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "dup-after-edit.txt",
+      file_text: "intro\nfoo\ntarget\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "dup-after-edit.txt",
+          edits: [
+            { old_str: "foo", new_str: "target" },
+            { old_str: "target", new_str: "replaced" },
+          ],
+        }),
+      (err: Error) => {
+        assert.match(err.message, /old_str matched more than once/);
+        assert.match(err.message, /edit 2\/2/);
+        // Must mention that an earlier edit may have caused the duplication.
+        assert.match(err.message, /earlier edit/i);
+        // Must include the in-progress buffer (which by now contains TWO "target"s).
+        assert.match(err.message, /Current file contents:/);
+        const snippetIdx = err.message.indexOf("Current file contents:");
+        const snippet = err.message.slice(snippetIdx);
+        const targetCount = (snippet.match(/target/g) ?? []).length;
+        assert.ok(targetCount >= 2, `snippet must show the in-progress buffer with both targets; got: ${snippet}`);
+        return true;
+      },
+    );
+    // File must be unchanged (all-or-nothing).
+    assert.equal(await readFile(path.join(workspace, "dup-after-edit.txt"), "utf8"), "intro\nfoo\ntarget\n");
+  });
+});
+
+test("single-edit dup-match error does not include the 'earlier edit' hint", async () => {
+  // Sanity check: the prior-edit hint must only appear for batch edits with
+  // i > 0, not for single-edit (or first-of-batch) calls.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "dup-single.txt",
+      file_text: "same\nsame\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "str_replace",
+          path: "dup-single.txt",
+          old_str: "same",
+          new_str: "different",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /matched more than once/);
+        assert.ok(!/earlier edit/i.test(err.message), "single-edit dup-match must not mention an earlier edit");
+        return true;
+      },
+    );
+  });
+});
+
+test("create reports a workspace-relative path in 'File already exists'", async () => {
+  // Regression for #11: previously the error echoed the raw user-supplied path,
+  // which was inconsistent with every other tool path that uses
+  // workspaceRelative(). Path-shape may differ between callers (e.g. with or
+  // without a leading "./") — the error should always report the relative form.
+  await withWorkspace(async (workspace) => {
+    await runTextEditorCommand(workspace, {
+      command: "create",
+      path: "exists.txt",
+      file_text: "original\n",
+    });
+    await assert.rejects(
+      () =>
+        runTextEditorCommand(workspace, {
+          command: "create",
+          // User supplies a path with a leading "./" — the error should still
+          // report the canonical relative form "exists.txt".
+          path: "./exists.txt",
+          file_text: "second\n",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /^File already exists: exists\.txt$/);
+        return true;
+      },
+    );
+    // File must be unchanged.
+    assert.equal(await readFile(path.join(workspace, "exists.txt"), "utf8"), "original\n");
+  });
+});
+
 test("adaptive paging truncates large files with continuation hint", async () => {
   await withWorkspace(async (workspace) => {
     const bigContent = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}`).join("\n");
