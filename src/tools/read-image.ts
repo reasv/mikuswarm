@@ -4,6 +4,7 @@ import sharp from "sharp";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
+import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
 
 export interface ReadImageToolContext {
   workspaceRoot: string;
@@ -21,17 +22,6 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 const SUPPORTED_EXT_LIST = Object.keys(MIME_BY_EXT).join(", ");
-
-/**
- * Cap on pixels sharp will render from a single SVG. 25 MP is large enough for
- * any reasonable diagram/logo/screenshot but small enough that even five
- * rasterization attempts together stay well below 1 GB of pixel memory.
- *
- * Sharp's own default (`Math.pow(0x3FFF, 2)` ≈ 268 MP) only catches truly
- * extreme inputs; a malicious SVG can still allocate hundreds of MB inside
- * that envelope, multiplied by every density attempt in `rasterizeSvgToPng`.
- */
-const SVG_MAX_INPUT_PIXELS = 25_000_000;
 
 function isPixelLimitError(error: unknown): boolean {
   // sharp throws an Error whose message includes "Input image exceeds pixel limit"

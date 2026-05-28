@@ -1,4 +1,4 @@
-export { processImageForInference, computeTargetDimensions, cleanupProcessedImage } from "./image.js";
+export { processImageForInference, computeTargetDimensions, cleanupProcessedImage, SVG_MAX_INPUT_PIXELS } from "./image.js";
 export { processVideoForInference } from "./video.js";
 export { processAudioForInference } from "./audio.js";
 export { MediaCache, hashFile } from "./cache.js";
