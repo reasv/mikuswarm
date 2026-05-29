@@ -57,7 +57,10 @@ export interface MikuAgentRuntime {
 
 export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntime> {
   const logger = createLogger("mikuswarm", config.app.log_level);
-  const storage = await Storage.open({ databasePath: config.storage.database_path });
+  const storage = await Storage.open({
+    databasePath: config.storage.database_path,
+    logger: logger.child("storage"),
+  });
   const timeline = new TimelineStore(storage);
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);

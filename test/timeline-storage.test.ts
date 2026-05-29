@@ -411,9 +411,9 @@ test("insertSummaryWithLineage succeeds and marks job complete when job exists",
   }
 });
 
-// ── getTimelineEventsAfter returns empty when cursor missing (#3) ──
+// ── getTimelineEventsAfter falls back when cursor missing (#2) ──
 
-test("getTimelineEventsAfter returns empty array when cursor event does not exist", async () => {
+test("getTimelineEventsAfter falls back to recent events when cursor event does not exist", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   const TK = "matrix:miku:room:!room";
   try {
@@ -425,27 +425,38 @@ test("getTimelineEventsAfter returns empty array when cursor event does not exis
       assistantEvent({ id: "ev2", body: "two", timestamp: 2000 }),
     );
 
-    // Capture console.warn output to verify the warning was logged.
-    const warnings: string[] = [];
-    const originalWarn = console.warn;
-    console.warn = (...args: unknown[]) => {
-      warnings.push(String(args[0]));
-    };
-    try {
-      const result = storage.getTimelineEventsAfter(TK, "nonexistent_event");
-      assert.deepEqual(result, [], "should return empty array when cursor event is missing");
-      assert.equal(warnings.length, 1, "should have logged exactly one warning");
-      assert.ok(
-        warnings[0]!.includes("cursor event not found"),
-        "warning should mention cursor event not found",
-      );
-      assert.ok(
-        warnings[0]!.includes("nonexistent_event"),
-        "warning should include the missing event ID",
-      );
-    } finally {
-      console.warn = originalWarn;
-    }
+    const result = storage.getTimelineEventsAfter(TK, "nonexistent_event");
+    // Should fall back to getTimelineEvents instead of returning empty array.
+    const ids = result.map((e: CanonicalChatEvent) => e.id);
+    assert.deepEqual(ids, ["ev1", "ev2"], "should fall back to recent events when cursor is missing");
+  } finally {
+    storage.close();
+  }
+});
+
+test("getTimelineEventsAfter uses structured logger when cursor event missing", async () => {
+  const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+  const mockLogger = {
+    debug() {},
+    info() {},
+    warn(message: string, fields?: Record<string, unknown>) { warnings.push({ message, fields }); },
+    error() {},
+    child() { return mockLogger; },
+  };
+  const storage = await Storage.open({ databasePath: ":memory:", logger: mockLogger });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev1", body: "one", timestamp: 1000 }),
+    );
+
+    storage.getTimelineEventsAfter(TK, "nonexistent_event");
+    assert.equal(warnings.length, 1, "should have logged exactly one warning via structured logger");
+    assert.ok(
+      warnings[0]!.message.includes("cursor event not found"),
+      "warning message should mention cursor event not found",
+    );
+    assert.equal(warnings[0]!.fields?.afterEventId, "nonexistent_event");
   } finally {
     storage.close();
   }
@@ -468,6 +479,51 @@ test("getTimelineEventsAfter returns events after cursor when it exists", async 
     const result = storage.getTimelineEventsAfter(TK, "ev1");
     const ids = result.map((e: CanonicalChatEvent) => e.id);
     assert.deepEqual(ids, ["ev2", "ev3"], "should return only events after the cursor (exclusive)");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── insertSummaryWithLineage rejects both eventIds and parentIds (#8) ──
+
+test("insertSummaryWithLineage rejects when both eventIds and parentIds are provided", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Create a job so the transaction doesn't fail on the job update.
+    await storage.insertSummarizationJob({
+      id: "job_both",
+      timelineKey: "matrix:test:room:!room",
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev2",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+
+    const result = storage.insertSummaryWithLineage({
+      id: "bad_both",
+      timelineKey: "matrix:test:room:!room",
+      level: 1,
+      content: "test",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev1",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      eventIds: ["ev1", "ev2"],
+      parentIds: ["parent1"],
+      jobId: "job_both",
+    });
+
+    await assert.rejects(result, { message: "Summary cannot have both eventIds and parentIds" });
+
+    // The summary must NOT have been persisted (transaction rolled back).
+    const summary = storage.getSummaryById("bad_both");
+    assert.equal(summary, undefined, "summary should not exist after guard rejection");
   } finally {
     storage.close();
   }

@@ -1,10 +1,12 @@
 import Database from "better-sqlite3";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 export interface StorageOptions {
   databasePath: string;
+  logger?: Logger;
 }
 
 type WriteJob<T> = {
@@ -248,15 +250,17 @@ export class Storage {
   private readonly queue: Array<WriteJob<any>> = [];
   private draining = false;
   private closed = false;
+  private readonly logger?: Logger;
 
-  private constructor(db: Database.Database) {
+  private constructor(db: Database.Database, logger?: Logger) {
     this.db = db;
+    this.logger = logger;
   }
 
   static async open(options: StorageOptions): Promise<Storage> {
     await mkdir(path.dirname(options.databasePath), { recursive: true });
     const db = new Database(options.databasePath);
-    const storage = new Storage(db);
+    const storage = new Storage(db, options.logger);
     await storage.write((writer) => {
       writer.pragma("journal_mode = WAL");
       writer.pragma("foreign_keys = ON");
@@ -934,17 +938,13 @@ export class Storage {
   ): CanonicalChatEvent[] {
     const cursor = this.getEventCursor(timelineKey, afterEventId);
     if (!cursor) {
-      console.warn(
-        JSON.stringify({
-          time: new Date().toISOString(),
-          level: "warn",
-          component: "mikuswarm.storage",
-          message: "getTimelineEventsAfter: cursor event not found, returning empty result",
-          timelineKey,
-          afterEventId,
-        }),
-      );
-      return [];
+      if (this.logger) {
+        this.logger.warn(
+          "getTimelineEventsAfter: cursor event not found, falling back to recent events",
+          { timelineKey, afterEventId },
+        );
+      }
+      return this.getTimelineEvents(timelineKey, limit);
     }
 
     const rows = this.read((db) =>
@@ -1151,10 +1151,15 @@ export class Storage {
    */
   insertSummaryWithLineage(insert: SummaryInsert): Promise<void> {
     return this.readAndWrite((db) => {
-      if (insert.level === 1 && (!insert.eventIds || insert.eventIds.length === 0)) {
+      const hasEventIds = insert.eventIds != null && insert.eventIds.length > 0;
+      const hasParentIds = insert.parentIds != null && insert.parentIds.length > 0;
+      if (hasEventIds && hasParentIds) {
+        throw new Error("Summary cannot have both eventIds and parentIds");
+      }
+      if (insert.level === 1 && !hasEventIds) {
         throw new Error("Level-1 summary must have eventIds");
       }
-      if (insert.level > 1 && (!insert.parentIds || insert.parentIds.length === 0)) {
+      if (insert.level > 1 && !hasParentIds) {
         throw new Error("Level 2+ summary must have parentIds");
       }
       const now = Date.now();
