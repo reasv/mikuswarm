@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Storage, type Summary } from "../src/storage/index.js";
+import { Storage, type Summary, type TimelineCursor } from "../src/storage/index.js";
 import { AssistantEchoResolver, TimelineStore } from "../src/timeline/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
@@ -468,6 +468,159 @@ test("getTimelineEventsAfter returns events after cursor when it exists", async 
     const result = storage.getTimelineEventsAfter(TK, "ev1");
     const ids = result.map((e: CanonicalChatEvent) => e.id);
     assert.deepEqual(ids, ["ev2", "ev3"], "should return only events after the cursor (exclusive)");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── claimNextSummarizationJob CAS tests (#10) ────────────────────
+
+test("claimNextSummarizationJob returns claimed job with status processing and attempts 1", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.insertSummarizationJob({
+      id: "job_claim",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev5",
+      inputTokenCount: 200,
+      targetTokenCount: 100,
+      maxRetries: 3,
+    });
+
+    const claimed = await storage.claimNextSummarizationJob();
+    assert.ok(claimed, "should return a job");
+    assert.equal(claimed!.id, "job_claim");
+    assert.equal(claimed!.status, "processing");
+    assert.equal(claimed!.attempts, 1);
+  } finally {
+    storage.close();
+  }
+});
+
+test("claimNextSummarizationJob returns undefined when no pending jobs exist", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const claimed = await storage.claimNextSummarizationJob();
+    assert.equal(claimed, undefined, "should return undefined when no pending jobs");
+  } finally {
+    storage.close();
+  }
+});
+
+test("claimNextSummarizationJob does not return the same job twice", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.insertSummarizationJob({
+      id: "job_once",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev3",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+
+    const first = await storage.claimNextSummarizationJob();
+    assert.ok(first, "first claim should succeed");
+    assert.equal(first!.id, "job_once");
+
+    const second = await storage.claimNextSummarizationJob();
+    assert.equal(second, undefined, "second claim should return undefined — job already processing");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── getMetadata / setMetadata round-trip tests (#10) ─────────────
+
+test("getMetadata returns null for a nonexistent key", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const value = storage.getMetadata("no_such_key");
+    assert.equal(value, null);
+  } finally {
+    storage.close();
+  }
+});
+
+test("setMetadata then getMetadata round-trips the value", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setMetadata("test_key", "test_value");
+    const value = storage.getMetadata("test_key");
+    assert.equal(value, "test_value");
+  } finally {
+    storage.close();
+  }
+});
+
+test("setMetadata with same key overwrites (upsert)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setMetadata("overwrite_key", "first");
+    await storage.setMetadata("overwrite_key", "second");
+    const value = storage.getMetadata("overwrite_key");
+    assert.equal(value, "second");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── getTimelineEventsBetween cursor range tests (#10) ────────────
+
+test("getTimelineEventsBetween returns events within inclusive cursor range", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Insert 5 events with distinct timestamps.
+    for (let i = 1; i <= 5; i++) {
+      await storage.appendTimelineEvent(
+        assistantEvent({ id: `ev${i}`, body: `body ${i}`, timestamp: i * 1000 }),
+      );
+    }
+
+    // Get cursors for the boundary events.
+    const startCursor = storage.getEventCursor(TK, "ev2");
+    const endCursor = storage.getEventCursor(TK, "ev4");
+    assert.ok(startCursor, "start cursor should exist");
+    assert.ok(endCursor, "end cursor should exist");
+
+    const events = storage.getTimelineEventsBetween(TK, startCursor!, endCursor!);
+    const ids = events.map((e) => e.id);
+
+    // ev2, ev3, ev4 are in range (inclusive).
+    assert.deepEqual(ids, ["ev2", "ev3", "ev4"]);
+  } finally {
+    storage.close();
+  }
+});
+
+test("getTimelineEventsBetween excludes events outside the range", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 1; i <= 5; i++) {
+      await storage.appendTimelineEvent(
+        assistantEvent({ id: `ev${i}`, body: `body ${i}`, timestamp: i * 1000 }),
+      );
+    }
+
+    const startCursor = storage.getEventCursor(TK, "ev2");
+    const endCursor = storage.getEventCursor(TK, "ev4");
+    assert.ok(startCursor);
+    assert.ok(endCursor);
+
+    const events = storage.getTimelineEventsBetween(TK, startCursor!, endCursor!);
+    const ids = events.map((e) => e.id);
+
+    // ev1 (before range) and ev5 (after range) must be excluded.
+    assert.ok(!ids.includes("ev1"), "ev1 should be excluded (before range)");
+    assert.ok(!ids.includes("ev5"), "ev5 should be excluded (after range)");
   } finally {
     storage.close();
   }
