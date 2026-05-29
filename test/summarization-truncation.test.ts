@@ -271,6 +271,73 @@ test("truncation fallback uses the shorter draft when DB has a shorter best-effo
   storage.close();
 });
 
+test("truncation fallback uses saved bestEffortDraft when current attempt produces no draft", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  await storage.appendTimelineEvent(event("ev0", 1000));
+  await storage.appendTimelineEvent(event("ev1", 2000));
+  await storage.insertSummarizationJob({
+    id: "job_nodraft",
+    timelineKey: TK,
+    level: 1,
+    inputStartId: "ev0",
+    inputEndId: "ev1",
+    inputTokenCount: 50,
+    targetTokenCount: 200,
+    maxRetries: 1, // two attempts: first saves draft, second produces nothing
+  });
+
+  const savedDraft = "Previously saved summary from attempt 1.";
+  let callCount = 0;
+  const factory = {
+    resolveModelId: () => "test-model",
+    create: async (_session: unknown, tools: AgentTool[]) => {
+      callCount++;
+      if (callCount === 1) {
+        // First attempt: write a draft, then fail.
+        const summaryTool = tools[0]!;
+        await summaryTool.execute("t", { command: "create", file_text: savedDraft });
+      }
+      // Second attempt: produce no draft at all — tools[0] is a fresh SummaryDraft.
+      return {
+        prompt: async () => {},
+        waitForIdle: async () => {
+          throw new Error("forced agent failure");
+        },
+      };
+    },
+  } as any;
+
+  const pool = new SummarizationWorkerPool({
+    storage,
+    factory,
+    config: { worker_count: 1, summary_max_overage_factor: 2.5, max_retries: 1 },
+    onComplete: () => {},
+    onError: () => {},
+    logger: silentLogger,
+  });
+
+  await pool.start();
+  pool.notifyNewWork();
+  await waitFor(() => {
+    const j = storage.getSummarizationJobById("job_nodraft");
+    return j?.status === "complete" || j?.status === "failed";
+  });
+  await pool.stop();
+
+  assert.equal(callCount, 2, "factory should have been called twice");
+  const job = storage.getSummarizationJobById("job_nodraft")!;
+  assert.equal(job.status, "complete", "job should complete via truncation fallback using saved draft");
+  assert.ok(job.resultSummaryId, "job should have a result summary");
+
+  const summary = storage.getSummaryById(job.resultSummaryId!)!;
+  assert.ok(
+    summary.content.includes("Previously saved summary"),
+    "truncation fallback should use the bestEffortDraft from the first attempt",
+  );
+
+  storage.close();
+});
+
 test("truncateToBudget result stays within the token budget", () => {
   // Build a text that is well over the target budget; verify the truncated
   // result (including the trailer) does not exceed the target.

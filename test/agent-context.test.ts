@@ -466,6 +466,69 @@ test("maybeEnqueueLevel1 enqueues when summarization.enabled is explicitly undef
   }
 });
 
+test("maybeEnqueueLevel1 does not enqueue a duplicate when a pending job covers the same range", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig({
+    summarization: {
+      generation_threshold_tokens: 1,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    },
+    context: {
+      tiers: {
+        rich_target_tokens: 1,
+        rich_max_tokens: 1,
+        compact_target_tokens: 40000,
+        compact_max_tokens: 80000,
+      },
+    },
+  } as any);
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 0; i < 20; i++) {
+      await timeline.append(testEvent({
+        id: `ev${String(i).padStart(4, "0")}`,
+        body: `message content with some words ${i}`,
+        timestamp: 1000 + i,
+      }));
+    }
+
+    // Pre-populate a pending level-1 job covering the range that maybeEnqueueLevel1
+    // would target (the oldest compact events).
+    await storage.insertSummarizationJob({
+      id: "existing_job",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev0000",
+      inputEndId: "ev0009",
+      inputTokenCount: 50,
+      targetTokenCount: 5,
+      maxRetries: 2,
+    });
+
+    let jobEnqueued = false;
+    builder.onJobEnqueued = () => { jobEnqueued = true; };
+
+    const trigger = testEvent({ id: "trigger_dedup", body: "hi", timestamp: 2000, role: "user" });
+    await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+
+    assert.equal(jobEnqueued, false, "no duplicate job should be enqueued when a pending job covers the range");
+    // Confirm only the pre-existing job is in the DB.
+    const jobs = storage.getActiveSummarizationJobs(TK, 1);
+    assert.equal(jobs.length, 1, "should still have exactly one active job");
+    assert.equal(jobs[0]!.id, "existing_job");
+  } finally {
+    storage.close();
+  }
+});
+
 test("maybeEnqueueLevel1 skips when summarization.enabled is explicitly false", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   const config = minimalConfig({

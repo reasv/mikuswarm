@@ -18,6 +18,15 @@ function summary(overrides: Partial<Summary> & Pick<Summary, "id" | "level" | "e
   };
 }
 
+test("single summary is selected and its latestEventId becomes the coverage cursor", () => {
+  const candidates = [
+    summary({ id: "solo", level: 1, earliestTimestamp: 100, latestTimestamp: 200, latestEventId: "ev_solo" }),
+  ];
+  const { summaries, coverageEndEventId } = selectSummaries(candidates);
+  assert.deepEqual(summaries.map((s) => s.id), ["solo"]);
+  assert.equal(coverageEndEventId, "ev_solo");
+});
+
 test("selects all non-overlapping level-1 summaries, ordered, cut at the latest", () => {
   const candidates = [
     summary({ id: "s1", level: 1, earliestTimestamp: 100, latestTimestamp: 200, latestEventId: "ev1" }),
@@ -120,6 +129,19 @@ test("gap with higher-level summary: contiguous chain uses highest coverage", ()
   assert.deepEqual(summaries.map((s) => s.id), ["l2", "l1c"]);
   // Cursor at l2, not l1c (gap between 300 and 500)
   assert.equal(coverageEndEventId, "evC");
+});
+
+test("overlapping summaries: lower level extending further selects both, cursor reflects L1", () => {
+  // L2 covers [100,300], L1 covers [250,400]. Both should be selected:
+  // L2 first (adds coverage to 300), then L1 extends coverage to 400.
+  // The cursor should reflect L1's latestEventId since it extends further.
+  const candidates = [
+    summary({ id: "l2", level: 2, earliestTimestamp: 100, latestTimestamp: 300, latestEventId: "evL2", eventCount: 2 }),
+    summary({ id: "l1", level: 1, earliestTimestamp: 250, latestTimestamp: 400, latestEventId: "evL1" }),
+  ];
+  const { summaries, coverageEndEventId } = selectSummaries(candidates);
+  assert.deepEqual(summaries.map((s) => s.id), ["l2", "l1"]);
+  assert.equal(coverageEndEventId, "evL1");
 });
 
 test("renderSummaryLayer escapes XML special characters in summary content", () => {

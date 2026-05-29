@@ -33,6 +33,12 @@ test("recency buckets: sub-hour, singular hour, hours, days", () => {
   assert.equal(computeRecencyLabel(NOW - 50 * HOUR, NOW), "2 days ago");
 });
 
+test("48-hour boundary: exactly 48 hours returns days format", () => {
+  // At exactly 48 hours, diffHours === 48, which is NOT < 48, so the function
+  // falls through to the days branch: Math.floor(48 / 24) = 2 days ago.
+  assert.equal(computeRecencyLabel(NOW - 48 * HOUR, NOW), "2 days ago");
+});
+
 test("negative time diff (clock skew: now < latestTimestamp) returns '< 1 hour ago'", () => {
   // When the trigger timestamp is earlier than the summary's latest timestamp
   // (e.g. clock skew), diffHours is negative. The function treats this the same

@@ -41,6 +41,16 @@ test("finalize terminates the turn", async () => {
   assert.equal(result.terminate, true);
 });
 
+test("double create returns isError: true with already created message", async () => {
+  const { tool } = toolFor();
+  const first = await tool.execute("1", { command: "create", file_text: "initial content" });
+  assert.notEqual(first.isError, true);
+
+  const second = await tool.execute("2", { command: "create", file_text: "second attempt" });
+  assert.equal(second.isError, true);
+  assert.match(text(second), /already created/);
+});
+
 test("create with empty string is rejected and does not lock the draft", async () => {
   const { draft, tool } = toolFor();
   const result = await tool.execute("1", { command: "create", file_text: "" });

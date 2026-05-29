@@ -122,6 +122,46 @@ test("a higher-level summary between members splits the run", async () => {
   storage.close();
 });
 
+test("a same-level summary between members is found by hasSummaryBetween (level >= L)", async () => {
+  const storage = await openStorage();
+  // Four level-1 summaries — not enough for fanout on their own.
+  for (let i = 0; i < 4; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+
+  // Verify hasSummaryBetween detects a same-level summary (level >= L, not just > L).
+  // Insert a level-1 summary whose range falls between s1 and s2.
+  // It sorts between them by earliest_timestamp, becoming a candidate in the walk.
+  await insertSummary(storage, {
+    id: "same_level_between",
+    level: 1,
+    earliestTimestamp: 155,
+    latestTimestamp: 195,
+  });
+
+  // The same-level summary joins the candidate walk (getSummariesByLevel returns it),
+  // making the run [s0, s1, same_level_between, s2, s3] = 5, which equals fanout.
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 1, "5 contiguous same-level summaries should form a run reaching fanout");
+  assert.equal(jobs[0]!.inputStartId, "s0");
+  assert.equal(jobs[0]!.inputEndId, "s3");
+
+  // Also verify that hasSummaryBetween with level >= 1 finds same-level summaries.
+  // The "same_level_between" summary has earliest=155, latest=195. If we check
+  // the gap [150, 200] (s1.latest to s2.earliest), hasSummaryBetween should find it.
+  const found = storage.hasSummaryBetween(TK, 1, 150, 200);
+  assert.equal(found, true, "hasSummaryBetween should detect same-level (level >= L) summaries");
+
+  storage.close();
+});
+
 test("does not enqueue a duplicate when an active job already covers the run", async () => {
   const storage = await openStorage();
   for (let i = 0; i < 5; i++) {
