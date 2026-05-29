@@ -35,7 +35,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
       ];
     }
 
-    if (message.type === "triggerGroup") {
+    if (message.type === "triggerGroup" || message.type === "satellite") {
       return [
         {
           role: "user",

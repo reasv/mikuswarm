@@ -18,6 +18,13 @@ export interface TriggerGroupMessage {
   timestamp?: number;
 }
 
+export interface SatelliteMessage {
+  type: "satellite";
+  content: string;
+  imageBlocks?: ImageBlock[];
+  timestamp?: number;
+}
+
 export interface InterjectionMessage {
   type: "interjection";
   content: string;
@@ -27,6 +34,7 @@ declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     chatEvent: ChatEventMessage;
     triggerGroup: TriggerGroupMessage;
+    satellite: SatelliteMessage;
     interjection: InterjectionMessage;
   }
 }

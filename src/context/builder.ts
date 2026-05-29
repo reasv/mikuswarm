@@ -29,7 +29,7 @@ import { nanoid } from "nanoid";
 import type { Logger } from "../observability/index.js";
 
 export interface ContextMessage {
-  type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer";
+  type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "satellite";
   role: "user" | "assistant" | "system";
   content: string;
   tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger" | "summary";
@@ -57,6 +57,8 @@ export interface BuildContextOptions {
     /** Cut context at this timestamp — no events past it are rendered. */
     endTimestamp: number;
   };
+  /** Optional signal to cancel a grace wait early (e.g. on shutdown). */
+  abortSignal?: AbortSignal;
 }
 
 export interface BuiltContext {
@@ -132,7 +134,7 @@ export class ContextBuilder {
     }
 
     const timelineEvents = events.filter((e) => !triggerGroupIds.has(e.id));
-    const triggerEvents = events.filter((e) => triggerGroupIds.has(e.id));
+    let triggerEvents = events.filter((e) => triggerGroupIds.has(e.id));
 
     // 3. Grace wait: if a drop is imminent and a processing job covers the
     //    oldest events, wait briefly for it (§11). Skipped for summarization builds.
@@ -143,12 +145,18 @@ export class ContextBuilder {
         timelineEvents,
         triggerGroupIds,
         selection,
+        options.abortSignal,
       );
       compactionInput = waited.events;
       // Adopt the post-wait selection so the summary layer renders the summary
       // whose completion just trimmed the raw set — otherwise those events would
       // be dropped from both the raw turns and the layer (a coverage gap).
       selection = waited.selection;
+      // Refresh trigger events from the re-queried set so they reflect any
+      // enrichment that landed during the wait (issue #3).
+      if (waited.triggerEvents) {
+        triggerEvents = waited.triggerEvents;
+      }
     }
 
     const compacted = compactTimelineEvents(
@@ -220,7 +228,7 @@ export class ContextBuilder {
       ...(summaryLayer ? [summaryLayer] : []),
       ...chatMessages,
       {
-        type: "triggerGroup",
+        type: cutoff ? "satellite" : "triggerGroup",
         role: "user",
         content: finalUserContent,
         tier: "trigger",
@@ -312,7 +320,8 @@ export class ContextBuilder {
     events: CanonicalChatEvent[],
     triggerGroupIds: Set<string>,
     selection: SummarySelection,
-  ): Promise<{ events: CanonicalChatEvent[]; selection: SummarySelection }> {
+    abortSignal?: AbortSignal,
+  ): Promise<{ events: CanonicalChatEvent[]; selection: SummarySelection; triggerEvents?: CanonicalChatEvent[] }> {
     const unchanged = { events, selection };
     if (!this.config.summarization?.enabled) return unchanged;
     const compactMax = this.config.context.tiers.compact_max_tokens;
@@ -354,6 +363,7 @@ export class ContextBuilder {
     const timeoutMs = this.config.summarization?.summary_wait_timeout_ms ?? 5000;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (abortSignal?.aborted) break;
       await delay(250);
       const job = this.storage.getSummarizationJobById(covering.id);
       if (!job || job.status === "complete") {
@@ -362,10 +372,16 @@ export class ContextBuilder {
         // newly-covered events would be dropped from both (a coverage gap).
         const reselected = selectSummaries(this.storage.getSummaryCandidates(timelineKey));
         if (!reselected.coverageEndEventId) return { events, selection: reselected };
-        const requeried = this.store
-          .queryAfterContext(timelineKey, reselected.coverageEndEventId)
-          .filter((e) => !triggerGroupIds.has(e.id));
-        return { events: this.hydrateEvents(requeried), selection: reselected };
+        const allRequeried = this.hydrateEvents(
+          this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId),
+        );
+        const requeriedTimeline = allRequeried.filter((e) => !triggerGroupIds.has(e.id));
+        const requeriedTrigger = allRequeried.filter((e) => triggerGroupIds.has(e.id));
+        return {
+          events: requeriedTimeline,
+          selection: reselected,
+          triggerEvents: requeriedTrigger,
+        };
       }
       if (job.status === "failed") break;
     }
