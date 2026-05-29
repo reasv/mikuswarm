@@ -234,15 +234,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
-  const summarizationPool = new SummarizationWorkerPool({
-    storage,
-    factory,
-    contextBuilder,
-    config: config.summarization ?? {},
-    onComplete: (jobId, summaryId) => logger.info("summarization_complete", { jobId, summaryId }),
-    onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
-    logger: logger.child("summarization"),
-  });
+  const summarizationEnabled = config.summarization?.enabled !== false;
+  const summarizationPool = summarizationEnabled
+    ? new SummarizationWorkerPool({
+        storage,
+        factory,
+        contextBuilder,
+        config: config.summarization ?? {},
+        onComplete: () => {},
+        onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
+        logger: logger.child("summarization"),
+      })
+    : null;
 
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
 
@@ -601,7 +604,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   await enrichmentPool.start();
   await captionPool.start();
-  await summarizationPool.start();
+  if (summarizationPool) await summarizationPool.start();
 
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
@@ -611,7 +614,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await provider.stop();
         triggerCoordinator.clear();
         await captionPool.stop();
-        await summarizationPool.stop();
+        if (summarizationPool) await summarizationPool.stop();
         await enrichmentPool.stop();
         await mcpPool.stop();
         fetchClient.stop();

@@ -933,7 +933,7 @@ export class Storage {
     limit = 1000,
   ): CanonicalChatEvent[] {
     const cursor = this.getEventCursor(timelineKey, afterEventId);
-    if (!cursor) return this.getTimelineEvents(timelineKey, limit);
+    if (!cursor) return [];
 
     const rows = this.read((db) =>
       db
@@ -1126,6 +1126,12 @@ export class Storage {
    * cursor is derived from latest_event_id).
    */
   insertSummaryWithLineage(insert: SummaryInsert): Promise<void> {
+    if (insert.level === 1 && (!insert.eventIds || insert.eventIds.length === 0)) {
+      throw new Error("Level-1 summary must have eventIds");
+    }
+    if (insert.level > 1 && (!insert.parentIds || insert.parentIds.length === 0)) {
+      throw new Error("Level 2+ summary must have parentIds");
+    }
     return this.readAndWrite((db) => {
       const now = Date.now();
       db.prepare(
@@ -1257,15 +1263,16 @@ export class Storage {
         )
         .get() as SummarizationJobRow | undefined;
       if (!row) return undefined;
+      const now = Date.now();
       const result = db
         .prepare(
           `update summarization_jobs
            set status = 'processing', attempts = attempts + 1, updated_at = ?
            where id = ? and status = 'pending'`,
         )
-        .run(Date.now(), row.id);
+        .run(now, row.id);
       if (result.changes === 0) return undefined;
-      return mapJobRow({ ...row, status: "processing", attempts: row.attempts + 1 });
+      return mapJobRow({ ...row, status: "processing", attempts: row.attempts + 1, updated_at: now });
     });
   }
 
