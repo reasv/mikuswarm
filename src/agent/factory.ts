@@ -62,6 +62,15 @@ export class AgentSessionFactory {
     return types[sessionType] ?? types["default"];
   }
 
+  /** Resolve the model id used by a session type (for summary record provenance). */
+  resolveModelId(sessionType: string): string {
+    const cfg = this.resolveSessionType(sessionType);
+    const modelKey = cfg?.model ?? "default";
+    const modelConfig = this.options.config.models[modelKey];
+    if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
+    return modelConfig.id;
+  }
+
   /**
    * Create an Agent for the given session.
    *

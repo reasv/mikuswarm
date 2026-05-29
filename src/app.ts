@@ -49,6 +49,7 @@ import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichmen
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
+import { SummarizationWorkerPool } from "./summarization/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -213,6 +214,34 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     config,
     contextBuilder,
     getActiveSessions: (timelineKey) => sessions.activeForTimeline(timelineKey),
+  });
+
+  // Fail-fast: a misconfigured summarizer must not silently fall back to the
+  // default chat agent or model.
+  if (config.summarization?.enabled) {
+    const sessionTypes = config.agent.session_types;
+    for (const typeName of ["summarize", "condense"] as const) {
+      const sessionType = sessionTypes?.[typeName];
+      if (!sessionType) {
+        throw new Error(`summarization enabled but session type "${typeName}" is not configured`);
+      }
+      const modelKey = sessionType.model ?? "default";
+      if (!config.models[modelKey]) {
+        throw new Error(
+          `summarization session type "${typeName}" references model "${modelKey}" which is not in config.models`,
+        );
+      }
+    }
+  }
+
+  const summarizationPool = new SummarizationWorkerPool({
+    storage,
+    factory,
+    contextBuilder,
+    config: config.summarization ?? {},
+    onComplete: (jobId, summaryId) => logger.info("summarization_complete", { jobId, summaryId }),
+    onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
+    logger: logger.child("summarization"),
   });
 
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
@@ -572,6 +601,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   await enrichmentPool.start();
   await captionPool.start();
+  await summarizationPool.start();
 
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
@@ -581,6 +611,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await provider.stop();
         triggerCoordinator.clear();
         await captionPool.stop();
+        await summarizationPool.stop();
         await enrichmentPool.stop();
         await mcpPool.stop();
         fetchClient.stop();
