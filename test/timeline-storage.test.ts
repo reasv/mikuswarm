@@ -682,6 +682,185 @@ test("getTimelineEventsBetween excludes events outside the range", async () => {
   }
 });
 
+// ── resetStaleSummarizationJobs (#6) ────────────────────────────────
+
+test("resetStaleSummarizationJobs resets processing jobs to pending with attempts unchanged", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Insert a pending job, claim it (sets status='processing', attempts=1).
+    await storage.insertSummarizationJob({
+      id: "job_stale",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev3",
+      inputTokenCount: 200,
+      targetTokenCount: 100,
+      maxRetries: 2,
+    });
+    const claimed = await storage.claimNextSummarizationJob();
+    assert.ok(claimed);
+    assert.equal(claimed!.status, "processing");
+    assert.equal(claimed!.attempts, 1);
+
+    // Reset stale processing jobs (simulates startup after crash).
+    const resetCount = await storage.resetStaleSummarizationJobs();
+    assert.equal(resetCount, 1, "should reset exactly 1 processing job");
+
+    // Verify the job is now pending with attempts unchanged.
+    const job = storage.getSummarizationJobById("job_stale");
+    assert.ok(job);
+    assert.equal(job!.status, "pending", "status should be reset to pending");
+    assert.equal(job!.attempts, 1, "attempts should be left as-is (spec: not modified)");
+  } finally {
+    storage.close();
+  }
+});
+
+test("resetStaleSummarizationJobs does not affect pending/complete/failed jobs", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Pending job: should remain pending.
+    await storage.insertSummarizationJob({
+      id: "job_pending",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev2",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+
+    // Complete job: create pending, claim it, then complete it via insertSummaryWithLineage.
+    await storage.insertSummarizationJob({
+      id: "job_complete",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev3",
+      inputEndId: "ev4",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+    await storage.claimNextSummarizationJob(); // claims job_pending (oldest)
+    await storage.retrySummarizationJob("job_pending", "retry test"); // back to pending
+    await storage.claimNextSummarizationJob(); // claims job_complete
+    await storage.insertSummaryWithLineage({
+      id: "sum_complete",
+      timelineKey: TK,
+      level: 1,
+      content: "done",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev4",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      eventIds: ["ev3", "ev4"],
+      jobId: "job_complete",
+    });
+
+    // Failed job: create, claim, then fail it.
+    await storage.insertSummarizationJob({
+      id: "job_failed",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev5",
+      inputEndId: "ev6",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 0,
+    });
+    await storage.claimNextSummarizationJob(); // claims job_pending again (it's pending again)
+    // Manually fail job_failed by first claiming it.
+    await storage.retrySummarizationJob("job_pending", "retry again"); // back to pending
+    // We need job_failed to be in 'pending' state first so we can claim it.
+    // Let's just directly set its status via failSummarizationJob.
+    await storage.failSummarizationJob("job_failed", "permanent failure");
+
+    // Now reset stale. Only processing jobs should be affected.
+    const resetCount = await storage.resetStaleSummarizationJobs();
+    assert.equal(resetCount, 0, "should not reset any jobs (none are processing)");
+
+    // Verify each job's status is unchanged.
+    const pending = storage.getSummarizationJobById("job_pending");
+    assert.equal(pending!.status, "pending", "pending job should remain pending");
+
+    const complete = storage.getSummarizationJobById("job_complete");
+    assert.equal(complete!.status, "complete", "complete job should remain complete");
+
+    const failed = storage.getSummarizationJobById("job_failed");
+    assert.equal(failed!.status, "failed", "failed job should remain failed");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── saveBestEffortDraft (#7) ────────────────────────────────────────
+
+test("saveBestEffortDraft saves draft text on the job row", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.insertSummarizationJob({
+      id: "job_draft",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev3",
+      inputTokenCount: 200,
+      targetTokenCount: 100,
+      maxRetries: 2,
+    });
+
+    // Before save, best_effort_draft should be null.
+    const before = storage.getSummarizationJobById("job_draft");
+    assert.ok(before);
+    assert.equal(before!.bestEffortDraft, null, "draft should be null before save");
+
+    // Save a draft.
+    await storage.saveBestEffortDraft("job_draft", "partial summary content here");
+
+    // After save, the draft should be persisted.
+    const after = storage.getSummarizationJobById("job_draft");
+    assert.ok(after);
+    assert.equal(after!.bestEffortDraft, "partial summary content here", "draft should match saved text");
+  } finally {
+    storage.close();
+  }
+});
+
+test("saveBestEffortDraft overwrites a previous draft", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.insertSummarizationJob({
+      id: "job_draft2",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev3",
+      inputTokenCount: 200,
+      targetTokenCount: 100,
+      maxRetries: 2,
+    });
+
+    await storage.saveBestEffortDraft("job_draft2", "first attempt");
+    await storage.saveBestEffortDraft("job_draft2", "second attempt shorter");
+
+    const job = storage.getSummarizationJobById("job_draft2");
+    assert.ok(job);
+    assert.equal(job!.bestEffortDraft, "second attempt shorter", "should overwrite previous draft");
+  } finally {
+    storage.close();
+  }
+});
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function insertSummary(
