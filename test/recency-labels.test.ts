@@ -25,8 +25,9 @@ function summary(id: string, latestTimestamp: number): Summary {
   };
 }
 
-test("recency buckets: sub-hour, hours, days", () => {
+test("recency buckets: sub-hour, singular hour, hours, days", () => {
   assert.equal(computeRecencyLabel(NOW - 30 * 60 * 1000, NOW), "< 1 hour ago");
+  assert.equal(computeRecencyLabel(NOW - 1.5 * HOUR, NOW), "1 hour ago");
   assert.equal(computeRecencyLabel(NOW - 5 * HOUR, NOW), "5 hours ago");
   assert.equal(computeRecencyLabel(NOW - 47 * HOUR, NOW), "47 hours ago");
   assert.equal(computeRecencyLabel(NOW - 50 * HOUR, NOW), "2 days ago");

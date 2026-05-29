@@ -248,12 +248,14 @@ export class ContextBuilder {
     }
 
     const content = renderSummaryLayer(summaries, labels);
+    const latestTs = summaries.reduce((max, s) => Math.max(max, s.latestTimestamp), 0);
     return {
       type: "summaryLayer",
       role: "user",
       content,
       tier: "summary",
       tokenEstimate: estimateTokens(content),
+      timestamp: latestTs,
     };
   }
 
@@ -310,7 +312,8 @@ export class ContextBuilder {
     if (!oldestCursor) return unchanged;
     const covering = processing.find((job) => {
       const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
-      return start != null && !cursorAfter(start, oldestCursor);
+      const end = this.storage.getEventCursor(timelineKey, job.inputEndId);
+      return start != null && end != null && !cursorAfter(start, oldestCursor) && !cursorAfter(oldestCursor, end);
     });
     if (!covering) return unchanged;
 

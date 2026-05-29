@@ -62,7 +62,8 @@ export function selectSummaries(candidates: Summary[]): SummarySelection {
 export function computeRecencyLabel(latestTimestamp: number, now: number): string {
   const diffHours = (now - latestTimestamp) / (1000 * 60 * 60);
   if (diffHours < 1) return "< 1 hour ago";
-  if (diffHours < 48) return `${Math.floor(diffHours)} hours ago`;
+  const wholeHours = Math.floor(diffHours);
+  if (diffHours < 48) return `${wholeHours} ${wholeHours === 1 ? "hour" : "hours"} ago`;
   return `${Math.floor(diffHours / 24)} days ago`;
 }
 
