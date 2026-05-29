@@ -41,6 +41,17 @@ test("finalize terminates the turn", async () => {
   assert.equal(result.terminate, true);
 });
 
+test("create with empty string is rejected and does not lock the draft", async () => {
+  const { draft, tool } = toolFor();
+  const result = await tool.execute("1", { command: "create", file_text: "" });
+  assert.match(text(result), /must not be empty/);
+  assert.equal(draft.isCreated(), false);
+  // Model can retry with real content.
+  await tool.execute("2", { command: "create", file_text: "actual content" });
+  assert.equal(draft.isCreated(), true);
+  assert.equal(draft.getContent(), "actual content");
+});
+
 test("over-budget mutation is rejected atomically and does not create the draft", async () => {
   const { draft, tool } = toolFor(10, 2); // limit ≈ 20 tokens
   const huge = "word ".repeat(500);
@@ -55,4 +66,45 @@ test("finalize is suppressed when a mutation fails the token limit", async () =>
   const huge = "word ".repeat(500);
   const result = await tool.execute("1", { command: "create", file_text: huge, finalize: true });
   assert.notEqual(result.terminate, true);
+});
+
+// --- str_replace error paths ---
+
+test("str_replace with non-matching old_str returns error and leaves draft unchanged", async () => {
+  const { draft, tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "hello world" });
+  const result = await tool.execute("2", { command: "str_replace", old_str: "xyz", new_str: "abc" });
+  assert.match(text(result), /old_str was not found/);
+  assert.equal(draft.getContent(), "hello world");
+});
+
+test("str_replace matching more than once returns error and leaves draft unchanged", async () => {
+  const { draft, tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "aaa bbb aaa" });
+  const result = await tool.execute("2", { command: "str_replace", old_str: "aaa", new_str: "ccc" });
+  assert.match(text(result), /old_str matched more than once/);
+  assert.equal(draft.getContent(), "aaa bbb aaa");
+});
+
+// --- view error paths ---
+
+test("view with start < 1 returns error", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "line one\nline two" });
+  const result = await tool.execute("2", { command: "view", view_range: [0, 2] });
+  assert.match(text(result), /view_range start must be >= 1/);
+});
+
+test("view with start past end of draft returns error", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "line one\nline two" });
+  const result = await tool.execute("2", { command: "view", view_range: [5, 6] });
+  assert.match(text(result), /past end of draft/);
+});
+
+test("view with end < start returns error", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "line one\nline two\nline three" });
+  const result = await tool.execute("2", { command: "view", view_range: [3, 1] });
+  assert.match(text(result), /view_range end must be >= start/);
 });

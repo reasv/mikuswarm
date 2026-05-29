@@ -3,6 +3,7 @@ import path from "node:path";
 import { redactSecrets } from "../config/redaction.js";
 
 export interface ContextDumpMessage {
+  type?: "system" | "chatEvent" | "triggerGroup" | "summaryLayer";
   role: string;
   tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger" | "summary";
   tokenEstimate?: number;

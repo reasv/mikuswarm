@@ -31,6 +31,9 @@ export class SummaryDraft {
     if (this.created) {
       throw new SummaryDraftError("Draft already created. Use str_replace or insert to modify.");
     }
+    if (!content.trim()) {
+      throw new SummaryDraftError("file_text must not be empty.");
+    }
     this.content = content;
     this.created = true;
   }

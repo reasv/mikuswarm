@@ -933,7 +933,7 @@ export class Storage {
     limit = 1000,
   ): CanonicalChatEvent[] {
     const cursor = this.getEventCursor(timelineKey, afterEventId);
-    if (!cursor) return [];
+    if (!cursor) return this.getTimelineEvents(timelineKey, limit);
 
     const rows = this.read((db) =>
       db
@@ -1048,10 +1048,15 @@ export class Storage {
     return rows.map(mapSummaryRow);
   }
 
-  getSummaryById(id: string): Summary | undefined {
-    const row = this.read((db) =>
-      db.prepare(`select * from summaries where id = ?`).get(id) as SummaryRow | undefined,
-    );
+  getSummaryById(id: string, timelineKey?: string): Summary | undefined {
+    const row = this.read((db) => {
+      if (timelineKey) {
+        return db
+          .prepare(`select * from summaries where id = ? and timeline_key = ?`)
+          .get(id, timelineKey) as SummaryRow | undefined;
+      }
+      return db.prepare(`select * from summaries where id = ?`).get(id) as SummaryRow | undefined;
+    });
     return row ? mapSummaryRow(row) : undefined;
   }
 
@@ -1075,8 +1080,8 @@ export class Storage {
    * When `level` is provided, only summaries at that level are returned.
    */
   getSummariesBetween(timelineKey: string, startId: string, endId: string, level?: number): Summary[] {
-    const start = this.getSummaryById(startId);
-    const end = this.getSummaryById(endId);
+    const start = this.getSummaryById(startId, timelineKey);
+    const end = this.getSummaryById(endId, timelineKey);
     if (!start || !end) return [];
     const levelFilter = level != null ? "and level = @level" : "";
     const rows = this.read((db) =>

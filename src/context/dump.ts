@@ -22,6 +22,7 @@ export async function dumpBuiltContext(
       sizeBytes: Buffer.byteLength(block.dataBase64, "base64"),
     })),
     messages: context.messages.map((message) => ({
+      type: message.type,
       role: message.role,
       tier: message.tier,
       tokenEstimate: message.tokenEstimate,

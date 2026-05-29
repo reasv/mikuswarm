@@ -303,20 +303,22 @@ export class ContextBuilder {
     if (!this.config.summarization?.enabled) return unchanged;
     const compactMax = this.config.context.tiers.compact_max_tokens;
     // Estimate the compact-tier token count by subtracting the rich-tier tail.
-    // Compaction assigns the newest events to the rich tier, then shrinks the
-    // rich tier to `rich_target_tokens` once it exceeds `rich_max_tokens`.
-    // Use `rich_target_tokens` (the post-compaction size) so the estimate is
-    // conservative: underestimating the rich tail would overestimate compact
-    // and risk false negatives (skipping a needed grace wait).
-    const perEvent = events.map((e) => estimateTokens(renderCompactMessage(e)));
-    const totalCompactRendered = perEvent.reduce((sum, t) => sum + t, 0);
+    // Compaction determines the rich boundary by accumulating rich-rendered
+    // tokens from the newest events until reaching rich_target_tokens.
+    // Mirror that here: use rich rendering for the tail to find how many
+    // events land in the rich tier, then subtract their compact cost.
+    const perEventCompact = events.map((e) => estimateTokens(renderCompactMessage(e)));
+    const totalCompactRendered = perEventCompact.reduce((sum, t) => sum + t, 0);
     const richTarget = this.config.context.tiers.rich_target_tokens;
-    let richEstimate = 0;
-    for (let i = perEvent.length - 1; i >= 0; i--) {
-      if (richEstimate >= richTarget) break;
-      richEstimate += perEvent[i]!;
+    let richTailTokens = 0;
+    let richTailStart = events.length;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (richTailTokens >= richTarget) break;
+      richTailTokens += estimateTokens(renderRichMessage(events[i]!));
+      richTailStart = i;
     }
-    const compactSum = Math.max(0, totalCompactRendered - richEstimate);
+    const richTailCompactCost = perEventCompact.slice(richTailStart).reduce((sum, t) => sum + t, 0);
+    const compactSum = Math.max(0, totalCompactRendered - richTailCompactCost);
     if (compactSum <= compactMax) return unchanged;
 
     const processing = this.storage.getProcessingSummarizationJobs(timelineKey);
