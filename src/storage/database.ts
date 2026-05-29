@@ -933,7 +933,19 @@ export class Storage {
     limit = 1000,
   ): CanonicalChatEvent[] {
     const cursor = this.getEventCursor(timelineKey, afterEventId);
-    if (!cursor) return this.getTimelineEvents(timelineKey, limit);
+    if (!cursor) {
+      console.warn(
+        JSON.stringify({
+          time: new Date().toISOString(),
+          level: "warn",
+          component: "mikuswarm.storage",
+          message: "getTimelineEventsAfter: cursor event not found, returning empty result",
+          timelineKey,
+          afterEventId,
+        }),
+      );
+      return [];
+    }
 
     const rows = this.read((db) =>
       db
@@ -1186,10 +1198,16 @@ export class Storage {
         insert.parentIds.forEach((parentId, ordinal) => stmt.run(insert.id, parentId, ordinal));
       }
 
-      db.prepare(
+      const jobUpdate = db.prepare(
         `update summarization_jobs set status = 'complete', result_summary_id = ?, updated_at = ?
          where id = ?`,
       ).run(insert.id, now, insert.jobId);
+      if (jobUpdate.changes !== 1) {
+        throw new Error(
+          `insertSummaryWithLineage: expected to update exactly 1 job row for "${insert.jobId}", ` +
+          `but ${jobUpdate.changes} rows matched — rolling back`,
+        );
+      }
     });
   }
 

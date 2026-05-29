@@ -323,6 +323,156 @@ test("getSummaryCandidates includes summaries whose latestTimestamp equals befor
   }
 });
 
+// ── insertSummaryWithLineage rolls back when job ID is invalid (#2) ──
+
+test("insertSummaryWithLineage rolls back entire transaction when job update affects 0 rows", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // No job row exists for "nonexistent_job", so the UPDATE will affect 0 rows.
+    const promise = storage.insertSummaryWithLineage({
+      id: "sum_rollback",
+      timelineKey: TK,
+      level: 1,
+      content: "should be rolled back",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev1",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      eventIds: ["ev1", "ev2"],
+      jobId: "nonexistent_job",
+    });
+
+    await assert.rejects(promise, /expected to update exactly 1 job row/);
+
+    // The summary must NOT have been persisted (transaction rolled back).
+    const summary = storage.getSummaryById("sum_rollback");
+    assert.equal(summary, undefined, "summary should not exist after rollback");
+
+    // Lineage rows must also not exist.
+    const lineageCount = storage.read((db) =>
+      (db.prepare("select count(*) as c from summary_events where summary_id = ?").get("sum_rollback") as { c: number }).c,
+    );
+    assert.equal(lineageCount, 0, "lineage rows should not exist after rollback");
+  } finally {
+    storage.close();
+  }
+});
+
+test("insertSummaryWithLineage succeeds and marks job complete when job exists", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Create a pending job first.
+    await storage.insertSummarizationJob({
+      id: "job_valid",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "ev1",
+      inputEndId: "ev2",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+
+    await storage.insertSummaryWithLineage({
+      id: "sum_valid",
+      timelineKey: TK,
+      level: 1,
+      content: "valid summary",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev2",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      eventIds: ["ev1", "ev2"],
+      jobId: "job_valid",
+    });
+
+    // Summary should be persisted.
+    const summary = storage.getSummaryById("sum_valid");
+    assert.ok(summary, "summary should exist");
+    assert.equal(summary!.content, "valid summary");
+
+    // Job should be marked complete with the result summary ID.
+    const job = storage.getSummarizationJobById("job_valid");
+    assert.ok(job, "job should exist");
+    assert.equal(job!.status, "complete");
+    assert.equal(job!.resultSummaryId, "sum_valid");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── getTimelineEventsAfter returns empty when cursor missing (#3) ──
+
+test("getTimelineEventsAfter returns empty array when cursor event does not exist", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Insert some events so getTimelineEvents would return them.
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev1", body: "one", timestamp: 1000 }),
+    );
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev2", body: "two", timestamp: 2000 }),
+    );
+
+    // Capture console.warn output to verify the warning was logged.
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(String(args[0]));
+    };
+    try {
+      const result = storage.getTimelineEventsAfter(TK, "nonexistent_event");
+      assert.deepEqual(result, [], "should return empty array when cursor event is missing");
+      assert.equal(warnings.length, 1, "should have logged exactly one warning");
+      assert.ok(
+        warnings[0]!.includes("cursor event not found"),
+        "warning should mention cursor event not found",
+      );
+      assert.ok(
+        warnings[0]!.includes("nonexistent_event"),
+        "warning should include the missing event ID",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  } finally {
+    storage.close();
+  }
+});
+
+test("getTimelineEventsAfter returns events after cursor when it exists", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev1", body: "one", timestamp: 1000 }),
+    );
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev2", body: "two", timestamp: 2000 }),
+    );
+    await storage.appendTimelineEvent(
+      assistantEvent({ id: "ev3", body: "three", timestamp: 3000 }),
+    );
+
+    const result = storage.getTimelineEventsAfter(TK, "ev1");
+    const ids = result.map((e: CanonicalChatEvent) => e.id);
+    assert.deepEqual(ids, ["ev2", "ev3"], "should return only events after the cursor (exclusive)");
+  } finally {
+    storage.close();
+  }
+});
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function insertSummary(
