@@ -12,6 +12,22 @@ const SessionTypeSchema = Type.Object({
       Type.Array(Type.String()),
     ]),
   ),
+  // Model key from the `models` record. Defaults to "default".
+  model: Type.Optional(Type.String()),
+});
+
+const SummarizationSchema = Type.Object({
+  enabled: Type.Optional(Type.Boolean()),
+  worker_count: Type.Optional(Type.Number({ minimum: 1 })),
+  generation_threshold_tokens: Type.Optional(Type.Number({ minimum: 1 })),
+  leaf_input_tokens: Type.Optional(Type.Number({ minimum: 1 })),
+  leaf_target_tokens: Type.Optional(Type.Number({ minimum: 1 })),
+  condense_fanout: Type.Optional(Type.Number({ minimum: 2 })),
+  condense_target_tokens: Type.Optional(Type.Number({ minimum: 1 })),
+  summary_max_overage_factor: Type.Optional(Type.Number({ minimum: 1 })),
+  summary_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  max_retries: Type.Optional(Type.Number({ minimum: 0 })),
+  label_cache_ttl_ms: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
 const ModelSchema = Type.Object({
@@ -186,6 +202,7 @@ export const AppConfigSchema = Type.Object({
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   captioning: Type.Optional(CaptioningSchema),
+  summarization: Type.Optional(SummarizationSchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -218,3 +235,4 @@ export const AppConfigSchema = Type.Object({
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
+export type SummarizationConfig = Static<typeof SummarizationSchema>;

@@ -36,7 +36,11 @@ export interface BuildContextOptions {
   workspace: WorkspaceContent;
   sessionType?: SessionTypeConfig;
   fallbackPrompt?: string;
-  now?: Date;
+  /** When set, build context for a summarization session. */
+  summarizationCutoff?: {
+    /** Cut context at this timestamp — no events past it are rendered. */
+    endTimestamp: number;
+  };
 }
 
 export interface BuiltContext {

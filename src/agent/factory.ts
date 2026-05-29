@@ -43,6 +43,13 @@ export interface AgentFactoryOptions {
   getActiveSessions: (timelineKey: string) => AgentSessionRecord[];
 }
 
+type ModelConfig = AppConfig["models"]["default"];
+
+export interface CreateAgentOptions {
+  /** When set, build context for a summarization session cut at this timestamp. */
+  summarizationCutoff?: { endTimestamp: number };
+}
+
 export class AgentSessionFactory {
   constructor(private readonly options: AgentFactoryOptions) {}
 
@@ -62,13 +69,20 @@ export class AgentSessionFactory {
    * and assembles the system prompt from it. The workspace content is also passed
    * to the context builder so the satellite block can be rendered at build time.
    */
-  async create(session: AgentSessionRecord, tools: AgentTool[] = []): Promise<Agent> {
-    const model = createModel(this.options.config);
-    const modelConfig = this.options.config.models.default;
-    const streamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+  async create(
+    session: AgentSessionRecord,
+    tools: AgentTool[] = [],
+    opts?: CreateAgentOptions,
+  ): Promise<Agent> {
     const workspaceRoot = this.options.config.workspace.root_dir;
     const sessionTypeConfig = this.resolveSessionType(session.sessionType);
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
+
+    const modelKey = sessionTypeConfig?.model ?? "default";
+    const modelConfig = this.options.config.models[modelKey];
+    if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
+    const model = createModelFromConfig(modelConfig);
+    const streamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
 
     // Load workspace files from disk at session creation time
     const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
@@ -92,10 +106,13 @@ export class AgentSessionFactory {
         const built = await this.options.contextBuilder.build({
           timelineKey: session.timelineKey,
           trigger: session.trigger.event,
-          activeSessions: this.options.getActiveSessions(session.timelineKey),
+          activeSessions: opts?.summarizationCutoff
+            ? []
+            : this.options.getActiveSessions(session.timelineKey),
           workspace,
           sessionType: sessionTypeConfig,
           fallbackPrompt,
+          summarizationCutoff: opts?.summarizationCutoff,
         });
         await dumpBuiltContext(
           this.options.config.app.context_dump_dir,
@@ -173,7 +190,10 @@ function isLiveRuntimeMessage(message: AgentMessage): boolean {
 }
 
 export function createModel(config: AppConfig): Model<"anthropic-messages"> {
-  const model = config.models.default;
+  return createModelFromConfig(config.models.default);
+}
+
+export function createModelFromConfig(model: ModelConfig): Model<"anthropic-messages"> {
   return {
     id: model.id,
     name: model.id,

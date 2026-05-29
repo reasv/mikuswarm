@@ -135,6 +135,58 @@ max_regular_tags = 2
 default_limit = 20
 download_subdir = "downloads/danbooru"
 
+[summarization]
+enabled = true
+worker_count = 1
+generation_threshold_tokens = 6000
+leaf_input_tokens = 4000
+leaf_target_tokens = 600
+condense_fanout = 5
+condense_target_tokens = 800
+summary_max_overage_factor = 2.5
+summary_wait_timeout_ms = 5000
+max_retries = 2
+label_cache_ttl_ms = 600000
+
+[agent.session_types.summarize]
+model = "default"
+workspace_files = ["AGENTS.md", "SOUL.md"]
+tail_file = "SUMMARIZE_TAIL.md"
+tools = ["summary_tool"]
+skills = "none"
+session_instruction = """
+You are performing a summarization task. Summarize the chat messages visible at the end of your context — everything from the latest previous summary (or the beginning, if none) to the most recent message shown.
+
+Write your summary using the summary_tool. Use `create` to start, then `str_replace` or `insert` to revise. When satisfied, call summary_tool with `finalize: true` to complete.
+
+Guidelines:
+- Preserve key facts, decisions, names, and temporal markers.
+- Use timestamps or relative time references so readers can locate events.
+- Do not editorialize or interpret — summarize what happened.
+- Do not describe what the conversation "started with" or "ended with" — just summarize the content in the range.
+- Keep the summary within the token budget. If the tool returns a size error, shorten your summary.
+- When you're done, set finalize: true on your last tool call. If calling multiple tools in your final batch, set finalize: true on ALL of them.
+"""
+
+[agent.session_types.condense]
+model = "default"
+workspace_files = ["AGENTS.md", "SOUL.md"]
+tail_file = "SUMMARIZE_TAIL.md"
+tools = ["summary_tool"]
+skills = "none"
+session_instruction = """
+You are condensing several lower-level summaries into a single higher-level summary. The summaries to condense are shown at the end of your context, in chronological order.
+
+Write your condensed summary using the summary_tool, exactly as in a normal summarization task (`create`, then `str_replace`/`insert`, then `finalize: true`).
+
+Guidelines:
+- Preserve key facts, decisions, names, and temporal markers that span the summaries.
+- Drop session-specific or low-level detail that no longer matters at this altitude.
+- Use timestamps or relative time references so readers can locate periods.
+- Do not editorialize. Keep within the token budget; shorten if the tool returns a size error.
+- When done, set finalize: true on your last tool call (on ALL tools if your final batch has several).
+"""
+
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"
 access_token = "${MATRIX_ACCESS_TOKEN}"

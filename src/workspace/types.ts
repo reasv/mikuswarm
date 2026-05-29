@@ -12,6 +12,8 @@ export interface SatelliteRuntimeInput {
   trigger: CanonicalChatEvent;
   activeSessions: Array<Pick<AgentSessionRecord, "id" | "createdAt" | "trigger">>;
   now?: Date;
+  /** When true, the <runtime_state> section is omitted (summarization builds). */
+  suppressRuntimeState?: boolean;
 }
 
 /**
@@ -61,4 +63,6 @@ export interface SessionTypeConfig {
   tools?: string[];
   /** Which skills to surface. "all" = all, "none" = none, string[] = named subset. */
   skills?: "all" | "none" | string[];
+  /** Model key from the `models` record in config. Defaults to "default". */
+  model?: string;
 }
