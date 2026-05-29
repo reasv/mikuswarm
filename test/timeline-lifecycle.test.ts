@@ -33,6 +33,23 @@ test("setTimelineState upserts and getTimelineState reflects each transition", a
   }
 });
 
+test("resetStaleActivations flips only 'activating' timelines back to 'inactive'", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setTimelineState("matrix:miku:room:!a", "activating");
+    await storage.setTimelineState("matrix:miku:room:!b", "active");
+    await storage.setTimelineState("matrix:miku:room:!c", "activating");
+
+    const count = await storage.resetStaleActivations();
+    assert.equal(count, 2, "both 'activating' rows should be reset");
+    assert.equal(storage.getTimelineState("matrix:miku:room:!a"), "inactive");
+    assert.equal(storage.getTimelineState("matrix:miku:room:!b"), "active", "active timelines untouched");
+    assert.equal(storage.getTimelineState("matrix:miku:room:!c"), "inactive");
+  } finally {
+    storage.close();
+  }
+});
+
 test("setTimelineState preserves existing compaction cursors", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

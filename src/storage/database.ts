@@ -505,6 +505,24 @@ export class Storage {
     });
   }
 
+  /**
+   * Reset timelines stranded in `'activating'` (process crashed mid-activation)
+   * back to `'inactive'` so the next trigger re-runs activation. Called on
+   * startup, mirroring the stale-claim resets for enrichment/captions/jobs.
+   * Returns the number of rows reset.
+   */
+  resetStaleActivations(): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update timeline_compaction_state set timeline_state = 'inactive', updated_at = ?
+           where timeline_state = 'activating'`,
+        )
+        .run(Date.now());
+      return result.changes;
+    });
+  }
+
   /** Earliest stored event timestamp for a timeline, or undefined when empty. */
   getOldestEventTimestamp(timelineKey: string): number | undefined {
     const row = this.read((db) =>
