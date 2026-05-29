@@ -94,9 +94,10 @@ export class ContextBuilder {
 
     if (cutoff) {
       // Cut at endTimestamp; re-select the summary layer to exclude any summary
-      // overlapping the events being summarized (§6). The event range stays
-      // derived from the unfiltered cursor, so no event renders both raw and
-      // inside a summary (and none is dropped from both).
+      // overlapping the events being summarized (§6). `getSummaryCandidates` uses
+      // an inclusive `<=` bound so a summary whose `latestTimestamp` equals
+      // `earliest` is still included (prevents a coverage gap on millisecond-
+      // precision timestamp collisions from Matrix batch sends).
       events = events.filter((e) => e.timestamp <= cutoff.endTimestamp);
       const earliest = events[0]?.timestamp ?? cutoff.endTimestamp + 1;
       selection = selectSummaries(
@@ -301,7 +302,20 @@ export class ContextBuilder {
     const unchanged = { events, selection };
     if (!this.config.summarization?.enabled) return unchanged;
     const compactMax = this.config.context.tiers.compact_max_tokens;
-    const compactSum = events.reduce((sum, e) => sum + estimateTokens(renderCompactMessage(e)), 0);
+    // Estimate the compact-tier token count by subtracting the rich-tier tail.
+    // Compaction assigns the newest events (from the end of the array) to the
+    // rich tier up to `rich_max_tokens`, then the remainder goes compact.
+    // Without this adjustment, the sum includes rich-tier events and can
+    // trigger false-positive grace waits (up to 5s polling latency).
+    const perEvent = events.map((e) => estimateTokens(renderCompactMessage(e)));
+    const totalCompactRendered = perEvent.reduce((sum, t) => sum + t, 0);
+    const richMax = this.config.context.tiers.rich_max_tokens;
+    let richEstimate = 0;
+    for (let i = perEvent.length - 1; i >= 0; i--) {
+      if (richEstimate >= richMax) break;
+      richEstimate += perEvent[i]!;
+    }
+    const compactSum = Math.max(0, totalCompactRendered - richEstimate);
     if (compactSum <= compactMax) return unchanged;
 
     const processing = this.storage.getProcessingSummarizationJobs(timelineKey);
@@ -369,19 +383,20 @@ export class ContextBuilder {
     const last = chunk[chunk.length - 1]!;
 
     // Skip if a pending/processing level-1 job already covers this range.
+    // If cursors are missing, the timeline is in an inconsistent state — skip
+    // enqueueing rather than bypass the overlap check and risk duplicates.
     const active = this.storage.getActiveSummarizationJobs(timelineKey, 1);
     const firstCursor = this.storage.getEventCursor(timelineKey, first.id);
     const lastCursor = this.storage.getEventCursor(timelineKey, last.id);
-    if (firstCursor && lastCursor) {
-      const overlaps = active.some((job) => {
-        const jobStart = this.storage.getEventCursor(timelineKey, job.inputStartId);
-        const jobEnd = this.storage.getEventCursor(timelineKey, job.inputEndId);
-        if (!jobStart || !jobEnd) return false;
-        // Ranges overlap unless one is entirely before the other.
-        return !cursorAfter(firstCursor, jobEnd) && !cursorAfter(jobStart, lastCursor);
-      });
-      if (overlaps) return;
-    }
+    if (!firstCursor || !lastCursor) return;
+    const overlaps = active.some((job) => {
+      const jobStart = this.storage.getEventCursor(timelineKey, job.inputStartId);
+      const jobEnd = this.storage.getEventCursor(timelineKey, job.inputEndId);
+      if (!jobStart || !jobEnd) return false;
+      // Ranges overlap unless one is entirely before the other.
+      return !cursorAfter(firstCursor, jobEnd) && !cursorAfter(jobStart, lastCursor);
+    });
+    if (overlaps) return;
 
     const jobId = `sumjob_${nanoid(10)}`;
     await this.storage.insertSummarizationJob({

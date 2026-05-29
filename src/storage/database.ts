@@ -1020,7 +1020,10 @@ export class Storage {
   /**
    * Candidate summaries for context selection: status in (complete,
    * truncated), ordered by earliest_timestamp ASC. When beforeTimestamp is
-   * set, only summaries whose coverage ends strictly before it.
+   * set, only summaries whose coverage ends at or before it (inclusive).
+   * The inclusive bound prevents a coverage gap when a summary's
+   * latestTimestamp exactly equals an event's timestamp (millisecond
+   * collision from Matrix batch sends — §6).
    */
   getSummaryCandidates(timelineKey: string, beforeTimestamp?: number): Summary[] {
     const rows = this.read((db) => {
@@ -1029,7 +1032,7 @@ export class Storage {
           .prepare(
             `select * from summaries
              where timeline_key = ? and status in ('complete', 'truncated')
-               and latest_timestamp < ?
+               and latest_timestamp <= ?
              order by earliest_timestamp asc`,
           )
           .all(timelineKey, beforeTimestamp) as SummaryRow[];

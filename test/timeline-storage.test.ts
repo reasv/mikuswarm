@@ -280,6 +280,49 @@ test("insertSummaryWithLineage rejects with precondition error via .catch()", as
   }
 });
 
+// ── getSummaryCandidates inclusive boundary (#4) ────────────────────
+
+test("getSummaryCandidates includes summaries whose latestTimestamp equals beforeTimestamp", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Summary whose latestTimestamp is exactly the cutoff.
+    await insertSummary(storage, {
+      id: "s_exact",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 100,
+      latestTimestamp: 500,
+    });
+    // Summary whose latestTimestamp is before the cutoff.
+    await insertSummary(storage, {
+      id: "s_before",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 50,
+      latestTimestamp: 400,
+    });
+    // Summary whose latestTimestamp is after the cutoff.
+    await insertSummary(storage, {
+      id: "s_after",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 200,
+      latestTimestamp: 600,
+    });
+
+    const candidates = storage.getSummaryCandidates(TK, 500);
+    const ids = candidates.map((s) => s.id);
+
+    // The summary at exactly 500 must be included (inclusive <=), the one at 600 must not.
+    assert.ok(ids.includes("s_exact"), "summary at exactly beforeTimestamp should be included");
+    assert.ok(ids.includes("s_before"), "summary before beforeTimestamp should be included");
+    assert.ok(!ids.includes("s_after"), "summary after beforeTimestamp should be excluded");
+  } finally {
+    storage.close();
+  }
+});
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function insertSummary(
