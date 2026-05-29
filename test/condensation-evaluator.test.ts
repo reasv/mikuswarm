@@ -151,6 +151,41 @@ test("does not enqueue a duplicate when an active job already covers the run", a
   storage.close();
 });
 
+test("skips enqueueing when an active job references nonexistent (deleted) summary IDs", async () => {
+  const storage = await openStorage();
+  // Five contiguous level-1 summaries — enough for condensation.
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  // An active (processing) level-2 job whose input IDs reference summaries that
+  // no longer exist in the DB (e.g. deleted). The evaluator cannot resolve their
+  // timestamps, so it conservatively treats them as overlapping to avoid
+  // enqueueing a duplicate.
+  await storage.insertSummarizationJob({
+    id: "ghost_job",
+    timelineKey: TK,
+    level: 2,
+    inputStartId: "deleted_s0",
+    inputEndId: "deleted_s4",
+    inputTokenCount: 500,
+    targetTokenCount: 800,
+    maxRetries: 2,
+  });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  // The only active job should be the ghost one — no new job enqueued.
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0]!.id, "ghost_job");
+  storage.close();
+});
+
 test("cascade: level-2 completion triggers evaluation for level-3 eligibility", async () => {
   const storage = await openStorage();
   for (let i = 0; i < 5; i++) {

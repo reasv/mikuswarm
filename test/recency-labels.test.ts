@@ -33,6 +33,13 @@ test("recency buckets: sub-hour, singular hour, hours, days", () => {
   assert.equal(computeRecencyLabel(NOW - 50 * HOUR, NOW), "2 days ago");
 });
 
+test("negative time diff (clock skew: now < latestTimestamp) returns '< 1 hour ago'", () => {
+  // When the trigger timestamp is earlier than the summary's latest timestamp
+  // (e.g. clock skew), diffHours is negative. The function treats this the same
+  // as sub-hour, returning "< 1 hour ago".
+  assert.equal(computeRecencyLabel(NOW + 5 * HOUR, NOW), "< 1 hour ago");
+});
+
 test("labels are stable across small time increments within a bucket", () => {
   const base = computeRecencyLabel(NOW - 5 * HOUR, NOW);
   // Advance now by a few minutes — still within the same hour bucket.

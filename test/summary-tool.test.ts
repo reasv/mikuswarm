@@ -133,3 +133,29 @@ test("insert without insert_line returns isError: true", async () => {
   assert.match(text(result), /insert requires insert_line/);
   assert.equal(result.isError, true);
 });
+
+// --- finalize: true on non-create commands ---
+
+test("view with finalize: true sets terminate: true", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "some content" });
+  const result = await tool.execute("2", { command: "view", finalize: true });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /1: some content/);
+});
+
+test("str_replace with finalize: true sets terminate: true", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "hello world" });
+  const result = await tool.execute("2", { command: "str_replace", old_str: "world", new_str: "there", finalize: true });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /str_replace applied/);
+});
+
+test("insert with finalize: true sets terminate: true", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "a\nc" });
+  const result = await tool.execute("2", { command: "insert", insert_line: 1, new_str: "b", finalize: true });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /insert applied/);
+});
