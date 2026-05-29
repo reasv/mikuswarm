@@ -231,6 +231,76 @@ test("getSummariesBetween filters by level when provided", async () => {
   }
 });
 
+// ── getSummariesBetween rejects superseded boundary summaries (#4) ──
+
+test("getSummariesBetween throws when start boundary summary has status superseded", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Insert a superseded summary as the start boundary.
+    await insertSummary(storage, {
+      id: "s_superseded",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 100,
+      latestTimestamp: 200,
+      status: "superseded",
+    });
+    // Insert a complete summary as the end boundary.
+    await insertSummary(storage, {
+      id: "s_complete",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 300,
+      latestTimestamp: 400,
+    });
+
+    assert.throws(
+      () => storage.getSummariesBetween(TK, "s_superseded", "s_complete"),
+      (err: Error) => {
+        assert.ok(err.message.includes("s_superseded"), "error should reference the boundary ID");
+        assert.ok(err.message.includes("superseded"), "error should mention the invalid status");
+        return true;
+      },
+    );
+  } finally {
+    storage.close();
+  }
+});
+
+test("getSummariesBetween throws when end boundary summary has status superseded", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await insertSummary(storage, {
+      id: "s_start_ok",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 100,
+      latestTimestamp: 200,
+    });
+    await insertSummary(storage, {
+      id: "s_end_superseded",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 300,
+      latestTimestamp: 400,
+      status: "superseded",
+    });
+
+    assert.throws(
+      () => storage.getSummariesBetween(TK, "s_start_ok", "s_end_superseded"),
+      (err: Error) => {
+        assert.ok(err.message.includes("s_end_superseded"), "error should reference the boundary ID");
+        assert.ok(err.message.includes("superseded"), "error should mention the invalid status");
+        return true;
+      },
+    );
+  } finally {
+    storage.close();
+  }
+});
+
 // ── insertSummaryWithLineage precondition throws via promise ────────
 
 test("insertSummaryWithLineage rejects with precondition error via .catch()", async () => {

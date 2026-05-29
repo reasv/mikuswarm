@@ -930,6 +930,17 @@ export class Storage {
    * Like getTimelineEventsForContext, but the cursor event is EXCLUDED
    * (id > cursor, not id >=). Used when the cursor event is covered by a
    * summary and must not also render raw.
+   *
+   * **Fallback on missing cursor (invariant violation):** When the cursor event
+   * is not found in `timeline_events`, this method falls back to
+   * `getTimelineEvents()` (recent events, no cursor filtering). This is
+   * intentional degradation — throwing would be worse than degraded rendering,
+   * since the missing cursor requires data corruption or an out-of-order delete
+   * to trigger. However, the fallback may return events that are already covered
+   * by a summary, potentially causing double-rendering (an event appears both in
+   * the summary layer and as a raw event). The warning log emitted in this path
+   * is the primary signal for investigation. Callers should not rely on the
+   * returned events being disjoint from summary coverage when the warning fires.
    */
   getTimelineEventsAfter(
     timelineKey: string,
@@ -1095,6 +1106,24 @@ export class Storage {
     const start = this.getSummaryById(startId, timelineKey);
     const end = this.getSummaryById(endId, timelineKey);
     if (!start || !end) return [];
+
+    // Precondition: boundary summaries must have a status that passes the range
+    // query's `status in ('complete', 'truncated')` filter. A superseded boundary
+    // would be found here (getSummaryById has no status filter) but excluded from
+    // the range results, silently producing incomplete output.
+    const validStatuses = new Set<string>(["complete", "truncated"]);
+    if (!validStatuses.has(start.status)) {
+      throw new Error(
+        `getSummariesBetween: start boundary summary "${startId}" has status "${start.status}" ` +
+        `which is excluded by the range query (requires 'complete' or 'truncated')`,
+      );
+    }
+    if (!validStatuses.has(end.status)) {
+      throw new Error(
+        `getSummariesBetween: end boundary summary "${endId}" has status "${end.status}" ` +
+        `which is excluded by the range query (requires 'complete' or 'truncated')`,
+      );
+    }
     const levelFilter = level != null ? "and level = @level" : "";
     const rows = this.read((db) =>
       db
