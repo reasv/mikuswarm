@@ -68,7 +68,18 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
       const jobEnd = storage.getSummaryById(job.inputEndId);
       // Treat an unresolvable active range as overlapping — be conservative and
       // never enqueue a duplicate condensation job.
-      if (!jobStart || !jobEnd) return true;
+      if (!jobStart || !jobEnd) {
+        logger.warn("condensation_unresolvable_active_job", {
+          activeJobId: job.id,
+          inputStartId: job.inputStartId,
+          inputEndId: job.inputEndId,
+          startResolved: !!jobStart,
+          endResolved: !!jobEnd,
+          timelineKey,
+          level: level + 1,
+        });
+        return true;
+      }
       return !summaryAfter(start, jobEnd) && !summaryAfter(jobStart, end);
     });
     if (overlaps) continue;

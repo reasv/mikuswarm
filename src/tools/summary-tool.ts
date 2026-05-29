@@ -186,6 +186,7 @@ export function createSummaryTool(options: {
             },
           ],
           details: { command: args.command, tokens: currentTokens, limit },
+          isError: true,
           // Do NOT terminate even if finalize was true — the error needs handling.
         };
       }
@@ -201,7 +202,7 @@ export function createSummaryTool(options: {
   };
 }
 
-function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; details: null } {
+function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; details: null; isError: true } {
   const message = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: "text", text: `Error: ${message}` }], details: null };
+  return { content: [{ type: "text", text: `Error: ${message}` }], details: null, isError: true };
 }

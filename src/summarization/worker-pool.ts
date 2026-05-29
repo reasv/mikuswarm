@@ -229,7 +229,7 @@ export class SummarizationWorkerPool {
 
     if (content.trim().length > 0) {
       const existing = job.bestEffortDraft;
-      if (!existing || content.length < existing.length) {
+      if (!existing || estimateTokens(content) < estimateTokens(existing)) {
         await storage.saveBestEffortDraft(job.id, content);
       }
     }
@@ -241,10 +241,30 @@ export class SummarizationWorkerPool {
       error: errMsg,
     });
 
-    if (job.attempts <= job.maxRetries) {
-      await storage.retrySummarizationJob(job.id, errMsg);
-    } else {
-      await this.truncationFallback(job, input, errMsg);
+    try {
+      if (job.attempts <= job.maxRetries) {
+        await storage.retrySummarizationJob(job.id, errMsg);
+      } else {
+        await this.truncationFallback(job, input, errMsg);
+      }
+    } catch (writeErr) {
+      // Retry/truncation write failed — try to fail the job so it doesn't stay
+      // stuck in 'processing' forever.
+      const writeErrMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+      logger.error("summarization_retry_write_failed", {
+        jobId: job.id,
+        originalError: errMsg,
+        writeError: writeErrMsg,
+      });
+      try {
+        await storage.failSummarizationJob(job.id, `retry/truncation write failed: ${writeErrMsg}`);
+      } catch (failErr) {
+        logger.error("summarization_fail_fallback_failed", {
+          jobId: job.id,
+          error: failErr instanceof Error ? failErr.message : String(failErr),
+        });
+      }
+      this.options.onError(job.id, new Error(errMsg));
     }
   }
 
