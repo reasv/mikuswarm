@@ -103,6 +103,20 @@ export class ContextBuilder {
       selection = selectSummaries(
         this.storage.getSummaryCandidates(options.timelineKey, earliest),
       );
+
+      // Re-query events against the corrected coverage cursor. The re-selection
+      // may have moved the cursor earlier (fewer summaries qualify with the
+      // beforeTimestamp filter), so events between the old and new cursor would
+      // be silently lost without this re-query.
+      if (selection.coverageEndEventId) {
+        events = this.store
+          .queryAfterContext(options.timelineKey, selection.coverageEndEventId)
+          .filter((e) => e.timestamp <= cutoff.endTimestamp);
+      } else {
+        events = this.store
+          .queryForContext(options.timelineKey, compactionState)
+          .filter((e) => e.timestamp <= cutoff.endTimestamp);
+      }
     }
 
     this.logger?.debug("summary_coverage_resolved", {

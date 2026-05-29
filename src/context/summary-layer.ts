@@ -1,5 +1,5 @@
 import type { Summary } from "../storage/index.js";
-import { escapeAttr } from "./xml.js";
+import { escapeAttr, escapeXml } from "./xml.js";
 
 export interface SummarySelection {
   /** Summaries to render, ordered by earliest_timestamp ASC. */
@@ -50,12 +50,30 @@ export function selectSummaries(candidates: Summary[]): SummarySelection {
 
   pruned.sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
 
-  const top = pruned.reduce<Summary | null>(
-    (best, s) => (best === null || s.latestTimestamp > best.latestTimestamp ? s : best),
-    null,
-  );
+  // Derive the cursor from the contiguous prefix of summaries. Walk
+  // chronologically; if one summary's earliestTimestamp is significantly past
+  // the previous summary's latestTimestamp (more than 1ms tolerance), stop the
+  // contiguous chain. Summaries after the gap are still rendered (they contain
+  // useful context) but don't drive the cursor past the gap, so events in the
+  // gap are queried and rendered raw.
+  const GAP_TOLERANCE_MS = 1;
+  let contiguousCursor: Summary | null = null;
+  for (const s of pruned) {
+    if (contiguousCursor === null) {
+      contiguousCursor = s;
+    } else if (s.earliestTimestamp <= contiguousCursor.latestTimestamp + GAP_TOLERANCE_MS) {
+      // This summary follows contiguously (or overlaps) — extend the chain.
+      if (s.latestTimestamp > contiguousCursor.latestTimestamp) {
+        contiguousCursor = s;
+      }
+    } else {
+      // Gap detected — stop extending the cursor. The contiguousCursor stays
+      // at the last contiguous summary.
+      break;
+    }
+  }
 
-  return { summaries: pruned, coverageEndEventId: top ? top.latestEventId : null };
+  return { summaries: pruned, coverageEndEventId: contiguousCursor ? contiguousCursor.latestEventId : null };
 }
 
 /** Progressive-rounding relative-time label (§5). `now` is always trigger.timestamp. */
@@ -132,7 +150,7 @@ export function renderSummaryLayer(selected: Summary[], labels: string[]): strin
         `id="${escapeAttr(s.id)}"`,
       ];
       if (s.status === "truncated") attrs.push(`truncated="true"`);
-      return `<summary ${attrs.join(" ")}>\n${s.content}\n</summary>`;
+      return `<summary ${attrs.join(" ")}>\n${escapeXml(s.content)}\n</summary>`;
     })
     .join("\n\n");
 }
