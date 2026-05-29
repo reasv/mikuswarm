@@ -151,18 +151,18 @@ export function createSummaryTool(options: {
       try {
         if (args.command === "create") {
           if (args.file_text === undefined) {
-            return { content: [{ type: "text", text: "Error: create requires file_text." }], details: null };
+            return { content: [{ type: "text", text: "Error: create requires file_text." }], details: null, isError: true };
           }
           draft.create(args.file_text);
         } else if (args.command === "str_replace") {
           if (args.old_str === undefined) {
-            return { content: [{ type: "text", text: "Error: str_replace requires old_str." }], details: null };
+            return { content: [{ type: "text", text: "Error: str_replace requires old_str." }], details: null, isError: true };
           }
           draft.strReplace(args.old_str, args.new_str ?? "");
         } else {
           // insert
           if (args.insert_line === undefined) {
-            return { content: [{ type: "text", text: "Error: insert requires insert_line." }], details: null };
+            return { content: [{ type: "text", text: "Error: insert requires insert_line." }], details: null, isError: true };
           }
           draft.insert(args.insert_line, args.new_str ?? "");
         }

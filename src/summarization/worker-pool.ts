@@ -24,7 +24,7 @@ interface ResolvedInput {
   latestTimestamp: number;
   latestEventId: string;
   eventCount: number;
-  modelId: string | null;
+  modelId: string;
   /** Ordered leaf event IDs (level 1). */
   eventIds?: string[];
   /** Ordered parent summary IDs (level 2+). */

@@ -108,3 +108,28 @@ test("view with end < start returns error", async () => {
   const result = await tool.execute("2", { command: "view", view_range: [3, 1] });
   assert.match(text(result), /view_range end must be >= start/);
 });
+
+// --- parameter-validation errors return isError: true ---
+
+test("create without file_text returns isError: true", async () => {
+  const { tool } = toolFor();
+  const result = await tool.execute("1", { command: "create" });
+  assert.match(text(result), /create requires file_text/);
+  assert.equal(result.isError, true);
+});
+
+test("str_replace without old_str returns isError: true", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "hello" });
+  const result = await tool.execute("2", { command: "str_replace" });
+  assert.match(text(result), /str_replace requires old_str/);
+  assert.equal(result.isError, true);
+});
+
+test("insert without insert_line returns isError: true", async () => {
+  const { tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "hello" });
+  const result = await tool.execute("2", { command: "insert" });
+  assert.match(text(result), /insert requires insert_line/);
+  assert.equal(result.isError, true);
+});
