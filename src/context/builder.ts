@@ -303,16 +303,17 @@ export class ContextBuilder {
     if (!this.config.summarization?.enabled) return unchanged;
     const compactMax = this.config.context.tiers.compact_max_tokens;
     // Estimate the compact-tier token count by subtracting the rich-tier tail.
-    // Compaction assigns the newest events (from the end of the array) to the
-    // rich tier up to `rich_max_tokens`, then the remainder goes compact.
-    // Without this adjustment, the sum includes rich-tier events and can
-    // trigger false-positive grace waits (up to 5s polling latency).
+    // Compaction assigns the newest events to the rich tier, then shrinks the
+    // rich tier to `rich_target_tokens` once it exceeds `rich_max_tokens`.
+    // Use `rich_target_tokens` (the post-compaction size) so the estimate is
+    // conservative: underestimating the rich tail would overestimate compact
+    // and risk false negatives (skipping a needed grace wait).
     const perEvent = events.map((e) => estimateTokens(renderCompactMessage(e)));
     const totalCompactRendered = perEvent.reduce((sum, t) => sum + t, 0);
-    const richMax = this.config.context.tiers.rich_max_tokens;
+    const richTarget = this.config.context.tiers.rich_target_tokens;
     let richEstimate = 0;
     for (let i = perEvent.length - 1; i >= 0; i--) {
-      if (richEstimate >= richMax) break;
+      if (richEstimate >= richTarget) break;
       richEstimate += perEvent[i]!;
     }
     const compactSum = Math.max(0, totalCompactRendered - richEstimate);
