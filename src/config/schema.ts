@@ -30,6 +30,18 @@ const SummarizationSchema = Type.Object({
   label_cache_ttl_ms: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
+const TimelineSchema = Type.Object({
+  // How many messages to fetch on first trigger (initial backfill). 0 = none.
+  initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
+  // Max time window for initial backfill (ms); whichever limit is reached first.
+  initial_backfill_window_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Timeout for the initial backfill fetch (ms). The first trigger is held this long.
+  initial_backfill_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Prune events from inactive timelines older than this (days). 0 = no pruning.
+  // Reserved for the deferred retention job (spec Phase 8); not yet enforced.
+  inactive_event_retention_days: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
 const ModelSchema = Type.Object({
   id: Type.String({ minLength: 1 }),
   provider: Type.String({ minLength: 1 }),
@@ -199,6 +211,7 @@ export const AppConfigSchema = Type.Object({
     trigger_group_lookback_ms: Type.Optional(Type.Number({ minimum: 0 })),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
   }),
+  timeline: Type.Optional(TimelineSchema),
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   captioning: Type.Optional(CaptioningSchema),

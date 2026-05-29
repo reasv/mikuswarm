@@ -50,6 +50,7 @@ import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModalit
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
+import { performInitialBackfill } from "./backfill/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -377,6 +378,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         enrichmentPool.notifyNewEvent(inbound.event.id);
       }
 
+      // Initial Matrix-history backfill (§4 step 3): blocking, held with the
+      // trigger. Failures are non-fatal — proceed with whatever was fetched.
+      await runInitialBackfill(inbound);
+
       // Flip all previously-stored inactive events to pending and nudge the
       // enrichment pool — a single nudge suffices since its poll query drains
       // every pending row.
@@ -418,6 +423,42 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       }
       throw error;
+    }
+  }
+
+  async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {
+    const maxMessages = config.timeline?.initial_backfill_messages ?? 200;
+    const target = inbound.outboundTarget;
+    if (maxMessages <= 0 || !target?.roomId) return;
+
+    const accountId = target.accountId ?? inbound.timelineKey.split(":")[1];
+    const selfUserId = config.matrix.accounts[accountId]?.user_id;
+    if (!selfUserId) {
+      logger.warn("initial_backfill_skipped", { timelineKey: inbound.timelineKey, reason: "unknown_self_user", accountId });
+      return;
+    }
+
+    try {
+      const result = await performInitialBackfill({
+        client: provider.getClient(target),
+        store: timeline,
+        storage,
+        timelineKey: inbound.timelineKey,
+        roomId: target.roomId,
+        accountId,
+        selfUserId,
+        maxMessages,
+        windowMs: config.timeline?.initial_backfill_window_ms ?? 3_600_000,
+        timeoutMs: config.timeline?.initial_backfill_timeout_ms ?? 30_000,
+        logger,
+      });
+      logger.info("initial_backfill", { timelineKey: inbound.timelineKey, ...result });
+    } catch (error) {
+      // Backfill is best-effort and must not abort activation.
+      logger.error("initial_backfill_failed", {
+        timelineKey: inbound.timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
