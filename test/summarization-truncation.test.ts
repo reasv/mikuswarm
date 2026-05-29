@@ -3,6 +3,7 @@ import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage } from "../src/storage/index.js";
 import { SummarizationWorkerPool, truncateToBudget } from "../src/summarization/index.js";
+import { estimateTokens } from "../src/context/index.js";
 import type { SummarizationConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
@@ -156,36 +157,132 @@ test("a job with no salvageable draft is marked failed", async () => {
 });
 
 test("truncateToBudget respects CJK sentence-boundary punctuation", () => {
-  // Target 10 tokens → char limit 40. The regex requires punctuation followed
-  // by whitespace or end-of-string. Build text with a 。 followed by a space,
-  // positioned within the last 20% (char ≥ 32) of the clipped region.
-  const filler = "QQQQ";                 // marker not in the truncation annotation
-  const before = "a".repeat(33) + "。";   // 34 chars (。 is 1 JS char)
-  const after = " " + filler.repeat(3);   // space + trailing content
-  const text = before + after;            // 47 chars total, over the 40-char limit
+  // Uses real BPE tokenizer. Build text where the CJK 。 followed by a space
+  // lands within the last 20% of the token-truncated region so the sentence
+  // boundary logic fires.
+  const filler = "QQQQ";                       // marker not in the truncation annotation
+  const prefix = "word ".repeat(12);            // ~13 tokens of filler words
+  const before = prefix + "。";                 // prefix + sentence-ending 。
+  const after = " " + filler.repeat(10);        // trailing content after boundary
+  const text = before + after;                  // ~34 tokens total, exceeds target
 
-  const result = truncateToBudget(text, 10);
-  // Should truncate at the 。 boundary (index 33 → keep 34 chars), not at the raw 40-char limit.
+  const result = truncateToBudget(text, 30);
+  // Should truncate at the 。 boundary, not at the raw token limit.
   assert.ok(result.startsWith(before), "should keep text up to and including 。");
   assert.ok(!result.includes(filler), "should not include text after 。 boundary");
   assert.match(result, /\[Summary truncated/);
 });
 
 test("truncateToBudget respects fullwidth exclamation and question marks", () => {
-  // Target 10 tokens → char limit 40. Punctuation at position 33 (last 20% = ≥32).
+  // Uses real BPE tokenizer. Same layout as the CJK test above but with ！ and ？.
   const filler = "QQQQ";
-  const before = "a".repeat(33) + "！";
-  const after = " " + filler.repeat(3);
+  const prefix = "word ".repeat(12);
+  const before = prefix + "！";
+  const after = " " + filler.repeat(10);
   const text = before + after;
 
-  const result = truncateToBudget(text, 10);
+  const result = truncateToBudget(text, 30);
   assert.ok(result.startsWith(before), "should keep text up to and including ！");
   assert.ok(!result.includes(filler), "should not include text after ！ boundary");
 
   // Also test ？
-  const before2 = "a".repeat(33) + "？";
-  const text2 = before2 + " " + filler.repeat(3);
-  const result2 = truncateToBudget(text2, 10);
+  const before2 = prefix + "？";
+  const text2 = before2 + " " + filler.repeat(10);
+  const result2 = truncateToBudget(text2, 30);
   assert.ok(result2.startsWith(before2), "should keep text up to and including ？");
   assert.ok(!result2.includes(filler), "should not include text after ？ boundary");
+});
+
+test("truncation fallback uses the shorter draft when DB has a shorter best-effort draft than the current attempt", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  await storage.appendTimelineEvent(event("ev0", 1000));
+  await storage.appendTimelineEvent(event("ev1", 2000));
+  await storage.insertSummarizationJob({
+    id: "job_draft",
+    timelineKey: TK,
+    level: 1,
+    inputStartId: "ev0",
+    inputEndId: "ev1",
+    inputTokenCount: 50,
+    targetTokenCount: 200,
+    maxRetries: 1, // two attempts: first saves short draft, second produces long draft
+  });
+
+  // A short draft (first attempt) and a long draft (second attempt).
+  const shortDraft = "Short summary. Done.";
+  const longDraft = Array.from({ length: 30 }, (_, i) => `Detailed sentence ${i} here.`).join(" ");
+  assert.ok(
+    estimateTokens(shortDraft) < estimateTokens(longDraft),
+    "precondition: short draft has fewer tokens than long draft",
+  );
+
+  let callCount = 0;
+  const factory = {
+    resolveModelId: () => "test-model",
+    create: async (_session: unknown, tools: AgentTool[]) => {
+      callCount++;
+      const summaryTool = tools[0]!;
+      // First attempt writes the short draft; second writes the long draft.
+      const text = callCount === 1 ? shortDraft : longDraft;
+      await summaryTool.execute("t", { command: "create", file_text: text });
+      return {
+        prompt: async () => {},
+        waitForIdle: async () => {
+          throw new Error("forced agent failure");
+        },
+      };
+    },
+  } as any;
+
+  const pool = new SummarizationWorkerPool({
+    storage,
+    factory,
+    config: { worker_count: 1, summary_max_overage_factor: 2.5, max_retries: 1 },
+    onComplete: () => {},
+    onError: () => {},
+    logger: silentLogger,
+  });
+
+  await pool.start();
+  pool.notifyNewWork();
+  await waitFor(() => {
+    const j = storage.getSummarizationJobById("job_draft");
+    return j?.status === "complete" || j?.status === "failed";
+  });
+  await pool.stop();
+
+  assert.equal(callCount, 2, "factory should have been called twice");
+  const job = storage.getSummarizationJobById("job_draft")!;
+  assert.equal(job.status, "complete");
+  assert.ok(job.resultSummaryId);
+
+  const summary = storage.getSummaryById(job.resultSummaryId!)!;
+  // The summary content should be based on the shorter draft, not the longer one.
+  // Since shortDraft is well within budget, it should be used as-is (no truncation needed).
+  assert.ok(
+    summary.content.includes("Short summary"),
+    "truncation fallback should have picked the shorter draft from the DB",
+  );
+  assert.ok(
+    !summary.content.includes("Detailed sentence"),
+    "truncation fallback should NOT have used the longer current draft",
+  );
+
+  storage.close();
+});
+
+test("truncateToBudget result stays within the token budget", () => {
+  // Build a text that is well over the target budget; verify the truncated
+  // result (including the trailer) does not exceed the target.
+  const longText = "The quick brown fox jumps over the lazy dog. ".repeat(50);
+  const target = 40;
+  assert.ok(estimateTokens(longText) > target, "precondition: text exceeds budget");
+
+  const result = truncateToBudget(longText, target);
+  const resultTokens = estimateTokens(result);
+  assert.ok(
+    resultTokens <= target,
+    `truncated result should be at most ${target} tokens, got ${resultTokens}`,
+  );
+  assert.match(result, /\[Summary truncated/);
 });

@@ -1,4 +1,4 @@
-export { estimateObjectTokens, estimateTokens } from "./tokens.js";
+export { estimateObjectTokens, estimateTokens, truncateToTokens } from "./tokens.js";
 export {
   renderCompactMessage,
   renderMessage,

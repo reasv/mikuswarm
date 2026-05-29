@@ -5,7 +5,7 @@ import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createSummaryTool } from "../tools/index.js";
-import { estimateTokens } from "../context/index.js";
+import { estimateTokens, truncateToTokens } from "../context/index.js";
 import { evaluateCondensation } from "./evaluator.js";
 
 export interface SummarizationWorkerPoolOptions {
@@ -281,9 +281,21 @@ export class SummarizationWorkerPool {
     currentDraftContent?: string,
   ): Promise<void> {
     const { storage, logger } = this.options;
-    const bestEffort = (currentDraftContent && currentDraftContent.trim().length > 0)
-      ? currentDraftContent
-      : storage.getSummarizationJobById(job.id)?.bestEffortDraft;
+    // Re-read the job to get the authoritative shortest draft saved across all
+    // attempts (the best-effort save at line 232-234 already ran before this
+    // method is called). Compare with the current attempt's draft by token count
+    // and pick whichever is shorter.
+    const savedDraft = storage.getSummarizationJobById(job.id)?.bestEffortDraft;
+    const hasCurrent = currentDraftContent != null && currentDraftContent.trim().length > 0;
+    const hasSaved = savedDraft != null && savedDraft.trim().length > 0;
+    let bestEffort: string | undefined;
+    if (hasCurrent && hasSaved) {
+      bestEffort = estimateTokens(currentDraftContent!) <= estimateTokens(savedDraft!)
+        ? currentDraftContent
+        : savedDraft;
+    } else {
+      bestEffort = hasCurrent ? currentDraftContent : hasSaved ? savedDraft : undefined;
+    }
 
     if (!bestEffort || bestEffort.trim().length === 0) {
       await storage.failSummarizationJob(job.id, errMsg || "no best-effort draft");
@@ -386,19 +398,25 @@ export class SummarizationWorkerPool {
   }
 }
 
+const TRUNCATION_TRAILER =
+  "\n\n[Summary truncated — original exceeded size limit. Coverage may be incomplete.]";
+
 /**
  * Hard-truncate over-budget text to roughly target_token_count, preferring a
  * sentence boundary within the last 20% of the clipped text (§10).
+ * Uses the real BPE tokenizer to respect the budget precisely. The trailer is
+ * accounted for in the token budget so the final result stays within bounds.
  */
 /** @internal Exported for testing. */
 export function truncateToBudget(text: string, targetTokenCount: number): string {
-  const charLimit = targetTokenCount * 4;
-  let clipped = text.slice(0, charLimit);
+  const trailerTokens = estimateTokens(TRUNCATION_TRAILER);
+  const bodyBudget = Math.max(1, targetTokenCount - trailerTokens);
+  let clipped = truncateToTokens(text, bodyBudget);
   const minBoundary = Math.floor(clipped.length * 0.8);
   const matches = [...clipped.matchAll(/[.!?。！？](?:\s|$)/g)];
   const lastBoundary = matches.length > 0 ? matches[matches.length - 1]!.index ?? -1 : -1;
   if (lastBoundary >= minBoundary) {
     clipped = clipped.slice(0, lastBoundary + 1);
   }
-  return `${clipped}\n\n[Summary truncated — original exceeded size limit. Coverage may be incomplete.]`;
+  return `${clipped}${TRUNCATION_TRAILER}`;
 }

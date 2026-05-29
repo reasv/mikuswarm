@@ -15,7 +15,7 @@ import type {
 import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
-import { estimateTokens } from "./tokens.js";
+import { estimateTokens, truncateToTokens } from "./tokens.js";
 import {
   selectSummaries,
   resolveRecencyLabels,
@@ -304,8 +304,10 @@ export class ContextBuilder {
     const maxTokens = (this.config.summarization?.leaf_input_tokens ?? 4000) * 1.5;
     const body = event.body ?? "";
     if (estimateTokens(body) <= maxTokens) return event;
-    const maxChars = Math.floor(maxTokens * 4);
-    const clipped = `${body.slice(0, maxChars)}…\n\n[Event truncated — exceeded summarization input budget.]`;
+    const trailer = "…\n\n[Event truncated — exceeded summarization input budget.]";
+    const trailerTokens = estimateTokens(trailer);
+    const bodyBudget = Math.max(1, Math.floor(maxTokens) - trailerTokens);
+    const clipped = `${truncateToTokens(body, bodyBudget)}${trailer}`;
     return { ...event, body: clipped };
   }
 
