@@ -245,7 +245,12 @@ export class SummarizationWorkerPool {
       if (job.attempts <= job.maxRetries) {
         await storage.retrySummarizationJob(job.id, errMsg);
       } else {
-        await this.truncationFallback(job, input, errMsg);
+        await this.truncationFallback(
+          job,
+          input,
+          errMsg,
+          draft.isCreated() ? draft.getContent() : undefined,
+        );
       }
     } catch (writeErr) {
       // Retry/truncation write failed — try to fail the job so it doesn't stay
@@ -273,10 +278,12 @@ export class SummarizationWorkerPool {
     job: SummarizationJob,
     input: ResolvedInput,
     errMsg: string,
+    currentDraftContent?: string,
   ): Promise<void> {
     const { storage, logger } = this.options;
-    const fresh = storage.getSummarizationJobById(job.id);
-    const bestEffort = fresh?.bestEffortDraft;
+    const bestEffort = (currentDraftContent && currentDraftContent.trim().length > 0)
+      ? currentDraftContent
+      : storage.getSummarizationJobById(job.id)?.bestEffortDraft;
 
     if (!bestEffort || bestEffort.trim().length === 0) {
       await storage.failSummarizationJob(job.id, errMsg || "no best-effort draft");
@@ -383,11 +390,12 @@ export class SummarizationWorkerPool {
  * Hard-truncate over-budget text to roughly target_token_count, preferring a
  * sentence boundary within the last 20% of the clipped text (§10).
  */
-function truncateToBudget(text: string, targetTokenCount: number): string {
+/** @internal Exported for testing. */
+export function truncateToBudget(text: string, targetTokenCount: number): string {
   const charLimit = targetTokenCount * 4;
   let clipped = text.slice(0, charLimit);
   const minBoundary = Math.floor(clipped.length * 0.8);
-  const matches = [...clipped.matchAll(/[.!?](?:\s|$)/g)];
+  const matches = [...clipped.matchAll(/[.!?。！？](?:\s|$)/g)];
   const lastBoundary = matches.length > 0 ? matches[matches.length - 1]!.index ?? -1 : -1;
   if (lastBoundary >= minBoundary) {
     clipped = clipped.slice(0, lastBoundary + 1);

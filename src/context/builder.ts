@@ -323,7 +323,7 @@ export class ContextBuilder {
     abortSignal?: AbortSignal,
   ): Promise<{ events: CanonicalChatEvent[]; selection: SummarySelection; triggerEvents?: CanonicalChatEvent[] }> {
     const unchanged = { events, selection };
-    if (!this.config.summarization?.enabled) return unchanged;
+    if (this.config.summarization?.enabled === false) return unchanged;
     const compactMax = this.config.context.tiers.compact_max_tokens;
     // Estimate the compact-tier token count by subtracting the rich-tier tail.
     // Compaction determines the rich boundary by accumulating rich-rendered
@@ -393,8 +393,8 @@ export class ContextBuilder {
     timelineKey: string,
     compactEvents: Array<{ id: string; timestamp: number; compactTokens: number }>,
   ): Promise<void> {
-    const cfg = this.config.summarization;
-    if (!cfg?.enabled) return;
+    if (this.config.summarization?.enabled === false) return;
+    const cfg = this.config.summarization ?? {};
     const generationThreshold = cfg.generation_threshold_tokens ?? 6000;
     const compactTotal = compactEvents.reduce((sum, e) => sum + e.compactTokens, 0);
     if (compactTotal <= generationThreshold) return;

@@ -415,3 +415,100 @@ test("summarizationCutoff: final message type is 'satellite' not 'triggerGroup'"
     storage.close();
   }
 });
+
+// ── enabled predicate: undefined means enabled (#1) ──────────────────
+
+test("maybeEnqueueLevel1 enqueues when summarization.enabled is explicitly undefined", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  // summarization key present but enabled is not set; low threshold + tiny rich tier
+  // so events land in the compact tier and exceed the threshold.
+  const config = minimalConfig({
+    summarization: {
+      generation_threshold_tokens: 1,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    },
+    context: {
+      tiers: {
+        rich_target_tokens: 1,
+        rich_max_tokens: 1,
+        compact_target_tokens: 40000,
+        compact_max_tokens: 80000,
+      },
+    },
+  } as any);
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 0; i < 20; i++) {
+      await timeline.append(testEvent({
+        id: `ev${String(i).padStart(4, "0")}`,
+        body: `message content with some words ${i}`,
+        timestamp: 1000 + i,
+      }));
+    }
+
+    let jobEnqueued = false;
+    builder.onJobEnqueued = () => { jobEnqueued = true; };
+
+    const trigger = testEvent({ id: "trigger2", body: "hi", timestamp: 2000, role: "user" });
+    await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+
+    assert.equal(jobEnqueued, true, "job should be enqueued when enabled key is missing (defaults to true)");
+  } finally {
+    storage.close();
+  }
+});
+
+test("maybeEnqueueLevel1 skips when summarization.enabled is explicitly false", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig({
+    summarization: {
+      enabled: false,
+      generation_threshold_tokens: 1,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    },
+    context: {
+      tiers: {
+        rich_target_tokens: 1,
+        rich_max_tokens: 1,
+        compact_target_tokens: 40000,
+        compact_max_tokens: 80000,
+      },
+    },
+  } as any);
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 0; i < 20; i++) {
+      await timeline.append(testEvent({
+        id: `ev${String(i).padStart(4, "0")}`,
+        body: `message content with some words ${i}`,
+        timestamp: 1000 + i,
+      }));
+    }
+
+    let jobEnqueued = false;
+    builder.onJobEnqueued = () => { jobEnqueued = true; };
+
+    const trigger = testEvent({ id: "trigger3", body: "hi", timestamp: 2000, role: "user" });
+    await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+
+    assert.equal(jobEnqueued, false, "no job should be enqueued when enabled is explicitly false");
+  } finally {
+    storage.close();
+  }
+});

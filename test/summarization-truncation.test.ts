@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage } from "../src/storage/index.js";
-import { SummarizationWorkerPool } from "../src/summarization/index.js";
+import { SummarizationWorkerPool, truncateToBudget } from "../src/summarization/index.js";
 import type { SummarizationConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
@@ -153,4 +153,39 @@ test("a job with no salvageable draft is marked failed", async () => {
 
   assert.equal(storage.getSummarizationJobById("job2")!.status, "failed");
   storage.close();
+});
+
+test("truncateToBudget respects CJK sentence-boundary punctuation", () => {
+  // Target 10 tokens → char limit 40. The regex requires punctuation followed
+  // by whitespace or end-of-string. Build text with a 。 followed by a space,
+  // positioned within the last 20% (char ≥ 32) of the clipped region.
+  const filler = "QQQQ";                 // marker not in the truncation annotation
+  const before = "a".repeat(33) + "。";   // 34 chars (。 is 1 JS char)
+  const after = " " + filler.repeat(3);   // space + trailing content
+  const text = before + after;            // 47 chars total, over the 40-char limit
+
+  const result = truncateToBudget(text, 10);
+  // Should truncate at the 。 boundary (index 33 → keep 34 chars), not at the raw 40-char limit.
+  assert.ok(result.startsWith(before), "should keep text up to and including 。");
+  assert.ok(!result.includes(filler), "should not include text after 。 boundary");
+  assert.match(result, /\[Summary truncated/);
+});
+
+test("truncateToBudget respects fullwidth exclamation and question marks", () => {
+  // Target 10 tokens → char limit 40. Punctuation at position 33 (last 20% = ≥32).
+  const filler = "QQQQ";
+  const before = "a".repeat(33) + "！";
+  const after = " " + filler.repeat(3);
+  const text = before + after;
+
+  const result = truncateToBudget(text, 10);
+  assert.ok(result.startsWith(before), "should keep text up to and including ！");
+  assert.ok(!result.includes(filler), "should not include text after ！ boundary");
+
+  // Also test ？
+  const before2 = "a".repeat(33) + "？";
+  const text2 = before2 + " " + filler.repeat(3);
+  const result2 = truncateToBudget(text2, 10);
+  assert.ok(result2.startsWith(before2), "should keep text up to and including ？");
+  assert.ok(!result2.includes(filler), "should not include text after ？ boundary");
 });

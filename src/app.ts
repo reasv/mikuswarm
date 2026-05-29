@@ -224,11 +224,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // the same predicate so validation always runs when the pool would start.
   const summarizationEnabled = config.summarization?.enabled !== false;
   if (summarizationEnabled) {
-    const sessionTypes = config.agent.session_types;
     for (const typeName of ["summarize", "condense"] as const) {
-      const sessionType = sessionTypes?.[typeName];
+      const sessionType = factory.resolveSessionType(typeName);
       if (!sessionType) {
-        throw new Error(`summarization enabled but session type "${typeName}" is not configured`);
+        throw new Error(`summarization enabled but session type "${typeName}" is not configured (and no "default" fallback exists)`);
       }
       const modelKey = sessionType.model ?? "default";
       if (!config.models[modelKey]) {
