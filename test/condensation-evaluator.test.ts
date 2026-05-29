@@ -150,3 +150,24 @@ test("does not enqueue a duplicate when an active job already covers the run", a
   assert.equal(jobs[0]!.id, "existing");
   storage.close();
 });
+
+test("cascade: level-2 completion triggers evaluation for level-3 eligibility", async () => {
+  const storage = await openStorage();
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `l2_${i}`,
+      level: 2,
+      earliestTimestamp: i * 1000,
+      latestTimestamp: i * 1000 + 500,
+    });
+  }
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 2, logger: silentLogger });
+
+  const jobs = storage.getActiveSummarizationJobs(TK, 3);
+  assert.equal(jobs.length, 1, "should enqueue a level-3 job");
+  assert.equal(jobs[0]!.inputStartId, "l2_0");
+  assert.equal(jobs[0]!.inputEndId, "l2_4");
+  assert.equal(jobs[0]!.level, 3);
+  storage.close();
+});

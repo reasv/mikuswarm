@@ -104,7 +104,7 @@ test("truncation fallback salvages an over-budget draft after retries exhaust", 
   assert.equal(summary.status, "truncated");
   assert.match(summary.content, /\[Summary truncated/);
   // Truncated content is no larger than the original best-effort draft.
-  assert.ok(summary.tokenCount <= storage.getSummarizationJobById("job1")!.targetTokenCount * 3);
+  assert.ok(summary.tokenCount <= storage.getSummarizationJobById("job1")!.targetTokenCount * 1.5);
   assert.equal(summary.level, 1);
   assert.equal(summary.latestEventId, "ev1");
   assert.equal(summary.eventCount, 2);
