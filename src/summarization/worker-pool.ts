@@ -13,6 +13,7 @@ export interface SummarizationWorkerPoolOptions {
   factory: AgentSessionFactory;
   config: SummarizationConfig;
   onComplete: (jobId: string, summaryId: string) => void;
+  /** Fires only on permanent (non-retriable) failures — not on retries. */
   onError: (jobId: string, error: Error) => void;
   logger: Logger;
 }
