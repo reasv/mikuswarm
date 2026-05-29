@@ -4,7 +4,7 @@ import { redactSecrets } from "../config/redaction.js";
 
 export interface ContextDumpMessage {
   role: string;
-  tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger";
+  tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger" | "summary";
   tokenEstimate?: number;
   content: unknown;
 }

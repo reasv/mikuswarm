@@ -65,7 +65,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   await mkdir(workspaceRoot, { recursive: true });
 
   const echo = new AssistantEchoResolver(timeline);
-  const contextBuilder = new ContextBuilder(timeline, config, storage);
+  const contextBuilder = new ContextBuilder(timeline, config, storage, logger);
 
   const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");

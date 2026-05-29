@@ -93,8 +93,10 @@ export function renderSatelliteBlock(
 ): string {
   const parts: string[] = [];
 
-  // Part 1: Runtime state
-  parts.push(`<runtime_state>\n${renderRuntimeState(options)}\n</runtime_state>`);
+  // Part 1: Runtime state (suppressed for summarization builds)
+  if (!options.suppressRuntimeState) {
+    parts.push(`<runtime_state>\n${renderRuntimeState(options)}\n</runtime_state>`);
+  }
 
   // Part 2: Tail instructions
   if (workspace.tailContent) {

@@ -4,19 +4,35 @@ import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
-import type { Storage, MediaAssetRow, LinkPreviewRow, ReplyContextRow } from "../storage/index.js";
+import type {
+  Storage,
+  MediaAssetRow,
+  LinkPreviewRow,
+  ReplyContextRow,
+  Summary,
+  TimelineCursor,
+} from "../storage/index.js";
 import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { estimateTokens } from "./tokens.js";
+import {
+  selectSummaries,
+  resolveRecencyLabels,
+  renderSummaryLayer,
+  type SummaryLabelCache,
+  type SummarySelection,
+} from "./summary-layer.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
+import { nanoid } from "nanoid";
+import type { Logger } from "../observability/index.js";
 
 export interface ContextMessage {
-  type: "system" | "chatEvent" | "triggerGroup";
+  type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer";
   role: "user" | "assistant" | "system";
   content: string;
-  tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger";
+  tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger" | "summary";
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
   timestamp?: number;
@@ -56,33 +72,90 @@ export class ContextBuilder {
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
     private readonly storage: Storage,
+    private readonly logger?: Logger,
   ) {}
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
-    const triggerGroupIds = this.resolveTriggerGroupIds(options.trigger);
+    const cutoff = options.summarizationCutoff;
+    const now = options.trigger.timestamp;
+    const triggerGroupIds = cutoff ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
     const compactionState = this.store.getCompactionState(options.timelineKey);
-    let events = this.store.queryForContext(options.timelineKey, compactionState);
+
+    // 1. Select summaries and derive the event-ID coverage cursor (§4).
+    let selection = selectSummaries(this.storage.getSummaryCandidates(options.timelineKey));
+
+    // 2. Query events starting strictly after the coverage cursor.
+    let events = selection.coverageEndEventId
+      ? this.store.queryAfterContext(options.timelineKey, selection.coverageEndEventId)
+      : this.store.queryForContext(options.timelineKey, compactionState);
+
+    if (cutoff) {
+      // Cut at endTimestamp; re-select the summary layer to exclude any summary
+      // overlapping the events being summarized (§6). The event range stays
+      // derived from the unfiltered cursor, so no event renders both raw and
+      // inside a summary (and none is dropped from both).
+      events = events.filter((e) => e.timestamp <= cutoff.endTimestamp);
+      const earliest = events[0]?.timestamp ?? cutoff.endTimestamp + 1;
+      selection = selectSummaries(
+        this.storage.getSummaryCandidates(options.timelineKey, earliest),
+      );
+    }
+
+    this.logger?.debug("summary_coverage_resolved", {
+      timelineKey: options.timelineKey,
+      coverageEndEventId: selection.coverageEndEventId,
+      selectedSummaryCount: selection.summaries.length,
+    });
 
     events = this.hydrateEvents(events);
+
+    if (cutoff) {
+      events = events.map((e) => this.truncateOversizedEvent(e));
+    }
 
     const timelineEvents = events.filter((e) => !triggerGroupIds.has(e.id));
     const triggerEvents = events.filter((e) => triggerGroupIds.has(e.id));
 
+    // 3. Grace wait: if a drop is imminent and a processing job covers the
+    //    oldest events, wait briefly for it (§11). Skipped for summarization builds.
+    let compactionInput = timelineEvents;
+    if (!cutoff) {
+      const waited = await this.graceWaitForDrop(
+        options.timelineKey,
+        timelineEvents,
+        triggerGroupIds,
+        selection,
+      );
+      compactionInput = waited.events;
+      // Adopt the post-wait selection so the summary layer renders the summary
+      // whose completion just trimmed the raw set — otherwise those events would
+      // be dropped from both the raw turns and the layer (a coverage gap).
+      selection = waited.selection;
+    }
+
     const compacted = compactTimelineEvents(
-      timelineEvents,
+      compactionInput,
       renderRichMessage,
       renderCompactMessage,
       this.config.context.tiers,
       {
         timelineKey: options.timelineKey,
-        state: compactionState,
+        // A summarization build operates on a cut-down event set; never persist
+        // its derived boundaries into the real compaction state.
+        state: cutoff ? undefined : compactionState,
       },
     );
-    if (compacted.stateChanged && compacted.state) {
+    if (!cutoff && compacted.stateChanged && compacted.state) {
       await this.store.saveCompactionState(compacted.state);
     }
 
-    const imageBlocks = await this.selectImageBlocks(options.trigger);
+    // 4. Threshold evaluation: enqueue a level-1 job if compact tier is large
+    //    enough (§4, §11). Skipped for summarization builds.
+    if (!cutoff) {
+      await this.maybeEnqueueLevel1(options.timelineKey, compacted.compactEvents);
+    }
+
+    const imageBlocks = cutoff ? [] : await this.selectImageBlocks(options.trigger);
     const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
 
     this.markImageBlocks(triggerEvents, imageBlockIds);
@@ -101,9 +174,22 @@ export class ContextBuilder {
     // pi-agent-core on every API call), and this one populates the system message in
     // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(options.workspace, options.fallbackPrompt);
-    const satellite = renderSatelliteBlock(options, options.workspace, options.sessionType);
+    const satellite = renderSatelliteBlock(
+      { ...options, suppressRuntimeState: cutoff != null },
+      options.workspace,
+      options.sessionType,
+    );
     const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");
-    const finalUserContent = `<system>\n${satellite}\n</system>\n\n${triggerContent}`;
+    const finalUserContent = cutoff
+      ? `<system>\n${satellite}\n</system>`
+      : `<system>\n${satellite}\n</system>\n\n${triggerContent}`;
+
+    const summaryLayer = await this.buildSummaryLayerMessage(
+      options.timelineKey,
+      selection.summaries,
+      now,
+      cutoff != null,
+    );
 
     const messages: ContextMessage[] = [
       {
@@ -113,6 +199,7 @@ export class ContextBuilder {
         tier: "system",
         tokenEstimate: estimateTokens(systemPrompt),
       },
+      ...(summaryLayer ? [summaryLayer] : []),
       ...chatMessages,
       {
         type: "triggerGroup",
@@ -130,6 +217,183 @@ export class ContextBuilder {
       richTokens: compacted.richTokens,
       imageBlocks,
     };
+  }
+
+  /**
+   * Render the summary-layer message (§4). For normal builds the recency-label
+   * cache is read/written to keep the prefix byte-stable (§5); summarization
+   * builds compute labels directly and never touch the cache.
+   */
+  private async buildSummaryLayerMessage(
+    timelineKey: string,
+    summaries: Summary[],
+    now: number,
+    isSummarizationBuild: boolean,
+  ): Promise<ContextMessage | null> {
+    if (summaries.length === 0) return null;
+
+    let labels: string[];
+    if (isSummarizationBuild) {
+      const resolved = resolveRecencyLabels(summaries, null, now, 0);
+      labels = resolved.labels;
+    } else {
+      const ttlMs = this.config.summarization?.label_cache_ttl_ms ?? 600000;
+      const cacheKey = `summary_labels:${timelineKey}`;
+      const cached = this.readLabelCache(cacheKey);
+      const resolved = resolveRecencyLabels(summaries, cached, now, ttlMs);
+      if (resolved.cacheToStore) {
+        await this.storage.setMetadata(cacheKey, JSON.stringify(resolved.cacheToStore));
+      }
+      labels = resolved.labels;
+    }
+
+    const content = renderSummaryLayer(summaries, labels);
+    return {
+      type: "summaryLayer",
+      role: "user",
+      content,
+      tier: "summary",
+      tokenEstimate: estimateTokens(content),
+    };
+  }
+
+  private readLabelCache(cacheKey: string): SummaryLabelCache | null {
+    const raw = this.storage.getMetadata(cacheKey);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as SummaryLabelCache;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Truncate an event whose body exceeds the summarization input budget so a
+   * single oversized event cannot stall the floor (§6). Lineage is unaffected —
+   * only the text shown to the summarizer is clipped.
+   */
+  private truncateOversizedEvent(event: CanonicalChatEvent): CanonicalChatEvent {
+    const maxTokens = (this.config.summarization?.leaf_input_tokens ?? 4000) * 1.5;
+    const body = event.body ?? "";
+    if (estimateTokens(body) <= maxTokens) return event;
+    const maxChars = Math.floor(maxTokens * 4);
+    const clipped = `${body.slice(0, maxChars)}…\n\n[Event truncated — exceeded summarization input budget.]`;
+    return { ...event, body: clipped };
+  }
+
+  /**
+   * One-shot bounded grace wait (§11): if compaction is about to drop the oldest
+   * events and a processing job covers them, poll up to summary_wait_timeout_ms
+   * for that job to complete, then re-query once so the new summary's cursor
+   * excludes those events.
+   */
+  private async graceWaitForDrop(
+    timelineKey: string,
+    events: CanonicalChatEvent[],
+    triggerGroupIds: Set<string>,
+    selection: SummarySelection,
+  ): Promise<{ events: CanonicalChatEvent[]; selection: SummarySelection }> {
+    const unchanged = { events, selection };
+    if (!this.config.summarization?.enabled) return unchanged;
+    const compactMax = this.config.context.tiers.compact_max_tokens;
+    const compactSum = events.reduce((sum, e) => sum + estimateTokens(renderCompactMessage(e)), 0);
+    if (compactSum <= compactMax) return unchanged;
+
+    const processing = this.storage.getProcessingSummarizationJobs(timelineKey);
+    if (processing.length === 0) return unchanged;
+
+    // The oldest events are the ones at risk of being dropped. A processing job
+    // covers them if its input range starts at or before the oldest event.
+    const oldest = events[0];
+    if (!oldest) return unchanged;
+    const oldestCursor = this.storage.getEventCursor(timelineKey, oldest.id);
+    if (!oldestCursor) return unchanged;
+    const covering = processing.find((job) => {
+      const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
+      return start != null && !cursorAfter(start, oldestCursor);
+    });
+    if (!covering) return unchanged;
+
+    const timeoutMs = this.config.summarization?.summary_wait_timeout_ms ?? 5000;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await delay(250);
+      const job = this.storage.getSummarizationJobById(covering.id);
+      if (!job || job.status === "complete") {
+        // Re-select and re-query against the new coverage cursor ONCE. The raw
+        // events AND the summary-layer selection must move together, or the
+        // newly-covered events would be dropped from both (a coverage gap).
+        const reselected = selectSummaries(this.storage.getSummaryCandidates(timelineKey));
+        if (!reselected.coverageEndEventId) return { events, selection: reselected };
+        const requeried = this.store
+          .queryAfterContext(timelineKey, reselected.coverageEndEventId)
+          .filter((e) => !triggerGroupIds.has(e.id));
+        return { events: this.hydrateEvents(requeried), selection: reselected };
+      }
+      if (job.status === "failed") break;
+    }
+    return unchanged;
+  }
+
+  /** Enqueue a level-1 summarization job for the oldest compact chunk (§4 threshold). */
+  private async maybeEnqueueLevel1(
+    timelineKey: string,
+    compactEvents: Array<{ id: string; timestamp: number; compactTokens: number }>,
+  ): Promise<void> {
+    const cfg = this.config.summarization;
+    if (!cfg?.enabled) return;
+    const generationThreshold = cfg.generation_threshold_tokens ?? 6000;
+    const compactTotal = compactEvents.reduce((sum, e) => sum + e.compactTokens, 0);
+    if (compactTotal <= generationThreshold) return;
+
+    const leafInput = cfg.leaf_input_tokens ?? 4000;
+    const chunk: typeof compactEvents = [];
+    let running = 0;
+    for (const e of compactEvents) {
+      // Accumulate until the running sum first reaches leaf_input_tokens; the
+      // crossing event is included, so a single large event naturally overshoots
+      // (capped in practice by the oversized-event truncation at build time).
+      chunk.push(e);
+      running += e.compactTokens;
+      if (running >= leafInput) break;
+    }
+    if (chunk.length === 0) return;
+
+    const first = chunk[0]!;
+    const last = chunk[chunk.length - 1]!;
+
+    // Skip if a pending/processing level-1 job already covers this range.
+    const active = this.storage.getActiveSummarizationJobs(timelineKey, 1);
+    const firstCursor = this.storage.getEventCursor(timelineKey, first.id);
+    const lastCursor = this.storage.getEventCursor(timelineKey, last.id);
+    if (firstCursor && lastCursor) {
+      const overlaps = active.some((job) => {
+        const jobStart = this.storage.getEventCursor(timelineKey, job.inputStartId);
+        const jobEnd = this.storage.getEventCursor(timelineKey, job.inputEndId);
+        if (!jobStart || !jobEnd) return false;
+        // Ranges overlap unless one is entirely before the other.
+        return !cursorAfter(firstCursor, jobEnd) && !cursorAfter(jobStart, lastCursor);
+      });
+      if (overlaps) return;
+    }
+
+    const jobId = `sumjob_${nanoid(10)}`;
+    await this.storage.insertSummarizationJob({
+      id: jobId,
+      timelineKey,
+      level: 1,
+      inputStartId: first.id,
+      inputEndId: last.id,
+      inputTokenCount: running,
+      targetTokenCount: cfg.leaf_target_tokens ?? 600,
+      maxRetries: cfg.max_retries ?? 2,
+    });
+    this.logger?.info("summarization_job_enqueued", {
+      jobId,
+      timelineKey,
+      level: 1,
+      inputTokens: running,
+    });
   }
 
   private resolveTriggerGroupIds(trigger: CanonicalChatEvent): Set<string> {
@@ -372,5 +636,16 @@ function linkPreviewRowToMeta(lp: LinkPreviewRow, allMedia: MediaAssetRow[]): Li
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {
   return (event.attachments ?? []).filter((attachment) => attachment.mediaType === "image" && attachment.localPath);
+}
+
+/** True if cursor `a` is strictly after cursor `b` in (timestamp, received_at, id) order. */
+function cursorAfter(a: TimelineCursor, b: TimelineCursor): boolean {
+  if (a.timestamp !== b.timestamp) return a.timestamp > b.timestamp;
+  if (a.receivedAt !== b.receivedAt) return a.receivedAt > b.receivedAt;
+  return a.id > b.id;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 

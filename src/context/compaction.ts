@@ -15,6 +15,8 @@ export interface CompactionResult {
   richTokens: number;
   compactedMessageIds: string[];
   droppedMessageIds: string[];
+  /** Compact-tier events, oldest first, with per-event compact token estimates. */
+  compactEvents: Array<{ id: string; timestamp: number; compactTokens: number }>;
   state?: TimelineCompactionState;
   stateChanged: boolean;
 }
@@ -109,6 +111,11 @@ export function compactTimelineEvents(
     droppedMessageIds: dropped
       .map((item) => item.event.id)
       .filter((id) => !originallyDropped.has(id)),
+    compactEvents: compacted.map((item) => ({
+      id: item.event.id,
+      timestamp: item.event.timestamp,
+      compactTokens: item.compactTokens,
+    })),
     state: stateChanged || options.state ? nextState : undefined,
     stateChanged,
   };

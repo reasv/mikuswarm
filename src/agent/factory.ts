@@ -159,6 +159,16 @@ export function buildAgentContextMessages(
         },
       ];
     }
+    if (message.type === "summaryLayer") {
+      return [
+        {
+          type: "chatEvent",
+          role: "user",
+          content: message.content,
+          timestamp: message.timestamp,
+        },
+      ];
+    }
     if (message.type === "chatEvent") {
       return [
         {

@@ -15,3 +15,12 @@ export {
   type ImageBlock,
 } from "./builder.js";
 export { dumpBuiltContext } from "./dump.js";
+export {
+  selectSummaries,
+  computeRecencyLabel,
+  resolveRecencyLabels,
+  renderSummaryLayer,
+  type SummarySelection,
+  type SummaryLabelCache,
+  type ResolvedLabels,
+} from "./summary-layer.js";
