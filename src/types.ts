@@ -8,6 +8,15 @@ export function isNodeError(err: unknown): err is NodeJS.ErrnoException {
 
 export type ChatRole = "user" | "assistant";
 
+/**
+ * Lifecycle state of a timeline (chat channel / DM). A timeline is `inactive`
+ * until someone first triggers the bot in it; activation runs through
+ * `activating` (first-trigger backfill + enrichment) to `active`. `backfilling`
+ * is reserved for operator-initiated bulk history fetching (deferred). A
+ * timeline with no `timeline_compaction_state` row is implicitly `inactive`.
+ */
+export type TimelineState = "inactive" | "activating" | "active" | "backfilling";
+
 export interface SenderInfo {
   id: string;
   displayName?: string;

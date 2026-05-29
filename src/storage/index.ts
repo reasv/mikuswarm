@@ -14,3 +14,4 @@ export {
   type SummarizationJobInsert,
   type TimelineCursor,
 } from "./database.js";
+export type { TimelineState } from "../types.js";

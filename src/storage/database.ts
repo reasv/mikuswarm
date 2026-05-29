@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
-import type { CanonicalChatEvent } from "../types.js";
+import type { CanonicalChatEvent, TimelineState } from "../types.js";
 
 export interface StorageOptions {
   databasePath: string;
@@ -438,6 +438,81 @@ export class Storage {
         updatedAt: state.updatedAt,
       });
     });
+  }
+
+  /**
+   * Current lifecycle state of a timeline. A missing `timeline_compaction_state`
+   * row means the channel has never been triggered, i.e. `'inactive'` (§2).
+   */
+  getTimelineState(timelineKey: string): TimelineState {
+    const row = this.read((db) =>
+      db
+        .prepare(`select timeline_state from timeline_compaction_state where timeline_key = ?`)
+        .get(timelineKey) as { timeline_state: TimelineState } | undefined,
+    );
+    return row?.timeline_state ?? "inactive";
+  }
+
+  /**
+   * Set a timeline's lifecycle state, upserting the compaction-state row. The
+   * insert seeds a minimal valid `state_json`; the on-conflict path touches only
+   * `timeline_state`/`updated_at`, preserving the compaction cursors and any
+   * existing serialized state written by the summarization pipeline.
+   */
+  setTimelineState(timelineKey: string, state: TimelineState): Promise<void> {
+    return this.write((db) => {
+      const now = Date.now();
+      const seedState: TimelineCompactionState = {
+        schemaVersion: 1,
+        timelineKey,
+        compactStartEventId: null,
+        richStartEventId: null,
+        updatedAt: now,
+      };
+      db.prepare(
+        `insert into timeline_compaction_state (
+          timeline_key, compact_start_event_id, rich_start_event_id, state_json,
+          timeline_state, updated_at
+        ) values (
+          @timelineKey, null, null, @stateJson, @state, @updatedAt
+        )
+        on conflict(timeline_key) do update set
+          timeline_state = excluded.timeline_state,
+          updated_at = excluded.updated_at`,
+      ).run({
+        timelineKey,
+        stateJson: JSON.stringify(seedState),
+        state,
+        updatedAt: now,
+      });
+    });
+  }
+
+  /**
+   * Flip every `'inactive'` event in a timeline to `'pending'` so the enrichment
+   * and caption pools pick them up after activation (§4 step 4). Returns the
+   * number of rows updated.
+   */
+  activateTimelineEvents(timelineKey: string): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update timeline_events set enrichment_status = 'pending', updated_at = ?
+           where timeline_key = ? and enrichment_status = 'inactive'`,
+        )
+        .run(Date.now(), timelineKey);
+      return result.changes;
+    });
+  }
+
+  /** Earliest stored event timestamp for a timeline, or undefined when empty. */
+  getOldestEventTimestamp(timelineKey: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select min(timestamp) as t from timeline_events where timeline_key = ?`)
+        .get(timelineKey) as { t: number | null } | undefined,
+    );
+    return row?.t ?? undefined;
   }
 
   getTimelineEventByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
@@ -1431,7 +1506,7 @@ create table if not exists timeline_events (
   agent_session_id text,
   event_json text not null,
   enrichment_status text not null default 'pending'
-    check(enrichment_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
+    check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
   enrichment_retries integer not null default 0,
   trigger_group_id text,
   created_at integer not null,
@@ -1464,6 +1539,9 @@ create table if not exists timeline_compaction_state (
   compact_start_event_id text,
   rich_start_event_id text,
   state_json text not null,
+  timeline_state text not null default 'inactive'
+    check(timeline_state in ('inactive', 'activating', 'active', 'backfilling')),
+  backfill_fence_timestamp integer,
   updated_at integer not null
 );
 
@@ -1619,6 +1697,91 @@ function runMigrations(db: Database.Database): void {
   }
   if (!columnNames.has("enrichment_retries")) {
     db.exec(`alter table timeline_events add column enrichment_retries integer not null default 0`);
+  }
+
+  // Widen the enrichment_status CHECK to allow 'inactive' (channel lifecycle).
+  // SQLite cannot ALTER a CHECK constraint in place and DOES enforce the
+  // CREATE-TABLE check on existing databases, so inserting 'inactive' would be
+  // rejected. Detect via the stored DDL and rebuild the table when the older
+  // constraint is still in effect. Fresh databases already create the table
+  // with 'inactive' in SCHEMA, so this is a no-op for them. Must run AFTER the
+  // column-add steps above so the rebuilt table copies every current column.
+  const teSql =
+    (db.prepare("select sql from sqlite_master where type = 'table' and name = 'timeline_events'").get() as
+      | { sql: string }
+      | undefined)?.sql ?? "";
+  if (!teSql.includes("'inactive'")) {
+    db.pragma("foreign_keys = OFF");
+    try {
+      db.transaction(() => {
+        db.exec(`
+          create table timeline_events_new (
+            id text primary key,
+            external_id text,
+            timeline_key text not null,
+            provider text not null,
+            role text not null check(role in ('user', 'assistant')),
+            sender_id text not null,
+            sender_display_name text,
+            body text not null,
+            timestamp integer not null,
+            received_at integer not null,
+            agent_session_id text,
+            event_json text not null,
+            enrichment_status text not null default 'pending'
+              check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
+            enrichment_retries integer not null default 0,
+            trigger_group_id text,
+            created_at integer not null,
+            updated_at integer not null
+          );
+          insert into timeline_events_new (
+            id, external_id, timeline_key, provider, role, sender_id,
+            sender_display_name, body, timestamp, received_at, agent_session_id,
+            event_json, enrichment_status, enrichment_retries, trigger_group_id,
+            created_at, updated_at
+          )
+          select
+            id, external_id, timeline_key, provider, role, sender_id,
+            sender_display_name, body, timestamp, received_at, agent_session_id,
+            event_json, enrichment_status, enrichment_retries, trigger_group_id,
+            created_at, updated_at
+          from timeline_events;
+          drop table timeline_events;
+          alter table timeline_events_new rename to timeline_events;
+          create index if not exists idx_timeline_events_timeline_time
+            on timeline_events(timeline_key, timestamp, received_at, id);
+          create index if not exists idx_timeline_events_external
+            on timeline_events(provider, external_id)
+            where external_id is not null;
+          create index if not exists idx_timeline_events_enrichment
+            on timeline_events(enrichment_status, timestamp desc)
+            where enrichment_status in ('pending', 'processing');
+          create index if not exists idx_timeline_events_trigger_group
+            on timeline_events(trigger_group_id)
+            where trigger_group_id is not null;
+        `);
+      })();
+    } finally {
+      db.pragma("foreign_keys = ON");
+    }
+  }
+
+  // Channel lifecycle columns on timeline_compaction_state (discrete columns,
+  // not folded into state_json). Existing rows predate this spec and represent
+  // timelines that were already active under Part 1 (a compaction-state row is
+  // only written once a timeline has been engaged), so migrate them to
+  // 'active' rather than the column default of 'inactive'.
+  const csColumns = db.prepare("pragma table_info(timeline_compaction_state)").all() as Array<{ name: string }>;
+  const csColumnNames = new Set(csColumns.map((c) => c.name));
+  if (!csColumnNames.has("timeline_state")) {
+    db.exec(
+      `alter table timeline_compaction_state add column timeline_state text not null default 'inactive'`,
+    );
+    db.exec(`update timeline_compaction_state set timeline_state = 'active'`);
+  }
+  if (!csColumnNames.has("backfill_fence_timestamp")) {
+    db.exec(`alter table timeline_compaction_state add column backfill_fence_timestamp integer`);
   }
 
   const maColumns = db.prepare("pragma table_info(media_assets)").all() as Array<{ name: string }>;
