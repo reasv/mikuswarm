@@ -70,6 +70,44 @@ test("agent context keeps timeline base and preserves live runtime messages", ()
   );
 });
 
+test("summary layer renders as a user turn ahead of chat and trigger", () => {
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      {
+        type: "summaryLayer",
+        role: "user",
+        content: "<summary level=\"1\">old history</summary>",
+        tier: "summary",
+        tokenEstimate: 1,
+        timestamp: 10,
+      },
+      { type: "chatEvent", role: "user", content: "<message>recent</message>", tier: "compact", tokenEstimate: 1, timestamp: 20 },
+      { type: "triggerGroup", role: "user", content: "<system>now</system>", tier: "trigger", tokenEstimate: 1, timestamp: 30 },
+    ],
+    tokenEstimate: 4,
+    compactTokens: 1,
+    richTokens: 0,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const messages = buildAgentContextMessages(built, []);
+
+  assert.deepEqual(
+    messages.map((m) => (m as any).type),
+    ["chatEvent", "chatEvent", "triggerGroup"],
+  );
+  // The summary layer is the first chatEvent, role user, carrying the summary body.
+  assert.equal((messages[0] as any).role, "user");
+  assert.match((messages[0] as any).content, /<summary/);
+
+  const llm = convertToLlm(messages);
+  assert.equal(
+    llm.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("<summary")),
+    true,
+  );
+});
+
 test("convertToLlm filters accidental system transcript messages", () => {
   const messages = convertToLlm([{ role: "system", content: "duplicate system", timestamp: 1 } as any]);
   assert.deepEqual(messages, []);
