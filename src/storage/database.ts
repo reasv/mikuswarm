@@ -1069,16 +1069,19 @@ export class Storage {
   /**
    * Summaries in the inclusive earliest_timestamp range bounded by two summary
    * IDs (resolved internally), ordered by earliest_timestamp ASC (tie-broken by id).
+   * When `level` is provided, only summaries at that level are returned.
    */
-  getSummariesBetween(timelineKey: string, startId: string, endId: string): Summary[] {
+  getSummariesBetween(timelineKey: string, startId: string, endId: string, level?: number): Summary[] {
     const start = this.getSummaryById(startId);
     const end = this.getSummaryById(endId);
     if (!start || !end) return [];
+    const levelFilter = level != null ? "and level = @level" : "";
     const rows = this.read((db) =>
       db
         .prepare(
           `select * from summaries
            where timeline_key = @timelineKey and status in ('complete', 'truncated')
+             ${levelFilter}
              and (
                earliest_timestamp > @startTs
                or (earliest_timestamp = @startTs and id >= @startId)
@@ -1091,6 +1094,7 @@ export class Storage {
         )
         .all({
           timelineKey,
+          ...(level != null ? { level } : {}),
           startTs: start.earliestTimestamp,
           startId: start.id,
           endTs: end.earliestTimestamp,
@@ -1126,13 +1130,13 @@ export class Storage {
    * cursor is derived from latest_event_id).
    */
   insertSummaryWithLineage(insert: SummaryInsert): Promise<void> {
-    if (insert.level === 1 && (!insert.eventIds || insert.eventIds.length === 0)) {
-      throw new Error("Level-1 summary must have eventIds");
-    }
-    if (insert.level > 1 && (!insert.parentIds || insert.parentIds.length === 0)) {
-      throw new Error("Level 2+ summary must have parentIds");
-    }
     return this.readAndWrite((db) => {
+      if (insert.level === 1 && (!insert.eventIds || insert.eventIds.length === 0)) {
+        throw new Error("Level-1 summary must have eventIds");
+      }
+      if (insert.level > 1 && (!insert.parentIds || insert.parentIds.length === 0)) {
+        throw new Error("Level 2+ summary must have parentIds");
+      }
       const now = Date.now();
       db.prepare(
         `insert into summaries (

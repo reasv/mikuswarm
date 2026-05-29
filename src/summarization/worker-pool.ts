@@ -1,7 +1,6 @@
 import { nanoid } from "nanoid";
 import type { Storage, SummarizationJob } from "../storage/index.js";
 import type { AgentSessionFactory, AgentSessionRecord } from "../agent/index.js";
-import type { ContextBuilder } from "../context/index.js";
 import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
@@ -12,7 +11,6 @@ import { evaluateCondensation } from "./evaluator.js";
 export interface SummarizationWorkerPoolOptions {
   storage: Storage;
   factory: AgentSessionFactory;
-  contextBuilder: ContextBuilder;
   config: SummarizationConfig;
   onComplete: (jobId: string, summaryId: string) => void;
   onError: (jobId: string, error: Error) => void;
@@ -345,7 +343,7 @@ export class SummarizationWorkerPool {
       };
     }
 
-    const summaries = storage.getSummariesBetween(job.timelineKey, job.inputStartId, job.inputEndId);
+    const summaries = storage.getSummariesBetween(job.timelineKey, job.inputStartId, job.inputEndId, job.level - 1);
     if (summaries.length === 0) return undefined;
     const latestTimestamp = Math.max(...summaries.map((s) => s.latestTimestamp));
     const last = summaries[summaries.length - 1]!;

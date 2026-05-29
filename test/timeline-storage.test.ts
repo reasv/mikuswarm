@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Storage } from "../src/storage/index.js";
+import { Storage, type Summary } from "../src/storage/index.js";
 import { AssistantEchoResolver, TimelineStore } from "../src/timeline/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
@@ -186,6 +186,129 @@ async function withTimeline(run: (timeline: TimelineStore) => Promise<void>): Pr
     storage.close();
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+// ── getSummariesBetween level filter ────────────────────────────────
+
+test("getSummariesBetween filters by level when provided", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Insert summaries at levels 1 and 2 in the same timestamp range.
+    for (let i = 0; i < 4; i++) {
+      await insertSummary(storage, {
+        id: `l1_${i}`,
+        timelineKey: TK,
+        level: 1,
+        earliestTimestamp: i * 100,
+        latestTimestamp: i * 100 + 50,
+      });
+    }
+    // A level-2 summary spanning the same range.
+    await insertSummary(storage, {
+      id: "l2_0",
+      timelineKey: TK,
+      level: 2,
+      earliestTimestamp: 100,
+      latestTimestamp: 250,
+    });
+
+    // Without level filter: returns both levels.
+    const all = storage.getSummariesBetween(TK, "l1_0", "l1_3");
+    assert.equal(all.length, 5);
+
+    // With level=1 filter: returns only L1 summaries.
+    const l1Only = storage.getSummariesBetween(TK, "l1_0", "l1_3", 1);
+    assert.equal(l1Only.length, 4);
+    assert.ok(l1Only.every((s) => s.level === 1));
+
+    // With level=2 filter: returns only the L2 summary.
+    const l2Only = storage.getSummariesBetween(TK, "l1_0", "l1_3", 2);
+    assert.equal(l2Only.length, 1);
+    assert.equal(l2Only[0]!.id, "l2_0");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── insertSummaryWithLineage precondition throws via promise ────────
+
+test("insertSummaryWithLineage rejects with precondition error via .catch()", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Level-1 summary without eventIds should be caught by .catch().
+    const result = storage.insertSummaryWithLineage({
+      id: "bad1",
+      timelineKey: "matrix:test:room:!room",
+      level: 1,
+      content: "test",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev1",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      eventIds: [],
+      jobId: "job1",
+    });
+
+    await assert.rejects(result, { message: "Level-1 summary must have eventIds" });
+
+    // Level 2+ summary without parentIds should also reject.
+    const result2 = storage.insertSummaryWithLineage({
+      id: "bad2",
+      timelineKey: "matrix:test:room:!room",
+      level: 2,
+      content: "test",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev1",
+      eventCount: 2,
+      tokenCount: 50,
+      modelId: null,
+      status: "complete",
+      generatedAt: Date.now(),
+      parentIds: [],
+      jobId: "job2",
+    });
+
+    await assert.rejects(result2, { message: "Level 2+ summary must have parentIds" });
+  } finally {
+    storage.close();
+  }
+});
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+function insertSummary(
+  storage: Storage,
+  s: Pick<Summary, "id" | "level" | "earliestTimestamp" | "latestTimestamp"> & { timelineKey?: string } & Partial<Summary>,
+): Promise<void> {
+  return storage.write((db) => {
+    db.prepare(
+      `insert into summaries (
+        id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+        latest_event_id, event_count, token_count, model_id, status,
+        backfill_job_id, generated_at, created_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?)`,
+    ).run(
+      s.id,
+      s.timelineKey ?? "matrix:miku:room:!room",
+      s.level,
+      s.content ?? "body",
+      s.earliestTimestamp,
+      s.latestTimestamp,
+      s.latestEventId ?? `ev_${s.id}`,
+      s.eventCount ?? 1,
+      s.tokenCount ?? 100,
+      s.modelId ?? "model",
+      s.status ?? "complete",
+      s.generatedAt ?? 0,
+      0,
+    );
+  });
 }
 
 function assistantEvent(overrides: {

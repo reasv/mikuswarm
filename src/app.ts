@@ -217,8 +217,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
-  // default chat agent or model.
-  if (config.summarization?.enabled) {
+  // default chat agent or model. Both this check and pool instantiation use
+  // the same predicate so validation always runs when the pool would start.
+  const summarizationEnabled = config.summarization?.enabled !== false;
+  if (summarizationEnabled) {
     const sessionTypes = config.agent.session_types;
     for (const typeName of ["summarize", "condense"] as const) {
       const sessionType = sessionTypes?.[typeName];
@@ -234,18 +236,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
-  const summarizationEnabled = config.summarization?.enabled !== false;
   const summarizationPool = summarizationEnabled
     ? new SummarizationWorkerPool({
         storage,
         factory,
-        contextBuilder,
         config: config.summarization ?? {},
-        onComplete: () => {},
+        onComplete: (jobId, summaryId) => {
+          logger.info("summarization_job_complete", { jobId, summaryId });
+          summarizationPool!.notifyNewWork();
+        },
         onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
         logger: logger.child("summarization"),
       })
     : null;
+
+  if (summarizationPool) {
+    contextBuilder.onJobEnqueued = () => summarizationPool.notifyNewWork();
+  }
 
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
 

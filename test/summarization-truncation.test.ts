@@ -84,7 +84,6 @@ test("truncation fallback salvages an over-budget draft after retries exhaust", 
   const pool = new SummarizationWorkerPool({
     storage,
     factory: makeFakeFactory(),
-    contextBuilder: undefined as any,
     config,
     onComplete: () => {},
     onError: () => {},
@@ -141,7 +140,6 @@ test("a job with no salvageable draft is marked failed", async () => {
   const pool = new SummarizationWorkerPool({
     storage,
     factory,
-    contextBuilder: undefined as any,
     config: { worker_count: 1, max_retries: 0 },
     onComplete: () => {},
     onError: () => {},

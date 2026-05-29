@@ -68,6 +68,9 @@ export interface BuiltContext {
 }
 
 export class ContextBuilder {
+  /** Called after a level-1 summarization job is enqueued (§4 threshold). */
+  onJobEnqueued?: () => void;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
@@ -397,6 +400,7 @@ export class ContextBuilder {
       level: 1,
       inputTokens: running,
     });
+    this.onJobEnqueued?.();
   }
 
   private resolveTriggerGroupIds(trigger: CanonicalChatEvent): Set<string> {
