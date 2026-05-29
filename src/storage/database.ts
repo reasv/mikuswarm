@@ -1153,7 +1153,7 @@ export class Storage {
     return rows.map(mapSummaryRow);
   }
 
-  /** True if any summary at level >= minLevel falls strictly between two timestamps. */
+  /** True if any summary at level >= minLevel falls between two timestamps (inclusive). */
   hasSummaryBetween(
     timelineKey: string,
     minLevel: number,
@@ -1165,7 +1165,7 @@ export class Storage {
         .prepare(
           `select 1 from summaries
            where timeline_key = ? and level >= ? and status in ('complete', 'truncated')
-             and earliest_timestamp > ? and latest_timestamp < ?
+             and earliest_timestamp >= ? and latest_timestamp <= ?
            limit 1`,
         )
         .get(timelineKey, minLevel, afterTimestamp, beforeTimestamp) as { 1: number } | undefined,

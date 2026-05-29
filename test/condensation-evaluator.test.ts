@@ -206,3 +206,66 @@ test("cascade: level-2 completion triggers evaluation for level-3 eligibility", 
   assert.equal(jobs[0]!.level, 3);
   storage.close();
 });
+
+test("edge-aligned interruptor breaks contiguity (inclusive boundary)", async () => {
+  const storage = await openStorage();
+  // Six level-1 summaries with timestamps: [0,50], [100,150], [200,250], [300,350], [400,450], [500,550]
+  for (let i = 0; i < 6; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  // A level-2 summary whose earliest_timestamp exactly equals s2's latest_timestamp (250).
+  // With inclusive boundaries (>=, <=), this falls between s2 (latest=250) and s3 (earliest=300),
+  // breaking the run into [s0..s2] (3) and [s3..s5] (3), both below fanout=5.
+  await insertSummary(storage, {
+    id: "edge_interruptor",
+    level: 2,
+    earliestTimestamp: 250,
+    latestTimestamp: 290,
+  });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "edge-aligned interruptor should split the run so neither half reaches fanout",
+  );
+  storage.close();
+});
+
+test("oversized run is chunked into fanout-sized segments", async () => {
+  const storage = await openStorage();
+  // 13 contiguous level-1 summaries, fanout=5.
+  // Expected: chunk [s0..s4] (5) and chunk [s5..s9] (5) are enqueued.
+  // Leftover [s10..s12] (3) is below fanout, not enqueued.
+  for (let i = 0; i < 13; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 2, "should enqueue exactly 2 jobs for 13 summaries with fanout=5");
+
+  // First chunk covers s0..s4
+  const job1 = jobs.find((j) => j.inputStartId === "s0");
+  assert.ok(job1, "first job should start at s0");
+  assert.equal(job1.inputEndId, "s4");
+
+  // Second chunk covers s5..s9
+  const job2 = jobs.find((j) => j.inputStartId === "s5");
+  assert.ok(job2, "second job should start at s5");
+  assert.equal(job2.inputEndId, "s9");
+
+  storage.close();
+});

@@ -57,55 +57,61 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
   if (current.length > 0) runs.push(current);
 
   for (const run of runs) {
-    if (run.length < fanout) continue;
-    const start = run[0]!;
-    const end = run[run.length - 1]!;
+    // Chunk oversized runs into fanout-sized segments. The last chunk may be
+    // smaller than fanout — only enqueue it if it meets the minimum (>= fanout).
+    // Leftover summaries below the threshold stay as stranded summaries until
+    // more accumulate.
+    for (let chunkStart = 0; chunkStart + fanout <= run.length; chunkStart += fanout) {
+      const chunk = run.slice(chunkStart, chunkStart + fanout);
+      const start = chunk[0]!;
+      const end = chunk[chunk.length - 1]!;
 
-    // Skip if a pending/processing level+1 job already overlaps this run.
-    const active = storage.getActiveSummarizationJobs(timelineKey, level + 1);
-    const overlaps = active.some((job) => {
-      const jobStart = storage.getSummaryById(job.inputStartId);
-      const jobEnd = storage.getSummaryById(job.inputEndId);
-      // Treat an unresolvable active range as overlapping — be conservative and
-      // never enqueue a duplicate condensation job.
-      if (!jobStart || !jobEnd) {
-        logger.warn("condensation_unresolvable_active_job", {
-          activeJobId: job.id,
-          inputStartId: job.inputStartId,
-          inputEndId: job.inputEndId,
-          startResolved: !!jobStart,
-          endResolved: !!jobEnd,
-          timelineKey,
-          level: level + 1,
-        });
-        return true;
-      }
-      return !summaryAfter(start, jobEnd) && !summaryAfter(jobStart, end);
-    });
-    if (overlaps) continue;
+      // Skip if a pending/processing level+1 job already overlaps this chunk.
+      const active = storage.getActiveSummarizationJobs(timelineKey, level + 1);
+      const overlaps = active.some((job) => {
+        const jobStart = storage.getSummaryById(job.inputStartId);
+        const jobEnd = storage.getSummaryById(job.inputEndId);
+        // Treat an unresolvable active range as overlapping — be conservative and
+        // never enqueue a duplicate condensation job.
+        if (!jobStart || !jobEnd) {
+          logger.warn("condensation_unresolvable_active_job", {
+            activeJobId: job.id,
+            inputStartId: job.inputStartId,
+            inputEndId: job.inputEndId,
+            startResolved: !!jobStart,
+            endResolved: !!jobEnd,
+            timelineKey,
+            level: level + 1,
+          });
+          return true;
+        }
+        return !summaryAfter(start, jobEnd) && !summaryAfter(jobStart, end);
+      });
+      if (overlaps) continue;
 
-    const inputTokenCount = run.reduce((sum, s) => sum + s.tokenCount, 0);
-    const jobId = `sumjob_${nanoid(10)}`;
-    await storage.insertSummarizationJob({
-      id: jobId,
-      timelineKey,
-      level: level + 1,
-      inputStartId: start.id,
-      inputEndId: end.id,
-      inputTokenCount,
-      targetTokenCount: config.condense_target_tokens ?? 800,
-      maxRetries: config.max_retries ?? 2,
-    });
-    logger.info("condensation_triggered", {
-      timelineKey,
-      sourceLevel: level,
-      summaryCount: run.length,
-    });
-    logger.info("summarization_job_enqueued", {
-      jobId,
-      timelineKey,
-      level: level + 1,
-      inputTokens: inputTokenCount,
-    });
+      const inputTokenCount = chunk.reduce((sum, s) => sum + s.tokenCount, 0);
+      const jobId = `sumjob_${nanoid(10)}`;
+      await storage.insertSummarizationJob({
+        id: jobId,
+        timelineKey,
+        level: level + 1,
+        inputStartId: start.id,
+        inputEndId: end.id,
+        inputTokenCount,
+        targetTokenCount: config.condense_target_tokens ?? 800,
+        maxRetries: config.max_retries ?? 2,
+      });
+      logger.info("condensation_triggered", {
+        timelineKey,
+        sourceLevel: level,
+        summaryCount: chunk.length,
+      });
+      logger.info("summarization_job_enqueued", {
+        jobId,
+        timelineKey,
+        level: level + 1,
+        inputTokens: inputTokenCount,
+      });
+    }
   }
 }
