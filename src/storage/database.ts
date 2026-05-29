@@ -90,6 +90,159 @@ export interface TimelineCompactionState {
   updatedAt: number;
 }
 
+export type SummaryStatus = "complete" | "truncated" | "superseded";
+
+export interface Summary {
+  id: string;
+  timelineKey: string;
+  level: number;
+  content: string;
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  latestEventId: string;
+  eventCount: number;
+  tokenCount: number;
+  modelId: string | null;
+  status: SummaryStatus;
+  backfillJobId: string | null;
+  generatedAt: number;
+  createdAt: number;
+}
+
+export type SummarizationJobStatus = "pending" | "processing" | "complete" | "failed";
+
+export interface SummarizationJob {
+  id: string;
+  timelineKey: string;
+  level: number;
+  status: SummarizationJobStatus;
+  inputStartId: string;
+  inputEndId: string;
+  inputTokenCount: number | null;
+  targetTokenCount: number;
+  attempts: number;
+  maxRetries: number;
+  bestEffortDraft: string | null;
+  error: string | null;
+  resultSummaryId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Sort key for events/summaries: (timestamp, received_at, id) ascending. */
+export interface TimelineCursor {
+  timestamp: number;
+  receivedAt: number;
+  id: string;
+}
+
+interface SummaryRow {
+  id: string;
+  timeline_key: string;
+  level: number;
+  content: string;
+  earliest_timestamp: number;
+  latest_timestamp: number;
+  latest_event_id: string;
+  event_count: number;
+  token_count: number;
+  model_id: string | null;
+  status: SummaryStatus;
+  backfill_job_id: string | null;
+  generated_at: number;
+  created_at: number;
+}
+
+interface SummarizationJobRow {
+  id: string;
+  timeline_key: string;
+  level: number;
+  status: SummarizationJobStatus;
+  input_start_id: string;
+  input_end_id: string;
+  input_token_count: number | null;
+  target_token_count: number;
+  attempts: number;
+  max_retries: number;
+  best_effort_draft: string | null;
+  error: string | null;
+  result_summary_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function mapSummaryRow(row: SummaryRow): Summary {
+  return {
+    id: row.id,
+    timelineKey: row.timeline_key,
+    level: row.level,
+    content: row.content,
+    earliestTimestamp: row.earliest_timestamp,
+    latestTimestamp: row.latest_timestamp,
+    latestEventId: row.latest_event_id,
+    eventCount: row.event_count,
+    tokenCount: row.token_count,
+    modelId: row.model_id,
+    status: row.status,
+    backfillJobId: row.backfill_job_id,
+    generatedAt: row.generated_at,
+    createdAt: row.created_at,
+  };
+}
+
+function mapJobRow(row: SummarizationJobRow): SummarizationJob {
+  return {
+    id: row.id,
+    timelineKey: row.timeline_key,
+    level: row.level,
+    status: row.status,
+    inputStartId: row.input_start_id,
+    inputEndId: row.input_end_id,
+    inputTokenCount: row.input_token_count,
+    targetTokenCount: row.target_token_count,
+    attempts: row.attempts,
+    maxRetries: row.max_retries,
+    bestEffortDraft: row.best_effort_draft,
+    error: row.error,
+    resultSummaryId: row.result_summary_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Parameters for inserting a completed or truncated summary with its lineage. */
+export interface SummaryInsert {
+  id: string;
+  timelineKey: string;
+  level: number;
+  content: string;
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  latestEventId: string;
+  eventCount: number;
+  tokenCount: number;
+  modelId: string | null;
+  status: SummaryStatus;
+  generatedAt: number;
+  /** Ordered leaf event IDs (level 1 only). */
+  eventIds?: string[];
+  /** Ordered parent summary IDs (level 2+ only). */
+  parentIds?: string[];
+  /** Job to mark complete with this summary as its result. */
+  jobId: string;
+}
+
+export interface SummarizationJobInsert {
+  id: string;
+  timelineKey: string;
+  level: number;
+  inputStartId: string;
+  inputEndId: string;
+  inputTokenCount: number | null;
+  targetTokenCount: number;
+  maxRetries: number;
+}
+
 export class Storage {
   readonly db: Database.Database;
   private readonly queue: Array<WriteJob<any>> = [];
@@ -746,6 +899,414 @@ export class Storage {
     });
   }
 
+  // ── Metadata key-value accessors ──────────────────────────────────
+
+  getMetadata(key: string): string | null {
+    const row = this.read((db) =>
+      db.prepare(`select value from metadata where key = ?`).get(key) as
+        | { value: string }
+        | undefined,
+    );
+    return row ? row.value : null;
+  }
+
+  setMetadata(key: string, value: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into metadata (key, value, updated_at)
+         values (?, ?, ?)
+         on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+      ).run(key, value, Date.now());
+    });
+  }
+
+  // ── Exclusive-cursor timeline query ───────────────────────────────
+
+  /**
+   * Like getTimelineEventsForContext, but the cursor event is EXCLUDED
+   * (id > cursor, not id >=). Used when the cursor event is covered by a
+   * summary and must not also render raw.
+   */
+  getTimelineEventsAfter(
+    timelineKey: string,
+    afterEventId: string,
+    limit = 1000,
+  ): CanonicalChatEvent[] {
+    const cursor = this.getEventCursor(timelineKey, afterEventId);
+    if (!cursor) return this.getTimelineEvents(timelineKey, limit);
+
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select event_json
+           from timeline_events
+           where timeline_key = @timelineKey
+             and (
+               timestamp > @timestamp
+               or (timestamp = @timestamp and received_at > @receivedAt)
+               or (timestamp = @timestamp and received_at = @receivedAt and id > @id)
+             )
+           order by timestamp asc, received_at asc, id asc
+           limit @limit`,
+        )
+        .all({
+          timelineKey,
+          timestamp: cursor.timestamp,
+          receivedAt: cursor.receivedAt,
+          id: cursor.id,
+          limit,
+        }) as Array<{ event_json: string }>,
+    );
+    return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+  }
+
+  getEventCursor(timelineKey: string, eventId: string): TimelineCursor | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select timestamp, received_at, id from timeline_events
+           where timeline_key = ? and id = ?`,
+        )
+        .get(timelineKey, eventId) as
+        | { timestamp: number; received_at: number; id: string }
+        | undefined,
+    );
+    return row ? { timestamp: row.timestamp, receivedAt: row.received_at, id: row.id } : undefined;
+  }
+
+  /**
+   * Events within the inclusive cursor range [start, end], ordered by
+   * (timestamp, received_at, id) ascending. IDs are not chronologically
+   * sortable, so callers resolve to cursors first.
+   */
+  getTimelineEventsBetween(
+    timelineKey: string,
+    start: TimelineCursor,
+    end: TimelineCursor,
+  ): CanonicalChatEvent[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select event_json
+           from timeline_events
+           where timeline_key = @timelineKey
+             and (
+               timestamp > @startTs
+               or (timestamp = @startTs and received_at > @startRcv)
+               or (timestamp = @startTs and received_at = @startRcv and id >= @startId)
+             )
+             and (
+               timestamp < @endTs
+               or (timestamp = @endTs and received_at < @endRcv)
+               or (timestamp = @endTs and received_at = @endRcv and id <= @endId)
+             )
+           order by timestamp asc, received_at asc, id asc`,
+        )
+        .all({
+          timelineKey,
+          startTs: start.timestamp,
+          startRcv: start.receivedAt,
+          startId: start.id,
+          endTs: end.timestamp,
+          endRcv: end.receivedAt,
+          endId: end.id,
+        }) as Array<{ event_json: string }>,
+    );
+    return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+  }
+
+  // ── Summary queries ───────────────────────────────────────────────
+
+  /**
+   * Candidate summaries for context selection: status in (complete,
+   * truncated), ordered by earliest_timestamp ASC. When beforeTimestamp is
+   * set, only summaries whose coverage ends strictly before it.
+   */
+  getSummaryCandidates(timelineKey: string, beforeTimestamp?: number): Summary[] {
+    const rows = this.read((db) => {
+      if (beforeTimestamp != null) {
+        return db
+          .prepare(
+            `select * from summaries
+             where timeline_key = ? and status in ('complete', 'truncated')
+               and latest_timestamp < ?
+             order by earliest_timestamp asc`,
+          )
+          .all(timelineKey, beforeTimestamp) as SummaryRow[];
+      }
+      return db
+        .prepare(
+          `select * from summaries
+           where timeline_key = ? and status in ('complete', 'truncated')
+           order by earliest_timestamp asc`,
+        )
+        .all(timelineKey) as SummaryRow[];
+    });
+    return rows.map(mapSummaryRow);
+  }
+
+  getSummaryById(id: string): Summary | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select * from summaries where id = ?`).get(id) as SummaryRow | undefined,
+    );
+    return row ? mapSummaryRow(row) : undefined;
+  }
+
+  /** Summaries at a given level, status in (complete, truncated), ordered by earliest_timestamp ASC. */
+  getSummariesByLevel(timelineKey: string, level: number): Summary[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summaries
+           where timeline_key = ? and level = ? and status in ('complete', 'truncated')
+           order by earliest_timestamp asc`,
+        )
+        .all(timelineKey, level) as SummaryRow[],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /**
+   * Summaries in the inclusive earliest_timestamp range bounded by two summary
+   * IDs (resolved internally), ordered by earliest_timestamp ASC (tie-broken by id).
+   */
+  getSummariesBetween(timelineKey: string, startId: string, endId: string): Summary[] {
+    const start = this.getSummaryById(startId);
+    const end = this.getSummaryById(endId);
+    if (!start || !end) return [];
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summaries
+           where timeline_key = @timelineKey and status in ('complete', 'truncated')
+             and (
+               earliest_timestamp > @startTs
+               or (earliest_timestamp = @startTs and id >= @startId)
+             )
+             and (
+               earliest_timestamp < @endTs
+               or (earliest_timestamp = @endTs and id <= @endId)
+             )
+           order by earliest_timestamp asc, id asc`,
+        )
+        .all({
+          timelineKey,
+          startTs: start.earliestTimestamp,
+          startId: start.id,
+          endTs: end.earliestTimestamp,
+          endId: end.id,
+        }) as SummaryRow[],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /** True if any summary at level >= minLevel falls strictly between two timestamps. */
+  hasSummaryBetween(
+    timelineKey: string,
+    minLevel: number,
+    afterTimestamp: number,
+    beforeTimestamp: number,
+  ): boolean {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select 1 from summaries
+           where timeline_key = ? and level >= ? and status in ('complete', 'truncated')
+             and earliest_timestamp > ? and latest_timestamp < ?
+           limit 1`,
+        )
+        .get(timelineKey, minLevel, afterTimestamp, beforeTimestamp) as { 1: number } | undefined,
+    );
+    return row != null;
+  }
+
+  /**
+   * Insert a completed/truncated summary, its lineage rows, and mark the source
+   * job complete — all in one transaction. No floor is persisted (the coverage
+   * cursor is derived from latest_event_id).
+   */
+  insertSummaryWithLineage(insert: SummaryInsert): Promise<void> {
+    return this.readAndWrite((db) => {
+      const now = Date.now();
+      db.prepare(
+        `insert into summaries (
+          id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+          latest_event_id, event_count, token_count, model_id, status,
+          backfill_job_id, generated_at, created_at
+        ) values (
+          @id, @timelineKey, @level, @content, @earliestTimestamp, @latestTimestamp,
+          @latestEventId, @eventCount, @tokenCount, @modelId, @status,
+          null, @generatedAt, @createdAt
+        )`,
+      ).run({
+        id: insert.id,
+        timelineKey: insert.timelineKey,
+        level: insert.level,
+        content: insert.content,
+        earliestTimestamp: insert.earliestTimestamp,
+        latestTimestamp: insert.latestTimestamp,
+        latestEventId: insert.latestEventId,
+        eventCount: insert.eventCount,
+        tokenCount: insert.tokenCount,
+        modelId: insert.modelId,
+        status: insert.status,
+        generatedAt: insert.generatedAt,
+        createdAt: now,
+      });
+
+      if (insert.eventIds && insert.eventIds.length > 0) {
+        const stmt = db.prepare(
+          `insert into summary_events (summary_id, event_id, ordinal) values (?, ?, ?)`,
+        );
+        insert.eventIds.forEach((eventId, ordinal) => stmt.run(insert.id, eventId, ordinal));
+      }
+
+      if (insert.parentIds && insert.parentIds.length > 0) {
+        const stmt = db.prepare(
+          `insert into summary_parents (summary_id, parent_id, ordinal) values (?, ?, ?)`,
+        );
+        insert.parentIds.forEach((parentId, ordinal) => stmt.run(insert.id, parentId, ordinal));
+      }
+
+      db.prepare(
+        `update summarization_jobs set status = 'complete', result_summary_id = ?, updated_at = ?
+         where id = ?`,
+      ).run(insert.id, now, insert.jobId);
+    });
+  }
+
+  // ── Summarization job queue ───────────────────────────────────────
+
+  insertSummarizationJob(job: SummarizationJobInsert): Promise<void> {
+    return this.write((db) => {
+      const now = Date.now();
+      db.prepare(
+        `insert into summarization_jobs (
+          id, timeline_key, level, status, input_start_id, input_end_id,
+          input_token_count, target_token_count, attempts, max_retries,
+          created_at, updated_at
+        ) values (
+          @id, @timelineKey, @level, 'pending', @inputStartId, @inputEndId,
+          @inputTokenCount, @targetTokenCount, 0, @maxRetries, @createdAt, @updatedAt
+        )`,
+      ).run({
+        id: job.id,
+        timelineKey: job.timelineKey,
+        level: job.level,
+        inputStartId: job.inputStartId,
+        inputEndId: job.inputEndId,
+        inputTokenCount: job.inputTokenCount,
+        targetTokenCount: job.targetTokenCount,
+        maxRetries: job.maxRetries,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+  }
+
+  getSummarizationJobById(id: string): SummarizationJob | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select * from summarization_jobs where id = ?`).get(id) as
+        | SummarizationJobRow
+        | undefined,
+    );
+    return row ? mapJobRow(row) : undefined;
+  }
+
+  /** Active (pending or processing) jobs for a timeline + level. */
+  getActiveSummarizationJobs(timelineKey: string, level: number): SummarizationJob[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summarization_jobs
+           where timeline_key = ? and level = ? and status in ('pending', 'processing')
+           order by created_at asc`,
+        )
+        .all(timelineKey, level) as SummarizationJobRow[],
+    );
+    return rows.map(mapJobRow);
+  }
+
+  /** All processing jobs for a timeline (any level). */
+  getProcessingSummarizationJobs(timelineKey: string): SummarizationJob[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summarization_jobs
+           where timeline_key = ? and status = 'processing'
+           order by created_at asc`,
+        )
+        .all(timelineKey) as SummarizationJobRow[],
+    );
+    return rows.map(mapJobRow);
+  }
+
+  /**
+   * Claim the oldest pending job via CAS (pending → processing). The SAME
+   * transaction increments attempts (first claim => attempts = 1), bounding
+   * crash-loops. Returns the claimed job (post-update) or undefined.
+   */
+  claimNextSummarizationJob(): Promise<SummarizationJob | undefined> {
+    return this.readAndWrite((db) => {
+      const row = db
+        .prepare(
+          `select * from summarization_jobs
+           where status = 'pending'
+           order by created_at asc
+           limit 1`,
+        )
+        .get() as SummarizationJobRow | undefined;
+      if (!row) return undefined;
+      const result = db
+        .prepare(
+          `update summarization_jobs
+           set status = 'processing', attempts = attempts + 1, updated_at = ?
+           where id = ? and status = 'pending'`,
+        )
+        .run(Date.now(), row.id);
+      if (result.changes === 0) return undefined;
+      return mapJobRow({ ...row, status: "processing", attempts: row.attempts + 1 });
+    });
+  }
+
+  /** Set a job back to pending for retry, recording the error. */
+  retrySummarizationJob(jobId: string, error: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update summarization_jobs set status = 'pending', error = ?, updated_at = ? where id = ?`,
+      ).run(error, Date.now(), jobId);
+    });
+  }
+
+  failSummarizationJob(jobId: string, error: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update summarization_jobs set status = 'failed', error = ?, updated_at = ? where id = ?`,
+      ).run(error, Date.now(), jobId);
+    });
+  }
+
+  saveBestEffortDraft(jobId: string, draft: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update summarization_jobs set best_effort_draft = ?, updated_at = ? where id = ?`,
+      ).run(draft, Date.now(), jobId);
+    });
+  }
+
+  /** Reset stale 'processing' claims to 'pending' on startup (attempts left as-is). */
+  resetStaleSummarizationJobs(): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update summarization_jobs set status = 'pending', updated_at = ?
+           where status = 'processing'`,
+        )
+        .run(Date.now());
+      return result.changes;
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -903,6 +1464,76 @@ create index if not exists idx_media_assets_preview
 create index if not exists idx_media_assets_caption_eligible
   on media_assets(caption_status, download_status, media_type)
   where caption_status in ('pending', 'processing');
+
+create table if not exists summaries (
+  id text primary key,
+  timeline_key text not null,
+  level integer not null,
+  content text not null,
+  earliest_timestamp integer not null,
+  latest_timestamp integer not null,
+  latest_event_id text not null,
+  event_count integer not null,
+  token_count integer not null,
+  model_id text,
+  status text not null default 'complete'
+    check(status in ('complete', 'truncated', 'superseded')),
+  backfill_job_id text,
+  generated_at integer not null,
+  created_at integer not null
+);
+
+create index if not exists idx_summaries_timeline
+  on summaries(timeline_key, latest_timestamp);
+
+create index if not exists idx_summaries_level
+  on summaries(timeline_key, level, earliest_timestamp);
+
+create table if not exists summary_events (
+  summary_id text not null references summaries(id) on delete cascade,
+  event_id text not null,
+  ordinal integer not null,
+  primary key (summary_id, event_id)
+);
+
+create index if not exists idx_summary_events_event
+  on summary_events(event_id);
+
+create table if not exists summary_parents (
+  summary_id text not null references summaries(id) on delete cascade,
+  parent_id text not null references summaries(id) on delete cascade,
+  ordinal integer not null,
+  primary key (summary_id, parent_id)
+);
+
+create index if not exists idx_summary_parents_parent
+  on summary_parents(parent_id);
+
+create table if not exists summarization_jobs (
+  id text primary key,
+  timeline_key text not null,
+  level integer not null,
+  status text not null default 'pending'
+    check(status in ('pending', 'processing', 'complete', 'failed')),
+  input_start_id text not null,
+  input_end_id text not null,
+  input_token_count integer,
+  target_token_count integer not null,
+  attempts integer not null default 0,
+  max_retries integer not null default 2,
+  best_effort_draft text,
+  error text,
+  result_summary_id text references summaries(id) on delete set null,
+  created_at integer not null,
+  updated_at integer not null
+);
+
+create index if not exists idx_summarization_jobs_status
+  on summarization_jobs(status, created_at)
+  where status in ('pending', 'processing');
+
+create index if not exists idx_summarization_jobs_timeline
+  on summarization_jobs(timeline_key, level, status);
 `;
 
 function runMigrations(db: Database.Database): void {

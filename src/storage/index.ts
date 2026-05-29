@@ -6,4 +6,11 @@ export {
   type ReplyContextRow,
   type LinkPreviewRow,
   type MediaAssetRow,
+  type Summary,
+  type SummaryStatus,
+  type SummaryInsert,
+  type SummarizationJob,
+  type SummarizationJobStatus,
+  type SummarizationJobInsert,
+  type TimelineCursor,
 } from "./database.js";

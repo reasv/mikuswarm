@@ -144,6 +144,11 @@ export class TimelineStore {
     );
   }
 
+  /** Events strictly after the given event (exclusive cursor); used when that event is covered by a summary. */
+  queryAfterContext(timelineKey: string, afterEventId: string): CanonicalChatEvent[] {
+    return this.storage.getTimelineEventsAfter(timelineKey, afterEventId, 1000);
+  }
+
   getCompactionState(timelineKey: string): TimelineCompactionState | undefined {
     return this.storage.getTimelineCompactionState(timelineKey);
   }
