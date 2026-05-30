@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { Storage, TimelineCompactionState } from "../storage/index.js";
-import type { CanonicalChatEvent } from "../types.js";
+import type { CanonicalChatEvent, TimelineState } from "../types.js";
 
 export interface TimelineQuery {
   timelineKey: string;
@@ -161,25 +161,47 @@ export class TimelineStore {
     return this.storage.setEnrichmentStatus(eventId, status);
   }
 
-  /** Stored undecryptable (UTD) events, oldest first, for the re-decryption sweeper. */
-  getUndecrypted(limit = 100): CanonicalChatEvent[] {
+  /**
+   * Stored undecryptable (UTD) events, oldest first, for the re-decryption
+   * sweeper. Rows past the re-decryption give-up ceiling are excluded so dead
+   * rows can't starve newer decryptable ones (issue #1). Each entry carries the
+   * row's current `attempts` count so the sweeper can prune its backoff map.
+   */
+  getUndecrypted(limit = 100): Array<{ event: CanonicalChatEvent; attempts: number }> {
     return this.storage.getUndecryptedEvents(limit);
   }
 
   /**
    * Replace a stored UTD event with its now-decrypted form: `updater` rebuilds
    * the canonical with `undecryptable` cleared and the real body/attachments, and
-   * the row's `enrichment_status` flips to 'pending'. Matched by event id. The
-   * decrypted relation may re-home the row to a thread timeline (see
-   * {@link Storage.replaceUndecryptedEvent}). Returns `{ event, replaced }` —
-   * `replaced` is `false` on the already-decrypted no-op — or `undefined` when no
-   * row matches.
+   * the row's `enrichment_status` is set to whatever `computeStatus` returns for
+   * the decrypted event and its (possibly re-homed) timeline's live state (issues
+   * #5/#6). Matched by event id. The decrypted relation may re-home the row to a
+   * thread timeline (see {@link Storage.replaceUndecryptedEvent}). Returns
+   * `{ event, replaced, status }` — `replaced` is `false` on the already-decrypted
+   * no-op — or `undefined` when no row matches.
    */
   replaceUndecrypted(
     eventId: string,
     updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
-  ): Promise<{ event: CanonicalChatEvent; replaced: boolean } | undefined> {
-    return this.storage.replaceUndecryptedEvent(eventId, updater);
+    computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
+  ): Promise<{ event: CanonicalChatEvent; replaced: boolean; status: string } | undefined> {
+    return this.storage.replaceUndecryptedEvent(eventId, updater, computeStatus);
+  }
+
+  /** Persist a failed re-decryption probe (bump attempts). Returns the new count. */
+  recordRedecryptFailure(eventId: string): Promise<number | undefined> {
+    return this.storage.recordRedecryptFailure(eventId);
+  }
+
+  /** Permanently retire a UTD row from re-decryption rotation (no re-fetch possible). */
+  retireUndecrypted(eventId: string): Promise<void> {
+    return this.storage.retireUndecryptedEvent(eventId);
+  }
+
+  /** Delete a UTD row that decrypted to a non-renderable message (issue #9). */
+  deleteUndecrypted(eventId: string): Promise<boolean> {
+    return this.storage.deleteUndecryptedEvent(eventId);
   }
 
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {

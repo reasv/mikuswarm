@@ -1,5 +1,7 @@
 export {
   Storage,
+  MAX_REDECRYPT_ATTEMPTS,
+  REDECRYPT_RETIRED,
   type StorageOptions,
   type TimelineCompactionState,
   type TimelineEventRow,

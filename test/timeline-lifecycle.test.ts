@@ -126,12 +126,14 @@ test("activateTimelineEvents flips only 'inactive' rows to 'pending' and returns
   }
 });
 
-test("fresh database opens at user_version = 1 with the full canonical schema", async () => {
+test("fresh database opens at the latest user_version with the full canonical schema", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
-    // The versioned migration runner stamps a fresh DB at the latest version.
+    // The versioned migration runner stamps a fresh DB at the latest version
+    // (v2: redecrypt_attempts added). A fresh DB must NOT run the additive ALTER
+    // migration steps — SCHEMA already built the column.
     const userVersion = storage.read((db) => db.pragma("user_version", { simple: true }) as number);
-    assert.equal(userVersion, 1, "fresh DB should be stamped user_version = 1");
+    assert.equal(userVersion, 2, "fresh DB should be stamped at the latest schema version");
 
     // enrichment_status CHECK includes 'inactive' (baked into the canonical schema).
     await storage.appendTimelineEvent(userEvent({ id: "inact-1", body: "x", timestamp: 1000 }), "inactive");
@@ -150,6 +152,7 @@ test("fresh database opens at user_version = 1 with the full canonical schema", 
     );
     assert.ok(teColumns.has("is_undecryptable"), "is_undecryptable generated column should exist");
     assert.ok(teColumns.has("enrichment_retries"), "enrichment_retries column should exist");
+    assert.ok(teColumns.has("redecrypt_attempts"), "redecrypt_attempts column should exist (v2)");
     assert.ok(teColumns.has("trigger_group_id"), "trigger_group_id column should exist");
 
     // The partial index over the generated column exists.
@@ -181,7 +184,7 @@ test("fresh database opens at user_version = 1 with the full canonical schema", 
   }
 });
 
-test("re-opening an existing database is idempotent (stays v1, preserves data)", async () => {
+test("re-opening an existing database is idempotent (stays at latest version, preserves data)", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-reopen-"));
   const dbPath = path.join(dir, "db.sqlite");
   try {
@@ -190,16 +193,17 @@ test("re-opening an existing database is idempotent (stays v1, preserves data)",
     try {
       await first.appendTimelineEvent(userEvent({ id: "persist-1", body: "keep me", timestamp: 1000 }), "inactive");
       await first.setTimelineState(TK, "active");
-      assert.equal(first.read((db) => db.pragma("user_version", { simple: true }) as number), 1);
+      assert.equal(first.read((db) => db.pragma("user_version", { simple: true }) as number), 2);
     } finally {
       first.close();
     }
 
     // Re-opening runs the migration runner again — it must be a no-op: stays at
-    // v1, no error, and previously written data is intact.
+    // the latest version, no error, and previously written data is intact. (The
+    // additive ALTER step must NOT re-run and hit "duplicate column".)
     const second = await Storage.open({ databasePath: dbPath });
     try {
-      assert.equal(second.read((db) => db.pragma("user_version", { simple: true }) as number), 1, "should stay at v1");
+      assert.equal(second.read((db) => db.pragma("user_version", { simple: true }) as number), 2, "should stay at the latest version");
       const body = second.read((db) =>
         (db.prepare("select body from timeline_events where id = ?").get("persist-1") as { body: string } | undefined)?.body,
       );

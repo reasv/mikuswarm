@@ -52,7 +52,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
-import { RedecryptionSweeper } from "./redecryption/index.js";
+import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -682,23 +682,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // clients are running; stopped before the provider during drain.
   const redecryptionSweeper = new RedecryptionSweeper({
     store: timeline,
-    retry: async ({ roomId, eventId }) => {
+    retry: ({ roomId, eventId }) =>
       // The accountId is the second segment of the timeline key, but the sweeper
-      // only hands us roomId/eventId; resolve the account via the room's account
-      // map. Each room belongs to exactly one account, so try each running
-      // account until one knows the room (cheap: messageSummary resolves the
-      // room locally and errors fast otherwise).
-      for (const accountId of Object.keys(config.matrix.accounts)) {
-        try {
-          const client = provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}`, accountId });
-          return await client.messageSummary({ roomId, eventId });
-        } catch {
-          // Account not running or room unknown to it — try the next account.
-          continue;
-        }
-      }
-      return null;
-    },
+      // only hands us roomId/eventId. A room can be shared by multiple bot accounts
+      // (separate agents / workspaces); a megolm key the first-tried account lacks
+      // may be known to another, so we try ALL accounts and prefer a decrypted
+      // result (issue #3). `resolveMultiAccountRetry` applies the outcome
+      // precedence and the throw-vs-null contract the sweeper depends on (#9).
+      resolveMultiAccountRetry(Object.keys(config.matrix.accounts), (accountId) => {
+        const client = provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}`, accountId });
+        return client.messageSummary({ roomId, eventId });
+      }),
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
     intervalMs: config.timeline?.redecryption_sweep_interval_ms ?? 60_000,

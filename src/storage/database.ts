@@ -9,6 +9,24 @@ export interface StorageOptions {
   logger?: Logger;
 }
 
+/**
+ * Re-decryption give-up ceiling (issue #1). A UTD row whose `redecrypt_attempts`
+ * reaches this count is excluded from `getUndecryptedEvents`, so permanently-dead
+ * events (megolm keys that will never arrive — e.g. messages sent before the bot
+ * joined) leave the oldest-first candidate window and stop starving newer,
+ * decryptable rows. At the default sweep interval with exponential backoff this
+ * spans well over a day of real-time retries before a row is retired.
+ */
+export const MAX_REDECRYPT_ATTEMPTS = 12;
+
+/**
+ * Sentinel `redecrypt_attempts` value marking a row permanently retired from the
+ * re-decryption rotation regardless of {@link MAX_REDECRYPT_ATTEMPTS} (e.g. a UTD
+ * row with no resolvable room/event id, which can never be re-fetched). Chosen
+ * far above the ceiling so it always falls outside the candidate query.
+ */
+export const REDECRYPT_RETIRED = 1_000_000;
+
 type WriteJob<T> = {
   run: (db: Database.Database) => T;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -264,8 +282,21 @@ export class Storage {
     await storage.write((writer) => {
       writer.pragma("journal_mode = WAL");
       writer.pragma("foreign_keys = ON");
+      // Distinguish a brand-new database from an existing one BEFORE applying
+      // SCHEMA (which uses `if not exists` and so leaves no trace of which case we
+      // are in). A fresh DB has no user tables yet; SCHEMA then builds the full
+      // latest shape and runMigrations only stamps the version — it must NOT run
+      // the additive ALTER steps, which target legacy DBs that predate a column.
+      const isFreshDatabase =
+        (
+          writer
+            .prepare(
+              `select count(*) as n from sqlite_master where type = 'table' and name = 'timeline_events'`,
+            )
+            .get() as { n: number }
+        ).n === 0;
       writer.exec(SCHEMA);
-      runMigrations(writer);
+      runMigrations(writer, isFreshDatabase);
     });
     return storage;
   }
@@ -614,51 +645,143 @@ export class Storage {
    * Stored undecryptable (UTD) events, oldest first, capped at `limit`. Backed
    * by the `is_undecryptable` generated column + partial index, so this is cheap
    * even with a large timeline. Used by the re-decryption sweeper.
+   *
+   * Rows whose `redecrypt_attempts` have reached {@link MAX_REDECRYPT_ATTEMPTS}
+   * (or the {@link REDECRYPT_RETIRED} sentinel) are excluded (issue #1): a wall of
+   * permanently-dead OLD rows must not consume the oldest-first window and starve
+   * newer, decryptable rows. Each returned event carries its current attempt count
+   * so the sweeper can prune its in-memory backoff map and persist increments.
    */
-  getUndecryptedEvents(limit = 100): CanonicalChatEvent[] {
+  getUndecryptedEvents(limit = 100): Array<{ event: CanonicalChatEvent; attempts: number }> {
     const rows = this.read((db) =>
       db
         .prepare(
-          `select event_json
+          `select event_json, redecrypt_attempts
            from timeline_events
-           where is_undecryptable = 1
+           where is_undecryptable = 1 and redecrypt_attempts < @max
            order by timestamp asc
-           limit ?`,
+           limit @limit`,
         )
-        .all(limit) as Array<{ event_json: string }>,
+        .all({ limit, max: MAX_REDECRYPT_ATTEMPTS }) as Array<{
+        event_json: string;
+        redecrypt_attempts: number;
+      }>,
     );
-    return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+    return rows.map((row) => ({
+      event: JSON.parse(row.event_json) as CanonicalChatEvent,
+      attempts: row.redecrypt_attempts,
+    }));
+  }
+
+  /**
+   * Persist a failed re-decryption probe: bump `redecrypt_attempts` by one (so the
+   * row eventually crosses {@link MAX_REDECRYPT_ATTEMPTS} and drops out of the
+   * candidate set) while the row is still UTD. Guarded on `is_undecryptable = 1`
+   * so a row that decrypted via a concurrent path is not bumped. Returns the new
+   * attempt count (or `undefined` if the row no longer exists / is no longer UTD).
+   */
+  recordRedecryptFailure(eventId: string): Promise<number | undefined> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update timeline_events
+             set redecrypt_attempts = redecrypt_attempts + 1, updated_at = ?
+           where id = ? and is_undecryptable = 1`,
+        )
+        .run(Date.now(), eventId);
+      if (result.changes === 0) return undefined;
+      const row = db
+        .prepare(`select redecrypt_attempts from timeline_events where id = ?`)
+        .get(eventId) as { redecrypt_attempts: number } | undefined;
+      return row?.redecrypt_attempts;
+    });
+  }
+
+  /**
+   * Permanently retire a UTD row from the re-decryption rotation by stamping its
+   * `redecrypt_attempts` to the {@link REDECRYPT_RETIRED} sentinel (issue #1).
+   * Used for rows that can never be re-fetched (no resolvable room/event id). The
+   * row stays UTD (content unchanged) but `getUndecryptedEvents` will never return
+   * it again. Guarded on `is_undecryptable = 1` so a decrypted row is untouched.
+   */
+  retireUndecryptedEvent(eventId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update timeline_events
+           set redecrypt_attempts = ?, updated_at = ?
+         where id = ? and is_undecryptable = 1`,
+      ).run(REDECRYPT_RETIRED, Date.now(), eventId);
+    });
+  }
+
+  /**
+   * Delete a UTD row outright (issue #9). Used when a re-decryption probe shows
+   * the event decrypted to a non-renderable message (sticker / poll / reaction):
+   * the native summary comes back `null` *without throwing*, which the live append
+   * path never stores, so removing the placeholder matches live parity. Guarded on
+   * `is_undecryptable = 1` so a row that became a real decrypted message via a
+   * concurrent path is never deleted. Returns `true` when a row was removed.
+   */
+  deleteUndecryptedEvent(eventId: string): Promise<boolean> {
+    return this.write((db) => {
+      const result = db
+        .prepare(`delete from timeline_events where id = ? and is_undecryptable = 1`)
+        .run(eventId);
+      return result.changes > 0;
+    });
   }
 
   /**
    * Replace a stored UTD event with its decrypted form. Rebuilds body/event_json
    * from `updater` (which must clear `undecryptable` and set the real
-   * body/attachments), flips `enrichment_status` to 'pending' so the now-real
-   * content enriches/captions, and bumps `updated_at`. Matched by event id.
+   * body/attachments), sets `enrichment_status` to the value `computeStatus`
+   * returns, and bumps `updated_at`. Matched by event id.
+   *
+   * `computeStatus(updated, timelineState)` decides the post-decrypt enrichment
+   * status (issues #5/#6). It is evaluated *inside* the write transaction with the
+   * decrypted event and the live `timeline_state` of the row's (possibly re-homed)
+   * timeline, so the sweeper and the persisted row agree without the sweeper
+   * needing its own read. The chosen status is returned to the caller so its
+   * notify decisions match exactly what was stored. The status must be a legal
+   * `enrichment_status` value: typically `'inactive'` for inactive timelines, else
+   * `'pending'` / `'skipped'` per `needsEnrichment`.
    *
    * The decrypted relation can move the event off the room timeline (a thread
    * message stored UTD has its `m.thread` relation encrypted at store time): the
    * `updater` may return a different `timelineKey`/`threadId`, which is persisted
-   * here — the row is re-homed. The canonical id (dedup key) is never changed.
+   * here — the row is re-homed, and the timeline state is read for the NEW key.
+   * The canonical id (dedup key) is never changed.
    *
-   * Returns `{ event, replaced }`. `replaced` is `false` when the row was already
-   * non-UTD (the sweeper races backfill/message_summary touches): nothing is
-   * written and the existing row is returned so the caller can skip re-arming
-   * enrichment and the misleading "replaced" log. Returns `undefined` only when
-   * no row exists for the id.
+   * Returns `{ event, replaced, status }`. `replaced` is `false` when the row was
+   * already non-UTD (the sweeper races backfill/message_summary touches): nothing
+   * is written, the existing row is returned, and `status` is its current stored
+   * status so the caller can skip re-arming enrichment and the misleading
+   * "replaced" log. Returns `undefined` only when no row exists for the id.
    */
   replaceUndecryptedEvent(
     eventId: string,
     updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
-  ): Promise<{ event: CanonicalChatEvent; replaced: boolean } | undefined> {
+    computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
+  ): Promise<{ event: CanonicalChatEvent; replaced: boolean; status: string } | undefined> {
     return this.write((db) => {
       const row = db
-        .prepare(`select event_json from timeline_events where id = ?`)
-        .get(eventId) as { event_json: string } | undefined;
+        .prepare(`select event_json, enrichment_status from timeline_events where id = ?`)
+        .get(eventId) as { event_json: string; enrichment_status: string } | undefined;
       if (!row) return undefined;
       const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
-      if (!existing.undecryptable) return { event: existing, replaced: false }; // already replaced; no-op
+      if (!existing.undecryptable) {
+        // Already replaced; no-op. Report the existing stored status.
+        return { event: existing, replaced: false, status: row.enrichment_status };
+      }
       const updated = updater(existing);
+      // Resolve the timeline state of the (possibly re-homed) destination key. A
+      // missing compaction-state row means the channel was never engaged →
+      // 'inactive' (mirrors getTimelineState).
+      const stateRow = db
+        .prepare(`select timeline_state from timeline_compaction_state where timeline_key = ?`)
+        .get(updated.timelineKey) as { timeline_state: TimelineState } | undefined;
+      const timelineState: TimelineState = stateRow?.timeline_state ?? "inactive";
+      const status = computeStatus(updated, timelineState);
       db.prepare(
         `update timeline_events
          set external_id = @externalId,
@@ -672,7 +795,7 @@ export class Storage {
              received_at = @receivedAt,
              agent_session_id = @agentSessionId,
              event_json = @eventJson,
-             enrichment_status = 'pending',
+             enrichment_status = @enrichmentStatus,
              updated_at = @updatedAt
          where id = @id`,
       ).run({
@@ -688,9 +811,10 @@ export class Storage {
         receivedAt: updated.receivedAt,
         agentSessionId: updated.agentSessionId ?? null,
         eventJson: JSON.stringify(updated),
+        enrichmentStatus: status,
         updatedAt: Date.now(),
       });
-      return { event: updated, replaced: true };
+      return { event: updated, replaced: true, status };
     });
   }
 
@@ -1640,6 +1764,13 @@ create table if not exists timeline_events (
   enrichment_status text not null default 'pending'
     check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
   enrichment_retries integer not null default 0,
+  -- Count of re-decryption probe attempts that did not yield decrypted content
+  -- (still-UTD or unfetchable). The re-decryption sweeper increments this per
+  -- failed probe and excludes rows at/above a ceiling from its candidate query
+  -- so permanently-dead UTD rows (keys will never arrive) can't starve the
+  -- oldest-first window and stall recovery of newer decryptable events. A large
+  -- sentinel value marks a row permanently retired (e.g. missing room/event id).
+  redecrypt_attempts integer not null default 0,
   trigger_group_id text,
   created_at integer not null,
   updated_at integer not null,
@@ -1658,8 +1789,11 @@ create index if not exists idx_timeline_events_timeline_time
 
 -- Partial index over the is_undecryptable generated column so the re-decryption
 -- sweeper finds stored UTD events cheaply (O(matches), no full JSON scan).
+-- redecrypt_attempts is carried in the index so the sweeper's candidate query
+-- (is_undecryptable = 1 and redecrypt_attempts < :max, ordered by timestamp)
+-- skips exhausted rows without touching the heap.
 create index if not exists idx_timeline_events_undecryptable
-  on timeline_events(is_undecryptable, timestamp)
+  on timeline_events(is_undecryptable, redecrypt_attempts, timestamp)
   where is_undecryptable = 1;
 
 create index if not exists idx_timeline_events_external
@@ -1835,52 +1969,77 @@ create index if not exists idx_summarization_jobs_timeline
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-const LATEST_SCHEMA_VERSION = 1;
+const LATEST_SCHEMA_VERSION = 2;
 
-// Ordered, additive migration steps keyed by the version they PRODUCE. A step
-// at index `i` migrates a database at `user_version = i` up to `user_version =
-// i + 1`. Each step runs inside the same write transaction as the version bump
-// and must be idempotent-safe to author (it only runs once per database, when
-// crossing its version boundary). There are no v2+ steps yet — version 1 is the
-// canonical SCHEMA above, so this list is empty. To add a future migration:
+// Ordered, additive migration steps. The runner's loop consults
+// `MIGRATIONS[version]` for each `version` from the DB's current version up to
+// LATEST, so the step at index `i` migrates a database at `user_version = i` up
+// to `user_version = i + 1`. Fresh DBs are built directly at the latest shape by
+// SCHEMA and NEVER run any step (see runMigrations). Each step runs inside the
+// version-bump transaction and only ever runs once per DB. To add a future
+// migration:
 //   1. bump LATEST_SCHEMA_VERSION to N,
-//   2. push the step that takes a v(N-1) DB to vN here (index N-2),
+//   2. set MIGRATIONS[N-1] to the step that takes a v(N-1) DB to vN,
 //   3. update SCHEMA so a fresh DB is created directly at vN.
-const MIGRATIONS: Array<(db: Database.Database) => void> = [
-  // index 0: 1 -> 2 (none yet)
+const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
+  // index 0 (v0 -> v1): unused. v1 is the original canonical SCHEMA; there are no
+  // real v0 databases (a fresh DB is built at the latest shape and skips steps).
+  undefined,
+  // index 1 (v1 -> v2): add `redecrypt_attempts` to `timeline_events`
+  // (re-decryption give-up counter, issue #1) and rebuild the UTD partial index
+  // to carry it. `ALTER TABLE ADD COLUMN` with a NOT NULL default backfills
+  // existing rows to 0; dropping/recreating the index picks up the new key
+  // column. Fresh DBs get this directly from SCHEMA above and never run this step.
+  (db) => {
+    db.exec(
+      `alter table timeline_events
+         add column redecrypt_attempts integer not null default 0;
+       drop index if exists idx_timeline_events_undecryptable;
+       create index if not exists idx_timeline_events_undecryptable
+         on timeline_events(is_undecryptable, redecrypt_attempts, timestamp)
+         where is_undecryptable = 1;`,
+    );
+  },
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
 // callback (single-writer queue), AFTER `writer.exec(SCHEMA)`.
 //
-//   - Fresh DB: SCHEMA already created every table/index, user_version is the
-//     default 0, so we stamp it to LATEST_SCHEMA_VERSION and apply no steps.
+//   - Fresh DB (`isFresh`): SCHEMA already created every table/index at the
+//     latest shape. `user_version` is the default 0, but there is nothing to
+//     migrate — we just stamp it to LATEST_SCHEMA_VERSION and apply NO steps.
+//     (Running the additive ALTER steps here would fail, e.g. "duplicate column",
+//     because SCHEMA already added the column the step targets.)
 //   - Existing DB at version V < LATEST: apply MIGRATIONS[V], MIGRATIONS[V+1],
 //     ... in order, advancing user_version to LATEST.
 //   - Existing DB already at LATEST: no steps, idempotent no-op.
 //
 // `create table/index if not exists` in SCHEMA makes re-running open() on an
 // up-to-date database harmless.
-function runMigrations(db: Database.Database): void {
+function runMigrations(db: Database.Database, isFresh: boolean): void {
   const current = Number((db.pragma("user_version", { simple: true }) as number) ?? 0);
 
-  if (current >= LATEST_SCHEMA_VERSION) {
-    // Already at (or ahead of) the latest version. A fresh DB reports
-    // user_version = 0, so it does NOT enter this block — it advances through
-    // the loop below and gets stamped to LATEST.
-    if (current > LATEST_SCHEMA_VERSION) {
-      throw new Error(
-        `Database schema version ${current} is newer than this build supports (${LATEST_SCHEMA_VERSION}). ` +
-          `Refusing to open to avoid corrupting forward-versioned data.`,
-      );
-    }
+  if (current > LATEST_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema version ${current} is newer than this build supports (${LATEST_SCHEMA_VERSION}). ` +
+        `Refusing to open to avoid corrupting forward-versioned data.`,
+    );
+  }
+  if (current === LATEST_SCHEMA_VERSION) {
+    // Already at the latest version. Idempotent no-op.
     return;
   }
 
-  // Apply each ordered step from `current` up to LATEST. For a fresh DB
-  // (current === 0) MIGRATIONS is consulted from index 0, but with no v2+ steps
-  // the loop body that runs a step is only entered for real upgrades; the loop
-  // here simply advances the stamp to LATEST in one transaction.
+  // A fresh DB reports user_version = 0 but its tables were just built at the
+  // latest shape by SCHEMA — there is no legacy column to add, so skip the steps
+  // and only stamp the version.
+  if (isFresh) {
+    db.pragma(`user_version = ${LATEST_SCHEMA_VERSION}`);
+    return;
+  }
+
+  // Existing DB below LATEST: apply each ordered step from `current` up to LATEST
+  // in one transaction. A step at index i migrates a v(i) DB up to v(i+1).
   db.transaction(() => {
     for (let version = current; version < LATEST_SCHEMA_VERSION; version++) {
       const step = MIGRATIONS[version];
