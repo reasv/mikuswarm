@@ -87,12 +87,15 @@ export class ActivationCoordinator {
     // guard is present. This means a prelude failed AND its catch-path reset to
     // 'inactive' also failed (logged as timeline_activation_reset_failed), so
     // the persisted state is stranded in 'activating' with the guard/buffer
-    // already cleared. Re-dispatching here (the legitimate just-cleared race
-    // below) would busy-loop: every trigger reads 'activating', finds no
-    // buffer, re-dispatches, re-reads 'activating'... forever, one DB write per
-    // pass. Instead, store the event cheaply (never dropped) and attempt a
-    // one-shot recovery by re-persisting 'inactive' so the NEXT trigger can
-    // re-activate. Do NOT re-dispatch.
+    // already cleared. Instead, store the event cheaply (never dropped) and
+    // attempt a one-shot recovery by re-persisting 'inactive'. Re-dispatch the
+    // trigger ONLY after that reset write SUCCEEDS: the next pass then reads
+    // 'inactive' and activates normally (no loop). If the reset write FAILS, do
+    // NOT re-dispatch — re-dispatching on every pass would busy-loop (each
+    // trigger reads 'activating', finds no buffer, re-dispatches, re-reads
+    // 'activating'... forever, one failing DB write per pass). The stranded
+    // state itself requires TWO consecutive write failures to arise, so this
+    // recovery only re-dispatches once per successful reset.
     if (timelineState === "activating" && !guarded) {
       const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
       await this.opts.router.route(inbound, holdStatus);
@@ -102,11 +105,16 @@ export class ActivationCoordinator {
         eventId: inbound.event.id,
         trigger: Boolean(inbound.trigger),
       });
-      // One-shot recovery: try to clear the stranded 'activating' so the next
-      // trigger re-activates from a clean state. Best-effort — if it fails
-      // again we simply stay inconsistent (still no loop) until the write heals.
+      // One-shot recovery: clear the stranded 'activating' so the next trigger
+      // re-activates from a clean state. Best-effort — if it fails again we stay
+      // inconsistent (still no loop) until the write heals.
       try {
         await this.opts.storage.setTimelineState(inbound.timelineKey, "inactive");
+        // Reset succeeded: re-dispatch so this trigger isn't lost. The next pass
+        // reads 'inactive' and activates normally — no loop (the state is no
+        // longer 'activating'). Only re-dispatch a real trigger; a non-trigger
+        // event was already stored above and needs no session.
+        if (inbound.trigger) this.opts.dispatch(inbound);
       } catch (resetError) {
         this.opts.logger.error("activation_state_recovery_failed", {
           timelineKey: inbound.timelineKey,

@@ -72,10 +72,13 @@ class BackfillTimeoutError extends Error {}
  * Fetch recent room history backward from the room head on first-trigger
  * activation (§4 step 3). Pages backward via `readMessages` (no `before` token
  * starts at the head; each subsequent page uses the previous result's
- * `nextBatch` — the backward continuation token), storing each message with
- * `enrichment_status='pending'`. Dedup is handled by `appendIfMissing` against
- * the canonical Matrix event ID, so the trigger event and any already-stored
- * inactive events are not re-inserted.
+ * `nextBatch` — the backward continuation token), storing each non-UTD message
+ * with `enrichment_status='inactive'` (UTD messages with `'skipped'`). Dedup is
+ * handled by `appendIfMissing` against the canonical Matrix event ID, so the
+ * trigger event and any already-stored inactive events are not re-inserted.
+ * Storing 'inactive' (not 'pending') keeps the catch-path invariant — a failed
+ * activation must not leave enrichable rows under an inactive timeline; the
+ * post-readiness `activateTimelineEvents` bulk-flip activates them on success.
  *
  * Stops at the first of: `maxMessages` newly stored, a page crossing the window
  * floor (`anchorTimestamp - windowMs`, anchored to the activation moment),
@@ -191,8 +194,14 @@ export async function performInitialBackfill(
       }
 
       // A UTD event is stored with `enrichment_status='skipped'` (no body/media
-      // to enrich); a normal event stays 'pending'.
-      const { duplicate } = await store.appendIfMissing(event, isUtd ? "skipped" : "pending");
+      // to enrich; the redecryption sweeper handles it once keys arrive, and it
+      // respects inactive timelines). A normal event is stored 'inactive' — NOT
+      // 'pending' — so a failed activation (readiness throws or the process
+      // crashes before reaching 'active') leaves it 'inactive' rather than
+      // stranding it 'pending' and enriching it under an inactive timeline. The
+      // post-readiness `activateTimelineEvents` bulk-flip ('inactive'→'pending')
+      // activates these together with the rest of the backlog on success.
+      const { duplicate } = await store.appendIfMissing(event, isUtd ? "skipped" : "inactive");
       if (!duplicate) {
         result.stored++;
         if (result.stored >= maxMessages) {

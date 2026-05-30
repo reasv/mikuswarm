@@ -340,6 +340,60 @@ test("#3/#9: on successful activation the backlog flips to pending and the trigg
   }
 });
 
+test("#4: a backfilled 'inactive' event flips to 'pending' (and nudges enrichment) on a successful activation", async () => {
+  // Simulate backfill storing a fetched history event 'inactive' (the post-#4
+  // backfill behavior). After a successful activation the bulk-flip must promote
+  // it to 'pending' and the enrichment pool must be nudged.
+  const h = await makeHarness({
+    runInitialBackfill: async () => {
+      await h.storage.appendTimelineEvent(userEvent({ id: "bf1", timestamp: 5 }), "inactive");
+    },
+  });
+  try {
+    const enrichedBefore = h.enriched.length;
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1", timestamp: 30 })));
+    await new Promise((r) => setImmediate(r));
+
+    const status = h.storage.read((db) =>
+      (db.prepare("select enrichment_status from timeline_events where id = ?").get("bf1") as { enrichment_status: string }).enrichment_status,
+    );
+    assert.equal(status, "pending", "the backfilled inactive event flips to pending via the bulk activation");
+    assert.equal(h.storage.getTimelineState(TK), "active");
+    assert.ok(h.enriched.length > enrichedBefore, "the enrichment pool is nudged after the bulk flip");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#4: a backfilled 'inactive' event stays 'inactive' (NOT pending) when activation fails after the fetch phase", async () => {
+  // The fix's core invariant: on a FAILED activation (readiness throws AFTER
+  // backfill), the backfilled event must remain 'inactive' so it is not enriched
+  // under a now-inactive timeline. This test FAILS under the old 'pending'
+  // backfill storage (the event would be left enrichable).
+  const h = await makeHarness({
+    runInitialBackfill: async () => {
+      await h.storage.appendTimelineEvent(userEvent({ id: "bf1", timestamp: 5 }), "inactive");
+    },
+    awaitTriggerReadiness: async () => {
+      throw new Error("readiness boom");
+    },
+  });
+  try {
+    await assert.rejects(
+      () => h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1", timestamp: 30 }))),
+      /readiness boom/,
+    );
+
+    const status = h.storage.read((db) =>
+      (db.prepare("select enrichment_status from timeline_events where id = ?").get("bf1") as { enrichment_status: string }).enrichment_status,
+    );
+    assert.equal(status, "inactive", "the backfilled event must stay inactive on a failed activation (no enrichment under an inactive timeline)");
+    assert.equal(h.storage.getTimelineState(TK), "inactive", "state resets to inactive");
+  } finally {
+    h.storage.close();
+  }
+});
+
 test("#9: a non-enriching duplicate trigger event leaves 'inactive' (marked skipped) and is not swept by the bulk flip", async () => {
   const h = await makeHarness();
   try {
@@ -448,7 +502,7 @@ test("#2/#14: a stranded 'activating' state (catch-path reset threw) does not bu
   }
 });
 
-test("#14: one-shot recovery clears the stranded 'activating' so a later trigger can re-activate", async () => {
+test("#7/#14: one-shot recovery clears the stranded 'activating' AND re-dispatches the trigger so it re-activates without waiting for a later trigger", async () => {
   // Make the FIRST 'inactive' write (the catch-path reset) throw, but allow
   // subsequent 'inactive' writes (the gateInbound one-shot recovery) to succeed.
   let inactiveWrites = 0;
@@ -479,17 +533,66 @@ test("#14: one-shot recovery clears the stranded 'activating' so a later trigger
     );
     assert.equal(h.storage.getTimelineState(TK), "activating", "stranded after failed reset");
 
-    // Follow-up trigger hits the inconsistent path: stores the event and the
-    // one-shot recovery re-persists 'inactive'.
+    // Follow-up trigger hits the inconsistent path: stores the event, the
+    // one-shot recovery re-persists 'inactive' (succeeds this time), and because
+    // the reset write SUCCEEDED the trigger is re-dispatched (#7). The replay
+    // re-enters gateInbound, reads 'inactive', and re-activates cleanly — no loop
+    // and no waiting for a separate later trigger.
+    const before = h.dispatched.length;
     await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
-    assert.equal(h.storage.getTimelineState(TK), "inactive", "the one-shot recovery cleared the stranded state");
-
-    // A NEXT trigger now re-activates cleanly from 'inactive'.
-    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t3", timestamp: 3_000 })));
     await new Promise((r) => setImmediate(r));
-    assert.equal(h.storage.getTimelineState(TK), "active", "the next trigger re-activated from the recovered 'inactive' state");
-    assert.equal(h.launched.length, 1, "the re-activating trigger launched a session");
-    assert.equal(h.launched[0].event.id, "t3");
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.dispatched.length - before, 1, "the recovered trigger is re-dispatched exactly once after the successful reset");
+    assert.equal(h.dispatched[before].event.id, "t2");
+    assert.equal(h.storage.getTimelineState(TK), "active", "the re-dispatched trigger re-activated from the recovered 'inactive' state");
+    assert.equal(h.launched.length, 1, "the re-dispatched trigger launched a session — the user gets a response");
+    assert.equal(h.launched[0].event.id, "t2");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#7: when the stranded-recovery reset write FAILS, the trigger is NOT re-dispatched (no busy-loop)", async () => {
+  // Every 'inactive' write fails — both the catch-path reset (creating the
+  // stranded state) and the gateInbound one-shot recovery. The trigger must NOT
+  // be re-dispatched, otherwise each pass would re-read 'activating' and
+  // re-dispatch forever against a persistently-failing write.
+  const wrapStorage = (storage: Storage): ActivationStorage => ({
+    getTimelineState: (timelineKey) => storage.getTimelineState(timelineKey),
+    setTimelineState: (timelineKey, state) => {
+      if (state === "inactive") return Promise.reject(new Error("reset write boom"));
+      return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
+    },
+    activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+  });
+
+  const h = await makeHarness({
+    awaitTriggerReadiness: async () => {
+      throw new Error("readiness boom");
+    },
+    wrapStorage,
+  });
+  try {
+    await assert.rejects(
+      () => h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" }))),
+      /readiness boom/,
+    );
+    assert.equal(h.storage.getTimelineState(TK), "activating", "stranded after failed reset");
+
+    const before = h.dispatched.length;
+    const outcome = await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(outcome, "handled", "the inconsistent-state trigger is consumed by the lifecycle path");
+    assert.equal(h.dispatched.length - before, 0, "a failing reset must NOT re-dispatch (would busy-loop)");
+    assert.equal(h.storage.getTimelineState(TK), "activating", "state stays stranded when the recovery write keeps failing");
+    // The event must not be dropped — it is stored regardless.
+    const stored = h.storage.read((db) =>
+      db.prepare("select id from timeline_events where id = ?").get("t2"),
+    );
+    assert.ok(stored, "the follow-up event was stored (not dropped) even though it wasn't re-dispatched");
   } finally {
     h.storage.close();
   }

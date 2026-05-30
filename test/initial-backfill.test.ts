@@ -109,7 +109,48 @@ test("stores messages with canonical IDs and stops on exhaustion (no nextBatch)"
     const status = storage.read((db) =>
       (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$a`) as { enrichment_status: string }).enrichment_status,
     );
-    assert.equal(status, "pending", "backfilled events are stored pending so they enrich");
+    // #4: backfilled non-UTD events are stored 'inactive' (NOT 'pending') so a
+    // failed activation leaves no enrichable rows under an inactive timeline; the
+    // post-readiness activateTimelineEvents bulk-flip activates them on success.
+    assert.equal(status, "inactive", "backfilled events are stored inactive, flipped to pending by the activation bulk-flip");
+  });
+});
+
+test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pending'; a failed activation leaves them 'inactive'", async () => {
+  // Backfill stores non-UTD events 'inactive'. The activation bulk-flip
+  // (activateTimelineEvents: 'inactive'→'pending') runs only after readiness
+  // succeeds, so on a FAILED activation the rows must remain 'inactive' and never
+  // enrich under an inactive timeline.
+  await withStores(async (store, storage) => {
+    const client = new ScriptedClient([
+      page([summary({ eventId: "$a", timestamp: 3000 }), summary({ eventId: "$b", timestamp: 2000 })], null),
+    ]);
+    await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+
+    const statusesAfterBackfill = storage.read((db) =>
+      Object.fromEntries(
+        (db.prepare("select id, enrichment_status from timeline_events").all() as Array<{ id: string; enrichment_status: string }>)
+          .map((r) => [r.id, r.enrichment_status]),
+      ),
+    );
+    assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$a`], "inactive");
+    assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$b`], "inactive");
+
+    // FAILED activation: the bulk-flip never runs (readiness threw before it), so
+    // the rows stay 'inactive'. Asserted by simply NOT calling the flip.
+    assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$a`], "inactive", "stays inactive when activation fails before the flip");
+
+    // SUCCESSFUL activation: the bulk-flip promotes them to 'pending'.
+    const flipped = await storage.activateTimelineEvents(ROOM_TK);
+    assert.equal(flipped, 2, "both backfilled rows are flipped by the bulk activation");
+    const statusesAfterFlip = storage.read((db) =>
+      Object.fromEntries(
+        (db.prepare("select id, enrichment_status from timeline_events").all() as Array<{ id: string; enrichment_status: string }>)
+          .map((r) => [r.id, r.enrichment_status]),
+      ),
+    );
+    assert.equal(statusesAfterFlip[`matrix:${ACCOUNT}:$a`], "pending");
+    assert.equal(statusesAfterFlip[`matrix:${ACCOUNT}:$b`], "pending");
   });
 });
 
