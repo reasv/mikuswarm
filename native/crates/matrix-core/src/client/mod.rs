@@ -490,6 +490,17 @@ fn register_inbound_handler(client: &Client, shared: Arc<SharedState>, config: M
             // here is one we could NOT decrypt — a live UTD. Surface it as a
             // placeholder like a human client would, but do NOT bump
             // `last_successful_decryption_at` (no decryption happened).
+            //
+            // SDK-VERSION-TIED INVARIANT (matrix-sdk 0.16.0): this is only sound
+            // because the base client decrypts-and-replaces encrypted events
+            // inside `base_client().receive_sync_response()` — sync-time, BEFORE
+            // any event handler dispatch. A successfully decrypted event therefore
+            // reaches this raw handler already typed as its plaintext type
+            // (e.g. `m.room.message`), and ONLY genuine UTDs remain typed
+            // `m.room.encrypted`. If a future SDK moved decryption to after handler
+            // dispatch (or made it lazy/on-demand), decryptable events would arrive
+            // here still typed `m.room.encrypted` and we'd emit false placeholders.
+            // Re-verify this assumption against the vendored SDK on every bump.
             if value.get("type").and_then(Value::as_str) == Some("m.room.encrypted") {
                 if let Some(inbound) = events::normalize_utd_inbound_event(&room, &value).await {
                     shared.push_inbound(inbound);

@@ -116,11 +116,13 @@ test("stores messages with canonical IDs and stops on exhaustion (no nextBatch)"
   });
 });
 
-test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pending'; a failed activation leaves them 'inactive'", async () => {
+test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pending'", async () => {
   // Backfill stores non-UTD events 'inactive'. The activation bulk-flip
   // (activateTimelineEvents: 'inactive'→'pending') runs only after readiness
-  // succeeds, so on a FAILED activation the rows must remain 'inactive' and never
-  // enrich under an inactive timeline.
+  // succeeds, promoting the backfilled rows. (The failed-activation invariant —
+  // rows stay 'inactive' when readiness throws before the flip — is covered in
+  // test/activation-flow.test.ts "#4: a backfilled 'inactive' event stays
+  // 'inactive' (NOT pending) when activation fails after the fetch phase".)
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
       page([summary({ eventId: "$a", timestamp: 3000 }), summary({ eventId: "$b", timestamp: 2000 })], null),
@@ -135,10 +137,6 @@ test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pe
     );
     assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$a`], "inactive");
     assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$b`], "inactive");
-
-    // FAILED activation: the bulk-flip never runs (readiness threw before it), so
-    // the rows stay 'inactive'. Asserted by simply NOT calling the flip.
-    assert.equal(statusesAfterBackfill[`matrix:${ACCOUNT}:$a`], "inactive", "stays inactive when activation fails before the flip");
 
     // SUCCESSFUL activation: the bulk-flip promotes them to 'pending'.
     const flipped = await storage.activateTimelineEvents(ROOM_TK);

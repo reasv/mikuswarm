@@ -33,7 +33,8 @@ const SummarizationSchema = Type.Object({
 const TimelineSchema = Type.Object({
   // How many messages to fetch on first trigger (initial backfill). 0 = none.
   initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
-  // Max time window for initial backfill (ms); whichever limit is reached first.
+  // Max history window for initial backfill (ms), measured back from the trigger
+  // (the activation moment), not from "now"; whichever limit is reached first.
   initial_backfill_window_ms: Type.Optional(Type.Number({ minimum: 0 })),
   // Timeout for the initial backfill fetch (ms). The first trigger is held this long.
   initial_backfill_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),

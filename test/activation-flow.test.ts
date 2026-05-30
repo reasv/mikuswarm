@@ -242,7 +242,6 @@ test("#1: a second trigger arriving during activation is not dropped — it queu
 });
 
 test("#2: once active, the timeline uses the normal path — a trigger after activation queues via the coordinator (guard cleared before session run)", async () => {
-  const sessionGate = deferred();
   const h = await makeHarness({
     // The first session never completes during the test, so the slot stays held.
     launchSession: () => {},
@@ -258,7 +257,6 @@ test("#2: once active, the timeline uses the normal path — a trigger after act
     // gate no longer claims it as a lifecycle event.
     const gate = await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
     assert.equal(gate, "active", "post-activation triggers fall through to the active path");
-    void sessionGate; // session intentionally left running
   } finally {
     h.storage.close();
   }

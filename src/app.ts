@@ -784,8 +784,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   let retentionTimer: ReturnType<typeof setInterval> | undefined;
 
   async function runInactiveRetention(): Promise<void> {
-    if (draining || retentionDays <= 0) return;
-    const cutoff = Date.now() - retentionDays * 86_400_000;
+    const decision = decideRetentionSweep({ retentionDays, draining, now: Date.now() });
+    if (decision.skip) return;
+    const { cutoff } = decision;
     try {
       const pruned = await storage.pruneInactiveTimelineEvents(cutoff);
       if (pruned > 0) {
@@ -857,6 +858,26 @@ async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 10_000));
   await Promise.race([Promise.allSettled([...runs]), timeout]);
+}
+
+const MILLIS_PER_DAY = 86_400_000;
+
+/**
+ * Pure decision for the inactive-event retention sweep: should it run, and if so
+ * what cutoff timestamp should be pruned below? The sweep is skipped entirely
+ * when retention is disabled (`retentionDays <= 0`) or the runtime is draining;
+ * otherwise events in inactive timelines older than `now − retentionDays days`
+ * are eligible for pruning. Extracted as a pure function so the cutoff math and
+ * the skip gate are unit-testable without standing up a runtime.
+ */
+export function decideRetentionSweep(params: {
+  retentionDays: number;
+  draining: boolean;
+  now: number;
+}): { skip: true } | { skip: false; cutoff: number } {
+  const { retentionDays, draining, now } = params;
+  if (draining || retentionDays <= 0) return { skip: true };
+  return { skip: false, cutoff: now - retentionDays * MILLIS_PER_DAY };
 }
 
 /**

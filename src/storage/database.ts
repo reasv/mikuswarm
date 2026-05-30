@@ -467,6 +467,18 @@ export class Storage {
       // `setTimelineState` (which conversely leaves `state_json`/the compaction
       // cursors untouched): the two writers update disjoint columns of the same
       // row and never regress each other.
+      //
+      // The bare insert branch (no existing row) deliberately omits
+      // `timeline_state` too, falling back to the column default `'inactive'`.
+      // That default is only correct because the sole caller — the summarization
+      // pipeline — runs exclusively for already-active timelines, which always
+      // already have a row written by `setTimelineState('active')` during
+      // activation. So this call always hits the UPDATE path; the insert branch
+      // is effectively unreachable today. A FUTURE caller that wrote compaction
+      // state before activation would insert with `timeline_state='inactive'`
+      // while carrying real cursors, and `pruneInactiveTimelineEvents` would
+      // treat the timeline as prunable — so such a caller must seed the
+      // lifecycle state explicitly rather than rely on this insert.
       db.prepare(
         `insert into timeline_compaction_state (
           timeline_key, compact_start_event_id, rich_start_event_id, state_json, updated_at

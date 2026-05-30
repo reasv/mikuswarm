@@ -79,7 +79,7 @@ root_dir = "./workspaces/miku"
 # Channel lifecycle: a timeline is inactive until first triggered. On the first
 # trigger the bot backfills recent history before the activating session runs.
 initial_backfill_messages = 200       # messages to fetch (0 = no backfill)
-initial_backfill_window_ms = 3600000  # 1h; whichever limit is reached first
+initial_backfill_window_ms = 3600000  # 1h of history before the trigger (the activation moment); whichever limit is reached first
 initial_backfill_timeout_ms = 30000   # 30s; the first trigger is held this long
 initial_backfill_page_size = 100      # messages per backward page request (clamped 1–1000)
 inactive_event_retention_days = 0     # 0 = no pruning; >0 prunes old inactive-timeline events
