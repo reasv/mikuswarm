@@ -18,6 +18,7 @@ export type SetEnrichmentStatus = (eventId: string, status: string) => Promise<v
 
 export interface ActivationLogger {
   info(event: string, fields?: Record<string, unknown>): void;
+  warn(event: string, fields?: Record<string, unknown>): void;
   error(event: string, fields?: Record<string, unknown>): void;
 }
 
@@ -40,6 +41,13 @@ export interface ActivationCoordinatorOptions {
   launchSession: (inbound: InboundChatEvent, duplicate: boolean) => Promise<void>;
   /** Re-dispatch an inbound event through the top-level handler (held replay). */
   dispatch: (inbound: InboundChatEvent) => void;
+  /**
+   * True once the app has begun draining for shutdown. An activation prelude
+   * already past gateInbound's `draining` early-return re-checks this before its
+   * post-readiness writes + session launch so it can't spawn a session that races
+   * `storage.waitForIdle()`/`close()` (#2).
+   */
+  isDraining: () => boolean;
   logger: ActivationLogger;
 }
 
@@ -97,9 +105,7 @@ export class ActivationCoordinator {
     // state itself requires TWO consecutive write failures to arise, so this
     // recovery only re-dispatches once per successful reset.
     if (timelineState === "activating" && !guarded) {
-      const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
-      await this.opts.router.route(inbound, holdStatus);
-      if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
+      await this.storeHeld(inbound);
       this.opts.logger.error("activation_state_inconsistent", {
         timelineKey: inbound.timelineKey,
         eventId: inbound.event.id,
@@ -120,6 +126,18 @@ export class ActivationCoordinator {
           timelineKey: inbound.timelineKey,
           error: resetError instanceof Error ? resetError.message : String(resetError),
         });
+        // The reset write failed, so we do NOT re-dispatch (that would busy-loop
+        // — see above). A trigger that arrives on this path is therefore stored
+        // but neither spawned nor buffered: its session is dropped until a future
+        // trigger heals the state or a restart's resetStaleActivations() runs.
+        // Behavior is intentional (anti-busy-loop); log distinctly so an operator
+        // can correlate the otherwise-silent drop (#7).
+        if (inbound.trigger) {
+          this.opts.logger.warn("activation_trigger_dropped_pending_heal", {
+            timelineKey: inbound.timelineKey,
+            eventId: inbound.event.id,
+          });
+        }
       }
       return "handled";
     }
@@ -129,9 +147,7 @@ export class ActivationCoordinator {
     // it enriches and the activating session sees it. A trigger here can't spawn
     // a second session yet — buffer it and replay once the timeline settles.
     if (timelineState === "activating" || guarded) {
-      const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
-      await this.opts.router.route(inbound, holdStatus);
-      if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
+      await this.storeHeld(inbound);
       if (inbound.trigger) {
         const held = this.heldTriggers.get(inbound.timelineKey);
         if (held) {
@@ -225,6 +241,22 @@ export class ActivationCoordinator {
       this.opts.notifyCaptions();
       await this.opts.awaitTriggerReadiness(inbound);
 
+      // Shutdown began while this prelude was in flight (backfill/readiness can
+      // hold for tens of seconds). Bail BEFORE the post-readiness writes and the
+      // session launch so we can't spawn a session whose writes race
+      // `storage.waitForIdle()`/`close()` during drain (#2). Clear the guard and
+      // buffer WITHOUT replaying — `handleInbound`'s `draining` early-return would
+      // swallow any replayed trigger anyway. The timeline is left 'activating';
+      // `resetStaleActivations()` heals it to 'inactive' on the next startup.
+      if (this.opts.isDraining()) {
+        this.finishActivation(inbound.timelineKey);
+        this.opts.logger.info("activation_aborted_draining", {
+          timelineKey: inbound.timelineKey,
+          eventId: inbound.event.id,
+        });
+        return;
+      }
+
       // Flip all previously-stored inactive events to pending and nudge the
       // enrichment pool. AFTER readiness succeeds so a pre-active failure (or
       // crash) leaves the backlog 'inactive' rather than stranding it 'pending'
@@ -283,6 +315,20 @@ export class ActivationCoordinator {
     }
 
     this.replay(held);
+  }
+
+  /**
+   * Store an event that arrived while a timeline is in the activation prelude
+   * (held). It must reach a processable status (never dropped) so the activating
+   * session sees it and enrichment runs: 'pending' when the event needs
+   * enrichment (nudging the pool), else 'skipped'. Returns the stored status.
+   * Shared by both `activating` branches in `gateInbound` (#9).
+   */
+  private async storeHeld(inbound: InboundChatEvent): Promise<"pending" | "skipped"> {
+    const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
+    await this.opts.router.route(inbound, holdStatus);
+    if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
+    return holdStatus;
   }
 
   /** Clear the guard and held-trigger buffer for a timeline; return the buffer. */

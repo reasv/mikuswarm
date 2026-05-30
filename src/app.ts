@@ -737,6 +737,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
       });
     },
+    isDraining: () => draining,
     logger,
   });
 

@@ -231,6 +231,71 @@ test("window is anchored to activation time, not the oldest stored event", async
   });
 });
 
+test("#1: the window-floor stop is not tripped by filtered-out (non-matching) messages", async () => {
+  await withStores(async (store, storage) => {
+    // A thread timeline. `readMessages` returns the whole room, so each page is
+    // dominated by old non-thread traffic far below the window floor, while the
+    // thread's own messages sit above it. The window floor must reflect only the
+    // events kept for THIS timeline — the non-thread noise must not trip it.
+    // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
+    const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
+    const thread = (eventId: string, timestamp: number) =>
+      summary({ eventId, timestamp, relatesTo: { relType: "m.thread", eventId: "$root" } });
+    const client = new ScriptedClient([
+      // Page 1: a thread message above the floor, plus old non-thread noise WAY
+      // below the floor. Old behavior: noise drags pageMinTimestamp < floor →
+      // stops here. New behavior: only $t1 (999_000) counts → keep paging.
+      page([
+        thread("$t1", 999_000),
+        summary({ eventId: "$noise1", timestamp: 100_000 }),
+        summary({ eventId: "$noise2", timestamp: 90_000 }),
+      ], "tok1"),
+      // Page 2: another in-window thread message + more old noise. Still no
+      // thread message below the floor → keep paging.
+      page([
+        thread("$t2", 998_000),
+        summary({ eventId: "$noise3", timestamp: 80_000 }),
+      ], "tok2"),
+      // Page 3: a thread message that finally crosses the floor → stop here.
+      page([thread("$t3", 994_000)], "tok3"),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: threadTk, ...BASE,
+      windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
+    });
+    assert.equal(result.stored, 3, "all three thread messages stored; noise excluded");
+    assert.equal(result.reachedWindow, true, "stops only when a KEPT thread message crosses the floor");
+    assert.equal(client.calls.length, 3, "non-thread noise below the floor must not stop backfill early");
+    assert.ok(store.getById(`matrix:${ACCOUNT}:$t3`), "the floor-crossing thread message is stored");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$noise1`), undefined, "non-thread noise is not stored on a thread timeline");
+  });
+});
+
+test("#1: a fully-filtered page leaves the floor untouched and paging continues on the token", async () => {
+  await withStores(async (store, storage) => {
+    // A thread timeline whose first page is ENTIRELY non-thread traffic, all
+    // below the window floor. pageMinTimestamp stays Infinity, so the floor stop
+    // does not fire and paging continues on the advancing token.
+    // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
+    const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
+    const client = new ScriptedClient([
+      page([
+        summary({ eventId: "$noise1", timestamp: 100_000 }),
+        summary({ eventId: "$noise2", timestamp: 90_000 }),
+      ], "tok1"),
+      page([summary({ eventId: "$mine", timestamp: 999_000, relatesTo: { relType: "m.thread", eventId: "$root" } })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: threadTk, ...BASE,
+      windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
+    });
+    assert.equal(result.reachedWindow, false, "a fully-filtered page must not trip the window floor");
+    assert.equal(result.exhausted, true, "paging continues past the filtered page to exhaustion");
+    assert.equal(result.stored, 1, "only the in-thread message is stored");
+    assert.equal(client.calls.length, 2, "the second page is fetched on the advancing token");
+  });
+});
+
 test("does not count duplicates (already-stored events) toward the limit", async () => {
   await withStores(async (store, storage) => {
     // Pre-store $a as if it were the trigger event already routed.
@@ -512,6 +577,58 @@ test("a non-UTD event resets the consecutive-UTD counter", async () => {
     assert.equal(result.exhausted, true);
     assert.equal(result.stored, 81, "all 80 UTD + 1 real stored");
     assert.ok(store.getById(`matrix:${ACCOUNT}:$real`), "the interrupting message is stored");
+  });
+});
+
+test("#5: re-paged already-stored UTD duplicates do not advance the consecutive-UTD halt", async () => {
+  await withStores(async (store, storage) => {
+    // Pre-store 50 UTD events as if a prior backfill already held them. A new
+    // backfill re-pages the SAME 50 (duplicates) followed by genuinely new
+    // history. Under the old behavior the 50 re-paged UTD duplicates would reach
+    // the threshold and halt on history already held; with the fix the counter
+    // only advances on real (newly-stored) events, so paging reaches the new page.
+    for (let i = 0; i < 50; i++) {
+      await store.appendIfMissing(
+        {
+          ...seedEvent(`matrix:${ACCOUNT}:$dup${i}`, 100_000 - i),
+          id: `matrix:${ACCOUNT}:$dup${i}`,
+          externalId: `$dup${i}`,
+          undecryptable: { sessionId: "s", reason: "missing_megolm_session" },
+        },
+        "skipped",
+      );
+    }
+    const dupPage = Array.from({ length: 50 }, (_, i) => utdSummary(`$dup${i}`, 100_000 - i));
+    const client = new ScriptedClient([
+      page(dupPage, "tok1"),
+      page([summary({ eventId: "$fresh", timestamp: 50_000 })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
+    });
+    assert.equal(result.haltedOnUtd, false, "re-paged UTD duplicates must not trip the halt");
+    assert.equal(result.exhausted, true, "paging continues past the duplicate page to the new history");
+    assert.equal(result.stored, 1, "only the genuinely-new $fresh is newly stored");
+    assert.equal(client.calls.length, 2, "the second page (new history) is fetched");
+    assert.ok(store.getById(`matrix:${ACCOUNT}:$fresh`), "the new event is stored");
+  });
+});
+
+test("#5: a run of newly-stored UTD duplicates still halts only on genuinely new dead history", async () => {
+  await withStores(async (store, storage) => {
+    // Sanity counterpart to the above: when the UTD events are genuinely new
+    // (not duplicates), the halt still fires at the threshold.
+    const utds = Array.from({ length: 50 }, (_, i) => utdSummary(`$new${i}`, 100_000 - i));
+    const client = new ScriptedClient([
+      page(utds, "tok1"),
+      page([summary({ eventId: "$never", timestamp: 1000 })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
+    });
+    assert.equal(result.haltedOnUtd, true, "genuinely-new dead history still halts");
+    assert.equal(result.stored, 50);
+    assert.equal(client.calls.length, 1, "the second page is never fetched");
   });
 });
 

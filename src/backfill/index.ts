@@ -173,7 +173,6 @@ export async function performInitialBackfill(
       result.fetched++;
       const parsed = Date.parse(summary.timestamp);
       const timestamp = Number.isFinite(parsed) ? parsed : Date.now();
-      pageMinTimestamp = Math.min(pageMinTimestamp, timestamp);
 
       const event = summaryToCanonical(summary, {
         accountId,
@@ -184,14 +183,14 @@ export async function performInitialBackfill(
       });
       if (!event) continue; // not part of the activated timeline (thread/edit filtering)
 
+      // Fold into the window floor ONLY for events kept for this timeline (#1):
+      // `readMessages` returns the whole room timeline, so a page dominated by
+      // non-thread traffic (or edits) would otherwise drag `pageMinTimestamp`
+      // past the floor and stop thread backfill short. A fully-filtered page
+      // leaves `pageMinTimestamp = Infinity` and paging continues on the token.
+      pageMinTimestamp = Math.min(pageMinTimestamp, timestamp);
+
       const isUtd = event.undecryptable != null;
-      // Track UTD runs over events belonging to this timeline (independent of
-      // dedup): a non-UTD event is forward progress and resets the run.
-      if (isUtd) {
-        consecutiveUtd++;
-      } else {
-        consecutiveUtd = 0;
-      }
 
       // A UTD event is stored with `enrichment_status='skipped'` (no body/media
       // to enrich; the redecryption sweeper handles it once keys arrive, and it
@@ -202,7 +201,17 @@ export async function performInitialBackfill(
       // post-readiness `activateTimelineEvents` bulk-flip ('inactive'→'pending')
       // activates these together with the rest of the backlog on success.
       const { duplicate } = await store.appendIfMissing(event, isUtd ? "skipped" : "inactive");
+
+      // Advance the consecutive-UTD run ONLY on a real (newly-stored) event (#5):
+      // re-paged duplicates are history we already hold, not new dead history, so
+      // counting them would let an already-stored UTD region halt the fetch early.
+      // A newly-stored non-UTD event is forward progress and resets the run.
       if (!duplicate) {
+        if (isUtd) {
+          consecutiveUtd++;
+        } else {
+          consecutiveUtd = 0;
+        }
         result.stored++;
         if (result.stored >= maxMessages) {
           result.reachedCount = true;

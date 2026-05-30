@@ -29,6 +29,7 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } 
 
 const silentLogger = {
   info() {},
+  warn() {},
   error() {},
 };
 
@@ -78,6 +79,8 @@ interface Harness {
   launched: InboundChatEvent[];
   dispatched: InboundChatEvent[];
   enriched: string[];
+  warnings: Array<{ event: string; fields?: Record<string, unknown> }>;
+  setDraining: (value: boolean) => void;
   hooks: {
     runInitialBackfill: (inbound: InboundChatEvent) => Promise<void>;
     awaitTriggerReadiness: (inbound: InboundChatEvent) => Promise<void>;
@@ -108,6 +111,8 @@ function makeHarness(overrides?: {
     const launched: InboundChatEvent[] = [];
     const dispatched: InboundChatEvent[] = [];
     const enriched: string[] = [];
+    const warnings: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    let draining = false;
 
     const harness = {} as Harness;
 
@@ -140,7 +145,14 @@ function makeHarness(overrides?: {
           }
         });
       },
-      logger: silentLogger,
+      isDraining: () => draining,
+      logger: {
+        info() {},
+        warn(event, fields) {
+          warnings.push({ event, fields });
+        },
+        error() {},
+      },
     });
 
     Object.assign(harness, {
@@ -152,6 +164,10 @@ function makeHarness(overrides?: {
       launched,
       dispatched,
       enriched,
+      warnings,
+      setDraining: (value: boolean) => {
+        draining = value;
+      },
     });
     return harness;
   });
@@ -593,6 +609,43 @@ test("#7: when the stranded-recovery reset write FAILS, the trigger is NOT re-di
       db.prepare("select id from timeline_events where id = ?").get("t2"),
     );
     assert.ok(stored, "the follow-up event was stored (not dropped) even though it wasn't re-dispatched");
+    // #7: the otherwise-silent drop is logged distinctly so an operator can
+    // correlate it (trigger stored but neither spawned nor buffered).
+    const dropWarn = h.warnings.find((w) => w.event === "activation_trigger_dropped_pending_heal");
+    assert.ok(dropWarn, "a WARN must be emitted when the dropped trigger awaits a heal");
+    assert.equal(dropWarn?.fields?.timelineKey, TK);
+    assert.equal(dropWarn?.fields?.eventId, "t2");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#2: an in-flight activation that observes draining bails before flipping to active and never launches a session", async () => {
+  // Shutdown begins (draining) while the prelude is held inside
+  // awaitTriggerReadiness. The prelude must re-check draining after readiness and
+  // bail cleanly — no bulk-flip, no 'active' write, no session launch — so it
+  // can't spawn a session whose writes race storage.waitForIdle()/close().
+  let release!: () => void;
+  const readinessGate = new Promise<void>((r) => {
+    release = r;
+  });
+  const h = await makeHarness({
+    awaitTriggerReadiness: async () => {
+      await readinessGate;
+    },
+  });
+  try {
+    const gate = h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" })));
+    // Let the prelude advance to the readiness await, then begin draining.
+    await new Promise((r) => setImmediate(r));
+    h.setDraining(true);
+    release();
+    await gate;
+
+    assert.equal(h.launched.length, 0, "no session is launched once draining is observed");
+    assert.equal(h.storage.getTimelineState(TK), "activating", "the timeline is left 'activating' (healed by resetStaleActivations on restart)");
+    // The guard/buffer must be cleared so a stale guard doesn't linger.
+    assert.equal(h.coordinator.isActivating(TK), false, "the activation guard is cleared on the draining bail");
   } finally {
     h.storage.close();
   }
