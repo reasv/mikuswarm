@@ -1796,6 +1796,12 @@ function runMigrations(db: Database.Database): void {
     db.exec(
       `alter table timeline_compaction_state add column timeline_state text not null default 'inactive'`,
     );
+    // Invariant this relies on: no compaction-state row is ever written for an
+    // inactive timeline. Only the summarization pipeline writes compaction
+    // state, and only for engaged/active timelines — so every pre-existing row
+    // belongs to an active timeline and migrates to 'active' (not the column
+    // default 'inactive'). Breaking that invariant (e.g. seeding compaction
+    // state for inactive timelines) requires revisiting this migration.
     db.exec(`update timeline_compaction_state set timeline_state = 'active'`);
   }
   if (!csColumnNames.has("backfill_fence_timestamp")) {

@@ -6,6 +6,7 @@ import { createLogger } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
 import { Storage } from "./storage/index.js";
 import {
+  ActivationCoordinator,
   AssistantEchoResolver,
   needsEnrichment,
   TimelineRouter,
@@ -44,7 +45,7 @@ import {
   createWebSearchTool,
   createWriteMemoryTool,
 } from "./tools/index.js";
-import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
+import type { InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
@@ -212,11 +213,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
   });
   const activeRuns = new Set<Promise<void>>();
-  // Timelines currently running activateTimeline(). An in-memory guard (vs. the
-  // DB 'activating' state) closes the race between concurrent inbound handlers
-  // before the 'activating' write lands: check-and-add happens with no await in
-  // between, and a handler runs its synchronous prefix atomically.
-  const activatingTimelines = new Set<string>();
   let draining = false;
   let stopPromise: Promise<void> | undefined;
   const factory = new AgentSessionFactory({
@@ -291,41 +287,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
 
-    // Channel lifecycle (§2–§4). An inactive timeline has never been triggered:
-    // store its events cheaply and skip all processing until the first trigger,
-    // which begins activation. A missing compaction-state row reads as inactive.
-    const timelineState = storage.getTimelineState(inbound.timelineKey);
-
-    // Activation in flight (state may still read 'inactive' until the write
-    // lands, so the in-memory set is authoritative): store the event as part of
-    // the timeline so it enriches and the activating session sees it, but hold
-    // any trigger — no second session spawns during activation (§2).
-    if (timelineState === "activating" || activatingTimelines.has(inbound.timelineKey)) {
-      const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
-      await router.route(inbound, holdStatus);
-      if (holdStatus === "pending") enrichmentPool.notifyNewEvent(inbound.event.id);
-      if (inbound.trigger) {
-        logger.info("trigger_held_during_activation", {
-          timelineKey: inbound.timelineKey,
-          eventId: inbound.event.id,
-        });
-      }
-      return;
-    }
-
-    if (timelineState === "inactive") {
-      if (inbound.trigger) {
-        activatingTimelines.add(inbound.timelineKey);
-        try {
-          await activateTimeline(inbound);
-        } finally {
-          activatingTimelines.delete(inbound.timelineKey);
-        }
-        return;
-      }
-      await router.route(inbound, "inactive");
-      return;
-    }
+    // Channel lifecycle gating (§2–§4): inactive timelines store cheaply until
+    // the first trigger; activating timelines buffer triggers; only active/
+    // backfilling timelines fall through to the normal path below. Delegated to
+    // ActivationCoordinator (src/timeline/activation.ts).
+    if ((await activationCoordinator.gateInbound(inbound)) === "handled") return;
 
     const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
     const routed = await router.route(inbound, enrichmentStatus);
@@ -353,77 +319,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     await awaitTriggerReadiness(inbound);
     await launchSession(inbound, routed.duplicate);
-  }
-
-  /**
-   * First-trigger activation (§4). Transitions the timeline inactive →
-   * activating → active: stores the trigger event, flips previously-stored
-   * inactive events to pending so they enrich, waits for the trigger group's
-   * enrichment/captions, then spawns the session. Initial Matrix-history
-   * backfill is wired into this path in a later phase. The trigger is held
-   * (this function is awaited) until activation completes.
-   */
-  async function activateTimeline(inbound: InboundChatEvent): Promise<void> {
-    logger.info("timeline_activating", { timelineKey: inbound.timelineKey });
-    await storage.setTimelineState(inbound.timelineKey, "activating");
-
-    try {
-      // Store the trigger event normally. It may already exist as an 'inactive'
-      // row (the provider emits each event once without a trigger and again when
-      // the trigger hold flushes); in that duplicate case router.route only
-      // attaches the trigger and the bulk activation below flips it to pending.
-      const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
-      const routed = await router.route(inbound, enrichmentStatus);
-      if (enrichmentStatus === "pending") {
-        enrichmentPool.notifyNewEvent(inbound.event.id);
-      }
-
-      // Initial Matrix-history backfill (§4 step 3): blocking, held with the
-      // trigger. Failures are non-fatal — proceed with whatever was fetched.
-      await runInitialBackfill(inbound);
-
-      // Flip all previously-stored inactive events to pending and nudge the
-      // enrichment pool — a single nudge suffices since its poll query drains
-      // every pending row.
-      const activatedCount = await storage.activateTimelineEvents(inbound.timelineKey);
-      enrichmentPool.notifyNewEvent(inbound.event.id);
-      logger.info("timeline_events_activated", {
-        timelineKey: inbound.timelineKey,
-        activatedCount,
-      });
-
-      // Await trigger readiness via the existing path, then go active.
-      await resolveTriggerGroup(inbound);
-      captionPool.notifyNewWork();
-      await awaitTriggerReadiness(inbound);
-      await storage.setTimelineState(inbound.timelineKey, "active");
-
-      const decision = triggerCoordinator.accept(inbound);
-      if (decision.action === "spawn") {
-        await launchSession(inbound, routed.duplicate);
-      } else {
-        logger.info("trigger_not_spawned", {
-          timelineKey: inbound.timelineKey,
-          action: decision.action,
-          reason: decision.reason,
-          queueLength: decision.queueLength,
-        });
-      }
-      logger.info("timeline_activated", { timelineKey: inbound.timelineKey });
-    } catch (error) {
-      // Don't strand the timeline in 'activating' (it would be silently treated
-      // as active with no recovery). Reset to 'inactive' so the next trigger
-      // retries activation; best-effort so the original error still propagates.
-      try {
-        await storage.setTimelineState(inbound.timelineKey, "inactive");
-      } catch (resetError) {
-        logger.error("timeline_activation_reset_failed", {
-          timelineKey: inbound.timelineKey,
-          error: resetError instanceof Error ? resetError.message : String(resetError),
-        });
-      }
-      throw error;
-    }
   }
 
   async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {
@@ -753,6 +648,29 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
     activeRuns.add(run);
   }
+
+  // Channel-lifecycle gating + first-trigger activation (§2–§4). Closures above
+  // are hoisted, so the heavy operations (backfill, readiness, session launch)
+  // are injected by reference; `dispatch` re-enters handleInbound for replayed
+  // held triggers.
+  const activationCoordinator = new ActivationCoordinator({
+    storage,
+    router,
+    triggerCoordinator,
+    setEnrichmentStatus: (eventId, status) => timeline.setEnrichmentStatus(eventId, status),
+    notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
+    notifyCaptions: () => captionPool.notifyNewWork(),
+    runInitialBackfill,
+    resolveTriggerGroup,
+    awaitTriggerReadiness,
+    launchSession,
+    dispatch: (inbound) => {
+      void handleInbound(inbound).catch((error) => {
+        logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
+      });
+    },
+    logger,
+  });
 
   // Recover timelines stranded mid-activation by a prior crash before the
   // provider begins delivering inbound events.
