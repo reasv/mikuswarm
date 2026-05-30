@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { Storage, TimelineCompactionState } from "../storage/index.js";
 import type { CanonicalChatEvent, TimelineState } from "../types.js";
+import { applyEditToCanonical, editStatus, type EditReplacement } from "./edits.js";
 
 export interface TimelineQuery {
   timelineKey: string;
@@ -47,8 +48,57 @@ export class TimelineStore {
           @eventJson, @enrichmentStatus, @createdAt, @updatedAt
         )`,
       ).run({ ...timelineEventParams(event, now), enrichmentStatus: enrichmentStatus ?? "pending" });
-      return { event, duplicate: false };
+
+      // Replay a pending edit that arrived before this target was stored (issue
+      // #12). Scoped by (provider, externalId, timelineKey) for the same
+      // multi-account reason as the edit lookup (issue #3). Same transaction as
+      // the insert, so the target never renders its pre-edit body. Honors the
+      // same inactive-timeline gating as the live edit path (editStatus).
+      const replayed = event.externalId
+        ? this.#applyPendingEdit(db, event)
+        : undefined;
+      return { event: replayed ?? event, duplicate: false };
     });
+  }
+
+  /**
+   * Apply a parked pending edit to a just-inserted target, in the caller's write
+   * transaction (issue #12). Returns the edited event when one was replayed, or
+   * undefined when there was no pending edit. Mirrors the live edit path: merges
+   * the replacement body/attachments onto the target and recomputes
+   * `enrichment_status` from the merged event and its timeline's live state.
+   */
+  #applyPendingEdit(
+    db: Database.Database,
+    event: CanonicalChatEvent,
+  ): CanonicalChatEvent | undefined {
+    const externalId = event.externalId;
+    if (!externalId) return undefined;
+    const pending = this.storage.getPendingEdit(db, event.provider, externalId, event.timelineKey);
+    if (!pending) return undefined;
+
+    const updated = applyEditToCanonical(event, pending);
+    const stateRow = db
+      .prepare(`select timeline_state from timeline_compaction_state where timeline_key = ?`)
+      .get(updated.timelineKey) as { timeline_state: TimelineState } | undefined;
+    const timelineState: TimelineState = stateRow?.timeline_state ?? "inactive";
+    const status = editStatus(updated, timelineState);
+    db.prepare(
+      `update timeline_events
+       set body = @body,
+           event_json = @eventJson,
+           enrichment_status = @enrichmentStatus,
+           updated_at = @updatedAt
+       where id = @id`,
+    ).run({
+      id: updated.id,
+      body: updated.body,
+      eventJson: JSON.stringify(updated),
+      enrichmentStatus: status,
+      updatedAt: Date.now(),
+    });
+    this.storage.deletePendingEdit(db, event.provider, externalId, event.timelineKey);
+    return updated;
   }
 
   ingestAssistantEcho(event: CanonicalChatEvent): Promise<"enriched" | "appended"> {
@@ -100,8 +150,12 @@ export class TimelineStore {
     return this.storage.getTimelineEventById(eventId);
   }
 
-  getByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
-    return this.storage.getTimelineEventByExternalId(provider, externalId);
+  getByExternalId(
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+  ): CanonicalChatEvent | undefined {
+    return this.storage.getTimelineEventByExternalId(provider, externalId, timelineKey);
   }
 
   query(query: TimelineQuery): CanonicalChatEvent[] {
@@ -210,20 +264,34 @@ export class TimelineStore {
    * replacement body/attachments onto it (identity/timestamps/sender/role
    * preserved). `computeStatus` recomputes the target's `enrichment_status` from
    * the merged event and its timeline's live state, honoring inactive-timeline
-   * gating. Returns `{ applied: true, event, status }`, or `{ applied: false }`
-   * when no target row exists (the caller logs and skips — the edit is never
-   * stored as a standalone message). See {@link Storage.applyEditToTarget}.
+   * gating. Returns `{ applied: true, event, status }`, or
+   * `{ applied: false, pending: true }` when no target row exists — in which case
+   * the resolved `replacement` is parked in `pending_edits` (keyed by
+   * `(provider, targetExternalId, timelineKey)`, latest-wins by `editTimestamp`)
+   * and replayed by the append path once the target lands (issue #12). The edit
+   * is never stored as a standalone message. See {@link Storage.applyEditToTarget}.
    */
   applyEdit(
     provider: string,
     targetExternalId: string,
+    timelineKey: string,
+    replacement: EditReplacement,
+    editTimestamp: number,
     updater: (target: CanonicalChatEvent) => CanonicalChatEvent,
     computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
   ): Promise<
     | { applied: true; event: CanonicalChatEvent; status: string }
-    | { applied: false }
+    | { applied: false; pending: true }
   > {
-    return this.storage.applyEditToTarget(provider, targetExternalId, updater, computeStatus);
+    return this.storage.applyEditToTarget(
+      provider,
+      targetExternalId,
+      timelineKey,
+      replacement,
+      editTimestamp,
+      updater,
+      computeStatus,
+    );
   }
 
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {

@@ -3,7 +3,7 @@ import test from "node:test";
 import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore, applyEditToCanonical, editStatus } from "../src/timeline/index.js";
-import { RedecryptionSweeper } from "../src/redecryption/index.js";
+import { RedecryptionSweeper, resolveMultiAccountRetry } from "../src/redecryption/index.js";
 import type { MatrixInboundEvent, MatrixMessageSummary } from "../src/matrix/native-types.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
@@ -40,6 +40,17 @@ function rowCount(storage: Storage, timelineKey: string): number {
       (
         db
           .prepare("select count(*) as n from timeline_events where timeline_key = ?")
+          .get(timelineKey) as { n: number }
+      ).n,
+  );
+}
+
+function pendingEditCount(storage: Storage, timelineKey: string): number {
+  return storage.read(
+    (db) =>
+      (
+        db
+          .prepare("select count(*) as n from pending_edits where timeline_key = ?")
           .get(timelineKey) as { n: number }
       ).n,
   );
@@ -98,6 +109,9 @@ test("applyEditToTarget updates the target body in place and creates no standalo
     const result = await store.applyEdit(
       "matrix",
       "$orig",
+      ROOM_TK,
+      { body: "edited text", attachments: [] },
+      1_700_000_002_000,
       (t) => applyEditToCanonical(t, { body: "edited text", attachments: [] }),
       editStatus,
     );
@@ -124,6 +138,9 @@ test("applyEditToTarget re-arms enrichment when the edit introduces a URL", asyn
     const result = await store.applyEdit(
       "matrix",
       "$orig",
+      ROOM_TK,
+      { body: "see http://example.org", attachments: [] },
+      1_700_000_002_000,
       (t) => applyEditToCanonical(t, { body: "see http://example.org", attachments: [] }),
       editStatus,
     );
@@ -135,16 +152,21 @@ test("applyEditToTarget re-arms enrichment when the edit introduces a URL", asyn
 
 // ── (b) an edit to a missing target is skipped (no standalone row) ──────────
 
-test("applyEditToTarget skips when the target is not stored (no standalone row)", async () => {
+test("applyEditToTarget parks a pending edit when the target is not stored (no standalone row)", async () => {
   await withStores(async (store, storage) => {
     const result = await store.applyEdit(
       "matrix",
       "$never-seen",
+      ROOM_TK,
+      { body: "edited", attachments: [] },
+      1_700_000_002_000,
       (t) => applyEditToCanonical(t, { body: "edited", attachments: [] }),
       editStatus,
     );
     assert.equal(result.applied, false, "a missing target is reported, not inserted");
     assert.equal(rowCount(storage, ROOM_TK), 0, "the edit is never stored as a standalone message");
+    // The edit is parked for replay (issue #12), not dropped.
+    assert.equal(pendingEditCount(storage, ROOM_TK), 1, "the edit is parked in pending_edits");
   });
 });
 
@@ -158,16 +180,19 @@ test("applyEditToTarget on an inactive timeline stores 'inactive' (no pool nudge
     // The edit introduces MEDIA — which on an active timeline would caption — but
     // the timeline is inactive, so the status must stay 'inactive' so the caller
     // nudges neither pool (activation's bulk-flip picks it up later).
+    const editReplacement = {
+      body: "now with an image",
+      attachments: [
+        { id: "$orig:media:0", mediaType: "image" as const, filename: "cat.png" },
+      ],
+    };
     const result = await store.applyEdit(
       "matrix",
       "$orig",
-      (t) =>
-        applyEditToCanonical(t, {
-          body: "now with an image",
-          attachments: [
-            { id: "$orig:media:0", mediaType: "image", filename: "cat.png" },
-          ],
-        }),
+      ROOM_TK,
+      editReplacement,
+      1_700_000_002_000,
+      (t) => applyEditToCanonical(t, editReplacement),
       editStatus,
     );
 
@@ -276,4 +301,297 @@ test("sweeper deletes the placeholder even when the edit's target is missing", a
     assert.equal(rowCount(storage, ROOM_TK), 0, "no standalone edit row remains");
     assert.equal(store.getUndecrypted(50).length, 0);
   });
+});
+
+// ── (#3) edit application is account-scoped in a multi-account shared room ────
+
+const ACCOUNT_B = "miku2";
+const ROOM_TK_B = `matrix:${ACCOUNT_B}:room:${ROOM}`;
+
+test("applyEdit edits only the timeline_key-scoped row when two accounts share a room (#3)", async () => {
+  await withStores(async (store, storage) => {
+    // Two bot accounts in the same Matrix room each store the SAME event ($orig):
+    // rows differ only by canonical id / timeline_key (matrix:<account>:...).
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT}:$orig`, timelineKey: ROOM_TK }),
+      "skipped",
+    );
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT_B}:$orig`, timelineKey: ROOM_TK_B }),
+      "skipped",
+    );
+    await storage.setTimelineState(ROOM_TK, "active");
+    await storage.setTimelineState(ROOM_TK_B, "active");
+
+    // An edit on account B's timeline must update account B's row only.
+    const replacement = { body: "edited via B", attachments: [] };
+    const result = await store.applyEdit(
+      "matrix",
+      "$orig",
+      ROOM_TK_B,
+      replacement,
+      1_700_000_002_000,
+      (t) => applyEditToCanonical(t, replacement),
+      editStatus,
+    );
+
+    assert.ok(result.applied);
+    assert.equal(result.applied && result.event.timelineKey, ROOM_TK_B, "the scoped row is edited");
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT_B}:$orig`)?.body,
+      "edited via B",
+      "account B's row is updated",
+    );
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "original text",
+      "account A's row is untouched",
+    );
+  });
+});
+
+test("getByExternalId is scoped by timeline_key (#3)", async () => {
+  await withStores(async (store) => {
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT}:$orig`, timelineKey: ROOM_TK, body: "A body" }),
+      "skipped",
+    );
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT_B}:$orig`, timelineKey: ROOM_TK_B, body: "B body" }),
+      "skipped",
+    );
+
+    assert.equal(store.getByExternalId("matrix", "$orig", ROOM_TK)?.body, "A body");
+    assert.equal(store.getByExternalId("matrix", "$orig", ROOM_TK_B)?.body, "B body");
+  });
+});
+
+// ── (#12) edit-before-target is parked and replayed when the target lands ────
+
+test("an edit parked before its target is replayed on append, on the live path (#12)", async () => {
+  await withStores(async (store, storage) => {
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    // Edit arrives FIRST — the target $orig is not stored yet. It is parked.
+    const replacement = { body: "edited body", attachments: [] };
+    const result = await store.applyEdit(
+      "matrix",
+      "$orig",
+      ROOM_TK,
+      replacement,
+      1_700_000_002_000,
+      (t) => applyEditToCanonical(t, replacement),
+      editStatus,
+    );
+    assert.equal(result.applied, false, "no target yet → not applied");
+    assert.equal(pendingEditCount(storage, ROOM_TK), 1, "the edit is parked");
+    assert.equal(rowCount(storage, ROOM_TK), 0, "no standalone row");
+
+    // Now the target lands via the normal append path (router/backfill use
+    // appendIfMissing). The pending edit must be replayed in place.
+    const { event: stored } = await store.appendIfMissing(targetEvent(), "skipped");
+    assert.equal(stored.body, "edited body", "appendIfMissing returns the edited event");
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "edited body",
+      "the stored target renders the edited body, not the pre-edit body",
+    );
+    assert.equal(pendingEditCount(storage, ROOM_TK), 0, "the pending edit is cleared after replay");
+    // Plain text on an active timeline → 'skipped'.
+    assert.equal(status(storage, `matrix:${ACCOUNT}:$orig`), "skipped");
+  });
+});
+
+test("a replayed pending edit honors inactive-timeline gating (#12)", async () => {
+  await withStores(async (store, storage) => {
+    // No compaction-state row → timeline is inactive. The edit introduces media,
+    // which on an active timeline would caption; on an inactive one the replay must
+    // store 'inactive' so activation's bulk-flip picks it up later.
+    const replacement = {
+      body: "now with an image",
+      attachments: [{ id: "$orig:media:0", mediaType: "image" as const, filename: "cat.png" }],
+    };
+    await store.applyEdit(
+      "matrix",
+      "$orig",
+      ROOM_TK,
+      replacement,
+      1_700_000_002_000,
+      (t) => applyEditToCanonical(t, replacement),
+      editStatus,
+    );
+
+    await store.appendIfMissing(targetEvent(), "inactive");
+
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "now with an image",
+      "the edit is still applied for later activation",
+    );
+    assert.equal(
+      status(storage, `matrix:${ACCOUNT}:$orig`),
+      "inactive",
+      "inactive timeline keeps the replayed edit 'inactive' (no pool nudge)",
+    );
+  });
+});
+
+test("pending edits are latest-wins by edit timestamp (#12)", async () => {
+  await withStores(async (store, storage) => {
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    const parkEdit = (body: string, ts: number) =>
+      store.applyEdit(
+        "matrix",
+        "$orig",
+        ROOM_TK,
+        { body, attachments: [] },
+        ts,
+        (t) => applyEditToCanonical(t, { body, attachments: [] }),
+        editStatus,
+      );
+
+    // Three edits land out of order before the target. The newest by edit
+    // timestamp must win regardless of arrival order.
+    await parkEdit("older edit", 1_700_000_002_000);
+    await parkEdit("NEWEST edit", 1_700_000_009_000);
+    await parkEdit("middle edit (stale)", 1_700_000_005_000);
+    assert.equal(pendingEditCount(storage, ROOM_TK), 1, "only one pending edit per target");
+
+    await store.appendIfMissing(targetEvent(), "skipped");
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "NEWEST edit",
+      "the newest edit by timestamp wins",
+    );
+  });
+});
+
+test("a pending edit is scoped by timeline_key so it doesn't bleed across accounts (#12/#3)", async () => {
+  await withStores(async (store, storage) => {
+    await storage.setTimelineState(ROOM_TK, "active");
+    await storage.setTimelineState(ROOM_TK_B, "active");
+
+    // Park an edit on account A's timeline only.
+    const replacement = { body: "A-only edit", attachments: [] };
+    await store.applyEdit(
+      "matrix",
+      "$orig",
+      ROOM_TK,
+      replacement,
+      1_700_000_002_000,
+      (t) => applyEditToCanonical(t, replacement),
+      editStatus,
+    );
+
+    // Account B's row for the same external id lands — it must NOT pick up A's edit.
+    await store.appendIfMissing(
+      targetEvent({ id: `matrix:${ACCOUNT_B}:$orig`, timelineKey: ROOM_TK_B }),
+      "skipped",
+    );
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT_B}:$orig`)?.body,
+      "original text",
+      "account B's row is unaffected by account A's pending edit",
+    );
+    assert.equal(pendingEditCount(storage, ROOM_TK), 1, "A's pending edit is still parked");
+
+    // Account A's row landing replays A's edit.
+    await store.appendIfMissing(targetEvent(), "skipped");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$orig`)?.body, "A-only edit");
+    assert.equal(pendingEditCount(storage, ROOM_TK), 0);
+  });
+});
+
+// ── (#12) the redecryption path also parks + replays ─────────────────────────
+
+test("a decrypted m.replace whose target is missing is parked, then replayed on append (#12)", async () => {
+  await withStores(async (store, storage) => {
+    // Only the UTD edit placeholder exists; the target $orig is not stored yet.
+    await store.appendIfMissing(utdEditPlaceholder(), "skipped");
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    const sweeper = new RedecryptionSweeper({
+      store,
+      retry: async () => ({
+        eventId: "$edit",
+        sender: "@alice:example.org",
+        body: "decrypted edit body",
+        timestamp: new Date(1_700_000_001_000).toISOString(),
+        relatesTo: { relType: "m.replace", eventId: "$orig" },
+      }),
+      notifyEnrichment: () => {},
+      notifyCaptions: () => {},
+      intervalMs: 1000,
+      batchSize: 10,
+      isDraining: () => false,
+    });
+
+    await sweeper.tick();
+
+    // Placeholder retired; the edit is parked (not dropped) because the target
+    // hasn't landed yet.
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$edit`), undefined, "the placeholder is removed");
+    assert.equal(pendingEditCount(storage, ROOM_TK), 1, "the decrypted edit is parked for replay");
+
+    // The target finally lands → the parked edit is replayed in place.
+    await store.appendIfMissing(targetEvent(), "skipped");
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "decrypted edit body",
+      "the target renders the decrypted edit body once it lands",
+    );
+    assert.equal(pendingEditCount(storage, ROOM_TK), 0, "the pending edit is cleared after replay");
+  });
+});
+
+// ── (#6) resolveMultiAccountRetry keeps the row alive on the defensive fallback ─
+
+test("resolveMultiAccountRetry rethrows when every account throws (transient → keep alive) (#6)", async () => {
+  const boom = new Error("room unknown to account");
+  await assert.rejects(
+    () =>
+      resolveMultiAccountRetry(["a", "b"], async () => {
+        throw boom;
+      }),
+    boom,
+    "all-threw must rethrow (transient), never collapse to null (the retire signal)",
+  );
+});
+
+test("resolveMultiAccountRetry returns null only for a genuine non-message (#6)", async () => {
+  // A null fetch is the ONLY path that yields null (retire as non-message).
+  const out = await resolveMultiAccountRetry(["a"], async () => null);
+  assert.equal(out, null);
+});
+
+test("resolveMultiAccountRetry surfaces a still-UTD summary (keep backing off) (#6)", async () => {
+  const utd: MatrixMessageSummary = {
+    eventId: "$x",
+    sender: "@a:e.org",
+    body: "",
+    timestamp: new Date(0).toISOString(),
+    undecryptable: true,
+  };
+  const out = await resolveMultiAccountRetry(["a"], async () => utd);
+  assert.equal(out, utd, "a UTD summary is returned so the sweeper keeps retrying");
+});
+
+test("resolveMultiAccountRetry does not return null when an account fetched a classifiable result (#6)", async () => {
+  // The decrypted-message branch short-circuits — proving a fetched, classifiable
+  // result NEVER falls through to the defensive (now-throwing) post-loop branch.
+  // The post-loop `anyFetched` branch is unreachable under the contract; the
+  // source change makes it THROW (keep-alive) instead of returning null, so a
+  // future contract break can't silently retire/delete the placeholder.
+  const decrypted: MatrixMessageSummary = {
+    eventId: "$x",
+    sender: "@a:e.org",
+    body: "hi",
+    timestamp: new Date(0).toISOString(),
+  };
+  const out = await resolveMultiAccountRetry(["a", "b"], async (id) => {
+    if (id === "a") return decrypted; // best outcome short-circuits
+    throw new Error("should not be asked");
+  });
+  assert.equal(out, decrypted);
 });

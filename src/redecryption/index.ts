@@ -280,9 +280,11 @@ export class RedecryptionSweeper {
    * Apply a now-decrypted `m.replace` edit (issue #17). The placeholder `event`
    * was the edit itself, stored UTD; now that it decrypted, route the replacement
    * to the target message in place (via the same store primitive the live path
-   * uses) and delete the placeholder so no standalone duplicate remains. The
-   * deletion is guarded on `is_undecryptable = 1`, so a row that became a real
-   * message via a concurrent path is never removed.
+   * uses) and delete the placeholder so no standalone duplicate remains. If the
+   * target isn't stored yet, the replacement is parked in `pending_edits` and the
+   * append path replays it once the target lands (issue #12). The deletion is
+   * guarded on `is_undecryptable = 1`, so a row that became a real message via a
+   * concurrent path is never removed.
    */
   async #applyDecryptedEdit(
     event: CanonicalChatEvent,
@@ -296,6 +298,9 @@ export class RedecryptionSweeper {
     const result = await this.#options.store.applyEdit(
       event.provider,
       targetExternalId,
+      event.timelineKey,
+      replacement,
+      event.timestamp,
       (target) => applyEditToCanonical(target, replacement),
       editStatus,
     );
@@ -306,7 +311,10 @@ export class RedecryptionSweeper {
     this.#backoff.delete(event.id);
 
     if (!result.applied) {
-      this.#options.logger?.info("redecryption_edit_target_missing", {
+      // The target isn't stored yet: the resolved replacement was parked in
+      // pending_edits and will be replayed when the target lands (issue #12); the
+      // placeholder is still retired (an edit is never a standalone message).
+      this.#options.logger?.info("redecryption_edit_target_missing_parked", {
         eventId: event.id,
         externalId: event.externalId,
         targetExternalId,
@@ -379,6 +387,12 @@ export function postDecryptStatus(
  *      last error so the sweeper treats it as a transient failure. It must NOT
  *      collapse to `null` — that would falsely retire the row as a non-message.
  *
+ * Defensive (issue #6): if a fetch ever returns a value none of the branches
+ * above classify (logically unreachable given the contract), this THROWS rather
+ * than returning `null`, so the sweeper keeps the row in rotation instead of
+ * retiring/deleting it as a non-message. A future contract change must not
+ * silently turn into placeholder deletion (data loss).
+ *
  * Behaviorally identical to a single-account probe: with one account the loop runs
  * once and returns exactly that account's outcome (or rethrows its error).
  */
@@ -413,9 +427,17 @@ export async function resolveMultiAccountRetry(
   if (sawNonMessage) return null;
   if (utdSummary) return utdSummary;
   if (anyFetched) {
-    // An account fetched but produced neither a summary nor a null (unreachable
-    // given the branches above, but keep the row in rotation if it ever happens).
-    return null;
+    // Unreachable given the branches above: a fetch that didn't throw returns
+    // either null (handled by sawNonMessage), a UTD summary (utdSummary), or a
+    // decrypted summary (returned early). This branch only fires if that
+    // exhaustiveness is ever broken. THROW rather than `return null` (issue #6):
+    // returning null is the "decrypted non-message" signal that makes the sweeper
+    // DELETE the placeholder, so a future logic change here must not silently
+    // become data loss. Throwing routes through the sweeper's transient-failure
+    // path (#recordFailure → back off), keeping the row alive in rotation.
+    throw new Error(
+      "redecryption: account fetched but produced no classifiable summary (kept in rotation)",
+    );
   }
   if (lastError !== undefined) throw lastError;
   // No accounts were tried at all.

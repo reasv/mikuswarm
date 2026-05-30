@@ -2,7 +2,18 @@ import Database from "better-sqlite3";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
-import type { CanonicalChatEvent, TimelineState } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
+
+/**
+ * The resolved replacement content an edit carries: the post-edit body and the
+ * serialized attachments. Mirrors `EditReplacement` in `src/timeline/edits.ts`
+ * but lives here so the storage layer (pending-edit persistence, issue #12) does
+ * not depend on the timeline layer. Kept structurally identical.
+ */
+export interface EditReplacementContent {
+  body: string;
+  attachments: AttachmentMeta[];
+}
 
 export interface StorageOptions {
   databasePath: string;
@@ -602,11 +613,23 @@ export class Storage {
     });
   }
 
-  getTimelineEventByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {
+  // Scoped by timeline_key (issue #3): two bot accounts sharing a room store the
+  // same Matrix event as two rows differing only by canonical id, so an unscoped
+  // `(provider, external_id)` lookup would return an arbitrary account's row. The
+  // existing `(provider, external_id)` index still serves the query — timeline_key
+  // just filters the tiny matched set.
+  getTimelineEventByExternalId(
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+  ): CanonicalChatEvent | undefined {
     const row = this.read((db) =>
       db
-        .prepare(`select event_json from timeline_events where provider = ? and external_id = ? limit 1`)
-        .get(provider, externalId) as { event_json: string } | undefined,
+        .prepare(
+          `select event_json from timeline_events
+           where provider = ? and external_id = ? and timeline_key = ? limit 1`,
+        )
+        .get(provider, externalId, timelineKey) as { event_json: string } | undefined,
     );
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
@@ -855,22 +878,59 @@ export class Storage {
   applyEditToTarget(
     provider: string,
     targetExternalId: string,
+    timelineKey: string,
+    replacement: EditReplacementContent,
+    editTimestamp: number,
     updater: (target: CanonicalChatEvent) => CanonicalChatEvent,
     computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
   ): Promise<
     | { applied: true; event: CanonicalChatEvent; status: string }
-    | { applied: false }
+    | { applied: false; pending: true }
   > {
     return this.write((db) => {
+      // Scoped by timeline_key (issue #3): in a multi-account shared room the same
+      // Matrix event is stored once per bot account (rows differ only by canonical
+      // id), so an unscoped `(provider, external_id)` lookup could edit the wrong
+      // account's row. An edit is always same-room/account as its target, so the
+      // caller's timelineKey is the correct scope.
       const row = db
         .prepare(
           `select id, event_json from timeline_events
-           where provider = ? and external_id = ? limit 1`,
+           where provider = ? and external_id = ? and timeline_key = ? limit 1`,
         )
-        .get(provider, targetExternalId) as
+        .get(provider, targetExternalId, timelineKey) as
         | { id: string; event_json: string }
         | undefined;
-      if (!row) return { applied: false };
+      if (!row) {
+        // The target isn't stored yet (out-of-order sync / backfill). Park the
+        // resolved replacement so the append path replays it once the target
+        // lands (issue #12). Latest edit wins: insert-or-replace on the PK keeps
+        // the newest by edit_timestamp.
+        db.prepare(
+          `insert into pending_edits (
+             provider, target_external_id, timeline_key,
+             body, attachments_json, edit_timestamp, created_at
+           ) values (
+             @provider, @targetExternalId, @timelineKey,
+             @body, @attachmentsJson, @editTimestamp, @createdAt
+           )
+           on conflict(provider, target_external_id, timeline_key) do update set
+             body = excluded.body,
+             attachments_json = excluded.attachments_json,
+             edit_timestamp = excluded.edit_timestamp,
+             created_at = excluded.created_at
+           where excluded.edit_timestamp >= pending_edits.edit_timestamp`,
+        ).run({
+          provider,
+          targetExternalId,
+          timelineKey,
+          body: replacement.body,
+          attachmentsJson: JSON.stringify(replacement.attachments),
+          editTimestamp,
+          createdAt: Date.now(),
+        });
+        return { applied: false, pending: true };
+      }
 
       const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
       const updated = updater(existing);
@@ -897,6 +957,46 @@ export class Storage {
       });
       return { applied: true, event: updated, status };
     });
+  }
+
+  /**
+   * Look up a parked pending edit for a just-stored event (issue #12), if any,
+   * scoped by `(provider, target_external_id, timeline_key)`. Used by the append
+   * path to replay an edit that arrived before its target. Read-only; the caller
+   * applies it and then calls {@link deletePendingEdit} in the same transaction.
+   */
+  getPendingEdit(
+    db: Database.Database,
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+  ): EditReplacementContent | undefined {
+    const row = db
+      .prepare(
+        `select body, attachments_json from pending_edits
+         where provider = ? and target_external_id = ? and timeline_key = ?`,
+      )
+      .get(provider, externalId, timelineKey) as
+      | { body: string; attachments_json: string }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      body: row.body,
+      attachments: JSON.parse(row.attachments_json) as AttachmentMeta[],
+    };
+  }
+
+  /** Delete a replayed pending edit (issue #12). Runs inside the caller's write. */
+  deletePendingEdit(
+    db: Database.Database,
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+  ): void {
+    db.prepare(
+      `delete from pending_edits
+       where provider = ? and target_external_id = ? and timeline_key = ?`,
+    ).run(provider, externalId, timelineKey);
   }
 
   claimPendingEnrichment(limit: number): Promise<string[]> {
@@ -2047,13 +2147,38 @@ create index if not exists idx_summarization_jobs_status
 
 create index if not exists idx_summarization_jobs_timeline
   on summarization_jobs(timeline_key, level, status);
+
+-- Edits (m.replace) that arrived/decrypted BEFORE their target message was
+-- stored (plausible during backfill or out-of-order sync). The live/decrypt edit
+-- path applies an edit to its target in place; when the target is missing it
+-- parks the resolved replacement here instead of dropping it, and the append path
+-- replays it once the target lands (issue #12). Keyed by
+-- (provider, target_external_id, timeline_key) — scoped by timeline_key for the
+-- same multi-account-shared-room reason as the edit lookup (issue #3): two bot
+-- accounts in one room store the same Matrix event as two rows differing only by
+-- canonical id, so a pending edit must target the right account's row. Latest
+-- edit wins (insert-or-replace on the PK keeps the newest by edit_timestamp).
+create table if not exists pending_edits (
+  provider text not null,
+  target_external_id text not null,
+  timeline_key text not null,
+  -- Resolved replacement content (post-edit body + serialized AttachmentMeta[]),
+  -- already extracted from m.new_content so apply-time needs no re-parse.
+  body text not null,
+  attachments_json text not null,
+  -- Origin timestamp of the edit event, used for latest-wins when several edits
+  -- target the same not-yet-stored message.
+  edit_timestamp integer not null,
+  created_at integer not null,
+  primary key (provider, target_external_id, timeline_key)
+);
 `;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-const LATEST_SCHEMA_VERSION = 2;
+const LATEST_SCHEMA_VERSION = 3;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2082,6 +2207,25 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
        create index if not exists idx_timeline_events_undecryptable
          on timeline_events(is_undecryptable, redecrypt_attempts, timestamp)
          where is_undecryptable = 1;`,
+    );
+  },
+  // index 2 (v2 -> v3): add the `pending_edits` table that parks edits whose
+  // target message hasn't been stored yet, so the append path can replay them
+  // once the target lands (issue #12). `create table if not exists` is harmless
+  // if a forward path already created it. Fresh DBs get this directly from SCHEMA
+  // above and never run this step.
+  (db) => {
+    db.exec(
+      `create table if not exists pending_edits (
+         provider text not null,
+         target_external_id text not null,
+         timeline_key text not null,
+         body text not null,
+         attachments_json text not null,
+         edit_timestamp integer not null,
+         created_at integer not null,
+         primary key (provider, target_external_id, timeline_key)
+       );`,
     );
   },
 ];

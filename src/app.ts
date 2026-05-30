@@ -294,7 +294,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
       if (needsEnrichment(inbound.event)) {
-        const resolvedEvent = (inbound.event.externalId != null ? timeline.getByExternalId(inbound.provider, inbound.event.externalId) : undefined) ?? inbound.event;
+        const resolvedEvent = (inbound.event.externalId != null ? timeline.getByExternalId(inbound.provider, inbound.event.externalId, inbound.timelineKey) : undefined) ?? inbound.event;
         await timeline.setEnrichmentStatus(resolvedEvent.id, "pending");
         enrichmentPool.notifyNewEvent(resolvedEvent.id);
       }
@@ -339,10 +339,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * Apply a Matrix edit (`m.replace`) to its target message in place (issue #17).
    * The replacement body/attachments are carried on `inbound.event`;
    * `inbound.edit.targetExternalId` identifies the message being edited. We locate
-   * the target by `(provider, externalId)` and update it via the store's
-   * single-writer primitive. If the target isn't stored (edit for a message we
-   * never saw — e.g. pre-join history, or a missed event), we log and skip; the
-   * edit is never inserted as a standalone message. Enrichment/captions are
+   * the target by `(provider, externalId, timelineKey)` (issue #3) and update it
+   * via the store's single-writer primitive. If the target isn't stored yet (edit
+   * arrived before its target — e.g. out-of-order sync or backfill), the resolved
+   * replacement is parked in `pending_edits` and the append path replays it once
+   * the target lands (issue #12); the edit is never inserted as a standalone
+   * message and never silently dropped. Enrichment/captions are
    * re-armed only when the recomputed status warrants it and the target's timeline
    * isn't inactive — mirroring the live append and re-decryption gating.
    */
@@ -355,12 +357,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const result = await timeline.applyEdit(
       inbound.provider,
       targetExternalId,
+      inbound.timelineKey,
+      replacement,
+      inbound.event.timestamp,
       (target) => applyEditToCanonical(target, replacement),
       editStatus,
     );
 
     if (!result.applied) {
-      logger.info("edit_target_missing", {
+      // The target isn't stored yet (out-of-order sync / backfill). The edit was
+      // parked in pending_edits and the append path will replay it once the
+      // target lands (issue #12) — it is not dropped.
+      logger.info("edit_target_missing_parked", {
         timelineKey: inbound.timelineKey,
         targetExternalId,
         editEventId: inbound.event.externalId,
@@ -543,7 +551,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!replyExternalId) return false;
     const activeIds = new Set(sessions.activeForTimeline(inbound.timelineKey).map((session) => session.id));
     if (activeIds.size === 0) return false;
-    const target = timeline.getByExternalId(inbound.provider, replyExternalId);
+    const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     if (target?.timelineKey !== inbound.timelineKey) return false;
     if (!target?.agentSessionId || !activeIds.has(target.agentSessionId)) return false;
     const ok = sessions.steer(target.agentSessionId, {
