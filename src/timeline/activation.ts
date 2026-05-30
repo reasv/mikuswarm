@@ -81,12 +81,46 @@ export class ActivationCoordinator {
    */
   async gateInbound(inbound: InboundChatEvent): Promise<"handled" | "active"> {
     const timelineState = this.opts.storage.getTimelineState(inbound.timelineKey);
+    const guarded = this.activatingTimelines.has(inbound.timelineKey);
+
+    // Inconsistent state: persisted state reads 'activating' but no in-memory
+    // guard is present. This means a prelude failed AND its catch-path reset to
+    // 'inactive' also failed (logged as timeline_activation_reset_failed), so
+    // the persisted state is stranded in 'activating' with the guard/buffer
+    // already cleared. Re-dispatching here (the legitimate just-cleared race
+    // below) would busy-loop: every trigger reads 'activating', finds no
+    // buffer, re-dispatches, re-reads 'activating'... forever, one DB write per
+    // pass. Instead, store the event cheaply (never dropped) and attempt a
+    // one-shot recovery by re-persisting 'inactive' so the NEXT trigger can
+    // re-activate. Do NOT re-dispatch.
+    if (timelineState === "activating" && !guarded) {
+      const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
+      await this.opts.router.route(inbound, holdStatus);
+      if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
+      this.opts.logger.error("activation_state_inconsistent", {
+        timelineKey: inbound.timelineKey,
+        eventId: inbound.event.id,
+        trigger: Boolean(inbound.trigger),
+      });
+      // One-shot recovery: try to clear the stranded 'activating' so the next
+      // trigger re-activates from a clean state. Best-effort — if it fails
+      // again we simply stay inconsistent (still no loop) until the write heals.
+      try {
+        await this.opts.storage.setTimelineState(inbound.timelineKey, "inactive");
+      } catch (resetError) {
+        this.opts.logger.error("activation_state_recovery_failed", {
+          timelineKey: inbound.timelineKey,
+          error: resetError instanceof Error ? resetError.message : String(resetError),
+        });
+      }
+      return "handled";
+    }
 
     // Activation prelude in flight (state may still read 'inactive' until the
     // write lands, so the in-memory set is authoritative): store the event so
     // it enriches and the activating session sees it. A trigger here can't spawn
     // a second session yet — buffer it and replay once the timeline settles.
-    if (timelineState === "activating" || this.activatingTimelines.has(inbound.timelineKey)) {
+    if (timelineState === "activating" || guarded) {
       const holdStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
       await this.opts.router.route(inbound, holdStatus);
       if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
@@ -101,7 +135,9 @@ export class ActivationCoordinator {
         } else {
           // The guard was cleared between the state read and here (activation
           // just finished). Re-dispatch so the trigger isn't lost; the timeline
-          // is now 'active' or 'inactive'.
+          // is now 'active' or 'inactive' (persisted state is no longer
+          // 'activating' — the inconsistent case is handled above). This is the
+          // legitimate just-cleared-guard re-dispatch race.
           this.opts.dispatch(inbound);
         }
       }

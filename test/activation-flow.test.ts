@@ -3,6 +3,7 @@ import test from "node:test";
 import { Storage } from "../src/storage/index.js";
 import {
   ActivationCoordinator,
+  type ActivationStorage,
   TimelineRouter,
   TimelineStore,
   TriggerCoordinator,
@@ -94,6 +95,10 @@ function makeHarness(overrides?: {
   runInitialBackfill?: (inbound: InboundChatEvent) => Promise<void>;
   awaitTriggerReadiness?: (inbound: InboundChatEvent) => Promise<void>;
   launchSession?: (inbound: InboundChatEvent, duplicate: boolean, h: Harness) => void;
+  // Wrap the storage surface handed to the coordinator (e.g. to make the
+  // catch-path 'inactive' reset throw). The real Storage is still used by the
+  // router/timeline so events persist normally.
+  wrapStorage?: (storage: Storage) => ActivationStorage;
 }): Promise<Harness> {
   return Storage.open({ databasePath: ":memory:" }).then((storage) => {
     const timeline = new TimelineStore(storage);
@@ -107,7 +112,7 @@ function makeHarness(overrides?: {
     const harness = {} as Harness;
 
     const coordinator = new ActivationCoordinator({
-      storage,
+      storage: overrides?.wrapStorage ? overrides.wrapStorage(storage) : storage,
       router,
       triggerCoordinator,
       setEnrichmentStatus: (eventId, status) => timeline.setEnrichmentStatus(eventId, status),
@@ -380,6 +385,160 @@ test("#4: a held trigger replayed after a failed activation re-activates the tim
     assert.equal(h.storage.getTimelineState(TK), "active", "the replayed held trigger re-activated the timeline");
     assert.equal(h.launched.length, 1, "the replayed held trigger launched a session");
     assert.equal(h.launched[0].event.id, "t2");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#2/#14: a stranded 'activating' state (catch-path reset threw) does not busy-loop on the next trigger and does not drop it", async () => {
+  // Make the catch-path 'inactive' reset throw, so after a prelude failure the
+  // persisted state stays 'activating' while the in-memory guard/buffer were
+  // cleared by finishActivation — the inconsistent state from #2.
+  const wrapStorage = (storage: Storage): ActivationStorage => ({
+    getTimelineState: (timelineKey) => storage.getTimelineState(timelineKey),
+    setTimelineState: (timelineKey, state) => {
+      if (state === "inactive") {
+        return Promise.reject(new Error("reset write boom"));
+      }
+      return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
+    },
+    activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+  });
+
+  const h = await makeHarness({
+    // Fail the prelude so the catch path runs (and its 'inactive' reset throws).
+    awaitTriggerReadiness: async () => {
+      throw new Error("readiness boom");
+    },
+    wrapStorage,
+  });
+  try {
+    await assert.rejects(
+      () => h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" }))),
+      /readiness boom/,
+    );
+
+    // The reset failed: persisted state is stranded 'activating', guard cleared.
+    assert.equal(h.storage.getTimelineState(TK), "activating", "the failed reset left state stranded in 'activating'");
+    assert.ok(!h.coordinator.isActivating(TK), "the in-memory guard was cleared by finishActivation");
+
+    // A follow-up trigger arrives. Pre-fix this re-dispatched into gateInbound
+    // which re-read 'activating', found no buffer, re-dispatched again... a tight
+    // unbounded loop. The fix must NOT re-dispatch in the inconsistent case.
+    const before = h.dispatched.length;
+    const outcome = await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
+    // Let any (erroneous) async re-dispatch chain run.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(outcome, "handled", "the inconsistent-state trigger is consumed by the lifecycle path");
+    const dispatchedDuringFollowup = h.dispatched.length - before;
+    assert.ok(
+      dispatchedDuringFollowup <= 1,
+      `the follow-up trigger must not busy-loop re-dispatching (got ${dispatchedDuringFollowup} dispatches)`,
+    );
+
+    // The event must not be dropped — it is stored.
+    const stored = h.storage.read((db) =>
+      db.prepare("select id from timeline_events where id = ?").get("t2"),
+    );
+    assert.ok(stored, "the follow-up event was stored (not dropped)");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#14: one-shot recovery clears the stranded 'activating' so a later trigger can re-activate", async () => {
+  // Make the FIRST 'inactive' write (the catch-path reset) throw, but allow
+  // subsequent 'inactive' writes (the gateInbound one-shot recovery) to succeed.
+  let inactiveWrites = 0;
+  const wrapStorage = (storage: Storage): ActivationStorage => ({
+    getTimelineState: (timelineKey) => storage.getTimelineState(timelineKey),
+    setTimelineState: (timelineKey, state) => {
+      if (state === "inactive") {
+        inactiveWrites++;
+        if (inactiveWrites === 1) return Promise.reject(new Error("reset write boom"));
+      }
+      return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
+    },
+    activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+  });
+
+  let readinessCalls = 0;
+  const h = await makeHarness({
+    awaitTriggerReadiness: async () => {
+      readinessCalls++;
+      if (readinessCalls === 1) throw new Error("readiness boom");
+    },
+    wrapStorage,
+  });
+  try {
+    await assert.rejects(
+      () => h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" }))),
+      /readiness boom/,
+    );
+    assert.equal(h.storage.getTimelineState(TK), "activating", "stranded after failed reset");
+
+    // Follow-up trigger hits the inconsistent path: stores the event and the
+    // one-shot recovery re-persists 'inactive'.
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
+    assert.equal(h.storage.getTimelineState(TK), "inactive", "the one-shot recovery cleared the stranded state");
+
+    // A NEXT trigger now re-activates cleanly from 'inactive'.
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t3", timestamp: 3_000 })));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.storage.getTimelineState(TK), "active", "the next trigger re-activated from the recovered 'inactive' state");
+    assert.equal(h.launched.length, 1, "the re-activating trigger launched a session");
+    assert.equal(h.launched[0].event.id, "t3");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("#14: the legitimate just-cleared-guard re-dispatch still works (guard present at entry, cleared during the route await)", async () => {
+  // The real just-cleared race: a trigger enters while the in-memory guard is
+  // still set (so it takes the activating branch), but during the `router.route`
+  // await the activation finishes — finishActivation clears the guard AND the
+  // held-trigger buffer. The code then reads heldTriggers.get() (now undefined)
+  // and, because the guard WAS present at entry (not the inconsistent stranded
+  // case), must re-dispatch rather than drop. We reproduce this by clearing the
+  // guard/buffer mid-route (one-shot router hook), with persisted state 'active'
+  // (a successful activation), and the dispatch hook detached so the re-dispatch
+  // doesn't recurse (we only assert the single re-dispatch happened).
+  const h = await makeHarness();
+  try {
+    // Activate normally so persisted state is 'active' and the guard is cleared.
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" })));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.storage.getTimelineState(TK), "active");
+
+    const activating = (h.coordinator as unknown as { activatingTimelines: Set<string> }).activatingTimelines;
+    const held = (h.coordinator as unknown as { heldTriggers: Map<string, InboundChatEvent[]> }).heldTriggers;
+    // Re-arm the guard + an empty buffer to mimic an activation prelude still in
+    // flight at the moment the follow-up trigger enters gateInbound.
+    activating.add(TK);
+    held.set(TK, []);
+
+    // During the route await of the follow-up trigger, simulate finishActivation
+    // racing to completion: clear the guard and buffer. One-shot.
+    const realRoute = h.router.route.bind(h.router);
+    let cleared = false;
+    (h.router as unknown as { route: typeof realRoute }).route = async (inbound, status) => {
+      const result = await realRoute(inbound, status);
+      if (!cleared) {
+        cleared = true;
+        activating.delete(TK);
+        held.delete(TK);
+      }
+      return result;
+    };
+
+    const before = h.dispatched.length;
+    const outcome = await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t2", timestamp: 2_000 })));
+
+    assert.equal(outcome, "handled", "the just-cleared-guard trigger is consumed by the lifecycle path");
+    assert.equal(h.dispatched.length - before, 1, "the trigger is re-dispatched exactly once (legitimate just-cleared race), not dropped");
+    assert.equal(h.dispatched[h.dispatched.length - 1].event.id, "t2");
   } finally {
     h.storage.close();
   }
