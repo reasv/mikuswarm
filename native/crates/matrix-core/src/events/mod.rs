@@ -278,6 +278,23 @@ fn replacement_new_content(
     }
 }
 
+/// The replacement (`m.new_content`) object for an `m.replace` edit, read from a
+/// raw `serde_json::Value` content. Mirrors the typed `replacement_new_content`
+/// for the summarize path, which works on untyped `Value`s. Returns `None` for
+/// non-edits (no `m.relates_to`, a non-`m.replace` rel_type, or a missing
+/// `m.new_content`), so callers fall back to the top-level content unchanged.
+fn replacement_new_content_value(content: &Value) -> Option<&Value> {
+    let is_replace = content
+        .get("m.relates_to")
+        .and_then(|relates_to| relates_to.get("rel_type"))
+        .and_then(Value::as_str)
+        == Some("m.replace");
+    if !is_replace {
+        return None;
+    }
+    content.get("m.new_content")
+}
+
 fn readable_body(content: &Value) -> String {
     let msgtype = content
         .get("msgtype")
@@ -323,7 +340,7 @@ fn readable_body(content: &Value) -> String {
 mod tests {
     use super::{
         formatted_body, media_from_timeline, media_items, readable_body, relation_details,
-        replacement_new_content, summarize_timeline_event,
+        replacement_new_content, summarize_message_value, summarize_timeline_event,
     };
     use crate::api::MatrixMediaKind;
     use matrix_sdk::deserialized_responses::{
@@ -626,6 +643,73 @@ mod tests {
         assert_eq!(replaces, None);
         assert!(replacement_new_content(&plain).is_none());
     }
+
+    #[test]
+    fn summary_edit_uses_new_content_body_not_fallback() {
+        // The summarize path (used by `messageSummary` and the re-decryption
+        // sweeper) must resolve `m.new_content` for an `m.replace` edit, just like
+        // the live `normalize_inbound_event`. The top-level body is the
+        // `* fallback`; the post-edit message lives under `m.new_content`.
+        let event = message_event(json!({
+            "msgtype": "m.text",
+            "body": "* edited",
+            "m.new_content": { "msgtype": "m.text", "body": "edited" },
+            "m.relates_to": { "rel_type": "m.replace", "event_id": "$target:example.org" },
+        }));
+        let summary = summarize_message_value(&event).expect("edit summary");
+        // The new-content body, NOT the `*`-prefixed fallback.
+        assert_eq!(summary.body, "edited");
+        assert_eq!(summary.msgtype.as_deref(), Some("m.text"));
+        // The relation must still carry the replace target so downstream applies
+        // the edit to the original message.
+        let relates_to = summary.relates_to.expect("relates_to present");
+        assert_eq!(relates_to.rel_type.as_deref(), Some("m.replace"));
+        assert_eq!(relates_to.event_id.as_deref(), Some("$target:example.org"));
+    }
+
+    #[test]
+    fn summary_edit_uses_new_content_media_not_fallback() {
+        // An edit can replace text with media; the summarize media path must draw
+        // the descriptor from `m.new_content`, not the top-level `* fallback`.
+        let raw = raw_event(message_event(json!({
+            "msgtype": "m.text",
+            "body": "* see image",
+            "m.new_content": {
+                "msgtype": "m.image",
+                "body": "cat.png",
+                "filename": "cat.png",
+                "url": "mxc://example.org/abc",
+                "info": { "mimetype": "image/png", "size": 1234 },
+            },
+            "m.relates_to": { "rel_type": "m.replace", "event_id": "$target:example.org" },
+        })));
+        let event = TimelineEvent::from_plaintext(raw);
+        let summary = summarize_timeline_event(&event).expect("edit summary");
+        // Body resolves to the new-content fallback (an image's filename), not the
+        // top-level `* see image`.
+        assert_eq!(summary.body, "cat.png");
+        assert_eq!(summary.msgtype.as_deref(), Some("m.image"));
+        // Media is drawn from `m.new_content`'s image, not the top-level text
+        // (which would yield no media at all).
+        assert_eq!(summary.media.len(), 1);
+        assert!(matches!(summary.media[0].kind, MatrixMediaKind::Image));
+        assert_eq!(summary.media[0].filename.as_deref(), Some("cat.png"));
+        assert_eq!(summary.media[0].content_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn summary_non_edit_body_is_unchanged() {
+        // Regression guard: a plain (non-edit) message's summary body and msgtype
+        // come from the top-level content exactly as before.
+        let event = message_event(json!({
+            "msgtype": "m.text",
+            "body": "hello world",
+        }));
+        let summary = summarize_message_value(&event).expect("plain summary");
+        assert_eq!(summary.body, "hello world");
+        assert_eq!(summary.msgtype.as_deref(), Some("m.text"));
+        assert!(summary.relates_to.is_none());
+    }
 }
 
 fn summary_relation(value: &Value) -> Option<MatrixMessageRelatesTo> {
@@ -675,7 +759,15 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
         .map(timestamp_from_millis)
         .unwrap_or_else(Utc::now);
     let content = value.get("content")?;
-    let msgtype = content
+    // For an `m.replace` edit the post-edit message lives under `m.new_content`;
+    // the top-level body/msgtype are only the `* fallback`. Resolve to the
+    // replacement content so the summarize path (used by the re-decryption
+    // sweeper) surfaces the same body/msgtype/formatted as the live path. Keep
+    // the top-level content for every non-edit message so all other behavior is
+    // unchanged. `relates_to` below stays sourced from the top-level
+    // `m.relates_to` so the edit is still detected downstream.
+    let display_content = replacement_new_content_value(content).unwrap_or(content);
+    let msgtype = display_content
         .get("msgtype")
         .and_then(Value::as_str)
         .map(str::to_string);
@@ -684,7 +776,7 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
         event_id,
         sender,
         sender_name: None,
-        body: readable_body(content),
+        body: readable_body(display_content),
         msgtype,
         timestamp,
         relates_to: summary_relation(value),
@@ -791,7 +883,17 @@ fn media_from_timeline(timeline: AnySyncTimelineEvent) -> Vec<MatrixInboundMedia
     match timeline {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(ev),
-        )) => media_items(&ev.content.msgtype),
+        )) => {
+            // For an `m.replace` edit the media descriptor must come from the
+            // replacement (`m.new_content`), not the top-level `* fallback`
+            // msgtype — mirroring the live path which resolves edit media via
+            // `media_items(&new_content.msgtype)`. Non-edits use the top-level
+            // msgtype exactly as before.
+            let msgtype = replacement_new_content(&ev.content)
+                .map(|new_content| &new_content.msgtype)
+                .unwrap_or(&ev.content.msgtype);
+            media_items(msgtype)
+        }
         _ => Vec::new(),
     }
 }
