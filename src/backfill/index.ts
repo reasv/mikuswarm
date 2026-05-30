@@ -2,6 +2,7 @@ import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
+import { mediaToAttachment } from "../matrix/inbound.js";
 import type {
   MatrixMessageSummary,
   MatrixReadMessagesRequest,
@@ -244,6 +245,11 @@ function summaryToCanonical(
     body: summary.body,
     timestamp: ctx.timestamp,
     receivedAt: Date.now(),
+    // Emit the same attachment shape as the live path so backfilled media flows
+    // through the identical download + caption pipeline (keyed by event ID).
+    attachments: (summary.media ?? []).map((media) =>
+      mediaToAttachment(summary.eventId, media),
+    ),
     threadId: ctx.threadRootId,
     replyTo,
   };

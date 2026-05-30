@@ -3,8 +3,11 @@ import test from "node:test";
 import { performInitialBackfill, type BackfillReadClient } from "../src/backfill/index.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
+import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 import type {
+  MatrixInboundEvent,
+  MatrixInboundMedia,
   MatrixMessageSummary,
   MatrixReadMessagesRequest,
   MatrixReadMessagesResult,
@@ -28,6 +31,7 @@ function summary(overrides: Partial<MatrixMessageSummary> & { eventId: string; t
     msgtype: overrides.msgtype ?? "m.text",
     timestamp: iso(overrides.timestamp),
     relatesTo: overrides.relatesTo,
+    media: overrides.media,
   };
 }
 
@@ -301,6 +305,74 @@ test("sets the errored flag on a read failure mid-pagination", async () => {
     assert.equal(result.timedOut, false, "errored is distinct from a timeout");
     assert.equal(result.exhausted, false, "errored is distinct from a clean exhaustion");
     assert.equal(result.stored, 1, "the partial page fetched before the failure is kept");
+  });
+});
+
+test("backfilled media is stored as attachments with the live shape", async () => {
+  await withStores(async (store, storage) => {
+    const client = new ScriptedClient([
+      page(
+        [
+          summary({
+            eventId: "$img",
+            timestamp: 5000,
+            msgtype: "m.image",
+            body: "cat.png",
+            media: [
+              { index: 0, kind: "image", body: "cat.png", filename: "cat.png", contentType: "image/png", sizeBytes: 1234 },
+            ],
+          }),
+        ],
+        null,
+      ),
+    ]);
+    const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    assert.equal(result.stored, 1);
+    const stored = store.getById(`matrix:${ACCOUNT}:$img`);
+    assert.ok(stored, "image event should be stored");
+    assert.deepEqual(stored?.attachments, [
+      {
+        id: "$img:media:0",
+        filename: "cat.png",
+        mimeType: "image/png",
+        mediaType: "image",
+        sizeBytes: 1234,
+        processing: { downloaded: false, captioned: false },
+      },
+    ]);
+  });
+});
+
+// The strongest parity guard: for equivalent native media input, the backfill
+// converter and the live normalizer must produce byte-for-byte identical
+// `attachments`. Both routes go through the shared `mediaToAttachment` helper.
+test("backfill and live produce identical attachments for equivalent media", async () => {
+  const media: MatrixInboundMedia[] = [
+    { index: 0, kind: "image", body: "cat.png", filename: "cat.png", contentType: "image/png", sizeBytes: 1234 },
+  ];
+  const eventId = "$shared";
+
+  // Live path attachments.
+  const liveEvent: MatrixInboundEvent = {
+    roomId: ROOM,
+    eventId,
+    senderId: "@alice:example.org",
+    chatType: "channel",
+    body: "cat.png",
+    msgtype: "m.image",
+    timestamp: iso(5000),
+    media,
+  };
+  const live = normalizeMatrixInboundEvent(liveEvent, { accountId: ACCOUNT, selfUserId: SELF });
+
+  // Backfill path attachments (run through the full converter via the store).
+  await withStores(async (store, storage) => {
+    const client = new ScriptedClient([
+      page([summary({ eventId, timestamp: 5000, msgtype: "m.image", body: "cat.png", media })], null),
+    ]);
+    await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    const stored = store.getById(`matrix:${ACCOUNT}:${eventId}`);
+    assert.deepEqual(stored?.attachments, live.event.attachments);
   });
 });
 

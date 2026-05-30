@@ -198,6 +198,13 @@ pub struct MatrixMessageSummary {
     pub msgtype: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub relates_to: Option<MatrixMessageRelatesTo>,
+    /// Media descriptors for this message, populated from the typed
+    /// `MessageType` via the same `media_items` converter used by the live path,
+    /// so backfilled events reach the download + caption pipeline with parity to
+    /// live reception. Best-effort: empty when the event is non-media or fails
+    /// typed deserialization. Carries no encryption keys (resolved at download).
+    #[serde(default)]
+    pub media: Vec<MatrixInboundMedia>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

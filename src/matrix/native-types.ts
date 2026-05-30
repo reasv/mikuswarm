@@ -172,6 +172,12 @@ export type MatrixMessageSummary = {
   msgtype?: string;
   timestamp: string;
   relatesTo?: MatrixMessageRelatesTo;
+  /**
+   * Media descriptors carried by backfilled/summarized events, mirroring the
+   * live {@link MatrixInboundEvent.media}. Optional for backward-compat with the
+   * Rust `#[serde(default)]` (older payloads / other summary producers omit it).
+   */
+  media?: MatrixInboundMedia[];
 };
 
 export type MatrixMessageSummaryRequest = {

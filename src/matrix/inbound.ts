@@ -1,11 +1,33 @@
 import { nanoid } from "nanoid";
-import type { MatrixInboundEvent } from "./native-types.js";
+import type { MatrixInboundEvent, MatrixInboundMedia } from "./native-types.js";
 import type {
   AttachmentMeta,
   CanonicalChatEvent,
   InboundChatEvent,
   TriggerInfo,
 } from "../types.js";
+
+/**
+ * Map a native media descriptor to a canonical {@link AttachmentMeta}. Shared by
+ * the live-receive path ({@link normalizeMatrixInboundEvent}) and the backfill
+ * converter (`summaryToCanonical`) so live and historical attachments are
+ * byte-for-byte identical. Download + caption happen later, keyed by event ID;
+ * the descriptor carries no encryption keys (encrypted media is resolved at
+ * download time by re-fetching the event).
+ */
+export function mediaToAttachment(eventId: string, media: MatrixInboundMedia): AttachmentMeta {
+  return {
+    id: `${eventId}:media:${media.index}`,
+    filename: media.filename ?? media.body,
+    mimeType: media.contentType,
+    mediaType: media.kind,
+    sizeBytes: media.sizeBytes,
+    processing: {
+      downloaded: false,
+      captioned: false,
+    },
+  };
+}
 
 export interface MatrixInboundContext {
   accountId: string;
@@ -46,17 +68,7 @@ export function normalizeMatrixInboundEvent(
     htmlBody: event.formattedBody,
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
     receivedAt: Date.now(),
-    attachments: event.media.map((media): AttachmentMeta => ({
-      id: `${event.eventId}:media:${media.index}`,
-      filename: media.filename ?? media.body,
-      mimeType: media.contentType,
-      mediaType: media.kind,
-      sizeBytes: media.sizeBytes,
-      processing: {
-        downloaded: false,
-        captioned: false,
-      },
-    })),
+    attachments: event.media.map((media) => mediaToAttachment(event.eventId, media)),
     replyTo: event.replyToId ? { externalId: event.replyToId } : undefined,
     mentions: {
       mentionedUserIds: event.mentions?.userIds ?? [],

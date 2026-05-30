@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
-    ruma::events::room::message::{
-        FormattedBody, MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+    ruma::events::{
+        room::message::{
+            FormattedBody, MessageType, OriginalSyncRoomMessageEvent, Relation,
+            RoomMessageEventContent, SyncRoomMessageEvent,
+        },
+        AnySyncMessageLikeEvent, AnySyncTimelineEvent,
     },
     Room,
 };
@@ -296,8 +300,10 @@ fn readable_body(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::readable_body;
-    use serde_json::json;
+    use super::{media_from_timeline, readable_body};
+    use crate::api::MatrixMediaKind;
+    use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+    use serde_json::{json, Value};
 
     #[test]
     fn uses_formatted_body_for_custom_emoji_in_summaries() {
@@ -307,6 +313,155 @@ mod tests {
             "formatted_body": "hello <img data-mx-emoticon src=\"mxc://matrix.example.org/party\" alt=\":party_parrot:\">"
         });
         assert_eq!(readable_body(&content), "hello :party_parrot:");
+    }
+
+    fn message_event(content: Value) -> Value {
+        json!({
+            "type": "m.room.message",
+            "event_id": "$event:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1_000,
+            "content": content,
+        })
+    }
+
+    fn media_from_json(event: Value) -> Vec<super::MatrixInboundMedia> {
+        let timeline: AnySyncTimelineEvent =
+            serde_json::from_value(event).expect("deserialize timeline event");
+        media_from_timeline(timeline)
+    }
+
+    #[test]
+    fn extracts_image_media_from_summary() {
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.image",
+            "body": "cat.png",
+            "filename": "cat.png",
+            "url": "mxc://example.org/abc",
+            "info": { "mimetype": "image/png", "size": 1234 },
+        })));
+        assert_eq!(media.len(), 1);
+        let item = &media[0];
+        assert_eq!(item.index, 0);
+        assert!(matches!(item.kind, MatrixMediaKind::Image));
+        assert_eq!(item.filename.as_deref(), Some("cat.png"));
+        assert_eq!(item.content_type.as_deref(), Some("image/png"));
+        assert_eq!(item.size_bytes, Some(1234));
+    }
+
+    #[test]
+    fn extracts_file_media_from_summary() {
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.file",
+            "body": "report.pdf",
+            "filename": "report.pdf",
+            "url": "mxc://example.org/file",
+            "info": { "mimetype": "application/pdf", "size": 4096 },
+        })));
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0].kind, MatrixMediaKind::File));
+        assert_eq!(media[0].filename.as_deref(), Some("report.pdf"));
+        assert_eq!(media[0].content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(media[0].size_bytes, Some(4096));
+    }
+
+    #[test]
+    fn extracts_video_media_from_summary() {
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.video",
+            "body": "clip.mp4",
+            "filename": "clip.mp4",
+            "url": "mxc://example.org/vid",
+            "info": { "mimetype": "video/mp4", "size": 8192 },
+        })));
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0].kind, MatrixMediaKind::Video));
+        assert_eq!(media[0].content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(media[0].size_bytes, Some(8192));
+    }
+
+    #[test]
+    fn extracts_audio_media_from_summary() {
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.audio",
+            "body": "voice.ogg",
+            "filename": "voice.ogg",
+            "url": "mxc://example.org/aud",
+            "info": { "mimetype": "audio/ogg", "size": 256 },
+        })));
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0].kind, MatrixMediaKind::Audio));
+        assert_eq!(media[0].content_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].size_bytes, Some(256));
+    }
+
+    #[test]
+    fn extracts_encrypted_media_descriptor_without_leaking_keys() {
+        // Encrypted m.image: the URL is replaced by an encrypted `file` block
+        // carrying key/iv. The descriptor must still be populated, but it carries
+        // NONE of the encryption material — keys are resolved later at download.
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.image",
+            "body": "secret.png",
+            "filename": "secret.png",
+            "file": {
+                "url": "mxc://example.org/enc",
+                "key": {
+                    "kty": "oct",
+                    "key_ops": ["encrypt", "decrypt"],
+                    "alg": "A256CTR",
+                    "k": "aWQ_onEl40OZQ_aWQ_onEl40OZQ_aWQ_onEl40OZQ_a",
+                    "ext": true
+                },
+                "iv": "w+sE15fzSSw0Kg==",
+                "hashes": { "sha256": "fdSLu/YkRx3Wyh3KQabP3rd6+SFiKg5lsJZQHtkSAYA" },
+                "v": "v2"
+            },
+            "info": { "mimetype": "image/png", "size": 2048 },
+        })));
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0].kind, MatrixMediaKind::Image));
+        assert_eq!(media[0].filename.as_deref(), Some("secret.png"));
+        assert_eq!(media[0].content_type.as_deref(), Some("image/png"));
+        assert_eq!(media[0].size_bytes, Some(2048));
+        // The descriptor type structurally cannot carry keys; serializing it must
+        // not surface any encryption material.
+        let serialized = serde_json::to_string(&media[0]).expect("serialize descriptor");
+        assert!(!serialized.contains("key"));
+        assert!(!serialized.contains("iv"));
+    }
+
+    #[test]
+    fn text_message_yields_no_media() {
+        let media = media_from_json(message_event(json!({
+            "msgtype": "m.text",
+            "body": "just text",
+        })));
+        assert!(media.is_empty());
+    }
+
+    #[test]
+    fn redacted_message_yields_no_media() {
+        // A redacted m.room.message deserializes to the `Redacted` variant, which
+        // is not `Original`, so no media is extracted (matches the live path).
+        let event = json!({
+            "type": "m.room.message",
+            "event_id": "$redacted:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1_000,
+            "content": {},
+            "unsigned": {
+                "redacted_because": {
+                    "type": "m.room.redaction",
+                    "event_id": "$redaction:example.org",
+                    "sender": "@mod:example.org",
+                    "origin_server_ts": 2_000,
+                    "content": {},
+                    "redacts": "$redacted:example.org"
+                }
+            }
+        });
+        assert!(media_from_json(event).is_empty());
     }
 }
 
@@ -370,12 +525,42 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
         msgtype,
         timestamp,
         relates_to: summary_relation(value),
+        // Default empty; the typed media extraction (when available) is layered
+        // on by `summarize_timeline_event`. Non-media messages stay empty,
+        // matching the live path where `media_items` returns `Vec::new()`.
+        media: Vec::new(),
     })
 }
 
 pub fn summarize_timeline_event(event: &TimelineEvent) -> Option<MatrixMessageSummary> {
     let value: Value = event.raw().deserialize_as_unchecked().ok()?;
-    summarize_message_value(&value)
+    let mut summary = summarize_message_value(&value)?;
+    summary.media = media_from_raw(event);
+    Some(summary)
+}
+
+/// Extract media descriptors from a timeline event by deserializing into the
+/// typed `MessageType` and reusing the live `media_items` converter, so backfill
+/// and live reception produce identical media. Best-effort: returns an empty vec
+/// on typed-deserialize failure or non-`Original` (e.g. redacted) events — media
+/// is additive and must never cause the surrounding summary to be dropped.
+fn media_from_raw(event: &TimelineEvent) -> Vec<MatrixInboundMedia> {
+    match event.raw().deserialize_as_unchecked::<AnySyncTimelineEvent>() {
+        Ok(timeline) => media_from_timeline(timeline),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Pull media from an already-deserialized timeline event. Only the `Original`
+/// (non-redacted) `m.room.message` variant yields media, mirroring the live
+/// download path (`media/mod.rs`); everything else maps to an empty vec.
+fn media_from_timeline(timeline: AnySyncTimelineEvent) -> Vec<MatrixInboundMedia> {
+    match timeline {
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncRoomMessageEvent::Original(ev),
+        )) => media_items(&ev.content.msgtype),
+        _ => Vec::new(),
+    }
 }
 
 pub async fn normalize_inbound_event(

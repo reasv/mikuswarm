@@ -153,6 +153,38 @@ test("Matrix direct self echoes keep the room target even when timeline identity
   assert.equal(inbound.trigger, undefined);
 });
 
+test("Matrix live media maps to attachments with the canonical shape", () => {
+  const nativeEvent: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$img",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "channel",
+    body: "cat.png",
+    msgtype: "m.image",
+    timestamp: new Date(1_000).toISOString(),
+    media: [
+      { index: 0, kind: "image", body: "cat.png", filename: "cat.png", contentType: "image/png", sizeBytes: 1234 },
+    ],
+  };
+
+  const inbound = normalizeMatrixInboundEvent(nativeEvent, {
+    accountId: "miku",
+    selfUserId: "@miku:example.org",
+  });
+
+  assert.deepEqual(inbound.event.attachments, [
+    {
+      id: "$img:media:0",
+      filename: "cat.png",
+      mimeType: "image/png",
+      mediaType: "image",
+      sizeBytes: 1234,
+      processing: { downloaded: false, captioned: false },
+    },
+  ]);
+});
+
 test("Matrix room triggers require structured Matrix mention metadata", () => {
   const textOnlyMention: MatrixInboundEvent = {
     roomId: "!room:example.org",
