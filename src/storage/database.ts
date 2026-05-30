@@ -462,6 +462,11 @@ export class Storage {
   setTimelineState(timelineKey: string, state: TimelineState): Promise<void> {
     return this.write((db) => {
       const now = Date.now();
+      // Minimal seed written only on first insert. The on-conflict path below
+      // deliberately leaves `state_json` untouched, so this never clobbers real
+      // compaction cursors. Keep this shape in sync with the
+      // `TimelineCompactionState` written by `saveTimelineCompactionState` — both
+      // sites construct the same serialized shape.
       const seedState: TimelineCompactionState = {
         schemaVersion: 1,
         timelineKey,
@@ -550,16 +555,6 @@ export class Storage {
         .run(olderThanMs);
       return result.changes;
     });
-  }
-
-  /** Earliest stored event timestamp for a timeline, or undefined when empty. */
-  getOldestEventTimestamp(timelineKey: string): number | undefined {
-    const row = this.read((db) =>
-      db
-        .prepare(`select min(timestamp) as t from timeline_events where timeline_key = ?`)
-        .get(timelineKey) as { t: number | null } | undefined,
-    );
-    return row?.t ?? undefined;
   }
 
   getTimelineEventByExternalId(provider: string, externalId: string): CanonicalChatEvent | undefined {

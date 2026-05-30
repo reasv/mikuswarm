@@ -126,19 +126,6 @@ test("activateTimelineEvents flips only 'inactive' rows to 'pending' and returns
   }
 });
 
-test("getOldestEventTimestamp returns the minimum timestamp or undefined when empty", async () => {
-  const storage = await Storage.open({ databasePath: ":memory:" });
-  try {
-    assert.equal(storage.getOldestEventTimestamp(TK), undefined);
-    await storage.appendTimelineEvent(userEvent({ id: "e1", body: "a", timestamp: 5_000 }));
-    await storage.appendTimelineEvent(userEvent({ id: "e2", body: "b", timestamp: 2_000 }));
-    await storage.appendTimelineEvent(userEvent({ id: "e3", body: "c", timestamp: 9_000 }));
-    assert.equal(storage.getOldestEventTimestamp(TK), 2_000);
-  } finally {
-    storage.close();
-  }
-});
-
 test("fresh database opens at user_version = 1 with the full canonical schema", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

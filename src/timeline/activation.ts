@@ -158,6 +158,9 @@ export class ActivationCoordinator {
       return "handled";
     }
 
+    // 'active' and (once Phase 4 lands) 'backfilling' both run the normal active
+    // path: a backfilling timeline still spawns sessions (CHANNEL-LIFECYCLE §2).
+    // This fall-through is intentional — there is no separate handling this pass.
     return "active";
   }
 
