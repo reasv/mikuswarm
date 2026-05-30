@@ -449,6 +449,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         selfUserId,
         maxMessages,
         windowMs: config.timeline?.initial_backfill_window_ms ?? 3_600_000,
+        // Anchor the backfill window to the activation moment: the trigger
+        // event's timestamp (falls back to now inside performInitialBackfill).
+        anchorTimestamp: inbound.event.timestamp,
         timeoutMs: config.timeline?.initial_backfill_timeout_ms ?? 30_000,
         logger,
       });

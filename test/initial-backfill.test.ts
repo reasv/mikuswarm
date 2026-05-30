@@ -67,7 +67,7 @@ test("maxMessages = 0 performs no fetch", async () => {
     const client = new ScriptedClient([page([summary({ eventId: "$a", timestamp: 1000 })], null)]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 0 });
     assert.equal(client.calls.length, 0, "client should not be called");
-    assert.deepEqual(result, { fetched: 0, stored: 0, reachedCount: false, reachedWindow: false, exhausted: false, timedOut: false });
+    assert.deepEqual(result, { fetched: 0, stored: 0, reachedCount: false, reachedWindow: false, exhausted: false, timedOut: false, errored: false });
   });
 });
 
@@ -109,21 +109,44 @@ test("stops after maxMessages newly-stored and threads the backward pagination t
   });
 });
 
-test("stops once a page crosses the window floor", async () => {
+test("stops once a page crosses the window floor (anchored to activation time)", async () => {
   await withStores(async (store, storage) => {
-    // Seed the timeline so oldestStored = 1_000_000; windowMs = 5000 → floor = 995_000.
-    await storage.appendTimelineEvent(seedEvent("seed", 1_000_000), "pending");
+    // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const client = new ScriptedClient([
       page([summary({ eventId: "$a", timestamp: 999_000 }), summary({ eventId: "$b", timestamp: 998_000 })], "tok1"),
       page([summary({ eventId: "$c", timestamp: 996_000 }), summary({ eventId: "$d", timestamp: 994_000 })], "tok2"),
       page([summary({ eventId: "$e", timestamp: 990_000 })], null),
     ]);
     const result = await performInitialBackfill({
-      client, store, storage, timelineKey: ROOM_TK, ...BASE, windowMs: 5000, maxMessages: 100,
+      client, store, storage, timelineKey: ROOM_TK, ...BASE,
+      windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
     });
     assert.equal(result.reachedWindow, true);
     assert.equal(result.stored, 4, "the crossing page is stored in full before stopping");
     assert.equal(client.calls.length, 2, "should not fetch past the window-crossing page");
+  });
+});
+
+test("window is anchored to activation time, not the oldest stored event", async () => {
+  await withStores(async (store, storage) => {
+    // A busy channel with months of pre-activation inactive history: the oldest
+    // stored event is far in the past. Under the OLD behavior (floor = oldest -
+    // windowMs) the window cap would never bite and all pages would be fetched.
+    // The new anchor pins the floor to the activation moment.
+    await storage.appendTimelineEvent(seedEvent("oldseed", 1_000), "inactive");
+    // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
+    const client = new ScriptedClient([
+      page([summary({ eventId: "$a", timestamp: 999_000 }), summary({ eventId: "$b", timestamp: 998_000 })], "tok1"),
+      page([summary({ eventId: "$c", timestamp: 994_000 }), summary({ eventId: "$d", timestamp: 993_000 })], "tok2"),
+      page([summary({ eventId: "$e", timestamp: 990_000 })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE,
+      windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
+    });
+    assert.equal(result.reachedWindow, true, "the window cap must bite despite old inactive history");
+    assert.equal(result.stored, 4, "crossing page stored in full; later pages not fetched");
+    assert.equal(client.calls.length, 2, "should stop at the window-crossing page, not paginate to exhaustion");
   });
 });
 
@@ -203,6 +226,81 @@ test("times out when reads hang, holding no longer than timeoutMs", async () => 
     assert.equal(result.timedOut, true);
     assert.equal(result.stored, 0);
     assert.ok(elapsed < 2000, `should give up promptly (elapsed ${elapsed}ms)`);
+  });
+});
+
+test("terminates instead of spinning when the pagination token does not advance", async () => {
+  await withStores(async (store, storage) => {
+    // Pre-store $a so the page is all-duplicate (stored does not advance), and
+    // have the homeserver return the SAME token it was just given. Without the
+    // spin guard this loops until the timeout; with it, it treats history as
+    // exhausted after a single non-advancing page.
+    await store.appendIfMissing(
+      { ...seedEvent("ignored", 5000), id: `matrix:${ACCOUNT}:$a`, externalId: "$a" },
+      "pending",
+    );
+    const client = new ScriptedClient([
+      // First page advances the token normally (undefined → "stuck").
+      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+      // Second page returns the same token it was handed: non-advancing.
+      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+      // Would loop forever if reached.
+      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+    ]);
+    const start = Date.now();
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, timeoutMs: 5000, maxMessages: 100,
+    });
+    const elapsed = Date.now() - start;
+    assert.equal(result.exhausted, true, "non-advancing token should terminate as exhausted");
+    assert.equal(result.timedOut, false, "must not fall through to the timeout");
+    assert.ok(elapsed < 2000, `should stop promptly, not burn the timeout (elapsed ${elapsed}ms)`);
+    // First call (undefined) then second call ("stuck"); the loop breaks before a third.
+    assert.deepEqual(client.calls, [undefined, "stuck"]);
+  });
+});
+
+test("keeps paginating when a page is fully deduped but the token advances", async () => {
+  await withStores(async (store, storage) => {
+    // $a is already stored (duplicate, stored does not advance), but the token
+    // advances each page — the spin guard must NOT trip here.
+    await store.appendIfMissing(
+      { ...seedEvent("ignored", 5000), id: `matrix:${ACCOUNT}:$a`, externalId: "$a" },
+      "pending",
+    );
+    const client = new ScriptedClient([
+      page([summary({ eventId: "$a", timestamp: 5000 })], "tok1"),
+      page([summary({ eventId: "$b", timestamp: 4000 })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100,
+    });
+    assert.equal(result.stored, 1, "the new $b is stored after paging past the deduped page");
+    assert.equal(result.exhausted, true);
+    assert.deepEqual(client.calls, [undefined, "tok1"], "advancing token keeps pagination going");
+  });
+});
+
+test("sets the errored flag on a read failure mid-pagination", async () => {
+  await withStores(async (store, storage) => {
+    let call = 0;
+    const failingClient: BackfillReadClient = {
+      readMessages: async (request: MatrixReadMessagesRequest) => {
+        call++;
+        if (call === 1) {
+          return page([summary({ eventId: "$a", timestamp: 5000 })], "tok1");
+        }
+        throw new Error("network down");
+      },
+    };
+    const result = await performInitialBackfill({
+      client: failingClient, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100,
+    });
+    assert.equal(result.errored, true, "a non-timeout read failure must set errored");
+    assert.equal(result.error, "network down");
+    assert.equal(result.timedOut, false, "errored is distinct from a timeout");
+    assert.equal(result.exhausted, false, "errored is distinct from a clean exhaustion");
+    assert.equal(result.stored, 1, "the partial page fetched before the failure is kept");
   });
 });
 
