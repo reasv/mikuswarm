@@ -143,22 +143,41 @@ export class RedecryptionSweeper {
     }
 
     // Keys arrived: replace the placeholder with the decrypted content.
-    const replaced = await this.#options.store.replaceUndecrypted(event.id, (existing) =>
+    const result = await this.#options.store.replaceUndecrypted(event.id, (existing) =>
       decryptedCanonical(existing, summary!),
     );
     this.#backoff.delete(event.id);
 
-    if (replaced && !replaced.undecryptable) {
-      this.#options.notifyEnrichment(replaced.id);
-      if (replaced.attachments && replaced.attachments.length > 0) {
-        this.#options.notifyCaptions();
-      }
-      this.#options.logger?.info("redecryption_replaced", {
+    // Only re-arm enrichment/captions and log a replacement when a real write
+    // happened. A no-op (`replaced === false`) means the row was already
+    // decrypted (the sweeper raced backfill / a message_summary touch) — nudging
+    // again would re-enrich already-handled content and the log would be
+    // misleading.
+    if (!result || !result.replaced) return;
+    const replaced = result.event;
+    if (replaced.undecryptable) return;
+
+    // A thread message stored UTD on the room timeline is re-homed to its thread
+    // timeline once the decrypted relation is known; surface that move.
+    if (replaced.timelineKey !== event.timelineKey) {
+      this.#options.logger?.info("redecryption_rehomed_to_thread", {
         eventId: replaced.id,
         externalId: replaced.externalId,
-        hasMedia: (replaced.attachments?.length ?? 0) > 0,
+        fromTimelineKey: event.timelineKey,
+        toTimelineKey: replaced.timelineKey,
+        threadId: replaced.threadId,
       });
     }
+
+    this.#options.notifyEnrichment(replaced.id);
+    if (replaced.attachments && replaced.attachments.length > 0) {
+      this.#options.notifyCaptions();
+    }
+    this.#options.logger?.info("redecryption_replaced", {
+      eventId: replaced.id,
+      externalId: replaced.externalId,
+      hasMedia: (replaced.attachments?.length ?? 0) > 0,
+    });
   }
 
   #recordFailure(eventId: string): void {
@@ -189,8 +208,44 @@ export function decryptedCanonical(
   if (summary.senderName && !next.sender.displayName) {
     next.sender = { ...next.sender, displayName: summary.senderName };
   }
+
+  // The relation was encrypted at store time, so a stored UTD always landed on
+  // the room timeline with `replyTo`/`threadId` unset. Now that the event is
+  // decrypted, `summary.relatesTo` reveals its true placement. Mirror
+  // `summaryToCanonical` in the backfill path so live and backfilled rows agree.
+  const relType = summary.relatesTo?.relType ?? undefined;
+  const relEventId = summary.relatesTo?.eventId ?? undefined;
+  if (relType === "m.thread" && relEventId) {
+    // A thread message belongs on the thread timeline, not the room timeline.
+    // Re-home it: set the thread root and recompute the timeline key. The
+    // canonical id (dedup key) is unchanged — only the placement moves.
+    next.threadId = relEventId;
+    const threadKey = threadTimelineKeyFrom(existing.timelineKey, relEventId);
+    if (threadKey) next.timelineKey = threadKey;
+  } else if (relType == null && relEventId) {
+    // A bare in-reply-to (no rel_type) is a reply; record it so enrichment can
+    // resolve the quoted context. `m.replace` (edits) and any other relation are
+    // intentionally left unset — the original event carries the content, and a
+    // UTD that turns out to be an edit should not masquerade as a normal message.
+    next.replyTo = { externalId: relEventId };
+  }
+
   delete next.undecryptable;
   return next;
+}
+
+/**
+ * Build the thread timeline key for a re-homed re-decrypted event from the
+ * room/DM timeline key it was stored under. Reuses the existing key scheme
+ * (`matrix:<account>:(room|dm):<roomId>[:thread:<root>]`); the account segment is
+ * `[^:]+` and the room id may contain colons. Returns undefined if the source
+ * key isn't a recognizable room/DM key or already carries a thread suffix.
+ */
+function threadTimelineKeyFrom(timelineKey: string, threadRoot: string): string | undefined {
+  const match = timelineKey.match(/^(matrix:[^:]+:(?:room|dm):.+?)(?::thread:.+)?$/);
+  const base = match?.[1];
+  if (!base) return undefined;
+  return `${base}:thread:${threadRoot}`;
 }
 
 /**

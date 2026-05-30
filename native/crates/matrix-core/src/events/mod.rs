@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use matrix_sdk::{
-    deserialized_responses::TimelineEvent,
+    deserialized_responses::{TimelineEvent, TimelineEventKind, UnableToDecryptReason},
     ruma::events::{
         room::message::{
             FormattedBody, MessageType, OriginalSyncRoomMessageEvent, Relation,
@@ -330,7 +330,7 @@ mod tests {
             raw,
             UnableToDecryptInfo {
                 session_id: Some("session-abc".to_string()),
-                reason: UnableToDecryptReason::Unknown,
+                reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
             },
         );
         let summary = summarize_timeline_event(&event).expect("utd summary surfaced");
@@ -340,6 +340,8 @@ mod tests {
         assert!(summary.body.is_empty());
         assert_eq!(summary.undecryptable, Some(true));
         assert_eq!(summary.session_id.as_deref(), Some("session-abc"));
+        // The structured UTD reason is mapped to a stable lowercase code.
+        assert_eq!(summary.utd_reason.as_deref(), Some("missing_megolm_session"));
         assert!(summary.media.is_empty());
         // The placeholder must never carry plaintext or ciphertext material.
         let serialized = serde_json::to_string(&summary).expect("serialize summary");
@@ -361,6 +363,7 @@ mod tests {
         assert_eq!(summary.body, "hello world");
         assert_eq!(summary.undecryptable, None);
         assert_eq!(summary.session_id, None);
+        assert_eq!(summary.utd_reason, None);
     }
 
     #[test]
@@ -590,6 +593,7 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
         // A decrypted m.room.message is never UTD.
         undecryptable: None,
         session_id: None,
+        utd_reason: None,
     })
 }
 
@@ -620,7 +624,35 @@ fn summarize_utd_event(event: &TimelineEvent) -> Option<MatrixMessageSummary> {
         media: Vec::new(),
         undecryptable: Some(true),
         session_id: event.kind.session_id().map(str::to_owned),
+        utd_reason: utd_reason_code(&event.kind),
     })
+}
+
+/// Map the SDK's `UnableToDecryptReason` to a stable lowercase string for
+/// diagnostics. `None` for non-UTD kinds. The set of codes is part of the
+/// native↔TS contract; keep it in sync with `MatrixMessageSummary.utdReason`
+/// consumers on the TS side. `Unknown` (the SDK's deserialization fallback for
+/// old records) maps to `"unknown"`.
+fn utd_reason_code(kind: &TimelineEventKind) -> Option<String> {
+    let TimelineEventKind::UnableToDecrypt { utd_info, .. } = kind else {
+        return None;
+    };
+    let code = match &utd_info.reason {
+        UnableToDecryptReason::MalformedEncryptedEvent => "malformed_encrypted_event",
+        UnableToDecryptReason::MissingMegolmSession { .. } => "missing_megolm_session",
+        UnableToDecryptReason::UnknownMegolmMessageIndex => "unknown_megolm_message_index",
+        UnableToDecryptReason::MegolmDecryptionFailure => "megolm_decryption_failure",
+        UnableToDecryptReason::PayloadDeserializationFailure => "payload_deserialization_failure",
+        UnableToDecryptReason::MismatchedIdentityKeys => "mismatched_identity_keys",
+        UnableToDecryptReason::SenderIdentityNotTrusted(_) => "sender_identity_not_trusted",
+        UnableToDecryptReason::Unknown => "unknown",
+        // `UnableToDecryptReason` is not `#[non_exhaustive]` and its only other
+        // variant (`StateKeyVerificationFailed`) is behind a matrix-sdk feature we
+        // don't enable, so this match is exhaustive. A future SDK variant will
+        // break the build here rather than be silently mislabeled — surface it
+        // explicitly when that happens.
+    };
+    Some(code.to_string())
 }
 
 pub fn summarize_timeline_event(event: &TimelineEvent) -> Option<MatrixMessageSummary> {
@@ -720,6 +752,7 @@ pub async fn normalize_inbound_event(
         // decrypted events, so the live normalized path is never UTD.
         undecryptable: None,
         session_id: None,
+        utd_reason: None,
     })
 }
 
@@ -779,5 +812,11 @@ pub async fn normalize_utd_inbound_event(
         media: Vec::new(),
         undecryptable: Some(true),
         session_id,
+        // The live UTD handler receives only the raw `m.room.encrypted` envelope,
+        // not the SDK's structured `UnableToDecryptInfo`, so no reason code is
+        // available here. The re-decryption sweeper's summary path
+        // (`summarize_utd_event`) supplies a `utd_reason` when it later re-fetches
+        // the event through `room.messages()`.
+        utd_reason: None,
     })
 }

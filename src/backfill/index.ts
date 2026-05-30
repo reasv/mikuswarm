@@ -284,7 +284,7 @@ function summaryToCanonical(
     threadId: ctx.threadRootId,
     replyTo,
     undecryptable: summary.undecryptable
-      ? { sessionId: summary.sessionId }
+      ? { sessionId: summary.sessionId, reason: summary.utdReason }
       : undefined,
   };
 }

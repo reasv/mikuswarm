@@ -188,6 +188,12 @@ pub struct MatrixInboundEvent {
     /// never used to display content.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Stable lowercase code for *why* decryption failed, when known (e.g.
+    /// `missing_megolm_session`, `unknown_megolm_message_index`). Diagnostic
+    /// only. `None` on the live path, where the raw event handler has no
+    /// structured UTD info.
+    #[serde(default)]
+    pub utd_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +229,12 @@ pub struct MatrixMessageSummary {
     /// The megolm session id whose key is missing, when known. Diagnostic only.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Stable lowercase code for *why* decryption failed, when known, mapped
+    /// from the SDK `UnableToDecryptReason` (e.g. `missing_megolm_session`,
+    /// `unknown_megolm_message_index`, `malformed_encrypted_event`). Diagnostic
+    /// only; the body/media stay empty regardless.
+    #[serde(default)]
+    pub utd_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

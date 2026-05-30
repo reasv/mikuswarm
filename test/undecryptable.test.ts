@@ -92,8 +92,9 @@ test("replaceUndecrypted flips body/event_json and sets enrichment_status=pendin
     }));
 
     assert.ok(replaced);
-    assert.equal(replaced?.body, "now decrypted");
-    assert.equal(replaced?.undecryptable, undefined);
+    assert.equal(replaced?.replaced, true, "a real write is reported");
+    assert.equal(replaced?.event.body, "now decrypted");
+    assert.equal(replaced?.event.undecryptable, undefined);
     assert.equal(status(storage, event.id), "pending", "decrypted content must re-enrich");
 
     const reloaded = store.getById(event.id);
@@ -120,7 +121,8 @@ test("replaceUndecrypted is a no-op once the row is no longer UTD", async () => 
     const event = utdEvent({ undecryptable: undefined, body: "already plain" });
     await store.appendIfMissing(event, "pending");
     const result = await store.replaceUndecrypted(event.id, (e) => ({ ...e, body: "should not apply" }));
-    assert.equal(result?.body, "already plain", "non-UTD rows are left untouched");
+    assert.equal(result?.replaced, false, "no-op is reported as not replaced");
+    assert.equal(result?.event.body, "already plain", "non-UTD rows are left untouched");
   });
 });
 
@@ -148,6 +150,141 @@ test("decryptedCanonical clears the flag and populates body + attachments", () =
   assert.equal(next.attachments?.length, 1);
   assert.equal(next.attachments?.[0]!.filename, "cat.png");
   assert.equal(next.id, existing.id, "identity is preserved");
+});
+
+// ── #3: re-decrypted reply linkage + thread re-homing ─────────────────────
+
+test("decryptedCanonical records a bare in-reply-to as replyTo", () => {
+  const existing = utdEvent();
+  const summary: MatrixMessageSummary = {
+    eventId: "$utd",
+    sender: "@alice:example.org",
+    body: "decrypted reply",
+    timestamp: new Date(existing.timestamp).toISOString(),
+    relatesTo: { eventId: "$parent:example.org" }, // no relType → bare in-reply-to
+  };
+  const next = decryptedCanonical(existing, summary);
+  assert.deepEqual(next.replyTo, { externalId: "$parent:example.org" });
+  assert.equal(next.threadId, undefined, "a reply is not a thread message");
+  assert.equal(next.timelineKey, existing.timelineKey, "reply stays on the room timeline");
+});
+
+test("decryptedCanonical re-homes an m.thread message to the thread timeline", () => {
+  const existing = utdEvent();
+  const summary: MatrixMessageSummary = {
+    eventId: "$utd",
+    sender: "@alice:example.org",
+    body: "decrypted thread message",
+    timestamp: new Date(existing.timestamp).toISOString(),
+    relatesTo: { relType: "m.thread", eventId: "$root:example.org" },
+  };
+  const next = decryptedCanonical(existing, summary);
+  assert.equal(next.threadId, "$root:example.org");
+  assert.equal(next.timelineKey, `${ROOM_TK}:thread:$root:example.org`);
+  assert.equal(next.id, existing.id, "dedup id is unchanged — only placement moves");
+});
+
+test("decryptedCanonical ignores an m.replace (edit) relation", () => {
+  const existing = utdEvent();
+  const summary: MatrixMessageSummary = {
+    eventId: "$utd",
+    sender: "@alice:example.org",
+    body: "decrypted edit body",
+    timestamp: new Date(existing.timestamp).toISOString(),
+    relatesTo: { relType: "m.replace", eventId: "$original:example.org" },
+  };
+  const next = decryptedCanonical(existing, summary);
+  assert.equal(next.replyTo, undefined, "an edit must not masquerade as a reply");
+  assert.equal(next.threadId, undefined);
+  assert.equal(next.timelineKey, existing.timelineKey);
+});
+
+test("replaceUndecrypted re-homes the stored row to the thread timeline_key", async () => {
+  await withStores(async (store, storage) => {
+    const event = utdEvent();
+    await store.appendIfMissing(event, "skipped");
+
+    const result = await store.replaceUndecrypted(event.id, (existing) =>
+      decryptedCanonical(existing, {
+        eventId: "$utd",
+        sender: "@alice:example.org",
+        body: "thread msg",
+        timestamp: new Date(existing.timestamp).toISOString(),
+        relatesTo: { relType: "m.thread", eventId: "$root:example.org" },
+      }),
+    );
+
+    assert.equal(result?.replaced, true);
+    const threadKey = `${ROOM_TK}:thread:$root:example.org`;
+    assert.equal(result?.event.timelineKey, threadKey);
+
+    // The persisted row's timeline_key column is re-homed, matched by id.
+    const persistedKey = storage.read(
+      (db) =>
+        (db.prepare("select timeline_key from timeline_events where id = ?").get(event.id) as {
+          timeline_key: string;
+        }).timeline_key,
+    );
+    assert.equal(persistedKey, threadKey, "the row moves to the thread timeline");
+
+    const reloaded = store.getById(event.id);
+    assert.equal(reloaded?.timelineKey, threadKey);
+    assert.equal(reloaded?.threadId, "$root:example.org");
+    assert.equal(reloaded?.undecryptable, undefined);
+  });
+});
+
+// ── #7: no-op race must not re-arm enrichment or log a replacement ─────────
+
+test("sweeper does not re-arm enrichment or captions when the replace is a no-op", async () => {
+  await withStores(async (store, storage) => {
+    const event = utdEvent();
+    await store.appendIfMissing(event, "skipped");
+
+    // Simulate the backfill race: the row is still UTD when the sweeper reads it
+    // via getUndecrypted, but a concurrent path decrypts it before the sweeper's
+    // own replaceUndecrypted write lands. Wrap the store so its replaceUndecrypted
+    // wins the race (decrypts the row) right before the sweeper's call no-ops.
+    const racingStore = {
+      getUndecrypted: (limit?: number) => store.getUndecrypted(limit),
+      replaceUndecrypted: async (
+        id: string,
+        updater: (e: CanonicalChatEvent) => CanonicalChatEvent,
+      ) => {
+        // Win the race: another writer already decrypted the row.
+        await store.replaceUndecrypted(id, (existing) => ({
+          ...existing,
+          body: "decrypted by the racing writer",
+          undecryptable: undefined,
+        }));
+        // Now the sweeper's own call must observe a non-UTD row and no-op.
+        return store.replaceUndecrypted(id, updater);
+      },
+    } as unknown as TimelineStore;
+
+    const sweeper = new RedecryptionSweeper({
+      store: racingStore,
+      retry: async () => ({
+        eventId: "$utd",
+        sender: "@alice:example.org",
+        body: "decrypted now",
+        timestamp: new Date(event.timestamp).toISOString(),
+      }),
+      notifyEnrichment: () => assert.fail("must not re-arm enrichment on a no-op replace"),
+      notifyCaptions: () => assert.fail("must not nudge captions on a no-op replace"),
+      intervalMs: 1000,
+      batchSize: 10,
+      isDraining: () => false,
+    });
+
+    await sweeper.tick();
+
+    // The row settled to the racing writer's content; the sweeper added nothing.
+    const reloaded = store.getById(event.id);
+    assert.equal(reloaded?.body, "decrypted by the racing writer");
+    assert.equal(reloaded?.undecryptable, undefined);
+    assert.equal(status(storage, event.id), "pending");
+  });
 });
 
 // ── Sweeper: UTD row → retry returns decrypted → replaced, status pending ──

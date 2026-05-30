@@ -80,7 +80,7 @@ export function normalizeMatrixInboundEvent(
     threadId: event.threadRootId,
     trigger,
     undecryptable: event.undecryptable
-      ? { sessionId: event.sessionId }
+      ? { sessionId: event.sessionId, reason: event.utdReason }
       : undefined,
   };
 

@@ -169,12 +169,16 @@ export class TimelineStore {
   /**
    * Replace a stored UTD event with its now-decrypted form: `updater` rebuilds
    * the canonical with `undecryptable` cleared and the real body/attachments, and
-   * the row's `enrichment_status` flips to 'pending'. Matched by event id.
+   * the row's `enrichment_status` flips to 'pending'. Matched by event id. The
+   * decrypted relation may re-home the row to a thread timeline (see
+   * {@link Storage.replaceUndecryptedEvent}). Returns `{ event, replaced }` —
+   * `replaced` is `false` on the already-decrypted no-op — or `undefined` when no
+   * row matches.
    */
   replaceUndecrypted(
     eventId: string,
     updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
-  ): Promise<CanonicalChatEvent | undefined> {
+  ): Promise<{ event: CanonicalChatEvent; replaced: boolean } | undefined> {
     return this.storage.replaceUndecryptedEvent(eventId, updater);
   }
 

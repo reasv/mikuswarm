@@ -610,21 +610,30 @@ export class Storage {
    * Replace a stored UTD event with its decrypted form. Rebuilds body/event_json
    * from `updater` (which must clear `undecryptable` and set the real
    * body/attachments), flips `enrichment_status` to 'pending' so the now-real
-   * content enriches/captions, and bumps `updated_at`. Matched by event id. The
-   * write is a no-op (returns the existing row) if the row is no longer UTD —
-   * the sweeper races with backfill/message_summary touches.
+   * content enriches/captions, and bumps `updated_at`. Matched by event id.
+   *
+   * The decrypted relation can move the event off the room timeline (a thread
+   * message stored UTD has its `m.thread` relation encrypted at store time): the
+   * `updater` may return a different `timelineKey`/`threadId`, which is persisted
+   * here — the row is re-homed. The canonical id (dedup key) is never changed.
+   *
+   * Returns `{ event, replaced }`. `replaced` is `false` when the row was already
+   * non-UTD (the sweeper races backfill/message_summary touches): nothing is
+   * written and the existing row is returned so the caller can skip re-arming
+   * enrichment and the misleading "replaced" log. Returns `undefined` only when
+   * no row exists for the id.
    */
   replaceUndecryptedEvent(
     eventId: string,
     updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
-  ): Promise<CanonicalChatEvent | undefined> {
+  ): Promise<{ event: CanonicalChatEvent; replaced: boolean } | undefined> {
     return this.write((db) => {
       const row = db
         .prepare(`select event_json from timeline_events where id = ?`)
         .get(eventId) as { event_json: string } | undefined;
       if (!row) return undefined;
       const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
-      if (!existing.undecryptable) return existing; // already replaced; no-op
+      if (!existing.undecryptable) return { event: existing, replaced: false }; // already replaced; no-op
       const updated = updater(existing);
       db.prepare(
         `update timeline_events
@@ -657,7 +666,7 @@ export class Storage {
         eventJson: JSON.stringify(updated),
         updatedAt: Date.now(),
       });
-      return updated;
+      return { event: updated, replaced: true };
     });
   }
 

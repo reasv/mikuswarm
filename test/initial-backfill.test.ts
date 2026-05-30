@@ -34,12 +34,20 @@ function summary(overrides: Partial<MatrixMessageSummary> & { eventId: string; t
     media: overrides.media,
     undecryptable: overrides.undecryptable,
     sessionId: overrides.sessionId,
+    utdReason: overrides.utdReason,
   };
 }
 
 /** A UTD summary as the native layer surfaces it: empty body, undecryptable flag. */
 function utdSummary(eventId: string, timestamp: number): MatrixMessageSummary {
-  return summary({ eventId, timestamp, body: "", undecryptable: true, sessionId: "s" });
+  return summary({
+    eventId,
+    timestamp,
+    body: "",
+    undecryptable: true,
+    sessionId: "s",
+    utdReason: "missing_megolm_session",
+  });
 }
 
 /** A scripted client that returns canned pages and records the `before` token of each call. */
@@ -394,7 +402,7 @@ test("UTD summaries are stored as placeholders with the undecryptable flag and s
     assert.equal(result.stored, 2, "both the UTD placeholder and the normal message are stored");
     const utd = store.getById(`matrix:${ACCOUNT}:$utd`);
     assert.ok(utd, "UTD event is stored, not dropped");
-    assert.deepEqual(utd?.undecryptable, { sessionId: "s" });
+    assert.deepEqual(utd?.undecryptable, { sessionId: "s", reason: "missing_megolm_session" });
     assert.equal(utd?.body, "", "no plaintext leaks into the stored body");
     const status = storage.read((db) =>
       (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$utd`) as { enrichment_status: string }).enrichment_status,

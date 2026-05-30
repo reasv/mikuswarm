@@ -165,6 +165,12 @@ export type MatrixInboundEvent = {
   undecryptable?: boolean;
   /** Megolm session id whose key is missing, when known. Diagnostic only. */
   sessionId?: string;
+  /**
+   * Stable lowercase code for *why* decryption failed, when known (mapped from
+   * the SDK `UnableToDecryptReason`). Always absent on the live path. Diagnostic
+   * only.
+   */
+  utdReason?: string;
 };
 
 export type MatrixMessageRelatesTo = {
@@ -194,6 +200,13 @@ export type MatrixMessageSummary = {
   undecryptable?: boolean;
   /** Megolm session id whose key is missing, when known. Diagnostic only. */
   sessionId?: string;
+  /**
+   * Stable lowercase code for *why* decryption failed, when known, mapped from
+   * the SDK `UnableToDecryptReason` (e.g. `missing_megolm_session`,
+   * `unknown_megolm_message_index`, `malformed_encrypted_event`). Diagnostic
+   * only.
+   */
+  utdReason?: string;
 };
 
 export type MatrixMessageSummaryRequest = {

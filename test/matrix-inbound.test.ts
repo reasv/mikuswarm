@@ -44,6 +44,7 @@ test("UTD inbound events propagate undecryptable and never attach a trigger", ()
     media: [],
     undecryptable: true,
     sessionId: "session-xyz",
+    utdReason: "missing_megolm_session",
   };
 
   const inbound = normalizeMatrixInboundEvent(utdDm, {
@@ -51,7 +52,10 @@ test("UTD inbound events propagate undecryptable and never attach a trigger", ()
     selfUserId: "@miku:example.org",
   });
 
-  assert.deepEqual(inbound.event.undecryptable, { sessionId: "session-xyz" });
+  assert.deepEqual(inbound.event.undecryptable, {
+    sessionId: "session-xyz",
+    reason: "missing_megolm_session",
+  });
   assert.equal(inbound.event.body, "", "no plaintext on a UTD event");
   assert.equal(inbound.trigger, undefined, "UTD must not trigger (even in a DM)");
   assert.equal(inbound.event.trigger, undefined);
