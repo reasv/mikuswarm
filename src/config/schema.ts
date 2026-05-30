@@ -37,6 +37,9 @@ const TimelineSchema = Type.Object({
   initial_backfill_window_ms: Type.Optional(Type.Number({ minimum: 0 })),
   // Timeout for the initial backfill fetch (ms). The first trigger is held this long.
   initial_backfill_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Messages per backward-pagination page request during initial backfill.
+  // Clamped 1–1000 by the backfill loop; defaults to 100.
+  initial_backfill_page_size: Type.Optional(Type.Number({ minimum: 1, maximum: 1000 })),
   // Stop backfill paging after this many consecutive undecryptable (UTD) events
   // (no useful forward progress into key-less history). 0 disables the guard.
   initial_backfill_utd_halt_threshold: Type.Optional(Type.Number({ minimum: 0 })),
@@ -46,7 +49,7 @@ const TimelineSchema = Type.Object({
   // Max UTD events probed per sweep tick (bounds native calls per interval).
   redecryption_sweep_batch: Type.Optional(Type.Number({ minimum: 1 })),
   // Prune events from inactive timelines older than this (days). 0 = no pruning.
-  // Reserved for the deferred retention job (spec Phase 8); not yet enforced.
+  // Drives the Phase 8 retention cleanup job (runs on startup + daily).
   inactive_event_retention_days: Type.Optional(Type.Number({ minimum: 0 })),
 });
 

@@ -53,9 +53,11 @@ function utdSummary(eventId: string, timestamp: number): MatrixMessageSummary {
 /** A scripted client that returns canned pages and records the `before` token of each call. */
 class ScriptedClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
+  readonly limits: Array<number | undefined> = [];
   constructor(private readonly pages: MatrixReadMessagesResult[]) {}
   async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
     this.calls.push(request.before);
+    this.limits.push(request.limit);
     return this.pages[this.calls.length - 1] ?? { messages: [], nextBatch: null, prevBatch: null };
   }
 }
@@ -108,6 +110,25 @@ test("stores messages with canonical IDs and stops on exhaustion (no nextBatch)"
       (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$a`) as { enrichment_status: string }).enrichment_status,
     );
     assert.equal(status, "pending", "backfilled events are stored pending so they enrich");
+  });
+});
+
+test("pageSize is passed through (clamped 1–1000) as the readMessages limit; defaults to 100", async () => {
+  await withStores(async (store, storage) => {
+    // Explicit pageSize flows through verbatim.
+    const c1 = new ScriptedClient([page([summary({ eventId: "$a", timestamp: 1000 })], null)]);
+    await performInitialBackfill({ client: c1, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100, pageSize: 250 });
+    assert.equal(c1.limits[0], 250, "explicit pageSize should be used as the read limit");
+
+    // Omitted pageSize defaults to 100.
+    const c2 = new ScriptedClient([page([summary({ eventId: "$b", timestamp: 1000 })], null)]);
+    await performInitialBackfill({ client: c2, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    assert.equal(c2.limits[0], 100, "omitted pageSize should default to 100");
+
+    // Out-of-range pageSize is clamped to the 1–1000 bounds.
+    const c3 = new ScriptedClient([page([summary({ eventId: "$c", timestamp: 1000 })], null)]);
+    await performInitialBackfill({ client: c3, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100, pageSize: 9999 });
+    assert.equal(c3.limits[0], 1000, "pageSize should be clamped to the 1000 ceiling");
   });
 });
 

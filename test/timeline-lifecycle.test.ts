@@ -226,10 +226,67 @@ test("re-opening an existing database is idempotent (stays v1, preserves data)",
   }
 });
 
-function userEvent(overrides: { id: string; body: string; timestamp: number }): CanonicalChatEvent {
+const INACTIVE_TK = "matrix:miku:room:!inactive";
+const ACTIVE_TK = "matrix:miku:room:!active";
+const ACTIVATING_TK = "matrix:miku:room:!activating";
+const NEVER_TK = "matrix:miku:room:!never"; // never-engaged: no compaction-state row
+
+function eventIds(storage: Storage): Set<string> {
+  return new Set(
+    (storage.read((db) =>
+      db.prepare("select id from timeline_events").all() as Array<{ id: string }>,
+    )).map((r) => r.id),
+  );
+}
+
+test("pruneInactiveTimelineEvents deletes only old events from inactive timelines", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setTimelineState(INACTIVE_TK, "inactive");
+    await storage.setTimelineState(ACTIVE_TK, "active");
+    await storage.setTimelineState(ACTIVATING_TK, "activating");
+
+    // Old events (timestamp 1000) across every state, plus a never-engaged room.
+    await storage.appendTimelineEvent(userEvent({ id: "old-inactive", body: "x", timestamp: 1_000, timelineKey: INACTIVE_TK }), "inactive");
+    await storage.appendTimelineEvent(userEvent({ id: "old-never", body: "x", timestamp: 1_000, timelineKey: NEVER_TK }), "inactive");
+    await storage.appendTimelineEvent(userEvent({ id: "old-active", body: "x", timestamp: 1_000, timelineKey: ACTIVE_TK }), "pending");
+    await storage.appendTimelineEvent(userEvent({ id: "old-activating", body: "x", timestamp: 1_000, timelineKey: ACTIVATING_TK }), "pending");
+    // A recent event on the inactive timeline (after the cutoff) must survive.
+    await storage.appendTimelineEvent(userEvent({ id: "recent-inactive", body: "x", timestamp: 9_000, timelineKey: INACTIVE_TK }), "inactive");
+
+    const pruned = await storage.pruneInactiveTimelineEvents(5_000);
+    assert.equal(pruned, 2, "only the two old inactive/never-engaged events should be pruned");
+
+    const remaining = eventIds(storage);
+    assert.ok(!remaining.has("old-inactive"), "old inactive event pruned");
+    assert.ok(!remaining.has("old-never"), "old never-engaged (no row) event pruned");
+    assert.ok(remaining.has("old-active"), "active-timeline events are never pruned");
+    assert.ok(remaining.has("old-activating"), "activating-timeline events are never pruned");
+    assert.ok(remaining.has("recent-inactive"), "recent inactive events (after cutoff) survive");
+  } finally {
+    storage.close();
+  }
+});
+
+test("pruneInactiveTimelineEvents is a no-op when nothing is old enough", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setTimelineState(INACTIVE_TK, "inactive");
+    await storage.appendTimelineEvent(userEvent({ id: "e1", body: "x", timestamp: 9_000, timelineKey: INACTIVE_TK }), "inactive");
+    // Cutoff older than every stored event → nothing deleted (mirrors the
+    // retention=0 gate, which the app enforces by not calling this at all).
+    const pruned = await storage.pruneInactiveTimelineEvents(1_000);
+    assert.equal(pruned, 0);
+    assert.ok(eventIds(storage).has("e1"));
+  } finally {
+    storage.close();
+  }
+});
+
+function userEvent(overrides: { id: string; body: string; timestamp: number; timelineKey?: string }): CanonicalChatEvent {
   return {
     id: overrides.id,
-    timelineKey: TK,
+    timelineKey: overrides.timelineKey ?? TK,
     provider: "matrix",
     role: "user",
     sender: { id: "@alice:example.org", displayName: "Alice" },

@@ -349,6 +349,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // event's timestamp (falls back to now inside performInitialBackfill).
         anchorTimestamp: inbound.event.timestamp,
         timeoutMs: config.timeline?.initial_backfill_timeout_ms ?? 30_000,
+        pageSize: config.timeline?.initial_backfill_page_size ?? 100,
         utdHaltThreshold: config.timeline?.initial_backfill_utd_halt_threshold ?? 50,
         logger,
       });
@@ -706,6 +707,29 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger: logger.child("redecryption"),
   });
 
+  // Inactive-event retention cleanup (spec §3, Phase 8). When
+  // `inactive_event_retention_days > 0`, periodically delete events from inactive
+  // timelines older than the retention window so never-activated rooms don't grow
+  // unbounded. Runs once on startup and then daily; gated on the knob being > 0.
+  const retentionDays = config.timeline?.inactive_event_retention_days ?? 0;
+  const RETENTION_SWEEP_INTERVAL_MS = 86_400_000; // daily (spec §3)
+  let retentionTimer: ReturnType<typeof setInterval> | undefined;
+
+  async function runInactiveRetention(): Promise<void> {
+    if (draining || retentionDays <= 0) return;
+    const cutoff = Date.now() - retentionDays * 86_400_000;
+    try {
+      const pruned = await storage.pruneInactiveTimelineEvents(cutoff);
+      if (pruned > 0) {
+        logger.info("inactive_retention_pruned", { pruned, retentionDays, cutoff });
+      }
+    } catch (error) {
+      logger.error("inactive_retention_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   // Recover timelines stranded mid-activation by a prior crash before the
   // provider begins delivering inbound events.
   const resetActivations = await storage.resetStaleActivations();
@@ -727,11 +751,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (summarizationPool) await summarizationPool.start();
   redecryptionSweeper.start();
 
+  if (retentionDays > 0) {
+    void runInactiveRetention();
+    retentionTimer = setInterval(() => {
+      void runInactiveRetention();
+    }, RETENTION_SWEEP_INTERVAL_MS);
+    // Don't keep the process alive solely for the retention sweep.
+    retentionTimer.unref?.();
+  }
+
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        if (retentionTimer) clearInterval(retentionTimer);
         await redecryptionSweeper.stop();
         await provider.stop();
         triggerCoordinator.clear();

@@ -523,6 +523,35 @@ export class Storage {
     });
   }
 
+  /**
+   * Prune events that belong to *inactive* timelines and are older than
+   * `olderThanMs` (a millisecond cutoff: rows with `timestamp < olderThanMs` are
+   * deleted). Implements the Phase 8 retention job (spec §3,§13).
+   *
+   * A timeline is "inactive" when it has no `timeline_compaction_state` row (a
+   * never-engaged channel — see `getTimelineState` semantics) OR its row's
+   * `timeline_state = 'inactive'`. Events belonging to timelines in any non-
+   * inactive state (`activating`/`active`/`backfilling`) are NEVER pruned — only
+   * those whose `timeline_key` is absent from the set of non-inactive rows.
+   *
+   * Returns the number of rows deleted. Runs through the single-writer queue.
+   */
+  pruneInactiveTimelineEvents(olderThanMs: number): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `delete from timeline_events
+           where timestamp < ?
+             and timeline_key not in (
+               select timeline_key from timeline_compaction_state
+               where timeline_state != 'inactive'
+             )`,
+        )
+        .run(olderThanMs);
+      return result.changes;
+    });
+  }
+
   /** Earliest stored event timestamp for a timeline, or undefined when empty. */
   getOldestEventTimestamp(timelineKey: string): number | undefined {
     const row = this.read((db) =>
