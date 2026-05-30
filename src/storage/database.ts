@@ -1584,6 +1584,12 @@ export class Storage {
   }
 }
 
+// Canonical schema, version 1. This is the COMPLETE current schema with every
+// constraint baked in from the start — there is no patch-an-old-DB step (this
+// software has never been deployed, so there are no legacy databases to
+// migrate). A fresh database executes this block and is stamped
+// `user_version = 1` by `runMigrations`. Any future schema change adds an
+// ordered step to MIGRATIONS (see below) rather than mutating this block.
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -1617,10 +1623,11 @@ create table if not exists timeline_events (
 create index if not exists idx_timeline_events_timeline_time
   on timeline_events(timeline_key, timestamp, received_at, id);
 
--- NOTE: the idx_timeline_events_undecryptable index is created by runMigrations
--- (alongside the is_undecryptable generated column), NOT here: on a pre-existing
--- legacy table a create-table-if-not-exists is a no-op, so the column may not
--- yet exist when this SCHEMA block runs. The migration owns both.
+-- Partial index over the is_undecryptable generated column so the re-decryption
+-- sweeper finds stored UTD events cheaply (O(matches), no full JSON scan).
+create index if not exists idx_timeline_events_undecryptable
+  on timeline_events(is_undecryptable, timestamp)
+  where is_undecryptable = 1;
 
 create index if not exists idx_timeline_events_external
   on timeline_events(provider, external_id)
@@ -1791,143 +1798,63 @@ create index if not exists idx_summarization_jobs_timeline
   on summarization_jobs(timeline_key, level, status);
 `;
 
+// Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
+// holds the ordered steps that advance an existing database from one version to
+// the next. Bump this (and append a MIGRATIONS entry) whenever the schema
+// changes.
+const LATEST_SCHEMA_VERSION = 1;
+
+// Ordered, additive migration steps keyed by the version they PRODUCE. A step
+// at index `i` migrates a database at `user_version = i` up to `user_version =
+// i + 1`. Each step runs inside the same write transaction as the version bump
+// and must be idempotent-safe to author (it only runs once per database, when
+// crossing its version boundary). There are no v2+ steps yet — version 1 is the
+// canonical SCHEMA above, so this list is empty. To add a future migration:
+//   1. bump LATEST_SCHEMA_VERSION to N,
+//   2. push the step that takes a v(N-1) DB to vN here (index N-2),
+//   3. update SCHEMA so a fresh DB is created directly at vN.
+const MIGRATIONS: Array<(db: Database.Database) => void> = [
+  // index 0: 1 -> 2 (none yet)
+];
+
+// PRAGMA user_version-based migration runner. Runs inside open()'s write
+// callback (single-writer queue), AFTER `writer.exec(SCHEMA)`.
+//
+//   - Fresh DB: SCHEMA already created every table/index, user_version is the
+//     default 0, so we stamp it to LATEST_SCHEMA_VERSION and apply no steps.
+//   - Existing DB at version V < LATEST: apply MIGRATIONS[V], MIGRATIONS[V+1],
+//     ... in order, advancing user_version to LATEST.
+//   - Existing DB already at LATEST: no steps, idempotent no-op.
+//
+// `create table/index if not exists` in SCHEMA makes re-running open() on an
+// up-to-date database harmless.
 function runMigrations(db: Database.Database): void {
-  const columns = db.prepare("pragma table_info(timeline_events)").all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((c) => c.name));
+  const current = Number((db.pragma("user_version", { simple: true }) as number) ?? 0);
 
-  if (!columnNames.has("enrichment_status")) {
-    db.exec(`alter table timeline_events add column enrichment_status text not null default 'skipped'`);
-  }
-  if (!columnNames.has("trigger_group_id")) {
-    db.exec(`alter table timeline_events add column trigger_group_id text`);
-  }
-  if (!columnNames.has("enrichment_retries")) {
-    db.exec(`alter table timeline_events add column enrichment_retries integer not null default 0`);
-  }
-  // Generated column + partial index so the re-decryption sweeper finds stored
-  // UTD events cheaply (no full JSON scan) and they persist across restarts.
-  // NOTE: `pragma table_info` omits generated columns, so detect via
-  // `table_xinfo` (which lists them) to avoid a duplicate-column ALTER on fresh
-  // databases where SCHEMA already created the column.
-  const xColumnNames = new Set(
-    (db.prepare("pragma table_xinfo(timeline_events)").all() as Array<{ name: string }>).map((c) => c.name),
-  );
-  if (!xColumnNames.has("is_undecryptable")) {
-    db.exec(
-      `alter table timeline_events add column is_undecryptable integer
-         generated always as
-         (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual`,
-    );
-  }
-  // Ensure the partial index regardless of whether the column was just added
-  // (fresh DBs get the column from SCHEMA's create-table but no index there).
-  // Idempotent via `if not exists`. The table-rebuild step below also recreates
-  // it; running it here first is harmless and covers the no-rebuild path.
-  db.exec(
-    `create index if not exists idx_timeline_events_undecryptable
-       on timeline_events(is_undecryptable, timestamp)
-       where is_undecryptable = 1`,
-  );
-
-  // Widen the enrichment_status CHECK to allow 'inactive' (channel lifecycle).
-  // SQLite cannot ALTER a CHECK constraint in place and DOES enforce the
-  // CREATE-TABLE check on existing databases, so inserting 'inactive' would be
-  // rejected. Detect via the stored DDL and rebuild the table when the older
-  // constraint is still in effect. Fresh databases already create the table
-  // with 'inactive' in SCHEMA, so this is a no-op for them. Must run AFTER the
-  // column-add steps above so the rebuilt table copies every current column.
-  const teSql =
-    (db.prepare("select sql from sqlite_master where type = 'table' and name = 'timeline_events'").get() as
-      | { sql: string }
-      | undefined)?.sql ?? "";
-  if (!teSql.includes("'inactive'")) {
-    db.pragma("foreign_keys = OFF");
-    try {
-      db.transaction(() => {
-        db.exec(`
-          create table timeline_events_new (
-            id text primary key,
-            external_id text,
-            timeline_key text not null,
-            provider text not null,
-            role text not null check(role in ('user', 'assistant')),
-            sender_id text not null,
-            sender_display_name text,
-            body text not null,
-            timestamp integer not null,
-            received_at integer not null,
-            agent_session_id text,
-            event_json text not null,
-            enrichment_status text not null default 'pending'
-              check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
-            enrichment_retries integer not null default 0,
-            trigger_group_id text,
-            created_at integer not null,
-            updated_at integer not null,
-            is_undecryptable integer generated always as
-              (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
-          );
-          insert into timeline_events_new (
-            id, external_id, timeline_key, provider, role, sender_id,
-            sender_display_name, body, timestamp, received_at, agent_session_id,
-            event_json, enrichment_status, enrichment_retries, trigger_group_id,
-            created_at, updated_at
-          )
-          select
-            id, external_id, timeline_key, provider, role, sender_id,
-            sender_display_name, body, timestamp, received_at, agent_session_id,
-            event_json, enrichment_status, enrichment_retries, trigger_group_id,
-            created_at, updated_at
-          from timeline_events;
-          drop table timeline_events;
-          alter table timeline_events_new rename to timeline_events;
-          create index if not exists idx_timeline_events_timeline_time
-            on timeline_events(timeline_key, timestamp, received_at, id);
-          create index if not exists idx_timeline_events_external
-            on timeline_events(provider, external_id)
-            where external_id is not null;
-          create index if not exists idx_timeline_events_enrichment
-            on timeline_events(enrichment_status, timestamp desc)
-            where enrichment_status in ('pending', 'processing');
-          create index if not exists idx_timeline_events_trigger_group
-            on timeline_events(trigger_group_id)
-            where trigger_group_id is not null;
-          create index if not exists idx_timeline_events_undecryptable
-            on timeline_events(is_undecryptable, timestamp)
-            where is_undecryptable = 1;
-        `);
-      })();
-    } finally {
-      db.pragma("foreign_keys = ON");
+  if (current >= LATEST_SCHEMA_VERSION) {
+    // Already at (or ahead of) the latest version. A fresh DB reports
+    // user_version = 0, so it does NOT enter this block — it advances through
+    // the loop below and gets stamped to LATEST.
+    if (current > LATEST_SCHEMA_VERSION) {
+      throw new Error(
+        `Database schema version ${current} is newer than this build supports (${LATEST_SCHEMA_VERSION}). ` +
+          `Refusing to open to avoid corrupting forward-versioned data.`,
+      );
     }
+    return;
   }
 
-  // Channel lifecycle columns on timeline_compaction_state (discrete columns,
-  // not folded into state_json). Existing rows predate this spec and represent
-  // timelines that were already active under Part 1 (a compaction-state row is
-  // only written once a timeline has been engaged), so migrate them to
-  // 'active' rather than the column default of 'inactive'.
-  const csColumns = db.prepare("pragma table_info(timeline_compaction_state)").all() as Array<{ name: string }>;
-  const csColumnNames = new Set(csColumns.map((c) => c.name));
-  if (!csColumnNames.has("timeline_state")) {
-    db.exec(
-      `alter table timeline_compaction_state add column timeline_state text not null default 'inactive'`,
-    );
-    // Invariant this relies on: no compaction-state row is ever written for an
-    // inactive timeline. Only the summarization pipeline writes compaction
-    // state, and only for engaged/active timelines — so every pre-existing row
-    // belongs to an active timeline and migrates to 'active' (not the column
-    // default 'inactive'). Breaking that invariant (e.g. seeding compaction
-    // state for inactive timelines) requires revisiting this migration.
-    db.exec(`update timeline_compaction_state set timeline_state = 'active'`);
-  }
-  if (!csColumnNames.has("backfill_fence_timestamp")) {
-    db.exec(`alter table timeline_compaction_state add column backfill_fence_timestamp integer`);
-  }
-
-  const maColumns = db.prepare("pragma table_info(media_assets)").all() as Array<{ name: string }>;
-  const maColumnNames = new Set(maColumns.map((c) => c.name));
-  if (!maColumnNames.has("caption_error")) {
-    db.exec(`alter table media_assets add column caption_error text`);
-  }
+  // Apply each ordered step from `current` up to LATEST. For a fresh DB
+  // (current === 0) MIGRATIONS is consulted from index 0, but with no v2+ steps
+  // the loop body that runs a step is only entered for real upgrades; the loop
+  // here simply advances the stamp to LATEST in one transaction.
+  db.transaction(() => {
+    for (let version = current; version < LATEST_SCHEMA_VERSION; version++) {
+      const step = MIGRATIONS[version];
+      if (step) step(db);
+    }
+    // PRAGMA does not accept bound parameters; LATEST_SCHEMA_VERSION is a
+    // compile-time integer constant, so interpolation here is safe.
+    db.pragma(`user_version = ${LATEST_SCHEMA_VERSION}`);
+  })();
 }
