@@ -1,6 +1,6 @@
 import type { Logger } from "../observability/index.js";
 import type { TimelineStore } from "../timeline/index.js";
-import { needsEnrichment } from "../timeline/index.js";
+import { applyEditToCanonical, editStatus, needsEnrichment } from "../timeline/index.js";
 import type { CanonicalChatEvent, TimelineState } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { mediaToAttachment } from "../matrix/inbound.js";
@@ -203,6 +203,18 @@ export class RedecryptionSweeper {
       return;
     }
 
+    // Keys arrived AND the decrypted event is an `m.replace` edit (edits can be
+    // UTD in E2EE rooms). The live path never stores an edit as its own message —
+    // it applies it to the target in place (issue #17) — so do the same here:
+    // apply the replacement to the target message, then retire (delete) this
+    // placeholder row so no standalone duplicate is left behind (mirrors the #9
+    // non-message retirement). If the target isn't stored, we still delete the
+    // placeholder (an edit's `*` fallback is not a renderable standalone message).
+    if (summary.relatesTo?.relType === "m.replace" && summary.relatesTo.eventId) {
+      await this.#applyDecryptedEdit(event, summary, summary.relatesTo.eventId);
+      return;
+    }
+
     // Keys arrived: replace the placeholder with the decrypted content. The
     // post-decrypt enrichment_status is computed from the decrypted event and its
     // timeline's live state (issues #5/#6): inactive timelines store 'inactive'
@@ -253,6 +265,62 @@ export class RedecryptionSweeper {
       externalId: replaced.externalId,
       hasMedia,
       enrichmentStatus: result.status,
+    });
+  }
+
+  /**
+   * Apply a now-decrypted `m.replace` edit (issue #17). The placeholder `event`
+   * was the edit itself, stored UTD; now that it decrypted, route the replacement
+   * to the target message in place (via the same store primitive the live path
+   * uses) and delete the placeholder so no standalone duplicate remains. The
+   * deletion is guarded on `is_undecryptable = 1`, so a row that became a real
+   * message via a concurrent path is never removed.
+   */
+  async #applyDecryptedEdit(
+    event: CanonicalChatEvent,
+    summary: MatrixMessageSummary,
+    targetExternalId: string,
+  ): Promise<void> {
+    const replacement = {
+      body: summary.body,
+      attachments: (summary.media ?? []).map((media) => mediaToAttachment(summary.eventId, media)),
+    };
+    const result = await this.#options.store.applyEdit(
+      event.provider,
+      targetExternalId,
+      (target) => applyEditToCanonical(target, replacement),
+      editStatus,
+    );
+
+    // Retire the placeholder regardless of whether the target was found: the edit
+    // fallback is never a standalone message, so it must not linger as a UTD row.
+    const deleted = await this.#options.store.deleteUndecrypted(event.id);
+    this.#backoff.delete(event.id);
+
+    if (!result.applied) {
+      this.#options.logger?.info("redecryption_edit_target_missing", {
+        eventId: event.id,
+        externalId: event.externalId,
+        targetExternalId,
+        placeholderDeleted: deleted,
+      });
+      return;
+    }
+
+    const hasMedia = (result.event.attachments?.length ?? 0) > 0;
+    if (result.status === "pending") {
+      this.#options.notifyEnrichment(result.event.id);
+    }
+    if (result.status !== "inactive" && hasMedia) {
+      this.#options.notifyCaptions();
+    }
+    this.#options.logger?.info("redecryption_edit_applied", {
+      eventId: event.id,
+      externalId: event.externalId,
+      targetExternalId,
+      enrichmentStatus: result.status,
+      hasMedia,
+      placeholderDeleted: deleted,
     });
   }
 
@@ -382,9 +450,10 @@ export function decryptedCanonical(
     if (threadKey) next.timelineKey = threadKey;
   } else if (relType == null && relEventId) {
     // A bare in-reply-to (no rel_type) is a reply; record it so enrichment can
-    // resolve the quoted context. `m.replace` (edits) and any other relation are
-    // intentionally left unset — the original event carries the content, and a
-    // UTD that turns out to be an edit should not masquerade as a normal message.
+    // resolve the quoted context. `m.replace` (edits) are handled earlier in the
+    // sweeper (#applyDecryptedEdit, issue #17) and never reach this merge, so a
+    // decrypted edit can't masquerade as a normal message here. Any other relation
+    // is intentionally left unset — the original event carries the content.
     next.replyTo = { externalId: relEventId };
   }
 

@@ -4,7 +4,7 @@ use matrix_sdk::{
     ruma::events::{
         room::message::{
             FormattedBody, MessageType, OriginalSyncRoomMessageEvent, Relation,
-            RoomMessageEventContent, SyncRoomMessageEvent,
+            RoomMessageEventContent, RoomMessageEventContentWithoutRelation, SyncRoomMessageEvent,
         },
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
     },
@@ -239,11 +239,20 @@ fn media_items(msgtype: &MessageType) -> Vec<MatrixInboundMedia> {
     }
 }
 
-fn relation_details(content: &RoomMessageEventContent) -> (Option<String>, Option<String>, bool) {
+/// Resolved relation metadata for a decrypted message: `(reply_to_id,
+/// thread_root_id, replaces_event_id)`. `replaces_event_id` is `Some(target)`
+/// for an `m.replace` edit — the id of the event this message edits. Edits are
+/// surfaced (not dropped) so the agent sees the timeline like a normal client;
+/// the live path routes the edit to the store's edit-application primitive.
+fn relation_details(
+    content: &RoomMessageEventContent,
+) -> (Option<String>, Option<String>, Option<String>) {
     match content.relates_to.as_ref() {
-        Some(Relation::Replacement(_)) => (None, None, true),
+        Some(Relation::Replacement(replacement)) => {
+            (None, None, Some(replacement.event_id.to_string()))
+        }
         Some(Relation::Reply { in_reply_to }) => {
-            (Some(in_reply_to.event_id.to_string()), None, false)
+            (Some(in_reply_to.event_id.to_string()), None, None)
         }
         Some(Relation::Thread(thread)) => (
             thread
@@ -251,9 +260,21 @@ fn relation_details(content: &RoomMessageEventContent) -> (Option<String>, Optio
                 .as_ref()
                 .map(|value| value.event_id.to_string()),
             Some(thread.event_id.to_string()),
-            false,
+            None,
         ),
-        Some(Relation::_Custom(_)) | Some(_) | None => (None, None, false),
+        Some(Relation::_Custom(_)) | Some(_) | None => (None, None, None),
+    }
+}
+
+/// The replacement (`m.new_content`) for an `m.replace` edit, if present. Matrix
+/// edits put the post-edit message under `m.new_content`; the top-level `body`
+/// is only the `* fallback` and must NOT be used for display.
+fn replacement_new_content(
+    content: &RoomMessageEventContent,
+) -> Option<&RoomMessageEventContentWithoutRelation> {
+    match content.relates_to.as_ref() {
+        Some(Relation::Replacement(replacement)) => Some(&replacement.new_content),
+        _ => None,
     }
 }
 
@@ -300,11 +321,15 @@ fn readable_body(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{media_from_timeline, readable_body, summarize_timeline_event};
+    use super::{
+        formatted_body, media_from_timeline, media_items, readable_body, relation_details,
+        replacement_new_content, summarize_timeline_event,
+    };
     use crate::api::MatrixMediaKind;
     use matrix_sdk::deserialized_responses::{
         TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
     };
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
     use matrix_sdk::ruma::serde::Raw;
     use serde_json::{json, Value};
@@ -524,6 +549,83 @@ mod tests {
         });
         assert!(media_from_json(event).is_empty());
     }
+
+    fn message_content(content: Value) -> RoomMessageEventContent {
+        serde_json::from_value(content).expect("deserialize message content")
+    }
+
+    #[test]
+    fn edit_relation_surfaces_target_and_new_content() {
+        // A real `m.replace` payload: the top-level body is the `* fallback`, and
+        // the post-edit message lives under `m.new_content`. Normalization must
+        // surface the target id and read the new content (never the fallback).
+        let content = message_content(json!({
+            "msgtype": "m.text",
+            "body": "* edited text",
+            "m.new_content": { "msgtype": "m.text", "body": "edited text" },
+            "m.relates_to": { "rel_type": "m.replace", "event_id": "$target:example.org" },
+        }));
+
+        let (reply_to_id, thread_root_id, replaces_event_id) = relation_details(&content);
+        assert_eq!(reply_to_id, None);
+        assert_eq!(thread_root_id, None);
+        assert_eq!(replaces_event_id.as_deref(), Some("$target:example.org"));
+
+        let new_content = replacement_new_content(&content).expect("new content present");
+        // The replacement body — not the `* fallback` — is what reaches the agent.
+        assert_eq!(new_content.msgtype.body(), "edited text");
+        assert_eq!(formatted_body(&new_content.msgtype), None);
+        assert!(media_items(&new_content.msgtype).is_empty());
+    }
+
+    #[test]
+    fn edit_relation_surfaces_replacement_media() {
+        // An edit can replace the message with media; the descriptor must come
+        // from `m.new_content`, mirroring the live non-edit media path.
+        let content = message_content(json!({
+            "msgtype": "m.text",
+            "body": "* see image",
+            "m.new_content": {
+                "msgtype": "m.image",
+                "body": "cat.png",
+                "filename": "cat.png",
+                "url": "mxc://example.org/abc",
+                "info": { "mimetype": "image/png", "size": 1234 },
+            },
+            "m.relates_to": { "rel_type": "m.replace", "event_id": "$target:example.org" },
+        }));
+
+        let (_, _, replaces_event_id) = relation_details(&content);
+        assert_eq!(replaces_event_id.as_deref(), Some("$target:example.org"));
+        let new_content = replacement_new_content(&content).expect("new content present");
+        let media = media_items(&new_content.msgtype);
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0].kind, MatrixMediaKind::Image));
+        assert_eq!(media[0].filename.as_deref(), Some("cat.png"));
+    }
+
+    #[test]
+    fn non_edit_relations_have_no_replacement() {
+        // A plain reply is not an edit: no replacement target, no new content.
+        let reply = message_content(json!({
+            "msgtype": "m.text",
+            "body": "sure",
+            "m.relates_to": { "m.in_reply_to": { "event_id": "$orig:example.org" } },
+        }));
+        let (reply_to_id, thread_root_id, replaces_event_id) = relation_details(&reply);
+        assert_eq!(reply_to_id.as_deref(), Some("$orig:example.org"));
+        assert_eq!(thread_root_id, None);
+        assert_eq!(replaces_event_id, None);
+        assert!(replacement_new_content(&reply).is_none());
+
+        // A plain message has no relation at all.
+        let plain = message_content(json!({ "msgtype": "m.text", "body": "hi" }));
+        let (reply, thread, replaces) = relation_details(&plain);
+        assert_eq!(reply, None);
+        assert_eq!(thread, None);
+        assert_eq!(replaces, None);
+        assert!(replacement_new_content(&plain).is_none());
+    }
 }
 
 fn summary_relation(value: &Value) -> Option<MatrixMessageRelatesTo> {
@@ -698,10 +800,24 @@ pub async fn normalize_inbound_event(
     room: &Room,
     event: &OriginalSyncRoomMessageEvent,
 ) -> Option<MatrixInboundEvent> {
-    let (reply_to_id, thread_root_id, is_replacement) = relation_details(&event.content);
-    if is_replacement {
-        return None;
-    }
+    let (reply_to_id, thread_root_id, replaces_event_id) = relation_details(&event.content);
+
+    // For an `m.replace` edit, the post-edit message lives under `m.new_content`;
+    // the top-level body is only the `* fallback`. Surface the edit (don't drop
+    // it) with its replacement body/media/msgtype and a `relates_to` carrying the
+    // target id so the TS live path can apply it to the original message. Mentions
+    // come from `new_content` too (ruma copies the mentions into the replacement).
+    let new_content = replacement_new_content(&event.content);
+    let content_msgtype = new_content
+        .map(|content| &content.msgtype)
+        .unwrap_or(&event.content.msgtype);
+    let content_mentions = new_content
+        .map(|content| content.mentions.as_ref())
+        .unwrap_or(event.content.mentions.as_ref());
+    let relates_to = replaces_event_id.map(|event_id| MatrixMessageRelatesTo {
+        rel_type: Some("m.replace".to_string()),
+        event_id: Some(event_id),
+    });
 
     let chat_type = if thread_root_id.is_some() {
         MatrixChatType::Thread
@@ -732,22 +848,19 @@ pub async fn normalize_inbound_event(
         room_name,
         room_alias,
         chat_type,
-        body: event.content.body().to_string(),
-        msgtype: Some(event.content.msgtype.msgtype().to_string()),
-        formatted_body: formatted_body(&event.content.msgtype),
-        mentions: event
-            .content
-            .mentions
-            .as_ref()
-            .map(|mentions| MatrixInboundMentions {
-                user_ids: (!mentions.user_ids.is_empty())
-                    .then(|| mentions.user_ids.iter().map(ToString::to_string).collect()),
-                room: mentions.room.then_some(true),
-            }),
+        body: content_msgtype.body().to_string(),
+        msgtype: Some(content_msgtype.msgtype().to_string()),
+        formatted_body: formatted_body(content_msgtype),
+        mentions: content_mentions.map(|mentions| MatrixInboundMentions {
+            user_ids: (!mentions.user_ids.is_empty())
+                .then(|| mentions.user_ids.iter().map(ToString::to_string).collect()),
+            room: mentions.room.then_some(true),
+        }),
         reply_to_id,
         thread_root_id,
+        relates_to,
         timestamp: timestamp_from_event(event),
-        media: media_items(&event.content.msgtype),
+        media: media_items(content_msgtype),
         // The typed `OriginalSyncRoomMessageEvent` handler only fires for already
         // decrypted events, so the live normalized path is never UTD.
         undecryptable: None,
@@ -808,6 +921,9 @@ pub async fn normalize_utd_inbound_event(
         mentions: None,
         reply_to_id: None,
         thread_root_id: None,
+        // A UTD envelope carries no decrypted relation; if it later decrypts to an
+        // edit, the re-decryption sweeper's summary path surfaces `relates_to`.
+        relates_to: None,
         timestamp,
         media: Vec::new(),
         undecryptable: Some(true),

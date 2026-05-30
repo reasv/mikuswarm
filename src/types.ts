@@ -132,6 +132,14 @@ export interface InboundChatEvent {
   event: CanonicalChatEvent;
   trigger?: TriggerInfo;
   outboundTarget?: OutboundTarget;
+  /**
+   * Set when this inbound event is a message edit (`m.replace`). `event` carries
+   * the replacement body/attachments (from `m.new_content`); `targetExternalId`
+   * is the provider event id of the message being edited. The pipeline applies
+   * the replacement to that target in place instead of appending a new timeline
+   * row, mirroring how a normal client shows an edited message (issue #17).
+   */
+  edit?: { targetExternalId: string };
 }
 
 export interface OutboundTarget {

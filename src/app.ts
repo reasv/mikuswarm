@@ -7,7 +7,9 @@ import { MatrixProvider } from "./matrix/index.js";
 import { Storage } from "./storage/index.js";
 import {
   ActivationCoordinator,
+  applyEditToCanonical,
   AssistantEchoResolver,
+  editStatus,
   needsEnrichment,
   TimelineRouter,
   TimelineStore,
@@ -278,6 +280,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   async function handleInbound(inbound: InboundChatEvent): Promise<void> {
     if (draining) return;
+
+    // An `m.replace` edit is applied to its target message in place (issue #17),
+    // mirroring a normal client — never appended as a standalone row and never a
+    // trigger. The replacement body/attachments live on `inbound.event`. Routed
+    // before echo/activation so it's handled uniformly for any sender and any
+    // timeline state (inactive targets stay 'inactive' via editStatus gating).
+    if (inbound.edit) {
+      await applyEdit(inbound);
+      return;
+    }
+
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
       if (needsEnrichment(inbound.event)) {
@@ -320,6 +333,58 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     await awaitTriggerReadiness(inbound);
     await launchSession(inbound, routed.duplicate);
+  }
+
+  /**
+   * Apply a Matrix edit (`m.replace`) to its target message in place (issue #17).
+   * The replacement body/attachments are carried on `inbound.event`;
+   * `inbound.edit.targetExternalId` identifies the message being edited. We locate
+   * the target by `(provider, externalId)` and update it via the store's
+   * single-writer primitive. If the target isn't stored (edit for a message we
+   * never saw — e.g. pre-join history, or a missed event), we log and skip; the
+   * edit is never inserted as a standalone message. Enrichment/captions are
+   * re-armed only when the recomputed status warrants it and the target's timeline
+   * isn't inactive — mirroring the live append and re-decryption gating.
+   */
+  async function applyEdit(inbound: InboundChatEvent): Promise<void> {
+    const targetExternalId = inbound.edit!.targetExternalId;
+    const replacement = {
+      body: inbound.event.body,
+      attachments: inbound.event.attachments ?? [],
+    };
+    const result = await timeline.applyEdit(
+      inbound.provider,
+      targetExternalId,
+      (target) => applyEditToCanonical(target, replacement),
+      editStatus,
+    );
+
+    if (!result.applied) {
+      logger.info("edit_target_missing", {
+        timelineKey: inbound.timelineKey,
+        targetExternalId,
+        editEventId: inbound.event.externalId,
+      });
+      return;
+    }
+
+    // Re-arm work consistently with the STORED status (inactive timelines defer to
+    // the activation bulk-flip; active timelines nudge enrichment when 'pending'
+    // and captions only when the edited target carries attachments).
+    const hasMedia = (result.event.attachments?.length ?? 0) > 0;
+    if (result.status === "pending") {
+      enrichmentPool.notifyNewEvent(result.event.id);
+    }
+    if (result.status !== "inactive" && hasMedia) {
+      captionPool.notifyNewWork();
+    }
+    logger.info("edit_applied", {
+      timelineKey: result.event.timelineKey,
+      targetExternalId,
+      editEventId: inbound.event.externalId,
+      enrichmentStatus: result.status,
+      hasMedia,
+    });
   }
 
   async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {

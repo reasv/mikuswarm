@@ -204,6 +204,28 @@ export class TimelineStore {
     return this.storage.deleteUndecryptedEvent(eventId);
   }
 
+  /**
+   * Apply a Matrix edit (`m.replace`) to its target message in place (issue #17).
+   * Locates the target by `(provider, externalId)` and lets `updater` merge the
+   * replacement body/attachments onto it (identity/timestamps/sender/role
+   * preserved). `computeStatus` recomputes the target's `enrichment_status` from
+   * the merged event and its timeline's live state, honoring inactive-timeline
+   * gating. Returns `{ applied: true, event, status }`, or `{ applied: false }`
+   * when no target row exists (the caller logs and skips — the edit is never
+   * stored as a standalone message). See {@link Storage.applyEditToTarget}.
+   */
+  applyEdit(
+    provider: string,
+    targetExternalId: string,
+    updater: (target: CanonicalChatEvent) => CanonicalChatEvent,
+    computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
+  ): Promise<
+    | { applied: true; event: CanonicalChatEvent; status: string }
+    | { applied: false }
+  > {
+    return this.storage.applyEditToTarget(provider, targetExternalId, updater, computeStatus);
+  }
+
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
     return this.storage.setTriggerGroup(triggerEventId, eventIds);
   }

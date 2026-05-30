@@ -818,6 +818,73 @@ export class Storage {
     });
   }
 
+  /**
+   * Apply a Matrix edit (`m.replace`) to its target message in place (issue #17),
+   * mirroring what a normal client shows: the original message is updated, not a
+   * new row inserted. The target is located by `(provider, externalId)`; `updater`
+   * rebuilds the canonical with the replacement body/attachments while preserving
+   * identity (id, timelineKey, role, sender, timestamps) — see
+   * {@link applyEditToCanonical}.
+   *
+   * `enrichment_status` is recomputed via `computeStatus(updated, timelineState)`
+   * (the same callback shape as {@link replaceUndecryptedEvent}), evaluated inside
+   * the write transaction against the target row's live `timeline_state` so an
+   * edit landing on an inactive timeline keeps `'inactive'` and never nudges the
+   * pools (issue #6 gating). The chosen status is returned so the caller's notify
+   * decisions match exactly what was stored.
+   *
+   * Returns `{ applied: true, event, status }` on success, or
+   * `{ applied: false }` when no target row exists for `(provider, externalId)` —
+   * the caller logs and skips, never inserting the edit as a standalone message.
+   * Last-write-wins on repeated edits (each call overwrites the body/attachments).
+   */
+  applyEditToTarget(
+    provider: string,
+    targetExternalId: string,
+    updater: (target: CanonicalChatEvent) => CanonicalChatEvent,
+    computeStatus: (updated: CanonicalChatEvent, timelineState: TimelineState) => string,
+  ): Promise<
+    | { applied: true; event: CanonicalChatEvent; status: string }
+    | { applied: false }
+  > {
+    return this.write((db) => {
+      const row = db
+        .prepare(
+          `select id, event_json from timeline_events
+           where provider = ? and external_id = ? limit 1`,
+        )
+        .get(provider, targetExternalId) as
+        | { id: string; event_json: string }
+        | undefined;
+      if (!row) return { applied: false };
+
+      const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
+      const updated = updater(existing);
+      // The edit-application path never re-homes the target: it edits an existing
+      // row by its own timeline. Resolve the target's timeline state for gating.
+      const stateRow = db
+        .prepare(`select timeline_state from timeline_compaction_state where timeline_key = ?`)
+        .get(updated.timelineKey) as { timeline_state: TimelineState } | undefined;
+      const timelineState: TimelineState = stateRow?.timeline_state ?? "inactive";
+      const status = computeStatus(updated, timelineState);
+      db.prepare(
+        `update timeline_events
+         set body = @body,
+             event_json = @eventJson,
+             enrichment_status = @enrichmentStatus,
+             updated_at = @updatedAt
+         where id = @id`,
+      ).run({
+        id: row.id,
+        body: updated.body,
+        eventJson: JSON.stringify(updated),
+        enrichmentStatus: status,
+        updatedAt: Date.now(),
+      });
+      return { applied: true, event: updated, status };
+    });
+  }
+
   claimPendingEnrichment(limit: number): Promise<string[]> {
     return this.write((db) => {
       const rows = db.prepare(

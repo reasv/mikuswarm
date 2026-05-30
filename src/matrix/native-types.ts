@@ -155,6 +155,14 @@ export type MatrixInboundEvent = {
   mentions?: MatrixInboundMentions;
   replyToId?: string;
   threadRootId?: string;
+  /**
+   * Relation metadata for this event. For an `m.replace` edit this is
+   * `{ relType: "m.replace", eventId: <target> }` — the id of the message this
+   * event edits — and `body`/`media` already hold the replacement
+   * (`m.new_content`), not the `*` fallback. Absent for non-relating messages;
+   * reply/thread relations are surfaced via `replyToId`/`threadRootId` instead.
+   */
+  relatesTo?: MatrixMessageRelatesTo;
   timestamp: string;
   media: MatrixInboundMedia[];
   /**

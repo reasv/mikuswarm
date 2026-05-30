@@ -177,6 +177,14 @@ pub struct MatrixInboundEvent {
     pub mentions: Option<MatrixInboundMentions>,
     pub reply_to_id: Option<String>,
     pub thread_root_id: Option<String>,
+    /// Relation metadata for this event. For an `m.replace` edit this carries
+    /// `{ rel_type: "m.replace", event_id: <target> }` — the id of the message
+    /// this event edits — and `body`/`media` already hold the replacement
+    /// (`m.new_content`) rather than the `*` fallback. `None` for non-relating
+    /// messages; reply/thread relations are surfaced via the dedicated
+    /// `reply_to_id`/`thread_root_id` fields instead.
+    #[serde(default)]
+    pub relates_to: Option<MatrixMessageRelatesTo>,
     pub timestamp: DateTime<Utc>,
     pub media: Vec<MatrixInboundMedia>,
     /// `Some(true)` when this event could not be decrypted (UTD). Surfaced as a

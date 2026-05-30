@@ -50,10 +50,19 @@ export function normalizeMatrixInboundEvent(
 ): InboundChatEvent {
   const timelineKey = timelineKeyForMatrixEvent(context.accountId, event);
   const mentionedSelf = isMentioningSelf(event, context);
+  // An `m.replace` edit is applied to its target message in place rather than
+  // appended as a new event (issue #17). `event.body`/`event.media` already hold
+  // the replacement (`m.new_content`); `relatesTo.eventId` is the target.
+  const editTargetExternalId =
+    event.relatesTo?.relType === "m.replace" ? event.relatesTo.eventId : undefined;
+  const edit = editTargetExternalId ? { targetExternalId: editTargetExternalId } : undefined;
   // A UTD event carries no body/mention info and must never trigger the bot —
-  // a human client wouldn't act on a message it can't read either. Surface it
-  // (stored + rendered as a placeholder) but with no trigger.
-  const trigger = event.undecryptable ? undefined : detectTrigger(event, context, mentionedSelf);
+  // a human client wouldn't act on a message it can't read either. An edit also
+  // never triggers: the agent already reacted (or not) to the original; an edit
+  // updates content in place and shouldn't re-fire a session. Surface both
+  // (stored / applied) but with no trigger.
+  const trigger =
+    event.undecryptable || edit ? undefined : detectTrigger(event, context, mentionedSelf);
   const timestamp = Date.parse(event.timestamp);
 
   const canonical: CanonicalChatEvent = {
@@ -89,6 +98,7 @@ export function normalizeMatrixInboundEvent(
     timelineKey,
     event: canonical,
     trigger,
+    edit,
     outboundTarget: {
       provider: "matrix",
       timelineKey,
