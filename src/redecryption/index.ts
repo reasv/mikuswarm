@@ -19,6 +19,14 @@ import { mediaToAttachment } from "../matrix/inbound.js";
  *
  * Per-event exponential backoff (capped) prevents hammering the homeserver for
  * events whose keys may never arrive (e.g. sent before the bot joined).
+ *
+ * Recovery SLA: this sweeper is the SOLE recovery path for late megolm keys.
+ * A key arriving after the fact does NOT re-fire the typed inbound handler, and
+ * if the homeserver happens to re-sync the (now-decryptable) event, the store's
+ * `appendIfMissing` dedups it against the existing UTD row by canonical id, so
+ * no live append re-decrypts it either. Recovery latency is therefore bounded
+ * by `intervalMs` (the poll cadence) plus the per-event backoff accumulated by
+ * prior failed probes — not by any push signal from the SDK.
  */
 export interface RedecryptionSweeperOptions {
   store: TimelineStore;

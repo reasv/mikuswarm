@@ -450,6 +450,12 @@ export class Storage {
 
   saveTimelineCompactionState(state: TimelineCompactionState): Promise<void> {
     return this.write((db) => {
+      // The on-conflict path deliberately omits `timeline_state` from the SET
+      // list, so a summarization-pipeline save never clobbers the lifecycle
+      // state owned by `setTimelineState`/activation. Symmetric to the note on
+      // `setTimelineState` (which conversely leaves `state_json`/the compaction
+      // cursors untouched): the two writers update disjoint columns of the same
+      // row and never regress each other.
       db.prepare(
         `insert into timeline_compaction_state (
           timeline_key, compact_start_event_id, rich_start_event_id, state_json, updated_at
@@ -571,6 +577,14 @@ export class Storage {
    * those whose `timeline_key` is absent from the set of non-inactive rows.
    *
    * Returns the number of rows deleted. Runs through the single-writer queue.
+   *
+   * Ordering invariant: prune treats "no `timeline_compaction_state` row =
+   * prunable", which stays safe only because `activateTimeline` writes the
+   * `'activating'` state (via `setTimelineState`, which inserts the row) BEFORE
+   * storing any backfilled events. Both writes serialize through the
+   * single-writer queue, so a concurrent prune can never see backfilled rows
+   * while their timeline still lacks a non-`inactive` row (which would delete
+   * them out from under an in-flight activation).
    */
   pruneInactiveTimelineEvents(olderThanMs: number): Promise<number> {
     return this.write((db) => {
@@ -1844,9 +1858,12 @@ create table if not exists timeline_events (
   -- Generated from event_json so undecryptable (UTD) events are cheaply
   -- queryable by the re-decryption sweeper without scanning every row's JSON.
   -- VIRTUAL (computed on read/index): the partial index below makes lookups
-  -- O(matches), and unlike STORED a VIRTUAL column can be ADDed to an existing
-  -- non-empty table during migration. Persisted-derived, so late keys still
-  -- resolve old rows across restarts (vs an in-memory UTD set).
+  -- O(matches) without storing a redundant column per row. This column is
+  -- created here by the canonical SCHEMA on a fresh DB; no migration ADDs it
+  -- (the only generated-column-related migration, v1->v2, adds the separate
+  -- redecrypt_attempts column and rebuilds the partial index — see MIGRATIONS).
+  -- Derived from event_json, so late keys still resolve old rows across restarts
+  -- (vs an in-memory UTD set).
   is_undecryptable integer generated always as
     (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
 );

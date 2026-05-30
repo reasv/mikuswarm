@@ -259,6 +259,26 @@ test("pruneInactiveTimelineEvents deletes only old events from inactive timeline
   }
 });
 
+test("pruneInactiveTimelineEvents treats the cutoff as exclusive (timestamp === cutoff survives)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.setTimelineState(INACTIVE_TK, "inactive");
+    // The prune query is `timestamp < ?` (strict), so an event sitting exactly
+    // on the cutoff must survive; only strictly-older events are deleted.
+    await storage.appendTimelineEvent(userEvent({ id: "at-cutoff", body: "x", timestamp: 5_000, timelineKey: INACTIVE_TK }), "inactive");
+    await storage.appendTimelineEvent(userEvent({ id: "below-cutoff", body: "x", timestamp: 4_999, timelineKey: INACTIVE_TK }), "inactive");
+
+    const pruned = await storage.pruneInactiveTimelineEvents(5_000);
+    assert.equal(pruned, 1, "only the strictly-older event is pruned");
+
+    const remaining = eventIds(storage);
+    assert.ok(remaining.has("at-cutoff"), "event with timestamp === cutoff survives (query is strict <)");
+    assert.ok(!remaining.has("below-cutoff"), "event with timestamp < cutoff is pruned");
+  } finally {
+    storage.close();
+  }
+});
+
 test("pruneInactiveTimelineEvents is a no-op when nothing is old enough", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
