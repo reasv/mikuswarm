@@ -82,6 +82,10 @@ initial_backfill_messages = 200       # messages to fetch (0 = no backfill)
 initial_backfill_window_ms = 3600000  # 1h; whichever limit is reached first
 initial_backfill_timeout_ms = 30000   # 30s; the first trigger is held this long
 inactive_event_retention_days = 0     # 0 = no pruning (retention job deferred)
+# Undecryptable (UTD) event handling (issue #11).
+initial_backfill_utd_halt_threshold = 50  # stop paging after N consecutive UTD events (0 = off)
+redecryption_sweep_interval_ms = 60000    # retry stored UTD events every 60s (0 = sweeper off)
+redecryption_sweep_batch = 50             # max UTD events probed per sweep tick
 
 [matrix]
 enabled = false

@@ -11,8 +11,22 @@ export function renderMessage(event: CanonicalChatEvent, tier: RenderTier): stri
   return tier === "rich" ? renderRichMessage(event) : renderCompactMessage(event);
 }
 
+/**
+ * Placeholder shown for an undecryptable (UTD) event, mirroring what a human
+ * Matrix client renders. Carries no body/attachments — only the sender and
+ * timestamp (from the message envelope) are visible.
+ */
+const UTD_PLACEHOLDER = "🔒 unable to decrypt this message";
+
 export function renderRichMessage(event: CanonicalChatEvent): string {
   const attrs = buildMessageAttrs(event);
+
+  // UTD: keep the <message> envelope (sender/time attrs) but emit only the lock
+  // placeholder — never the body or attachments, which are absent/meaningless.
+  if (event.undecryptable) {
+    return `<message ${attrs}>\n${escapeXml(UTD_PLACEHOLDER)}\n</message>`;
+  }
+
   const parts: string[] = [];
 
   if (event.replyTo) parts.push(renderReply(event.replyTo));
@@ -27,6 +41,13 @@ export function renderRichMessage(event: CanonicalChatEvent): string {
 export function renderCompactMessage(event: CanonicalChatEvent): string {
   const time = compactTime(event.timestamp);
   const sender = compactSenderLabel(event);
+
+  // UTD: keep the `[time] sender:` prefix but emit only the lock placeholder,
+  // never the body/attachments (absent and never to be leaked).
+  if (event.undecryptable) {
+    return `[${time}] ${sender}: ${UTD_PLACEHOLDER}`;
+  }
+
   const reply = event.replyTo ? compactReply(event.replyTo) : "";
   const attachments = (event.attachments ?? [])
     .map((a) => ` [attachment: ${truncate(a.filename ?? a.id, MAX_FILENAME)}${a.localPath ? ` ${a.localPath}` : ""}${a.caption ? ` caption=${truncate(a.caption, 300)}` : ""}]`)

@@ -752,6 +752,32 @@ test("getTimelineEventsBetween excludes events outside the range", async () => {
   }
 });
 
+test("getTimelineEventsBetween includes UTD events in range (summary input path, #11)", async () => {
+  // Requirement #11.4: when the agent creates a summary for a range containing
+  // UTD events, they appear in the summary INPUT. The summarization worker's
+  // resolveInput drives getTimelineEventsBetween for level-1 jobs, so this is
+  // the exact assembly path that must surface UTD placeholders.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev1", body: "a", timestamp: 1000 }), "pending");
+    await storage.appendTimelineEvent(
+      { ...assistantEvent({ id: "ev2", body: "", timestamp: 2000 }), undecryptable: { sessionId: "s" } },
+      "skipped",
+    );
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev3", body: "c", timestamp: 3000 }), "pending");
+
+    const start = storage.getEventCursor(TK, "ev1");
+    const end = storage.getEventCursor(TK, "ev3");
+    const events = storage.getTimelineEventsBetween(TK, start!, end!);
+    assert.deepEqual(events.map((e) => e.id), ["ev1", "ev2", "ev3"]);
+    const utd = events.find((e) => e.id === "ev2");
+    assert.ok(utd?.undecryptable, "the UTD event is present in the summary input range");
+  } finally {
+    storage.close();
+  }
+});
+
 // ── resetStaleSummarizationJobs (#6) ────────────────────────────────
 
 test("resetStaleSummarizationJobs resets processing jobs to pending with attempts unchanged", async () => {

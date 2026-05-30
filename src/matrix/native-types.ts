@@ -157,6 +157,14 @@ export type MatrixInboundEvent = {
   threadRootId?: string;
   timestamp: string;
   media: MatrixInboundMedia[];
+  /**
+   * `true` when this event could not be decrypted (UTD). `body`/`media` are
+   * empty; the TS renderer shows a human-client-style placeholder. Never set for
+   * a normal decrypted event.
+   */
+  undecryptable?: boolean;
+  /** Megolm session id whose key is missing, when known. Diagnostic only. */
+  sessionId?: string;
 };
 
 export type MatrixMessageRelatesTo = {
@@ -178,6 +186,14 @@ export type MatrixMessageSummary = {
    * Rust `#[serde(default)]` (older payloads / other summary producers omit it).
    */
   media?: MatrixInboundMedia[];
+  /**
+   * `true` when the summarized event could not be decrypted (UTD). Re-fetching
+   * the same event id once room keys arrive returns a non-UTD summary — the
+   * signal the re-decryption sweeper uses to detect success.
+   */
+  undecryptable?: boolean;
+  /** Megolm session id whose key is missing, when known. Diagnostic only. */
+  sessionId?: string;
 };
 
 export type MatrixMessageSummaryRequest = {

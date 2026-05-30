@@ -116,6 +116,14 @@ export interface CanonicalChatEvent {
   threadId?: string;
   trigger?: TriggerInfo;
   generatedCaptions?: CaptionResult[];
+  /**
+   * Set when this event could not be decrypted (UTD). The renderer keys off this
+   * field — not the body — to show a human-client-style "unable to decrypt"
+   * placeholder, so `body` stays empty and never leaks. Cleared by the
+   * re-decryption sweeper when the real event is recovered, at which point
+   * `body`/`attachments` carry the decrypted content.
+   */
+  undecryptable?: { sessionId?: string; reason?: string };
 }
 
 export interface InboundChatEvent {

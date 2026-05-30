@@ -586,6 +586,81 @@ export class Storage {
     });
   }
 
+  /**
+   * Stored undecryptable (UTD) events, oldest first, capped at `limit`. Backed
+   * by the `is_undecryptable` generated column + partial index, so this is cheap
+   * even with a large timeline. Used by the re-decryption sweeper.
+   */
+  getUndecryptedEvents(limit = 100): CanonicalChatEvent[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select event_json
+           from timeline_events
+           where is_undecryptable = 1
+           order by timestamp asc
+           limit ?`,
+        )
+        .all(limit) as Array<{ event_json: string }>,
+    );
+    return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+  }
+
+  /**
+   * Replace a stored UTD event with its decrypted form. Rebuilds body/event_json
+   * from `updater` (which must clear `undecryptable` and set the real
+   * body/attachments), flips `enrichment_status` to 'pending' so the now-real
+   * content enriches/captions, and bumps `updated_at`. Matched by event id. The
+   * write is a no-op (returns the existing row) if the row is no longer UTD —
+   * the sweeper races with backfill/message_summary touches.
+   */
+  replaceUndecryptedEvent(
+    eventId: string,
+    updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
+  ): Promise<CanonicalChatEvent | undefined> {
+    return this.write((db) => {
+      const row = db
+        .prepare(`select event_json from timeline_events where id = ?`)
+        .get(eventId) as { event_json: string } | undefined;
+      if (!row) return undefined;
+      const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
+      if (!existing.undecryptable) return existing; // already replaced; no-op
+      const updated = updater(existing);
+      db.prepare(
+        `update timeline_events
+         set external_id = @externalId,
+             timeline_key = @timelineKey,
+             provider = @provider,
+             role = @role,
+             sender_id = @senderId,
+             sender_display_name = @senderDisplayName,
+             body = @body,
+             timestamp = @timestamp,
+             received_at = @receivedAt,
+             agent_session_id = @agentSessionId,
+             event_json = @eventJson,
+             enrichment_status = 'pending',
+             updated_at = @updatedAt
+         where id = @id`,
+      ).run({
+        id: eventId,
+        externalId: updated.externalId ?? null,
+        timelineKey: updated.timelineKey,
+        provider: updated.provider,
+        role: updated.role,
+        senderId: updated.sender.id,
+        senderDisplayName: updated.sender.displayName ?? null,
+        body: updated.body,
+        timestamp: updated.timestamp,
+        receivedAt: updated.receivedAt,
+        agentSessionId: updated.agentSessionId ?? null,
+        eventJson: JSON.stringify(updated),
+        updatedAt: Date.now(),
+      });
+      return updated;
+    });
+  }
+
   claimPendingEnrichment(limit: number): Promise<string[]> {
     return this.write((db) => {
       const rows = db.prepare(
@@ -1528,11 +1603,24 @@ create table if not exists timeline_events (
   enrichment_retries integer not null default 0,
   trigger_group_id text,
   created_at integer not null,
-  updated_at integer not null
+  updated_at integer not null,
+  -- Generated from event_json so undecryptable (UTD) events are cheaply
+  -- queryable by the re-decryption sweeper without scanning every row's JSON.
+  -- VIRTUAL (computed on read/index): the partial index below makes lookups
+  -- O(matches), and unlike STORED a VIRTUAL column can be ADDed to an existing
+  -- non-empty table during migration. Persisted-derived, so late keys still
+  -- resolve old rows across restarts (vs an in-memory UTD set).
+  is_undecryptable integer generated always as
+    (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
 );
 
 create index if not exists idx_timeline_events_timeline_time
   on timeline_events(timeline_key, timestamp, received_at, id);
+
+-- NOTE: the idx_timeline_events_undecryptable index is created by runMigrations
+-- (alongside the is_undecryptable generated column), NOT here: on a pre-existing
+-- legacy table a create-table-if-not-exists is a no-op, so the column may not
+-- yet exist when this SCHEMA block runs. The migration owns both.
 
 create index if not exists idx_timeline_events_external
   on timeline_events(provider, external_id)
@@ -1716,6 +1804,30 @@ function runMigrations(db: Database.Database): void {
   if (!columnNames.has("enrichment_retries")) {
     db.exec(`alter table timeline_events add column enrichment_retries integer not null default 0`);
   }
+  // Generated column + partial index so the re-decryption sweeper finds stored
+  // UTD events cheaply (no full JSON scan) and they persist across restarts.
+  // NOTE: `pragma table_info` omits generated columns, so detect via
+  // `table_xinfo` (which lists them) to avoid a duplicate-column ALTER on fresh
+  // databases where SCHEMA already created the column.
+  const xColumnNames = new Set(
+    (db.prepare("pragma table_xinfo(timeline_events)").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!xColumnNames.has("is_undecryptable")) {
+    db.exec(
+      `alter table timeline_events add column is_undecryptable integer
+         generated always as
+         (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual`,
+    );
+  }
+  // Ensure the partial index regardless of whether the column was just added
+  // (fresh DBs get the column from SCHEMA's create-table but no index there).
+  // Idempotent via `if not exists`. The table-rebuild step below also recreates
+  // it; running it here first is harmless and covers the no-rebuild path.
+  db.exec(
+    `create index if not exists idx_timeline_events_undecryptable
+       on timeline_events(is_undecryptable, timestamp)
+       where is_undecryptable = 1`,
+  );
 
   // Widen the enrichment_status CHECK to allow 'inactive' (channel lifecycle).
   // SQLite cannot ALTER a CHECK constraint in place and DOES enforce the
@@ -1751,7 +1863,9 @@ function runMigrations(db: Database.Database): void {
             enrichment_retries integer not null default 0,
             trigger_group_id text,
             created_at integer not null,
-            updated_at integer not null
+            updated_at integer not null,
+            is_undecryptable integer generated always as
+              (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
           );
           insert into timeline_events_new (
             id, external_id, timeline_key, provider, role, sender_id,
@@ -1778,6 +1892,9 @@ function runMigrations(db: Database.Database): void {
           create index if not exists idx_timeline_events_trigger_group
             on timeline_events(trigger_group_id)
             where trigger_group_id is not null;
+          create index if not exists idx_timeline_events_undecryptable
+            on timeline_events(is_undecryptable, timestamp)
+            where is_undecryptable = 1;
         `);
       })();
     } finally {

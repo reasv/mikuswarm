@@ -300,10 +300,68 @@ fn readable_body(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{media_from_timeline, readable_body};
+    use super::{media_from_timeline, readable_body, summarize_timeline_event};
     use crate::api::MatrixMediaKind;
+    use matrix_sdk::deserialized_responses::{
+        TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+    };
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+    use matrix_sdk::ruma::serde::Raw;
     use serde_json::{json, Value};
+
+    fn raw_event(value: Value) -> Raw<AnySyncTimelineEvent> {
+        Raw::from_json(serde_json::value::to_raw_value(&value).expect("to raw value"))
+    }
+
+    #[test]
+    fn summarizes_utd_event_as_placeholder() {
+        let raw = raw_event(json!({
+            "type": "m.room.encrypted",
+            "event_id": "$utd:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1_700_000_000_000i64,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "session_id": "session-abc",
+                "ciphertext": "AwgAEnABCDEF",
+            },
+        }));
+        let event = TimelineEvent::from_utd(
+            raw,
+            UnableToDecryptInfo {
+                session_id: Some("session-abc".to_string()),
+                reason: UnableToDecryptReason::Unknown,
+            },
+        );
+        let summary = summarize_timeline_event(&event).expect("utd summary surfaced");
+        assert_eq!(summary.event_id, "$utd:example.org");
+        assert_eq!(summary.sender, "@alice:example.org");
+        assert_eq!(summary.timestamp.timestamp_millis(), 1_700_000_000_000);
+        assert!(summary.body.is_empty());
+        assert_eq!(summary.undecryptable, Some(true));
+        assert_eq!(summary.session_id.as_deref(), Some("session-abc"));
+        assert!(summary.media.is_empty());
+        // The placeholder must never carry plaintext or ciphertext material.
+        let serialized = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(!serialized.contains("ciphertext"));
+    }
+
+    #[test]
+    fn summarizes_normal_message_without_utd_flag() {
+        let raw = raw_event(json!({
+            "type": "m.room.message",
+            "event_id": "$msg:example.org",
+            "sender": "@bob:example.org",
+            "origin_server_ts": 1_700_000_001_000i64,
+            "content": { "msgtype": "m.text", "body": "hello world" },
+        }));
+        let event = TimelineEvent::from_plaintext(raw);
+        let summary = summarize_timeline_event(&event).expect("normal summary");
+        assert_eq!(summary.event_id, "$msg:example.org");
+        assert_eq!(summary.body, "hello world");
+        assert_eq!(summary.undecryptable, None);
+        assert_eq!(summary.session_id, None);
+    }
 
     #[test]
     fn uses_formatted_body_for_custom_emoji_in_summaries() {
@@ -529,10 +587,51 @@ fn summarize_message_value(value: &Value) -> Option<MatrixMessageSummary> {
         // on by `summarize_timeline_event`. Non-media messages stay empty,
         // matching the live path where `media_items` returns `Vec::new()`.
         media: Vec::new(),
+        // A decrypted m.room.message is never UTD.
+        undecryptable: None,
+        session_id: None,
+    })
+}
+
+/// Build a UTD (undecryptable) summary placeholder from a timeline event whose
+/// `kind` is `UnableToDecrypt`. Pulls `event_id`/`sender`/`origin_server_ts` from
+/// the raw `m.room.encrypted` value (the only metadata available without the
+/// session key) and the megolm `session_id` from the SDK's UTD info. Body and
+/// media are intentionally empty — there is no plaintext to leak. Returns `None`
+/// only if the raw event lacks the basic event_id/sender envelope.
+fn summarize_utd_event(event: &TimelineEvent) -> Option<MatrixMessageSummary> {
+    let value: Value = event.raw().deserialize_as_unchecked().ok()?;
+    let event_id = value.get("event_id").and_then(Value::as_str)?.to_string();
+    let sender = value.get("sender").and_then(Value::as_str)?.to_string();
+    let timestamp = value
+        .get("origin_server_ts")
+        .and_then(Value::as_i64)
+        .map(timestamp_from_millis)
+        .unwrap_or_else(Utc::now);
+
+    Some(MatrixMessageSummary {
+        event_id,
+        sender,
+        sender_name: None,
+        body: String::new(),
+        msgtype: None,
+        timestamp,
+        relates_to: None,
+        media: Vec::new(),
+        undecryptable: Some(true),
+        session_id: event.kind.session_id().map(str::to_owned),
     })
 }
 
 pub fn summarize_timeline_event(event: &TimelineEvent) -> Option<MatrixMessageSummary> {
+    // Undecryptable events carry no plaintext, so they never deserialize as an
+    // `m.room.message`. Surface them as a placeholder instead of dropping them so
+    // they reach the timeline like a human client shows them. Re-fetching the
+    // same event id once keys arrive returns a normal summary (the path the
+    // re-decryption sweeper relies on).
+    if event.kind.is_utd() {
+        return summarize_utd_event(event);
+    }
     let value: Value = event.raw().deserialize_as_unchecked().ok()?;
     let mut summary = summarize_message_value(&value)?;
     summary.media = media_from_raw(event);
@@ -617,5 +716,68 @@ pub async fn normalize_inbound_event(
         thread_root_id,
         timestamp: timestamp_from_event(event),
         media: media_items(&event.content.msgtype),
+        // The typed `OriginalSyncRoomMessageEvent` handler only fires for already
+        // decrypted events, so the live normalized path is never UTD.
+        undecryptable: None,
+        session_id: None,
+    })
+}
+
+/// Build a UTD placeholder `MatrixInboundEvent` from a raw `m.room.encrypted`
+/// value seen on live sync. Only metadata visible without the session key is
+/// surfaced (event_id/sender/origin_server_ts/session_id); body is empty and no
+/// content is leaked. Returns `None` if the raw envelope lacks event_id/sender or
+/// the event is a redaction tombstone. `chat_type` is resolved from the room the
+/// same way as the decrypted path.
+pub async fn normalize_utd_inbound_event(
+    room: &Room,
+    value: &Value,
+) -> Option<MatrixInboundEvent> {
+    if value
+        .get("unsigned")
+        .and_then(|unsigned| unsigned.get("redacted_because"))
+        .is_some()
+    {
+        return None;
+    }
+    let event_id = value.get("event_id").and_then(Value::as_str)?.to_string();
+    let sender = value.get("sender").and_then(Value::as_str)?.to_string();
+    let timestamp = value
+        .get("origin_server_ts")
+        .and_then(Value::as_i64)
+        .map(timestamp_from_millis)
+        .unwrap_or_else(Utc::now);
+    let session_id = value
+        .get("content")
+        .and_then(|content| content.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let chat_type = if room.is_direct().await.unwrap_or(false) {
+        MatrixChatType::Direct
+    } else {
+        MatrixChatType::Channel
+    };
+    let room_name = room.display_name().await.ok().map(|value| value.to_string());
+    let room_alias = room.canonical_alias().map(|value| value.to_string());
+
+    Some(MatrixInboundEvent {
+        room_id: room.room_id().to_string(),
+        event_id,
+        sender_id: sender,
+        sender_name: None,
+        room_name,
+        room_alias,
+        chat_type,
+        body: String::new(),
+        msgtype: None,
+        formatted_body: None,
+        mentions: None,
+        reply_to_id: None,
+        thread_root_id: None,
+        timestamp,
+        media: Vec::new(),
+        undecryptable: Some(true),
+        session_id,
     })
 }

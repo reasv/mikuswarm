@@ -52,6 +52,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
+import { RedecryptionSweeper } from "./redecryption/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -348,6 +349,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // event's timestamp (falls back to now inside performInitialBackfill).
         anchorTimestamp: inbound.event.timestamp,
         timeoutMs: config.timeline?.initial_backfill_timeout_ms ?? 30_000,
+        utdHaltThreshold: config.timeline?.initial_backfill_utd_halt_threshold ?? 50,
         logger,
       });
       logger.info("initial_backfill", { timelineKey: inbound.timelineKey, ...result });
@@ -672,6 +674,38 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger,
   });
 
+  // Re-decryption sweeper (issue #11): periodically retries stored UTD events to
+  // see if room keys have since arrived, replacing placeholders with the real
+  // decrypted content. Uses the native `messageSummary` primitive per account
+  // (resolved from the event's timeline key). Started after the provider so its
+  // clients are running; stopped before the provider during drain.
+  const redecryptionSweeper = new RedecryptionSweeper({
+    store: timeline,
+    retry: async ({ roomId, eventId }) => {
+      // The accountId is the second segment of the timeline key, but the sweeper
+      // only hands us roomId/eventId; resolve the account via the room's account
+      // map. Each room belongs to exactly one account, so try each running
+      // account until one knows the room (cheap: messageSummary resolves the
+      // room locally and errors fast otherwise).
+      for (const accountId of Object.keys(config.matrix.accounts)) {
+        try {
+          const client = provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}`, accountId });
+          return await client.messageSummary({ roomId, eventId });
+        } catch {
+          // Account not running or room unknown to it — try the next account.
+          continue;
+        }
+      }
+      return null;
+    },
+    notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
+    notifyCaptions: () => captionPool.notifyNewWork(),
+    intervalMs: config.timeline?.redecryption_sweep_interval_ms ?? 60_000,
+    batchSize: config.timeline?.redecryption_sweep_batch ?? 50,
+    isDraining: () => draining,
+    logger: logger.child("redecryption"),
+  });
+
   // Recover timelines stranded mid-activation by a prior crash before the
   // provider begins delivering inbound events.
   const resetActivations = await storage.resetStaleActivations();
@@ -691,12 +725,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   await enrichmentPool.start();
   await captionPool.start();
   if (summarizationPool) await summarizationPool.start();
+  redecryptionSweeper.start();
 
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        await redecryptionSweeper.stop();
         await provider.stop();
         triggerCoordinator.clear();
         await captionPool.stop();

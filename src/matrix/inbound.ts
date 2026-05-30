@@ -50,7 +50,10 @@ export function normalizeMatrixInboundEvent(
 ): InboundChatEvent {
   const timelineKey = timelineKeyForMatrixEvent(context.accountId, event);
   const mentionedSelf = isMentioningSelf(event, context);
-  const trigger = detectTrigger(event, context, mentionedSelf);
+  // A UTD event carries no body/mention info and must never trigger the bot —
+  // a human client wouldn't act on a message it can't read either. Surface it
+  // (stored + rendered as a placeholder) but with no trigger.
+  const trigger = event.undecryptable ? undefined : detectTrigger(event, context, mentionedSelf);
   const timestamp = Date.parse(event.timestamp);
 
   const canonical: CanonicalChatEvent = {
@@ -76,6 +79,9 @@ export function normalizeMatrixInboundEvent(
     },
     threadId: event.threadRootId,
     trigger,
+    undecryptable: event.undecryptable
+      ? { sessionId: event.sessionId }
+      : undefined,
   };
 
   return {

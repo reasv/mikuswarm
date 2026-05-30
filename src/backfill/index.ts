@@ -39,6 +39,13 @@ export interface InitialBackfillOptions {
   timeoutMs: number;
   /** Messages per page request (clamped 1–1000). Defaults to 100. */
   pageSize?: number;
+  /**
+   * Stop paging after this many *consecutive* stored undecryptable (UTD) events
+   * — a long UTD run means we've paged into history we lack keys for, with no
+   * useful forward progress. Counter resets on any non-UTD stored event.
+   * Defaults to 50; 0 disables the guard.
+   */
+  utdHaltThreshold?: number;
   logger?: Logger;
 }
 
@@ -55,6 +62,8 @@ export interface InitialBackfillResult {
   errored: boolean;
   /** Message of the read failure when `errored` is true. */
   error?: string;
+  /** Paging stopped after a long run of consecutive undecryptable (UTD) events. */
+  haltedOnUtd: boolean;
 }
 
 class BackfillTimeoutError extends Error {}
@@ -96,6 +105,7 @@ export async function performInitialBackfill(
     timeoutMs,
     logger,
   } = options;
+  const utdHaltThreshold = options.utdHaltThreshold ?? 50;
 
   const result: InitialBackfillResult = {
     fetched: 0,
@@ -105,8 +115,13 @@ export async function performInitialBackfill(
     exhausted: false,
     timedOut: false,
     errored: false,
+    haltedOnUtd: false,
   };
   if (maxMessages <= 0) return result;
+
+  // Consecutive-UTD counter (§5): increments per stored UTD event, resets to 0
+  // on any non-UTD stored event. A long run means no useful forward progress.
+  let consecutiveUtd = 0;
 
   const threadRootId = threadRootFromKey(timelineKey);
   // Anchor the window to the activation moment (the trigger timestamp), NOT the
@@ -166,7 +181,18 @@ export async function performInitialBackfill(
       });
       if (!event) continue; // not part of the activated timeline (thread/edit filtering)
 
-      const { duplicate } = await store.appendIfMissing(event, "pending");
+      const isUtd = event.undecryptable != null;
+      // Track UTD runs over events belonging to this timeline (independent of
+      // dedup): a non-UTD event is forward progress and resets the run.
+      if (isUtd) {
+        consecutiveUtd++;
+      } else {
+        consecutiveUtd = 0;
+      }
+
+      // A UTD event is stored with `enrichment_status='skipped'` (no body/media
+      // to enrich); a normal event stays 'pending'.
+      const { duplicate } = await store.appendIfMissing(event, isUtd ? "skipped" : "pending");
       if (!duplicate) {
         result.stored++;
         if (result.stored >= maxMessages) {
@@ -174,8 +200,13 @@ export async function performInitialBackfill(
           break;
         }
       }
+
+      if (utdHaltThreshold > 0 && consecutiveUtd >= utdHaltThreshold) {
+        result.haltedOnUtd = true;
+        break;
+      }
     }
-    if (result.reachedCount) break;
+    if (result.reachedCount || result.haltedOnUtd) break;
 
     if (pageMinTimestamp < windowFloor) {
       result.reachedWindow = true;
@@ -252,6 +283,9 @@ function summaryToCanonical(
     ),
     threadId: ctx.threadRootId,
     replyTo,
+    undecryptable: summary.undecryptable
+      ? { sessionId: summary.sessionId }
+      : undefined,
   };
 }
 

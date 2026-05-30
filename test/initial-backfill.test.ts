@@ -32,7 +32,14 @@ function summary(overrides: Partial<MatrixMessageSummary> & { eventId: string; t
     timestamp: iso(overrides.timestamp),
     relatesTo: overrides.relatesTo,
     media: overrides.media,
+    undecryptable: overrides.undecryptable,
+    sessionId: overrides.sessionId,
   };
+}
+
+/** A UTD summary as the native layer surfaces it: empty body, undecryptable flag. */
+function utdSummary(eventId: string, timestamp: number): MatrixMessageSummary {
+  return summary({ eventId, timestamp, body: "", undecryptable: true, sessionId: "s" });
 }
 
 /** A scripted client that returns canned pages and records the `before` token of each call. */
@@ -71,7 +78,7 @@ test("maxMessages = 0 performs no fetch", async () => {
     const client = new ScriptedClient([page([summary({ eventId: "$a", timestamp: 1000 })], null)]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 0 });
     assert.equal(client.calls.length, 0, "client should not be called");
-    assert.deepEqual(result, { fetched: 0, stored: 0, reachedCount: false, reachedWindow: false, exhausted: false, timedOut: false, errored: false });
+    assert.deepEqual(result, { fetched: 0, stored: 0, reachedCount: false, reachedWindow: false, exhausted: false, timedOut: false, errored: false, haltedOnUtd: false });
   });
 });
 
@@ -373,6 +380,68 @@ test("backfill and live produce identical attachments for equivalent media", asy
     await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     const stored = store.getById(`matrix:${ACCOUNT}:${eventId}`);
     assert.deepEqual(stored?.attachments, live.event.attachments);
+  });
+});
+
+// ── Undecryptable (UTD) handling (issue #11) ───────────────────────────────
+
+test("UTD summaries are stored as placeholders with the undecryptable flag and skipped status", async () => {
+  await withStores(async (store, storage) => {
+    const client = new ScriptedClient([
+      page([utdSummary("$utd", 5000), summary({ eventId: "$ok", timestamp: 4000 })], null),
+    ]);
+    const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    assert.equal(result.stored, 2, "both the UTD placeholder and the normal message are stored");
+    const utd = store.getById(`matrix:${ACCOUNT}:$utd`);
+    assert.ok(utd, "UTD event is stored, not dropped");
+    assert.deepEqual(utd?.undecryptable, { sessionId: "s" });
+    assert.equal(utd?.body, "", "no plaintext leaks into the stored body");
+    const status = storage.read((db) =>
+      (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$utd`) as { enrichment_status: string }).enrichment_status,
+    );
+    assert.equal(status, "skipped", "a UTD placeholder has nothing to enrich");
+  });
+});
+
+test("halts paging after a long run of consecutive UTD events", async () => {
+  await withStores(async (store, storage) => {
+    // 55 consecutive UTD events across pages; threshold is 50.
+    const first = Array.from({ length: 30 }, (_, i) => utdSummary(`$u${i}`, 100_000 - i));
+    const second = Array.from({ length: 30 }, (_, i) => utdSummary(`$u${30 + i}`, 70_000 - i));
+    const client = new ScriptedClient([
+      page(first, "tok1"),
+      page(second, "tok2"),
+      page([summary({ eventId: "$never", timestamp: 1000 })], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
+    });
+    assert.equal(result.haltedOnUtd, true, "should halt on the consecutive-UTD guard");
+    assert.equal(result.reachedCount, false);
+    assert.equal(result.exhausted, false);
+    // 30 in page 1, then 20 more in page 2 reaches 50 and breaks mid-page.
+    assert.equal(result.stored, 50, "stops exactly when the threshold is hit");
+    assert.equal(client.calls.length, 2, "the third page is never fetched");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$never`), undefined);
+  });
+});
+
+test("a non-UTD event resets the consecutive-UTD counter", async () => {
+  await withStores(async (store, storage) => {
+    // 40 UTD, then one real message (resets), then 40 more UTD: never reaches 50
+    // consecutive, so the run is NOT halted and pages to exhaustion.
+    const utdsA = Array.from({ length: 40 }, (_, i) => utdSummary(`$a${i}`, 200_000 - i));
+    const utdsB = Array.from({ length: 40 }, (_, i) => utdSummary(`$b${i}`, 150_000 - i));
+    const client = new ScriptedClient([
+      page([...utdsA, summary({ eventId: "$real", timestamp: 160_000 }), ...utdsB], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
+    });
+    assert.equal(result.haltedOnUtd, false, "the interrupting real message resets the run below threshold");
+    assert.equal(result.exhausted, true);
+    assert.equal(result.stored, 81, "all 80 UTD + 1 real stored");
+    assert.ok(store.getById(`matrix:${ACCOUNT}:$real`), "the interrupting message is stored");
   });
 });
 

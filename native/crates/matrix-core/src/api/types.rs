@@ -179,6 +179,15 @@ pub struct MatrixInboundEvent {
     pub thread_root_id: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub media: Vec<MatrixInboundMedia>,
+    /// `Some(true)` when this event could not be decrypted (UTD). Surfaced as a
+    /// human-client-style placeholder; `body`/`media` are empty and carry no
+    /// leaked content. `None`/`Some(false)` for normal decrypted events.
+    #[serde(default)]
+    pub undecryptable: Option<bool>,
+    /// The megolm session id whose key is missing, when known. Diagnostic only;
+    /// never used to display content.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +214,15 @@ pub struct MatrixMessageSummary {
     /// typed deserialization. Carries no encryption keys (resolved at download).
     #[serde(default)]
     pub media: Vec<MatrixInboundMedia>,
+    /// `Some(true)` when this summarized event could not be decrypted (UTD).
+    /// `body`/`media` are empty; the placeholder is rendered by the TS layer.
+    /// Re-fetching the same event id once room keys arrive yields a normal
+    /// (non-UTD) summary, which is how the re-decryption sweeper detects success.
+    #[serde(default)]
+    pub undecryptable: Option<bool>,
+    /// The megolm session id whose key is missing, when known. Diagnostic only.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

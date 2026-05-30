@@ -161,6 +161,23 @@ export class TimelineStore {
     return this.storage.setEnrichmentStatus(eventId, status);
   }
 
+  /** Stored undecryptable (UTD) events, oldest first, for the re-decryption sweeper. */
+  getUndecrypted(limit = 100): CanonicalChatEvent[] {
+    return this.storage.getUndecryptedEvents(limit);
+  }
+
+  /**
+   * Replace a stored UTD event with its now-decrypted form: `updater` rebuilds
+   * the canonical with `undecryptable` cleared and the real body/attachments, and
+   * the row's `enrichment_status` flips to 'pending'. Matched by event id.
+   */
+  replaceUndecrypted(
+    eventId: string,
+    updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
+  ): Promise<CanonicalChatEvent | undefined> {
+    return this.storage.replaceUndecryptedEvent(eventId, updater);
+  }
+
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
     return this.storage.setTriggerGroup(triggerEventId, eventIds);
   }

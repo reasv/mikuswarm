@@ -448,8 +448,10 @@ impl MatrixCoreService {
 
 fn register_inbound_handler(client: &Client, shared: Arc<SharedState>, config: MatrixClientConfig) {
     let message_config = config.clone();
+    let message_shared = shared.clone();
+    let utd_shared = shared.clone();
     client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
-        let shared = shared.clone();
+        let shared = message_shared.clone();
         let config = message_config.clone();
         async move {
             if let Some(inbound) = events::normalize_inbound_event(&room, &event).await {
@@ -473,6 +475,25 @@ fn register_inbound_handler(client: &Client, shared: Arc<SharedState>, config: M
                     diagnostics.last_successful_decryption_at = Some(now);
                 });
                 shared.push_inbound(inbound);
+            }
+        }
+    });
+
+    client.add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
+        let shared = utd_shared.clone();
+        async move {
+            let Ok(value) = raw.deserialize_as_unchecked::<Value>() else {
+                return;
+            };
+            // The SDK re-injects events it decrypted under their decrypted type
+            // (e.g. `m.room.message`), so an event still typed `m.room.encrypted`
+            // here is one we could NOT decrypt — a live UTD. Surface it as a
+            // placeholder like a human client would, but do NOT bump
+            // `last_successful_decryption_at` (no decryption happened).
+            if value.get("type").and_then(Value::as_str) == Some("m.room.encrypted") {
+                if let Some(inbound) = events::normalize_utd_inbound_event(&room, &value).await {
+                    shared.push_inbound(inbound);
+                }
             }
         }
     });

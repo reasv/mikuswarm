@@ -30,6 +30,33 @@ test("Matrix direct events keep dm timeline identity and exact outbound room tar
   assert.equal(inbound.trigger?.type, "dm");
 });
 
+test("UTD inbound events propagate undecryptable and never attach a trigger", () => {
+  // A UTD event in a DM would normally trigger (dm type), and one mentioning the
+  // bot would trigger (mention). Neither must fire — a human client wouldn't act
+  // on a message it can't read.
+  const utdDm: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$utd",
+    senderId: "@alice:example.org",
+    chatType: "direct",
+    body: "",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+    undecryptable: true,
+    sessionId: "session-xyz",
+  };
+
+  const inbound = normalizeMatrixInboundEvent(utdDm, {
+    accountId: "miku",
+    selfUserId: "@miku:example.org",
+  });
+
+  assert.deepEqual(inbound.event.undecryptable, { sessionId: "session-xyz" });
+  assert.equal(inbound.event.body, "", "no plaintext on a UTD event");
+  assert.equal(inbound.trigger, undefined, "UTD must not trigger (even in a DM)");
+  assert.equal(inbound.event.trigger, undefined);
+});
+
 test("Matrix provider preserves body text separately when sending attachments", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-send-"));
   try {
