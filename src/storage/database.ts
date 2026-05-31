@@ -450,6 +450,16 @@ export class Storage {
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
 
+  /** Current enrichment_status of a stored event, or undefined if absent. */
+  getEnrichmentStatus(id: string): string | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select enrichment_status from timeline_events where id = ?`)
+        .get(id) as { enrichment_status: string } | undefined,
+    );
+    return row?.enrichment_status;
+  }
+
   getTimelineCompactionState(timelineKey: string): TimelineCompactionState | undefined {
     const row = this.read((db) =>
       db
@@ -575,6 +585,15 @@ export class Storage {
    * back to `'inactive'` so the next trigger re-runs activation. Called on
    * startup, mirroring the stale-claim resets for enrichment/captions/jobs.
    * Returns the number of rows reset.
+   *
+   * NOTE (#9): this only heals timelines stuck in `'activating'`. It does NOT
+   * touch `'active'` timelines. Combined with the retention sweep
+   * (`pruneInactiveTimelineEvents`) only touching INACTIVE timelines, this means
+   * the activation path's bulk `'inactive'`→`'pending'` flip
+   * (`activateTimelineEvents`) MUST happen before the `setTimelineState('active')`
+   * promotion: any `'inactive'` event rows left under an `'active'` timeline would
+   * be invisible to both recovery paths and thus never enriched or pruned. See
+   * the matching comment in `ActivationCoordinator.activateTimeline`.
    */
   resetStaleActivations(): Promise<number> {
     return this.write((db) => {

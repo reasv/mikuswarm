@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decideRetentionSweep } from "../src/app.js";
+import { decideRetentionSweep, runRetentionSweep } from "../src/app.js";
+
+const noopLogger = { info() {}, error() {} };
 
 const MILLIS_PER_DAY = 86_400_000;
 const NOW = 1_700_000_000_000;
@@ -28,4 +30,47 @@ test("retention sweep runs with cutoff = now − days·86_400_000 when enabled a
 test("retention cutoff scales linearly with the day count", () => {
   const oneDay = decideRetentionSweep({ retentionDays: 1, draining: false, now: NOW });
   assert.deepEqual(oneDay, { skip: false, cutoff: NOW - MILLIS_PER_DAY });
+});
+
+test("#6: a sweep does NOT start when draining flips true between the decision and the prune", async () => {
+  // The race the fix closes: decideRetentionSweep sees draining=false (so it does
+  // not skip), but stop() sets draining=true before the awaited prune. The
+  // re-check must bail so no prune is started.
+  let draining = false;
+  let pruneCalls = 0;
+  await runRetentionSweep({
+    retentionDays: 30,
+    // First read (inside decideRetentionSweep) sees false; flip true for the
+    // re-check just before the prune, mimicking stop() racing the callback.
+    isDraining: () => {
+      const value = draining;
+      draining = true; // next read (the re-check) observes drain has begun
+      return value;
+    },
+    now: () => NOW,
+    prune: async () => {
+      pruneCalls++;
+      return 0;
+    },
+    logger: noopLogger,
+  });
+  assert.equal(pruneCalls, 0, "the prune must not start once draining flips true before it");
+});
+
+test("#6: a sweep runs the prune when not draining at either check", async () => {
+  let pruneCalls = 0;
+  let prunedCutoff: number | undefined;
+  await runRetentionSweep({
+    retentionDays: 30,
+    isDraining: () => false,
+    now: () => NOW,
+    prune: async (cutoff) => {
+      pruneCalls++;
+      prunedCutoff = cutoff;
+      return 3;
+    },
+    logger: noopLogger,
+  });
+  assert.equal(pruneCalls, 1, "the prune runs when not draining");
+  assert.equal(prunedCutoff, NOW - 30 * MILLIS_PER_DAY);
 });

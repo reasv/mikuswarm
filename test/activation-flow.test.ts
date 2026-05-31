@@ -96,6 +96,7 @@ interface Harness {
  */
 function makeHarness(overrides?: {
   runInitialBackfill?: (inbound: InboundChatEvent) => Promise<void>;
+  resolveTriggerGroup?: (inbound: InboundChatEvent) => Promise<void>;
   awaitTriggerReadiness?: (inbound: InboundChatEvent) => Promise<void>;
   launchSession?: (inbound: InboundChatEvent, duplicate: boolean, h: Harness) => void;
   // Wrap the storage surface handed to the coordinator (e.g. to make the
@@ -126,7 +127,7 @@ function makeHarness(overrides?: {
       },
       notifyCaptions: () => {},
       runInitialBackfill: overrides?.runInitialBackfill ?? (async () => {}),
-      resolveTriggerGroup: async () => {},
+      resolveTriggerGroup: overrides?.resolveTriggerGroup ?? (async () => {}),
       awaitTriggerReadiness: overrides?.awaitTriggerReadiness ?? (async () => {}),
       launchSession: async (inbound, duplicate) => {
         launched.push(inbound);
@@ -408,6 +409,53 @@ test("#4: a backfilled 'inactive' event stays 'inactive' (NOT pending) when acti
   }
 });
 
+function imageEvent(overrides: { id: string; timestamp?: number }): CanonicalChatEvent {
+  return {
+    ...userEvent({ id: overrides.id, timestamp: overrides.timestamp }),
+    body: "",
+    attachments: [{ id: `att-${overrides.id}`, mediaType: "image" }],
+  };
+}
+
+test("#2: a grouped attachment message that was 'inactive' is flipped to 'pending' (and enrichment nudged) BEFORE readiness", async () => {
+  // Reproduces #2: user posts media in an inactive channel, then mentions the bot
+  // within the trigger-group lookback. resolveTriggerGroup pulls the prior
+  // attachment message into the group. Under the OLD code that grouped event
+  // stayed 'inactive' until the post-readiness bulk flip, so awaitTriggerReadiness
+  // saw it as ready (no enrichment, no caption) and the first session rendered the
+  // image uncaptioned. The fix flips the group's still-'inactive' members BEFORE
+  // readiness.
+  let statusAtReadiness: string | undefined;
+  let enrichedAtReadiness = 0;
+  const h = await makeHarness({
+    // Mimic app.ts resolveTriggerGroup pulling the prior media event m1 into the group.
+    resolveTriggerGroup: async (inbound) => {
+      inbound.trigger = { ...inbound.trigger!, groupedEventIds: [inbound.event.id, "m1"] };
+      inbound.event.trigger = inbound.trigger;
+    },
+    awaitTriggerReadiness: async () => {
+      statusAtReadiness = h.storage.read((db) =>
+        (db.prepare("select enrichment_status from timeline_events where id = ?").get("m1") as { enrichment_status: string }).enrichment_status,
+      );
+      enrichedAtReadiness = h.enriched.length;
+    },
+  });
+  try {
+    // Prior media message, stored cheaply as 'inactive' while the channel was inactive.
+    await h.storage.appendTimelineEvent(imageEvent({ id: "m1", timestamp: 10 }), "inactive");
+
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1", body: "look @miku", timestamp: 20 })));
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(statusAtReadiness, "pending", "the grouped media event must be 'pending' BEFORE readiness so it enriches + captions");
+    assert.ok(enrichedAtReadiness > 0, "the enrichment pool must be nudged for the grouped media before readiness");
+    assert.equal(h.storage.getTimelineState(TK), "active");
+    assert.equal(h.launched.length, 1);
+  } finally {
+    h.storage.close();
+  }
+});
+
 test("#9: a non-enriching duplicate trigger event leaves 'inactive' (marked skipped) and is not swept by the bulk flip", async () => {
   const h = await makeHarness();
   try {
@@ -471,6 +519,8 @@ test("#2/#14: a stranded 'activating' state (catch-path reset threw) does not bu
       return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
     },
     activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+    getTimelineEventById: (eventId) => storage.getTimelineEventById(eventId),
+    getEnrichmentStatus: (eventId) => storage.getEnrichmentStatus(eventId),
   });
 
   const h = await makeHarness({
@@ -530,6 +580,8 @@ test("#7/#14: one-shot recovery clears the stranded 'activating' AND re-dispatch
       return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
     },
     activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+    getTimelineEventById: (eventId) => storage.getTimelineEventById(eventId),
+    getEnrichmentStatus: (eventId) => storage.getEnrichmentStatus(eventId),
   });
 
   let readinessCalls = 0;
@@ -579,6 +631,8 @@ test("#7: when the stranded-recovery reset write FAILS, the trigger is NOT re-di
       return storage.setTimelineState(timelineKey, state as Parameters<Storage["setTimelineState"]>[1]);
     },
     activateTimelineEvents: (timelineKey) => storage.activateTimelineEvents(timelineKey),
+    getTimelineEventById: (eventId) => storage.getTimelineEventById(eventId),
+    getEnrichmentStatus: (eventId) => storage.getEnrichmentStatus(eventId),
   });
 
   const h = await makeHarness({

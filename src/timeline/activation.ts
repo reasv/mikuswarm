@@ -1,4 +1,4 @@
-import type { InboundChatEvent } from "../types.js";
+import type { CanonicalChatEvent, InboundChatEvent } from "../types.js";
 import type { TimelineRouter } from "./router.js";
 import { needsEnrichment } from "./store.js";
 import type { TriggerCoordinator } from "./trigger.js";
@@ -11,6 +11,10 @@ export interface ActivationStorage {
   getTimelineState(timelineKey: string): string;
   setTimelineState(timelineKey: string, state: string): Promise<void>;
   activateTimelineEvents(timelineKey: string): Promise<number>;
+  /** Read a stored event by id (used to extend the trigger-group flip, #2). */
+  getTimelineEventById(eventId: string): CanonicalChatEvent | undefined;
+  /** Read the current enrichment_status of a stored event (#2). */
+  getEnrichmentStatus(eventId: string): string | undefined;
 }
 
 /** Sets the enrichment status of an already-stored event. */
@@ -234,10 +238,16 @@ export class ActivationCoordinator {
       // trigger. Best-effort — never throws (failures logged inside).
       await this.opts.runInitialBackfill(inbound);
 
-      // Await trigger readiness. The trigger group's own events were routed/
-      // flipped above; readiness depends only on those, not on the not-yet-
-      // activated backlog.
+      // Resolve the trigger group FIRST: it can pull a prior attachment-bearing
+      // message into the group (app.ts resolveTriggerGroup), and on first
+      // activation that grouped message is still 'inactive'. The bulk flip below
+      // runs only AFTER readiness (#3), so we must flip the resolved group's
+      // still-'inactive' members to a processable status here — otherwise
+      // awaitEnrichmentComplete treats 'inactive' as ready and countPendingCaptions
+      // sees no media_assets rows (none exist until enrichment runs), and the first
+      // session renders a grouped image with no enrichment and no caption (#2).
       await this.opts.resolveTriggerGroup(inbound);
+      await this.activateTriggerGroupEvents(inbound);
       this.opts.notifyCaptions();
       await this.opts.awaitTriggerReadiness(inbound);
 
@@ -261,6 +271,15 @@ export class ActivationCoordinator {
       // enrichment pool. AFTER readiness succeeds so a pre-active failure (or
       // crash) leaves the backlog 'inactive' rather than stranding it 'pending'
       // under an 'inactive' timeline (#3). One nudge drains every pending row.
+      //
+      // LOAD-BEARING ORDERING (#9): this bulk 'inactive'→'pending' flip MUST run
+      // BEFORE the setTimelineState('active') promotion below, never after. If a
+      // future change promoted to 'active' first, a crash between the two writes
+      // would strand 'inactive' rows under an 'active' timeline — invisible to
+      // BOTH recovery paths: resetStaleActivations() only heals timelines stuck
+      // in 'activating', and the retention sweep (pruneInactiveTimelineEvents)
+      // only touches inactive timelines. Such rows would never enrich and never
+      // prune. Flip first, then promote.
       const activatedCount = await this.opts.storage.activateTimelineEvents(inbound.timelineKey);
       if (activatedCount > 0) this.opts.notifyEnrichment(inbound.event.id);
       this.opts.logger.info("timeline_events_activated", {
@@ -329,6 +348,47 @@ export class ActivationCoordinator {
     await this.opts.router.route(inbound, holdStatus);
     if (holdStatus === "pending") this.opts.notifyEnrichment(inbound.event.id);
     return holdStatus;
+  }
+
+  /**
+   * Flip the resolved trigger group's still-'inactive' members to a processable
+   * status BEFORE awaiting readiness, and nudge the pools (#2). This extends the
+   * single-trigger pre-readiness exception (above) to the whole resolved group:
+   * `resolveTriggerGroup` may have pulled a prior attachment-bearing message into
+   * the group that, on first activation, is still 'inactive'. Without this, that
+   * grouped media would be treated as ready (awaitEnrichmentComplete) with no
+   * caption (countPendingCaptions sees no media_assets until enrichment runs).
+   *
+   * Only events currently 'inactive' are touched — the trigger event itself was
+   * already routed/flipped above, and any non-'inactive' member is left as is.
+   * Invariant #3 is preserved for the rest of the backlog: only the resolved
+   * group is flipped here; the broader backlog flips only after readiness via
+   * `activateTimelineEvents`, so a pre-active failure still leaves it 'inactive'.
+   * The few group rows flipped here are an accepted, bounded exception (same as
+   * the single trigger event) — on a pre-active failure they stay 'pending' under
+   * a reset-to-'inactive' timeline, but the enrichment/caption pools simply drain
+   * them; the timeline re-activates on the next trigger.
+   */
+  private async activateTriggerGroupEvents(inbound: InboundChatEvent): Promise<void> {
+    const groupIds = inbound.trigger?.groupedEventIds ?? [];
+    let nudgeEnrichment = false;
+    for (const eventId of groupIds) {
+      if (eventId === inbound.event.id) continue; // trigger handled above
+      if (this.opts.storage.getEnrichmentStatus(eventId) !== "inactive") continue;
+      const event = this.opts.storage.getTimelineEventById(eventId);
+      if (!event) continue;
+      if (needsEnrichment(event)) {
+        await this.opts.setEnrichmentStatus(eventId, "pending");
+        nudgeEnrichment = true;
+      } else {
+        // Leave it processable but skip enrichment/captions (readiness treats any
+        // non-pending/processing status as ready).
+        await this.opts.setEnrichmentStatus(eventId, "skipped");
+      }
+    }
+    // The caption pool is nudged unconditionally by the caller after this; only
+    // the enrichment pool needs an explicit nudge for the rows we just flipped.
+    if (nudgeEnrichment) this.opts.notifyEnrichment(inbound.event.id);
   }
 
   /** Clear the guard and held-trigger buffer for a timeline; return the buffer. */

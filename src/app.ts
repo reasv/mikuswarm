@@ -783,20 +783,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const RETENTION_SWEEP_INTERVAL_MS = 86_400_000; // daily (spec §3)
   let retentionTimer: ReturnType<typeof setInterval> | undefined;
 
-  async function runInactiveRetention(): Promise<void> {
-    const decision = decideRetentionSweep({ retentionDays, draining, now: Date.now() });
-    if (decision.skip) return;
-    const { cutoff } = decision;
-    try {
-      const pruned = await storage.pruneInactiveTimelineEvents(cutoff);
-      if (pruned > 0) {
-        logger.info("inactive_retention_pruned", { pruned, retentionDays, cutoff });
-      }
-    } catch (error) {
-      logger.error("inactive_retention_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  function runInactiveRetention(): Promise<void> {
+    return runRetentionSweep({
+      retentionDays,
+      // Read `draining` lazily so the re-check inside runRetentionSweep observes
+      // its CURRENT value, not a snapshot from when the callback fired (#6).
+      isDraining: () => draining,
+      now: () => Date.now(),
+      prune: (cutoff) => storage.pruneInactiveTimelineEvents(cutoff),
+      logger,
+    });
   }
 
   // Recover timelines stranded mid-activation by a prior crash before the
@@ -870,6 +866,41 @@ const MILLIS_PER_DAY = 86_400_000;
  * are eligible for pruning. Extracted as a pure function so the cutoff math and
  * the skip gate are unit-testable without standing up a runtime.
  */
+/**
+ * Run one inactive-event retention sweep, re-checking `draining` immediately
+ * before the (awaited) prune (#6). The daily `setInterval` callback computes the
+ * decision synchronously, but `stop()` may flip `draining=true` between the
+ * decision and the prune; this re-check (via the lazy `isDraining()` getter)
+ * ensures a sweep does NOT START once drain has begun. A sweep already in flight
+ * still completes — `stop()` awaits `storage.waitForIdle()` before `close()` —
+ * this just avoids kicking off a new one during drain. Injectable so the
+ * decision + re-check + prune sequencing is unit-testable without a runtime.
+ */
+export async function runRetentionSweep(deps: {
+  retentionDays: number;
+  isDraining: () => boolean;
+  now: () => number;
+  prune: (cutoff: number) => Promise<number>;
+  logger: { info: (e: string, f?: Record<string, unknown>) => void; error: (e: string, f?: Record<string, unknown>) => void };
+}): Promise<void> {
+  const { retentionDays, isDraining, now, prune, logger } = deps;
+  const decision = decideRetentionSweep({ retentionDays, draining: isDraining(), now: now() });
+  if (decision.skip) return;
+  const { cutoff } = decision;
+  // Re-check draining immediately before starting the prune (#6).
+  if (isDraining()) return;
+  try {
+    const pruned = await prune(cutoff);
+    if (pruned > 0) {
+      logger.info("inactive_retention_pruned", { pruned, retentionDays, cutoff });
+    }
+  } catch (error) {
+    logger.error("inactive_retention_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 export function decideRetentionSweep(params: {
   retentionDays: number;
   draining: boolean;
