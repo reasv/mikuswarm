@@ -1,4 +1,4 @@
-import type { Agent } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord } from "./session-manager.js";
@@ -30,7 +30,12 @@ const TYPING_KEEPALIVE_MS = 4_000;
 export class SessionRunner {
   constructor(private readonly options: SessionRunnerOptions = {}) {}
 
-  async run(agent: Agent, session: AgentSessionRecord, maxRetries: number): Promise<SessionRunResult> {
+  async run(
+    agent: Agent,
+    session: AgentSessionRecord,
+    maxRetries: number,
+    kickoff: AgentMessage,
+  ): Promise<SessionRunResult> {
     let retries = 0;
     let typingInterval: NodeJS.Timeout | undefined;
     try {
@@ -43,13 +48,10 @@ export class SessionRunner {
         }, TYPING_KEEPALIVE_MS);
       }
 
-      await promptAgent(agent, {
-        type: "chatEvent",
-        role: "user",
-        content: session.trigger.event.body,
-        event: session.trigger.event,
-        timestamp: session.trigger.event.timestamp,
-      });
+      // Kick the loop with the frozen final user turn (the rich `triggerGroup` popped
+      // off the prefix by the factory, §2b). It becomes the first turn of the
+      // transcript — delivered once, not echoed as a separate raw user message.
+      await promptAgent(agent, kickoff);
       await waitForAgentIdle(agent);
 
       while (!isTerminallyValid(agent.state.messages) && retries < maxRetries) {

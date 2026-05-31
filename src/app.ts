@@ -669,8 +669,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...mcpTools,
     ].filter((t) => !disabledTools.has(t.name));
     let agent;
+    let kickoff;
     try {
-      agent = await factory.create(session, tools);
+      ({ agent, finalTurn: kickoff } = await factory.create(session, tools));
+      // Chat builds always emit a final trigger turn; absence indicates a build bug.
+      if (!kickoff) throw new Error("context build produced no final user turn");
     } catch (error) {
       sessions.markDiscarded(session.id);
       logger.error("session_factory_failed", {
@@ -692,7 +695,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const runner = new SessionRunner({ provider, target });
 
     const run = runner
-      .run(agent, session, config.agent.sessions.forced_completion_retries)
+      .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff)
       .then((result) => {
         sessions.markCompleted(session.id);
         logger.info("session_completed", {

@@ -48,6 +48,24 @@ type ModelConfig = AppConfig["models"]["default"];
 export interface CreateAgentOptions {
   /** When set, build context for a summarization session cut at this timestamp. */
   summarizationCutoff?: { endTimestamp: number };
+  /**
+   * Resume seam (designed-for, not yet wired — see §6 of spec/OBSERVABILITY-UI.md).
+   * When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
+   * frozen prefix and `transcript` seeds the live message array. The caller is expected
+   * to append the awaited input as a new user turn before continuing.
+   */
+  resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
+}
+
+export interface CreatedAgent {
+  agent: Agent;
+  /**
+   * The final user turn — a rich `triggerGroup` (chat) or the cutoff `satellite`
+   * (summarization) — popped off the frozen prefix (§2b). The caller kicks the loop
+   * with it via `agent.prompt(...)`, making it the first turn of the live transcript.
+   * Undefined in resume mode (the caller appends a new user turn instead).
+   */
+  finalTurn?: AgentMessage;
 }
 
 export class AgentSessionFactory {
@@ -82,7 +100,7 @@ export class AgentSessionFactory {
     session: AgentSessionRecord,
     tools: AgentTool[] = [],
     opts?: CreateAgentOptions,
-  ): Promise<Agent> {
+  ): Promise<CreatedAgent> {
     const workspaceRoot = this.options.config.workspace.root_dir;
     const sessionTypeConfig = this.resolveSessionType(session.sessionType);
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
@@ -105,33 +123,47 @@ export class AgentSessionFactory {
     // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(workspace, fallbackPrompt);
 
-    return new Agent({
+    // Phase 0 — frozen sessions (§2b). Build the context ONCE, here at creation, and
+    // freeze it. The prefix (`frozenBase`) is append-only thereafter; the final user
+    // turn is popped off and returned so the caller can deliver it via
+    // `agent.prompt(...)` as the first turn of the transcript. `transformContext`
+    // never rebuilds — it only appends live runtime messages onto the frozen prefix.
+    let frozenBase: AgentMessage[];
+    let finalTurn: AgentMessage | undefined;
+    if (opts?.resume) {
+      frozenBase = opts.resume.snapshot;
+    } else {
+      const built = await this.options.contextBuilder.build({
+        timelineKey: session.timelineKey,
+        trigger: session.trigger.event,
+        activeSessions: opts?.summarizationCutoff
+          ? []
+          : this.options.getActiveSessions(session.timelineKey),
+        workspace,
+        sessionType: sessionTypeConfig,
+        fallbackPrompt,
+        summarizationCutoff: opts?.summarizationCutoff,
+      });
+      await dumpBuiltContext(
+        this.options.config.app.context_dump_dir,
+        session.timelineKey,
+        session.id,
+        built,
+        session.trigger.event.id,
+      ).catch(() => undefined);
+      ({ frozenBase, finalTurn } = splitBuiltContext(built));
+    }
+
+    const agent = new Agent({
       initialState: {
         systemPrompt,
         model,
         tools: filteredTools,
       },
-      transformContext: async (messages) => {
-        const built = await this.options.contextBuilder.build({
-          timelineKey: session.timelineKey,
-          trigger: session.trigger.event,
-          activeSessions: opts?.summarizationCutoff
-            ? []
-            : this.options.getActiveSessions(session.timelineKey),
-          workspace,
-          sessionType: sessionTypeConfig,
-          fallbackPrompt,
-          summarizationCutoff: opts?.summarizationCutoff,
-        });
-        await dumpBuiltContext(
-          this.options.config.app.context_dump_dir,
-          session.timelineKey,
-          session.id,
-          built,
-          session.trigger.event.id,
-        ).catch(() => undefined);
-        return buildAgentContextMessages(built, messages);
-      },
+      transformContext: async (messages) => [
+        ...frozenBase,
+        ...messages.filter(isLiveRuntimeMessage),
+      ],
       convertToLlm,
       streamFn,
       getApiKey: () => modelConfig.api_key,
@@ -139,6 +171,12 @@ export class AgentSessionFactory {
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
     });
+
+    if (opts?.resume?.transcript?.length) {
+      agent.state.messages = opts.resume.transcript;
+    }
+
+    return { agent, finalTurn };
   }
 }
 
@@ -152,11 +190,15 @@ export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig)
   return tools.filter((tool) => allowed.has(tool.name));
 }
 
-export function buildAgentContextMessages(
-  built: BuiltContext,
-  liveMessages: AgentMessage[] = [],
-): AgentMessage[] {
-    const baseMessages = built.messages.flatMap((message): AgentMessage[] => {
+/**
+ * Map a BuiltContext's messages into the agent's message vocabulary:
+ * - `system` is dropped (it lives in `AgentState.systemPrompt`, not the array).
+ * - `triggerGroup`/`satellite` are kept as-is.
+ * - `summaryLayer` becomes a user `chatEvent`.
+ * - historical `chatEvent`s keep their (assistant-or-user) role.
+ */
+export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
+  return built.messages.flatMap((message): AgentMessage[] => {
     if (message.type === "system") return [];
     if (message.type === "triggerGroup" || message.type === "satellite") {
       return [
@@ -191,15 +233,48 @@ export function buildAgentContextMessages(
     }
     return [];
   });
+}
 
-  return [...baseMessages, ...liveMessages.filter(isLiveRuntimeMessage)];
+/**
+ * Split a frozen BuiltContext into the append-only prefix (`frozenBase`) and the
+ * final user turn (`finalTurn`) — the last message, which the builder always emits
+ * as a `triggerGroup` (chat) or `satellite` (summarization cutoff). The caller
+ * delivers `finalTurn` via `agent.prompt(...)` so it becomes the first turn of the
+ * live transcript (§2b of spec/OBSERVABILITY-UI.md), rather than living in the prefix.
+ */
+export function splitBuiltContext(built: BuiltContext): {
+  frozenBase: AgentMessage[];
+  finalTurn: AgentMessage | undefined;
+} {
+  const mapped = mapBuiltMessages(built);
+  const lastSource = built.messages[built.messages.length - 1];
+  if (lastSource && (lastSource.type === "triggerGroup" || lastSource.type === "satellite")) {
+    return { frozenBase: mapped.slice(0, -1), finalTurn: mapped[mapped.length - 1] };
+  }
+  return { frozenBase: mapped, finalTurn: undefined };
+}
+
+/**
+ * Legacy combined render: the full built context (prefix + final turn) followed by
+ * filtered live messages. Retained for tests and any non-frozen call site; the
+ * factory uses {@link splitBuiltContext} + an append-only `transformContext` instead.
+ */
+export function buildAgentContextMessages(
+  built: BuiltContext,
+  liveMessages: AgentMessage[] = [],
+): AgentMessage[] {
+  return [...mapBuiltMessages(built), ...liveMessages.filter(isLiveRuntimeMessage)];
 }
 
 function isLiveRuntimeMessage(message: AgentMessage): boolean {
   const typed = message as any;
   if (!typed || typeof typed !== "object") return false;
   if (typed.type === "interjection") return true;
-  if (typed.type === "chatEvent" || typed.type === "triggerGroup" || typed.type === "satellite") return false;
+  // The trigger/satellite final turn is now delivered live via agent.prompt() as the
+  // first transcript turn (§2b), so it must be KEPT. Historical chat events stay in the
+  // frozen prefix and are dropped if they ever appear in the live array.
+  if (typed.type === "triggerGroup" || typed.type === "satellite") return true;
+  if (typed.type === "chatEvent") return false;
   if (typed.role === "toolResult") return true;
   if (typed.role === "user") return true;
   if (typed.role === "assistant") {

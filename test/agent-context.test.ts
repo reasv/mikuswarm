@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "../src/agent/convert.js";
-import { buildAgentContextMessages } from "../src/agent/factory.js";
+import { buildAgentContextMessages, splitBuiltContext } from "../src/agent/factory.js";
 import type { BuiltContext } from "../src/context/index.js";
 import { ContextBuilder, type BuildContextOptions } from "../src/context/builder.js";
 import { Storage } from "../src/storage/index.js";
@@ -112,6 +112,81 @@ test("summary layer renders as a user turn ahead of chat and trigger", () => {
     llm.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("<summary")),
     true,
   );
+});
+
+// ── Phase 0: frozen sessions — split & append-only filter (§2b) ──────
+
+test("splitBuiltContext pops the triggerGroup final turn off the frozen prefix", () => {
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "rich", tokenEstimate: 1 },
+      { type: "triggerGroup", role: "user", content: "<system>now</system>\n\n<message>hi miku</message>", tier: "trigger", tokenEstimate: 1, timestamp: 30 },
+    ],
+    tokenEstimate: 3,
+    compactTokens: 0,
+    richTokens: 1,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const { frozenBase, finalTurn } = splitBuiltContext(built);
+
+  // Prefix keeps history only; the trigger turn is popped out (system is dropped).
+  assert.deepEqual(frozenBase.map((m) => (m as any).type), ["chatEvent"]);
+  assert.equal((finalTurn as any)?.type, "triggerGroup");
+  assert.match((finalTurn as any).content, /hi miku/);
+});
+
+test("splitBuiltContext pops the satellite final turn for a cutoff build", () => {
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "compact", tokenEstimate: 1 },
+      { type: "satellite", role: "user", content: "<system>summarize state</system>", tier: "trigger", tokenEstimate: 1 },
+    ],
+    tokenEstimate: 3,
+    compactTokens: 1,
+    richTokens: 0,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const { frozenBase, finalTurn } = splitBuiltContext(built);
+  assert.deepEqual(frozenBase.map((m) => (m as any).type), ["chatEvent"]);
+  assert.equal((finalTurn as any)?.type, "satellite");
+});
+
+test("frozen append-only context delivers the trigger exactly once", () => {
+  // The trigger lives only in the live transcript (delivered via prompt), never in
+  // the frozen prefix — so it must appear exactly once when the two are combined.
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "rich", tokenEstimate: 1 },
+      { type: "triggerGroup", role: "user", content: "<system>now</system>\n\n<message>hi miku</message>", tier: "trigger", tokenEstimate: 1, timestamp: 30 },
+    ],
+    tokenEstimate: 3,
+    compactTokens: 0,
+    richTokens: 1,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const { frozenBase, finalTurn } = splitBuiltContext(built);
+  // Mirror the factory's transformContext: prefix + filtered live (the prompted finalTurn).
+  const combined = buildAgentContextMessages(
+    { ...built, messages: built.messages.slice(0, -1) },
+    [finalTurn as AgentMessage],
+  );
+  void frozenBase;
+
+  const triggerGroups = combined.filter((m) => (m as any).type === "triggerGroup");
+  assert.equal(triggerGroups.length, 1, "triggerGroup must not be duplicated");
+
+  // A historical chatEvent appearing in the live array is still dropped (stays in prefix).
+  const withStrayHistory = buildAgentContextMessages(
+    { ...built, messages: built.messages.slice(0, -1) },
+    [{ type: "chatEvent", role: "user", content: "stray" } as AgentMessage, finalTurn as AgentMessage],
+  );
+  assert.equal(withStrayHistory.filter((m) => (m as any).content === "stray").length, 0);
 });
 
 test("convertToLlm filters accidental system transcript messages", () => {

@@ -175,12 +175,18 @@ export class SummarizationWorkerPool {
 
     let agentError: unknown;
     try {
-      const agent = await factory.create(syntheticSession, [summaryTool], {
+      const { agent, finalTurn } = await factory.create(syntheticSession, [summaryTool], {
         summarizationCutoff: { endTimestamp: input.cutoffTimestamp },
       });
       // Drive the agent directly — SessionRunner is hardwired to chat semantics
       // (send_message / NO_REPLY) and would fight a summary_tool-only session.
-      await agent.prompt(syntheticTrigger.body);
+      // Frozen sessions (§2b) pop the final turn off the prefix; for a cutoff build
+      // that is the runtime-suppressed `satellite` block. Deliver it followed by the
+      // summarize instruction as the kickoff turns, preserving the prior ordering.
+      const kickoff = finalTurn
+        ? [finalTurn, { role: "user", content: syntheticTrigger.body, timestamp: syntheticTrigger.timestamp }]
+        : syntheticTrigger.body;
+      await agent.prompt(kickoff as any);
       await agent.waitForIdle();
     } catch (err) {
       agentError = err;
