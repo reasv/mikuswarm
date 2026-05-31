@@ -15,6 +15,9 @@ export {
   type SummarizationJob,
   type SummarizationJobStatus,
   type SummarizationJobInsert,
+  type AgentSessionStatus,
+  type AgentSessionInsert,
+  type AgentSessionRow,
   type TimelineCursor,
 } from "./database.js";
 export type { TimelineState } from "../types.js";

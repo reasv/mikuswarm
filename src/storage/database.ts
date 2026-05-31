@@ -274,6 +274,68 @@ export interface SummarizationJobInsert {
   maxRetries: number;
 }
 
+/**
+ * Lifecycle status of a durable session record (spec §4 status model).
+ *   - `created`     placeholder made, not yet run (in-memory)
+ *   - `running`     actively executing (in-memory)
+ *   - `completed`   finished normally, incl. no_reply (terminal, default)
+ *   - `discarded`   failed/aborted (terminal)
+ *   - `interrupted` process stopped mid-run; healed on startup (reserved)
+ *   - `suspended`   paused awaiting external input (reserved, future §7)
+ */
+export type AgentSessionStatus =
+  | "created"
+  | "running"
+  | "completed"
+  | "discarded"
+  | "interrupted"
+  | "suspended";
+
+/**
+ * Initial-insert shape for an `agent_sessions` row (spec §4, §5). The runner
+ * creates the placeholder at `created`; the snapshot/transcript/timestamp
+ * columns are filled in later by the dedicated save/update methods. `status` is
+ * supplied by the caller (typically `'created'`).
+ */
+export interface AgentSessionInsert {
+  id: string;
+  timelineKey: string;
+  sessionType: string;
+  status: AgentSessionStatus;
+  modelId?: string | null;
+  triggerEventId?: string | null;
+  triggerExternalId?: string | null;
+  triggerBody?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * A persisted `agent_sessions` row as stored (snake_case columns). Read-side
+ * shape returned by {@link Storage.getAgentSession}; mirrors the table in
+ * spec §4 verbatim so the console can render snapshot + transcript directly.
+ */
+export interface AgentSessionRow {
+  id: string;
+  timeline_key: string;
+  session_type: string;
+  status: AgentSessionStatus;
+  model_id: string | null;
+  trigger_event_id: string | null;
+  trigger_external_id: string | null;
+  trigger_body: string | null;
+  context_snapshot_json: string | null;
+  context_dump_path: string | null;
+  transcript_json: string | null;
+  token_estimate: number | null;
+  no_reply: number;
+  error: string | null;
+  created_at: number;
+  started_at: number | null;
+  updated_at: number;
+  completed_at: number | null;
+}
+
 export class Storage {
   readonly db: Database.Database;
   private readonly queue: Array<WriteJob<any>> = [];
@@ -2010,6 +2072,166 @@ export class Storage {
     });
   }
 
+  // ── Agent sessions (durable session record) ───────────────────────
+  // Spec §3–§5: a session's durable record is the frozen context prefix
+  // (snapshot, written once) plus its transcript (rewritten atomically at each
+  // turn boundary). The snapshot and transcript live in separate columns so the
+  // large immutable prefix is NOT re-serialized through the single-writer queue
+  // on every cheap transcript flush.
+
+  /** Insert the initial `agent_sessions` placeholder row (spec §5, status='created'). */
+  insertAgentSession(row: AgentSessionInsert): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into agent_sessions (
+          id, timeline_key, session_type, status, model_id,
+          trigger_event_id, trigger_external_id, trigger_body,
+          no_reply, created_at, updated_at
+        ) values (
+          @id, @timelineKey, @sessionType, @status, @modelId,
+          @triggerEventId, @triggerExternalId, @triggerBody,
+          0, @createdAt, @updatedAt
+        )`,
+      ).run({
+        id: row.id,
+        timelineKey: row.timelineKey,
+        sessionType: row.sessionType,
+        status: row.status,
+        modelId: row.modelId ?? null,
+        triggerEventId: row.triggerEventId ?? null,
+        triggerExternalId: row.triggerExternalId ?? null,
+        triggerBody: row.triggerBody ?? null,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      });
+    });
+  }
+
+  /**
+   * Update a session's status and any of the lifecycle timestamps/flags. Only
+   * the fields provided in `opts` are written; `updated_at` is always bumped
+   * (defaulting to now). Mirrors `markRunning/markCompleted/markDiscarded` from
+   * spec §5.
+   */
+  updateAgentSessionStatus(
+    id: string,
+    status: AgentSessionStatus,
+    opts: {
+      startedAt?: number;
+      completedAt?: number;
+      noReply?: boolean;
+      error?: string | null;
+      updatedAt?: number;
+    } = {},
+  ): Promise<void> {
+    return this.write((db) => {
+      const sets: string[] = ["status = @status", "updated_at = @updatedAt"];
+      const params: Record<string, unknown> = {
+        id,
+        status,
+        updatedAt: opts.updatedAt ?? Date.now(),
+      };
+      if (opts.startedAt !== undefined) {
+        sets.push("started_at = @startedAt");
+        params.startedAt = opts.startedAt;
+      }
+      if (opts.completedAt !== undefined) {
+        sets.push("completed_at = @completedAt");
+        params.completedAt = opts.completedAt;
+      }
+      if (opts.noReply !== undefined) {
+        sets.push("no_reply = @noReply");
+        params.noReply = opts.noReply ? 1 : 0;
+      }
+      if (opts.error !== undefined) {
+        sets.push("error = @error");
+        params.error = opts.error;
+      }
+      db.prepare(`update agent_sessions set ${sets.join(", ")} where id = @id`).run(params);
+    });
+  }
+
+  /**
+   * Persist the frozen context snapshot for a session (spec §3). Written ONCE,
+   * when the build completes at session creation: the snapshot prefix, its
+   * on-disk dump path, and the snapshot token estimate.
+   */
+  saveAgentSessionSnapshot(
+    id: string,
+    snapshot: {
+      snapshotJson: string;
+      dumpPath: string | null;
+      tokenEstimate: number | null;
+      updatedAt?: number;
+    },
+  ): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update agent_sessions set
+          context_snapshot_json = @snapshotJson,
+          context_dump_path = @dumpPath,
+          token_estimate = @tokenEstimate,
+          updated_at = @updatedAt
+         where id = @id`,
+      ).run({
+        id,
+        snapshotJson: snapshot.snapshotJson,
+        dumpPath: snapshot.dumpPath ?? null,
+        tokenEstimate: snapshot.tokenEstimate ?? null,
+        updatedAt: snapshot.updatedAt ?? Date.now(),
+      });
+    });
+  }
+
+  /**
+   * Flush the session transcript (spec §3). Cheap, repeated at each turn
+   * boundary — it touches ONLY `transcript_json` + `updated_at` and never
+   * re-serializes the large immutable snapshot columns.
+   */
+  saveAgentSessionTranscript(
+    id: string,
+    transcriptJson: string,
+    updatedAt?: number,
+  ): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update agent_sessions set transcript_json = @transcriptJson, updated_at = @updatedAt
+         where id = @id`,
+      ).run({
+        id,
+        transcriptJson,
+        updatedAt: updatedAt ?? Date.now(),
+      });
+    });
+  }
+
+  /**
+   * Startup healing (spec §4): flip any session left mid-flight (`running` or
+   * `created`) to `interrupted`, before the provider delivers events. No
+   * auto-resume. Mirrors `resetStaleActivations`/`resetStaleSummarizationJobs`.
+   * Returns the number of rows healed.
+   */
+  resetStaleSessions(): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update agent_sessions set status = 'interrupted', updated_at = ?
+           where status in ('running', 'created')`,
+        )
+        .run(Date.now());
+      return result.changes;
+    });
+  }
+
+  /** Read a single session record by id (spec §4), or undefined if absent. */
+  getAgentSession(id: string): AgentSessionRow | undefined {
+    return this.read((db) =>
+      db.prepare(`select * from agent_sessions where id = ?`).get(id) as
+        | AgentSessionRow
+        | undefined,
+    );
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -2306,13 +2528,46 @@ create table if not exists pending_edits (
   created_at integer not null,
   primary key (provider, target_external_id, timeline_key)
 );
+
+-- Durable session record (spec §3-§5): the frozen context prefix (snapshot,
+-- written once at session creation) plus the appended transcript (rewritten
+-- atomically at each turn boundary). Together context_snapshot_json ++
+-- transcript_json reconstruct the exact sequence the model saw. The persisted
+-- record outlives SessionManager's in-memory eviction; the console reads it
+-- from here. See the status model in spec section 4.
+create table if not exists agent_sessions (
+  id text primary key,
+  timeline_key text not null,
+  session_type text not null default 'default',
+  status text not null,
+  model_id text,
+  trigger_event_id text,
+  trigger_external_id text,
+  trigger_body text,
+  context_snapshot_json text,
+  context_dump_path text,
+  transcript_json text,
+  token_estimate integer,
+  no_reply integer not null default 0,
+  error text,
+  created_at integer not null,
+  started_at integer,
+  updated_at integer not null,
+  completed_at integer
+);
+
+create index if not exists idx_agent_sessions_timeline
+  on agent_sessions(timeline_key, created_at desc);
+
+create index if not exists idx_agent_sessions_status
+  on agent_sessions(status, updated_at desc);
 `;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 4;
+export const LATEST_SCHEMA_VERSION = 5;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2370,6 +2625,41 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // run this step.
   (db) => {
     db.exec(`alter table timeline_events add column last_edit_timestamp integer;`);
+  },
+  // index 4 (v4 -> v5): add the `agent_sessions` table — the durable session
+  // record (spec §3–§5): frozen context snapshot (written once) + appended
+  // transcript (flushed at each turn boundary), the status model, and the two
+  // lookup indexes (by timeline reverse-chron, and by status for startup
+  // healing). `create table/index if not exists` is harmless if a forward path
+  // already created it. Fresh DBs get this directly from SCHEMA above and never
+  // run this step.
+  (db) => {
+    db.exec(
+      `create table if not exists agent_sessions (
+         id text primary key,
+         timeline_key text not null,
+         session_type text not null default 'default',
+         status text not null,
+         model_id text,
+         trigger_event_id text,
+         trigger_external_id text,
+         trigger_body text,
+         context_snapshot_json text,
+         context_dump_path text,
+         transcript_json text,
+         token_estimate integer,
+         no_reply integer not null default 0,
+         error text,
+         created_at integer not null,
+         started_at integer,
+         updated_at integer not null,
+         completed_at integer
+       );
+       create index if not exists idx_agent_sessions_timeline
+         on agent_sessions(timeline_key, created_at desc);
+       create index if not exists idx_agent_sessions_status
+         on agent_sessions(status, updated_at desc);`,
+    );
   },
 ];
 
