@@ -3,6 +3,7 @@ import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent
 import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
+import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
@@ -66,6 +67,21 @@ export interface CreatedAgent {
    * Undefined in resume mode (the caller appends a new user turn instead).
    */
   finalTurn?: AgentMessage;
+  /**
+   * Frozen context **prefix** for persistence (spec §3 / §10a): `built.messages`
+   * minus the final live user turn (the trailing `triggerGroup`/`satellite`).
+   *
+   * This DELIBERATELY retains the leading `system` ContextMessage and the
+   * summary/compact/rich tiers WITH their `tier`/`tokenEstimate` metadata intact —
+   * the verbatim renderer (§10a) needs the system block + tier metadata. Do NOT
+   * reuse the runtime `frozenBase` here: that drops the system message and tier
+   * metadata. Undefined in resume mode (no fresh build occurred).
+   */
+  snapshot?: ContextMessage[];
+  /** Snapshot-level token totals copied verbatim from `BuiltContext` (§11 top bar). */
+  tokenEstimate?: number;
+  compactTokens?: number;
+  richTokens?: number;
 }
 
 export class AgentSessionFactory {
@@ -130,6 +146,11 @@ export class AgentSessionFactory {
     // never rebuilds — it only appends live runtime messages onto the frozen prefix.
     let frozenBase: AgentMessage[];
     let finalTurn: AgentMessage | undefined;
+    // Persistence snapshot surfaced to the caller (§3). Undefined in resume mode.
+    let snapshot: ContextMessage[] | undefined;
+    let snapshotTokenEstimate: number | undefined;
+    let snapshotCompactTokens: number | undefined;
+    let snapshotRichTokens: number | undefined;
     if (opts?.resume) {
       frozenBase = opts.resume.snapshot;
     } else {
@@ -152,6 +173,14 @@ export class AgentSessionFactory {
         session.trigger.event.id,
       ).catch(() => undefined);
       ({ frozenBase, finalTurn } = splitBuiltContext(built));
+      // Snapshot prefix for persistence: keep the FULL built messages (system +
+      // tiers, with tier/tokenEstimate metadata) minus the final live user turn.
+      // `finalTurn` is set iff the build ended with a triggerGroup/satellite, so
+      // it mirrors splitBuiltContext's detection of the trailing live turn.
+      snapshot = finalTurn ? built.messages.slice(0, -1) : built.messages;
+      snapshotTokenEstimate = built.tokenEstimate;
+      snapshotCompactTokens = built.compactTokens;
+      snapshotRichTokens = built.richTokens;
     }
 
     const agent = new Agent({
@@ -176,7 +205,14 @@ export class AgentSessionFactory {
       agent.state.messages = opts.resume.transcript;
     }
 
-    return { agent, finalTurn };
+    return {
+      agent,
+      finalTurn,
+      snapshot,
+      tokenEstimate: snapshotTokenEstimate,
+      compactTokens: snapshotCompactTokens,
+      richTokens: snapshotRichTokens,
+    };
   }
 }
 
