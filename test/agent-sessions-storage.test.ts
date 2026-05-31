@@ -9,11 +9,47 @@ import {
   Storage,
   type AgentSessionInsert,
 } from "../src/storage/index.js";
+import type { Logger } from "../src/observability/index.js";
 
 async function withStorage(fn: (storage: Storage) => Promise<void>): Promise<void> {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     await fn(storage);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+}
+
+interface CapturedWarning {
+  message: string;
+  fields?: Record<string, unknown>;
+}
+
+/** A Logger that records `warn` calls so tests can assert on observable signals. */
+function makeCapturingLogger(): { logger: Logger; warnings: CapturedWarning[] } {
+  const warnings: CapturedWarning[] = [];
+  const logger: Logger = {
+    debug() {},
+    info() {},
+    warn(message, fields) {
+      warnings.push({ message, fields });
+    },
+    error() {},
+    child() {
+      return logger;
+    },
+  };
+  return { logger, warnings };
+}
+
+async function withCapturingStorage(
+  fn: (storage: Storage, warnings: CapturedWarning[]) => Promise<void>,
+): Promise<void> {
+  const { logger, warnings } = makeCapturingLogger();
+  const storage = await Storage.open({ databasePath: ":memory:", logger });
+  try {
+    await fn(storage, warnings);
   } finally {
     await storage.waitForIdle();
     storage.close();
@@ -260,4 +296,289 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Issue #5: missing-row writes are observable (warn, no throw) ---
+
+test("updateAgentSessionStatus on a non-existent id warns and does not throw", async () => {
+  await withCapturingStorage(async (storage, warnings) => {
+    // No row inserted: the UPDATE matches zero rows.
+    await storage.updateAgentSessionStatus("s-nonexistent", "running", {
+      startedAt: 1_000,
+      updatedAt: 1_000,
+    });
+
+    assert.equal(warnings.length, 1, "exactly one warning for the no-op update");
+    const warn = warnings[0];
+    assert.match(warn.message, /updateAgentSessionStatus/);
+    assert.equal(warn.fields?.method, "updateAgentSessionStatus");
+    assert.equal(warn.fields?.sessionId, "s-nonexistent");
+  });
+});
+
+test("saveAgentSessionSnapshot on a non-existent id warns and does not throw", async () => {
+  await withCapturingStorage(async (storage, warnings) => {
+    await storage.saveAgentSessionSnapshot("s-missing-snap", {
+      snapshotJson: "{}",
+      dumpPath: null,
+      tokenEstimate: null,
+      updatedAt: 1_000,
+    });
+
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].fields?.method, "saveAgentSessionSnapshot");
+    assert.equal(warnings[0].fields?.sessionId, "s-missing-snap");
+  });
+});
+
+test("saveAgentSessionTranscript on a non-existent id warns and does not throw", async () => {
+  await withCapturingStorage(async (storage, warnings) => {
+    await storage.saveAgentSessionTranscript("s-missing-tx", "[]", 1_000);
+
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].fields?.method, "saveAgentSessionTranscript");
+    assert.equal(warnings[0].fields?.sessionId, "s-missing-tx");
+  });
+});
+
+test("a write to an existing session row does NOT warn", async () => {
+  await withCapturingStorage(async (storage, warnings) => {
+    await storage.insertAgentSession(baseInsert());
+    await storage.updateAgentSessionStatus("s-abc1234567", "running", {
+      startedAt: 2_000,
+      updatedAt: 2_000,
+    });
+    await storage.saveAgentSessionSnapshot("s-abc1234567", {
+      snapshotJson: "{}",
+      dumpPath: null,
+      tokenEstimate: null,
+      updatedAt: 3_000,
+    });
+    await storage.saveAgentSessionTranscript("s-abc1234567", "[]", 4_000);
+
+    assert.equal(warnings.length, 0, "matched rows must not warn");
+  });
+});
+
+// --- Issue #6: status CHECK constraint is enforced at the DB layer ---
+
+test("inserting a session with an out-of-band status is rejected by the DB", async () => {
+  await withStorage(async (storage) => {
+    await assert.rejects(
+      // Cast through unknown: the TS union forbids this, but a raw/buggy caller
+      // could still try, and the CHECK constraint is the backstop.
+      storage.insertAgentSession(
+        baseInsert({ status: "bogus" as unknown as AgentSessionInsert["status"] }),
+      ),
+      /CHECK constraint failed/,
+    );
+  });
+});
+
+test("updating a session to an out-of-band status is rejected by the DB", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+    await assert.rejects(
+      storage.updateAgentSessionStatus(
+        "s-abc1234567",
+        "bogus" as unknown as AgentSessionInsert["status"],
+        { updatedAt: 2_000 },
+      ),
+      /CHECK constraint failed/,
+    );
+    // The row keeps its original valid status.
+    assert.equal(storage.getAgentSession("s-abc1234567")?.status, "created");
+  });
+});
+
+test("all spec-defined statuses (incl. reserved 'suspended') are accepted", async () => {
+  await withStorage(async (storage) => {
+    const statuses: AgentSessionInsert["status"][] = [
+      "created",
+      "running",
+      "completed",
+      "discarded",
+      "interrupted",
+      "suspended",
+    ];
+    for (const [i, status] of statuses.entries()) {
+      const id = `s-status${i}xxx`;
+      await storage.insertAgentSession(baseInsert({ id, status }));
+      assert.equal(storage.getAgentSession(id)?.status, status);
+    }
+  });
+});
+
+// --- Issue #7: insertAgentSession can set started_at (insert-as-running) ---
+
+test("insert-as-running with startedAt round-trips a non-null started_at", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      baseInsert({
+        id: "s-running-st",
+        status: "running",
+        startedAt: 7_777,
+      }),
+    );
+    const row = storage.getAgentSession("s-running-st");
+    assert.ok(row);
+    assert.equal(row.status, "running");
+    assert.equal(row.started_at, 7_777);
+  });
+});
+
+test("chat-style insert (created, no startedAt) leaves started_at null", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-created-st" }));
+    const row = storage.getAgentSession("s-created-st");
+    assert.ok(row);
+    assert.equal(row.status, "created");
+    assert.equal(row.started_at, null);
+  });
+});
+
+test("explicit startedAt: null is treated the same as omitted", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-null-st", startedAt: null }));
+    assert.equal(storage.getAgentSession("s-null-st")?.started_at, null);
+  });
+});
+
+// --- Issue #14: storage test gaps ---
+
+test("resetStaleSessions strictly advances updated_at on healed rows", async () => {
+  await withStorage(async (storage) => {
+    // Insert a running row with a fixed, old updated_at.
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-stale00000", status: "running", updatedAt: 1_000 }),
+    );
+    const before = storage.getAgentSession("s-stale00000");
+    assert.ok(before);
+    assert.equal(before.updated_at, 1_000);
+
+    const healed = await storage.resetStaleSessions();
+    assert.equal(healed, 1);
+
+    const after = storage.getAgentSession("s-stale00000");
+    assert.ok(after);
+    assert.equal(after.status, "interrupted");
+    // resetStaleSessions stamps Date.now(); the captured baseline (1_000) is far
+    // in the past, so the healed row's updated_at must have strictly advanced.
+    assert.ok(
+      after.updated_at > before.updated_at,
+      `updated_at should advance: ${before.updated_at} -> ${after.updated_at}`,
+    );
+  });
+});
+
+test("both agent_sessions indexes exist on a fresh DB", async () => {
+  await withStorage(async (storage) => {
+    const names = storage.read((db) =>
+      (
+        db
+          .prepare(
+            `select name from sqlite_master
+             where type = 'index' and tbl_name = 'agent_sessions'`,
+          )
+          .all() as Array<{ name: string }>
+      ).map((r) => r.name),
+    );
+    assert.ok(
+      names.includes("idx_agent_sessions_timeline"),
+      `missing idx_agent_sessions_timeline; have: ${names.join(", ")}`,
+    );
+    assert.ok(
+      names.includes("idx_agent_sessions_status"),
+      `missing idx_agent_sessions_status; have: ${names.join(", ")}`,
+    );
+  });
+});
+
+test("both agent_sessions indexes exist after a v4 -> v5 migration", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-idx-migrate-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    // Minimal v4 DB: the fresh-vs-existing probe keys on `timeline_events`, so it
+    // must exist with the full v4 column set referenced by SCHEMA's index DDL.
+    const legacy = new Database(dbPath);
+    legacy.exec(
+      `create table timeline_events (
+         id text primary key,
+         external_id text,
+         timeline_key text not null,
+         provider text not null,
+         role text not null check(role in ('user', 'assistant')),
+         sender_id text not null,
+         sender_display_name text,
+         body text not null,
+         timestamp integer not null,
+         received_at integer not null,
+         agent_session_id text,
+         event_json text not null,
+         enrichment_status text not null default 'pending'
+           check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
+         enrichment_retries integer not null default 0,
+         redecrypt_attempts integer not null default 0,
+         last_edit_timestamp integer,
+         trigger_group_id text,
+         created_at integer not null,
+         updated_at integer not null,
+         is_undecryptable integer generated always as
+           (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
+       );`,
+    );
+    legacy.pragma("user_version = 4");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const names = storage.read((db) =>
+        (
+          db
+            .prepare(
+              `select name from sqlite_master
+               where type = 'index' and tbl_name = 'agent_sessions'`,
+            )
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      );
+      assert.ok(names.includes("idx_agent_sessions_timeline"));
+      assert.ok(names.includes("idx_agent_sessions_status"));
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("saveAgentSessionSnapshot leaves an already-written transcript untouched", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    // Write the transcript FIRST (reverse of the existing snapshot-preserved test).
+    await storage.saveAgentSessionTranscript(
+      "s-abc1234567",
+      '[{"role":"user"},{"role":"assistant"}]',
+      2_000,
+    );
+
+    // Now write the snapshot; it must not clobber the transcript column.
+    await storage.saveAgentSessionSnapshot("s-abc1234567", {
+      snapshotJson: '{"prefix":true}',
+      dumpPath: "/dumps/s-abc1234567.json",
+      tokenEstimate: 123,
+      updatedAt: 3_000,
+    });
+
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.ok(row);
+    // Snapshot columns written.
+    assert.equal(row.context_snapshot_json, '{"prefix":true}');
+    assert.equal(row.token_estimate, 123);
+    assert.equal(row.updated_at, 3_000);
+    // Transcript survives the snapshot write.
+    assert.equal(row.transcript_json, '[{"role":"user"},{"role":"assistant"}]');
+  });
 });

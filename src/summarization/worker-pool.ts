@@ -189,6 +189,9 @@ export class SummarizationWorkerPool {
       triggerEventId: syntheticTrigger.id,
       triggerBody: syntheticTrigger.body,
       createdAt: sessionStartedAt,
+      // Inserted directly at 'running' (bypasses created → markRunning), so set
+      // started_at here; otherwise the row would show a null start time.
+      startedAt: sessionStartedAt,
       updatedAt: sessionStartedAt,
     });
 

@@ -296,6 +296,11 @@ export type AgentSessionStatus =
  * creates the placeholder at `created`; the snapshot/transcript/timestamp
  * columns are filled in later by the dedicated save/update methods. `status` is
  * supplied by the caller (typically `'created'`).
+ *
+ * `startedAt` is optional: the chat path inserts at `created` and leaves it
+ * null until `markRunning` sets it. Callers that insert directly at `running`
+ * (e.g. the summarization worker, which bypasses `created → markRunning`) pass
+ * `startedAt` so the row carries a non-null start time from the outset.
  */
 export interface AgentSessionInsert {
   id: string;
@@ -307,6 +312,7 @@ export interface AgentSessionInsert {
   triggerExternalId?: string | null;
   triggerBody?: string | null;
   createdAt: number;
+  startedAt?: number | null;
   updatedAt: number;
 }
 
@@ -2086,11 +2092,11 @@ export class Storage {
         `insert into agent_sessions (
           id, timeline_key, session_type, status, model_id,
           trigger_event_id, trigger_external_id, trigger_body,
-          no_reply, created_at, updated_at
+          no_reply, created_at, started_at, updated_at
         ) values (
           @id, @timelineKey, @sessionType, @status, @modelId,
           @triggerEventId, @triggerExternalId, @triggerBody,
-          0, @createdAt, @updatedAt
+          0, @createdAt, @startedAt, @updatedAt
         )`,
       ).run({
         id: row.id,
@@ -2102,9 +2108,29 @@ export class Storage {
         triggerExternalId: row.triggerExternalId ?? null,
         triggerBody: row.triggerBody ?? null,
         createdAt: row.createdAt,
+        startedAt: row.startedAt ?? null,
         updatedAt: row.updatedAt,
       });
     });
+  }
+
+  /**
+   * Surface a no-op `agent_sessions` write. The session save/update methods all
+   * target `where id = @id`; if that id does not exist the UPDATE silently
+   * affects zero rows and the caller is none the wiser. A zero-change write here
+   * means a wiring bug (the placeholder insert failed, or the row was deleted)
+   * is losing snapshot/transcript/status data. We log a structured warning so
+   * the no-op is visible, but deliberately do NOT throw: these run on the
+   * fire-and-forget flush path (single-writer queue), and throwing could
+   * destabilize it or reject unrelated queued writes.
+   */
+  private warnIfNoSessionRow(method: string, id: string, changes: number): void {
+    if (changes === 0 && this.logger) {
+      this.logger.warn(`${method}: no agent_sessions row matched id`, {
+        method,
+        sessionId: id,
+      });
+    }
   }
 
   /**
@@ -2112,6 +2138,11 @@ export class Storage {
    * the fields provided in `opts` are written; `updated_at` is always bumped
    * (defaulting to now). Mirrors `markRunning/markCompleted/markDiscarded` from
    * spec §5.
+   *
+   * `started_at`/`completed_at` are forward-only (write-once in practice): the
+   * lifecycle sets each exactly once (`markRunning`, `markCompleted`/
+   * `markDiscarded`), and callers never rewind them. This is intentional — the
+   * timestamps record when the session first entered each phase.
    */
   updateAgentSessionStatus(
     id: string,
@@ -2147,7 +2178,10 @@ export class Storage {
         sets.push("error = @error");
         params.error = opts.error;
       }
-      db.prepare(`update agent_sessions set ${sets.join(", ")} where id = @id`).run(params);
+      const result = db
+        .prepare(`update agent_sessions set ${sets.join(", ")} where id = @id`)
+        .run(params);
+      this.warnIfNoSessionRow("updateAgentSessionStatus", id, result.changes);
     });
   }
 
@@ -2166,20 +2200,23 @@ export class Storage {
     },
   ): Promise<void> {
     return this.write((db) => {
-      db.prepare(
-        `update agent_sessions set
-          context_snapshot_json = @snapshotJson,
-          context_dump_path = @dumpPath,
-          token_estimate = @tokenEstimate,
-          updated_at = @updatedAt
-         where id = @id`,
-      ).run({
-        id,
-        snapshotJson: snapshot.snapshotJson,
-        dumpPath: snapshot.dumpPath ?? null,
-        tokenEstimate: snapshot.tokenEstimate ?? null,
-        updatedAt: snapshot.updatedAt ?? Date.now(),
-      });
+      const result = db
+        .prepare(
+          `update agent_sessions set
+            context_snapshot_json = @snapshotJson,
+            context_dump_path = @dumpPath,
+            token_estimate = @tokenEstimate,
+            updated_at = @updatedAt
+           where id = @id`,
+        )
+        .run({
+          id,
+          snapshotJson: snapshot.snapshotJson,
+          dumpPath: snapshot.dumpPath ?? null,
+          tokenEstimate: snapshot.tokenEstimate ?? null,
+          updatedAt: snapshot.updatedAt ?? Date.now(),
+        });
+      this.warnIfNoSessionRow("saveAgentSessionSnapshot", id, result.changes);
     });
   }
 
@@ -2194,14 +2231,17 @@ export class Storage {
     updatedAt?: number,
   ): Promise<void> {
     return this.write((db) => {
-      db.prepare(
-        `update agent_sessions set transcript_json = @transcriptJson, updated_at = @updatedAt
-         where id = @id`,
-      ).run({
-        id,
-        transcriptJson,
-        updatedAt: updatedAt ?? Date.now(),
-      });
+      const result = db
+        .prepare(
+          `update agent_sessions set transcript_json = @transcriptJson, updated_at = @updatedAt
+           where id = @id`,
+        )
+        .run({
+          id,
+          transcriptJson,
+          updatedAt: updatedAt ?? Date.now(),
+        });
+      this.warnIfNoSessionRow("saveAgentSessionTranscript", id, result.changes);
     });
   }
 
@@ -2539,7 +2579,8 @@ create table if not exists agent_sessions (
   id text primary key,
   timeline_key text not null,
   session_type text not null default 'default',
-  status text not null,
+  status text not null
+    check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended')),
   model_id text,
   trigger_event_id text,
   trigger_external_id text,
@@ -2639,7 +2680,8 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          id text primary key,
          timeline_key text not null,
          session_type text not null default 'default',
-         status text not null,
+         status text not null
+           check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended')),
          model_id text,
          trigger_event_id text,
          trigger_external_id text,
