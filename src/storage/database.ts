@@ -646,6 +646,51 @@ export class Storage {
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
 
+  /**
+   * Resolve the ACTUAL stored timeline_key of an edit target (issue #4). A
+   * re-decrypted `m.replace` placeholder always lands on the room/DM key (its
+   * thread relation was megolm-encrypted at store time), but the target original,
+   * once decrypted, may live on a thread key (`…:thread:<root>`). Looking the edit
+   * up under the placeholder's room key alone would miss a thread target and park
+   * the edit under the wrong key, where replay never matches — silent edit loss.
+   *
+   * Scope: the target is the same Matrix event in the same room/account as the
+   * placeholder, so we match `(provider, external_id)` constrained to the
+   * placeholder's room base — either the room key itself or any of its thread keys
+   * (`<roomKey>:thread:%`). The room base embeds `matrix:<account>:room:<roomId>`,
+   * so this preserves the multi-account scoping that the room-key lookup has
+   * (issue #3): a different account's row lives under a different base and is never
+   * matched. Returns the target's stored timeline_key, or undefined if no target
+   * is stored under this room base (caller falls back to the room key → parks).
+   * Prefers an exact room-key match (the common room-target case) over a thread one.
+   */
+  resolveEditTargetTimelineKey(
+    provider: string,
+    externalId: string,
+    roomTimelineKey: string,
+  ): string | undefined {
+    const row = this.read(
+      (db) =>
+        db
+          .prepare(
+            `select timeline_key from timeline_events
+             where provider = ? and external_id = ?
+               and (timeline_key = @roomKey
+                    or timeline_key like @threadPrefix escape '\\')
+             order by case when timeline_key = @roomKey then 0 else 1 end,
+                      timeline_key
+             limit 1`,
+          )
+          .get(provider, externalId, {
+            roomKey: roomTimelineKey,
+            // SQLite LIKE: escape %/_/\ in the room key so a roomId containing them
+            // can't broaden the match. `:thread:` keys append the root after this.
+            threadPrefix: `${roomTimelineKey.replace(/[\\%_]/g, "\\$&")}:thread:%`,
+          }) as { timeline_key: string } | undefined,
+    );
+    return row?.timeline_key;
+  }
+
   updateTimelineEvent(
     id: string,
     updater: (event: CanonicalChatEvent) => CanonicalChatEvent,
@@ -885,7 +930,10 @@ export class Storage {
    * Returns `{ applied: true, event, status }` on success, or
    * `{ applied: false }` when no target row exists for `(provider, externalId)` —
    * the caller logs and skips, never inserting the edit as a standalone message.
-   * Last-write-wins on repeated edits (each call overwrites the body/attachments).
+   * Latest-by-origin_server_ts wins on repeated edits (issue #3): the row tracks
+   * `last_edit_timestamp`, and an incoming edit older than it is a no-op (returns
+   * the already-stored event/status). Equal-or-newer timestamps apply. This
+   * mirrors the pending_edits `>=` guard, so the applied and parked paths agree.
    */
   applyEditToTarget(
     provider: string,
@@ -907,11 +955,11 @@ export class Storage {
       // caller's timelineKey is the correct scope.
       const row = db
         .prepare(
-          `select id, event_json from timeline_events
+          `select id, event_json, last_edit_timestamp from timeline_events
            where provider = ? and external_id = ? and timeline_key = ? limit 1`,
         )
         .get(provider, targetExternalId, timelineKey) as
-        | { id: string; event_json: string }
+        | { id: string; event_json: string; last_edit_timestamp: number | null }
         | undefined;
       if (!row) {
         // The target isn't stored yet (out-of-order sync / backfill). Park the
@@ -945,6 +993,25 @@ export class Storage {
       }
 
       const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
+      // Latest-by-origin_server_ts wins (issue #3): if a newer edit has already
+      // been applied to this row, an older incoming edit is a no-op. Without this
+      // guard the applied path was last-arrival-wins (unlike the pending_edits
+      // path, which has always been latest-wins), so a re-decrypted older edit
+      // arriving after a newer live edit could clobber the newer body. Return the
+      // already-stored event/status so the caller (e.g. the redecryption sweeper,
+      // which retires its placeholder on `applied`) sees a stable result and does
+      // not re-arm pools for a stale edit. Equal timestamps still apply (mirrors
+      // the pending_edits `>=` guard) — a benign re-application of the same edit.
+      if (row.last_edit_timestamp !== null && editTimestamp < row.last_edit_timestamp) {
+        const storedStatusRow = db
+          .prepare(`select enrichment_status from timeline_events where id = ?`)
+          .get(row.id) as { enrichment_status: string } | undefined;
+        return {
+          applied: true,
+          event: existing,
+          status: storedStatusRow?.enrichment_status ?? "skipped",
+        };
+      }
       const updated = updater(existing);
       // The edit-application path never re-homes the target: it edits an existing
       // row by its own timeline. Resolve the target's timeline state for gating.
@@ -958,6 +1025,7 @@ export class Storage {
          set body = @body,
              event_json = @eventJson,
              enrichment_status = @enrichmentStatus,
+             last_edit_timestamp = @lastEditTimestamp,
              updated_at = @updatedAt
          where id = @id`,
       ).run({
@@ -965,6 +1033,7 @@ export class Storage {
         body: updated.body,
         eventJson: JSON.stringify(updated),
         enrichmentStatus: status,
+        lastEditTimestamp: editTimestamp,
         updatedAt: Date.now(),
       });
       return { applied: true, event: updated, status };
@@ -982,19 +1051,20 @@ export class Storage {
     provider: string,
     externalId: string,
     timelineKey: string,
-  ): EditReplacementContent | undefined {
+  ): (EditReplacementContent & { editTimestamp: number }) | undefined {
     const row = db
       .prepare(
-        `select body, attachments_json from pending_edits
+        `select body, attachments_json, edit_timestamp from pending_edits
          where provider = ? and target_external_id = ? and timeline_key = ?`,
       )
       .get(provider, externalId, timelineKey) as
-      | { body: string; attachments_json: string }
+      | { body: string; attachments_json: string; edit_timestamp: number }
       | undefined;
     if (!row) return undefined;
     return {
       body: row.body,
       attachments: JSON.parse(row.attachments_json) as AttachmentMeta[],
+      editTimestamp: row.edit_timestamp,
     };
   }
 
@@ -1957,6 +2027,14 @@ create table if not exists timeline_events (
   enrichment_status text not null default 'pending'
     check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
   enrichment_retries integer not null default 0,
+  -- origin_server_ts of the most recent edit (m.replace) applied to this row, or
+  -- NULL if the row has never been edited. The edit-application paths use this to
+  -- enforce latest-by-origin_server_ts wins (issue #3): an incoming edit whose
+  -- timestamp is older than this is a no-op, so an out-of-order delivery (notably a
+  -- re-decrypted older edit arriving after a newer live edit across the
+  -- live/redecryption boundary) can never clobber a newer edit. Mirrors the
+  -- pending_edits latest-wins guard for the not-yet-stored-target case.
+  last_edit_timestamp integer,
   -- Count of re-decryption probe attempts that did not yield decrypted content
   -- (still-UTD or unfetchable). The re-decryption sweeper increments this per
   -- failed probe and excludes rows at/above a ceiling from its candidate query
@@ -2190,7 +2268,7 @@ create table if not exists pending_edits (
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-const LATEST_SCHEMA_VERSION = 3;
+const LATEST_SCHEMA_VERSION = 4;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2239,6 +2317,15 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          primary key (provider, target_external_id, timeline_key)
        );`,
     );
+  },
+  // index 3 (v3 -> v4): add `last_edit_timestamp` to `timeline_events`, the
+  // origin_server_ts of the most recently applied edit. The edit-application
+  // paths use it to enforce latest-by-origin_server_ts wins (issue #3). Nullable
+  // with no default: existing rows backfill to NULL ("never edited"), so the next
+  // edit always applies. Fresh DBs get this directly from SCHEMA above and never
+  // run this step.
+  (db) => {
+    db.exec(`alter table timeline_events add column last_edit_timestamp integer;`);
   },
 ];
 

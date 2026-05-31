@@ -77,6 +77,22 @@ export class TimelineStore {
     const pending = this.storage.getPendingEdit(db, event.provider, externalId, event.timelineKey);
     if (!pending) return undefined;
 
+    // Latest-by-origin_server_ts wins (issue #3), consistent with the live edit
+    // path. The freshly-inserted target normally has last_edit_timestamp = NULL
+    // (never edited), so the parked edit applies; the guard only blocks if a newer
+    // edit had somehow already landed on this row. Always retire the parked edit
+    // afterward — it is stale by definition once a newer edit is present.
+    const targetRow = db
+      .prepare(`select last_edit_timestamp from timeline_events where id = ?`)
+      .get(event.id) as { last_edit_timestamp: number | null } | undefined;
+    if (
+      targetRow?.last_edit_timestamp != null &&
+      pending.editTimestamp < targetRow.last_edit_timestamp
+    ) {
+      this.storage.deletePendingEdit(db, event.provider, externalId, event.timelineKey);
+      return undefined;
+    }
+
     const updated = applyEditToCanonical(event, pending);
     const stateRow = db
       .prepare(`select timeline_state from timeline_compaction_state where timeline_key = ?`)
@@ -88,6 +104,7 @@ export class TimelineStore {
        set body = @body,
            event_json = @eventJson,
            enrichment_status = @enrichmentStatus,
+           last_edit_timestamp = @lastEditTimestamp,
            updated_at = @updatedAt
        where id = @id`,
     ).run({
@@ -95,6 +112,7 @@ export class TimelineStore {
       body: updated.body,
       eventJson: JSON.stringify(updated),
       enrichmentStatus: status,
+      lastEditTimestamp: pending.editTimestamp,
       updatedAt: Date.now(),
     });
     this.storage.deletePendingEdit(db, event.provider, externalId, event.timelineKey);
@@ -156,6 +174,20 @@ export class TimelineStore {
     timelineKey: string,
   ): CanonicalChatEvent | undefined {
     return this.storage.getTimelineEventByExternalId(provider, externalId, timelineKey);
+  }
+
+  /**
+   * Resolve the actual stored timeline_key of an edit target across the room and
+   * its thread keys (issue #4). Used by the redecryption sweeper so a re-decrypted
+   * edit reaches a thread-keyed target instead of parking under the room key where
+   * replay never matches. Returns undefined when no target is stored.
+   */
+  resolveEditTargetTimelineKey(
+    provider: string,
+    externalId: string,
+    roomTimelineKey: string,
+  ): string | undefined {
+    return this.storage.resolveEditTargetTimelineKey(provider, externalId, roomTimelineKey);
   }
 
   query(query: TimelineQuery): CanonicalChatEvent[] {

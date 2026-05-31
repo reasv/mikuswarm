@@ -545,6 +545,163 @@ test("a decrypted m.replace whose target is missing is parked, then replayed on 
   });
 });
 
+// ── (#3/#12) latest-by-origin_server_ts wins on the applied (target-present) path ─
+
+test("two out-of-order edits on a stored target: the origin_server_ts-newer one wins (#3/#12)", async () => {
+  await withStores(async (store, storage) => {
+    await store.append(targetEvent(), "skipped");
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    const applyEdit = (body: string, ts: number) =>
+      store.applyEdit(
+        "matrix",
+        "$orig",
+        ROOM_TK,
+        { body, attachments: [] },
+        ts,
+        (t) => applyEditToCanonical(t, { body, attachments: [] }),
+        editStatus,
+      );
+
+    // The NEWER edit (by origin_server_ts) arrives first; the OLDER edit arrives
+    // afterward (out-of-order delivery — e.g. a re-decrypted older edit crossing
+    // the live/redecryption boundary). The newer body must survive: the stale
+    // older edit is a no-op. Pre-#3 (last-arrival-wins) this asserted "old body".
+    const newer = await applyEdit("NEWER edit", 1_700_000_009_000);
+    assert.ok(newer.applied);
+    assert.equal(newer.applied && newer.event.body, "NEWER edit");
+
+    const older = await applyEdit("older edit (stale, arrives late)", 1_700_000_002_000);
+    assert.ok(older.applied, "the placeholder/caller still sees applied=true");
+    assert.equal(
+      older.applied && older.event.body,
+      "NEWER edit",
+      "the stale edit returns the already-stored newer event, unchanged",
+    );
+
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "NEWER edit",
+      "the newer-by-origin_server_ts edit wins regardless of arrival order",
+    );
+  });
+});
+
+test("a newer edit still applies over an older one on the applied path (#3)", async () => {
+  await withStores(async (store, storage) => {
+    await store.append(targetEvent(), "skipped");
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    const applyEdit = (body: string, ts: number) =>
+      store.applyEdit(
+        "matrix",
+        "$orig",
+        ROOM_TK,
+        { body, attachments: [] },
+        ts,
+        (t) => applyEditToCanonical(t, { body, attachments: [] }),
+        editStatus,
+      );
+
+    // In-order: older then newer — the newer wins (the guard is `<`, so an equal
+    // or newer timestamp applies).
+    await applyEdit("first edit", 1_700_000_002_000);
+    await applyEdit("second edit", 1_700_000_005_000);
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$orig`)?.body, "second edit");
+
+    // An equal-timestamp re-application is still applied (benign), mirroring the
+    // pending_edits `>=` guard.
+    await applyEdit("re-applied at same ts", 1_700_000_005_000);
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$orig`)?.body, "re-applied at same ts");
+  });
+});
+
+// ── (#4) a re-decrypted edit targeting a THREAD message reaches the thread row ──
+
+const THREAD_ROOT = "$threadroot";
+const THREAD_TK = `${ROOM_TK}:thread:${THREAD_ROOT}`;
+
+test("sweeper resolves a thread-keyed target for a re-decrypted edit (#4)", async () => {
+  await withStores(async (store, storage) => {
+    // The target original is a DECRYPTED THREAD message: it lives on the thread
+    // timeline key, not the room key.
+    await store.append(
+      targetEvent({
+        id: `matrix:${ACCOUNT}:$orig`,
+        timelineKey: THREAD_TK,
+        threadId: THREAD_ROOT,
+        body: "original thread text",
+      }),
+      "skipped",
+    );
+    // The UTD edit placeholder landed on the ROOM key (its thread relation was
+    // megolm-encrypted at store time).
+    await store.appendIfMissing(utdEditPlaceholder(), "skipped");
+    await storage.setTimelineState(ROOM_TK, "active");
+    await storage.setTimelineState(THREAD_TK, "active");
+
+    const sweeper = new RedecryptionSweeper({
+      store,
+      retry: async () => ({
+        eventId: "$edit",
+        sender: "@alice:example.org",
+        body: "decrypted thread edit body",
+        timestamp: new Date(1_700_000_001_000).toISOString(),
+        relatesTo: { relType: "m.replace", eventId: "$orig" },
+      }),
+      notifyEnrichment: () => {},
+      notifyCaptions: () => {},
+      intervalMs: 1000,
+      batchSize: 10,
+      isDraining: () => false,
+    });
+
+    await sweeper.tick();
+
+    // The edit reached the thread-keyed target (pre-#4 it parked under the room
+    // key and was permanently lost).
+    assert.equal(
+      store.getById(`matrix:${ACCOUNT}:$orig`)?.body,
+      "decrypted thread edit body",
+      "the thread target renders the decrypted edit body",
+    );
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$edit`), undefined, "the placeholder is removed");
+    // Nothing parked under either key.
+    assert.equal(pendingEditCount(storage, ROOM_TK), 0, "no edit parked under the room key");
+    assert.equal(pendingEditCount(storage, THREAD_TK), 0, "no edit parked under the thread key");
+  });
+});
+
+test("sweeper still edits a room-keyed target and parks correctly when missing (#4 regression)", async () => {
+  await withStores(async (store, storage) => {
+    // Common case: the target is a plain ROOM message — resolution returns the
+    // room key and the edit applies there.
+    await store.append(targetEvent(), "skipped");
+    await store.appendIfMissing(utdEditPlaceholder(), "skipped");
+    await storage.setTimelineState(ROOM_TK, "active");
+
+    const sweeper = new RedecryptionSweeper({
+      store,
+      retry: async () => ({
+        eventId: "$edit",
+        sender: "@alice:example.org",
+        body: "decrypted room edit body",
+        timestamp: new Date(1_700_000_001_000).toISOString(),
+        relatesTo: { relType: "m.replace", eventId: "$orig" },
+      }),
+      notifyEnrichment: () => {},
+      notifyCaptions: () => {},
+      intervalMs: 1000,
+      batchSize: 10,
+      isDraining: () => false,
+    });
+
+    await sweeper.tick();
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$orig`)?.body, "decrypted room edit body");
+    assert.equal(pendingEditCount(storage, ROOM_TK), 0);
+  });
+});
+
 // ── (#6) resolveMultiAccountRetry keeps the row alive on the defensive fallback ─
 
 test("resolveMultiAccountRetry rethrows when every account throws (transient → keep alive) (#6)", async () => {

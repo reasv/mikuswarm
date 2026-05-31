@@ -295,10 +295,25 @@ export class RedecryptionSweeper {
       body: summary.body,
       attachments: (summary.media ?? []).map((media) => mediaToAttachment(summary.eventId, media)),
     };
+    // Resolve the target's ACTUAL timeline key (issue #4). The UTD edit placeholder
+    // always landed on the room/DM key (its thread relation was megolm-encrypted at
+    // store time), but the target original — once decrypted — may live on a thread
+    // key (`…:thread:<root>`). Scoping the edit to the placeholder's room key alone
+    // would miss a thread target: the lookup fails, the edit parks under the room
+    // key, and replay (keyed by the target's own thread key) never matches it —
+    // silent, permanent edit loss. Resolve across the room and its thread keys;
+    // fall back to the placeholder's key (the common room-target case, and the
+    // park-for-replay case when the target isn't stored yet).
+    const targetTimelineKey =
+      this.#options.store.resolveEditTargetTimelineKey(
+        event.provider,
+        targetExternalId,
+        event.timelineKey,
+      ) ?? event.timelineKey;
     const result = await this.#options.store.applyEdit(
       event.provider,
       targetExternalId,
-      event.timelineKey,
+      targetTimelineKey,
       replacement,
       event.timestamp,
       (target) => applyEditToCanonical(target, replacement),

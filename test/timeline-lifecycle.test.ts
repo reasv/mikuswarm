@@ -130,10 +130,11 @@ test("fresh database opens at the latest user_version with the full canonical sc
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     // The versioned migration runner stamps a fresh DB at the latest version
-    // (v2: redecrypt_attempts added; v3: pending_edits table added). A fresh DB
-    // must NOT run the additive migration steps — SCHEMA already built everything.
+    // (v2: redecrypt_attempts added; v3: pending_edits table added; v4:
+    // last_edit_timestamp added). A fresh DB must NOT run the additive migration
+    // steps — SCHEMA already built everything.
     const userVersion = storage.read((db) => db.pragma("user_version", { simple: true }) as number);
-    assert.equal(userVersion, 3, "fresh DB should be stamped at the latest schema version");
+    assert.equal(userVersion, 4, "fresh DB should be stamped at the latest schema version");
 
     // enrichment_status CHECK includes 'inactive' (baked into the canonical schema).
     await storage.appendTimelineEvent(userEvent({ id: "inact-1", body: "x", timestamp: 1000 }), "inactive");
@@ -153,6 +154,7 @@ test("fresh database opens at the latest user_version with the full canonical sc
     assert.ok(teColumns.has("is_undecryptable"), "is_undecryptable generated column should exist");
     assert.ok(teColumns.has("enrichment_retries"), "enrichment_retries column should exist");
     assert.ok(teColumns.has("redecrypt_attempts"), "redecrypt_attempts column should exist (v2)");
+    assert.ok(teColumns.has("last_edit_timestamp"), "last_edit_timestamp column should exist (v4)");
     assert.ok(teColumns.has("trigger_group_id"), "trigger_group_id column should exist");
 
     // The partial index over the generated column exists.
@@ -201,7 +203,7 @@ test("re-opening an existing database is idempotent (stays at latest version, pr
     try {
       await first.appendTimelineEvent(userEvent({ id: "persist-1", body: "keep me", timestamp: 1000 }), "inactive");
       await first.setTimelineState(TK, "active");
-      assert.equal(first.read((db) => db.pragma("user_version", { simple: true }) as number), 3);
+      assert.equal(first.read((db) => db.pragma("user_version", { simple: true }) as number), 4);
     } finally {
       first.close();
     }
@@ -211,7 +213,7 @@ test("re-opening an existing database is idempotent (stays at latest version, pr
     // additive ALTER step must NOT re-run and hit "duplicate column".)
     const second = await Storage.open({ databasePath: dbPath });
     try {
-      assert.equal(second.read((db) => db.pragma("user_version", { simple: true }) as number), 3, "should stay at the latest version");
+      assert.equal(second.read((db) => db.pragma("user_version", { simple: true }) as number), 4, "should stay at the latest version");
       const body = second.read((db) =>
         (db.prepare("select body from timeline_events where id = ?").get("persist-1") as { body: string } | undefined)?.body,
       );
