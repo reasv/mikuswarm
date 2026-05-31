@@ -468,7 +468,7 @@ export function decryptedCanonical(
   // The relation was encrypted at store time, so a stored UTD always landed on
   // the room timeline with `replyTo`/`threadId` unset. Now that the event is
   // decrypted, `summary.relatesTo` reveals its true placement. Mirror
-  // `summaryToCanonical` in the backfill path so live and backfilled rows agree.
+  // `classifySummary` in the backfill path so live and backfilled rows agree.
   const relType = summary.relatesTo?.relType ?? undefined;
   const relEventId = summary.relatesTo?.eventId ?? undefined;
   if (relType === "m.thread" && relEventId) {

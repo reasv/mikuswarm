@@ -325,7 +325,7 @@ test("room timeline excludes thread messages and edits; sets role and replyTo", 
     assert.equal(result.fetched, 5);
     assert.equal(result.stored, 3, "plain + self + reply; thread and edit excluded");
     assert.equal(store.getById(`matrix:${ACCOUNT}:$thread`), undefined, "thread message excluded from room timeline");
-    assert.equal(store.getById(`matrix:${ACCOUNT}:$edit`), undefined, "m.replace edit skipped");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$edit`), undefined, "m.replace edit applied to its target, never stored as a standalone row");
 
     const self = store.getById(`matrix:${ACCOUNT}:$self`);
     assert.equal(self?.role, "assistant");
@@ -627,6 +627,106 @@ test("#5: a run of newly-stored UTD duplicates still halts only on genuinely new
     assert.equal(result.haltedOnUtd, true, "genuinely-new dead history still halts");
     assert.equal(result.stored, 50);
     assert.equal(client.calls.length, 1, "the second page is never fetched");
+  });
+});
+
+// ── Historical edit handling (issues #1 / #11) ──────────────────────────────
+
+test("#11: an edit later in a backward page is applied to its original earlier in the page", async () => {
+  await withStores(async (store, storage) => {
+    // Backward pages are newest-first, so the original (newer ts) appears BEFORE
+    // its edit (older ts is not required, but matrix-sdk does not fold edits — the
+    // original keeps its pre-edit body and the m.replace is a separate event).
+    const client = new ScriptedClient([
+      page([
+        summary({ eventId: "$orig", timestamp: 5000, body: "original body" }),
+        summary({
+          eventId: "$edit",
+          timestamp: 5001,
+          body: "edited body",
+          relatesTo: { relType: "m.replace", eventId: "$orig" },
+        }),
+      ], null),
+    ]);
+    const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    // The edit is never a standalone row and never counts toward stored.
+    assert.equal(result.stored, 1, "only the original message is a stored row");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$edit`), undefined, "the edit is not stored standalone");
+    const orig = store.getById(`matrix:${ACCOUNT}:$orig`);
+    assert.equal(orig?.body, "edited body", "the stored original renders the edited body, not the stale pre-edit body");
+  });
+});
+
+test("#1: an edit appearing before its original (later backward page) parks and replays on append", async () => {
+  await withStores(async (store, storage) => {
+    // Backward-page ordering can surface the edit BEFORE the original it targets.
+    // The edit parks in pending_edits, and appendIfMissing replays it when the
+    // original lands in a later page — so the original still renders the edit.
+    const client = new ScriptedClient([
+      page([summary({
+        eventId: "$edit",
+        timestamp: 5001,
+        body: "edited body",
+        relatesTo: { relType: "m.replace", eventId: "$orig" },
+      })], "tok1"),
+      page([summary({ eventId: "$orig", timestamp: 5000, body: "original body" })], null),
+    ]);
+    const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    assert.equal(result.stored, 1, "only the original message is a stored row");
+    const orig = store.getById(`matrix:${ACCOUNT}:$orig`);
+    assert.equal(orig?.body, "edited body", "the parked edit is replayed onto the original when it lands");
+  });
+});
+
+test("#1: a backfilled edit keeps the target 'inactive' (deferred to the activation bulk-flip)", async () => {
+  await withStores(async (store, storage) => {
+    const client = new ScriptedClient([
+      page([
+        summary({ eventId: "$orig", timestamp: 5000, body: "original" }),
+        summary({
+          eventId: "$edit",
+          timestamp: 5001,
+          body: "edited",
+          relatesTo: { relType: "m.replace", eventId: "$orig" },
+        }),
+      ], null),
+    ]);
+    await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
+    const status = storage.read((db) =>
+      (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$orig`) as { enrichment_status: string }).enrichment_status,
+    );
+    assert.equal(status, "inactive", "editStatus preserves 'inactive'; enrichment defers to the bulk-flip");
+  });
+});
+
+test("#5: a UTD event during thread backfill lands on the room timeline, not the thread key", async () => {
+  await withStores(async (store, storage) => {
+    // Activating a thread. A UTD event has an encrypted relation (relatesTo is
+    // undefined), so it fails the thread filter — but instead of being dropped it
+    // must land on the ROOM timeline so the re-decryption sweeper can recover and
+    // re-home it once keys arrive.
+    const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
+    const client = new ScriptedClient([
+      page([
+        summary({ eventId: "$mine", timestamp: 5000, relatesTo: { relType: "m.thread", eventId: "$root" } }),
+        utdSummary("$utd", 4900),
+      ], null),
+    ]);
+    const result = await performInitialBackfill({ client, store, storage, timelineKey: threadTk, ...BASE, maxMessages: 100 });
+    assert.equal(result.stored, 2, "the in-thread message and the UTD placeholder are both stored");
+
+    const mine = store.getById(`matrix:${ACCOUNT}:$mine`);
+    assert.equal(mine?.timelineKey, threadTk, "the decrypted thread message stays on the thread timeline");
+
+    const utd = store.getById(`matrix:${ACCOUNT}:$utd`);
+    assert.ok(utd, "the UTD event is stored, not dropped");
+    assert.equal(utd?.timelineKey, ROOM_TK, "the UTD event lands on the room timeline (sweeper re-homes on decrypt)");
+    assert.equal(utd?.threadId, undefined, "no thread id is asserted for a UTD event");
+    assert.deepEqual(utd?.undecryptable, { sessionId: "s", reason: "missing_megolm_session" });
+    const status = storage.read((db) =>
+      (db.prepare("select enrichment_status from timeline_events where id = ?").get(`matrix:${ACCOUNT}:$utd`) as { enrichment_status: string }).enrichment_status,
+    );
+    assert.equal(status, "skipped", "a UTD placeholder has nothing to enrich");
   });
 });
 

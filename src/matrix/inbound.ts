@@ -10,7 +10,7 @@ import type {
 /**
  * Map a native media descriptor to a canonical {@link AttachmentMeta}. Shared by
  * the live-receive path ({@link normalizeMatrixInboundEvent}) and the backfill
- * converter (`summaryToCanonical`) so live and historical attachments are
+ * converter (`classifySummary`) so live and historical attachments are
  * byte-for-byte identical. Download + caption happen later, keyed by event ID;
  * the descriptor carries no encryption keys (encrypted media is resolved at
  * download time by re-fetching the event).
