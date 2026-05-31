@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "../src/agent/convert.js";
-import { buildAgentContextMessages, splitBuiltContext } from "../src/agent/factory.js";
+import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext } from "../src/agent/factory.js";
+import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import type { BuiltContext } from "../src/context/index.js";
 import { ContextBuilder, type BuildContextOptions } from "../src/context/builder.js";
 import { Storage } from "../src/storage/index.js";
@@ -155,9 +156,9 @@ test("splitBuiltContext pops the satellite final turn for a cutoff build", () =>
   assert.equal((finalTurn as any)?.type, "satellite");
 });
 
-test("frozen append-only context delivers the trigger exactly once", () => {
-  // The trigger lives only in the live transcript (delivered via prompt), never in
-  // the frozen prefix — so it must appear exactly once when the two are combined.
+// #3: the snapshot prefix and the mapped frozenBase are derived from one boundary,
+// so they always cover the same source messages (same terminal-trimming).
+test("splitBuiltContext: snapshot prefix and frozenBase share one boundary (trigger present)", () => {
   const built: BuiltContext = {
     messages: [
       { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
@@ -170,23 +171,228 @@ test("frozen append-only context delivers the trigger exactly once", () => {
     imageBlocks: [],
   } as BuiltContext;
 
-  const { frozenBase, finalTurn } = splitBuiltContext(built);
-  // Mirror the factory's transformContext: prefix + filtered live (the prompted finalTurn).
-  const combined = buildAgentContextMessages(
-    { ...built, messages: built.messages.slice(0, -1) },
-    [finalTurn as AgentMessage],
-  );
-  void frozenBase;
+  const { frozenBase, finalTurn, snapshot } = splitBuiltContext(built);
 
-  const triggerGroups = combined.filter((m) => (m as any).type === "triggerGroup");
-  assert.equal(triggerGroups.length, 1, "triggerGroup must not be duplicated");
-
-  // A historical chatEvent appearing in the live array is still dropped (stays in prefix).
-  const withStrayHistory = buildAgentContextMessages(
-    { ...built, messages: built.messages.slice(0, -1) },
-    [{ type: "chatEvent", role: "user", content: "stray" } as AgentMessage, finalTurn as AgentMessage],
+  // The trailing live turn was trimmed from BOTH views.
+  assert.equal((finalTurn as any)?.type, "triggerGroup");
+  // snapshot keeps the system message (verbatim renderer needs it); frozenBase drops it.
+  assert.deepEqual(snapshot.map((m) => m.type), ["system", "chatEvent"]);
+  assert.deepEqual(frozenBase.map((m) => (m as any).type), ["chatEvent"]);
+  // Same source coverage: snapshot is the raw prefix, frozenBase is that prefix minus
+  // the dropped `system` message — exactly one terminal turn trimmed from each.
+  assert.equal(snapshot.length, built.messages.length - 1);
+  assert.equal(
+    snapshot.filter((m) => m.type !== "system").length,
+    frozenBase.length,
+    "snapshot (minus system) and frozenBase must cover the same source messages",
   );
-  assert.equal(withStrayHistory.filter((m) => (m as any).content === "stray").length, 0);
+  // Neither view aliases the builder's array.
+  assert.notEqual(snapshot, built.messages);
+});
+
+test("splitBuiltContext: snapshot prefix and frozenBase share one boundary (trigger absent)", () => {
+  // A build that does NOT end in a triggerGroup/satellite (defensive: should not
+  // happen for real builds, but the boundary logic must keep both views in lockstep).
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "rich", tokenEstimate: 1 },
+    ],
+    tokenEstimate: 2,
+    compactTokens: 0,
+    richTokens: 1,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const { frozenBase, finalTurn, snapshot } = splitBuiltContext(built);
+
+  assert.equal(finalTurn, undefined, "no final turn when the build doesn't end in trigger/satellite");
+  // Nothing is trimmed from either view.
+  assert.deepEqual(snapshot.map((m) => m.type), ["system", "chatEvent"]);
+  assert.deepEqual(frozenBase.map((m) => (m as any).type), ["chatEvent"]);
+  assert.equal(snapshot.length, built.messages.length);
+  assert.equal(snapshot.filter((m) => m.type !== "system").length, frozenBase.length);
+  // Snapshot is a fresh copy, not the builder's array.
+  assert.notEqual(snapshot, built.messages);
+});
+
+// ── #13: pin the REAL factory transformContext closure (production path) ──────
+
+/** A ContextBuilder stub that returns a fixed BuiltContext, so create() exercises
+ *  the real freeze/split/transformContext path without touching the timeline DB. */
+function stubContextBuilder(built: BuiltContext): ContextBuilder {
+  return {
+    build: async () => built,
+  } as unknown as ContextBuilder;
+}
+
+function chatSession(): AgentSessionRecord {
+  return {
+    id: "s-test",
+    timelineKey: "matrix:miku:room:!room",
+    sessionType: "default",
+    status: "running",
+    trigger: {
+      provider: "matrix",
+      timelineKey: "matrix:miku:room:!room",
+      event: testEvent({ id: "trig", body: "hi miku", timestamp: 30 }),
+    } as any,
+    createdAt: 0,
+  };
+}
+
+function triggerBuilt(): BuiltContext {
+  return {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "rich", tokenEstimate: 1 },
+      { type: "triggerGroup", role: "user", content: "<system>now</system>\n\n<message>hi miku</message>", tier: "trigger", tokenEstimate: 1, timestamp: 30 },
+    ],
+    tokenEstimate: 3,
+    compactTokens: 0,
+    richTokens: 1,
+    imageBlocks: [],
+  } as BuiltContext;
+}
+
+test("factory transformContext: prefix is byte-stable across turns and keeps the trigger exactly once", async () => {
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const { agent, finalTurn } = await factory.create(chatSession(), []);
+  assert.equal((finalTurn as any)?.type, "triggerGroup", "final turn popped off the prefix");
+
+  // Invoke the REAL closure the factory installed on the Agent. pi-agent-core exposes
+  // `transformContext` as a public property on the instance, so this is the actual
+  // production closure — no test-only seam in production code.
+  const transform = agent.transformContext!;
+
+  const assistantTurn: AgentMessage = {
+    role: "assistant",
+    content: [{ type: "toolCall", id: "t1", name: "web_fetch", input: {} }],
+    timestamp: 40,
+  } as any;
+  const toolResult: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "t1",
+    toolName: "web_fetch",
+    content: [{ type: "text", text: "tool output" }],
+    details: {},
+    isError: false,
+    timestamp: 41,
+  } as any;
+
+  // Turn 1: only the kickoff final turn is live.
+  const ctx1 = await transform([finalTurn as AgentMessage]);
+  // Turn 2: the live array has grown by an assistant tool-call turn + its result.
+  const ctx2 = await transform([finalTurn as AgentMessage, assistantTurn, toolResult]);
+
+  // (a) The leading prefix slice is byte-identical across both calls (the #1 regression
+  // Phase 0 exists to prevent: prefix-cache invalidation on tool round-trips).
+  const prefixLen = ctx1.length - 1; // ctx1 = prefix + finalTurn
+  assert.deepEqual(
+    ctx2.slice(0, prefixLen),
+    ctx1.slice(0, prefixLen),
+    "frozen prefix must be byte-identical across successive transformContext calls",
+  );
+  // Same element identities, not just structural equality (true byte-stable cache prefix).
+  for (let i = 0; i < prefixLen; i++) {
+    assert.equal(ctx2[i], ctx1[i], `prefix element ${i} must be the same object reference`);
+  }
+
+  // (b) finalTurn appears exactly once.
+  assert.equal(
+    ctx2.filter((m) => (m as any).type === "triggerGroup").length,
+    1,
+    "triggerGroup (final turn) must appear exactly once",
+  );
+
+  // (c) The filter keeps the trigger + a satellite, and drops a stray historical chatEvent.
+  const satellite: AgentMessage = { type: "satellite", content: "<system>x</system>", timestamp: 42 } as any;
+  const strayHistory: AgentMessage = { type: "chatEvent", role: "user", content: "stray", timestamp: 5 } as any;
+  const ctx3 = await transform([strayHistory, finalTurn as AgentMessage, satellite]);
+  assert.equal(ctx3.filter((m) => (m as any).content === "stray").length, 0, "stray chatEvent must be dropped");
+  assert.equal(ctx3.filter((m) => (m as any).type === "triggerGroup").length, 1, "trigger kept");
+  assert.equal(ctx3.filter((m) => (m as any).type === "satellite").length, 1, "satellite kept");
+});
+
+// #4: the append-only prefix is frozen at its single point of construction, so any
+// future reassignment of an element/the array throws in strict mode.
+test("splitBuiltContext freezes the runtime prefix (append-only invariant)", () => {
+  const built = triggerBuilt();
+  const { frozenBase } = splitBuiltContext(built);
+  assert.ok(Object.isFrozen(frozenBase), "frozenBase must be frozen");
+  assert.throws(() => {
+    (frozenBase as AgentMessage[]).push({ type: "chatEvent", role: "user", content: "x" } as AgentMessage);
+  }, "pushing onto the frozen prefix must throw in strict mode");
+
+  // Trigger-absent branch is frozen too.
+  const noTrigger: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "rich", tokenEstimate: 1 },
+    ],
+    tokenEstimate: 2,
+    compactTokens: 0,
+    richTokens: 1,
+    imageBlocks: [],
+  } as BuiltContext;
+  assert.ok(Object.isFrozen(splitBuiltContext(noTrigger).frozenBase));
+});
+
+// #4 (resume path): the factory freezes the prefix it seeds from a stored snapshot,
+// and the runtime prefix never aliases the caller's persisted snapshot array (#2).
+test("factory freezes the resume prefix and does not alias the caller's snapshot", async () => {
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const resumeSnapshot: AgentMessage[] = [
+    { type: "chatEvent", role: "user", content: "<message>prior</message>", timestamp: 1 } as any,
+  ];
+  const { agent } = await factory.create(chatSession(), [], { resume: { snapshot: resumeSnapshot } });
+  const transform = agent.transformContext!;
+
+  // The closure's prefix is frozen: a second call yields the same prior-message bytes.
+  const ctx = await transform([]);
+  assert.equal(ctx.length, 1);
+  assert.equal((ctx[0] as any).content, "<message>prior</message>");
+
+  // Mutating the caller's snapshot afterwards must NOT change the agent's prefix
+  // (the factory copied it, so it is not aliased).
+  resumeSnapshot.push({ type: "chatEvent", role: "user", content: "injected" } as any);
+  const ctx2 = await transform([]);
+  assert.equal(ctx2.length, 1, "caller's snapshot mutation must not leak into the runtime prefix");
+  assert.equal((ctx2[0] as any).content, "<message>prior</message>");
+});
+
+// #2: resume transcript array is defensively copied — the agent loop mutating
+// agent.state.messages must not corrupt the caller's persisted transcript array.
+test("factory does not alias the caller's resume transcript array", async () => {
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const transcript: AgentMessage[] = [
+    { role: "user", content: "resumed question", timestamp: 1 } as any,
+  ];
+  const { agent } = await factory.create(chatSession(), [], {
+    resume: { snapshot: [], transcript },
+  });
+
+  // The agent loop appends to agent.state.messages in place. Simulate one append.
+  assert.notEqual(agent.state.messages, transcript, "state.messages must be a copy, not the same array");
+  agent.state.messages.push({ role: "assistant", content: [], timestamp: 2 } as any);
+
+  assert.equal(transcript.length, 1, "caller's transcript array must not be mutated");
+  assert.equal((transcript[0] as any).content, "resumed question");
 });
 
 test("convertToLlm filters accidental system transcript messages", () => {

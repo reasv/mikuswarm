@@ -144,7 +144,11 @@ export class AgentSessionFactory {
     // turn is popped off and returned so the caller can deliver it via
     // `agent.prompt(...)` as the first turn of the transcript. `transformContext`
     // never rebuilds — it only appends live runtime messages onto the frozen prefix.
-    let frozenBase: AgentMessage[];
+    //
+    // `frozenBase` is assigned exactly once below and then `Object.freeze`d: the
+    // append-only/byte-stable invariant (spec §2b) is enforced, not merely observed.
+    // `transformContext` only ever spreads it, so freezing is safe.
+    let frozenBaseSeed: AgentMessage[];
     let finalTurn: AgentMessage | undefined;
     // Persistence snapshot surfaced to the caller (§3). Undefined in resume mode.
     let snapshot: ContextMessage[] | undefined;
@@ -152,7 +156,10 @@ export class AgentSessionFactory {
     let snapshotCompactTokens: number | undefined;
     let snapshotRichTokens: number | undefined;
     if (opts?.resume) {
-      frozenBase = opts.resume.snapshot;
+      // Defensive copy: the resume snapshot is a persisted array owned by the caller
+      // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
+      // from aliasing — and freezing — the caller's array (§6).
+      frozenBaseSeed = [...opts.resume.snapshot];
     } else {
       const built = await this.options.contextBuilder.build({
         timelineKey: session.timelineKey,
@@ -172,16 +179,22 @@ export class AgentSessionFactory {
         built,
         session.trigger.event.id,
       ).catch(() => undefined);
-      ({ frozenBase, finalTurn } = splitBuiltContext(built));
-      // Snapshot prefix for persistence: keep the FULL built messages (system +
-      // tiers, with tier/tokenEstimate metadata) minus the final live user turn.
-      // `finalTurn` is set iff the build ended with a triggerGroup/satellite, so
-      // it mirrors splitBuiltContext's detection of the trailing live turn.
-      snapshot = finalTurn ? built.messages.slice(0, -1) : built.messages;
+      // Single source of truth for the prefix/trigger boundary: `splitBuiltContext`
+      // computes the trailing-live-turn cut once and returns BOTH the runtime prefix
+      // (`frozenBase`) and the raw-`built.messages` persistence prefix (`snapshot`),
+      // so the two cannot drift if the terminal-type detection ever changes (§3 / §10a).
+      const split = splitBuiltContext(built);
+      frozenBaseSeed = split.frozenBase;
+      finalTurn = split.finalTurn;
+      snapshot = split.snapshot;
       snapshotTokenEstimate = built.tokenEstimate;
       snapshotCompactTokens = built.compactTokens;
       snapshotRichTokens = built.richTokens;
     }
+
+    // Freeze the prefix so accidental reassignment of an element or the array throws
+    // in strict mode and any future write-back surfaces immediately (§2b invariant).
+    const frozenBase: readonly AgentMessage[] = Object.freeze(frozenBaseSeed);
 
     const agent = new Agent({
       initialState: {
@@ -202,7 +215,11 @@ export class AgentSessionFactory {
     });
 
     if (opts?.resume?.transcript?.length) {
-      agent.state.messages = opts.resume.transcript;
+      // Defensive copy: the agent loop mutates `agent.state.messages` in place every
+      // turn. Assigning the caller's persisted transcript array by reference would
+      // silently corrupt their parsed `transcript_json` (§6). Copy so live runtime
+      // state never aliases a persisted array.
+      agent.state.messages = [...opts.resume.transcript];
     }
 
     return {
@@ -277,17 +294,41 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
  * as a `triggerGroup` (chat) or `satellite` (summarization cutoff). The caller
  * delivers `finalTurn` via `agent.prompt(...)` so it becomes the first turn of the
  * live transcript (§2b of spec/OBSERVABILITY-UI.md), rather than living in the prefix.
+ *
+ * The "did the build end with a live final turn?" boundary is computed **once** here
+ * and applied to both views of the prefix, so they cannot drift (§3 / §10a):
+ * - `frozenBase` — the runtime prefix (mapped into the agent message vocabulary,
+ *   system dropped), spread by `transformContext` on every turn.
+ * - `snapshot` — the persistence prefix: the raw `built.messages` (system + tiers,
+ *   with `tier`/`tokenEstimate` metadata intact) minus the same trailing final turn,
+ *   surfaced for `context_snapshot_json` and the verbatim renderer.
+ *
+ * Both `frozenBase` and `snapshot` are trimmed by the **same** terminal-turn test,
+ * so changing the set of "final live turn" types updates both in lockstep.
  */
 export function splitBuiltContext(built: BuiltContext): {
   frozenBase: AgentMessage[];
   finalTurn: AgentMessage | undefined;
+  snapshot: ContextMessage[];
 } {
   const mapped = mapBuiltMessages(built);
   const lastSource = built.messages[built.messages.length - 1];
+  // The runtime prefix is append-only from the moment it is split (spec §2b), so it is
+  // frozen here — its single point of construction — making the invariant observable
+  // and enforced regardless of caller. The factory freezes again for the resume path
+  // (where the prefix originates from a stored snapshot, not from this helper).
   if (lastSource && (lastSource.type === "triggerGroup" || lastSource.type === "satellite")) {
-    return { frozenBase: mapped.slice(0, -1), finalTurn: mapped[mapped.length - 1] };
+    return {
+      frozenBase: Object.freeze(mapped.slice(0, -1)) as AgentMessage[],
+      finalTurn: mapped[mapped.length - 1],
+      snapshot: built.messages.slice(0, -1),
+    };
   }
-  return { frozenBase: mapped, finalTurn: undefined };
+  return {
+    frozenBase: Object.freeze(mapped) as AgentMessage[],
+    finalTurn: undefined,
+    snapshot: built.messages.slice(),
+  };
 }
 
 /**
