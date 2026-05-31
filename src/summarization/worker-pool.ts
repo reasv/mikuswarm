@@ -6,6 +6,7 @@ import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createSummaryTool } from "../tools/index.js";
 import { estimateTokens, truncateToTokens } from "../context/index.js";
+import { attachSessionCapture } from "../agent/session-capture.js";
 import { evaluateCondensation } from "./evaluator.js";
 
 export interface SummarizationWorkerPoolOptions {
@@ -161,7 +162,10 @@ export class SummarizationWorkerPool {
       receivedAt: Date.now(),
     };
     const syntheticSession: AgentSessionRecord = {
-      id: `sumjob:${job.id}`,
+      // Unique per attempt: each summarization run is a real, separately
+      // inspectable session, and reusing `sumjob:${job.id}` across retries of the
+      // same job would collide on the agent_sessions PRIMARY KEY.
+      id: `s-${nanoid(10)}`,
       timelineKey: job.timelineKey,
       sessionType: job.level === 1 ? "summarize" : "condense",
       status: "running",
@@ -173,27 +177,75 @@ export class SummarizationWorkerPool {
       createdAt: Date.now(),
     };
 
+    // This synthetic session bypasses SessionManager, so write its durable
+    // agent_sessions row inline. It runs immediately, so insert as 'running'.
+    const sessionStartedAt = Date.now();
+    await storage.insertAgentSession({
+      id: syntheticSession.id,
+      timelineKey: job.timelineKey,
+      sessionType: syntheticSession.sessionType,
+      status: "running",
+      modelId: input.modelId,
+      triggerEventId: syntheticTrigger.id,
+      triggerBody: syntheticTrigger.body,
+      createdAt: sessionStartedAt,
+      updatedAt: sessionStartedAt,
+    });
+
     let agentError: unknown;
     try {
-      const { agent, finalTurn } = await factory.create(syntheticSession, [summaryTool], {
-        summarizationCutoff: { endTimestamp: input.cutoffTimestamp },
+      const { agent, finalTurn, snapshot, tokenEstimate } = await factory.create(
+        syntheticSession,
+        [summaryTool],
+        { summarizationCutoff: { endTimestamp: input.cutoffTimestamp } },
+      );
+      // Attach snapshot + transcript capture so summarization sessions are
+      // inspectable too (spec §5). Detached after the run settles.
+      const detachCapture = attachSessionCapture(agent, {
+        storage,
+        sessionId: syntheticSession.id,
+        snapshot,
+        tokenEstimate,
+        logger,
       });
-      // Drive the agent directly — SessionRunner is hardwired to chat semantics
-      // (send_message / NO_REPLY) and would fight a summary_tool-only session.
-      // Frozen sessions (§2b) pop the final turn off the prefix; for a cutoff build
-      // that is the runtime-suppressed `satellite` block. Deliver it followed by the
-      // summarize instruction as the kickoff turns, preserving the prior ordering.
-      const kickoff = finalTurn
-        ? [finalTurn, { role: "user", content: syntheticTrigger.body, timestamp: syntheticTrigger.timestamp }]
-        : syntheticTrigger.body;
-      await agent.prompt(kickoff as any);
-      await agent.waitForIdle();
+      try {
+        // Drive the agent directly — SessionRunner is hardwired to chat semantics
+        // (send_message / NO_REPLY) and would fight a summary_tool-only session.
+        // Frozen sessions (§2b) pop the final turn off the prefix; for a cutoff build
+        // that is the runtime-suppressed `satellite` block. Deliver it followed by the
+        // summarize instruction as the kickoff turns, preserving the prior ordering.
+        const kickoff = finalTurn
+          ? [finalTurn, { role: "user", content: syntheticTrigger.body, timestamp: syntheticTrigger.timestamp }]
+          : syntheticTrigger.body;
+        await agent.prompt(kickoff as any);
+        await agent.waitForIdle();
+      } finally {
+        detachCapture();
+      }
     } catch (err) {
       agentError = err;
     }
 
     const content = draft.getContent();
     const succeeded = !agentError && draft.isCreated() && content.trim().length > 0;
+
+    // Record the synthetic session's terminal status (spec §5). Content capture
+    // is handled by attachSessionCapture above; this only flips status/error.
+    if (succeeded) {
+      await storage.updateAgentSessionStatus(syntheticSession.id, "completed", {
+        completedAt: Date.now(),
+      });
+    } else {
+      const sessionErr = agentError instanceof Error
+        ? agentError.message
+        : agentError != null
+          ? String(agentError)
+          : "summary draft empty or not created";
+      await storage.updateAgentSessionStatus(syntheticSession.id, "discarded", {
+        completedAt: Date.now(),
+        error: sessionErr,
+      });
+    }
 
     if (succeeded) {
       const summaryId = `sum_${nanoid(10)}`;

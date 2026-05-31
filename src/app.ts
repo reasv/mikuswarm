@@ -16,7 +16,9 @@ import {
   TriggerCoordinator,
 } from "./timeline/index.js";
 import { AgentSessionFactory, SessionManager, SessionRunner } from "./agent/index.js";
+import { attachSessionCapture } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
+import type { ContextMessage } from "./context/builder.js";
 import {
   createChannelInfoTool,
   createCreatePollTool,
@@ -69,7 +71,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const timeline = new TimelineStore(storage);
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);
-  const sessions = new SessionManager();
+  const sessions = new SessionManager({ storage, logger });
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
 
@@ -670,8 +672,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     ].filter((t) => !disabledTools.has(t.name));
     let agent;
     let kickoff;
+    let snapshot: ContextMessage[] | undefined;
+    let tokenEstimate: number | undefined;
     try {
-      ({ agent, finalTurn: kickoff } = await factory.create(session, tools));
+      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(session, tools));
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
     } catch (error) {
@@ -692,12 +696,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
     sessions.attachAgent(session.id, agent);
+
+    // Attach snapshot + transcript capture (spec §5). Detached in the run
+    // promise's .finally() below (the agent_end transcript flush already happens
+    // during the run; detach only unsubscribes). Only reached on the success
+    // path — the kickoff-missing / factory-failed early returns above never get
+    // here.
+    const detachCapture = attachSessionCapture(agent, {
+      storage,
+      sessionId: session.id,
+      snapshot,
+      tokenEstimate,
+      logger,
+    });
     const runner = new SessionRunner({ provider, target });
 
     const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff)
       .then((result) => {
-        sessions.markCompleted(session.id);
+        sessions.markCompleted(session.id, { noReply: result.noReply });
         logger.info("session_completed", {
           sessionId: session.id,
           noReply: result.noReply,
@@ -705,7 +722,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       })
       .catch((error) => {
-        sessions.markDiscarded(session.id);
+        sessions.markDiscarded(session.id, {
+          error: error instanceof Error ? error.message : String(error),
+        });
         logger.error("session_failed", {
           sessionId: session.id,
           error: error instanceof Error ? error.message : String(error),
@@ -713,6 +732,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       })
       .finally(() => {
+        detachCapture();
         activeRuns.delete(run);
         if (draining) return;
         const next = triggerCoordinator.complete(session.timelineKey);
@@ -803,6 +823,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const resetActivations = await storage.resetStaleActivations();
   if (resetActivations > 0) {
     logger.info("stale_activations_reset", { count: resetActivations });
+  }
+  // Heal sessions left mid-run by a prior crash (running/created -> interrupted),
+  // before the provider delivers events. No auto-resume (spec §4).
+  const resetSessions = await storage.resetStaleSessions();
+  if (resetSessions > 0) {
+    logger.info("stale_sessions_reset", { count: resetSessions });
   }
 
   await provider.start(config.matrix);
