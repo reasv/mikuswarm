@@ -306,8 +306,33 @@ export class Storage {
             )
             .get() as { n: number }
         ).n === 0;
-      writer.exec(SCHEMA);
-      runMigrations(writer, isFreshDatabase);
+      if (isFreshDatabase) {
+        // Fresh build must be all-or-nothing (issue #7): wrap the full-schema
+        // build AND the version stamp in one transaction so a crash mid-build
+        // cannot leave a partial set of tables that the next open()'s
+        // `timeline_events`-presence probe would misclassify as fresh (skipping
+        // the additive ALTER steps). runMigrations(fresh) here only stamps
+        // user_version and opens NO inner transaction, so there is no nested
+        // BEGIN. The existing-DB upgrade path keeps its own transaction inside
+        // runMigrations (better-sqlite3 forbids nested transactions), so it must
+        // NOT be wrapped here.
+        writer.transaction(() => {
+          writer.exec(SCHEMA);
+          runMigrations(writer, true);
+        })();
+      } else {
+        // Existing DB: run the additive migrations FIRST, then SCHEMA. SCHEMA is
+        // the latest (vN) shape and its index/table DDL references columns that
+        // only the ALTER steps add (e.g. idx_timeline_events_undecryptable keys on
+        // redecrypt_attempts); running SCHEMA against an un-migrated legacy table
+        // would raise "no such column" before the steps could add it. runMigrations
+        // brings the legacy tables up to the current column shape under its own
+        // transaction; the subsequent `create table/index if not exists` in SCHEMA
+        // is then harmless (every referenced column now exists) and creates any
+        // genuinely-new tables/indexes that no migration step covers.
+        runMigrations(writer, false);
+        writer.exec(SCHEMA);
+      }
     });
     return storage;
   }
@@ -2287,7 +2312,7 @@ create table if not exists pending_edits (
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-const LATEST_SCHEMA_VERSION = 4;
+export const LATEST_SCHEMA_VERSION = 4;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2349,13 +2374,20 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
-// callback (single-writer queue), AFTER `writer.exec(SCHEMA)`.
+// callback (single-writer queue). Ordering relative to `writer.exec(SCHEMA)`
+// differs by case (see Storage.open):
+//   - Fresh DB: SCHEMA runs FIRST (builds every table/index at the latest
+//     shape), then runMigrations(isFresh=true) only STAMPS the version and
+//     applies NO steps. (Running the additive ALTER steps would fail, e.g.
+//     "duplicate column", because SCHEMA already added the targeted columns.)
+//   - Existing DB: runMigrations runs FIRST (additive ALTERs bring legacy tables
+//     up to the current column shape), then SCHEMA runs to create any new
+//     tables/indexes. SCHEMA must NOT precede the steps: its latest-shape DDL
+//     references columns that only the steps add (e.g. the undecryptable index
+//     keys on redecrypt_attempts), so running it against an un-migrated table
+//     raises "no such column".
 //
-//   - Fresh DB (`isFresh`): SCHEMA already created every table/index at the
-//     latest shape. `user_version` is the default 0, but there is nothing to
-//     migrate — we just stamp it to LATEST_SCHEMA_VERSION and apply NO steps.
-//     (Running the additive ALTER steps here would fail, e.g. "duplicate column",
-//     because SCHEMA already added the column the step targets.)
+//   - Fresh DB (`isFresh`): stamp to LATEST_SCHEMA_VERSION, apply NO steps.
 //   - Existing DB at version V < LATEST: apply MIGRATIONS[V], MIGRATIONS[V+1],
 //     ... in order, advancing user_version to LATEST.
 //   - Existing DB already at LATEST: no steps, idempotent no-op.

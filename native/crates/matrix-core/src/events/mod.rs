@@ -391,6 +391,64 @@ mod tests {
     }
 
     #[test]
+    fn utd_summary_serializes_camelcase_wire_keys() {
+        // Pins the native -> TS wire contract: the TS re-decryption / inbound
+        // layer parses these exact camelCase keys, but the Rust struct fields are
+        // snake_case and depend on `#[serde(rename_all = "camelCase")]` plus the
+        // per-field renames. A serde-rename regression here would be caught by
+        // neither side's existing tests (TS tests hand-build camelCase objects),
+        // silently breaking UTD recovery in production (issue #13).
+        let raw = raw_event(json!({
+            "type": "m.room.encrypted",
+            "event_id": "$utd:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1_700_000_000_000i64,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "session_id": "session-abc",
+                "ciphertext": "AwgAEnABCDEF",
+            },
+        }));
+        let event = TimelineEvent::from_utd(
+            raw,
+            UnableToDecryptInfo {
+                session_id: Some("session-abc".to_string()),
+                reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+            },
+        );
+        let summary = summarize_timeline_event(&event).expect("utd summary surfaced");
+        let value: Value =
+            serde_json::from_str(&serde_json::to_string(&summary).expect("serialize summary"))
+                .expect("reparse serialized summary");
+        let obj = value.as_object().expect("summary serializes to a JSON object");
+
+        // The wire keys the TS side reads must be present in camelCase form.
+        assert_eq!(obj.get("undecryptable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            obj.get("sessionId").and_then(Value::as_str),
+            Some("session-abc"),
+            "session_id must serialize as sessionId",
+        );
+        assert_eq!(
+            obj.get("utdReason").and_then(Value::as_str),
+            Some("missing_megolm_session"),
+            "utd_reason must serialize as utdReason",
+        );
+        // relates_to is None for a UTD placeholder (serializes as null since the
+        // field has no skip_serializing_if); the camelCase key must still appear
+        // so a populated edit/thread relation reaches TS under `relatesTo`.
+        assert!(
+            obj.contains_key("relatesTo"),
+            "relates_to must serialize as relatesTo (never the snake_case name)",
+        );
+        assert!(obj.get("relatesTo").map_or(false, Value::is_null), "relatesTo is null for a UTD");
+        // The snake_case field names must NOT leak onto the wire.
+        assert!(!obj.contains_key("session_id"), "snake_case session_id must not appear");
+        assert!(!obj.contains_key("utd_reason"), "snake_case utd_reason must not appear");
+        assert!(!obj.contains_key("relates_to"), "snake_case relates_to must not appear");
+    }
+
+    #[test]
     fn summarizes_normal_message_without_utd_flag() {
         let raw = raw_event(json!({
             "type": "m.room.message",

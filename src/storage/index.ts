@@ -1,5 +1,6 @@
 export {
   Storage,
+  LATEST_SCHEMA_VERSION,
   MAX_REDECRYPT_ATTEMPTS,
   REDECRYPT_RETIRED,
   type StorageOptions,

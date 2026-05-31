@@ -439,6 +439,16 @@ export async function resolveMultiAccountRetry(
     }
     return summary; // decrypted message — best possible result.
   }
+  // Precedence is load-bearing and depends on the native fetch contract (issue
+  // #8). A `null` from `fetch`/`retry` MUST mean "decrypted to a
+  // non-renderable/non-message event" — NEVER a soft/transient fetch failure
+  // (those MUST throw / surface as Err and are caught above, routing to the
+  // rethrow path). This is because returning `null` here tells the sweeper to
+  // permanently DELETE the placeholder: a single account reporting "non-message"
+  // wins over any still-UTD summary, retiring the row even if another account is
+  // still UTD. If a future change ever lets `fetch` return `null` on a transient
+  // failure, that would silently become placeholder deletion (data loss); such a
+  // failure must continue to throw so it lands in the rethrow path below.
   if (sawNonMessage) return null;
   if (utdSummary) return utdSummary;
   if (anyFetched) {
