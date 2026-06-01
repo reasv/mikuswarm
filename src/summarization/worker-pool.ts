@@ -204,7 +204,7 @@ export class SummarizationWorkerPool {
       );
       // Attach snapshot + transcript capture so summarization sessions are
       // inspectable too (spec §5). Detached after the run settles.
-      const detachCapture = attachSessionCapture(agent, {
+      const capture = attachSessionCapture(agent, {
         storage,
         sessionId: syntheticSession.id,
         snapshot,
@@ -222,8 +222,22 @@ export class SummarizationWorkerPool {
           : syntheticTrigger.body;
         await agent.prompt(kickoff as any);
         await agent.waitForIdle();
+      } catch (err) {
+        // The run rejected (possibly before any turn_end). Best-effort flush the
+        // current transcript so the discarded summarization session is still
+        // inspectable (issue #1), before detaching. Never let the flush mask the
+        // original error.
+        try {
+          await capture.flushNow();
+        } catch (flushErr) {
+          logger.error("session capture: error-path flush failed", {
+            sessionId: syntheticSession.id,
+            error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+          });
+        }
+        throw err;
       } finally {
-        detachCapture();
+        capture.detach();
       }
     } catch (err) {
       agentError = err;

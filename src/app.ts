@@ -16,7 +16,7 @@ import {
   TriggerCoordinator,
 } from "./timeline/index.js";
 import { AgentSessionFactory, SessionManager, SessionRunner } from "./agent/index.js";
-import { attachSessionCapture } from "./agent/session-capture.js";
+import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import type { ContextMessage } from "./context/builder.js";
 import {
@@ -702,7 +702,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // during the run; detach only unsubscribes). Only reached on the success
     // path — the kickoff-missing / factory-failed early returns above never get
     // here.
-    const detachCapture = attachSessionCapture(agent, {
+    const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: session.id,
       snapshot,
@@ -721,7 +721,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           duplicate,
         });
       })
-      .catch((error) => {
+      .catch(async (error) => {
+        // Best-effort transcript flush before marking the session discarded
+        // (issue #1): if the run rejected before any turn_end, the only durable
+        // copy of the kickoff turn (+ any partial assistant message) is the live
+        // state. flushNow() never throws, but wrap it so it can never mask the
+        // original run error.
+        try {
+          await captureHandle.flushNow();
+        } catch (flushErr) {
+          logger.error("session capture: error-path flush failed", {
+            sessionId: session.id,
+            error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+          });
+        }
         sessions.markDiscarded(session.id, {
           error: error instanceof Error ? error.message : String(error),
         });
@@ -732,7 +745,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       })
       .finally(() => {
-        detachCapture();
+        captureHandle.detach();
         activeRuns.delete(run);
         if (draining) return;
         const next = triggerCoordinator.complete(session.timelineKey);

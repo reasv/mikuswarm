@@ -32,8 +32,30 @@ export interface SessionCaptureContext {
  * (`subscribe` at agent.d.ts:66, `state.messages` an `AgentMessage[]`).
  */
 export interface CapturableAgent {
-  subscribe(listener: (event: { type: string }, signal: AbortSignal) => void | Promise<void>): () => void;
+  subscribe(
+    listener: (
+      event: { type: string; messages?: AgentMessage[] },
+      signal: AbortSignal,
+    ) => void | Promise<void>,
+  ): () => void;
   state: { messages: AgentMessage[] };
+}
+
+/**
+ * Handle returned by {@link attachSessionCapture}.
+ *
+ * - `detach()` unsubscribes the agent listener (the live transcript stops being
+ *   flushed). It does NOT write anything.
+ * - `flushNow()` performs a best-effort, one-shot serialize of the current
+ *   `agent.state.messages` → `saveAgentSessionTranscript`. It is used by the
+ *   error/abort paths (issue #1) to durably capture the kickoff turn (and any
+ *   partial assistant message) even when the run rejects before any `turn_end`
+ *   fires. It never throws — failures are logged and swallowed so they cannot
+ *   mask the original error.
+ */
+export interface SessionCaptureHandle {
+  detach(): void;
+  flushNow(): Promise<void>;
 }
 
 /**
@@ -50,36 +72,110 @@ export interface ImageRef {
   sizeBytes: number;
 }
 
-function base64ByteLength(b64: string): number {
+/**
+ * Decoded byte length of a base64 payload, computed arithmetically — without
+ * allocating/decoding the whole payload (issue #9). Strips an optional `data:`
+ * URI prefix and all whitespace, then derives `floor(len * 3 / 4) - padding`,
+ * where `padding` is the count of trailing `=`. Malformed input (non-base64
+ * characters, lengths that aren't a valid base64 length) yields 0 so a bad
+ * payload can never throw out of the capture path.
+ *
+ * @internal Exported for testing.
+ */
+export function base64ByteLength(b64: string): number {
   if (typeof b64 !== "string" || b64.length === 0) return 0;
-  // Strip any data: URI prefix and whitespace before measuring.
+  // Strip any data: URI prefix before measuring.
   const comma = b64.indexOf(",");
-  const raw = comma >= 0 && b64.slice(0, comma).includes("base64") ? b64.slice(comma + 1) : b64;
-  try {
-    return Buffer.from(raw, "base64").length;
-  } catch {
-    return 0;
-  }
+  const withoutPrefix =
+    comma >= 0 && b64.slice(0, comma).includes("base64") ? b64.slice(comma + 1) : b64;
+  // Remove all whitespace (base64 may be line-wrapped).
+  const raw = withoutPrefix.replace(/\s/g, "");
+  if (raw.length === 0) return 0;
+  // A valid base64 string (no padding stripped) has length divisible by 4.
+  // Unpadded base64 has length % 4 ∈ {2, 3}; length % 4 === 1 is impossible.
+  const rem = raw.length % 4;
+  if (rem === 1) return 0;
+  // Reject anything that isn't base64 (incl. base64url, which we don't emit).
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) return 0;
+  let padding = 0;
+  if (raw.endsWith("==")) padding = 2;
+  else if (raw.endsWith("=")) padding = 1;
+  // For padded input (length a multiple of 4) `floor(len*3/4)` counts the
+  // padding bytes, so subtract them. For unpadded input there is no padding to
+  // remove and `floor(len*3/4)` already yields the decoded length directly.
+  const bytes = Math.floor((raw.length * 3) / 4) - padding;
+  return bytes < 0 ? 0 : bytes;
+}
+
+/**
+ * Matches an inline `data:[<mediatype>][;base64],<payload>` URI anywhere inside a
+ * string. We only externalize the base64-encoded variant — that is the only one
+ * that carries a heavy binary payload worth stripping (and the only one that can
+ * leak raw image bytes into persisted JSON, issue #8).
+ */
+const DATA_URI_RE = /data:([\w.+-]+\/[\w.+-]+)?;base64,([A-Za-z0-9+/]+={0,2})/g;
+
+/**
+ * Replace every `data:[mime];base64,<...>` substring in a string with a compact,
+ * lossless-enough marker (`data:[mime];base64,<imageRef sizeBytes=N>`), so no raw
+ * base64 survives serialization even when it is embedded inside text content
+ * rather than a structured image block. Returns the input unchanged when it holds
+ * no base64 data URI.
+ */
+function stripDataUris(text: string): string {
+  if (!text.includes(";base64,")) return text;
+  return text.replace(DATA_URI_RE, (_match, mime: string | undefined, payload: string) => {
+    const size = base64ByteLength(payload);
+    const mimePart = mime ? `${mime};` : "";
+    return `data:${mimePart}base64,<imageRef sizeBytes=${size}>`;
+  });
 }
 
 /**
  * Pure deep-clone that replaces every base64 image payload with an {@link ImageRef}.
  * Never mutates the input (the live `agent.state.messages` / `snapshot` arrays).
  *
- * Handles three shapes:
+ * Exhaustive across the shapes any layer can emit (issue #8):
  *  - ContextMessage `imageBlocks`: `{ eventId, attachmentId, mediaType, dataBase64 }`
- *  - pi-core message `imageBlocks`: `{ type: "image", source: { media_type, data } }`
- *  - inline content blocks: `{ type: "image", source: { media_type, data } }`
+ *  - Anthropic image content block: `{ type: "image", source: { type: "base64", media_type, data } }`
  *    (incl. tool_result content arrays).
+ *  - OpenAI-style image block: `{ type: "image_url", image_url: { url } }` or a
+ *    bare `{ url }` block, where `url` is a `data:...;base64,` URI.
+ *  - As a structural backstop, any `source` object whose `type === "base64"` and
+ *    that carries a `data` string is externalized regardless of the parent shape.
+ *  - As a final string-level backstop, any `data:[mime];base64,<...>` substring
+ *    inside ANY string in the tree is stripped, so raw base64 can never survive
+ *    serialization even when embedded in free text.
  *
- * As a backstop, any `source.data` / `dataBase64` string encountered anywhere in
- * the tree is replaced, so no raw base64 can survive serialization.
+ * Where derivable, refs record `mimeType` + `sizeBytes` (plus `eventId`/
+ * `attachmentId` for ContextMessage blocks) so the record stays lossless enough
+ * to rehydrate on resume.
  */
 export function externalizeImages<T>(value: T): T {
   return externalize(value) as T;
 }
 
+/** Parse a `data:[mime];base64,<payload>` URI into a ref, or null if not one. */
+function dataUriToRef(url: string): ImageRef | null {
+  if (typeof url !== "string") return null;
+  const comma = url.indexOf(",");
+  if (!url.startsWith("data:") || comma < 0 || !url.slice(0, comma).includes("base64")) {
+    return null;
+  }
+  const header = url.slice("data:".length, comma); // e.g. "image/png;base64"
+  const mime = header.split(";")[0];
+  return {
+    __imageRef: true,
+    mimeType: mime && mime.length > 0 ? mime : undefined,
+    sizeBytes: base64ByteLength(url),
+  };
+}
+
 function externalize(value: unknown): unknown {
+  if (typeof value === "string") {
+    // String-level backstop: strip any embedded base64 data URI.
+    return stripDataUris(value);
+  }
   if (value === null || typeof value !== "object") {
     return value;
   }
@@ -101,7 +197,7 @@ function externalize(value: unknown): unknown {
     return ref;
   }
 
-  // Inline image content block: { type: "image", source: { type: "base64", media_type, data } }
+  // Anthropic image content block: { type: "image", source: { type: "base64", media_type, data } }
   if (obj.type === "image" && obj.source && typeof obj.source === "object") {
     const source = obj.source as Record<string, unknown>;
     if (typeof source.data === "string") {
@@ -116,6 +212,42 @@ function externalize(value: unknown): unknown {
         sizeBytes: base64ByteLength(source.data),
       };
       return { ...rest, source: ref };
+    }
+  }
+
+  // OpenAI-style image block: { type: "image_url", image_url: { url } } — the url
+  // is typically a `data:...;base64,` URI. Externalize the nested url when so.
+  if (obj.type === "image_url" && obj.image_url && typeof obj.image_url === "object") {
+    const imageUrl = obj.image_url as Record<string, unknown>;
+    if (typeof imageUrl.url === "string") {
+      const ref = dataUriToRef(imageUrl.url);
+      if (ref) {
+        const rest: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === "image_url") continue;
+          rest[k] = externalize(v);
+        }
+        // Preserve any sibling fields on image_url (e.g. detail) while replacing url.
+        const restImageUrl: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(imageUrl)) {
+          if (k === "url") continue;
+          restImageUrl[k] = externalize(v);
+        }
+        return { ...rest, image_url: { ...restImageUrl, url: ref } };
+      }
+    }
+  }
+
+  // Bare `{ url: "data:...;base64,..." }` block (no recognized wrapper type).
+  if (typeof obj.url === "string") {
+    const ref = dataUriToRef(obj.url);
+    if (ref) {
+      const rest: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (k === "url") continue;
+        rest[k] = externalize(v);
+      }
+      return { ...rest, url: ref };
     }
   }
 
@@ -151,48 +283,86 @@ function serialize(value: unknown): string {
 /**
  * Attach snapshot + transcript capture to an agent.
  *
- * 1. Snapshot is written once, immediately (non-blocking async IIFE).
- * 2. Transcript is flushed on every `turn_end` / `agent_end`.
+ * 1. Snapshot is written once, immediately. The snapshot write is *enqueued*
+ *    before any transcript write: the first transcript flush (whether from a
+ *    `turn_end`/`agent_end` event or from {@link SessionCaptureHandle.flushNow})
+ *    is chained behind the snapshot-enqueue promise (issue #10). This guarantees
+ *    the documented "snapshot written first" invariant — a reader observing a
+ *    transcript can rely on the snapshot row having been enqueued. The chaining
+ *    does not block the agent loop: the snapshot enqueue is itself async and the
+ *    listener awaits a settled promise, not synchronous work.
+ * 2. Transcript is flushed on every `turn_end` / `agent_end`, and on demand via
+ *    `flushNow()` (used by error/abort paths, issue #1).
  *
- * Returns the unsubscribe function from `agent.subscribe`.
+ * Returns a {@link SessionCaptureHandle} (`detach` + `flushNow`).
  */
-export function attachSessionCapture(agent: CapturableAgent, ctx: SessionCaptureContext): () => void {
-  // 1. Snapshot — fire-and-forget, but log failures.
-  if (ctx.snapshot !== undefined) {
-    void (async () => {
+export function attachSessionCapture(
+  agent: CapturableAgent,
+  ctx: SessionCaptureContext,
+): SessionCaptureHandle {
+  // 1. Snapshot — enqueue once. Hold the promise so the first transcript flush
+  //    can be chained behind it (issue #10). Resolves even on failure (logged).
+  const snapshotDone: Promise<void> =
+    ctx.snapshot === undefined
+      ? Promise.resolve()
+      : (async () => {
+          try {
+            const snapshotJson = serialize(ctx.snapshot);
+            await ctx.storage.saveAgentSessionSnapshot(ctx.sessionId, {
+              snapshotJson,
+              dumpPath: ctx.dumpPath ?? null,
+              tokenEstimate: ctx.tokenEstimate ?? null,
+            });
+          } catch (err) {
+            ctx.logger?.error("session capture: snapshot write failed", {
+              sessionId: ctx.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+
+  // Serializes transcript writes so flushNow() and the listener never interleave,
+  // and so the very first transcript write is ordered after the snapshot enqueue.
+  let transcriptChain: Promise<void> = snapshotDone;
+
+  /**
+   * Best-effort transcript flush. `messages` lets callers supply the canonical
+   * source (e.g. the `agent_end { messages }` payload, issue #12); when absent we
+   * fall back to the live `agent.state.messages`. Never throws.
+   */
+  const flushTranscript = (messages: AgentMessage[], context: string): Promise<void> => {
+    transcriptChain = transcriptChain.then(async () => {
       try {
-        const snapshotJson = serialize(ctx.snapshot);
-        await ctx.storage.saveAgentSessionSnapshot(ctx.sessionId, {
-          snapshotJson,
-          dumpPath: ctx.dumpPath ?? null,
-          tokenEstimate: ctx.tokenEstimate ?? null,
-        });
+        const transcriptJson = serialize(messages);
+        await ctx.storage.saveAgentSessionTranscript(ctx.sessionId, transcriptJson);
       } catch (err) {
-        ctx.logger?.error("session capture: snapshot write failed", {
+        // Never throw out of the listener / flushNow.
+        ctx.logger?.error("session capture: transcript write failed", {
           sessionId: ctx.sessionId,
+          context,
           error: err instanceof Error ? err.message : String(err),
         });
       }
-    })();
-  }
+    });
+    return transcriptChain;
+  };
 
   // 2. Transcript — flush on turn_end / agent_end.
   const unsubscribe = agent.subscribe(async (event) => {
     if (event.type !== "turn_end" && event.type !== "agent_end") {
       return;
     }
-    try {
-      const transcriptJson = serialize(agent.state.messages);
-      await ctx.storage.saveAgentSessionTranscript(ctx.sessionId, transcriptJson);
-    } catch (err) {
-      // Never throw out of the listener.
-      ctx.logger?.error("session capture: transcript write failed", {
-        sessionId: ctx.sessionId,
-        eventType: event.type,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // Contract (spec §3): `agent_end` carries the finalized `{ messages }`
+    // payload; prefer it so capture is decoupled from the agent's internal
+    // `state.messages` field (which a future loop could trim post-emit). Fall
+    // back to `state.messages` when the payload is absent (e.g. `turn_end`).
+    const messages = event.messages ?? agent.state.messages;
+    await flushTranscript(messages, event.type);
   });
 
-  return unsubscribe;
+  return {
+    detach: unsubscribe,
+    // One-shot best-effort flush of the current live messages (issue #1).
+    flushNow: () => flushTranscript(agent.state.messages, "flushNow"),
+  };
 }

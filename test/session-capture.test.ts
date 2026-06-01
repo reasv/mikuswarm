@@ -5,6 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   attachSessionCapture,
   externalizeImages,
+  base64ByteLength,
   type CapturableAgent,
 } from "../src/agent/session-capture.js";
 import type { ContextMessage } from "../src/context/builder.js";
@@ -53,9 +54,14 @@ class FakeAgent implements CapturableAgent {
     };
   }
 
-  async fire(type: string): Promise<void> {
+  /**
+   * Fire an agent event. The optional `payload` lets a test attach an event
+   * payload such as `agent_end`'s `{ messages }` (used to exercise #12, where
+   * capture must prefer the payload over `state.messages`).
+   */
+  async fire(type: string, payload?: { messages?: AgentMessage[] }): Promise<void> {
     if (!this.listener) return;
-    await this.listener({ type }, new AbortController().signal);
+    await this.listener({ type, ...payload }, new AbortController().signal);
   }
 }
 
@@ -299,13 +305,13 @@ test("returned unsubscribe stops further flushes", async () => {
       { type: "message", role: "user", content: "first" },
     ] as unknown as AgentMessage[];
 
-    const unsubscribe = attachSessionCapture(agent, {
+    const capture = attachSessionCapture(agent, {
       storage,
       sessionId: "s-abc1234567",
     });
     await settle(storage);
 
-    unsubscribe();
+    capture.detach();
     assert.equal(agent.unsubscribeCalled, true);
 
     // Fire after unsubscribe -> listener detached, no flush.
@@ -313,5 +319,419 @@ test("returned unsubscribe stops further flushes", async () => {
     await settle(storage);
     const row = storage.getAgentSession("s-abc1234567");
     assert.equal(row?.transcript_json, null, "no flush after unsubscribe");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #8 — exhaustive image externalization (non-Anthropic shapes + data URIs)
+// ---------------------------------------------------------------------------
+
+test("#8 externalizes OpenAI-style image_url blocks (no base64 survives)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    const b64 = Buffer.from([1, 2, 3, 4, 5]).toString("base64");
+    const dataUri = `data:image/webp;base64,${b64}`;
+    agent.state.messages = [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "text", content: "look" },
+          { type: "image_url", image_url: { url: dataUri, detail: "high" } },
+        ],
+      },
+    ] as unknown as AgentMessage[];
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("turn_end");
+    await settle(storage);
+
+    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
+    assert.ok(!json.includes(b64), "raw base64 must not survive in transcript JSON");
+
+    const parsed = JSON.parse(json);
+    const block = parsed[0].content[1];
+    assert.equal(block.type, "image_url");
+    assert.equal(block.image_url.detail, "high", "sibling fields preserved");
+    assert.equal(block.image_url.url.__imageRef, true);
+    assert.equal(block.image_url.url.mimeType, "image/webp");
+    assert.equal(block.image_url.url.sizeBytes, 5);
+  });
+});
+
+test("#8 externalizes a bare { url: data-URI } block", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    const b64 = Buffer.from([7, 7, 7]).toString("base64");
+    agent.state.messages = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ url: `data:image/gif;base64,${b64}`, alt: "g" }],
+      },
+    ] as unknown as AgentMessage[];
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("turn_end");
+    await settle(storage);
+
+    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
+    assert.ok(!json.includes(b64), "raw base64 must not survive");
+
+    const parsed = JSON.parse(json);
+    const block = parsed[0].content[0];
+    assert.equal(block.alt, "g", "sibling fields preserved");
+    assert.equal(block.url.__imageRef, true);
+    assert.equal(block.url.mimeType, "image/gif");
+    assert.equal(block.url.sizeBytes, 3);
+  });
+});
+
+test("#8 strips inline base64 data URIs embedded in text strings", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    const b64 = Buffer.from([4, 4, 4, 4, 4, 4]).toString("base64");
+    agent.state.messages = [
+      {
+        type: "message",
+        role: "assistant",
+        content: `here it is: data:image/png;base64,${b64} done`,
+      },
+    ] as unknown as AgentMessage[];
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("turn_end");
+    await settle(storage);
+
+    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
+    assert.ok(!json.includes(b64), "embedded base64 must be stripped from text");
+
+    const parsed = JSON.parse(json);
+    assert.match(
+      parsed[0].content,
+      /data:image\/png;base64,<imageRef sizeBytes=6>/,
+      "data URI replaced with size-bearing marker",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #9 — base64ByteLength computed arithmetically, equal to a real decode
+// ---------------------------------------------------------------------------
+
+test("#9 base64ByteLength matches Buffer decode across payload shapes", () => {
+  const cases: Buffer[] = [
+    Buffer.alloc(0),
+    Buffer.from([0]),
+    Buffer.from([0, 1]),
+    Buffer.from([0, 1, 2]),
+    Buffer.from([0, 1, 2, 3]),
+    Buffer.from([0, 1, 2, 3, 4]),
+    Buffer.from("hello world, this is a longer payload!"),
+    Buffer.from(Array.from({ length: 257 }, (_, i) => i % 256)),
+  ];
+  for (const buf of cases) {
+    const b64 = buf.toString("base64"); // padded
+    assert.equal(
+      base64ByteLength(b64),
+      Buffer.from(b64, "base64").length,
+      `padded len mismatch for ${buf.length} bytes`,
+    );
+    // Unpadded variant.
+    const unpadded = b64.replace(/=+$/, "");
+    assert.equal(
+      base64ByteLength(unpadded),
+      buf.length,
+      `unpadded len mismatch for ${buf.length} bytes`,
+    );
+    // Whitespace-wrapped variant (line breaks every 8 chars).
+    const wrapped = b64.replace(/(.{8})/g, "$1\n");
+    assert.equal(
+      base64ByteLength(wrapped),
+      buf.length,
+      `whitespace-wrapped len mismatch for ${buf.length} bytes`,
+    );
+    // data: URI variant.
+    assert.equal(
+      base64ByteLength(`data:image/png;base64,${b64}`),
+      buf.length,
+      `data-uri len mismatch for ${buf.length} bytes`,
+    );
+  }
+});
+
+test("#9 base64ByteLength guards malformed input", () => {
+  assert.equal(base64ByteLength(""), 0);
+  assert.equal(base64ByteLength("@@@@"), 0, "non-base64 chars -> 0");
+  assert.equal(base64ByteLength("ABCDE"), 0, "len % 4 === 1 is impossible -> 0");
+  assert.equal(base64ByteLength(undefined as unknown as string), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #10 — snapshot write is enqueued before the first transcript write
+// ---------------------------------------------------------------------------
+
+test("#10 snapshot is enqueued before the first transcript flush", async () => {
+  // Fake storage that records call order and lets us delay the snapshot write to
+  // prove the first transcript flush waits for the snapshot enqueue regardless.
+  const order: string[] = [];
+  let releaseSnapshot!: () => void;
+  const snapshotGate = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  const fakeStorage = {
+    async saveAgentSessionSnapshot() {
+      order.push("snapshot");
+      await snapshotGate; // hold the snapshot mid-write
+    },
+    async saveAgentSessionTranscript() {
+      order.push("transcript");
+    },
+  } as unknown as Storage;
+
+  const agent = new FakeAgent();
+  agent.state.messages = [
+    { type: "message", role: "user", content: "hi" },
+  ] as unknown as AgentMessage[];
+
+  attachSessionCapture(agent, {
+    storage: fakeStorage,
+    sessionId: "s-abc1234567",
+    snapshot: [
+      { type: "system", content: "s", tier: "system", tokenEstimate: 1 },
+    ] as unknown as ContextMessage[],
+  });
+
+  // Fire turn_end immediately — the transcript flush must still be ordered after
+  // the snapshot enqueue even though the snapshot write hasn't resolved yet.
+  await agent.fire("turn_end");
+  // At this point the transcript must NOT have run (it's chained behind snapshot).
+  assert.deepEqual(order, ["snapshot"], "transcript must wait for snapshot");
+
+  releaseSnapshot();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(order, ["snapshot", "transcript"], "snapshot precedes transcript");
+});
+
+// ---------------------------------------------------------------------------
+// Issue #12 — agent_end flush prefers the event's { messages } payload
+// ---------------------------------------------------------------------------
+
+test("#12 agent_end uses event.messages payload over state.messages", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    // state.messages is deliberately STALE / different from the event payload.
+    agent.state.messages = [
+      { type: "message", role: "user", content: "stale-state" },
+    ] as unknown as AgentMessage[];
+
+    const payloadMessages = [
+      { type: "message", role: "user", content: "payload-user" },
+      { type: "message", role: "assistant", content: "payload-assistant" },
+    ] as unknown as AgentMessage[];
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("agent_end", { messages: payloadMessages });
+    await settle(storage);
+
+    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
+    const parsed = JSON.parse(json);
+    assert.equal(parsed.length, 2, "persisted the payload, not the 1-msg state");
+    assert.equal(parsed[1].content, "payload-assistant");
+    assert.ok(!json.includes("stale-state"), "state.messages must not be persisted");
+  });
+});
+
+test("#12 turn_end (no payload) falls back to state.messages", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    agent.state.messages = [
+      { type: "message", role: "user", content: "from-state" },
+    ] as unknown as AgentMessage[];
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("turn_end");
+    await settle(storage);
+
+    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
+    const parsed = JSON.parse(json);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].content, "from-state");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1 — flushNow() captures the transcript on the error/abort path
+// ---------------------------------------------------------------------------
+
+test("#1 flushNow persists the kickoff turn when run errors before turn_end", async () => {
+  await withStorage(async (storage) => {
+    // Mirror the chat path: a 'running' row exists; the run rejects before any
+    // turn_end. The error path must flush before detaching + marking discarded.
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    // state.messages holds the kickoff turn (delivered via agent.prompt) plus a
+    // partial assistant message — exactly what we must not lose.
+    agent.state.messages = [
+      { type: "message", role: "user", content: "kickoff trigger" },
+      { type: "message", role: "assistant", content: "partial..." },
+    ] as unknown as AgentMessage[];
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId: "s-abc1234567",
+    });
+
+    // Simulate the error path: NO turn_end fired; flush then detach.
+    await capture.flushNow();
+    capture.detach();
+    // Caller flips status on the error path.
+    await storage.updateAgentSessionStatus("s-abc1234567", "discarded", {
+      completedAt: 2_000,
+      error: "boom",
+    });
+    await settle(storage);
+
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.equal(row?.status, "discarded");
+    assert.ok(row?.transcript_json, "transcript must be non-null after error flush");
+    const parsed = JSON.parse(row!.transcript_json!);
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0].content, "kickoff trigger", "kickoff turn preserved");
+  });
+});
+
+test("#1 flushNow never throws even when the write fails", async () => {
+  const fakeStorage = {
+    async saveAgentSessionTranscript() {
+      throw new Error("disk full");
+    },
+  } as unknown as Storage;
+  const agent = new FakeAgent();
+  agent.state.messages = [
+    { type: "message", role: "user", content: "x" },
+  ] as unknown as AgentMessage[];
+
+  const capture = attachSessionCapture(agent, {
+    storage: fakeStorage,
+    sessionId: "s-abc1234567",
+  });
+  // Must resolve (swallow), not reject — so it can't mask the original error.
+  await capture.flushNow();
+  capture.detach();
+});
+
+// ---------------------------------------------------------------------------
+// Issue #15(a) — summarization capture path: insert-as-running → capture →
+// terminal status, with snapshot + transcript both present.
+//
+// The summarization worker (src/summarization/worker-pool.ts) bypasses
+// SessionManager: it inserts the agent_sessions row directly at status
+// 'running' (with started_at), attaches the SAME attachSessionCapture, drives
+// the agent, then flips status to completed/discarded. These tests reproduce
+// that exact sequence against real Storage so a regression in the
+// insert-as-running + capture + status-flip contract is caught.
+// ---------------------------------------------------------------------------
+
+test("#15 summarization capture: completed run has snapshot + transcript", async () => {
+  await withStorage(async (storage) => {
+    const sessionId = "s-sum1234567";
+    const startedAt = 5_000;
+    // Worker inserts directly as 'running' with started_at (see worker-pool.ts).
+    await storage.insertAgentSession({
+      id: sessionId,
+      timelineKey: "matrix:miku:room:!room",
+      sessionType: "summarize",
+      status: "running",
+      modelId: "model-summarize-1",
+      triggerEventId: "summarize:job-1",
+      triggerBody: "Summarize the conversation shown above.",
+      createdAt: startedAt,
+      startedAt,
+      updatedAt: startedAt,
+    });
+
+    const agent = new FakeAgent();
+    agent.state.messages = [
+      { type: "message", role: "user", content: "Summarize the conversation shown above." },
+      { type: "message", role: "assistant", content: "<summary tool call>" },
+    ] as unknown as AgentMessage[];
+    const snapshot = [
+      { type: "system", content: "you summarize", tier: "system", tokenEstimate: 3 },
+    ] as unknown as ContextMessage[];
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId,
+      snapshot,
+      tokenEstimate: 7,
+    });
+    try {
+      await agent.fire("agent_end", { messages: agent.state.messages });
+    } finally {
+      capture.detach();
+    }
+    // Worker flips status on success.
+    await storage.updateAgentSessionStatus(sessionId, "completed", { completedAt: 6_000 });
+    await settle(storage);
+
+    const row = storage.getAgentSession(sessionId);
+    assert.equal(row?.status, "completed");
+    assert.equal(row?.started_at, startedAt, "insert-as-running set started_at");
+    assert.ok(row?.context_snapshot_json, "snapshot present");
+    assert.equal(row?.token_estimate, 7);
+    assert.ok(row?.transcript_json, "transcript present");
+    assert.equal(JSON.parse(row!.transcript_json!).length, 2);
+  });
+});
+
+test("#15 summarization capture: discarded run still flushes via error path", async () => {
+  await withStorage(async (storage) => {
+    const sessionId = "s-sum7654321";
+    const startedAt = 8_000;
+    await storage.insertAgentSession({
+      id: sessionId,
+      timelineKey: "matrix:miku:room:!room",
+      sessionType: "summarize",
+      status: "running",
+      createdAt: startedAt,
+      startedAt,
+      updatedAt: startedAt,
+    });
+
+    const agent = new FakeAgent();
+    // Run threw before any turn_end; state holds only the kickoff turn.
+    agent.state.messages = [
+      { type: "message", role: "user", content: "Summarize the conversation shown above." },
+    ] as unknown as AgentMessage[];
+
+    const capture = attachSessionCapture(agent, { storage, sessionId });
+    // Mirror worker-pool.ts catch: flushNow() before detach.
+    await capture.flushNow();
+    capture.detach();
+    await storage.updateAgentSessionStatus(sessionId, "discarded", {
+      completedAt: 9_000,
+      error: "agent prompt failed",
+    });
+    await settle(storage);
+
+    const row = storage.getAgentSession(sessionId);
+    assert.equal(row?.status, "discarded");
+    assert.equal(row?.error, "agent prompt failed");
+    assert.ok(row?.transcript_json, "kickoff turn flushed on error path");
+    assert.equal(JSON.parse(row!.transcript_json!)[0].content, "Summarize the conversation shown above.");
   });
 });
