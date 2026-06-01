@@ -285,6 +285,92 @@ test("SSE: terminal session yields a not_live event and event-stream headers", a
   });
 });
 
+/**
+ * A minimal `Agent` stand-in for the SSE stream. `signal` models pi-agent-core's
+ * `agent.signal` — defined while a run is active, `undefined` once it settles
+ * (which happens before SessionManager evicts the agent). `subscribe` only
+ * delivers FUTURE events, matching the real contract the late-subscribe race
+ * relies on.
+ */
+function fakeAgent(opts: { live: boolean } = { live: true }): {
+  agent: any;
+  emit: (event: any) => void;
+} {
+  const listeners = new Set<(event: any) => void>();
+  const agent = {
+    get signal() {
+      return opts.live ? new AbortController().signal : undefined;
+    },
+    subscribe(listener: (event: any) => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  return {
+    agent,
+    emit: (event) => {
+      for (const l of listeners) l(event);
+    },
+  };
+}
+
+/** Register a `running` session in both storage and an in-memory manager. */
+async function attachRunningSession(
+  storage: Storage,
+  sessions: SessionManager,
+  agent: any,
+): Promise<string> {
+  const record = sessions.createPlaceholder({
+    provider: "matrix",
+    timelineKey: TK,
+    event: userEvent("evt-1", "hi", 1_000),
+  });
+  sessions.markRunning(record.id);
+  sessions.attachAgent(record.id, agent);
+  await storage.insertAgentSession(sessionInsert({ id: record.id, status: "running" }));
+  return record.id;
+}
+
+test("SSE: late subscribe after run already settled self-closes with not_live", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    // Agent is still in the map (not yet evicted) but its run has already
+    // settled — `signal` is undefined. The old code subscribed and waited
+    // forever for an `agent_end` that will never replay; the stream must now
+    // self-close immediately after the post-subscribe liveness re-check.
+    const { agent } = fakeAgent({ live: false });
+    const id = await attachRunningSession(storage, sessions, agent);
+
+    await withServer({ storage, sessions }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/${id}/stream`);
+      assert.equal(res.status, 200);
+      // The body completes (stream closed) and carries a not_live terminal event.
+      const text = await res.text();
+      assert.match(text, /event: not_live/);
+    });
+  });
+});
+
+test("SSE: live session streams events and closes on agent_end", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    const { agent, emit } = fakeAgent({ live: true });
+    const id = await attachRunningSession(storage, sessions, agent);
+
+    await withServer({ storage, sessions }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/${id}/stream`);
+      assert.equal(res.status, 200);
+      // Drive a terminal event so the read below completes.
+      emit({ type: "turn_end", message: { role: "assistant", content: [] }, toolResults: [] });
+      emit({ type: "agent_end", messages: [] });
+      const text = await res.text();
+      assert.match(text, /event: turn_end/);
+      assert.match(text, /event: agent_end/);
+      assert.doesNotMatch(text, /event: not_live/);
+    });
+  });
+});
+
 test("SSE: unknown session id is 404", async () => {
   await withStorage(async (storage) => {
     await withServer({ storage }, async (base) => {

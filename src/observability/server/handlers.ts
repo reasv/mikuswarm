@@ -116,6 +116,19 @@ export function sessionStream(
     if (event.type === "agent_end") stream.close();
   });
   stream.onClose(unsubscribe);
+
+  // Late-subscribe race: `Agent.subscribe` only delivers FUTURE events and does
+  // not replay the terminal `agent_end`. The agent is evicted from the map only
+  // AFTER its run settles, so `getAgent(id)` can return an agent whose run has
+  // already ended — we'd then forward nothing and never close, leaking the SSE.
+  // Subscribe FIRST (above) so an `agent_end` firing between this check and the
+  // subscribe isn't lost, THEN re-check liveness: if the run already settled,
+  // synthesize a terminal `not_live` event and close so the client falls back to
+  // the persisted record.
+  if (!stream.closed && !ctx.deps.sessions.isAgentLive(id)) {
+    stream.send("not_live", { sessionId: id, status: row.status });
+    stream.close();
+  }
 }
 
 /**

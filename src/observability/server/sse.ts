@@ -29,17 +29,32 @@ export function openSse(req: IncomingMessage, res: ServerResponse): SseStream {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-store",
-    connection: "keep-alive",
+    // No `connection` header: it's a forbidden connection-specific header under
+    // HTTP/2 and implicit (keep-alive) on the plain HTTP/1.1 server we run.
     // Disable proxy buffering (nginx) so events flush immediately.
     "x-accel-buffering": "no",
   });
-  res.write(": connected\n\n");
 
   let closed = false;
   const closeFns: Array<() => void> = [];
 
+  /**
+   * Best-effort write to the SSE socket. A read-only observer must NEVER throw
+   * back into the `agent.subscribe` listener that pi-agent-core awaits, so a
+   * dead/reset socket (write throws) is treated as a disconnect → `close()`.
+   */
+  const safeWrite = (chunk: string): void => {
+    if (closed) return;
+    try {
+      res.write(chunk);
+    } catch {
+      // Socket is gone; tear down rather than letting the throw escape.
+      stream.close();
+    }
+  };
+
   const heartbeat = setInterval(() => {
-    if (!closed) res.write(": ping\n\n");
+    safeWrite(": ping\n\n");
   }, HEARTBEAT_MS);
   // Don't keep the process alive solely for an idle SSE heartbeat.
   if (typeof heartbeat.unref === "function") heartbeat.unref();
@@ -51,10 +66,10 @@ export function openSse(req: IncomingMessage, res: ServerResponse): SseStream {
     send(event, payload) {
       if (closed) return;
       const data = redactSecrets(JSON.stringify(externalizeImages(payload)));
-      res.write(`event: ${event}\ndata: ${data}\n\n`);
+      safeWrite(`event: ${event}\ndata: ${data}\n\n`);
     },
     comment(text) {
-      if (!closed) res.write(`: ${text}\n\n`);
+      safeWrite(`: ${text}\n\n`);
     },
     onClose(fn) {
       closeFns.push(fn);
@@ -70,10 +85,21 @@ export function openSse(req: IncomingMessage, res: ServerResponse): SseStream {
           /* best-effort teardown */
         }
       }
-      res.end();
+      try {
+        res.end();
+      } catch {
+        /* socket already torn down */
+      }
     },
   };
 
+  safeWrite(": connected\n\n");
+
+  // Tear down on any client-side disconnect. `error` covers a reset socket that
+  // never fires `close` (which would leave `closed=false` and let a later write
+  // throw); without these, a socket error could surface inside the agent loop.
   req.on("close", () => stream.close());
+  req.on("error", () => stream.close());
+  res.on("error", () => stream.close());
   return stream;
 }

@@ -120,6 +120,19 @@ export class SessionManager {
     return this.sessions.get(sessionId);
   }
 
+  /**
+   * Register the live `Agent` for a session so observers (the SSE stream) and
+   * steering can reach it.
+   *
+   * Convention — callers MUST `markRunning(sessionId)` (or otherwise drive the
+   * agent to a `running` state) BEFORE calling `attachAgent`. The observability
+   * SSE liveness check (`isAgentLive`) and `steer` both gate on the agent being
+   * in an active run; attaching an agent that has not yet been prompted would
+   * make `getAgent(id)` return a not-yet-running agent. Today the chat path
+   * (`markRunning` then `attachAgent`) and the summarization path (inserts at
+   * `running`) both honor this. `SessionManager` does not structurally enforce
+   * the ordering, so it is recorded here and defended against in `isAgentLive`.
+   */
   attachAgent(sessionId: string, agent: Agent): void {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
@@ -128,6 +141,25 @@ export class SessionManager {
 
   getAgent(sessionId: string): Agent | undefined {
     return this.agents.get(sessionId);
+  }
+
+  /**
+   * True only when a session has an attached agent that is *actively running*.
+   *
+   * "Live" must mean more than map presence: pi-agent-core clears the agent's
+   * active run (`agent.signal` → `undefined`) the moment its run settles, which
+   * happens BEFORE `markCompleted`/`markDiscarded` evict the agent from the map.
+   * So there is a window where `getAgent(id)` still returns an agent whose run
+   * has already ended. The SSE stream uses this to refuse to treat such an agent
+   * as live (belt-and-suspenders with its own terminal re-check), and it also
+   * guards the markRunning-before-attach convention on `attachAgent`: an agent
+   * attached before being prompted has no active run and is not yet live.
+   */
+  isAgentLive(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    const agent = this.agents.get(sessionId);
+    if (!session || !agent || session.status !== "running") return false;
+    return agent.signal !== undefined;
   }
 
   steer(sessionId: string, message: AgentMessage): boolean {
