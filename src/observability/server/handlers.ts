@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { ContextMessage } from "../../context/builder.js";
 import { externalizeImages } from "../../agent/session-capture.js";
+import { isFinalTurnMessage } from "../../agent/factory.js";
 import type { AgentSessionRow } from "../../storage/index.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
@@ -34,9 +35,8 @@ export async function roomContext(
   res: ServerResponse,
   ctx: RequestContext,
 ): Promise<void> {
-  const { built, syntheticTriggerEventId, finalTurnIndex } = await ctx.deps.factory.buildPreview(
-    ctx.params.key,
-  );
+  const { built, syntheticTriggerEventId, finalTurnIndex, cacheBoundaries } =
+    await ctx.deps.factory.buildPreview(ctx.params.key);
   const messages = built.messages.map((msg, i) => ({
     ...renderContextMessage(msg),
     preview: finalTurnIndex >= 0 && i >= finalTurnIndex,
@@ -49,6 +49,7 @@ export async function roomContext(
     tokenEstimate: built.tokenEstimate,
     compactTokens: built.compactTokens,
     richTokens: built.richTokens,
+    cacheBoundaries,
   });
 }
 
@@ -70,6 +71,19 @@ export function roomSessions(
  * transcript head (final user turn) together are the verbatim input view; the
  * rest of the transcript is the rollout. Both are stored already redacted and
  * with images externalized.
+ *
+ * `rolloutStartIndex` marks where the rollout begins inside `transcript`: the
+ * index of the first message that is NOT a head final-user-turn
+ * (`triggerGroup`/`satellite`) message. The verbatim input view (§10a) renders
+ * the snapshot prefix plus `transcript[0..rolloutStartIndex)`; the rollout
+ * renderer (§10b) begins at `rolloutStartIndex` (the first assistant turn). This
+ * is explicit so the client never heuristically guesses the first assistant
+ * message (interjection / forced-completion user turns can legitimately appear
+ * later in the rollout). Edge cases: empty transcript → 0; a transcript with no
+ * head final turn → 0; an all-final-turn transcript → transcript length.
+ *
+ * `contextDumpPath` surfaces the on-disk dump path for snapshot/dump parity
+ * debugging (issue #9); it is deliberately NOT included in the list/meta shape.
  */
 export function sessionDetail(
   _req: IncomingMessage,
@@ -78,11 +92,29 @@ export function sessionDetail(
 ): void {
   const row = ctx.deps.storage.getAgentSession(ctx.params.id);
   if (!row) return sendError(res, 404, `Unknown session: ${ctx.params.id}`);
+  const transcript = parseJsonArray(row.transcript_json);
   sendJson(res, 200, {
     session: sessionMeta(row),
     contextSnapshot: parseJsonArray(row.context_snapshot_json),
-    transcript: parseJsonArray(row.transcript_json),
+    transcript,
+    rolloutStartIndex: rolloutStartIndex(transcript),
+    contextDumpPath: row.context_dump_path,
   });
+}
+
+/**
+ * Index of the first rollout message in a persisted transcript: skip the leading
+ * run of head final-user-turn messages (`triggerGroup`/`satellite`), reusing the
+ * factory's {@link isFinalTurnMessage} predicate so the classification cannot
+ * drift from the prefix/turn split (§3 / §10). Returns `transcript.length` when
+ * every message is a head final turn, and `0` when there is none at the head.
+ */
+function rolloutStartIndex(transcript: unknown[]): number {
+  let i = 0;
+  while (i < transcript.length && isFinalTurnMessage(transcript[i] as { type?: string })) {
+    i++;
+  }
+  return i;
 }
 
 /**

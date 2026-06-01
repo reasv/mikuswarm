@@ -2,7 +2,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
-import { dumpBuiltContext, type BuiltContext, type ContextBuilder } from "../context/index.js";
+import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
@@ -68,6 +68,12 @@ export interface PreviewContext {
    * final user turn.
    */
   finalTurnIndex: number;
+  /**
+   * Cache-boundary markers for the built context (spec §8 endpoint shape, §11 top
+   * bar), copied verbatim from the shared {@link CACHE_BOUNDARIES} const so the
+   * preview, the on-disk dump, and the endpoint cannot drift.
+   */
+  cacheBoundaries: string[];
 }
 
 type ModelConfig = AppConfig["models"]["default"];
@@ -80,6 +86,19 @@ export interface CreateAgentOptions {
    * When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
    * frozen prefix and `transcript` seeds the live message array. The caller is expected
    * to append the awaited input as a new user turn before continuing.
+   *
+   * IMPORTANT — vocabulary contract: `resume.snapshot` must ALREADY be in the agent
+   * message vocabulary, NOT raw `BuiltContext.messages`. The persisted
+   * `context_snapshot_json` is serialized from raw `built.messages`, which keeps the
+   * leading `system` ContextMessage (the runtime carries it in
+   * `AgentState.systemPrompt`, never in the array) and the summary/compact/rich tier
+   * shapes with `tier`/`tokenEstimate` metadata. The live frozen prefix, by contrast,
+   * is `mapBuiltMessages(built)`: the `system` block dropped and `summaryLayer` folded
+   * into a user `chatEvent`. A caller resuming from `context_snapshot_json` MUST run the
+   * parsed array through {@link mapBuiltMessages} before passing it here — spreading the
+   * raw snapshot verbatim would double the system message and carry tier shapes the
+   * runtime prefix never contains. The `create()` resume branch only defensively copies
+   * `snapshot`; it does NOT re-project it.
    */
   resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
 }
@@ -319,8 +338,23 @@ export class AgentSessionFactory {
       built,
       syntheticTriggerEventId: latest ? latest.id : null,
       finalTurnIndex: previewFinalTurnIndex(built),
+      cacheBoundaries: [...CACHE_BOUNDARIES],
     };
   }
+}
+
+/**
+ * The single terminal-turn predicate: is this message the trigger-dependent final
+ * user turn — a `triggerGroup` (chat) or `satellite` (summarization cutoff)?
+ *
+ * This is the ONE source of "what counts as the final live turn", reused by
+ * {@link splitBuiltContext} (the prefix/turn cut), {@link previewFinalTurnIndex}
+ * (the room-preview `preview` flag), and the session-detail `rolloutStartIndex`
+ * marker (spec §10). Keeping a single predicate means those classifications cannot
+ * drift if the set of final-turn types ever changes.
+ */
+export function isFinalTurnMessage(message: { type?: string } | undefined | null): boolean {
+  return message?.type === "triggerGroup" || message?.type === "satellite";
 }
 
 /**
@@ -331,7 +365,7 @@ export class AgentSessionFactory {
  */
 function previewFinalTurnIndex(built: BuiltContext): number {
   const last = built.messages[built.messages.length - 1];
-  if (last && (last.type === "triggerGroup" || last.type === "satellite")) {
+  if (isFinalTurnMessage(last)) {
     return built.messages.length - 1;
   }
   return -1;
@@ -440,7 +474,7 @@ export function splitBuiltContext(built: BuiltContext): {
   // frozen here — its single point of construction — making the invariant observable
   // and enforced regardless of caller. The factory freezes again for the resume path
   // (where the prefix originates from a stored snapshot, not from this helper).
-  if (lastSource && (lastSource.type === "triggerGroup" || lastSource.type === "satellite")) {
+  if (isFinalTurnMessage(lastSource)) {
     return {
       frozenBase: Object.freeze(mapped.slice(0, -1)) as AgentMessage[],
       finalTurn: mapped[mapped.length - 1],

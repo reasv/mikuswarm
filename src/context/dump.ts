@@ -1,6 +1,17 @@
 import { writeContextDump } from "../observability/index.js";
 import type { BuiltContext } from "./builder.js";
 
+/**
+ * Cache-boundary markers for a built context (spec §8 endpoint shape, §11 top bar).
+ *
+ * Single source of truth: BOTH the on-disk context dump ({@link dumpBuiltContext})
+ * and the `/api/rooms/:key/context` endpoint reference this const, so the two
+ * cannot drift. The value is an aspirational placeholder — real cache-breakpoint
+ * logic does not exist yet (see issues doc) — but it must be identical wherever it
+ * is surfaced.
+ */
+export const CACHE_BOUNDARIES: readonly string[] = ["after_system", "after_compact_tier"];
+
 export async function dumpBuiltContext(
   dumpDir: string,
   timelineKey: string,
@@ -14,7 +25,7 @@ export async function dumpBuiltContext(
     createdAt: new Date().toISOString(),
     triggerEventId,
     tokenEstimate: context.tokenEstimate,
-    cacheBoundaries: ["after_system", "after_compact_tier"],
+    cacheBoundaries: [...CACHE_BOUNDARIES],
     imageBlocks: context.imageBlocks.map((block, index) => ({
       eventId: block.eventId,
       attachmentId: block.attachmentId,

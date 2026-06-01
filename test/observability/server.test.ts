@@ -16,6 +16,7 @@ import {
   type ConsoleServerDeps,
 } from "../../src/observability/server/index.js";
 import { registerSecret, resetRedactionRegistry } from "../../src/config/index.js";
+import { CACHE_BOUNDARIES } from "../../src/context/index.js";
 
 const TK = "matrix:miku:room:!room:example.org";
 
@@ -168,6 +169,85 @@ test("GET /api/sessions/:id returns snapshot + transcript; 404 for unknown", asy
 
       const missing = await fetch(`${base}/api/sessions/s-nope`);
       assert.equal(missing.status, 404);
+    });
+  });
+});
+
+test("GET /api/sessions/:id marks rolloutStartIndex past the head final turn (issue #4)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert());
+    await storage.saveAgentSessionSnapshot("s-aaa1111111", {
+      snapshotJson: JSON.stringify([{ type: "system", role: "system", content: "sys" }]),
+      dumpPath: "/var/dumps/s-aaa1111111.json",
+      tokenEstimate: 42,
+    });
+    // Transcript: head final user turn (triggerGroup), then the rollout begins at
+    // the first assistant turn. A later user-role interjection must NOT shift the
+    // boundary — only the leading run of final-turn messages is the input view.
+    await storage.saveAgentSessionTranscript(
+      "s-aaa1111111",
+      JSON.stringify([
+        { type: "triggerGroup", role: "user", content: "hi" },
+        { type: "chatEvent", role: "assistant", content: "hello back" },
+        { role: "user", content: "an interjection mid-rollout" },
+        { type: "chatEvent", role: "assistant", content: "more" },
+      ]),
+    );
+
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-aaa1111111`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      // Rollout begins at index 1 (the first assistant turn), not at the later
+      // user-role interjection.
+      assert.equal(body.rolloutStartIndex, 1);
+      // context_dump_path is surfaced on the detail shape only (issue #9).
+      assert.equal(body.contextDumpPath, "/var/dumps/s-aaa1111111.json");
+    });
+  });
+});
+
+test("GET /api/sessions/:id rolloutStartIndex edge cases (empty / all-final-turn)", async () => {
+  await withStorage(async (storage) => {
+    // Empty transcript → rolloutStartIndex 0.
+    await storage.insertAgentSession(sessionInsert({ id: "s-empty111111" }));
+    // All-final-turn transcript (two satellite/trigger heads, no rollout yet) →
+    // rolloutStartIndex equals the transcript length.
+    await storage.insertAgentSession(sessionInsert({ id: "s-allhead1111" }));
+    await storage.saveAgentSessionTranscript(
+      "s-allhead1111",
+      JSON.stringify([
+        { type: "satellite", role: "user", content: "sat" },
+        { type: "triggerGroup", role: "user", content: "trig" },
+      ]),
+    );
+
+    await withServer({ storage }, async (base) => {
+      const empty = (await (await fetch(`${base}/api/sessions/s-empty111111`)).json()) as any;
+      assert.equal(empty.rolloutStartIndex, 0);
+      // No dump persisted → null, not undefined/missing.
+      assert.equal(empty.contextDumpPath, null);
+
+      const allHead = (await (await fetch(`${base}/api/sessions/s-allhead1111`)).json()) as any;
+      assert.equal(allHead.rolloutStartIndex, 2);
+    });
+  });
+});
+
+test("GET /api/rooms/:key/sessions list shape omits contextDumpPath (issue #9)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert());
+    await storage.saveAgentSessionSnapshot("s-aaa1111111", {
+      snapshotJson: "[]",
+      dumpPath: "/var/dumps/s-aaa1111111.json",
+      tokenEstimate: 1,
+    });
+    await withServer({ storage }, async (base) => {
+      const body = (await (
+        await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/sessions`)
+      ).json()) as any;
+      assert.equal(body.sessions.length, 1);
+      assert.ok(!("contextDumpPath" in body.sessions[0]), "list shape must not leak dump path");
     });
   });
 });
@@ -385,6 +465,7 @@ test("GET /api/rooms/:key/context flags the final turn preview and externalizes 
     const preview: PreviewContext = {
       syntheticTriggerEventId: "evt-1",
       finalTurnIndex: 1,
+      cacheBoundaries: [...CACHE_BOUNDARIES],
       built: {
         tokenEstimate: 100,
         compactTokens: 10,
@@ -427,6 +508,8 @@ test("GET /api/rooms/:key/context flags the final turn preview and externalizes 
       assert.equal(body.preview, true);
       assert.equal(body.syntheticTriggerEventId, "evt-1");
       assert.equal(body.tokenEstimate, 100);
+      // Cache boundaries are surfaced from the single shared const (issue #1).
+      assert.deepEqual(body.cacheBoundaries, [...CACHE_BOUNDARIES]);
       // System block is not preview; final turn is.
       assert.equal(body.messages[0].preview, false);
       assert.equal(body.messages[1].preview, true);

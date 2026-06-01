@@ -14,7 +14,7 @@ export {
   type ContextMessage,
   type ImageBlock,
 } from "./builder.js";
-export { dumpBuiltContext } from "./dump.js";
+export { dumpBuiltContext, CACHE_BOUNDARIES } from "./dump.js";
 export {
   selectSummaries,
   computeRecencyLabel,
