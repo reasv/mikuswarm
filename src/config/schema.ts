@@ -184,7 +184,14 @@ const ObservabilityServerSchema = Type.Object({
   // When set, required as a bearer token on every request and SSE connection.
   // The key name matches the secret-redaction regex (`token`), so the loader
   // auto-registers the value for redaction in logs and JSON responses.
-  auth_token: Type.Optional(Type.String()),
+  //
+  // `minLength: 1` enforces the fail-fast distinction (issue #5): the key being
+  // ABSENT means auth is intentionally disabled (localhost-operator default),
+  // whereas a key PRESENT but empty (e.g. `${MIKUSWARM_CONSOLE_TOKEN}` expanding to
+  // "") is a misconfiguration that would otherwise silently open the console —
+  // it is rejected at load time. Whitespace-only tokens are caught by the
+  // explicit guard in the loader (schema length alone can't see them).
+  auth_token: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const ObservabilitySchema = Type.Object({

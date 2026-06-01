@@ -100,7 +100,29 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   }
 
   const config = Value.Decode(AppConfigSchema, merged);
+  validateConfig(config);
   resetRedactionRegistry();
   registerSecretsByKey(config);
   return config;
+}
+
+/**
+ * Cross-field, fail-fast checks the TypeBox schema can't express on its own.
+ * Runs after structural validation/decoding so all values are present and typed.
+ */
+function validateConfig(config: AppConfig): void {
+  // Observability console auth (issue #5). The schema's `minLength: 1` already
+  // rejects an empty `auth_token`, but a whitespace-only value (e.g.
+  // `${MIKUSWARM_CONSOLE_TOKEN}` expanding to " ") would slip through and silently
+  // open the console to every request. When the server is enabled, a present
+  // token must be non-blank. Absent token = auth intentionally disabled (the
+  // localhost-operator default) and is left untouched.
+  const server = config.observability?.server;
+  if (server?.enabled && server.auth_token !== undefined && server.auth_token.trim() === "") {
+    throw new Error(
+      "Invalid config: observability.server.auth_token is present but blank — " +
+        "set a non-empty token or remove the key to run the console without auth " +
+        "(localhost-only operator default).",
+    );
+  }
 }

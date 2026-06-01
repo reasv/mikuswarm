@@ -125,6 +125,52 @@ test("GET /api/rooms returns aggregated room rows", async () => {
   });
 });
 
+test("GET /api/rooms includes timelines with sessions but no events (issue #6)", async () => {
+  await withStorage(async (storage) => {
+    const eventfulTk = TK;
+    const orphanTk = "matrix:miku:room:!orphan:example.org";
+
+    // A normal timeline with events + a session.
+    await storage.appendTimelineEvent(userEvent("evt-1", "hello", 1_000));
+    await storage.insertAgentSession(sessionInsert({ id: "s-aaa1111111" }));
+
+    // A timeline whose events were pruned/deleted but whose session row persists.
+    // It must still appear so its sessions stay reachable via drill-down, and its
+    // last-activity must fall back to session activity for ordering.
+    await storage.insertAgentSession(
+      sessionInsert({
+        id: "s-orphan11111",
+        timelineKey: orphanTk,
+        createdAt: 5_000,
+        updatedAt: 5_000,
+      }),
+    );
+
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/rooms`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { rooms: any[] };
+      assert.equal(body.rooms.length, 2);
+
+      const orphan = body.rooms.find((r) => r.timelineKey === orphanTk);
+      assert.ok(orphan, "timeline with sessions but no events must appear");
+      assert.equal(orphan.eventCount, 0);
+      assert.equal(orphan.sessionCount, 1);
+      // Falls back to session activity (max created_at/updated_at).
+      assert.equal(orphan.lastActivityAt, 5_000);
+
+      const eventful = body.rooms.find((r) => r.timelineKey === eventfulTk);
+      assert.ok(eventful);
+      assert.equal(eventful.eventCount, 1);
+      assert.equal(eventful.lastActivityAt, 1_000);
+
+      // Reverse-chron: orphan (5_000) before eventful (1_000).
+      assert.equal(body.rooms[0].timelineKey, orphanTk);
+      assert.equal(body.rooms[1].timelineKey, eventfulTk);
+    });
+  });
+});
+
 test("GET /api/rooms/:key/sessions lists sessions for the timeline", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert({ id: "s-aaa1111111" }));

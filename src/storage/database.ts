@@ -2318,29 +2318,43 @@ export class Storage {
 
   /**
    * One row per timeline for the console room list (spec §8, `GET /api/rooms`),
-   * reverse-chron by latest activity. Anchored on `timeline_events` (every
-   * session has a triggering event), with correlated session counts and the
-   * lifecycle state from `timeline_compaction_state` (defaulting to 'inactive',
-   * mirroring `getTimelineState`). Pure read.
+   * reverse-chron by latest activity. The anchor set is the UNION of timelines
+   * that have `timeline_events` OR have `agent_sessions` rows (issue #6): a
+   * timeline whose events were pruned (§13 delete-events / retention sweep) but
+   * whose sessions persist must still appear so its sessions stay reachable via
+   * room→session drill-down. Session counts and lifecycle state are correlated
+   * subqueries; `last_activity_at` is the max event timestamp, falling back to
+   * the latest session activity (`max(created_at, updated_at)`) when no events
+   * survive, so reverse-chron ordering stays sensible. Pure read.
    */
   listConsoleRooms(limit = 500): RoomSummaryRow[] {
     return this.read((db) =>
       db
         .prepare(
           `select
-             te.timeline_key as timeline_key,
-             te.timeline_key as display_name,
+             tk.timeline_key as timeline_key,
+             tk.timeline_key as display_name,
              coalesce(
                (select c.timeline_state from timeline_compaction_state c
-                 where c.timeline_key = te.timeline_key),
+                 where c.timeline_key = tk.timeline_key),
                'inactive'
              ) as timeline_state,
-             max(te.timestamp) as last_activity_at,
-             count(*) as event_count,
+             coalesce(
+               (select max(te.timestamp) from timeline_events te
+                  where te.timeline_key = tk.timeline_key),
+               (select max(max(s.created_at, s.updated_at)) from agent_sessions s
+                  where s.timeline_key = tk.timeline_key),
+               0
+             ) as last_activity_at,
+             (select count(*) from timeline_events te
+                where te.timeline_key = tk.timeline_key) as event_count,
              (select count(*) from agent_sessions s
-                where s.timeline_key = te.timeline_key) as session_count
-           from timeline_events te
-           group by te.timeline_key
+                where s.timeline_key = tk.timeline_key) as session_count
+           from (
+             select timeline_key from timeline_events
+             union
+             select timeline_key from agent_sessions
+           ) tk
            order by last_activity_at desc
            limit ?`,
         )
