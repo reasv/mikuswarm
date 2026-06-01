@@ -8,6 +8,8 @@ import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
+import type { Storage } from "../storage/index.js";
+import type { CanonicalChatEvent } from "../types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
@@ -42,6 +44,30 @@ export interface AgentFactoryOptions {
   config: AppConfig;
   contextBuilder: ContextBuilder;
   getActiveSessions: (timelineKey: string) => AgentSessionRecord[];
+  /**
+   * Read access for the room-context preview (spec §9). Used only by
+   * {@link AgentSessionFactory.buildPreview} to pick the synthetic trigger
+   * (most recent timeline event); the live session path never touches it.
+   * Optional so existing tests can construct a factory without a DB; absent =
+   * `buildPreview` is unavailable.
+   */
+  storage?: Storage;
+}
+
+/** Result of a room-context preview build (spec §9). */
+export interface PreviewContext {
+  /** The real `ContextBuilder.build()` output — identical to a live session's. */
+  built: BuiltContext;
+  /** Canonical id of the event used as the synthetic trigger, or null if the timeline is empty. */
+  syntheticTriggerEventId: string | null;
+  /**
+   * Index into `built.messages` at which the trigger-dependent final user turn
+   * begins (the trailing `triggerGroup`/`satellite`, and any `satellite` system
+   * block immediately preceding it). Messages from here on are flagged
+   * `preview: true` by the endpoint (spec §9). `-1` if the build produced no
+   * final user turn.
+   */
+  finalTurnIndex: number;
 }
 
 type ModelConfig = AppConfig["models"]["default"];
@@ -161,12 +187,9 @@ export class AgentSessionFactory {
       // from aliasing — and freezing — the caller's array (§6).
       frozenBaseSeed = [...opts.resume.snapshot];
     } else {
-      const built = await this.options.contextBuilder.build({
+      const built = await this.buildContext({
         timelineKey: session.timelineKey,
         trigger: session.trigger.event,
-        activeSessions: opts?.summarizationCutoff
-          ? []
-          : this.options.getActiveSessions(session.timelineKey),
         workspace,
         sessionType: sessionTypeConfig,
         fallbackPrompt,
@@ -231,6 +254,106 @@ export class AgentSessionFactory {
       richTokens: snapshotRichTokens,
     };
   }
+
+  /**
+   * The single `ContextBuilder.build()` call, shared by the live session path
+   * ({@link create}) and the room-context preview ({@link buildPreview}). Keeping
+   * one call site is what guarantees the preview is byte-faithful to what a real
+   * session would build (spec §1) — the two cannot drift in their build inputs.
+   * `activeSessions` is empty for a summarization cutoff (mirrors the original
+   * inline logic).
+   */
+  private buildContext(args: {
+    timelineKey: string;
+    trigger: CanonicalChatEvent;
+    workspace: WorkspaceContent;
+    sessionType: SessionTypeConfig | undefined;
+    fallbackPrompt: string | undefined;
+    summarizationCutoff?: { endTimestamp: number };
+  }): Promise<BuiltContext> {
+    return this.options.contextBuilder.build({
+      timelineKey: args.timelineKey,
+      trigger: args.trigger,
+      activeSessions: args.summarizationCutoff
+        ? []
+        : this.options.getActiveSessions(args.timelineKey),
+      workspace: args.workspace,
+      sessionType: args.sessionType,
+      fallbackPrompt: args.fallbackPrompt,
+      summarizationCutoff: args.summarizationCutoff,
+    });
+  }
+
+  /**
+   * Build the context a room's *next* session would see (spec §9), for the
+   * console room view. Uses the **real** build path (via {@link buildContext}),
+   * with the most recent timeline event as a synthetic trigger; builds NO Agent
+   * and writes NO dump. The trigger-dependent final user turn (`finalTurnIndex`
+   * onward) is what the endpoint flags `preview: true`.
+   */
+  async buildPreview(timelineKey: string): Promise<PreviewContext> {
+    const storage = this.options.storage;
+    if (!storage) throw new Error("buildPreview requires a storage-backed factory");
+    const workspaceRoot = this.options.config.workspace.root_dir;
+    const sessionTypeConfig = this.resolveSessionType("default");
+    const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
+    const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
+
+    // Synthetic trigger = most recent timeline event (spec §9). `getTimelineEvents`
+    // returns ascending order, so the last element is the newest. When the timeline
+    // has no events, a minimal placeholder lets the builder still render the prefix
+    // tiers; the final user turn is simply sparse.
+    const recent = storage.getTimelineEvents(timelineKey, 1);
+    const latest = recent[recent.length - 1];
+    const trigger = latest ?? syntheticPlaceholderEvent(timelineKey);
+
+    const built = await this.buildContext({
+      timelineKey,
+      trigger,
+      workspace,
+      sessionType: sessionTypeConfig,
+      fallbackPrompt,
+    });
+
+    return {
+      built,
+      syntheticTriggerEventId: latest ? latest.id : null,
+      finalTurnIndex: previewFinalTurnIndex(built),
+    };
+  }
+}
+
+/**
+ * Index of the trigger-dependent final user turn in a built context, using the
+ * SAME terminal-turn test as {@link splitBuiltContext} so the preview marking
+ * and the live prefix/turn split never diverge. Returns the index of the
+ * trailing `triggerGroup`/`satellite` message, or `-1` if none.
+ */
+function previewFinalTurnIndex(built: BuiltContext): number {
+  const last = built.messages[built.messages.length - 1];
+  if (last && (last.type === "triggerGroup" || last.type === "satellite")) {
+    return built.messages.length - 1;
+  }
+  return -1;
+}
+
+/**
+ * Minimal synthetic trigger for a room with no timeline events yet (spec §9).
+ * Just enough for `ContextBuilder.build()` to render the prefix tiers and an
+ * (empty) final turn; never persisted, never sent to a model.
+ */
+function syntheticPlaceholderEvent(timelineKey: string): CanonicalChatEvent {
+  const now = Date.now();
+  return {
+    id: `preview-synthetic-${now}`,
+    timelineKey,
+    provider: "preview",
+    role: "user",
+    sender: { id: "preview" },
+    body: "",
+    timestamp: now,
+    receivedAt: now,
+  };
 }
 
 /**

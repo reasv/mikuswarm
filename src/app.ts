@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { createLogger } from "./observability/index.js";
+import { createLogger, createObservabilityServer, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
 import { Storage } from "./storage/index.js";
 import {
@@ -224,6 +224,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     config,
     contextBuilder,
     getActiveSessions: (timelineKey) => sessions.activeForTimeline(timelineKey),
+    storage,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -867,11 +868,29 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     retentionTimer.unref?.();
   }
 
+  // Observability console (spec/OBSERVABILITY-UI.md Part B). Read-only HTTP + SSE
+  // over the live storage/factory/session state; gated by config, off by default.
+  let consoleServer: ConsoleServer | undefined;
+  if (config.observability?.server?.enabled) {
+    consoleServer = createObservabilityServer({
+      config: config.observability.server,
+      storage,
+      factory,
+      sessions,
+      workspaceRoot,
+      logger: logger.child("console"),
+    });
+    await consoleServer.start();
+  }
+
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Stop the console first: it stops accepting requests and tears down any
+        // open SSE streams before the live state it reads begins shutting down.
+        if (consoleServer) await consoleServer.stop();
         if (retentionTimer) clearInterval(retentionTimer);
         await redecryptionSweeper.stop();
         await provider.stop();

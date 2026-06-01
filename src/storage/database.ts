@@ -342,6 +342,32 @@ export interface AgentSessionRow {
   completed_at: number | null;
 }
 
+/**
+ * One row per timeline for the observability console's room list (spec §8,
+ * `GET /api/rooms`). Aggregated from `timeline_events` with correlated counts;
+ * read-only. `display_name` falls back to `timeline_key` (no room-name column
+ * exists in the schema today).
+ */
+export interface RoomSummaryRow {
+  timeline_key: string;
+  display_name: string;
+  timeline_state: TimelineState;
+  last_activity_at: number;
+  event_count: number;
+  session_count: number;
+}
+
+/**
+ * Backing data for a summary in the console detail column (spec §12): the raw
+ * timeline events it covers (level-1, via `summary_events`) and/or the child
+ * summaries it condenses (level-2+, via `summary_parents`). Both are returned;
+ * a given summary populates one or the other depending on its level.
+ */
+export interface SummaryLineage {
+  events: CanonicalChatEvent[];
+  children: Summary[];
+}
+
 export class Storage {
   readonly db: Database.Database;
   private readonly queue: Array<WriteJob<any>> = [];
@@ -2268,6 +2294,101 @@ export class Storage {
     return this.read((db) =>
       db.prepare(`select * from agent_sessions where id = ?`).get(id) as
         | AgentSessionRow
+        | undefined,
+    );
+  }
+
+  /**
+   * Sessions for a timeline, reverse-chron by creation (spec §8,
+   * `GET /api/rooms/:key/sessions`). The `idx_agent_sessions_timeline`
+   * index covers this ordering. Read-only.
+   */
+  getAgentSessionsByTimeline(timelineKey: string, limit = 100): AgentSessionRow[] {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select * from agent_sessions
+           where timeline_key = ?
+           order by created_at desc
+           limit ?`,
+        )
+        .all(timelineKey, limit) as AgentSessionRow[],
+    );
+  }
+
+  /**
+   * One row per timeline for the console room list (spec §8, `GET /api/rooms`),
+   * reverse-chron by latest activity. Anchored on `timeline_events` (every
+   * session has a triggering event), with correlated session counts and the
+   * lifecycle state from `timeline_compaction_state` (defaulting to 'inactive',
+   * mirroring `getTimelineState`). Pure read.
+   */
+  listConsoleRooms(limit = 500): RoomSummaryRow[] {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select
+             te.timeline_key as timeline_key,
+             te.timeline_key as display_name,
+             coalesce(
+               (select c.timeline_state from timeline_compaction_state c
+                 where c.timeline_key = te.timeline_key),
+               'inactive'
+             ) as timeline_state,
+             max(te.timestamp) as last_activity_at,
+             count(*) as event_count,
+             (select count(*) from agent_sessions s
+                where s.timeline_key = te.timeline_key) as session_count
+           from timeline_events te
+           group by te.timeline_key
+           order by last_activity_at desc
+           limit ?`,
+        )
+        .all(limit) as RoomSummaryRow[],
+    );
+  }
+
+  /**
+   * Backing data for a summary (spec §12 detail column): the raw timeline events
+   * it covers (`summary_events`, ordered) and the child summaries it condenses
+   * (`summary_parents`, ordered). Returns both arrays; one is typically empty
+   * depending on the summary's level. Pure read.
+   */
+  getSummaryLineage(id: string): SummaryLineage {
+    return this.read((db) => {
+      const eventRows = db
+        .prepare(
+          `select te.event_json as event_json
+             from summary_events se
+             join timeline_events te on te.id = se.event_id
+            where se.summary_id = ?
+            order by se.ordinal asc`,
+        )
+        .all(id) as Array<{ event_json: string }>;
+      const childRows = db
+        .prepare(
+          `select s.* from summary_parents sp
+             join summaries s on s.id = sp.parent_id
+            where sp.summary_id = ?
+            order by sp.ordinal asc`,
+        )
+        .all(id) as SummaryRow[];
+      return {
+        events: eventRows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent),
+        children: childRows.map(mapSummaryRow),
+      };
+    });
+  }
+
+  /**
+   * A single media asset by its id (= `${eventId}:attach:${index}`, which is
+   * also the `attachmentId` carried in externalized image refs — see
+   * `mediaAssetToAttachmentMeta`). Backs `GET /api/media/:ref`. Pure read.
+   */
+  getMediaAssetById(id: string): MediaAssetRow | undefined {
+    return this.read((db) =>
+      db.prepare(`select * from media_assets where id = ?`).get(id) as
+        | MediaAssetRow
         | undefined,
     );
   }

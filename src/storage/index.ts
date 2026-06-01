@@ -18,6 +18,8 @@ export {
   type AgentSessionStatus,
   type AgentSessionInsert,
   type AgentSessionRow,
+  type RoomSummaryRow,
+  type SummaryLineage,
   type TimelineCursor,
 } from "./database.js";
 export type { TimelineState } from "../types.js";

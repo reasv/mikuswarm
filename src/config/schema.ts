@@ -173,6 +173,26 @@ const CaptioningSchema = Type.Object({
   audio: Type.Optional(ModalityConfigSchema),
 });
 
+const ObservabilityServerSchema = Type.Object({
+  // Off by default; the operator opts in via local config (memory:
+  // feedback_explicit_deployment_config — ship defaults, set real values
+  // explicitly). When false, no server is started.
+  enabled: Type.Boolean(),
+  // Bind localhost only; the console is for the operator, not end users (spec §1).
+  bind: Type.String(),
+  port: Type.Integer({ minimum: 1, maximum: 65535 }),
+  // When set, required as a bearer token on every request and SSE connection.
+  // The key name matches the secret-redaction regex (`token`), so the loader
+  // auto-registers the value for redaction in logs and JSON responses.
+  auth_token: Type.Optional(Type.String()),
+});
+
+const ObservabilitySchema = Type.Object({
+  server: Type.Optional(ObservabilityServerSchema),
+});
+
+export type ObservabilityServerConfig = Static<typeof ObservabilityServerSchema>;
+
 export const AppConfigSchema = Type.Object({
   app: Type.Object({
     name: Type.String(),
@@ -257,6 +277,7 @@ export const AppConfigSchema = Type.Object({
   network: Type.Optional(Type.Object({
     http_proxy_url: Type.Optional(Type.String()),
   })),
+  observability: Type.Optional(ObservabilitySchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

@@ -7,6 +7,15 @@ context_dump_dir = "./debug/context"
 [agent]
 disabled_tools = ["web_fetch", "web_search"]
 
+# In-process observability console (read-only HTTP + SSE; spec/OBSERVABILITY-UI.md
+# Part B). Off by default — enable it explicitly in local config and set an
+# auth_token. Binds localhost; the console is for the operator, not end users.
+[observability.server]
+enabled = false
+bind = "127.0.0.1"
+port = 8799
+# auth_token = "${MIKUSWARM_CONSOLE_TOKEN}"  # when set, required as a bearer token
+
 [agent.sessions]
 max_concurrent = 3
 max_concurrent_dm = 1
