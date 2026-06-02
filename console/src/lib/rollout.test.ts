@@ -3,7 +3,8 @@ import {
 	assistantBlocks,
 	contentText,
 	collectToolResults,
-	coerceContextMessage
+	coerceContextMessage,
+	isInjectedUserTurn
 } from './rollout';
 
 describe('rollout helpers', () => {
@@ -31,6 +32,17 @@ describe('rollout helpers', () => {
 		]);
 		expect(map.get('t1')?.toolName).toBe('send');
 		expect(contentText(map.get('t1')?.content)).toBe('ok');
+	});
+
+	it('classifies injected user turns (interjections + forced-completion prompts)', () => {
+		// Interjections carry NO role — they must still route to InterjectionCard (issue #3).
+		expect(isInjectedUserTurn({ type: 'interjection', content: 'oi' })).toBe(true);
+		// Forced-completion prompts arrive as plain role:'user'.
+		expect(isInjectedUserTurn({ role: 'user', content: 'finish up' })).toBe(true);
+		// Assistant / tool-result / raw turns are not injected user turns.
+		expect(isInjectedUserTurn({ role: 'assistant', content: [] })).toBe(false);
+		expect(isInjectedUserTurn({ role: 'toolResult', toolCallId: 't1' })).toBe(false);
+		expect(isInjectedUserTurn({ type: 'something', content: 'x' })).toBe(false);
 	});
 
 	it('coerces a transcript head turn into a context message', () => {

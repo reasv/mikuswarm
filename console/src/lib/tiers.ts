@@ -26,3 +26,45 @@ const FALLBACK: TierMeta = { label: '—', accent: 'border-l-zinc-300 text-zinc-
 export function tierMeta(tier: Tier): TierMeta {
 	return (tier && TIERS[tier]) || FALLBACK;
 }
+
+/**
+ * Verbatim renderer mode (spec §10):
+ * - `room`   — §10a: the live `build()` output; only the system prompt and the
+ *   `<system>` satellite block collapse by default.
+ * - `session`— §10b: the captured input context above a session rollout; the final
+ *   user turn / trigger stays expanded, while earlier tiers (summary/compact/rich)
+ *   AND system/satellite collapse by default so the long prefix doesn't bury the
+ *   rollout below the fold.
+ */
+export type VerbatimMode = 'room' | 'session';
+
+/** A message's collapse-relevant shape (subset of `ContextMessageWire`). */
+export interface CollapsibleMessage {
+	type?: string | null;
+	tier?: Tier;
+}
+
+/** The earlier-context tiers that collapse by default in session mode (spec §10b). */
+const SESSION_COLLAPSED_TIERS = new Set(['summary', 'compact', 'rich', 'mixed']);
+
+/**
+ * Whether a verbatim message renders with a collapse toggle. System prompt and the
+ * `<system>` satellite block always get the affordance (both modes, spec §10a). In
+ * session mode the earlier summary/compact/rich tiers also become collapsible so the
+ * captured prefix can be folded away (spec §10b).
+ */
+export function isCollapsible(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
+	if (msg.type === 'system' || msg.type === 'satellite') return true;
+	if (mode === 'session') return SESSION_COLLAPSED_TIERS.has(msg.tier ?? '');
+	return false;
+}
+
+/**
+ * Default `open` state for a collapsible verbatim message. System/satellite start
+ * collapsed in both modes; in session mode the earlier tiers also start collapsed,
+ * while the final user turn / trigger stays expanded (spec §10a/§10b). Non-collapsible
+ * messages are always open.
+ */
+export function defaultOpen(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
+	return !isCollapsible(msg, mode);
+}

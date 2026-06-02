@@ -4,6 +4,7 @@
 		assistantBlocks,
 		collectToolResults,
 		contentText,
+		isInjectedUserTurn,
 		type RolloutMsg
 	} from '$lib/rollout';
 	import AssistantTextCard from './AssistantTextCard.svelte';
@@ -33,7 +34,11 @@
 					/>
 				{/if}
 			{/each}
-		{:else if msg.role === 'user'}
+		{:else if isInjectedUserTurn(msg)}
+			<!-- Injected user turns: interjections carry no `role` (just
+			     `{ type:'interjection', content }`, see src/agent/messages.ts), while
+			     forced-completion prompts arrive as `role:'user'` (src/agent/runner.ts).
+			     Both render as distinct user-role injections (spec §10b). -->
 			<InterjectionCard text={contentText(msg.content)} />
 		{:else if msg.role === 'toolResult'}
 			<!-- rendered inside its tool-call card; skip standalone -->

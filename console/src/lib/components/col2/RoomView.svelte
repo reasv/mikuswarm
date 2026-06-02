@@ -30,6 +30,6 @@
 	{:else if ctx.isError}
 		<div class="p-4 text-sm text-destructive">{ctx.error.message}</div>
 	{:else}
-		<VerbatimContext messages={ctx.data.messages} />
+		<VerbatimContext messages={ctx.data.messages} mode="room" />
 	{/if}
 </div>

@@ -41,6 +41,19 @@ export function asMsg(m: unknown): RolloutMsg {
 	return (m ?? {}) as RolloutMsg;
 }
 
+/**
+ * Whether a rollout message is an injected user turn (spec §10b) — rendered as a
+ * distinct InterjectionCard rather than the raw-JSON fallback. Covers two shapes:
+ * interjections, which carry NO `role` (just `{ type:'interjection', content }`,
+ * src/agent/messages.ts), and forced-completion prompts, which arrive as plain
+ * `role:'user'` messages (src/agent/runner.ts). The leading final user turn is rendered
+ * by the verbatim input view (§10a) and excluded from the rollout upstream
+ * (rolloutStartIndex), so it never reaches here.
+ */
+export function isInjectedUserTurn(m: RolloutMsg): boolean {
+	return m.type === 'interjection' || m.role === 'user';
+}
+
 /** Assistant content blocks (text / thinking / toolCall), normalized to an array. */
 export function assistantBlocks(content: unknown): AssistantBlock[] {
 	if (!Array.isArray(content)) return [];

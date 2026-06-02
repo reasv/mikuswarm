@@ -26,27 +26,37 @@
 				streaming = null;
 				break;
 			case 'agent_end':
-				if (Array.isArray(evt.messages)) messages = evt.messages as RolloutMsg[];
+				// Deliberately ignore `evt.messages` (the whole `agent.state.messages`, which
+				// still carries the leading final user turn). Replacing `messages` wholesale
+				// here would briefly render that trigger turn as raw JSON before the
+				// persisted-fallback switch. Instead we keep the folded rollout as-is; `onEnd`
+				// refetches the persisted record, which SessionView then renders via the
+				// non-live `Rollout` (transcript.slice(rolloutStartIndex)) — identical to this
+				// view with no flicker (spec §10b: "on completion it is identical to the
+				// persisted record").
 				streaming = null;
 				break;
 		}
 	}
 
-	// Consume the live stream for the current session. Breaking the `for await` on
-	// teardown calls the iterator's `return()`, which aborts the upstream fetch so the
-	// agent releases its subscription (spec §3.3).
+	// Consume the live stream for the current session. On teardown we acquire and close
+	// the iterator explicitly (`iter.return()`), which aborts the upstream fetch so the
+	// agent releases its subscription immediately — independent of whether another event
+	// ever arrives (a quiet running session would otherwise leak the SSE connection and
+	// the `Agent.subscribe` listener until `agent_end`; spec §3.3 / §14).
 	$effect(() => {
 		const id = sessionId;
 		messages = [];
 		streaming = null;
 		contextSummary.set({ live: true });
 		let stop = false;
-		const live = streamSession(id);
+		const iter = streamSession(id)[Symbol.asyncIterator]();
 		(async () => {
 			try {
-				for await (const evt of live) {
-					if (stop) break;
-					fold(evt);
+				for (;;) {
+					const { value, done } = await iter.next();
+					if (done || stop) break;
+					fold(value);
 				}
 			} catch {
 				/* aborted on teardown / disconnect — ignore */
@@ -58,6 +68,9 @@
 		})();
 		return () => {
 			stop = true;
+			// Close the iterator so the live generator's `finally` runs now, tearing down
+			// the upstream SSE + agent subscription without waiting for the next event.
+			void iter.return?.();
 			contextSummary.set({ live: false });
 		};
 	});
