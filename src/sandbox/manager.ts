@@ -3,6 +3,13 @@ import type { Logger } from "../observability/logger.js";
 import { createDockerExecBackend } from "./docker-exec-backend.js";
 import type { ExecBackend, ExecOptions, ExecResult } from "./exec-backend.js";
 
+/**
+ * Runs a single `docker` CLI invocation to completion and returns its captured
+ * output. Implementations must reject (not hang) when the daemon is unresponsive.
+ * Injectable so tests can drive the manager without a real Docker daemon.
+ */
+export type DockerRunner = (args: string[]) => Promise<DockerResult>;
+
 export interface SandboxManagerOptions {
   image: string;
   containerName: string;
@@ -23,6 +30,11 @@ export interface SandboxManagerOptions {
   execTimeoutMs: number;
   maxOutputBytes: number;
   logger: Logger;
+  /**
+   * Overrides the docker CLI runner (tests inject a fake). Defaults to the real
+   * spawn-based runner with a wall-clock timeout.
+   */
+  runDocker?: DockerRunner;
 }
 
 interface DockerResult {
@@ -31,14 +43,81 @@ interface DockerResult {
   code: number;
 }
 
-function runDocker(args: string[]): Promise<DockerResult> {
+interface ContainerState {
+  exists: boolean;
+  running: boolean;
+  /** The image ID the existing container was created from (`.Image`). */
+  imageId?: string;
+  /** Current image ID the requested image tag resolves to. */
+  requestedImageId?: string;
+  /** Bind-mount source mounted at the requested `workspace_mount`, if any. */
+  workspaceMountSource?: string;
+}
+
+/**
+ * Wall-clock bound on every lifecycle `docker` call. A hung/unresponsive daemon
+ * must not block startup forever — the child is killed and the call rejects with
+ * a clear error. This also bounds each readiness probe (issue #11).
+ */
+const DOCKER_CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * Ceiling on buffered stdout/stderr per lifecycle docker call. These commands
+ * (inspect/create/start/exec true) produce tiny output; this caps a misconfigured
+ * daemon streaming a large error from growing memory unboundedly (issue #13).
+ */
+const DOCKER_OUTPUT_CAP_BYTES = 256 * 1024;
+
+/**
+ * The sandbox image's HOME (`docker/Dockerfile.sandbox`: `useradd sandbox`,
+ * `ENV HOME=/home/sandbox`). Under `read_only_root` this path is backed by a
+ * writable tmpfs so cargo/uv/brew/npm installs keep working (issue #7).
+ */
+const SANDBOX_HOME = "/home/sandbox";
+
+/** Accumulates buffer chunks up to a fixed byte ceiling, dropping the overflow. */
+class CappedBuffer {
+  private readonly chunks: Buffer[] = [];
+  private size = 0;
+  constructor(private readonly cap: number) {}
+  push(chunk: Buffer): void {
+    if (this.size >= this.cap) return;
+    const room = this.cap - this.size;
+    const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
+    this.chunks.push(slice);
+    this.size += slice.length;
+  }
+  toString(): string {
+    return Buffer.concat(this.chunks).toString("utf8");
+  }
+}
+
+function runDockerReal(args: string[]): Promise<DockerResult> {
   return new Promise<DockerResult>((resolve, reject) => {
     const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
+    const out = new CappedBuffer(DOCKER_OUTPUT_CAP_BYTES);
+    const err = new CappedBuffer(DOCKER_OUTPUT_CAP_BYTES);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(
+        Object.assign(
+          new Error(
+            `docker daemon unresponsive: "docker ${args.join(" ")}" exceeded ${DOCKER_CALL_TIMEOUT_MS}ms`,
+          ),
+          { code: "DOCKER_TIMEOUT" },
+        ),
+      );
+    }, DOCKER_CALL_TIMEOUT_MS);
+    timer.unref?.();
     child.stdout?.on("data", (c) => out.push(Buffer.from(c)));
     child.stderr?.on("data", (c) => err.push(Buffer.from(c)));
     child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         reject(
           Object.assign(
@@ -54,9 +133,12 @@ function runDocker(args: string[]): Promise<DockerResult> {
       reject(error);
     });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       resolve({
-        stdout: Buffer.concat(out).toString("utf8"),
-        stderr: Buffer.concat(err).toString("utf8"),
+        stdout: out.toString(),
+        stderr: err.toString(),
         code: code ?? 1,
       });
     });
@@ -73,12 +155,40 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * since miku uses a single global workspace and one shared container.
  */
 export class SandboxManager implements ExecBackend {
+  /**
+   * Single-flight guard (issue #15): concurrent/repeat `ensure()` calls share one
+   * in-flight promise so they can't race `docker create --name`. Cleared on
+   * failure so a later call can retry, and on success (a settled container needs
+   * no further guarding — the create path is idempotent on subsequent calls).
+   */
+  private static inFlight: Promise<SandboxManager> | undefined;
+
   private constructor(
     private readonly options: SandboxManagerOptions,
     private readonly backend: ExecBackend,
   ) {}
 
-  static async ensure(options: SandboxManagerOptions): Promise<SandboxManager> {
+  private static runner(options: SandboxManagerOptions): DockerRunner {
+    return options.runDocker ?? runDockerReal;
+  }
+
+  static ensure(options: SandboxManagerOptions): Promise<SandboxManager> {
+    if (SandboxManager.inFlight) return SandboxManager.inFlight;
+    const run = SandboxManager.ensureUnguarded(options).then(
+      (manager) => {
+        SandboxManager.inFlight = undefined;
+        return manager;
+      },
+      (error) => {
+        SandboxManager.inFlight = undefined;
+        throw error;
+      },
+    );
+    SandboxManager.inFlight = run;
+    return run;
+  }
+
+  private static async ensureUnguarded(options: SandboxManagerOptions): Promise<SandboxManager> {
     const { logger } = options;
     await SandboxManager.ensureNetwork(options);
     await SandboxManager.assertImageExists(options);
@@ -99,6 +209,7 @@ export class SandboxManager implements ExecBackend {
   }
 
   private static async ensureNetwork(options: SandboxManagerOptions): Promise<void> {
+    const runDocker = SandboxManager.runner(options);
     const { network } = options;
     if (network === "bridge" || network === "none" || network === "host" || network.startsWith("container:")) {
       return; // built-in modes need no creation
@@ -123,7 +234,7 @@ export class SandboxManager implements ExecBackend {
   }
 
   private static async assertImageExists(options: SandboxManagerOptions): Promise<void> {
-    const result = await runDocker(["image", "inspect", options.image]);
+    const result = await SandboxManager.runner(options)(["image", "inspect", options.image]);
     if (result.code !== 0) {
       throw new Error(
         `Sandbox image not found: ${options.image}. Build it first with docker/build-sandbox.sh, ` +
@@ -133,18 +244,39 @@ export class SandboxManager implements ExecBackend {
   }
 
   private static async ensureContainerRunning(options: SandboxManagerOptions): Promise<void> {
-    const state = await SandboxManager.containerState(options.containerName);
-    if (state.running) {
-      options.logger.info("sandbox_container_reused", { container: options.containerName });
-      return;
-    }
+    const runDocker = SandboxManager.runner(options);
+    const state = await SandboxManager.containerState(options, options.containerName);
     if (state.exists) {
-      // Exists but stopped — start it (preserves any persisted in-container state).
-      const start = await runDocker(["start", options.containerName]);
-      if (start.code !== 0) {
-        throw new Error(`Failed to start sandbox container ${options.containerName}: ${start.stderr.trim()}`);
+      // Reuse re-validates against the requested config (issue #6): with
+      // stop_on_shutdown=false the named container persists across image/mount
+      // changes, so an operator who retags the image or changes workspace_mount
+      // would otherwise keep serving tool calls from a stale container — a silent
+      // fail-open on correctness and the isolation boundary. If the live image ID
+      // or the workspace bind-mount source no longer match, remove and recreate
+      // rather than (re)using the stale container.
+      const mismatch = SandboxManager.containerMismatch(options, state);
+      if (mismatch) {
+        options.logger.warn("sandbox_container_recreate", {
+          container: options.containerName,
+          reason: mismatch,
+        });
+        const remove = await runDocker(["rm", "-f", options.containerName]);
+        if (remove.code !== 0) {
+          throw new Error(
+            `Failed to remove stale sandbox container ${options.containerName}: ${remove.stderr.trim()}`,
+          );
+        }
+      } else if (state.running) {
+        options.logger.info("sandbox_container_reused", { container: options.containerName });
+        return;
+      } else {
+        // Exists, matches, but stopped — start it (preserves in-container state).
+        const start = await runDocker(["start", options.containerName]);
+        if (start.code !== 0) {
+          throw new Error(`Failed to start sandbox container ${options.containerName}: ${start.stderr.trim()}`);
+        }
+        return;
       }
-      return;
     }
     await SandboxManager.createContainer(options);
     const start = await runDocker(["start", options.containerName]);
@@ -152,6 +284,34 @@ export class SandboxManager implements ExecBackend {
       throw new Error(`Failed to start sandbox container ${options.containerName}: ${start.stderr.trim()}`);
     }
     options.logger.info("sandbox_container_created", { container: options.containerName });
+  }
+
+  /**
+   * Returns a human-readable reason string when the existing container no longer
+   * matches the requested config (image ID or workspace bind-mount source), or
+   * `undefined` when it still matches. Scoped strictly to image ID + workspace
+   * mount source — broader cap/network/user comparison is intentionally out of
+   * scope (issue #6).
+   */
+  private static containerMismatch(
+    options: SandboxManagerOptions,
+    state: ContainerState,
+  ): string | undefined {
+    if (state.imageId !== undefined && state.requestedImageId !== undefined) {
+      if (state.imageId !== state.requestedImageId) {
+        return `image changed (running ${state.imageId.slice(0, 19)} != requested ${state.requestedImageId.slice(0, 19)})`;
+      }
+    }
+    if (state.workspaceMountSource !== undefined) {
+      if (state.workspaceMountSource !== options.workspaceHostDir) {
+        return `workspace mount changed (running ${state.workspaceMountSource} != requested ${options.workspaceHostDir})`;
+      }
+    } else if (state.exists) {
+      // The container has no bind mount at the requested container path at all —
+      // it was created with a different workspace_mount. Treat as a mismatch.
+      return `workspace mount missing at ${options.workspaceMount}`;
+    }
+    return undefined;
   }
 
   private static async createContainer(options: SandboxManagerOptions): Promise<void> {
@@ -170,7 +330,18 @@ export class SandboxManager implements ExecBackend {
     ];
     if (options.memory) args.push("--memory", options.memory);
     if (options.cpus !== undefined) args.push("--cpus", String(options.cpus));
-    if (options.readOnlyRoot) args.push("--read-only");
+    if (options.readOnlyRoot) {
+      // A read-only rootfs alone breaks the toolchain: pip/cargo/npm/brew/mktemp
+      // all need a writable /tmp, and the image's HOME (/home/sandbox, per
+      // docker/Dockerfile.sandbox — where CARGO_HOME/RUSTUP_HOME/brew live) must
+      // stay writable for installs. Back both with tmpfs so everything inside the
+      // container works normally even with --read-only (issue #7). The home tmpfs
+      // is mounted over the build-time toolchains, so this trades brew/cargo cache
+      // persistence for a writable home; the rootfs binaries on PATH still work.
+      args.push("--read-only");
+      args.push("--tmpfs", "/tmp:rw,exec,nosuid,nodev");
+      args.push("--tmpfs", `${SANDBOX_HOME}:rw,exec,nosuid,nodev`);
+    }
     for (const [key, value] of Object.entries(options.env ?? {})) {
       args.push("-e", `${key}=${value}`);
     }
@@ -179,27 +350,56 @@ export class SandboxManager implements ExecBackend {
     }
     args.push(options.image, "sleep", "infinity");
 
-    const result = await runDocker(args);
+    const result = await SandboxManager.runner(options)(args);
     if (result.code !== 0) {
       throw new Error(`Failed to create sandbox container ${options.containerName}: ${result.stderr.trim()}`);
     }
   }
 
-  private static async containerState(name: string): Promise<{ exists: boolean; running: boolean }> {
-    const result = await runDocker(["inspect", "-f", "{{.State.Running}}", name]);
+  private static async containerState(
+    options: SandboxManagerOptions,
+    name: string,
+  ): Promise<ContainerState> {
+    const runDocker = SandboxManager.runner(options);
+    // One inspect pulls running-state, the container's image ID, and the bind
+    // source mounted at the requested workspace path (empty if none). Tab-joined
+    // so an empty mount source is still a distinct field.
+    const tmpl =
+      "{{.State.Running}}\t{{.Image}}\t" +
+      `{{range .Mounts}}{{if eq .Destination "${options.workspaceMount}"}}{{.Source}}{{end}}{{end}}`;
+    const result = await runDocker(["inspect", "-f", tmpl, name]);
     if (result.code !== 0) return { exists: false, running: false };
-    return { exists: true, running: result.stdout.trim() === "true" };
+    const [running = "", imageId = "", mountSource = ""] = result.stdout.replace(/\n$/, "").split("\t");
+    // Resolve the requested image tag to its current image ID so a retag that
+    // points the tag at a new build is detected even though the name is unchanged.
+    const imgInspect = await runDocker(["image", "inspect", "-f", "{{.Id}}", options.image]);
+    const requestedImageId = imgInspect.code === 0 ? imgInspect.stdout.trim() : undefined;
+    return {
+      exists: true,
+      running: running.trim() === "true",
+      imageId: imageId.trim() || undefined,
+      requestedImageId,
+      workspaceMountSource: mountSource.length > 0 ? mountSource : undefined,
+    };
   }
 
   /** Defeat the start race: `docker start` returns before PID 1 is exec-able. */
   private static async waitForReady(options: SandboxManagerOptions): Promise<void> {
+    const runDocker = SandboxManager.runner(options);
     const attempts = 5;
+    // Each probe goes through runDocker, so it inherits the wall-clock timeout
+    // (issue #3) and can't hang. On final failure we surface the last probe's
+    // exit code and stderr instead of a bare "did not become ready" (issue #11).
+    let last: DockerResult | undefined;
     for (let i = 0; i < attempts; i++) {
-      const probe = await runDocker(["exec", options.containerName, "true"]);
-      if (probe.code === 0) return;
+      last = await runDocker(["exec", options.containerName, "true"]);
+      if (last.code === 0) return;
       await sleep(200);
     }
-    throw new Error(`Sandbox container ${options.containerName} did not become ready`);
+    const detail = last
+      ? ` (last probe exit ${last.code}${last.stderr.trim() ? `: ${last.stderr.trim()}` : ""})`
+      : "";
+    throw new Error(`Sandbox container ${options.containerName} did not become ready${detail}`);
   }
 
   exec(command: string, execOptions?: ExecOptions): Promise<ExecResult> {
@@ -209,7 +409,11 @@ export class SandboxManager implements ExecBackend {
   async shutdown(opts: { stop: boolean }): Promise<void> {
     if (!opts.stop) return; // leave running for fast restarts
     try {
-      await runDocker(["stop", this.options.containerName]);
+      // PID 1 is `sleep infinity`, which ignores SIGTERM, so a plain `docker stop`
+      // always pays the full 10s grace before SIGKILL. The container holds no
+      // state worth a graceful drain, so `-t 1` (SIGTERM then SIGKILL after 1s)
+      // shuts down promptly (issue #10).
+      await SandboxManager.runner(this.options)(["stop", "-t", "1", this.options.containerName]);
       this.options.logger.info("sandbox_container_stopped", { container: this.options.containerName });
     } catch (error) {
       this.options.logger.warn("sandbox_container_stop_failed", {

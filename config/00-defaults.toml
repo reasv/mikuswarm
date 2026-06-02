@@ -86,7 +86,7 @@ database_path = "./var/mikuswarm.db"
 [workspace]
 root_dir = "./workspaces/miku"
 
-# Docker sandbox (ARCHITECTURE.md §12). Off by default; when enabled, the `bash`
+# Docker sandbox (ARCHITECTURE.md §11a). Off by default; when enabled, the `bash`
 # tool and `search_files`/ripgrep run inside a long-lived container with the
 # workspace bind-mounted at workspace_mount. Enabling requires the image built
 # (docker/build-sandbox.sh) and Docker reachable, or startup fails fast.

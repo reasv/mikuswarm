@@ -251,7 +251,7 @@ export const AppConfigSchema = Type.Object({
   // Docker sandbox: when enabled, shell-shaped tool calls (the `bash` tool and
   // `search_files`/ripgrep) execute inside a long-lived container whose
   // /workspace is the bind-mounted workspace root. Pure byte I/O and image
-  // tools stay in-process on the same bind-mounted files. See ARCHITECTURE.md §12.
+  // tools stay in-process on the same bind-mounted files. See ARCHITECTURE.md §11a.
   // Optional so existing configs stay valid; when enabled, startup fails fast if
   // Docker/the image/the container are unavailable.
   sandbox: Type.Optional(Type.Object({

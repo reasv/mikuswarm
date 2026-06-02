@@ -77,7 +77,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
 
-  // Docker sandbox (ARCHITECTURE.md §12). When enabled, ensure the container is
+  // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
   // The sandbox handle is closed over by the per-session tools builder below.
   let sandbox: SandboxManager | undefined;
