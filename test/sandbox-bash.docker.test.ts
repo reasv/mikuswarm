@@ -75,11 +75,17 @@ test("sandbox bash: round-trips a command and shares the bind-mounted workspace"
     // the command lets us pgrep for survivors afterwards.
     const ac = new AbortController();
     const abortSentinel = `miku-abort-${Date.now()}`;
+    const abortStart = Date.now();
     const slow = manager.exec(`sleep 300 # ${abortSentinel}`, { signal: ac.signal });
     ac.abort();
     const slowResult = await slow;
+    const abortElapsed = Date.now() - abortStart;
     assert.notEqual(slowResult.exitCode, 0);
     assert.equal(slowResult.timedOut, false, "abort is not a timeout");
+    // The awaited abort must resolve promptly — a no-op abort would block on the
+    // `sleep 300` and only return after the wall-clock/grace, so bound it well
+    // under that. (The out-of-band in-container kill is what unblocks the exec.)
+    assert.ok(abortElapsed < 5_000, `abort resolved promptly (took ${abortElapsed}ms)`);
     {
       const survivors = spawnSync(
         "docker",

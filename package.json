@@ -6,7 +6,8 @@
   "scripts": {
     "build": "pnpm build:native && tsc --noEmit",
     "build:native": "napi build --platform --manifest-path native/crates/matrix-core/Cargo.toml --js-package-name mikuswarm --output-dir npm",
-    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "test": "node --import tsx --test \"test/**/!(*.docker).test.ts\"",
+    "test:docker": "node --import tsx --test \"test/**/*.docker.test.ts\"",
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts"
   },
