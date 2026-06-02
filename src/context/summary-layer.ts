@@ -1,5 +1,6 @@
 import type { Summary } from "../storage/index.js";
 import { escapeAttr, escapeXml } from "./xml.js";
+import { formatAgentTimestamp } from "../time/index.js";
 
 export interface SummarySelection {
   /** Summaries to render, ordered by earliest_timestamp ASC. */
@@ -143,8 +144,8 @@ export function renderSummaryLayer(selected: Summary[], labels: string[]): strin
     .map((s, i) => {
       const attrs = [
         `level="${s.level}"`,
-        `earliest="${new Date(s.earliestTimestamp).toISOString()}"`,
-        `latest="${new Date(s.latestTimestamp).toISOString()}"`,
+        `earliest="${formatAgentTimestamp(s.earliestTimestamp)}"`,
+        `latest="${formatAgentTimestamp(s.latestTimestamp)}"`,
         `recency="${escapeAttr(labels[i] ?? "")}"`,
         `events="${s.eventCount}"`,
         `id="${escapeAttr(s.id)}"`,

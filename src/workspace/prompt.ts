@@ -1,5 +1,6 @@
 import type { WorkspaceContent, SessionTypeConfig, SatelliteRuntimeInput } from "./types.js";
 import { escapeXml, escapeAttr } from "../context/xml.js";
+import { formatAgentTimestamp } from "../time/index.js";
 
 /**
  * Tag name mapping for workspace files.
@@ -126,7 +127,7 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
   const sessions = options.activeSessions
     .map(
       (session) =>
-        `<session id="${escapeAttr(session.id)}" started="${new Date(session.createdAt).toISOString()}" triggered_by="${escapeAttr((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
+        `<session id="${escapeAttr(session.id)}" started="${formatAgentTimestamp(session.createdAt)}" triggered_by="${escapeAttr((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
     )
     .join("\n");
 
@@ -134,7 +135,7 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
     ? `\n\n<active_sessions>\n${sessions}\n</active_sessions>`
     : "";
 
-  return `Current time: ${(options.now ?? new Date(options.trigger.timestamp)).toISOString()}
+  return `Current time: ${formatAgentTimestamp(options.now ?? options.trigger.timestamp)}
 Current timeline: ${escapeXml(options.timelineKey)}
 Trigger event: ${escapeXml(options.trigger.id)}${sessionsBlock}`;
 }

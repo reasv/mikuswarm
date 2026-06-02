@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
+import { formatAgentTimestamp } from "../time/index.js";
 
 // ---------------------------------------------------------------------------
 // Context
@@ -448,7 +449,7 @@ async function executeUserProfileEdit(input: {
       throw new Error(`No profile exists for ${target.provider}:${target.senderId}.`);
     }
 
-    const now = new Date().toISOString();
+    const now = formatAgentTimestamp(Date.now());
     const existing = resolvedPath.exists
       ? parseUserProfileDocument(await fs.readFile(resolvedPath.absolutePath, "utf8"), target)
       : createEmptyUserProfileDocument(target, now);
@@ -631,7 +632,7 @@ function parseUserProfileDocument(
   fallbackTarget: ResolvedUserProfileTarget,
 ): UserProfileDocument {
   const { metadata, body } = parseUserProfileFrontmatter(raw);
-  const now = new Date().toISOString();
+  const now = formatAgentTimestamp(Date.now());
   const mergedMetadata: UserProfileMetadata = {
     provider: normalizeProvider(metadata.provider) ?? fallbackTarget.provider,
     senderId: normalizeOptionalText(metadata.sender_id) ?? fallbackTarget.senderId,

@@ -1,5 +1,6 @@
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
 import { escapeAttr, escapeXml } from "./xml.js";
+import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
 
 export type RenderTier = "rich" | "compact";
 
@@ -68,7 +69,7 @@ function buildMessageAttrs(event: CanonicalChatEvent): string {
   if (event.sender.displayName && event.sender.displayName !== event.sender.id) {
     pairs.push(["display_name", truncate(event.sender.displayName, MAX_DISPLAY_NAME)]);
   }
-  pairs.push(["time", new Date(event.timestamp).toISOString()]);
+  pairs.push(["time", formatAgentTimestamp(event.timestamp)]);
   if (event.mentions?.mentionedSelf) pairs.push(["mentions_you", "true"]);
   if (event.externalId) pairs.push(["external_id", event.externalId]);
   if (event.agentSessionId) pairs.push(["agent_session_id", event.agentSessionId]);
@@ -83,7 +84,7 @@ function renderReply(reply: ReplyContext): string {
       pairs.push(["display_name", truncate(reply.sender.displayName, MAX_DISPLAY_NAME)]);
     }
   }
-  if (reply.timestamp) pairs.push(["time", new Date(reply.timestamp).toISOString()]);
+  if (reply.timestamp) pairs.push(["time", formatAgentTimestamp(reply.timestamp)]);
   if (reply.externalId) pairs.push(["external_id", reply.externalId]);
 
   const innerParts: string[] = [escapeXml(reply.body ?? "")];
@@ -176,7 +177,7 @@ function compactReply(reply: ReplyContext): string {
 }
 
 function compactTime(timestamp: number): string {
-  return new Date(timestamp).toISOString().slice(0, 16).replace("T", " ");
+  return compactAgentTimestamp(timestamp);
 }
 
 function normalizeWhitespace(value: string): string {

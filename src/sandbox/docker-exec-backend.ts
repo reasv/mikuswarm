@@ -275,6 +275,12 @@ export interface DockerExecBackendOptions {
   defaultTimeoutMs?: number;
   maxOutputBytes?: number;
   /**
+   * Base environment injected into every exec (per-call env takes precedence).
+   * Carries `TZ` so the configured agent timezone holds for `date`/`ls -l` even
+   * if a long-lived container was created before the zone was set.
+   */
+  env?: Record<string, string>;
+  /**
    * Overrides the docker spawn (tests inject a fake to assert the argv/kill
    * construction without a real daemon). Defaults to the real spawn runner.
    */
@@ -303,7 +309,7 @@ export function createDockerExecBackend(options: DockerExecBackendOptions): Exec
         containerName: options.containerName,
         command,
         workdir,
-        env: execOptions.env,
+        env: { ...options.env, ...execOptions.env },
         timeoutSecs,
         marker,
       });

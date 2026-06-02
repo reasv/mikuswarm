@@ -309,7 +309,9 @@ describe("satellite block rendering", () => {
 
     const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace);
     assert.ok(satellite.includes("<runtime_state>"));
-    assert.ok(satellite.includes("Current time: 2026-05-26T14:00:00.000Z"));
+    // Rendered via formatAgentTimestamp (configured zone, default UTC → "Z",
+    // no milliseconds — see src/time).
+    assert.ok(satellite.includes("Current time: 2026-05-26T14:00:00Z"));
     assert.ok(satellite.includes("Current timeline: matrix:miku:room:!test:server.org"));
     assert.ok(satellite.includes("Trigger event: evt-1"));
     assert.ok(satellite.includes("</runtime_state>"));

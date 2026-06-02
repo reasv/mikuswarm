@@ -59,6 +59,7 @@ import { SummarizationWorkerPool } from "./summarization/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
+import { getConfiguredTimezone } from "./time/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -94,7 +95,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       cpus: config.sandbox.cpus,
       pidsLimit: config.sandbox.pids_limit,
       readOnlyRoot: config.sandbox.read_only_root,
-      env: config.sandbox.env,
+      // Inject the agent's timezone so in-container `date`/`ls -l` reflect the
+      // configured zone, not the image/host zone (leak prevention). A config
+      // value can still override TZ explicitly if ever needed.
+      env: { TZ: getConfiguredTimezone(), ...config.sandbox.env },
       binds: config.sandbox.binds,
       execTimeoutMs: config.sandbox.exec_timeout_ms,
       maxOutputBytes: config.sandbox.max_output_bytes,

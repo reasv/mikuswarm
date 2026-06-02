@@ -4,6 +4,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { runRipgrep, runTextEditorCommand, type TextEditorArgs } from "./file.js";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
+import { agentDateStamp } from "../time/index.js";
 
 export interface MemoryToolContext {
   workspaceRoot: string;
@@ -129,7 +130,7 @@ async function ensureMemoryDirectory(workspaceRoot: string): Promise<string> {
 }
 
 async function ensureDailyMemoryFile(workspaceRoot: string, now: Date): Promise<string> {
-  const date = now.toISOString().slice(0, 10);
+  const date = agentDateStamp(now);
   const memoryDir = await ensureMemoryDirectory(workspaceRoot);
   const memoryPath = path.join(memoryDir, `${date}.md`);
   try {

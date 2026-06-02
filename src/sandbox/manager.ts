@@ -204,6 +204,9 @@ export class SandboxManager implements ExecBackend {
       workspaceMount: options.workspaceMount,
       defaultTimeoutMs: options.execTimeoutMs,
       maxOutputBytes: options.maxOutputBytes,
+      // Base env (incl. TZ) is re-applied per exec so the configured zone holds
+      // even against a long-lived container created before the zone was set.
+      env: options.env,
     });
     return new SandboxManager(options, backend);
   }

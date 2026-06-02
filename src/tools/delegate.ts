@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { escapeAttr, escapeXml } from "../context/xml.js";
+import { formatAgentTimestamp } from "../time/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 export interface DelegateToolContext {
@@ -21,7 +22,7 @@ export function createDelegateToSessionTool(context: DelegateToolContext): Agent
       const args = params as { session_id: string; note?: string };
       const content = [
         args.note ? `<delegation_note>${escapeXml(args.note)}</delegation_note>` : undefined,
-        `<message sender="${escapeAttr(context.currentEvent.sender.displayName ?? context.currentEvent.sender.id)}" time="${new Date(context.currentEvent.timestamp).toISOString()}">
+        `<message sender="${escapeAttr(context.currentEvent.sender.displayName ?? context.currentEvent.sender.id)}" time="${formatAgentTimestamp(context.currentEvent.timestamp)}">
 ${escapeXml(context.currentEvent.body)}
 </message>`,
       ]

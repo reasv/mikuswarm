@@ -6,6 +6,10 @@ context_dump_dir = "./debug/context"
 
 [agent]
 disabled_tools = ["web_fetch", "web_search"]
+# IANA time zone the agent operates in. Every date the agent sees is rendered in
+# this zone (never the server's real zone), and it is exported as TZ to the
+# process and the Docker sandbox. Set explicitly in local config.
+timezone = "UTC"
 
 # In-process observability console (read-only HTTP + SSE; spec/OBSERVABILITY-UI.md
 # Part B). Off by default — enable it explicitly in local config and set an

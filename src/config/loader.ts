@@ -5,6 +5,7 @@ import { parse } from "smol-toml";
 import { loadDotEnv, type EnvLoadOptions } from "./env.js";
 import { AppConfigSchema, type AppConfig } from "./schema.js";
 import { registerSecret, resetRedactionRegistry } from "./redaction.js";
+import { configureAgentTimezone } from "../time/index.js";
 
 type PlainObject = Record<string, unknown>;
 
@@ -103,6 +104,10 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   validateConfig(config);
   resetRedactionRegistry();
   registerSecretsByKey(config);
+  // Establish the agent's timezone (and set process.env.TZ) as part of config
+  // load — before the provider, workers, or sandbox start. Throws on an invalid
+  // zone (fail-fast), mirroring the redaction-registry wiring above.
+  configureAgentTimezone(config.agent.timezone ?? "UTC");
   return config;
 }
 

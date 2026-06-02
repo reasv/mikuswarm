@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MatrixNativeClient } from "../matrix/native-client.js";
+import { formatAgentTimestamp } from "../time/index.js";
 
 export interface PinsToolContext {
   client: MatrixNativeClient;
@@ -44,7 +45,7 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
             const body = ev.body.length > 100 ? ev.body.slice(0, 100) + "…" : ev.body;
             let time: string;
             try {
-              time = new Date(/^\d+$/.test(ev.timestamp) ? Number(ev.timestamp) : ev.timestamp).toISOString();
+              time = formatAgentTimestamp(new Date(/^\d+$/.test(ev.timestamp) ? Number(ev.timestamp) : ev.timestamp));
             } catch {
               time = ev.timestamp;
             }
