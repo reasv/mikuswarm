@@ -139,6 +139,8 @@ function stripDataUris(text: string): string {
  *  - ContextMessage `imageBlocks`: `{ eventId, attachmentId, mediaType, dataBase64 }`
  *  - Anthropic image content block: `{ type: "image", source: { type: "base64", media_type, data } }`
  *    (incl. tool_result content arrays).
+ *  - pi-ai inline image content block: `{ type: "image", data: <base64>, mimeType }`
+ *    (no `source` wrapper; used in UserMessage/ToolResultMessage content arrays).
  *  - OpenAI-style image block: `{ type: "image_url", image_url: { url } }` or a
  *    bare `{ url }` block, where `url` is a `data:...;base64,` URI.
  *  - As a structural backstop, any `source` object whose `type === "base64"` and
@@ -213,6 +215,24 @@ function externalize(value: unknown): unknown {
       };
       return { ...rest, source: ref };
     }
+  }
+
+  // pi-ai inline image content block: { type: "image", data: <base64>, mimeType }
+  // (pi-ai `ImageContent`, used in UserMessage/ToolResultMessage content arrays).
+  // Distinct from the Anthropic shape above, which wraps the payload in `source`;
+  // guarding on the ABSENCE of `source` keeps the two branches from colliding.
+  if (obj.type === "image" && typeof obj.data === "string" && obj.source === undefined) {
+    const rest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "data") continue;
+      rest[k] = externalize(v);
+    }
+    const ref: ImageRef = {
+      __imageRef: true,
+      mimeType: typeof obj.mimeType === "string" ? obj.mimeType : undefined,
+      sizeBytes: base64ByteLength(obj.data),
+    };
+    return { ...rest, data: ref };
   }
 
   // OpenAI-style image block: { type: "image_url", image_url: { url } } — the url

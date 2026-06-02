@@ -37,7 +37,9 @@
 		{#if imageRefs.length > 0}
 			<span class="text-muted-foreground">{imageRefs.length} img</span>
 		{/if}
-		<span class="text-muted-foreground tabular-nums">{msg.tokenEstimate} tok</span>
+		<span class="text-muted-foreground tabular-nums"
+			>{msg.tokenEstimate === null ? '—' : msg.tokenEstimate} tok</span
+		>
 	</div>
 
 	{#if open}

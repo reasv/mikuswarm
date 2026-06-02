@@ -403,7 +403,9 @@ export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig)
 /**
  * Map a BuiltContext's messages into the agent's message vocabulary:
  * - `system` is dropped (it lives in `AgentState.systemPrompt`, not the array).
- * - `triggerGroup`/`satellite` are kept as-is.
+ * - `triggerGroup`/`satellite` are kept as-is, carrying the builder's per-message
+ *   `tier`/`tokenEstimate` so the persisted transcript head renders accurate
+ *   token counts in the verbatim view (spec §10a/§11).
  * - `summaryLayer` becomes a user `chatEvent`.
  * - historical `chatEvent`s keep their (assistant-or-user) role.
  */
@@ -417,6 +419,11 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
           content: message.content,
           imageBlocks: message.imageBlocks,
           timestamp: message.timestamp,
+          // Carry the builder's per-message tier + token estimate onto the head
+          // turn so the persisted transcript head (the default-expanded final
+          // user turn) renders the real values rather than 0/`trigger` (#9).
+          tier: message.tier,
+          tokenEstimate: message.tokenEstimate,
         },
       ];
     }

@@ -18,7 +18,7 @@
 		const totals = new Map<string, number>();
 		for (const m of messages) {
 			const key = m.tier ?? '—';
-			totals.set(key, (totals.get(key) ?? 0) + m.tokenEstimate);
+			totals.set(key, (totals.get(key) ?? 0) + (m.tokenEstimate ?? 0));
 		}
 		return [...totals.entries()];
 	});

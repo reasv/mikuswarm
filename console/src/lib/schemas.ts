@@ -30,7 +30,10 @@ export const ContextMessageWire = Schema.Struct({
 	role: Schema.String,
 	content: Schema.String,
 	tier: Schema.NullOr(Schema.String),
-	tokenEstimate: Schema.Number,
+	// Nullable so a genuinely-legacy persisted transcript head (captured before the
+	// producer threaded the real estimate, issue #9) decodes and renders an em-dash
+	// rather than a misleading 0. Live producer paths always emit a real number.
+	tokenEstimate: Schema.NullOr(Schema.Number),
 	timestamp: Schema.NullOr(Schema.Number),
 	imageRefs: Schema.optional(Schema.Array(ImageRef)),
 	/** present only on room-context preview messages (spec §9) */

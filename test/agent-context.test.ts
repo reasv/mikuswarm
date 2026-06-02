@@ -138,6 +138,28 @@ test("splitBuiltContext pops the triggerGroup final turn off the frozen prefix",
   assert.match((finalTurn as any).content, /hi miku/);
 });
 
+// #9: the persisted transcript head (the popped final turn) must carry the
+// builder's real per-message tier + tokenEstimate, so the verbatim renderer shows
+// the true token count instead of 0/`trigger`.
+test("splitBuiltContext: final turn carries the builder's real tier and tokenEstimate (#9)", () => {
+  const built: BuiltContext = {
+    messages: [
+      { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 1 },
+      { type: "triggerGroup", role: "user", content: "<system>now</system>\n\n<message>hi miku</message>", tier: "trigger", tokenEstimate: 137, timestamp: 30 },
+    ],
+    tokenEstimate: 138,
+    compactTokens: 0,
+    richTokens: 0,
+    imageBlocks: [],
+  } as BuiltContext;
+
+  const { finalTurn } = splitBuiltContext(built);
+  // The head turn must carry the real estimate, not the default 0 (#9).
+  assert.equal((finalTurn as any)?.type, "triggerGroup");
+  assert.equal((finalTurn as any)?.tokenEstimate, 137);
+  assert.equal((finalTurn as any)?.tier, "trigger");
+});
+
 test("splitBuiltContext pops the satellite final turn for a cutoff build", () => {
   const built: BuiltContext = {
     messages: [

@@ -141,6 +141,13 @@ function coerceImageRefs(o: RolloutMsg): readonly ImageRef[] | undefined {
  * Coerce a transcript head element (the kickoff final user turn — `triggerGroup` /
  * `satellite`, spec §2b) into the verbatim renderer's ContextMessage shape so the
  * verbatim-input view can render it alongside the frozen snapshot prefix.
+ *
+ * The producer now persists the real per-message `tier`/`tokenEstimate` onto the
+ * head turn (`mapBuiltMessages`, src/agent/factory.ts, issue #9), so prefer those.
+ * Fall back to `null` (rendered as an em-dash, NOT a misleading 0/`trigger`) only
+ * for genuinely-legacy records captured before that change. Image normalization
+ * now also happens server-side (externalizeImages, issue #4); `coerceImageRefs`
+ * stays as a legacy fallback for raw context `imageBlocks` in old records.
  */
 export function coerceContextMessage(raw: unknown): ContextMessageWire {
 	const o = asMsg(raw);
@@ -148,8 +155,8 @@ export function coerceContextMessage(raw: unknown): ContextMessageWire {
 		type: typeof o.type === 'string' ? o.type : 'triggerGroup',
 		role: typeof o.role === 'string' ? o.role : 'user',
 		content: contentText(o.content),
-		tier: typeof o.tier === 'string' ? o.tier : 'trigger',
-		tokenEstimate: typeof o.tokenEstimate === 'number' ? o.tokenEstimate : 0,
+		tier: typeof o.tier === 'string' ? o.tier : null,
+		tokenEstimate: typeof o.tokenEstimate === 'number' ? o.tokenEstimate : null,
 		timestamp: typeof o.timestamp === 'number' ? o.timestamp : null,
 		imageRefs: coerceImageRefs(o)
 	};

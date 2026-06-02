@@ -237,6 +237,54 @@ test("image externalization in transcript content blocks drops base64", async ()
   });
 });
 
+test("externalizeImages externalizes pi-ai inline image blocks ({type:image,data,mimeType})", () => {
+  // pi-ai's ImageContent shape (no `source` wrapper) appears in UserMessage /
+  // ToolResultMessage content arrays (issue #4). It must be externalized too.
+  const b64 = Buffer.from([1, 2, 3, 4, 5]).toString("base64");
+  const input = [
+    {
+      role: "toolResult",
+      toolCallId: "t1",
+      content: [
+        { type: "text", content: "here's the screenshot" },
+        { type: "image", data: b64, mimeType: "image/png" },
+      ],
+    },
+  ];
+  const out = externalizeImages(input) as Array<{
+    content: Array<Record<string, unknown>>;
+  }>;
+  const json = JSON.stringify(out);
+  assert.ok(!json.includes(b64), "raw base64 must not survive externalization");
+
+  const imgBlock = out[0]!.content[1]!;
+  assert.equal(imgBlock.type, "image", "the block type is preserved");
+  const ref = imgBlock.data as { __imageRef: boolean; mimeType?: string; sizeBytes: number };
+  assert.equal(ref.__imageRef, true);
+  assert.equal(ref.mimeType, "image/png");
+  assert.equal(ref.sizeBytes, 5);
+  assert.equal(typeof imgBlock.data, "object", "data replaced by an ImageRef object");
+});
+
+test("pi-ai inline branch does not collide with the Anthropic source branch", () => {
+  // A block that has BOTH a `source` wrapper and a top-level `data` must take the
+  // Anthropic path (externalize `source`), never the pi-ai path.
+  const b64 = Buffer.from([7, 7, 7]).toString("base64");
+  const input = [
+    {
+      type: "image",
+      source: { type: "base64", media_type: "image/gif", data: b64 },
+    },
+  ];
+  const out = externalizeImages(input) as Array<Record<string, unknown>>;
+  const block = out[0]!;
+  const src = block.source as { __imageRef: boolean; mimeType?: string; sizeBytes: number };
+  assert.equal(src.__imageRef, true, "Anthropic source branch handled the block");
+  assert.equal(src.mimeType, "image/gif");
+  assert.equal(src.sizeBytes, 3);
+  assert.ok(!("data" in block), "no stray top-level data ref was added");
+});
+
 test("externalizeImages is pure (does not mutate input)", () => {
   const b64 = Buffer.from([1, 2, 3]).toString("base64");
   const input = [

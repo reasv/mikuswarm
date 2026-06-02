@@ -88,10 +88,25 @@ describe('rollout helpers', () => {
 		expect((cm.imageRefs![0] as Record<string, unknown>).sizeBytes).toBe(42);
 	});
 
-	it('coerces defensively when fields are missing', () => {
+	it('coerces defensively when fields are missing (legacy records → null, not 0)', () => {
+		// A genuinely-legacy head turn (persisted before the producer threaded the
+		// real tier/tokenEstimate, issue #9) must surface null so the renderer shows
+		// an em-dash — never a misleading 0 / hardcoded `trigger`.
 		const cm = coerceContextMessage({});
 		expect(cm.content).toBe('');
-		expect(cm.tokenEstimate).toBe(0);
+		expect(cm.tokenEstimate).toBe(null);
+		expect(cm.tier).toBe(null);
+	});
+
+	it('prefers the real persisted tier/tokenEstimate on the head turn (issue #9)', () => {
+		const cm = coerceContextMessage({
+			type: 'triggerGroup',
+			role: 'user',
+			content: 'go',
+			tier: 'trigger',
+			tokenEstimate: 123
+		});
+		expect(cm.tokenEstimate).toBe(123);
 		expect(cm.tier).toBe('trigger');
 	});
 });
