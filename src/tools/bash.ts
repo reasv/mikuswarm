@@ -19,7 +19,7 @@ interface BashArgs {
  * boundary that makes arbitrary shell execution safe: the command runs as the
  * sandbox user inside the container, not in the harness process. The workspace
  * is mounted at the container root, so files created here are visible to the
- * in-process file/image tools (hybrid FS model — ARCHITECTURE.md §12).
+ * in-process file/image tools (hybrid FS model — ARCHITECTURE.md §11a).
  */
 export function createBashTool(context: BashToolContext): AgentTool {
   return {
