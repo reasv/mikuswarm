@@ -1,10 +1,24 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MatrixNativeClient } from "../matrix/native-client.js";
+import { formatAgentTimestamp } from "../time/index.js";
 
 export interface ReadMessagesToolContext {
   client: MatrixNativeClient;
   roomId: string;
+}
+
+/**
+ * Render a `MatrixMessageSummary.timestamp` (RFC3339 string or epoch-ms numeric
+ * string) in the configured agent timezone, falling back to the raw string on an
+ * invalid date — mirrors the treatment in src/tools/pins.ts.
+ */
+function fmtTs(timestamp: string): string {
+  try {
+    return formatAgentTimestamp(new Date(/^\d+$/.test(timestamp) ? Number(timestamp) : timestamp));
+  } catch {
+    return timestamp;
+  }
 }
 
 export function createReadMessagesTool(context: ReadMessagesToolContext): AgentTool {
@@ -35,7 +49,7 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
           }
           const senderLabel = summary.senderName ?? summary.sender;
           return {
-            content: [{ type: "text", text: `[${summary.timestamp}] ${senderLabel}: ${summary.body}` }],
+            content: [{ type: "text", text: `[${fmtTs(summary.timestamp)}] ${senderLabel}: ${summary.body}` }],
             details: summary,
           };
         }
@@ -56,7 +70,7 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
 
         const lines = result.messages.map((m) => {
           const sender = m.senderName ?? m.sender;
-          return `[${m.timestamp}] ${sender}: ${m.body}`;
+          return `[${fmtTs(m.timestamp)}] ${sender}: ${m.body}`;
         });
 
         const pagination: string[] = [];

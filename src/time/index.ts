@@ -40,7 +40,8 @@ function getFormatter(tz: string): Intl.DateTimeFormat {
       second: "2-digit",
       // h23 keeps midnight as "00" rather than ICU's "24:00" quirk.
       hourCycle: "h23",
-      // "GMT+09:00" / "GMT-05:00" / "GMT" — parsed into the ISO offset suffix.
+      // ICU `longOffset` emits "GMT+09:00" / "GMT-05:00" / "GMT+00:00" (full
+      // GMT±HH:MM, even for UTC) — parsed into the ISO offset suffix by offsetSuffix.
       timeZoneName: "longOffset",
     });
     formatterCache.set(tz, formatter);
@@ -68,7 +69,10 @@ function partsOf(date: Date): DateParts {
 
 /**
  * Convert an ICU `longOffset` time-zone name into an ISO-8601 offset suffix.
- * "GMT+09:00" → "+09:00"; "GMT-5" → "-05:00"; "GMT"/"UTC"/"+00:00" → "Z".
+ * Current ICU always emits the full `GMT±HH:MM` form, including for UTC:
+ *   "GMT+09:00" → "+09:00"; "GMT+05:45" → "+05:45"; "GMT+00:00" → "Z".
+ * The minutes-less branch ("GMT-5" → "-05:00") and the bare-"GMT" fallback ("Z")
+ * are defensive against ICU/locale variants and are not hit by current ICU.
  */
 function offsetSuffix(timeZoneName: string): string {
   const match = /GMT([+-])(\d{1,2})(?::?(\d{2}))?/.exec(timeZoneName);
@@ -85,14 +89,33 @@ function toDate(ts: number | Date): Date {
 }
 
 /**
- * Set the agent's timezone. Validates `tz` is a real IANA zone (fail-fast on a
- * misconfigured value) and sets `process.env.TZ` as a defense-in-depth backstop.
- * Throws on an unrecognized zone.
+ * Set the agent's timezone. Requires a *named* IANA zone and fails fast on a
+ * misconfigured value, then sets `process.env.TZ` as a defense-in-depth backstop.
+ *
+ * Two rejection paths:
+ *   1. Unrecognized zones throw via `Intl.DateTimeFormat` (RangeError).
+ *   2. Bare numeric offset strings (e.g. "+09:00", "+0900", "-05:30", "09:00")
+ *      are rejected explicitly — `Intl` silently accepts them, but they break
+ *      both backstops: V8 ignores an offset `process.env.TZ` and leaks the host's
+ *      real local zone, while the sandbox's glibc treats `TZ=+09:00` as UTC. Only
+ *      named zones keep the explicit formatters and the backstops in agreement.
+ *
+ * Named zones including "UTC", "GMT", and "Etc/GMT+9" pass — only bare offsets fail.
  */
 export function configureAgentTimezone(tz: string): void {
+  // Reject bare numeric offsets before the Intl check. A named IANA zone never
+  // starts with a sign or digit, so anything matching here is an offset form
+  // ("+09:00", "+0900", "-05:30") or a bare offset ("09:00"). Note "Etc/GMT+9",
+  // "UTC", "GMT", "Asia/Tokyo" etc. all start with a letter and pass through.
+  if (/^[+-]?\d/.test(tz)) {
+    throw new Error(
+      `Invalid agent.timezone "${tz}": a named IANA time zone is required, not a ` +
+        `numeric offset (e.g. use "Asia/Tokyo" or "Etc/GMT-9", not "+09:00"). ` +
+        `Offset strings are silently mishandled by the TZ backstops.`,
+    );
+  }
   try {
-    // Throws RangeError for an unrecognized zone; offset-style values are not
-    // accepted here (we require a named IANA zone).
+    // Throws RangeError for an unrecognized zone name.
     new Intl.DateTimeFormat("en-US", { timeZone: tz });
   } catch (error) {
     throw new Error(

@@ -228,10 +228,11 @@ export const AppConfigSchema = Type.Object({
     }),
     session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
     disabled_tools: Type.Optional(Type.Array(Type.String())),
-    // IANA time zone name (e.g. "UTC", "America/New_York", "Asia/Tokyo"). All
+    // Named IANA time zone (e.g. "UTC", "America/New_York", "Asia/Tokyo"). All
     // timestamps the agent can see are rendered in this zone; the server's real
     // zone is never exposed. Defaults to "UTC" (00-defaults.toml). Validated as a
-    // real IANA zone at load time (see configureAgentTimezone in src/time).
+    // real named zone at load time — bare numeric offsets like "+09:00" are
+    // rejected (see configureAgentTimezone in src/time).
     timezone: Type.Optional(Type.String({ minLength: 1 })),
   }),
   models: Type.Intersect([
