@@ -8,9 +8,15 @@ import { apiBaseUrl, authHeaders } from '$lib/server/config';
  * token is attached server-side here; the browser uses `<img src="/api/media/{ref}">`
  * and never sees the token.
  */
-export const GET: RequestHandler = async ({ params, fetch, setHeaders }) => {
+export const GET: RequestHandler = async ({ params, fetch, setHeaders, request }) => {
 	const ref = encodeURIComponent(params.ref);
-	const upstream = await fetch(`${apiBaseUrl}/api/media/${ref}`, { headers: authHeaders() });
+	const upstream = await fetch(`${apiBaseUrl}/api/media/${ref}`, {
+		headers: authHeaders(),
+		// Forward the client's abort signal so a browser-cancelled image request
+		// (navigation away, <img> removed) aborts the upstream fetch/stream too —
+		// mirrors the SSE path's signal handling (see lib/server/api/sse.ts).
+		signal: request.signal
+	});
 	if (!upstream.ok || !upstream.body) {
 		throw error(upstream.status || 502, 'media fetch failed');
 	}
