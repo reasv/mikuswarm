@@ -1,4 +1,4 @@
-import type { ContextMessageWire } from '$lib/schemas';
+import type { ContextMessageWire, ImageRef } from '$lib/schemas';
 
 /**
  * Helpers for the rollout renderer (spec §10b). The persisted transcript holds
@@ -74,6 +74,56 @@ export function collectToolResults(msgs: readonly unknown[]): Map<string, Rollou
 	return out;
 }
 
+/** base64 byte length (mirrors src/agent/session-capture.ts `base64ByteLength`). */
+function base64ByteLength(b64: string): number {
+	const len = b64.length;
+	if (len === 0) return 0;
+	const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+	return Math.floor((len * 3) / 4) - padding;
+}
+
+/**
+ * Normalize a transcript-head image entry into the wire `ImageRef` shape the
+ * renderer expects (`{ attachmentId?, mimeType?, sizeBytes }`). The persisted head
+ * (`mapBuiltMessages`, src/agent/factory.ts) keeps RAW context `imageBlocks`
+ * (`{ eventId, attachmentId, mediaType, dataBase64 }`), so map `mediaType`→`mimeType`
+ * and derive `sizeBytes` from the base64; an already-externalized `ImageRef`
+ * (handler path) passes through unchanged. Raw `dataBase64` is intentionally
+ * dropped — the renderer only reads attachmentId/mimeType/sizeBytes.
+ */
+function toImageRef(raw: unknown): ImageRef | null {
+	if (!raw || typeof raw !== 'object') return null;
+	const o = raw as Record<string, unknown>;
+	if (typeof o.sizeBytes === 'number') {
+		return {
+			__imageRef: o.__imageRef === true ? true : undefined,
+			eventId: typeof o.eventId === 'string' ? o.eventId : undefined,
+			attachmentId: typeof o.attachmentId === 'string' ? o.attachmentId : undefined,
+			mimeType: typeof o.mimeType === 'string' ? o.mimeType : undefined,
+			sizeBytes: o.sizeBytes
+		};
+	}
+	const dataBase64 = typeof o.dataBase64 === 'string' ? o.dataBase64 : '';
+	return {
+		__imageRef: true,
+		eventId: typeof o.eventId === 'string' ? o.eventId : undefined,
+		attachmentId: typeof o.attachmentId === 'string' ? o.attachmentId : undefined,
+		mimeType: typeof o.mediaType === 'string' ? o.mediaType : undefined,
+		sizeBytes: base64ByteLength(dataBase64)
+	};
+}
+
+function coerceImageRefs(o: RolloutMsg): readonly ImageRef[] | undefined {
+	const src = Array.isArray(o.imageBlocks)
+		? o.imageBlocks
+		: Array.isArray(o.imageRefs)
+			? o.imageRefs
+			: undefined;
+	if (!src) return undefined;
+	const refs = src.map(toImageRef).filter((r): r is ImageRef => r !== null);
+	return refs.length > 0 ? refs : undefined;
+}
+
 /**
  * Coerce a transcript head element (the kickoff final user turn — `triggerGroup` /
  * `satellite`, spec §2b) into the verbatim renderer's ContextMessage shape so the
@@ -88,10 +138,6 @@ export function coerceContextMessage(raw: unknown): ContextMessageWire {
 		tier: typeof o.tier === 'string' ? o.tier : 'trigger',
 		tokenEstimate: typeof o.tokenEstimate === 'number' ? o.tokenEstimate : 0,
 		timestamp: typeof o.timestamp === 'number' ? o.timestamp : null,
-		imageRefs: Array.isArray(o.imageBlocks)
-			? (o.imageBlocks as unknown[])
-			: Array.isArray(o.imageRefs)
-				? (o.imageRefs as unknown[])
-				: undefined
+		imageRefs: coerceImageRefs(o)
 	};
 }

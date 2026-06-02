@@ -47,6 +47,35 @@ describe('rollout helpers', () => {
 		expect(cm.imageRefs).toHaveLength(1);
 	});
 
+	it('externalizes RAW context imageBlocks into ImageRefs (no dataBase64 leak)', () => {
+		// Persisted head keeps raw context blocks: { eventId, attachmentId, mediaType, dataBase64 }.
+		const cm = coerceContextMessage({
+			type: 'triggerGroup',
+			role: 'user',
+			content: 'see pic',
+			imageBlocks: [
+				{ eventId: '$e:m', attachmentId: 'a1', mediaType: 'image/png', dataBase64: 'AAAA' }
+			]
+		});
+		expect(cm.imageRefs).toHaveLength(1);
+		const ref = cm.imageRefs![0] as Record<string, unknown>;
+		expect(ref.mimeType).toBe('image/png');
+		expect(ref.attachmentId).toBe('a1');
+		expect(ref.sizeBytes).toBe(3); // 'AAAA' = 3 bytes
+		// raw base64 must not survive into the wire ref
+		expect('dataBase64' in ref).toBe(false);
+	});
+
+	it('passes through already-externalized imageRefs', () => {
+		const cm = coerceContextMessage({
+			type: 'triggerGroup',
+			content: 'x',
+			imageRefs: [{ __imageRef: true, attachmentId: 'a2', mimeType: 'image/jpeg', sizeBytes: 42 }]
+		});
+		expect(cm.imageRefs).toHaveLength(1);
+		expect((cm.imageRefs![0] as Record<string, unknown>).sizeBytes).toBe(42);
+	});
+
 	it('coerces defensively when fields are missing', () => {
 		const cm = coerceContextMessage({});
 		expect(cm.content).toBe('');

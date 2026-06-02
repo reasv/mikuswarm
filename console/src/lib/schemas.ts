@@ -22,6 +22,7 @@ export const ImageRef = Schema.Struct({
 	mimeType: Schema.optional(Schema.String),
 	sizeBytes: Schema.Number
 });
+export type ImageRef = Schema.Schema.Type<typeof ImageRef>;
 
 /** A rendered context message (handlers.ts `renderContextMessage`). */
 export const ContextMessageWire = Schema.Struct({
@@ -31,7 +32,7 @@ export const ContextMessageWire = Schema.Struct({
 	tier: Schema.NullOr(Schema.String),
 	tokenEstimate: Schema.Number,
 	timestamp: Schema.NullOr(Schema.Number),
-	imageRefs: Schema.optional(Schema.Array(Schema.Unknown)),
+	imageRefs: Schema.optional(Schema.Array(ImageRef)),
 	/** present only on room-context preview messages (spec §9) */
 	preview: Schema.optional(Schema.Boolean)
 });
@@ -58,7 +59,7 @@ export const RoomContextResponse = Schema.Struct({
 	tokenEstimate: Schema.Number,
 	compactTokens: Schema.Number,
 	richTokens: Schema.Number,
-	cacheBoundaries: Schema.Array(Schema.Number)
+	cacheBoundaries: Schema.Array(Schema.String)
 });
 export type RoomContextResponse = Schema.Schema.Type<typeof RoomContextResponse>;
 

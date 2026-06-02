@@ -7,7 +7,7 @@ export interface ContextSummaryData {
 	tokenEstimate: number | null;
 	compactTokens: number | null;
 	richTokens: number | null;
-	cacheBoundaries: readonly number[];
+	cacheBoundaries: readonly string[];
 	live: boolean;
 }
 
@@ -15,7 +15,7 @@ class ContextSummary {
 	tokenEstimate = $state<number | null>(null);
 	compactTokens = $state<number | null>(null);
 	richTokens = $state<number | null>(null);
-	cacheBoundaries = $state<readonly number[]>([]);
+	cacheBoundaries = $state<readonly string[]>([]);
 	live = $state(false);
 
 	set(data: Partial<ContextSummaryData>) {
