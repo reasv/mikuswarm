@@ -2,13 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildDockerExecArgs, mapContainerCwd } from "../src/sandbox/index.js";
 
-test("buildDockerExecArgs: minimal command", () => {
+test("buildDockerExecArgs: minimal command (no explicit timeout/marker)", () => {
   const args = buildDockerExecArgs({
     containerName: "miku-sbx",
     command: "echo hi",
     workdir: "/workspace",
   });
-  assert.deepEqual(args, ["exec", "-i", "-w", "/workspace", "miku-sbx", "/bin/sh", "-lc", "echo hi"]);
+  // The command always runs under coreutils `timeout` so its tree gets its own
+  // process group (killed as a unit on timeout/abort — issue #1). With no
+  // explicit limit the duration is a large sentinel.
+  assert.deepEqual(args.slice(0, 5), ["exec", "-i", "-w", "/workspace", "miku-sbx"]);
+  assert.deepEqual(args.slice(5, 10), ["timeout", "-s", "TERM", "-k", "5"]);
+  assert.ok(Number(args[10]) > 1_000_000);
+  assert.deepEqual(args.slice(11), ["/bin/sh", "-lc", "echo hi"]);
 });
 
 test("buildDockerExecArgs: env entries become -e, PATH is skipped", () => {
@@ -21,8 +27,9 @@ test("buildDockerExecArgs: env entries become -e, PATH is skipped", () => {
   assert.ok(args.includes("-e"));
   assert.ok(args.includes("FOO=bar"));
   assert.ok(!args.some((a) => a.startsWith("PATH=")), "PATH must not be passed via -e");
-  // container/shell tail is preserved
-  assert.deepEqual(args.slice(-4), ["c", "/bin/sh", "-lc", "true"]);
+  // container/shell tail is preserved (under the `timeout` wrapper)
+  assert.deepEqual(args.slice(-3), ["/bin/sh", "-lc", "true"]);
+  assert.ok(args.includes("timeout"));
 });
 
 test("mapContainerCwd: defaults to the mount root", () => {

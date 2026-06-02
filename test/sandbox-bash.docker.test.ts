@@ -69,16 +69,44 @@ test("sandbox bash: round-trips a command and shares the bind-mounted workspace"
     const fail = await manager.exec("exit 7");
     assert.equal(fail.exitCode, 7);
 
-    // AbortSignal cancels a long-running command.
+    // AbortSignal cancels a long-running command and leaves NO orphan in the
+    // long-lived container (issue #1: the in-container process tree is killed
+    // out-of-band, not just the local docker-exec client). A unique sentinel in
+    // the command lets us pgrep for survivors afterwards.
     const ac = new AbortController();
-    const slow = manager.exec("sleep 30", { signal: ac.signal });
+    const abortSentinel = `miku-abort-${Date.now()}`;
+    const slow = manager.exec(`sleep 300 # ${abortSentinel}`, { signal: ac.signal });
     ac.abort();
     const slowResult = await slow;
     assert.notEqual(slowResult.exitCode, 0);
+    assert.equal(slowResult.timedOut, false, "abort is not a timeout");
+    {
+      const survivors = spawnSync(
+        "docker",
+        ["exec", TEST_CONTAINER, "pgrep", "-fc", abortSentinel],
+        { encoding: "utf8" },
+      );
+      // pgrep exits 1 (no match) -> count "0". Anything else is an orphan.
+      assert.equal((survivors.stdout || "0").trim(), "0", "no orphaned process survives an abort");
+    }
 
-    // timeout_ms kills the command and flags timedOut.
-    const timed = await manager.exec("sleep 30", { timeoutMs: 500 });
+    // timeout_ms kills the command in-container, flags timedOut, maps to exit
+    // 124 (coreutils `timeout`), and leaves no orphan.
+    const timeoutSentinel = `miku-timeout-${Date.now()}`;
+    const timed = await manager.exec(`sleep 300 # ${timeoutSentinel}`, { timeoutMs: 500 });
     assert.equal(timed.timedOut, true);
+    assert.equal(timed.exitCode, 124);
+    {
+      // Allow the in-container TERM->KILL to settle before checking.
+      const settle = spawnSync("docker", ["exec", TEST_CONTAINER, "sleep", "1"]);
+      assert.equal(settle.status, 0);
+      const survivors = spawnSync(
+        "docker",
+        ["exec", TEST_CONTAINER, "pgrep", "-fc", timeoutSentinel],
+        { encoding: "utf8" },
+      );
+      assert.equal((survivors.stdout || "0").trim(), "0", "no orphaned process survives a timeout");
+    }
   } finally {
     await manager?.shutdown({ stop: true });
     spawnSync("docker", ["rm", "-f", TEST_CONTAINER], { stdio: "ignore" });
