@@ -556,15 +556,22 @@ test("#10 snapshot is enqueued before the first transcript flush", async () => {
     ] as unknown as ContextMessage[],
   });
 
-  // Fire turn_end immediately — the transcript flush must still be ordered after
-  // the snapshot enqueue even though the snapshot write hasn't resolved yet.
-  await agent.fire("turn_end");
-  // At this point the transcript must NOT have run (it's chained behind snapshot).
+  // Fire turn_end but DON'T await it yet. The listener awaits the transcript
+  // flush, which is chained behind the snapshot write — and that write is still
+  // gated open. Awaiting fire() here would deadlock (the gate is released below,
+  // after this point). In production the snapshot write resolves on its own via
+  // the single-writer queue, so the turn_end listener never stalls; the gate only
+  // exists to prove the transcript is ordered strictly AFTER the snapshot write.
+  const fired = agent.fire("turn_end");
+  // Let microtasks drain. The transcript must NOT have run: its flush is chained
+  // behind the snapshot write, which is still held open by snapshotGate.
+  await new Promise((r) => setImmediate(r));
   assert.deepEqual(order, ["snapshot"], "transcript must wait for snapshot");
 
+  // Releasing the gate lets the snapshot write resolve, which unblocks the chained
+  // transcript flush; awaiting `fired` then waits for that flush to complete.
   releaseSnapshot();
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setImmediate(r));
+  await fired;
 
   assert.deepEqual(order, ["snapshot", "transcript"], "snapshot precedes transcript");
 });
