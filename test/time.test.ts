@@ -53,8 +53,50 @@ test("compactAgentTimestamp renders YYYY-MM-DD HH:MM in zone", () => {
   assert.equal(compactAgentTimestamp(SUMMER), "2026-06-02 23:00");
 });
 
+test("formatAgentTimestamp renders a half-hour offset zone (+05:30)", () => {
+  configureAgentTimezone("Asia/Kolkata"); // +05:30 year-round
+  // SUMMER is 14:00 UTC → 19:30 in Kolkata. Exercises offsetSuffix's minutes branch.
+  assert.equal(formatAgentTimestamp(SUMMER), "2026-06-02T19:30:00+05:30");
+});
+
+test("formatAgentTimestamp renders a 45-minute offset zone (+05:45)", () => {
+  configureAgentTimezone("Asia/Kathmandu"); // +05:45 year-round
+  const formatted = formatAgentTimestamp(SUMMER);
+  assert.equal(formatted, "2026-06-02T19:45:00+05:45");
+  assert.match(formatted, /\+05:45$/);
+});
+
+test("formatAgentTimestamp throws RangeError on an invalid date (fallback contract)", () => {
+  configureAgentTimezone("UTC");
+  // pins.ts and read-messages.ts rely on this throw to fall back to the raw string.
+  assert.throws(() => formatAgentTimestamp(new Date("nope")), RangeError);
+  assert.throws(() => formatAgentTimestamp(new Date(NaN)), RangeError);
+  // agentDateStamp / compactAgentTimestamp share the formatToParts path.
+  assert.throws(() => agentDateStamp(new Date("nope")), RangeError);
+  assert.throws(() => compactAgentTimestamp(new Date("nope")), RangeError);
+});
+
+test("configureAgentTimezone sets and resets process.env.TZ", () => {
+  configureAgentTimezone("Asia/Tokyo");
+  assert.equal(process.env.TZ, "Asia/Tokyo");
+  resetAgentTimezone();
+  assert.equal(process.env.TZ, "UTC");
+});
+
 test("configureAgentTimezone rejects an unknown zone (fail-fast)", () => {
   assert.throws(() => configureAgentTimezone("Mars/Phobos"), /Invalid agent\.timezone/);
+});
+
+test("configureAgentTimezone rejects offset-style strings, accepts named zones", () => {
+  // Bare numeric offsets are unsafe for the TZ backstops — must fail fast.
+  for (const offset of ["+09:00", "+0900", "-05:30", "09:00"]) {
+    assert.throws(() => configureAgentTimezone(offset), /named IANA/, `expected "${offset}" to throw`);
+  }
+  // Named zones (including UTC, GMT, and Etc/GMT+9) must still pass.
+  for (const zone of ["UTC", "GMT", "Etc/GMT+9", "Asia/Tokyo"]) {
+    assert.doesNotThrow(() => configureAgentTimezone(zone), `expected "${zone}" to be accepted`);
+    resetAgentTimezone();
+  }
 });
 
 test("resetAgentTimezone returns to UTC", () => {
