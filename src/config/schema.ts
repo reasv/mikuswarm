@@ -218,10 +218,9 @@ export const AppConfigSchema = Type.Object({
       max_concurrent_dm: Type.Number({ minimum: 1 }),
       max_queued_per_timeline: Type.Optional(Type.Number({ minimum: 1 })),
       forced_completion_retries: Type.Number({ minimum: 0 }),
-      // Hard cap on tool-call iterations within a single session run. The agent
-      // loop continues as long as the model emits tool calls; this bounds a
-      // runaway or stuck loop. When exceeded, further tool calls are blocked and
-      // the run is aborted. Omit to leave uncapped (not recommended in prod).
+      // Optional hard cap on tool-call iterations within a single session run.
+      // Left unset by default → agent work is unbounded (the loop runs as long as
+      // the model emits tool calls). Set a number only if you want a guardrail.
       max_tool_calls: Type.Optional(Type.Number({ minimum: 1 })),
     }),
     system: Type.Object({
