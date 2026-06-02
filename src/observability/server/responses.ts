@@ -15,7 +15,23 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
   res.end(json);
 }
 
-/** A JSON error envelope: `{ error: { status, message } }`. */
-export function sendError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { error: { status, message } });
+/**
+ * A JSON error envelope: `{ error: { status, message, ...details } }`.
+ *
+ * Every error response across the server shares this single shape so the BFF and
+ * console can branch on `error.status` (the HTTP status) and surface
+ * `error.message` (human-readable) uniformly. The optional `details` lets a route
+ * attach structured, route-specific fields *inside* the same envelope rather than
+ * hanging sibling keys off the top level (which would collide conceptually with
+ * `error.status` and break the one-shape invariant). Pick non-colliding field
+ * names for `details` — e.g. the abort 409 carries `sessionId` and `sessionStatus`
+ * (NOT a bare `status`, which would shadow the HTTP `error.status`).
+ */
+export function sendError(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  sendJson(res, status, { error: { status, message, ...details } });
 }

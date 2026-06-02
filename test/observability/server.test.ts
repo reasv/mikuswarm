@@ -587,7 +587,7 @@ test("POST /api/sessions/:id/abort requires the x-console-request CSRF header (4
   });
 });
 
-test("POST /api/sessions/:id/abort returns 409 when the session isn't running", async () => {
+test("POST /api/sessions/:id/abort returns 409 (standard error envelope) with the session status when not running", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert({ status: "completed" }));
     await withServer({ storage }, async (base) => {
@@ -597,7 +597,56 @@ test("POST /api/sessions/:id/abort returns 409 when the session isn't running", 
       });
       assert.equal(res.status, 409);
       const body = (await res.json()) as any;
-      assert.equal(body.sessionId, "s-aaa1111111");
+      // Standard error envelope `{ error: { status, message, ...details } }` — the
+      // session-specific fields live INSIDE `error`, never as top-level siblings, and
+      // the session status is `sessionStatus` (distinct from the HTTP `error.status`).
+      assert.equal(body.error.status, 409);
+      assert.equal(typeof body.error.message, "string");
+      assert.equal(body.error.sessionId, "s-aaa1111111");
+      assert.equal(body.error.sessionStatus, "completed");
+      // No legacy top-level siblings: the old mixed shape is gone.
+      assert.ok(!("sessionId" in body), "sessionId must live inside the error envelope");
+      assert.ok(!("status" in body), "no top-level status colliding with error.status");
+      // The BFF surfaces the raw 409 body text as the operator-facing message, so the
+      // human-readable message must convey the session status on its own.
+      assert.match(body.error.message, /completed/);
+    });
+  });
+});
+
+test("POST /api/sessions/:id/abort is idempotent: live run → 200, second abort → 409 with interrupted status", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    const { agent, aborted } = fakeAbortableAgent();
+    const id = await attachRunningSession(storage, sessions, agent);
+    // Model a live, interruptible run (the runner sets this for the whole run()).
+    sessions.runLifecycle(id).markRunInProgress();
+
+    await withServer({ storage, sessions }, async (base) => {
+      // First abort hits a live run → 200, status flips to interrupted.
+      const first = await fetch(`${base}/api/sessions/${id}/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as any;
+      assert.equal(firstBody.sessionId, id);
+      assert.equal(firstBody.status, "interrupted");
+      assert.ok(aborted(), "agent.abort() must have run on the first abort");
+      assert.equal(sessions.get(id)?.status, "interrupted");
+
+      // Second abort on the now-interrupted (no longer running) session → 409,
+      // carrying the session's current status in the standard envelope.
+      const second = await fetch(`${base}/api/sessions/${id}/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
+      assert.equal(second.status, 409);
+      const secondBody = (await second.json()) as any;
+      assert.equal(secondBody.error.status, 409);
+      assert.equal(secondBody.error.sessionId, id);
+      assert.equal(secondBody.error.sessionStatus, "interrupted");
+      assert.match(secondBody.error.message, /interrupted/);
     });
   });
 });

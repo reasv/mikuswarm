@@ -169,13 +169,20 @@ export function sessionStream(
  * {@link SessionManager.interrupt}.
  *
  * - 200 `{ sessionId, status: "interrupted" }` — a live run was aborted.
- * - 404 — no such session row.
- * - 409 `{ sessionId, status }` — the session exists but isn't actively running
- *   (already terminal, or between runs). Idempotent-friendly: the caller learns
- *   the run is already not in flight and can treat it as success.
+ * - 404 — no such session row (standard error envelope).
+ * - 409 — the session exists but isn't actively running (already terminal, or
+ *   evicted between runs). Uses the standard error envelope with structured
+ *   details: `{ error: { status: 409, message, sessionId, sessionStatus } }`.
+ *   `sessionStatus` is the session's current lifecycle status (e.g. `completed`,
+ *   `interrupted`) — named distinctly from the HTTP `error.status` so the two
+ *   never collide. The `message` embeds it too so the BFF (which surfaces the raw
+ *   409 body text as the operator-facing error message) stays human-readable.
+ *   Idempotent-friendly: the caller learns the run is already not in flight and
+ *   can treat it as success.
  *
  * This is the console's first mutating route; everything else is read-only. The
- * bearer-token check in the server's request handler gates it like every route.
+ * bearer-token check in the server's request handler gates it like every route,
+ * and the `x-console-request` CSRF-guard header is required before dispatch.
  */
 export function abortSession(
   _req: IncomingMessage,
@@ -188,10 +195,10 @@ export function abortSession(
 
   const aborted = ctx.deps.sessions.interrupt(id);
   if (!aborted) {
-    return sendJson(res, 409, {
-      error: { status: 409, message: `Session is not running: ${id}` },
+    const sessionStatus = ctx.deps.sessions.get(id)?.status ?? row.status;
+    return sendError(res, 409, `Session is not running (${sessionStatus}): ${id}`, {
       sessionId: id,
-      status: ctx.deps.sessions.get(id)?.status ?? row.status,
+      sessionStatus,
     });
   }
   sendJson(res, 200, { sessionId: id, status: "interrupted" });
