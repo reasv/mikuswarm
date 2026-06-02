@@ -2,7 +2,7 @@
 
 The observability & admin console for **mikuswarm** — a SvelteKit app that renders,
 with byte-for-byte fidelity, the context each room would build and the full input +
-rollout of each session (spec: `../spec/OBSERVABILITY-UI.md`, Part B).
+rollout of each session (see `../ARCHITECTURE.md` §11).
 
 ## Architecture (BFF)
 

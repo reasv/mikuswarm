@@ -21,6 +21,10 @@ max_concurrent = 3
 max_concurrent_dm = 1
 max_queued_per_timeline = 10000
 forced_completion_retries = 3
+# Hard cap on tool-call iterations per session run (runaway/cost guardrail).
+# Exceeding it blocks further tool calls and aborts the run. Generous headroom
+# over normal multi-tool turns; omit to leave uncapped.
+max_tool_calls = 80
 
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."

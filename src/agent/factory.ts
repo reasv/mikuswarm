@@ -9,6 +9,7 @@ import { convertToLlm } from "./convert.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage } from "../storage/index.js";
+import type { Logger } from "../observability/logger.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
@@ -52,6 +53,12 @@ export interface AgentFactoryOptions {
    * `buildPreview` is unavailable.
    */
   storage?: Storage;
+  /**
+   * Optional structured logger. Used to surface the tool-call cap being hit
+   * (`agent_tool_call_cap_reached`). Optional so tests can construct a factory
+   * without one.
+   */
+  logger?: Logger;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -82,7 +89,7 @@ export interface CreateAgentOptions {
   /** When set, build context for a summarization session cut at this timestamp. */
   summarizationCutoff?: { endTimestamp: number };
   /**
-   * Resume seam (designed-for, not yet wired — see §6 of spec/OBSERVABILITY-UI.md).
+   * Resume seam (designed-for, not yet wired — see ARCHITECTURE.md "Appendix: Deferred designs" §B).
    * When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
    * frozen prefix and `transcript` seeds the live message array. The caller is expected
    * to append the awaited input as a new user turn before continuing.
@@ -238,6 +245,18 @@ export class AgentSessionFactory {
     // in strict mode and any future write-back surfaces immediately (§2b invariant).
     const frozenBase: readonly AgentMessage[] = Object.freeze(frozenBaseSeed);
 
+    // Runaway/cost guardrail: the agent loop runs as long as the model emits tool
+    // calls, with no built-in iteration bound. Cap total tool-call iterations per
+    // session run. Once the cap is exceeded we abort the run (hard stop, so the
+    // model can't keep emitting blocked calls and billing turns) and block the
+    // offending call. Scoped per `create()` → per session run. `agentRef` is a
+    // late-bound holder so the hook can call `agent.abort()` (the const isn't
+    // assigned yet when the option object is built; it is by the time the hook runs).
+    const maxToolCalls = this.options.config.agent.sessions.max_tool_calls;
+    const agentRef: { agent?: Agent } = {};
+    let toolCallCount = 0;
+    const logger = this.options.logger;
+
     const agent = new Agent({
       initialState: {
         systemPrompt,
@@ -248,6 +267,25 @@ export class AgentSessionFactory {
         ...frozenBase,
         ...messages.filter(isLiveRuntimeMessage),
       ],
+      ...(maxToolCalls !== undefined
+        ? {
+            beforeToolCall: async (ctx) => {
+              toolCallCount += 1;
+              if (toolCallCount > maxToolCalls) {
+                logger?.warn("agent_tool_call_cap_reached", {
+                  sessionId: session.id,
+                  timelineKey: session.timelineKey,
+                  toolCallCount,
+                  maxToolCalls,
+                  tool: ctx.toolCall?.name,
+                });
+                agentRef.agent?.abort();
+                return { block: true, reason: `Tool-call cap (${maxToolCalls}) reached; run aborted.` };
+              }
+              return undefined;
+            },
+          }
+        : {}),
       convertToLlm,
       streamFn,
       getApiKey: () => modelConfig.api_key,
@@ -255,6 +293,7 @@ export class AgentSessionFactory {
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
     });
+    agentRef.agent = agent;
 
     if (opts?.resume?.transcript?.length) {
       // Defensive copy: the agent loop mutates `agent.state.messages` in place every
@@ -457,7 +496,7 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
  * final user turn (`finalTurn`) — the last message, which the builder always emits
  * as a `triggerGroup` (chat) or `satellite` (summarization cutoff). The caller
  * delivers `finalTurn` via `agent.prompt(...)` so it becomes the first turn of the
- * live transcript (§2b of spec/OBSERVABILITY-UI.md), rather than living in the prefix.
+ * live transcript (frozen-context invariant §2b, ARCHITECTURE.md §8), rather than living in the prefix.
  *
  * The "did the build end with a live final turn?" boundary is computed **once** here
  * and applied to both views of the prefix, so they cannot drift (§3 / §10a):

@@ -387,6 +387,12 @@ export class Storage {
     await storage.write((writer) => {
       writer.pragma("journal_mode = WAL");
       writer.pragma("foreign_keys = ON");
+      // Wait up to 5s on a locked database rather than failing immediately with
+      // SQLITE_BUSY. The single-writer queue avoids self-contention, but external
+      // readers (the observability console reads the DB directly) and the WAL
+      // checkpoint can still briefly hold a lock; without busy_timeout a transient
+      // lock would surface as a swallowed fire-and-forget write failure.
+      writer.pragma("busy_timeout = 5000");
       // Distinguish a brand-new database from an existing one BEFORE applying
       // SCHEMA (which uses `if not exists` and so leaves no trace of which case we
       // are in). A fresh DB has no user tables yet; SCHEMA then builds the full

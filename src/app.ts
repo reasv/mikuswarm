@@ -225,6 +225,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     contextBuilder,
     getActiveSessions: (timelineKey) => sessions.activeForTimeline(timelineKey),
     storage,
+    logger,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -868,7 +869,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     retentionTimer.unref?.();
   }
 
-  // Observability console (spec/OBSERVABILITY-UI.md Part B). Read-only HTTP + SSE
+  // Observability console (ARCHITECTURE.md §11). Read-only HTTP + SSE
   // over the live storage/factory/session state; gated by config, off by default.
   let consoleServer: ConsoleServer | undefined;
   if (config.observability?.server?.enabled) {
