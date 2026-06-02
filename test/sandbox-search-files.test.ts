@@ -85,3 +85,33 @@ test("runRipgrep (sandbox): single quotes in the pattern are escaped", async () 
     assert.ok(calls[0].command.includes("'it'\\''s'"), `got: ${calls[0].command}`);
   });
 });
+
+test("runRipgrep (sandbox): backend byte-truncation is surfaced as truncated", async () => {
+  await withWorkspace(async (root) => {
+    // Output is under the max_results line cap, but the backend clipped it at
+    // the byte cap (truncated: true). The reported result must reflect that.
+    const { backend } = fakeBackend({ stdout: "src/a.ts:1:hit\n", exitCode: 0, truncated: true });
+    const result = await runRipgrep(root, { pattern: "hit", path: ".", max_results: 100 }, backend);
+    assert.equal(result.details.truncated, true);
+    assert.match(result.text, /\[output truncated\]/);
+  });
+});
+
+test("runRipgrep (sandbox): no truncation when under line cap and backend not clipped", async () => {
+  await withWorkspace(async (root) => {
+    const { backend } = fakeBackend({ stdout: "src/a.ts:1:hit\n", exitCode: 0, truncated: false });
+    const result = await runRipgrep(root, { pattern: "hit", path: ".", max_results: 100 }, backend);
+    assert.equal(result.details.truncated, false);
+    assert.doesNotMatch(result.text, /\[output truncated\]/);
+  });
+});
+
+test("runRipgrep (sandbox): a `-`-prefixed pattern is passed after `--`, not as a flag", async () => {
+  await withWorkspace(async (root) => {
+    const { backend, calls } = fakeBackend({ stdout: "", exitCode: 1 });
+    await runRipgrep(root, { pattern: "-l", path: "." }, backend);
+    const cmd = calls[0].command;
+    // `--` must appear immediately before the pattern (after all flags/globs).
+    assert.ok(cmd.includes("'--' '-l'"), `expected end-of-options separator before pattern; got: ${cmd}`);
+  });
+});

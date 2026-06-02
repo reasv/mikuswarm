@@ -274,17 +274,31 @@ export async function runRipgrep(
 
   if (sandbox) {
     // Run rg inside the container, from /workspace, targeting the relative path.
+    // The `--` end-of-options separator guards a pattern that begins with `-`
+    // (e.g. `-l`, `--files`) so rg treats it as a search term, not a flag; the
+    // path that follows is likewise positional and safe even if it starts `-`.
     // ripgrep exits 1 on "no matches" and 2 on error; docker exec forwards the code.
-    const command = ["rg", ...argv, args.pattern, relativePath].map(shellQuote).join(" ");
+    const command = ["rg", ...argv, "--", args.pattern, relativePath].map(shellQuote).join(" ");
     const result = await sandbox.exec(command, { maxOutputBytes: 1024 * 1024 });
     if (result.exitCode === 1 && !result.stdout) return noMatches();
     if (result.exitCode > 1) {
       throw new Error(`ripgrep failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
     }
-    return buildResult(result.stdout);
+    const built = buildResult(result.stdout);
+    // The backend caps each stream at maxOutputBytes and sets result.truncated
+    // when it clips. Surface that as truncation too — otherwise an over-cap
+    // search is mislabeled `truncated: false` and the model may wrongly conclude
+    // a symbol is absent. Final truncation reflects EITHER the max_results line
+    // cap (set by buildResult) OR the backend byte cap. Mirror the bash tool's
+    // `[output truncated]` marker so the model knows output was cut.
+    if (result.truncated) {
+      built.details.truncated = true;
+      if (built.text !== "No matches.") built.text += "\n[output truncated]";
+    }
+    return built;
   }
 
-  argv.push(args.pattern, absolute);
+  argv.push("--", args.pattern, absolute);
   try {
     const { stdout } = await execFileAsync("rg", argv, {
       cwd: workspaceRoot,
