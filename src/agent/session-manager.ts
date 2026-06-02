@@ -26,10 +26,41 @@ export interface AgentSessionRecord {
   completedAt?: number;
 }
 
+/**
+ * Per-session run lifecycle state, owned by {@link SessionManager} and shared
+ * with the {@link SessionRunner} via {@link SessionManager.runLifecycle}.
+ *
+ * `runInProgress` is the authoritative "logically running" signal: it is set
+ * when the runner enters `run()` and cleared when the run settles. Unlike the
+ * transient per-run `agent.signal` (defined only during an active `prompt()`),
+ * it stays true across the inter-turn gap between forced-completion turns, so an
+ * operator Stop landing in that gap is correctly treated as interruptible.
+ *
+ * `interrupted` is set by {@link SessionManager.interrupt} and read by the
+ * runner's force-completion loop, which breaks on it even if an in-flight turn
+ * resolved normally (`stopReason:"stop"`) a hair before the abort landed.
+ */
+interface RunState {
+  runInProgress: boolean;
+  interrupted: boolean;
+}
+
+/**
+ * The slice of run lifecycle the {@link SessionRunner} consults/drives. Lets the
+ * runner mark run-in-progress and observe interruption without holding a
+ * reference to the whole manager (keeps the runner decoupled and unit-testable).
+ */
+export interface SessionRunLifecycle {
+  markRunInProgress(): void;
+  clearRunInProgress(): void;
+  isInterrupted(): boolean;
+}
+
 export class SessionManager {
   private readonly sessions = new Map<string, AgentSessionRecord>();
   private readonly agents = new Map<string, Agent>();
   private readonly byTimeline = new Map<string, Set<string>>();
+  private readonly runStates = new Map<string, RunState>();
 
   /**
    * Storage and logger are optional so existing unit tests that construct
@@ -158,6 +189,28 @@ export class SessionManager {
   }
 
   /**
+   * Hand the runner the lifecycle slice for a session. The runner marks
+   * run-in-progress on entry to `run()`, clears it when the run settles, and
+   * polls `isInterrupted()` in its force-completion loop. Reading through this
+   * (rather than a captured `AgentSessionRecord`, which `update()` replaces with
+   * a fresh object) guarantees the runner sees live interrupt state.
+   */
+  runLifecycle(sessionId: string): SessionRunLifecycle {
+    return {
+      markRunInProgress: () => {
+        const state = this.runStates.get(sessionId) ?? { runInProgress: false, interrupted: false };
+        state.runInProgress = true;
+        this.runStates.set(sessionId, state);
+      },
+      clearRunInProgress: () => {
+        const state = this.runStates.get(sessionId);
+        if (state) state.runInProgress = false;
+      },
+      isInterrupted: () => this.runStates.get(sessionId)?.interrupted === true,
+    };
+  }
+
+  /**
    * True only when a session has an attached agent that is *actively running*.
    *
    * "Live" must mean more than map presence: pi-agent-core clears the agent's
@@ -185,10 +238,17 @@ export class SessionManager {
   }
 
   /**
-   * Interrupt a live run: abort the in-flight LLM call / tool execution and mark
-   * the session `interrupted` (spec §13 — operator Stop button). Returns `true`
-   * if a live run was aborted, `false` if the session has no actively-running
-   * agent (unknown / already terminal / between runs).
+   * Interrupt a live run: tear down all pending work and mark the session
+   * `interrupted` (spec §13 — operator Stop button). Returns `true` if a logically
+   * running session was interrupted, `false` if the session has no in-progress run
+   * (unknown / already terminal / never started).
+   *
+   * Liveness is gated on the explicit **run-in-progress** flag (set by the runner
+   * for the whole duration of `run()`), NOT on the transient `agent.signal`.
+   * `agent.signal` is defined only during an active `prompt()`; it is `undefined`
+   * in the inter-turn gap between forced-completion turns, where the session is
+   * still genuinely mid-`run()`. Gating on run-in-progress means a Stop landing in
+   * that gap is honored instead of spuriously returning "not running".
    *
    * Status is set to `interrupted` BEFORE aborting so the run promise's natural
    * settlement (`markCompleted`/`markDiscarded`) defers to it. We deliberately do
@@ -196,22 +256,33 @@ export class SessionManager {
    * still needs the live agent ref to forward the terminal `agent_end`. Eviction
    * happens once, from whichever terminal handler the settling run reaches.
    *
-   * Liveness is gated on `agent.signal !== undefined` (the same check as
-   * {@link isAgentLive}): pi-agent-core clears the active run the instant it
-   * settles, so a present-but-idle agent must not be reported as interruptible.
+   * Teardown ordering: mark `interrupted` (sets the runner's loop-break signal) →
+   * clear pending steering/follow-up queues → abort the in-flight run. The loop
+   * break (the runner reads `isInterrupted()`) is the authoritative termination
+   * signal; `abort()` is best-effort and only meaningful while a signal is
+   * present (a missing signal in the inter-turn gap is fine — the loop break
+   * catches it). Clearing the queues ensures no steered/follow-up message
+   * survives the abort to re-prompt the agent.
    */
   interrupt(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     const agent = this.agents.get(sessionId);
-    if (!session || !agent || session.status !== "running" || agent.signal === undefined) {
+    const runState = this.runStates.get(sessionId);
+    if (!session || !agent || session.status !== "running" || !runState?.runInProgress) {
       return false;
     }
+    runState.interrupted = true;
     const completedAt = Date.now();
     this.update(sessionId, (s) => ({ ...s, status: "interrupted", completedAt }));
     this.persist("session status interrupted", sessionId, (storage) =>
       storage.updateAgentSessionStatus(sessionId, "interrupted", { completedAt }),
     );
-    agent.abort();
+    // Drop any queued steering/follow-up messages so nothing re-prompts the
+    // agent after the abort. Guarded so we only touch the queue when needed.
+    if (agent.hasQueuedMessages()) agent.clearAllQueues();
+    // Only meaningful while a run is actively streaming; in the inter-turn gap
+    // the signal is absent and the runner's loop break (above) does the work.
+    if (agent.signal !== undefined) agent.abort();
     this.deps.logger?.info("session_interrupted", { sessionId });
     return true;
   }
@@ -251,6 +322,7 @@ export class SessionManager {
     const session = this.sessions.get(sessionId);
     this.agents.delete(sessionId);
     this.sessions.delete(sessionId);
+    this.runStates.delete(sessionId);
     if (!session) return;
     const ids = this.byTimeline.get(session.timelineKey);
     ids?.delete(sessionId);

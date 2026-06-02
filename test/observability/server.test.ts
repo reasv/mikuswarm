@@ -522,6 +522,8 @@ function fakeAbortableAgent(): { agent: any; aborted: () => boolean } {
       didAbort = true;
       controller.abort();
     },
+    hasQueuedMessages: () => false,
+    clearAllQueues() {},
     subscribe() {
       return () => {};
     },
@@ -534,6 +536,9 @@ test("POST /api/sessions/:id/abort interrupts a live run (200) and aborts the ag
     const sessions = new SessionManager();
     const { agent, aborted } = fakeAbortableAgent();
     const id = await attachRunningSession(storage, sessions, agent);
+    // interrupt() gates on the explicit run-in-progress flag the runner sets for
+    // the duration of run() — model that here so the session is interruptible.
+    sessions.runLifecycle(id).markRunInProgress();
 
     await withServer({ storage, sessions }, async (base) => {
       const res = await fetch(`${base}/api/sessions/${id}/abort`, { method: "POST" });

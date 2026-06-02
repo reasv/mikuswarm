@@ -742,7 +742,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const runner = new SessionRunner({ provider, target });
 
     const run = runner
-      .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff)
+      .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(session.id))
       .then((result) => {
         sessions.markCompleted(session.id, { noReply: result.noReply });
         logger.info("session_completed", {

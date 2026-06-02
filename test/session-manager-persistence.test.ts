@@ -116,8 +116,22 @@ function fakeAbortableAgent(opts: { live: boolean } = { live: true }): {
       didAbort = true;
       controller.abort();
     },
+    hasQueuedMessages: () => false,
+    clearAllQueues() {},
   };
   return { agent, aborted: () => didAbort };
+}
+
+/**
+ * Drive the session into the run-in-progress state the way the runner does:
+ * markRunning + attachAgent + mark the lifecycle in-progress. Without this,
+ * `interrupt()` (which now gates on the explicit run-in-progress flag) returns
+ * false.
+ */
+function startRun(sessions: SessionManager, sessionId: string, agent: any): void {
+  sessions.markRunning(sessionId);
+  sessions.attachAgent(sessionId, agent);
+  sessions.runLifecycle(sessionId).markRunInProgress();
 }
 
 test("SessionManager.interrupt aborts a live run and persists interrupted status", async () => {
@@ -125,9 +139,8 @@ test("SessionManager.interrupt aborts a live run and persists interrupted status
   try {
     const sessions = new SessionManager({ storage });
     const record = sessions.createPlaceholder(makeTrigger(), "default");
-    sessions.markRunning(record.id);
     const { agent, aborted } = fakeAbortableAgent();
-    sessions.attachAgent(record.id, agent);
+    startRun(sessions, record.id, agent);
 
     const ok = sessions.interrupt(record.id);
     assert.equal(ok, true, "interrupt returns true for a live run");
@@ -151,18 +164,94 @@ test("SessionManager.interrupt aborts a live run and persists interrupted status
   }
 });
 
-test("SessionManager.interrupt returns false when no live run is attached", () => {
+test("SessionManager.interrupt: markDiscarded after interrupt keeps interrupted status and evicts", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    const { agent } = fakeAbortableAgent();
+    startRun(sessions, record.id, agent);
+
+    assert.equal(sessions.interrupt(record.id), true);
+    assert.equal(sessions.get(record.id)?.status, "interrupted");
+
+    // The settling run may reach the ERROR/discard handler instead of completion
+    // (e.g. an aborted tool surfaces as a rejection). markDiscarded must defer to
+    // the authoritative `interrupted` status — no clobber — but still evict.
+    sessions.markDiscarded(record.id, { error: "aborted mid-tool" });
+    await storage.waitForIdle();
+    const row = storage.getAgentSession(record.id);
+    assert.equal(row!.status, "interrupted", "discard must not clobber interrupted");
+    // The discard error must not be written over the interrupted record.
+    assert.equal(row!.error, null);
+    assert.equal(sessions.get(record.id), undefined, "session evicted from live map");
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager.interrupt: clears pending steering/follow-up queues", () => {
+  const sessions = new SessionManager();
+  const record = sessions.createPlaceholder(makeTrigger(), "default");
+  let cleared = false;
+  const controller = new AbortController();
+  const agent: any = {
+    get signal() {
+      return controller.signal;
+    },
+    abort() {
+      controller.abort();
+    },
+    hasQueuedMessages: () => true,
+    clearAllQueues: () => {
+      cleared = true;
+    },
+  };
+  startRun(sessions, record.id, agent);
+
+  assert.equal(sessions.interrupt(record.id), true);
+  assert.ok(cleared, "interrupt must clear pending queues (clearAllQueues)");
+});
+
+test("SessionManager.interrupt: honored in the inter-turn gap (signal undefined but run in progress)", () => {
+  const sessions = new SessionManager();
+  const record = sessions.createPlaceholder(makeTrigger(), "default");
+  let aborted = false;
+  // Inter-turn gap: no active prompt, so `agent.signal` is undefined, but the
+  // run is logically still in progress. interrupt() must gate on run-in-progress
+  // (not signal) and still succeed.
+  const agent: any = {
+    signal: undefined,
+    abort() {
+      aborted = true;
+    },
+    hasQueuedMessages: () => false,
+    clearAllQueues() {},
+  };
+  startRun(sessions, record.id, agent);
+
+  assert.equal(sessions.interrupt(record.id), true, "interrupt honored in inter-turn gap");
+  assert.equal(sessions.get(record.id)?.status, "interrupted");
+  // No signal present, so abort() is (correctly) not called — the loop break is
+  // what terminates the run in this window.
+  assert.equal(aborted, false, "abort() skipped when no active signal");
+  assert.equal(sessions.runLifecycle(record.id).isInterrupted(), true);
+});
+
+test("SessionManager.interrupt returns false when no run is in progress", () => {
   const sessions = new SessionManager();
   const record = sessions.createPlaceholder(makeTrigger(), "default");
 
-  // No agent attached / not running.
+  // No agent attached / not running / no run-in-progress.
   assert.equal(sessions.interrupt(record.id), false);
 
-  // Running, but the attached agent's run has already settled (signal undefined).
+  // Running with an attached agent, but no run-in-progress flag set (the runner
+  // never entered run(), or the run already settled and cleared the flag).
   sessions.markRunning(record.id);
-  const { agent } = fakeAbortableAgent({ live: false });
+  const { agent } = fakeAbortableAgent({ live: true });
   sessions.attachAgent(record.id, agent);
-  assert.equal(sessions.interrupt(record.id), false);
+  assert.equal(sessions.interrupt(record.id), false, "no run-in-progress → not interruptible");
 
   // Unknown id.
   assert.equal(sessions.interrupt("s-nope"), false);

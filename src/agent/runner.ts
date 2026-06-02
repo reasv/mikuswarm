@@ -1,7 +1,7 @@
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ChatProvider, OutboundTarget } from "../types.js";
-import type { AgentSessionRecord } from "./session-manager.js";
+import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
 
 export interface SessionRunResult {
   sessionId: string;
@@ -35,9 +35,15 @@ export class SessionRunner {
     session: AgentSessionRecord,
     maxRetries: number,
     kickoff: AgentMessage,
+    lifecycle?: SessionRunLifecycle,
   ): Promise<SessionRunResult> {
     let retries = 0;
     let typingInterval: NodeJS.Timeout | undefined;
+    // Mark the session logically running for the WHOLE duration of run() — not
+    // just while a prompt is streaming. `interrupt()` gates on this so a Stop
+    // landing in the inter-turn gap (where `agent.signal` is transiently absent)
+    // is still honored (#2). Cleared in finally once the run settles.
+    lifecycle?.markRunInProgress();
     try {
       if (this.options.provider && this.options.target) {
         await this.options.provider.setTyping(this.options.target, true);
@@ -57,6 +63,14 @@ export class SessionRunner {
       while (
         !isTerminallyValid(agent.state.messages) &&
         retries < maxRetries &&
+        // Authoritative termination signal: an operator Stop flips the session's
+        // interrupt state (#1). Break even if the just-resolved turn settled
+        // normally (`stopReason:"stop"`) a hair before the abort landed, so we
+        // never issue an extra forced-completion turn after Stop.
+        !lifecycle?.isInterrupted() &&
+        // Fast path / fallback when no lifecycle is wired (e.g. summarization
+        // path, unit tests): pi-agent-core resolves an aborted run with a
+        // synthetic `stopReason:"aborted"` turn (#5).
         !wasAborted(agent.state.messages)
       ) {
         retries += 1;
@@ -72,6 +86,9 @@ export class SessionRunner {
         retries,
       };
     } finally {
+      // The run has settled: clear the logically-running flag so a late Stop is
+      // (correctly) reported as "not running" and defers to the terminal handler.
+      lifecycle?.clearRunInProgress();
       if (typingInterval) clearInterval(typingInterval);
       if (this.options.provider && this.options.target) {
         await this.options.provider.setTyping(this.options.target, false).catch(() => undefined);
@@ -179,15 +196,31 @@ export function isExplicitNoReply(messages: unknown[]): boolean {
   return extractLastAssistantText(messages).trim() === "NO_REPLY";
 }
 
+/** How many trailing assistant messages `wasAborted` scans for an abort marker. */
+const ABORT_TAIL_SCAN = 5;
+
 /**
- * True when the most recent assistant turn was produced by an aborted run.
+ * True when a recent assistant turn was produced by an aborted run.
  * pi-agent-core resolves (does not reject) an aborted run, appending a synthetic
  * assistant message with `stopReason: "aborted"`. The force-completion loop must
  * break on this rather than re-prompting an agent whose run has been cancelled —
  * see {@link SessionManager.interrupt}.
+ *
+ * Scans the recent assistant-message *tail* (not only the final message): if the
+ * transcript ever gains a trailing assistant turn after the synthetic aborted one
+ * (#5), inspecting only the last message would wrongly report `false` and let the
+ * loop re-prompt a cancelled agent. The authoritative termination signal is the
+ * session's interrupt state (see the loop in {@link SessionRunner.run}); this
+ * remains as a robust fast path / fallback when no lifecycle is wired.
  */
 function wasAborted(messages: unknown[]): boolean {
-  const last = findLastAssistantMessage(messages) as { stopReason?: unknown } | undefined;
-  return last?.stopReason === "aborted";
+  let seen = 0;
+  for (let i = messages.length - 1; i >= 0 && seen < ABORT_TAIL_SCAN; i -= 1) {
+    const candidate = messages[i] as { role?: unknown; stopReason?: unknown } | undefined;
+    if (candidate?.role !== "assistant") continue;
+    seen += 1;
+    if (candidate.stopReason === "aborted") return true;
+  }
+  return false;
 }
 
