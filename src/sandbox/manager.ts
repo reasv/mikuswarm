@@ -105,11 +105,21 @@ export class SandboxManager implements ExecBackend {
     }
     const inspect = await runDocker(["network", "inspect", network]);
     if (inspect.code === 0) return;
-    const create = await runDocker(["network", "create", "--driver", "bridge", network]);
+    // Create with IPv6 disabled so the IPv4-only egress hardening
+    // (docker/sandbox-egress-rules.sh) gives a closed boundary; a v6-enabled
+    // bridge would route around the RFC1918 DROP rules.
+    const create = await runDocker(["network", "create", "--driver", "bridge", "--ipv6=false", network]);
     if (create.code !== 0) {
       throw new Error(`Failed to create sandbox network ${network}: ${create.stderr.trim()}`);
     }
-    options.logger.info("sandbox_network_created", { network });
+    // Warn loudly: a freshly created network has no egress firewall yet. The
+    // bridge name is derived from the new network ID, so any previously applied
+    // rules are now stale. The operator must (re)run sandbox-egress-rules.sh as
+    // root to restore RFC1918 blocking for the current bridge.
+    options.logger.warn("sandbox_network_created", {
+      network,
+      action: "run docker/sandbox-egress-rules.sh as root to (re)apply egress firewall for this bridge",
+    });
   }
 
   private static async assertImageExists(options: SandboxManagerOptions): Promise<void> {

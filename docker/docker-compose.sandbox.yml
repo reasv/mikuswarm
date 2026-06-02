@@ -33,8 +33,19 @@ services:
       - "no-new-privileges:true"
     cap_drop:
       - ALL
+    # NOTE: read_only_root / tmpfs parity with the [sandbox] config is
+    # intentionally NOT expressed here. The SandboxManager is the lifecycle owner
+    # and wires --read-only + tmpfs from config; this compose file only documents
+    # the equivalent service for manual ops.
 
 networks:
   mikuswarm-sandbox:
     name: ${MIKUSWARM_SANDBOX_NETWORK:-mikuswarm-sandbox}
     driver: bridge
+    enable_ipv6: false
+    # REQUIRED FOLLOW-UP: this network only blocks RFC1918/private egress after
+    # docker/sandbox-egress-rules.sh is run as root against the resulting bridge.
+    # Compose creates the network but cannot install the host iptables rules. Run
+    # (and re-run after any network recreation):
+    #   sudo MIKUSWARM_SANDBOX_NETWORK=${MIKUSWARM_SANDBOX_NETWORK:-mikuswarm-sandbox} \
+    #     docker/sandbox-egress-rules.sh

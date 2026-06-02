@@ -29,5 +29,9 @@ if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
   exit 0
 fi
 
-docker network create --driver bridge "$NETWORK_NAME" >/dev/null
+# Create with IPv6 explicitly disabled: the egress hardening (RFC1918 blocking
+# in sandbox-egress-rules.sh) pins IPv4 public resolvers and the v4 DROP rules
+# only cover IPv4. A v6-enabled bridge would route IPv6 around that block, so we
+# keep IPv6 off to give a single, closed IPv4 boundary.
+docker network create --driver bridge --ipv6=false "$NETWORK_NAME" >/dev/null
 echo "Created sandbox Docker network: $NETWORK_NAME" >&2
