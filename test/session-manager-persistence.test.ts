@@ -101,6 +101,73 @@ test("SessionManager truncates an overlong trigger body before persisting", asyn
   }
 });
 
+/** Live agent stub: `signal` is defined (active run) and `abort()` records the call. */
+function fakeAbortableAgent(opts: { live: boolean } = { live: true }): {
+  agent: any;
+  aborted: () => boolean;
+} {
+  const controller = new AbortController();
+  let didAbort = false;
+  const agent = {
+    get signal() {
+      return opts.live ? controller.signal : undefined;
+    },
+    abort() {
+      didAbort = true;
+      controller.abort();
+    },
+  };
+  return { agent, aborted: () => didAbort };
+}
+
+test("SessionManager.interrupt aborts a live run and persists interrupted status", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    sessions.markRunning(record.id);
+    const { agent, aborted } = fakeAbortableAgent();
+    sessions.attachAgent(record.id, agent);
+
+    const ok = sessions.interrupt(record.id);
+    assert.equal(ok, true, "interrupt returns true for a live run");
+    assert.ok(aborted(), "agent.abort() was called");
+    assert.equal(sessions.get(record.id)?.status, "interrupted");
+
+    await storage.waitForIdle();
+    const row = storage.getAgentSession(record.id);
+    assert.equal(row!.status, "interrupted");
+    assert.ok(typeof row!.completed_at === "number" && row!.completed_at! > 0, "completed_at set");
+
+    // The settling run's natural terminal handler must NOT clobber `interrupted`.
+    sessions.markCompleted(record.id, { noReply: true });
+    await storage.waitForIdle();
+    assert.equal(storage.getAgentSession(record.id)!.status, "interrupted");
+    // ...but it still evicts the now-finished session from the live map.
+    assert.equal(sessions.get(record.id), undefined);
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager.interrupt returns false when no live run is attached", () => {
+  const sessions = new SessionManager();
+  const record = sessions.createPlaceholder(makeTrigger(), "default");
+
+  // No agent attached / not running.
+  assert.equal(sessions.interrupt(record.id), false);
+
+  // Running, but the attached agent's run has already settled (signal undefined).
+  sessions.markRunning(record.id);
+  const { agent } = fakeAbortableAgent({ live: false });
+  sessions.attachAgent(record.id, agent);
+  assert.equal(sessions.interrupt(record.id), false);
+
+  // Unknown id.
+  assert.equal(sessions.interrupt("s-nope"), false);
+});
+
 test("SessionManager without storage is a no-op and never throws", () => {
   const sessions = new SessionManager();
   const record = sessions.createPlaceholder(makeTrigger(), "default");

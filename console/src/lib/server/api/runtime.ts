@@ -42,3 +42,8 @@ export async function runApi<A>(
 export function apiGet<A, I>(path: string, schema: Schema.Schema<A, I>): Promise<A> {
 	return runApi(Effect.flatMap(AgentApiClient, (c) => c.get(path, schema)));
 }
+
+/** Convenience: POST (empty body) to a path and decode the response with `schema`. */
+export function apiPost<A, I>(path: string, schema: Schema.Schema<A, I>): Promise<A> {
+	return runApi(Effect.flatMap(AgentApiClient, (c) => c.post(path, schema)));
+}

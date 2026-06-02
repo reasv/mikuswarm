@@ -506,6 +506,87 @@ test("SSE: unknown session id is 404", async () => {
   });
 });
 
+/**
+ * A live `Agent` stand-in for the abort endpoint: `signal` is defined (an active
+ * run) and `abort()` flips it, recording the call. Mirrors how pi-agent-core's
+ * `Agent.abort()` aborts the active run's controller.
+ */
+function fakeAbortableAgent(): { agent: any; aborted: () => boolean } {
+  const controller = new AbortController();
+  let didAbort = false;
+  const agent = {
+    get signal() {
+      return controller.signal;
+    },
+    abort() {
+      didAbort = true;
+      controller.abort();
+    },
+    subscribe() {
+      return () => {};
+    },
+  };
+  return { agent, aborted: () => didAbort };
+}
+
+test("POST /api/sessions/:id/abort interrupts a live run (200) and aborts the agent", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    const { agent, aborted } = fakeAbortableAgent();
+    const id = await attachRunningSession(storage, sessions, agent);
+
+    await withServer({ storage, sessions }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/${id}/abort`, { method: "POST" });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.sessionId, id);
+      assert.equal(body.status, "interrupted");
+      assert.ok(aborted(), "agent.abort() must have been called");
+      assert.equal(sessions.get(id)?.status, "interrupted");
+    });
+  });
+});
+
+test("POST /api/sessions/:id/abort returns 409 when the session isn't running", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ status: "completed" }));
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-aaa1111111/abort`, { method: "POST" });
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as any;
+      assert.equal(body.sessionId, "s-aaa1111111");
+    });
+  });
+});
+
+test("POST /api/sessions/:id/abort returns 404 for an unknown session", async () => {
+  await withStorage(async (storage) => {
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-nope/abort`, { method: "POST" });
+      assert.equal(res.status, 404);
+    });
+  });
+});
+
+test("abort route: GET is 405 (method not allowed); POST is 401 without token", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ status: "completed" }));
+    // GET on a POST-only path → 405 (path exists under another method).
+    await withServer({ storage }, async (base) => {
+      const wrongMethod = await fetch(`${base}/api/sessions/s-aaa1111111/abort`);
+      assert.equal(wrongMethod.status, 405);
+    });
+    // Bearer-token gate covers the mutation like every other route.
+    await withServer(
+      { storage, config: { enabled: true, bind: "127.0.0.1", port: 0, auth_token: "sekret-token" } },
+      async (base) => {
+        const unauth = await fetch(`${base}/api/sessions/s-aaa1111111/abort`, { method: "POST" });
+        assert.equal(unauth.status, 401);
+      },
+    );
+  });
+});
+
 test("GET /api/rooms/:key/context flags the final turn preview and externalizes images", async () => {
   await withStorage(async (storage) => {
     const preview: PreviewContext = {

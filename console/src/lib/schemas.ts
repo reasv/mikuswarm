@@ -97,6 +97,17 @@ export const SessionDetailResponse = Schema.Struct({
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 
+/**
+ * POST /api/sessions/:id/abort — the Stop button (spec §13). On a 200 the agent
+ * returns `{ sessionId, status: "interrupted" }`. A 409 (session not running) is
+ * mapped to a thrown `HttpError` by the API client before this schema is reached.
+ */
+export const AbortSessionResponse = Schema.Struct({
+	sessionId: Schema.String,
+	status: Schema.String
+});
+export type AbortSessionResponse = Schema.Schema.Type<typeof AbortSessionResponse>;
+
 /** GET /api/summaries/:id — lineage shape is backend-internal; keep permissive. */
 export const SummaryResponse = Schema.Struct({
 	summary: Schema.Unknown,

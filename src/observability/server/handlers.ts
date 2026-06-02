@@ -164,6 +164,40 @@ export function sessionStream(
 }
 
 /**
+ * POST /api/sessions/:id/abort — operator Stop button (spec §13). Aborts the
+ * in-flight run and marks the session `interrupted` via
+ * {@link SessionManager.interrupt}.
+ *
+ * - 200 `{ sessionId, status: "interrupted" }` — a live run was aborted.
+ * - 404 — no such session row.
+ * - 409 `{ sessionId, status }` — the session exists but isn't actively running
+ *   (already terminal, or between runs). Idempotent-friendly: the caller learns
+ *   the run is already not in flight and can treat it as success.
+ *
+ * This is the console's first mutating route; everything else is read-only. The
+ * bearer-token check in the server's request handler gates it like every route.
+ */
+export function abortSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const id = ctx.params.id;
+  const row = ctx.deps.storage.getAgentSession(id);
+  if (!row) return sendError(res, 404, `Unknown session: ${id}`);
+
+  const aborted = ctx.deps.sessions.interrupt(id);
+  if (!aborted) {
+    return sendJson(res, 409, {
+      error: { status: 409, message: `Session is not running: ${id}` },
+      sessionId: id,
+      status: ctx.deps.sessions.get(id)?.status ?? row.status,
+    });
+  }
+  sendJson(res, 200, { sessionId: id, status: "interrupted" });
+}
+
+/**
  * GET /api/media/:ref — bytes for an externalized image ref. `:ref` is the media
  * asset id (= `attachmentId`). Resolved beneath the workspace root with a
  * path-traversal guard.

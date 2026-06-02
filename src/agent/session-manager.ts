@@ -85,6 +85,14 @@ export class SessionManager {
   }
 
   markCompleted(sessionId: string, opts: { noReply?: boolean } = {}): void {
+    // Interruption is the authoritative terminal state: a run aborted via
+    // `interrupt()` still settles normally (pi-agent-core resolves an aborted
+    // run), so its run promise's `.then` lands here. Don't overwrite the
+    // `interrupted` status — just evict and return.
+    if (this.sessions.get(sessionId)?.status === "interrupted") {
+      this.evict(sessionId);
+      return;
+    }
     const completedAt = Date.now();
     this.update(sessionId, (session) => ({
       ...session,
@@ -101,6 +109,12 @@ export class SessionManager {
   }
 
   markDiscarded(sessionId: string, opts: { error?: string } = {}): void {
+    // See `markCompleted`: an interrupted run that settles via the error path
+    // must not clobber the `interrupted` status. Evict and return.
+    if (this.sessions.get(sessionId)?.status === "interrupted") {
+      this.evict(sessionId);
+      return;
+    }
     const completedAt = Date.now();
     this.update(sessionId, (session) => ({
       ...session,
@@ -167,6 +181,38 @@ export class SessionManager {
     const agent = this.agents.get(sessionId);
     if (!session || !agent || session.status !== "running") return false;
     agent.steer(message);
+    return true;
+  }
+
+  /**
+   * Interrupt a live run: abort the in-flight LLM call / tool execution and mark
+   * the session `interrupted` (spec §13 — operator Stop button). Returns `true`
+   * if a live run was aborted, `false` if the session has no actively-running
+   * agent (unknown / already terminal / between runs).
+   *
+   * Status is set to `interrupted` BEFORE aborting so the run promise's natural
+   * settlement (`markCompleted`/`markDiscarded`) defers to it. We deliberately do
+   * NOT evict here: `agent.abort()` unwinds asynchronously and the SSE stream
+   * still needs the live agent ref to forward the terminal `agent_end`. Eviction
+   * happens once, from whichever terminal handler the settling run reaches.
+   *
+   * Liveness is gated on `agent.signal !== undefined` (the same check as
+   * {@link isAgentLive}): pi-agent-core clears the active run the instant it
+   * settles, so a present-but-idle agent must not be reported as interruptible.
+   */
+  interrupt(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    const agent = this.agents.get(sessionId);
+    if (!session || !agent || session.status !== "running" || agent.signal === undefined) {
+      return false;
+    }
+    const completedAt = Date.now();
+    this.update(sessionId, (s) => ({ ...s, status: "interrupted", completedAt }));
+    this.persist("session status interrupted", sessionId, (storage) =>
+      storage.updateAgentSessionStatus(sessionId, "interrupted", { completedAt }),
+    );
+    agent.abort();
+    this.deps.logger?.info("session_interrupted", { sessionId });
     return true;
   }
 

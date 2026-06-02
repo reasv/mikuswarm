@@ -54,7 +54,11 @@ export class SessionRunner {
       await promptAgent(agent, kickoff);
       await waitForAgentIdle(agent);
 
-      while (!isTerminallyValid(agent.state.messages) && retries < maxRetries) {
+      while (
+        !isTerminallyValid(agent.state.messages) &&
+        retries < maxRetries &&
+        !wasAborted(agent.state.messages)
+      ) {
         retries += 1;
         await forceCompletion(agent);
         await waitForAgentIdle(agent);
@@ -173,5 +177,17 @@ export function isTerminallyValid(messages: unknown[]): boolean {
 
 export function isExplicitNoReply(messages: unknown[]): boolean {
   return extractLastAssistantText(messages).trim() === "NO_REPLY";
+}
+
+/**
+ * True when the most recent assistant turn was produced by an aborted run.
+ * pi-agent-core resolves (does not reject) an aborted run, appending a synthetic
+ * assistant message with `stopReason: "aborted"`. The force-completion loop must
+ * break on this rather than re-prompting an agent whose run has been cancelled —
+ * see {@link SessionManager.interrupt}.
+ */
+function wasAborted(messages: unknown[]): boolean {
+  const last = findLastAssistantMessage(messages) as { stopReason?: unknown } | undefined;
+  return last?.stopReason === "aborted";
 }
 

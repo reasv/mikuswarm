@@ -9,6 +9,7 @@ import {
   roomSessions,
   sessionDetail,
   sessionStream,
+  abortSession,
   media,
   summaryDetail,
 } from "./handlers.js";
@@ -24,10 +25,13 @@ export interface ConsoleServer {
 }
 
 /**
- * In-process, read-only observability console (spec §8). Plain `node:http`, no
- * framework, no new dependencies. Every request is bearer-authorized (when a
- * token is configured) and every JSON body is secret-redacted on the way out.
- * Read-only: no mutating routes (admin actions, spec §13, are a later phase).
+ * In-process observability console (spec §8). Plain `node:http`, no framework,
+ * no new dependencies. Every request is bearer-authorized (when a token is
+ * configured) and every JSON body is secret-redacted on the way out.
+ *
+ * Read-only except for the single operator mutation `POST /api/sessions/:id/abort`
+ * (the Stop button, spec §13), which aborts a live run via `SessionManager`. All
+ * other routes are GET observability reads.
  */
 export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServer {
   const log = deps.logger;
@@ -38,6 +42,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/rooms/:key/sessions", roomSessions)
     .add("GET", "/api/sessions/:id", sessionDetail)
     .add("GET", "/api/sessions/:id/stream", sessionStream)
+    .add("POST", "/api/sessions/:id/abort", abortSession)
     .add("GET", "/api/media/:ref", media)
     .add("GET", "/api/summaries/:id", summaryDetail);
 
