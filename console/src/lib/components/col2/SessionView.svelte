@@ -27,8 +27,16 @@
 		if (!id || stopping) return;
 		stopping = true;
 		try {
-			await abortSession(id);
-			toast.success('Session stopped');
+			// The 200 contract is `{ sessionId, status: "interrupted" }` (spec §13). Consume
+			// the decoded status rather than assuming success: confirm the run was actually
+			// interrupted before claiming so, and surface any other status explicitly instead
+			// of mislabeling it (e.g. if the backend 200 contract ever drifts).
+			const { status } = await abortSession(id);
+			if (status === 'interrupted') {
+				toast.success('Session stopped');
+			} else {
+				toast.warning('Session stop returned an unexpected status', { description: status });
+			}
 		} catch (err) {
 			const status = (err as { status?: number })?.status;
 			if (status === 409) {

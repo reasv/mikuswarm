@@ -5,6 +5,7 @@ import {
 	RoomContextResponse,
 	SessionsResponse,
 	SessionDetailResponse,
+	AbortSessionResponse,
 	AgentEventWire,
 	ImageRef,
 	ContextMessageWire
@@ -189,6 +190,18 @@ describe('wire schemas (fidelity guard)', () => {
 		expect(out.rolloutStartIndex).toBe(1);
 		// permissive transcript preserves unknown fields
 		expect((out.transcript[1] as Record<string, unknown>).anyExtraField).toBe(42);
+	});
+
+	it('decodes POST /api/sessions/:id/abort 200 body to the typed value', () => {
+		// The Stop button's success path branches on this `status` (SessionView.svelte
+		// `handleStop`), so pin the 200 contract: `{ sessionId, status: "interrupted" }`.
+		const out = decode(AbortSessionResponse, { sessionId: 's-x', status: 'interrupted' });
+		expect(out.sessionId).toBe('s-x');
+		expect(out.status).toBe('interrupted');
+	});
+
+	it('rejects an abort body missing the status field', () => {
+		expect(() => decode(AbortSessionResponse, { sessionId: 's-x' })).toThrow();
 	});
 
 	it('AgentEventWire validates type and preserves payload', () => {
