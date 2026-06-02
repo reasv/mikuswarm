@@ -17,6 +17,22 @@ import type { ConsoleServerDeps } from "./types.js";
 
 export type { ConsoleServerDeps } from "./types.js";
 
+/**
+ * CSRF guard for state-mutating routes. The console BFF attaches this header to
+ * every outbound request (`console/src/lib/server/api/client.ts` `request()`); the
+ * value is a constant marker, not a credential. Requiring a *custom* header on
+ * mutating methods makes any cross-origin browser request non-"simple" → the
+ * browser must send a CORS preflight → this server implements no CORS, so the
+ * actual request is blocked. A real CSRF attack (auto-submitted form / `no-cors`
+ * fetch) can only issue simple requests and cannot set this header. The legitimate
+ * server-to-server BFF `fetch` is not subject to CORS and passes. Keep this literal
+ * in sync with the BFF constant of the same name.
+ */
+export const CONSOLE_REQUEST_HEADER = "x-console-request";
+
+/** HTTP methods that mutate state and therefore require the CSRF guard header. */
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 export interface ConsoleServer {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -57,7 +73,15 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
       if (!isAuthorized(req, url, deps.config.auth_token)) {
         return sendError(res, 401, "Unauthorized");
       }
-      const matched = router.match(req.method ?? "GET", url.pathname);
+      // CSRF guard: mutating routes are console-BFF-only (server-to-server). A
+      // browser can only reach them via a CORS-preflighted request carrying this
+      // custom header, which this no-CORS server never approves; simple-request
+      // CSRF cannot set it. GET reads (incl. the SSE stream) need no header.
+      const method = req.method ?? "GET";
+      if (MUTATING_METHODS.has(method) && req.headers[CONSOLE_REQUEST_HEADER] === undefined) {
+        return sendError(res, 403, "Forbidden");
+      }
+      const matched = router.match(method, url.pathname);
       if (!matched) {
         if (router.pathExists(url.pathname)) return sendError(res, 405, "Method not allowed");
         return sendError(res, 404, "Not found");

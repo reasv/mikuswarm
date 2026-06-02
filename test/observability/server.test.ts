@@ -541,7 +541,10 @@ test("POST /api/sessions/:id/abort interrupts a live run (200) and aborts the ag
     sessions.runLifecycle(id).markRunInProgress();
 
     await withServer({ storage, sessions }, async (base) => {
-      const res = await fetch(`${base}/api/sessions/${id}/abort`, { method: "POST" });
+      const res = await fetch(`${base}/api/sessions/${id}/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
       assert.equal(res.status, 200);
       const body = (await res.json()) as any;
       assert.equal(body.sessionId, id);
@@ -552,11 +555,46 @@ test("POST /api/sessions/:id/abort interrupts a live run (200) and aborts the ag
   });
 });
 
+test("POST /api/sessions/:id/abort requires the x-console-request CSRF header (403 without, 200 with)", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    const { agent, aborted } = fakeAbortableAgent();
+    const id = await attachRunningSession(storage, sessions, agent);
+    sessions.runLifecycle(id).markRunInProgress();
+
+    await withServer({ storage, sessions }, async (base) => {
+      // A live, interruptible, fully-authorized session — the only thing missing is
+      // the console-request marker, so a 403 here is unambiguously the CSRF guard
+      // (not 401/404/409). On the pre-fix server this POST would have aborted the run.
+      const missing = await fetch(`${base}/api/sessions/${id}/abort`, { method: "POST" });
+      assert.equal(missing.status, 403);
+      assert.equal(aborted(), false, "abort must NOT run when the CSRF header is absent");
+      assert.equal(sessions.get(id)?.status, "running");
+      const body = (await missing.json()) as any;
+      // Same error envelope as every other error response.
+      assert.equal(body.error.status, 403);
+      assert.equal(typeof body.error.message, "string");
+
+      // With the header the request passes the guard and interrupts the run.
+      const ok = await fetch(`${base}/api/sessions/${id}/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
+      assert.equal(ok.status, 200);
+      assert.ok(aborted(), "agent.abort() must run once the CSRF header is present");
+      assert.equal(sessions.get(id)?.status, "interrupted");
+    });
+  });
+});
+
 test("POST /api/sessions/:id/abort returns 409 when the session isn't running", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert({ status: "completed" }));
     await withServer({ storage }, async (base) => {
-      const res = await fetch(`${base}/api/sessions/s-aaa1111111/abort`, { method: "POST" });
+      const res = await fetch(`${base}/api/sessions/s-aaa1111111/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
       assert.equal(res.status, 409);
       const body = (await res.json()) as any;
       assert.equal(body.sessionId, "s-aaa1111111");
@@ -567,7 +605,10 @@ test("POST /api/sessions/:id/abort returns 409 when the session isn't running", 
 test("POST /api/sessions/:id/abort returns 404 for an unknown session", async () => {
   await withStorage(async (storage) => {
     await withServer({ storage }, async (base) => {
-      const res = await fetch(`${base}/api/sessions/s-nope/abort`, { method: "POST" });
+      const res = await fetch(`${base}/api/sessions/s-nope/abort`, {
+        method: "POST",
+        headers: { "x-console-request": "1" },
+      });
       assert.equal(res.status, 404);
     });
   });

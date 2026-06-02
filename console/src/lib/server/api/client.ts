@@ -27,6 +27,17 @@ export class AgentApiClient extends Context.Tag('AgentApiClient')<
 	}
 >() {}
 
+/**
+ * CSRF guard marker required by the observability server on state-mutating routes
+ * (see `src/observability/server/index.ts` `CONSOLE_REQUEST_HEADER`). It is a
+ * constant, *not* a credential: its only job is to be a custom header, which forces
+ * a CORS preflight on any cross-origin browser request and so blocks simple-request
+ * CSRF against the mutating routes. Sent on every request (a constant marker is
+ * cleaner than gating on the verb); the server only enforces it for mutations.
+ * Keep this literal in sync with the server constant of the same name.
+ */
+const CONSOLE_REQUEST_HEADER = 'x-console-request';
+
 /** Shared request → decode pipeline for both verbs (the only difference is the method). */
 function request<A, I>(method: 'GET' | 'POST', path: string, schema: Schema.Schema<A, I>) {
 	return Effect.gen(function* () {
@@ -34,7 +45,7 @@ function request<A, I>(method: 'GET' | 'POST', path: string, schema: Schema.Sche
 			try: (signal) =>
 				fetch(apiBaseUrl + path, {
 					method,
-					headers: { accept: 'application/json', ...authHeaders() },
+					headers: { accept: 'application/json', [CONSOLE_REQUEST_HEADER]: '1', ...authHeaders() },
 					signal
 				}),
 			catch: (cause) => new UpstreamError({ path, cause })
