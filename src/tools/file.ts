@@ -6,12 +6,19 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 import { isNodeError } from "../types.js";
+import type { ExecBackend } from "../sandbox/index.js";
 
 const execFileAsync = promisify(execFile);
 
 export interface FileToolContext {
   workspaceRoot: string;
   contextWindowTokens?: number;
+  /**
+   * When present, `search_files` runs ripgrep inside the sandbox container
+   * instead of on the host. The workspace is the same bind-mounted files, so
+   * results are identical; this just moves the `rg` process into the sandbox.
+   */
+  sandbox?: ExecBackend;
 }
 
 export function createTextEditorTool(context: FileToolContext): AgentTool {
@@ -78,7 +85,7 @@ export function createSearchFilesTool(context: FileToolContext): AgentTool {
       const result = await runRipgrep(context.workspaceRoot, {
         ...args,
         path: args.path ?? ".",
-      });
+      }, context.sandbox);
       return {
         content: [{ type: "text", text: result.text }],
         details: result.details,
@@ -234,40 +241,66 @@ export async function runRipgrep(
     context_lines?: number;
     max_results?: number;
   },
+  sandbox?: ExecBackend,
 ) {
+  // resolveWorkspacePath runs the host-side containment check (reject `..`/symlink
+  // escapes) for both backends. relativePath is the in-workspace target used as
+  // ripgrep's path arg in the sandbox and as the reported `details.path`.
   const absolute = resolveWorkspacePath(workspaceRoot, args.path);
+  const relativePath = workspaceRelative(workspaceRoot, absolute);
   const argv = ["--line-number", "--no-heading", "--color", "never"];
   if (args.case_sensitive === false) argv.push("--ignore-case");
   if (args.context_lines !== undefined && args.context_lines > 0) argv.push("--context", String(args.context_lines));
   for (const glob of args.glob ?? []) argv.push("--glob", glob);
+
+  const maxResults = args.max_results ?? 100;
+  const buildResult = (stdout: string) => {
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    const selected = lines.slice(0, maxResults);
+    return {
+      text: selected.join("\n") || "No matches.",
+      details: {
+        pattern: args.pattern,
+        path: relativePath,
+        count: lines.length,
+        truncated: lines.length > selected.length,
+      },
+    };
+  };
+  const noMatches = () => ({
+    text: "No matches.",
+    details: { pattern: args.pattern, path: relativePath, count: 0, truncated: false },
+  });
+
+  if (sandbox) {
+    // Run rg inside the container, from /workspace, targeting the relative path.
+    // ripgrep exits 1 on "no matches" and 2 on error; docker exec forwards the code.
+    const command = ["rg", ...argv, args.pattern, relativePath].map(shellQuote).join(" ");
+    const result = await sandbox.exec(command, { maxOutputBytes: 1024 * 1024 });
+    if (result.exitCode === 1 && !result.stdout) return noMatches();
+    if (result.exitCode > 1) {
+      throw new Error(`ripgrep failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    return buildResult(result.stdout);
+  }
+
   argv.push(args.pattern, absolute);
   try {
     const { stdout } = await execFileAsync("rg", argv, {
       cwd: workspaceRoot,
       maxBuffer: 1024 * 1024,
     });
-    const lines = stdout.split(/\r?\n/).filter(Boolean);
-    const maxResults = args.max_results ?? 100;
-    const selected = lines.slice(0, maxResults);
-    return {
-      text: selected.join("\n") || "No matches.",
-      details: {
-        pattern: args.pattern,
-        path: workspaceRelative(workspaceRoot, absolute),
-        count: lines.length,
-        truncated: lines.length > selected.length,
-      },
-    };
+    return buildResult(stdout);
   } catch (error) {
     const execError = error as NodeJS.ErrnoException & { code?: number; stdout?: string };
-    if (execError.code === 1) {
-      return {
-        text: "No matches.",
-        details: { pattern: args.pattern, path: workspaceRelative(workspaceRoot, absolute), count: 0, truncated: false },
-      };
-    }
+    if (execError.code === 1) return noMatches();
     throw error;
   }
+}
+
+/** Single-quote-escape an argv element for safe interpolation into `sh -lc`. */
+function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
 function selectLineRange(content: string, range?: [number, number]) {

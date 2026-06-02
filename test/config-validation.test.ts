@@ -130,3 +130,38 @@ auth_token = "sekret-token"
     assert.equal(config.observability?.server?.auth_token, "sekret-token");
   });
 });
+
+const SANDBOX_BLOCK = (mount: string) => `
+[sandbox]
+enabled = true
+image = "mikuswarm-sandbox:24.04"
+container_name = "mikuswarm-sandbox"
+network = "mikuswarm-sandbox"
+workspace_mount = "${mount}"
+exec_timeout_ms = 120000
+max_output_bytes = 1048576
+`;
+
+test("config: absent [sandbox] section is accepted", async () => {
+  await withConfigDir(BASE_CONFIG, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.sandbox, undefined);
+  });
+});
+
+test("config: valid enabled [sandbox] with absolute workspace_mount is accepted", async () => {
+  await withConfigDir(`${BASE_CONFIG}${SANDBOX_BLOCK("/workspace")}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.sandbox?.enabled, true);
+    assert.equal(config.sandbox?.workspace_mount, "/workspace");
+  });
+});
+
+test("config: enabled [sandbox] with a relative workspace_mount is rejected", async () => {
+  await withConfigDir(`${BASE_CONFIG}${SANDBOX_BLOCK("workspace")}`, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /workspace_mount must be an absolute path/,
+    );
+  });
+});

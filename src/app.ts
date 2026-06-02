@@ -34,6 +34,7 @@ import {
   createPinsTool,
   createPollVoteTool,
   createReactTool,
+  createBashTool,
   createReadImageTool,
   createSearchMemoryTool,
   createSearchFilesTool,
@@ -57,6 +58,7 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
+import { SandboxManager } from "./sandbox/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -74,6 +76,31 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const sessions = new SessionManager({ storage, logger });
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
+
+  // Docker sandbox (ARCHITECTURE.md §12). When enabled, ensure the container is
+  // up before anything else connects — a failure here aborts startup (fail-fast).
+  // The sandbox handle is closed over by the per-session tools builder below.
+  let sandbox: SandboxManager | undefined;
+  if (config.sandbox?.enabled) {
+    sandbox = await SandboxManager.ensure({
+      image: config.sandbox.image,
+      containerName: config.sandbox.container_name,
+      network: config.sandbox.network,
+      workspaceHostDir: path.resolve(workspaceRoot),
+      workspaceMount: config.sandbox.workspace_mount,
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+      memory: config.sandbox.memory,
+      cpus: config.sandbox.cpus,
+      pidsLimit: config.sandbox.pids_limit,
+      readOnlyRoot: config.sandbox.read_only_root,
+      env: config.sandbox.env,
+      binds: config.sandbox.binds,
+      execTimeoutMs: config.sandbox.exec_timeout_ms,
+      maxOutputBytes: config.sandbox.max_output_bytes,
+      logger: logger.child("sandbox"),
+    });
+  }
 
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(timeline, config, storage, logger);
@@ -632,7 +659,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.
       // Clamps in resolveMaxCharacters (50KB–512KB) bound the impact, so a mismatch only shifts the cap within those limits.
       createTextEditorTool({ workspaceRoot, contextWindowTokens: config.models.default.context_window }),
-      createSearchFilesTool({ workspaceRoot }),
+      createSearchFilesTool({ workspaceRoot, sandbox }),
+      ...(sandbox ? [createBashTool({ sandbox, defaultTimeoutMs: config.sandbox?.exec_timeout_ms })] : []),
       createMediaTool({
         workspaceRoot,
         clients: captionClients,
@@ -903,6 +931,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();
         await waitForRuns(activeRuns);
+        // After in-flight runs (and their bash execs) drain, release the sandbox.
+        if (sandbox) await sandbox.shutdown({ stop: config.sandbox?.stop_on_shutdown ?? false });
         await storage.waitForIdle();
         storage.close();
         logger.info("runtime_stopped");

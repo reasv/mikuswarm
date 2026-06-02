@@ -248,6 +248,29 @@ export const AppConfigSchema = Type.Object({
   workspace: Type.Object({
     root_dir: Type.String(),
   }),
+  // Docker sandbox: when enabled, shell-shaped tool calls (the `bash` tool and
+  // `search_files`/ripgrep) execute inside a long-lived container whose
+  // /workspace is the bind-mounted workspace root. Pure byte I/O and image
+  // tools stay in-process on the same bind-mounted files. See ARCHITECTURE.md §12.
+  // Optional so existing configs stay valid; when enabled, startup fails fast if
+  // Docker/the image/the container are unavailable.
+  sandbox: Type.Optional(Type.Object({
+    enabled: Type.Boolean(),
+    image: Type.String(),
+    container_name: Type.String(),
+    network: Type.String(),
+    workspace_mount: Type.String(),
+    exec_timeout_ms: Type.Number({ minimum: 1 }),
+    max_output_bytes: Type.Number({ minimum: 1 }),
+    stop_on_shutdown: Type.Optional(Type.Boolean()),
+    // Resource/isolation knobs (room to grow; passed to `docker create`).
+    memory: Type.Optional(Type.String()),
+    cpus: Type.Optional(Type.Number({ minimum: 0 })),
+    pids_limit: Type.Optional(Type.Number({ minimum: 1 })),
+    read_only_root: Type.Optional(Type.Boolean()),
+    env: Type.Optional(Type.Record(Type.String(), Type.String())),
+    binds: Type.Optional(Type.Array(Type.String())),
+  })),
   matrix: Type.Object({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),

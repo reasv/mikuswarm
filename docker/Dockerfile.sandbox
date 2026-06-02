@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1.7
+#
+# MikuSwarm sandbox image. Carried over essentially verbatim from the OpenClaw
+# agent's sandbox (../../Dockerfile.sandbox-ubuntu-dev) so the agent keeps the
+# same toolchain it had before: full apt dev set, pnpm, uv, rust, homebrew.
+#
+# The one deliberate difference from the original: this container is meant to be
+# run with `--user <harness-uid>:<gid>` so files the agent's `bash` tool writes
+# into the bind-mounted /workspace are owned by the host harness process (which
+# also reads/writes those same files in-process — the hybrid FS model). Because
+# the runtime uid is arbitrary (not necessarily the build-time `sandbox` user),
+# /home/sandbox is made group/world-writable so cargo/uv/brew installs still
+# work at runtime, and WORKDIR is /workspace (the bind mount).
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN --mount=type=cache,id=miku-ubuntu-apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=miku-ubuntu-apt-lists,target=/var/lib/apt,sharing=locked \
+  apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    cmake \
+    coreutils \
+    curl \
+    dnsutils \
+    fd-find \
+    ffmpeg \
+    file \
+    gcc \
+    g++ \
+    git \
+    iputils-ping \
+    jq \
+    less \
+    lsof \
+    make \
+    netcat-openbsd \
+    npm \
+    openssh-client \
+    pkg-config \
+    procps \
+    python-is-python3 \
+    python3 \
+    python3-pip \
+    python3-venv \
+    ripgrep \
+    rsync \
+    socat \
+    sqlite3 \
+    tar \
+    tree \
+    unzip \
+    wget \
+    xz-utils \
+    zip \
+    zstd \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+RUN useradd --create-home --shell /bin/bash sandbox
+
+USER sandbox
+WORKDIR /home/sandbox
+
+ENV CARGO_HOME=/home/sandbox/.cargo
+ENV RUSTUP_HOME=/home/sandbox/.rustup
+ENV UV_INSTALL_DIR=/home/sandbox/.local/bin
+ENV HOMEBREW_PREFIX=/home/sandbox/.linuxbrew
+ENV HOMEBREW_CELLAR=/home/sandbox/.linuxbrew/Cellar
+ENV HOMEBREW_REPOSITORY=/home/sandbox/.linuxbrew/Homebrew
+ENV PATH=/home/sandbox/.local/bin:/home/sandbox/.cargo/bin:/home/sandbox/.linuxbrew/bin:/home/sandbox/.linuxbrew/sbin:/home/sandbox/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN mkdir -p \
+    /home/sandbox/.local/bin \
+    /home/sandbox/.npm-global \
+    /home/sandbox/.cache \
+    /home/sandbox/.config
+
+RUN npm config set prefix /home/sandbox/.npm-global \
+  && npm install -g pnpm
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+  sh -s -- -y --profile default --default-toolchain stable
+
+RUN git clone --depth=1 https://github.com/Homebrew/brew "${HOMEBREW_REPOSITORY}" \
+  && mkdir -p "${HOMEBREW_PREFIX}/bin" "${HOMEBREW_PREFIX}/sbin" \
+  && ln -sf ../Homebrew/bin/brew "${HOMEBREW_PREFIX}/bin/brew" \
+  && eval "$("${HOMEBREW_PREFIX}/bin/brew" shellenv)" \
+  && brew update --force --quiet
+
+# The container runs with an arbitrary runtime uid (--user), so the build-time
+# `sandbox` HOME and its installed toolchains must stay writable/usable. Make the
+# whole tree group/world-accessible; this is a throwaway sandbox, not a secret store.
+USER root
+RUN chmod -R a+rwX /home/sandbox \
+  && mkdir -p /workspace \
+  && chmod 0777 /workspace
+
+# HOME stays /home/sandbox so CARGO_HOME/RUSTUP_HOME/HOMEBREW and the rust/uv/brew
+# toolchains resolve exactly as they did at build time, regardless of runtime uid.
+ENV HOME=/home/sandbox
+WORKDIR /workspace
+
+CMD ["sleep", "infinity"]

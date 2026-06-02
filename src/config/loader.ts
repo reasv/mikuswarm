@@ -125,4 +125,13 @@ function validateConfig(config: AppConfig): void {
         "(localhost-only operator default).",
     );
   }
+
+  // Sandbox workspace_mount is a container-absolute path (e.g. /workspace).
+  // A relative value would silently break the bind mount and cwd mapping.
+  const sandbox = config.sandbox;
+  if (sandbox?.enabled && !sandbox.workspace_mount.startsWith("/")) {
+    throw new Error(
+      `Invalid config: sandbox.workspace_mount must be an absolute path (got "${sandbox.workspace_mount}").`,
+    );
+  }
 }

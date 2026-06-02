@@ -1,0 +1,40 @@
+# Manual-ops / production-future artifact. The runtime does NOT use this file to
+# manage the sandbox — the SandboxManager drives the raw `docker` CLI
+# (create/start/inspect/exec) so there is a single lifecycle owner. This compose
+# file documents the equivalent service and is the precursor to a single
+# production compose with both `harness` and `sandbox` services sharing the
+# workspace volume.
+#
+# Bring it up manually with:
+#   MIKUSWARM_UID=$(id -u) MIKUSWARM_GID=$(id -g) \
+#   MIKUSWARM_WORKSPACE_HOST_DIR=$(realpath ./workspaces/miku) \
+#   docker compose -f docker/docker-compose.sandbox.yml up -d
+
+services:
+  sandbox:
+    image: ${MIKUSWARM_SANDBOX_IMAGE:-mikuswarm-sandbox:24.04}
+    container_name: ${MIKUSWARM_SANDBOX_CONTAINER:-mikuswarm-sandbox}
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    user: "${MIKUSWARM_UID}:${MIKUSWARM_GID}"
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ${MIKUSWARM_WORKSPACE_HOST_DIR}:/workspace
+    networks:
+      - mikuswarm-sandbox
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    mem_limit: ${MIKUSWARM_SANDBOX_MEM:-2g}
+    cpus: ${MIKUSWARM_SANDBOX_CPUS:-2}
+    pids_limit: 512
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+
+networks:
+  mikuswarm-sandbox:
+    name: ${MIKUSWARM_SANDBOX_NETWORK:-mikuswarm-sandbox}
+    driver: bridge

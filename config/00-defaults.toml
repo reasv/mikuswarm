@@ -86,6 +86,20 @@ database_path = "./var/mikuswarm.db"
 [workspace]
 root_dir = "./workspaces/miku"
 
+# Docker sandbox (ARCHITECTURE.md §12). Off by default; when enabled, the `bash`
+# tool and `search_files`/ripgrep run inside a long-lived container with the
+# workspace bind-mounted at workspace_mount. Enabling requires the image built
+# (docker/build-sandbox.sh) and Docker reachable, or startup fails fast.
+[sandbox]
+enabled = false
+image = "mikuswarm-sandbox:24.04"
+container_name = "mikuswarm-sandbox"
+network = "mikuswarm-sandbox"
+workspace_mount = "/workspace"
+exec_timeout_ms = 120000      # default per-command timeout (overridable per bash call)
+max_output_bytes = 1048576    # cap on captured stdout/stderr per stream
+stop_on_shutdown = false      # leave the container running across restarts
+
 [timeline]
 # Channel lifecycle: a timeline is inactive until first triggered. On the first
 # trigger the bot backfills recent history before the activating session runs.
