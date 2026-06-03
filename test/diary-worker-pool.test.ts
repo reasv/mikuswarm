@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage, MemoryFileWriter } from "../src/storage/index.js";
-import { DiaryWorkerPool, diaryHeaderRegex, roomIdFromTimelineKey } from "../src/diary/index.js";
+import { DiaryWorkerPool, diaryHeaderRegex } from "../src/diary/index.js";
+import { roomIdFromTimelineKey } from "../src/timeline/index.js";
 import { configureAgentTimezone } from "../src/time/index.js";
 import type { Logger } from "../src/observability/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
@@ -136,7 +137,19 @@ test("roomIdFromTimelineKey extracts the room id, ignoring a thread suffix", () 
   assert.equal(roomIdFromTimelineKey("matrix:acct:room:!abc:server"), "!abc:server");
   assert.equal(roomIdFromTimelineKey("matrix:acct:dm:!abc:server"), "!abc:server");
   assert.equal(roomIdFromTimelineKey("matrix:acct:room:!abc:server:thread:$root"), "!abc:server");
+});
+
+test("roomIdFromTimelineKey returns undefined for malformed keys", () => {
+  // Too few segments.
   assert.equal(roomIdFromTimelineKey("matrix:acct"), undefined);
+  // Unknown kind segment (the stricter regex validates room|dm).
+  assert.equal(roomIdFromTimelineKey("matrix:acct:space:!abc:server"), undefined);
+  // Empty room id.
+  assert.equal(roomIdFromTimelineKey("matrix:acct:room:"), undefined);
+  // Wrong backend prefix.
+  assert.equal(roomIdFromTimelineKey("slack:acct:room:!abc:server"), undefined);
+  // Not a timeline key at all.
+  assert.equal(roomIdFromTimelineKey("not-a-matrix-key"), undefined);
 });
 
 test("a participated range writes a diary entry and marks the summary done", async () => {

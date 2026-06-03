@@ -31,3 +31,18 @@ export class TimelineRouter {
 export function isDmTimeline(timelineKey: string): boolean {
   return timelineKey.includes(":dm:");
 }
+
+/**
+ * Extract the Matrix room id from a timeline key. Keys are shaped
+ * `matrix:<account>:room:<roomId>[:thread:<root>]` or
+ * `matrix:<account>:dm:<roomId>`. A Matrix room id (`!local:server`) itself
+ * contains a colon, so this captures everything between the `room:`/`dm:` marker
+ * and an optional `:thread:` suffix rather than splitting on every colon. The
+ * `room|dm` kind segment is validated, so a malformed key returns `undefined`
+ * (callers fall back / log rather than surfacing a garbage room id).
+ */
+export function roomIdFromTimelineKey(timelineKey: string): string | undefined {
+  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
+  const roomId = match?.[1];
+  return roomId && roomId.length > 0 ? roomId : undefined;
+}

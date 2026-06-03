@@ -6,6 +6,7 @@ import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createDiaryTool } from "../tools/index.js";
 import { renderRichMessage } from "../context/index.js";
+import { roomIdFromTimelineKey } from "../timeline/index.js";
 import { attachSessionCapture } from "../agent/session-capture.js";
 import { agentDateStamp } from "../time/index.js";
 import { buildDiaryHeader, draftBeginsWithHeader } from "./header.js";
@@ -378,21 +379,6 @@ export class DiaryWorkerPool {
     }
     return roomId;
   }
-}
-
-/**
- * Parse the Matrix room id out of a timeline key
- * (`matrix:{account}:{room|dm}:{roomId}[:thread:{root}]`). The room id itself can
- * contain colons (`!abc:server`), so we take everything after the 3rd segment up to
- * an optional `:thread:` suffix.
- */
-export function roomIdFromTimelineKey(timelineKey: string): string | undefined {
-  const parts = timelineKey.split(":");
-  if (parts.length < 4) return undefined;
-  const afterKind = parts.slice(3).join(":");
-  const threadIdx = afterKind.indexOf(":thread:");
-  const roomId = threadIdx >= 0 ? afterKind.slice(0, threadIdx) : afterKind;
-  return roomId.length > 0 ? roomId : undefined;
 }
 
 function delay(ms: number): Promise<void> {

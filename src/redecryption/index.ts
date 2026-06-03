@@ -1,6 +1,7 @@
 import type { Logger } from "../observability/index.js";
 import type { TimelineStore } from "../timeline/index.js";
-import { applyEditToCanonical, editStatus, needsEnrichment } from "../timeline/index.js";
+import { applyEditToCanonical, editStatus, needsEnrichment, roomIdFromTimelineKey } from "../timeline/index.js";
+export { roomIdFromTimelineKey } from "../timeline/index.js";
 import type { CanonicalChatEvent, TimelineState } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { mediaToAttachment } from "../matrix/inbound.js";
@@ -528,17 +529,4 @@ function threadTimelineKeyFrom(timelineKey: string, threadRoot: string): string 
   const base = match?.[1];
   if (!base) return undefined;
   return `${base}:thread:${threadRoot}`;
-}
-
-/**
- * Extract the Matrix room id from a timeline key. Keys are shaped
- * `matrix:<account>:room:<roomId>[:thread:<root>]` or
- * `matrix:<account>:dm:<roomId>`. A Matrix room id (`!local:server`) itself
- * contains a colon, so this captures everything between the `room:`/`dm:` marker
- * and an optional `:thread:` suffix rather than splitting on every colon.
- */
-export function roomIdFromTimelineKey(timelineKey: string): string | undefined {
-  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
-  const roomId = match?.[1];
-  return roomId && roomId.length > 0 ? roomId : undefined;
 }

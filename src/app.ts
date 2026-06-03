@@ -11,6 +11,7 @@ import {
   AssistantEchoResolver,
   editStatus,
   needsEnrichment,
+  roomIdFromTimelineKey,
   TimelineRouter,
   TimelineStore,
   TriggerCoordinator,
@@ -56,7 +57,7 @@ import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModalit
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
-import { DiaryWorkerPool, roomIdFromTimelineKey } from "./diary/index.js";
+import { DiaryWorkerPool } from "./diary/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";

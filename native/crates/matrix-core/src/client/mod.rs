@@ -28,7 +28,8 @@ use matrix_sdk::{
         EventId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, RoomAliasId, RoomId,
         RoomOrAliasId, UInt, UserId,
     },
-    Client, Error as MatrixSdkError, HttpError, RefreshTokenError, Room, RoomState, SessionTokens,
+    Client, Error as MatrixSdkError, HttpError, RefreshTokenError, Room, RoomDisplayName, RoomState,
+    SessionTokens,
 };
 use serde_json::{json, Value};
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -1015,11 +1016,7 @@ pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> Mat
 
     Ok(MatrixChannelInfo {
         room_id: room.room_id().to_string(),
-        display_name: room
-            .display_name()
-            .await
-            .ok()
-            .map(|value| value.to_string()),
+        display_name: room.display_name().await.ok().and_then(display_name_or_none),
         canonical_alias: room.canonical_alias().map(|value| value.to_string()),
         alt_aliases: room
             .alt_aliases()
@@ -1074,9 +1071,26 @@ async fn resolve_parent_space_name(room: &Room) -> Option<String> {
 
     let parent_room = best?.2;
     if let Ok(name) = parent_room.display_name().await {
-        return Some(name.to_string());
+        if let Some(name) = display_name_or_none(name) {
+            return Some(name);
+        }
     }
     parent_room.canonical_alias().map(|alias| alias.to_string())
+}
+
+/// Convert a resolved [`RoomDisplayName`] into an owned name, dropping the
+/// placeholder variants that matrix-sdk synthesizes for a room/space with no
+/// name, no canonical alias, and no resolvable heroes. `Empty` renders as the
+/// literal `"Empty Room"` and `EmptyWas` as `"Empty Room (was …)"` — neither is a
+/// real name, so we treat both as "no name" and return `None`, letting callers
+/// fall through to a canonical alias / room id instead of surfacing the
+/// placeholder. Matching on the variant (not the rendered string) keeps this
+/// robust against localization / wording changes.
+fn display_name_or_none(name: RoomDisplayName) -> Option<String> {
+    match name {
+        RoomDisplayName::Empty | RoomDisplayName::EmptyWas(_) => None,
+        other => Some(other.to_string()),
+    }
 }
 
 pub(crate) async fn send_message_internal(
