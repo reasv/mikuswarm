@@ -409,6 +409,33 @@ export class AgentSessionFactory {
 }
 
 /**
+ * Throw if a worker-driven run settled into an aborted/errored state instead of a
+ * clean completion.
+ *
+ * pi-agent-core's `runWithLifecycle` CATCHES a run failure (a cap-driven
+ * `agent.abort()` or a stream error) and RESOLVES the run promise — it synthesizes
+ * a final assistant message with `stopReason: "aborted"` (abort) or `"error"`
+ * (stream error) and records its text in `AgentState.errorMessage`
+ * (`agent.js` `handleRunFailure`). So `agent.prompt()`/`waitForIdle()` resolve
+ * WITHOUT throwing, and a worker that only catches thrown errors would treat a
+ * runaway (cap-aborted) or errored run as a success and commit its partial draft.
+ *
+ * `AgentState.errorMessage` is the documented seam: "Error message from the most
+ * recent failed or aborted assistant turn, if any" (`types.d.ts`). It is cleared
+ * (`undefined`) at the start of every run and only set on a failed/aborted turn,
+ * so a clean normal completion — including the legitimate empty-draft "nothing to
+ * record" finalize — leaves it unset and does NOT throw. Call this immediately
+ * after `waitForIdle()`, inside the worker's existing `try` block, so the throw
+ * flows into the established failure → retry path (§8c).
+ */
+export function assertRunSettledCleanly(agent: { state: { errorMessage?: string } }): void {
+  const errorMessage = agent.state.errorMessage;
+  if (errorMessage && errorMessage.length > 0) {
+    throw new Error(`agent run did not complete cleanly: ${errorMessage}`);
+  }
+}
+
+/**
  * The single terminal-turn predicate: is this message the trigger-dependent final
  * user turn — a `triggerGroup` (chat) or `satellite` (summarization cutoff)?
  *

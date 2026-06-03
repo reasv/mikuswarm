@@ -1,6 +1,6 @@
 import { nanoid } from "nanoid";
 import type { Storage, DiaryJob, MemoryFileWriter } from "../storage/index.js";
-import type { AgentSessionFactory, AgentSessionRecord } from "../agent/index.js";
+import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { DiaryConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
@@ -263,6 +263,14 @@ export class DiaryWorkerPool {
       try {
         await agent.prompt(kickoff);
         await agent.waitForIdle();
+        // pi-agent-core resolves the run promise even when the cap-driven abort
+        // (§8c) or a stream error fires — it synthesizes a final message with
+        // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
+        // throwing. Surface that as a throw HERE so a runaway/errored run routes to
+        // the failure → retry path below instead of committing a partial draft. A
+        // clean completion (including the legitimate empty-draft skip) leaves
+        // `errorMessage` unset and does not throw.
+        assertRunSettledCleanly(agent);
       } catch (err) {
         try {
           await capture.flushNow();
@@ -360,7 +368,15 @@ export class DiaryWorkerPool {
       }
       if (attempt < 3) await delay(200 * attempt);
     }
-    return roomIdFromTimelineKey(timelineKey) ?? timelineKey;
+    const roomId = roomIdFromTimelineKey(timelineKey);
+    if (roomId === undefined) {
+      // Double fallback: label resolution failed AND the timeline key didn't
+      // parse to a room id, so the header gets the whole (unparseable) key. Still
+      // regex-valid, but surface it so the malformed key is visible (#5).
+      this.options.logger.warn("diary_channel_label_unparseable_key", { timelineKey });
+      return timelineKey;
+    }
+    return roomId;
   }
 }
 

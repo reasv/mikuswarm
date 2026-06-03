@@ -32,7 +32,15 @@ function event(id: string, timestamp: number, role: "user" | "assistant" = "user
   };
 }
 
-type Behavior = (tool: AgentTool, kickoff: string) => Promise<void>;
+/** Mutable agent state the behavior can poke (e.g. set `errorMessage` to mimic a
+ * cap-driven abort / stream error, which pi-agent-core surfaces via state, not a
+ * throw — see assertRunSettledCleanly). */
+interface FakeAgentState {
+  messages: unknown[];
+  errorMessage?: string;
+}
+
+type Behavior = (tool: AgentTool, kickoff: string, state: FakeAgentState) => Promise<void>;
 
 /** A fake factory that drives the diary tool from the agent's prompt(kickoff). */
 function makeFakeFactory(behavior: Behavior, createdRef?: { created: boolean }) {
@@ -44,12 +52,13 @@ function makeFakeFactory(behavior: Behavior, createdRef?: { created: boolean }) 
     create: async (_session: unknown, tools: AgentTool[]) => {
       if (createdRef) createdRef.created = true;
       const tool = tools[0]!;
+      const state: FakeAgentState = { messages: [] };
       return {
         agent: {
-          prompt: async (kickoff: string) => behavior(tool, kickoff),
+          prompt: async (kickoff: string) => behavior(tool, kickoff, state),
           waitForIdle: async () => {},
           subscribe: () => () => {},
-          state: { messages: [] },
+          state,
           abort: () => {},
         },
         snapshot: undefined,
@@ -57,6 +66,10 @@ function makeFakeFactory(behavior: Behavior, createdRef?: { created: boolean }) 
       };
     },
   } as any;
+}
+
+function diaryAttempts(storage: Storage, id: string): number {
+  return (storage.read((db) => db.prepare(`select diary_attempts from summaries where id = ?`).get(id)) as { diary_attempts: number }).diary_attempts;
 }
 
 async function withFixture(
@@ -106,12 +119,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void
 function makePool(opts: {
   storage: Storage; memoryWriter: MemoryFileWriter; workspaceRoot: string;
   factory: any; resolveChannelLabel?: (tk: string) => Promise<string>;
+  maxRetries?: number;
 }): DiaryWorkerPool {
   return new DiaryWorkerPool({
     storage: opts.storage,
     factory: opts.factory,
     memoryWriter: opts.memoryWriter,
-    config: { worker_count: 1, max_retries: 0, per_session_budget_tokens: 1000 },
+    config: { worker_count: 1, max_retries: opts.maxRetries ?? 0, per_session_budget_tokens: 1000 },
     workspaceRoot: opts.workspaceRoot,
     resolveChannelLabel: opts.resolveChannelLabel ?? (async () => "Test Room (Earendil)"),
     logger: silentLogger,
@@ -223,5 +237,139 @@ test("channel-label resolution failure falls back to the room id in the header",
     const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
     // roomIdFromTimelineKey("matrix:test:room:!room:server") === "!room:server".
     assert.match(content, /· !room:server\n/);
+  });
+});
+
+// ── Issue #1: cap-driven abort / stream error must NOT commit as success ──────
+
+test("a cap-aborted run (errorMessage set, no throw) routes to failure/retry, not a commit", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+
+    // Mimic pi-agent-core's runaway termination: it CATCHES the cap-driven
+    // agent.abort() and RESOLVES the run promise, synthesizing a final message with
+    // stopReason "aborted" and setting state.errorMessage — prompt()/waitForIdle()
+    // do NOT throw. The agent even produced a valid (partial) draft before the cap.
+    // Pre-fix, the worker committed that draft as `done`; post-fix it must retry to
+    // exhaustion and end `failed`.
+    const factory = makeFakeFactory(async (tool, kickoff, state) => {
+      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      await tool.execute("t", { command: "create", file_text: `${header}\npartial runaway content` });
+      state.errorMessage = "Tool-call cap (30) reached; run aborted.";
+    });
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory, maxRetries: 0 });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "failed");
+    await pool.stop();
+
+    // The partial draft must NOT have been laundered onto disk as a diary entry.
+    const files = await readdir(path.join(workspaceRoot, "memory")).catch(() => []);
+    assert.equal(files.length, 0, "an aborted run must not commit its partial draft");
+  });
+});
+
+// ── Issue #9: retry path — attempts persistence, re-queue, stale-reset ────────
+
+test("a run that fails the first N attempts then succeeds ends 'done' with attempts reflecting the retries", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+
+    let calls = 0;
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      calls += 1;
+      if (calls <= 2) throw new Error(`transient failure ${calls}`);
+      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      await tool.execute("t", { command: "create", file_text: `${header}\nrecovered on attempt ${calls}`, finalize: true });
+    });
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory, maxRetries: 2 });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    // Claimed three times (2 failures + 1 success) → diary_attempts persisted = 3.
+    assert.equal(diaryAttempts(storage, "sum1"), 3, "attempts persist+increment across re-claims");
+    const files = await readdir(path.join(workspaceRoot, "memory"));
+    const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
+    assert.match(content, /recovered on attempt 3/);
+  });
+});
+
+test("resetStaleDiary on start() re-claims a stranded 'processing' row, preserving attempts", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+    // Simulate a crash mid-session: row stuck 'processing' with a nonzero attempt
+    // budget already consumed.
+    await storage.write((db) =>
+      db.prepare(`update summaries set diary_status = 'processing', diary_attempts = 2 where id = ?`).run("sum1"),
+    );
+
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      await tool.execute("t", { command: "create", file_text: `${header}\nresumed after crash`, finalize: true });
+    });
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory, maxRetries: 3 });
+    // start() runs resetStaleDiary (processing → pending, attempts preserved).
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    // The reset did NOT refund the budget: prior attempts (2) preserved, then the
+    // re-claim incremented to 3.
+    assert.equal(diaryAttempts(storage, "sum1"), 3, "stale-reset preserves accumulated attempts (no refund)");
+  });
+});
+
+// ── Issue #10: unfinalized commit + revert-then-recover ──────────────────────
+
+test("a created+valid draft WITHOUT finalize is still committed on idle", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+
+    // No `finalize: true` — the worker commits any created, valid, non-empty draft
+    // when the run goes idle.
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      await tool.execute("t", { command: "create", file_text: `${header}\nwrote without finalizing` });
+    });
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    const files = await readdir(path.join(workspaceRoot, "memory"));
+    const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
+    assert.match(content, /wrote without finalizing/);
+  });
+});
+
+test("a rejected over-budget edit that recovers to a valid draft appends the reverted-to-valid content", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+
+    // per_session_budget_tokens is 1000 (makePool default). First write a valid
+    // small draft, then attempt a wildly over-budget insert (reverted via isError),
+    // then finalize on the still-valid reverted content.
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      await tool.execute("t", { command: "create", file_text: `${header}\nvalid recovered entry` });
+      const huge = "x ".repeat(5000); // >> 1000-token budget → rejected + reverted
+      const rejected = await tool.execute("t", { command: "insert", insert_line: 2, new_str: huge });
+      assert.equal((rejected as any).isError, true, "over-budget edit is reported as error and reverted");
+      await tool.execute("t", { command: "view", finalize: true });
+    });
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    const files = await readdir(path.join(workspaceRoot, "memory"));
+    const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
+    assert.match(content, /valid recovered entry/);
+    assert.doesNotMatch(content, /x x x/, "the rejected over-budget content must not be appended");
   });
 });

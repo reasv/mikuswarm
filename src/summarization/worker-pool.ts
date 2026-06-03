@@ -1,6 +1,6 @@
 import { nanoid } from "nanoid";
 import type { Storage, SummarizationJob } from "../storage/index.js";
-import type { AgentSessionFactory, AgentSessionRecord } from "../agent/index.js";
+import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { CanonicalChatEvent } from "../types.js";
@@ -222,6 +222,13 @@ export class SummarizationWorkerPool {
           : syntheticTrigger.body;
         await agent.prompt(kickoff as any);
         await agent.waitForIdle();
+        // pi-agent-core resolves the run promise even when the cap-driven abort
+        // (§8c) or a stream error fires — it synthesizes a final message with
+        // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
+        // throwing. Surface that as a throw HERE so a runaway/errored run routes to
+        // the failure → retry path below (a partial summary is load-bearing for
+        // context reconstruction, so committing one is worse than retrying).
+        assertRunSettledCleanly(agent);
       } catch (err) {
         // The run rejected (possibly before any turn_end). Best-effort flush the
         // current transcript so the discarded summarization session is still
