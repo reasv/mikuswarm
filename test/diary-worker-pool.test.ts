@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage, MemoryFileWriter } from "../src/storage/index.js";
-import { DiaryWorkerPool, diaryHeaderRegex } from "../src/diary/index.js";
+import { DiaryWorkerPool, buildDiaryHeader } from "../src/diary/index.js";
 import { roomIdFromTimelineKey } from "../src/timeline/index.js";
 import { configureAgentTimezone } from "../src/time/index.js";
 import type { Logger } from "../src/observability/index.js";
@@ -14,6 +14,27 @@ import type { CanonicalChatEvent } from "../src/types.js";
 configureAgentTimezone("UTC");
 
 const TK = "matrix:test:room:!room:server";
+
+const DEFAULT_ROOM_LABEL = "Test Room (Earendil)";
+
+/**
+ * Build the diary header EXACTLY as the worker does (same `buildDiaryHeader` call,
+ * timezone is the configured "UTC"). Tests assert the kickoff CONTAINS this known
+ * header rather than re-deriving it via a global regex scan of the kickoff — the
+ * scan is order-fragile because the kickoff embeds prior diary entries (which also
+ * begin with real `## …` headers) before the dictated one (#14).
+ */
+function expectedHeader(opts: {
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  room?: string;
+}): string {
+  return buildDiaryHeader({
+    earliestTimestamp: opts.earliestTimestamp,
+    latestTimestamp: opts.latestTimestamp,
+    room: opts.room ?? DEFAULT_ROOM_LABEL,
+  });
+}
 
 const silentLogger: Logger = {
   debug() {}, info() {}, warn() {}, error() {},
@@ -156,9 +177,9 @@ test("a participated range writes a diary entry and marks the summary done", asy
   await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
     await insertLevel1(storage, "sum1", [event("u0", 1000), event("a0", 2000, "assistant")]);
 
+    const header = expectedHeader({ earliestTimestamp: 1000, latestTimestamp: 2000 });
     const factory = makeFakeFactory(async (tool, kickoff) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0];
-      assert.ok(header, "kickoff must carry the dictated header");
+      assert.ok(kickoff.includes(header), "kickoff must carry the dictated header");
       await tool.execute("t", { command: "create", file_text: `${header}\nI helped out today.`, finalize: true });
     });
     const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
@@ -233,8 +254,11 @@ test("channel-label resolution failure falls back to the room id in the header",
   await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
     await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
 
+    // resolveChannelLabel throws → the worker falls back to the room id parsed from
+    // the timeline key, so the dictated header carries "!room:server" as the room.
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000, room: "!room:server" });
     const factory = makeFakeFactory(async (tool, kickoff) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+      assert.ok(kickoff.includes(header), "kickoff must carry the room-id-fallback header");
       await tool.execute("t", { command: "create", file_text: `${header}\nfallback test`, finalize: true });
     });
     const pool = makePool({
@@ -265,8 +289,8 @@ test("a cap-aborted run (errorMessage set, no throw) routes to failure/retry, no
     // do NOT throw. The agent even produced a valid (partial) draft before the cap.
     // Pre-fix, the worker committed that draft as `done`; post-fix it must retry to
     // exhaustion and end `failed`.
-    const factory = makeFakeFactory(async (tool, kickoff, state) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
+    const factory = makeFakeFactory(async (tool, _kickoff, state) => {
       await tool.execute("t", { command: "create", file_text: `${header}\npartial runaway content` });
       state.errorMessage = "Tool-call cap (30) reached; run aborted.";
     });
@@ -288,11 +312,11 @@ test("a run that fails the first N attempts then succeeds ends 'done' with attem
   await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
     await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
 
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
     let calls = 0;
-    const factory = makeFakeFactory(async (tool, kickoff) => {
+    const factory = makeFakeFactory(async (tool) => {
       calls += 1;
       if (calls <= 2) throw new Error(`transient failure ${calls}`);
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
       await tool.execute("t", { command: "create", file_text: `${header}\nrecovered on attempt ${calls}`, finalize: true });
     });
     const pool = makePool({ storage, memoryWriter, workspaceRoot, factory, maxRetries: 2 });
@@ -318,8 +342,8 @@ test("resetStaleDiary on start() re-claims a stranded 'processing' row, preservi
       db.prepare(`update summaries set diary_status = 'processing', diary_attempts = 2 where id = ?`).run("sum1"),
     );
 
-    const factory = makeFakeFactory(async (tool, kickoff) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
+    const factory = makeFakeFactory(async (tool) => {
       await tool.execute("t", { command: "create", file_text: `${header}\nresumed after crash`, finalize: true });
     });
     const pool = makePool({ storage, memoryWriter, workspaceRoot, factory, maxRetries: 3 });
@@ -343,8 +367,8 @@ test("a created+valid draft WITHOUT finalize is still committed on idle", async 
 
     // No `finalize: true` — the worker commits any created, valid, non-empty draft
     // when the run goes idle.
-    const factory = makeFakeFactory(async (tool, kickoff) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
+    const factory = makeFakeFactory(async (tool) => {
       await tool.execute("t", { command: "create", file_text: `${header}\nwrote without finalizing` });
     });
     const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
@@ -366,8 +390,8 @@ test("a rejected over-budget edit that recovers to a valid draft appends the rev
     // per_session_budget_tokens is 1000 (makePool default). First write a valid
     // small draft, then attempt a wildly over-budget insert (reverted via isError),
     // then finalize on the still-valid reverted content.
-    const factory = makeFakeFactory(async (tool, kickoff) => {
-      const header = kickoff.match(diaryHeaderRegex())?.[0]!;
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
+    const factory = makeFakeFactory(async (tool) => {
       await tool.execute("t", { command: "create", file_text: `${header}\nvalid recovered entry` });
       const huge = "x ".repeat(5000); // >> 1000-token budget → rejected + reverted
       const rejected = await tool.execute("t", { command: "insert", insert_line: 2, new_str: huge });

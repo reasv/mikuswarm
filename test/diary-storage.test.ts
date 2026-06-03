@@ -167,13 +167,32 @@ test("setDiaryStatus and resetStaleDiary transition rows (attempts preserved)", 
   });
 });
 
-test("the v5->v6 migration adds diary columns to a legacy DB", async () => {
-  // A fresh DB is built directly at v6 by SCHEMA; assert the columns exist and a
-  // level-1 insert queues a diary job (exercises the column + index end to end).
+test("a fresh-schema DB has the diary columns AND the idx_summaries_diary index", async () => {
+  // A fresh DB is built directly at v6 by SCHEMA (no migration runs here). This
+  // asserts the fresh-schema SHAPE: the two diary columns plus the partial index.
+  // The v5->v6 ALTER/migration path is exercised in agent-sessions-storage.test.ts's
+  // "v4 -> v6 migration" tests (which build a synthetic pre-diary DB and run it
+  // through Storage.open).
   await withStorage(async (storage) => {
     const cols = storage.read((db) => db.prepare(`pragma table_info(summaries)`).all()) as Array<{ name: string }>;
     const names = cols.map((c) => c.name);
     assert.ok(names.includes("diary_status"));
     assert.ok(names.includes("diary_attempts"));
+
+    // The partial index backing the diary queue (#12). A partial index still appears
+    // in sqlite_master with type='index'.
+    const indexes = storage.read((db) =>
+      (
+        db
+          .prepare(
+            `select name from sqlite_master where type = 'index' and tbl_name = 'summaries'`,
+          )
+          .all() as Array<{ name: string }>
+      ).map((r) => r.name),
+    );
+    assert.ok(
+      indexes.includes("idx_summaries_diary"),
+      `missing idx_summaries_diary; have: ${indexes.join(", ")}`,
+    );
   });
 });

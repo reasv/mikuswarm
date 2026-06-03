@@ -63,6 +63,69 @@ test("recentMemoryWindow walks back over gaps (sparse files), not calendar days"
   });
 });
 
+test("recentMemoryWindow trims through to the ceiling: drops earliest blocks, keeps the most recent", async () => {
+  await withMemoryDir(async (root) => {
+    // Two day files, each a single big header-delimited block. A low ceiling forces
+    // the trim path THROUGH recentMemoryWindow (not just trimToTokenCeiling directly).
+    const h1 = buildDiaryHeader({ earliestTimestamp: 0, latestTimestamp: 1, room: "A", timezone: "UTC" });
+    const h2 = buildDiaryHeader({ earliestTimestamp: 2, latestTimestamp: 3, room: "B", timezone: "UTC" });
+    const big = "word ".repeat(800);
+    await writeDay(root, "2026-06-01", `${h1}\n${big}\nOLDEST-BODY`);
+    await writeDay(root, "2026-06-03", `${h2}\nNEWEST-BODY`);
+
+    const out = await recentMemoryWindow({
+      workspaceRoot: root,
+      anchorDay: "2026-06-03",
+      ceilingTokens: 50,
+      fileCount: 2,
+    });
+    // The earliest (front-most in text) oversized block is dropped; the newest block survives.
+    assert.ok(out.includes("NEWEST-BODY"), "the most recent block is retained");
+    assert.ok(!out.includes(big.trim()), "the oversized earliest block was dropped to fit the ceiling");
+    assert.ok(!out.includes("OLDEST-BODY"), "the dropped block's body is gone too");
+  });
+});
+
+test("recentMemoryWindow ignores malformed/garbage filenames (DAY_FILE_RE)", async () => {
+  await withMemoryDir(async (root) => {
+    const memory = path.join(root, "memory");
+    // A single valid day file...
+    await writeDay(root, "2026-06-03", "VALID-DAY");
+    // ...alongside files that DAY_FILE_RE must reject.
+    await writeFile(path.join(memory, "2026-6-3.md"), "MALFORMED-SHORT-MONTH\n", "utf8"); // single-digit month/day
+    await writeFile(path.join(memory, "notes.md"), "FREEFORM-NOTES\n", "utf8");
+    await writeFile(path.join(memory, ".2026-06-02.md"), "DOTFILE-PREFIX\n", "utf8"); // leading dot
+    await writeFile(path.join(memory, "2026-06-04.txt"), "WRONG-EXT\n", "utf8"); // not .md
+    await writeFile(path.join(memory, "2026-06-02-extra.md"), "TRAILING-EXTRA\n", "utf8"); // extra suffix
+
+    const out = await recentMemoryWindow({
+      workspaceRoot: root,
+      anchorDay: "2026-06-03",
+      ceilingTokens: 100000,
+      fileCount: 5,
+    });
+    assert.ok(out.includes("VALID-DAY"), "the well-formed day file is included");
+    assert.ok(!out.includes("MALFORMED-SHORT-MONTH"));
+    assert.ok(!out.includes("FREEFORM-NOTES"));
+    assert.ok(!out.includes("DOTFILE-PREFIX"));
+    assert.ok(!out.includes("WRONG-EXT"));
+    assert.ok(!out.includes("TRAILING-EXTRA"));
+  });
+});
+
+test("recentMemoryWindow includes a file whose date EXACTLY equals anchorDay (≤ boundary)", async () => {
+  await withMemoryDir(async (root) => {
+    await writeDay(root, "2026-06-03", "ANCHOR-DAY-BODY");
+    const out = await recentMemoryWindow({
+      workspaceRoot: root,
+      anchorDay: "2026-06-03",
+      ceilingTokens: 100000,
+      fileCount: 2,
+    });
+    assert.ok(out.includes("ANCHOR-DAY-BODY"), "a file dated exactly anchorDay is in the window (≤, not <)");
+  });
+});
+
 test("trimToTokenCeiling drops earliest header-delimited blocks from the front", () => {
   const h1 = buildDiaryHeader({ earliestTimestamp: 0, latestTimestamp: 1, room: "A", timezone: "UTC" });
   const h2 = buildDiaryHeader({ earliestTimestamp: 2, latestTimestamp: 3, room: "B", timezone: "UTC" });

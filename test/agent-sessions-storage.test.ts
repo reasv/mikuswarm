@@ -310,6 +310,37 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
         (db) => db.pragma("user_version", { simple: true }) as number,
       );
       assert.equal(version, LATEST_SCHEMA_VERSION);
+
+      // Issue #13: the synthetic `summaries` fixture above has NO diary columns, so
+      // the v5->v6 ALTER path genuinely ran here. Assert it added both diary columns.
+      const summaryCols = storage.read((db) =>
+        (db.prepare(`pragma table_info(summaries)`).all() as Array<{ name: string }>).map(
+          (c) => c.name,
+        ),
+      );
+      assert.ok(
+        summaryCols.includes("diary_status"),
+        `migration must add diary_status; have: ${summaryCols.join(", ")}`,
+      );
+      assert.ok(
+        summaryCols.includes("diary_attempts"),
+        `migration must add diary_attempts; have: ${summaryCols.join(", ")}`,
+      );
+
+      // Issue #12: the partial diary-queue index must exist after migration too.
+      const summaryIndexes = storage.read((db) =>
+        (
+          db
+            .prepare(
+              `select name from sqlite_master where type = 'index' and tbl_name = 'summaries'`,
+            )
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      );
+      assert.ok(
+        summaryIndexes.includes("idx_summaries_diary"),
+        `migration must create idx_summaries_diary; have: ${summaryIndexes.join(", ")}`,
+      );
     } finally {
       await storage.waitForIdle();
       storage.close();
