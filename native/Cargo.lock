@@ -2190,6 +2190,7 @@ dependencies = [
  "base64",
  "chrono",
  "emojis",
+ "futures-util",
  "matrix-sdk",
  "mime",
  "napi",

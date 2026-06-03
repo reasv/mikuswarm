@@ -190,12 +190,50 @@ summary_wait_timeout_ms = 5000
 max_retries = 2
 label_cache_ttl_ms = 600000
 
+# Diary memory (ARCHITECTURE.md §9c). The agent's durable, first-person journal of
+# its own participation, written automatically from each level-1 summary range and
+# surfaced back into chat sessions (§10a). When disabled the worker simply doesn't
+# drain — level-1 summaries still queue `diary_status='pending'` and flush if it is
+# re-enabled later (no backfill machinery).
+[diary]
+enabled = true
+worker_count = 1                  # like summarization; diary is not latency-critical.
+max_retries = 3                   # a lost diary entry is acceptable, so an extra retry is a cheap hedge.
+per_session_budget_tokens = 1200  # new-section cap = 1/5 of generation_threshold_tokens (6000).
+recency_max_tokens = 6000         # token ceiling for the recent-memory window (§9a/§10a).
+recency_file_count = 2            # N most recent EXISTING day files at/before the anchor (§9a).
+
+[agent.session_types.diary]
+model = "default"
+workspace_files = ["AGENTS.md", "SOUL.md"]
+tools = ["diary_tool"]
+skills = "none"
+max_tool_calls = 30
+max_turns = 15
+session_instruction = """
+You are writing in your own first-person diary. Above you can see, in <your_recent_memory>, your existing recent diary entries (read-only, for continuity), and in <conversation>, a stretch of conversation from {{room}} with timestamps.
+
+Write a NEW diary entry about YOUR OWN part in that conversation: what you said and did, how you reacted, opinions you formed, running bits, things you promised to do. A neutral record of what happened already exists elsewhere — do not recap the room or narrate other people; write only your own thread, in your own voice. Build on your existing entries rather than restating them ("X did Y again", ongoing threads, etc.).
+
+Begin your entry with EXACTLY this header line, character for character:
+{{header}}
+
+Then write your entry below it. Markdown is fine; be concise.
+
+Use the diary_tool: `create` to start (the very first line MUST be the header above), then `str_replace`/`insert` to revise, then set `finalize: true` on your final tool call (on ALL tools if your final batch has several). If there is genuinely nothing about your own participation worth keeping, call diary_tool with command `view` and `finalize: true` on the empty draft to finish without writing anything.
+"""
+
 [agent.session_types.summarize]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
 tools = ["summary_tool"]
 skills = "none"
+# Runaway loop-breakers (NOT a wall-clock timeout): high enough to never bite a
+# healthy run, low enough to break a degenerate loop. Hitting either aborts the
+# run → the pool's catch → failure → retry path.
+max_tool_calls = 30
+max_turns = 15
 session_instruction = """
 You are performing a summarization task. Summarize the chat messages visible at the end of your context — everything from the latest previous summary (or the beginning, if none) to the most recent message shown.
 
@@ -216,6 +254,8 @@ workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
 tools = ["summary_tool"]
 skills = "none"
+max_tool_calls = 30
+max_turns = 15
 session_instruction = """
 You are condensing several lower-level summaries into a single higher-level summary. The summaries to condense are shown at the end of your context, in chronological order.
 

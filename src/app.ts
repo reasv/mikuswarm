@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger, createObservabilityServer, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
-import { Storage } from "./storage/index.js";
+import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
   ActivationCoordinator,
   applyEditToCanonical,
@@ -56,6 +56,7 @@ import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModalit
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
+import { DiaryWorkerPool, roomIdFromTimelineKey } from "./diary/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
@@ -77,6 +78,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const sessions = new SessionManager({ storage, logger });
   const workspaceRoot = config.workspace.root_dir;
   await mkdir(workspaceRoot, { recursive: true });
+
+  // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
+  // diary worker's appends and `write_memory`'s edits serialize through it so a
+  // concurrent read-modify-write can't corrupt a day file.
+  const memoryWriter = new MemoryFileWriter(workspaceRoot);
 
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
@@ -286,6 +292,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           summarizationPool!.notifyNewWork();
+          // A completed level-1 summary just queued a diary job (diary_status =
+          // 'pending'); wake the diary pool so it doesn't wait for its next poll.
+          diaryPool?.notifyNewWork();
         },
         onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
         logger: logger.child("summarization"),
@@ -295,6 +304,43 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (summarizationPool) {
     contextBuilder.onJobEnqueued = () => summarizationPool.notifyNewWork();
   }
+
+  // Diary worker pool (ARCHITECTURE.md §9c). Same fail-fast validation as
+  // summarization: a misconfigured diary session type must not silently fall back.
+  const diaryEnabled = config.diary?.enabled !== false;
+  if (diaryEnabled) {
+    const sessionType = factory.resolveSessionType("diary");
+    if (!sessionType) {
+      throw new Error(`diary enabled but session type "diary" is not configured (and no "default" fallback exists)`);
+    }
+    const modelKey = sessionType.model ?? "default";
+    if (!config.models[modelKey]) {
+      throw new Error(`diary session type "diary" references model "${modelKey}" which is not in config.models`);
+    }
+  }
+
+  const diaryPool = diaryEnabled
+    ? new DiaryWorkerPool({
+        storage,
+        factory,
+        memoryWriter,
+        config: config.diary ?? {},
+        workspaceRoot,
+        // The diary header needs a human room label. Map the (per-room) timeline key
+        // to its account + room id and ask that account's Matrix client. The worker
+        // retries this and falls back to the room id, so it never blocks a job.
+        resolveChannelLabel: async (timelineKey) => {
+          const accountId = timelineKey.split(":")[1];
+          const roomId = roomIdFromTimelineKey(timelineKey);
+          if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
+          const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+          return client.channelLabel({ roomId });
+        },
+        onComplete: (summaryId) => logger.info("diary_job_complete", { summaryId }),
+        onError: (summaryId, error) => logger.error("diary_failed", { summaryId, error: error.message }),
+        logger: logger.child("diary"),
+      })
+    : null;
 
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
 
@@ -675,7 +721,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
       ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
-      createWriteMemoryTool({ workspaceRoot }),
+      createWriteMemoryTool({ workspaceRoot, memoryWriter }),
       createDanbooruTool({
         workspaceRoot,
         downloadSizeLimit,
@@ -890,6 +936,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   await enrichmentPool.start();
   await captionPool.start();
   if (summarizationPool) await summarizationPool.start();
+  if (diaryPool) await diaryPool.start();
   redecryptionSweeper.start();
 
   if (retentionDays > 0) {
@@ -929,6 +976,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await provider.stop();
         triggerCoordinator.clear();
         await captionPool.stop();
+        if (diaryPool) await diaryPool.stop();
         if (summarizationPool) await summarizationPool.stop();
         await enrichmentPool.stop();
         await mcpPool.stop();

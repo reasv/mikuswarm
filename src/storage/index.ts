@@ -15,6 +15,8 @@ export {
   type SummarizationJob,
   type SummarizationJobStatus,
   type SummarizationJobInsert,
+  type DiaryStatus,
+  type DiaryJob,
   type AgentSessionStatus,
   type AgentSessionInsert,
   type AgentSessionRow,
@@ -22,4 +24,5 @@ export {
   type SummaryLineage,
   type TimelineCursor,
 } from "./database.js";
+export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

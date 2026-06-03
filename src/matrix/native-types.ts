@@ -286,6 +286,11 @@ export type MatrixChannelInfo = {
   joined: boolean;
   isDirect: boolean;
   memberCount?: number;
+  // Display name (or canonical alias) of the room's single legitimate parent
+  // space, when one exists (ARCHITECTURE.md §9c). Used to build the diary header's
+  // `<ROOM>` label as `Room Name (Space Name)`. Absent when the room has no
+  // spec-legitimate, name-resolvable parent space.
+  parentSpaceName?: string;
 };
 
 export type MatrixUploadMediaThumbnail = {

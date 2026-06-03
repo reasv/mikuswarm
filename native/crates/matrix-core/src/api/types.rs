@@ -391,6 +391,11 @@ pub struct MatrixChannelInfo {
     pub joined: bool,
     pub is_direct: bool,
     pub member_count: Option<u64>,
+    /// Display name (or canonical alias) of the room's single legitimate parent
+    /// space, when one exists. Used to build the diary header's `<ROOM>` label
+    /// as `Room Name (Space Name)`. `None` when the room advertises no
+    /// spec-legitimate, name-resolvable parent space.
+    pub parent_space_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

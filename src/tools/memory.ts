@@ -1,14 +1,22 @@
-import { mkdir, stat, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { mkdir } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { runRipgrep, runTextEditorCommand, type TextEditorArgs } from "./file.js";
-import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
+import { runRipgrep, type TextEditorArgs } from "./file.js";
+import { resolveWorkspacePath } from "./workspace.js";
 import { agentDateStamp } from "../time/index.js";
+import type { MemoryFileWriter } from "../storage/memory-writer.js";
 
 export interface MemoryToolContext {
   workspaceRoot: string;
   now?: Date;
+}
+
+export interface WriteMemoryToolContext extends MemoryToolContext {
+  /**
+   * Single-writer FIFO for memory-file mutations (ARCHITECTURE.md §9b). All
+   * `write_memory` edits route through it so they serialize with diary appends.
+   */
+  memoryWriter: MemoryFileWriter;
 }
 
 export function createSearchMemoryTool(context: MemoryToolContext): AgentTool {
@@ -48,7 +56,7 @@ export function createSearchMemoryTool(context: MemoryToolContext): AgentTool {
   };
 }
 
-export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
+export function createWriteMemoryTool(context: WriteMemoryToolContext): AgentTool {
   return {
     name: "write_memory",
     label: "Daily memory editor",
@@ -67,8 +75,9 @@ export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
       max_characters: Type.Optional(Type.Number({ minimum: 1, maximum: 500_000 })),
     }),
     execute: async (_toolCallId, params) => {
-      const memoryPath = await ensureDailyMemoryFile(context.workspaceRoot, context.now ?? new Date());
-      const relativePath = workspaceRelative(context.workspaceRoot, memoryPath);
+      const date = agentDateStamp(context.now ?? new Date());
+      const memoryPath = await context.memoryWriter.ensureDailyFile(date);
+      const relativePath = context.memoryWriter.relative(memoryPath);
       const args = params as {
         command: "view" | "str_replace" | "insert";
         view_range?: [number, number];
@@ -78,7 +87,7 @@ export function createWriteMemoryTool(context: MemoryToolContext): AgentTool {
         insert_text?: string;
         max_characters?: number;
       };
-      const result = await runTextEditorCommand(context.workspaceRoot, memoryEditorArgs(relativePath, args));
+      const result = await context.memoryWriter.editorCommand(memoryEditorArgs(relativePath, args));
       return {
         content: [{ type: "text", text: result.text }],
         details: { ...result.details, memoryPath: relativePath },
@@ -127,17 +136,4 @@ async function ensureMemoryDirectory(workspaceRoot: string): Promise<string> {
   const memoryDir = resolveWorkspacePath(workspaceRoot, "memory");
   await mkdir(memoryDir, { recursive: true });
   return memoryDir;
-}
-
-async function ensureDailyMemoryFile(workspaceRoot: string, now: Date): Promise<string> {
-  const date = agentDateStamp(now);
-  const memoryDir = await ensureMemoryDirectory(workspaceRoot);
-  const memoryPath = path.join(memoryDir, `${date}.md`);
-  try {
-    await stat(memoryPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await writeFile(memoryPath, `# ${date} Daily Memory\n`, "utf8");
-  }
-  return memoryPath;
 }

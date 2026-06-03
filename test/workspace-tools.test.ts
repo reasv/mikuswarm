@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import sharp from "sharp";
 import { createSearchMemoryTool, createWriteMemoryTool } from "../src/tools/memory.js";
+import { MemoryFileWriter } from "../src/storage/memory-writer.js";
 import { createTextEditorTool, runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
 import { createReadImageTool } from "../src/tools/read-image.js";
 
@@ -128,6 +129,7 @@ test("daily memory editor is forced to memory/YYYY-MM-DD.md and memory search us
   await withWorkspace(async (workspace) => {
     const editor = createWriteMemoryTool({
       workspaceRoot: workspace,
+      memoryWriter: new MemoryFileWriter(workspace),
       now: new Date("2026-05-22T12:00:00.000Z"),
     });
     assert.equal(editor.name, "write_memory");

@@ -11,6 +11,7 @@ anyhow = "1.0.98"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["clock", "serde"] }
 emojis = "0.8.0"
+futures-util = "0.3.32"
 matrix-sdk = { version = "0.16.0", default-features = false, features = ["bundled-sqlite", "e2e-encryption", "sqlite", "rustls-tls"] }
 mime = "0.3.17"
 napi = { version = "2.16.17", default-features = false, features = ["napi8", "tokio_rt"] }

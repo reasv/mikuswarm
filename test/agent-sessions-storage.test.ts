@@ -222,8 +222,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 5", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 5);
+test("LATEST_SCHEMA_VERSION is 6", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 6);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -263,6 +263,27 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
          updated_at integer not null,
          is_undecryptable integer generated always as
            (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
+       );`,
+    );
+    // A real v1+ DB always has `summaries` (base schema since v1); the v5->v6
+    // migration ALTERs it, so the synthetic fixture must include it too.
+    legacy.exec(
+      `create table summaries (
+         id text primary key,
+         timeline_key text not null,
+         level integer not null,
+         content text not null,
+         earliest_timestamp integer not null,
+         latest_timestamp integer not null,
+         latest_event_id text not null,
+         event_count integer not null,
+         token_count integer not null,
+         model_id text,
+         status text not null default 'complete'
+           check(status in ('complete', 'truncated', 'superseded')),
+         backfill_job_id text,
+         generated_at integer not null,
+         created_at integer not null
        );`,
     );
     legacy.pragma("user_version = 4");
@@ -525,6 +546,27 @@ test("both agent_sessions indexes exist after a v4 -> v5 migration", async () =>
          updated_at integer not null,
          is_undecryptable integer generated always as
            (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
+       );`,
+    );
+    // A real v1+ DB always has `summaries` (base schema since v1); the v5->v6
+    // migration ALTERs it, so the synthetic fixture must include it too.
+    legacy.exec(
+      `create table summaries (
+         id text primary key,
+         timeline_key text not null,
+         level integer not null,
+         content text not null,
+         earliest_timestamp integer not null,
+         latest_timestamp integer not null,
+         latest_event_id text not null,
+         event_count integer not null,
+         token_count integer not null,
+         model_id text,
+         status text not null default 'complete'
+           check(status in ('complete', 'truncated', 'superseded')),
+         backfill_job_id text,
+         generated_at integer not null,
+         created_at integer not null
        );`,
     );
     legacy.pragma("user_version = 4");

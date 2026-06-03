@@ -160,6 +160,24 @@ export interface SummarizationJob {
   updatedAt: number;
 }
 
+/** Diary queue state on a level-1 summary row (ARCHITECTURE.md §9c). */
+export type DiaryStatus = "pending" | "processing" | "done" | "skipped" | "failed";
+
+/**
+ * A claimed diary job: the level-1 summary whose participation range the diary
+ * session writes about. Carries just what the worker needs — the lineage events
+ * are loaded separately via {@link Storage.getSummaryLineage}.
+ */
+export interface DiaryJob {
+  summaryId: string;
+  timelineKey: string;
+  level: number;
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  /** Persisted attempt count, post-increment at claim time. */
+  attempts: number;
+}
+
 /** Sort key for events/summaries: (timestamp, received_at, id) ascending. */
 export interface TimelineCursor {
   timestamp: number;
@@ -1924,15 +1942,21 @@ export class Storage {
         throw new Error("Level 2+ summary must have parentIds");
       }
       const now = Date.now();
+      // Diary queue (ARCHITECTURE.md §9c): every LEVEL-1 summary gets queued for a
+      // diary entry, unconditionally (NOT gated on [diary].enabled — when the
+      // feature is off the pool simply doesn't drain, so rows accumulate as
+      // 'pending' and flush when it's turned on). Level 2+ summaries get NULL: the
+      // diary is written from raw participation, never from condensed summaries.
+      const diaryStatus = insert.level === 1 ? "pending" : null;
       db.prepare(
         `insert into summaries (
           id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
           latest_event_id, event_count, token_count, model_id, status,
-          backfill_job_id, generated_at, created_at
+          backfill_job_id, generated_at, created_at, diary_status, diary_attempts
         ) values (
           @id, @timelineKey, @level, @content, @earliestTimestamp, @latestTimestamp,
           @latestEventId, @eventCount, @tokenCount, @modelId, @status,
-          null, @generatedAt, @createdAt
+          null, @generatedAt, @createdAt, @diaryStatus, 0
         )`,
       ).run({
         id: insert.id,
@@ -1948,6 +1972,7 @@ export class Storage {
         status: insert.status,
         generatedAt: insert.generatedAt,
         createdAt: now,
+        diaryStatus,
       });
 
       if (insert.eventIds && insert.eventIds.length > 0) {
@@ -2106,6 +2131,81 @@ export class Storage {
            where status = 'processing'`,
         )
         .run(Date.now());
+      return result.changes;
+    });
+  }
+
+  // ── Diary queue (ARCHITECTURE.md §9c) ─────────────────────────────
+  //
+  // The `diary_status` column on level-1 summary rows IS the queue — identical
+  // to the enrichment_status / caption_status / summarization_jobs.status idiom.
+  // No separate job/queue table. Only 'pending' rows are ever claimed → the DB
+  // is the sole idempotency authority (correctness never depends on file state).
+
+  /**
+   * Claim the oldest pending diary job via CAS (pending → processing). The SAME
+   * transaction increments+persists `diary_attempts` (first claim => attempts =
+   * 1), so a crash un-sticks the row (via {@link resetStaleDiary}) without
+   * refunding its retry budget. Returns the claimed job (post-update) or
+   * undefined.
+   */
+  claimNextDiaryJob(): Promise<DiaryJob | undefined> {
+    return this.readAndWrite((db) => {
+      const row = db
+        .prepare(
+          `select id, timeline_key, level, earliest_timestamp, latest_timestamp, diary_attempts
+           from summaries
+           where level = 1 and diary_status = 'pending'
+           order by latest_timestamp asc
+           limit 1`,
+        )
+        .get() as
+        | {
+            id: string;
+            timeline_key: string;
+            level: number;
+            earliest_timestamp: number;
+            latest_timestamp: number;
+            diary_attempts: number;
+          }
+        | undefined;
+      if (!row) return undefined;
+      const result = db
+        .prepare(
+          `update summaries
+           set diary_status = 'processing', diary_attempts = diary_attempts + 1
+           where id = ? and diary_status = 'pending'`,
+        )
+        .run(row.id);
+      if (result.changes === 0) return undefined;
+      return {
+        summaryId: row.id,
+        timelineKey: row.timeline_key,
+        level: row.level,
+        earliestTimestamp: row.earliest_timestamp,
+        latestTimestamp: row.latest_timestamp,
+        attempts: row.diary_attempts + 1,
+      };
+    });
+  }
+
+  /** Set a level-1 summary's diary status (done / skipped / failed / pending-retry). */
+  setDiaryStatus(summaryId: string, status: DiaryStatus): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`update summaries set diary_status = ? where id = ?`).run(status, summaryId);
+    });
+  }
+
+  /**
+   * Reset stale 'processing' diary claims to 'pending' on startup (attempts left
+   * as-is, so a crash doesn't refund the retry budget). Mirrors
+   * resetStaleEnrichment / resetStaleCaptions / resetStaleSummarizationJobs.
+   */
+  resetStaleDiary(): Promise<number> {
+    return this.write((db) => {
+      const result = db
+        .prepare(`update summaries set diary_status = 'pending' where diary_status = 'processing'`)
+        .run();
       return result.changes;
     });
   }
@@ -2630,7 +2730,15 @@ create table if not exists summaries (
     check(status in ('complete', 'truncated', 'superseded')),
   backfill_job_id text,
   generated_at integer not null,
-  created_at integer not null
+  created_at integer not null,
+  -- Diary queue (ARCHITECTURE.md §9c). Set to 'pending' on every LEVEL-1 summary
+  -- insert (unconditionally, regardless of [diary].enabled); NULL for level 2+.
+  -- The DiaryWorkerPool drains 'pending' rows, mirroring the
+  -- enrichment_status/caption_status/summarization_jobs.status idiom. NULL passes
+  -- the CHECK (level 2+ never gets a diary entry).
+  diary_status text
+    check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed')),
+  diary_attempts integer not null default 0
 );
 
 create index if not exists idx_summaries_timeline
@@ -2638,6 +2746,11 @@ create index if not exists idx_summaries_timeline
 
 create index if not exists idx_summaries_level
   on summaries(timeline_key, level, earliest_timestamp);
+
+-- Diary claim path: oldest pending level-1 summary first.
+create index if not exists idx_summaries_diary
+  on summaries(diary_status, latest_timestamp)
+  where diary_status in ('pending', 'processing');
 
 create table if not exists summary_events (
   summary_id text not null references summaries(id) on delete cascade,
@@ -2749,7 +2862,7 @@ create index if not exists idx_agent_sessions_status
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 5;
+export const LATEST_SCHEMA_VERSION = 6;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2842,6 +2955,25 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          on agent_sessions(timeline_key, created_at desc);
        create index if not exists idx_agent_sessions_status
          on agent_sessions(status, updated_at desc);`,
+    );
+  },
+  // index 5 (v5 -> v6): add the diary queue columns to `summaries` — `diary_status`
+  // (the per-level-1 diary queue: pending/processing/done/skipped/failed, NULL for
+  // level 2+) and `diary_attempts` (claim-time retry counter, mirroring
+  // summarization_jobs.attempts) — plus the claim index (ARCHITECTURE.md §9c). The
+  // ADD COLUMNs are nullable / NOT NULL-with-default so existing rows backfill
+  // cleanly (diary_status → NULL = "no diary queued"; diary_attempts → 0). Fresh
+  // DBs get this directly from SCHEMA above and never run this step.
+  (db) => {
+    db.exec(
+      `alter table summaries
+         add column diary_status text
+           check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed'));
+       alter table summaries
+         add column diary_attempts integer not null default 0;
+       create index if not exists idx_summaries_diary
+         on summaries(diary_status, latest_timestamp)
+         where diary_status in ('pending', 'processing');`,
     );
   },
 ];

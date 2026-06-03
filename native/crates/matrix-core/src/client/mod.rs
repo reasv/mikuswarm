@@ -12,7 +12,7 @@ use matrix_sdk::{
     config::RequestConfig,
     deserialized_responses::SyncOrStrippedState,
     encryption::EncryptionSettings,
-    room::{edit::EditedContent, IncludeRelations, MessagesOptions, RelationsOptions},
+    room::{edit::EditedContent, IncludeRelations, MessagesOptions, ParentSpace, RelationsOptions},
     ruma::{
         api::Direction,
         events::room::message::{
@@ -1029,7 +1029,54 @@ pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> Mat
         joined: room.state() == RoomState::Joined,
         is_direct: room.is_direct().await.unwrap_or(false),
         member_count: Some(room.clone_info().active_members_count() as u64),
+        parent_space_name: resolve_parent_space_name(&room).await,
     })
+}
+
+/// Resolve the display name (or canonical alias) of the room's single legitimate
+/// parent space, for the diary header's `<ROOM>` label (ARCHITECTURE.md §9c).
+///
+/// Iterates `Room::parent_spaces()`, keeping ONLY spec-legitimate parents
+/// (`ParentSpace::Reciprocal` and `::WithPowerlevel`) and dropping
+/// `::Illegitimate` / `::Unverifiable` (unconfirmed / unauthenticated claims).
+/// Matrix permits multiple parents, so the pick is deterministic — prefer
+/// `Reciprocal` over `WithPowerlevel`, tie-break by lowest room id — yielding one
+/// suffix. For the chosen parent, prefer its display name, else its canonical
+/// alias. Returns `None` (no suffix) when there is no legitimate, name-resolvable
+/// parent; any error in resolution degrades to `None` rather than failing the call.
+async fn resolve_parent_space_name(room: &Room) -> Option<String> {
+    use futures_util::StreamExt;
+
+    let stream = match room.parent_spaces().await {
+        Ok(stream) => stream,
+        Err(_) => return None,
+    };
+    futures_util::pin_mut!(stream);
+
+    // rank: 0 = Reciprocal (preferred), 1 = WithPowerlevel.
+    let mut best: Option<(u8, OwnedRoomId, Room)> = None;
+    while let Some(item) = stream.next().await {
+        let (rank, parent_room) = match item {
+            Ok(ParentSpace::Reciprocal(parent)) => (0u8, parent),
+            Ok(ParentSpace::WithPowerlevel(parent)) => (1u8, parent),
+            // Drop unconfirmed / unauthenticated parent claims, and skip errors.
+            Ok(ParentSpace::Illegitimate(_)) | Ok(ParentSpace::Unverifiable(_)) | Err(_) => continue,
+        };
+        let parent_id = parent_room.room_id().to_owned();
+        let replace = match &best {
+            None => true,
+            Some((best_rank, best_id, _)) => rank < *best_rank || (rank == *best_rank && parent_id < *best_id),
+        };
+        if replace {
+            best = Some((rank, parent_id, parent_room));
+        }
+    }
+
+    let parent_room = best?.2;
+    if let Ok(name) = parent_room.display_name().await {
+        return Some(name.to_string());
+    }
+    parent_room.canonical_alias().map(|alias| alias.to_string())
 }
 
 pub(crate) async fn send_message_internal(

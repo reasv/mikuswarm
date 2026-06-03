@@ -147,6 +147,19 @@ export class MatrixNativeClient {
     return parseNativeJson(await this.#client.channelInfo(JSON.stringify(request)), "channelInfo");
   }
 
+  /**
+   * Human channel label for the diary header's `<ROOM>` token (ARCHITECTURE.md §9c):
+   * `displayName ?? canonicalAlias ?? roomId`, suffixed ` (parentSpaceName)` when the
+   * room has a legitimate, name-resolvable parent space. A thin wrapper over
+   * `channelInfo` — no new NAPI binding (the parent-space name rides on the existing
+   * channel-info payload).
+   */
+  async channelLabel(request: MatrixChannelInfoRequest): Promise<string> {
+    const info = await this.channelInfo(request);
+    const base = info.displayName ?? info.canonicalAlias ?? info.roomId;
+    return info.parentSpaceName ? `${base} (${info.parentSpaceName})` : base;
+  }
+
   async uploadMedia(request: MatrixUploadMediaRequest): Promise<MatrixUploadMediaResult> {
     return parseNativeJson(await this.#client.uploadMedia(JSON.stringify(request)), "uploadMedia");
   }

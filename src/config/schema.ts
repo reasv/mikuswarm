@@ -14,6 +14,29 @@ const SessionTypeSchema = Type.Object({
   ),
   // Model key from the `models` record. Defaults to "default".
   model: Type.Optional(Type.String()),
+  // Per-session-type runaway loop-breakers (ARCHITECTURE.md §9c, §4). When set,
+  // they override the global `agent.sessions.max_tool_calls` for sessions of this
+  // type and add a turn-count cap. NOT a wall-clock timeout — purely a guard
+  // against a degenerate loop. Worker session types (summarize/condense/diary)
+  // set these to sane defaults; chat sessions leave them unset (unbounded, falling
+  // back to the global cap).
+  max_tool_calls: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_turns: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
+const DiarySchema = Type.Object({
+  // When false, the diary worker pool does not drain — level-1 summaries still
+  // accumulate `diary_status='pending'` and flush if it is later enabled.
+  enabled: Type.Optional(Type.Boolean()),
+  worker_count: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_retries: Type.Optional(Type.Integer({ minimum: 0 })),
+  // The new-section token cap enforced per-edit by the diary tool (§8/§8c).
+  per_session_budget_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Token ceiling for the recent-memory window (§9a/§10a), shared by the diary
+  // session's continuity context and the chat-side recent-diary surfacing layer.
+  recency_max_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // N most recent EXISTING day files at/before the anchor day to surface (§9a).
+  recency_file_count: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
 const SummarizationSchema = Type.Object({
@@ -288,6 +311,7 @@ export const AppConfigSchema = Type.Object({
   enrichment: Type.Optional(EnrichmentSchema),
   captioning: Type.Optional(CaptioningSchema),
   summarization: Type.Optional(SummarizationSchema),
+  diary: Type.Optional(DiarySchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -322,3 +346,4 @@ export const AppConfigSchema = Type.Object({
 
 export type AppConfig = Static<typeof AppConfigSchema>;
 export type SummarizationConfig = Static<typeof SummarizationSchema>;
+export type DiaryConfig = Static<typeof DiarySchema>;

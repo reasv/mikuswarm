@@ -245,14 +245,19 @@ export class AgentSessionFactory {
     // in strict mode and any future write-back surfaces immediately (§2b invariant).
     const frozenBase: readonly AgentMessage[] = Object.freeze(frozenBaseSeed);
 
-    // Runaway/cost guardrail: the agent loop runs as long as the model emits tool
-    // calls, with no built-in iteration bound. Cap total tool-call iterations per
-    // session run. Once the cap is exceeded we abort the run (hard stop, so the
-    // model can't keep emitting blocked calls and billing turns) and block the
-    // offending call. Scoped per `create()` → per session run. `agentRef` is a
-    // late-bound holder so the hook can call `agent.abort()` (the const isn't
-    // assigned yet when the option object is built; it is by the time the hook runs).
-    const maxToolCalls = this.options.config.agent.sessions.max_tool_calls;
+    // Runaway/cost guardrail (ARCHITECTURE.md §4, §9c): the agent loop runs as long
+    // as the model emits tool calls, with no built-in iteration bound. A session
+    // type may set its own `max_tool_calls` (and `max_turns`) loop-breaker — worker
+    // session types (summarize/condense/diary) do, so a degenerate worker session
+    // can't loop unbounded. The session-type cap takes precedence over the global
+    // `agent.sessions.max_tool_calls`; chat sessions leave both unset (unbounded).
+    // Once a cap is exceeded we abort the run (hard stop, so the model can't keep
+    // emitting blocked calls and billing turns). Scoped per `create()` → per session
+    // run. `agentRef` is a late-bound holder so the hooks can call `agent.abort()`
+    // (the const isn't assigned yet when the option object is built; it is by the
+    // time the hook runs).
+    const maxToolCalls = sessionTypeConfig?.max_tool_calls ?? this.options.config.agent.sessions.max_tool_calls;
+    const maxTurns = sessionTypeConfig?.max_turns;
     const agentRef: { agent?: Agent } = {};
     let toolCallCount = 0;
     const logger = this.options.logger;
@@ -294,6 +299,27 @@ export class AgentSessionFactory {
       sessionId: session.timelineKey,
     });
     agentRef.agent = agent;
+
+    // Turn-count loop-breaker (§8c): NOT a wall-clock timeout — purely a guard
+    // against a degenerate loop. We count completed turns (`turn_end`) and abort the
+    // run once the cap is hit, so a worker session that never finalizes still
+    // settles into the normal catch → failure → retry path. Unset (chat) → no cap.
+    if (maxTurns !== undefined) {
+      let turnCount = 0;
+      agent.subscribe((event) => {
+        if (event.type !== "turn_end") return;
+        turnCount += 1;
+        if (turnCount >= maxTurns) {
+          logger?.warn("agent_turn_cap_reached", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            turnCount,
+            maxTurns,
+          });
+          agent.abort();
+        }
+      });
+    }
 
     if (opts?.resume?.transcript?.length) {
       // Defensive copy: the agent loop mutates `agent.state.messages` in place every
@@ -466,7 +492,7 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
         },
       ];
     }
-    if (message.type === "summaryLayer") {
+    if (message.type === "summaryLayer" || message.type === "diaryLayer") {
       return [
         {
           type: "chatEvent",

@@ -65,4 +65,12 @@ export interface SessionTypeConfig {
   skills?: "all" | "none" | string[];
   /** Model key from the `models` record in config. Defaults to "default". */
   model?: string;
+  /**
+   * Per-session-type runaway loop-breakers (ARCHITECTURE.md §9c/§4). When set,
+   * `max_tool_calls` overrides the global `agent.sessions.max_tool_calls` for this
+   * session type, and `max_turns` adds a completed-turn cap. NOT a wall-clock
+   * timeout. Worker session types set these; chat leaves them unset (unbounded).
+   */
+  max_tool_calls?: number;
+  max_turns?: number;
 }

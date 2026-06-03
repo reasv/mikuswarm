@@ -3,9 +3,9 @@ import path from "node:path";
 import { redactSecrets } from "../config/redaction.js";
 
 export interface ContextDumpMessage {
-  type?: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "satellite";
+  type?: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "diaryLayer" | "satellite";
   role: string;
-  tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger" | "summary";
+  tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger" | "summary" | "diary";
   tokenEstimate?: number;
   content: unknown;
 }

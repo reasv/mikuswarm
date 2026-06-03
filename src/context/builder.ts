@@ -25,14 +25,16 @@ import {
 } from "./summary-layer.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
+import { buildRecentDiaryContent } from "./diary-layer.js";
+import { agentDateStamp } from "../time/index.js";
 import { nanoid } from "nanoid";
 import type { Logger } from "../observability/index.js";
 
 export interface ContextMessage {
-  type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "satellite";
+  type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "diaryLayer" | "satellite";
   role: "user" | "assistant" | "system";
   content: string;
-  tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger" | "summary";
+  tier?: "compact" | "rich" | "mixed" | "runtime" | "system" | "trigger" | "summary" | "diary";
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
   timestamp?: number;
@@ -217,6 +219,13 @@ export class ContextBuilder {
       cutoff != null,
     );
 
+    // Recent-diary surfacing (§10a): a layer after the system prompt and before the
+    // summaries layer (top-to-bottom: system → diary → summaries), so the agent
+    // reads back what it wrote. Omitted from generation builds (summarizer cutoff) —
+    // temporally wrong (they operate on past ranges) and a feedback risk. The diary
+    // session itself never goes through here (it uses resume mode, no build).
+    const diaryLayer = cutoff ? null : await this.buildDiaryLayerMessage(now);
+
     const messages: ContextMessage[] = [
       {
         type: "system",
@@ -225,6 +234,7 @@ export class ContextBuilder {
         tier: "system",
         tokenEstimate: estimateTokens(systemPrompt),
       },
+      ...(diaryLayer ? [diaryLayer] : []),
       ...(summaryLayer ? [summaryLayer] : []),
       ...chatMessages,
       {
@@ -282,6 +292,37 @@ export class ContextBuilder {
       tier: "summary",
       tokenEstimate: estimateTokens(content),
       timestamp: latestTs,
+    };
+  }
+
+  /**
+   * Render the recent-diary surfacing layer (§10a). Anchored at the latest
+   * in-context message day (`now` = trigger.timestamp), NOT wall-clock — so
+   * backfill/replay surface the diary that was current then. Returns null when
+   * nothing is surfaceable. Bounded by `diary.recency_max_tokens` and front-trimmed
+   * by whole blocks; shared sparsity handling lives in `recentMemoryWindow` (§9a).
+   */
+  private async buildDiaryLayerMessage(now: number): Promise<ContextMessage | null> {
+    const diaryCfg = this.config.diary ?? {};
+    const content = await buildRecentDiaryContent({
+      workspaceRoot: this.config.workspace.root_dir,
+      anchorDay: agentDateStamp(now),
+      ceilingTokens: diaryCfg.recency_max_tokens ?? 6000,
+      fileCount: diaryCfg.recency_file_count ?? 2,
+    }).catch((error) => {
+      this.logger?.warn("diary_layer_build_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    if (!content) return null;
+    return {
+      type: "diaryLayer",
+      role: "user",
+      content,
+      tier: "diary",
+      tokenEstimate: estimateTokens(content),
+      timestamp: now,
     };
   }
 

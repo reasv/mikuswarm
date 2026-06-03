@@ -347,6 +347,27 @@ test("Storage.open upgrades a legacy v1 database through the full migration chai
             (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
         );
       `);
+      // A real v1 DB has `summaries` from the base schema; the v5->v6 migration
+      // ALTERs it, so the synthetic v1 fixture must include it too.
+      raw.exec(`
+        create table summaries (
+          id text primary key,
+          timeline_key text not null,
+          level integer not null,
+          content text not null,
+          earliest_timestamp integer not null,
+          latest_timestamp integer not null,
+          latest_event_id text not null,
+          event_count integer not null,
+          token_count integer not null,
+          model_id text,
+          status text not null default 'complete'
+            check(status in ('complete', 'truncated', 'superseded')),
+          backfill_job_id text,
+          generated_at integer not null,
+          created_at integer not null
+        );
+      `);
       // A pre-existing row that must survive the upgrade and read back.
       const now = 1_000;
       raw

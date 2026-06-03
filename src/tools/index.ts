@@ -9,6 +9,7 @@ export {
   createSearchMemoryTool,
   createWriteMemoryTool,
   type MemoryToolContext,
+  type WriteMemoryToolContext,
 } from "./memory.js";
 export { createMediaTool, type MediaToolContext } from "./media.js";
 export { createReadImageTool, type ReadImageToolContext } from "./read-image.js";
@@ -38,4 +39,5 @@ export { createSetProfileTool, type SetProfileToolContext } from "./set-profile.
 export { createCreatePollTool, type CreatePollToolContext } from "./create-poll.js";
 export { createPollVoteTool, type PollVoteToolContext } from "./poll-vote.js";
 export { createSummaryTool, SummaryDraft } from "./summary-tool.js";
+export { createDiaryTool } from "./diary-tool.js";
 export { createBashTool, type BashToolContext } from "./bash.js";
