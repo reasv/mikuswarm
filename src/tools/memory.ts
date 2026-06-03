@@ -76,6 +76,13 @@ export function createWriteMemoryTool(context: WriteMemoryToolContext): AgentToo
     }),
     execute: async (_toolCallId, params) => {
       const date = agentDateStamp(context.now ?? new Date());
+      // `ensureDailyFile` and `editorCommand` are two separate FIFO ops, not a
+      // single critical section. A diary `appendEntry` for the same day may
+      // interleave between them — this is design-accepted concurrency: each op is
+      // atomic, and the editor re-reads the file under `str_replace`/`insert`, so a
+      // stale `old_str` simply errors back to the caller rather than corrupting.
+      // View-then-edit atomicity (if ever needed) would require a single combined
+      // op enqueued on the writer; we intentionally don't do that here.
       const memoryPath = await context.memoryWriter.ensureDailyFile(date);
       const relativePath = context.memoryWriter.relative(memoryPath);
       const args = params as {

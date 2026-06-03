@@ -317,6 +317,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!config.models[modelKey]) {
       throw new Error(`diary session type "diary" references model "${modelKey}" which is not in config.models`);
     }
+    // A diary session with a `tools` allowlist that omits `diary_tool` spawns with
+    // no editor: every job exhausts its retries to `failed` silently (a slow,
+    // invisible failure). An absent allowlist (`tools` undefined) permits all tools
+    // and is fine — only a present allowlist missing the editor is misconfigured.
+    if (sessionType.tools && !sessionType.tools.includes("diary_tool")) {
+      throw new Error(
+        `diary session type "diary" has a tools allowlist that does not include "diary_tool" (the diary editor); diary sessions would spawn with no editor and fail every job`,
+      );
+    }
   }
 
   const diaryPool = diaryEnabled

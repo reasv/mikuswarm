@@ -224,6 +224,14 @@ export class ContextBuilder {
     // reads back what it wrote. Omitted from generation builds (summarizer cutoff) —
     // temporally wrong (they operate on past ranges) and a feedback risk. The diary
     // session itself never goes through here (it uses resume mode, no build).
+    //
+    // The anchor `now` is the trigger's timestamp (set above), used deliberately
+    // rather than wall-clock Date.now(): it is deterministic and stable across
+    // context rebuilds and replay. It is effectively the latest in-context event day
+    // — the trigger (or one of the coalesced triggers) is the last event
+    // chronologically. Any cross-midnight divergence from §10a's literal "latest
+    // in-context message day" wording is cosmetic: recentMemoryWindow only surfaces
+    // existing files ≤ the anchor and never shows empty days.
     const diaryLayer = cutoff ? null : await this.buildDiaryLayerMessage(now);
 
     const messages: ContextMessage[] = [
