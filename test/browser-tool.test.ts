@@ -4,8 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import sharp from "sharp";
+
 import { BrowserSession, type ConnectOverCdp } from "../src/browser/session.js";
-import { createBrowserTool } from "../src/tools/browser.js";
+import { createBrowserTool, boundScreenshot } from "../src/tools/browser.js";
+import { aiSnapshot } from "../src/browser/snapshot.js";
+import { base64ByteSize } from "../src/tools/read-image.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
 
@@ -98,7 +102,7 @@ async function withTool(
   const restore = stubManager();
   const connect: ConnectOverCdp = async () => makeBrowser(pageOpts) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880 });
   try {
     await fn(tool);
   } finally {
@@ -231,4 +235,124 @@ test("tool: a screenshot timeout surfaces as act_timeout (#8)", async () => {
       /browser:act_timeout/,
     );
   });
+});
+
+// ── #10: text maxLength schema bound ─────────────────────────────────────────
+
+// pi-ai's re-exported typebox uses different Kind symbols than the direct
+// @sinclair/typebox dep, so a cross-package Value.Check throws "Unknown type".
+// Instead validate the emitted JSON Schema fragment directly (same approach as
+// sillytavern-card.test.ts): pull `maxLength` off the `text` property and check
+// a candidate string against it.
+function checkMaxLength(schema: { maxLength?: number }, value: string): boolean {
+  if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return false;
+  return true;
+}
+
+test("tool: schema bounds `text` length, rejecting pathological multi-MB input (#10)", () => {
+  const tool = createBrowserTool({
+    session: undefined as never,
+    agentSessionId: "s1",
+    config: baseConfig(),
+    maxImageBytes: 5_242_880,
+  });
+  const params = tool.parameters as { properties: { text: { maxLength?: number } } };
+  const textSchema = params.properties.text;
+  assert.equal(textSchema.maxLength, 100000, "text field carries a generous maxLength bound");
+
+  // Just-fits input passes the schema bound; over-length input is rejected.
+  assert.equal(checkMaxLength(textSchema, "x".repeat(100000)), true);
+  assert.equal(checkMaxLength(textSchema, "x".repeat(100001)), false);
+  // A pathological multi-MB fill/evaluate value fails fast at the schema layer.
+  assert.equal(checkMaxLength(textSchema, "x".repeat(5 * 1024 * 1024)), false);
+});
+
+// ── #11: snapshot truncation marker / refCount on returned text ──────────────
+
+const MARKER = "\n[... snapshot truncated — scroll or interact to reveal more ...]";
+
+/** A page whose ariaSnapshot returns an arbitrary raw string. */
+function snapshotPage(raw: string) {
+  return { locator: (_sel: string) => ({ async ariaSnapshot() { return raw; } }) } as never;
+}
+
+test("aiSnapshot: truncates to ≤ maxChars, marks truncation, and counts refs in returned text only (#11)", async () => {
+  // Long raw snapshot with several refs; some fall past a small cut so they
+  // must NOT be counted in the returned refCount.
+  const head = "- generic [ref=e1]:\n  - link [ref=e2]\n  - link [ref=e3]\n";
+  const filler = "  - text node padding line\n".repeat(200);
+  const tail = "  - link [ref=e98]\n  - link [ref=e99]\n";
+  const raw = head + filler + tail;
+  const maxChars = 200;
+
+  const result = await aiSnapshot(snapshotPage(raw), maxChars);
+
+  assert.equal(result.truncated, true, "marked truncated");
+  assert.ok(result.text.length <= maxChars, `output length ${result.text.length} ≤ ${maxChars}`);
+  assert.ok(result.text.endsWith(MARKER) || result.text.length === maxChars, "marker present (or clamped)");
+  assert.ok(result.text.includes(MARKER.trim().slice(0, 10)) || result.text.includes("truncated"), "marker text present");
+
+  // refCount reflects ONLY refs in the returned text, not the trailing refs
+  // (e98/e99) that were sliced off.
+  const refsInReturned = (result.text.match(/\[ref=e\d+\]/g) ?? []).length;
+  assert.equal(result.refCount, refsInReturned, "refCount counts only returned refs");
+  assert.ok(!result.text.includes("[ref=e98]"), "trailing refs were sliced off");
+  assert.ok(result.refCount < (raw.match(/\[ref=e\d+\]/g) ?? []).length, "refCount is below the raw ref total");
+});
+
+test("aiSnapshot: clamps total output to maxChars even when maxChars < marker length (#11)", async () => {
+  const raw = "- generic [ref=e1]:\n  - link [ref=e2]\n".repeat(50);
+  const tiny = 5; // smaller than MARKER.length
+  const result = await aiSnapshot(snapshotPage(raw), tiny);
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= tiny, `output length ${result.text.length} ≤ ${tiny}`);
+});
+
+test("aiSnapshot: short snapshot passes through untruncated with full refCount", async () => {
+  const raw = "- generic [ref=e1]:\n  - heading [ref=e2]\n  - link [ref=e3]";
+  const result = await aiSnapshot(snapshotPage(raw), 20000);
+  assert.equal(result.truncated, false);
+  assert.equal(result.text, raw);
+  assert.equal(result.refCount, 3);
+});
+
+// ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
+
+test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {
+  const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+    .png().toBuffer();
+  const cap = 5_242_880;
+  const bounded = await boundScreenshot(png, cap);
+  assert.equal(bounded.downscaled, false, "not downscaled");
+  assert.equal(bounded.data, png.toString("base64"), "identical bytes passed through");
+  assert.ok(bounded.base64Bytes <= cap);
+  assert.equal(bounded.base64Bytes, base64ByteSize(png.byteLength));
+});
+
+test("boundScreenshot: an over-cap capture is downscaled to fit (#2)", async () => {
+  // A 2000x2000 gradient PNG: photo-like content that compresses and shrinks
+  // monotonically under resize (like a real screenshot), with a cap below the
+  // full size so real sharp downscaling must run to satisfy it.
+  const w = 2000, h = 2000;
+  const raw = Buffer.alloc(w * h * 3);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 3;
+      raw[i] = (x * 255 / w) | 0;
+      raw[i + 1] = (y * 255 / h) | 0;
+      raw[i + 2] = ((x + y) * 255 / (w + h)) | 0;
+    }
+  }
+  const png = await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
+
+  const cap = 350_000; // below the full image's base64 size, reachable above the dimension floor
+  assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
+
+  const bounded = await boundScreenshot(png, cap);
+  assert.equal(bounded.downscaled, true, "downscaled");
+  assert.ok(bounded.base64Bytes <= cap, `resulting base64 ${bounded.base64Bytes} ≤ cap ${cap}`);
+  // Result is still a valid, smaller PNG.
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.equal(meta.format, "png");
+  assert.ok((meta.width ?? w) < w, "dimensions were reduced");
 });

@@ -776,7 +776,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createWebFetchTool(),
       createWebSearchTool(),
       ...(browserSession && config.browser
-        ? [createBrowserTool({ session: browserSession, agentSessionId: session.id, config: config.browser })]
+        ? [createBrowserTool({
+            session: browserSession,
+            agentSessionId: session.id,
+            config: config.browser,
+            // Same shared per-model base64 cap read_image uses, so inline
+            // screenshots respect the model's per-image budget (issue #2).
+            maxImageBytes: resolveReadImageMaxBytes(config),
+          })]
         : []),
       // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.
       // Clamps in resolveMaxCharacters (50KB–512KB) bound the impact, so a mismatch only shifts the cap within those limits.

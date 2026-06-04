@@ -26,7 +26,7 @@ const SVG_SCAN_MAX_BYTES = 5 * 1024 * 1024;
  * model's per-image budget is the encoded size, not the raw size. Formula:
  * `4 * ceil(rawBytes / 3)`.
  */
-function base64ByteSize(rawBytes: number): number {
+export function base64ByteSize(rawBytes: number): number {
   return 4 * Math.ceil(rawBytes / 3);
 }
 
