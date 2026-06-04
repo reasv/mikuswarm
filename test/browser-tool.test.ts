@@ -29,6 +29,8 @@ const SNAPSHOT = '- generic [ref=e1]:\n  - heading "Example" [level=1] [ref=e2]\
 interface FakePageOptions {
   refError?: Error; // thrown by locator actions (stale ref / timeout)
   evalResult?: unknown;
+  evalError?: Error; // thrown by page.evaluate (page-script runtime exception)
+  screenshotError?: Error; // thrown by page.screenshot
 }
 
 function makeFakePage(opts: FakePageOptions) {
@@ -43,8 +45,8 @@ function makeFakePage(opts: FakePageOptions) {
     async goto(u: string) { currentUrl = u; },
     async goBack() {},
     async waitForTimeout() {},
-    async screenshot() { return Buffer.from("\x89PNGfake"); },
-    async evaluate() { return opts.evalResult ?? "ok"; },
+    async screenshot() { if (opts.screenshotError) throw opts.screenshotError; return Buffer.from("\x89PNGfake"); },
+    async evaluate() { if (opts.evalError) throw opts.evalError; return opts.evalResult ?? "ok"; },
     mouse: { async wheel() {} },
     keyboard: { async press() {} },
     locator(_selector: string) {
@@ -185,5 +187,48 @@ test("tool: act:click returns a refreshed snapshot", async () => {
     const text = textOf(result as { content: Array<{ type: string; text?: string }> });
     assert.match(text, /clicked e3/);
     assert.match(text, /\[ref=e1\]/);
+  });
+});
+
+test("tool: a synchronous stale-ref error (no timeout) surfaces as ref_expired (#4)", async () => {
+  // Playwright can throw a sync "no node found for aria-ref" rather than timing
+  // out; with a valid ref this means the ref went stale. Pre-fix this mapped to
+  // bad_request. NB: not a TimeoutError (no name, no "Timeout … exceeded").
+  const staleRef = new Error('No node found for selector: aria-ref=e3');
+  await withTool(baseConfig(), { refError: staleRef }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "act", kind: "click", ref: "e3" }),
+      /browser:ref_expired/,
+    );
+  });
+});
+
+test("tool: act:evaluate runtime throw surfaces as evaluate_failed (#8)", async () => {
+  const boom = new Error("ReferenceError: x is not defined");
+  await withTool(baseConfig({ evaluate_enabled: true }), { evalError: boom }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "act", kind: "evaluate", text: "x()" }),
+      /browser:evaluate_failed/,
+    );
+  });
+});
+
+test("tool: a non-timeout screenshot failure surfaces as screenshot_failed (#8)", async () => {
+  const detached = new Error("Target page, context or browser has been closed");
+  await withTool(baseConfig(), { screenshotError: detached }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot" }),
+      /browser:screenshot_failed/,
+    );
+  });
+});
+
+test("tool: a screenshot timeout surfaces as act_timeout (#8)", async () => {
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  await withTool(baseConfig(), { screenshotError: timeout }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot" }),
+      /browser:act_timeout/,
+    );
   });
 });

@@ -106,11 +106,39 @@ test("manager client: a transport failure maps to backend_unavailable", async ()
   }
 });
 
-test("manager client: launch treats 409 (already running) as success", async () => {
+test("manager client: launch treats 409 (already running) as success via structured status", async () => {
+  // Body deliberately omits any "HTTP 409" text — detection must rely on the
+  // structured httpStatus field, not a regex over the human-readable message (#7).
   const { calls, restore } = stubFetch(() => new Response(JSON.stringify({ detail: "Profile is already running" }), { status: 409 }));
   try {
     await client().launch("p1"); // must not throw
     assert.equal(calls[0]!.url, "http://127.0.0.1:8080/api/profiles/p1/launch");
+  } finally {
+    restore();
+  }
+});
+
+test("manager client: request carries the HTTP status on the BrowserError", async () => {
+  const { restore } = stubFetch(() => new Response("boom", { status: 503 }));
+  try {
+    await assert.rejects(
+      () => client().getStatus("p1"),
+      (err: unknown) =>
+        isBrowserError(err) && err.code === "backend_unavailable" && err.httpStatus === 503,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("manager client: launch re-throws a non-409 failure (not tolerated)", async () => {
+  // A 500 on launch must surface as profile_launch_failed, not be swallowed.
+  const { restore } = stubFetch(() => new Response("internal error", { status: 500 }));
+  try {
+    await assert.rejects(
+      () => client().launch("p1"),
+      (err: unknown) => isBrowserError(err) && err.code === "profile_launch_failed",
+    );
   } finally {
     restore();
   }

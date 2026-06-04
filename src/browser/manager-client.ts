@@ -94,6 +94,7 @@ export class ManagerClient {
       throw new BrowserError(
         "auth_failed",
         `CloakBrowser-Manager rejected the auth token (401). Check that [browser].auth_token matches the Manager's AUTH_TOKEN.`,
+        { httpStatus: 401 },
       );
     }
     if (!response.ok) {
@@ -101,6 +102,7 @@ export class ManagerClient {
       throw new BrowserError(
         "backend_unavailable",
         `CloakBrowser-Manager ${method} ${path} failed: HTTP ${response.status}${detail ? ` — ${detail}` : ""}`,
+        { httpStatus: response.status },
       );
     }
 
@@ -141,7 +143,7 @@ export class ManagerClient {
     try {
       await this.request("POST", `/api/profiles/${encodeURIComponent(profileId)}/launch`);
     } catch (error) {
-      if (error instanceof BrowserError && /HTTP 409/.test(error.message)) {
+      if (error instanceof BrowserError && error.httpStatus === 409) {
         this.logger.debug("profile_already_running", { profileId });
         return;
       }

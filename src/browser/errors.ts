@@ -12,16 +12,25 @@ export type BrowserErrorCode =
   | "ref_expired" // a [ref=eN] went stale (take a fresh snapshot, §5.3)
   | "bad_url" // scheme/host rejected at the tool layer (§5.5)
   | "evaluate_disabled" // act:evaluate used while evaluate_enabled=false
+  | "evaluate_failed" // act:evaluate ran but the page expression threw
+  | "screenshot_failed" // a non-timeout screenshot capture failure
   | "no_active_page" // no tab/page resolved for the session
   | "bad_request"; // malformed action/params
 
 export class BrowserError extends Error {
   readonly code: BrowserErrorCode;
+  /** The originating HTTP status, when the error came from a Manager response. */
+  readonly httpStatus?: number;
 
-  constructor(code: BrowserErrorCode, message: string, options?: { cause?: unknown }) {
+  constructor(
+    code: BrowserErrorCode,
+    message: string,
+    options?: { cause?: unknown; httpStatus?: number },
+  ) {
     super(message, options);
     this.name = "BrowserError";
     this.code = code;
+    this.httpStatus = options?.httpStatus;
   }
 }
 

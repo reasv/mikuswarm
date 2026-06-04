@@ -9,6 +9,7 @@ import {
   assertBrowserUrl,
   BrowserError,
   isBrowserError,
+  isTimeoutError,
   type ActKind,
   type ActParams,
   type BrowserSession,
@@ -157,11 +158,14 @@ async function dispatch(
       try {
         buffer = await page.screenshot({ fullPage: args.full_page ?? false, timeout: config.act_timeout_ms });
       } catch (error) {
-        throw new BrowserError(
-          "act_timeout",
-          `Screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
-        );
+        // Distinguish a genuine capture timeout from any other failure so the
+        // code isn't misleading (issue #8): a timeout is act_timeout, everything
+        // else (detached page, encoding error, …) is screenshot_failed.
+        const message = error instanceof Error ? error.message : String(error);
+        if (isTimeoutError(error)) {
+          throw new BrowserError("act_timeout", `Screenshot timed out: ${message}`, { cause: error });
+        }
+        throw new BrowserError("screenshot_failed", `Screenshot failed: ${message}`, { cause: error });
       }
       return {
         content: [
