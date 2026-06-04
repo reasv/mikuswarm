@@ -222,8 +222,11 @@ fallback_chunk_overlap = 80
 
 [retrieval.query]
 max_results = 6                   # recall_memory default
+# Absolute relevance floor in [0,1]; drop results scoring below it. After the
+# saturating BM25 transform (rel/(rel+k)) this is an *absolute* quality cut, not a
+# within-candidate rank cut — a weak lone match scores low and can fall below it.
 min_score = 0.35
-vector_weight = 0.7               # §8a hybrid weights (normalized)
+vector_weight = 0.7               # §8a hybrid weights (normalized; sum must be > 0)
 text_weight = 0.3
 candidate_multiplier = 4
 mmr_enabled = false               # §8a diversity re-rank (off, like OpenClaw)
@@ -233,7 +236,9 @@ temporal_decay_half_life_days = 45
 
 [retrieval.auto]
 max_results = 3                   # §8c — small on purpose
-min_score = 0.45                  # tighter than the tool
+# Tighter absolute floor than the tool — see [retrieval.query].min_score. With the
+# saturating BM25 transform this reliably excludes weak common-word-only matches.
+min_score = 0.45
 max_tokens = 600                  # whole injected block budget
 dedup_against_recency = true      # §8c — skip blocks already in the §10a recency layer
 

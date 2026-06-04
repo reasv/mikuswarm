@@ -75,17 +75,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       fallbackChunkTokens: index.fallback_chunk_tokens ?? 400,
       fallbackChunkOverlap: index.fallback_chunk_overlap ?? 80,
     },
-    query: {
-      maxResults: query.max_results ?? 6,
-      minScore: query.min_score ?? 0.35,
-      vectorWeight: query.vector_weight ?? 0.7,
-      textWeight: query.text_weight ?? 0.3,
-      candidateMultiplier: query.candidate_multiplier ?? 4,
-      mmrEnabled: query.mmr_enabled ?? false,
-      mmrLambda: query.mmr_lambda ?? 0.7,
-      temporalDecayEnabled: query.temporal_decay_enabled ?? true,
-      temporalDecayHalfLifeDays: query.temporal_decay_half_life_days ?? 45,
-    },
+    query: resolveQuery(query),
     auto: {
       maxResults: auto.max_results ?? 3,
       minScore: auto.min_score ?? 0.45,
@@ -107,6 +97,37 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
           }
         : null,
     },
+  };
+}
+
+/**
+ * Resolve the `[retrieval.query]` block and fail fast on a zero-sum hybrid weight pair
+ * (review issue #6). With `vector_weight + text_weight == 0` every hybrid score would
+ * collapse to 0 and silently return no results; reject it at config time per the
+ * project's explicit-deployment-config / fail-fast preference.
+ */
+function resolveQuery(
+  query: NonNullable<RetrievalConfig["query"]>,
+): ResolvedRetrievalConfig["query"] {
+  const vectorWeight = query.vector_weight ?? 0.7;
+  const textWeight = query.text_weight ?? 0.3;
+  if (vectorWeight + textWeight <= 0) {
+    throw new Error(
+      "Invalid [retrieval.query]: vector_weight + text_weight must be > 0 " +
+        `(got vector_weight=${vectorWeight}, text_weight=${textWeight}); a zero-sum ` +
+        "weight pair makes every hybrid score 0 and returns no results.",
+    );
+  }
+  return {
+    maxResults: query.max_results ?? 6,
+    minScore: query.min_score ?? 0.35,
+    vectorWeight,
+    textWeight,
+    candidateMultiplier: query.candidate_multiplier ?? 4,
+    mmrEnabled: query.mmr_enabled ?? false,
+    mmrLambda: query.mmr_lambda ?? 0.7,
+    temporalDecayEnabled: query.temporal_decay_enabled ?? true,
+    temporalDecayHalfLifeDays: query.temporal_decay_half_life_days ?? 45,
   };
 }
 

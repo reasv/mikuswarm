@@ -55,6 +55,18 @@ export async function buildAutoRetrievalBlock(
   let tokenBudget = auto.maxTokens - estimateTokens(`<retrieved_memory note="${NOTE}">\n</retrieved_memory>`);
   for (const r of outcome.results) {
     // Dedup against the recency layer: skip a chunk whose body already appears there.
+    //
+    // This is a deliberate best-effort substring heuristic, NOT chunk-`id` identity
+    // (review issue #15). The recency layer (`recentMemoryWindow` → `diary-layer`) is
+    // index-free: it renders raw block text and exposes only that concatenated/trimmed
+    // string — it carries no chunk ids and loses each block's path/line provenance once
+    // the blocks are joined and trimmed to the token budget. An id-based dedup would
+    // therefore have to recover identity by matching the recency text back to chunk
+    // rows via fragile byte-identity, coupling the recency path to the chunk-id scheme —
+    // more plumbing for a low-stakes miss (at worst the model occasionally sees one
+    // diary entry twice). So we probe a normalized 60-char prefix of the snippet against
+    // the normalized recency text. The `>= 12` guard skips probes too short to be a
+    // confident match (per operator: not a concern).
     if (recencyNorm) {
       const probe = norm(r.snippet).slice(0, 60);
       if (probe.length >= 12 && recencyNorm.includes(probe)) continue;

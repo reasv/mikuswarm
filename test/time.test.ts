@@ -6,6 +6,7 @@ import {
   configureAgentTimezone,
   formatAgentTimestamp,
   getConfiguredTimezone,
+  parseZonedWallClock,
   resetAgentTimezone,
 } from "../src/time/index.js";
 import { renderMessage } from "../src/context/renderer.js";
@@ -105,6 +106,22 @@ test("resetAgentTimezone returns to UTC", () => {
   resetAgentTimezone();
   assert.equal(getConfiguredTimezone(), "UTC");
   assert.equal(formatAgentTimestamp(SUMMER), "2026-06-02T14:00:00Z");
+});
+
+test("parseZonedWallClock rejects out-of-range calendar fields (review issue #4a)", () => {
+  // Pre-fix `Date.UTC` silently normalized these (e.g. 2026-13-40 → 2027-02-09),
+  // so a bad recall_memory date filter resolved to a wrong day instead of being
+  // surfaced. They must now be null, consistent with the nonsense→null contract.
+  assert.equal(parseZonedWallClock("2026-13-40 00:00", "UTC"), null, "month 13 / day 40");
+  assert.equal(parseZonedWallClock("2026-00-10 00:00", "UTC"), null, "month 0");
+  assert.equal(parseZonedWallClock("2026-01-32 00:00", "UTC"), null, "day 32");
+  assert.equal(parseZonedWallClock("2026-02-30 00:00", "UTC"), null, "Feb 30 (no round-trip)");
+  assert.equal(parseZonedWallClock("2026-04-31 00:00", "UTC"), null, "Apr 31 (no round-trip)");
+  assert.equal(parseZonedWallClock("2026-06-01 24:00", "UTC"), null, "hour 24");
+  assert.equal(parseZonedWallClock("2026-06-01 12:60", "UTC"), null, "minute 60");
+  // Valid edges still parse (including a real leap day).
+  assert.ok(parseZonedWallClock("2024-02-29 00:00", "UTC") != null, "2024-02-29 is valid");
+  assert.ok(parseZonedWallClock("2026-12-31 23:59", "UTC") != null, "Dec 31 23:59 is valid");
 });
 
 test("rendered messages carry the configured zone, never the host/UTC zone", () => {

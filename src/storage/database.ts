@@ -2393,7 +2393,9 @@ export class Storage {
         params.afterTs = opts.afterTs;
       }
       if (opts.beforeTs !== undefined) {
-        clauses.push("c.entry_ts <= @beforeTs");
+        // Exclusive: `beforeTs` is the start of the day AFTER the `before` filter, so
+        // the `before` day is fully inclusive (review issue #12).
+        clauses.push("c.entry_ts < @beforeTs");
         params.beforeTs = opts.beforeTs;
       }
       const rows = db
@@ -2435,7 +2437,8 @@ export class Storage {
         params.push(filters.afterTs);
       }
       if (filters?.beforeTs !== undefined) {
-        clauses.push("entry_ts <= ?");
+        // Exclusive start-of-next-day bound (review issue #12); mirrors searchMemoryLexical.
+        clauses.push("entry_ts < ?");
         params.push(filters.beforeTs);
       }
       const rows = db

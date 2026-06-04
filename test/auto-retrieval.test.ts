@@ -27,7 +27,12 @@ function result(over: Partial<RetrievalResult>): RetrievalResult {
 /** A MemorySearch stub returning canned results. */
 function fakeSearch(results: RetrievalResult[]): MemorySearch {
   return {
-    search: async (): Promise<SearchOutcome> => ({ results, mode: "hybrid", degraded: false }),
+    search: async (): Promise<SearchOutcome> => ({
+      results,
+      mode: "hybrid",
+      degraded: false,
+      ignoredDateBounds: [],
+    }),
   } as unknown as MemorySearch;
 }
 
