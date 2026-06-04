@@ -5,13 +5,25 @@ import type { PipelineId } from "../../src/storage/index.js";
 import { SessionManager } from "../../src/agent/index.js";
 import type { AgentSessionFactory } from "../../src/agent/factory.js";
 import type { Logger } from "../../src/observability/index.js";
-import type { PipelineRegistry, PipelineStats } from "../../src/observability/pipelines.js";
+import type {
+  PipelineActivityEvent,
+  PipelineRegistry,
+  PipelineStats,
+} from "../../src/observability/pipelines.js";
 import { PipelineActivityBus } from "../../src/observability/pipelines.js";
 import {
   createObservabilityServer,
   type ConsoleServer,
   type ConsoleServerDeps,
 } from "../../src/observability/server/index.js";
+import { CaptionWorkerPool } from "../../src/captioning/index.js";
+import type {
+  CaptionRequest,
+  CaptionResponse,
+  ConcurrencyLimitedInferenceClient,
+  MediaModality,
+} from "../../src/captioning/index.js";
+import { registerSecret, resetRedactionRegistry } from "../../src/config/index.js";
 import type { CanonicalChatEvent } from "../../src/types.js";
 
 const TK = "matrix:miku:room:!room:example.org";
@@ -808,6 +820,261 @@ test("GET /api/pipelines/stream opens and idles when no activity bus is wired", 
       assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
       ac.abort();
     });
+  });
+});
+
+// ── Real pool → activity bus wiring (issue #1) ───────────────────────────────
+//
+// The tests above exercise the bus + SSE forwarding by calling `bus.publish(...)`
+// manually. These drive a REAL `CaptionWorkerPool` through its claim/process loop
+// with a stubbed inference client, asserting the pool's private `emit()` call
+// sites fire at the right transitions with the right kind/status/attempts. A
+// dropped or mislabeled `emit()` (e.g. `completed` vs `failed`) must fail here.
+//
+// The captioning pool is the simplest to drive: its only heavy dependency is the
+// per-modality inference-client map, which we substitute with a fake whose
+// `caption()` we control (resolve = success path, reject = failure/retry path).
+// `CaptionWorker` reads the asset's `local_path` only to feed the client; with a
+// non-existent path `isAnimatedImage` falls back to `false` and goes straight to
+// `client.caption(...)`, so no real media/inference work happens.
+
+/** A fake inference client; only `caption()` and `maxConcurrency` are touched. */
+function fakeInferenceClient(
+  caption: (req: CaptionRequest) => Promise<CaptionResponse>,
+): ConcurrencyLimitedInferenceClient {
+  return {
+    modality: "image" as MediaModality,
+    maxConcurrency: undefined,
+    caption,
+    stop() {},
+  } as unknown as ConcurrencyLimitedInferenceClient;
+}
+
+/** Seed a claim-eligible (trigger_group_id set) pending image asset for captioning. */
+async function seedCaptionable(
+  storage: Storage,
+  eventId: string,
+  assetId: string,
+): Promise<void> {
+  await storage.appendTimelineEvent(userEvent(eventId));
+  await storage.write((db) =>
+    db.prepare(`update timeline_events set trigger_group_id = 'g1' where id = ?`).run(eventId),
+  );
+  await storage.insertMediaAsset({
+    id: assetId,
+    event_id: eventId,
+    role: "attachment",
+    media_type: "image",
+    original_filename: `${assetId}.png`,
+    local_path: `media/${assetId}.png`, // never read: caption() is stubbed
+    caption_status: "pending",
+    caption_attempts: 0,
+    download_status: "complete",
+    created_at: 1_000,
+    updated_at: 1_000,
+  });
+}
+
+/** Build a CaptionWorkerPool wired to a real bus and a stubbed image client. */
+function makeCaptionPool(
+  storage: Storage,
+  bus: PipelineActivityBus,
+  caption: (req: CaptionRequest) => Promise<CaptionResponse>,
+  maxRetries: number,
+): CaptionWorkerPool {
+  return new CaptionWorkerPool({
+    storage,
+    clients: new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
+      ["image", fakeInferenceClient(caption)],
+    ]),
+    workspaceRoot: "/tmp",
+    config: { worker_count: 1, caption_all: false, max_retries: maxRetries },
+    activityBus: bus,
+    logger: silentLogger,
+  });
+}
+
+/** Poll until `predicate(events)` holds (or time out), then resolve. */
+async function waitForEvents(
+  events: PipelineActivityEvent[],
+  predicate: (e: PipelineActivityEvent[]) => boolean,
+  label: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!predicate(events)) {
+    if (Date.now() > deadline) {
+      assert.fail(`timed out waiting for ${label}; got ${JSON.stringify(events)}`);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+test("CaptionWorkerPool emits claimed→completed through the real activity bus", async () => {
+  await withStorage(async (storage) => {
+    await seedCaptionable(storage, "evt-1", "cap-1");
+
+    const bus = new PipelineActivityBus();
+    const events: PipelineActivityEvent[] = [];
+    bus.subscribe((e) => events.push(e));
+
+    const pool = makeCaptionPool(
+      storage,
+      bus,
+      async () => ({ caption: "a stubbed caption", model: "stub-model" }),
+      2,
+    );
+
+    await pool.start();
+    try {
+      await waitForEvents(events, (e) => e.some((x) => x.kind === "completed"), "completed");
+    } finally {
+      await pool.stop();
+    }
+
+    // The captioning emit() is fire-and-forget relative to persistence; ensure the
+    // single-writer queue settled before asserting durable state.
+    await storage.waitForIdle();
+
+    const forAsset = events.filter((e) => e.id === "cap-1");
+    assert.deepEqual(
+      forAsset.map((e) => e.kind),
+      ["claimed", "completed"],
+      "a successful caption fires exactly claimed then completed (no failed/retried)",
+    );
+
+    const claimed = forAsset[0]!;
+    assert.equal(claimed.pool, "captioning");
+    assert.equal(claimed.id, "cap-1");
+    assert.equal(claimed.status, "processing");
+    assert.equal(claimed.attempts, 1, "claim increments the durable attempt counter to 1");
+    assert.equal(claimed.room, null);
+
+    const completed = forAsset[1]!;
+    assert.equal(completed.pool, "captioning");
+    assert.equal(completed.id, "cap-1");
+    assert.equal(completed.kind, "completed");
+    assert.equal(completed.status, "complete", "terminal-success carries the persisted status");
+    assert.equal(completed.attempts, 1);
+
+    // Wiring is load-bearing only if it matches the persisted row.
+    const row = storage.getMediaAssetById("cap-1")!;
+    assert.equal(row.caption_status, "complete");
+    assert.equal(row.caption, "a stubbed caption");
+  });
+});
+
+test("CaptionWorkerPool emits claimed→retried→…→failed with attempts incrementing", async () => {
+  await withStorage(async (storage) => {
+    await seedCaptionable(storage, "evt-1", "cap-1");
+
+    const bus = new PipelineActivityBus();
+    const events: PipelineActivityEvent[] = [];
+    bus.subscribe((e) => events.push(e));
+
+    // Every caption attempt fails. With max_retries=2 the first failure is a
+    // retry (attempts 1 < 2 → back to pending) and the second is terminal
+    // (attempts 2 >= 2 → failed).
+    const pool = makeCaptionPool(
+      storage,
+      bus,
+      async () => {
+        throw new Error("inference exploded");
+      },
+      2,
+    );
+
+    await pool.start();
+    try {
+      await waitForEvents(events, (e) => e.some((x) => x.kind === "failed"), "failed");
+    } finally {
+      await pool.stop();
+    }
+    await storage.waitForIdle();
+
+    const forAsset = events.filter((e) => e.id === "cap-1");
+    assert.deepEqual(
+      forAsset.map((e) => e.kind),
+      ["claimed", "retried", "claimed", "failed"],
+      "first failure retries, re-claim then terminal failure",
+    );
+
+    // Attempts increment across the claim+failure cycle: 1,1,2,2.
+    assert.deepEqual(
+      forAsset.map((e) => e.attempts),
+      [1, 1, 2, 2],
+      "durable caption_attempts increments at each claim and is reported on retry/fail",
+    );
+
+    const retried = forAsset[1]!;
+    assert.equal(retried.kind, "retried");
+    assert.equal(retried.status, "pending", "a retry sends the row back to pending");
+
+    const failed = forAsset[3]!;
+    assert.equal(failed.kind, "failed");
+    assert.equal(failed.status, "failed", "terminal failure carries the failed status");
+    assert.equal(failed.pool, "captioning");
+
+    const row = storage.getMediaAssetById("cap-1")!;
+    assert.equal(row.caption_status, "failed", "the persisted status matches the failed emit");
+  });
+});
+
+// ── Activity SSE redaction (issue #5) ────────────────────────────────────────
+//
+// The activity SSE frame is `redactSecrets(JSON.stringify(externalizeImages(...)))`.
+// `redactSecrets` only rewrites values previously registered via `registerSecret`.
+// This publishes an activity event whose `room` carries a registered secret and
+// asserts the wire frame shows it REDACTED — fails if redaction is dropped from
+// the activity path.
+
+test("GET /api/pipelines/stream redacts registered secrets in activity payloads", async () => {
+  await withStorage(async (storage) => {
+    const secret = "sk-supersecret-activity-token-9f8e7d6c5b4a";
+    registerSecret(secret);
+    try {
+      const bus = new PipelineActivityBus();
+      await withServer({ storage, pipelines: fullRegistry(), activityBus: bus }, async (base) => {
+        const ac = new AbortController();
+        const res = await fetch(`${base}/api/pipelines/stream`, { signal: ac.signal });
+        assert.equal(res.status, 200);
+
+        // Let the server register its bus subscription before publishing.
+        await new Promise((r) => setTimeout(r, 20));
+        bus.publish({
+          pool: "enrichment",
+          id: "e1",
+          kind: "completed",
+          status: "complete",
+          attempts: 0,
+          // The secret rides in a string field that flows verbatim into the frame.
+          room: `matrix:miku:room:${secret}`,
+          ts: 1,
+        });
+
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (!buf.includes("event: activity")) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+        }
+        ac.abort();
+
+        assert.match(buf, /event: activity/);
+        assert.match(buf, /\[REDACTED\]/, "the activity frame ran through redactSecrets");
+        assert.ok(
+          !buf.includes(secret),
+          "the raw secret must never appear verbatim on the SSE wire",
+        );
+        // Sanity: the non-secret portion of the payload is still present.
+        assert.match(buf, /"pool":"enrichment"/);
+        assert.match(buf, /"id":"e1"/);
+      });
+    } finally {
+      // Global redaction registry is module state; don't leak into other tests.
+      resetRedactionRegistry();
+    }
   });
 });
 
