@@ -126,6 +126,167 @@ test("ensureLabel swallows resolver errors and leaves the prior label intact", a
   assert.equal(store.writes, 0);
 });
 
+test("ensureLabel does not re-resolve a failed key while within the failure cooldown", async () => {
+  const store = new FakeStore();
+  let calls = 0;
+  let clock = 1_000_000;
+  const cache = new RoomLabelCache({
+    store,
+    resolve: async () => {
+      calls++;
+      throw new Error("homeserver down");
+    },
+    logger: noopLogger,
+    ttlMs: 60_000,
+    failureCooldownMs: 300_000,
+    now: () => clock,
+  });
+
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+
+  // Second inbound event well within the cooldown: must not re-resolve.
+  clock += 1_000;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+
+  // Still within the cooldown a moment before it elapses.
+  clock += 298_000;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+});
+
+test("ensureLabel re-resolves a failed key once the failure cooldown elapses", async () => {
+  const store = new FakeStore();
+  let calls = 0;
+  let clock = 1_000_000;
+  const cache = new RoomLabelCache({
+    store,
+    resolve: async () => {
+      calls++;
+      if (calls === 1) throw new Error("homeserver down");
+      return "Recovered";
+    },
+    logger: noopLogger,
+    ttlMs: 60_000,
+    failureCooldownMs: 300_000,
+    now: () => clock,
+  });
+
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+
+  // Advance past the cooldown: a retry is allowed and succeeds.
+  clock += 300_001;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 2);
+  assert.equal(store.rows.get(TK)?.displayName, "Recovered");
+});
+
+test("a successful resolve clears a prior failure so the cooldown no longer applies", async () => {
+  const store = new FakeStore();
+  let calls = 0;
+  let clock = 1_000_000;
+  const cache = new RoomLabelCache({
+    store,
+    resolve: async () => {
+      calls++;
+      if (calls === 1) throw new Error("homeserver down");
+      return "Resolved";
+    },
+    logger: noopLogger,
+    // No TTL window: a fresh label is never considered stale here, so a re-fire
+    // would only happen if the failure entry were still suppressing/allowing.
+    ttlMs: 60_000,
+    failureCooldownMs: 300_000,
+    now: () => clock,
+  });
+
+  // First attempt fails and records a failure timestamp.
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+
+  // After the cooldown, the retry succeeds and clears the failure entry.
+  clock += 300_001;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 2);
+  assert.equal(store.rows.get(TK)?.displayName, "Resolved");
+
+  // A later inbound event finds a fresh label and does not resolve again, and no
+  // stale failure entry lingers to interfere.
+  clock += 1_000;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 2);
+});
+
+test("backfillAll skips a key still within its failure cooldown", async () => {
+  const store = new FakeStore();
+  store.rows.set(TK, { displayName: TK, resolvedAt: 0 });
+  let calls = 0;
+  let clock = 1_000_000;
+  const cache = new RoomLabelCache({
+    store,
+    resolve: async () => {
+      calls++;
+      throw new Error("homeserver down");
+    },
+    logger: noopLogger,
+    ttlMs: 60_000,
+    backfillSpacingMs: 0,
+    failureCooldownMs: 300_000,
+    now: () => clock,
+  });
+
+  // First backfill attempts the resolve and fails, recording the failure.
+  await cache.backfillAll();
+  assert.equal(calls, 1);
+
+  // A second backfill within the cooldown must not re-resolve.
+  clock += 1_000;
+  await cache.backfillAll();
+  assert.equal(calls, 1);
+});
+
+test("ensureLabel does not persist an empty/whitespace resolved label and backs off", async () => {
+  const store = new FakeStore();
+  let calls = 0;
+  let clock = 1_000_000;
+  const cache = new RoomLabelCache({
+    store,
+    resolve: async () => {
+      calls++;
+      return "   ";
+    },
+    logger: noopLogger,
+    ttlMs: 60_000,
+    failureCooldownMs: 300_000,
+    now: () => clock,
+  });
+
+  cache.ensureLabel(TK);
+  await tick();
+
+  // Nothing persisted for an empty label.
+  assert.equal(store.writes, 0);
+  assert.equal(store.rows.has(TK), false);
+  assert.equal(calls, 1);
+
+  // An empty result engages the backoff: a second inbound event within the
+  // cooldown does not re-resolve.
+  clock += 1_000;
+  cache.ensureLabel(TK);
+  await tick();
+  assert.equal(calls, 1);
+});
+
 test("backfillAll resolves every known timeline that lacks a fresh label", async () => {
   const store = new FakeStore();
   store.rows.set("matrix:miku:room:!a", { displayName: "!a", resolvedAt: 0 });
