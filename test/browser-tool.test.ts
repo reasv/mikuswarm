@@ -356,3 +356,23 @@ test("boundScreenshot: an over-cap capture is downscaled to fit (#2)", async () 
   assert.equal(meta.format, "png");
   assert.ok((meta.width ?? w) < w, "dimensions were reduced");
 });
+
+test("boundScreenshot: an unshrinkable over-cap capture throws screenshot_failed, never ships oversized (#2)", async () => {
+  // High-entropy noise already at the 320px dimension floor: it can't be made
+  // smaller (already at the floor) and noise doesn't compress, so no downscale
+  // can satisfy a tiny cap. The helper must throw rather than loop or ship an
+  // over-cap payload (the floor-throw safety branch).
+  const dim = 320;
+  const raw = Buffer.alloc(dim * dim * 3);
+  for (let i = 0; i < raw.length; i += 1) raw[i] = (i * 2654435761) & 0xff; // cheap deterministic noise
+  const png = await sharp(raw, { raw: { width: dim, height: dim, channels: 3 } }).png().toBuffer();
+
+  const cap = 1000; // far below any 320x320 PNG's base64 size
+  assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
+
+  await assert.rejects(
+    boundScreenshot(png, cap),
+    (err: unknown) => (err as { code?: string }).code === "screenshot_failed",
+    "must throw screenshot_failed rather than ship an oversized block",
+  );
+});
