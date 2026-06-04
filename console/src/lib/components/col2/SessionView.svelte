@@ -13,17 +13,38 @@
 	import Rollout from '$lib/components/rollout/Rollout.svelte';
 	import LiveRollout from '$lib/components/rollout/LiveRollout.svelte';
 
+	// Reusable across both areas (ARCHITECTURE.md §11): the Conversations Col2
+	// renders it bound to `selection.sessionId`; the Pipelines Col3 embeds it with an
+	// explicit `sessionId` (a summarize/condense/diary run). When `embedded`, it does
+	// NOT publish to the conversations top-bar `contextSummary` nor invalidate the
+	// room-session list; the parent passes `onMutated` to refresh pipeline queries.
+	let {
+		sessionId: sessionIdProp = null,
+		embedded = false,
+		onMutated
+	}: { sessionId?: string | null; embedded?: boolean; onMutated?: () => void } = $props();
+
+	const activeId = $derived(sessionIdProp ?? selection.sessionId);
+
 	const queryClient = useQueryClient();
-	const session = sessionQuery(() => selection.sessionId);
+	const session = sessionQuery(() => activeId);
 
 	let stopping = $state(false);
+
+	/** Invalidate the affected caches after a stop / stream-end. */
+	function refreshAfterMutation(id: string) {
+		queryClient.invalidateQueries({ queryKey: keys.session(id) });
+		if (!embedded && selection.roomKey)
+			queryClient.invalidateQueries({ queryKey: keys.roomSessions(selection.roomKey) });
+		onMutated?.();
+	}
 
 	// Stop button → POST abort. A 409 means the run already settled between render
 	// and click (benign — it's no longer in flight), so treat it as success. Either
 	// way, refetch so the view flips to the persisted terminal record; the live SSE
 	// stream's own `agent_end` → `onStreamEnd` covers the happy path too.
 	async function handleStop() {
-		const id = selection.sessionId;
+		const id = activeId;
 		if (!id || stopping) return;
 		stopping = true;
 		try {
@@ -48,9 +69,7 @@
 			}
 		} finally {
 			stopping = false;
-			queryClient.invalidateQueries({ queryKey: keys.session(id) });
-			if (selection.roomKey)
-				queryClient.invalidateQueries({ queryKey: keys.roomSessions(selection.roomKey) });
+			refreshAfterMutation(id);
 		}
 	}
 
@@ -70,7 +89,9 @@
 
 	$effect(() => {
 		const d = session.data;
-		if (d) {
+		// The conversations top-bar summary belongs to the Conversations area only;
+		// an embedded (pipelines Col3) session must not hijack it.
+		if (d && !embedded) {
 			contextSummary.set({
 				tokenEstimate: d.session.tokenEstimate,
 				compactTokens: null,
@@ -84,11 +105,9 @@
 	// When the live stream ends, the persisted record is now authoritative: refetch
 	// the session (→ terminal status → persisted rollout) and the room's list badge.
 	function onStreamEnd() {
-		const id = selection.sessionId;
+		const id = activeId;
 		if (!id) return;
-		queryClient.invalidateQueries({ queryKey: keys.session(id) });
-		if (selection.roomKey)
-			queryClient.invalidateQueries({ queryKey: keys.roomSessions(selection.roomKey) });
+		refreshAfterMutation(id);
 	}
 </script>
 
@@ -120,9 +139,9 @@
 				</Button>
 			{/if}
 		</div>
-		{#if isRunning && selection.sessionId}
-			{#key selection.sessionId}
-				<LiveRollout sessionId={selection.sessionId} onEnd={onStreamEnd} />
+		{#if isRunning && activeId}
+			{#key activeId}
+				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} />
 			{/key}
 		{:else}
 			<Rollout messages={rolloutMessages} />

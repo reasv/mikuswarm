@@ -8,5 +8,13 @@ export const keys = {
 	roomContext: (key: string) => ['rooms', key, 'context'] as const,
 	roomSessions: (key: string) => ['rooms', key, 'sessions'] as const,
 	session: (id: string) => ['sessions', id] as const,
-	summary: (id: string) => ['summaries', id] as const
+	summary: (id: string) => ['summaries', id] as const,
+	// Pipeline monitor (ARCHITECTURE.md §11). `pipelines()` is the dashboard feed;
+	// `pipelineItems(pool, filters)` a filtered list; `pipelineItem(pool, id)` one
+	// detail. Hierarchical so invalidating `['pipelines', pool]` cascades to its
+	// lists + details.
+	pipelines: () => ['pipelines'] as const,
+	pipelineItems: (pool: string, filters: Record<string, unknown> = {}) =>
+		['pipelines', pool, 'items', filters] as const,
+	pipelineItem: (pool: string, id: string) => ['pipelines', pool, 'items', id] as const
 };

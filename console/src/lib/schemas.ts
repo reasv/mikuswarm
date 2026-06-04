@@ -120,3 +120,127 @@ export const SummaryResponse = Schema.Struct({
  */
 export const AgentEventWire = Schema.Struct({ type: Schema.String }, PassthroughObject);
 export type AgentEventWire = Schema.Schema.Type<typeof AgentEventWire>;
+
+// ── Pipeline monitor (ARCHITECTURE.md §11) ──────────────────────────────────
+
+/** The four background pipelines surfaced by the monitor. */
+export const PipelineId = Schema.Literal('enrichment', 'captioning', 'summarization', 'diary');
+export type PipelineId = Schema.Schema.Type<typeof PipelineId>;
+
+/** Status-bucket counts (GET /api/pipelines `counts`). */
+export const PipelineCounts = Schema.Struct({
+	pending: Schema.Number,
+	processing: Schema.Number,
+	retrying: Schema.Number,
+	done: Schema.Number,
+	failed: Schema.Number,
+	skipped: Schema.Number
+});
+export type PipelineCounts = Schema.Schema.Type<typeof PipelineCounts>;
+
+/** One pool's dashboard row (GET /api/pipelines). */
+export const PipelineHealth = Schema.Struct({
+	pool: PipelineId,
+	enabled: Schema.Boolean,
+	workerCount: Schema.Number,
+	maxRetries: Schema.Number,
+	concurrency: Schema.NullOr(Schema.Record({ key: Schema.String, value: Schema.Number })),
+	inFlight: Schema.Number,
+	counts: PipelineCounts
+});
+export type PipelineHealth = Schema.Schema.Type<typeof PipelineHealth>;
+export const PipelinesResponse = Schema.Struct({ pipelines: Schema.Array(PipelineHealth) });
+export type PipelinesResponse = Schema.Schema.Type<typeof PipelinesResponse>;
+
+/** One unified queue item (GET /api/pipelines/:pool/items). */
+export const PipelineItem = Schema.Struct({
+	pool: PipelineId,
+	id: Schema.String,
+	status: Schema.String,
+	attempts: Schema.Number,
+	maxRetries: Schema.Number,
+	retrying: Schema.Boolean,
+	room: Schema.NullOr(Schema.String),
+	createdAt: Schema.Number,
+	updatedAt: Schema.Number,
+	inputSummary: Schema.String,
+	outputSummary: Schema.NullOr(Schema.String),
+	error: Schema.NullOr(Schema.String),
+	sessionId: Schema.NullOr(Schema.String)
+});
+export type PipelineItem = Schema.Schema.Type<typeof PipelineItem>;
+export const PipelineItemsResponse = Schema.Struct({
+	items: Schema.Array(PipelineItem),
+	nextCursor: Schema.NullOr(Schema.String)
+});
+export type PipelineItemsResponse = Schema.Schema.Type<typeof PipelineItemsResponse>;
+
+/** Wire shape of a produced/source media asset in an item detail. */
+export const PipelineMediaAsset = Schema.Struct({
+	ref: Schema.String,
+	role: Schema.String,
+	mediaType: Schema.String,
+	mimeType: Schema.NullOr(Schema.String),
+	filename: Schema.NullOr(Schema.String),
+	downloadStatus: Schema.String,
+	captionStatus: Schema.String,
+	caption: Schema.NullOr(Schema.String),
+	captionModel: Schema.NullOr(Schema.String),
+	hasBytes: Schema.Boolean
+});
+export type PipelineMediaAsset = Schema.Schema.Type<typeof PipelineMediaAsset>;
+
+/**
+ * GET /api/pipelines/:pool/items/:id — the pool-specific detail. Modeled as one
+ * Struct with the base `{ pool, item }` plus all-optional per-pool extras (rather
+ * than a strict discriminated union), so a partial/evolving backend detail stays
+ * forward-decodable; the UI branches on `pool`. Backend-internal `summary`/`lineage`/
+ * `replyContext` shapes are kept permissive.
+ */
+export const PipelineItemDetail = Schema.Struct({
+	pool: PipelineId,
+	item: PipelineItem,
+	sessionId: Schema.optional(Schema.NullOr(Schema.String)),
+	// enrichment
+	mediaAssets: Schema.optional(Schema.Array(PipelineMediaAsset)),
+	linkPreviews: Schema.optional(Schema.Array(Schema.Unknown)),
+	replyContext: Schema.optional(Schema.Unknown),
+	// captioning
+	media: Schema.optional(Schema.NullOr(PipelineMediaAsset)),
+	// summarization / diary
+	summary: Schema.optional(Schema.Unknown),
+	lineage: Schema.optional(Schema.Unknown),
+	bestEffortDraft: Schema.optional(Schema.NullOr(Schema.String)),
+	error: Schema.optional(Schema.NullOr(Schema.String))
+});
+export type PipelineItemDetail = Schema.Schema.Type<typeof PipelineItemDetail>;
+
+/**
+ * POST /api/pipelines/:pool/items/:id/retry (Phase 5). On 200 the item is reset to
+ * `pending`; a 409 (not retryable) is mapped to a thrown HttpError before this.
+ */
+export const RetryPipelineItemResponse = Schema.Struct({
+	pool: PipelineId,
+	id: Schema.String,
+	status: Schema.String
+});
+export type RetryPipelineItemResponse = Schema.Schema.Type<typeof RetryPipelineItemResponse>;
+
+/** POST /api/pipelines/:pool/retry-failed — bulk retry; `retried` is the count reset. */
+export const RetryFailedResponse = Schema.Struct({
+	pool: PipelineId,
+	retried: Schema.Number
+});
+export type RetryFailedResponse = Schema.Schema.Type<typeof RetryFailedResponse>;
+
+/** One live activity event off GET /api/pipelines/stream (the SSE firehose). */
+export const PipelineActivityEvent = Schema.Struct({
+	pool: PipelineId,
+	id: Schema.String,
+	kind: Schema.Literal('claimed', 'completed', 'failed', 'retried', 'skipped'),
+	status: Schema.String,
+	attempts: Schema.Number,
+	room: Schema.NullOr(Schema.String),
+	ts: Schema.Number
+});
+export type PipelineActivityEvent = Schema.Schema.Type<typeof PipelineActivityEvent>;

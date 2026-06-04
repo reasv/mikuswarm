@@ -1,7 +1,12 @@
 import { error } from '@sveltejs/kit';
 import { Schema } from 'effect';
 import { apiBaseUrl, authHeaders } from '../config';
-import { AgentEventWire, type AgentEventWire as AgentEvent } from '$lib/schemas';
+import {
+	AgentEventWire,
+	type AgentEventWire as AgentEvent,
+	PipelineActivityEvent,
+	type PipelineActivityEvent as PipelineActivity
+} from '$lib/schemas';
 
 /**
  * Server-side consumer of the agent's SSE endpoint (`GET /api/sessions/:id/stream`),
@@ -129,6 +134,74 @@ export async function* streamUpstream(path: string): AsyncGenerator<AgentEvent> 
 	const controller = new AbortController();
 	try {
 		yield* upstreamSse(path, controller.signal);
+	} finally {
+		controller.abort();
+	}
+}
+
+const decodeActivity = Schema.decodeUnknownSync(PipelineActivityEvent);
+
+/**
+ * Server-side consumer of the pipeline activity firehose (`GET /api/pipelines/stream`,
+ * ARCHITECTURE.md §11). Unlike the session stream this never self-terminates — it
+ * runs until the client disconnects (or the upstream closes) — and decodes the
+ * `event: activity` records into {@link PipelineActivity}. Same buffer-bound and
+ * malformed-record tolerance as {@link upstreamSse}; non-`activity` records (the
+ * heartbeat comments are already dropped by `parseRecord`) are ignored.
+ */
+async function* pipelineActivityUpstream(
+	path: string,
+	signal: AbortSignal
+): AsyncGenerator<PipelineActivity> {
+	const res = await fetch(apiBaseUrl + path, {
+		headers: { accept: 'text/event-stream', ...authHeaders() },
+		signal
+	});
+	if (!res.ok || !res.body) throw error(res.status || 502, `upstream stream failed for ${path}`);
+
+	const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+	let buf = '';
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			buf += value;
+			if (buf.length > MAX_SSE_BUFFER_BYTES) {
+				throw error(502, `upstream stream record exceeded ${MAX_SSE_BUFFER_BYTES} bytes for ${path}`);
+			}
+			let m: RegExpMatchArray | null;
+			while ((m = RECORD_DELIMITER.exec(buf)) !== null) {
+				const idx = m.index!;
+				const rec = parseRecord(buf.slice(0, idx));
+				buf = buf.slice(idx + m[0].length);
+				if (!rec || rec.event !== 'activity' || !rec.data) continue;
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(rec.data);
+				} catch {
+					continue;
+				}
+				try {
+					yield decodeActivity(parsed);
+				} catch {
+					continue; // skip a malformed/unknown record rather than killing the stream
+				}
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+/**
+ * Controller-owning wrapper around {@link pipelineActivityUpstream} for a
+ * `query.live` body (mirrors {@link streamUpstream}). The `finally` aborts the
+ * upstream fetch on teardown so the agent releases its bus subscription.
+ */
+export async function* streamPipelineActivity(path: string): AsyncGenerator<PipelineActivity> {
+	const controller = new AbortController();
+	try {
+		yield* pipelineActivityUpstream(path, controller.signal);
 	} finally {
 		controller.abort();
 	}

@@ -11,6 +11,60 @@ import {
 } from "../src/storage/index.js";
 import type { Logger } from "../src/observability/index.js";
 
+/**
+ * `media_assets` + `summarization_jobs` are base (v1) tables present in every real
+ * DB. The v7→v8 migration ALTERs `media_assets` (adds caption_attempts/updated_at)
+ * and creates keyset indexes on both, so a synthetic legacy fixture must include
+ * them in their pre-v8 shape (without the columns the migration adds), or the
+ * ALTER/index DDL has nothing to target. FK `references` clauses are dropped — the
+ * migration only ALTERs/indexes, never writes, so referential targets are moot.
+ */
+const LEGACY_MEDIA_AND_JOBS = `
+  create table media_assets (
+    id text primary key,
+    event_id text not null,
+    role text not null,
+    source_index integer,
+    link_preview_id text,
+    local_path text,
+    mime_type text,
+    media_type text not null,
+    size_bytes integer,
+    width integer,
+    height integer,
+    duration_seconds real,
+    original_filename text,
+    detected_content text,
+    detected_metadata_json text,
+    caption text,
+    caption_model text,
+    caption_status text not null default 'pending'
+      check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
+    caption_error text,
+    download_status text not null default 'complete'
+      check(download_status in ('complete', 'failed')),
+    download_error text,
+    created_at integer not null
+  );
+  create table summarization_jobs (
+    id text primary key,
+    timeline_key text not null,
+    level integer not null,
+    status text not null default 'pending'
+      check(status in ('pending', 'processing', 'complete', 'failed')),
+    input_start_id text not null,
+    input_end_id text not null,
+    input_token_count integer,
+    target_token_count integer not null,
+    attempts integer not null default 0,
+    max_retries integer not null default 2,
+    best_effort_draft text,
+    error text,
+    result_summary_id text,
+    created_at integer not null,
+    updated_at integer not null
+  );`;
+
 async function withStorage(fn: (storage: Storage) => Promise<void>): Promise<void> {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
@@ -222,8 +276,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 8", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 8);
+test("LATEST_SCHEMA_VERSION is 9", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 9);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -286,6 +340,7 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
          created_at integer not null
        );`,
     );
+    legacy.exec(LEGACY_MEDIA_AND_JOBS);
     legacy.pragma("user_version = 4");
     // Sanity: table absent before migration.
     const before = legacy
@@ -405,6 +460,30 @@ const V6_TIMELINE_EVENTS = `create table timeline_events (
      (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
  );`;
 
+// A v7-shaped `summaries` carrying the diary-queue columns (added at v5->v6). The
+// chain from v7 doesn't run v5->v6, so the fixture must already have them — the
+// v8->v9 step indexes `summaries(latest_timestamp, id) where diary_status is not null`.
+const V7_SUMMARIES = `create table summaries (
+   id text primary key,
+   timeline_key text not null,
+   level integer not null,
+   content text not null,
+   earliest_timestamp integer not null,
+   latest_timestamp integer not null,
+   latest_event_id text not null,
+   event_count integer not null,
+   token_count integer not null,
+   model_id text,
+   status text not null default 'complete'
+     check(status in ('complete', 'truncated', 'superseded')),
+   backfill_job_id text,
+   generated_at integer not null,
+   created_at integer not null,
+   diary_status text
+     check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed')),
+   diary_attempts integer not null default 0
+ );`;
+
 // The v7 retrieval tables with the OLD, UNGUARDED update trigger (no WHEN clause) —
 // exactly what the v6->v7 migration created before issue #11.
 const V7_RETRIEVAL_WITH_UNGUARDED_TRIGGER = `
@@ -451,6 +530,12 @@ test("v7 -> v8 migration guards the memory_chunks_au trigger and keeps FTS corre
     const legacy = new Database(dbPath);
     legacy.exec(V6_TIMELINE_EVENTS);
     legacy.exec(V7_RETRIEVAL_WITH_UNGUARDED_TRIGGER);
+    // Opening runs the chain to the current LATEST (now v9): the v8->v9 step ALTERs
+    // media_assets and indexes summarization_jobs + summaries, so this v7 fixture must
+    // include those base tables (with the v6 diary columns on summaries) too, or that
+    // later step has nothing to target.
+    legacy.exec(LEGACY_MEDIA_AND_JOBS);
+    legacy.exec(V7_SUMMARIES);
     legacy.pragma("user_version = 7");
 
     // Sanity: the fixture trigger is the OLD unguarded form (no WHEN clause).
@@ -875,6 +960,7 @@ test("both agent_sessions indexes exist after a v4 -> v5 migration", async () =>
          created_at integer not null
        );`,
     );
+    legacy.exec(LEGACY_MEDIA_AND_JOBS);
     legacy.pragma("user_version = 4");
     legacy.close();
 

@@ -4,6 +4,7 @@ import type { Storage } from "../../storage/index.js";
 import type { AgentSessionFactory } from "../../agent/factory.js";
 import type { SessionManager } from "../../agent/session-manager.js";
 import type { Logger } from "../logger.js";
+import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -16,6 +17,15 @@ export interface ConsoleServerDeps {
   storage: Storage;
   factory: AgentSessionFactory;
   sessions: SessionManager;
+  /**
+   * Live stat sources for the four background worker pools (ARCHITECTURE.md §11).
+   * The monitor reads in-flight counts + config from here; counts-by-status come
+   * from the DB via `storage`. Optional so existing callers/tests that don't
+   * exercise the pipeline routes need not assemble it.
+   */
+  pipelines?: PipelineRegistry;
+  /** In-process activity bus the pools publish to; backs the `/api/pipelines/stream` SSE. */
+  activityBus?: PipelineActivityBus;
   /** Workspace root; media `local_path`s are resolved beneath it. */
   workspaceRoot: string;
   logger: Logger;

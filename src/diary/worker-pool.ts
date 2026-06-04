@@ -3,6 +3,7 @@ import type { Storage, DiaryJob, MemoryFileWriter } from "../storage/index.js";
 import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { DiaryConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
+import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createDiaryTool } from "../tools/index.js";
 import { renderRichMessage } from "../context/index.js";
@@ -27,6 +28,8 @@ export interface DiaryWorkerPoolOptions {
   resolveChannelLabel: (timelineKey: string) => Promise<string>;
   onComplete?: (summaryId: string) => void;
   onError?: (summaryId: string, error: Error) => void;
+  /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
+  activityBus?: PipelineActivityBus;
   logger: Logger;
 }
 
@@ -72,6 +75,30 @@ export class DiaryWorkerPool {
     await Promise.allSettled([...this.activeWorkers]);
   }
 
+  /** Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). */
+  stats(): PipelineStats {
+    return {
+      pool: "diary",
+      workerCount: this.options.config.worker_count ?? 1,
+      maxRetries: this.options.config.max_retries ?? DEFAULT_MAX_RETRIES,
+      inFlight: () => this.activeWorkers.size,
+      notify: () => this.notifyNewWork(),
+    };
+  }
+
+  /** Publish one pipeline-activity event (ARCHITECTURE.md §11); best-effort. */
+  private emit(job: DiaryJob, kind: PipelineActivityKind, status: string): void {
+    this.options.activityBus?.publish({
+      pool: "diary",
+      id: job.summaryId,
+      kind,
+      status,
+      attempts: job.attempts,
+      room: job.timelineKey,
+      ts: Date.now(),
+    });
+  }
+
   /** Wake the pool immediately (e.g. when a new level-1 summary lands). */
   notifyNewWork(): void {
     if (this.wakeResolve) {
@@ -112,6 +139,7 @@ export class DiaryWorkerPool {
       const job = await this.options.storage.claimNextDiaryJob();
       if (!job) break;
       claimedAny = true;
+      this.emit(job, "claimed", "processing");
       const work = this.processJob(job)
         .catch((error) =>
           this.options.logger.error("diary_worker_error", {
@@ -163,6 +191,7 @@ export class DiaryWorkerPool {
     if (!events.some((e) => e.role === "assistant")) {
       await storage.setDiaryStatus(job.summaryId, "skipped");
       logger.debug("diary_skipped_no_participation", { summaryId: job.summaryId, timelineKey: job.timelineKey });
+      this.emit(job, "skipped", "skipped");
       return;
     }
 
@@ -310,6 +339,7 @@ export class DiaryWorkerPool {
       }
       await storage.setDiaryStatus(job.summaryId, "done");
       this.options.onComplete?.(job.summaryId);
+      this.emit(job, "completed", "done");
       return;
     }
 
@@ -333,11 +363,13 @@ export class DiaryWorkerPool {
     try {
       if (job.attempts <= maxRetries) {
         await storage.setDiaryStatus(job.summaryId, "pending");
+        this.emit(job, "retried", "pending");
       } else {
         // Terminal: a missing diary entry is acceptable (unlike a summary). No
         // truncation fallback — mark failed and move on.
         await storage.setDiaryStatus(job.summaryId, "failed");
         this.options.onError?.(job.summaryId, new Error(errMsg));
+        this.emit(job, "failed", "failed");
       }
     } catch (writeErr) {
       logger.error("diary_status_write_failed", {

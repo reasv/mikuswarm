@@ -1,0 +1,147 @@
+<script lang="ts">
+	import { pipelinesQuery } from '$lib/query/pipelines';
+	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
+	import { pipelineSummary } from '$lib/stores/pipeline-summary.svelte';
+	import type { PipelineHealth } from '$lib/schemas';
+	import { cn } from '$lib/utils';
+
+	const pipelines = pipelinesQuery();
+
+	const POOL_LABELS: Record<string, string> = {
+		enrichment: 'Enrichment',
+		captioning: 'Captioning',
+		summarization: 'Summarization',
+		diary: 'Diary'
+	};
+
+	// Publish the aggregate health to the top-bar summary as the feed loads.
+	$effect(() => {
+		const rows = pipelines.data?.pipelines;
+		if (!rows) return;
+		pipelineSummary.set({
+			failing: rows.reduce((n, p) => n + p.counts.failed, 0),
+			retrying: rows.reduce((n, p) => n + p.counts.retrying, 0),
+			inFlight: rows.reduce((n, p) => n + p.inFlight, 0)
+		});
+	});
+
+	const totals = $derived.by(() => {
+		const rows = pipelines.data?.pipelines ?? [];
+		return {
+			failed: rows.reduce((n, p) => n + p.counts.failed, 0),
+			retrying: rows.reduce((n, p) => n + p.counts.retrying, 0),
+			inFlight: rows.reduce((n, p) => n + p.inFlight, 0),
+			pending: rows.reduce((n, p) => n + p.counts.pending, 0)
+		};
+	});
+
+	function broken(p: PipelineHealth): boolean {
+		return p.counts.failed > 0 || p.counts.retrying > 0;
+	}
+</script>
+
+{#snippet countChip(label: string, n: number, tone: string, animate = false)}
+	{#if n > 0}
+		<span class={cn('inline-flex items-center gap-1 rounded px-1 font-mono text-[10px]', tone)}>
+			{#if animate}
+				<span class="relative flex size-1.5">
+					<span
+						class="absolute inline-flex size-full animate-ping rounded-full bg-current opacity-75"
+					></span>
+					<span class="relative inline-flex size-1.5 rounded-full bg-current"></span>
+				</span>
+			{/if}
+			{label}
+			{n}
+		</span>
+	{/if}
+{/snippet}
+
+<div class="flex h-full flex-col">
+	<div class="px-3 py-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+		Pipelines
+	</div>
+	<div class="min-h-0 flex-1 overflow-y-auto">
+		{#if pipelines.isPending}
+			<div class="space-y-2 p-3">
+				{#each Array(4) as _, i (i)}
+					<div class="h-12 animate-pulse rounded bg-muted"></div>
+				{/each}
+			</div>
+		{:else if pipelines.isError}
+			<div class="p-3 text-sm text-destructive">{pipelines.error.message}</div>
+		{:else}
+			<!-- "All" aggregate summary row -->
+			<div
+				class="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs text-muted-foreground"
+			>
+				<span class="font-semibold tracking-wide uppercase">All</span>
+				<div class="flex flex-wrap items-center justify-end gap-1">
+					{@render countChip(
+						'⚙',
+						totals.inFlight,
+						'bg-blue-500/15 text-blue-600 dark:text-blue-400',
+						true
+					)}
+					{@render countChip('↻', totals.retrying, 'bg-amber-500/15 text-amber-600 dark:text-amber-400')}
+					{@render countChip('✕', totals.failed, 'bg-red-500/15 text-red-600 dark:text-red-400')}
+					{#if totals.inFlight === 0 && totals.retrying === 0 && totals.failed === 0}
+						<span class="text-[10px] text-emerald-600 dark:text-emerald-400">healthy</span>
+					{/if}
+				</div>
+			</div>
+
+			<ul>
+				{#each pipelines.data.pipelines as p (p.pool)}
+					<li>
+						<button
+							type="button"
+							onclick={() => pipelineSelection.selectPool(p.pool)}
+							class={cn(
+								'flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-accent',
+								pipelineSelection.pool === p.pool && 'bg-accent'
+							)}
+						>
+							<div class="flex items-center justify-between gap-2">
+								<span class={cn('text-sm font-medium', broken(p) && 'text-red-600 dark:text-red-400')}>
+									{POOL_LABELS[p.pool] ?? p.pool}
+								</span>
+								{#if !p.enabled}
+									<span class="font-mono text-[10px] text-muted-foreground">off</span>
+								{/if}
+							</div>
+							<div class="flex flex-wrap items-center gap-1">
+								{@render countChip(
+									'⚙',
+									p.inFlight,
+									'bg-blue-500/15 text-blue-600 dark:text-blue-400',
+									true
+								)}
+								{@render countChip(
+									'pend',
+									p.counts.pending,
+									'bg-zinc-500/15 text-zinc-600 dark:text-zinc-400'
+								)}
+								{@render countChip(
+									'↻',
+									p.counts.retrying,
+									'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+								)}
+								{@render countChip(
+									'✕',
+									p.counts.failed,
+									'bg-red-500/15 text-red-600 dark:text-red-400'
+								)}
+								{@render countChip(
+									'done',
+									p.counts.done,
+									'bg-emerald-500/10 text-emerald-600/80 dark:text-emerald-400/80'
+								)}
+							</div>
+						</button>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</div>
+</div>
