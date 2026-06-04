@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { PIPELINE_IDS, type PipelineId } from "../../storage/index.js";
+import { PIPELINE_IDS, type MediaAssetRow, type PipelineId } from "../../storage/index.js";
 import { sendJson, sendError } from "./responses.js";
 import type { RequestContext } from "./types.js";
 
@@ -82,4 +82,96 @@ export function pipelineItems(
     maxRetries,
   );
   sendJson(res, 200, page);
+}
+
+/** Wire projection of a produced/source media asset (no base64; bytes via /api/media). */
+function mediaAssetWire(asset: MediaAssetRow): Record<string, unknown> {
+  return {
+    ref: asset.id,
+    role: asset.role,
+    mediaType: asset.media_type,
+    mimeType: asset.mime_type ?? null,
+    filename: asset.original_filename ?? null,
+    downloadStatus: asset.download_status,
+    captionStatus: asset.caption_status,
+    caption: asset.caption ?? null,
+    captionModel: asset.caption_model ?? null,
+    /** Whether bytes are fetchable at GET /api/media/:ref. */
+    hasBytes: asset.local_path != null,
+  };
+}
+
+/**
+ * GET /api/pipelines/:pool/items/:id — the pool-specific detail union
+ * (ARCHITECTURE.md §11). 404 for an unknown pool or an id outside the pool's
+ * track. Every response carries the base `item` plus pool-specific extras:
+ *
+ * - enrichment → the produced `mediaAssets` / `linkPreviews` / `replyContext`.
+ * - captioning → the source `media` (bytes via `/api/media/:ref`) + caption/model.
+ * - summarization → the resulting `summary` + `lineage` (mirrors `/api/summaries/:id`)
+ *   + `bestEffortDraft`/`error`, and `sessionId` → the synthetic agent_sessions run.
+ * - diary → the source `summary` (covered range + neutral record) + `sessionId`; the
+ *   written first-person entry is rendered by the client via the linked SessionView
+ *   (the day-file path depends on the agent timezone, which the console does not hold).
+ */
+export function pipelineItemDetail(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const pool = ctx.params.pool;
+  if (!isPipelineId(pool)) return sendError(res, 404, `Unknown pipeline: ${pool}`);
+
+  const stats = ctx.deps.pipelines ? ctx.deps.pipelines[pool] : null;
+  const maxRetries = stats?.maxRetries ?? FALLBACK_MAX_RETRIES[pool];
+  const { storage } = ctx.deps;
+  const item = storage.getPipelineItem(pool, ctx.params.id, maxRetries);
+  if (!item) return sendError(res, 404, `Unknown ${pool} item: ${ctx.params.id}`);
+
+  switch (pool) {
+    case "enrichment": {
+      const data = storage.getEnrichmentData([item.id]);
+      return sendJson(res, 200, {
+        pool,
+        item,
+        replyContext: data.replyContexts.get(item.id) ?? null,
+        linkPreviews: data.linkPreviews.get(item.id) ?? [],
+        mediaAssets: (data.mediaAssets.get(item.id) ?? []).map(mediaAssetWire),
+      });
+    }
+    case "captioning": {
+      const asset = storage.getMediaAssetById(item.id);
+      return sendJson(res, 200, {
+        pool,
+        item,
+        media: asset ? mediaAssetWire(asset) : null,
+      });
+    }
+    case "summarization": {
+      const job = storage.getSummarizationJobById(item.id);
+      const summaryId = job?.resultSummaryId ?? null;
+      const summary = summaryId ? (storage.getSummaryById(summaryId) ?? null) : null;
+      const lineage = summaryId ? storage.getSummaryLineage(summaryId) : null;
+      return sendJson(res, 200, {
+        pool,
+        item,
+        sessionId: item.sessionId,
+        summary,
+        lineage,
+        bestEffortDraft: job?.bestEffortDraft ?? null,
+        error: job?.error ?? null,
+      });
+    }
+    case "diary": {
+      // The diary item IS a level-1 summary; surface it (covered range + the neutral
+      // record) plus the session that wrote the first-person entry.
+      const summary = storage.getSummaryById(item.id) ?? null;
+      return sendJson(res, 200, {
+        pool,
+        item,
+        sessionId: item.sessionId,
+        summary,
+      });
+    }
+  }
 }

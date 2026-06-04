@@ -3353,6 +3353,27 @@ export class Storage {
     return { items, nextCursor };
   }
 
+  /**
+   * A single pipeline item by id (backs `/api/pipelines/:pool/items/:id`), using
+   * the same projection + scope as {@link listPipelineItems}. Returns undefined
+   * when the id is unknown OR falls outside the pool's scope (e.g. a non
+   * image/video/audio media asset, or an `inactive` enrichment event) — so an
+   * out-of-track id reads as a 404, never a partial item. Pure read.
+   */
+  getPipelineItem(
+    pool: PipelineId,
+    id: string,
+    defaultMaxRetries: number,
+  ): PipelineItem | undefined {
+    const spec = PIPELINE_LIST_SPECS[pool];
+    const where = [spec.scope, `${spec.idCol} = @id`].filter(Boolean).join(" and ");
+    const sql = `${spec.selectFrom} where ${where} limit 1`;
+    const row = this.read(
+      (db) => db.prepare(sql).get({ id }) as Record<string, unknown> | undefined,
+    );
+    return row ? spec.project(row, defaultMaxRetries) : undefined;
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();

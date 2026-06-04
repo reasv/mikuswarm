@@ -13,7 +13,7 @@ import {
   media,
   summaryDetail,
 } from "./handlers.js";
-import { listPipelines, pipelineItems } from "./pipeline-handlers.js";
+import { listPipelines, pipelineItems, pipelineItemDetail } from "./pipeline-handlers.js";
 import type { ConsoleServerDeps } from "./types.js";
 
 export type { ConsoleServerDeps } from "./types.js";
@@ -63,7 +63,8 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/media/:ref", media)
     .add("GET", "/api/summaries/:id", summaryDetail)
     .add("GET", "/api/pipelines", listPipelines)
-    .add("GET", "/api/pipelines/:pool/items", pipelineItems);
+    .add("GET", "/api/pipelines/:pool/items", pipelineItems)
+    .add("GET", "/api/pipelines/:pool/items/:id", pipelineItemDetail);
 
   // Track live sockets so `stop()` can force-close long-lived SSE connections
   // (which would otherwise keep `server.close()` pending forever).

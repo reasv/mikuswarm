@@ -527,3 +527,185 @@ test("GET /api/pipelines/:pool/items works without a registry (default maxRetrie
     });
   });
 });
+
+// ── Item detail (Phase 2) ────────────────────────────────────────────────────
+
+test("GET enrichment item detail returns produced media/previews/replyContext", async () => {
+  await withStorage(async (storage) => {
+    await storage.appendTimelineEvent(userEvent("evt-1"));
+    await storage.persistEnrichmentResults("evt-1", {
+      replyContext: { event_id: "evt-1", body: "the quoted message", created_at: 1_000 },
+      linkPreviews: [
+        {
+          id: "lp-1",
+          event_id: "evt-1",
+          context: "body",
+          url: "https://example.org",
+          title: "Example",
+          preview_index: 0,
+          fetch_status: "complete",
+          created_at: 1_000,
+        },
+      ],
+      mediaAssets: [
+        {
+          id: "evt-1:attach:0",
+          event_id: "evt-1",
+          role: "attachment",
+          media_type: "image",
+          original_filename: "pic.png",
+          caption_status: "complete",
+          caption: "a cat",
+          download_status: "complete",
+          created_at: 1_000,
+        },
+      ],
+    });
+
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await fetch(`${base}/api/pipelines/enrichment/items/evt-1`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.pool, "enrichment");
+      assert.equal(body.item.id, "evt-1");
+      assert.equal(body.item.status, "complete");
+      assert.equal(body.mediaAssets.length, 1);
+      assert.equal(body.mediaAssets[0].ref, "evt-1:attach:0");
+      assert.equal(body.mediaAssets[0].caption, "a cat");
+      assert.equal(body.linkPreviews.length, 1);
+      assert.equal(body.linkPreviews[0].url, "https://example.org");
+      assert.equal(body.replyContext.body, "the quoted message");
+    });
+  });
+});
+
+test("GET captioning item detail returns the source media + caption", async () => {
+  await withStorage(async (storage) => {
+    await storage.appendTimelineEvent(userEvent("evt-1"));
+    await storage.insertMediaAsset({
+      id: "cap-1",
+      event_id: "evt-1",
+      role: "attachment",
+      media_type: "audio",
+      mime_type: "audio/ogg",
+      original_filename: "voice.ogg",
+      local_path: "media/voice.ogg",
+      caption: "transcript text",
+      caption_model: "whisper",
+      caption_status: "complete",
+      download_status: "complete",
+      created_at: 1_000,
+    });
+
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await fetch(`${base}/api/pipelines/captioning/items/cap-1`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.pool, "captioning");
+      assert.equal(body.media.ref, "cap-1");
+      assert.equal(body.media.mediaType, "audio");
+      assert.equal(body.media.caption, "transcript text");
+      assert.equal(body.media.captionModel, "whisper");
+      assert.equal(body.media.hasBytes, true);
+    });
+  });
+});
+
+test("GET summarization item detail returns the summary, lineage and session", async () => {
+  await withStorage(async (storage) => {
+    await storage.appendTimelineEvent(userEvent("evt-a"));
+    await storage.insertSummarizationJob({
+      id: "job-1",
+      timelineKey: TK,
+      level: 1,
+      inputStartId: "evt-a",
+      inputEndId: "evt-a",
+      inputTokenCount: 100,
+      targetTokenCount: 50,
+      maxRetries: 2,
+    });
+    await storage.insertSummaryWithLineage({
+      id: "sum-1",
+      timelineKey: TK,
+      level: 1,
+      content: "the summary text",
+      earliestTimestamp: 900,
+      latestTimestamp: 1_000,
+      latestEventId: "evt-a",
+      eventCount: 1,
+      tokenCount: 5,
+      modelId: "m",
+      status: "complete",
+      generatedAt: 1_000,
+      eventIds: ["evt-a"],
+      jobId: "job-1",
+    });
+    await storage.insertAgentSession({
+      id: "s-sum1111111",
+      timelineKey: TK,
+      sessionType: "summarize",
+      status: "completed",
+      triggerEventId: "summarize:job-1",
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    });
+
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await fetch(`${base}/api/pipelines/summarization/items/job-1`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.pool, "summarization");
+      assert.equal(body.sessionId, "s-sum1111111");
+      assert.equal(body.summary.id, "sum-1");
+      assert.equal(body.summary.content, "the summary text");
+      assert.equal(body.lineage.events.length, 1);
+    });
+  });
+});
+
+test("GET diary item detail returns the source summary + session", async () => {
+  await withStorage(async (storage) => {
+    await diarySummary(storage, "sum-1", "done", { latestTimestamp: 9_000 });
+    await storage.insertAgentSession({
+      id: "s-diary111111",
+      timelineKey: TK,
+      sessionType: "diary",
+      status: "completed",
+      triggerEventId: "diary:sum-1",
+      createdAt: 9_100,
+      updatedAt: 9_100,
+    });
+
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await fetch(`${base}/api/pipelines/diary/items/sum-1`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.pool, "diary");
+      assert.equal(body.sessionId, "s-diary111111");
+      assert.equal(body.summary.id, "sum-1");
+      assert.equal(body.item.outputSummary, "entry written");
+    });
+  });
+});
+
+test("item detail 404s for unknown pool, unknown id, and out-of-track id", async () => {
+  await withStorage(async (storage) => {
+    await storage.appendTimelineEvent(userEvent("evt-1"));
+    // A non image/video/audio asset is not in the captioning track → 404.
+    await storage.insertMediaAsset({
+      id: "doc-1",
+      event_id: "evt-1",
+      role: "attachment",
+      media_type: "file",
+      caption_status: "pending",
+      download_status: "complete",
+      created_at: 1_000,
+    });
+
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      assert.equal((await fetch(`${base}/api/pipelines/nope/items/x`)).status, 404);
+      assert.equal((await fetch(`${base}/api/pipelines/enrichment/items/missing`)).status, 404);
+      assert.equal((await fetch(`${base}/api/pipelines/captioning/items/doc-1`)).status, 404);
+    });
+  });
+});
