@@ -95,6 +95,76 @@ test("RemoteEmbeddingProvider rejects a dim mismatch", async () => {
   }
 });
 
+test("RemoteEmbeddingProvider throws on a short/partial response instead of misaligning", async () => {
+  // Respond with ONE vector for a TWO-input batch (a truncated/partial response).
+  // Without count validation the provider would silently return a single vector,
+  // mis-mapping it to the wrong content-hash; it must throw so the batch retries.
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: [{ embedding: [1, 0, 0, 0], index: 0 }] }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+    });
+    await assert.rejects(
+      () => provider.embedDocuments(["alpha", "beta"]),
+      /returned 1 vectors for 2 inputs/,
+    );
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("RemoteEmbeddingProvider throws on an out-of-range / duplicated index", async () => {
+  // Two inputs, two vectors, but both at index 0 (a duplicated-index response):
+  // would leave one slot empty and overwrite the other → misalignment. Must throw.
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [
+            { embedding: [1, 0, 0, 0], index: 0 },
+            { embedding: [0, 1, 0, 0], index: 0 },
+          ],
+        }),
+      );
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+    });
+    await assert.rejects(
+      () => provider.embedDocuments(["alpha", "beta"]),
+      /duplicate index 0/,
+    );
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
 test("VectorStore.ensureSchema flags model swaps and dim changes (active-model invariant)", async () => {
   await withStorage(async (storage) => {
     const vs = new VectorStore(storage);

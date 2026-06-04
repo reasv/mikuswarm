@@ -95,9 +95,24 @@ export class EmbedWorkerPool {
       for (const c of claimed) {
         if (byHash.has(c.contentHash)) continue;
         const cached = storage.getCachedEmbedding(c.contentHash, modelId);
+        // A remote `dim` change without a `model_id` change can leave a stale,
+        // wrong-width BLOB cached under the same key. Validate the cached vector's
+        // width against the active provider's dim (mirroring the remote provider's
+        // response-dim check) — on mismatch, treat it as a miss so we re-embed and
+        // overwrite the stale entry rather than upserting a wrong-width vector.
         if (cached) {
-          byHash.set(c.contentHash, vecFromBuffer(cached));
-        } else if (!missHashes.includes(c.contentHash)) {
+          const vec = vecFromBuffer(cached);
+          if (vec.length === provider.dim) {
+            byHash.set(c.contentHash, vec);
+            continue;
+          }
+          this.options.logger?.warn("embed_cache_dim_mismatch", {
+            modelId,
+            cachedDim: vec.length,
+            expectedDim: provider.dim,
+          });
+        }
+        if (!missHashes.includes(c.contentHash)) {
           missHashes.push(c.contentHash);
           missTexts.push(c.text);
         }
