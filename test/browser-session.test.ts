@@ -510,6 +510,211 @@ test("session #14: a download whose saveAs resolves after closeSession is droppe
   });
 });
 
+// ── #19/#20: capture per-page dialog/download handlers ───────────────────────
+
+interface CapturedHandlers {
+  dialog?: (dialog: unknown) => void;
+  download?: (download: unknown) => void;
+}
+
+/**
+ * A browser whose single page records the `dialog`/`download` handlers that
+ * trackPage registers, so a test can fire them directly with fake events.
+ */
+function makeHandlerCapturingBrowser(captured: CapturedHandlers): {
+  contexts: () => unknown[];
+  isConnected: () => boolean;
+  on: () => void;
+  close: () => Promise<void>;
+} {
+  const fakePage = {
+    _closed: false,
+    isClosed() { return this._closed; },
+    async close() { this._closed = true; },
+    on(event: string, cb: (arg: unknown) => void) {
+      if (event === "dialog") captured.dialog = cb;
+      if (event === "download") captured.download = cb;
+    },
+    url: () => "about:blank",
+    title: async () => "",
+  };
+  const context = { newPage: async () => fakePage, pages: () => [fakePage] };
+  const browser = {
+    _connected: true,
+    contexts: () => [context],
+    isConnected: () => true,
+    on: () => {},
+    close: async () => { browser._connected = false; },
+  };
+  return browser;
+}
+
+interface FakeDialog {
+  type(): string;
+  accept(): Promise<void>;
+  dismiss(): Promise<void>;
+  accepted: boolean;
+  dismissed: boolean;
+}
+
+function makeFakeDialog(type: "alert" | "confirm" | "prompt"): FakeDialog {
+  const d: FakeDialog = {
+    type: () => type,
+    accept: async () => { d.accepted = true; },
+    dismiss: async () => { d.dismissed = true; },
+    accepted: false,
+    dismissed: false,
+  };
+  return d;
+}
+
+// alert ALWAYS accepts (nothing to dismiss); confirm/prompt follow dialog_policy.
+// Asserting both policies catches an inverted policy that a single-policy test
+// would miss (spec §5.1).
+const DIALOG_MATRIX: Array<{
+  policy: "dismiss" | "accept";
+  type: "alert" | "confirm" | "prompt";
+  expect: "accept" | "dismiss";
+}> = [
+  { policy: "dismiss", type: "alert", expect: "accept" },
+  { policy: "dismiss", type: "confirm", expect: "dismiss" },
+  { policy: "dismiss", type: "prompt", expect: "dismiss" },
+  { policy: "accept", type: "alert", expect: "accept" },
+  { policy: "accept", type: "confirm", expect: "accept" },
+  { policy: "accept", type: "prompt", expect: "accept" },
+];
+
+for (const { policy, type, expect } of DIALOG_MATRIX) {
+  test(`session #19: dialog_policy="${policy}" → ${type} is ${expect}ed`, async () => {
+    await withWorkspace(async (ws) => {
+      const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+      const captured: CapturedHandlers = {};
+      const connect: ConnectOverCdp = async () =>
+        makeHandlerCapturingBrowser(captured) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+      const session = new BrowserSession({
+        config: baseConfig({ dialog_policy: policy }),
+        agentTimezone: "UTC",
+        workspaceRoot: ws,
+        logger: silentLogger,
+        connectOverCdp: connect,
+      });
+      try {
+        await session.getActivePage("s1");
+        assert.ok(captured.dialog, "dialog handler was registered on the page");
+        const dialog = makeFakeDialog(type);
+        captured.dialog!(dialog);
+        // Handler is fire-and-forget (void); let its async accept/dismiss settle.
+        await new Promise((r) => setTimeout(r, 5));
+        if (expect === "accept") {
+          assert.equal(dialog.accepted, true, `${type} under "${policy}" must accept`);
+          assert.equal(dialog.dismissed, false, `${type} under "${policy}" must not dismiss`);
+        } else {
+          assert.equal(dialog.dismissed, true, `${type} under "${policy}" must dismiss`);
+          assert.equal(dialog.accepted, false, `${type} under "${policy}" must not accept`);
+        }
+      } finally {
+        manager.restore();
+        await session.shutdown();
+      }
+    });
+  });
+}
+
+// ── #20: download capture + filename sanitization ────────────────────────────
+
+interface FakeDownload {
+  suggestedFilename(): string;
+  saveAs(p: string): Promise<void>;
+  url(): string;
+  savedTo?: string;
+}
+
+function makeFakeDownload(suggested: string, url: string): FakeDownload {
+  const d: FakeDownload = {
+    suggestedFilename: () => suggested,
+    url: () => url,
+    saveAs: async (p: string) => { d.savedTo = p; },
+  };
+  return d;
+}
+
+const HOSTILE_FILENAMES: Array<{ name: string; suggested: string }> = [
+  { name: "path traversal", suggested: "../../etc/passwd" },
+  { name: "absolute-looking path", suggested: "/etc/shadow" },
+  { name: "weird chars + spaces", suggested: "my report (final)!.pdf" },
+  { name: "null/slash mix", suggested: "a/b\\c:d*e?.bin" },
+];
+
+for (const { name, suggested } of HOSTILE_FILENAMES) {
+  test(`session #20: a hostile download filename (${name}) is sanitized and stays under the session dir`, async () => {
+    await withWorkspace(async (ws) => {
+      const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+      const captured: CapturedHandlers = {};
+      const connect: ConnectOverCdp = async () =>
+        makeHandlerCapturingBrowser(captured) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+      // A session id with hostile chars too, to exercise sanitizeSessionId.
+      const sessionId = "../sneaky:id";
+      const session = new BrowserSession({
+        config: baseConfig(),
+        agentTimezone: "UTC",
+        workspaceRoot: ws,
+        logger: silentLogger,
+        connectOverCdp: connect,
+      });
+      try {
+        await session.getActivePage(sessionId);
+        assert.ok(captured.download, "download handler was registered on the page");
+
+        const dl = makeFakeDownload(suggested, "https://example.com/file");
+        captured.download!(dl);
+        // handleDownload awaits mkdir + saveAs; give it a moment to settle.
+        await new Promise((r) => setTimeout(r, 20));
+
+        assert.ok(dl.savedTo, "saveAs was called");
+        const savedTo = dl.savedTo!;
+        assert.ok(path.isAbsolute(savedTo), "saveAs got an absolute path");
+
+        // The download dir is workspaceRoot/browser-downloads/<sanitized-session>/.
+        const downloadsRoot = path.join(ws, "browser-downloads");
+        const rel = path.relative(downloadsRoot, savedTo);
+        // Must stay UNDER browser-downloads — no absolute jump out of the root.
+        assert.ok(!path.isAbsolute(rel), `saved path escaped browser-downloads: ${rel}`);
+
+        // <sanitized-session>/<sanitized-filename>: exactly two path segments.
+        const parts = rel.split(path.sep);
+        assert.equal(parts.length, 2, `expected <session>/<file>, got "${rel}"`);
+        const [sessionSeg, fileSeg] = parts;
+        // No segment is a real traversal step. (A sanitized name may *contain* the
+        // chars "." — e.g. "..sneaky" → "_sneaky" collapses dots to underscores —
+        // but it is never the bare ".." that path resolution would walk up.)
+        assert.notEqual(sessionSeg, "..", "session dir is not a traversal step");
+        assert.notEqual(fileSeg, "..", "filename is not a traversal step");
+        assert.match(sessionSeg!, /^[A-Za-z0-9._-]+$/, "session dir is sanitized to a safe charset");
+        // The sanitized charset itself forbids the path separator, so no segment
+        // it produces can introduce a new directory level.
+
+        // Filename: sanitized to a safe charset, no separators, no "..".
+        assert.match(fileSeg!, /^[A-Za-z0-9._-]+$/, `filename not sanitized: "${fileSeg}"`);
+        assert.ok(!fileSeg!.includes("/") && !fileSeg!.includes("\\"), "no separators in filename");
+        assert.notEqual(fileSeg, "..", "filename is not a bare ..");
+
+        // The record is drained once, then cleared.
+        const drained = session.drainDownloads(sessionId);
+        assert.equal(drained.length, 1, "exactly one download record surfaces");
+        assert.equal(drained[0]!.url, "https://example.com/file");
+        assert.equal(drained[0]!.filename, fileSeg, "record filename matches the sanitized name");
+        // The record's relative path is workspace-relative and stays under the dir.
+        assert.equal(drained[0]!.path, path.join("browser-downloads", sessionSeg!, fileSeg!));
+        // A second drain returns nothing — the buffer was cleared.
+        assert.equal(session.drainDownloads(sessionId).length, 0, "downloads cleared after drain");
+      } finally {
+        manager.restore();
+        await session.shutdown();
+      }
+    });
+  });
+}
+
 test("session: a down Manager surfaces backend_unavailable (graceful degradation)", async () => {
   await withWorkspace(async (ws) => {
     const manager = stubManager({ throwOnFetch: true });

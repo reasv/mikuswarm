@@ -247,3 +247,96 @@ ${block}`;
     });
   });
 }
+
+// --- #18: [browser] fail-fast validation (parity with the observability guard) ---
+
+// A structurally-complete enabled [browser] block. `auth_token` and
+// `manager_url` are interpolated so each test can exercise the present-but-blank
+// / absent-token guard and the manager_url scheme guard (loader.ts validateConfig).
+const BROWSER_BLOCK = (opts: { authTokenLine: string; managerUrl: string }) => `
+[browser]
+enabled = true
+manager_url = "${opts.managerUrl}"
+${opts.authTokenLine}
+profile_name = "miku"
+platform = "windows"
+humanize = true
+evaluate_enabled = false
+geoip = false
+dialog_policy = "dismiss"
+snapshot_max_chars = 20000
+nav_timeout_ms = 30000
+act_timeout_ms = 15000
+connect_timeout_ms = 20000
+session_page_idle_ms = 600000
+`;
+
+const VALID_MANAGER_URL = "http://127.0.0.1:8080";
+
+test("config: browser enabled with blank auth_token is rejected (issue #18)", async () => {
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: `auth_token = ""`, managerUrl: VALID_MANAGER_URL })}`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /auth_token|minLength|Invalid config/i,
+      "empty auth_token must fail-fast when the browser is enabled",
+    );
+  });
+});
+
+test("config: browser enabled with whitespace-only auth_token is rejected (issue #18)", async () => {
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: `auth_token = "  "`, managerUrl: VALID_MANAGER_URL })}`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /auth_token/i,
+      "whitespace-only auth_token must fail-fast when the browser is enabled",
+    );
+  });
+});
+
+test("config: browser enabled with ABSENT auth_token is accepted (token-less Manager) (issue #18)", async () => {
+  // Key absent = the Manager runs token-less (localhost isolation) — allowed.
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: "", managerUrl: VALID_MANAGER_URL })}`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.browser?.enabled, true);
+    assert.equal(config.browser?.auth_token, undefined);
+  });
+});
+
+test("config: browser enabled with a real auth_token is accepted (issue #18)", async () => {
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: `auth_token = "sekret-token"`, managerUrl: VALID_MANAGER_URL })}`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.browser?.auth_token, "sekret-token");
+  });
+});
+
+// manager_url must be an absolute http(s) URL the harness can connect to.
+const BAD_MANAGER_URLS: Array<{ name: string; url: string }> = [
+  { name: "bare host:port (no scheme)", url: "localhost:8080" },
+  { name: "scheme-relative path", url: "/foo" },
+  { name: "non-http(s) scheme", url: "ftp://x" },
+];
+
+for (const { name, url } of BAD_MANAGER_URLS) {
+  test(`config: browser enabled with invalid manager_url rejected — ${name} (issue #18)`, async () => {
+    const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: `auth_token = "t"`, managerUrl: url })}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        /manager_url must be an absolute http\(s\) URL/i,
+        `${name} must fail-fast when the browser is enabled`,
+      );
+    });
+  });
+}
+
+test("config: browser enabled with a valid http manager_url is accepted (issue #18)", async () => {
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: `auth_token = "t"`, managerUrl: "http://127.0.0.1:8080" })}`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.browser?.manager_url, "http://127.0.0.1:8080");
+  });
+});

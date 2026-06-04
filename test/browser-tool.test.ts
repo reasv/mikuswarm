@@ -137,6 +137,18 @@ test("tool: rejects non-http(s) schemes (bad_url)", async () => {
   });
 });
 
+test("tool: open with a non-http(s) scheme is rejected (bad_url) (#17)", async () => {
+  // Mirror the navigate file:// guard for the `open` branch: open also calls
+  // assertBrowserUrl, so its rejection path must be covered (drop the call there
+  // and nothing catches it).
+  await withTool(baseConfig(), {}, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "open", url: "file:///etc/passwd" }),
+      /browser:bad_url/,
+    );
+  });
+});
+
 test("tool: a stale ref surfaces as ref_expired", async () => {
   const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
   await withTool(baseConfig(), { refError: timeout }, async (tool) => {
