@@ -7,6 +7,7 @@ import test from "node:test";
 import { AddressInfo } from "node:net";
 import { Storage } from "../src/storage/index.js";
 import {
+  MemoryIndexer,
   VectorStore,
   RemoteEmbeddingProvider,
   createRetrievalSubsystem,
@@ -230,5 +231,208 @@ test("subsystem fail-fast: provider=remote with no remote block throws", async (
         }),
       /no resolvable \[retrieval\.embedding\.remote\] block/,
     );
+  });
+});
+
+// #19: a CONFIGURED-but-unreachable remote endpoint must fail startup loudly via a
+// boot probe, not silently degrade to lexical-only. Before the fix, the provider was
+// created but never called at boot, so an unreachable endpoint was caught and
+// swallowed into lexical-only mode.
+test("subsystem fail-fast: configured remote that errors on probe rejects at boot", async () => {
+  const server = http.createServer((_req, res) => {
+    res.statusCode = 500;
+    res.end("upstream exploded");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    await withStorage(async (storage) => {
+      const config = resolveRetrievalConfig({
+        enabled: true,
+        embedding: {
+          provider: "remote",
+          remote: {
+            id: "test-embed",
+            endpoint: `http://127.0.0.1:${port}/v1`,
+            api_key: "k",
+            dim: 4,
+          },
+        },
+      });
+      await assert.rejects(
+        () =>
+          createRetrievalSubsystem({
+            storage,
+            workspaceRoot: "/tmp/nope",
+            dataDir: "/tmp/nope-data",
+            config,
+          }),
+        /configured but unreachable/,
+      );
+    });
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+// #2: in lexical-only mode (no active provider) the reconciler must stamp new chunks
+// 'skip', not 'pending' — otherwise the pending queue grows forever with work nothing
+// will ever process. Drives the real indexer over an on-disk memory file so the
+// embeddingsActive → 'skip' wiring is exercised end to end.
+test("indexer stamps new chunks 'skip' when embeddings are inactive (#2)", async () => {
+  const ws = await mkdtemp(path.join(os.tmpdir(), "miku-skip-"));
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  await mkdir(path.join(ws, "memory"), { recursive: true });
+  await writeFile(
+    path.join(ws, "memory", "2026-06-03.md"),
+    "# 2026-06-03\n\n## 09:00 → 09:05 · UTC · #general\nLexical-only diary entry.\n",
+  );
+  try {
+    await withStorage(async (storage) => {
+      // Lexical-only: embeddingsActive() === false.
+      const skipIndexer = new MemoryIndexer({
+        storage,
+        workspaceRoot: ws,
+        config: resolveRetrievalConfig({ enabled: true }),
+        embeddingsActive: () => false,
+      });
+      await skipIndexer.reconcileAll();
+      assert.ok(storage.listMemoryChunkPaths().includes("memory/2026-06-03.md"));
+      assert.equal(storage.countPendingEmbedding(), 0, "no pending chunks in lexical-only mode");
+      const statuses = storage.read(
+        (db) =>
+          db.prepare("select embed_status from memory_chunks").all() as Array<{
+            embed_status: string;
+          }>,
+      );
+      assert.ok(statuses.length > 0);
+      assert.ok(
+        statuses.every((r) => r.embed_status === "skip"),
+        "all chunks stamped 'skip'",
+      );
+    });
+
+    // And the provider-present default (embeddingsActive true) stamps 'pending'.
+    await withStorage(async (storage) => {
+      const activeIndexer = new MemoryIndexer({
+        storage,
+        workspaceRoot: ws,
+        config: resolveRetrievalConfig({ enabled: true }),
+        embeddingsActive: () => true,
+      });
+      await activeIndexer.reconcileAll();
+      assert.ok(storage.countPendingEmbedding() > 0, "provider-present path keeps 'pending'");
+    });
+  } finally {
+    await rm(ws, { recursive: true, force: true });
+  }
+});
+
+// #2 (round-trip): skipPendingEmbedding converts a stale 'pending' backlog to 'skip',
+// and resetAllEmbeddings re-queues those 'skip' rows when a provider returns.
+test("skipPendingEmbedding drains the queue; resetAllEmbeddings re-queues skip rows (#2)", async () => {
+  await withStorage(async (storage) => {
+    await storage.reconcileMemoryChunks("memory/x.md", [
+      {
+        id: "a",
+        path: "memory/x.md",
+        ordinal: 0,
+        source: "memory",
+        startLine: 1,
+        endLine: 2,
+        room: null,
+        entryTs: 1,
+        text: "hello",
+        tokenCount: 1,
+        contentHash: "h-a",
+      },
+    ]);
+    assert.equal(storage.countPendingEmbedding(), 1);
+    const skipped = await storage.skipPendingEmbedding();
+    assert.equal(skipped, 1);
+    assert.equal(storage.countPendingEmbedding(), 0);
+    const requeued = await storage.resetAllEmbeddings();
+    assert.equal(requeued, 1);
+    assert.equal(storage.countPendingEmbedding(), 1);
+  });
+});
+
+// #3: a same-dim model swap must EMPTY memory_vec so KNN never compares new-model
+// query vectors against leftover old-model rows mid-reindex.
+test("ensureSchema empties memory_vec on a same-dim model swap (#3)", async () => {
+  await withStorage(async (storage) => {
+    const vs = new VectorStore(storage);
+    await vs.ensureSchema(4, "model-a");
+    // Seed a vector under model-a.
+    await vs.upsert(1, "memory", new Float32Array([1, 0, 0, 0]));
+    let count = storage.read(
+      (db) => (db.prepare("select count(*) as n from memory_vec").get() as { n: number }).n,
+    );
+    assert.equal(count, 1);
+
+    // Same dim, different model id → table kept (dim unchanged) but must be cleared.
+    const swap = await vs.ensureSchema(4, "model-b");
+    assert.equal(swap.modelChanged, true);
+    assert.equal(swap.recreated, false);
+    count = storage.read(
+      (db) => (db.prepare("select count(*) as n from memory_vec").get() as { n: number }).n,
+    );
+    assert.equal(count, 0, "old-model vectors cleared on same-dim swap");
+  });
+});
+
+// #8: an orphan memory_vec row (chunk deleted by reconcile after pruneVectors but
+// before the worker's upsert) is removed by the startup sweep; valid rows are kept.
+test("sweepOrphanVectors deletes vectors with no owning chunk (#8)", async () => {
+  await withStorage(async (storage) => {
+    const vs = new VectorStore(storage);
+    await vs.ensureSchema(4, "model-a");
+    // A real chunk (rowid assigned) plus its vector.
+    await storage.reconcileMemoryChunks("memory/x.md", [
+      {
+        id: "live",
+        path: "memory/x.md",
+        ordinal: 0,
+        source: "memory",
+        startLine: 1,
+        endLine: 2,
+        room: null,
+        entryTs: 1,
+        text: "live chunk",
+        tokenCount: 2,
+        contentHash: "h-live",
+      },
+    ]);
+    const liveRowid = storage.read(
+      (db) =>
+        (db.prepare("select rowid from memory_chunks where id='live'").get() as { rowid: number })
+          .rowid,
+    );
+    await vs.upsert(liveRowid, "memory", new Float32Array([1, 0, 0, 0]));
+    // An orphan vector: a chunk_id with no memory_chunks row.
+    await vs.upsert(999999, "memory", new Float32Array([0, 1, 0, 0]));
+
+    const before = storage.read(
+      (db) => (db.prepare("select count(*) as n from memory_vec").get() as { n: number }).n,
+    );
+    assert.equal(before, 2);
+
+    const swept = await storage.sweepOrphanVectors();
+    assert.equal(swept, 1, "exactly the orphan removed");
+
+    const rows = storage.read(
+      (db) =>
+        db.prepare("select chunk_id from memory_vec").all() as Array<{ chunk_id: number }>,
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(Number(rows[0]!.chunk_id), liveRowid, "live vector retained");
+  });
+});
+
+// #8 (no-op guard): sweep must not throw when memory_vec doesn't exist (lexical-only).
+test("sweepOrphanVectors is a no-op when memory_vec is absent (#8)", async () => {
+  await withStorage(async (storage) => {
+    const swept = await storage.sweepOrphanVectors();
+    assert.equal(swept, 0);
   });
 });

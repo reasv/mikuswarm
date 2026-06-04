@@ -84,6 +84,20 @@ export class VectorStore {
       ),
     );
 
+    // A same-dim model swap keeps the table (dim is unchanged) but every existing
+    // vector belongs to the OLD model's space — cosine against new-model query
+    // vectors is meaningless (#3). The caller re-queues all chunks for re-embedding,
+    // but until each is overwritten the table would mix old/new-model rows and KNN
+    // could surface stale cross-space hits. Clear it now so KNN returns only fresh
+    // rows and search degrades to lexical for the rest (the intended graceful path,
+    // §4/§5a). `memory_chunks` (lexical/FTS) is untouched, so search stays live.
+    // (The dim-change branch above already dropped+recreated the table, so this only
+    // matters for the same-dim case where the table survived.)
+    if (modelChanged && !recreated) {
+      await this.storage.write((db) => db.exec(`delete from memory_vec`));
+      this.logger?.warn("vector_index_model_changed", { from: priorModel, to: modelId, dim });
+    }
+
     if (priorModel !== modelId) await this.storage.setIndexMeta(ACTIVE_MODEL_KEY, modelId);
     if (priorDim !== String(dim)) await this.storage.setIndexMeta(ACTIVE_DIM_KEY, String(dim));
     return { recreated, modelChanged };

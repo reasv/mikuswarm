@@ -19,6 +19,13 @@ export interface MemoryIndexerOptions {
   pruneVectors?: (rowids: number[]) => void;
   /** Fired after a reconcile that inserted chunks, to wake the embed worker. */
   onChunksInserted?: () => void;
+  /**
+   * Whether an embedding provider is active (#2). When false (lexical-only mode —
+   * provider/vector-store init failed or no model resolved), newly-inserted chunks
+   * are stamped `'skip'` instead of `'pending'` so the embed queue doesn't grow
+   * unbounded with work nothing will ever process. Defaults to active.
+   */
+  embeddingsActive?: () => boolean;
 }
 
 /**
@@ -38,6 +45,7 @@ export class MemoryIndexer {
   private readonly logger?: Logger;
   private readonly pruneVectors?: (rowids: number[]) => void;
   private readonly onChunksInserted?: () => void;
+  private readonly embeddingsActive?: () => boolean;
   /** Strict-FIFO tail so reconciles never overlap (low volume; mirrors the writer). */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -48,6 +56,7 @@ export class MemoryIndexer {
     this.logger = opts.logger;
     this.pruneVectors = opts.pruneVectors;
     this.onChunksInserted = opts.onChunksInserted;
+    this.embeddingsActive = opts.embeddingsActive;
   }
 
   private get memoryDir(): string {
@@ -143,7 +152,11 @@ export class MemoryIndexer {
       fallbackChunkTokens: this.config.index.fallbackChunkTokens,
       fallbackChunkOverlap: this.config.index.fallbackChunkOverlap,
     });
-    const result = await this.storage.reconcileMemoryChunks(rel, chunks);
+    // In lexical-only mode (no active provider) stamp new chunks 'skip' so the embed
+    // queue doesn't grow unbounded (#2); 'pending' otherwise. `resetAllEmbeddings()`
+    // re-queues 'skip' rows if a provider later becomes active (§5a).
+    const newChunkStatus = this.embeddingsActive?.() === false ? "skip" : "pending";
+    const result = await this.storage.reconcileMemoryChunks(rel, chunks, newChunkStatus);
     if (result.deletedRowids.length > 0) this.pruneVectors?.(result.deletedRowids);
     if (result.inserted || result.deleted) {
       this.logger?.debug("memory_reconciled", {

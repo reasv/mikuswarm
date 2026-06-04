@@ -61,7 +61,17 @@ export async function createRetrievalSubsystem(
       for (const r of rowids) void vectorStore?.remove(r);
     },
     onChunksInserted: () => embedWorker?.notifyNewWork(),
+    // Lexical-only when no provider came up: stamp new chunks 'skip' so the embed
+    // queue doesn't grow unbounded (#2). Read live (closure over `provider`) so a
+    // provider that comes up below flips this without re-wiring the indexer.
+    embeddingsActive: () => provider !== undefined,
   });
+
+  // Is the *remote* provider the active one? `createEmbeddingProvider` returns the
+  // local provider both when `provider="local"` and as the fallback when a remote
+  // block is absent — so "remote configured" is specifically provider==="remote" AND
+  // a resolvable [remote] block (the no-block case already fail-fasts above).
+  const remoteActive = config.embedding.provider === "remote" && !!config.embedding.remote;
 
   // Bring up the semantic half. Loading sqlite-vec is the failure point if the native
   // dep is missing; on any failure we log and run lexical-only (§4 graceful degrade).
@@ -73,6 +83,27 @@ export async function createRetrievalSubsystem(
       httpProxyUrl: opts.httpProxyUrl,
       logger,
     });
+
+    // Boot-probe vs runtime-degrade (#19): a configured REMOTE endpoint that is
+    // unreachable/misconfigured must fail startup loudly (explicit-deployment-config
+    // / fail-fast), not silently degrade to lexical-only. Probe it once here and
+    // rethrow on failure. This is distinct from the runtime *query-time* degrade
+    // (MemorySearch catches a remote embedQuery failure and falls back to lexical for
+    // that one query) — that path stays graceful. We deliberately do NOT probe the
+    // LOCAL provider: its first-run weight download / native-dep load failing is the
+    // documented graceful-degrade path (§4), not a boot error.
+    if (remoteActive) {
+      try {
+        await p.embedQuery("probe");
+      } catch (probeError) {
+        const detail = probeError instanceof Error ? probeError.message : String(probeError);
+        await p.close().catch(() => {});
+        throw new Error(
+          `retrieval.embedding remote provider '${p.modelId}' is configured but unreachable: ${detail}`,
+        );
+      }
+    }
+
     const vs = new VectorStore(storage, logger);
     const { recreated, modelChanged } = await vs.ensureSchema(p.dim, p.modelId);
     if (recreated || modelChanged) {
@@ -84,6 +115,9 @@ export async function createRetrievalSubsystem(
     embedWorker = new EmbedWorkerPool({ storage, vectorStore, provider, config, logger });
     logger?.info("retrieval_semantic_ready", { model: p.modelId, dim: p.dim });
   } catch (error) {
+    // A configured remote provider failing here is fatal (#19) — rethrow rather than
+    // swallowing into lexical-only. Local/sqlite-vec failures stay graceful (§4).
+    if (remoteActive) throw error;
     logger?.warn("retrieval_semantic_unavailable", {
       error: error instanceof Error ? error.message : String(error),
     });
@@ -91,6 +125,11 @@ export async function createRetrievalSubsystem(
     provider = undefined;
     vectorStore = undefined;
     embedWorker = undefined;
+    // No provider will ever process the queue: convert any 'pending' chunks left from
+    // a prior provider-present run to 'skip' so the queue doesn't read as "queued
+    // forever" (#2). resetAllEmbeddings() re-queues them if a provider returns (§5a).
+    const skipped = await storage.skipPendingEmbedding();
+    if (skipped > 0) logger?.info("embed_skip_lexical_only", { skipped });
   }
 
   const search = new MemorySearch(storage, indexer, config, { provider, vectorStore });
@@ -100,6 +139,14 @@ export async function createRetrievalSubsystem(
     search,
     onMemoryWrite: (absPath) => indexer.enqueueReconcile(absPath),
     start: async () => {
+      // Orphan-vector sweep (#8): a chunk deleted by reconcile after `pruneVectors`
+      // but before the embed worker's `upsert` leaves a `memory_vec` row with no
+      // owning `memory_chunks` row — harmless but an unbounded space leak. Sweep once
+      // at startup, alongside the embed worker's `resetStaleEmbedding`. No-op when the
+      // vector table doesn't exist (lexical-only).
+      const orphans = await storage.sweepOrphanVectors();
+      if (orphans > 0) logger?.info("embed_orphan_vectors_swept", { count: orphans });
+
       // Startup full sweep (§7): fire-and-forget — lexical reconcile is cheap and the
       // lazy on-search check covers correctness; don't block boot. Wake the embed
       // worker once the sweep has queued pending chunks.

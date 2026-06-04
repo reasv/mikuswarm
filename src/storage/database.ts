@@ -2264,7 +2264,19 @@ export class Storage {
    * metadata are updated in place (text identical → embedding preserved). FTS rows
    * follow via triggers. Runs in one transaction so a search never sees a torn diff.
    */
-  reconcileMemoryChunks(path: string, chunks: MemoryChunkInput[]): Promise<ReconcileResult> {
+  /**
+   * Reconcile a file's chunks into the index (§7). `newChunkStatus` is the
+   * `embed_status` stamped on freshly-inserted chunks: `'pending'` in the normal
+   * (provider-present) path so the embed worker picks them up, or `'skip'` in the
+   * lexical-only path (no active provider) so the pending queue doesn't grow
+   * unbounded (#2). `resetAllEmbeddings()` re-queues `'skip'` rows when a provider
+   * later becomes active, keeping the round-trip consistent (§5a).
+   */
+  reconcileMemoryChunks(
+    path: string,
+    chunks: MemoryChunkInput[],
+    newChunkStatus: "pending" | "skip" = "pending",
+  ): Promise<ReconcileResult> {
     return this.readAndWrite((db) => {
       const existing = db
         .prepare(`select rowid, id, ordinal, start_line, end_line from memory_chunks where path = ?`)
@@ -2283,7 +2295,7 @@ export class Storage {
            text, token_count, content_hash, embed_status, indexed_at
          ) values (
            @id, @path, @ordinal, @source, @startLine, @endLine, @room, @entryTs,
-           @text, @tokenCount, @contentHash, 'pending', @now
+           @text, @tokenCount, @contentHash, @embedStatus, @now
          )`,
       );
       const updateStmt = db.prepare(
@@ -2312,6 +2324,7 @@ export class Storage {
             text: c.text,
             tokenCount: c.tokenCount,
             contentHash: c.contentHash,
+            embedStatus: newChunkStatus,
             now,
           });
           inserted += 1;
@@ -2506,6 +2519,34 @@ export class Storage {
           .prepare(`update memory_chunks set embed_status = 'pending' where embed_status = 'processing'`)
           .run().changes,
     );
+  }
+
+  /**
+   * Delete `memory_vec` rows whose `chunk_id` no longer has a `memory_chunks` row
+   * (#8). A chunk deleted by reconcile *after* `pruneVectors` but *before* the embed
+   * worker's `upsert` leaves an orphan vector with no owning chunk — harmless to
+   * correctness (search filters unmatched KNN hits) but an unbounded space leak.
+   * Run at startup alongside `resetStaleEmbedding`. No-op (returns 0) if `memory_vec`
+   * doesn't exist yet (lexical-only / semantic half never came up).
+   */
+  sweepOrphanVectors(): Promise<number> {
+    return this.write((db) => {
+      const exists =
+        (
+          db
+            .prepare(
+              `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
+            )
+            .get() as { n: number }
+        ).n > 0;
+      if (!exists) return 0;
+      return db
+        .prepare(
+          `delete from memory_vec
+           where chunk_id not in (select rowid from memory_chunks)`,
+        )
+        .run().changes;
+    });
   }
 
   /** Mark a chunk embedded: status='done', record the model it was embedded with. */
