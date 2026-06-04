@@ -203,6 +203,57 @@ per_session_budget_tokens = 1200  # new-section cap = 1/5 of generation_threshol
 recency_max_tokens = 6000         # token ceiling for the recent-memory window (§9a/§10a).
 recency_file_count = 2            # N most recent EXISTING day files at/before the anchor (§9a).
 
+# Memory retrieval (ARCHITECTURE.md §9d). Hybrid lexical+semantic search over
+# memory/*.md: the recall_memory tool, and auto-retrieval of relevant past entries
+# injected per trigger. Phase 1 (lexical FTS5/BM25) needs no external deps; the
+# semantic half uses a small in-process embedding model (or a configured remote
+# endpoint). Disable the whole subsystem by setting enabled = false.
+[retrieval]
+enabled = true
+auto_retrieval = true             # §8c — inject the small relevant-memory block per trigger
+
+[retrieval.index]
+worker_count = 1                  # embedding worker pool (not latency-critical)
+max_retries = 3
+embed_batch_size = 32             # chunks per remote /embeddings call
+max_chunk_tokens = 512            # oversized header blocks above this are sub-split (= embedder limit)
+fallback_chunk_tokens = 400       # §3 legacy/oversized token-window chunking
+fallback_chunk_overlap = 80
+
+[retrieval.query]
+max_results = 6                   # recall_memory default
+min_score = 0.35
+vector_weight = 0.7               # §8a hybrid weights (normalized)
+text_weight = 0.3
+candidate_multiplier = 4
+mmr_enabled = false               # §8a diversity re-rank (off, like OpenClaw)
+mmr_lambda = 0.7
+temporal_decay_enabled = true     # §8b — ON (diary recency matters; real timestamps)
+temporal_decay_half_life_days = 45
+
+[retrieval.auto]
+max_results = 3                   # §8c — small on purpose
+min_score = 0.45                  # tighter than the tool
+max_tokens = 600                  # whole injected block budget
+dedup_against_recency = true      # §8c — skip blocks already in the §10a recency layer
+
+[retrieval.embedding]
+# Active model resolution (§5a): remote if [.remote] is set & resolvable, else local.
+provider = "local"                # 'local' | 'remote'
+
+[retrieval.embedding.local]
+model = "bge-small-en-v1.5"       # fastembed, 384-dim, English (§5c)
+dim = 384
+
+# Optional remote endpoint; OpenRouter-compatible (§5d). When set (and provider is
+# "remote", or provider is unset), it becomes the active model and `dim` governs the
+# vector index width. Leave commented to use the local model.
+# [retrieval.embedding.remote]
+# id = "openai/text-embedding-3-small"
+# endpoint = "https://<our-proxy>/api/v1"
+# api_key = "${OPENROUTER_KEY}"
+# dim = 1536
+
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]

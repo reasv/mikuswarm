@@ -178,6 +178,48 @@ export interface DiaryJob {
   attempts: number;
 }
 
+/**
+ * A memory-retrieval chunk as produced by the indexer (ARCHITECTURE.md §9d). The
+ * storage layer accepts this structurally for reconciliation; the canonical shape
+ * (with docs) lives in `src/retrieval/chunk.ts` as `MemoryChunk`.
+ */
+export interface MemoryChunkInput {
+  id: string;
+  path: string;
+  ordinal: number;
+  source: string;
+  startLine: number;
+  endLine: number;
+  room: string | null;
+  entryTs: number;
+  text: string;
+  tokenCount: number;
+  contentHash: string;
+}
+
+/** Net effect of one reconcile pass over a file (for logging). */
+export interface ReconcileResult {
+  inserted: number;
+  updated: number;
+  deleted: number;
+  /** rowids of chunks removed this pass — so the caller can prune their vectors. */
+  deletedRowids: number[];
+}
+
+/** One lexical (FTS5/BM25) search hit, pre-ranking. */
+export interface LexicalHit {
+  rowid: number;
+  id: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+  room: string | null;
+  entryTs: number;
+  text: string;
+  /** Raw SQLite bm25() cost — lower (more negative) is a better match. */
+  bm25: number;
+}
+
 /** Sort key for events/summaries: (timestamp, received_at, id) ascending. */
 export interface TimelineCursor {
   timestamp: number;
@@ -2210,6 +2252,342 @@ export class Storage {
     });
   }
 
+  // ── Memory retrieval index (ARCHITECTURE.md §9d) ──────────────────
+  // `memory_chunks` is the corpus index; reconciliation is a content-hash set-diff
+  // per file (§7). The DB — keyed on chunk `id = hash(path+text)` — is the sole
+  // idempotency authority; correctness never depends on when a file write happened.
+
+  /**
+   * Reconcile a single file's chunks against the index (§7). New/changed-hash
+   * chunks (a different `id`) are inserted with `embed_status='pending'`; chunks no
+   * longer present are deleted; chunks present in both with shifted line/ordinal
+   * metadata are updated in place (text identical → embedding preserved). FTS rows
+   * follow via triggers. Runs in one transaction so a search never sees a torn diff.
+   */
+  reconcileMemoryChunks(path: string, chunks: MemoryChunkInput[]): Promise<ReconcileResult> {
+    return this.readAndWrite((db) => {
+      const existing = db
+        .prepare(`select rowid, id, ordinal, start_line, end_line from memory_chunks where path = ?`)
+        .all(path) as Array<{
+        rowid: number;
+        id: string;
+        ordinal: number;
+        start_line: number;
+        end_line: number;
+      }>;
+      const existingById = new Map(existing.map((r) => [r.id, r]));
+      const now = Date.now();
+      const insertStmt = db.prepare(
+        `insert into memory_chunks (
+           id, path, ordinal, source, start_line, end_line, room, entry_ts,
+           text, token_count, content_hash, embed_status, indexed_at
+         ) values (
+           @id, @path, @ordinal, @source, @startLine, @endLine, @room, @entryTs,
+           @text, @tokenCount, @contentHash, 'pending', @now
+         )`,
+      );
+      const updateStmt = db.prepare(
+        `update memory_chunks set ordinal = @ordinal, start_line = @startLine, end_line = @endLine
+         where id = @id`,
+      );
+      const deleteStmt = db.prepare(`delete from memory_chunks where id = ?`);
+
+      let inserted = 0;
+      let updated = 0;
+      const deletedRowids: number[] = [];
+      const seen = new Set<string>();
+      for (const c of chunks) {
+        seen.add(c.id);
+        const prev = existingById.get(c.id);
+        if (!prev) {
+          insertStmt.run({
+            id: c.id,
+            path: c.path,
+            ordinal: c.ordinal,
+            source: c.source,
+            startLine: c.startLine,
+            endLine: c.endLine,
+            room: c.room,
+            entryTs: c.entryTs,
+            text: c.text,
+            tokenCount: c.tokenCount,
+            contentHash: c.contentHash,
+            now,
+          });
+          inserted += 1;
+        } else if (
+          prev.ordinal !== c.ordinal ||
+          prev.start_line !== c.startLine ||
+          prev.end_line !== c.endLine
+        ) {
+          updateStmt.run({
+            id: c.id,
+            ordinal: c.ordinal,
+            startLine: c.startLine,
+            endLine: c.endLine,
+          });
+          updated += 1;
+        }
+      }
+      for (const r of existing) {
+        if (!seen.has(r.id)) {
+          deleteStmt.run(r.id);
+          deletedRowids.push(r.rowid);
+        }
+      }
+      return { inserted, updated, deleted: deletedRowids.length, deletedRowids };
+    });
+  }
+
+  /** All distinct file paths currently represented in the index (for sweep pruning). */
+  listMemoryChunkPaths(): string[] {
+    return this.read((db) => {
+      const rows = db
+        .prepare(`select distinct path from memory_chunks`)
+        .all() as Array<{ path: string }>;
+      return rows.map((r) => r.path);
+    });
+  }
+
+  /** Drop every chunk for a path (a file deleted out from under the index). */
+  deleteMemoryChunksForPath(path: string): Promise<number> {
+    return this.write((db) => {
+      return db.prepare(`delete from memory_chunks where path = ?`).run(path).changes;
+    });
+  }
+
+  /**
+   * Lexical (FTS5/BM25) candidate search (§4/§8a). `match` is a pre-built FTS5 MATCH
+   * expression (the tool sanitizes free text into it). Optional room/time filters
+   * apply to the joined `memory_chunks` metadata. Ordered best-first (bm25 ascending).
+   */
+  searchMemoryLexical(opts: {
+    match: string;
+    limit: number;
+    room?: string;
+    afterTs?: number;
+    beforeTs?: number;
+  }): LexicalHit[] {
+    return this.read((db) => {
+      const clauses: string[] = ["memory_chunks_fts match @match"];
+      const params: Record<string, unknown> = { match: opts.match, limit: opts.limit };
+      if (opts.room !== undefined) {
+        clauses.push("c.room = @room");
+        params.room = opts.room;
+      }
+      if (opts.afterTs !== undefined) {
+        clauses.push("c.entry_ts >= @afterTs");
+        params.afterTs = opts.afterTs;
+      }
+      if (opts.beforeTs !== undefined) {
+        clauses.push("c.entry_ts <= @beforeTs");
+        params.beforeTs = opts.beforeTs;
+      }
+      const rows = db
+        .prepare(
+          `select c.rowid as rowid, c.id as id, c.path as path, c.start_line as startLine,
+                  c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
+                  bm25(memory_chunks_fts) as bm25
+           from memory_chunks_fts
+           join memory_chunks c on c.rowid = memory_chunks_fts.rowid
+           where ${clauses.join(" and ")}
+           order by bm25 asc
+           limit @limit`,
+        )
+        .all(params) as LexicalHit[];
+      return rows;
+    });
+  }
+
+  /**
+   * Fetch chunk metadata + text by rowid (for vector-only hits that weren't in the
+   * lexical candidate set, §8a). Optional room/time filters mirror the lexical query
+   * so the same constraints apply to the semantic half.
+   */
+  getChunksByRowids(
+    rowids: number[],
+    filters?: { room?: string; afterTs?: number; beforeTs?: number },
+  ): LexicalHit[] {
+    if (rowids.length === 0) return [];
+    return this.read((db) => {
+      const placeholders = rowids.map(() => "?").join(",");
+      const clauses = [`rowid in (${placeholders})`];
+      const params: unknown[] = [...rowids];
+      if (filters?.room !== undefined) {
+        clauses.push("room = ?");
+        params.push(filters.room);
+      }
+      if (filters?.afterTs !== undefined) {
+        clauses.push("entry_ts >= ?");
+        params.push(filters.afterTs);
+      }
+      if (filters?.beforeTs !== undefined) {
+        clauses.push("entry_ts <= ?");
+        params.push(filters.beforeTs);
+      }
+      const rows = db
+        .prepare(
+          `select rowid, id, path, start_line as startLine, end_line as endLine, room,
+                  entry_ts as entryTs, text, 0 as bm25
+           from memory_chunks where ${clauses.join(" and ")}`,
+        )
+        .all(...params) as LexicalHit[];
+      return rows;
+    });
+  }
+
+  /** Read a single `index_meta` value (active model id/dim, corpus signature). */
+  getIndexMeta(key: string): string | undefined {
+    return this.read((db) => {
+      const row = db.prepare(`select value from index_meta where key = ?`).get(key) as
+        | { value: string }
+        | undefined;
+      return row?.value;
+    });
+  }
+
+  /** Upsert a single `index_meta` value. */
+  setIndexMeta(key: string, value: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into index_meta (key, value) values (?, ?)
+         on conflict(key) do update set value = excluded.value`,
+      ).run(key, value);
+    });
+  }
+
+  // ── Embedding queue (the `embed_status` column IS the queue, §7) ───
+  // Mirrors the enrichment/caption/diary worker idiom: poll 'pending' → CAS-claim a
+  // batch to 'processing' (attempts++) → embed → 'done' (or 'failed'/'skip').
+
+  /** Claim up to `limit` pending chunks for embedding (CAS pending→processing). */
+  claimPendingEmbedChunks(limit: number): Promise<
+    Array<{
+      rowid: number;
+      id: string;
+      contentHash: string;
+      text: string;
+      source: string;
+      /** Attempt count AFTER this claim's increment. */
+      attempts: number;
+    }>
+  > {
+    return this.readAndWrite((db) => {
+      const rows = db
+        .prepare(
+          `select rowid, id, content_hash as contentHash, text, source, embed_attempts as attempts
+           from memory_chunks where embed_status = 'pending'
+           order by indexed_at asc limit ?`,
+        )
+        .all(limit) as Array<{
+        rowid: number;
+        id: string;
+        contentHash: string;
+        text: string;
+        source: string;
+        attempts: number;
+      }>;
+      if (rows.length === 0) return [];
+      const claim = db.prepare(
+        `update memory_chunks set embed_status = 'processing', embed_attempts = embed_attempts + 1
+         where rowid = ? and embed_status = 'pending'`,
+      );
+      return rows
+        .filter((r) => claim.run(r.rowid).changes > 0)
+        .map((r) => ({ ...r, attempts: r.attempts + 1 }));
+    });
+  }
+
+  /** Reset stale 'processing' embed claims to 'pending' on startup (§7). */
+  resetStaleEmbedding(): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(`update memory_chunks set embed_status = 'pending' where embed_status = 'processing'`)
+          .run().changes,
+    );
+  }
+
+  /** Mark a chunk embedded: status='done', record the model it was embedded with. */
+  setEmbedDone(rowid: number, modelId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`update memory_chunks set embed_status = 'done', model_id = ? where rowid = ?`).run(
+        modelId,
+        rowid,
+      );
+    });
+  }
+
+  /**
+   * Set a chunk's embed status (failed-retry → 'pending', exhausted → 'failed', or
+   * 'skip' when embeddings are disabled). `maxRetries` chooses pending vs failed.
+   */
+  setEmbedFailed(rowid: number, attempts: number, maxRetries: number): Promise<void> {
+    const status = attempts > maxRetries ? "failed" : "pending";
+    return this.write((db) => {
+      db.prepare(`update memory_chunks set embed_status = ? where rowid = ?`).run(status, rowid);
+    });
+  }
+
+  /** Mark chunks 'skip' (embeddings intentionally off — lexical-only chunk, §6). */
+  skipPendingEmbedding(): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(`update memory_chunks set embed_status = 'skip' where embed_status = 'pending'`)
+          .run().changes,
+    );
+  }
+
+  /**
+   * Invalidate the vector index for a model switch (§5a): every embedded/failed/skip
+   * chunk goes back to 'pending' and loses its `model_id`, so the worker re-embeds
+   * with the new active model. The lexical index is untouched. Returns the count.
+   */
+  resetAllEmbeddings(): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(
+            `update memory_chunks set embed_status = 'pending', model_id = null
+             where embed_status in ('done', 'failed', 'skip')`,
+          )
+          .run().changes,
+    );
+  }
+
+  /** Count chunks still awaiting embedding (for worker idle detection / logs). */
+  countPendingEmbedding(): number {
+    return this.read(
+      (db) =>
+        (
+          db
+            .prepare(`select count(*) as n from memory_chunks where embed_status = 'pending'`)
+            .get() as { n: number }
+        ).n,
+    );
+  }
+
+  /** Document-embedding cache lookup (§5e): identical text+model never re-embeds. */
+  getCachedEmbedding(textHash: string, modelId: string): Buffer | undefined {
+    return this.read((db) => {
+      const row = db
+        .prepare(`select embedding from embedding_cache where text_hash = ? and model_id = ?`)
+        .get(textHash, modelId) as { embedding: Buffer } | undefined;
+      return row?.embedding;
+    });
+  }
+
+  /** Store a document embedding in the cache (§5e). */
+  putCachedEmbedding(textHash: string, modelId: string, embedding: Buffer): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into embedding_cache (text_hash, model_id, embedding) values (?, ?, ?)
+         on conflict(text_hash, model_id) do update set embedding = excluded.embedding`,
+      ).run(textHash, modelId, embedding);
+    });
+  }
+
   // ── Agent sessions (durable session record) ───────────────────────
   // Spec §3–§5: a session's durable record is the frozen context prefix
   // (snapshot, written once) plus its transcript (rewritten atomically at each
@@ -2551,6 +2929,78 @@ export class Storage {
   }
 }
 
+// Memory-retrieval index DDL (ARCHITECTURE.md §9d). Shared verbatim by the
+// fresh-DB SCHEMA (interpolated below) and the v6→v7 migration step, so the two
+// can never drift. Plain SQLite + built-in FTS5 only — NO extension load is
+// required here. The `sqlite-vec` `memory_vec` virtual table is NOT created here:
+// it depends on the extension being loaded on the connection and on the active
+// embedding model's dimension, so it is created at retrieval-subsystem init time
+// (§5b), leaving lexical search fully functional with zero native deps.
+const RETRIEVAL_SCHEMA = `
+create table if not exists memory_chunks (
+  -- AUTOINCREMENT so a deleted chunk's rowid is NEVER reused: the vector index
+  -- (memory_vec) keys on this rowid, and a reused rowid could otherwise bind a
+  -- stale vector to a different chunk (§9d). Orphaned vec rows are also pruned on
+  -- delete, but the no-reuse guarantee makes a mismatch impossible regardless.
+  rowid         integer primary key autoincrement,
+  id            text unique not null,
+  path          text not null,
+  ordinal       integer not null,
+  source        text not null default 'memory',
+  start_line    integer not null,
+  end_line      integer not null,
+  room          text,
+  entry_ts      integer not null,
+  text          text not null,
+  token_count   integer not null,
+  content_hash  text not null,
+  model_id      text,
+  embed_status  text not null default 'pending'
+                  check(embed_status in ('pending','processing','done','failed','skip')),
+  embed_attempts integer not null default 0,
+  indexed_at    integer not null
+);
+
+create index if not exists idx_chunks_embed on memory_chunks(embed_status)
+  where embed_status in ('pending','processing');
+create index if not exists idx_chunks_path on memory_chunks(path);
+
+-- Lexical index: external-content FTS5 over memory_chunks (unicode61, English).
+create virtual table if not exists memory_chunks_fts using fts5(
+  text, room, content='memory_chunks', content_rowid='rowid'
+);
+
+-- Triggers mirror memory_chunks → FTS. External-content tables require the special
+-- 'delete' command (with the old column values) to retract a row before re-add.
+create trigger if not exists memory_chunks_ai after insert on memory_chunks begin
+  insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+end;
+create trigger if not exists memory_chunks_ad after delete on memory_chunks begin
+  insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+    values ('delete', old.rowid, old.text, old.room);
+end;
+create trigger if not exists memory_chunks_au after update on memory_chunks begin
+  insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+    values ('delete', old.rowid, old.text, old.room);
+  insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+end;
+
+-- Document-embedding cache (§5e): identical text under the same model never
+-- re-embeds. Keyed by content_hash (= hash(text)) + model_id.
+create table if not exists embedding_cache (
+  text_hash text not null,
+  model_id  text not null,
+  embedding blob not null,
+  primary key (text_hash, model_id)
+);
+
+-- Single-key/value metadata: active embedding model + dim, corpus signature (§6).
+create table if not exists index_meta (
+  key   text primary key,
+  value text not null
+);
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -2856,13 +3306,13 @@ create index if not exists idx_agent_sessions_timeline
 
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
-`;
+${RETRIEVAL_SCHEMA}`;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 6;
+export const LATEST_SCHEMA_VERSION = 7;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -2975,6 +3425,16 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          on summaries(diary_status, latest_timestamp)
          where diary_status in ('pending', 'processing');`,
     );
+  },
+  // index 6 (v6 -> v7): add the memory-retrieval index (ARCHITECTURE.md §9d) —
+  // `memory_chunks` (+ embed-queue/path indexes), the external-content FTS5 table
+  // `memory_chunks_fts` with its sync triggers, `embedding_cache`, and `index_meta`.
+  // All plain SQLite + built-in FTS5; the `sqlite-vec` `memory_vec` table is created
+  // at runtime (it needs the extension + active-model dim), not here. `create ... if
+  // not exists` is harmless if a forward path already created any object. Fresh DBs
+  // get this directly from SCHEMA above and never run this step.
+  (db) => {
+    db.exec(RETRIEVAL_SCHEMA);
   },
 ];
 

@@ -8,8 +8,10 @@ export {
 export {
   createSearchMemoryTool,
   createWriteMemoryTool,
+  createRecallMemoryTool,
   type MemoryToolContext,
   type WriteMemoryToolContext,
+  type RecallMemoryToolContext,
 } from "./memory.js";
 export { createMediaTool, type MediaToolContext } from "./media.js";
 export { createReadImageTool, type ReadImageToolContext } from "./read-image.js";

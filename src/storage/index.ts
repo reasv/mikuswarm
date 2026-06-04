@@ -23,6 +23,9 @@ export {
   type RoomSummaryRow,
   type SummaryLineage,
   type TimelineCursor,
+  type MemoryChunkInput,
+  type ReconcileResult,
+  type LexicalHit,
 } from "./database.js";
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

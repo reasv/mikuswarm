@@ -26,6 +26,16 @@ import { runTextEditorCommand, type TextEditorArgs } from "../tools/file.js";
 export class MemoryFileWriter {
   private tail: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Optional post-write hook fired after every successful memory-file *mutation*
+   * (diary append, or a `write_memory` str_replace/insert — never a read-only
+   * `view`). The memory-retrieval indexer (ARCHITECTURE.md §9d) sets this to
+   * enqueue a reconcile of the touched file, so a new diary entry is searchable
+   * seconds after it lands. Must be non-throwing/fire-and-forget — it runs inside
+   * the FIFO op and must not poison the chain.
+   */
+  onAfterWrite?: (absPath: string) => void;
+
   constructor(private readonly workspaceRoot: string) {}
 
   /** Strict-FIFO enqueue. The op runs after all previously-enqueued ops settle. */
@@ -72,6 +82,7 @@ export class MemoryFileWriter {
       const padding = "\n".repeat(Math.max(0, 2 - trailingNewlines));
       const normalizedBlock = block.endsWith("\n") ? block : `${block}\n`;
       await appendFile(memoryPath, `${padding}${normalizedBlock}`, "utf8");
+      this.#fireAfterWrite(memoryPath);
     });
   }
 
@@ -80,7 +91,23 @@ export class MemoryFileWriter {
    * through the same FIFO, so `write_memory`'s edits serialize with diary appends.
    */
   editorCommand(args: TextEditorArgs): ReturnType<typeof runTextEditorCommand> {
-    return this.enqueue(() => runTextEditorCommand(this.workspaceRoot, args));
+    return this.enqueue(async () => {
+      const result = await runTextEditorCommand(this.workspaceRoot, args);
+      // Only mutations change the corpus; a read-only `view` must not trigger reindex.
+      if (args.command !== "view") {
+        this.#fireAfterWrite(resolveWorkspacePath(this.workspaceRoot, args.path));
+      }
+      return result;
+    });
+  }
+
+  /** Invoke the reconcile hook, swallowing any error so the FIFO chain survives. */
+  #fireAfterWrite(absPath: string): void {
+    try {
+      this.onAfterWrite?.(absPath);
+    } catch {
+      // hook is fire-and-forget; never let it break a memory write
+    }
   }
 
   /** Workspace-relative form of an absolute memory path (for tool result details). */

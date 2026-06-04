@@ -22,6 +22,8 @@
     "gpt-tokenizer": "^3.4.0",
     "nanoid": "5.1.11",
     "character-card-utils": "^2.0.3",
+    "fastembed": "2.1.0",
+    "sqlite-vec": "0.1.9",
     "png-chunk-text": "^1.0.0",
     "png-chunks-encode": "^1.0.0",
     "png-chunks-extract": "^1.0.0",
@@ -42,6 +44,7 @@
     "onlyBuiltDependencies": [
       "better-sqlite3",
       "esbuild",
+      "onnxruntime-node",
       "sharp"
     ]
   }

@@ -162,3 +162,64 @@ export function compactAgentTimestamp(ts: number | Date): string {
   const p = partsOf(toDate(ts));
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
+
+/**
+ * The offset (ms) of named IANA zone `tz` at instant `utcMs`, i.e.
+ * `localWallClock - UTC`. Positive east of UTC (Asia/Tokyo → +9h). Computed by
+ * formatting the instant in `tz` and differencing against the same wall-clock read
+ * as UTC — the standard ICU round-trip, no external dep. Mirrors the formatter
+ * approach used throughout this module.
+ */
+function zoneOffsetMs(tz: string, utcMs: number): number {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  const p: Record<string, string> = {};
+  for (const part of dtf.formatToParts(new Date(utcMs))) p[part.type] = part.value;
+  const asUtc = Date.UTC(
+    Number(p.year),
+    Number(p.month) - 1,
+    Number(p.day),
+    Number(p.hour),
+    Number(p.minute),
+    Number(p.second),
+  );
+  return asUtc - utcMs;
+}
+
+/**
+ * Inverse of {@link compactAgentTimestamp}: parse a `YYYY-MM-DD HH:MM` wall-clock
+ * string interpreted in the **given** IANA zone `tz` back to an epoch (ms). The
+ * zone is passed explicitly (not read from module state) because callers parse
+ * historical timestamps whose zone is recorded alongside them — e.g. the diary
+ * header embeds the zone it was written in (ARCHITECTURE.md §9c), which may differ
+ * from the current `agent.timezone`.
+ *
+ * Returns `null` if the string isn't the expected shape or the zone is unknown.
+ * DST-correct: the naive UTC guess is corrected by the zone offset at that instant,
+ * then re-checked once against the offset at the corrected instant so a guess that
+ * landed on the wrong side of a DST transition still resolves (the standard
+ * two-pass fixed-point; a single iteration suffices for all real transitions).
+ */
+export function parseZonedWallClock(wallClock: string, tz: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/.exec(wallClock.trim());
+  if (!m) return null;
+  const [, y, mo, d, h, mi] = m;
+  const naiveUtc = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
+  if (Number.isNaN(naiveUtc)) return null;
+  try {
+    const offset1 = zoneOffsetMs(tz, naiveUtc);
+    const guess = naiveUtc - offset1;
+    const offset2 = zoneOffsetMs(tz, guess);
+    return offset2 === offset1 ? guess : naiveUtc - offset2;
+  } catch {
+    return null; // unknown zone name
+  }
+}

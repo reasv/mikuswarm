@@ -53,6 +53,72 @@ const SummarizationSchema = Type.Object({
   label_cache_ttl_ms: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
+// Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus
+// auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
+// configs stay valid; `enabled` is the master switch for the whole index.
+const RetrievalEmbeddingRemoteSchema = Type.Object({
+  // OpenRouter-compatible embeddings endpoint (§5d). `dim` is REQUIRED when remote
+  // is the active provider — it governs the vector index width (§5a/§6).
+  id: Type.String({ minLength: 1 }),
+  endpoint: Type.String({ minLength: 1 }),
+  api_key: Type.String({ minLength: 1 }),
+  dim: Type.Integer({ minimum: 1 }),
+});
+
+const RetrievalEmbeddingSchema = Type.Object({
+  // Active-model resolution (§5a): 'remote' if the [remote] block is set, else the
+  // bundled 'local' ONNX model (the zero-config default + safety net).
+  provider: Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("remote")])),
+  local: Type.Optional(
+    Type.Object({
+      model: Type.Optional(Type.String({ minLength: 1 })),
+      dim: Type.Optional(Type.Integer({ minimum: 1 })),
+    }),
+  ),
+  remote: Type.Optional(RetrievalEmbeddingRemoteSchema),
+});
+
+const RetrievalSchema = Type.Object({
+  enabled: Type.Optional(Type.Boolean()),
+  // §8c — inject the small relevant-memory block inside each trigger's final user
+  // turn. Independently disablable (cache-safe placement; risk is distraction).
+  auto_retrieval: Type.Optional(Type.Boolean()),
+  index: Type.Optional(
+    Type.Object({
+      worker_count: Type.Optional(Type.Integer({ minimum: 1 })),
+      max_retries: Type.Optional(Type.Integer({ minimum: 0 })),
+      embed_batch_size: Type.Optional(Type.Integer({ minimum: 1 })),
+      // Oversized header blocks above this many tokens are sub-split (§3); also the
+      // embedder's per-input token ceiling.
+      max_chunk_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+      fallback_chunk_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+      fallback_chunk_overlap: Type.Optional(Type.Integer({ minimum: 0 })),
+    }),
+  ),
+  query: Type.Optional(
+    Type.Object({
+      max_results: Type.Optional(Type.Integer({ minimum: 1 })),
+      min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      vector_weight: Type.Optional(Type.Number({ minimum: 0 })),
+      text_weight: Type.Optional(Type.Number({ minimum: 0 })),
+      candidate_multiplier: Type.Optional(Type.Integer({ minimum: 1 })),
+      mmr_enabled: Type.Optional(Type.Boolean()),
+      mmr_lambda: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      temporal_decay_enabled: Type.Optional(Type.Boolean()),
+      temporal_decay_half_life_days: Type.Optional(Type.Number({ minimum: 1 })),
+    }),
+  ),
+  auto: Type.Optional(
+    Type.Object({
+      max_results: Type.Optional(Type.Integer({ minimum: 1 })),
+      min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      max_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+      dedup_against_recency: Type.Optional(Type.Boolean()),
+    }),
+  ),
+  embedding: Type.Optional(RetrievalEmbeddingSchema),
+});
+
 const TimelineSchema = Type.Object({
   // How many messages to fetch on first trigger (initial backfill). 0 = none.
   initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
@@ -312,6 +378,7 @@ export const AppConfigSchema = Type.Object({
   captioning: Type.Optional(CaptioningSchema),
   summarization: Type.Optional(SummarizationSchema),
   diary: Type.Optional(DiarySchema),
+  retrieval: Type.Optional(RetrievalSchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -347,3 +414,4 @@ export const AppConfigSchema = Type.Object({
 export type AppConfig = Static<typeof AppConfigSchema>;
 export type SummarizationConfig = Static<typeof SummarizationSchema>;
 export type DiaryConfig = Static<typeof DiarySchema>;
+export type RetrievalConfig = Static<typeof RetrievalSchema>;

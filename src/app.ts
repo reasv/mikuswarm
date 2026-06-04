@@ -38,6 +38,7 @@ import {
   createBashTool,
   createReadImageTool,
   createSearchMemoryTool,
+  createRecallMemoryTool,
   createSearchFilesTool,
   createSendMessageTool,
   createSetProfileTool,
@@ -58,6 +59,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
+import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
@@ -84,6 +86,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // diary worker's appends and `write_memory`'s edits serialize through it so a
   // concurrent read-modify-write can't corrupt a day file.
   const memoryWriter = new MemoryFileWriter(workspaceRoot);
+
+  // Memory retrieval (ARCHITECTURE.md §9d): a hybrid lexical+semantic index over
+  // `memory/*.md`. When enabled, the indexer reconciles the corpus on startup and
+  // after each memory write (hooked below), the embedding worker populates the vector
+  // index in the background, and the search engine backs the `recall_memory` tool and
+  // auto-retrieval. Degrades to lexical-only (FTS5/BM25) if embeddings are unavailable.
+  const retrievalConfig = resolveRetrievalConfig(config.retrieval);
+  let retrieval: RetrievalSubsystem | undefined;
+  if (retrievalConfig.enabled) {
+    retrieval = await createRetrievalSubsystem({
+      storage,
+      workspaceRoot,
+      dataDir: config.app.data_dir,
+      config: retrievalConfig,
+      httpProxyUrl: config.network?.http_proxy_url,
+      logger: logger.child("retrieval"),
+    });
+    // Reconcile the touched file after every memory mutation (diary append /
+    // write_memory edit), so new entries become searchable promptly (§7).
+    memoryWriter.onAfterWrite = (absPath) => retrieval!.onMemoryWrite(absPath);
+  }
 
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
@@ -114,7 +137,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   const echo = new AssistantEchoResolver(timeline);
-  const contextBuilder = new ContextBuilder(timeline, config, storage, logger);
+  const contextBuilder = new ContextBuilder(
+    timeline,
+    config,
+    storage,
+    logger,
+    // Auto-retrieval (§8c): only when retrieval is enabled AND auto_retrieval is on.
+    retrieval && retrievalConfig.autoRetrieval
+      ? { search: retrieval.search, config: retrievalConfig }
+      : undefined,
+  );
 
   const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
@@ -741,6 +773,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
       ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
+      ...(retrieval
+        ? [
+            createRecallMemoryTool({
+              search: retrieval.search,
+              defaults: {
+                maxResults: retrievalConfig.query.maxResults,
+                minScore: retrievalConfig.query.minScore,
+              },
+            }),
+          ]
+        : []),
       createWriteMemoryTool({ workspaceRoot, memoryWriter }),
       createDanbooruTool({
         workspaceRoot,
@@ -957,6 +1000,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   await captionPool.start();
   if (summarizationPool) await summarizationPool.start();
   if (diaryPool) await diaryPool.start();
+  if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
 
   if (retentionDays > 0) {
@@ -996,6 +1040,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await provider.stop();
         triggerCoordinator.clear();
         await captionPool.stop();
+        if (retrieval) await retrieval.stop();
         if (diaryPool) await diaryPool.stop();
         if (summarizationPool) await summarizationPool.stop();
         await enrichmentPool.stop();

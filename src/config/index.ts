@@ -1,6 +1,12 @@
 export { loadConfig } from "./loader.js";
 export { loadDotEnv, parseDotEnv, type EnvLoadOptions, type EnvLoadResult } from "./env.js";
-export type { AppConfig, SummarizationConfig, DiaryConfig, ObservabilityServerConfig } from "./schema.js";
+export type {
+  AppConfig,
+  SummarizationConfig,
+  DiaryConfig,
+  RetrievalConfig,
+  ObservabilityServerConfig,
+} from "./schema.js";
 export {
   redactSecrets,
   redactValue,

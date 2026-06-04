@@ -26,6 +26,7 @@ import {
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
+import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { agentDateStamp } from "../time/index.js";
 import { nanoid } from "nanoid";
 import type { Logger } from "../observability/index.js";
@@ -75,12 +76,22 @@ export class ContextBuilder {
   /** Called after a level-1 summarization job is enqueued (§4 threshold). */
   onJobEnqueued?: () => void;
 
+  /**
+   * Auto-retrieval dependencies (ARCHITECTURE.md §9d / design §8c). Set when the
+   * retrieval subsystem is enabled AND `retrieval.auto_retrieval` is on; otherwise
+   * undefined and no auto-retrieval block is built.
+   */
+  private readonly autoRetrieval?: AutoRetrievalDeps;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
     private readonly storage: Storage,
     private readonly logger?: Logger,
-  ) {}
+    autoRetrieval?: AutoRetrievalDeps,
+  ) {
+    this.autoRetrieval = autoRetrieval;
+  }
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
     const cutoff = options.summarizationCutoff;
@@ -208,9 +219,6 @@ export class ContextBuilder {
       options.sessionType,
     );
     const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");
-    const finalUserContent = cutoff
-      ? `<system>\n${satellite}\n</system>`
-      : `<system>\n${satellite}\n</system>\n\n${triggerContent}`;
 
     const summaryLayer = await this.buildSummaryLayerMessage(
       options.timelineKey,
@@ -233,6 +241,29 @@ export class ContextBuilder {
     // in-context message day" wording is cosmetic: recentMemoryWindow only surfaces
     // existing files ≤ the anchor and never shows empty days.
     const diaryLayer = cutoff ? null : await this.buildDiaryLayerMessage(now);
+
+    // Auto-retrieval (§8c): a small, cited block of relevant-but-not-recent memory,
+    // riding INSIDE the final user turn (cache-safe) BEFORE the trigger messages, so
+    // the trigger stays last (most-attended). Deduped against the recency layer.
+    // Omitted from generation builds (cutoff) — temporally wrong, a feedback risk.
+    const retrievedMemory =
+      cutoff || !this.autoRetrieval
+        ? null
+        : await buildAutoRetrievalBlock(this.autoRetrieval, {
+            query: triggerContent,
+            recencyContent: diaryLayer?.content ?? null,
+            now,
+          }).catch((error) => {
+            this.logger?.warn("auto_retrieval_failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return null;
+          });
+
+    const systemBlock = `<system>\n${satellite}\n</system>`;
+    const finalUserContent = cutoff
+      ? systemBlock
+      : [retrievedMemory, systemBlock, triggerContent].filter(Boolean).join("\n\n");
 
     const messages: ContextMessage[] = [
       {

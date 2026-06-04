@@ -5,10 +5,18 @@ import { runRipgrep, type TextEditorArgs } from "./file.js";
 import { resolveWorkspacePath } from "./workspace.js";
 import { agentDateStamp } from "../time/index.js";
 import type { MemoryFileWriter } from "../storage/memory-writer.js";
+import type { MemorySearch, RetrievalResult } from "../retrieval/index.js";
 
 export interface MemoryToolContext {
   workspaceRoot: string;
   now?: Date;
+}
+
+export interface RecallMemoryToolContext {
+  /** Shared hybrid/lexical search engine over `memory/*.md` (ARCHITECTURE.md §9d). */
+  search: MemorySearch;
+  /** Defaults for the optional params (resolved from `[retrieval.query]`). */
+  defaults: { maxResults: number; minScore: number };
 }
 
 export interface WriteMemoryToolContext extends MemoryToolContext {
@@ -54,6 +62,79 @@ export function createSearchMemoryTool(context: MemoryToolContext): AgentTool {
       };
     },
   };
+}
+
+export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentTool {
+  return {
+    name: "recall_memory",
+    label: "Recall memory",
+    description:
+      "Semantically recall your own past diary entries from memory — ranked by relevance " +
+      "(meaning, not just exact words) with temporal recency factored in. Use this to answer " +
+      'questions about past conversations, decisions, people, or running bits ("what did we ' +
+      'decide about X", "have I talked to Y before"). Each result cites its source as ' +
+      "memory/<file>.md:<startLine>-<endLine>; open that range with the text editor or bash to " +
+      "read the full entry. For an exact string/regex match (a URL, an exact phrase) use " +
+      "search_memory (ripgrep) instead.",
+    parameters: Type.Object({
+      query: Type.String({ minLength: 1 }),
+      max_results: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
+      min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      room: Type.Optional(Type.String()),
+      after: Type.Optional(Type.String({ description: "YYYY-MM-DD inclusive lower bound" })),
+      before: Type.Optional(Type.String({ description: "YYYY-MM-DD inclusive upper bound" })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const args = params as {
+        query: string;
+        max_results?: number;
+        min_score?: number;
+        room?: string;
+        after?: string;
+        before?: string;
+      };
+      const outcome = await context.search.search({
+        query: args.query,
+        maxResults: args.max_results ?? context.defaults.maxResults,
+        minScore: args.min_score ?? context.defaults.minScore,
+        room: args.room,
+        after: args.after,
+        before: args.before,
+        snippetMaxChars: 700,
+      });
+      return {
+        content: [{ type: "text", text: renderRecallResults(outcome.results, outcome) }],
+        details: {
+          mode: outcome.mode,
+          degraded: outcome.degraded,
+          count: outcome.results.length,
+          results: outcome.results,
+        },
+      };
+    },
+  };
+}
+
+function renderRecallResults(
+  results: RetrievalResult[],
+  outcome: { mode: string; degraded: boolean },
+): string {
+  const note = outcome.degraded ? " (semantic search unavailable — lexical only)" : "";
+  if (results.length === 0) {
+    return `No matching memories found (${outcome.mode}${note}).`;
+  }
+  const lines = results.map((r, i) => {
+    const room = r.room ? ` · ${r.room}` : "";
+    return (
+      `${i + 1}. ${r.path}:${r.startLine}-${r.endLine}${room} · ${r.date} ` +
+      `(${r.score.toFixed(2)})\n   ${r.snippet}`
+    );
+  });
+  return (
+    `Recalled ${results.length} memor${results.length === 1 ? "y" : "ies"} ` +
+    `(${outcome.mode}${note}). Open a cited path:lines with the text editor or bash for the ` +
+    `full entry.\n\n${lines.join("\n")}`
+  );
 }
 
 export function createWriteMemoryTool(context: WriteMemoryToolContext): AgentTool {

@@ -222,8 +222,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 6", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 6);
+test("LATEST_SCHEMA_VERSION is 7", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 7);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -341,6 +341,30 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
         summaryIndexes.includes("idx_summaries_diary"),
         `migration must create idx_summaries_diary; have: ${summaryIndexes.join(", ")}`,
       );
+
+      // v6->v7 (ARCHITECTURE.md §9d): the memory-retrieval index tables exist after
+      // migration. (memory_vec is created at runtime, not by this migration.)
+      const tables = storage.read((db) =>
+        (
+          db
+            .prepare(`select name from sqlite_master where type in ('table','view')`)
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      );
+      for (const t of ["memory_chunks", "memory_chunks_fts", "embedding_cache", "index_meta"]) {
+        assert.ok(tables.includes(t), `migration must create ${t}; have: ${tables.join(", ")}`);
+      }
+      // The FTS sync triggers are present too.
+      const triggers = storage.read((db) =>
+        (
+          db
+            .prepare(`select name from sqlite_master where type = 'trigger'`)
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      );
+      for (const tr of ["memory_chunks_ai", "memory_chunks_ad", "memory_chunks_au"]) {
+        assert.ok(triggers.includes(tr), `migration must create ${tr}; have: ${triggers.join(", ")}`);
+      }
     } finally {
       await storage.waitForIdle();
       storage.close();
