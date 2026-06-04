@@ -409,8 +409,9 @@ export interface AgentSessionRow {
 /**
  * One row per timeline for the observability console's room list (spec §8,
  * `GET /api/rooms`). Aggregated from `timeline_events` with correlated counts;
- * read-only. `display_name` falls back to `timeline_key` (no room-name column
- * exists in the schema today).
+ * read-only. `display_name` is the cached human room label from `room_metadata`
+ * (populated by RoomLabelCache), falling back to `timeline_key` when no label
+ * has been resolved yet.
  */
 export interface RoomSummaryRow {
   timeline_key: string;
@@ -1125,6 +1126,57 @@ export class Storage {
         updatedAt: now,
       });
     });
+  }
+
+  /**
+   * Cached human room label for a timeline, or `undefined` if none has been
+   * resolved yet. Read by RoomLabelCache to decide whether a (re)resolve is due
+   * (missing or `resolved_at` older than the TTL).
+   */
+  getRoomMetadata(timelineKey: string): { displayName: string; resolvedAt: number } | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select display_name, resolved_at from room_metadata where timeline_key = ?`)
+        .get(timelineKey) as { display_name: string; resolved_at: number } | undefined,
+    );
+    return row ? { displayName: row.display_name, resolvedAt: row.resolved_at } : undefined;
+  }
+
+  /**
+   * Upsert the cached human room label for a timeline. Stamps `resolved_at` so
+   * RoomLabelCache can expire stale labels (rooms can be renamed). Written by
+   * RoomLabelCache on inbound activity and the startup backfill; read by
+   * `listConsoleRooms` and `getRoomMetadata`.
+   */
+  setRoomDisplayName(timelineKey: string, displayName: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into room_metadata (timeline_key, display_name, resolved_at)
+         values (@timelineKey, @displayName, @resolvedAt)
+         on conflict(timeline_key) do update set
+           display_name = excluded.display_name,
+           resolved_at = excluded.resolved_at`,
+      ).run({ timelineKey, displayName, resolvedAt: Date.now() });
+    });
+  }
+
+  /**
+   * Every distinct timeline key known to the store (events or sessions),
+   * regardless of lifecycle state. Used by the startup room-label backfill to
+   * resolve names for rooms that may currently be idle.
+   */
+  listKnownTimelineKeys(): string[] {
+    return this.read((db) =>
+      (
+        db
+          .prepare(
+            `select timeline_key from timeline_events
+             union
+             select timeline_key from agent_sessions`,
+          )
+          .all() as Array<{ timeline_key: string }>
+      ).map((row) => row.timeline_key),
+    );
   }
 
   /**
@@ -3264,7 +3316,11 @@ export class Storage {
         .prepare(
           `select
              tk.timeline_key as timeline_key,
-             tk.timeline_key as display_name,
+             coalesce(
+               (select m.display_name from room_metadata m
+                 where m.timeline_key = tk.timeline_key),
+               tk.timeline_key
+             ) as display_name,
              coalesce(
                (select c.timeline_state from timeline_compaction_state c
                  where c.timeline_key = tk.timeline_key),
@@ -3765,6 +3821,12 @@ create table if not exists timeline_compaction_state (
   updated_at integer not null
 );
 
+create table if not exists room_metadata (
+  timeline_key text primary key,
+  display_name text not null,
+  resolved_at integer not null
+);
+
 create table if not exists reply_contexts (
   event_id text primary key references timeline_events(id) on delete cascade,
   reply_external_id text,
@@ -4036,7 +4098,7 @@ ${RETRIEVAL_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 10;
+export const LATEST_SCHEMA_VERSION = 11;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -4230,6 +4292,23 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
        create index if not exists idx_summaries_diary_status_updated
          on summaries(diary_status, latest_timestamp, id)
          where diary_status is not null;`,
+    );
+  },
+  // index 10 (v10 -> v11): add the `room_metadata` table that caches resolved
+  // human room labels (Matrix `m.room.name`/canonical alias, with a parent-space
+  // suffix) keyed by timeline_key, so the observability console room list can
+  // show real names instead of raw room ids. Populated lazily on inbound
+  // activity (and a throttled startup backfill) by RoomLabelCache; read by
+  // listConsoleRooms. `create table if not exists` is harmless if a forward path
+  // already created it. Fresh DBs get this directly from SCHEMA above and never
+  // run this step.
+  (db) => {
+    db.exec(
+      `create table if not exists room_metadata (
+         timeline_key text primary key,
+         display_name text not null,
+         resolved_at integer not null
+       );`,
     );
   },
 ];

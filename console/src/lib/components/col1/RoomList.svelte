@@ -34,7 +34,7 @@
 								selection.roomKey === room.timelineKey && 'bg-accent'
 							)}
 						>
-							<span class="min-w-0 flex-1 truncate">
+							<span class="min-w-0 flex-1 truncate" title={room.timelineKey}>
 								{room.displayName ?? room.timelineKey}
 							</span>
 							{#if room.timelineState}
