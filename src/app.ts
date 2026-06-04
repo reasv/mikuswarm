@@ -282,6 +282,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           `summarization session type "${typeName}" references model "${modelKey}" which is not in config.models`,
         );
       }
+      // A summarization session with a `tools` allowlist that omits `summary_tool`
+      // spawns with no editor: every job exhausts its retries to `failed` silently
+      // (a slow, invisible failure). An absent allowlist (`tools` undefined) permits
+      // all tools, so only a *present* allowlist missing the editor is misconfigured.
+      // (Symmetric with the diary `diary_tool` check below.)
+      if (sessionType.tools && !sessionType.tools.includes("summary_tool")) {
+        throw new Error(
+          `summarization session type "${typeName}" has a tools allowlist that does not include "summary_tool" (the summarization editor); summarization sessions would spawn with no editor and fail every job`,
+        );
+      }
     }
   }
 
