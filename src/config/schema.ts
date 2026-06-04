@@ -85,11 +85,13 @@ const RetrievalSchema = Type.Object({
   auto_retrieval: Type.Optional(Type.Boolean()),
   // Numeric knobs carry both minimum AND maximum bounds (review issue #10): an
   // unbounded value degrades silently — e.g. a huge candidate_multiplier or
-  // max_results blows the `getChunksByRowids` IN-list toward SQLite's 999-param
-  // limit. The maxima are generous (well above every value 00-defaults.toml ships)
-  // but reject fat-fingered config at load. A cross-field constraint that TypeBox
-  // can't express (fallback_chunk_tokens <= max_chunk_tokens) is enforced in
-  // resolveRetrievalConfig (issue #14).
+  // max_results blows the `getChunksByRowids` IN-list toward SQLite's bound-parameter
+  // limit (32766 since SQLite 3.32; the old 999 default predates it). The maxima are
+  // generous (well above every value 00-defaults.toml ships) yet keep the worst-case
+  // IN-list — `max_results × candidate_multiplier` = 100 × 50 = 5000 rowids — safely
+  // under that ceiling, while still rejecting fat-fingered config at load. A cross-
+  // field constraint that TypeBox can't express (fallback_chunk_tokens <=
+  // max_chunk_tokens) is enforced in resolveRetrievalConfig (issue #14).
   index: Type.Optional(
     Type.Object({
       worker_count: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),

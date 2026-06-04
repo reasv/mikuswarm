@@ -27,11 +27,28 @@ function toBuffer(vec: Float32Array): Buffer {
  */
 export class VectorStore {
   private loaded = false;
+  /**
+   * Once-per-process guard so a genuine vec0 corruption/binding failure (which makes
+   * the semantic half silently no-op) is surfaced exactly once rather than spammed on
+   * every query (#17). Set the first time `getVectors`/`knn` swallows an error.
+   */
+  private loggedVectorError = false;
 
   constructor(
     private readonly storage: Storage,
     private readonly logger?: Logger,
   ) {}
+
+  /** Warn once per process when a read path swallows an error into a graceful empty result (#17). */
+  private warnVectorError(op: string, error: unknown): void {
+    if (this.loggedVectorError) return;
+    this.loggedVectorError = true;
+    this.logger?.warn("vector_store_read_failed", {
+      op,
+      error: error instanceof Error ? error.message : String(error),
+      note: "semantic half degraded to empty for this query; warned once per process",
+    });
+  }
 
   /** Load the sqlite-vec extension onto the Storage connection (idempotent). */
   async load(): Promise<void> {
@@ -133,7 +150,8 @@ export class VectorStore {
           out.set(id, new Float32Array(copy));
         }
       });
-    } catch {
+    } catch (error) {
+      this.warnVectorError("getVectors", error);
       return new Map();
     }
     return out;
@@ -154,28 +172,37 @@ export class VectorStore {
   knn(queryVec: Float32Array, k: number, source?: string): VecHit[] {
     if (!this.loaded) return [];
     const safeK = Math.max(1, Math.floor(k));
-    return this.storage.read((db) => {
-      const exists =
-        (
-          db
-            .prepare(
-              `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
-            )
-            .get() as { n: number }
-        ).n > 0;
-      if (!exists) return [];
-      // `k` is interpolated (a validated integer) for the same reason chunk_id is
-      // bound as BigInt: vec0's hidden `k` constraint is strict about integer typing.
-      const sourceClause = source !== undefined ? " and source = ?" : "";
-      const params: unknown[] =
-        source !== undefined ? [toBuffer(queryVec), source] : [toBuffer(queryVec)];
-      const rows = db
-        .prepare(
-          `select chunk_id as chunkId, distance from memory_vec
-           where embedding match ? and k = ${safeK}${sourceClause} order by distance`,
-        )
-        .all(...params) as VecHit[];
-      return rows;
-    });
+    try {
+      return this.storage.read((db) => {
+        const exists =
+          (
+            db
+              .prepare(
+                `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
+              )
+              .get() as { n: number }
+          ).n > 0;
+        if (!exists) return [];
+        // `k` is interpolated (a validated integer) for the same reason chunk_id is
+        // bound as BigInt: vec0's hidden `k` constraint is strict about integer typing.
+        const sourceClause = source !== undefined ? " and source = ?" : "";
+        const params: unknown[] =
+          source !== undefined ? [toBuffer(queryVec), source] : [toBuffer(queryVec)];
+        const rows = db
+          .prepare(
+            `select chunk_id as chunkId, distance from memory_vec
+             where embedding match ? and k = ${safeK}${sourceClause} order by distance`,
+          )
+          .all(...params) as VecHit[];
+        return rows;
+      });
+    } catch (error) {
+      // A genuine vec0 corruption/binding failure would otherwise present as "the
+      // semantic half just no-ops" forever with no log. Warn once, degrade to empty so
+      // search.ts falls back to lexical-only (#17). Behavior unchanged on the missing-
+      // table path (that returns `[]` above without throwing).
+      this.warnVectorError("knn", error);
+      return [];
+    }
   }
 }

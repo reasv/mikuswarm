@@ -11,7 +11,12 @@ import {
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
-import { configureAgentTimezone, resetAgentTimezone, parseZonedWallClock } from "../src/time/index.js";
+import {
+  configureAgentTimezone,
+  resetAgentTimezone,
+  parseZonedWallClock,
+  agentDateStamp,
+} from "../src/time/index.js";
 
 const TZ = "Asia/Tokyo";
 
@@ -54,6 +59,78 @@ async function writeMemory(workspaceRoot: string, name: string, content: string)
   const p = path.join(workspaceRoot, "memory", name);
   await writeFile(p, content, "utf8");
   return p;
+}
+
+/**
+ * #20: verify the day-inclusive `before` bound on a DST-transition day. Builds a
+ * harness in the given DST zone (not the module's Tokyo), indexes a single entry late
+ * on `day`, pushes its `entry_ts` to a near-midnight wall-clock in that zone (the part
+ * of the day the old `23:59` cutoff dropped), and asserts `before=day` includes it
+ * while `before=<dayBefore>` excludes it. Exercises `dateBoundTs`'s "end" branch
+ * (parse noon → +24h → re-stamp next-day 00:00) across the transition.
+ */
+async function dstBeforeInclusiveCase(opts: {
+  tz: string;
+  day: string;
+  lateEvening: string;
+  nextDay: string;
+}): Promise<void> {
+  configureAgentTimezone(opts.tz);
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-dst-"));
+  const workspaceRoot = path.join(dir, "ws");
+  await mkdir(path.join(workspaceRoot, "memory"), { recursive: true });
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  const config = resolveRetrievalConfig({ enabled: true });
+  const indexer = new MemoryIndexer({ storage, workspaceRoot, config });
+  const search = new MemorySearch(storage, indexer, config);
+  try {
+    // Index a real file so the corpus signature is recorded and the lazy on-search
+    // reconcile is a no-op (it won't overwrite the entry_ts we set below). The diary
+    // header is minute-precision; we set the chunk's entry_ts directly to 23:30 in-zone.
+    const header = buildDiaryHeader({
+      earliestTimestamp: parseZonedWallClock(`${opts.day} 22:00`, opts.tz)!,
+      latestTimestamp: parseZonedWallClock(`${opts.day} 23:00`, opts.tz)!,
+      room: "#general",
+    });
+    const p = path.join(workspaceRoot, "memory", `${opts.day}.md`);
+    await writeFile(p, `# ${opts.day} Daily Memory\n\n${header}\nWe shipped the release late.\n`, "utf8");
+    await indexer.reconcileAll();
+
+    const entryTs = parseZonedWallClock(opts.lateEvening, opts.tz)!;
+    await storage.readAndWrite((db) =>
+      db.prepare("update memory_chunks set entry_ts = ?").run(entryTs),
+    );
+    await storage.waitForIdle();
+
+    const included = await search.search({
+      query: "shipped release late",
+      maxResults: 6,
+      minScore: 0,
+      before: opts.day,
+      snippetMaxChars: 200,
+    });
+    assert.equal(
+      included.results.length,
+      1,
+      `${opts.lateEvening} must be inside before=${opts.day} across the DST transition`,
+    );
+
+    // The prior day excludes it (exclusive start-of-next-day upper bound).
+    const priorDay = agentDateStamp(parseZonedWallClock(`${opts.day} 12:00`, opts.tz)! - 86_400_000);
+    const excluded = await search.search({
+      query: "shipped release late",
+      maxResults: 6,
+      minScore: 0,
+      before: priorDay,
+      snippetMaxChars: 200,
+    });
+    assert.equal(excluded.results.length, 0, `before=${priorDay} must exclude an entry on ${opts.day}`);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+    resetAgentTimezone();
+  }
 }
 
 // --- #5a stopwords + #9 column scoping (pure, no DB) ---
@@ -197,6 +274,117 @@ test("before filter includes an entry at 23:59:30 on the before day (review #12)
       snippetMaxChars: 200,
     });
     assert.equal(excluded.results.length, 0);
+  });
+});
+
+// --- #12 inverted after/before range is flagged (not silently empty) ---
+
+test("an inverted after/before range sets contradictoryDateBounds (review #12)", async () => {
+  await withHarness(async ({ workspaceRoot, indexer, search }) => {
+    await writeMemory(
+      workspaceRoot,
+      "2026-04-12.md",
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "We discussed the roadmap."),
+    );
+    await indexer.reconcileAll();
+
+    // Both bounds parse, but after (2026-06-10) is later than before (2026-06-01) → the
+    // window is empty. Pre-fix this silently returned nothing; post-fix the flag is set
+    // and ignoredDateBounds stays empty (both parsed fine).
+    const outcome = await search.search({
+      query: "roadmap discussed",
+      maxResults: 6,
+      minScore: 0,
+      after: "2026-06-10",
+      before: "2026-06-01",
+      snippetMaxChars: 200,
+    });
+    assert.equal(outcome.contradictoryDateBounds, true);
+    assert.deepEqual(outcome.ignoredDateBounds, [], "both bounds parsed, so neither is ignored");
+    assert.equal(outcome.results.length, 0, "an empty window matches nothing");
+
+    // A normal (non-inverted) range does not set the flag.
+    const ok = await search.search({
+      query: "roadmap discussed",
+      maxResults: 6,
+      minScore: 0,
+      after: "2026-04-01",
+      before: "2026-04-30",
+      snippetMaxChars: 200,
+    });
+    assert.equal(ok.contradictoryDateBounds, false);
+    assert.ok(ok.results.length >= 1);
+
+    // Equal after == before is also empty (after >= before): the start-of-day lower
+    // bound is on/after the exclusive next-day upper bound for the same earlier day.
+    const same = await search.search({
+      query: "roadmap discussed",
+      maxResults: 6,
+      minScore: 0,
+      after: "2026-04-13",
+      before: "2026-04-12",
+      snippetMaxChars: 200,
+    });
+    assert.equal(same.contradictoryDateBounds, true);
+  });
+});
+
+// --- #9 lexical FTS failure degrades to empty rather than throwing ---
+
+test("a throwing lexical search degrades to empty results instead of rejecting (review #9)", async () => {
+  await withHarness(async ({ workspaceRoot, storage, indexer, search }) => {
+    await writeMemory(
+      workspaceRoot,
+      "2026-04-12.md",
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "We discussed the roadmap."),
+    );
+    await indexer.reconcileAll();
+
+    // Inject a lexical failure on the real Storage instance the search holds. The
+    // semantic half is absent (no provider/vectorStore in this harness), so without the
+    // try/catch this would reject out of search(). With it, search() resolves degraded
+    // to empty lexical results.
+    const original = storage.searchMemoryLexical.bind(storage);
+    (storage as unknown as { searchMemoryLexical: () => never }).searchMemoryLexical = () => {
+      throw new Error("simulated FTS5 MATCH failure");
+    };
+    try {
+      const outcome = await search.search({
+        query: "roadmap discussed",
+        maxResults: 6,
+        minScore: 0,
+        snippetMaxChars: 200,
+      });
+      assert.equal(outcome.results.length, 0, "degraded to empty lexical results, did not throw");
+      assert.equal(outcome.mode, "lexical");
+    } finally {
+      (storage as unknown as { searchMemoryLexical: typeof original }).searchMemoryLexical = original;
+    }
+  });
+});
+
+// --- #20 before filter is day-inclusive across DST transitions ---
+
+test("before filter is fully day-inclusive on a spring-forward DST day (review #20)", async () => {
+  await dstBeforeInclusiveCase({
+    tz: "America/New_York",
+    // US spring-forward 2026: 2026-03-08 (clocks jump 02:00 → 03:00). A late-evening
+    // entry on that day must be inside before=2026-03-08.
+    day: "2026-03-08",
+    lateEvening: "2026-03-08 23:30",
+    nextDay: "2026-03-09",
+  });
+});
+
+test("before filter is fully day-inclusive on a fall-back DST day (review #20)", async () => {
+  await dstBeforeInclusiveCase({
+    tz: "America/New_York",
+    // US fall-back 2026: 2026-11-01 (clocks repeat 01:00 → 01:00, the day is 25h long).
+    day: "2026-11-01",
+    lateEvening: "2026-11-01 23:30",
+    nextDay: "2026-11-02",
   });
 });
 

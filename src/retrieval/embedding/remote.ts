@@ -18,6 +18,13 @@ interface EmbeddingsResponse {
 }
 
 /**
+ * Upper bound on a buffered embeddings response (16 MiB). Generous for any legitimate
+ * batch (a few thousand float vectors as JSON) but small enough to reject a runaway
+ * body before reading it. The per-request abort timeout bounds time, not bytes (#7).
+ */
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+/**
  * Remote embedding provider (ARCHITECTURE.md §9d / design §5d): an OpenRouter/OpenAI
  * -compatible `POST {endpoint}/embeddings` (`{ model, input, encoding_format:"float" }`
  * → `{ data: [{ embedding, index }] }`). `input` accepts an array, so documents embed
@@ -37,12 +44,12 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     this.dispatcher = options.httpProxyUrl ? new ProxyAgent(options.httpProxyUrl) : undefined;
   }
 
-  async embedDocuments(texts: string[]): Promise<Float32Array[]> {
+  async embedDocuments(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
     const out: Float32Array[] = [];
     for (let i = 0; i < texts.length; i += this.options.batchSize) {
       const batch = texts.slice(i, i + this.options.batchSize);
-      const vectors = await this.embedBatch(batch);
+      const vectors = await this.embedBatch(batch, signal);
       out.push(...vectors);
     }
     return out;
@@ -54,10 +61,18 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     return vec;
   }
 
-  private async embedBatch(input: string[]): Promise<Float32Array[]> {
+  private async embedBatch(input: string[], stopSignal?: AbortSignal): Promise<Float32Array[]> {
     const url = `${this.options.endpoint.replace(/\/$/, "")}/embeddings`;
+    // Per-request timeout (always applies) combined with the optional external stop
+    // signal (shutdown), so SIGTERM aborts an in-flight fetch without waiting the full
+    // timeout, while a normal request still bounds itself by the timeout alone (#11).
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
+    const onStop = () => controller.abort();
+    if (stopSignal) {
+      if (stopSignal.aborted) controller.abort();
+      else stopSignal.addEventListener("abort", onStop, { once: true });
+    }
     try {
       const res = await fetch(url, {
         method: "POST",
@@ -71,6 +86,16 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       });
       if (!res.ok) {
         throw new Error(`embeddings endpoint ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      }
+      // Lightweight response-size guard: the abort timeout bounds wall-clock, not
+      // bytes. A misbehaving (operator-configured) endpoint advertising an absurd
+      // body would otherwise balloon memory while we buffer it. Reject before reading
+      // when the declared content-length is implausible for an embeddings response.
+      const declaredLength = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+        throw new Error(
+          `embeddings endpoint response too large: ${declaredLength} bytes > ${MAX_RESPONSE_BYTES} (${this.options.id})`,
+        );
       }
       const json = (await res.json()) as EmbeddingsResponse;
       const data = json.data ?? [];
@@ -96,6 +121,14 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
             `embeddings endpoint returned duplicate index ${d.index} (${this.options.id})`,
           );
         }
+        // A malformed element (missing/non-array `embedding`) would otherwise raw-
+        // TypeError on `.length`; throw the same descriptive style so it routes
+        // through the normal retry path with a clear log.
+        if (!Array.isArray(d.embedding)) {
+          throw new Error(
+            `embeddings endpoint returned a malformed embedding element at index ${d.index} (${this.options.id})`,
+          );
+        }
         if (d.embedding.length !== this.dim) {
           throw new Error(
             `embedding dim ${d.embedding.length} != configured ${this.dim} for ${this.options.id}`,
@@ -108,6 +141,7 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       return out.map((v) => v!);
     } finally {
       clearTimeout(timeout);
+      if (stopSignal) stopSignal.removeEventListener("abort", onStop);
     }
   }
 

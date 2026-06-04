@@ -243,7 +243,10 @@ max_tokens = 600                  # whole injected block budget
 dedup_against_recency = true      # §8c — skip blocks already in the §10a recency layer
 
 [retrieval.embedding]
-# Active model resolution (§5a): remote if [.remote] is set & resolvable, else local.
+# Active model resolution (§5a): an explicit `provider` wins; an unset `provider`
+# defaults to remote when a resolvable [.remote] block is present, else local. So
+# `provider="local"` plus a populated [.remote] block runs local (startup logs a
+# warning about the ignored block); `provider="remote"` with no block fails fast.
 provider = "local"                # 'local' | 'remote'
 
 [retrieval.embedding.local]

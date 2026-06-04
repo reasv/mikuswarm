@@ -2706,6 +2706,12 @@ export class Storage {
       const deletedRowids: number[] = [];
       const seen = new Set<string>();
       for (const c of chunks) {
+        // A chunk id is sha256(path\0text), so two byte-identical chunks in one
+        // file share an id. The first occurrence inserts/updates and records the
+        // id in `seen`; skip any later duplicate so we don't hit the UNIQUE
+        // constraint (which would abort the whole reconcile transaction). The id
+        // is already in `seen`, so the delete pass below won't prune its row.
+        if (seen.has(c.id)) continue;
         seen.add(c.id);
         const prev = existingById.get(c.id);
         if (!prev) {

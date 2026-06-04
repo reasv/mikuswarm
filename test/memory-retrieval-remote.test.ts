@@ -10,6 +10,7 @@ import {
   MemoryIndexer,
   VectorStore,
   RemoteEmbeddingProvider,
+  LocalEmbeddingProvider,
   createRetrievalSubsystem,
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
@@ -160,6 +161,92 @@ test("RemoteEmbeddingProvider throws on an out-of-range / duplicated index", asy
       () => provider.embedDocuments(["alpha", "beta"]),
       /duplicate index 0/,
     );
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("LocalEmbeddingProvider throws when passageEmbed returns the wrong vector count (#6)", async () => {
+  // The local provider binds out[i] to texts[i]'s content-hash positionally; a
+  // fastembed under-count/reorder would silently misalign vectors with hashes. Inject
+  // a fake `flag` whose passageEmbed yields one vector for two inputs and assert the
+  // descriptive count guard throws (the native fastembed module is not exercised).
+  const provider = new LocalEmbeddingProvider({
+    model: "bge-small-en-v1.5",
+    dim: 4,
+    cacheDir: "/tmp/none",
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (provider as any).flag = Promise.resolve({
+    // Two inputs in, but only one vector out.
+    async *passageEmbed(_texts: string[], _batchSize: number) {
+      yield [[1, 0, 0, 0]];
+    },
+  });
+  await assert.rejects(
+    () => provider.embedDocuments(["alpha", "beta"]),
+    /returned 1 vectors for 2 inputs/,
+  );
+});
+
+test("RemoteEmbeddingProvider throws a descriptive error on a malformed embedding element (#7)", async () => {
+  // An element whose `embedding` is missing/non-array would raw-TypeError on `.length`;
+  // the provider must throw the descriptive "malformed embedding element" error so it
+  // routes through the normal retry path with a clear log instead.
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: [{ embedding: null, index: 0 }] }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+    });
+    await assert.rejects(
+      () => provider.embedQuery("x"),
+      /malformed embedding element at index 0/,
+    );
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("RemoteEmbeddingProvider rejects an absurdly large content-length before reading the body (#7)", async () => {
+  // The abort timeout bounds wall-clock, not bytes. A misbehaving endpoint advertising
+  // a huge body must be rejected before we buffer it.
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      // Advertise an absurd length, then send a small valid body. The guard should fire
+      // on the header before reading.
+      res.setHeader("content-length", String(1024 * 1024 * 1024)); // 1 GiB
+      res.end(JSON.stringify({ data: [{ embedding: [1, 0, 0, 0], index: 0 }] }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+    });
+    await assert.rejects(() => provider.embedQuery("x"), /response too large/);
     await provider.close();
   } finally {
     await new Promise<void>((r) => server.close(() => r()));

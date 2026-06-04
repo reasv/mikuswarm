@@ -250,6 +250,145 @@ test("embed worker ignores a stale wrong-width cached vector and re-embeds", asy
   });
 });
 
+test("a high-relevance old chunk survives the min_score floor but ranks below a fresh one (review #13)", async () => {
+  await withStack(async ({ storage, indexer, search, worker, workspaceRoot }) => {
+    // Two chunks with identical strong-match bodies: one fresh, one ~2 half-lives old.
+    // Decay (default ON, 30-day half-life) multiplies the old one's score to ~1/4 — pre-
+    // fix that decayed value was tested against `min_score`, dropping the old exact
+    // match. Post-fix the floor tests PRE-DECAY relevance (identical for both), so both
+    // survive; decay only reorders them (review issue #13).
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-06-01.md"),
+      `# 2026-06-01 Daily Memory\n\n` +
+        block("2026-06-01 12:00", "2026-06-01 12:30", "#general", "We argued and decided to use SQLite as our database."),
+      "utf8",
+    );
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-04-02.md"),
+      `# 2026-04-02 Daily Memory\n\n` +
+        block("2026-04-02 12:00", "2026-04-02 12:30", "#general", "We argued and decided to use SQLite as our database."),
+      "utf8",
+    );
+    await indexer.reconcileAll();
+    await drainEmbeddings(storage, worker);
+
+    // "now" ~60 days after the old entry (2 half-lives) → its decayed score is ~1/4 of
+    // the fresh one's. Pick a floor between the old chunk's decayed score and its (equal-
+    // to-fresh) pre-decay relevance, so the test only passes when the floor uses
+    // pre-decay relevance.
+    const now = parseZonedWallClock("2026-06-01 13:00", TZ)!;
+    const query = "what database did we decide on";
+    // First, read both pre-decay relevances/decayed scores with the floor wide open.
+    const open = await search.search({ query, maxResults: 6, minScore: 0, snippetMaxChars: 200, now });
+    assert.equal(open.results.length, 2);
+    const fresh = open.results.find((r) => r.date === "2026-06-01")!;
+    const old = open.results.find((r) => r.date === "2026-04-02")!;
+    assert.ok(old.score < fresh.score, "decay ranks the old chunk below the fresh one");
+    // A floor strictly above the old chunk's DECAYED score: pre-fix (decay-then-drop)
+    // this would drop the old chunk; post-fix (floor on pre-decay relevance) it survives.
+    const floor = (old.score + fresh.score) / 2;
+    const outcome = await search.search({ query, maxResults: 6, minScore: floor, snippetMaxChars: 200, now });
+    assert.equal(outcome.results.length, 2, "both equal-relevance chunks survive a floor above the old decayed score");
+    assert.equal(outcome.results[0]!.date, "2026-06-01", "fresh chunk ranks first");
+    assert.equal(outcome.results[1]!.date, "2026-04-02", "old chunk ranked below but still returned");
+    assert.ok(outcome.results[1]!.score < floor, "the old chunk's decayed score is below the floor it survived");
+  });
+});
+
+test("a narrow date filter still surfaces in-range vector hits; mode reflects reality (review #2)", async () => {
+  await withStack(async ({ storage, indexer, search, worker, workspaceRoot }) => {
+    // The nearest neighbours to the query are out of the date window; the only in-range
+    // chunk is a weaker (but still relevant) semantic match. Pre-fix, the KNN's top-k
+    // (ignoring the filter) was filled by the out-of-range chunks and the in-range one
+    // could be crowded out — and `mode` was computed from the pre-filter KNN size, so it
+    // reported `hybrid` even when every vector neighbour was filtered away. Post-fix the
+    // KNN over-fetches under a filter (in-range chunk survives) and `mode` is honest.
+    //
+    // Build several near-duplicate strong matches dated in May (out of range) and one
+    // in-range (April) chunk that matches on a single keyword the query also carries.
+    const mayBlocks = Array.from({ length: 8 }, (_, i) =>
+      block(
+        `2026-05-0${(i % 9) + 1} 12:00`,
+        `2026-05-0${(i % 9) + 1} 12:30`,
+        "#general",
+        "We argued and decided to use SQLite as our database database.",
+      ),
+    ).join("\n");
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-05-10.md"),
+      `# 2026-05-10 Daily Memory\n\n${mayBlocks}`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-04-12.md"),
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "We picked a database for the project."),
+      "utf8",
+    );
+    await indexer.reconcileAll();
+    await drainEmbeddings(storage, worker);
+
+    // Restrict to April only — every strong May neighbour is excluded; the lone in-range
+    // April chunk (a weaker but real semantic match) must still come back.
+    const outcome = await search.search({
+      query: "what database did we decide on",
+      maxResults: 3,
+      minScore: 0,
+      after: "2026-04-01",
+      before: "2026-04-30",
+      snippetMaxChars: 200,
+    });
+    assert.equal(outcome.results.length, 1, "the in-range chunk survives the over-fetched KNN");
+    assert.equal(outcome.results[0]!.date, "2026-04-12");
+    // A vector neighbour passed the filter, so the semantic half genuinely contributed.
+    assert.equal(outcome.mode, "hybrid");
+    assert.equal(outcome.degraded, false);
+  });
+});
+
+test("mode honestly reports lexical when no surviving candidate carries a vector (review #2)", async () => {
+  await withStack(async ({ storage, indexer, search, worker, workspaceRoot }) => {
+    // A #tech chunk is embedded; a #random chunk matches LEXICALLY (shares "database")
+    // but is left UNEMBEDDED (no vector → never a KNN hit). Filtering to #random means
+    // the only vector neighbour (the #tech chunk) is excluded post-filter, and the
+    // surviving candidate (#random) carries no vector score. Pre-fix `mode` was computed
+    // from the pre-filter KNN size and would report `hybrid`; post-fix it is `lexical`.
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-04-12.md"),
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#tech", "We decided to use SQLite as our database."),
+      "utf8",
+    );
+    await indexer.reconcileAll();
+    await drainEmbeddings(storage, worker); // embeds the #tech chunk only
+
+    // Add the #random lexical-only chunk and reconcile, but do NOT drain — it stays
+    // `pending`, so it has no vector and never appears as a KNN neighbour.
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-04-13.md"),
+      `# 2026-04-13 Daily Memory\n\n` +
+        block("2026-04-13 18:00", "2026-04-13 19:00", "#random", "Notes about the database from yesterday."),
+      "utf8",
+    );
+    await indexer.reconcileAll();
+    await storage.waitForIdle();
+
+    const outcome = await search.search({
+      query: "what database did we decide on",
+      maxResults: 5,
+      minScore: 0,
+      room: "#random",
+      snippetMaxChars: 200,
+    });
+    assert.ok(outcome.results.length >= 1, "the lexical match in #random is still found");
+    assert.equal(outcome.results[0]!.room, "#random");
+    // The only embedded chunk (#tech) was filtered out by room and the surviving
+    // candidate carries no vector → honest `lexical`, not a falsely-reported `hybrid`.
+    assert.equal(outcome.mode, "lexical", "no surviving candidate carries a vector score");
+    assert.equal(outcome.degraded, false, "not degraded — embeddings were available, just filtered");
+  });
+});
+
 test("deleting a chunk prunes its vector", async () => {
   await withStack(async ({ storage, indexer, worker, workspaceRoot }) => {
     const file = path.join(workspaceRoot, "memory", "2026-04-12.md");

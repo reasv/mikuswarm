@@ -7,7 +7,11 @@ export interface AutoRetrievalDeps {
 }
 
 export interface AutoRetrievalInput {
-  /** The trigger-group text driving this run — the query (§8c). */
+  /**
+   * The query (§8c): the plain message body the user typed — the bare `body` of
+   * each trigger event joined by newlines, NOT the rich `<message …>` envelope.
+   * Reply/caption/attachment context is deliberately excluded (see builder.ts).
+   */
   query: string;
   /** The recency-layer (§10a) content for dedup, or null when absent. */
   recencyContent: string | null;
@@ -22,6 +26,19 @@ const NOTE =
 /** Normalize for substring dedup: collapse whitespace, lowercase. */
 function norm(s: string): string {
   return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * Neutralize angle brackets before embedding a snippet in the tag-delimited
+ * `<retrieved_memory>…</retrieved_memory>` block (review issue #10). `makeSnippet`
+ * collapses whitespace but preserves `<`/`>`, so a diary entry that quotes a literal
+ * `</retrieved_memory>` (or any other tag) would otherwise forge the block's
+ * structure. Escaping to HTML entities keeps the text human-readable while making it
+ * impossible to terminate or fabricate a tag mid-block. The dedup probe runs on the
+ * raw snippet (above) so escaping doesn't perturb it.
+ */
+function escapeAngleBrackets(s: string): string {
+  return s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**
@@ -72,7 +89,7 @@ export async function buildAutoRetrievalBlock(
       if (probe.length >= 12 && recencyNorm.includes(probe)) continue;
     }
     const room = r.room ? ` · ${r.room}` : "";
-    const line = `- [${r.path}:${r.startLine}-${r.endLine}${room} · ${r.date}] ${r.snippet}`;
+    const line = `- [${r.path}:${r.startLine}-${r.endLine}${room} · ${r.date}] ${escapeAngleBrackets(r.snippet)}`;
     const cost = estimateTokens(line) + 1;
     if (cost > tokenBudget) break;
     tokenBudget -= cost;

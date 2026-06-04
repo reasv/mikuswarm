@@ -246,11 +246,24 @@ export class ContextBuilder {
     // riding INSIDE the final user turn (cache-safe) BEFORE the trigger messages, so
     // the trigger stays last (most-attended). Deduped against the recency layer.
     // Omitted from generation builds (cutoff) — temporally wrong, a feedback risk.
+    //
+    // The retrieval QUERY is the plain message body the user typed — the bare
+    // `body` of each trigger event joined by newlines, NOT `triggerContent` (the
+    // rich `<message sender=… time=…>…` envelope with reply/attachment/link-preview
+    // XML). Per the operator's decision, reply/caption/attachment context is
+    // deliberately excluded from the query for now: the rich envelope's structural
+    // tokens (sender, timestamps, XML) only dilute the lexical/semantic match. This
+    // does NOT touch the context turn the model reads — `triggerContent` is still
+    // what goes into `finalUserContent` below.
+    const retrievalQuery = triggerEvents
+      .map((e) => e.body)
+      .filter(Boolean)
+      .join("\n");
     const retrievedMemory =
       cutoff || !this.autoRetrieval
         ? null
         : await buildAutoRetrievalBlock(this.autoRetrieval, {
-            query: triggerContent,
+            query: retrievalQuery,
             recencyContent: diaryLayer?.content ?? null,
             now,
           }).catch((error) => {

@@ -19,8 +19,12 @@ export interface EmbeddingProvider {
   /** Identity recorded in `index_meta`/`memory_chunks.model_id` (§5a/§6). */
   readonly modelId: string;
   readonly dim: number;
-  /** Embed documents (passage side for asymmetric retrieval models). */
-  embedDocuments(texts: string[]): Promise<Float32Array[]>;
+  /**
+   * Embed documents (passage side for asymmetric retrieval models). An optional
+   * `signal` aborts an in-flight request on shutdown so teardown doesn't block on a
+   * slow remote call (the per-request timeout still applies independently, §9d #11).
+   */
+  embedDocuments(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>;
   /** Embed a single query (query side). */
   embedQuery(text: string): Promise<Float32Array>;
   close(): Promise<void>;
@@ -100,8 +104,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     return this.flag;
   }
 
-  async embedDocuments(texts: string[]): Promise<Float32Array[]> {
+  async embedDocuments(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
+    // Local embedding is a synchronous-ish in-process forward pass with no network
+    // wait; honor a pre-aborted signal (shutdown) by not starting, but the per-batch
+    // generator below isn't itself interruptible mid-pass (bounded by LOCAL_EMBED_
+    // BATCH_CAP, so each pass is short).
+    if (signal?.aborted) throw new Error("embedDocuments aborted before start");
     const flag = await this.embedding();
     const out: Float32Array[] = [];
     // passageEmbed yields batches of number[][]; flatten and normalize. The second
@@ -110,6 +119,16 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     const batchSize = Math.min(texts.length, LOCAL_EMBED_BATCH_CAP);
     for await (const batch of flag.passageEmbed(texts, batchSize) as AsyncGenerator<number[][]>) {
       for (const vec of batch) out.push(l2normalize(vec));
+    }
+    // Guard one-vector-per-input (mirrors the remote provider's count check). The
+    // caller binds `out[i]` to `texts[i]`'s content-hash positionally; a fastembed
+    // reorder/under-count would silently misalign vectors with hashes (corrupting
+    // embedding_cache/memory_vec). Throw so the batch routes through the normal
+    // retry/failed path rather than persisting a wrong vector.
+    if (out.length !== texts.length) {
+      throw new Error(
+        `local embedder returned ${out.length} vectors for ${texts.length} inputs (${this.modelId})`,
+      );
     }
     return out;
   }
