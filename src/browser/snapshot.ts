@@ -8,7 +8,12 @@ import type { Page } from "playwright-core";
 export interface SnapshotResult {
   text: string;
   truncated: boolean;
-  /** Number of [ref=eN] handles present in the (untruncated) snapshot. */
+  /**
+   * Number of [ref=eN] handles present in the RETURNED text. When the snapshot
+   * is truncated this counts only the refs the model can actually see and use,
+   * not refs that were sliced off past the cut — so the model is never told
+   * about refs it can't reach.
+   */
   refCount: number;
 }
 
@@ -16,12 +21,17 @@ const TRUNCATION_MARKER = "\n[... snapshot truncated — scroll or interact to r
 
 export async function aiSnapshot(page: Page, maxChars: number): Promise<SnapshotResult> {
   const raw = await page.locator("body").ariaSnapshot({ mode: "ai" });
-  const refCount = countRefs(raw);
   if (raw.length <= maxChars) {
-    return { text: raw, truncated: false, refCount };
+    return { text: raw, truncated: false, refCount: countRefs(raw) };
   }
+  // Reserve room for the marker, but never let (slice + marker) exceed maxChars
+  // even when maxChars < TRUNCATION_MARKER.length: clamp the final string to the
+  // cap so the total returned text is always ≤ maxChars.
   const budget = Math.max(0, maxChars - TRUNCATION_MARKER.length);
-  return { text: raw.slice(0, budget) + TRUNCATION_MARKER, truncated: true, refCount };
+  const text = (raw.slice(0, budget) + TRUNCATION_MARKER).slice(0, maxChars);
+  // Count refs on the truncated output, not the raw, so refCount reflects only
+  // the refs actually present in what we return.
+  return { text, truncated: true, refCount: countRefs(text) };
 }
 
 function countRefs(snapshot: string): number {

@@ -1,6 +1,7 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { Page } from "playwright-core";
+import sharp from "sharp";
 
 import type { BrowserConfig } from "../config/index.js";
 import {
@@ -9,11 +10,13 @@ import {
   assertBrowserUrl,
   BrowserError,
   isBrowserError,
+  isTimeoutError,
   type ActKind,
   type ActParams,
   type BrowserSession,
   type DownloadRecord,
 } from "../browser/index.js";
+import { base64ByteSize } from "./read-image.js";
 
 export interface BrowserToolContext {
   /** Shared connection/identity manager (one persistent CloakBrowser identity). */
@@ -21,6 +24,13 @@ export interface BrowserToolContext {
   /** The calling chat session — selects this session's tab(s) (spec §4.1). */
   agentSessionId: string;
   config: BrowserConfig;
+  /**
+   * Max bytes for an inline screenshot payload, measured as the base64-encoded
+   * size — the same shared per-model cap `read_image` uses (resolved from
+   * `resolveReadImageMaxBytes(config)`). A capture over this is downscaled via
+   * sharp to fit rather than shipped oversized.
+   */
+  maxImageBytes: number;
 }
 
 const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "tabs", "open", "close"] as const;
@@ -45,7 +55,7 @@ const DESCRIPTION = [
 ].join("\n");
 
 export function createBrowserTool(context: BrowserToolContext): AgentTool {
-  const { session, agentSessionId, config } = context;
+  const { session, agentSessionId, config, maxImageBytes } = context;
   const actTimeoutMs = config.act_timeout_ms;
 
   return {
@@ -57,7 +67,10 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
       url: Type.Optional(Type.String({ description: "URL for navigate/open (http/https only)." })),
       kind: Type.Optional(Type.Union(ACT_KINDS.map((v) => Type.Literal(v)))),
       ref: Type.Optional(Type.String({ description: "A [ref=eN] handle from the latest snapshot." })),
-      text: Type.Optional(Type.String({ description: "Text to type/fill, or JS for evaluate." })),
+      // maxLength is a generous defensive bound: a pathological multi-MB
+      // fill/evaluate value fails fast with a clear schema error instead of by
+      // timeout (issue #10). 100k chars is far above any legitimate input.
+      text: Type.Optional(Type.String({ maxLength: 100000, description: "Text to type/fill, or JS for evaluate." })),
       key: Type.Optional(Type.String({ description: 'Key for act:press, e.g. "Enter".' })),
       value: Type.Optional(
         Type.Union([Type.String(), Type.Array(Type.String())], { description: "Option value(s) for act:select." }),
@@ -70,7 +83,13 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
     execute: async (_toolCallId, params) => {
       const args = params as BrowserToolArgs;
       try {
-        return await dispatch(session, agentSessionId, config, actTimeoutMs, args);
+        // Bracket the whole op with beginOp/endOp (via runOp) so the idle
+        // sweeper never reaps this session's page mid-operation (issue #1).
+        // Symmetric even on throw; endOp also refreshes the idle clock so a long
+        // op resets it on completion.
+        return await session.runOp(agentSessionId, () =>
+          dispatch(session, agentSessionId, config, actTimeoutMs, maxImageBytes, args),
+        );
       } catch (error) {
         if (isBrowserError(error)) {
           // Surface a clean, actionable failure to the model (not a raw crash).
@@ -101,6 +120,7 @@ async function dispatch(
   sessionId: string,
   config: BrowserConfig,
   actTimeoutMs: number,
+  maxImageBytes: number,
   args: BrowserToolArgs,
 ): Promise<AgentToolResult<unknown>> {
   switch (args.action) {
@@ -151,18 +171,32 @@ async function dispatch(
       try {
         buffer = await page.screenshot({ fullPage: args.full_page ?? false, timeout: config.act_timeout_ms });
       } catch (error) {
-        throw new BrowserError(
-          "act_timeout",
-          `Screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
-        );
+        // Distinguish a genuine capture timeout from any other failure so the
+        // code isn't misleading (issue #8): a timeout is act_timeout, everything
+        // else (detached page, encoding error, …) is screenshot_failed.
+        const message = error instanceof Error ? error.message : String(error);
+        if (isTimeoutError(error)) {
+          throw new BrowserError("act_timeout", `Screenshot timed out: ${message}`, { cause: error });
+        }
+        throw new BrowserError("screenshot_failed", `Screenshot failed: ${message}`, { cause: error });
       }
+      // Bound the inline payload to the shared per-model base64 cap (issue #2):
+      // a long full-page capture can be many MB and blow the per-image/context
+      // budget. Downscale to fit rather than reject — the model should still see
+      // the page.
+      const bounded = await boundScreenshot(buffer, maxImageBytes);
       return {
         content: [
           { type: "text", text: `screenshot of ${page.url()}${args.full_page ? " (full page)" : ""}` },
-          { type: "image", data: buffer.toString("base64"), mimeType: "image/png" },
+          { type: "image", data: bounded.data, mimeType: "image/png" },
         ],
-        details: { action: "screenshot", url: page.url(), fullPage: args.full_page ?? false },
+        details: {
+          action: "screenshot",
+          url: page.url(),
+          fullPage: args.full_page ?? false,
+          downscaled: bounded.downscaled,
+          base64Bytes: bounded.base64Bytes,
+        },
       };
     }
 
@@ -227,6 +261,71 @@ async function pageResult(
       downloads,
     },
   };
+}
+
+/**
+ * Bound a screenshot PNG to `maxBytes` measured as its base64-encoded size (the
+ * size providers meter against the per-image budget — the exact accounting
+ * read_image uses via `base64ByteSize`). If the capture already fits it passes
+ * through untouched (`downscaled: false`). Otherwise it's iteratively downscaled
+ * via sharp (re-encoded PNG) until it fits or a minimum dimension / iteration
+ * cap is hit. If it genuinely can't be made to fit, throws a clean
+ * `screenshot_failed` BrowserError rather than shipping an oversized block.
+ *
+ * Factored out (and exported) for direct testing.
+ */
+export async function boundScreenshot(
+  buffer: Buffer,
+  maxBytes: number,
+): Promise<{ data: string; downscaled: boolean; base64Bytes: number }> {
+  if (base64ByteSize(buffer.byteLength) <= maxBytes) {
+    return { data: buffer.toString("base64"), downscaled: false, base64Bytes: base64ByteSize(buffer.byteLength) };
+  }
+
+  // Establish the current pixel dimensions to scale from.
+  const meta = await sharp(buffer).metadata();
+  let width = meta.width ?? 0;
+  let height = meta.height ?? 0;
+  if (!width || !height) {
+    // Can't introspect dimensions — we have no safe way to downscale, so refuse
+    // rather than ship an oversized payload.
+    throw new BrowserError(
+      "screenshot_failed",
+      `Screenshot is ${(base64ByteSize(buffer.byteLength) / (1024 * 1024)).toFixed(1)}MB (base64) — exceeds the ${(maxBytes / (1024 * 1024)).toFixed(1)}MB image cap and its dimensions can't be read to downscale.`,
+    );
+  }
+
+  // A capped iterative shrink: each step scales linear dimensions by ~0.8
+  // (≈0.64× pixels). Seed the first step from the byte ratio so a wildly
+  // oversized capture converges quickly instead of crawling down 20% at a time.
+  const MIN_DIMENSION = 320; // below this a screenshot is no longer useful
+  const MAX_ITERATIONS = 12;
+  let current = buffer;
+  let currentBytes = base64ByteSize(current.byteLength);
+  const initialRatio = Math.sqrt(maxBytes / currentBytes); // <1
+  let scale = Math.min(0.9, Math.max(0.1, initialRatio));
+
+  for (let i = 0; i < MAX_ITERATIONS; i += 1) {
+    const nextWidth = Math.max(MIN_DIMENSION, Math.floor(width * scale));
+    const nextHeight = Math.max(MIN_DIMENSION, Math.floor(height * scale));
+    // No further progress possible (already at the floor) and still too big.
+    if (nextWidth === width && nextHeight === height) break;
+    width = nextWidth;
+    height = nextHeight;
+    current = await sharp(buffer).resize({ width, height, fit: "inside", withoutEnlargement: true }).png().toBuffer();
+    currentBytes = base64ByteSize(current.byteLength);
+    if (currentBytes <= maxBytes) {
+      return { data: current.toString("base64"), downscaled: true, base64Bytes: currentBytes };
+    }
+    // After the first (ratio-seeded) step, shrink more conservatively.
+    scale = 0.8;
+    if (width <= MIN_DIMENSION && height <= MIN_DIMENSION) break;
+  }
+
+  throw new BrowserError(
+    "screenshot_failed",
+    `Screenshot could not be downscaled under the ${(maxBytes / (1024 * 1024)).toFixed(1)}MB image cap (smallest attempt was ${(currentBytes / (1024 * 1024)).toFixed(1)}MB at ${width}x${height}). Try a non-full-page capture or a smaller viewport.`,
+  );
 }
 
 function renderDownloads(downloads: DownloadRecord[]): string {

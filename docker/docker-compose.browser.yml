@@ -42,6 +42,15 @@ services:
       - ${MIKUSWARM_BROWSER_DATA_DIR:-mikuswarm-browser-data}:/data
     networks:
       - mikuswarm-browser
+    # Pin DNS to the same public resolvers the egress hardening permits
+    # (PUBLIC_RESOLVERS in browser-egress-rules.sh, which DROPs RFC1918 and only
+    # RETURNs DNS to these). Without this the container would inherit Docker's
+    # embedded resolver → the host's (often RFC1918) DNS, bypassing the pinning
+    # and reopening the DNS-tunnel-to-LAN exfil path the rules exist to close.
+    # Keep this list in sync with PUBLIC_RESOLVERS. (Mirrors the dev sandbox.)
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     # KasmVNC + a headed Chromium need shared memory; the default 64MB causes tab
     # crashes on heavy pages.
     shm_size: "1g"

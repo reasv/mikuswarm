@@ -126,8 +126,11 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
       try {
         result = await page.evaluate(expr);
       } catch (error) {
+        // A runtime exception from the page expression — not a malformed request.
+        // This is the page's own JS throwing; report it as evaluate_failed so
+        // observability/programmatic handling isn't misled (see issue #8).
         throw new BrowserError(
-          "bad_request",
+          "evaluate_failed",
           `act:evaluate threw: ${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
         );
@@ -159,11 +162,35 @@ async function withRef(
   }
 }
 
-/** Map Playwright errors to structured BrowserErrors. */
-function mapError(error: unknown, refUsed: boolean, ref?: string): BrowserError {
+/** True for Playwright timeout errors (by error name or message shape). */
+export function isTimeoutError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  const isTimeout = (error as { name?: string })?.name === "TimeoutError" || /Timeout .*exceeded/i.test(message);
-  if (isTimeout && refUsed) {
+  return (error as { name?: string })?.name === "TimeoutError" || /Timeout .*exceeded/i.test(message);
+}
+
+// A stale `aria-ref` can fail to resolve *synchronously* (Playwright throwing a
+// "no node found"-style error) rather than timing out. By the time mapError runs
+// with refUsed=true, withRef has already accepted the ref via REF_RE, so the ref
+// was syntactically valid — a resolution failure means it went stale. Scope this
+// strictly to aria-ref resolution failures so a genuine bad_request (invalid
+// params) isn't misclassified. Empirical confirmation of the exact thrown error
+// lives in the docker integration test (test/browser.docker.test.ts).
+const ARIA_REF_RE = /aria-ref/i;
+// Match only genuine "the ref points at nothing" phrasings. Deliberately NOT
+// matching the generic "resolve"/"unable to" — `aria-ref=eN` is echoed in nearly
+// every locator error message, so a strict-mode "...resolved to 2 elements"
+// violation (a real, non-stale error) would otherwise be misclassified.
+const REF_UNRESOLVED_RE = /not found|no node|cannot find|no element|did not match/i;
+
+/** Map Playwright errors to structured BrowserErrors. */
+export function mapError(error: unknown, refUsed: boolean, ref?: string): BrowserError {
+  const message = error instanceof Error ? error.message : String(error);
+  const isTimeout = isTimeoutError(error);
+  // A stale ref surfaces either as a resolution timeout or a synchronous
+  // "no node for aria-ref" error — both mean "take a fresh snapshot" (§5.3).
+  const isStaleRef =
+    refUsed && (isTimeout || (ARIA_REF_RE.test(message) && REF_UNRESOLVED_RE.test(message)));
+  if (isStaleRef) {
     return new BrowserError(
       "ref_expired",
       `Ref ${ref ?? ""} did not resolve (it likely went stale after a navigation or DOM change). Take a fresh \`snapshot\` and retry with a current ref.`,

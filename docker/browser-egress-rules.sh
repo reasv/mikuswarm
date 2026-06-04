@@ -70,6 +70,8 @@ add_rule() {
 # -I prepends, so we add in REVERSE priority order: drops first, then the DNS
 # RETURNs on top, so DNS-to-public-resolvers is evaluated before the RFC1918
 # drops.
+# 169.254.0.0/16 is link-local; it subsumes the cloud metadata endpoint
+# 169.254.169.254 (AWS/GCP/Azure IMDS), so that high-value SSRF target is blocked.
 PRIVATE_RANGES_V4=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 127.0.0.0/8)
 
 flush_owned_rules iptables

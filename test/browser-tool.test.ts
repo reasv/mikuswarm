@@ -4,8 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import sharp from "sharp";
+
 import { BrowserSession, type ConnectOverCdp } from "../src/browser/session.js";
-import { createBrowserTool } from "../src/tools/browser.js";
+import { createBrowserTool, boundScreenshot } from "../src/tools/browser.js";
+import { aiSnapshot } from "../src/browser/snapshot.js";
+import { base64ByteSize } from "../src/tools/read-image.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
 
@@ -29,6 +33,8 @@ const SNAPSHOT = '- generic [ref=e1]:\n  - heading "Example" [level=1] [ref=e2]\
 interface FakePageOptions {
   refError?: Error; // thrown by locator actions (stale ref / timeout)
   evalResult?: unknown;
+  evalError?: Error; // thrown by page.evaluate (page-script runtime exception)
+  screenshotError?: Error; // thrown by page.screenshot
 }
 
 function makeFakePage(opts: FakePageOptions) {
@@ -43,8 +49,8 @@ function makeFakePage(opts: FakePageOptions) {
     async goto(u: string) { currentUrl = u; },
     async goBack() {},
     async waitForTimeout() {},
-    async screenshot() { return Buffer.from("\x89PNGfake"); },
-    async evaluate() { return opts.evalResult ?? "ok"; },
+    async screenshot() { if (opts.screenshotError) throw opts.screenshotError; return Buffer.from("\x89PNGfake"); },
+    async evaluate() { if (opts.evalError) throw opts.evalError; return opts.evalResult ?? "ok"; },
     mouse: { async wheel() {} },
     keyboard: { async press() {} },
     locator(_selector: string) {
@@ -96,7 +102,7 @@ async function withTool(
   const restore = stubManager();
   const connect: ConnectOverCdp = async () => makeBrowser(pageOpts) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880 });
   try {
     await fn(tool);
   } finally {
@@ -126,6 +132,18 @@ test("tool: rejects non-http(s) schemes (bad_url)", async () => {
   await withTool(baseConfig(), {}, async (tool) => {
     await assert.rejects(
       () => tool.execute("c1", { action: "navigate", url: "file:///etc/passwd" }),
+      /browser:bad_url/,
+    );
+  });
+});
+
+test("tool: open with a non-http(s) scheme is rejected (bad_url) (#17)", async () => {
+  // Mirror the navigate file:// guard for the `open` branch: open also calls
+  // assertBrowserUrl, so its rejection path must be covered (drop the call there
+  // and nothing catches it).
+  await withTool(baseConfig(), {}, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "open", url: "file:///etc/passwd" }),
       /browser:bad_url/,
     );
   });
@@ -186,4 +204,198 @@ test("tool: act:click returns a refreshed snapshot", async () => {
     assert.match(text, /clicked e3/);
     assert.match(text, /\[ref=e1\]/);
   });
+});
+
+test("tool: a synchronous stale-ref error (no timeout) surfaces as ref_expired (#4)", async () => {
+  // Playwright can throw a sync "no node found for aria-ref" rather than timing
+  // out; with a valid ref this means the ref went stale. Pre-fix this mapped to
+  // bad_request. NB: not a TimeoutError (no name, no "Timeout … exceeded").
+  const staleRef = new Error('No node found for selector: aria-ref=e3');
+  await withTool(baseConfig(), { refError: staleRef }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "act", kind: "click", ref: "e3" }),
+      /browser:ref_expired/,
+    );
+  });
+});
+
+test("tool: act:evaluate runtime throw surfaces as evaluate_failed (#8)", async () => {
+  const boom = new Error("ReferenceError: x is not defined");
+  await withTool(baseConfig({ evaluate_enabled: true }), { evalError: boom }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "act", kind: "evaluate", text: "x()" }),
+      /browser:evaluate_failed/,
+    );
+  });
+});
+
+test("tool: a non-timeout screenshot failure surfaces as screenshot_failed (#8)", async () => {
+  const detached = new Error("Target page, context or browser has been closed");
+  await withTool(baseConfig(), { screenshotError: detached }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot" }),
+      /browser:screenshot_failed/,
+    );
+  });
+});
+
+test("tool: a screenshot timeout surfaces as act_timeout (#8)", async () => {
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  await withTool(baseConfig(), { screenshotError: timeout }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot" }),
+      /browser:act_timeout/,
+    );
+  });
+});
+
+// ── #10: text maxLength schema bound ─────────────────────────────────────────
+
+// pi-ai's re-exported typebox uses different Kind symbols than the direct
+// @sinclair/typebox dep, so a cross-package Value.Check throws "Unknown type".
+// Instead validate the emitted JSON Schema fragment directly (same approach as
+// sillytavern-card.test.ts): pull `maxLength` off the `text` property and check
+// a candidate string against it.
+function checkMaxLength(schema: { maxLength?: number }, value: string): boolean {
+  if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return false;
+  return true;
+}
+
+test("tool: schema bounds `text` length, rejecting pathological multi-MB input (#10)", () => {
+  const tool = createBrowserTool({
+    session: undefined as never,
+    agentSessionId: "s1",
+    config: baseConfig(),
+    maxImageBytes: 5_242_880,
+  });
+  const params = tool.parameters as { properties: { text: { maxLength?: number } } };
+  const textSchema = params.properties.text;
+  assert.equal(textSchema.maxLength, 100000, "text field carries a generous maxLength bound");
+
+  // Just-fits input passes the schema bound; over-length input is rejected.
+  assert.equal(checkMaxLength(textSchema, "x".repeat(100000)), true);
+  assert.equal(checkMaxLength(textSchema, "x".repeat(100001)), false);
+  // A pathological multi-MB fill/evaluate value fails fast at the schema layer.
+  assert.equal(checkMaxLength(textSchema, "x".repeat(5 * 1024 * 1024)), false);
+});
+
+// ── #11: snapshot truncation marker / refCount on returned text ──────────────
+
+const MARKER = "\n[... snapshot truncated — scroll or interact to reveal more ...]";
+
+/** A page whose ariaSnapshot returns an arbitrary raw string. */
+function snapshotPage(raw: string) {
+  return { locator: (_sel: string) => ({ async ariaSnapshot() { return raw; } }) } as never;
+}
+
+test("aiSnapshot: truncates to ≤ maxChars, marks truncation, and counts refs in returned text only (#11)", async () => {
+  // Long raw snapshot with several refs; some fall past a small cut so they
+  // must NOT be counted in the returned refCount.
+  const head = "- generic [ref=e1]:\n  - link [ref=e2]\n  - link [ref=e3]\n";
+  const filler = "  - text node padding line\n".repeat(200);
+  const tail = "  - link [ref=e98]\n  - link [ref=e99]\n";
+  const raw = head + filler + tail;
+  const maxChars = 200;
+
+  const result = await aiSnapshot(snapshotPage(raw), maxChars);
+
+  assert.equal(result.truncated, true, "marked truncated");
+  assert.ok(result.text.length <= maxChars, `output length ${result.text.length} ≤ ${maxChars}`);
+  assert.ok(result.text.endsWith(MARKER) || result.text.length === maxChars, "marker present (or clamped)");
+  assert.ok(result.text.includes(MARKER.trim().slice(0, 10)) || result.text.includes("truncated"), "marker text present");
+
+  // refCount reflects ONLY refs in the returned text, not the trailing refs
+  // (e98/e99) that were sliced off.
+  const refsInReturned = (result.text.match(/\[ref=e\d+\]/g) ?? []).length;
+  assert.equal(result.refCount, refsInReturned, "refCount counts only returned refs");
+  assert.ok(!result.text.includes("[ref=e98]"), "trailing refs were sliced off");
+  assert.ok(result.refCount < (raw.match(/\[ref=e\d+\]/g) ?? []).length, "refCount is below the raw ref total");
+});
+
+test("aiSnapshot: clamps total output to maxChars even when maxChars < marker length (#11)", async () => {
+  const raw = "- generic [ref=e1]:\n  - link [ref=e2]\n".repeat(50);
+  const tiny = 5; // smaller than MARKER.length
+  const result = await aiSnapshot(snapshotPage(raw), tiny);
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= tiny, `output length ${result.text.length} ≤ ${tiny}`);
+});
+
+test("aiSnapshot: short snapshot passes through untruncated with full refCount", async () => {
+  const raw = "- generic [ref=e1]:\n  - heading [ref=e2]\n  - link [ref=e3]";
+  const result = await aiSnapshot(snapshotPage(raw), 20000);
+  assert.equal(result.truncated, false);
+  assert.equal(result.text, raw);
+  assert.equal(result.refCount, 3);
+});
+
+test("aiSnapshot: raw exactly at the cap (raw.length === maxChars) is NOT truncated (#11 boundary)", async () => {
+  // The passthrough guard is `raw.length <= maxChars`, so a raw snapshot whose
+  // length is exactly the cap must pass through verbatim — no marker, no slice,
+  // full refCount. (Off-by-one in the guard would truncate here.)
+  const raw = "- generic [ref=e1]:\n  - link [ref=e2]\n  - link [ref=e3] pad";
+  const result = await aiSnapshot(snapshotPage(raw), raw.length);
+  assert.equal(result.truncated, false, "exactly-at-cap is not truncated");
+  assert.equal(result.text, raw, "raw passes through verbatim");
+  assert.equal(result.refCount, 3, "all refs counted when not truncated");
+});
+
+// ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
+
+test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {
+  const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+    .png().toBuffer();
+  const cap = 5_242_880;
+  const bounded = await boundScreenshot(png, cap);
+  assert.equal(bounded.downscaled, false, "not downscaled");
+  assert.equal(bounded.data, png.toString("base64"), "identical bytes passed through");
+  assert.ok(bounded.base64Bytes <= cap);
+  assert.equal(bounded.base64Bytes, base64ByteSize(png.byteLength));
+});
+
+test("boundScreenshot: an over-cap capture is downscaled to fit (#2)", async () => {
+  // A 2000x2000 gradient PNG: photo-like content that compresses and shrinks
+  // monotonically under resize (like a real screenshot), with a cap below the
+  // full size so real sharp downscaling must run to satisfy it.
+  const w = 2000, h = 2000;
+  const raw = Buffer.alloc(w * h * 3);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 3;
+      raw[i] = (x * 255 / w) | 0;
+      raw[i + 1] = (y * 255 / h) | 0;
+      raw[i + 2] = ((x + y) * 255 / (w + h)) | 0;
+    }
+  }
+  const png = await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
+
+  const cap = 350_000; // below the full image's base64 size, reachable above the dimension floor
+  assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
+
+  const bounded = await boundScreenshot(png, cap);
+  assert.equal(bounded.downscaled, true, "downscaled");
+  assert.ok(bounded.base64Bytes <= cap, `resulting base64 ${bounded.base64Bytes} ≤ cap ${cap}`);
+  // Result is still a valid, smaller PNG.
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.equal(meta.format, "png");
+  assert.ok((meta.width ?? w) < w, "dimensions were reduced");
+});
+
+test("boundScreenshot: an unshrinkable over-cap capture throws screenshot_failed, never ships oversized (#2)", async () => {
+  // High-entropy noise already at the 320px dimension floor: it can't be made
+  // smaller (already at the floor) and noise doesn't compress, so no downscale
+  // can satisfy a tiny cap. The helper must throw rather than loop or ship an
+  // over-cap payload (the floor-throw safety branch).
+  const dim = 320;
+  const raw = Buffer.alloc(dim * dim * 3);
+  for (let i = 0; i < raw.length; i += 1) raw[i] = (i * 2654435761) & 0xff; // cheap deterministic noise
+  const png = await sharp(raw, { raw: { width: dim, height: dim, channels: 3 } }).png().toBuffer();
+
+  const cap = 1000; // far below any 320x320 PNG's base64 size
+  assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
+
+  await assert.rejects(
+    boundScreenshot(png, cap),
+    (err: unknown) => (err as { code?: string }).code === "screenshot_failed",
+    "must throw screenshot_failed rather than ship an oversized block",
+  );
 });
