@@ -561,6 +561,70 @@ test("v7 -> v8 migration guards the memory_chunks_au trigger and keeps FTS corre
   }
 });
 
+// --- Issue #16: the memory_chunks FTS triggers round-trip insert→MATCH→delete→MATCH ---
+//
+// Group 4's v7->v8 test (above) round-trips insert→MATCH and update (status-only and
+// text), but never deletes a row. This pins the external-content `'delete'` trigger
+// syntax of `memory_chunks_ad` against the CURRENT schema (a fresh Storage open, not a
+// legacy migration fixture) independent of the indexer: a deleted row's terms must be
+// retracted from FTS, and the external-content index must stay internally consistent.
+
+test("memory_chunks FTS triggers round-trip insert→MATCH→delete→MATCH on the current schema (issue #16)", async () => {
+  // A fresh in-memory Storage applies the full SCHEMA, including the FTS triggers.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Insert a chunk; the `_ai` trigger must make it findable by FTS MATCH.
+    await storage.readAndWrite((db) => {
+      db.prepare(
+        `insert into memory_chunks
+           (id, path, ordinal, source, start_line, end_line, room, entry_ts,
+            text, token_count, content_hash, model_id, embed_status, embed_attempts, indexed_at)
+         values
+           ('c1', 'memory/2026-06-04.md', 0, 'memory', 1, 2, '!room', 1000,
+            'unicornflux pinball', 2, 'h1', null, 'pending', 0, 5000)`,
+      ).run();
+    });
+    const rowid = storage.read(
+      (db) =>
+        (db.prepare(`select rowid from memory_chunks where id='c1'`).get() as { rowid: number })
+          .rowid,
+    );
+    const found = storage.read(
+      (db) =>
+        db
+          .prepare(`select rowid from memory_chunks_fts where memory_chunks_fts match 'unicornflux'`)
+          .all() as Array<{ rowid: number }>,
+    );
+    assert.deepEqual(
+      found.map((r) => r.rowid),
+      [rowid],
+      "FTS must find the inserted chunk",
+    );
+
+    // Delete the row; the `_ad` `'delete'` trigger must retract its terms from FTS.
+    await storage.readAndWrite((db) => {
+      db.prepare(`delete from memory_chunks where id='c1'`).run();
+    });
+    const afterDelete = storage.read(
+      (db) =>
+        db
+          .prepare(`select rowid from memory_chunks_fts where memory_chunks_fts match 'unicornflux'`)
+          .all() as Array<{ rowid: number }>,
+    );
+    assert.equal(afterDelete.length, 0, "FTS must not match a deleted chunk");
+
+    // integrity-check raises if the external-content index drifted from the table.
+    assert.doesNotThrow(() =>
+      storage.read((db) =>
+        db.prepare(`insert into memory_chunks_fts(memory_chunks_fts) values('integrity-check')`).run(),
+      ),
+    );
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
 // --- Issue #5: missing-row writes are observable (warn, no throw) ---
 
 test("updateAgentSessionStatus on a non-existent id warns and does not throw", async () => {
