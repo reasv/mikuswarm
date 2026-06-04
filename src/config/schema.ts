@@ -289,6 +289,64 @@ const ObservabilitySchema = Type.Object({
 
 export type ObservabilityServerConfig = Static<typeof ObservabilityServerSchema>;
 
+// Browser-use backend (ARCHITECTURE.md browser section; spec/BROWSER-USE.md).
+// Off by default; the harness connects to an operator-run CloakBrowser-Manager
+// over HTTP and degrades gracefully if it is down (it does NOT manage the
+// container). All fields are set explicitly in local config per the
+// explicit-deployment-config convention.
+const BrowserSchema = Type.Object({
+  enabled: Type.Boolean(),
+  // CloakBrowser-Manager base URL (loopback-published REST + CDP-WS proxy).
+  manager_url: Type.String({ minLength: 1 }),
+  // Matches the Manager's AUTH_TOKEN. Passed as `Authorization: Bearer` on REST
+  // and on connectOverCDP (forwarded on the WS upgrade — phase-0 verified). The
+  // key name ends in `token`, so the loader auto-registers it for log redaction.
+  // Optional + minLength:1: ABSENT means the Manager runs token-less (localhost
+  // isolation only); PRESENT-but-empty is a misconfiguration and is rejected.
+  auth_token: Type.Optional(Type.String({ minLength: 1 })),
+  // The single persistent identity. Resolved by name each boot; created lazily
+  // with auto_launch=true if absent.
+  profile_name: Type.String({ minLength: 1 }),
+  // Fingerprint platform spoof. Most common / least suspicious is windows.
+  platform: Type.Union([
+    Type.Literal("windows"),
+    Type.Literal("macos"),
+    Type.Literal("linux"),
+  ]),
+  // Stable fingerprint seed (create-once). 0 (or unset) ⇒ let the Manager pick a
+  // random seed once and persist it; a drifting seed defeats the "same person".
+  fingerprint_seed: Type.Optional(Type.Number({ minimum: 0 })),
+  // Bézier-curve mouse + per-character typing — a stronger "real user" signal.
+  humanize: Type.Boolean(),
+  // Gate browser act:evaluate (arbitrary JS in the page), mirroring OpenClaw.
+  evaluate_enabled: Type.Boolean(),
+  // Optional fingerprint screen size (defaults to the Manager's 1920x1080).
+  screen_width: Type.Optional(Type.Integer({ minimum: 1 })),
+  screen_height: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Profile timezone/locale. Default to agent.timezone (and a derived locale)
+  // unless overridden here, so the browser and chat persona agree on locale.
+  timezone: Type.Optional(Type.String({ minLength: 1 })),
+  locale: Type.Optional(Type.String({ minLength: 1 })),
+  // Optional egress proxy: http(s)://… or socks5://… (host:port:user:pass is
+  // normalized by the Manager). Empty ⇒ direct egress through the hardened bridge.
+  proxy: Type.Optional(Type.String()),
+  // Match the spoofed timezone/locale to the proxy's exit IP.
+  geoip: Type.Boolean(),
+  // Auto-handling of JS alert/confirm/prompt so a dialog can never hang a page.
+  // alert is always accepted; this controls confirm/prompt.
+  dialog_policy: Type.Union([Type.Literal("dismiss"), Type.Literal("accept")]),
+  // Truncate AI snapshots to bound context cost.
+  snapshot_max_chars: Type.Integer({ minimum: 1000 }),
+  // Per-navigation / per-action / connect (incl. first-launch cold start) timeouts.
+  nav_timeout_ms: Type.Integer({ minimum: 1 }),
+  act_timeout_ms: Type.Integer({ minimum: 1 }),
+  connect_timeout_ms: Type.Integer({ minimum: 1 }),
+  // Close a session's tab after this much idle, to bound tab growth.
+  session_page_idle_ms: Type.Integer({ minimum: 1 }),
+});
+
+export type BrowserConfig = Static<typeof BrowserSchema>;
+
 export const AppConfigSchema = Type.Object({
   app: Type.Object({
     name: Type.String(),
@@ -409,6 +467,7 @@ export const AppConfigSchema = Type.Object({
     http_proxy_url: Type.Optional(Type.String()),
   })),
   observability: Type.Optional(ObservabilitySchema),
+  browser: Type.Optional(BrowserSchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

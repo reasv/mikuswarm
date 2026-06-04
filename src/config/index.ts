@@ -6,6 +6,7 @@ export type {
   DiaryConfig,
   RetrievalConfig,
   ObservabilityServerConfig,
+  BrowserConfig,
 } from "./schema.js";
 export {
   redactSecrets,

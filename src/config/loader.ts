@@ -139,4 +139,32 @@ function validateConfig(config: AppConfig): void {
       `Invalid config: sandbox.workspace_mount must be an absolute path (got "${sandbox.workspace_mount}").`,
     );
   }
+
+  // Browser backend (parity with the console-auth guard above). The schema's
+  // `minLength: 1` rejects an empty auth_token, but a whitespace-only value
+  // (e.g. `${BROWSER_AUTH_TOKEN}` expanding to " ") would slip through. When the
+  // browser is enabled, a present token must be non-blank; an ABSENT token means
+  // the Manager runs token-less (localhost isolation) and is left untouched.
+  const browser = config.browser;
+  if (browser?.enabled && browser.auth_token !== undefined && browser.auth_token.trim() === "") {
+    throw new Error(
+      "Invalid config: browser.auth_token is present but blank — set a non-empty " +
+        "token (matching the Manager's AUTH_TOKEN) or remove the key to connect to " +
+        "a token-less Manager.",
+    );
+  }
+  // manager_url must be an absolute http(s) URL the harness can connect to.
+  if (browser?.enabled) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(browser.manager_url);
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+      throw new Error(
+        `Invalid config: browser.manager_url must be an absolute http(s) URL (got "${browser.manager_url}").`,
+      );
+    }
+  }
 }

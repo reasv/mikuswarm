@@ -328,3 +328,31 @@ recovery_key = "${MATRIX_RECOVERY_KEY}"
 user_id = "${MATRIX_USER_ID}"
 device_id = "${MATRIX_DEVICE_ID}"
 store_path = "./var/matrix/miku"
+
+# Browser-use backend (spec/BROWSER-USE.md; ARCHITECTURE.md browser section). Off
+# by default. When enabled, the `browser` tool drives one persistent stealth
+# Chromium identity inside an operator-run CloakBrowser-Manager (a sibling docker
+# service — docker/docker-compose.browser.yml), connected in-process over CDP.
+# The harness does NOT manage that container; it connects over HTTP and degrades
+# gracefully if the Manager is down. Set everything explicitly in local config.
+[browser]
+enabled = false
+manager_url = "http://127.0.0.1:8080"  # CloakBrowser-Manager base (loopback-published)
+# auth_token is intentionally unset here: ABSENT ⇒ token-less Manager (localhost
+# isolation only). Set it in local config to "${BROWSER_AUTH_TOKEN}" to match the
+# Manager's AUTH_TOKEN. PRESENT-but-empty is rejected at load time (fail-fast).
+profile_name = "miku"                   # the single persistent identity (resolved by name)
+platform = "windows"                    # fingerprint platform: windows | macos | linux
+fingerprint_seed = 0                    # 0/unset ⇒ Manager picks a random seed once, then persists it
+humanize = true                         # Bézier mouse + per-char typing
+evaluate_enabled = false                # gate browser act:evaluate (arbitrary page JS)
+# screen_width / screen_height: unset ⇒ Manager default 1920x1080
+# timezone / locale: unset ⇒ default to agent.timezone (+ a derived locale)
+proxy = ""                              # optional http(s)://… or socks5://…; empty ⇒ direct egress
+geoip = false                           # match spoofed TZ/locale to the proxy exit IP
+dialog_policy = "dismiss"               # auto JS dialog handling: dismiss | accept (alert always accepts)
+snapshot_max_chars = 20000              # truncate AI snapshots to bound context cost
+nav_timeout_ms = 30000                  # per-navigation timeout
+act_timeout_ms = 15000                  # per-action timeout
+connect_timeout_ms = 20000              # connectOverCDP + first-launch cold start
+session_page_idle_ms = 600000           # close a session's tab after this idle (bounds tab growth)
