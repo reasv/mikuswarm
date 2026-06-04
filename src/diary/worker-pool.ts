@@ -82,6 +82,7 @@ export class DiaryWorkerPool {
       workerCount: this.options.config.worker_count ?? 1,
       maxRetries: this.options.config.max_retries ?? DEFAULT_MAX_RETRIES,
       inFlight: () => this.activeWorkers.size,
+      notify: () => this.notifyNewWork(),
     };
   }
 

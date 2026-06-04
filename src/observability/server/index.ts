@@ -18,6 +18,8 @@ import {
   pipelineItems,
   pipelineItemDetail,
   pipelineActivityStream,
+  retryPipelineItem,
+  retryFailedPipelineItems,
 } from "./pipeline-handlers.js";
 import type { ConsoleServerDeps } from "./types.js";
 
@@ -70,7 +72,9 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)
     .add("GET", "/api/pipelines/:pool/items", pipelineItems)
-    .add("GET", "/api/pipelines/:pool/items/:id", pipelineItemDetail);
+    .add("GET", "/api/pipelines/:pool/items/:id", pipelineItemDetail)
+    .add("POST", "/api/pipelines/:pool/items/:id/retry", retryPipelineItem)
+    .add("POST", "/api/pipelines/:pool/retry-failed", retryFailedPipelineItems);
 
   // Track live sockets so `stop()` can force-close long-lived SSE connections
   // (which would otherwise keep `server.close()` pending forever).

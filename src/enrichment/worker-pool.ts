@@ -72,6 +72,7 @@ export class EnrichmentWorkerPool {
       workerCount: this.options.config.worker_count ?? 3,
       maxRetries: this.options.config.max_retries ?? 3,
       inFlight: () => this.activeWorkers.size,
+      notify: () => this.notifyNewEvent("retry"),
     };
   }
 

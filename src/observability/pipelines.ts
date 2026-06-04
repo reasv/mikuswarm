@@ -14,6 +14,12 @@ export interface PipelineStats {
   maxRetries: number;
   inFlight(): number;
   concurrency?: Record<string, number>;
+  /**
+   * Wake the pool's poll loop so a manually re-enqueued item (Phase 5 retry) is
+   * claimed immediately rather than on the next 1s tick. Optional so test stubs and
+   * the dashboard read path need not provide it.
+   */
+  notify?(): void;
 }
 
 /**

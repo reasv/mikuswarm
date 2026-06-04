@@ -226,6 +226,13 @@ export const RetryPipelineItemResponse = Schema.Struct({
 });
 export type RetryPipelineItemResponse = Schema.Schema.Type<typeof RetryPipelineItemResponse>;
 
+/** POST /api/pipelines/:pool/retry-failed — bulk retry; `retried` is the count reset. */
+export const RetryFailedResponse = Schema.Struct({
+	pool: PipelineId,
+	retried: Schema.Number
+});
+export type RetryFailedResponse = Schema.Schema.Type<typeof RetryFailedResponse>;
+
 /** One live activity event off GET /api/pipelines/stream (the SSE firehose). */
 export const PipelineActivityEvent = Schema.Struct({
 	pool: PipelineId,

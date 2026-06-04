@@ -203,3 +203,68 @@ export function pipelineActivityStream(
   });
   stream.onClose(unsubscribe);
 }
+
+/** Operator-facing reason a manual retry was rejected (the BFF surfaces it verbatim). */
+function retryRejectionMessage(pool: PipelineId, itemStatus: string, id: string): string {
+  if (itemStatus === "processing") {
+    return `${pool} item ${id} is currently processing; stop the linked session instead of retrying.`;
+  }
+  if (pool === "summarization" && (itemStatus === "complete" || itemStatus === "truncated")) {
+    return `Regenerating a consumed summary isn't supported yet — it may already feed a higher-level condensation and a diary entry (item ${id} is ${itemStatus}).`;
+  }
+  if (pool === "diary" && itemStatus === "done") {
+    return `Re-running a written diary entry isn't supported yet — the day file is append-only and would be duplicated (item ${id} is done).`;
+  }
+  return `${pool} item ${id} is ${itemStatus}, which is not a retryable state.`;
+}
+
+/**
+ * POST /api/pipelines/:pool/items/:id/retry — manual retry (ARCHITECTURE.md §11,
+ * spec §3.7). Resets a terminal safe item to `pending` and pokes the pool.
+ * `200 { pool, id, status: "pending" }` on success; `404` unknown item; `409` when
+ * not retryable (`processing`, or a deferred unsafe state). The `409` uses the
+ * standard error envelope with structured details `{ pool, id, itemStatus }` and a
+ * message that reads sensibly on its own (the BFF surfaces it as operator text).
+ * Behind the `x-console-request` CSRF guard like every mutating route.
+ */
+export async function retryPipelineItem(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): Promise<void> {
+  const pool = ctx.params.pool;
+  if (!isPipelineId(pool)) return sendError(res, 404, `Unknown pipeline: ${pool}`);
+  const id = ctx.params.id;
+
+  const outcome = await ctx.deps.storage.retryPipelineItem(pool, id);
+  if (!outcome.ok && outcome.code === "not_found") {
+    return sendError(res, 404, `Unknown ${pool} item: ${id}`);
+  }
+  if (!outcome.ok && outcome.code === "not_retryable") {
+    return sendError(res, 409, retryRejectionMessage(pool, outcome.itemStatus, id), {
+      pool,
+      id,
+      itemStatus: outcome.itemStatus,
+    });
+  }
+  // Poke the pool so the re-enqueued item is claimed at once (else next 1s tick).
+  ctx.deps.pipelines?.[pool]?.notify?.();
+  sendJson(res, 200, { pool, id, status: "pending" });
+}
+
+/**
+ * POST /api/pipelines/:pool/retry-failed — bulk retry (ARCHITECTURE.md §11, spec
+ * §3.7), restricted to the unambiguously-safe `failed` state. `200 { pool, retried }`.
+ * Behind the same CSRF guard.
+ */
+export async function retryFailedPipelineItems(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): Promise<void> {
+  const pool = ctx.params.pool;
+  if (!isPipelineId(pool)) return sendError(res, 404, `Unknown pipeline: ${pool}`);
+  const retried = await ctx.deps.storage.retryFailedPipelineItems(pool);
+  if (retried > 0) ctx.deps.pipelines?.[pool]?.notify?.();
+  sendJson(res, 200, { pool, retried });
+}

@@ -514,6 +514,28 @@ export interface PipelineItemQuery {
   limit?: number;
 }
 
+/** Result of {@link Storage.retryPipelineItem} (Phase 5 manual retry). */
+export type PipelineRetryOutcome =
+  | { ok: true }
+  | { ok: false; code: "not_found" }
+  | { ok: false; code: "not_retryable"; itemStatus: string };
+
+/**
+ * Per-pool terminal states that are *safe* to manually reset to `pending`
+ * (ARCHITECTURE.md §11 / spec §3.7). The deferred-unsafe states are everything
+ * else terminal: summarization `complete`/`truncated` (the summary may already be
+ * consumed by a higher-level condensation + a diary entry — a regenerate is a
+ * cascade delete, not a status flip) and diary `done` (the memory file is
+ * append-only with no dedup, so a re-run would duplicate the day-file entry).
+ * `processing` (in-flight) is never here — stop the linked session instead.
+ */
+export const PIPELINE_SAFE_RETRY: Record<PipelineId, readonly string[]> = {
+  enrichment: ["failed", "complete", "skipped"],
+  captioning: ["failed", "complete", "skipped"],
+  summarization: ["failed"],
+  diary: ["failed", "skipped"],
+};
+
 /** Opaque reverse-chron keyset cursor: `(sortValue, id)` on `(updatedAt, id)`. */
 interface PipelineCursor {
   s: number;
@@ -3372,6 +3394,87 @@ export class Storage {
       (db) => db.prepare(sql).get({ id }) as Record<string, unknown> | undefined,
     );
     return row ? spec.project(row, defaultMaxRetries) : undefined;
+  }
+
+  /**
+   * Manual retry (ARCHITECTURE.md §11, Phase 5): re-enqueue a terminal item —
+   * status→pending, attempts→0, error cleared. Gated by per-pool safety
+   * ({@link PIPELINE_SAFE_RETRY}): `processing` (in-flight) and the deferred unsafe
+   * states (summarization `complete`/`truncated`, diary `done`) are rejected with
+   * `not_retryable` (the caller maps that to a 409). The reset is idempotent and
+   * goes through the single-writer queue; the pool re-claims on its next tick (the
+   * server additionally pokes the pool's notify seam for immediacy). Terminal safe
+   * states are never auto-claimed, so the read-then-write needs no extra CAS.
+   */
+  async retryPipelineItem(pool: PipelineId, id: string): Promise<PipelineRetryOutcome> {
+    const item = this.getPipelineItem(pool, id, 0);
+    if (!item) return { ok: false, code: "not_found" };
+    if (!PIPELINE_SAFE_RETRY[pool].includes(item.status)) {
+      return { ok: false, code: "not_retryable", itemStatus: item.status };
+    }
+    const now = Date.now();
+    await this.write((db) => {
+      switch (pool) {
+        case "enrichment":
+          db.prepare(
+            `update timeline_events set enrichment_status = 'pending', enrichment_retries = 0, updated_at = ? where id = ?`,
+          ).run(now, id);
+          break;
+        case "captioning":
+          db.prepare(
+            `update media_assets set caption_status = 'pending', caption_attempts = 0, caption_error = null, updated_at = ? where id = ?`,
+          ).run(now, id);
+          break;
+        case "summarization":
+          db.prepare(
+            `update summarization_jobs set status = 'pending', attempts = 0, error = null, updated_at = ? where id = ?`,
+          ).run(now, id);
+          break;
+        case "diary":
+          db.prepare(
+            `update summaries set diary_status = 'pending', diary_attempts = 0 where id = ?`,
+          ).run(id);
+          break;
+      }
+    });
+    return { ok: true };
+  }
+
+  /**
+   * Bulk retry (ARCHITECTURE.md §11, Phase 5): reset every `failed` item in a pool
+   * to `pending` (attempts→0, error cleared). Restricted to the unambiguously-safe
+   * `failed` state — a thin wrapper over the per-item reset. Returns the count
+   * re-enqueued. Goes through the single-writer queue.
+   */
+  retryFailedPipelineItems(pool: PipelineId): Promise<number> {
+    const now = Date.now();
+    return this.write((db) => {
+      switch (pool) {
+        case "enrichment":
+          return db
+            .prepare(
+              `update timeline_events set enrichment_status = 'pending', enrichment_retries = 0, updated_at = ? where enrichment_status = 'failed'`,
+            )
+            .run(now).changes;
+        case "captioning":
+          return db
+            .prepare(
+              `update media_assets set caption_status = 'pending', caption_attempts = 0, caption_error = null, updated_at = ?
+               where caption_status = 'failed' and media_type in ('image', 'video', 'audio')`,
+            )
+            .run(now).changes;
+        case "summarization":
+          return db
+            .prepare(
+              `update summarization_jobs set status = 'pending', attempts = 0, error = null, updated_at = ? where status = 'failed'`,
+            )
+            .run(now).changes;
+        case "diary":
+          return db
+            .prepare(`update summaries set diary_status = 'pending', diary_attempts = 0 where diary_status = 'failed'`)
+            .run().changes;
+      }
+    });
   }
 
   close(): void {

@@ -72,6 +72,7 @@ export class CaptionWorkerPool {
       maxRetries: this.options.config.max_retries ?? 2,
       inFlight: () => this.activeWorkers.size,
       concurrency: Object.keys(concurrency).length > 0 ? concurrency : undefined,
+      notify: () => this.notifyNewWork(),
     };
   }
 

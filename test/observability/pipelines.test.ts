@@ -790,3 +790,116 @@ test("GET /api/pipelines/stream opens and idles when no activity bus is wired", 
     });
   });
 });
+
+// ── Manual retry (Phase 5) ───────────────────────────────────────────────────
+
+const POST = (base: string, path: string, headers: Record<string, string> = {}) =>
+  fetch(`${base}${path}`, { method: "POST", headers: { "x-console-request": "1", ...headers } });
+
+test("retryPipelineItem resets a failed enrichment item and pokes the pool", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "e1", "failed", { retries: 3 });
+    let notified = false;
+    const pipelines = fullRegistry({
+      enrichment: stubStats("enrichment", { notify: () => (notified = true) }),
+    });
+
+    await withServer({ storage, pipelines }, async (base) => {
+      const res = await POST(base, "/api/pipelines/enrichment/items/e1/retry");
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.deepEqual(body, { pool: "enrichment", id: "e1", status: "pending" });
+      assert.ok(notified, "the pool's notify seam was poked");
+
+      const item = storage.getPipelineItem("enrichment", "e1", 3)!;
+      assert.equal(item.status, "pending");
+      assert.equal(item.attempts, 0, "attempts zeroed");
+      assert.equal(item.retrying, false);
+    });
+  });
+});
+
+test("retryPipelineItem allows re-captioning a complete item (idempotent overwrite)", async () => {
+  await withStorage(async (storage) => {
+    await storage.appendTimelineEvent(userEvent("evt-1"));
+    await mediaAsset(storage, "cap-1", "evt-1", "complete", { attempts: 2 });
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await POST(base, "/api/pipelines/captioning/items/cap-1/retry");
+      assert.equal(res.status, 200);
+      const row = storage.getMediaAssetById("cap-1")!;
+      assert.equal(row.caption_status, "pending");
+      assert.equal(row.caption_attempts, 0);
+    });
+  });
+});
+
+test("retryPipelineItem 409s on a processing (in-flight) item", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "e1", "processing");
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const res = await POST(base, "/api/pipelines/enrichment/items/e1/retry");
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as any;
+      assert.equal(body.error.status, 409);
+      assert.equal(body.error.pool, "enrichment");
+      assert.equal(body.error.id, "e1");
+      assert.equal(body.error.itemStatus, "processing");
+      assert.match(body.error.message, /processing/);
+    });
+  });
+});
+
+test("retryPipelineItem 409s on the deferred-unsafe states (summary complete, diary done)", async () => {
+  await withStorage(async (storage) => {
+    await summarizationJob(storage, "job-1", "complete");
+    await diarySummary(storage, "sum-1", "done");
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const sum = await POST(base, "/api/pipelines/summarization/items/job-1/retry");
+      assert.equal(sum.status, 409);
+      assert.match((await sum.json()).error.message, /consumed summary/i);
+
+      const diary = await POST(base, "/api/pipelines/diary/items/sum-1/retry");
+      assert.equal(diary.status, 409);
+      assert.match((await diary.json()).error.message, /diary entry/i);
+    });
+  });
+});
+
+test("retryPipelineItem 404s for unknown item/pool; 403 without CSRF header", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "e1", "failed");
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      assert.equal((await POST(base, "/api/pipelines/enrichment/items/missing/retry")).status, 404);
+      assert.equal((await POST(base, "/api/pipelines/nope/items/x/retry")).status, 404);
+      // No CSRF marker → 403 (mutating-route guard), abort never runs.
+      const noCsrf = await fetch(`${base}/api/pipelines/enrichment/items/e1/retry`, { method: "POST" });
+      assert.equal(noCsrf.status, 403);
+      // Item untouched.
+      assert.equal(storage.getPipelineItem("enrichment", "e1", 3)!.status, "failed");
+    });
+  });
+});
+
+test("retry-failed bulk-resets only failed items and returns the count", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "f1", "failed");
+    await enrichEvent(storage, "f2", "failed");
+    await enrichEvent(storage, "ok", "complete");
+    let notified = false;
+    const pipelines = fullRegistry({
+      enrichment: stubStats("enrichment", { notify: () => (notified = true) }),
+    });
+
+    await withServer({ storage, pipelines }, async (base) => {
+      const res = await POST(base, "/api/pipelines/enrichment/retry-failed");
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { pool: "enrichment", retried: 2 });
+      assert.ok(notified);
+
+      assert.equal(storage.getPipelineItem("enrichment", "f1", 3)!.status, "pending");
+      assert.equal(storage.getPipelineItem("enrichment", "f2", 3)!.status, "pending");
+      // The already-complete item is left alone.
+      assert.equal(storage.getPipelineItem("enrichment", "ok", 3)!.status, "complete");
+    });
+  });
+});

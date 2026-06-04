@@ -78,6 +78,7 @@ export class SummarizationWorkerPool {
       workerCount: this.options.config.worker_count ?? 1,
       maxRetries: this.options.config.max_retries ?? 2,
       inFlight: () => this.activeWorkers.size,
+      notify: () => this.notifyNewWork(),
     };
   }
 

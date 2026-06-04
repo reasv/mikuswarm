@@ -5,6 +5,7 @@
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import PipelineStatusBadge from '$lib/components/col1/PipelineStatusBadge.svelte';
 	import SessionView from '$lib/components/col2/SessionView.svelte';
+	import RetryButton from '$lib/components/RetryButton.svelte';
 	import { relativeTime } from '$lib/utils';
 
 	const queryClient = useQueryClient();
@@ -59,6 +60,7 @@
 							<span class="font-mono tabular-nums">{item.attempts}/{item.maxRetries}</span>
 						{/if}
 						<span title={new Date(item.updatedAt).toLocaleString()}>{relativeTime(item.updatedAt)}</span>
+						<RetryButton pool={item.pool} id={item.id} status={item.status} />
 					</div>
 				</div>
 				<div class="text-xs text-foreground">{item.inputSummary}</div>
