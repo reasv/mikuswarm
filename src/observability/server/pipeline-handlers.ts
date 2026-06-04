@@ -209,7 +209,7 @@ function retryRejectionMessage(pool: PipelineId, itemStatus: string, id: string)
   if (itemStatus === "processing") {
     return `${pool} item ${id} is currently processing; stop the linked session instead of retrying.`;
   }
-  if (pool === "summarization" && (itemStatus === "complete" || itemStatus === "truncated")) {
+  if (pool === "summarization" && itemStatus === "complete") {
     return `Regenerating a consumed summary isn't supported yet — it may already feed a higher-level condensation and a diary entry (item ${id} is ${itemStatus}).`;
   }
   if (pool === "diary" && itemStatus === "done") {

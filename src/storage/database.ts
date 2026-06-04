@@ -523,11 +523,13 @@ export type PipelineRetryOutcome =
 /**
  * Per-pool terminal states that are *safe* to manually reset to `pending`
  * (ARCHITECTURE.md §11 / spec §3.7). The deferred-unsafe states are everything
- * else terminal: summarization `complete`/`truncated` (the summary may already be
- * consumed by a higher-level condensation + a diary entry — a regenerate is a
- * cascade delete, not a status flip) and diary `done` (the memory file is
- * append-only with no dedup, so a re-run would duplicate the day-file entry).
- * `processing` (in-flight) is never here — stop the linked session instead.
+ * else terminal: summarization `complete` (the summary may already be consumed by
+ * a higher-level condensation + a diary entry — a regenerate is a cascade delete,
+ * not a status flip; note a best-effort *truncated* result is still a `complete`
+ * job — `truncated` is a summaries-row status, not a job status) and diary `done`
+ * (the memory file is append-only with no dedup, so a re-run would duplicate the
+ * day-file entry). `processing` (in-flight) is never here — stop the linked
+ * session instead.
  */
 export const PIPELINE_SAFE_RETRY: Record<PipelineId, readonly string[]> = {
   enrichment: ["failed", "complete", "skipped"],
@@ -3452,7 +3454,7 @@ export class Storage {
    * Manual retry (ARCHITECTURE.md §11, Phase 5): re-enqueue a terminal item —
    * status→pending, attempts→0, error cleared. Gated by per-pool safety
    * ({@link PIPELINE_SAFE_RETRY}): `processing` (in-flight) and the deferred unsafe
-   * states (summarization `complete`/`truncated`, diary `done`) are rejected with
+   * states (summarization `complete`, diary `done`) are rejected with
    * `not_retryable` (the caller maps that to a 409). The reset is idempotent and
    * goes through the single-writer queue; the pool re-claims on its next tick (the
    * server additionally pokes the pool's notify seam for immediacy). Terminal safe

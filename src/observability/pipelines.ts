@@ -38,8 +38,10 @@ export interface PipelineRegistry {
 /**
  * The transition a {@link PipelineActivityEvent} reports — the five points each
  * pool publishes at: `claimed` (pending→processing), `completed` (terminal
- * success: complete/done/truncated), `failed` (terminal failure), `retried`
- * (back to pending, attempts incremented), `skipped` (terminal no-op).
+ * success, carrying the persisted job status: enrichment/captioning/summarization
+ * `complete`, diary `done` — a best-effort truncated summary is still a `complete`
+ * job), `failed` (terminal failure), `retried` (back to pending, attempts
+ * incremented), `skipped` (terminal no-op).
  */
 export type PipelineActivityKind = "claimed" | "completed" | "failed" | "retried" | "skipped";
 

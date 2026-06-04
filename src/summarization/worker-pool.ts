@@ -452,7 +452,12 @@ export class SummarizationWorkerPool {
       truncatedTokens,
     });
     this.options.onComplete(job.id, summaryId);
-    this.emit(job, "completed", "truncated");
+    // The job row is persisted as `complete` (insertSummaryWithLineage), even on
+    // this best-effort truncation path — `truncated` is a *summaries-row* status,
+    // never a summarization_jobs status. Emit the job status so the SSE event
+    // matches what the DB-derived list/detail endpoints return; the truncated
+    // nature is surfaced via the projected outputSummary, not the job status.
+    this.emit(job, "completed", "complete");
     await this.runCondensation(job.timelineKey, job.level);
   }
 
