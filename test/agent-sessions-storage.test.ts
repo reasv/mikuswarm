@@ -406,9 +406,26 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
             .all() as Array<{ name: string }>
         ).map((r) => r.name),
       );
-      for (const t of ["memory_chunks", "memory_chunks_fts", "embedding_cache", "index_meta"]) {
+      for (const t of [
+        "memory_chunks",
+        "memory_chunks_fts",
+        "embedding_cache",
+        "index_meta",
+        // v10->v11 (RoomLabelCache): the room_metadata table must exist after migration.
+        "room_metadata",
+      ]) {
         assert.ok(tables.includes(t), `migration must create ${t}; have: ${tables.join(", ")}`);
       }
+
+      // v10->v11: prove the migrated room_metadata table has the correct shape
+      // (columns display_name / resolved_at) by round-tripping a label through the
+      // SAME migrated Storage instance — a wrong-named or wrong-shaped table would
+      // throw here, where a bare "table exists" check would not.
+      await storage.setRoomDisplayName("!migrated:example.org", "Migrated Room");
+      const roomMeta = storage.getRoomMetadata("!migrated:example.org");
+      assert.ok(roomMeta, "room_metadata row should round-trip after migration");
+      assert.equal(roomMeta.displayName, "Migrated Room");
+      assert.equal(typeof roomMeta.resolvedAt, "number");
       // The FTS sync triggers are present too.
       const triggers = storage.read((db) =>
         (
