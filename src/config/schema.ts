@@ -83,36 +83,43 @@ const RetrievalSchema = Type.Object({
   // §8c — inject the small relevant-memory block inside each trigger's final user
   // turn. Independently disablable (cache-safe placement; risk is distraction).
   auto_retrieval: Type.Optional(Type.Boolean()),
+  // Numeric knobs carry both minimum AND maximum bounds (review issue #10): an
+  // unbounded value degrades silently — e.g. a huge candidate_multiplier or
+  // max_results blows the `getChunksByRowids` IN-list toward SQLite's 999-param
+  // limit. The maxima are generous (well above every value 00-defaults.toml ships)
+  // but reject fat-fingered config at load. A cross-field constraint that TypeBox
+  // can't express (fallback_chunk_tokens <= max_chunk_tokens) is enforced in
+  // resolveRetrievalConfig (issue #14).
   index: Type.Optional(
     Type.Object({
-      worker_count: Type.Optional(Type.Integer({ minimum: 1 })),
-      max_retries: Type.Optional(Type.Integer({ minimum: 0 })),
-      embed_batch_size: Type.Optional(Type.Integer({ minimum: 1 })),
+      worker_count: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+      max_retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
+      embed_batch_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 2048 })),
       // Oversized header blocks above this many tokens are sub-split (§3); also the
       // embedder's per-input token ceiling.
-      max_chunk_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
-      fallback_chunk_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
-      fallback_chunk_overlap: Type.Optional(Type.Integer({ minimum: 0 })),
+      max_chunk_tokens: Type.Optional(Type.Integer({ minimum: 16, maximum: 8192 })),
+      fallback_chunk_tokens: Type.Optional(Type.Integer({ minimum: 16, maximum: 8192 })),
+      fallback_chunk_overlap: Type.Optional(Type.Integer({ minimum: 0, maximum: 8192 })),
     }),
   ),
   query: Type.Optional(
     Type.Object({
-      max_results: Type.Optional(Type.Integer({ minimum: 1 })),
+      max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-      vector_weight: Type.Optional(Type.Number({ minimum: 0 })),
-      text_weight: Type.Optional(Type.Number({ minimum: 0 })),
-      candidate_multiplier: Type.Optional(Type.Integer({ minimum: 1 })),
+      vector_weight: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      text_weight: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      candidate_multiplier: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
       mmr_enabled: Type.Optional(Type.Boolean()),
       mmr_lambda: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       temporal_decay_enabled: Type.Optional(Type.Boolean()),
-      temporal_decay_half_life_days: Type.Optional(Type.Number({ minimum: 1 })),
+      temporal_decay_half_life_days: Type.Optional(Type.Number({ minimum: 1, maximum: 36500 })),
     }),
   ),
   auto: Type.Optional(
     Type.Object({
-      max_results: Type.Optional(Type.Integer({ minimum: 1 })),
+      max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-      max_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+      max_tokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
       dedup_against_recency: Type.Optional(Type.Boolean()),
     }),
   ),

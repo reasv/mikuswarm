@@ -222,8 +222,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 7", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 7);
+test("LATEST_SCHEMA_VERSION is 8", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 8);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -365,6 +365,193 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
       for (const tr of ["memory_chunks_ai", "memory_chunks_ad", "memory_chunks_au"]) {
         assert.ok(triggers.includes(tr), `migration must create ${tr}; have: ${triggers.join(", ")}`);
       }
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Issue #11: v7 -> v8 swaps the memory_chunks_au FTS trigger to the guarded form ---
+
+// A v6-shaped timeline_events (the fresh-vs-existing probe keys on this table) so the
+// DB is treated as an existing migration target, plus the v7 retrieval tables carrying
+// the OLD, UNGUARDED memory_chunks_au trigger. Opening through Storage must run the
+// v7->v8 step that drops+recreates it with the WHEN guard (review issue #11).
+const V6_TIMELINE_EVENTS = `create table timeline_events (
+   id text primary key,
+   external_id text,
+   timeline_key text not null,
+   provider text not null,
+   role text not null check(role in ('user', 'assistant')),
+   sender_id text not null,
+   sender_display_name text,
+   body text not null,
+   timestamp integer not null,
+   received_at integer not null,
+   agent_session_id text,
+   event_json text not null,
+   enrichment_status text not null default 'pending'
+     check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
+   enrichment_retries integer not null default 0,
+   redecrypt_attempts integer not null default 0,
+   last_edit_timestamp integer,
+   trigger_group_id text,
+   created_at integer not null,
+   updated_at integer not null,
+   is_undecryptable integer generated always as
+     (case when json_extract(event_json, '$.undecryptable') is not null then 1 else 0 end) virtual
+ );`;
+
+// The v7 retrieval tables with the OLD, UNGUARDED update trigger (no WHEN clause) —
+// exactly what the v6->v7 migration created before issue #11.
+const V7_RETRIEVAL_WITH_UNGUARDED_TRIGGER = `
+create table memory_chunks (
+  rowid integer primary key autoincrement,
+  id text unique not null,
+  path text not null,
+  ordinal integer not null,
+  source text not null default 'memory',
+  start_line integer not null,
+  end_line integer not null,
+  room text,
+  entry_ts integer not null,
+  text text not null,
+  token_count integer not null,
+  content_hash text not null,
+  model_id text,
+  embed_status text not null default 'pending'
+    check(embed_status in ('pending','processing','done','failed','skip')),
+  embed_attempts integer not null default 0,
+  indexed_at integer not null
+);
+create virtual table memory_chunks_fts using fts5(
+  text, room, content='memory_chunks', content_rowid='rowid'
+);
+create trigger memory_chunks_ai after insert on memory_chunks begin
+  insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+end;
+create trigger memory_chunks_ad after delete on memory_chunks begin
+  insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+    values ('delete', old.rowid, old.text, old.room);
+end;
+create trigger memory_chunks_au after update on memory_chunks begin
+  insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+    values ('delete', old.rowid, old.text, old.room);
+  insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+end;
+`;
+
+test("v7 -> v8 migration guards the memory_chunks_au trigger and keeps FTS correct (issue #11)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-au-migrate-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS);
+    legacy.exec(V7_RETRIEVAL_WITH_UNGUARDED_TRIGGER);
+    legacy.pragma("user_version = 7");
+
+    // Sanity: the fixture trigger is the OLD unguarded form (no WHEN clause).
+    const before = legacy
+      .prepare(`select sql from sqlite_master where type='trigger' and name='memory_chunks_au'`)
+      .get() as { sql: string };
+    assert.ok(
+      !/\bwhen\b/i.test(before.sql),
+      "fixture must start with the unguarded trigger",
+    );
+    legacy.close();
+
+    // Open through Storage: runs the v7 -> v8 step.
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read(
+        (db) => db.pragma("user_version", { simple: true }) as number,
+      );
+      assert.equal(version, LATEST_SCHEMA_VERSION);
+
+      // The trigger now carries the WHEN guard on the FTS-indexed columns.
+      const after = storage.read(
+        (db) =>
+          db
+            .prepare(
+              `select sql from sqlite_master where type='trigger' and name='memory_chunks_au'`,
+            )
+            .get() as { sql: string },
+      );
+      assert.match(after.sql, /when\s+new\.text\s+is\s+not\s+old\.text/i);
+      assert.match(after.sql, /new\.room\s+is\s+not\s+old\.room/i);
+
+      // Insert a chunk; FTS MATCH must find it (insert trigger).
+      await storage.readAndWrite((db) => {
+        db.prepare(
+          `insert into memory_chunks
+             (id, path, ordinal, source, start_line, end_line, room, entry_ts,
+              text, token_count, content_hash, model_id, embed_status, embed_attempts, indexed_at)
+           values
+             ('c1', 'memory/2026-06-04.md', 0, 'memory', 1, 2, '!room', 1000,
+              'unicornflux pinball', 2, 'h1', null, 'pending', 0, 5000)`,
+        ).run();
+      });
+      const found = storage.read(
+        (db) =>
+          db
+            .prepare(
+              `select rowid from memory_chunks_fts where memory_chunks_fts match 'unicornflux'`,
+            )
+            .all() as Array<{ rowid: number }>,
+      );
+      assert.equal(found.length, 1, "FTS must find the inserted chunk");
+
+      // An embed-status-ONLY update (the frequent case the guard targets) must NOT
+      // touch FTS, and the external-content FTS index must remain internally consistent.
+      await storage.readAndWrite((db) => {
+        db.prepare(`update memory_chunks set embed_status='done', model_id='m1' where id='c1'`).run();
+      });
+      // integrity-check raises if the external-content index has drifted.
+      assert.doesNotThrow(() =>
+        storage.read((db) =>
+          db.prepare(`insert into memory_chunks_fts(memory_chunks_fts) values('integrity-check')`).run(),
+        ),
+      );
+      const stillFound = storage.read(
+        (db) =>
+          db
+            .prepare(
+              `select rowid from memory_chunks_fts where memory_chunks_fts match 'unicornflux'`,
+            )
+            .all() as Array<{ rowid: number }>,
+      );
+      assert.equal(stillFound.length, 1, "FTS still matches after an embed-status-only update");
+
+      // A text change DOES resync FTS (old token gone, new token present).
+      await storage.readAndWrite((db) => {
+        db.prepare(`update memory_chunks set text='zephyrquartz arcade' where id='c1'`).run();
+      });
+      const oldGone = storage.read(
+        (db) =>
+          db
+            .prepare(
+              `select rowid from memory_chunks_fts where memory_chunks_fts match 'unicornflux'`,
+            )
+            .all() as Array<{ rowid: number }>,
+      );
+      assert.equal(oldGone.length, 0, "stale FTS term must be retracted on text change");
+      const newFound = storage.read(
+        (db) =>
+          db
+            .prepare(
+              `select rowid from memory_chunks_fts where memory_chunks_fts match 'zephyrquartz'`,
+            )
+            .all() as Array<{ rowid: number }>,
+      );
+      assert.equal(newFound.length, 1, "new FTS term must be indexed on text change");
+      assert.doesNotThrow(() =>
+        storage.read((db) =>
+          db.prepare(`insert into memory_chunks_fts(memory_chunks_fts) values('integrity-check')`).run(),
+        ),
+      );
     } finally {
       await storage.waitForIdle();
       storage.close();

@@ -3023,7 +3023,16 @@ create trigger if not exists memory_chunks_ad after delete on memory_chunks begi
   insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
     values ('delete', old.rowid, old.text, old.room);
 end;
-create trigger if not exists memory_chunks_au after update on memory_chunks begin
+-- The update trigger is gated on the FTS-indexed columns (review issue #11): most
+-- memory_chunks updates touch only embed_status/model_id/embed_attempts (the embed
+-- queue), which the lexical index does not care about. Without this WHEN guard every
+-- such update — and resetAllEmbeddings rewrites EVERY row's embed_status — would
+-- delete+reinsert the FTS row needlessly. IS NOT (not <>) so a NULL room is
+-- compared correctly. Changing this DDL means existing DBs that already created the
+-- unguarded trigger need the v7->v8 migration to swap it (see MIGRATIONS).
+create trigger if not exists memory_chunks_au after update on memory_chunks
+  when new.text is not old.text or new.room is not old.room
+begin
   insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
     values ('delete', old.rowid, old.text, old.room);
   insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
@@ -3356,7 +3365,7 @@ ${RETRIEVAL_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 8;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -3479,6 +3488,26 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // get this directly from SCHEMA above and never run this step.
   (db) => {
     db.exec(RETRIEVAL_SCHEMA);
+  },
+  // index 7 (v7 -> v8): re-create the `memory_chunks_au` FTS-sync trigger with a WHEN
+  // guard on the indexed columns (review issue #11). The v6->v7 step created the
+  // trigger WITHOUT the guard, so its `create trigger if not exists` in RETRIEVAL_SCHEMA
+  // is now a no-op for those DBs — they keep the old, unguarded trigger. Drop and
+  // recreate it so existing DBs get the guarded version (fresh DBs build it directly
+  // from RETRIEVAL_SCHEMA and never run this step). The guard makes embed-queue-only
+  // updates (embed_status/model_id/embed_attempts) skip the FTS delete+reinsert; the
+  // index stays correct because text/room changes still resync.
+  (db) => {
+    db.exec(
+      `drop trigger if exists memory_chunks_au;
+       create trigger memory_chunks_au after update on memory_chunks
+         when new.text is not old.text or new.room is not old.room
+       begin
+         insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+           values ('delete', old.rowid, old.text, old.room);
+         insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+       end;`,
+    );
   },
 ];
 

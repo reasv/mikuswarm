@@ -248,3 +248,25 @@ test("config resolution rejects a zero-sum vector+text weight pair (review #6)",
     resolveRetrievalConfig({ enabled: true, query: { vector_weight: 0, text_weight: 1 } }),
   );
 });
+
+// --- #14 fallback_chunk_tokens > max_chunk_tokens fails fast at config resolution ---
+
+test("config resolution rejects fallback_chunk_tokens > max_chunk_tokens (review #14)", () => {
+  assert.throws(
+    () =>
+      resolveRetrievalConfig({
+        enabled: true,
+        index: { fallback_chunk_tokens: 600, max_chunk_tokens: 512 },
+      }),
+    /fallback_chunk_tokens \(600\) must be <= max_chunk_tokens \(512\)/,
+  );
+  // fallback == max is allowed (the boundary is inclusive).
+  assert.doesNotThrow(() =>
+    resolveRetrievalConfig({
+      enabled: true,
+      index: { fallback_chunk_tokens: 512, max_chunk_tokens: 512 },
+    }),
+  );
+  // The shipped defaults (fallback 400 <= max 512) resolve cleanly.
+  assert.doesNotThrow(() => resolveRetrievalConfig({ enabled: true }));
+});
