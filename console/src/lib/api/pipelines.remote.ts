@@ -1,6 +1,7 @@
 import { query } from '$app/server';
 import { Schema } from 'effect';
 import { apiGet } from '$lib/server/api/runtime';
+import { streamPipelineActivity as streamPipelineActivityUpstream } from '$lib/server/api/sse';
 import {
 	PipelineId,
 	PipelinesResponse,
@@ -53,4 +54,13 @@ export const getPipelineItem = query(PipelineItemArg, (arg) =>
 		`/api/pipelines/${encodeURIComponent(arg.pool)}/items/${encodeURIComponent(arg.id)}`,
 		PipelineItemDetail
 	)
+);
+
+/**
+ * GET /api/pipelines/stream — the cross-pool activity firehose as a `query.live`
+ * async generator (mirroring `streamSession`). A single consumer patches the
+ * affected pool's counts + visible rows on top of the 5s poll.
+ */
+export const streamPipelineActivity = query.live(() =>
+	streamPipelineActivityUpstream('/api/pipelines/stream')
 );

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { PIPELINE_IDS, type MediaAssetRow, type PipelineId } from "../../storage/index.js";
 import { sendJson, sendError } from "./responses.js";
+import { openSse } from "./sse.js";
 import type { RequestContext } from "./types.js";
 
 /**
@@ -174,4 +175,31 @@ export function pipelineItemDetail(
       });
     }
   }
+}
+
+/**
+ * GET /api/pipelines/stream — SSE firehose of {@link PipelineActivityEvent}s across
+ * all four pools (ARCHITECTURE.md §11). Each event is one `event: activity` record;
+ * the stream stays open (heartbeat only) until the client disconnects. Redacted +
+ * image-externalized by the SSE layer like every other stream. When no activity bus
+ * is wired (e.g. a degraded/test deployment), the stream opens and idles rather than
+ * erroring, so the client's `query.live` simply receives nothing.
+ */
+export function pipelineActivityStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const bus = ctx.deps.activityBus;
+  const stream = openSse(req, res);
+  if (!bus) return; // open + idle; heartbeat keeps it alive until disconnect
+
+  // Read-only observer: openSse's safeWrite never throws back into publish(), and
+  // the bus isolates a throwing listener per-call, so a dead socket can't reach a
+  // worker loop. Unsubscribe on client disconnect.
+  const unsubscribe = bus.subscribe((event) => {
+    if (stream.closed) return;
+    stream.send("activity", event);
+  });
+  stream.onClose(unsubscribe);
 }

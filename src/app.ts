@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { createLogger, createObservabilityServer, type ConsoleServer } from "./observability/index.js";
+import { createLogger, createObservabilityServer, PipelineActivityBus, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider } from "./matrix/index.js";
 import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
@@ -239,6 +239,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const enrichmentEmitter = new EventEmitter();
   const captionEmitter = new EventEmitter();
 
+  // Pipeline monitor activity bus (ARCHITECTURE.md §11). One shared in-process bus
+  // the four pools publish transitions to; the observability server subscribes and
+  // fans out to `/api/pipelines/stream` SSE clients.
+  const pipelineActivityBus = new PipelineActivityBus();
+
   const enrichmentPool = new EnrichmentWorkerPool({
     storage,
     timeline,
@@ -250,6 +255,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     onComplete: (eventId) => enrichmentEmitter.emit(`complete:${eventId}`),
     onError: (eventId, error) =>
       logger.error("enrichment_failed", { eventId, error: error instanceof Error ? error.message : String(error) }),
+    activityBus: pipelineActivityBus,
     logger,
   });
 
@@ -261,6 +267,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     onComplete: (eventId) => captionEmitter.emit(`complete:${eventId}`),
     onError: (assetId, error) =>
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
+    activityBus: pipelineActivityBus,
     logger,
   });
 
@@ -340,6 +347,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           diaryPool?.notifyNewWork();
         },
         onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
+        activityBus: pipelineActivityBus,
         logger: logger.child("summarization"),
       })
     : null;
@@ -390,6 +398,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         },
         onComplete: (summaryId) => logger.info("diary_job_complete", { summaryId }),
         onError: (summaryId, error) => logger.error("diary_failed", { summaryId, error: error.message }),
+        activityBus: pipelineActivityBus,
         logger: logger.child("diary"),
       })
     : null;
@@ -1030,6 +1039,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         summarization: summarizationPool?.stats() ?? null,
         diary: diaryPool?.stats() ?? null,
       },
+      activityBus: pipelineActivityBus,
       workspaceRoot,
       logger: logger.child("console"),
     });

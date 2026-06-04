@@ -4,7 +4,11 @@
 	import PipelineList from '$lib/components/col1/PipelineList.svelte';
 	import PipelineItemList from '$lib/components/col2/PipelineItemList.svelte';
 	import PipelineItemDetail from '$lib/components/detail/PipelineItemDetail.svelte';
+	import PipelineActivityListener from '$lib/components/PipelineActivityListener.svelte';
 </script>
+
+<!-- Live SSE activity → query invalidation (renders nothing). -->
+<PipelineActivityListener />
 
 <!--
   Pipelines area (ARCHITECTURE.md §11): the same 3-column resizable idiom as the

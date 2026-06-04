@@ -1,7 +1,7 @@
 import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
-import type { PipelineStats } from "../observability/pipelines.js";
+import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { CaptionWorker } from "./worker.js";
 
 export interface CaptionConfig {
@@ -19,6 +19,8 @@ export interface CaptionWorkerPoolOptions {
   config: CaptionConfig;
   onComplete?: (eventId: string) => void;
   onError?: (assetId: string, error: unknown) => void;
+  /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
+  activityBus?: PipelineActivityBus;
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -119,8 +121,12 @@ export class CaptionWorkerPool {
     });
 
     for (const asset of claimed) {
+      this.emit("claimed", asset.id, "processing", asset.caption_attempts ?? 0);
       const work = worker.process(asset)
-        .then((eventId) => this.options.onComplete?.(eventId))
+        .then((eventId) => {
+          this.options.onComplete?.(eventId);
+          this.emit("completed", asset.id, "complete", asset.caption_attempts ?? 0);
+        })
         .catch((error) => this.handleWorkerError(asset, error))
         .finally(() => {
           this.activeWorkers.delete(work);
@@ -149,8 +155,23 @@ export class CaptionWorkerPool {
         error instanceof Error ? error.message : String(error),
       );
       this.options.onError?.(asset.id, error);
+      this.emit("failed", asset.id, "failed", attempts);
     } else {
       await this.options.storage.setCaptionStatus(asset.id, "pending");
+      this.emit("retried", asset.id, "pending", attempts);
     }
+  }
+
+  /** Publish one pipeline-activity event (ARCHITECTURE.md §11); best-effort. */
+  private emit(kind: PipelineActivityKind, assetId: string, status: string, attempts: number): void {
+    this.options.activityBus?.publish({
+      pool: "captioning",
+      id: assetId,
+      kind,
+      status,
+      attempts,
+      room: null,
+      ts: Date.now(),
+    });
   }
 }

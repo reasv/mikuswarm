@@ -5,7 +5,7 @@ import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { EnrichmentCapabilities, EnrichmentConfig } from "./types.js";
 import type { ConcurrencyLimitedFetchClient } from "./fetch-client.js";
-import type { PipelineStats } from "../observability/pipelines.js";
+import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 
 export interface EnrichmentWorkerPoolOptions {
@@ -18,6 +18,8 @@ export interface EnrichmentWorkerPoolOptions {
   config: EnrichmentConfig;
   onComplete?: (eventId: string) => void;
   onError?: (eventId: string, error: unknown) => void;
+  /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
+  activityBus?: PipelineActivityBus;
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -73,6 +75,25 @@ export class EnrichmentWorkerPool {
     };
   }
 
+  /** Publish one pipeline-activity event (ARCHITECTURE.md §11); best-effort. */
+  private emit(
+    kind: PipelineActivityKind,
+    eventId: string,
+    status: string,
+    attempts: number,
+    room: string | null,
+  ): void {
+    this.options.activityBus?.publish({
+      pool: "enrichment",
+      id: eventId,
+      kind,
+      status,
+      attempts,
+      room,
+      ts: Date.now(),
+    });
+  }
+
   notifyNewEvent(_eventId: string): void {
     if (this.wakeResolve) {
       if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = undefined; }
@@ -119,6 +140,7 @@ export class EnrichmentWorkerPool {
     }
 
     for (const eventId of claimed) {
+      this.emit("claimed", eventId, "processing", 0, null);
       const work = this.processEvent(eventId)
         .catch((error) => this.handleWorkerError(eventId, error))
         .finally(() => {
@@ -156,6 +178,7 @@ export class EnrichmentWorkerPool {
 
     await worker.process(event);
     this.options.onComplete?.(eventId);
+    this.emit("completed", eventId, "complete", 0, event.timelineKey);
   }
 
   private async handleWorkerError(eventId: string, error: unknown): Promise<void> {
@@ -169,8 +192,10 @@ export class EnrichmentWorkerPool {
         count,
       );
       this.options.onError?.(eventId, error);
+      this.emit("failed", eventId, "failed", count, null);
     } else {
       await this.options.storage.setEnrichmentStatus(eventId, "pending", undefined, count);
+      this.emit("retried", eventId, "pending", count, null);
     }
   }
 

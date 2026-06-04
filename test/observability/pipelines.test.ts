@@ -6,6 +6,7 @@ import { SessionManager } from "../../src/agent/index.js";
 import type { AgentSessionFactory } from "../../src/agent/factory.js";
 import type { Logger } from "../../src/observability/index.js";
 import type { PipelineRegistry, PipelineStats } from "../../src/observability/pipelines.js";
+import { PipelineActivityBus } from "../../src/observability/pipelines.js";
 import {
   createObservabilityServer,
   type ConsoleServer,
@@ -73,6 +74,7 @@ async function withServer(
     factory: deps.factory ?? throwingFactory,
     sessions: deps.sessions ?? new SessionManager(),
     pipelines: deps.pipelines,
+    activityBus: deps.activityBus,
     workspaceRoot: deps.workspaceRoot ?? "/tmp",
     logger: deps.logger ?? silentLogger,
   };
@@ -706,6 +708,85 @@ test("item detail 404s for unknown pool, unknown id, and out-of-track id", async
       assert.equal((await fetch(`${base}/api/pipelines/nope/items/x`)).status, 404);
       assert.equal((await fetch(`${base}/api/pipelines/enrichment/items/missing`)).status, 404);
       assert.equal((await fetch(`${base}/api/pipelines/captioning/items/doc-1`)).status, 404);
+    });
+  });
+});
+
+// ── Activity bus + SSE (Phase 4) ─────────────────────────────────────────────
+
+test("PipelineActivityBus delivers to subscribers, isolates throwers, unsubscribes", () => {
+  const bus = new PipelineActivityBus();
+  const got: string[] = [];
+  const unsub = bus.subscribe((e) => got.push(e.id));
+  bus.subscribe(() => {
+    throw new Error("a dead SSE socket must not break publish()");
+  });
+
+  const sample = {
+    pool: "enrichment" as const,
+    id: "e1",
+    kind: "completed" as const,
+    status: "complete",
+    attempts: 0,
+    room: null,
+    ts: 1,
+  };
+  bus.publish(sample);
+  assert.deepEqual(got, ["e1"], "the throwing listener did not block delivery to the good one");
+
+  unsub();
+  bus.publish({ ...sample, id: "e2" });
+  assert.deepEqual(got, ["e1"], "unsubscribed listener receives nothing further");
+});
+
+test("GET /api/pipelines/stream forwards bus activity as SSE 'activity' events", async () => {
+  await withStorage(async (storage) => {
+    const bus = new PipelineActivityBus();
+    await withServer({ storage, pipelines: fullRegistry(), activityBus: bus }, async (base) => {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/pipelines/stream`, { signal: ac.signal });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+
+      // Subscription is registered synchronously when the request is handled; a
+      // tiny yield ensures the server tick completed before we publish.
+      await new Promise((r) => setTimeout(r, 20));
+      bus.publish({
+        pool: "captioning",
+        id: "cap-1",
+        kind: "failed",
+        status: "failed",
+        attempts: 2,
+        room: "matrix:miku:room:!r",
+        ts: 123,
+      });
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (!buf.includes("event: activity")) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+      }
+      ac.abort();
+
+      assert.match(buf, /event: activity/);
+      assert.match(buf, /"pool":"captioning"/);
+      assert.match(buf, /"kind":"failed"/);
+      assert.match(buf, /"id":"cap-1"/);
+    });
+  });
+});
+
+test("GET /api/pipelines/stream opens and idles when no activity bus is wired", async () => {
+  await withStorage(async (storage) => {
+    await withServer({ storage, pipelines: fullRegistry() }, async (base) => {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/pipelines/stream`, { signal: ac.signal });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+      ac.abort();
     });
   });
 });

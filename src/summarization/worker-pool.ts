@@ -3,7 +3,7 @@ import type { Storage, SummarizationJob } from "../storage/index.js";
 import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
-import type { PipelineStats } from "../observability/pipelines.js";
+import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createSummaryTool } from "../tools/index.js";
 import { estimateTokens, truncateToTokens } from "../context/index.js";
@@ -17,6 +17,8 @@ export interface SummarizationWorkerPoolOptions {
   onComplete: (jobId: string, summaryId: string) => void;
   /** Fires only on permanent (non-retriable) failures — not on retries. */
   onError: (jobId: string, error: Error) => void;
+  /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
+  activityBus?: PipelineActivityBus;
   logger: Logger;
 }
 
@@ -79,6 +81,19 @@ export class SummarizationWorkerPool {
     };
   }
 
+  /** Publish one pipeline-activity event (ARCHITECTURE.md §11); best-effort. */
+  private emit(job: SummarizationJob, kind: PipelineActivityKind, status: string): void {
+    this.options.activityBus?.publish({
+      pool: "summarization",
+      id: job.id,
+      kind,
+      status,
+      attempts: job.attempts,
+      room: job.timelineKey,
+      ts: Date.now(),
+    });
+  }
+
   private schedulePoll(delayMs: number): void {
     if (!this.running) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
@@ -107,6 +122,7 @@ export class SummarizationWorkerPool {
       const job = await this.options.storage.claimNextSummarizationJob();
       if (!job) break;
       claimedAny = true;
+      this.emit(job, "claimed", "processing");
       const work = this.processJob(job)
         .catch((error) =>
           this.options.logger.error("summarization_worker_error", {
@@ -152,6 +168,7 @@ export class SummarizationWorkerPool {
       // Input material no longer resolvable (e.g. events dropped). Nothing to do.
       await storage.failSummarizationJob(job.id, "input material not found");
       this.options.onError(job.id, new Error("input material not found"));
+      this.emit(job, "failed", "failed");
       return;
     }
 
@@ -310,6 +327,7 @@ export class SummarizationWorkerPool {
         elapsed: Date.now() - started,
       });
       this.options.onComplete(job.id, summaryId);
+      this.emit(job, "completed", "complete");
       await this.runCondensation(job.timelineKey, job.level);
       return;
     }
@@ -338,6 +356,7 @@ export class SummarizationWorkerPool {
     try {
       if (job.attempts <= job.maxRetries) {
         await storage.retrySummarizationJob(job.id, errMsg);
+        this.emit(job, "retried", "pending");
       } else {
         await this.truncationFallback(
           job,
@@ -364,6 +383,7 @@ export class SummarizationWorkerPool {
         });
       }
       this.options.onError(job.id, new Error(errMsg));
+      this.emit(job, "failed", "failed");
     }
   }
 
@@ -394,6 +414,7 @@ export class SummarizationWorkerPool {
     if (!bestEffort || bestEffort.trim().length === 0) {
       await storage.failSummarizationJob(job.id, errMsg || "no best-effort draft");
       this.options.onError(job.id, new Error(errMsg || "summarization failed"));
+      this.emit(job, "failed", "failed");
       return;
     }
 
@@ -430,6 +451,7 @@ export class SummarizationWorkerPool {
       truncatedTokens,
     });
     this.options.onComplete(job.id, summaryId);
+    this.emit(job, "completed", "truncated");
     await this.runCondensation(job.timelineKey, job.level);
   }
 

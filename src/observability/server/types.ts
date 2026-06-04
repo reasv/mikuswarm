@@ -4,7 +4,7 @@ import type { Storage } from "../../storage/index.js";
 import type { AgentSessionFactory } from "../../agent/factory.js";
 import type { SessionManager } from "../../agent/session-manager.js";
 import type { Logger } from "../logger.js";
-import type { PipelineRegistry } from "../pipelines.js";
+import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -24,6 +24,8 @@ export interface ConsoleServerDeps {
    * exercise the pipeline routes need not assemble it.
    */
   pipelines?: PipelineRegistry;
+  /** In-process activity bus the pools publish to; backs the `/api/pipelines/stream` SSE. */
+  activityBus?: PipelineActivityBus;
   /** Workspace root; media `local_path`s are resolved beneath it. */
   workspaceRoot: string;
   logger: Logger;

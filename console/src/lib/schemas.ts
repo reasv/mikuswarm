@@ -225,3 +225,15 @@ export const RetryPipelineItemResponse = Schema.Struct({
 	status: Schema.String
 });
 export type RetryPipelineItemResponse = Schema.Schema.Type<typeof RetryPipelineItemResponse>;
+
+/** One live activity event off GET /api/pipelines/stream (the SSE firehose). */
+export const PipelineActivityEvent = Schema.Struct({
+	pool: PipelineId,
+	id: Schema.String,
+	kind: Schema.Literal('claimed', 'completed', 'failed', 'retried', 'skipped'),
+	status: Schema.String,
+	attempts: Schema.Number,
+	room: Schema.NullOr(Schema.String),
+	ts: Schema.Number
+});
+export type PipelineActivityEvent = Schema.Schema.Type<typeof PipelineActivityEvent>;
