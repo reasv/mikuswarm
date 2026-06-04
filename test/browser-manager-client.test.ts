@@ -131,6 +131,28 @@ test("manager client: request carries the HTTP status on the BrowserError", asyn
   }
 });
 
+test("manager client: a double launch is idempotent (first 200, second 409 both tolerated) (#23)", async () => {
+  // Pins the real Manager's already-running response shape: the SECOND launch of
+  // a profile that the FIRST already started returns 409. Both calls must resolve
+  // without throwing, so a redundant launch on an already-running profile is a
+  // no-op at the client level (detection is by structured httpStatus, not regex).
+  let n = 0;
+  const { calls, restore } = stubFetch(() => {
+    n += 1;
+    return n === 1
+      ? new Response(JSON.stringify({ profile_id: "p1", status: "running" }), { status: 200 })
+      : new Response(JSON.stringify({ detail: "Profile is already running" }), { status: 409 });
+  });
+  try {
+    await client().launch("p1"); // cold launch
+    await client().launch("p1"); // redundant launch → 409, still tolerated
+    assert.equal(calls.length, 2, "both launches hit the Manager");
+    assert.ok(calls.every((c) => c.url.endsWith("/api/profiles/p1/launch")), "both target the launch endpoint");
+  } finally {
+    restore();
+  }
+});
+
 test("manager client: launch re-throws a non-409 failure (not tolerated)", async () => {
   // A 500 on launch must surface as profile_launch_failed, not be swallowed.
   const { restore } = stubFetch(() => new Response("internal error", { status: 500 }));

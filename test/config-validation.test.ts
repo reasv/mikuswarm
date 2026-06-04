@@ -340,3 +340,71 @@ test("config: browser enabled with a valid http manager_url is accepted (issue #
     assert.equal(config.browser?.manager_url, "http://127.0.0.1:8080");
   });
 });
+
+// --- #23: shipped [browser] defaults pass schema validation ---
+
+// Mirrors the values config/00-defaults.toml ships in its [browser] block (with
+// enabled flipped on + an auth_token so the fail-fast guard is satisfied). Every
+// numeric knob must pass TypeBox validation, so the schema floors raised for the
+// idle-sweeper hardening (session_page_idle_ms ≥ 30000, *_timeout_ms ≥ 1000) and
+// snapshot_max_chars ≥ 1000 don't reject the defaults the project actually ships.
+// If a default ever violates a `minimum:` bound this load fails loudly.
+const BROWSER_DEFAULTS_BLOCK = `
+[browser]
+enabled = true
+manager_url = "http://127.0.0.1:8080"
+auth_token = "t"
+profile_name = "miku"
+platform = "windows"
+fingerprint_seed = 0
+humanize = true
+evaluate_enabled = false
+proxy = ""
+geoip = false
+dialog_policy = "dismiss"
+snapshot_max_chars = 20000
+nav_timeout_ms = 30000
+act_timeout_ms = 15000
+connect_timeout_ms = 20000
+session_page_idle_ms = 600000
+`;
+
+test("config: shipped [browser] defaults pass schema validation (issue #23)", async () => {
+  await withConfigDir(`${BASE_CONFIG}${BROWSER_DEFAULTS_BLOCK}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.browser?.enabled, true);
+    // Spot-check the knobs guarded by the raised schema floors.
+    assert.equal(config.browser?.session_page_idle_ms, 600000);
+    assert.equal(config.browser?.nav_timeout_ms, 30000);
+    assert.equal(config.browser?.act_timeout_ms, 15000);
+    assert.equal(config.browser?.connect_timeout_ms, 20000);
+    assert.equal(config.browser?.snapshot_max_chars, 20000);
+  });
+});
+
+// Each case fat-fingers ONE [browser] knob below its schema floor; the load must
+// be rejected. These directly guard the idle-sweeper schema floors. We rewrite
+// the value in the otherwise-valid defaults block (no duplicate key) so only the
+// schema bound — not a TOML parse error — can be the cause of rejection.
+const BROWSER_OUT_OF_BOUNDS_CASES: Array<{ name: string; find: string; replace: string }> = [
+  { name: "session_page_idle_ms below the sweep-interval floor (30000)", find: "session_page_idle_ms = 600000", replace: "session_page_idle_ms = 29999" },
+  { name: "nav_timeout_ms below floor (1000)", find: "nav_timeout_ms = 30000", replace: "nav_timeout_ms = 999" },
+  { name: "act_timeout_ms below floor (1000)", find: "act_timeout_ms = 15000", replace: "act_timeout_ms = 0" },
+  { name: "connect_timeout_ms below floor (1000)", find: "connect_timeout_ms = 20000", replace: "connect_timeout_ms = 999" },
+  { name: "snapshot_max_chars below floor (1000)", find: "snapshot_max_chars = 20000", replace: "snapshot_max_chars = 999" },
+];
+
+for (const { name, find, replace } of BROWSER_OUT_OF_BOUNDS_CASES) {
+  test(`config: out-of-bounds [browser] knob rejected — ${name} (issue #23)`, async () => {
+    const browserBlock = BROWSER_DEFAULTS_BLOCK.replace(find, replace);
+    assert.ok(browserBlock.includes(replace), "precondition: the bad value was substituted in");
+    const toml = `${BASE_CONFIG}${browserBlock}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        /Invalid config|minimum|maximum/i,
+        `${name} must fail TypeBox validation at load`,
+      );
+    });
+  });
+}

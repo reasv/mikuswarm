@@ -328,6 +328,17 @@ test("aiSnapshot: short snapshot passes through untruncated with full refCount",
   assert.equal(result.refCount, 3);
 });
 
+test("aiSnapshot: raw exactly at the cap (raw.length === maxChars) is NOT truncated (#11 boundary)", async () => {
+  // The passthrough guard is `raw.length <= maxChars`, so a raw snapshot whose
+  // length is exactly the cap must pass through verbatim — no marker, no slice,
+  // full refCount. (Off-by-one in the guard would truncate here.)
+  const raw = "- generic [ref=e1]:\n  - link [ref=e2]\n  - link [ref=e3] pad";
+  const result = await aiSnapshot(snapshotPage(raw), raw.length);
+  assert.equal(result.truncated, false, "exactly-at-cap is not truncated");
+  assert.equal(result.text, raw, "raw passes through verbatim");
+  assert.equal(result.refCount, 3, "all refs counted when not truncated");
+});
+
 // ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
 
 test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {

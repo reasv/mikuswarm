@@ -419,6 +419,35 @@ test("session #1: an idle-and-quiet session IS reaped by a sweep", async () => {
   });
 });
 
+test("session #22: a sweep reaps ALL tabs of an idle multi-tab session", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const connect: ConnectOverCdp = async () => makeFakeBrowser() as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    const session = new BrowserSession({ config: baseConfig({ session_page_idle_ms: 30000 }), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      await session.getActivePage("s1");
+      await session.openTab("s1");
+      await session.openTab("s1");
+      assert.equal((await session.listTabs("s1")).length, 3, "precondition: session has three tabs");
+      // Grab the actual page objects from the private state (listTabs returns only
+      // metadata) so we can assert each underlying tab is closed by the sweep.
+      const state = (session as unknown as { sessions: Map<string, { pages: FakePage[] }> }).sessions.get("s1")!;
+      const pages = [...state.pages];
+      assert.equal(pages.length, 3, "captured all three page objects");
+
+      forceIdle(session, "s1"); // idle and quiet
+      await session.sweepIdleNow();
+
+      // Every tab of the reaped session is closed, not just the active one.
+      for (const p of pages) assert.equal(p._closed, true, "each idle tab is closed");
+      assert.equal((await session.listTabs("s1")).length, 0, "the whole session is reaped");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
 test("session #1: op completion (endOp) refreshes lastUsed so a just-finished op isn't instantly reaped", async () => {
   await withWorkspace(async (ws) => {
     const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
