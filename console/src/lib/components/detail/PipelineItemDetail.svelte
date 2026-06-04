@@ -104,7 +104,23 @@
 									<li class="space-y-1">
 										<div class="flex items-center justify-between gap-2">
 											<span class="truncate">{m.filename ?? m.ref}</span>
-											<span class="font-mono text-[10px] text-muted-foreground">{m.mediaType}</span>
+											<div class="flex items-center gap-2">
+												<span class="font-mono text-[10px] text-muted-foreground">{m.mediaType}</span>
+												<!-- Cross-pipeline drill: jump to this asset's captioning item. -->
+												{#if ['image', 'video', 'audio'].includes(m.mediaType)}
+													<button
+														type="button"
+														class="rounded border px-1 text-[10px] text-muted-foreground hover:bg-accent"
+														title="View in the captioning pipeline"
+														onclick={() => {
+															pipelineSelection.selectPool('captioning');
+															pipelineSelection.selectItem(m.ref);
+														}}
+													>
+														caption →
+													</button>
+												{/if}
+											</div>
 										</div>
 										{#if m.hasBytes && m.mediaType === 'image'}
 											<img

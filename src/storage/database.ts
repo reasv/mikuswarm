@@ -3340,7 +3340,15 @@ export class Storage {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
     if (spec.scope) where.push(spec.scope);
-    if (query.status) {
+    // `pending`/`retrying` are the two count buckets that share the raw `pending`
+    // status (retrying = pending with prior attempts); filter on the same predicate
+    // the counts use so a chip's rows match its badge. Any other value is a raw
+    // status match.
+    if (query.status === "retrying") {
+      where.push(`${spec.statusCol} = 'pending' and ${spec.attemptsCol} > 0`);
+    } else if (query.status === "pending") {
+      where.push(`${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0`);
+    } else if (query.status) {
       where.push(`${spec.statusCol} = @status`);
       params.status = query.status;
     }

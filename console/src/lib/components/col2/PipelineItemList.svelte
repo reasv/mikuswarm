@@ -5,17 +5,28 @@
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { retryFailedPipelineItems } from '$lib/api/admin.remote';
 	import { keys } from '$lib/query/keys';
+	import type { PipelineId } from '$lib/schemas';
 	import PipelineStatusBadge from '$lib/components/col1/PipelineStatusBadge.svelte';
 	import RetryButton from '$lib/components/RetryButton.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { relativeTime } from '$lib/utils';
 	import { cn } from '$lib/utils';
 
+	// Status filter chips per pool. `pending`/`retrying` are backed by the same
+	// pseudo-filter the dashboard buckets use; the rest are raw statuses.
+	const STATUS_CHIPS: Record<PipelineId, string[]> = {
+		enrichment: ['processing', 'pending', 'retrying', 'complete', 'failed', 'skipped'],
+		captioning: ['processing', 'pending', 'retrying', 'complete', 'failed', 'skipped'],
+		summarization: ['processing', 'pending', 'retrying', 'complete', 'failed'],
+		diary: ['processing', 'pending', 'retrying', 'done', 'skipped', 'failed']
+	};
+
 	const queryClient = useQueryClient();
 	const items = pipelineItemsQuery(
 		() => pipelineSelection.pool,
 		() => ({ status: pipelineSelection.status, room: pipelineSelection.room })
 	);
+	const allItems = $derived(items.data?.pages.flatMap((p) => p.items) ?? []);
 
 	// Reuse the (cached) dashboard feed for the selected pool's failed count → the
 	// bulk "retry all failed" affordance.
@@ -61,6 +72,27 @@
 			</Button>
 		{/if}
 	</div>
+
+	<!-- Status filter chips -->
+	{#if pipelineSelection.pool}
+		<div class="flex flex-wrap gap-1 border-b px-3 pb-2">
+			{#each STATUS_CHIPS[pipelineSelection.pool] as chip (chip)}
+				<button
+					type="button"
+					onclick={() => pipelineSelection.setStatus(chip)}
+					class={cn(
+						'rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase transition-colors',
+						pipelineSelection.status === chip
+							? 'border-foreground/30 bg-accent text-foreground'
+							: 'border-transparent text-muted-foreground hover:bg-accent/50'
+					)}
+				>
+					{chip}
+				</button>
+			{/each}
+		</div>
+	{/if}
+
 	<div class="min-h-0 flex-1 overflow-y-auto">
 		{#if pipelineSelection.pool == null}
 			<div class="p-3 text-sm text-muted-foreground">Select a pipeline.</div>
@@ -72,11 +104,11 @@
 			</div>
 		{:else if items.isError}
 			<div class="p-3 text-sm text-destructive">{items.error.message}</div>
-		{:else if items.data.items.length === 0}
+		{:else if allItems.length === 0}
 			<div class="p-3 text-sm text-muted-foreground">No items.</div>
 		{:else}
 			<ul>
-				{#each items.data.items as item (item.id)}
+				{#each allItems as item (item.id)}
 					<li class="relative">
 						<button
 							type="button"
@@ -117,12 +149,20 @@
 						{/if}
 					</li>
 				{/each}
-				{#if items.data.nextCursor}
-					<li class="px-3 py-2 text-center text-[10px] text-muted-foreground">
-						more items below (load-more arrives with infinite scroll)
-					</li>
-				{/if}
 			</ul>
+			{#if items.hasNextPage}
+				<div class="p-2 text-center">
+					<Button
+						variant="ghost"
+						size="sm"
+						class="h-7 text-[11px]"
+						disabled={items.isFetchingNextPage}
+						onclick={() => items.fetchNextPage()}
+					>
+						{items.isFetchingNextPage ? 'Loading…' : 'Load older'}
+					</Button>
+				</div>
+			{/if}
 		{/if}
 	</div>
 </div>

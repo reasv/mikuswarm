@@ -1,6 +1,6 @@
-import { createQuery } from '@tanstack/svelte-query';
+import { createQuery, createInfiniteQuery } from '@tanstack/svelte-query';
 import { getPipelines, getPipelineItems, getPipelineItem } from '$lib/api/pipelines.remote';
-import type { PipelineId } from '$lib/schemas';
+import type { PipelineId, PipelineItemsResponse } from '$lib/schemas';
 import { fresh } from './client';
 import { keys } from './keys';
 
@@ -23,19 +23,33 @@ export interface PipelineItemFilters {
 	room: string | null;
 }
 
+/**
+ * Keyset-paginated, infinitely-scrollable item list. Each page carries a
+ * `nextCursor`; `getNextPageParam` chains them. The 5s `refetchInterval` keeps the
+ * loaded pages current (the SSE listener also invalidates this key on activity).
+ */
 export function pipelineItemsQuery(
 	pool: () => PipelineId | null,
 	filters: () => PipelineItemFilters
 ) {
-	return createQuery(() => {
+	return createInfiniteQuery(() => {
 		const p = pool();
 		const f = filters();
 		return {
 			queryKey: p
 				? keys.pipelineItems(p, { status: f.status, room: f.room })
 				: (['pipelines', '∅', 'items'] as const),
-			queryFn: () =>
-				fresh(getPipelineItems({ pool: p as PipelineId, status: f.status, room: f.room })),
+			queryFn: ({ pageParam }: { pageParam: string | null }) =>
+				fresh(
+					getPipelineItems({
+						pool: p as PipelineId,
+						status: f.status,
+						room: f.room,
+						cursor: pageParam
+					})
+				),
+			initialPageParam: null as string | null,
+			getNextPageParam: (lastPage: PipelineItemsResponse) => lastPage.nextCursor,
 			enabled: p != null,
 			refetchInterval: 5_000
 		};

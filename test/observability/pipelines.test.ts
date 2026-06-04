@@ -330,6 +330,26 @@ test("listPipelineItems honors status and room filters", async () => {
   });
 });
 
+test("listPipelineItems pending/retrying filters match the count buckets", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "fresh", "pending", { retries: 0, updatedAt: 1_000 });
+    await enrichEvent(storage, "again", "pending", { retries: 2, updatedAt: 2_000 });
+
+    const pending = storage.listPipelineItems("enrichment", { status: "pending" }, 3);
+    assert.deepEqual(
+      pending.items.map((i) => i.id),
+      ["fresh"],
+      "the 'pending' chip excludes retrying rows (attempts>0)",
+    );
+    const retrying = storage.listPipelineItems("enrichment", { status: "retrying" }, 3);
+    assert.deepEqual(
+      retrying.items.map((i) => i.id),
+      ["again"],
+      "the 'retrying' chip is pending rows with prior attempts",
+    );
+  });
+});
+
 test("listPipelineItems captioning projection: filename, media_type, caption, error", async () => {
   await withStorage(async (storage) => {
     await storage.appendTimelineEvent(userEvent("evt-1"));
