@@ -53,6 +53,11 @@ export class ConcurrencyLimitedInferenceClient {
     return this.options.modality;
   }
 
+  /** Configured concurrency cap for this modality, or undefined when unbounded. */
+  get maxConcurrency(): number | undefined {
+    return this.options.maxConcurrency;
+  }
+
   async caption(request: CaptionRequest): Promise<CaptionResponse> {
     if (this.stopped) throw new Error("InferenceClient is stopped");
 

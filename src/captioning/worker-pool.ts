@@ -1,6 +1,7 @@
-import type { Storage } from "../storage/index.js";
+import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
+import type { PipelineStats } from "../observability/pipelines.js";
 import { CaptionWorker } from "./worker.js";
 
 export interface CaptionConfig {
@@ -24,7 +25,6 @@ export interface CaptionWorkerPoolOptions {
 export class CaptionWorkerPool {
   private running = false;
   private readonly activeWorkers = new Set<Promise<void>>();
-  private readonly failureCounts = new Map<string, number>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
 
@@ -52,6 +52,25 @@ export class CaptionWorkerPool {
       this.wakeResolve();
       this.wakeResolve = undefined;
     }
+  }
+
+  /**
+   * Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). Surfaces
+   * the per-modality concurrency caps (image/video/audio) when configured.
+   */
+  stats(): PipelineStats {
+    const concurrency: Record<string, number> = {};
+    for (const [modality, client] of this.options.clients) {
+      const cap = client.maxConcurrency;
+      if (cap != null) concurrency[modality] = cap;
+    }
+    return {
+      pool: "captioning",
+      workerCount: this.options.config.worker_count ?? 2,
+      maxRetries: this.options.config.max_retries ?? 2,
+      inFlight: () => this.activeWorkers.size,
+      concurrency: Object.keys(concurrency).length > 0 ? concurrency : undefined,
+    };
   }
 
   private schedulePoll(delayMs: number): void {
@@ -102,7 +121,7 @@ export class CaptionWorkerPool {
     for (const asset of claimed) {
       const work = worker.process(asset)
         .then((eventId) => this.options.onComplete?.(eventId))
-        .catch((error) => this.handleWorkerError(asset.id, error))
+        .catch((error) => this.handleWorkerError(asset, error))
         .finally(() => {
           this.activeWorkers.delete(work);
           if (this.running) this.schedulePoll(0);
@@ -113,20 +132,25 @@ export class CaptionWorkerPool {
     if (this.running) this.schedulePoll(500);
   }
 
-  private async handleWorkerError(assetId: string, error: unknown): Promise<void> {
-    const count = (this.failureCounts.get(assetId) ?? 0) + 1;
-    this.failureCounts.set(assetId, count);
+  /**
+   * Failure handler. The retry counter (`caption_attempts`) is now durable: it was
+   * already incremented inside the claim CAS, so `asset.caption_attempts` holds the
+   * post-increment count for this attempt. Fail terminally once it reaches
+   * `max_retries` (preserving the prior semantics where `max_retries` bounds total
+   * attempts), otherwise reset to `pending` for re-claim.
+   */
+  private async handleWorkerError(asset: MediaAssetRow, error: unknown): Promise<void> {
+    const attempts = asset.caption_attempts ?? 1;
     const maxRetries = this.options.config.max_retries ?? 2;
 
-    if (count >= maxRetries) {
-      this.failureCounts.delete(assetId);
+    if (attempts >= maxRetries) {
       await this.options.storage.setCaptionStatus(
-        assetId, "failed",
+        asset.id, "failed",
         error instanceof Error ? error.message : String(error),
       );
-      this.options.onError?.(assetId, error);
+      this.options.onError?.(asset.id, error);
     } else {
-      await this.options.storage.setCaptionStatus(assetId, "pending");
+      await this.options.storage.setCaptionStatus(asset.id, "pending");
     }
   }
 }

@@ -1021,6 +1021,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       storage,
       factory,
       sessions,
+      // Pipeline monitor stat seam (ARCHITECTURE.md §11). `stats()` returns objects
+      // whose `inFlight()` closes over the live pool, so this is captured once.
+      // Summarization/diary are null when disabled by config.
+      pipelines: {
+        enrichment: enrichmentPool.stats(),
+        captioning: captionPool.stats(),
+        summarization: summarizationPool?.stats() ?? null,
+        diary: diaryPool?.stats() ?? null,
+      },
       workspaceRoot,
       logger: logger.child("console"),
     });

@@ -11,6 +11,60 @@ import {
 } from "../src/storage/index.js";
 import type { Logger } from "../src/observability/index.js";
 
+/**
+ * `media_assets` + `summarization_jobs` are base (v1) tables present in every real
+ * DB. The v7→v8 migration ALTERs `media_assets` (adds caption_attempts/updated_at)
+ * and creates keyset indexes on both, so a synthetic legacy fixture must include
+ * them in their pre-v8 shape (without the columns the migration adds), or the
+ * ALTER/index DDL has nothing to target. FK `references` clauses are dropped — the
+ * migration only ALTERs/indexes, never writes, so referential targets are moot.
+ */
+const LEGACY_MEDIA_AND_JOBS = `
+  create table media_assets (
+    id text primary key,
+    event_id text not null,
+    role text not null,
+    source_index integer,
+    link_preview_id text,
+    local_path text,
+    mime_type text,
+    media_type text not null,
+    size_bytes integer,
+    width integer,
+    height integer,
+    duration_seconds real,
+    original_filename text,
+    detected_content text,
+    detected_metadata_json text,
+    caption text,
+    caption_model text,
+    caption_status text not null default 'pending'
+      check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
+    caption_error text,
+    download_status text not null default 'complete'
+      check(download_status in ('complete', 'failed')),
+    download_error text,
+    created_at integer not null
+  );
+  create table summarization_jobs (
+    id text primary key,
+    timeline_key text not null,
+    level integer not null,
+    status text not null default 'pending'
+      check(status in ('pending', 'processing', 'complete', 'failed')),
+    input_start_id text not null,
+    input_end_id text not null,
+    input_token_count integer,
+    target_token_count integer not null,
+    attempts integer not null default 0,
+    max_retries integer not null default 2,
+    best_effort_draft text,
+    error text,
+    result_summary_id text,
+    created_at integer not null,
+    updated_at integer not null
+  );`;
+
 async function withStorage(fn: (storage: Storage) => Promise<void>): Promise<void> {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
@@ -222,8 +276,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 7", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 7);
+test("LATEST_SCHEMA_VERSION is 8", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 8);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -286,6 +340,7 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
          created_at integer not null
        );`,
     );
+    legacy.exec(LEGACY_MEDIA_AND_JOBS);
     legacy.pragma("user_version = 4");
     // Sanity: table absent before migration.
     const before = legacy
@@ -624,6 +679,7 @@ test("both agent_sessions indexes exist after a v4 -> v5 migration", async () =>
          created_at integer not null
        );`,
     );
+    legacy.exec(LEGACY_MEDIA_AND_JOBS);
     legacy.pragma("user_version = 4");
     legacy.close();
 

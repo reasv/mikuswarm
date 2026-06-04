@@ -5,6 +5,7 @@ import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { EnrichmentCapabilities, EnrichmentConfig } from "./types.js";
 import type { ConcurrencyLimitedFetchClient } from "./fetch-client.js";
+import type { PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 
 export interface EnrichmentWorkerPoolOptions {
@@ -60,6 +61,16 @@ export class EnrichmentWorkerPool {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.wakeResolve) this.wakeResolve();
     await Promise.allSettled([...this.activeWorkers]);
+  }
+
+  /** Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). */
+  stats(): PipelineStats {
+    return {
+      pool: "enrichment",
+      workerCount: this.options.config.worker_count ?? 3,
+      maxRetries: this.options.config.max_retries ?? 3,
+      inFlight: () => this.activeWorkers.size,
+    };
   }
 
   notifyNewEvent(_eventId: string): void {

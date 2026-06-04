@@ -3,6 +3,7 @@ import type { Storage, SummarizationJob } from "../storage/index.js";
 import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
+import type { PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createSummaryTool } from "../tools/index.js";
 import { estimateTokens, truncateToTokens } from "../context/index.js";
@@ -66,6 +67,16 @@ export class SummarizationWorkerPool {
       this.wakeResolve();
       this.wakeResolve = undefined;
     }
+  }
+
+  /** Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). */
+  stats(): PipelineStats {
+    return {
+      pool: "summarization",
+      workerCount: this.options.config.worker_count ?? 1,
+      maxRetries: this.options.config.max_retries ?? 2,
+      inFlight: () => this.activeWorkers.size,
+    };
   }
 
   private schedulePoll(delayMs: number): void {

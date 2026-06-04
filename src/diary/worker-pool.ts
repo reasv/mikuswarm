@@ -3,6 +3,7 @@ import type { Storage, DiaryJob, MemoryFileWriter } from "../storage/index.js";
 import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
 import type { DiaryConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
+import type { PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createDiaryTool } from "../tools/index.js";
 import { renderRichMessage } from "../context/index.js";
@@ -70,6 +71,16 @@ export class DiaryWorkerPool {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.wakeResolve) this.wakeResolve();
     await Promise.allSettled([...this.activeWorkers]);
+  }
+
+  /** Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). */
+  stats(): PipelineStats {
+    return {
+      pool: "diary",
+      workerCount: this.options.config.worker_count ?? 1,
+      maxRetries: this.options.config.max_retries ?? DEFAULT_MAX_RETRIES,
+      inFlight: () => this.activeWorkers.size,
+    };
   }
 
   /** Wake the pool immediately (e.g. when a new level-1 summary lands). */

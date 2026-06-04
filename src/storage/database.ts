@@ -108,9 +108,13 @@ export interface MediaAssetRow {
   caption_model?: string | null;
   caption_status: string;
   caption_error?: string | null;
+  /** Durable claim-time caption retry counter (mirrors enrichment_retries). */
+  caption_attempts?: number;
   download_status: string;
   download_error?: string | null;
   created_at: number;
+  /** Last-mutated wall clock (bumped on every caption write); seeded to created_at. */
+  updated_at?: number | null;
 }
 
 export interface TimelineCompactionState {
@@ -427,6 +431,357 @@ export interface SummaryLineage {
   events: CanonicalChatEvent[];
   children: Summary[];
 }
+
+// ── Pipeline monitor (ARCHITECTURE.md §11) ───────────────────────────────────
+// A unified read model over the four background worker queues (enrichment,
+// captioning, summarization, diary). Counts and item lists are derived from the
+// DB (the single source of truth that survives restart); live in-flight state is
+// read separately from the pool objects via `PipelineStats`.
+
+/** The four background pipelines surfaced by the monitor. */
+export type PipelineId = "enrichment" | "captioning" | "summarization" | "diary";
+
+export const PIPELINE_IDS: readonly PipelineId[] = [
+  "enrichment",
+  "captioning",
+  "summarization",
+  "diary",
+];
+
+/**
+ * Status-bucket counts for a pipeline's full history. Each pool's raw statuses are
+ * normalized into these six buckets (e.g. `complete`→`done`; a `pending` row with
+ * `attempts > 0` → `retrying`). Enrichment's `inactive` (never-queued) rows are
+ * excluded entirely — the monitor only counts events that are/were in the queue.
+ */
+export interface PipelineCounts {
+  pending: number;
+  processing: number;
+  retrying: number;
+  done: number;
+  failed: number;
+  skipped: number;
+}
+
+/**
+ * Unified list projection of one queue item across the four heterogeneous pools
+ * (event / media asset / job row / level-1 summary). The detail responses stay
+ * pool-specific (see {@link PipelineItemDetail}); this is the common browsable
+ * shape Col2 renders.
+ */
+export interface PipelineItem {
+  pool: PipelineId;
+  /** event id | media asset id | job id | summary id. */
+  id: string;
+  /** Raw pool status (pending/processing/complete/failed/skipped/done/...). */
+  status: string;
+  /** enrichment_retries | caption_attempts | jobs.attempts | diary_attempts. */
+  attempts: number;
+  maxRetries: number;
+  /** No explicit "retrying" state exists: derived as status===pending && attempts>0. */
+  retrying: boolean;
+  /** timeline_key, or null when not resolvable. */
+  room: string | null;
+  createdAt: number;
+  /**
+   * Reverse-chron sort key surfaced to the client and used as the keyset cursor
+   * value. = updated_at for enrichment/captioning/summarization; = latest_timestamp
+   * (the covered range's end) for diary, which has no updated_at column.
+   */
+  updatedAt: number;
+  /** Short input descriptor (sender+snippet / filename / job range / date+range). */
+  inputSummary: string;
+  /** Short output descriptor, or null when not yet produced. */
+  outputSummary: string | null;
+  /** Persisted error text where the pool stores one, else null. */
+  error: string | null;
+  /** agent_sessions.id for summarize/condense/diary (latest attempt); null otherwise. */
+  sessionId: string | null;
+}
+
+/** One keyset-paginated page of {@link PipelineItem}s. */
+export interface PipelineItemPage {
+  items: PipelineItem[];
+  /** Opaque cursor for the next page, or null when the last page was returned. */
+  nextCursor: string | null;
+}
+
+/** Filters + keyset cursor for {@link Storage.listPipelineItems}. */
+export interface PipelineItemQuery {
+  status?: string | null;
+  room?: string | null;
+  cursor?: string | null;
+  limit?: number;
+}
+
+/** Opaque reverse-chron keyset cursor: `(sortValue, id)` on `(updatedAt, id)`. */
+interface PipelineCursor {
+  s: number;
+  id: string;
+}
+
+function encodePipelineCursor(cursor: PipelineCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodePipelineCursor(raw: string | null | undefined): PipelineCursor | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as unknown;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof (parsed as PipelineCursor).s === "number" &&
+      typeof (parsed as PipelineCursor).id === "string"
+    ) {
+      return parsed as PipelineCursor;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Per-pool wiring for the unified counts/list read. `scope` is the base predicate
+ * that defines "in this pipeline's queue" (e.g. captioning only tracks
+ * image/video/audio; enrichment excludes never-queued `inactive` events). `sortCol`
+ * /`idCol` drive both the reverse-chron order and the keyset cursor. `project` maps
+ * a raw row to the unified {@link PipelineItem}; `done` lists the raw statuses that
+ * normalize to the `done` bucket.
+ */
+interface PipelineListSpec {
+  table: string;
+  statusCol: string;
+  attemptsCol: string;
+  roomCol: string;
+  sortCol: string;
+  idCol: string;
+  scope: string | null;
+  done: string[];
+  /** Full SELECT list + FROM (incl. any join + correlated session subquery). */
+  selectFrom: string;
+  project: (row: Record<string, unknown>, defaultMaxRetries: number) => PipelineItem;
+}
+
+/**
+ * Per-pool wiring for the unqualified (no-join) counts aggregate. Mirrors the
+ * scope/status/attempts/done of {@link PIPELINE_LIST_SPECS} but with bare column
+ * names, since the counts query hits the single base table directly.
+ */
+interface PipelineCountSpec {
+  table: string;
+  statusCol: string;
+  attemptsCol: string;
+  scope: string | null;
+  done: string[];
+}
+
+const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
+  enrichment: {
+    table: "timeline_events",
+    statusCol: "enrichment_status",
+    attemptsCol: "enrichment_retries",
+    scope: "enrichment_status != 'inactive'",
+    done: ["complete"],
+  },
+  captioning: {
+    table: "media_assets",
+    statusCol: "caption_status",
+    attemptsCol: "caption_attempts",
+    scope: "media_type in ('image', 'video', 'audio')",
+    done: ["complete"],
+  },
+  summarization: {
+    table: "summarization_jobs",
+    statusCol: "status",
+    attemptsCol: "attempts",
+    scope: null,
+    done: ["complete"],
+  },
+  diary: {
+    table: "summaries",
+    statusCol: "diary_status",
+    attemptsCol: "diary_attempts",
+    scope: "diary_status is not null",
+    done: ["done"],
+  },
+};
+
+/** Collapse whitespace and clip to `max` chars for a list descriptor. */
+function pipelineSnippet(text: string, max = 80): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
+}
+
+/** ISO day (UTC) for a diary item's covered-range end, for the list descriptor. */
+function pipelineDay(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
+  enrichment: {
+    table: "timeline_events",
+    statusCol: "enrichment_status",
+    attemptsCol: "enrichment_retries",
+    roomCol: "timeline_key",
+    sortCol: "updated_at",
+    idCol: "id",
+    // Exclude never-queued events (assistant turns / nothing enrichable): the
+    // monitor only shows events that are/were actually in the enrichment queue.
+    scope: "enrichment_status != 'inactive'",
+    done: ["complete"],
+    selectFrom: `select id, enrichment_status as status, enrichment_retries as attempts,
+        timeline_key as room, created_at, updated_at,
+        sender_display_name, sender_id, body
+      from timeline_events`,
+    project: (row, maxRetries) => {
+      const status = String(row.status);
+      const attempts = Number(row.attempts ?? 0);
+      const sender =
+        (row.sender_display_name as string | null) ?? (row.sender_id as string | null) ?? "unknown";
+      const createdAt = Number(row.created_at ?? 0);
+      return {
+        pool: "enrichment",
+        id: String(row.id),
+        status,
+        attempts,
+        maxRetries,
+        retrying: status === "pending" && attempts > 0,
+        room: (row.room as string | null) ?? null,
+        createdAt,
+        updatedAt: Number(row.updated_at ?? createdAt),
+        inputSummary: `${sender}: ${pipelineSnippet(String(row.body ?? ""))}`,
+        // Enrichment does not persist an error string on the row (no column); the
+        // produced rows live in the detail response. Output stays in detail.
+        outputSummary: null,
+        error: null,
+        sessionId: null,
+      };
+    },
+  },
+  captioning: {
+    table: "media_assets",
+    statusCol: "ma.caption_status",
+    attemptsCol: "ma.caption_attempts",
+    roomCol: "te.timeline_key",
+    sortCol: "ma.updated_at",
+    idCol: "ma.id",
+    // The captioning track is image/video/audio assets only (what the pool claims).
+    scope: "ma.media_type in ('image', 'video', 'audio')",
+    done: ["complete"],
+    selectFrom: `select ma.id as id, ma.caption_status as status, ma.caption_attempts as attempts,
+        te.timeline_key as room, ma.created_at as created_at, ma.updated_at as updated_at,
+        ma.original_filename as original_filename, ma.media_type as media_type,
+        ma.caption as caption, ma.caption_error as caption_error
+      from media_assets ma
+      join timeline_events te on te.id = ma.event_id`,
+    project: (row, maxRetries) => {
+      const status = String(row.status);
+      const attempts = Number(row.attempts ?? 0);
+      const createdAt = Number(row.created_at ?? 0);
+      const caption = (row.caption as string | null) ?? null;
+      return {
+        pool: "captioning",
+        id: String(row.id),
+        status,
+        attempts,
+        maxRetries,
+        retrying: status === "pending" && attempts > 0,
+        room: (row.room as string | null) ?? null,
+        createdAt,
+        updatedAt: Number(row.updated_at ?? createdAt),
+        inputSummary: `${(row.original_filename as string | null) ?? "(file)"} · ${row.media_type}`,
+        outputSummary: caption ? pipelineSnippet(caption, 100) : null,
+        error: (row.caption_error as string | null) ?? null,
+        sessionId: null,
+      };
+    },
+  },
+  summarization: {
+    table: "summarization_jobs",
+    statusCol: "status",
+    attemptsCol: "attempts",
+    roomCol: "timeline_key",
+    sortCol: "updated_at",
+    idCol: "id",
+    scope: null,
+    done: ["complete"],
+    selectFrom: `select id, status, attempts, max_retries, timeline_key as room,
+        created_at, updated_at, level, input_token_count, target_token_count,
+        best_effort_draft, error, result_summary_id,
+        (select s.id from agent_sessions s
+           where s.trigger_event_id = 'summarize:' || summarization_jobs.id
+           order by s.created_at desc limit 1) as session_id
+      from summarization_jobs`,
+    project: (row, defaultMaxRetries) => {
+      const status = String(row.status);
+      const attempts = Number(row.attempts ?? 0);
+      const createdAt = Number(row.created_at ?? 0);
+      const resultSummaryId = (row.result_summary_id as string | null) ?? null;
+      const bestEffort = (row.best_effort_draft as string | null) ?? null;
+      return {
+        pool: "summarization",
+        id: String(row.id),
+        status,
+        attempts,
+        maxRetries: Number(row.max_retries ?? defaultMaxRetries),
+        retrying: status === "pending" && attempts > 0,
+        room: (row.room as string | null) ?? null,
+        createdAt,
+        updatedAt: Number(row.updated_at ?? createdAt),
+        inputSummary: `L${row.level} · ${row.input_token_count ?? "?"}→${row.target_token_count} tok`,
+        outputSummary: resultSummaryId
+          ? `→ ${resultSummaryId}`
+          : bestEffort
+            ? "best-effort draft"
+            : null,
+        error: (row.error as string | null) ?? null,
+        sessionId: (row.session_id as string | null) ?? null,
+      };
+    },
+  },
+  diary: {
+    table: "summaries",
+    statusCol: "diary_status",
+    attemptsCol: "diary_attempts",
+    roomCol: "timeline_key",
+    sortCol: "latest_timestamp",
+    idCol: "id",
+    // Only the diary-bearing level-1 summaries (level 2+ have NULL diary_status).
+    scope: "diary_status is not null",
+    done: ["done"],
+    selectFrom: `select id, diary_status as status, diary_attempts as attempts,
+        timeline_key as room, created_at, latest_timestamp, earliest_timestamp, event_count,
+        (select s.id from agent_sessions s
+           where s.trigger_event_id = 'diary:' || summaries.id
+           order by s.created_at desc limit 1) as session_id
+      from summaries`,
+    project: (row, defaultMaxRetries) => {
+      const status = String(row.status);
+      const attempts = Number(row.attempts ?? 0);
+      const latestTs = Number(row.latest_timestamp ?? 0);
+      return {
+        pool: "diary",
+        id: String(row.id),
+        status,
+        attempts,
+        maxRetries: defaultMaxRetries,
+        retrying: status === "pending" && attempts > 0,
+        room: (row.room as string | null) ?? null,
+        createdAt: Number(row.created_at ?? 0),
+        // summaries has no updated_at; the diary item's recency is its range end.
+        updatedAt: latestTs,
+        inputSummary: `${pipelineDay(latestTs)} · ${row.event_count} msgs`,
+        outputSummary:
+          status === "done" ? "entry written" : status === "skipped" ? "no participation" : null,
+        // Diary stores no error text on the summary row; the session carries it.
+        error: null,
+        sessionId: (row.session_id as string | null) ?? null,
+      };
+    },
+  },
+};
 
 export class Storage {
   readonly db: Database.Database;
@@ -1410,14 +1765,14 @@ export class Storage {
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
           original_filename, detected_content, detected_metadata_json,
-          caption, caption_model, caption_status, caption_error,
-          download_status, download_error, created_at
+          caption, caption_model, caption_status, caption_error, caption_attempts,
+          download_status, download_error, created_at, updated_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
           @originalFilename, @detectedContent, @detectedMetadataJson,
-          @caption, @captionModel, @captionStatus, @captionError,
-          @downloadStatus, @downloadError, @createdAt
+          @caption, @captionModel, @captionStatus, @captionError, @captionAttempts,
+          @downloadStatus, @downloadError, @createdAt, @updatedAt
         )`,
       ).run({
         id: row.id,
@@ -1439,9 +1794,11 @@ export class Storage {
         captionModel: row.caption_model ?? null,
         captionStatus: row.caption_status,
         captionError: row.caption_error ?? null,
+        captionAttempts: row.caption_attempts ?? 0,
         downloadStatus: row.download_status,
         downloadError: row.download_error ?? null,
         createdAt: row.created_at,
+        updatedAt: row.updated_at ?? row.created_at,
       });
     });
   }
@@ -1512,14 +1869,14 @@ export class Storage {
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
           original_filename, detected_content, detected_metadata_json,
-          caption, caption_model, caption_status, caption_error,
-          download_status, download_error, created_at
+          caption, caption_model, caption_status, caption_error, caption_attempts,
+          download_status, download_error, created_at, updated_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
           @originalFilename, @detectedContent, @detectedMetadataJson,
-          @caption, @captionModel, @captionStatus, @captionError,
-          @downloadStatus, @downloadError, @createdAt
+          @caption, @captionModel, @captionStatus, @captionError, @captionAttempts,
+          @downloadStatus, @downloadError, @createdAt, @updatedAt
         )`,
       );
       for (const ma of result.mediaAssets) {
@@ -1543,9 +1900,11 @@ export class Storage {
           captionModel: ma.caption_model ?? null,
           captionStatus: ma.caption_status,
           captionError: ma.caption_error ?? null,
+          captionAttempts: ma.caption_attempts ?? 0,
           downloadStatus: ma.download_status,
           downloadError: ma.download_error ?? null,
           createdAt: ma.created_at,
+          updatedAt: ma.updated_at ?? ma.created_at,
         });
       }
 
@@ -1620,14 +1979,28 @@ export class Storage {
 
       if (rows.length === 0) return [];
 
+      // CAS pending → processing, incrementing the durable `caption_attempts`
+      // counter in the SAME statement (mirroring claimNextSummarizationJob /
+      // claimNextDiaryJob). First claim => attempts = 1; a crash un-sticks the row
+      // via resetStaleCaptions without refunding its retry budget. `updated_at` is
+      // bumped so the pipeline monitor's reverse-chron sort reflects the claim.
+      const now = Date.now();
       const update = db.prepare(
-        `update media_assets set caption_status = 'processing'
+        `update media_assets
+         set caption_status = 'processing', caption_attempts = caption_attempts + 1, updated_at = ?
          where id = ? and caption_status = 'pending'`,
       );
       const claimed: MediaAssetRow[] = [];
       for (const row of rows) {
-        const result = update.run(row.id);
-        if (result.changes > 0) claimed.push({ ...row, caption_status: "processing" });
+        const result = update.run(now, row.id);
+        if (result.changes > 0) {
+          claimed.push({
+            ...row,
+            caption_status: "processing",
+            caption_attempts: (row.caption_attempts ?? 0) + 1,
+            updated_at: now,
+          });
+        }
       }
       return claimed;
     });
@@ -1637,26 +2010,26 @@ export class Storage {
     return this.write((db) => {
       db.prepare(
         `update media_assets
-         set caption = ?, caption_model = ?, caption_status = 'complete'
+         set caption = ?, caption_model = ?, caption_status = 'complete', caption_error = null, updated_at = ?
          where id = ?`,
-      ).run(caption, model, assetId);
+      ).run(caption, model, Date.now(), assetId);
     });
   }
 
   setCaptionStatus(assetId: string, status: string, error?: string): Promise<void> {
     return this.write((db) => {
       db.prepare(
-        `update media_assets set caption_status = ?${error ? ", caption_error = ?" : ""} where id = ?`,
-      ).run(...(error ? [status, error, assetId] : [status, assetId]));
+        `update media_assets set caption_status = ?${error ? ", caption_error = ?" : ""}, updated_at = ? where id = ?`,
+      ).run(...(error ? [status, error, Date.now(), assetId] : [status, Date.now(), assetId]));
     });
   }
 
   resetStaleCaptions(): Promise<number> {
     return this.write((db) => {
       const result = db.prepare(
-        `update media_assets set caption_status = 'pending'
+        `update media_assets set caption_status = 'pending', updated_at = ?
          where caption_status = 'processing'`,
-      ).run();
+      ).run(Date.now());
       return result.changes;
     });
   }
@@ -2891,6 +3264,95 @@ export class Storage {
     );
   }
 
+  // ── Pipeline monitor reads (ARCHITECTURE.md §11) ──────────────────────────
+
+  /**
+   * Status-bucket counts for a pipeline's full history (the `/api/pipelines`
+   * dashboard feed). DB-derived (the single source of truth that survives
+   * restart). Raw statuses normalize into the six {@link PipelineCounts} buckets;
+   * a `pending` row with `attempts > 0` is `retrying` (no explicit state exists).
+   * Pure read.
+   */
+  getPipelineCounts(pool: PipelineId): PipelineCounts {
+    const spec = PIPELINE_COUNT_SPECS[pool];
+    const where = spec.scope ? `where ${spec.scope}` : "";
+    const donePlaceholders = spec.done.map(() => "?").join(", ");
+    const sql = `select
+        sum(case when ${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0 then 1 else 0 end) as pending,
+        sum(case when ${spec.statusCol} = 'pending' and ${spec.attemptsCol} > 0 then 1 else 0 end) as retrying,
+        sum(case when ${spec.statusCol} = 'processing' then 1 else 0 end) as processing,
+        sum(case when ${spec.statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
+        sum(case when ${spec.statusCol} = 'failed' then 1 else 0 end) as failed,
+        sum(case when ${spec.statusCol} = 'skipped' then 1 else 0 end) as skipped
+      from ${spec.table} ${where}`;
+    return this.read((db) => {
+      const row = db.prepare(sql).get(...spec.done) as Record<string, number | null>;
+      return {
+        pending: row.pending ?? 0,
+        processing: row.processing ?? 0,
+        retrying: row.retrying ?? 0,
+        done: row.done ?? 0,
+        failed: row.failed ?? 0,
+        skipped: row.skipped ?? 0,
+      };
+    });
+  }
+
+  /**
+   * One keyset-paginated page of a pipeline's items (the `/api/pipelines/:pool/items`
+   * feed), reverse-chron on `(updatedAt, id)`. `status`/`room` are optional indexed
+   * filters. The cursor is opaque (base64 of `(sortValue, id)`); a fetched-one-extra
+   * probe sets `nextCursor`. `defaultMaxRetries` is the pool's configured retry cap,
+   * stamped onto items whose pool has no per-row max (enrichment/captioning/diary;
+   * summarization carries its own `max_retries`). Pure read.
+   */
+  listPipelineItems(
+    pool: PipelineId,
+    query: PipelineItemQuery,
+    defaultMaxRetries: number,
+  ): PipelineItemPage {
+    const spec = PIPELINE_LIST_SPECS[pool];
+    const limit = Math.min(Math.max(query.limit ?? 50, 1), 200);
+    const cursor = decodePipelineCursor(query.cursor);
+
+    const where: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (spec.scope) where.push(spec.scope);
+    if (query.status) {
+      where.push(`${spec.statusCol} = @status`);
+      params.status = query.status;
+    }
+    if (query.room) {
+      where.push(`${spec.roomCol} = @room`);
+      params.room = query.room;
+    }
+    if (cursor) {
+      where.push(
+        `(${spec.sortCol} < @cursorSort or (${spec.sortCol} = @cursorSort and ${spec.idCol} < @cursorId))`,
+      );
+      params.cursorSort = cursor.s;
+      params.cursorId = cursor.id;
+    }
+    // Fetch one extra row to learn whether a further page exists.
+    params.limit = limit + 1;
+
+    const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+    const sql = `${spec.selectFrom} ${whereSql}
+      order by ${spec.sortCol} desc, ${spec.idCol} desc
+      limit @limit`;
+
+    const rows = this.read(
+      (db) => db.prepare(sql).all(params) as Array<Record<string, unknown>>,
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => spec.project(row, defaultMaxRetries));
+    const last = items[items.length - 1];
+    const nextCursor =
+      hasMore && last ? encodePipelineCursor({ s: last.updatedAt, id: last.id }) : null;
+    return { items, nextCursor };
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -3075,6 +3537,11 @@ create index if not exists idx_timeline_events_enrichment
   on timeline_events(enrichment_status, timestamp desc)
   where enrichment_status in ('pending', 'processing');
 
+-- Pipeline monitor: keyset pagination of the enrichment queue, reverse-chron on
+-- (updated_at, id) across full history (ARCHITECTURE.md §11).
+create index if not exists idx_timeline_events_updated
+  on timeline_events(updated_at, id);
+
 create index if not exists idx_timeline_events_trigger_group
   on timeline_events(trigger_group_id)
   where trigger_group_id is not null;
@@ -3148,10 +3615,21 @@ create table if not exists media_assets (
   caption_status text not null default 'pending'
     check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
   caption_error text,
+  -- Durable caption retry counter (ARCHITECTURE.md §11 pipeline monitor). Mirrors
+  -- timeline_events.enrichment_retries / summarization_jobs.attempts /
+  -- summaries.diary_attempts: incremented at claim time inside the CAS so "what's
+  -- retrying" survives a restart and is visible to the DB-derived pipeline counts
+  -- (the captioning pool previously tracked this in-memory only).
+  caption_attempts integer not null default 0,
   download_status text not null default 'complete'
     check(download_status in ('complete', 'failed')),
   download_error text,
-  created_at integer not null
+  created_at integer not null,
+  -- Last-mutated wall clock, bumped on every caption claim/result/status write.
+  -- The pipeline monitor sorts the captioning queue reverse-chron on this (= "most
+  -- recently processed"); media_assets otherwise only carried created_at. Inserts
+  -- seed it to created_at; the v7→v8 migration backfills existing rows likewise.
+  updated_at integer
 );
 
 create index if not exists idx_media_assets_event
@@ -3164,6 +3642,11 @@ create index if not exists idx_media_assets_preview
 create index if not exists idx_media_assets_caption_eligible
   on media_assets(caption_status, download_status, media_type)
   where caption_status in ('pending', 'processing');
+
+-- Pipeline monitor: keyset pagination of the captioning queue, reverse-chron on
+-- (updated_at, id) across full history (ARCHITECTURE.md §11).
+create index if not exists idx_media_assets_updated
+  on media_assets(updated_at, id);
 
 create table if not exists summaries (
   id text primary key,
@@ -3201,6 +3684,14 @@ create index if not exists idx_summaries_level
 create index if not exists idx_summaries_diary
   on summaries(diary_status, latest_timestamp)
   where diary_status in ('pending', 'processing');
+
+-- Pipeline monitor: keyset pagination of the diary queue (the diary-bearing
+-- level-1 summaries), reverse-chron on (latest_timestamp, id). summaries has no
+-- updated_at; the diary item's natural recency is its covered range's end
+-- (ARCHITECTURE.md §11).
+create index if not exists idx_summaries_diary_list
+  on summaries(latest_timestamp, id)
+  where diary_status is not null;
 
 create table if not exists summary_events (
   summary_id text not null references summaries(id) on delete cascade,
@@ -3247,6 +3738,11 @@ create index if not exists idx_summarization_jobs_status
 
 create index if not exists idx_summarization_jobs_timeline
   on summarization_jobs(timeline_key, level, status);
+
+-- Pipeline monitor: keyset pagination of the summarization queue, reverse-chron
+-- on (updated_at, id) across full history (ARCHITECTURE.md §11).
+create index if not exists idx_summarization_jobs_updated
+  on summarization_jobs(updated_at, id);
 
 -- Edits (m.replace) that arrived/decrypted BEFORE their target message was
 -- stored (plausible during backfill or out-of-order sync). The live/decrypt edit
@@ -3312,7 +3808,7 @@ ${RETRIEVAL_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 8;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -3435,6 +3931,31 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // get this directly from SCHEMA above and never run this step.
   (db) => {
     db.exec(RETRIEVAL_SCHEMA);
+  },
+  // index 7 (v7 -> v8): make captioning retry state durable and uniform for the
+  // pipeline monitor (ARCHITECTURE.md §11). Add `caption_attempts` (claim-time
+  // retry counter, previously in-memory `failureCounts`) and `updated_at`
+  // (last-mutated wall clock, sorted on by the monitor) to `media_assets`,
+  // backfilling `updated_at` to each row's `created_at`. Add the four per-pool
+  // keyset-pagination indexes on (updated_at/latest_timestamp, id). The ADD
+  // COLUMNs are NOT NULL-with-default / nullable so existing rows backfill cleanly
+  // (caption_attempts → 0; updated_at → created_at). Fresh DBs get all of this
+  // directly from SCHEMA above and never run this step.
+  (db) => {
+    db.exec(
+      `alter table media_assets add column caption_attempts integer not null default 0;
+       alter table media_assets add column updated_at integer;
+       update media_assets set updated_at = created_at where updated_at is null;
+       create index if not exists idx_media_assets_updated
+         on media_assets(updated_at, id);
+       create index if not exists idx_timeline_events_updated
+         on timeline_events(updated_at, id);
+       create index if not exists idx_summarization_jobs_updated
+         on summarization_jobs(updated_at, id);
+       create index if not exists idx_summaries_diary_list
+         on summaries(latest_timestamp, id)
+         where diary_status is not null;`,
+    );
   },
 ];
 
