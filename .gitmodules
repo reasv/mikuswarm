@@ -1,0 +1,3 @@
+[submodule "vendor/cloakbrowser-manager"]
+	path = vendor/cloakbrowser-manager
+	url = https://github.com/CloakHQ/CloakBrowser-Manager

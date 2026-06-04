@@ -1,0 +1,66 @@
+# CloakBrowser-Manager — sibling operator service (browser-use backend).
+#
+# Unlike the dev sandbox (whose lifecycle the SandboxManager drives via the raw
+# docker CLI), this Manager is an INDEPENDENT, operator-run service. The harness
+# does not start/stop it — it only connects over HTTP at manager_url and degrades
+# gracefully if it is down (ARCHITECTURE.md browser section §3.4). This compose
+# file IS the bring-up mechanism.
+#
+# Bring up:
+#   1. docker/build-browser.sh                       # build image from submodule
+#   2. docker/ensure-browser-network.sh              # create the mikuswarm-browser bridge
+#   3. sudo MIKUSWARM_BROWSER_NETWORK=mikuswarm-browser \      # (hardening, root) block RFC1918
+#        docker/browser-egress-rules.sh
+#   4. BROWSER_AUTH_TOKEN=<token> \
+#        docker compose -f docker/docker-compose.browser.yml up -d
+#
+# The Manager binds 127.0.0.1:8080 only (localhost). Humans reach the noVNC GUI
+# via SSH tunnel: ssh -L 8080:localhost:8080 your-host
+
+services:
+  manager:
+    image: ${MIKUSWARM_BROWSER_IMAGE:-mikuswarm-cloakbrowser-manager:pinned}
+    # Lets `docker compose -f docker/docker-compose.browser.yml build` build the
+    # pinned submodule into the tagged image. `build-browser.sh` does the same.
+    build:
+      context: ../vendor/cloakbrowser-manager
+    container_name: ${MIKUSWARM_BROWSER_CONTAINER:-mikuswarm-cloakbrowser-manager}
+    restart: unless-stopped
+    init: true
+    # Publish to loopback ONLY. The harness reaches REST + CDP-WS here; the bridge
+    # (below) is the egress boundary, not this published port.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # When set, all /api/* routes (except /api/status, /api/auth/*) require
+      # Authorization: Bearer <token>. The harness passes it on connectOverCDP.
+      - AUTH_TOKEN=${BROWSER_AUTH_TOKEN:-}
+    volumes:
+      # Persistent "miku" identity: cookies, logins, prefs, fingerprint seed.
+      # Defaults to a named volume; set MIKUSWARM_BROWSER_DATA_DIR to an ABSOLUTE host
+      # path to bind-mount instead (compose does not expand ~ in bind paths).
+      - ${MIKUSWARM_BROWSER_DATA_DIR:-mikuswarm-browser-data}:/data
+    networks:
+      - mikuswarm-browser
+    # KasmVNC + a headed Chromium need shared memory; the default 64MB causes tab
+    # crashes on heavy pages.
+    shm_size: "1g"
+    # Resource envelope: a headed Chromium + Xvfb + VNC ≈ ~512MB per running
+    # profile (we run one). Budget a little headroom.
+    mem_limit: ${MIKUSWARM_BROWSER_MEM:-1500m}
+    cpus: ${MIKUSWARM_BROWSER_CPUS:-2}
+    # Healthcheck is defined in the image (GET /api/status).
+
+networks:
+  # External: created and owned by docker/ensure-browser-network.sh so the egress
+  # hardening (browser-egress-rules.sh) has a single, stable bridge to key its
+  # iptables rules to. Reapply those rules after any network recreation.
+  mikuswarm-browser:
+    external: true
+    name: ${MIKUSWARM_BROWSER_NETWORK:-mikuswarm-browser}
+
+volumes:
+  # Only used when MIKUSWARM_BROWSER_DATA_DIR is unset (the default). A bind path in
+  # that env var takes precedence and this stays unused.
+  mikuswarm-browser-data:
+    name: ${MIKUSWARM_BROWSER_DATA_VOLUME:-mikuswarm-browser-data}
