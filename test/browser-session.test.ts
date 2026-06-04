@@ -131,6 +131,17 @@ function stubManager(opts: ManagerStubOptions = {}): ManagerStub {
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
+/**
+ * Push a session's lastUsed far into the past so the next sweep considers it
+ * idle, without waiting real time. Reaches into private state by design (test
+ * seam for the sweeper, issues #1/#22).
+ */
+function forceIdle(session: BrowserSession, sessionId: string): void {
+  const sessions = (session as unknown as { sessions: Map<string, { lastUsed: number }> }).sessions;
+  const state = sessions.get(sessionId);
+  if (state) state.lastUsed = 0;
+}
+
 async function withWorkspace(fn: (ws: string) => Promise<void>): Promise<void> {
   const ws = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-browser-test-"));
   try {
@@ -359,6 +370,139 @@ test("session #13: a cold start (stopped→running) succeeds on the first call v
       const page = await session.getActivePage("s1");
       assert.ok(page, "first call succeeds without surfacing a failed call");
       assert.ok(attempts >= 2, "the poll retried connectOverCDP until ready");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #1: an idle-but-busy session (inFlight>0) is NOT reaped by a sweep", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const connect: ConnectOverCdp = async () => makeFakeBrowser() as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    // Tiny idle window so the session is "idle" almost immediately, isolating the
+    // busy-guard from the elapsed-time check.
+    const session = new BrowserSession({ config: baseConfig({ session_page_idle_ms: 30000 }), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      const page = await session.getActivePage("s1") as unknown as FakePage;
+      // Simulate a long op in flight, then force lastUsed far into the past so the
+      // session would be reaped if it weren't for the in-flight guard.
+      session.beginOp("s1");
+      forceIdle(session, "s1");
+      await session.sweepIdleNow();
+      assert.equal(page._closed, false, "busy session's page survives the sweep");
+      assert.equal((await session.listTabs("s1")).length, 1, "busy session not reaped");
+      session.endOp("s1");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #1: an idle-and-quiet session IS reaped by a sweep", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const connect: ConnectOverCdp = async () => makeFakeBrowser() as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    const session = new BrowserSession({ config: baseConfig({ session_page_idle_ms: 30000 }), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      const page = await session.getActivePage("s1") as unknown as FakePage;
+      forceIdle(session, "s1"); // no in-flight op
+      await session.sweepIdleNow();
+      assert.equal(page._closed, true, "quiet idle session's page is closed");
+      assert.equal((await session.listTabs("s1")).length, 0, "quiet idle session reaped");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #1: op completion (endOp) refreshes lastUsed so a just-finished op isn't instantly reaped", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const connect: ConnectOverCdp = async () => makeFakeBrowser() as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    const session = new BrowserSession({ config: baseConfig({ session_page_idle_ms: 30000 }), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      const page = await session.getActivePage("s1") as unknown as FakePage;
+      session.beginOp("s1");
+      forceIdle(session, "s1");      // op ran long; lastUsed is now stale
+      session.endOp("s1");           // completion must refresh lastUsed
+      const state = (session as unknown as { sessions: Map<string, { lastUsed: number }> }).sessions.get("s1")!;
+      assert.ok(Date.now() - state.lastUsed < 1000, "endOp refreshed lastUsed to ~now");
+      await session.sweepIdleNow();
+      assert.equal(page._closed, false, "session survives a sweep right after the op completes");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #14: a download whose saveAs resolves after closeSession is dropped, not pushed onto a dead state", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    // Capture the page-level `download` handler so we can fire it manually.
+    let downloadHandler: ((download: unknown) => void) | undefined;
+    const fakePage = {
+      _closed: false,
+      isClosed() { return this._closed; },
+      async close() { this._closed = true; },
+      on(event: string, cb: (arg: unknown) => void) { if (event === "download") downloadHandler = cb; },
+      url: () => "about:blank",
+      title: async () => "",
+    };
+    const context = { newPage: async () => fakePage, pages: () => [fakePage] };
+    const browser = {
+      _connected: true,
+      contexts: () => [context],
+      isConnected: () => true,
+      on: () => {},
+      close: async () => { browser._connected = false; },
+    };
+    const connect: ConnectOverCdp = async () => browser as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+
+    // Capturing logger to assert the deliberate drop.
+    const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const capturingLogger: Logger = {
+      debug(event, fields) { logged.push({ event, fields }); },
+      info(event, fields) { logged.push({ event, fields }); },
+      warn(event, fields) { logged.push({ event, fields }); },
+      error(event, fields) { logged.push({ event, fields }); },
+      child() { return capturingLogger; },
+    };
+
+    const session = new BrowserSession({ config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: capturingLogger, connectOverCdp: connect });
+    try {
+      await session.getActivePage("s1");
+      assert.ok(downloadHandler, "download handler was registered");
+
+      // A fake Download whose saveAs resolves only after we release it — letting
+      // us close the session mid-saveAs (the exact race in issue #14).
+      let releaseSaveAs!: () => void;
+      const saveAsGate = new Promise<void>((resolve) => { releaseSaveAs = resolve; });
+      const fakeDownload = {
+        suggestedFilename: () => "report.pdf",
+        url: () => "https://example.com/report.pdf",
+        saveAs: async (_p: string) => { await saveAsGate; },
+      };
+
+      // Fire the download; it parks inside saveAs.
+      downloadHandler!(fakeDownload);
+      // Close the session while saveAs is still pending.
+      await session.closeSession("s1");
+      // Now let saveAs resolve — handleDownload must NOT throw and must drop.
+      releaseSaveAs();
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Record is unreachable (state is gone) and a deliberate drop was logged.
+      assert.equal(session.drainDownloads("s1").length, 0, "no record surfaces from the dead session");
+      assert.ok(
+        logged.some((l) => l.event === "browser_download_after_close_dropped"),
+        "a deliberate after-close drop was logged",
+      );
+      assert.ok(!logged.some((l) => l.event === "browser_download_failed"), "the drop is not an error/failure");
     } finally {
       manager.restore();
       await session.shutdown();

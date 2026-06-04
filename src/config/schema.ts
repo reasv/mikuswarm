@@ -345,11 +345,17 @@ const BrowserSchema = Type.Object({
   // Truncate AI snapshots to bound context cost.
   snapshot_max_chars: Type.Integer({ minimum: 1000 }),
   // Per-navigation / per-action / connect (incl. first-launch cold start) timeouts.
-  nav_timeout_ms: Type.Integer({ minimum: 1 }),
-  act_timeout_ms: Type.Integer({ minimum: 1 }),
-  connect_timeout_ms: Type.Integer({ minimum: 1 }),
-  // Close a session's tab after this much idle, to bound tab growth.
-  session_page_idle_ms: Type.Integer({ minimum: 1 }),
+  // Floor of 1000ms: a sub-second op/nav/connect timeout would spuriously fail
+  // real work; the previous minimum of 1ms was a footgun, not a useful setting.
+  nav_timeout_ms: Type.Integer({ minimum: 1000 }),
+  act_timeout_ms: Type.Integer({ minimum: 1000 }),
+  connect_timeout_ms: Type.Integer({ minimum: 1000 }),
+  // Close a session's tab after this much idle, to bound tab growth. Floor is
+  // the sweep interval (30000ms, SWEEP_INTERVAL_MS in src/browser/session.ts):
+  // a smaller value would reap sessions on the very first sweep after a single
+  // op, racing live tool calls (issue #1). Shipped default is 600000, well above
+  // this floor.
+  session_page_idle_ms: Type.Integer({ minimum: 30000 }),
 });
 
 export type BrowserConfig = Static<typeof BrowserSchema>;

@@ -70,7 +70,13 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
     execute: async (_toolCallId, params) => {
       const args = params as BrowserToolArgs;
       try {
-        return await dispatch(session, agentSessionId, config, actTimeoutMs, args);
+        // Bracket the whole op with beginOp/endOp (via runOp) so the idle
+        // sweeper never reaps this session's page mid-operation (issue #1).
+        // Symmetric even on throw; endOp also refreshes the idle clock so a long
+        // op resets it on completion.
+        return await session.runOp(agentSessionId, () =>
+          dispatch(session, agentSessionId, config, actTimeoutMs, args),
+        );
       } catch (error) {
         if (isBrowserError(error)) {
           // Surface a clean, actionable failure to the model (not a raw crash).

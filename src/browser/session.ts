@@ -39,6 +39,21 @@ interface SessionState {
   /** Downloads captured since the last drain, surfaced in tool results. */
   pendingDownloads: DownloadRecord[];
   /**
+   * Number of browser-tool operations currently in flight against this session
+   * (issue #1). Bracketed by beginOp/endOp around every page-using tool op so
+   * the idle sweeper never reaps a session mid-operation (which would close the
+   * page out from under a long goto/wait → confusing "Target closed" instead of
+   * a clean timeout). > 0 means "busy — do not reap".
+   */
+  inFlight: number;
+  /**
+   * Set once closeSession() has detached this state from `sessions` (issue #14).
+   * A download whose saveAs() resolves AFTER the session closed must not push
+   * its record onto this now-orphaned array (drainDownloads can never reach it);
+   * handleDownload checks this and the live-session map and deliberately drops.
+   */
+  closed: boolean;
+  /**
    * In-flight lazy creation of this session's first tab. Single-flights
    * concurrent getActivePage() callers so they share one tab instead of each
    * racing to open one (mirrors connectPromise). Cleared on settle.
@@ -331,12 +346,53 @@ export class BrowserSession {
     return true;
   }
 
+  // ── In-flight op tracking (issue #1) ─────────────────────────────────────
+
+  /**
+   * Mark a browser-tool operation as starting against this session: increments
+   * the in-flight ref-count and refreshes lastUsed so the op's whole duration
+   * counts as activity. While inFlight > 0 the idle sweeper will not reap the
+   * session, so a long goto/wait can't have its page closed out from under it.
+   * Must be paired with endOp() (use a try/finally — see runOp).
+   */
+  beginOp(sessionId: string): void {
+    const state = this.getOrCreateState(sessionId);
+    state.inFlight++;
+    state.lastUsed = Date.now();
+  }
+
+  /**
+   * Mark a browser-tool operation as finished. Refreshes lastUsed so the idle
+   * clock resets at op completion (a long op shouldn't be instantly reapable the
+   * moment it returns). Tolerant of a missing/already-closed session.
+   */
+  endOp(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    if (state.inFlight > 0) state.inFlight--;
+    state.lastUsed = Date.now();
+  }
+
+  /**
+   * Run a browser-tool operation bracketed by beginOp/endOp so the idle sweeper
+   * never reaps the session mid-op (issue #1). Symmetric even on throw. Every
+   * page-using path in the tool layer should go through this.
+   */
+  async runOp<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    this.beginOp(sessionId);
+    try {
+      return await fn();
+    } finally {
+      this.endOp(sessionId);
+    }
+  }
+
   // ── Per-session tab management ───────────────────────────────────────────
 
   private getOrCreateState(sessionId: string): SessionState {
     let state = this.sessions.get(sessionId);
     if (!state) {
-      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [] };
+      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [], inFlight: 0, closed: false };
       this.sessions.set(sessionId, state);
     }
     return state;
@@ -411,6 +467,9 @@ export class BrowserSession {
     const state = this.sessions.get(sessionId);
     if (!state) throw new BrowserError("no_active_page", "This session has no open tabs.");
     this.compact(state);
+    // An empty-pages state can exist transiently (beginOp creates state before
+    // any tab); treat it the same as a missing session.
+    if (state.pages.length === 0) throw new BrowserError("no_active_page", "This session has no open tabs.");
     if (index < 0 || index >= state.pages.length) {
       throw new BrowserError("bad_request", `Tab index ${index} is out of range (0..${state.pages.length - 1}).`);
     }
@@ -423,6 +482,7 @@ export class BrowserSession {
     const state = this.sessions.get(sessionId);
     if (!state) throw new BrowserError("no_active_page", "This session has no open tabs.");
     this.compact(state);
+    if (state.pages.length === 0) throw new BrowserError("no_active_page", "This session has no open tabs.");
     const page = state.pages[index];
     if (!page) {
       throw new BrowserError("bad_request", `Tab index ${index} is out of range (0..${state.pages.length - 1}).`);
@@ -484,6 +544,15 @@ export class BrowserSession {
       const absPath = path.join(absDir, safeName);
       await download.saveAs(absPath);
       const relPath = path.join(relDir, safeName);
+      // Re-check AFTER the awaited saveAs (that's when the close race resolves):
+      // if the session closed mid-download, the file is on disk but `state` is
+      // detached from `sessions`, so pushing the record would silently lose it.
+      // Drop it deliberately with a log instead (issue #14). File-on-disk
+      // behavior is unchanged.
+      if (state.closed || this.sessions.get(sessionId) !== state) {
+        this.logger.info("browser_download_after_close_dropped", { sessionId, path: relPath, url: download.url() });
+        return;
+      }
       state.pendingDownloads.push({ path: relPath, filename: safeName, url: download.url() });
       this.logger.info("browser_download", { sessionId, path: relPath, url: download.url() });
     } catch (error) {
@@ -500,6 +569,10 @@ export class BrowserSession {
   async closeSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    // Mark closed BEFORE detaching so an in-flight handleDownload whose saveAs()
+    // resolves after this point deliberately drops its record instead of pushing
+    // onto an orphaned array drainDownloads can never reach (issue #14).
+    state.closed = true;
     this.sessions.delete(sessionId);
     for (const page of state.pages) {
       await page.close().catch(() => {});
@@ -509,16 +582,24 @@ export class BrowserSession {
   private startSweeper(): void {
     if (this.sweeper) return;
     this.sweeper = setInterval(() => {
-      void this.sweepIdle();
+      void this.sweepIdleNow();
     }, SWEEP_INTERVAL_MS);
     // Don't keep the event loop alive solely for the sweeper.
     this.sweeper.unref?.();
   }
 
-  private async sweepIdle(): Promise<void> {
+  /**
+   * Test seam (issues #1/#22): run one idle-sweep pass synchronously instead of
+   * waiting for the 30s interval. The production interval calls exactly this.
+   */
+  async sweepIdleNow(): Promise<void> {
     const now = Date.now();
     const idleMs = this.config.session_page_idle_ms;
     for (const [sessionId, state] of this.sessions) {
+      // Never reap a session with an operation in flight (issue #1): closing its
+      // page mid-op surfaces a confusing "Target closed" instead of a clean
+      // timeout. A busy session is by definition not idle.
+      if (state.inFlight > 0) continue;
       if (now - state.lastUsed >= idleMs) {
         this.logger.debug("browser_session_idle_close", { sessionId, idleMs });
         await this.closeSession(sessionId);
