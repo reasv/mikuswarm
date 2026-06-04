@@ -176,7 +176,11 @@ export function isTimeoutError(error: unknown): boolean {
 // params) isn't misclassified. Empirical confirmation of the exact thrown error
 // lives in the docker integration test (test/browser.docker.test.ts).
 const ARIA_REF_RE = /aria-ref/i;
-const REF_UNRESOLVED_RE = /not found|no node|cannot find|no element|resolve|unable to|did not match/i;
+// Match only genuine "the ref points at nothing" phrasings. Deliberately NOT
+// matching the generic "resolve"/"unable to" — `aria-ref=eN` is echoed in nearly
+// every locator error message, so a strict-mode "...resolved to 2 elements"
+// violation (a real, non-stale error) would otherwise be misclassified.
+const REF_UNRESOLVED_RE = /not found|no node|cannot find|no element|did not match/i;
 
 /** Map Playwright errors to structured BrowserErrors. */
 export function mapError(error: unknown, refUsed: boolean, ref?: string): BrowserError {
