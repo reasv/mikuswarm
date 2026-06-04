@@ -21,6 +21,7 @@ import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import type { ContextMessage } from "./context/builder.js";
 import {
+  createBrowserTool,
   createChannelInfoTool,
   createCreatePollTool,
   createDanbooruTool,
@@ -63,6 +64,7 @@ import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsyst
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
+import { BrowserSession } from "./browser/index.js";
 import { getConfiguredTimezone } from "./time/index.js";
 
 export interface MikuAgentRuntime {
@@ -133,6 +135,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       execTimeoutMs: config.sandbox.exec_timeout_ms,
       maxOutputBytes: config.sandbox.max_output_bytes,
       logger: logger.child("sandbox"),
+    });
+  }
+
+  // Browser-use backend (spec/BROWSER-USE.md). Unlike the sandbox, this does NOT
+  // connect or fail-fast at startup: the CloakBrowser-Manager is an operator-run
+  // service the harness only reaches lazily on first browser-tool use, degrading
+  // gracefully if it is down (§3.4). Constructing the manager here just holds
+  // config + the per-session tab map; no I/O happens until a tool runs.
+  let browserSession: BrowserSession | undefined;
+  if (config.browser?.enabled) {
+    browserSession = new BrowserSession({
+      config: config.browser,
+      agentTimezone: getConfiguredTimezone(),
+      workspaceRoot,
+      logger: logger.child("browser"),
     });
   }
 
@@ -758,6 +775,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
       createWebSearchTool(),
+      ...(browserSession && config.browser
+        ? [createBrowserTool({ session: browserSession, agentSessionId: session.id, config: config.browser })]
+        : []),
       // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.
       // Clamps in resolveMaxCharacters (50KB–512KB) bound the impact, so a mismatch only shifts the cap within those limits.
       createTextEditorTool({ workspaceRoot, contextWindowTokens: config.models.default.context_window }),
@@ -890,6 +910,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       .finally(() => {
         captureHandle.detach();
         activeRuns.delete(run);
+        // Close this session's browser tab(s) when the run settles (the idle
+        // sweeper is only a backstop). Fire-and-forget; never block completion.
+        if (browserSession) {
+          void browserSession.closeSession(session.id).catch((error) => {
+            logger.warn("browser_session_close_failed", {
+              sessionId: session.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
         if (draining) return;
         const next = triggerCoordinator.complete(session.timelineKey);
         if (next) void launchSession(next, true).catch((error) => {
@@ -1048,6 +1078,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();
         await waitForRuns(activeRuns);
+        // After in-flight runs drain, disconnect the browser (closes our CDP link
+        // and any lingering tabs; does NOT stop the operator-run Manager).
+        if (browserSession) await browserSession.shutdown();
         // After in-flight runs (and their bash execs) drain, release the sandbox.
         if (sandbox) await sandbox.shutdown({ stop: config.sandbox?.stop_on_shutdown ?? false });
         await storage.waitForIdle();

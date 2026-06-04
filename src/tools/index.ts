@@ -1,5 +1,6 @@
 export { createSendMessageTool, type SendMessageToolContext } from "./send-message.js";
 export { createDelegateToSessionTool, type DelegateToolContext } from "./delegate.js";
+export { createBrowserTool, type BrowserToolContext } from "./browser.js";
 export {
   createSearchFilesTool,
   createTextEditorTool,
