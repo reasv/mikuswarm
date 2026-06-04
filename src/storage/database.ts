@@ -3727,6 +3727,15 @@ create index if not exists idx_timeline_events_enrichment
 create index if not exists idx_timeline_events_updated
   on timeline_events(updated_at, id);
 
+-- Pipeline monitor: status-filtered keyset pagination ("what is failing?"). The
+-- pre-existing partial index only covers pending/processing; a status=failed /
+-- complete / skipped list must filter+sort without a full scan, so a non-partial
+-- composite ordered to match the keyset sort (status, updated_at, id) is needed
+-- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
+-- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
+create index if not exists idx_timeline_events_status_updated
+  on timeline_events(enrichment_status, updated_at, id);
+
 create index if not exists idx_timeline_events_trigger_group
   on timeline_events(trigger_group_id)
   where trigger_group_id is not null;
@@ -3833,6 +3842,15 @@ create index if not exists idx_media_assets_caption_eligible
 create index if not exists idx_media_assets_updated
   on media_assets(updated_at, id);
 
+-- Pipeline monitor: status-filtered keyset pagination ("what is failing?"). The
+-- pre-existing partial index only covers pending/processing; a status=failed /
+-- complete / skipped list must filter+sort without a full scan, so a non-partial
+-- composite ordered to match the keyset sort (status, updated_at, id) is needed
+-- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
+-- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
+create index if not exists idx_media_assets_status_updated
+  on media_assets(caption_status, updated_at, id);
+
 create table if not exists summaries (
   id text primary key,
   timeline_key text not null,
@@ -3876,6 +3894,15 @@ create index if not exists idx_summaries_diary
 -- (ARCHITECTURE.md §11).
 create index if not exists idx_summaries_diary_list
   on summaries(latest_timestamp, id)
+  where diary_status is not null;
+
+-- Pipeline monitor: status-filtered keyset pagination of the diary queue ("what is
+-- failing?"). The diary list sorts by latest_timestamp (summaries has no
+-- updated_at), so the composite is (diary_status, latest_timestamp, id), partial on
+-- the diary-bearing rows to mirror idx_summaries_diary_list (spec §3.4;
+-- ARCHITECTURE.md §11). (Does not cover getPipelineCounts — see §11 perf note.)
+create index if not exists idx_summaries_diary_status_updated
+  on summaries(diary_status, latest_timestamp, id)
   where diary_status is not null;
 
 create table if not exists summary_events (
@@ -3928,6 +3955,14 @@ create index if not exists idx_summarization_jobs_timeline
 -- on (updated_at, id) across full history (ARCHITECTURE.md §11).
 create index if not exists idx_summarization_jobs_updated
   on summarization_jobs(updated_at, id);
+
+-- Pipeline monitor: status-filtered keyset pagination ("what is failing?"). The
+-- pre-existing partial index only covers pending/processing; a status=failed /
+-- complete list must filter+sort without a full scan, so a non-partial composite
+-- ordered to match the keyset sort (status, updated_at, id) is needed (spec §3.4;
+-- ARCHITECTURE.md §11). (Does not cover getPipelineCounts — see §11 perf note.)
+create index if not exists idx_summarization_jobs_status_updated
+  on summarization_jobs(status, updated_at, id);
 
 -- Edits (m.replace) that arrived/decrypted BEFORE their target message was
 -- stored (plausible during backfill or out-of-order sync). The live/decrypt edit
@@ -3993,7 +4028,7 @@ ${RETRIEVAL_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 9;
+export const LATEST_SCHEMA_VERSION = 10;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -4159,6 +4194,33 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          on summarization_jobs(updated_at, id);
        create index if not exists idx_summaries_diary_list
          on summaries(latest_timestamp, id)
+         where diary_status is not null;`,
+    );
+  },
+  // index 9 (v9 -> v10): add the per-pool status-filtered keyset-pagination indexes
+  // (spec §3.4). The v9 step added only (updated_at, id) covering indexes; a
+  // status=failed / complete / skipped list (the monitor's "what is failing?" view)
+  // had no index for filter+sort and full-scanned the large enrichment/captioning
+  // tables. These non-partial composites are ordered to match the keyset sort
+  // (status, sort, id) so a status-filtered page reads only its window from the
+  // index (review issues #2/#8). These do NOT cover getPipelineCounts, whose
+  // pending/retrying split reads the uncovered attempts column (deliberate; the 5s
+  // count poll keeps its full scan — see the §11 perf note). diary sorts by
+  // latest_timestamp (summaries
+  // has no updated_at) and is partial on diary-bearing rows, mirroring
+  // idx_summaries_diary_list. All `if not exists`, so a forward path that already
+  // created any is harmless. Fresh DBs get these directly from SCHEMA above and
+  // never run this step.
+  (db) => {
+    db.exec(
+      `create index if not exists idx_timeline_events_status_updated
+         on timeline_events(enrichment_status, updated_at, id);
+       create index if not exists idx_media_assets_status_updated
+         on media_assets(caption_status, updated_at, id);
+       create index if not exists idx_summarization_jobs_status_updated
+         on summarization_jobs(status, updated_at, id);
+       create index if not exists idx_summaries_diary_status_updated
+         on summaries(diary_status, latest_timestamp, id)
          where diary_status is not null;`,
     );
   },
