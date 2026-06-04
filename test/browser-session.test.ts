@@ -91,6 +91,8 @@ function makeFakeBrowser(): FakeBrowser {
 interface ManagerStubOptions {
   profiles?: Array<{ id: string; name: string; status: string }>;
   status?: string; // status returned by GET .../status
+  /** Successive statuses returned by GET .../status (overrides `status`). Last value sticks. */
+  statusSequence?: string[];
   throwOnFetch?: boolean;
 }
 
@@ -115,7 +117,11 @@ function stubManager(opts: ManagerStubOptions = {}): ManagerStub {
       return new Response(JSON.stringify({ id: "p1", name: body.name, fingerprint_seed: 1, status: "stopped", cdp_url: null }), { status: 201 });
     }
     if (method === "GET" && /\/status$/.test(url)) {
-      return new Response(JSON.stringify({ status: opts.status ?? "stopped", cdp_url: null }), { status: 200 });
+      let status = opts.status ?? "stopped";
+      if (opts.statusSequence && opts.statusSequence.length > 0) {
+        status = opts.statusSequence.length > 1 ? opts.statusSequence.shift()! : opts.statusSequence[0]!;
+      }
+      return new Response(JSON.stringify({ status, cdp_url: null }), { status: 200 });
     }
     if (method === "POST" && /\/launch$/.test(url)) {
       return new Response(JSON.stringify({ profile_id: "p1", status: "running", vnc_ws_port: 6100, display: ":100" }), { status: 200 });
@@ -242,6 +248,117 @@ test("session: transparently reconnects after the browser disconnects", async ()
       const page = await session.getActivePage("s1");
       assert.ok(page);
       assert.equal(connectCount, 2);
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #5: a late disconnect from an OLD browser does not clobber the new connection", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const browsers: FakeBrowser[] = [];
+    const connect: ConnectOverCdp = async () => {
+      const b = makeFakeBrowser();
+      browsers.push(b);
+      return b as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    };
+    const session = new BrowserSession({ config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      // First connection (browser A), with a live tab.
+      await session.getActivePage("s1");
+      assert.equal(browsers.length, 1);
+      // A disconnects → forces a reconnect to browser B on next use.
+      browsers[0]!._disconnect();
+      await session.getActivePage("s1");
+      assert.equal(browsers.length, 2, "reconnected to a new browser");
+      assert.equal((await session.listTabs("s1")).length, 1, "B has the session's tab");
+      // A late, stale disconnect from the OLD browser A must NOT wipe B's state.
+      browsers[0]!._disconnect();
+      assert.equal((await session.listTabs("s1")).length, 1, "B's tab survives the stale disconnect");
+      // And no spurious reconnect: still on browser B.
+      await session.getActivePage("s1");
+      assert.equal(browsers.length, 2, "no spurious reconnect after stale disconnect");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #6: concurrent getActivePage for one session opens exactly one tab", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const browser = makeFakeBrowser();
+    const connect: ConnectOverCdp = async () => browser as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    const session = new BrowserSession({ config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      const [a, b] = await Promise.all([session.getActivePage("s1"), session.getActivePage("s1")]);
+      assert.equal(a, b, "both calls resolve to the same page");
+      assert.equal((await session.listTabs("s1")).length, 1, "exactly one tab created");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #9: a 401 on the CDP connect surfaces as auth_failed (not connect_failed)", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    const connect: ConnectOverCdp = async () => { throw new Error("WebSocket error: Unexpected server response: 401 Unauthorized"); };
+    const session = new BrowserSession({ config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      await assert.rejects(
+        () => session.getActivePage("s1"),
+        (err: unknown) => isBrowserError(err) && err.code === "auth_failed",
+      );
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #12: two rapid failing connects within the cooldown only hit the Manager once", async () => {
+  await withWorkspace(async (ws) => {
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+    let connectAttempts = 0;
+    const connect: ConnectOverCdp = async () => { connectAttempts++; throw new Error("ECONNRESET during CDP upgrade"); };
+    const session = new BrowserSession({ config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      await assert.rejects(() => session.getActivePage("s1"), (err: unknown) => isBrowserError(err) && err.code === "connect_failed");
+      const callsAfterFirst = manager.calls.length;
+      // Second attempt within the cooldown window: returns the cached error,
+      // re-hitting neither connectOverCDP nor the Manager.
+      await assert.rejects(() => session.getActivePage("s1"), (err: unknown) => isBrowserError(err) && err.code === "connect_failed");
+      assert.equal(connectAttempts, 1, "connectOverCDP attempted only once within the cooldown");
+      assert.equal(manager.calls.length, callsAfterFirst, "Manager not re-hit within the cooldown");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #13: a cold start (stopped→running) succeeds on the first call via the readiness poll", async () => {
+  await withWorkspace(async (ws) => {
+    // Profile is stopped, so a launch is issued and the cold-start poll engages.
+    const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "stopped" }], statusSequence: ["stopped", "running"] });
+    let attempts = 0;
+    const connect: ConnectOverCdp = async () => {
+      attempts++;
+      // First post-launch attempt fails (not CDP-ready yet); the poll retries.
+      if (attempts === 1) throw new Error("connect ECONNREFUSED 127.0.0.1:9222");
+      return makeFakeBrowser() as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+    };
+    // Keep the budget comfortably above one poll interval.
+    const session = new BrowserSession({ config: baseConfig({ connect_timeout_ms: 5000 }), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+    try {
+      const page = await session.getActivePage("s1");
+      assert.ok(page, "first call succeeds without surfacing a failed call");
+      assert.ok(attempts >= 2, "the poll retried connectOverCDP until ready");
     } finally {
       manager.restore();
       await session.shutdown();

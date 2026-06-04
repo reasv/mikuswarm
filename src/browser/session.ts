@@ -38,6 +38,12 @@ interface SessionState {
   lastUsed: number;
   /** Downloads captured since the last drain, surfaced in tool results. */
   pendingDownloads: DownloadRecord[];
+  /**
+   * In-flight lazy creation of this session's first tab. Single-flights
+   * concurrent getActivePage() callers so they share one tab instead of each
+   * racing to open one (mirrors connectPromise). Cleared on settle.
+   */
+  firstPagePromise?: Promise<void>;
 }
 
 /** Connect to a CDP endpoint. Injectable so tests can supply a fake browser. */
@@ -59,6 +65,21 @@ export interface BrowserSessionOptions {
 
 const SWEEP_INTERVAL_MS = 30_000;
 
+/**
+ * After a failed connect, suppress reconnect attempts arriving within this
+ * window by re-throwing the cached failure WITHOUT re-hitting the Manager.
+ * Caps reconnect-thrash against a flapping Manager (issue #12). Pacing of
+ * subsequent retries is otherwise left to the model's own cadence.
+ */
+const CONNECT_COOLDOWN_MS = 2_000;
+
+/**
+ * While waiting for a cold-started profile to become CDP-ready, poll the
+ * Manager's status at this cadence (issue #13). The total wait is bounded by
+ * connect_timeout_ms, not by this interval.
+ */
+const LAUNCH_POLL_INTERVAL_MS = 500;
+
 export class BrowserSession {
   private readonly config: BrowserConfig;
   private readonly agentTimezone: string;
@@ -70,6 +91,14 @@ export class BrowserSession {
   private connectPromise: Promise<BrowserContext> | undefined;
   private browser: Browser | undefined;
   private context: BrowserContext | undefined;
+
+  /**
+   * Wall-clock of the last failed connect() and the error it produced. Used to
+   * short-circuit reconnects within CONNECT_COOLDOWN_MS so a flapping Manager
+   * isn't hammered (issue #12). Reset on a successful connect.
+   */
+  private lastConnectFailureAt = 0;
+  private lastConnectError: BrowserError | undefined;
 
   private readonly sessions = new Map<string, SessionState>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
@@ -101,37 +130,50 @@ export class BrowserSession {
   private async ensureContext(): Promise<BrowserContext> {
     if (this.closed) throw new BrowserError("backend_unavailable", "Browser backend is shutting down.");
     if (this.context && this.browser?.isConnected()) return this.context;
-    this.connectPromise ??= this.connect().catch((error) => {
-      // Allow a later retry after a failed connect.
-      this.connectPromise = undefined;
-      throw error;
-    });
+    // Reconnect cooldown (issue #12): if a recent connect failed, re-throw the
+    // cached error without re-hitting the Manager. Never blocks the first
+    // connect (lastConnectError is undefined until a failure is recorded).
+    if (this.lastConnectError && Date.now() - this.lastConnectFailureAt < CONNECT_COOLDOWN_MS) {
+      throw this.lastConnectError;
+    }
+    this.connectPromise ??= this.connect().then(
+      (context) => {
+        // Successful connect clears any prior failure cooldown.
+        this.lastConnectFailureAt = 0;
+        this.lastConnectError = undefined;
+        return context;
+      },
+      (error) => {
+        // Record the failure for the cooldown and allow a later retry.
+        this.lastConnectFailureAt = Date.now();
+        this.lastConnectError =
+          error instanceof BrowserError
+            ? error
+            : new BrowserError("connect_failed", error instanceof Error ? error.message : String(error), { cause: error });
+        this.connectPromise = undefined;
+        throw error;
+      },
+    );
     return this.connectPromise;
   }
 
   private async connect(): Promise<BrowserContext> {
     const profile = await this.resolveOrCreateProfile();
-    await this.ensureLaunched(profile.id);
+    const launched = await this.ensureLaunched(profile.id);
 
     const cdpEndpoint = `${this.manager.base}/api/profiles/${encodeURIComponent(profile.id)}/cdp`;
     const headers = this.config.auth_token
       ? { Authorization: `Bearer ${this.config.auth_token}` }
       : undefined;
 
-    let browser: Browser;
-    try {
-      browser = await this.connectOverCdp(cdpEndpoint, {
-        headers,
-        timeout: this.config.connect_timeout_ms,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new BrowserError(
-        "connect_failed",
-        `connectOverCDP to the CloakBrowser-Manager failed (${message}). The profile may still be warming up — retry shortly.`,
-        { cause: error },
-      );
-    }
+    // If we just issued a launch, Chromium may not be CDP-ready the instant the
+    // Manager accepts the request, so poll until ready or connect_timeout_ms
+    // elapses — letting a genuine cold start succeed on the FIRST tool call
+    // instead of costing one guaranteed-failed call (issue #13). When the
+    // profile was already running we connect once with no extra wait (fast path).
+    const browser = launched
+      ? await this.connectColdStart(profile.id, cdpEndpoint, headers)
+      : await this.connectCdp(cdpEndpoint, headers, this.config.connect_timeout_ms);
 
     const contexts = browser.contexts();
     const context = contexts[0];
@@ -142,7 +184,14 @@ export class BrowserSession {
 
     // Reconnect-on-drop: clear the cache so the next ensureContext() reconnects.
     // Per-session pages are dead once the socket drops, so drop their state too.
+    // Guard on identity (issue #5): a late disconnect from an OLD browser must
+    // not clobber a newer connection we've since established. Only clear shared
+    // state if it still points at the browser whose socket just dropped.
     browser.on("disconnected", () => {
+      if (this.browser !== browser) {
+        this.logger.debug("browser_disconnected_stale");
+        return;
+      }
       this.logger.warn("browser_disconnected");
       this.browser = undefined;
       this.context = undefined;
@@ -155,6 +204,79 @@ export class BrowserSession {
     this.startSweeper();
     this.logger.info("browser_connected", { profileId: profile.id, cdpEndpoint });
     return context;
+  }
+
+  /**
+   * Single connectOverCDP attempt, mapping the underlying failure to an
+   * actionable BrowserError: 401/unauthorized → auth_failed (retrying won't
+   * fix auth, issue #9), everything else → connect_failed ("warming up").
+   */
+  private async connectCdp(
+    cdpEndpoint: string,
+    headers: Record<string, string> | undefined,
+    timeoutMs: number,
+  ): Promise<Browser> {
+    try {
+      return await this.connectOverCdp(cdpEndpoint, { headers, timeout: timeoutMs });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A 401 on the CDP WebSocket upgrade is an auth problem, not a cold start —
+      // retrying won't fix it, so surface auth_failed rather than connect_failed
+      // (issue #9). REST normally 401s first, but the WS path can 401 alone.
+      if (/\b401\b|unauthorized/i.test(message)) {
+        throw new BrowserError(
+          "auth_failed",
+          `CloakBrowser-Manager rejected the CDP connection (401 Unauthorized: ${message}). Check that [browser].auth_token matches the Manager's AUTH_TOKEN.`,
+          { cause: error },
+        );
+      }
+      throw new BrowserError(
+        "connect_failed",
+        `connectOverCDP to the CloakBrowser-Manager failed (${message}). The profile may still be warming up — retry shortly.`,
+        { cause: error },
+      );
+    }
+  }
+
+  /**
+   * Connect after a cold-start launch: poll connectOverCDP (interleaved with a
+   * short wait) until the profile is CDP-ready or connect_timeout_ms elapses
+   * (issue #13). A non-auth connect failure is treated as "not ready yet" and
+   * retried within budget; auth_failed is fatal immediately (retrying won't
+   * help). If the whole budget is exhausted, the last connect_failed
+   * ("warming up") is surfaced so the model can retry on its own cadence.
+   */
+  private async connectColdStart(
+    profileId: string,
+    cdpEndpoint: string,
+    headers: Record<string, string> | undefined,
+  ): Promise<Browser> {
+    const deadline = Date.now() + this.config.connect_timeout_ms;
+    let lastError: BrowserError | undefined;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw (
+          lastError ??
+          new BrowserError(
+            "connect_failed",
+            `Browser profile did not become CDP-ready within ${this.config.connect_timeout_ms}ms (warming up). Retry shortly.`,
+          )
+        );
+      }
+      try {
+        return await this.connectCdp(cdpEndpoint, headers, remaining);
+      } catch (error) {
+        // Auth failures won't resolve by waiting — surface immediately.
+        if (error instanceof BrowserError && error.code === "auth_failed") throw error;
+        lastError = error instanceof BrowserError ? error : undefined;
+        this.logger.debug("browser_cold_start_poll", { profileId });
+      }
+      // Wait before the next attempt, but never past the deadline.
+      const wait = Math.min(LAUNCH_POLL_INTERVAL_MS, deadline - Date.now());
+      if (wait <= 0) continue;
+      await delay(wait);
+    }
   }
 
   /** Resolve the persistent profile by name; create it (idempotently) if absent. */
@@ -192,12 +314,18 @@ export class BrowserSession {
     }
   }
 
-  /** Ensure the profile is running (launch if stopped; 409 already-running is fine). */
-  private async ensureLaunched(profileId: string): Promise<void> {
+  /**
+   * Ensure the profile is running (launch if stopped; 409 already-running is
+   * fine). Returns true iff a launch was actually issued — the caller uses this
+   * to decide whether a post-launch readiness poll is needed (issue #13). An
+   * already-running profile returns false and skips the poll (fast path).
+   */
+  private async ensureLaunched(profileId: string): Promise<boolean> {
     const status = await this.manager.getStatus(profileId);
-    if (status.status === "running") return;
+    if (status.status === "running") return false;
     this.logger.info("browser_profile_launching", { profileId });
     await this.manager.launch(profileId);
+    return true;
   }
 
   // ── Per-session tab management ───────────────────────────────────────────
@@ -225,13 +353,21 @@ export class BrowserSession {
    * lazily (and reconnecting / recreating transparently after a drop).
    */
   async getActivePage(sessionId: string): Promise<Page> {
-    const context = await this.ensureContext();
+    await this.ensureContext();
     const state = this.getOrCreateState(sessionId);
     state.lastUsed = Date.now();
     this.compact(state);
     if (state.pages.length === 0) {
-      await this.openTab(sessionId);
-      return state.pages[state.activeIndex]!;
+      // Single-flight lazy first-tab creation (issue #6): two concurrent calls
+      // both seeing pages.length === 0 must share ONE openTab, not each open a
+      // tab. Mirror the connectPromise pattern; clear on settle so a failed
+      // creation can be retried.
+      state.firstPagePromise ??= this.openTab(sessionId)
+        .then(() => undefined)
+        .finally(() => {
+          state.firstPagePromise = undefined;
+        });
+      await state.firstPagePromise;
     }
     return state.pages[state.activeIndex]!;
   }
@@ -405,6 +541,11 @@ export class BrowserSession {
     }
     this.connectPromise = undefined;
   }
+}
+
+/** Promise-based sleep, used by the cold-start readiness poll. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Filesystem-safe session id for the per-session download directory. */
