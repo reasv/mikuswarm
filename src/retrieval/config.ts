@@ -54,9 +54,12 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
   const embedding = config?.embedding ?? {};
   const remoteBlock = embedding.remote;
 
-  // Active-model resolution (§5a): a configured remote block wins; otherwise local.
-  // An explicit `provider="remote"` with no resolvable block is a fail-fast handled
-  // by the caller (§10), not silently downgraded here.
+  // Active-model resolution (§5a): an explicit `provider` wins; an unset `provider`
+  // defaults to remote when a resolvable `[remote]` block is present, else local. So
+  // `provider="local"` with a populated `[remote]` block runs local (the explicit knob
+  // is honored) — `createRetrievalSubsystem` warns about that likely-misconfiguration
+  // without being fatal (#14). An explicit `provider="remote"` with no resolvable block
+  // is a fail-fast handled by the caller (§10), not silently downgraded here.
   const provider: "local" | "remote" =
     embedding.provider === "remote" || (embedding.provider === undefined && remoteBlock)
       ? "remote"

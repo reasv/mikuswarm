@@ -48,6 +48,17 @@ export async function createRetrievalSubsystem(
     );
   }
 
+  // Likely-misconfiguration warn (#14): explicit `provider="local"` honors the knob and
+  // runs local, but a populated [remote] block alongside it is silently inert — the
+  // operator probably meant to use it. Warn (not fatal — local still wins) so the
+  // asymmetry with the remote-without-block fail-fast above is visible.
+  if (config.embedding.provider === "local" && config.embedding.remote) {
+    logger?.warn("retrieval_remote_block_ignored", {
+      remoteModel: config.embedding.remote.id,
+      note: "provider is 'local' so the configured [retrieval.embedding.remote] block is ignored; set provider='remote' (or unset it) to use the remote model",
+    });
+  }
+
   let provider: EmbeddingProvider | undefined;
   let vectorStore: VectorStore | undefined;
   let embedWorker: EmbedWorkerPool | undefined;
