@@ -105,6 +105,13 @@ export class MemorySearch {
 
   async search(opts: SearchOptions): Promise<SearchOutcome> {
     await this.indexer.ensureFreshForQuery();
+    // Temporal-decay anchor. Callers that need determinism across context rebuilds
+    // and replay (auto-retrieval, diary) pass `opts.now` = the trigger timestamp so
+    // the cache-stable layers stay byte-identical (review issue #15). The
+    // `recall_memory` tool intentionally omits `now` and falls through to wall-clock
+    // `Date.now()`: it is a live, one-shot agent action reasoning in the present, not
+    // a cached context layer, so the determinism rationale does not apply — anchoring
+    // its decay on "now" is the correct behavior.
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const candidateLimit = Math.max(opts.maxResults, opts.maxResults * q.candidateMultiplier);

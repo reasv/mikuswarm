@@ -102,6 +102,10 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
         after?: string;
         before?: string;
       };
+      // No `now` passed: the tool intentionally anchors temporal decay on wall-clock
+      // `Date.now()` (search.ts default). It is a live, one-shot agent action that
+      // reasons in the present — unlike the cache-stable auto-retrieval/diary layers,
+      // which anchor on trigger time for determinism (review issue #15).
       const outcome = await context.search.search({
         query: args.query,
         maxResults: args.max_results ?? context.defaults.maxResults,
