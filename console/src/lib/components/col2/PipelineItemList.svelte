@@ -26,7 +26,17 @@
 		() => pipelineSelection.pool,
 		() => ({ status: pipelineSelection.status, room: pipelineSelection.room })
 	);
-	const allItems = $derived(items.data?.pages.flatMap((p) => p.items) ?? []);
+	// De-dupe by id when flattening pages: the 5s `refetchInterval` refetches every loaded
+	// page with its originally-captured keyset cursor, so a boundary item whose `updatedAt`
+	// changes between cursors can satisfy two adjacent page windows at once and surface
+	// twice. Svelte's keyed `{#each … (item.id)}` throws on a duplicate key. Pages are
+	// reverse-chron, so the first occurrence is the fresher position — keep it.
+	const allItems = $derived.by(() => {
+		const seen = new Set<string>();
+		return (items.data?.pages.flatMap((p) => p.items) ?? []).filter(
+			(i) => !seen.has(i.id) && seen.add(i.id)
+		);
+	});
 
 	// Reuse the (cached) dashboard feed for the selected pool's failed count → the
 	// bulk "retry all failed" affordance.
