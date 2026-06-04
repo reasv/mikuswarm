@@ -40,6 +40,12 @@ interface SessionState {
   pendingDownloads: DownloadRecord[];
 }
 
+/** Connect to a CDP endpoint. Injectable so tests can supply a fake browser. */
+export type ConnectOverCdp = (
+  endpoint: string,
+  options: { headers?: Record<string, string>; timeout: number },
+) => Promise<Browser>;
+
 export interface BrowserSessionOptions {
   config: BrowserConfig;
   /** Fallback timezone (agent.timezone) when config.timezone is unset. */
@@ -47,6 +53,8 @@ export interface BrowserSessionOptions {
   /** Absolute workspace root; downloads are saved beneath it. */
   workspaceRoot: string;
   logger: Logger;
+  /** Override the CDP connector (tests). Defaults to chromium.connectOverCDP. */
+  connectOverCdp?: ConnectOverCdp;
 }
 
 const SWEEP_INTERVAL_MS = 30_000;
@@ -66,12 +74,16 @@ export class BrowserSession {
   private readonly sessions = new Map<string, SessionState>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
   private closed = false;
+  private readonly connectOverCdp: ConnectOverCdp;
 
   constructor(opts: BrowserSessionOptions) {
     this.config = opts.config;
     this.agentTimezone = opts.agentTimezone;
     this.workspaceRoot = opts.workspaceRoot;
     this.logger = opts.logger;
+    this.connectOverCdp =
+      opts.connectOverCdp ??
+      ((endpoint, options) => chromium.connectOverCDP(endpoint, options));
     this.manager = new ManagerClient({
       baseUrl: opts.config.manager_url,
       authToken: opts.config.auth_token,
@@ -108,7 +120,7 @@ export class BrowserSession {
 
     let browser: Browser;
     try {
-      browser = await chromium.connectOverCDP(cdpEndpoint, {
+      browser = await this.connectOverCdp(cdpEndpoint, {
         headers,
         timeout: this.config.connect_timeout_ms,
       });
