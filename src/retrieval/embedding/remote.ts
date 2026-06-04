@@ -73,16 +73,39 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
         throw new Error(`embeddings endpoint ${res.status}: ${(await res.text()).slice(0, 200)}`);
       }
       const json = (await res.json()) as EmbeddingsResponse;
-      // Sort by `index` so order matches the input array regardless of API ordering.
-      const sorted = [...json.data].sort((a, b) => a.index - b.index);
-      return sorted.map((d) => {
+      const data = json.data ?? [];
+      // The response must be a complete 0..n-1 permutation of the input: one vector
+      // per input, every index in range, no gaps or dupes. A short/partial/duplicated
+      // -index response would otherwise misalign vectors with content-hashes (silent
+      // corruption of memory_vec + embedding_cache). Validate and route any mismatch
+      // through the normal retry/failed path by throwing, rather than mis-mapping.
+      if (data.length !== input.length) {
+        throw new Error(
+          `embeddings endpoint returned ${data.length} vectors for ${input.length} inputs (${this.options.id})`,
+        );
+      }
+      const out = new Array<Float32Array | undefined>(input.length);
+      for (const d of data) {
+        if (!Number.isInteger(d.index) || d.index < 0 || d.index >= input.length) {
+          throw new Error(
+            `embeddings endpoint returned out-of-range index ${d.index} for ${input.length} inputs (${this.options.id})`,
+          );
+        }
+        if (out[d.index] !== undefined) {
+          throw new Error(
+            `embeddings endpoint returned duplicate index ${d.index} (${this.options.id})`,
+          );
+        }
         if (d.embedding.length !== this.dim) {
           throw new Error(
             `embedding dim ${d.embedding.length} != configured ${this.dim} for ${this.options.id}`,
           );
         }
-        return l2normalize(d.embedding);
-      });
+        out[d.index] = l2normalize(d.embedding);
+      }
+      // Every slot is now filled: length matches and indices are a no-gap, no-dupe
+      // permutation, so the non-null assertion is safe.
+      return out.map((v) => v!);
     } finally {
       clearTimeout(timeout);
     }

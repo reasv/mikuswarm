@@ -67,25 +67,8 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
     // retrieval stays off); the shipped 00-defaults.toml turns it on explicitly.
     enabled: config?.enabled ?? false,
     autoRetrieval: config?.auto_retrieval ?? true,
-    index: {
-      workerCount: index.worker_count ?? 1,
-      maxRetries: index.max_retries ?? 3,
-      embedBatchSize: index.embed_batch_size ?? 32,
-      maxChunkTokens: index.max_chunk_tokens ?? 512,
-      fallbackChunkTokens: index.fallback_chunk_tokens ?? 400,
-      fallbackChunkOverlap: index.fallback_chunk_overlap ?? 80,
-    },
-    query: {
-      maxResults: query.max_results ?? 6,
-      minScore: query.min_score ?? 0.35,
-      vectorWeight: query.vector_weight ?? 0.7,
-      textWeight: query.text_weight ?? 0.3,
-      candidateMultiplier: query.candidate_multiplier ?? 4,
-      mmrEnabled: query.mmr_enabled ?? false,
-      mmrLambda: query.mmr_lambda ?? 0.7,
-      temporalDecayEnabled: query.temporal_decay_enabled ?? true,
-      temporalDecayHalfLifeDays: query.temporal_decay_half_life_days ?? 45,
-    },
+    index: resolveIndex(index),
+    query: resolveQuery(query),
     auto: {
       maxResults: auto.max_results ?? 3,
       minScore: auto.min_score ?? 0.45,
@@ -107,6 +90,70 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
           }
         : null,
     },
+  };
+}
+
+/**
+ * Resolve the `[retrieval.index]` block and fail fast when `fallback_chunk_tokens`
+ * exceeds `max_chunk_tokens` (review issue #14). The chunker sub-splits an oversized
+ * block (> maxChunkTokens) using fallbackChunkTokens as the window; a fallback larger
+ * than the max would yield sub-chunks still over the threshold the split exists to
+ * enforce (possibly over the embedder's input limit). The two knobs have independent
+ * per-field bounds in the TypeBox schema, which can't express this cross-field
+ * relation — so reject it here at config-resolve time rather than silently clamping,
+ * per the project's explicit-deployment-config / fail-fast preference.
+ */
+function resolveIndex(
+  index: NonNullable<RetrievalConfig["index"]>,
+): ResolvedRetrievalConfig["index"] {
+  const maxChunkTokens = index.max_chunk_tokens ?? 512;
+  const fallbackChunkTokens = index.fallback_chunk_tokens ?? 400;
+  if (fallbackChunkTokens > maxChunkTokens) {
+    throw new Error(
+      "Invalid [retrieval.index]: fallback_chunk_tokens " +
+        `(${fallbackChunkTokens}) must be <= max_chunk_tokens (${maxChunkTokens}); ` +
+        "a larger fallback window defeats the oversized-block sub-split and can emit " +
+        "chunks over the embedder's input limit.",
+    );
+  }
+  return {
+    workerCount: index.worker_count ?? 1,
+    maxRetries: index.max_retries ?? 3,
+    embedBatchSize: index.embed_batch_size ?? 32,
+    maxChunkTokens,
+    fallbackChunkTokens,
+    fallbackChunkOverlap: index.fallback_chunk_overlap ?? 80,
+  };
+}
+
+/**
+ * Resolve the `[retrieval.query]` block and fail fast on a zero-sum hybrid weight pair
+ * (review issue #6). With `vector_weight + text_weight == 0` every hybrid score would
+ * collapse to 0 and silently return no results; reject it at config time per the
+ * project's explicit-deployment-config / fail-fast preference.
+ */
+function resolveQuery(
+  query: NonNullable<RetrievalConfig["query"]>,
+): ResolvedRetrievalConfig["query"] {
+  const vectorWeight = query.vector_weight ?? 0.7;
+  const textWeight = query.text_weight ?? 0.3;
+  if (vectorWeight + textWeight <= 0) {
+    throw new Error(
+      "Invalid [retrieval.query]: vector_weight + text_weight must be > 0 " +
+        `(got vector_weight=${vectorWeight}, text_weight=${textWeight}); a zero-sum ` +
+        "weight pair makes every hybrid score 0 and returns no results.",
+    );
+  }
+  return {
+    maxResults: query.max_results ?? 6,
+    minScore: query.min_score ?? 0.35,
+    vectorWeight,
+    textWeight,
+    candidateMultiplier: query.candidate_multiplier ?? 4,
+    mmrEnabled: query.mmr_enabled ?? false,
+    mmrLambda: query.mmr_lambda ?? 0.7,
+    temporalDecayEnabled: query.temporal_decay_enabled ?? true,
+    temporalDecayHalfLifeDays: query.temporal_decay_half_life_days ?? 45,
   };
 }
 

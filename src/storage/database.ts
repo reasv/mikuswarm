@@ -2264,7 +2264,19 @@ export class Storage {
    * metadata are updated in place (text identical → embedding preserved). FTS rows
    * follow via triggers. Runs in one transaction so a search never sees a torn diff.
    */
-  reconcileMemoryChunks(path: string, chunks: MemoryChunkInput[]): Promise<ReconcileResult> {
+  /**
+   * Reconcile a file's chunks into the index (§7). `newChunkStatus` is the
+   * `embed_status` stamped on freshly-inserted chunks: `'pending'` in the normal
+   * (provider-present) path so the embed worker picks them up, or `'skip'` in the
+   * lexical-only path (no active provider) so the pending queue doesn't grow
+   * unbounded (#2). `resetAllEmbeddings()` re-queues `'skip'` rows when a provider
+   * later becomes active, keeping the round-trip consistent (§5a).
+   */
+  reconcileMemoryChunks(
+    path: string,
+    chunks: MemoryChunkInput[],
+    newChunkStatus: "pending" | "skip" = "pending",
+  ): Promise<ReconcileResult> {
     return this.readAndWrite((db) => {
       const existing = db
         .prepare(`select rowid, id, ordinal, start_line, end_line from memory_chunks where path = ?`)
@@ -2283,7 +2295,7 @@ export class Storage {
            text, token_count, content_hash, embed_status, indexed_at
          ) values (
            @id, @path, @ordinal, @source, @startLine, @endLine, @room, @entryTs,
-           @text, @tokenCount, @contentHash, 'pending', @now
+           @text, @tokenCount, @contentHash, @embedStatus, @now
          )`,
       );
       const updateStmt = db.prepare(
@@ -2312,6 +2324,7 @@ export class Storage {
             text: c.text,
             tokenCount: c.tokenCount,
             contentHash: c.contentHash,
+            embedStatus: newChunkStatus,
             now,
           });
           inserted += 1;
@@ -2380,7 +2393,9 @@ export class Storage {
         params.afterTs = opts.afterTs;
       }
       if (opts.beforeTs !== undefined) {
-        clauses.push("c.entry_ts <= @beforeTs");
+        // Exclusive: `beforeTs` is the start of the day AFTER the `before` filter, so
+        // the `before` day is fully inclusive (review issue #12).
+        clauses.push("c.entry_ts < @beforeTs");
         params.beforeTs = opts.beforeTs;
       }
       const rows = db
@@ -2422,7 +2437,8 @@ export class Storage {
         params.push(filters.afterTs);
       }
       if (filters?.beforeTs !== undefined) {
-        clauses.push("entry_ts <= ?");
+        // Exclusive start-of-next-day bound (review issue #12); mirrors searchMemoryLexical.
+        clauses.push("entry_ts < ?");
         params.push(filters.beforeTs);
       }
       const rows = db
@@ -2506,6 +2522,34 @@ export class Storage {
           .prepare(`update memory_chunks set embed_status = 'pending' where embed_status = 'processing'`)
           .run().changes,
     );
+  }
+
+  /**
+   * Delete `memory_vec` rows whose `chunk_id` no longer has a `memory_chunks` row
+   * (#8). A chunk deleted by reconcile *after* `pruneVectors` but *before* the embed
+   * worker's `upsert` leaves an orphan vector with no owning chunk — harmless to
+   * correctness (search filters unmatched KNN hits) but an unbounded space leak.
+   * Run at startup alongside `resetStaleEmbedding`. No-op (returns 0) if `memory_vec`
+   * doesn't exist yet (lexical-only / semantic half never came up).
+   */
+  sweepOrphanVectors(): Promise<number> {
+    return this.write((db) => {
+      const exists =
+        (
+          db
+            .prepare(
+              `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
+            )
+            .get() as { n: number }
+        ).n > 0;
+      if (!exists) return 0;
+      return db
+        .prepare(
+          `delete from memory_vec
+           where chunk_id not in (select rowid from memory_chunks)`,
+        )
+        .run().changes;
+    });
   }
 
   /** Mark a chunk embedded: status='done', record the model it was embedded with. */
@@ -2979,7 +3023,16 @@ create trigger if not exists memory_chunks_ad after delete on memory_chunks begi
   insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
     values ('delete', old.rowid, old.text, old.room);
 end;
-create trigger if not exists memory_chunks_au after update on memory_chunks begin
+-- The update trigger is gated on the FTS-indexed columns (review issue #11): most
+-- memory_chunks updates touch only embed_status/model_id/embed_attempts (the embed
+-- queue), which the lexical index does not care about. Without this WHEN guard every
+-- such update — and resetAllEmbeddings rewrites EVERY row's embed_status — would
+-- delete+reinsert the FTS row needlessly. IS NOT (not <>) so a NULL room is
+-- compared correctly. Changing this DDL means existing DBs that already created the
+-- unguarded trigger need the v7->v8 migration to swap it (see MIGRATIONS).
+create trigger if not exists memory_chunks_au after update on memory_chunks
+  when new.text is not old.text or new.room is not old.room
+begin
   insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
     values ('delete', old.rowid, old.text, old.room);
   insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
@@ -3312,7 +3365,7 @@ ${RETRIEVAL_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 8;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -3435,6 +3488,26 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // get this directly from SCHEMA above and never run this step.
   (db) => {
     db.exec(RETRIEVAL_SCHEMA);
+  },
+  // index 7 (v7 -> v8): re-create the `memory_chunks_au` FTS-sync trigger with a WHEN
+  // guard on the indexed columns (review issue #11). The v6->v7 step created the
+  // trigger WITHOUT the guard, so its `create trigger if not exists` in RETRIEVAL_SCHEMA
+  // is now a no-op for those DBs — they keep the old, unguarded trigger. Drop and
+  // recreate it so existing DBs get the guarded version (fresh DBs build it directly
+  // from RETRIEVAL_SCHEMA and never run this step). The guard makes embed-queue-only
+  // updates (embed_status/model_id/embed_attempts) skip the FTS delete+reinsert; the
+  // index stays correct because text/room changes still resync.
+  (db) => {
+    db.exec(
+      `drop trigger if exists memory_chunks_au;
+       create trigger memory_chunks_au after update on memory_chunks
+         when new.text is not old.text or new.room is not old.room
+       begin
+         insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+           values ('delete', old.rowid, old.text, old.room);
+         insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+       end;`,
+    );
   },
 ];
 

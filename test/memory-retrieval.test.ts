@@ -136,6 +136,61 @@ test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", 
   }
 });
 
+test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that contain its text (issue #18)", () => {
+  configureAgentTimezone(TZ);
+  try {
+    const header = buildDiaryHeader({
+      earliestTimestamp: parseZonedWallClock("2026-04-12 14:00", TZ)!,
+      latestTimestamp: parseZonedWallClock("2026-04-12 15:30", TZ)!,
+      room: "#general",
+    });
+    // A multi-line body laced with emoji and CJK so a token-window boundary lands on
+    // (or beside) a multi-byte character. Many lines so the [startLine,endLine] mapping
+    // is non-trivial and a mis-count would surface.
+    const body = Array.from(
+      { length: 60 },
+      (_, i) => `行 ${i} 🎌 about the launch 🚀 with café notes 日本語 and ümlauts`,
+    ).join("\n");
+    const text = `${header}\n${body}\n`;
+    // Force the oversized path: maxChunkTokens below the block's size so it sub-splits,
+    // and a fallback window small enough to yield several sub-chunks (≥2).
+    const chunks = chunkMemoryFile({
+      relativePath: "memory/2026-04-12.md",
+      text,
+      fileDate: "2026-04-12",
+      fallbackTimestamp: 0,
+      maxChunkTokens: 40,
+      fallbackChunkTokens: 30,
+      fallbackChunkOverlap: 6,
+    });
+    assert.ok(chunks.length >= 2, `oversized multi-byte block should sub-split, got ${chunks.length}`);
+
+    // Re-read the file by 1-indexed line number; each chunk's reported [startLine,endLine]
+    // span must actually contain its text. This guards splitByTokens' char offsets +
+    // chunk.ts' lineAt/emit mapping against multi-byte miscounting. The span is
+    // reconstructed preserving line terminators (a chunk may begin/end mid-line and its
+    // text can include a trailing newline), so `splitLines` keeps each line's own "\n".
+    const splitLines = text.split(/(?<=\n)/); // keep the terminating newline on each line
+    const lineCount = text.split("\n").length;
+    for (const c of chunks) {
+      assert.ok(c.startLine >= 1, `startLine must be 1-indexed, got ${c.startLine}`);
+      assert.ok(c.endLine >= c.startLine, `endLine ≥ startLine, got [${c.startLine},${c.endLine}]`);
+      assert.ok(c.endLine <= lineCount, `endLine ${c.endLine} within file (${lineCount} lines)`);
+      // Lines are 1-indexed inclusive; slice is 0-indexed half-open.
+      const span = splitLines.slice(c.startLine - 1, c.endLine).join("");
+      assert.ok(
+        span.includes(c.text),
+        `chunk text must lie within lines [${c.startLine},${c.endLine}]\n` +
+          `--- chunk.text ---\n${JSON.stringify(c.text)}\n--- span ---\n${JSON.stringify(span)}`,
+      );
+    }
+    // Sanity: at least one chunk actually carries multi-byte content (the test is real).
+    assert.ok(chunks.some((c) => /[🎌🚀日本語café]/u.test(c.text)), "chunks should retain multi-byte content");
+  } finally {
+    resetAgentTimezone();
+  }
+});
+
 test("chunkMemoryFile: header-less legacy file falls back to token windows", () => {
   const chunks = chunkMemoryFile({
     relativePath: "memory/legacy.md",

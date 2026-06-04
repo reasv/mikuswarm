@@ -79,7 +79,16 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
     parameters: Type.Object({
       query: Type.String({ minLength: 1 }),
       max_results: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
-      min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      min_score: Type.Optional(
+        Type.Number({
+          minimum: 0,
+          maximum: 1,
+          description:
+            "Absolute relevance floor in [0,1]; results scoring below it are dropped. " +
+            "It is an absolute quality cut, not a within-results rank cut — a weak lone " +
+            "match scores low and may return nothing. Default ~0.35. Lower to widen, raise to tighten.",
+        }),
+      ),
       room: Type.Optional(Type.String()),
       after: Type.Optional(Type.String({ description: "YYYY-MM-DD inclusive lower bound" })),
       before: Type.Optional(Type.String({ description: "YYYY-MM-DD inclusive upper bound" })),
@@ -107,6 +116,7 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
         details: {
           mode: outcome.mode,
           degraded: outcome.degraded,
+          ignoredDateBounds: outcome.ignoredDateBounds,
           count: outcome.results.length,
           results: outcome.results,
         },
@@ -117,11 +127,19 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
 
 function renderRecallResults(
   results: RetrievalResult[],
-  outcome: { mode: string; degraded: boolean },
+  outcome: { mode: string; degraded: boolean; ignoredDateBounds: string[] },
 ): string {
   const note = outcome.degraded ? " (semantic search unavailable — lexical only)" : "";
+  // Surface ignored date filters so the agent doesn't believe it constrained the range
+  // when an unparseable after/before was silently dropped (review issue #4b). Mirrors
+  // the "lexical only" degradation-note style.
+  const dateNote =
+    outcome.ignoredDateBounds.length > 0
+      ? ` (ignored unparseable ${outcome.ignoredDateBounds.join(" and ")} date ` +
+        `filter${outcome.ignoredDateBounds.length > 1 ? "s" : ""} — use YYYY-MM-DD)`
+      : "";
   if (results.length === 0) {
-    return `No matching memories found (${outcome.mode}${note}).`;
+    return `No matching memories found (${outcome.mode}${note})${dateNote}.`;
   }
   const lines = results.map((r, i) => {
     const room = r.room ? ` · ${r.room}` : "";
@@ -132,8 +150,8 @@ function renderRecallResults(
   });
   return (
     `Recalled ${results.length} memor${results.length === 1 ? "y" : "ies"} ` +
-    `(${outcome.mode}${note}). Open a cited path:lines with the text editor or bash for the ` +
-    `full entry.\n\n${lines.join("\n")}`
+    `(${outcome.mode}${note})${dateNote}. Open a cited path:lines with the text editor or bash ` +
+    `for the full entry.\n\n${lines.join("\n")}`
   );
 }
 

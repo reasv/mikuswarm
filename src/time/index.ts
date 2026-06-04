@@ -212,8 +212,31 @@ export function parseZonedWallClock(wallClock: string, tz: string): number | nul
   const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/.exec(wallClock.trim());
   if (!m) return null;
   const [, y, mo, d, h, mi] = m;
-  const naiveUtc = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
+  const year = Number(y);
+  const month = Number(mo);
+  const day = Number(d);
+  const hour = Number(h);
+  const minute = Number(mi);
+  // The regex only constrains digit count, so `Date.UTC` would silently normalize
+  // out-of-range fields (e.g. "2026-13-40" → 2027-02-09). Range-check the calendar
+  // fields up front and reject overflow with `null`, consistent with the
+  // nonsense→null contract above (and so bad `recall_memory` date filters surface
+  // rather than resolving to a wrong day — review issue #4a).
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) {
+    return null;
+  }
+  const naiveUtc = Date.UTC(year, month - 1, day, hour, minute);
   if (Number.isNaN(naiveUtc)) return null;
+  // Reject days that don't exist in the given month (e.g. Feb 30, Apr 31): if any
+  // field didn't round-trip, `Date.UTC` normalized it into a later month/day.
+  const check = new Date(naiveUtc);
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
   try {
     const offset1 = zoneOffsetMs(tz, naiveUtc);
     const guess = naiveUtc - offset1;

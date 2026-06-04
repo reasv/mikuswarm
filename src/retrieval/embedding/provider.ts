@@ -1,6 +1,16 @@
 import type { Logger } from "../../observability/logger.js";
 
 /**
+ * Internal cap on fastembed's onnxruntime batch size, decoupled from the remote
+ * `embed_batch_size` knob (which governs per-request size for the remote HTTP
+ * provider, §5d/§5e). The worker may claim up to `embed_batch_size` chunks at once;
+ * feeding all of them to onnxruntime in a single forward pass would scale local
+ * memory with a remote-oriented knob and risk OOM on a big first-run sweep. We
+ * instead chunk the local forward pass at this fixed, sane width (§13).
+ */
+const LOCAL_EMBED_BATCH_CAP = 32;
+
+/**
  * The embedding-provider seam (ARCHITECTURE.md §9d / design §5). A single provider
  * is active at a time (§5a); its `modelId`/`dim` govern the entire vector index.
  * Document and query embeddings are L2-normalized so cosine distance is meaningful.
@@ -94,8 +104,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (texts.length === 0) return [];
     const flag = await this.embedding();
     const out: Float32Array[] = [];
-    // passageEmbed yields batches of number[][]; flatten and normalize.
-    for await (const batch of flag.passageEmbed(texts, texts.length) as AsyncGenerator<number[][]>) {
+    // passageEmbed yields batches of number[][]; flatten and normalize. The second
+    // arg is fastembed's onnxruntime batch size — cap it independently of the
+    // remote-oriented `embed_batch_size` knob so local memory stays bounded (#13).
+    const batchSize = Math.min(texts.length, LOCAL_EMBED_BATCH_CAP);
+    for await (const batch of flag.passageEmbed(texts, batchSize) as AsyncGenerator<number[][]>) {
       for (const vec of batch) out.push(l2normalize(vec));
     }
     return out;

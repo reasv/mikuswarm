@@ -42,6 +42,13 @@ export interface SearchOutcome {
   mode: "hybrid" | "lexical";
   /** True when embeddings were configured but unavailable for this query. */
   degraded: boolean;
+  /**
+   * Names of date-range args (`"after"`/`"before"`) that were provided but failed to
+   * parse to a valid bound, so they were *ignored* (review issue #4b). Empty when both
+   * resolved or neither was given. The caller surfaces this so the agent doesn't
+   * believe it constrained the range when it didn't.
+   */
+  ignoredDateBounds: string[];
 }
 
 export interface MemorySearchDeps {
@@ -82,8 +89,18 @@ export class MemorySearch {
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const candidateLimit = Math.max(opts.maxResults, opts.maxResults * q.candidateMultiplier);
-    const afterTs = dateBoundTs(opts.after, "start");
-    const beforeTs = dateBoundTs(opts.before, "end");
+    // Resolve the optional date filters. A bound that's present but unparseable (bad
+    // month/day, wrong shape) yields `invalid`, surfaced in the outcome so the caller
+    // can tell the agent the filter was ignored rather than silently dropping it
+    // (review issue #4b). `beforeTs` is an *exclusive* start-of-next-day bound so the
+    // `before` day is fully inclusive down to 23:59:59.999 (review issue #12).
+    const after = dateBoundTs(opts.after, "start");
+    const before = dateBoundTs(opts.before, "end");
+    const afterTs = after.ts;
+    const beforeTs = before.ts;
+    const invalidDateBounds: string[] = [];
+    if (after.invalid) invalidDateBounds.push("after");
+    if (before.invalid) invalidDateBounds.push("before");
 
     // --- Lexical candidates (always) ---
     const match = buildFtsMatch(opts.query);
@@ -131,7 +148,10 @@ export class MemorySearch {
 
     // Weights: normalize when both halves are present; lexical-only → all text weight.
     const useVec = semanticRan && vecScoreByRow.size > 0;
-    const wSum = useVec ? q.vectorWeight + q.textWeight || 1 : 1;
+    // Parenthesized so a zero-sum (both weights 0) falls back to 1 rather than
+    // `0 || 1` binding as `vectorWeight + (textWeight || 1)` (review issue #6). Config
+    // resolution also rejects a zero-sum weight pair, so this is belt-and-suspenders.
+    const wSum = useVec ? (q.vectorWeight + q.textWeight) || 1 : 1;
     const wv = useVec ? q.vectorWeight / wSum : 0;
     const wt = useVec ? q.textWeight / wSum : 1;
 
@@ -159,6 +179,7 @@ export class MemorySearch {
       results: ranked.map((s) => this.toResult(s, opts.snippetMaxChars)),
       mode: useVec ? "hybrid" : "lexical",
       degraded,
+      ignoredDateBounds: invalidDateBounds,
     };
   }
 
@@ -209,27 +230,71 @@ export class MemorySearch {
 }
 
 /**
- * Sanitize free-text into an FTS5 MATCH expression: extract word tokens and OR them
- * (each phrase-quoted so FTS operators / punctuation in the user text can't inject
- * syntax). Returns null when the query has no usable terms.
+ * Common English stopwords dropped from FTS queries (review issue #5a). Without this,
+ * a query carrying only function words (the full trigger text in auto-retrieval is the
+ * worst case) matches on "the"/"and"/etc. and surfaces weak material. Kept small and
+ * dependency-free — just the high-frequency closed-class words that never carry recall
+ * signal. Content words (including short ones like "ai", "go", "k8s") are preserved.
+ */
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can",
+  "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "hers",
+  "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "of",
+  "on", "or", "our", "ours", "out", "she", "so", "than", "that", "the", "their",
+  "theirs", "them", "then", "there", "these", "they", "this", "those", "to", "up",
+  "us", "was", "we", "were", "what", "when", "where", "which", "who", "whom", "why",
+  "will", "with", "would", "you", "your", "yours",
+]);
+
+/**
+ * Sanitize free-text into an FTS5 MATCH expression: extract word tokens, drop common
+ * stopwords (#5a), and OR them — each phrase-quoted so FTS operators / punctuation in
+ * the user text can't inject syntax. The OR group is scoped to the `text` column via
+ * the FTS5 column-filter form `{text} : (...)` so a token equal to a `room` label
+ * can't match the indexed `room` column and inflate BM25 for off-topic chunks (#9 —
+ * room stays a metadata filter on `memory_chunks.room`, applied separately in
+ * `searchMemoryLexical`). Returns null when no usable (non-stopword) terms remain.
  */
 export function buildFtsMatch(query: string): string | null {
   const tokens = Array.from(
-    new Set((query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 2)),
+    new Set(
+      (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
+        (t) => t.length >= 2 && !STOPWORDS.has(t),
+      ),
+    ),
   ).slice(0, 32);
   if (tokens.length === 0) return null;
-  return tokens.map((t) => `"${t}"`).join(" OR ");
+  const orGroup = tokens.map((t) => `"${t}"`).join(" OR ");
+  return `{text} : (${orGroup})`;
 }
 
-/** Min-max normalize BM25 cost into a [0,1] relevance per rowid (best match → 1). */
+/**
+ * Saturating BM25-relevance constant (review issue #5b). SQLite FTS5 `bm25()` returns
+ * a *cost* (more-negative = better); we flip via `-h.bm25` to a relevance `rel ≥ 0`
+ * that grows with match quality (more/rarer query-term hits → larger `rel`). The
+ * saturating map `rel / (rel + BM25_SATURATION)` then sends that to [0,1) with
+ * *absolute* meaning: a lone weak match (small `rel`) scores low and can fall below
+ * `min_score`, while strong matches approach 1. `k ≈ 1.5` is tuned for FTS5's default
+ * BM25 (k1=1.2, b=0.75): a single solid term hit lands around the 0.45 auto-retrieval
+ * floor, multi-term matches clear it comfortably, and a marginal common-word-only hit
+ * stays below. Not a config knob (kept as a documented constant) — flagged in the
+ * tracker; promote to `[retrieval.query]` later if tuning demands it.
+ */
+const BM25_SATURATION = 1.5;
+
+/**
+ * Map FTS5 BM25 cost into an absolute [0,1) relevance per rowid via a saturating
+ * transform (review issue #5b). Replaces the old within-candidate min-max normalize
+ * (which always forced the best hit to 1.0 regardless of absolute quality, so
+ * `min_score` was a relative rank cut, not an absolute floor). Now a weak lone match
+ * scores low and can be dropped by `min_score`. Better match → higher score.
+ */
 function normalizeBm25(hits: LexicalHit[]): Map<number, number> {
   const out = new Map<number, number>();
-  if (hits.length === 0) return out;
-  const rels = hits.map((h) => -h.bm25); // bm25() is a cost; flip to relevance
-  const min = Math.min(...rels);
-  const max = Math.max(...rels);
-  const span = max - min;
-  hits.forEach((h, i) => out.set(h.rowid, span === 0 ? 1 : (rels[i]! - min) / span));
+  for (const h of hits) {
+    const rel = Math.max(0, -h.bm25); // bm25() is a cost; flip to non-negative relevance
+    out.set(h.rowid, rel / (rel + BM25_SATURATION));
+  }
   return out;
 }
 
@@ -250,11 +315,41 @@ function dot(a: Float32Array, b: Float32Array): number {
   return s;
 }
 
-/** A `YYYY-MM-DD` bound → epoch ms at the day's start (00:00) or end (23:59). */
-function dateBoundTs(date: string | undefined, edge: "start" | "end"): number | undefined {
-  if (!date) return undefined;
-  const wall = edge === "start" ? `${date} 00:00` : `${date} 23:59`;
-  return parseZonedWallClock(wall, getConfiguredTimezone()) ?? undefined;
+/** One resolved date bound: `ts` is the epoch-ms cutoff (undefined = no constraint). */
+interface DateBound {
+  /** The resolved bound, or undefined when no date was given OR it was invalid. */
+  ts: number | undefined;
+  /** True when a non-empty date was given but didn't parse to a bound (review #4b). */
+  invalid: boolean;
+}
+
+/**
+ * Resolve a `YYYY-MM-DD` filter into an epoch-ms bound (review issues #4b, #12).
+ *
+ * - `"start"` → 00:00 of that day, used as an inclusive lower bound (`entry_ts >= ts`).
+ * - `"end"` → 00:00 of the **next** day, used as an *exclusive* upper bound
+ *   (`entry_ts < ts`). This makes `before` fully day-inclusive: the old `23:59` cutoff
+ *   silently dropped `[23:59:00.001, 23:59:59.999]`.
+ *
+ * No date → `{ ts: undefined, invalid: false }` (no constraint). A non-empty date that
+ * fails to parse (bad calendar field, wrong shape — `parseZonedWallClock` now rejects
+ * overflow, review #4a) → `{ ts: undefined, invalid: true }` so the caller surfaces
+ * the ignored filter rather than silently widening the range.
+ */
+function dateBoundTs(date: string | undefined, edge: "start" | "end"): DateBound {
+  if (date === undefined || date.trim() === "") return { ts: undefined, invalid: false };
+  const tz = getConfiguredTimezone();
+  if (edge === "start") {
+    const ts = parseZonedWallClock(`${date.trim()} 00:00`, tz);
+    return ts === null ? { ts: undefined, invalid: true } : { ts, invalid: false };
+  }
+  // End bound = start of the next day. Parse the day at noon to dodge any DST edge,
+  // then add 24h and snap to that day's 00:00 via the agent-zone date stamp.
+  const noon = parseZonedWallClock(`${date.trim()} 12:00`, tz);
+  if (noon === null) return { ts: undefined, invalid: true };
+  const nextDay = agentDateStamp(noon + 86_400_000);
+  const ts = parseZonedWallClock(`${nextDay} 00:00`, tz);
+  return ts === null ? { ts: undefined, invalid: true } : { ts, invalid: false };
 }
 
 /** Strip a leading `## ` header line, collapse whitespace, truncate to N chars. */

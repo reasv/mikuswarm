@@ -1,5 +1,5 @@
 export { MemoryIndexer, type MemoryIndexerOptions } from "./indexer.js";
-export { MemorySearch, type MemorySearchDeps } from "./search.js";
+export { MemorySearch, buildFtsMatch, type MemorySearchDeps } from "./search.js";
 export type { RetrievalResult, SearchOptions, SearchOutcome } from "./search.js";
 export {
   createRetrievalSubsystem,

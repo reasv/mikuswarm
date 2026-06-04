@@ -27,7 +27,12 @@ function result(over: Partial<RetrievalResult>): RetrievalResult {
 /** A MemorySearch stub returning canned results. */
 function fakeSearch(results: RetrievalResult[]): MemorySearch {
   return {
-    search: async (): Promise<SearchOutcome> => ({ results, mode: "hybrid", degraded: false }),
+    search: async (): Promise<SearchOutcome> => ({
+      results,
+      mode: "hybrid",
+      degraded: false,
+      ignoredDateBounds: [],
+    }),
   } as unknown as MemorySearch;
 }
 
@@ -147,6 +152,87 @@ test("ContextBuilder injects the retrieved_memory block before the trigger, afte
     const idxSys = content.indexOf("<system>");
     const idxTrigger = content.indexOf("pricing?");
     assert.ok(idxMem < idxSys && idxSys < idxTrigger, "ordering: retrieved_memory < system < trigger");
+  } finally {
+    storage.close();
+  }
+});
+
+test("ContextBuilder prefix is byte-identical with vs without auto-retrieval (cache-safety, issue #17)", async () => {
+  // The feature's central cache-safety claim (§8c): enabling auto-retrieval changes ONLY
+  // the final user turn — every message before it (system, diaryLayer, summaryLayer, all
+  // prior chat messages) stays byte-identical, so the cached prefix is untouched. This
+  // test builds the SAME timeline twice through the REAL builder — once with the
+  // autoRetrieval dep and once without — and pins that invariant. It fails if a future
+  // change threads retrieved content into any higher (cached-prefix) message.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const TK = "matrix:miku:room:!room";
+  // A prior turn from a DIFFERENT sender so it forms its own chatEvent message before the
+  // trigger (same-sender messages coalesce into the trigger group, leaving no prefix turn).
+  const otherSender = (id: string, body: string, ts: number): CanonicalChatEvent => ({
+    id,
+    timelineKey: TK,
+    provider: "matrix",
+    role: "user",
+    sender: { id: "bob", displayName: "Bob" },
+    body,
+    timestamp: ts,
+    receivedAt: ts,
+  });
+  try {
+    // A real prefix: a prior chat turn (from Bob) before the trigger (from Alice).
+    await timeline.append(otherSender("ev1", "hey, are we still on for the launch?", 1000));
+    await timeline.append(otherSender("ev2", "what was the target month again?", 1100));
+    const trigger = event("ev3", "what did we decide about pricing?", 1200);
+    await timeline.append(trigger);
+
+    const search = fakeSearch([result({ snippet: "A relevant older decision about pricing." })]);
+    const retrievalCfg = resolveRetrievalConfig({ enabled: true });
+
+    // WITHOUT auto-retrieval: no autoRetrieval dep passed (5th ctor arg undefined).
+    const builderOff = new ContextBuilder(timeline, minimalConfig(), storage, undefined);
+    // WITH auto-retrieval: same everything, plus the dep.
+    const builderOn = new ContextBuilder(timeline, minimalConfig(), storage, undefined, {
+      search,
+      config: retrievalCfg,
+    });
+
+    const builtOff = await builderOff.build({ timelineKey: TK, trigger, activeSessions: [], workspace: emptyWorkspace });
+    const builtOn = await builderOn.build({ timelineKey: TK, trigger, activeSessions: [], workspace: emptyWorkspace });
+
+    // Same message count and shape.
+    assert.equal(builtOn.messages.length, builtOff.messages.length, "same number of messages");
+    assert.ok(builtOn.messages.length >= 3, "expect system + ≥1 chat + final turn");
+    // Sanity: there is a genuine non-trivial prefix (a prior chat turn before the final).
+    assert.ok(
+      builtOff.messages.slice(0, -1).some((m) => m.type === "chatEvent"),
+      "prefix must include at least one prior chat message (otherwise the test is trivial)",
+    );
+
+    // Everything BEFORE the final user turn must be byte-identical.
+    const lastIdx = builtOff.messages.length - 1;
+    for (let i = 0; i < lastIdx; i++) {
+      const a = builtOff.messages[i]!;
+      const b = builtOn.messages[i]!;
+      assert.equal(b.type, a.type, `message ${i} type stable`);
+      assert.equal(b.role, a.role, `message ${i} role stable`);
+      assert.equal(
+        b.content,
+        a.content,
+        `message ${i} (${a.type}) content must be byte-identical with/without auto-retrieval`,
+      );
+      assert.equal(b.tokenEstimate, a.tokenEstimate, `message ${i} tokenEstimate stable`);
+    }
+
+    // The final user turn is the ONLY message allowed to differ: the block is injected
+    // there when on, and absent when off.
+    const finalOff = builtOff.messages[lastIdx]!;
+    const finalOn = builtOn.messages[lastIdx]!;
+    assert.equal(finalOff.type, "triggerGroup");
+    assert.equal(finalOn.type, "triggerGroup");
+    assert.ok(!finalOff.content.includes("<retrieved_memory"), "no block when auto-retrieval off");
+    assert.ok(finalOn.content.includes("<retrieved_memory"), "block present when auto-retrieval on");
+    assert.notEqual(finalOn.content, finalOff.content, "final turn differs (the only difference)");
   } finally {
     storage.close();
   }

@@ -203,6 +203,53 @@ test("temporal decay favors the more recent of two equally-relevant entries", as
   });
 });
 
+test("embed worker ignores a stale wrong-width cached vector and re-embeds", async () => {
+  await withStack(async ({ storage, indexer, worker, provider, workspaceRoot }) => {
+    await writeFile(
+      path.join(workspaceRoot, "memory", "2026-04-12.md"),
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "Carol shared a pancake recipe."),
+      "utf8",
+    );
+    await indexer.reconcileAll();
+
+    // Find the chunk's real content hash, then poison the cache with a wrong-width
+    // BLOB under the active model id (simulating a remote dim change without an id
+    // change). Pre-fix, the cache-hit path would upsert this wrong-width vector
+    // (vec0 rejects it → the batch fails); post-fix it is ignored and re-embedded.
+    const contentHash = storage.read(
+      (db) =>
+        (db.prepare("select content_hash as h from memory_chunks limit 1").get() as { h: string }).h,
+    );
+    const badVec = l2normalize([1, 2, 3]); // dim 3, provider.dim is KEYWORDS.length (8)
+    await storage.putCachedEmbedding(
+      contentHash,
+      provider.modelId,
+      Buffer.from(badVec.buffer, badVec.byteOffset, badVec.byteLength),
+    );
+
+    await drainEmbeddings(storage, worker);
+
+    // The chunk embedded successfully (status done, not failed) and the vector index
+    // holds exactly one full-width row.
+    assert.equal(storage.countPendingEmbedding(), 0);
+    const done = storage.read(
+      (db) =>
+        (db.prepare("select count(*) as n from memory_chunks where embed_status='done'").get() as {
+          n: number;
+        }).n,
+    );
+    assert.equal(done, 1, "chunk should embed despite the poisoned cache entry");
+    const vecRows = storage.read(
+      (db) => (db.prepare("select count(*) as n from memory_vec").get() as { n: number }).n,
+    );
+    assert.equal(vecRows, 1, "a correct-width vector should be inserted");
+    // The stale cache entry was repaired to the correct width.
+    const repaired = storage.getCachedEmbedding(contentHash, provider.modelId)!;
+    assert.equal(repaired.byteLength, provider.dim * 4, "cache entry repaired to active dim");
+  });
+});
+
 test("deleting a chunk prunes its vector", async () => {
   await withStack(async ({ storage, indexer, worker, workspaceRoot }) => {
     const file = path.join(workspaceRoot, "memory", "2026-04-12.md");

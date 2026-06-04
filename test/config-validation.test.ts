@@ -165,3 +165,85 @@ test("config: enabled [sandbox] with a relative workspace_mount is rejected", as
     );
   });
 });
+
+// --- #10: numeric [retrieval] knobs are bounded in the schema ---
+
+// Mirrors the values 00-defaults.toml ships. Every one must pass TypeBox validation,
+// so the bounds added for issue #10 don't reject the shipped defaults.
+const RETRIEVAL_DEFAULTS_BLOCK = `
+[retrieval]
+enabled = true
+auto_retrieval = true
+
+[retrieval.index]
+worker_count = 1
+max_retries = 3
+embed_batch_size = 32
+max_chunk_tokens = 512
+fallback_chunk_tokens = 400
+fallback_chunk_overlap = 80
+
+[retrieval.query]
+max_results = 6
+min_score = 0.35
+vector_weight = 0.7
+text_weight = 0.3
+candidate_multiplier = 4
+mmr_enabled = false
+mmr_lambda = 0.7
+temporal_decay_enabled = true
+temporal_decay_half_life_days = 45
+
+[retrieval.auto]
+max_results = 3
+min_score = 0.45
+max_tokens = 600
+dedup_against_recency = true
+
+[retrieval.embedding]
+provider = "local"
+
+[retrieval.embedding.local]
+model = "bge-small-en-v1.5"
+dim = 384
+`;
+
+test("config: shipped [retrieval] defaults pass schema validation (issue #10)", async () => {
+  await withConfigDir(`${BASE_CONFIG}${RETRIEVAL_DEFAULTS_BLOCK}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.retrieval?.enabled, true);
+    assert.equal(config.retrieval?.query?.candidate_multiplier, 4);
+  });
+});
+
+// Each case fat-fingers ONE knob out of its bound; the schema must reject the load.
+const OUT_OF_BOUNDS_CASES: Array<{ name: string; block: string }> = [
+  { name: "candidate_multiplier above max", block: `[retrieval.query]\ncandidate_multiplier = 9999\n` },
+  { name: "candidate_multiplier below min", block: `[retrieval.query]\ncandidate_multiplier = 0\n` },
+  { name: "query max_results above max", block: `[retrieval.query]\nmax_results = 100000\n` },
+  { name: "vector_weight above 1", block: `[retrieval.query]\nvector_weight = 5\n` },
+  { name: "mmr_lambda above 1", block: `[retrieval.query]\nmmr_lambda = 2\n` },
+  { name: "min_score above 1", block: `[retrieval.query]\nmin_score = 1.5\n` },
+  { name: "temporal_decay_half_life_days below min", block: `[retrieval.query]\ntemporal_decay_half_life_days = 0\n` },
+  { name: "worker_count above max", block: `[retrieval.index]\nworker_count = 100000\n` },
+  { name: "embed_batch_size below min", block: `[retrieval.index]\nembed_batch_size = 0\n` },
+  { name: "max_chunk_tokens below floor", block: `[retrieval.index]\nmax_chunk_tokens = 1\n` },
+  { name: "auto max_tokens below min", block: `[retrieval.auto]\nmax_tokens = 0\n` },
+];
+
+for (const { name, block } of OUT_OF_BOUNDS_CASES) {
+  test(`config: out-of-bounds [retrieval] knob rejected — ${name} (issue #10)`, async () => {
+    const toml = `${BASE_CONFIG}
+[retrieval]
+enabled = true
+
+${block}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        /Invalid config|minimum|maximum/i,
+        `${name} must fail TypeBox validation at load`,
+      );
+    });
+  });
+}
