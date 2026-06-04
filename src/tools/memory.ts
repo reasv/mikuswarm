@@ -117,6 +117,7 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
           mode: outcome.mode,
           degraded: outcome.degraded,
           ignoredDateBounds: outcome.ignoredDateBounds,
+          contradictoryDateBounds: outcome.contradictoryDateBounds,
           count: outcome.results.length,
           results: outcome.results,
         },
@@ -127,7 +128,12 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
 
 function renderRecallResults(
   results: RetrievalResult[],
-  outcome: { mode: string; degraded: boolean; ignoredDateBounds: string[] },
+  outcome: {
+    mode: string;
+    degraded: boolean;
+    ignoredDateBounds: string[];
+    contradictoryDateBounds: boolean;
+  },
 ): string {
   const note = outcome.degraded ? " (semantic search unavailable — lexical only)" : "";
   // Surface ignored date filters so the agent doesn't believe it constrained the range
@@ -138,8 +144,14 @@ function renderRecallResults(
       ? ` (ignored unparseable ${outcome.ignoredDateBounds.join(" and ")} date ` +
         `filter${outcome.ignoredDateBounds.length > 1 ? "s" : ""} — use YYYY-MM-DD)`
       : "";
+  // Both bounds parsed but the window is empty (`after` later than `before`). Distinct
+  // from an unparseable bound — the agent should know the range was the problem, not the
+  // absence of a matching memory (review issue #12). Mirrors the dateNote style.
+  const rangeNote = outcome.contradictoryDateBounds
+    ? " (the after/before range is empty — `after` is later than `before`)"
+    : "";
   if (results.length === 0) {
-    return `No matching memories found (${outcome.mode}${note})${dateNote}.`;
+    return `No matching memories found (${outcome.mode}${note})${dateNote}${rangeNote}.`;
   }
   const lines = results.map((r, i) => {
     const room = r.room ? ` · ${r.room}` : "";

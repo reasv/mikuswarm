@@ -1,5 +1,6 @@
 import type { LexicalHit, Storage } from "../storage/index.js";
 import { agentDateStamp, parseZonedWallClock, getConfiguredTimezone } from "../time/index.js";
+import type { Logger } from "../observability/logger.js";
 import type { MemoryIndexer } from "./indexer.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
 import type { EmbeddingProvider } from "./embedding/provider.js";
@@ -49,16 +50,32 @@ export interface SearchOutcome {
    * believe it constrained the range when it didn't.
    */
   ignoredDateBounds: string[];
+  /**
+   * True when **both** `after` and `before` resolved to valid bounds but the range is
+   * empty because `afterTs >= beforeTs` (the caller asked for an inverted window, e.g.
+   * `after=2026-06-10 before=2026-06-01`). The query matches nothing — distinct from
+   * "no such memory" — so the caller surfaces it (review issue #12). Both bounds parsed,
+   * so they are *not* in `ignoredDateBounds`.
+   */
+  contradictoryDateBounds: boolean;
 }
 
 export interface MemorySearchDeps {
   provider?: EmbeddingProvider;
   vectorStore?: VectorStore;
+  /** Optional structured logger for degraded-path warnings (e.g. lexical FTS failure, #9). */
+  logger?: Logger;
 }
 
 interface Scored extends LexicalHit {
   vecScore: number;
   bm25Score: number;
+  /** Pre-decay combined relevance (`wv·vec + wt·bm25`). The `min_score` floor tests
+   * THIS, not the decayed `score` — so a high-relevance old chunk survives the cut and
+   * merely ranks lower (review issue #13). */
+  relevance: number;
+  /** Relevance after temporal decay (when enabled). Used ONLY for ordering, never for
+   * the `min_score` cut. Equals `relevance` when decay is off. */
   score: number;
 }
 
@@ -73,6 +90,7 @@ interface Scored extends LexicalHit {
 export class MemorySearch {
   private readonly provider?: EmbeddingProvider;
   private readonly vectorStore?: VectorStore;
+  private readonly logger?: Logger;
 
   constructor(
     private readonly storage: Storage,
@@ -82,6 +100,7 @@ export class MemorySearch {
   ) {
     this.provider = deps?.provider;
     this.vectorStore = deps?.vectorStore;
+    this.logger = deps?.logger;
   }
 
   async search(opts: SearchOptions): Promise<SearchOutcome> {
@@ -101,22 +120,63 @@ export class MemorySearch {
     const invalidDateBounds: string[] = [];
     if (after.invalid) invalidDateBounds.push("after");
     if (before.invalid) invalidDateBounds.push("before");
+    // Both bounds parsed but the window is inverted (`after` is on/after `before`'s
+    // exclusive next-day start) → the range is empty and the query matches nothing.
+    // Distinct from an unparseable bound (which lands in `ignoredDateBounds`); surfaced
+    // separately so the caller can tell "empty window" from "no such memory" (#12).
+    const contradictoryDateBounds =
+      afterTs !== undefined && beforeTs !== undefined && afterTs >= beforeTs;
 
     // --- Lexical candidates (always) ---
+    // The lexical half is wrapped (mirroring the semantic half below) so a future
+    // `buildFtsMatch`/FTS5 change that emits a rejectable MATCH degrades to empty
+    // lexical results rather than throwing out of `search()` into context assembly,
+    // which has no caller-side guard (review issue #9). `buildFtsMatch` strips FTS
+    // specials and returns null on degenerate input, so this is defensive insurance.
     const match = buildFtsMatch(opts.query);
-    const ftsHits = match
-      ? this.storage.searchMemoryLexical({ match, limit: candidateLimit, room: opts.room, afterTs, beforeTs })
-      : [];
+    let ftsHits: LexicalHit[] = [];
+    if (match) {
+      try {
+        ftsHits = this.storage.searchMemoryLexical({
+          match,
+          limit: candidateLimit,
+          room: opts.room,
+          afterTs,
+          beforeTs,
+        });
+      } catch (error) {
+        this.logger?.warn("memory_lexical_search_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        ftsHits = [];
+      }
+    }
 
     // --- Vector candidates (when embeddings are available) ---
     let vecScoreByRow = new Map<number, number>();
     let vecMeta: LexicalHit[] = [];
     let semanticRan = false;
     let degraded = false;
+    // The vec0 KNN can't cleanly carry the room/date predicate (it ranks purely by
+    // vector distance), so the filter is applied post-hoc via `getChunksByRowids`.
+    // With a narrow room/date filter the top-`candidateLimit` neighbours can all fall
+    // outside the range, collapsing the semantic contribution to ~zero while in-range
+    // relevant chunks sit deeper in the KNN ranking. To reduce that silent degradation,
+    // over-fetch the KNN when a filter is active so enough in-range neighbours survive
+    // the post-filter (review issue #2). No filter → no over-fetch (the plain top-K is
+    // already correct).
+    const filterActive =
+      opts.room !== undefined || afterTs !== undefined || beforeTs !== undefined;
+    // Cap the over-fetched `k` so the resulting `getChunksByRowids` IN-list stays within
+    // the bound the config maxima target (see src/config/schema.ts) — over-fetch is a
+    // recall improvement, never a path to blow SQLite's bound-parameter limit.
+    const knnK = filterActive
+      ? Math.min(candidateLimit * FILTERED_KNN_OVERFETCH, MAX_KNN_CANDIDATES)
+      : candidateLimit;
     if (this.provider && this.vectorStore) {
       try {
         const queryVec = await this.provider.embedQuery(opts.query);
-        const hits = this.vectorStore.knn(queryVec, candidateLimit, "memory");
+        const hits = this.vectorStore.knn(queryVec, knnK, "memory");
         if (hits.length > 0) {
           vecScoreByRow = new Map(
             hits.map((h) => [h.chunkId, clamp01(1 - h.distance)]),
@@ -146,8 +206,13 @@ export class MemorySearch {
     for (const h of ftsHits) candidateRows.add(h.rowid);
     for (const rowid of vecScoreByRow.keys()) if (metaByRow.has(rowid)) candidateRows.add(rowid);
 
-    // Weights: normalize when both halves are present; lexical-only → all text weight.
-    const useVec = semanticRan && vecScoreByRow.size > 0;
+    // Does the semantic half actually contribute to the *post-filter* candidate set?
+    // `vecScoreByRow` is pre-filter (raw KNN), so testing its size would report `hybrid`
+    // even when every vector neighbour was filtered out by room/date and the result
+    // effectively degraded to lexical. Test the post-filter survivors instead, so the
+    // reported `mode` reflects reality (review issue #2). `vecMeta` is exactly the KNN
+    // rows that passed the room/date filter.
+    const useVec = semanticRan && vecMeta.length > 0;
     // Parenthesized so a zero-sum (both weights 0) falls back to 1 rather than
     // `0 || 1` binding as `vectorWeight + (textWeight || 1)` (review issue #6). Config
     // resolution also rejects a zero-sum weight pair, so this is belt-and-suspenders.
@@ -160,15 +225,21 @@ export class MemorySearch {
       const meta = metaByRow.get(rowid)!;
       const vecScore = vecScoreByRow.get(rowid) ?? 0;
       const bm25Score = bm25ByRow.get(rowid) ?? 0;
-      let score = wv * vecScore + wt * bm25Score;
-      if (q.temporalDecayEnabled) {
-        score *= decayFactor(meta.entryTs, now, q.temporalDecayHalfLifeDays);
-      }
-      scored.push({ ...meta, vecScore, bm25Score, score });
+      // `relevance` is the pre-decay combined relevance; the `min_score` floor tests
+      // THIS (an absolute relevance floor, the point of the saturating BM25 transform).
+      // `score` adds temporal decay and is used ONLY for ordering, so a high-relevance
+      // *old* match survives the floor but ranks below a fresher equal-relevance one,
+      // instead of decaying below the floor and vanishing (review issue #13).
+      const relevance = wv * vecScore + wt * bm25Score;
+      const score = q.temporalDecayEnabled
+        ? relevance * decayFactor(meta.entryTs, now, q.temporalDecayHalfLifeDays)
+        : relevance;
+      scored.push({ ...meta, vecScore, bm25Score, relevance, score });
     }
 
     scored.sort((a, b) => b.score - a.score);
-    const aboveThreshold = scored.filter((s) => s.score >= opts.minScore);
+    // Floor on PRE-DECAY relevance, order by the decayed score (review issue #13).
+    const aboveThreshold = scored.filter((s) => s.relevance >= opts.minScore);
 
     const ranked =
       q.mmrEnabled && useVec
@@ -180,6 +251,7 @@ export class MemorySearch {
       mode: useVec ? "hybrid" : "lexical",
       degraded,
       ignoredDateBounds: invalidDateBounds,
+      contradictoryDateBounds,
     };
   }
 
@@ -196,6 +268,13 @@ export class MemorySearch {
       for (let i = 0; i < pool.length; i++) {
         const c = pool[i]!;
         const cv = vectors.get(c.rowid);
+        // `maxSim` deliberately starts at 0 and is only ever raised, so a negative
+        // cosine (anti-similar to everything already selected) is clamped to 0 — i.e.
+        // anti-similar is treated as orthogonal, never as a *diversity bonus*. This is a
+        // defensible MMR variant: the redundancy penalty `(1-λ)·maxSim` is one-sided, so
+        // it can only push a candidate down for overlap, never reward it for opposing an
+        // already-picked vector (review issue #16). L2-normalized vectors → `dot` is the
+        // cosine in [-1,1].
         let maxSim = 0;
         if (cv) {
           for (const s of selected) {
@@ -283,6 +362,26 @@ export function buildFtsMatch(query: string): string | null {
 const BM25_SATURATION = 1.5;
 
 /**
+ * KNN over-fetch multiplier when a room/date filter is active (review issue #2). The
+ * vec0 KNN ranks purely by vector distance and can't carry the room/date predicate, so
+ * the filter is applied post-hoc; a narrow filter can otherwise let all top-K neighbours
+ * fall outside the range and silently zero out the semantic half. Fetching `k × this`
+ * candidates gives the post-filter enough in-range neighbours to keep the hybrid score
+ * meaningful. A documented constant (like `BM25_SATURATION`), not a config knob — promote
+ * to `[retrieval.query]` later if tuning demands it.
+ */
+const FILTERED_KNN_OVERFETCH = 4;
+
+/**
+ * Hard ceiling on KNN candidates after the filtered over-fetch (review issue #2). The
+ * fetched rowids become an IN-list in `getChunksByRowids`; this keeps that list within
+ * the bound the `[retrieval.query]` config maxima already target (src/config/schema.ts)
+ * and safely under SQLite's bound-parameter limit (32766), even at the largest
+ * configurable `candidate_multiplier`.
+ */
+const MAX_KNN_CANDIDATES = 5000;
+
+/**
  * Map FTS5 BM25 cost into an absolute [0,1) relevance per rowid via a saturating
  * transform (review issue #5b). Replaces the old within-candidate min-max normalize
  * (which always forced the best hit to 1.0 regardless of absolute quality, so
@@ -308,7 +407,18 @@ function decayFactor(entryTs: number, now: number, halfLifeDays: number): number
   return Math.pow(2, -ageDays / halfLifeDays);
 }
 
+/**
+ * Inner product. All retrieval vectors are L2-normalized and come from the single
+ * active model (§9d single-active-model invariant), so in practice `a` and `b` always
+ * share a length and this is the cosine. It deliberately iterates over
+ * `min(a.length, b.length)` so a hypothetical dim mismatch truncates rather than
+ * throwing out of the MMR re-rank (review issue #16). A dev-only assert catches a
+ * mismatch in tests/dev without affecting production ranking behavior.
+ */
 function dot(a: Float32Array, b: Float32Array): number {
+  if (process.env.NODE_ENV !== "production" && a.length !== b.length) {
+    throw new Error(`dot(): vector length mismatch ${a.length} != ${b.length}`);
+  }
   let s = 0;
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) s += a[i]! * b[i]!;

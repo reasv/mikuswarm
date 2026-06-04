@@ -32,6 +32,7 @@ function fakeSearch(results: RetrievalResult[]): MemorySearch {
       mode: "hybrid",
       degraded: false,
       ignoredDateBounds: [],
+      contradictoryDateBounds: false,
     }),
   } as unknown as MemorySearch;
 }

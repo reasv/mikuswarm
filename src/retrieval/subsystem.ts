@@ -132,7 +132,7 @@ export async function createRetrievalSubsystem(
     if (skipped > 0) logger?.info("embed_skip_lexical_only", { skipped });
   }
 
-  const search = new MemorySearch(storage, indexer, config, { provider, vectorStore });
+  const search = new MemorySearch(storage, indexer, config, { provider, vectorStore, logger });
 
   return {
     indexer,
