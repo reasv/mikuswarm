@@ -254,6 +254,9 @@ export class BrowserSession {
     const deadline = Date.now() + this.config.connect_timeout_ms;
     let lastError: BrowserError | undefined;
     for (;;) {
+      // Abort the poll promptly if the backend is shutting down rather than
+      // spinning out the full connect_timeout_ms budget after shutdown().
+      if (this.closed) throw new BrowserError("backend_unavailable", "Browser backend is shutting down.");
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw (
