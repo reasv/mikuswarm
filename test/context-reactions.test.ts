@@ -124,6 +124,20 @@ test("a long snippet is whitespace-normalized and truncated", () => {
   assert.doesNotMatch(m[1], /\n/);
 });
 
+test("snippet truncation never splits an emoji surrogate pair", () => {
+  // Emoji straddles the 80th code point; truncation must keep it whole.
+  const body = "x".repeat(78) + "😀" + "y".repeat(40);
+  const lines = synthesizeReactionLines(
+    [discrete({ reactionEventId: "$r1" })],
+    new Map([["$a1", body]]),
+    { nameCap: 8 },
+  );
+  const snippet = lines[0].content.match(/: "([^"]*)"/)![1];
+  assert.ok(snippet.includes("😀"), "the emoji must survive truncation intact");
+  // No lone surrogate: re-encoding round-trips cleanly.
+  assert.equal([...snippet].some((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff), false);
+});
+
 test("an unresolvable target falls back to the bare event ref with no snippet", () => {
   const lines = synthesizeReactionLines([discrete({ reactionEventId: "$r1" })], new Map(), { nameCap: 8 });
   assert.equal(lines[0].content, `<reaction>Alice reacted 👍 to your message [$a1]</reaction>`);
