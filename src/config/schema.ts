@@ -53,6 +53,19 @@ const SummarizationSchema = Type.Object({
   label_cache_ttl_ms: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
+// Chat-history search & recap tools (ARCHITECTURE.md §9e). The FTS index is always
+// built; these knobs tune the absence-gap detection ("since I was gone") and recap's
+// summary token budget. Optional — defaults fall back to the shared constants.
+const SearchSchema = Type.Object({
+  // Inter-message gap (ms) above which a user counts as having been "away" — the
+  // boundary for recap / search_messages since_user_absence.
+  absence_gap_ms: Type.Optional(Type.Integer({ minimum: 60_000 })),
+  // Fallback recap/absence window (ms) when a user has no messages in the horizon.
+  default_lookback_ms: Type.Optional(Type.Integer({ minimum: 60_000 })),
+  // Token budget for the summaries recap returns before coarsening to higher levels.
+  recap_budget_tokens: Type.Optional(Type.Integer({ minimum: 200 })),
+});
+
 // Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus
 // auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
 // configs stay valid; `enabled` is the master switch for the whole index.
@@ -452,6 +465,7 @@ export const AppConfigSchema = Type.Object({
   summarization: Type.Optional(SummarizationSchema),
   diary: Type.Optional(DiarySchema),
   retrieval: Type.Optional(RetrievalSchema),
+  search: Type.Optional(SearchSchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -489,3 +503,4 @@ export type AppConfig = Static<typeof AppConfigSchema>;
 export type SummarizationConfig = Static<typeof SummarizationSchema>;
 export type DiaryConfig = Static<typeof DiarySchema>;
 export type RetrievalConfig = Static<typeof RetrievalSchema>;
+export type SearchConfig = Static<typeof SearchSchema>;

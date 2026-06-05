@@ -262,6 +262,15 @@ dim = 384
 # api_key = "${OPENROUTER_KEY}"
 # dim = 1536
 
+# Chat-history search & recap (ARCHITECTURE.md §9e). The FTS5 + metadata index that
+# backs the search_messages / recap / user_activity tools is ALWAYS built (plain
+# bundled SQLite, no embeddings); these knobs only tune the absence-gap detection that
+# powers "what did I miss since I was gone" and recap's summary token budget.
+[search]
+absence_gap_ms = 10800000         # 3h: inter-message gap above which a user counts as "away"
+default_lookback_ms = 86400000    # 24h: recap/absence fallback window when a user has no recent messages
+recap_budget_tokens = 6000        # summary token budget recap returns before coarsening to higher levels
+
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]

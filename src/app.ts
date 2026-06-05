@@ -31,6 +31,9 @@ import {
   createEmojiListTool,
   createListReactionsTool,
   createReadMessagesTool,
+  createSearchMessagesTool,
+  createRecapTool,
+  createUserActivityTool,
   createMediaTool,
   createMemberInfoTool,
   createPinsTool,
@@ -61,6 +64,11 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
+import {
+  ChatSearchIndexer,
+  ABSENCE_GAP_DEFAULT_MS,
+  ABSENCE_LOOKBACK_DEFAULT_MS,
+} from "./search/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
@@ -109,6 +117,28 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // write_memory edit), so new entries become searchable promptly (§7).
     memoryWriter.onAfterWrite = (absPath) => retrieval!.onMemoryWrite(absPath);
   }
+
+  // Chat-history search index (ARCHITECTURE.md §9e): a denormalized FTS5 + metadata
+  // projection of the timeline, backing the `search_messages` / `recap` /
+  // `user_activity` tools. Unlike memory retrieval this is plain bundled SQLite (no
+  // embeddings), so it is always on. The indexer backfills/repairs on the startup
+  // sweep below, picks up late captions/previews via the enrichment + caption
+  // completion hooks (wired into the pools below), and the tools lazily catch up new
+  // events before each query.
+  const chatSearchIndexer = new ChatSearchIndexer({
+    storage,
+    logger: logger.child("chat-search"),
+  });
+  // Resolved defaults for the search_messages / recap tools (§9e). Sourced from
+  // [search] config with fail-fast fallbacks to the shared constants; set explicitly
+  // in deployment config per project convention.
+  const chatSearchDefaults = {
+    absence: {
+      gapThresholdMs: config.search?.absence_gap_ms ?? ABSENCE_GAP_DEFAULT_MS,
+      defaultLookbackMs: config.search?.default_lookback_ms ?? ABSENCE_LOOKBACK_DEFAULT_MS,
+    },
+    recapBudgetTokens: config.search?.recap_budget_tokens ?? 6000,
+  };
 
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
@@ -269,7 +299,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     workspaceRoot,
     downloadSizeLimit,
     config: config.enrichment ?? {},
-    onComplete: (eventId) => enrichmentEmitter.emit(`complete:${eventId}`),
+    onComplete: (eventId) => {
+      enrichmentEmitter.emit(`complete:${eventId}`);
+      // Re-project now that attachments, link previews and the reply sender are
+      // resolved (§9e) — promotes the body-only index row to its full form.
+      chatSearchIndexer.enqueueReconcileEvent(eventId);
+    },
     onError: (eventId, error) =>
       logger.error("enrichment_failed", { eventId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
@@ -281,7 +316,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     clients: captionClients,
     workspaceRoot,
     config: config.captioning ?? {},
-    onComplete: (eventId) => captionEmitter.emit(`complete:${eventId}`),
+    onComplete: (eventId) => {
+      captionEmitter.emit(`complete:${eventId}`);
+      // Re-project so the freshly generated caption text lands in the event's
+      // searchable aux_text column (§9e).
+      chatSearchIndexer.enqueueReconcileEvent(eventId);
+    },
     onError: (assetId, error) =>
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
@@ -781,6 +821,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         createCreatePollTool({ client: provider.getClient(target), roomId }),
         createPollVoteTool({ client: provider.getClient(target), roomId }),
       ] : []),
+      // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
+      // client, so available regardless of roomId and able to span all rooms.
+      createSearchMessagesTool({
+        storage,
+        indexer: chatSearchIndexer,
+        currentTimelineKey: session.timelineKey,
+        absenceDefaults: chatSearchDefaults.absence,
+      }),
+      createRecapTool({
+        storage,
+        indexer: chatSearchIndexer,
+        currentTimelineKey: session.timelineKey,
+        askerId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
+        defaults: {
+          budgetTokens: chatSearchDefaults.recapBudgetTokens,
+          gapThresholdMs: chatSearchDefaults.absence.gapThresholdMs,
+          defaultLookbackMs: chatSearchDefaults.absence.defaultLookbackMs,
+        },
+      }),
+      createUserActivityTool({
+        storage,
+        indexer: chatSearchIndexer,
+        currentTimelineKey: session.timelineKey,
+      }),
       createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
       createWebSearchTool(),
@@ -1047,6 +1111,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (summarizationPool) await summarizationPool.start();
   if (diaryPool) await diaryPool.start();
   if (retrieval) await retrieval.start();
+  // Backfill/repair the chat-search index (§9e). Fire-and-forget: the projection sweep
+  // is plain SQLite and the tools' lazy catch-up covers correctness, so don't block
+  // boot on it. Backfills existing events on first run after the v11 migration.
+  void chatSearchIndexer.reconcileAll().catch((error) =>
+    logger.warn("chat_index_sweep_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
   redecryptionSweeper.start();
 
   if (retentionDays > 0) {

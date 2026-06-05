@@ -34,6 +34,12 @@ export {
   type MemoryChunkInput,
   type ReconcileResult,
   type LexicalHit,
+  type ChatProjectionInput,
+  type ChatIndexUpsert,
+  type ChatIndexReconcileResult,
+  type ChatSearchQuery,
+  type ChatSearchHit,
+  type ChatSearchResult,
 } from "./database.js";
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

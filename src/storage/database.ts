@@ -224,6 +224,111 @@ export interface LexicalHit {
   bm25: number;
 }
 
+/**
+ * Raw inputs for one event's chat-search projection (ARCHITECTURE.md §9e), joined
+ * from timeline_events + aggregated media_assets / link_previews / reply_contexts.
+ * The indexer turns this into a `ChatIndexUpsert` (parses mentions from event_json,
+ * builds aux_text, computes the content signature). `srcRowid` is the timeline_events
+ * implicit rowid, used only as the full-sweep paging cursor.
+ */
+export interface ChatProjectionInput {
+  srcRowid: number;
+  eventId: string;
+  timelineKey: string;
+  senderId: string;
+  senderDisplayName: string | null;
+  role: string;
+  body: string;
+  timestamp: number;
+  updatedAt: number;
+  eventJson: string;
+  /** csv of distinct media_type for role='attachment' media, or null. */
+  attachmentTypes: string | null;
+  attachCount: number;
+  /** space-joined complete captions across all media roles (recall over precision). */
+  captions: string | null;
+  linkCount: number;
+  /** space-joined link-preview title/description/site_name. */
+  linkText: string | null;
+  quotedSenderId: string | null;
+  replyCount: number;
+}
+
+/** A projected chat-index row ready to upsert, plus its denormalized mentions. */
+export interface ChatIndexUpsert {
+  eventId: string;
+  timelineKey: string;
+  senderId: string;
+  senderDisplayName: string | null;
+  role: string;
+  timestamp: number;
+  body: string;
+  auxText: string;
+  hasAttachment: number;
+  attachmentTypes: string;
+  hasLink: number;
+  isReply: number;
+  quotedSenderId: string | null;
+  mentions: string[];
+  contentSig: string;
+}
+
+/** Net effect of one chat-index reconcile batch (for logging). */
+export interface ChatIndexReconcileResult {
+  inserted: number;
+  updated: number;
+  unchanged: number;
+}
+
+/** A parsed `search_messages` query against the chat index (ARCHITECTURE.md §9e). */
+export interface ChatSearchQuery {
+  /** Pre-built, column-scoped FTS5 MATCH expression; undefined = metadata-only search. */
+  match?: string;
+  /** Restrict to these timeline_keys; undefined = all rooms. */
+  timelineKeys?: string[];
+  fromSenders?: string[];
+  mentions?: string[];
+  quotedUsers?: string[];
+  isReply?: boolean;
+  hasAttachment?: boolean;
+  /** Any-of media types (image/video/audio/file). */
+  attachmentTypes?: string[];
+  hasLink?: boolean;
+  afterTs?: number;
+  /** Exclusive upper bound (ms). */
+  beforeTs?: number;
+  limit: number;
+  /** Keyset cursor for newest/oldest order (ignored for relevance). */
+  cursor?: { timestamp: number; rowid: number };
+  order: "newest" | "oldest" | "relevance";
+}
+
+/** One chat-index search hit (snippet is built by the caller from body/auxText). */
+export interface ChatSearchHit {
+  rowid: number;
+  eventId: string;
+  timelineKey: string;
+  senderId: string;
+  senderDisplayName: string | null;
+  role: string;
+  timestamp: number;
+  body: string;
+  auxText: string;
+  hasAttachment: number;
+  attachmentTypes: string;
+  hasLink: number;
+  isReply: number;
+  quotedSenderId: string | null;
+  /** Raw bm25 cost when ordered by relevance (lower = better); 0 otherwise. */
+  bm25: number;
+}
+
+export interface ChatSearchResult {
+  hits: ChatSearchHit[];
+  /** Total matches ignoring limit/cursor — so the agent knows if it saw everything. */
+  total: number;
+}
+
 /** Sort key for events/summaries: (timestamp, received_at, id) ascending. */
 export interface TimelineCursor {
   timestamp: number;
@@ -2260,6 +2365,41 @@ export class Storage {
     return rows.map(mapSummaryRow);
   }
 
+  /**
+   * All summaries (every level, status complete/truncated) overlapping the inclusive
+   * window [start, end] across a room set (undefined = all rooms), for `recap`'s
+   * coverage selection (§9e). Overlap = latest_timestamp >= start AND
+   * earliest_timestamp <= end. Ordered by timeline_key then earliest_timestamp.
+   */
+  getSummariesInWindow(opts: {
+    timelineKeys?: string[];
+    start: number;
+    end: number;
+  }): Summary[] {
+    const rows = this.read((db) => {
+      const where: string[] = [
+        "status in ('complete', 'truncated')",
+        "latest_timestamp >= @start",
+        "earliest_timestamp <= @end",
+      ];
+      const params: Record<string, unknown> = { start: opts.start, end: opts.end };
+      if (opts.timelineKeys && opts.timelineKeys.length > 0) {
+        const keys = opts.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`timeline_key in (${keys.join(", ")})`);
+      }
+      return db
+        .prepare(
+          `select * from summaries where ${where.join(" and ")}
+           order by timeline_key asc, earliest_timestamp asc`,
+        )
+        .all(params) as SummaryRow[];
+    });
+    return rows.map(mapSummaryRow);
+  }
+
   getSummaryById(id: string, timelineKey?: string): Summary | undefined {
     const row = this.read((db) => {
       if (timelineKey) {
@@ -2872,6 +3012,408 @@ export class Storage {
         `insert into index_meta (key, value) values (?, ?)
          on conflict(key) do update set value = excluded.value`,
       ).run(key, value);
+    });
+  }
+
+  // ── Chat-history search index (ARCHITECTURE.md §9e, src/search/) ───────────────
+
+  /**
+   * Join the projection inputs for chat-search indexing. With `eventId`, returns that
+   * one event (incremental reconcile after persist / caption / edit). Otherwise returns
+   * a full-sweep page of `limit` events with `timeline_events.rowid > afterRowid`,
+   * ordered by rowid so the caller can keyset-page the whole corpus. Undecryptable
+   * events project with an empty body (harmless); they re-project when re-decryption
+   * bumps `updated_at` and changes the body.
+   */
+  getChatProjectionInputs(opts: {
+    eventId?: string;
+    afterRowid?: number;
+    limit?: number;
+  }): ChatProjectionInput[] {
+    return this.read((db) => {
+      const selectCols = `
+        e.rowid as srcRowid, e.id as eventId, e.timeline_key as timelineKey,
+        e.sender_id as senderId, e.sender_display_name as senderDisplayName,
+        e.role as role, e.body as body, e.timestamp as timestamp,
+        e.updated_at as updatedAt, e.event_json as eventJson,
+        (select group_concat(distinct ma.media_type) from media_assets ma
+           where ma.event_id = e.id and ma.role = 'attachment') as attachmentTypes,
+        (select count(*) from media_assets ma
+           where ma.event_id = e.id and ma.role = 'attachment') as attachCount,
+        (select group_concat(ma.caption, ' ') from media_assets ma
+           where ma.event_id = e.id and ma.caption_status = 'complete'
+             and ma.caption is not null and ma.caption <> '') as captions,
+        (select count(*) from link_previews lp where lp.event_id = e.id) as linkCount,
+        (select group_concat(
+                  trim(coalesce(lp.title,'') || ' ' || coalesce(lp.description,'') || ' '
+                       || coalesce(lp.site_name,'')), ' ')
+           from link_previews lp where lp.event_id = e.id) as linkText,
+        (select rc.sender_id from reply_contexts rc where rc.event_id = e.id) as quotedSenderId,
+        (select count(*) from reply_contexts rc where rc.event_id = e.id) as replyCount`;
+      if (opts.eventId !== undefined) {
+        return db
+          .prepare(`select ${selectCols} from timeline_events e where e.id = ?`)
+          .all(opts.eventId) as ChatProjectionInput[];
+      }
+      return db
+        .prepare(
+          `select ${selectCols} from timeline_events e
+           where e.rowid > @afterRowid order by e.rowid limit @limit`,
+        )
+        .all({
+          afterRowid: opts.afterRowid ?? 0,
+          limit: opts.limit ?? 500,
+        }) as ChatProjectionInput[];
+    });
+  }
+
+  /**
+   * Set-diff a batch of projected rows into `chat_index` (+ `chat_mentions`) in one
+   * transaction. A row whose `content_sig` is unchanged is left untouched (no FTS
+   * churn — the `chat_index_au` trigger is gated on body/aux_text anyway, but skipping
+   * the write entirely avoids even evaluating it). Inserts/updates rewrite the row and
+   * replace its mention set. Returns counts + the max source rowid for cursor advance.
+   */
+  upsertChatIndexRows(rows: ChatIndexUpsert[]): Promise<ChatIndexReconcileResult> {
+    return this.readAndWrite((db) => {
+      const existing = db.prepare(
+        `select rowid, content_sig as sig from chat_index where event_id = ?`,
+      );
+      const insertRow = db.prepare(
+        `insert into chat_index (
+           event_id, timeline_key, sender_id, sender_display_name, role, timestamp,
+           body, aux_text, has_attachment, attachment_types, has_link, is_reply,
+           quoted_sender_id, content_sig, indexed_at
+         ) values (
+           @eventId, @timelineKey, @senderId, @senderDisplayName, @role, @timestamp,
+           @body, @auxText, @hasAttachment, @attachmentTypes, @hasLink, @isReply,
+           @quotedSenderId, @contentSig, @now
+         )`,
+      );
+      const updateRow = db.prepare(
+        `update chat_index set
+           timeline_key = @timelineKey, sender_id = @senderId,
+           sender_display_name = @senderDisplayName, role = @role, timestamp = @timestamp,
+           body = @body, aux_text = @auxText, has_attachment = @hasAttachment,
+           attachment_types = @attachmentTypes, has_link = @hasLink, is_reply = @isReply,
+           quoted_sender_id = @quotedSenderId, content_sig = @contentSig, indexed_at = @now
+         where event_id = @eventId`,
+      );
+      const deleteMentions = db.prepare(`delete from chat_mentions where event_id = ?`);
+      const insertMention = db.prepare(
+        `insert or ignore into chat_mentions (event_id, user_id) values (?, ?)`,
+      );
+      const now = Date.now();
+      let inserted = 0;
+      let updated = 0;
+      let unchanged = 0;
+      for (const r of rows) {
+        const prev = existing.get(r.eventId) as { rowid: number; sig: string } | undefined;
+        if (prev && prev.sig === r.contentSig) {
+          unchanged += 1;
+          continue;
+        }
+        const params = {
+          eventId: r.eventId,
+          timelineKey: r.timelineKey,
+          senderId: r.senderId,
+          senderDisplayName: r.senderDisplayName,
+          role: r.role,
+          timestamp: r.timestamp,
+          body: r.body,
+          auxText: r.auxText,
+          hasAttachment: r.hasAttachment,
+          attachmentTypes: r.attachmentTypes,
+          hasLink: r.hasLink,
+          isReply: r.isReply,
+          quotedSenderId: r.quotedSenderId,
+          contentSig: r.contentSig,
+          now,
+        };
+        if (prev) {
+          updateRow.run(params);
+          updated += 1;
+        } else {
+          insertRow.run(params);
+          inserted += 1;
+        }
+        // Replace the mention set for this event.
+        deleteMentions.run(r.eventId);
+        for (const userId of r.mentions) insertMention.run(r.eventId, userId);
+      }
+      return { inserted, updated, unchanged };
+    });
+  }
+
+  /** Count indexed events (optionally within a room set) — for the search trailer. */
+  countChatIndex(timelineKeys?: string[]): number {
+    return this.read((db) => {
+      if (timelineKeys && timelineKeys.length > 0) {
+        const keys = timelineKeys.map((_, i) => `@k${i}`);
+        const params: Record<string, string> = {};
+        timelineKeys.forEach((k, i) => (params[`k${i}`] = k));
+        const row = db
+          .prepare(
+            `select count(*) as n from chat_index where timeline_key in (${keys.join(", ")})`,
+          )
+          .get(params) as { n: number };
+        return row.n;
+      }
+      return (db.prepare(`select count(*) as n from chat_index`).get() as { n: number }).n;
+    });
+  }
+
+  /** Remove a single event's chat-index row (and, via trigger, its mentions). */
+  deleteChatIndexForEvent(eventId: string): Promise<number> {
+    return this.write((db) => {
+      return db.prepare(`delete from chat_index where event_id = ?`).run(eventId).changes;
+    });
+  }
+
+  /** Drop chat-index rows whose source event no longer exists (sweep prune). */
+  pruneChatIndexOrphans(): Promise<number> {
+    return this.write((db) => {
+      return db.prepare(
+        `delete from chat_index
+         where not exists (select 1 from timeline_events e where e.id = chat_index.event_id)`,
+      ).run().changes;
+    });
+  }
+
+  /**
+   * Cheap fingerprint of the chat-search source tables for the lazy pre-query freshness
+   * check (§9e): event count + latest mutation across the tables that feed a projection.
+   * Changes whenever an event is added/edited/re-decrypted or a caption/preview settles.
+   */
+  chatSourceSignature(): string {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select
+             (select count(*) from timeline_events) as events,
+             (select coalesce(max(updated_at), 0) from timeline_events) as evMax,
+             (select coalesce(max(updated_at), 0) from media_assets) as maMax,
+             (select count(*) from link_previews) as links,
+             (select coalesce(max(fetched_at), 0) from link_previews) as lpMax`,
+        )
+        .get() as {
+        events: number;
+        evMax: number;
+        maMax: number;
+        links: number;
+        lpMax: number;
+      };
+      return `${row.events}:${row.evMax}:${row.maMax}:${row.links}:${row.lpMax}`;
+    });
+  }
+
+  /**
+   * Execute a parsed chat-search query (`search_messages`, ARCHITECTURE.md §9e) over
+   * `chat_index` (+ `chat_index_fts` when a text MATCH is present, + `chat_mentions`
+   * for the mention filter). Returns the requested page plus the unpaginated `total`
+   * so the tool can tell the agent whether it saw every match. All filters are
+   * AND-combined. Ordering: newest/oldest are keyset-paginated on (timestamp, rowid);
+   * relevance (bm25) returns the first page only (the tool documents this).
+   */
+  searchChatIndex(q: ChatSearchQuery): ChatSearchResult {
+    return this.read((db) => {
+      const where: string[] = [];
+      const params: Record<string, unknown> = {};
+      const ftsJoin = q.match ? "join chat_index_fts f on f.rowid = ci.rowid" : "";
+      if (q.match) {
+        where.push("chat_index_fts match @match");
+        params.match = q.match;
+      }
+      const inClause = (col: string, values: string[], prefix: string): void => {
+        const keys = values.map((v, i) => {
+          params[`${prefix}${i}`] = v;
+          return `@${prefix}${i}`;
+        });
+        where.push(`${col} in (${keys.join(", ")})`);
+      };
+      if (q.timelineKeys && q.timelineKeys.length > 0) {
+        inClause("ci.timeline_key", q.timelineKeys, "tk");
+      }
+      if (q.fromSenders && q.fromSenders.length > 0) {
+        inClause("ci.sender_id", q.fromSenders, "fs");
+      }
+      if (q.quotedUsers && q.quotedUsers.length > 0) {
+        inClause("ci.quoted_sender_id", q.quotedUsers, "qu");
+      }
+      if (q.mentions && q.mentions.length > 0) {
+        const keys = q.mentions.map((v, i) => {
+          params[`mn${i}`] = v;
+          return `@mn${i}`;
+        });
+        where.push(
+          `exists (select 1 from chat_mentions m
+                   where m.event_id = ci.event_id and m.user_id in (${keys.join(", ")}))`,
+        );
+      }
+      if (q.isReply !== undefined) {
+        where.push("ci.is_reply = @isReply");
+        params.isReply = q.isReply ? 1 : 0;
+      }
+      if (q.hasAttachment !== undefined) {
+        where.push("ci.has_attachment = @hasAttachment");
+        params.hasAttachment = q.hasAttachment ? 1 : 0;
+      }
+      if (q.hasLink !== undefined) {
+        where.push("ci.has_link = @hasLink");
+        params.hasLink = q.hasLink ? 1 : 0;
+      }
+      if (q.attachmentTypes && q.attachmentTypes.length > 0) {
+        // attachment_types is a csv of the fixed tokens image/video/audio/file — none
+        // is a substring of another, so a LIKE per requested type is unambiguous.
+        const ors = q.attachmentTypes.map((t, i) => {
+          params[`at${i}`] = `%${t}%`;
+          return `ci.attachment_types like @at${i}`;
+        });
+        where.push(`ci.has_attachment = 1 and (${ors.join(" or ")})`);
+      }
+      if (q.afterTs !== undefined) {
+        where.push("ci.timestamp >= @afterTs");
+        params.afterTs = q.afterTs;
+      }
+      if (q.beforeTs !== undefined) {
+        where.push("ci.timestamp < @beforeTs");
+        params.beforeTs = q.beforeTs;
+      }
+
+      const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+
+      const totalRow = db
+        .prepare(`select count(*) as n from chat_index ci ${ftsJoin} ${whereSql}`)
+        .get(params) as { n: number };
+
+      // Keyset cursor (newest/oldest only). Relevance can't keyset on bm25 cheaply, so
+      // it returns the first page; the tool notes this in its output.
+      const pageWhere = [...where];
+      const pageParams: Record<string, unknown> = { ...params, limit: q.limit };
+      let orderSql: string;
+      if (q.order === "relevance" && q.match) {
+        orderSql = "order by bm25(chat_index_fts) asc";
+      } else {
+        const desc = q.order !== "oldest";
+        if (q.cursor) {
+          const cmp = desc ? "<" : ">";
+          pageWhere.push(
+            `(ci.timestamp ${cmp} @curTs or (ci.timestamp = @curTs and ci.rowid ${cmp} @curRowid))`,
+          );
+          pageParams.curTs = q.cursor.timestamp;
+          pageParams.curRowid = q.cursor.rowid;
+        }
+        orderSql = desc
+          ? "order by ci.timestamp desc, ci.rowid desc"
+          : "order by ci.timestamp asc, ci.rowid asc";
+      }
+      const pageWhereSql = pageWhere.length > 0 ? `where ${pageWhere.join(" and ")}` : "";
+      const bm25Sel = q.match ? "bm25(chat_index_fts) as bm25" : "0 as bm25";
+      const hits = db
+        .prepare(
+          `select ci.rowid as rowid, ci.event_id as eventId, ci.timeline_key as timelineKey,
+                  ci.sender_id as senderId, ci.sender_display_name as senderDisplayName,
+                  ci.role as role, ci.timestamp as timestamp, ci.body as body,
+                  ci.aux_text as auxText, ci.has_attachment as hasAttachment,
+                  ci.attachment_types as attachmentTypes, ci.has_link as hasLink,
+                  ci.is_reply as isReply, ci.quoted_sender_id as quotedSenderId, ${bm25Sel}
+           from chat_index ci ${ftsJoin} ${pageWhereSql} ${orderSql} limit @limit`,
+        )
+        .all(pageParams) as ChatSearchHit[];
+      return { hits, total: totalRow.n };
+    });
+  }
+
+  /**
+   * A sender's message timestamps (descending), for absence-gap detection in `recap`
+   * / `search_messages` since_user_absence (§9e). Reads the chat index (which carries
+   * the (sender_id, timestamp) index); callers run `ensureFreshForQuery` first so a
+   * just-arrived "what did I miss" message is already present. `timelineKeys` scopes to
+   * a room set (undefined = all rooms); `sinceTs` bounds the lookback horizon.
+   */
+  getChatSenderTimestamps(opts: {
+    senderId: string;
+    timelineKeys?: string[];
+    sinceTs?: number;
+    limit?: number;
+  }): number[] {
+    return this.read((db) => {
+      const where: string[] = ["sender_id = @senderId"];
+      const params: Record<string, unknown> = {
+        senderId: opts.senderId,
+        limit: opts.limit ?? 5000,
+      };
+      if (opts.timelineKeys && opts.timelineKeys.length > 0) {
+        const keys = opts.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`timeline_key in (${keys.join(", ")})`);
+      }
+      if (opts.sinceTs !== undefined) {
+        where.push("timestamp >= @sinceTs");
+        params.sinceTs = opts.sinceTs;
+      }
+      const rows = db
+        .prepare(
+          `select timestamp from chat_index where ${where.join(" and ")}
+           order by timestamp desc limit @limit`,
+        )
+        .all(params) as Array<{ timestamp: number }>;
+      return rows.map((r) => r.timestamp);
+    });
+  }
+
+  /**
+   * Per-(sender, room) message-activity aggregates over a window, for the
+   * `user_activity` tool (§9e) — the admin's inactive-user view. With `senderId`,
+   * scopes to one user; otherwise returns every sender (the tool aggregates into a
+   * roster). Counts/first/last come straight off the (sender_id, timestamp) index.
+   */
+  aggregateChatActivity(opts: {
+    senderId?: string;
+    timelineKeys?: string[];
+    sinceTs?: number;
+    untilTs?: number;
+  }): Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }> {
+    return this.read((db) => {
+      const where: string[] = [];
+      const params: Record<string, unknown> = {};
+      if (opts.senderId !== undefined) {
+        where.push("sender_id = @senderId");
+        params.senderId = opts.senderId;
+      }
+      if (opts.timelineKeys && opts.timelineKeys.length > 0) {
+        const keys = opts.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`timeline_key in (${keys.join(", ")})`);
+      }
+      if (opts.sinceTs !== undefined) {
+        where.push("timestamp >= @sinceTs");
+        params.sinceTs = opts.sinceTs;
+      }
+      if (opts.untilTs !== undefined) {
+        where.push("timestamp < @untilTs");
+        params.untilTs = opts.untilTs;
+      }
+      const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+      return db
+        .prepare(
+          `select sender_id as senderId, timeline_key as timelineKey, count(*) as count,
+                  min(timestamp) as firstAt, max(timestamp) as lastAt
+           from chat_index ${whereSql}
+           group by sender_id, timeline_key
+           order by sender_id asc, timeline_key asc`,
+        )
+        .all(params) as Array<{
+        senderId: string;
+        timelineKey: string;
+        count: number;
+        firstAt: number;
+        lastAt: number;
+      }>;
     });
   }
 
@@ -3656,6 +4198,74 @@ create table if not exists index_meta (
 );
 `;
 
+// Chat-history search index (ARCHITECTURE.md §9e). A denormalized, search-optimized
+// projection of timeline_events: one row per searchable event, flattening the
+// scattered searchable text (message body + image captions + link-preview text) and
+// the filter metadata (attachment presence/type, links, replies, quoted sender) that
+// otherwise live across media_assets / link_previews / reply_contexts / event_json.
+// Rebuilt incrementally by the reconciliation indexer (src/search/) as bodies, edits,
+// captions and previews settle — the same content-hash set-diff idiom as the memory
+// index above. `chat_mentions` denormalizes event_json.mentions for an indexed
+// "who was mentioned" join. `chat_index_fts` is external-content FTS5 over the two
+// searchable columns; the tools' `scope` selects which column set MATCH applies to.
+const CHAT_SEARCH_SCHEMA = `
+create table if not exists chat_index (
+  -- AUTOINCREMENT for the same reason memory_chunks uses it: the FTS docid keys on
+  -- this rowid, and never reusing a deleted row's id keeps the external-content FTS
+  -- mapping unambiguous.
+  rowid               integer primary key autoincrement,
+  event_id            text not null unique,
+  timeline_key        text not null,
+  sender_id           text not null,
+  sender_display_name text,
+  role                text not null,
+  timestamp           integer not null,
+  body                text not null default '',   -- default search scope
+  aux_text            text not null default '',   -- captions + link-preview text (opt-in scope)
+  has_attachment      integer not null default 0, -- 1 if any role='attachment' media
+  attachment_types    text not null default '',   -- csv subset of image,video,audio,file
+  has_link            integer not null default 0,
+  is_reply            integer not null default 0,
+  quoted_sender_id    text,
+  content_sig         text not null,              -- hash of all projected inputs (dirty check)
+  indexed_at          integer not null
+);
+create index if not exists idx_chat_index_room_time on chat_index(timeline_key, timestamp);
+create index if not exists idx_chat_index_sender_time on chat_index(sender_id, timestamp);
+create index if not exists idx_chat_index_quoted on chat_index(quoted_sender_id, timestamp)
+  where quoted_sender_id is not null;
+
+create table if not exists chat_mentions (
+  event_id text not null,
+  user_id  text not null,
+  primary key (event_id, user_id)
+);
+create index if not exists idx_chat_mentions_user on chat_mentions(user_id);
+
+-- Lexical index: external-content FTS5 over chat_index (unicode61, English).
+create virtual table if not exists chat_index_fts using fts5(
+  body, aux_text, content='chat_index', content_rowid='rowid'
+);
+create trigger if not exists chat_index_ai after insert on chat_index begin
+  insert into chat_index_fts(rowid, body, aux_text) values (new.rowid, new.body, new.aux_text);
+end;
+create trigger if not exists chat_index_ad after delete on chat_index begin
+  insert into chat_index_fts(chat_index_fts, rowid, body, aux_text)
+    values ('delete', old.rowid, old.body, old.aux_text);
+  -- Mentions are keyed by event_id, not rowid, so drop them alongside the index row.
+  delete from chat_mentions where event_id = old.event_id;
+end;
+-- Gated on the FTS-indexed columns: a projection upsert that only touches metadata
+-- (e.g. has_link flipping) must not churn the FTS row. IS NOT compares NULLs safely.
+create trigger if not exists chat_index_au after update on chat_index
+  when new.body is not old.body or new.aux_text is not old.aux_text
+begin
+  insert into chat_index_fts(chat_index_fts, rowid, body, aux_text)
+    values ('delete', old.rowid, old.body, old.aux_text);
+  insert into chat_index_fts(rowid, body, aux_text) values (new.rowid, new.body, new.aux_text);
+end;
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -4030,13 +4640,14 @@ create index if not exists idx_agent_sessions_timeline
 
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
-${RETRIEVAL_SCHEMA}`;
+${RETRIEVAL_SCHEMA}
+${CHAT_SEARCH_SCHEMA}`;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 10;
+export const LATEST_SCHEMA_VERSION = 11;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -4231,6 +4842,19 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          on summaries(diary_status, latest_timestamp, id)
          where diary_status is not null;`,
     );
+  },
+  // index 10 (v10 -> v11): add the chat-history search index (ARCHITECTURE.md §9e) —
+  // `chat_index` (the denormalized per-event projection + its room/sender/quoted
+  // indexes), `chat_mentions` (denormalized mention lookup), and the external-content
+  // FTS5 table `chat_index_fts` with its insert/delete/update sync triggers. All plain
+  // SQLite + built-in FTS5. The tables are created EMPTY here; the reconciliation
+  // indexer (src/search/) backfills them from existing `timeline_events` on its first
+  // startup sweep — identical to how the v7 memory index bootstraps from disk files,
+  // so there is no row-level backfill in this step. `create ... if not exists` is
+  // harmless if a forward path already created any object. Fresh DBs get all of this
+  // directly from SCHEMA above (via CHAT_SEARCH_SCHEMA) and never run this step.
+  (db) => {
+    db.exec(CHAT_SEARCH_SCHEMA);
   },
 ];
 
