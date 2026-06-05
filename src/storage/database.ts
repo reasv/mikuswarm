@@ -4998,7 +4998,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 14;
+export const LATEST_SCHEMA_VERSION = 15;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5348,6 +5348,25 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // from SCHEMA and never run this step.
   (db) => {
     db.exec(REACTIONS_SCHEMA);
+  },
+  // index 14 (v14 -> v15): retarget the reactions index. v14 shipped
+  // idx_reactions_by_target on (timeline_key, target_event_id) plus
+  // idx_reactions_by_recency on (timeline_key, reacted_at). Reactions are now
+  // matched purely by the globally-unique target_event_id (a reaction event cannot
+  // derive its target's authoritative timeline_key — dm/room/thread — so a
+  // timeline_key predicate silently missed DM/threaded targets), so drop both old
+  // indexes and create the target-keyed one. This needs an explicit version step:
+  // a bare REACTIONS_SCHEMA edit could not fix an existing v14 DB because
+  // `create index if not exists` no-ops on the already-present index name. Fresh
+  // DBs get the final shape from REACTIONS_SCHEMA and never run this. (Keep the
+  // create below in sync with REACTIONS_SCHEMA's idx_reactions_by_target.)
+  (db) => {
+    db.exec(
+      `drop index if exists idx_reactions_by_recency;
+       drop index if exists idx_reactions_by_target;
+       create index if not exists idx_reactions_by_target
+         on reactions(target_event_id, reacted_at) where redacted_at is null;`,
+    );
   },
 ];
 

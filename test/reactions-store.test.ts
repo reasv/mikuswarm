@@ -131,7 +131,7 @@ test("empty target list short-circuits to empty results", async () => {
   });
 });
 
-test("v13 -> v14 migration creates the reactions table on an existing DB", async () => {
+test("migrating a pre-reactions (v13) DB creates the reactions table", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-reactions-migrate-"));
   const dbPath = path.join(dir, "legacy.db");
   try {
@@ -160,6 +160,49 @@ test("v13 -> v14 migration creates the reactions table on an existing DB", async
     // Version was stamped forward to latest.
     const check = new Database(dbPath);
     assert.equal(check.pragma("user_version", { simple: true }), LATEST_SCHEMA_VERSION);
+    check.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("v14 (stage-2 index shape) -> v15 migration retargets the reactions index", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-reactions-v15-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    // Build a current DB, then rewrite it into the stage-2 v14 shape: the old
+    // (timeline_key, *) indexes and user_version = 14.
+    const built = await Storage.open({ databasePath: dbPath });
+    await built.waitForIdle();
+    built.close();
+
+    const raw = new Database(dbPath);
+    raw.exec(`
+      drop index if exists idx_reactions_by_target;
+      create index idx_reactions_by_target
+        on reactions(timeline_key, target_event_id) where redacted_at is null;
+      create index idx_reactions_by_recency
+        on reactions(timeline_key, reacted_at) where redacted_at is null;
+    `);
+    raw.pragma("user_version = 14");
+    raw.close();
+
+    // Reopen: the v14 -> v15 step must converge the indexes (this is exactly the
+    // case `create index if not exists` alone would silently fail to fix).
+    const migrated = await Storage.open({ databasePath: dbPath });
+    await migrated.waitForIdle();
+    migrated.close();
+
+    const check = new Database(dbPath);
+    assert.equal(check.pragma("user_version", { simple: true }), LATEST_SCHEMA_VERSION);
+    const targetCols = (
+      check.pragma("index_info(idx_reactions_by_target)") as Array<{ name: string }>
+    ).map((r) => r.name);
+    assert.deepEqual(targetCols, ["target_event_id", "reacted_at"], "index must be retargeted");
+    const recency = check
+      .prepare("select name from sqlite_master where type='index' and name='idx_reactions_by_recency'")
+      .get();
+    assert.equal(recency, undefined, "stale recency index must be dropped");
     check.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
