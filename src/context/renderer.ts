@@ -1,4 +1,10 @@
-import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
+import type {
+  AttachmentMeta,
+  CanonicalChatEvent,
+  LinkPreviewMeta,
+  ReactionAggregate,
+  ReplyContext,
+} from "../types.js";
 import { escapeAttr, escapeXml } from "./xml.js";
 import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
 
@@ -46,8 +52,21 @@ export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOp
   for (const a of event.attachments ?? []) parts.push(renderAttachment(a));
   for (const m of event.linkedMedia ?? []) parts.push(renderLinkedMedia(m));
   for (const lp of event.linkPreviews ?? []) parts.push(renderLinkPreview(lp));
+  // View A (ARCHITECTURE.md §9f): deduped reaction counts, spatially attached to
+  // the message. Rich tier only — renderCompactMessage deliberately omits these,
+  // which is what confines reaction-driven byte changes to the cache-volatile
+  // rich suffix.
+  if (event.reactions && event.reactions.length > 0) parts.push(renderReactions(event.reactions));
 
   return `<message ${attrs}>\n${parts.join("\n\n")}\n</message>`;
+}
+
+function renderReactions(reactions: ReactionAggregate[]): string {
+  // e.g. <reactions>👍×3 :blobwave:×1 😮×1</reactions>. `display` is already the
+  // glyph / :shortcode: / literal form; we can't show the custom image, identical
+  // to how the react/list_reactions tools render.
+  const items = reactions.map((r) => `${escapeXml(r.display)}×${r.count}`).join(" ");
+  return `<reactions>${items}</reactions>`;
 }
 
 export function renderCompactMessage(event: CanonicalChatEvent): string {

@@ -80,10 +80,19 @@ export interface MentionInfo {
   mentionedSelf?: boolean;
 }
 
-export interface ReactionInfo {
-  key: string;
-  sender: SenderInfo;
-  timestamp: number;
+/**
+ * One deduped reaction count on a message (View A — ARCHITECTURE.md §9f). Derived
+ * from the reaction store at context-build time and attached to
+ * {@link CanonicalChatEvent.reactions}; it is a render-time projection, never
+ * persisted into `event_json`. `display` is the glyph (unicode), `:shortcode:`
+ * (custom), or literal (text); `count` is the number of distinct senders.
+ */
+export interface ReactionAggregate {
+  normalizedKey: string;
+  kind: "unicode" | "custom" | "text";
+  display: string;
+  shortcode?: string;
+  count: number;
 }
 
 export interface TriggerInfo {
@@ -112,7 +121,13 @@ export interface CanonicalChatEvent {
   replyTo?: ReplyContext;
   linkPreviews?: LinkPreviewMeta[];
   mentions?: MentionInfo;
-  reactions?: ReactionInfo[];
+  /**
+   * Deduped reaction counts on this message (View A). A render-time derivation
+   * populated by the context builder from the reaction store — NOT part of the
+   * persisted event (never written into `event_json`). Only the rich renderer
+   * emits it.
+   */
+  reactions?: ReactionAggregate[];
   threadId?: string;
   trigger?: TriggerInfo;
   generatedCaptions?: CaptionResult[];
