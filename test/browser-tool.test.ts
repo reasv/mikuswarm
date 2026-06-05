@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { writeFile, mkdir } from "node:fs/promises";
+
 import sharp from "sharp";
 
 import { BrowserSession, type ConnectOverCdp } from "../src/browser/session.js";
-import { createBrowserTool, boundScreenshot } from "../src/tools/browser.js";
+import { createBrowserTool, boundScreenshot, resolveUploadFiles } from "../src/tools/browser.js";
 import { aiSnapshot } from "../src/browser/snapshot.js";
 import { base64ByteSize } from "../src/tools/read-image.js";
 import type { BrowserConfig } from "../src/config/index.js";
@@ -102,7 +104,7 @@ async function withTool(
   const restore = stubManager();
   const connect: ConnectOverCdp = async () => makeBrowser(pageOpts) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880 });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880, workspaceRoot: ws });
   try {
     await fn(tool);
   } finally {
@@ -267,6 +269,7 @@ test("tool: schema bounds `text` length, rejecting pathological multi-MB input (
     agentSessionId: "s1",
     config: baseConfig(),
     maxImageBytes: 5_242_880,
+    workspaceRoot: "/tmp",
   });
   const params = tool.parameters as { properties: { text: { maxLength?: number } } };
   const textSchema = params.properties.text;
@@ -398,4 +401,166 @@ test("boundScreenshot: an unshrinkable over-cap capture throws screenshot_failed
     (err: unknown) => (err as { code?: string }).code === "screenshot_failed",
     "must throw screenshot_failed rather than ship an oversized block",
   );
+});
+
+test("boundScreenshot: jpeg format under the cap passes through with image/jpeg mimeType", async () => {
+  const jpeg = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 1, g: 2, b: 3 } } })
+    .jpeg().toBuffer();
+  const bounded = await boundScreenshot(jpeg, 5_242_880, "jpeg");
+  assert.equal(bounded.downscaled, false);
+  assert.equal(bounded.mimeType, "image/jpeg");
+  assert.equal(bounded.data, jpeg.toString("base64"));
+});
+
+test("boundScreenshot: png format reports image/png mimeType", async () => {
+  const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 1, g: 2, b: 3 } } })
+    .png().toBuffer();
+  const bounded = await boundScreenshot(png, 5_242_880, "png");
+  assert.equal(bounded.mimeType, "image/png");
+});
+
+test("boundScreenshot: an over-cap jpeg downscales and re-encodes as jpeg", async () => {
+  const w = 2000, h = 2000;
+  const raw = Buffer.alloc(w * h * 3);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 3;
+      raw[i] = (i * 2654435761) & 0xff; // noise so it can't trivially compress
+      raw[i + 1] = (i * 40503) & 0xff;
+      raw[i + 2] = (i * 2246822519) & 0xff;
+    }
+  }
+  const jpeg = await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).jpeg().toBuffer();
+  const cap = 200_000;
+  assert.ok(base64ByteSize(jpeg.byteLength) > cap, "precondition: capture exceeds the cap");
+
+  const bounded = await boundScreenshot(jpeg, cap, "jpeg");
+  assert.equal(bounded.downscaled, true);
+  assert.equal(bounded.mimeType, "image/jpeg");
+  assert.ok(bounded.base64Bytes <= cap);
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.equal(meta.format, "jpeg");
+});
+
+// ── upload path policy (resolveUploadFiles) ──────────────────────────────────
+
+async function withWorkspace(fn: (root: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "miku-upload-"));
+  try {
+    await fn(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("resolveUploadFiles: reads workspace files into name/mime/buffer", async () => {
+  await withWorkspace(async (root) => {
+    await writeFile(path.join(root, "doc.png"), Buffer.from([1, 2, 3]));
+    const files = await resolveUploadFiles(root, ["doc.png"]);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].name, "doc.png");
+    assert.equal(files[0].mimeType, "image/png");
+    assert.deepEqual([...files[0].buffer], [1, 2, 3]);
+  });
+});
+
+test("resolveUploadFiles: resolves nested workspace paths and infers mime from ext", async () => {
+  await withWorkspace(async (root) => {
+    await mkdir(path.join(root, "sub"), { recursive: true });
+    await writeFile(path.join(root, "sub", "f.pdf"), Buffer.from("%PDF"));
+    const files = await resolveUploadFiles(root, ["sub/f.pdf"]);
+    assert.equal(files[0].name, "f.pdf");
+    assert.equal(files[0].mimeType, "application/pdf");
+  });
+});
+
+test("resolveUploadFiles: rejects an empty list (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    await assert.rejects(
+      () => resolveUploadFiles(root, []),
+      (e: unknown) => (e as { code?: string }).code === "bad_request",
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects a ../ traversal escape (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    await assert.rejects(
+      () => resolveUploadFiles(root, ["../secret.txt"]),
+      (e: unknown) => (e as { code?: string }).code === "bad_request" && /escapes the workspace/.test((e as Error).message),
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects an absolute path outside the workspace (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    await assert.rejects(
+      () => resolveUploadFiles(root, ["/etc/passwd"]),
+      (e: unknown) => (e as { code?: string }).code === "bad_request",
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects a missing file (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    await assert.rejects(
+      () => resolveUploadFiles(root, ["nope.txt"]),
+      (e: unknown) => (e as { code?: string }).code === "bad_request" && /not found/.test((e as Error).message),
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects a directory (not a regular file)", async () => {
+  await withWorkspace(async (root) => {
+    await mkdir(path.join(root, "adir"), { recursive: true });
+    await assert.rejects(
+      () => resolveUploadFiles(root, ["adir"]),
+      (e: unknown) => (e as { code?: string }).code === "bad_request" && /not a regular file/.test((e as Error).message),
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects more than the file-count cap (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    const names: string[] = [];
+    for (let i = 0; i < 11; i += 1) {
+      const n = `f${i}.txt`;
+      await writeFile(path.join(root, n), "x");
+      names.push(n);
+    }
+    await assert.rejects(
+      () => resolveUploadFiles(root, names),
+      (e: unknown) => (e as { code?: string }).code === "bad_request" && /at most/.test((e as Error).message),
+    );
+  });
+});
+
+test("resolveUploadFiles: rejects when total bytes exceed the cap (bad_request)", async () => {
+  await withWorkspace(async (root) => {
+    // Two ~16 MiB files exceed the 25 MiB total cap.
+    const big = Buffer.alloc(16 * 1024 * 1024, 7);
+    await writeFile(path.join(root, "a.bin"), big);
+    await writeFile(path.join(root, "b.bin"), big);
+    await assert.rejects(
+      () => resolveUploadFiles(root, ["a.bin", "b.bin"]),
+      (e: unknown) => (e as { code?: string }).code === "bad_request" && /total cap/.test((e as Error).message),
+    );
+  });
+});
+
+// ── new act kinds are exposed in the tool schema ─────────────────────────────
+
+test("tool: schema `kind` union includes drag, upload, clear_site_data", () => {
+  const tool = createBrowserTool({
+    session: undefined as never,
+    agentSessionId: "s1",
+    config: baseConfig(),
+    maxImageBytes: 5_242_880,
+    workspaceRoot: "/tmp",
+  });
+  const params = tool.parameters as { properties: { kind: { anyOf: Array<{ const?: string }> } } };
+  const kinds = params.properties.kind.anyOf.map((s) => s.const);
+  for (const k of ["drag", "upload", "clear_site_data"]) {
+    assert.ok(kinds.includes(k), `kind union includes ${k}`);
+  }
 });

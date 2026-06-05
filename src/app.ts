@@ -885,6 +885,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // Same shared per-model base64 cap read_image uses, so inline
             // screenshots respect the model's per-image budget (issue #2).
             maxImageBytes: resolveReadImageMaxBytes(config),
+            // Upload paths resolve within (and are confined to) the workspace (§6).
+            workspaceRoot,
           })]
         : []),
       // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.

@@ -1,3 +1,6 @@
+import { stat, readFile } from "node:fs/promises";
+import path from "node:path";
+
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { Page } from "playwright-core";
@@ -11,12 +14,22 @@ import {
   BrowserError,
   isBrowserError,
   isTimeoutError,
+  mapError,
+  REF_RE,
   type ActKind,
   type ActParams,
   type BrowserSession,
   type DownloadRecord,
+  type UploadFile,
 } from "../browser/index.js";
 import { base64ByteSize } from "./read-image.js";
+
+/** Upload bounds ship as code constants (proposal §9); promote to config if a deployment needs to tune them. */
+const MAX_UPLOAD_FILES = 10;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MiB total across all files
+
+type ScreenshotFormat = "png" | "jpeg";
+const JPEG_QUALITY = 80;
 
 export interface BrowserToolContext {
   /** Shared connection/identity manager (one persistent CloakBrowser identity). */
@@ -31,10 +44,18 @@ export interface BrowserToolContext {
    * sharp to fit rather than shipped oversized.
    */
   maxImageBytes: number;
+  /**
+   * Workspace root for resolving `upload` paths. Upload files must resolve
+   * within this directory (no absolute paths, no `../` escape — see §3.5/§6).
+   */
+  workspaceRoot: string;
 }
 
 const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "tabs", "open", "close"] as const;
-const ACT_KINDS: ActKind[] = ["click", "type", "press", "hover", "select", "fill", "scroll", "wait", "back", "evaluate"];
+const ACT_KINDS: ActKind[] = [
+  "click", "type", "press", "hover", "select", "fill", "scroll", "wait", "back", "evaluate",
+  "drag", "upload", "clear_site_data",
+];
 
 const DESCRIPTION = [
   "Drive a real, stealth web browser (one persistent identity — shared cookies/logins) to read pages, follow links, and fill the occasional form.",
@@ -43,11 +64,15 @@ const DESCRIPTION = [
   "Pick an `action`:",
   "- navigate { url }: go to an http/https URL; returns the page's AI snapshot.",
   "- snapshot: return the current page's accessibility tree, with every interactive element tagged [ref=eN].",
-  "- act { kind, ... }: interact by ref. kinds: click|type|press|hover|select|fill|scroll|wait|back|evaluate.",
-  "    click/hover/fill/type/select/scroll take `ref` (and fill/type take `text`; select takes `value`).",
+  "- act { kind, ... }: interact by ref. kinds: click|type|press|hover|select|fill|scroll|wait|back|evaluate|drag|upload|clear_site_data.",
+  "    click takes `ref`, plus optional `button` (left|right|middle), `double` (double-click), `modifiers` (Alt/Control/Meta/Shift).",
+  "    hover/fill/type/select/scroll take `ref` (and fill/type take `text`; select takes `value`). type takes optional `submit` to press Enter after typing.",
   "    press takes `key` (e.g. \"Enter\"), optional `ref`. scroll without `ref` scrolls the page by `delta_y`.",
-  "    wait takes `ms`. back navigates history. evaluate runs JS in `text` (only if enabled).",
-  "- screenshot { full_page? }: return a PNG of the page to look at.",
+  "    wait takes EXACTLY ONE of: ms, wait_text, wait_text_gone, wait_selector (CSS), wait_url (glob), wait_load_state (load|domcontentloaded|networkidle). With none, ms is a plain sleep.",
+  "    back navigates history. evaluate runs JS in `text` (only if enabled).",
+  "    drag takes `ref` (source) and `to_ref` (target). upload takes `ref` (an <input type=file> or a button that opens the chooser) and `paths` (workspace-relative files).",
+  "    clear_site_data discards cookies + all web storage for the CURRENT page's origin (a fresh start on this site; cookies are cleared by security origin, so parent-domain cookies set elsewhere may persist).",
+  "- screenshot { full_page?, ref?, format? }: return an image to look at. With `ref`, capture just that element (full_page is ignored). `format` is png (default) or jpeg.",
   "- open { url? }: open a new tab (optionally navigate it). close { index }: close a tab.",
   "- tabs: list this session's tabs; pass `index` to switch the active tab.",
   "",
@@ -55,7 +80,7 @@ const DESCRIPTION = [
 ].join("\n");
 
 export function createBrowserTool(context: BrowserToolContext): AgentTool {
-  const { session, agentSessionId, config, maxImageBytes } = context;
+  const { session, agentSessionId, config, maxImageBytes, workspaceRoot } = context;
   const actTimeoutMs = config.act_timeout_ms;
 
   return {
@@ -66,7 +91,8 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
       action: Type.Union(ACTION_VALUES.map((v) => Type.Literal(v))),
       url: Type.Optional(Type.String({ description: "URL for navigate/open (http/https only)." })),
       kind: Type.Optional(Type.Union(ACT_KINDS.map((v) => Type.Literal(v)))),
-      ref: Type.Optional(Type.String({ description: "A [ref=eN] handle from the latest snapshot." })),
+      ref: Type.Optional(Type.String({ description: "A [ref=eN] handle from the latest snapshot (act target, or element to screenshot)." })),
+      to_ref: Type.Optional(Type.String({ description: "Drop-target [ref=eN] handle for act:drag." })),
       // maxLength is a generous defensive bound: a pathological multi-MB
       // fill/evaluate value fails fast with a clear schema error instead of by
       // timeout (issue #10). 100k chars is far above any legitimate input.
@@ -76,8 +102,33 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
         Type.Union([Type.String(), Type.Array(Type.String())], { description: "Option value(s) for act:select." }),
       ),
       delta_y: Type.Optional(Type.Number({ description: "Pixels to scroll (act:scroll without a ref)." })),
-      ms: Type.Optional(Type.Number({ description: "Milliseconds for act:wait." })),
-      full_page: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page (screenshot)." })),
+      ms: Type.Optional(Type.Number({ description: "Milliseconds for act:wait (sleep fallback when no wait_* condition is set)." })),
+      button: Type.Optional(
+        Type.Union(["left", "right", "middle"].map((v) => Type.Literal(v)), { description: "Mouse button for act:click (default left)." }),
+      ),
+      double: Type.Optional(Type.Boolean({ description: "Double-click instead of single-click (act:click)." })),
+      modifiers: Type.Optional(
+        Type.Array(Type.Union(["Alt", "Control", "Meta", "Shift"].map((v) => Type.Literal(v))), {
+          description: "Keyboard modifiers held during act:click.",
+        }),
+      ),
+      submit: Type.Optional(Type.Boolean({ description: "Press Enter after typing (act:type)." })),
+      paths: Type.Optional(
+        Type.Array(Type.String(), { description: "Workspace-relative file paths to upload (act:upload)." }),
+      ),
+      wait_text: Type.Optional(Type.String({ description: "act:wait until this text is visible." })),
+      wait_text_gone: Type.Optional(Type.String({ description: "act:wait until this text is hidden/detached." })),
+      wait_selector: Type.Optional(Type.String({ description: "act:wait until this CSS selector is visible." })),
+      wait_url: Type.Optional(Type.String({ description: "act:wait until the page URL matches this glob." })),
+      wait_load_state: Type.Optional(
+        Type.Union(["load", "domcontentloaded", "networkidle"].map((v) => Type.Literal(v)), {
+          description: "act:wait until the page reaches this load state.",
+        }),
+      ),
+      full_page: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page (screenshot; ignored when ref is set)." })),
+      format: Type.Optional(
+        Type.Union(["png", "jpeg"].map((v) => Type.Literal(v)), { description: "Screenshot image format (default png)." }),
+      ),
       index: Type.Optional(Type.Number({ description: "Tab index for close / tabs-switch." })),
     }),
     execute: async (_toolCallId, params) => {
@@ -88,7 +139,7 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
         // Symmetric even on throw; endOp also refreshes the idle clock so a long
         // op resets it on completion.
         return await session.runOp(agentSessionId, () =>
-          dispatch(session, agentSessionId, config, actTimeoutMs, maxImageBytes, args),
+          dispatch(session, agentSessionId, config, actTimeoutMs, maxImageBytes, workspaceRoot, args),
         );
       } catch (error) {
         if (isBrowserError(error)) {
@@ -106,12 +157,24 @@ interface BrowserToolArgs {
   url?: string;
   kind?: ActKind;
   ref?: string;
+  to_ref?: string;
   text?: string;
   key?: string;
   value?: string | string[];
   delta_y?: number;
   ms?: number;
+  button?: "left" | "right" | "middle";
+  double?: boolean;
+  modifiers?: Array<"Alt" | "Control" | "Meta" | "Shift">;
+  submit?: boolean;
+  paths?: string[];
+  wait_text?: string;
+  wait_text_gone?: string;
+  wait_selector?: string;
+  wait_url?: string;
+  wait_load_state?: "load" | "domcontentloaded" | "networkidle";
   full_page?: boolean;
+  format?: ScreenshotFormat;
   index?: number;
 }
 
@@ -121,6 +184,7 @@ async function dispatch(
   config: BrowserConfig,
   actTimeoutMs: number,
   maxImageBytes: number,
+  workspaceRoot: string,
   args: BrowserToolArgs,
 ): Promise<AgentToolResult<unknown>> {
   switch (args.action) {
@@ -144,14 +208,28 @@ async function dispatch(
     case "act": {
       if (!args.kind) throw new BrowserError("bad_request", "act requires `kind`.");
       const page = await session.getActivePage(sessionId);
+      // Path policy lives here (not in act.ts) so `act` stays filesystem-agnostic:
+      // resolve+read upload files into buffers before handing them to act.
+      const files = args.kind === "upload" ? await resolveUploadFiles(workspaceRoot, args.paths) : undefined;
       const actParams: ActParams = {
         kind: args.kind,
         ref: args.ref,
+        to_ref: args.to_ref,
         text: args.text,
         key: args.key,
         value: args.value,
         delta_y: args.delta_y,
         ms: args.ms,
+        button: args.button,
+        double: args.double,
+        modifiers: args.modifiers,
+        submit: args.submit,
+        files,
+        wait_text: args.wait_text,
+        wait_text_gone: args.wait_text_gone,
+        wait_selector: args.wait_selector,
+        wait_url: args.wait_url,
+        wait_load_state: args.wait_load_state,
       };
       const result = await act(page, actParams, { timeoutMs: actTimeoutMs, evaluateEnabled: config.evaluate_enabled });
       // evaluate/wait don't change what's worth re-snapshotting; return terse.
@@ -167,14 +245,31 @@ async function dispatch(
 
     case "screenshot": {
       const page = await session.getActivePage(sessionId);
+      const format: ScreenshotFormat = args.format ?? "png";
+      // With a `ref`, capture just that element; otherwise capture the page.
+      // full_page has no meaning for an element capture, so it's ignored there.
+      const elementRef = args.ref;
+      if (elementRef !== undefined && !REF_RE.test(elementRef)) {
+        throw new BrowserError("bad_request", `Invalid ref "${elementRef}" — expected a snapshot handle like "e12".`);
+      }
       let buffer: Buffer;
       try {
-        buffer = await page.screenshot({ fullPage: args.full_page ?? false, timeout: config.act_timeout_ms });
+        const target = elementRef ? page.locator(`aria-ref=${elementRef}`) : page;
+        buffer = await target.screenshot({
+          ...(elementRef ? {} : { fullPage: args.full_page ?? false }),
+          type: format,
+          timeout: config.act_timeout_ms,
+        });
       } catch (error) {
         // Distinguish a genuine capture timeout from any other failure so the
         // code isn't misleading (issue #8): a timeout is act_timeout, everything
-        // else (detached page, encoding error, …) is screenshot_failed.
+        // else (detached page, encoding error, …) is screenshot_failed. A stale
+        // element ref surfaces as ref_expired (take a fresh snapshot).
         const message = error instanceof Error ? error.message : String(error);
+        if (elementRef) {
+          const mapped = mapError(error, true, elementRef);
+          if (mapped.code === "ref_expired") throw mapped;
+        }
         if (isTimeoutError(error)) {
           throw new BrowserError("act_timeout", `Screenshot timed out: ${message}`, { cause: error });
         }
@@ -184,16 +279,19 @@ async function dispatch(
       // a long full-page capture can be many MB and blow the per-image/context
       // budget. Downscale to fit rather than reject — the model should still see
       // the page.
-      const bounded = await boundScreenshot(buffer, maxImageBytes);
+      const bounded = await boundScreenshot(buffer, maxImageBytes, format);
+      const scope = elementRef ? ` (element ${elementRef})` : args.full_page ? " (full page)" : "";
       return {
         content: [
-          { type: "text", text: `screenshot of ${page.url()}${args.full_page ? " (full page)" : ""}` },
-          { type: "image", data: bounded.data, mimeType: "image/png" },
+          { type: "text", text: `screenshot of ${page.url()}${scope}` },
+          { type: "image", data: bounded.data, mimeType: bounded.mimeType },
         ],
         details: {
           action: "screenshot",
           url: page.url(),
-          fullPage: args.full_page ?? false,
+          ref: elementRef,
+          format,
+          fullPage: elementRef ? false : args.full_page ?? false,
           downscaled: bounded.downscaled,
           base64Bytes: bounded.base64Bytes,
         },
@@ -264,22 +362,34 @@ async function pageResult(
 }
 
 /**
- * Bound a screenshot PNG to `maxBytes` measured as its base64-encoded size (the
+ * Bound a screenshot to `maxBytes` measured as its base64-encoded size (the
  * size providers meter against the per-image budget — the exact accounting
  * read_image uses via `base64ByteSize`). If the capture already fits it passes
  * through untouched (`downscaled: false`). Otherwise it's iteratively downscaled
- * via sharp (re-encoded PNG) until it fits or a minimum dimension / iteration
- * cap is hit. If it genuinely can't be made to fit, throws a clean
+ * via sharp (re-encoded in `format`) until it fits or a minimum dimension /
+ * iteration cap is hit. If it genuinely can't be made to fit, throws a clean
  * `screenshot_failed` BrowserError rather than shipping an oversized block.
+ * Returns the `mimeType` matching `format` so the caller's image block is tagged
+ * correctly (png vs jpeg).
  *
  * Factored out (and exported) for direct testing.
  */
 export async function boundScreenshot(
   buffer: Buffer,
   maxBytes: number,
-): Promise<{ data: string; downscaled: boolean; base64Bytes: number }> {
+  format: ScreenshotFormat = "png",
+): Promise<{ data: string; downscaled: boolean; base64Bytes: number; mimeType: string }> {
+  const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
+  const reencode = (pipeline: sharp.Sharp): sharp.Sharp =>
+    format === "jpeg" ? pipeline.jpeg({ quality: JPEG_QUALITY }) : pipeline.png();
+
   if (base64ByteSize(buffer.byteLength) <= maxBytes) {
-    return { data: buffer.toString("base64"), downscaled: false, base64Bytes: base64ByteSize(buffer.byteLength) };
+    return {
+      data: buffer.toString("base64"),
+      downscaled: false,
+      base64Bytes: base64ByteSize(buffer.byteLength),
+      mimeType,
+    };
   }
 
   // Establish the current pixel dimensions to scale from.
@@ -312,10 +422,12 @@ export async function boundScreenshot(
     if (nextWidth === width && nextHeight === height) break;
     width = nextWidth;
     height = nextHeight;
-    current = await sharp(buffer).resize({ width, height, fit: "inside", withoutEnlargement: true }).png().toBuffer();
+    current = await reencode(
+      sharp(buffer).resize({ width, height, fit: "inside", withoutEnlargement: true }),
+    ).toBuffer();
     currentBytes = base64ByteSize(current.byteLength);
     if (currentBytes <= maxBytes) {
-      return { data: current.toString("base64"), downscaled: true, base64Bytes: currentBytes };
+      return { data: current.toString("base64"), downscaled: true, base64Bytes: currentBytes, mimeType };
     }
     // After the first (ratio-seeded) step, shrink more conservatively.
     scale = 0.8;
@@ -326,6 +438,69 @@ export async function boundScreenshot(
     "screenshot_failed",
     `Screenshot could not be downscaled under the ${(maxBytes / (1024 * 1024)).toFixed(1)}MB image cap (smallest attempt was ${(currentBytes / (1024 * 1024)).toFixed(1)}MB at ${width}x${height}). Try a non-full-page capture or a smaller viewport.`,
   );
+}
+
+/**
+ * Resolve workspace-relative upload paths into inline `{name, mimeType, buffer}`
+ * files. Confined to `workspaceRoot` (no absolute paths, no `../` escape — §6),
+ * bounded by file count and total bytes. Reads bytes here (the Node harness can
+ * see the workspace; the browser container cannot), so uploads ship over CDP as
+ * buffers rather than host paths (§3.5). Throws `bad_request` on any policy
+ * violation. Exported for direct testing.
+ */
+export async function resolveUploadFiles(workspaceRoot: string, paths: string[] | undefined): Promise<UploadFile[]> {
+  if (!paths || paths.length === 0) {
+    throw new BrowserError("bad_request", "upload requires a non-empty `paths` list.");
+  }
+  if (paths.length > MAX_UPLOAD_FILES) {
+    throw new BrowserError("bad_request", `upload accepts at most ${MAX_UPLOAD_FILES} files (got ${paths.length}).`);
+  }
+  const root = path.resolve(workspaceRoot);
+  const files: UploadFile[] = [];
+  let totalBytes = 0;
+  for (const p of paths) {
+    const resolved = path.resolve(root, p);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new BrowserError("bad_request", `upload path escapes the workspace: ${p}`);
+    }
+    let info;
+    try {
+      info = await stat(resolved);
+    } catch {
+      throw new BrowserError("bad_request", `file not found in workspace: ${p}`);
+    }
+    if (!info.isFile()) {
+      throw new BrowserError("bad_request", `upload path is not a regular file: ${p}`);
+    }
+    totalBytes += info.size;
+    if (totalBytes > MAX_UPLOAD_BYTES) {
+      throw new BrowserError(
+        "bad_request",
+        `upload exceeds the ${(MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0)} MiB total cap.`,
+      );
+    }
+    const name = path.basename(resolved);
+    files.push({ name, mimeType: mimeFromExt(name), buffer: await readFile(resolved) });
+  }
+  return files;
+}
+
+/** Minimal extension→MIME map for uploads; unknown types fall back to octet-stream. */
+function mimeFromExt(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+    webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", avif: "image/avif",
+    tiff: "image/tiff", pdf: "application/pdf", txt: "text/plain", csv: "text/csv",
+    json: "application/json", xml: "application/xml", html: "text/html",
+    zip: "application/zip", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
+    mp3: "audio/mpeg", ogg: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4",
+    doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls: "application/vnd.ms-excel",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  };
+  return map[ext ?? ""] ?? "application/octet-stream";
 }
 
 function renderDownloads(downloads: DownloadRecord[]): string {
