@@ -246,6 +246,7 @@ test("sweeper applies a decrypted m.replace to the target and deletes the placeh
         };
         return summary;
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {
         enrichNudged = true;
       },
@@ -286,6 +287,7 @@ test("sweeper deletes the placeholder even when the edit's target is missing", a
         timestamp: new Date(1_700_000_001_000).toISOString(),
         relatesTo: { relType: "m.replace", eventId: "$missing" },
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("a missing-target edit must not enrich"),
       notifyCaptions: () => assert.fail("a missing-target edit must not caption"),
       intervalMs: 1000,
@@ -520,6 +522,7 @@ test("a decrypted m.replace whose target is missing is parked, then replayed on 
         timestamp: new Date(1_700_000_001_000).toISOString(),
         relatesTo: { relType: "m.replace", eventId: "$orig" },
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {},
       notifyCaptions: () => {},
       intervalMs: 1000,
@@ -649,6 +652,7 @@ test("sweeper resolves a thread-keyed target for a re-decrypted edit (#4)", asyn
         timestamp: new Date(1_700_000_001_000).toISOString(),
         relatesTo: { relType: "m.replace", eventId: "$orig" },
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {},
       notifyCaptions: () => {},
       intervalMs: 1000,
@@ -689,6 +693,7 @@ test("sweeper still edits a room-keyed target and parks correctly when missing (
         timestamp: new Date(1_700_000_001_000).toISOString(),
         relatesTo: { relType: "m.replace", eventId: "$orig" },
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {},
       notifyCaptions: () => {},
       intervalMs: 1000,

@@ -53,6 +53,15 @@ export interface RedecryptionSweeperOptions {
   notifyEnrichment(eventId: string): void;
   /** Nudge the caption pool when a decrypted event has media. */
   notifyCaptions(): void;
+  /**
+   * Re-project a freshly-decrypted event into the chat-search index (§9e). Called
+   * unconditionally on a successful body write — NOT gated on enrichment status — so
+   * a plain-text decrypted message (status 'skipped', no enrichment/caption onComplete
+   * to ride) still becomes searchable without waiting for the next restart sweep. The
+   * decrypt rewrites the body `""→text` on an already-indexed below-watermark row that
+   * lazy catch-up never revisits. Idempotent via the index's content_sig set-diff.
+   */
+  notifyChatIndex(eventId: string): void;
   /** Poll interval (ms); 0 disables the sweeper entirely. */
   intervalMs: number;
   /** Max UTD events probed per tick. */
@@ -245,6 +254,13 @@ export class RedecryptionSweeper {
     const replaced = result.event;
     if (replaced.undecryptable) return;
 
+    // Re-project the now-decrypted event into the chat-search index (§9e),
+    // unconditionally — a plain-text decrypted message is 'skipped' for enrichment
+    // and would otherwise never re-index until the next restart sweep (see the
+    // notifyChatIndex doc on the options). The canonical id is preserved across a
+    // thread re-home, so this reconciles the correct row.
+    this.#options.notifyChatIndex(replaced.id);
+
     // A thread message stored UTD on the room timeline is re-homed to its thread
     // timeline once the decrypted relation is known; surface that move.
     if (replaced.timelineKey !== event.timelineKey) {
@@ -338,6 +354,10 @@ export class RedecryptionSweeper {
       });
       return;
     }
+
+    // The edit rewrote the target message's body in place on an already-indexed row;
+    // re-project it (unconditional, same rationale as the live applyEdit path, §9e).
+    this.#options.notifyChatIndex(result.event.id);
 
     const hasMedia = (result.event.attachments?.length ?? 0) > 0;
     if (result.status === "pending") {

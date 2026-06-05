@@ -595,6 +595,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
 
+    // Re-project the edited event into the chat-search index (§9e). The edit rewrote
+    // the body in place on an already-indexed (below-watermark) row, which lazy
+    // catch-up never revisits, so without this nudge the stale pre-edit body keeps
+    // surfacing in search until the next restart's full sweep. This is unconditional —
+    // NOT gated on enrichment status: a plain-text edit yields status 'skipped', so the
+    // enrichment/caption onComplete hooks never fire for it. The content_sig set-diff in
+    // upsertChatIndexRows makes this a no-op when nothing actually changed.
+    chatSearchIndexer.enqueueReconcileEvent(result.event.id);
+
     // Re-arm work consistently with the STORED status (inactive timelines defer to
     // the activation bulk-flip; active timelines nudge enrichment when 'pending'
     // and captions only when the edited target carries attachments).
@@ -1078,6 +1087,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }),
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
+    notifyChatIndex: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
     intervalMs: config.timeline?.redecryption_sweep_interval_ms ?? 60_000,
     batchSize: config.timeline?.redecryption_sweep_batch ?? 50,
     isDraining: () => draining,
@@ -1117,6 +1127,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger.info("stale_sessions_reset", { count: resetSessions });
   }
 
+  // Backfill/repair the chat-search index (§9e). Enqueued BEFORE provider.start() so
+  // this cross-restart repair sweep is guaranteed to sit ahead of any inbound-triggered
+  // query's lazy catch-up on the indexer's shared FIFO tail (#14). Fire-and-forget: the
+  // projection sweep is plain SQLite and the tools' lazy catch-up covers correctness, so
+  // don't block boot on it. Its only deps — the open storage and the constructed indexer —
+  // exist well above this point; nothing between here and provider.start() feeds it.
+  // Backfills existing events on first run after the v11 migration.
+  void chatSearchIndexer.reconcileAll().catch((error) =>
+    logger.warn("chat_index_sweep_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
+
   await provider.start(config.matrix);
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
@@ -1140,14 +1163,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (summarizationPool) await summarizationPool.start();
   if (diaryPool) await diaryPool.start();
   if (retrieval) await retrieval.start();
-  // Backfill/repair the chat-search index (§9e). Fire-and-forget: the projection sweep
-  // is plain SQLite and the tools' lazy catch-up covers correctness, so don't block
-  // boot on it. Backfills existing events on first run after the v11 migration.
-  void chatSearchIndexer.reconcileAll().catch((error) =>
-    logger.warn("chat_index_sweep_failed", {
-      error: error instanceof Error ? error.message : String(error),
-    }),
-  );
   redecryptionSweeper.start();
 
   if (retentionDays > 0) {
@@ -1201,6 +1216,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (diaryPool) await diaryPool.stop();
         if (summarizationPool) await summarizationPool.stop();
         await enrichmentPool.stop();
+        // Drain the chat-search indexer: refuse new reconciles and await the
+        // in-flight FIFO tail so the last projection commits before storage.close()
+        // (§9e). Ordered after the pools whose onComplete hooks enqueue into it, so
+        // no enqueue can arrive after the indexer has stopped accepting work.
+        await chatSearchIndexer.stop();
         await mcpPool.stop();
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();

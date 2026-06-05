@@ -3233,33 +3233,6 @@ export class Storage {
   }
 
   /**
-   * Cheap fingerprint of the chat-search source tables for the lazy pre-query freshness
-   * check (§9e): event count + latest mutation across the tables that feed a projection.
-   * Changes whenever an event is added/edited/re-decrypted or a caption/preview settles.
-   */
-  chatSourceSignature(): string {
-    return this.read((db) => {
-      const row = db
-        .prepare(
-          `select
-             (select count(*) from timeline_events) as events,
-             (select coalesce(max(updated_at), 0) from timeline_events) as evMax,
-             (select coalesce(max(updated_at), 0) from media_assets) as maMax,
-             (select count(*) from link_previews) as links,
-             (select coalesce(max(fetched_at), 0) from link_previews) as lpMax`,
-        )
-        .get() as {
-        events: number;
-        evMax: number;
-        maMax: number;
-        links: number;
-        lpMax: number;
-      };
-      return `${row.events}:${row.evMax}:${row.maMax}:${row.links}:${row.lpMax}`;
-    });
-  }
-
-  /**
    * Execute a parsed chat-search query (`search_messages`, ARCHITECTURE.md §9e) over
    * `chat_index` (+ `chat_index_fts` when a text MATCH is present, + `chat_mentions`
    * for the mention filter). Returns the requested page plus the unpaginated `total`

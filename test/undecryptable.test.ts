@@ -295,6 +295,7 @@ test("sweeper does not re-arm enrichment or captions when the replace is a no-op
         body: "decrypted now",
         timestamp: new Date(event.timestamp).toISOString(),
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("must not re-arm enrichment on a no-op replace"),
       notifyCaptions: () => assert.fail("must not nudge captions on a no-op replace"),
       intervalMs: 1000,
@@ -339,6 +340,7 @@ test("sweeper replaces a UTD row when retry returns a decrypted summary and re-a
           media: [{ index: 0, kind: "image", filename: "cat.png", contentType: "image/png", sizeBytes: 1 }],
         };
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: (id) => enriched.push(id),
       notifyCaptions: () => {
         captionNudges++;
@@ -373,6 +375,7 @@ test("sweeper leaves a still-UTD row untouched and backs off", async () => {
         // Still undecryptable: keys have not arrived.
         return { eventId: "$utd", sender: "@alice:example.org", body: "", timestamp: new Date(event.timestamp).toISOString(), undecryptable: true };
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("must not enrich a still-UTD event"),
       notifyCaptions: () => assert.fail("must not nudge captions"),
       intervalMs: 1000,
@@ -488,6 +491,7 @@ test("#1 a wall of dead old UTD rows does not starve a newer decryptable row", a
           timestamp: new Date(live.timestamp).toISOString(),
         };
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {},
       notifyCaptions: () => {},
       intervalMs: 1000,
@@ -516,6 +520,7 @@ test("#1 a failed probe persists an attempt and a row at the ceiling retires", a
       retry: async () => {
         throw new Error("unknown room");
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("no enrichment on a failed probe"),
       notifyCaptions: () => {},
       intervalMs: 1000,
@@ -549,6 +554,7 @@ test("#1 a UTD row with no resolvable room/event id is retired in the DB", async
     const sweeper = new RedecryptionSweeper({
       store,
       retry: async () => assert.fail("must not attempt a re-fetch without a room id"),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {},
       notifyCaptions: () => {},
       intervalMs: 1000,
@@ -583,6 +589,7 @@ test("#5 active-timeline plain-text redecrypt stores 'skipped' and does not nudg
         body: "just plain text",
         timestamp: new Date(event.timestamp).toISOString(),
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => {
         enrichNudged = true;
       },
@@ -619,6 +626,7 @@ test("#6 inactive-timeline redecrypt stores 'inactive' and nudges neither pool",
         timestamp: new Date(event.timestamp).toISOString(),
         media: [{ index: 0, kind: "image", filename: "cat.png", contentType: "image/png", sizeBytes: 1 }],
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("must not nudge enrichment for an inactive timeline (spec §3)"),
       notifyCaptions: () => assert.fail("must not nudge captions for an inactive timeline (spec §3)"),
       intervalMs: 1000,
@@ -666,6 +674,7 @@ test("#9 retry returning null (decrypted non-message) deletes the placeholder ro
         calls++;
         return null;
       },
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("a non-message must not enrich"),
       notifyCaptions: () => assert.fail("a non-message must not caption"),
       intervalMs: 1000,
@@ -697,6 +706,7 @@ test("#9 a still-UTD summary (undecryptable=true) is distinct from a null return
         timestamp: new Date(event.timestamp).toISOString(),
         undecryptable: true,
       }),
+      notifyChatIndex: () => {},
       notifyEnrichment: () => assert.fail("still-UTD must not enrich"),
       notifyCaptions: () => {},
       intervalMs: 1000,

@@ -35,6 +35,8 @@ export class ChatSearchIndexer {
   private readonly batchSize: number;
   /** Strict-FIFO tail so reconciles never overlap (mirrors MemoryIndexer). */
   private tail: Promise<unknown> = Promise.resolve();
+  /** Set by `stop()`: refuse new work and let the in-flight tail drain. */
+  private stopped = false;
 
   constructor(opts: ChatSearchIndexerOptions) {
     this.storage = opts.storage;
@@ -49,11 +51,24 @@ export class ChatSearchIndexer {
   }
 
   /**
+   * Drain on shutdown: stop accepting new reconciles and await the in-flight FIFO
+   * tail so the last enqueued projection commits before `storage.close()` (mirrors
+   * how the other worker pools are drained in `app.stop()`). Idempotent. After this
+   * resolves, all enqueue entry points are no-ops, so a late hook (e.g. an enrichment
+   * `onComplete` firing mid-drain) can't attempt a write against a closing DB.
+   */
+  async stop(): Promise<void> {
+    this.stopped = true;
+    await this.tail;
+  }
+
+  /**
    * Fire-and-forget incremental reconcile of one event, hooked off persist and the
    * enrichment/caption terminal callbacks. Serialized on the tail; errors are logged,
    * never thrown back to the caller (indexing must not break the message pipeline).
    */
   enqueueReconcileEvent(eventId: string): void {
+    if (this.stopped) return;
     void this.enqueue(() => this.reconcileEventInner(eventId)).catch((error) => {
       this.logger?.warn("chat_index_reconcile_failed", {
         eventId,
@@ -64,6 +79,7 @@ export class ChatSearchIndexer {
 
   /** Reconcile every event and prune rows for events that no longer exist (§9e). */
   reconcileAll(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     return this.enqueue(() => this.reconcileAllInner());
   }
 
@@ -74,6 +90,7 @@ export class ChatSearchIndexer {
    * sweep, not this path.
    */
   ensureFreshForQuery(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     return this.enqueue(() => this.catchUpNewEventsInner());
   }
 
