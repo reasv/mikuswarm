@@ -219,7 +219,7 @@ test("search_messages(corpus:summaries) returns summary hits and rejects message
     const ok = await tool.execute("c1", { corpus: "summaries", query: "release", rooms: "all" });
     const okText = (ok.content[0] as { text: string }).text;
     assert.match(okText, /id: sum_abc/);
-    assert.match(okText, /follow-up/);
+    assert.match(okText, /expand_summary/);
     const okDetails = ok.details as { corpus: string; hits: Array<{ id: string }> };
     assert.equal(okDetails.corpus, "summaries");
     assert.equal(okDetails.hits[0]?.id, "sum_abc");

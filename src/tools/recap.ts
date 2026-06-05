@@ -62,8 +62,8 @@ export function createRecapTool(context: RecapToolContext): AgentTool {
       "returns the finest available summaries from then to now. Or give an explicit window with " +
       "last (e.g. \"1d\"), after/before, or since_user_absence:<user>. Defaults to this room; pass " +
       "rooms:\"all\" to span every channel. Returns more detailed (lower-level) summaries than the " +
-      "ones already in your context; each one cites its summary id (id=...) for follow-up. For " +
-      "finding specific messages, use search_messages instead.",
+      "ones already in your context; each one cites its summary id (id=...), which you can drill " +
+      "further with expand_summary. For finding specific messages, use search_messages instead.",
     parameters: Type.Object({
       since_user_absence: Type.Optional(
         Type.String({

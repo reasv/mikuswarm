@@ -78,6 +78,21 @@ const SearchSchema = Type.Object({
   default_lookback_ms: Type.Optional(Type.Integer({ minimum: 60_000, maximum: SEARCH_HORIZON_MS })),
   // Token budget for the summaries recap returns before coarsening to higher levels.
   recap_budget_tokens: Type.Optional(Type.Integer({ minimum: 200, maximum: 100_000 })),
+  // Summary search & expansion (§9e "Summary search"). Bounds the expand_summary tool's
+  // output — both knobs are safety caps on a single drill-down, so they carry min+max
+  // like the others (an unbounded expansion of a high-level summary could fan out into
+  // hundreds of events).
+  summaries: Type.Optional(
+    Type.Object({
+      // Max rendered tokens one expand_summary call accumulates before it stops and
+      // reports how many constituents were omitted. Default 4000; max mirrors
+      // recap_budget_tokens (100k) as the ceiling on a single tool's output.
+      expand_token_cap: Type.Optional(Type.Integer({ minimum: 200, maximum: 100_000 })),
+      // Max tiers a single expand_summary call may auto-recurse. Default 3; a hard cap
+      // keeps a deep drill from blowing up regardless of the per-call `depth` arg.
+      expand_max_depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
+    }),
+  ),
 });
 
 // Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus

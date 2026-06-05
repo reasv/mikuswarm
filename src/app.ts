@@ -32,6 +32,7 @@ import {
   createListReactionsTool,
   createReadMessagesTool,
   createSearchMessagesTool,
+  createExpandSummaryTool,
   createRecapTool,
   createUserActivityTool,
   createMediaTool,
@@ -138,6 +139,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       defaultLookbackMs: config.search?.default_lookback_ms ?? ABSENCE_LOOKBACK_DEFAULT_MS,
     },
     recapBudgetTokens: config.search?.recap_budget_tokens ?? 6000,
+    expand: {
+      tokenCap: config.search?.summaries?.expand_token_cap ?? 4000,
+      maxDepth: config.search?.summaries?.expand_max_depth ?? 3,
+    },
   };
 
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
@@ -858,6 +863,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         currentTimelineKey: session.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
       }),
+      // Summary drill-down (§9e). DB-backed (lineage tables + shared renderer), so like
+      // search/recap it's available regardless of roomId and is single-id (room implicit).
+      createExpandSummaryTool({ storage, defaults: chatSearchDefaults.expand }),
       createRecapTool({
         storage,
         indexer: chatSearchIndexer,
