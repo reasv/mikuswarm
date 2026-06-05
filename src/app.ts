@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, type ConsoleServer } from "./observability/index.js";
-import { MatrixProvider } from "./matrix/index.js";
+import { MatrixProvider, RoomLabelCache } from "./matrix/index.js";
 import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
   ActivationCoordinator,
@@ -436,6 +436,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  // Map a (per-room) timeline key to its account + room id and ask that account's
+  // Matrix client for a human room label. Shared by the diary header and the
+  // RoomLabelCache (which feeds the observability console room list). Rejects on a
+  // malformed key; both callers retry and fall back to the room id, so a failure
+  // never blocks a job.
+  const resolveChannelLabel = (timelineKey: string): Promise<string> => {
+    const accountId = timelineKey.split(":")[1];
+    const roomId = roomIdFromTimelineKey(timelineKey);
+    if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
+    const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+    return client.channelLabel({ roomId });
+  };
+
   const diaryPool = diaryEnabled
     ? new DiaryWorkerPool({
         storage,
@@ -443,16 +456,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         memoryWriter,
         config: config.diary ?? {},
         workspaceRoot,
-        // The diary header needs a human room label. Map the (per-room) timeline key
-        // to its account + room id and ask that account's Matrix client. The worker
-        // retries this and falls back to the room id, so it never blocks a job.
-        resolveChannelLabel: async (timelineKey) => {
-          const accountId = timelineKey.split(":")[1];
-          const roomId = roomIdFromTimelineKey(timelineKey);
-          if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
-          const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
-          return client.channelLabel({ roomId });
-        },
+        // The diary header needs a human room label. The worker retries this and
+        // falls back to the room id, so it never blocks a job.
+        resolveChannelLabel,
         onComplete: (summaryId) => logger.info("diary_job_complete", { summaryId }),
         onError: (summaryId, error) => logger.error("diary_failed", { summaryId, error: error.message }),
         activityBus: pipelineActivityBus,
@@ -470,6 +476,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const mcpTools = mcpPool.getEntries().flatMap((entry) =>
     adaptMcpTools(entry.name, entry.tools, entry.client, logger.child("mcp")),
   );
+
+  // Caches resolved human room labels in `room_metadata` so the observability
+  // console shows real room names instead of raw room ids. Populated lazily on
+  // inbound activity (ensureLabel below) plus a throttled startup backfill.
+  const roomLabels = new RoomLabelCache({
+    store: storage,
+    resolve: resolveChannelLabel,
+    logger: logger.child("room-labels"),
+  });
 
   provider.subscribe((inbound) => {
     void handleInbound(inbound).catch((error) => {
@@ -489,6 +504,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       await applyEdit(inbound);
       return;
     }
+
+    // Lazily cache a human room label for the console room list. Cheap and
+    // fire-and-forget: a synchronous freshness check, then a background resolve
+    // only when due. Covers every non-edit inbound event (including self-echo).
+    roomLabels.ensureLabel(inbound.event.timelineKey);
 
     if (inbound.event.role === "assistant" && inbound.event.sender.isSelf) {
       await echo.ingestOwnEcho(inbound.event);
@@ -1098,6 +1118,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   await provider.start(config.matrix);
+
+  // Resolve room labels for already-known (possibly idle) rooms so the console
+  // shows real names without waiting for each room's next message. Throttled and
+  // fire-and-forget so it never delays startup.
+  void roomLabels.backfillAll().catch((error) => {
+    logger.warn("room_label_backfill_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
 
   for (const accountId of Object.keys(config.matrix.accounts)) {
     enrichmentPool.options.providerCapabilities.set(
