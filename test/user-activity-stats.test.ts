@@ -120,7 +120,47 @@ test("include_silent surfaces current members who never posted (total 0)", async
     // A member who DID post is not in the zero set.
     assert.equal(byId.get("@a")?.neverPosted, false);
     assert.ok((byId.get("@a")?.total ?? 0) > 0);
-    assert.match((res.content[0] as { text: string }).text, /never posted/);
+    const text = (res.content[0] as { text: string }).text;
+    assert.match(text, /never posted/);
+    // A resolved display name is shown so the opaque mxid is recognizable.
+    assert.match(text, /@d \(Dee\)/);
+  });
+});
+
+test("include_silent + max_messages:0 + least_active isolates only the never-posted", async () => {
+  const members = async (tk: string): Promise<RoomMemberLite[]> =>
+    tk === ROOM_A ? [{ userId: "@a" }, { userId: "@b" }, { userId: "@d" }, { userId: "@e" }] : [];
+  await withTool(RECENT, members, async (tool) => {
+    const res = await tool.execute("c11", { rooms: [ROOM_A], include_silent: true, order: "least_active", max_messages: 0 });
+    const senders = (res.details as { senders: Array<{ senderId: string; total: number }> }).senders;
+    // @a (3 in A) and @b (1 in A) are filtered out by max_messages:0; only the silent remain.
+    assert.deepEqual(senders.map((s) => s.senderId).sort(), ["@d", "@e"]);
+    assert.ok(senders.every((s) => s.total === 0));
+  });
+});
+
+test("top-3 channel breakdown caps at three rooms", async () => {
+  const ROOM_C = "matrix:test:room:!c";
+  const ROOM_D = "matrix:test:room:!d";
+  // @a posts in four rooms with distinct counts: A=4, B=3, C=2, D=1.
+  const events = [
+    ev("@a", ROOM_A, NOW - 1 * DAY, "qa1"),
+    ev("@a", ROOM_A, NOW - 2 * DAY, "qa2"),
+    ev("@a", ROOM_A, NOW - 3 * DAY, "qa3"),
+    ev("@a", ROOM_A, NOW - 4 * DAY, "qa4"),
+    ev("@a", ROOM_B, NOW - 1 * DAY, "qb1"),
+    ev("@a", ROOM_B, NOW - 2 * DAY, "qb2"),
+    ev("@a", ROOM_B, NOW - 3 * DAY, "qb3"),
+    ev("@a", ROOM_C, NOW - 1 * DAY, "qc1"),
+    ev("@a", ROOM_C, NOW - 2 * DAY, "qc2"),
+    ev("@a", ROOM_D, NOW - 1 * DAY, "qd1"),
+  ];
+  await withTool(events, undefined, async (tool) => {
+    const res = await tool.execute("c12", { rooms: "all" });
+    const text = (res.content[0] as { text: string }).text;
+    // Top 3 by count are A:4, B:3, C:2; the 4th (D:1) is omitted.
+    assert.match(text, /top: \{matrix:test:room:!a\}:4, \{matrix:test:room:!b\}:3, \{matrix:test:room:!c\}:2/);
+    assert.doesNotMatch(text, /!d\}:1/);
   });
 });
 

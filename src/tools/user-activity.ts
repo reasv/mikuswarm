@@ -258,7 +258,10 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
       } else {
         const lines = shown.map((s, i) => {
           const lastSeen = s.neverPosted ? "never posted" : `last ${fmtTs(s.lastAt)}`;
-          let line = `${i + 1}. ${s.senderId} — ${s.total} msg(s), ${s.perRoom.length} room(s), ${lastSeen}`;
+          // A never-posted member is only known by its (opaque) mxid in chat_index — show
+          // the resolved display name when we have one so the admin can recognize them.
+          const label = s.displayName ? `${s.senderId} (${s.displayName})` : s.senderId;
+          let line = `${i + 1}. ${label} — ${s.total} msg(s), ${s.perRoom.length} room(s), ${lastSeen}`;
           if (multiRoom && s.perRoom.length > 0) {
             const top3 = [...s.perRoom]
               .sort((a, b) => b.count - a.count)
@@ -285,6 +288,7 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
           ignoredBounds: window.ignored,
           senders: shown.map((s) => ({
             senderId: s.senderId,
+            displayName: s.displayName ?? null,
             total: s.total,
             firstAt: s.firstAt,
             lastAt: s.lastAt,
