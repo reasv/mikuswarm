@@ -56,14 +56,28 @@ const SummarizationSchema = Type.Object({
 // Chat-history search & recap tools (ARCHITECTURE.md §9e). The FTS index is always
 // built; these knobs tune the absence-gap detection ("since I was gone") and recap's
 // summary token budget. Optional — defaults fall back to the shared constants.
+//
+// Upper bound for the absence-window knobs. Mirrors HORIZON_MS in
+// src/search/absence.ts (the absence resolver's look-back window); duplicated here as
+// a literal to avoid a config → search module dependency. 30 days in ms.
+const SEARCH_HORIZON_MS = 30 * 24 * 60 * 60 * 1000;
 const SearchSchema = Type.Object({
+  // Numeric knobs carry both minimum AND maximum bounds (review issue #7), mirroring
+  // [retrieval]: an unbounded value degrades silently rather than failing fast at
+  // load. The two *_ms fields are capped at SEARCH_HORIZON_MS (30 days) — the absence
+  // resolver only ever scans that far back (src/search/absence.ts HORIZON_MS), so a
+  // larger gap/lookback is meaningless. recap_budget_tokens is the live risk: it
+  // bypasses recap's own bounded max_tokens arg and flows straight into summary
+  // coverage selection (src/search/coverage.ts), so a fat-fingered value would bloat
+  // recap output with no cap; its maximum mirrors [retrieval] auto.max_tokens (100k).
+  //
   // Inter-message gap (ms) above which a user counts as having been "away" — the
   // boundary for recap / search_messages since_user_absence.
-  absence_gap_ms: Type.Optional(Type.Integer({ minimum: 60_000 })),
+  absence_gap_ms: Type.Optional(Type.Integer({ minimum: 60_000, maximum: SEARCH_HORIZON_MS })),
   // Fallback recap/absence window (ms) when a user has no messages in the horizon.
-  default_lookback_ms: Type.Optional(Type.Integer({ minimum: 60_000 })),
+  default_lookback_ms: Type.Optional(Type.Integer({ minimum: 60_000, maximum: SEARCH_HORIZON_MS })),
   // Token budget for the summaries recap returns before coarsening to higher levels.
-  recap_budget_tokens: Type.Optional(Type.Integer({ minimum: 200 })),
+  recap_budget_tokens: Type.Optional(Type.Integer({ minimum: 200, maximum: 100_000 })),
 });
 
 // Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus

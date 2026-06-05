@@ -248,6 +248,50 @@ ${block}`;
   });
 }
 
+// --- #7: numeric [search] knobs are bounded in the schema ---
+
+// Mirrors the values 00-defaults.toml ships for [search]. All must pass so the maxima
+// added for issue #7 don't reject the shipped defaults.
+const SEARCH_DEFAULTS_BLOCK = `
+[search]
+absence_gap_ms = 10800000
+default_lookback_ms = 86400000
+recap_budget_tokens = 6000
+`;
+
+test("config: shipped [search] defaults pass schema validation (issue #7)", async () => {
+  await withConfigDir(`${BASE_CONFIG}${SEARCH_DEFAULTS_BLOCK}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.search?.absence_gap_ms, 10_800_000);
+    assert.equal(config.search?.recap_budget_tokens, 6000);
+  });
+});
+
+// Each case fat-fingers ONE [search] knob out of its bound; the schema must reject it.
+// 2_592_000_000 = SEARCH_HORIZON_MS (30 days); 100_000 = recap_budget_tokens max.
+const SEARCH_OUT_OF_BOUNDS_CASES: Array<{ name: string; block: string }> = [
+  { name: "absence_gap_ms below min", block: `[search]\nabsence_gap_ms = 1\n` },
+  { name: "absence_gap_ms above horizon", block: `[search]\nabsence_gap_ms = 2592000001\n` },
+  { name: "default_lookback_ms below min", block: `[search]\ndefault_lookback_ms = 0\n` },
+  { name: "default_lookback_ms above horizon", block: `[search]\ndefault_lookback_ms = 2592000001\n` },
+  { name: "recap_budget_tokens below min", block: `[search]\nrecap_budget_tokens = 100\n` },
+  { name: "recap_budget_tokens above max", block: `[search]\nrecap_budget_tokens = 100001\n` },
+];
+
+for (const { name, block } of SEARCH_OUT_OF_BOUNDS_CASES) {
+  test(`config: out-of-bounds [search] knob rejected — ${name} (issue #7)`, async () => {
+    const toml = `${BASE_CONFIG}
+${block}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        /Invalid config|minimum|maximum/i,
+        `${name} must fail TypeBox validation at load`,
+      );
+    });
+  });
+}
+
 // --- #18: [browser] fail-fast validation (parity with the observability guard) ---
 
 // A structurally-complete enabled [browser] block. `auth_token` and

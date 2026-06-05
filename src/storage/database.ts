@@ -3088,17 +3088,24 @@ export class Storage {
         e.sender_id as senderId, e.sender_display_name as senderDisplayName,
         e.role as role, e.body as body, e.timestamp as timestamp,
         e.updated_at as updatedAt, e.event_json as eventJson,
-        (select group_concat(distinct ma.media_type) from media_assets ma
+        -- group_concat without ORDER BY is order-unstable, which would let aux_text
+        -- (and the derived content_sig) flap across runs for multi-attachment /
+        -- multi-link events, churning the FTS projection. Each concat below pins a
+        -- deterministic order by a stable column: media_type for the DISTINCT set
+        -- (order expr must match the distinct expr), and the (ordinal, primary-key)
+        -- pair for the others (source_index/preview_index are nullable/duplicable,
+        -- so the text id PK is the stable tiebreaker).
+        (select group_concat(distinct ma.media_type order by ma.media_type) from media_assets ma
            where ma.event_id = e.id and ma.role = 'attachment') as attachmentTypes,
         (select count(*) from media_assets ma
            where ma.event_id = e.id and ma.role = 'attachment') as attachCount,
-        (select group_concat(ma.caption, ' ') from media_assets ma
+        (select group_concat(ma.caption, ' ' order by ma.source_index, ma.id) from media_assets ma
            where ma.event_id = e.id and ma.caption_status = 'complete'
              and ma.caption is not null and ma.caption <> '') as captions,
         (select count(*) from link_previews lp where lp.event_id = e.id) as linkCount,
         (select group_concat(
                   trim(coalesce(lp.title,'') || ' ' || coalesce(lp.description,'') || ' '
-                       || coalesce(lp.site_name,'')), ' ')
+                       || coalesce(lp.site_name,'')), ' ' order by lp.preview_index, lp.id)
            from link_previews lp where lp.event_id = e.id) as linkText,
         (select rc.sender_id from reply_contexts rc where rc.event_id = e.id) as quotedSenderId,
         (select count(*) from reply_contexts rc where rc.event_id = e.id) as replyCount`;
@@ -4362,7 +4369,8 @@ create table if not exists chat_mentions (
 );
 create index if not exists idx_chat_mentions_user on chat_mentions(user_id);
 
--- Lexical index: external-content FTS5 over chat_index (unicode61, English).
+-- Lexical index: external-content FTS5 over chat_index. No tokenize= clause, so
+-- the FTS5 default (unicode61, no stemming) applies — same as memory_chunks_fts.
 create virtual table if not exists chat_index_fts using fts5(
   body, aux_text, content='chat_index', content_rowid='rowid'
 );

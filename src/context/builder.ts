@@ -2,13 +2,11 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
-import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta, ReplyContext } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type {
   Storage,
   MediaAssetRow,
-  LinkPreviewRow,
-  ReplyContextRow,
   Summary,
   TimelineCursor,
 } from "../storage/index.js";
