@@ -19,7 +19,17 @@ export function renderMessage(event: CanonicalChatEvent, tier: RenderTier): stri
  */
 const UTD_PLACEHOLDER = "🔒 unable to decrypt this message";
 
-export function renderRichMessage(event: CanonicalChatEvent): string {
+export interface RenderRichOptions {
+  /**
+   * Cap the rendered message body to this many characters (truncated with an
+   * ellipsis). Undefined (the default) emits the body verbatim — the live
+   * context builder relies on the full body, so only bounded callers (e.g. the
+   * search tool over arbitrary-size historical events) should pass this.
+   */
+  bodyMax?: number;
+}
+
+export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOptions): string {
   const attrs = buildMessageAttrs(event);
 
   // UTD: keep the <message> envelope (sender/time attrs) but emit only the lock
@@ -29,9 +39,10 @@ export function renderRichMessage(event: CanonicalChatEvent): string {
   }
 
   const parts: string[] = [];
+  const body = opts?.bodyMax !== undefined ? truncate(event.body, opts.bodyMax) : event.body;
 
   if (event.replyTo) parts.push(renderReply(event.replyTo));
-  parts.push(escapeXml(event.body));
+  parts.push(escapeXml(body));
   for (const a of event.attachments ?? []) parts.push(renderAttachment(a));
   for (const m of event.linkedMedia ?? []) parts.push(renderLinkedMedia(m));
   for (const lp of event.linkPreviews ?? []) parts.push(renderLinkPreview(lp));

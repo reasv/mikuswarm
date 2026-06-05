@@ -219,7 +219,7 @@ export class ContextBuilder {
       options.workspace,
       options.sessionType,
     );
-    const triggerContent = triggerEvents.map(renderRichMessage).join("\n\n---\n\n");
+    const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
 
     const summaryLayer = await this.buildSummaryLayerMessage(
       options.timelineKey,

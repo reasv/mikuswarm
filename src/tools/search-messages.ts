@@ -32,6 +32,22 @@ export interface SearchMessagesToolContext {
 
 const ATTACHMENT_TYPES = ["image", "video", "audio", "file"] as const;
 
+/**
+ * Per-message body cap for `format:"rich"` (chars). Mirrors the 6000-char body
+ * truncation `renderCompactMessage` already applies, so rich isn't unbounded
+ * relative to compact. The live context builder never passes a cap — only this
+ * tool does, over arbitrary-size historical events.
+ */
+const RICH_BODY_MAX = 6000;
+
+/**
+ * Aggregate cap (chars) on the total full-message output across all rendered hits
+ * in compact/rich mode. Once exceeded, remaining hits degrade to one-line snippets
+ * and a note is surfaced. With `limit` up to 200 this is the hard ceiling that keeps
+ * a single search from blowing the model's context window.
+ */
+const RICH_AGGREGATE_MAX = 200_000;
+
 interface SearchMessagesArgs {
   query?: string;
   rooms?: string[] | "current" | "all";
@@ -209,30 +225,54 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       // For compact/rich we render the *actual* message via the shared context renderer
       // (full body + reply/attachment/caption context), so a hit is self-sufficient and
       // doesn't force a read_messages round-trip. Load + hydrate the hits' events in one
-      // batch; fall back to a snippet line for any event that has since been deleted.
+      // batch; fall back to a snippet line for any event that has since been deleted or
+      // whose stored event_json is corrupt (a single bad row must not abort the render).
       const eventsById = new Map<string, CanonicalChatEvent>();
       if (format !== "snippet") {
-        const base = outcome.hits
-          .map((h) => context.storage.getTimelineEventById(h.eventId))
-          .filter((e): e is CanonicalChatEvent => e !== undefined);
+        const base: CanonicalChatEvent[] = [];
+        for (const h of outcome.hits) {
+          // getTimelineEventById JSON.parses the stored row; a corrupt event_json
+          // throws. Guard per-hit so one bad row degrades to a snippet (#5).
+          try {
+            const ev = context.storage.getTimelineEventById(h.eventId);
+            if (ev !== undefined) base.push(ev);
+          } catch {
+            // leave it out → falls through to the snippet line below.
+          }
+        }
         for (const ev of hydrateEvents(context.storage, base)) eventsById.set(ev.id, ev);
       }
       const snippetLine = (h: (typeof outcome.hits)[number], ref: string): string => {
         const sender = h.senderDisplayName ?? h.senderId;
         return `[${fmtTs(h.timestamp)}] ${sender}: ${buildSnippet(h, terms)}${flagTags(h)}\n${ref}`;
       };
+      // Rich/compact render the full message verbatim; over arbitrary-size historical
+      // events with limit up to 200 this can blow the context window. Bound it two ways:
+      // a per-message body cap (matches compact mode's 6000-char body truncation) and a
+      // total aggregate-byte budget across all rendered hits, after which remaining hits
+      // degrade to one-line snippets. A note is surfaced when the aggregate cap trips.
+      const bodyMax = format === "rich" ? RICH_BODY_MAX : undefined;
+      let renderedBudget = RICH_AGGREGATE_MAX;
+      let aggregateTruncated = false;
       const lines = outcome.hits.map((h) => {
         const ref = `   ↳ id: ${h.eventId}${showRoom ? ` · {${h.timelineKey}}` : ""}`;
         if (format !== "snippet") {
           const ev = eventsById.get(h.eventId);
-          if (ev) {
-            const rendered = format === "rich" ? renderRichMessage(ev) : renderCompactMessage(ev);
-            return `${rendered}\n${ref}`;
+          if (ev && renderedBudget > 0) {
+            const rendered =
+              format === "rich" ? renderRichMessage(ev, { bodyMax }) : renderCompactMessage(ev);
+            const line = `${rendered}\n${ref}`;
+            renderedBudget -= line.length;
+            return line;
           }
+          if (ev) aggregateTruncated = true; // had a full render to give but the budget is spent
         }
         return snippetLine(h, ref);
       });
       const lineSep = format === "snippet" ? "\n" : "\n\n";
+      const truncationNote = aggregateTruncated
+        ? `\n(Output cap reached — remaining matches shown as one-line snippets; narrow your query or use format:snippet.)`
+        : "";
 
       const nextCursor =
         order !== "relevance" && outcome.hits.length === limit
@@ -243,9 +283,14 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
         window.ignored.length > 0
           ? ` (ignored unparseable ${window.ignored.join(", ")} bound — use ISO or YYYY-MM-DD / a duration like 3d)`
           : "";
+      // `scanned` is the size of the indexed corpus in the searched room(s) only — it
+      // does NOT reflect the time/sender/attachment/etc. filters (those are applied by
+      // the query, and `total` is the honest count of matches under ALL filters). Label
+      // it as the in-scope corpus so it can't be read as "N events examined under your
+      // filters" (#10). Kept to one cheap room-scoped count.
       const trailer =
-        `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`}, ` +
-        `${outcome.scanned} indexed events, ${outcome.total} match(es) in ${outcome.elapsedMs} ms`;
+        `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`} ` +
+        `(${outcome.scanned} indexed events in scope), ${outcome.total} match(es) in ${outcome.elapsedMs} ms`;
 
       let text: string;
       if (outcome.hits.length === 0) {
@@ -257,7 +302,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
               (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
             : "";
         text =
-          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}:\n\n${lines.join(lineSep)}${more}\n\n(${trailer})`;
+          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}:\n\n${lines.join(lineSep)}${more}${truncationNote}\n\n(${trailer})`;
       }
 
       return {
@@ -269,6 +314,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
           scanned: outcome.scanned,
           order,
           format,
+          aggregateTruncated,
           nextCursor: nextCursor ?? null,
           ignoredBounds: window.ignored,
           hits: outcome.hits.map((h) => ({

@@ -314,6 +314,92 @@ test("format:compact returns the full message body + id reference; snippet trunc
   });
 });
 
+test("a corrupt event_json degrades that hit to a snippet without aborting the render (#5)", async () => {
+  // Two matches; make getTimelineEventById throw for one row, mirroring an unguarded
+  // JSON.parse failure on a corrupt event_json (the generated `is_undecryptable`
+  // column means a literally-malformed row can't be written here, so we inject the
+  // throw at the accessor — the exact failure the tool-level guard must absorb). The
+  // render must still complete: the good hit renders in full and the corrupt one
+  // falls back to its snippet line.
+  const seed = [
+    ev({ id: "good1", senderId: "@alice", body: "needle in the good one", timestamp: 6_000 }),
+    ev({ id: "bad1", senderId: "@bob", body: "needle in the corrupt one", timestamp: 7_000 }),
+  ];
+  await withIndexed(seed, async (storage, indexer) => {
+    const realGet = storage.getTimelineEventById.bind(storage);
+    storage.getTimelineEventById = (id: string) => {
+      if (id === "bad1") throw new SyntaxError("Unexpected token in JSON (corrupt event_json)");
+      return realGet(id);
+    };
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: ROOM_A });
+
+    // Must not throw even though one of the two hits has corrupt event_json.
+    const res = await tool.execute("t1", { query: "needle", format: "rich", order: "oldest" });
+    const text = (res.content[0] as { type: "text"; text: string }).text;
+
+    // Good hit rendered as the full rich envelope; corrupt hit degraded to a snippet
+    // line (the `[time] sender: …` form), and both ids are still referenced.
+    assert.match(text, /<message[^>]*sender="@alice"/);
+    assert.match(text, /↳ id: good1/);
+    assert.match(text, /↳ id: bad1/);
+    assert.match(text, /@bob: .*needle/); // snippet fallback for the corrupt row
+    assert.equal((res.details as { total: number }).total, 2);
+  });
+});
+
+test("rich aggregate output cap degrades overflow hits to snippets with a note (#3)", async () => {
+  // Many large bodies in rich mode would otherwise blow the context window. The
+  // aggregate cap must stop emitting full envelopes partway and surface a note.
+  const big = "z".repeat(20_000); // ~20k chars each; ~RICH_AGGREGATE_MAX/20k ≈ 10 fit
+  const seed = Array.from({ length: 40 }, (_, i) =>
+    ev({ id: `r${i}`, senderId: "@alice", body: `needle ${i} ${big}`, timestamp: 1_000 + i }),
+  );
+  await withIndexed(seed, async (storage, indexer) => {
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: ROOM_A });
+    const res = await tool.execute("t1", { query: "needle", format: "rich", limit: 40, order: "oldest" });
+    const text = (res.content[0] as { type: "text"; text: string }).text;
+    const details = res.details as { aggregateTruncated: boolean };
+
+    assert.equal(details.aggregateTruncated, true);
+    assert.match(text, /Output cap reached/);
+    // At least one full <message> envelope was emitted, but not all 40 (some degraded
+    // to snippet lines), so total output stays well under 40 * 20k.
+    assert.ok(text.includes("<message"), "at least one full envelope rendered");
+    assert.ok(text.length < 40 * 20_000, "aggregate output is bounded");
+    // All 40 are still accounted for as hits.
+    assert.equal((res.details as { returned: number }).returned, 40);
+  });
+});
+
+test("rich per-message body is capped (#3)", async () => {
+  const huge = "q".repeat(20_000);
+  const seed = [ev({ id: "huge1", senderId: "@alice", body: `needle ${huge}`, timestamp: 5_000 })];
+  await withIndexed(seed, async (storage, indexer) => {
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: ROOM_A });
+    const res = await tool.execute("t1", { query: "needle", format: "rich" });
+    const text = (res.content[0] as { type: "text"; text: string }).text;
+    // The 20k-char body is truncated to the 6000-char cap (+ envelope), so the full
+    // 20k run never appears verbatim.
+    assert.ok(!text.includes(huge), "rich body is truncated to the cap, not emitted verbatim");
+    assert.match(text, /needle/);
+    assert.match(text, /\.\.\./); // truncation ellipsis present
+  });
+});
+
+test("trailer reports scanned as in-scope corpus, not filtered coverage (#10)", async () => {
+  // SEED has 3 events in ROOM_A. A filtered query (sender @bob) matches 1, but the
+  // trailer's scanned count is the room corpus size, labelled as such so it can't be
+  // misread as "events examined under your filters".
+  await withIndexed(SEED, async (storage, indexer) => {
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: ROOM_A });
+    const res = await tool.execute("t1", { from: ["@bob"], format: "snippet" });
+    const text = (res.content[0] as { type: "text"; text: string }).text;
+    assert.match(text, /3 indexed events in scope/);
+    assert.match(text, /1 match\(es\)/);
+    assert.equal((res.details as { scanned: number }).scanned, 3);
+  });
+});
+
 test("aggregateChatActivity counts per sender and room", async () => {
   await withIndexed(SEED, async (storage) => {
     const rows = storage.aggregateChatActivity({});
