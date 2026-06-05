@@ -48,7 +48,7 @@ test("aggregate dedups by distinct sender and orders by count desc, display asc"
       reaction({ reactionEventId: "$r4", senderId: "@cy:test", display: "😮", normalizedKey: "😮" }),
     );
 
-    const agg = storage.getReactionAggregates(TK, ["$msg1"]);
+    const agg = storage.getReactionAggregates(["$msg1"]);
     const rows = agg.get("$msg1");
     assert.ok(rows, "msg1 should have aggregates");
     assert.equal(rows.length, 2);
@@ -68,7 +68,7 @@ test("upsert is idempotent on duplicate delivery of the same reaction event id",
     await storage.upsertReaction(reaction({ reactionEventId: "$r1" }));
     // Re-deliver with a different (stale) display — must be ignored, not overwrite.
     await storage.upsertReaction(reaction({ reactionEventId: "$r1", display: "CHANGED" }));
-    const rows = storage.getReactionAggregates(TK, ["$msg1"]).get("$msg1");
+    const rows = storage.getReactionAggregates(["$msg1"]).get("$msg1");
     assert.equal(rows?.length, 1);
     assert.equal(rows?.[0].count, 1);
     assert.equal(rows?.[0].display, "👍");
@@ -88,10 +88,10 @@ test("tombstone removes a reaction from both views; redaction is idempotent", as
     // Redacting an unknown id (e.g. a message redaction) is a no-op.
     assert.equal(await storage.tombstoneReaction("$nonexistent", 6000), 0);
 
-    const rows = storage.getReactionAggregates(TK, ["$msg1"]).get("$msg1");
+    const rows = storage.getReactionAggregates(["$msg1"]).get("$msg1");
     assert.equal(rows?.length, 1);
     assert.equal(rows?.[0].count, 1); // only bob remains
-    const discrete = storage.getDiscreteReactions(TK, ["$msg1"]);
+    const discrete = storage.getDiscreteReactions(["$msg1"]);
     assert.deepEqual(
       discrete.map((d) => d.reactionEventId),
       ["$r2"],
@@ -112,7 +112,7 @@ test("discrete reactions are returned oldest-first and scoped to the target set"
       reaction({ reactionEventId: "$r3", targetEventId: "$msg2", senderId: "@cy:test" }),
     );
 
-    const discrete = storage.getDiscreteReactions(TK, ["$msg1"]);
+    const discrete = storage.getDiscreteReactions(["$msg1"]);
     assert.deepEqual(
       discrete.map((d) => [d.reactionEventId, d.reactedAt]),
       [
@@ -126,8 +126,8 @@ test("discrete reactions are returned oldest-first and scoped to the target set"
 test("empty target list short-circuits to empty results", async () => {
   await withStorage(async (storage) => {
     await storage.upsertReaction(reaction({ reactionEventId: "$r1" }));
-    assert.equal(storage.getReactionAggregates(TK, []).size, 0);
-    assert.deepEqual(storage.getDiscreteReactions(TK, []), []);
+    assert.equal(storage.getReactionAggregates([]).size, 0);
+    assert.deepEqual(storage.getDiscreteReactions([]), []);
   });
 });
 
@@ -150,7 +150,7 @@ test("v13 -> v14 migration creates the reactions table on an existing DB", async
     const migrated = await Storage.open({ databasePath: dbPath });
     try {
       await migrated.upsertReaction(reaction({ reactionEventId: "$r1" }));
-      const rows = migrated.getReactionAggregates(TK, ["$msg1"]).get("$msg1");
+      const rows = migrated.getReactionAggregates(["$msg1"]).get("$msg1");
       assert.equal(rows?.length, 1, "reactions table should exist and accept writes after migration");
     } finally {
       await migrated.waitForIdle();
@@ -177,7 +177,7 @@ test("custom reactions carry shortcode through the aggregate", async () => {
         normalizedKey: "mxc://example/blobwave",
       }),
     );
-    const rows = storage.getReactionAggregates(TK, ["$msg1"]).get("$msg1");
+    const rows = storage.getReactionAggregates(["$msg1"]).get("$msg1");
     assert.equal(rows?.[0].kind, "custom");
     assert.equal(rows?.[0].display, ":blobwave:");
     assert.equal(rows?.[0].shortcode, ":blobwave:");

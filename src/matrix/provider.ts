@@ -12,7 +12,11 @@ import type {
   Unsubscribe,
 } from "../types.js";
 import { MatrixNativeClient } from "./native-client.js";
-import type { MatrixNativeConfig, MatrixNativeEvent } from "./native-types.js";
+import type {
+  MatrixNativeConfig,
+  MatrixNativeEvent,
+  MatrixReactionStreamEvent,
+} from "./native-types.js";
 import { normalizeMatrixInboundEvent } from "./inbound.js";
 import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
@@ -34,7 +38,17 @@ interface PendingTrigger {
 
 export interface MatrixProviderOptions {
   onError?: (error: unknown, context: { accountId?: string; phase: string }) => void;
-  onNativeEvent?: (event: Exclude<MatrixNativeEvent, { type: "inbound" }>, context: { accountId: string }) => void;
+  onNativeEvent?: (
+    event: Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>,
+    context: { accountId: string },
+  ) => void;
+  /**
+   * A passively-observed reaction (add) or un-reaction (remove). Routed here
+   * instead of through {@link onNativeEvent} so the app can persist it to the
+   * reaction store without ever waking a session (ARCHITECTURE.md §9f). Carries
+   * the account id; the room is on `event.roomId`.
+   */
+  onReaction?: (event: MatrixReactionStreamEvent, context: { accountId: string }) => void;
   onDiagnostics?: (diagnostics: ReturnType<MatrixNativeClient["start"]>, context: { accountId: string }) => void;
 }
 
@@ -197,6 +211,11 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     if (this.stopped) return;
     const events = account.client.pollEvents();
     for (const nativeEvent of events) {
+      if (nativeEvent.type === "reaction") {
+        // Passive: persist only, never wake a session (ARCHITECTURE.md §9f).
+        this.options.onReaction?.(nativeEvent.event, { accountId: account.accountId });
+        continue;
+      }
       if (nativeEvent.type !== "inbound") {
         this.options.onNativeEvent?.(nativeEvent, { accountId: account.accountId });
         continue;

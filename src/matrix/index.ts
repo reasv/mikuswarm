@@ -8,3 +8,8 @@ export {
 } from "./inbound.js";
 export type * from "./native-types.js";
 export { sendMatrixMessage } from "./outbound.js";
+export {
+  ingestReactionEvent,
+  type ReactionIngestOutcome,
+  type ReactionStore,
+} from "./reaction-ingest.js";

@@ -4292,11 +4292,13 @@ export class Storage {
    * `normalizedKey` with a distinct-sender count, ordered count desc then display
    * asc (matching `react`/`list_reactions`). Tombstoned rows are excluded; targets
    * with no live reactions are simply absent from the map.
+   *
+   * Matches purely on `target_event_id` (a globally-unique Matrix event id) — not
+   * on timeline_key, which is not derivable from a reaction event (see the
+   * reactions schema). The caller passes the exact event ids it is rendering, so
+   * there is no cross-room leakage.
    */
-  getReactionAggregates(
-    timelineKey: string,
-    targetEventIds: string[],
-  ): Map<string, ReactionAggregateRow[]> {
+  getReactionAggregates(targetEventIds: string[]): Map<string, ReactionAggregateRow[]> {
     const result = new Map<string, ReactionAggregateRow[]>();
     if (targetEventIds.length === 0) return result;
     return this.read((db) => {
@@ -4309,12 +4311,12 @@ export class Storage {
             `select target_event_id as targetEventId, normalized_key as normalizedKey,
                     kind, display, shortcode, count(distinct sender_id) as count
              from reactions
-             where timeline_key = ? and target_event_id in (${placeholders})
+             where target_event_id in (${placeholders})
                and redacted_at is null
              group by target_event_id, normalized_key
              order by count desc, display asc`,
           )
-          .all(timelineKey, ...batch) as ReactionAggregateRow[];
+          .all(...batch) as ReactionAggregateRow[];
         for (const row of rows) {
           const list = result.get(row.targetEventId);
           if (list) list.push(row);
@@ -4329,9 +4331,10 @@ export class Storage {
    * View B: live (non-tombstoned) reactions on a batch of target messages, ordered
    * oldest-first by `reacted_at`. The caller (context builder) coalesces these per
    * (target, normalizedKey) and applies the recency horizon + name cap. Flat list
-   * across all targets.
+   * across all targets. Matches on `target_event_id` only (see
+   * {@link getReactionAggregates}).
    */
-  getDiscreteReactions(timelineKey: string, targetEventIds: string[]): DiscreteReactionRow[] {
+  getDiscreteReactions(targetEventIds: string[]): DiscreteReactionRow[] {
     if (targetEventIds.length === 0) return [];
     return this.read((db) => {
       const rows: DiscreteReactionRow[] = [];
@@ -4347,11 +4350,11 @@ export class Storage {
                       normalized_key as normalizedKey, kind, display, shortcode,
                       reacted_at as reactedAt
                from reactions
-               where timeline_key = ? and target_event_id in (${placeholders})
+               where target_event_id in (${placeholders})
                  and redacted_at is null
                order by reacted_at asc, reaction_event_id asc`,
             )
-            .all(timelineKey, ...batch) as DiscreteReactionRow[]),
+            .all(...batch) as DiscreteReactionRow[]),
         );
       }
       return rows;
@@ -4571,8 +4574,16 @@ create table if not exists reactions (
   -- The m.reaction event's OWN id ($...). Redactions name this id, so an un-react
   -- is a single UPDATE ... where reaction_event_id = ? — no content matching.
   reaction_event_id text primary key,
+  -- Room-level locality hint (matrix:{account}:room:{roomId}) — informational
+  -- only. A reaction event carries just a room id; the target message's
+  -- authoritative timeline_key (dm vs room vs :thread:root) is NOT derivable from
+  -- it, and there is an ingest-vs-persist race. So reactions are matched to their
+  -- target purely by the globally-unique target_event_id (a Matrix event id is
+  -- unique across rooms); this column is for debugging/console context, never the
+  -- join key.
   timeline_key      text not null,
   -- The annotated message's Matrix event id (== CanonicalChatEvent.externalId).
+  -- This, not timeline_key, is the authoritative match key for both views.
   target_event_id   text not null,
   sender_id         text not null,
   -- Display name at observation time (untrusted; for View B prose lines only).
@@ -4591,13 +4602,12 @@ create table if not exists reactions (
   -- redaction is a no-op.
   redacted_at       integer
 );
--- View A (aggregate counts) and dedup scope by (timeline_key, target); partial on
--- the live rows since tombstones never render.
+-- Both views match by target_event_id (View A aggregates per target, View B fetches
+-- live rows for a target set). Partial on the live rows since tombstones never
+-- render. Carries reacted_at so View B's oldest-first scan and View A's grouping
+-- are served from the index without touching the heap for the ordering key.
 create index if not exists idx_reactions_by_target
-  on reactions(timeline_key, target_event_id) where redacted_at is null;
--- View B (discrete, recent) scans by recency within a room.
-create index if not exists idx_reactions_by_recency
-  on reactions(timeline_key, reacted_at) where redacted_at is null;
+  on reactions(target_event_id, reacted_at) where redacted_at is null;
 `;
 
 // Canonical schema, version 1. This is the COMPLETE current schema with every
