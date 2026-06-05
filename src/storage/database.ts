@@ -4243,7 +4243,15 @@ create table if not exists chat_index (
   -- this rowid, and never reusing a deleted row's id keeps the external-content FTS
   -- mapping unambiguous.
   rowid               integer primary key autoincrement,
-  event_id            text not null unique,
+  -- Cascade-delete with the source event: when a timeline_events row is removed
+  -- (pruneInactiveTimelineEvents / deleteUndecryptedEvent), its denormalized
+  -- search projection must go too, or search_messages keeps surfacing the
+  -- deleted event from chat_index's OWN stored body copy until the next startup
+  -- orphan sweep (a privacy/consistency leak across restarts — review #4). The
+  -- chat_index_ad AFTER DELETE trigger fires on the cascade, transitively
+  -- cleaning chat_index_fts + chat_mentions (recursive triggers are on by
+  -- default). PRAGMA foreign_keys is ON (Storage.open), so this takes effect.
+  event_id            text not null unique references timeline_events(id) on delete cascade,
   timeline_key        text not null,
   sender_id           text not null,
   sender_display_name text,
@@ -4682,7 +4690,7 @@ ${CHAT_SEARCH_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 12;
+export const LATEST_SCHEMA_VERSION = 13;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -4907,6 +4915,121 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // directly from SCHEMA above (via CHAT_SEARCH_SCHEMA) and never run this step.
   (db) => {
     db.exec(CHAT_SEARCH_SCHEMA);
+  },
+  // index 12 (v12 -> v13): add the missing `references timeline_events(id) on
+  // delete cascade` FK to `chat_index.event_id` (ARCHITECTURE.md §9e, review #4).
+  // The v11->v12 step created `chat_index` WITHOUT the FK, so deleting a
+  // timeline_events row (pruneInactiveTimelineEvents / deleteUndecryptedEvent)
+  // orphaned its search projection; search_messages then kept surfacing the
+  // deleted event from chat_index's own stored body copy until the next startup
+  // orphan sweep (a cross-restart privacy/consistency leak). SQLite cannot
+  // `ALTER TABLE ADD CONSTRAINT`, so we rebuild the table per SQLite's official
+  // table-redefinition procedure (https://sqlite.org/lang_altertable.html):
+  //
+  //   1. DROP the FTS table + the three sync triggers first. The triggers fire
+  //      on every chat_index write; leaving them in place would make the row
+  //      copy below double-insert into the FTS shadow. The external-content FTS
+  //      keys on chat_index.rowid, so we drop it and fully rebuild it from the
+  //      rowid-preserved content table at the end — this is correctness-robust
+  //      regardless of any rowid subtlety (chosen over trying to keep the old
+  //      FTS rows valid in place).
+  //   2. Rename the old table aside, CREATE the new one WITH the FK (identical
+  //      columns/constraints/rowid-pk otherwise), and copy every row INCLUDING
+  //      the explicit `rowid` so the FTS docid mapping is preserved 1:1.
+  //   3. DROP the old table and recreate the indexes + FTS table + triggers
+  //      exactly as CHAT_SEARCH_SCHEMA builds them, then `rebuild` the FTS from
+  //      the now-FK-bearing content table.
+  //
+  // This whole step runs inside runMigrations' single wrapping transaction with
+  // foreign_keys ON. Per SQLite, foreign_keys cannot be toggled inside a
+  // transaction, but `defer_foreign_keys=ON` CAN be — it postpones FK
+  // enforcement to the COMMIT at the end of the migration transaction, so the
+  // mid-rebuild window (old table dropped, rows being copied) does not trip an
+  // FK check; by COMMIT every chat_index row references a live timeline_events
+  // row (the indexer only ever projected real events). defer_foreign_keys auto-
+  // resets to OFF at the end of the transaction, leaving foreign_keys itself ON.
+  // chat_mentions is keyed by event_id (not rowid) and is untouched by the
+  // rebuild; its cleanup stays driven by the chat_index_ad trigger. Fresh DBs
+  // get the FK directly from SCHEMA (via CHAT_SEARCH_SCHEMA) and never run this.
+  (db) => {
+    db.exec(
+      `pragma defer_foreign_keys = ON;
+
+       -- 0. Purge any already-orphaned rows BEFORE the rebuild. A pre-v13 DB
+       -- could hold chat_index rows whose timeline_events were deleted while the
+       -- FK was absent (only the startup orphan sweep ever cleaned them). With
+       -- the FK now enforced, such orphans would fail the deferred FK check at
+       -- this transaction's COMMIT and abort the migration; delete them first so
+       -- the copied table is referentially clean. (The chat_index_ad trigger is
+       -- still live at this point, so this also drops their FTS + mentions rows.)
+       delete from chat_index
+         where not exists (select 1 from timeline_events e where e.id = chat_index.event_id);
+
+       -- 1. Drop FTS + sync triggers so the row copy doesn't churn the shadow.
+       drop trigger if exists chat_index_ai;
+       drop trigger if exists chat_index_ad;
+       drop trigger if exists chat_index_au;
+       drop table if exists chat_index_fts;
+
+       -- 2. Rebuild chat_index WITH the cascade FK, preserving rowids.
+       alter table chat_index rename to chat_index_old;
+       create table chat_index (
+         rowid               integer primary key autoincrement,
+         event_id            text not null unique
+                               references timeline_events(id) on delete cascade,
+         timeline_key        text not null,
+         sender_id           text not null,
+         sender_display_name text,
+         role                text not null,
+         timestamp           integer not null,
+         body                text not null default '',
+         aux_text            text not null default '',
+         has_attachment      integer not null default 0,
+         attachment_types    text not null default '',
+         has_link            integer not null default 0,
+         is_reply            integer not null default 0,
+         quoted_sender_id    text,
+         content_sig         text not null,
+         indexed_at          integer not null
+       );
+       insert into chat_index
+         (rowid, event_id, timeline_key, sender_id, sender_display_name, role,
+          timestamp, body, aux_text, has_attachment, attachment_types, has_link,
+          is_reply, quoted_sender_id, content_sig, indexed_at)
+         select
+          rowid, event_id, timeline_key, sender_id, sender_display_name, role,
+          timestamp, body, aux_text, has_attachment, attachment_types, has_link,
+          is_reply, quoted_sender_id, content_sig, indexed_at
+         from chat_index_old;
+       drop table chat_index_old;
+
+       -- 3. Recreate indexes + FTS + triggers exactly as CHAT_SEARCH_SCHEMA does,
+       -- then fully rebuild the external-content FTS from the copied rows.
+       create index if not exists idx_chat_index_room_time on chat_index(timeline_key, timestamp);
+       create index if not exists idx_chat_index_sender_time on chat_index(sender_id, timestamp);
+       create index if not exists idx_chat_index_quoted on chat_index(quoted_sender_id, timestamp)
+         where quoted_sender_id is not null;
+
+       create virtual table chat_index_fts using fts5(
+         body, aux_text, content='chat_index', content_rowid='rowid'
+       );
+       create trigger chat_index_ai after insert on chat_index begin
+         insert into chat_index_fts(rowid, body, aux_text) values (new.rowid, new.body, new.aux_text);
+       end;
+       create trigger chat_index_ad after delete on chat_index begin
+         insert into chat_index_fts(chat_index_fts, rowid, body, aux_text)
+           values ('delete', old.rowid, old.body, old.aux_text);
+         delete from chat_mentions where event_id = old.event_id;
+       end;
+       create trigger chat_index_au after update on chat_index
+         when new.body is not old.body or new.aux_text is not old.aux_text
+       begin
+         insert into chat_index_fts(chat_index_fts, rowid, body, aux_text)
+           values ('delete', old.rowid, old.body, old.aux_text);
+         insert into chat_index_fts(rowid, body, aux_text) values (new.rowid, new.body, new.aux_text);
+       end;
+       insert into chat_index_fts(chat_index_fts) values ('rebuild');`,
+    );
   },
 ];
 
