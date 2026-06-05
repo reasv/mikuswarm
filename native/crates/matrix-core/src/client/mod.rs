@@ -561,6 +561,26 @@ async fn handle_reaction_add(
     let Some(decoded) = decode_reaction_event(value) else {
         return;
     };
+
+    // Keep custom-emoji discovery working: record catalog usage for custom keys
+    // (custom-only, gated on a shortcode) — independent of whether the reaction
+    // is surfaceable, matching the prior handler's behavior exactly.
+    if decoded.key.starts_with("mxc://") {
+        if let Some(shortcode) = decoded.shortcode.clone() {
+            let _ = emoji::record_usage(
+                config,
+                &crate::api::MatrixCustomEmojiUsageRequest {
+                    emoji: vec![crate::api::MatrixCustomEmojiRef {
+                        shortcode,
+                        mxc_url: decoded.key.clone(),
+                    }],
+                    room_id: Some(room.room_id().to_string()),
+                    observed_at_ms: Some(decoded.timestamp_ms),
+                },
+            );
+        }
+    }
+
     let Some(target_event_id) = value
         .get("content")
         .and_then(|content| content.get("m.relates_to"))
@@ -571,29 +591,21 @@ async fn handle_reaction_add(
         return;
     };
 
-    // Resolve kind/display/shortcode/normalized exactly as the `react` and
-    // `list_reactions` tools do, so passive display matches on-demand display.
+    // Resolve kind/display/shortcode/normalized for the *inbound* direction:
+    // custom reactions arrive as a raw mxc key plus a `:shortcode:` in metadata,
+    // which the outbound resolver alone cannot reverse (see
+    // resolve_inbound_reaction_key_info).
     let now_ms = Utc::now().timestamp_millis();
-    let Ok(mut info) = reactions::resolve_reaction_key_info(
+    let Ok(info) = reactions::resolve_inbound_reaction_key_info(
         config,
         &decoded.key,
+        decoded.shortcode.as_deref(),
         Some(room.room_id().as_str()),
         now_ms,
     ) else {
         // Unresolvable key (e.g. empty) — nothing meaningful to store/render.
         return;
     };
-    // Inbound custom reactions may carry a shortcode the local catalog has not
-    // learned yet; prefer it so display resolves to `:foo:` rather than a raw
-    // mxc fallback.
-    if info.shortcode.is_none() {
-        if let Some(shortcode) = decoded.shortcode.clone() {
-            if info.kind == crate::api::MatrixReactionKeyKind::Custom {
-                info.display = shortcode.clone();
-            }
-            info.shortcode = Some(shortcode);
-        }
-    }
 
     let sender_display = match UserId::parse(decoded.sender_id.as_str()) {
         Ok(user_id) => room
@@ -618,23 +630,6 @@ async fn handle_reaction_add(
         shortcode: info.shortcode.clone(),
         normalized_key: Some(info.normalized.clone()),
     });
-
-    // Keep custom-emoji discovery working: record catalog usage for custom keys.
-    if decoded.key.starts_with("mxc://") {
-        if let Some(shortcode) = decoded.shortcode.clone() {
-            let _ = emoji::record_usage(
-                config,
-                &crate::api::MatrixCustomEmojiUsageRequest {
-                    emoji: vec![crate::api::MatrixCustomEmojiRef {
-                        shortcode,
-                        mxc_url: decoded.key.clone(),
-                    }],
-                    room_id: Some(room.room_id().to_string()),
-                    observed_at_ms: Some(decoded.timestamp_ms),
-                },
-            );
-        }
-    }
 }
 
 /// Forward an `m.room.redaction` to the reaction store as a removal signal.
