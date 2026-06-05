@@ -12,8 +12,32 @@ export type SearchScope = "text" | "text+captions" | "all";
  * Returns undefined when the query has no usable tokens (→ metadata-only search).
  */
 export function sanitizeFtsMatch(query: string, scope: SearchScope): string | undefined {
+  const terms = ftsQuotedTerms(query);
+  if (terms.length === 0) return undefined;
+  const cols = scope === "text" ? "body" : "body aux_text";
+  return `{${cols}} : (${terms.join(" ")})`;
+}
+
+/**
+ * Column-scoped MATCH expression over `summaries_fts`'s single `content` column, for
+ * `search_messages(corpus:"summaries")` (§9e). Same tokenization/quoting as
+ * `sanitizeFtsMatch` — only the column set differs. Returns undefined for a no-token
+ * query (→ metadata-only summary search).
+ */
+export function sanitizeSummaryFtsMatch(query: string): string | undefined {
+  const terms = ftsQuotedTerms(query);
+  if (terms.length === 0) return undefined;
+  return `{content} : (${terms.join(" ")})`;
+}
+
+/**
+ * Tokenize free text into quoted FTS5 terms (implicit AND; trailing `*` = prefix
+ * query). Quoting neutralizes FTS5 operators so user text can't inject syntax; pure
+ * punctuation tokens are dropped. Shared by the message and summary match builders.
+ */
+function ftsQuotedTerms(query: string): string[] {
   const tokens = query.match(/\S+/g);
-  if (!tokens || tokens.length === 0) return undefined;
+  if (!tokens || tokens.length === 0) return [];
   const terms: string[] = [];
   for (const raw of tokens) {
     const prefix = raw.endsWith("*") && raw.length > 1;
@@ -22,9 +46,7 @@ export function sanitizeFtsMatch(query: string, scope: SearchScope): string | un
     if (escaped.replace(/[^\p{L}\p{N}]/gu, "") === "") continue; // pure punctuation
     terms.push(prefix ? `"${escaped}"*` : `"${escaped}"`);
   }
-  if (terms.length === 0) return undefined;
-  const cols = scope === "text" ? "body" : "body aux_text";
-  return `{${cols}} : (${terms.join(" ")})`;
+  return terms;
 }
 
 const SNIPPET_RADIUS = 90;
@@ -40,7 +62,26 @@ function escapeAngles(s: string): string {
  * body. Angle brackets are neutralized. Whitespace is collapsed.
  */
 export function buildSnippet(hit: ChatSearchHit, terms: string[]): string {
-  const haystacks = [hit.body, hit.auxText].filter((s) => s.length > 0);
+  return buildSnippetFromTexts([hit.body, hit.auxText], terms);
+}
+
+/**
+ * Snippet for a summary hit (`search_messages(corpus:"summaries")`, §9e): a window
+ * around the first query match in the summary `content`, or its head when there is no
+ * text query. Same windowing/escaping as message snippets — one haystack, the content.
+ */
+export function buildSummarySnippet(content: string, terms: string[]): string {
+  return buildSnippetFromTexts([content], terms);
+}
+
+/**
+ * Shared snippet builder over one or more haystacks (first non-empty wins for the
+ * head fallback). With a text query, centers a ~180-char window on the first matching
+ * token; otherwise takes the head of the first haystack. Angle brackets neutralized;
+ * whitespace collapsed.
+ */
+function buildSnippetFromTexts(rawHaystacks: string[], terms: string[]): string {
+  const haystacks = rawHaystacks.filter((s) => s.length > 0);
   const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
   if (terms.length > 0) {
     for (const text of haystacks) {

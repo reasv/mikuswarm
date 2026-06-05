@@ -1140,6 +1140,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }),
   );
 
+  // Backfill the summary-content search index (§9e). Insert/delete triggers keep
+  // `summaries_fts` live and the v13->v14 migration rebuilds it for pre-existing rows,
+  // so this is the belt-and-suspenders convergence net for any trigger gap (mirrors the
+  // chat-index sweep above). Cheap anti-join; fire-and-forget — summary search degrades
+  // to "miss a not-yet-indexed summary" at worst, never incorrectness.
+  void storage.reconcileSummariesFts().catch((error) =>
+    logger.warn("summaries_fts_sweep_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
+
   await provider.start(config.matrix);
 
   // Resolve room labels for already-known (possibly idle) rooms so the console

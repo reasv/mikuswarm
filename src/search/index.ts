@@ -2,7 +2,9 @@ export { ChatSearchIndexer, type ChatSearchIndexerOptions } from "./indexer.js";
 export { projectChatEvent } from "./project.js";
 export {
   sanitizeFtsMatch,
+  sanitizeSummaryFtsMatch,
   buildSnippet,
+  buildSummarySnippet,
   resolveRooms,
   decodeCursor,
   encodeCursor,
@@ -11,6 +13,11 @@ export {
   type SearchScope,
   type RunChatSearchResult,
 } from "./query.js";
+export {
+  runSummarySearch,
+  encodeSummaryCursor,
+  type RunSummarySearchResult,
+} from "./summaries-query.js";
 export {
   parseDuration,
   parseInstant,
