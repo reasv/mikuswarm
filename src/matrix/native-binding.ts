@@ -16,6 +16,7 @@ export declare class MatrixCoreClient {
   unpinMessage(requestJson: string): Promise<string>;
   listPins(requestJson: string): Promise<string>;
   memberInfo(requestJson: string): Promise<string>;
+  roomMembers(requestJson: string): Promise<string>;
   channelInfo(requestJson: string): Promise<string>;
   uploadMedia(requestJson: string): Promise<string>;
   downloadMedia(requestJson: string): Promise<string>;

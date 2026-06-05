@@ -274,6 +274,16 @@ export type MatrixMemberInfo = {
   isDirect: boolean;
 };
 
+export type MatrixRoomMembersRequest = {
+  roomId: string;
+};
+
+export type MatrixRoomMember = {
+  userId: string;
+  displayName?: string;
+  membership: string;
+};
+
 export type MatrixChannelInfoRequest = {
   roomId: string;
 };

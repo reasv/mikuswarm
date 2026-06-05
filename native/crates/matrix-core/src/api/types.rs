@@ -377,6 +377,20 @@ pub struct MatrixMemberInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MatrixRoomMembersRequest {
+    pub room_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixRoomMember {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub membership: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MatrixChannelInfoRequest {
     pub room_id: String,
 }

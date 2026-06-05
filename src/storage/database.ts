@@ -3624,15 +3624,24 @@ export class Storage {
    * this pushes the bound into SQL correctly in two passes over the same window:
    *   1. rank senders by their global total (`group by sender_id`), take the top `limit`;
    *   2. fetch the per-(sender, room) breakdown only for those sender ids.
-   * Also returns `totalSenders` — a cheap `count(distinct sender_id)` over the window — so the
-   * tool's "(+N more)" overflow line can report the true sender count without materializing
-   * every group. The per-room rows for one sender are contiguous; the tool aggregates them.
+   * Also returns `totalSenders` — the count of senders matching the window (and the
+   * `maxMessages` threshold when set) — so the tool's "(+N more)" overflow line can report
+   * the true sender count without materializing every group. The per-room rows for one sender
+   * are contiguous; the tool aggregates them.
+   *
+   * `order` ranks senders by global total: `"most"` (default) for the most-active view,
+   * `"least"` for the inactive view (least-active first). `maxMessages` keeps only senders
+   * whose total is `<= maxMessages` (the "who's gone quiet below N" threshold). Both bound
+   * the *posting* roster; users who never posted have no `chat_index` row and are surfaced
+   * separately by the tool's `include_silent` membership union (§9e).
    */
   topChatActivity(opts: {
     timelineKeys?: string[];
     sinceTs?: number;
     untilTs?: number;
     limit: number;
+    order?: "most" | "least";
+    maxMessages?: number;
   }): {
     rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
     totalSenders: number;
@@ -3656,22 +3665,39 @@ export class Storage {
         params.untilTs = opts.untilTs;
       }
       const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+      const dir = opts.order === "least" ? "asc" : "desc";
+      const havingSql = opts.maxMessages !== undefined ? "having count(*) <= @maxMessages" : "";
 
-      const totalSenders = (
-        db
-          .prepare(`select count(distinct sender_id) as n from chat_index ${whereSql}`)
-          .get(params) as { n: number }
-      ).n;
+      // totalSenders honours the maxMessages threshold (so "(+N more)" counts only senders
+      // that pass the filter). Without it, a cheap count(distinct) suffices.
+      const totalSenders =
+        opts.maxMessages !== undefined
+          ? (
+              db
+                .prepare(
+                  `select count(*) as n from (
+                     select sender_id from chat_index ${whereSql}
+                     group by sender_id ${havingSql})`,
+                )
+                .get({ ...params, maxMessages: opts.maxMessages }) as { n: number }
+            ).n
+          : (
+              db
+                .prepare(`select count(distinct sender_id) as n from chat_index ${whereSql}`)
+                .get(params) as { n: number }
+            ).n;
 
-      // Pass 1: top-N senders by global total across rooms.
+      // Pass 1: the limit-N senders by global total across rooms, ranked per `order`.
+      const pass1Params: Record<string, unknown> = { ...params, limit: opts.limit };
+      if (opts.maxMessages !== undefined) pass1Params.maxMessages = opts.maxMessages;
       const top = db
         .prepare(
           `select sender_id as senderId from chat_index ${whereSql}
-           group by sender_id
-           order by count(*) desc, sender_id asc
+           group by sender_id ${havingSql}
+           order by count(*) ${dir}, sender_id asc
            limit @limit`,
         )
-        .all({ ...params, limit: opts.limit }) as Array<{ senderId: string }>;
+        .all(pass1Params) as Array<{ senderId: string }>;
       if (top.length === 0) return { rows: [], totalSenders };
 
       // Pass 2: per-room breakdown for exactly those senders.

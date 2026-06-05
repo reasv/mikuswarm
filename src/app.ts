@@ -881,6 +881,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         storage,
         indexer: chatSearchIndexer,
         currentTimelineKey: session.timelineKey,
+        // Membership source for include_silent / never-posted users (§9e). Maps a
+        // timeline_key (`matrix:<account>:room:<roomId>[:thread:...]`) to the account's
+        // client and asks the native layer for the room's current joined members. A
+        // Matrix room id contains a colon (`!opaque:server`), so capture everything
+        // between `room:` and an optional `:thread:` suffix rather than splitting on `:`.
+        roomMembers: async (timelineKey) => {
+          const m = /^matrix:[^:]+:room:(.+?)(?::thread:.*)?$/.exec(timelineKey);
+          if (!m) return [];
+          const client = provider.getClient({ provider: "matrix", timelineKey });
+          const members = await client.roomMembers({ roomId: m[1] });
+          return members.map((mem) => ({ userId: mem.userId, displayName: mem.displayName }));
+        },
       }),
       createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
