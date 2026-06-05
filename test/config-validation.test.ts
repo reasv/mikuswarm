@@ -452,3 +452,47 @@ for (const { name, find, replace } of BROWSER_OUT_OF_BOUNDS_CASES) {
     });
   });
 }
+
+test("config: [reactions] block parses and exposes its knobs", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+enabled = true
+show_aggregates = false
+show_discrete = true
+discrete_assistant_only = false
+discrete_horizon_messages = 5
+discrete_name_cap = 12
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.reactions?.enabled, true);
+    assert.equal(config.reactions?.show_aggregates, false);
+    assert.equal(config.reactions?.discrete_assistant_only, false);
+    assert.equal(config.reactions?.discrete_horizon_messages, 5);
+    assert.equal(config.reactions?.discrete_name_cap, 12);
+  });
+});
+
+test("config: [reactions] discrete_name_cap below 4 is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_name_cap = 2
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /Invalid config|minimum/i,
+      "name cap below the shown-name count (4) must fail-fast",
+    );
+  });
+});
+
+test("config: [reactions] negative discrete_horizon_messages is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_horizon_messages = -1
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|minimum/i);
+  });
+});

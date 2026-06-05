@@ -80,6 +80,27 @@ const SearchSchema = Type.Object({
   recap_budget_tokens: Type.Optional(Type.Integer({ minimum: 200, maximum: 100_000 })),
 });
 
+// Passive reaction surfacing (ARCHITECTURE.md §9f). All optional; defaults ship in
+// 00-defaults.toml. `enabled` is the master switch for both ingest and the two views.
+const ReactionsSchema = Type.Object({
+  // Master switch: persist inbound reactions AND surface them in context.
+  enabled: Type.Optional(Type.Boolean()),
+  // View A: deduped key×count on rich-tier messages.
+  show_aggregates: Type.Optional(Type.Boolean()),
+  // View B: chronological discrete reaction lines.
+  show_discrete: Type.Optional(Type.Boolean()),
+  // View B target filter: true = only reactions to the assistant's own messages;
+  // false also surfaces reactions to anyone's recent messages.
+  discrete_assistant_only: Type.Optional(Type.Boolean()),
+  // View B horizon: 0 = the whole rich tier; >0 = only the last N rich messages
+  // produce discrete lines. Bounded (mirrors the [search] min/max convention) so a
+  // fat-fingered value can't silently degrade.
+  discrete_horizon_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 100_000 })),
+  // More than this many senders on one reaction → first 4 + "(and N others)".
+  // Minimum 4 (the shown-name count) so "(and N others)" can never go negative.
+  discrete_name_cap: Type.Optional(Type.Integer({ minimum: 4, maximum: 1_000 })),
+});
+
 // Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus
 // auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
 // configs stay valid; `enabled` is the master switch for the whole index.
@@ -480,6 +501,7 @@ export const AppConfigSchema = Type.Object({
   diary: Type.Optional(DiarySchema),
   retrieval: Type.Optional(RetrievalSchema),
   search: Type.Optional(SearchSchema),
+  reactions: Type.Optional(ReactionsSchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -518,3 +540,4 @@ export type SummarizationConfig = Static<typeof SummarizationSchema>;
 export type DiaryConfig = Static<typeof DiarySchema>;
 export type RetrievalConfig = Static<typeof RetrievalSchema>;
 export type SearchConfig = Static<typeof SearchSchema>;
+export type ReactionsConfig = Static<typeof ReactionsSchema>;

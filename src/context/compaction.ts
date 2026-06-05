@@ -30,10 +30,17 @@ export interface CompactTimelineOptions {
    * View B reaction lines (ARCHITECTURE.md §9f) to interleave into the rich-tier
    * turn stream. They do NOT influence the compact/rich boundary (reaction lines
    * are tiny — useless as a token-budget signal); only those whose timestamp
-   * falls within the rich tier's time span (>= the oldest rich event) are
-   * injected, at their chronological position, merged into adjacent user turns.
+   * falls within the rich tier's time span are injected, at their chronological
+   * position, merged into adjacent user turns.
    */
   reactionLines?: ReactionLine[];
+  /**
+   * View B horizon as a rich-tier message count: 0 (default) = the whole rich
+   * tier (horizon = oldest rich event); >0 = only the last N rich messages, so
+   * the horizon is the Nth-from-last rich event's timestamp. Past the horizon a
+   * reaction exists only as a View A count.
+   */
+  discreteHorizonMessages?: number;
 }
 
 /** A renderable unit fed to {@link buildTieredTurns}: a real event or a synthetic line. */
@@ -135,7 +142,8 @@ export function compactTimelineEvents(
     messageId: item.event.id,
   }));
   // Inject only reaction lines within the rich tier's time span (§8 horizon).
-  const richHorizon = rich.length > 0 ? rich[0]!.event.timestamp : Number.POSITIVE_INFINITY;
+  // discreteHorizonMessages tightens it to the last N rich messages (0 = whole tier).
+  const richHorizon = computeReactionHorizon(rich, options.discreteHorizonMessages ?? 0);
   const reactionUnits: TurnUnit[] = (options.reactionLines ?? [])
     .filter((line) => line.timestamp >= richHorizon)
     .map((line) => ({
@@ -222,6 +230,18 @@ function buildState(
 /** Rank for sort tiebreak: real events (with a messageId) precede synthetic lines. */
 function rankUnit(unit: TurnUnit): number {
   return unit.messageId ? 0 : 1;
+}
+
+/**
+ * The View B inclusion horizon: a reaction line renders only if its timestamp is
+ * >= this value. `n <= 0` (or n covering the whole tier) → the oldest rich event;
+ * `n > 0` → the Nth-from-last rich event, restricting lines to the last N rich
+ * messages' time span. With no rich tier, nothing can interleave (+Infinity).
+ */
+function computeReactionHorizon(rich: PreparedEvent[], n: number): number {
+  if (rich.length === 0) return Number.POSITIVE_INFINITY;
+  if (n <= 0 || n >= rich.length) return rich[0]!.event.timestamp;
+  return rich[rich.length - n]!.event.timestamp;
 }
 
 function buildTieredTurns(units: TurnUnit[]): TieredTurn[] {

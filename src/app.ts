@@ -345,6 +345,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // store only — never wake a session. Writes are fire-and-forget through the
     // single-writer queue; a failure is logged but must not stall the poll loop.
     onReaction: (event, context) => {
+      // Master switch: when reactions are disabled, don't even persist (the views
+      // are gated independently in the context builder).
+      if (config.reactions?.enabled === false) return;
       void ingestReactionEvent(storage, context.accountId, event, Date.now())
         .then((outcome) => {
           if (outcome.action === "skipped") {

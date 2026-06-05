@@ -14,7 +14,7 @@ import { processImageForInference, cleanupProcessedImage, buildInferenceImageOpt
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { hydrateEvents as hydrateEventsShared, mediaAssetToAttachmentMeta } from "./hydrate.js";
-import { synthesizeReactionLines, type ReactionLine } from "./reactions.js";
+import { synthesizeReactionLines, type ReactionLine, type ReactionTarget } from "./reactions.js";
 import { estimateTokens, truncateToTokens } from "./tokens.js";
 import {
   selectSummaries,
@@ -175,12 +175,22 @@ export class ContextBuilder {
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
     // projections from the reaction store, attached now (after the grace wait has
     // finalized the event set) and never persisted into event_json. Off for
-    // summarization builds — reactions must never leak into summaries (§4).
+    // summarization builds — reactions must never leak into summaries (§4) — and
+    // gated by [reactions] config.
+    const rx = this.config.reactions ?? {};
+    const reactionsEnabled = !cutoff && rx.enabled !== false;
     let reactionLines: ReactionLine[] = [];
-    if (!cutoff) {
-      compactionInput = this.attachReactionAggregates(compactionInput);
-      triggerEvents = this.attachReactionAggregates(triggerEvents);
-      reactionLines = this.buildDiscreteReactionLines(compactionInput);
+    if (reactionsEnabled) {
+      if (rx.show_aggregates !== false) {
+        compactionInput = this.attachReactionAggregates(compactionInput);
+        triggerEvents = this.attachReactionAggregates(triggerEvents);
+      }
+      if (rx.show_discrete !== false) {
+        reactionLines = this.buildDiscreteReactionLines(compactionInput, {
+          assistantOnly: rx.discrete_assistant_only !== false,
+          nameCap: rx.discrete_name_cap ?? 8,
+        });
+      }
     }
 
     const compacted = compactTimelineEvents(
@@ -194,6 +204,7 @@ export class ContextBuilder {
         // its derived boundaries into the real compaction state.
         state: cutoff ? undefined : compactionState,
         reactionLines,
+        discreteHorizonMessages: rx.discrete_horizon_messages ?? 0,
       },
     );
     if (!cutoff && compacted.stateChanged && compacted.state) {
@@ -634,25 +645,37 @@ export class ContextBuilder {
   }
 
   /**
-   * View B (ARCHITECTURE.md §9f): synthesize discrete reaction lines for the
-   * assistant's own messages among `events`. The store is queried for all such
-   * targets; compaction injects only the lines whose timestamp falls within the
-   * rich tier's time span. Returns [] when there are no assistant targets or no
-   * live reactions on them.
+   * View B (ARCHITECTURE.md §9f): synthesize discrete reaction lines for messages
+   * among `events`. By default only the assistant's own messages are targeted
+   * (`assistantOnly`); when false, any sender's recent messages qualify and the
+   * line reads "<author>'s message" instead of "your message". The store is
+   * queried for all such targets; compaction injects only the lines whose
+   * timestamp falls within the rich tier's time span. Returns [] when there are no
+   * targets or no live reactions on them.
    */
-  private buildDiscreteReactionLines(events: CanonicalChatEvent[]): ReactionLine[] {
-    const targets = events.filter((e) => e.role === "assistant" && e.externalId);
+  private buildDiscreteReactionLines(
+    events: CanonicalChatEvent[],
+    opts: { assistantOnly: boolean; nameCap: number },
+  ): ReactionLine[] {
+    const targets = events.filter(
+      (e) => e.externalId !== undefined && (!opts.assistantOnly || e.role === "assistant"),
+    );
     const externalIds = targets
       .map((e) => e.externalId)
       .filter((id): id is string => id !== undefined);
     if (externalIds.length === 0) return [];
     const rows = this.storage.getDiscreteReactions(externalIds);
     if (rows.length === 0) return [];
-    const bodies = new Map<string, string>();
+    const targetInfo = new Map<string, ReactionTarget>();
     for (const target of targets) {
-      if (target.externalId) bodies.set(target.externalId, target.body);
+      if (!target.externalId) continue;
+      targetInfo.set(target.externalId, {
+        body: target.body,
+        self: target.role === "assistant",
+        authorDisplay: target.sender.displayName ?? undefined,
+      });
     }
-    return synthesizeReactionLines(rows, bodies, { nameCap: 8 });
+    return synthesizeReactionLines(rows, targetInfo, { nameCap: opts.nameCap });
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

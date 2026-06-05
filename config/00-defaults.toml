@@ -271,6 +271,16 @@ absence_gap_ms = 10800000         # 3h: inter-message gap above which a user cou
 default_lookback_ms = 86400000    # 24h: recap/absence fallback window when a user has no recent messages
 recap_budget_tokens = 6000        # summary token budget recap returns before coarsening to higher levels
 
+# Passive reaction surfacing (ARCHITECTURE.md §9f): let the agent perceive emoji
+# reactions (unicode + custom) on messages, without ever triggering a session.
+[reactions]
+enabled = true                    # master switch: persist inbound reactions AND surface them
+show_aggregates = true            # View A: key×count on every rich-tier message
+show_discrete = true              # View B: "X reacted Y to your message" lines, interleaved
+discrete_assistant_only = true    # View B targets: true = only the agent's own messages
+discrete_horizon_messages = 0     # View B horizon: 0 = whole rich tier; >0 = last N rich messages
+discrete_name_cap = 8             # >N senders on one reaction → first 4 + "(and N others)"
+
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]
