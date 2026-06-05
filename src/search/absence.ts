@@ -39,17 +39,24 @@ function humanGap(ms: number): string {
  * recent messages are the burst and are excluded.
  *
  * Edge cases: no messages in the horizon → fall back to `now - defaultLookback`
- * (ambiguous); continuously present (no gap ≥ threshold) → earliest known message
+ * (ambiguous). The basis distinguishes two empty-horizon causes via `hasOlderMessage`:
+ * the user has been away *longer* than the look-back horizon (an older message exists
+ * outside it — honest about the horizon limit, review #9) vs. genuinely no messages from
+ * the user at all. Continuously present (no gap ≥ threshold) → earliest known message
  * (ambiguous), since there is no real absence to anchor on.
  */
 export function detectAbsence(
   timestampsDesc: number[],
-  opts: { now: number; gapThresholdMs: number; defaultLookbackMs: number },
+  opts: { now: number; gapThresholdMs: number; defaultLookbackMs: number; hasOlderMessage?: boolean },
 ): AbsenceResult {
   if (timestampsDesc.length === 0) {
+    const lookback = humanGap(opts.defaultLookbackMs);
     return {
       startTs: opts.now - opts.defaultLookbackMs,
-      basis: `no recent messages from you — defaulted to the last ${humanGap(opts.defaultLookbackMs)}`,
+      basis: opts.hasOlderMessage
+        ? `you've been away longer than the 30-day window I look back over — showing the last ${lookback}; ` +
+          `pass an explicit \`after\`/\`last\` to widen`
+        : `no recent messages from you — defaulted to the last ${lookback}`,
       ambiguous: true,
     };
   }
@@ -92,9 +99,23 @@ export async function resolveAbsence(
     timelineKeys: opts.timelineKeys,
     sinceTs: opts.now - HORIZON_MS,
   });
+  // When nothing is in-horizon, the 24h fallback would otherwise read as "nothing
+  // happened" even if the user has simply been away longer than the 30-day horizon
+  // (review #9). A cheap unbounded probe (limit 1, no `sinceTs`) tells the two apart so
+  // the basis can be honest about the horizon limit rather than silently collapsing.
+  let hasOlderMessage = false;
+  if (timestampsDesc.length === 0) {
+    hasOlderMessage =
+      storage.getChatSenderTimestamps({
+        senderId: opts.senderId,
+        timelineKeys: opts.timelineKeys,
+        limit: 1,
+      }).length > 0;
+  }
   return detectAbsence(timestampsDesc, {
     now: opts.now,
     gapThresholdMs: opts.gapThresholdMs ?? ABSENCE_GAP_DEFAULT_MS,
     defaultLookbackMs: opts.defaultLookbackMs ?? ABSENCE_LOOKBACK_DEFAULT_MS,
+    hasOlderMessage,
   });
 }

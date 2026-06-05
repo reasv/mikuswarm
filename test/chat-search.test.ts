@@ -6,8 +6,14 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { LATEST_SCHEMA_VERSION, Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
-import { ChatSearchIndexer, sanitizeFtsMatch, resolveRooms, projectChatEvent } from "../src/search/index.js";
-import { createSearchMessagesTool } from "../src/tools/index.js";
+import {
+  ChatSearchIndexer,
+  sanitizeFtsMatch,
+  resolveRooms,
+  projectChatEvent,
+  resolveAbsence,
+} from "../src/search/index.js";
+import { createSearchMessagesTool, createUserActivityTool } from "../src/tools/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 import type { ChatProjectionInput, ChatIndexUpsert } from "../src/storage/index.js";
 
@@ -411,6 +417,100 @@ test("aggregateChatActivity counts per sender and room", async () => {
     const scoped = storage.aggregateChatActivity({ senderId: "@bob" });
     assert.equal(scoped.length, 1);
     assert.equal(scoped[0].count, 1);
+  });
+});
+
+function toolText(res: { content: Array<{ type: string }> }): string {
+  return (res.content[0] as { type: "text"; text: string }).text;
+}
+
+test("user_activity with a lone `before` keeps the lower bound open (does not invert the window) (#8)", async () => {
+  // SEED timestamps are tiny epoch-ms (1_000..4_000) — far older than 30 days before
+  // any real `now`. The pre-fix code injected a default `last:"30d"` for a lone `before`,
+  // producing afterTs = now-30d > beforeTs, inverting the window → flat "No activity".
+  await withIndexed(SEED, async (storage, indexer) => {
+    const tool = createUserActivityTool({
+      storage,
+      indexer,
+      currentTimelineKey: ROOM_A,
+      now: () => 1_000_000_000_000, // far in the future relative to the seed
+    });
+    // Upper bound after the newest seed event, with NO last/after → open lower bound.
+    const res = await tool.execute("t1", { before: "2001-09-09", rooms: "all" });
+    const text = toolText(res);
+    assert.doesNotMatch(text, /No activity/);
+    assert.match(text, /Activity roster/);
+    // All four seed events fall in the open-ended window: @alice (3) + @bob (1).
+    const details = res.details as { window: { after: number | null }; senderCount: number };
+    assert.equal(details.window.after, null); // lower bound is genuinely open
+    assert.equal(details.senderCount, 2);
+  });
+});
+
+test("user_activity roster is bounded to top-N by GLOBAL total with per-room detail (#6)", async () => {
+  // @alice: 2 in room A + 1 in room B = 3 (global top). @bob: 1 in room A. @carol: 1.
+  // limit:1 must return @alice (global #1) with BOTH her rooms — not a single (sender,room)
+  // row — and the "(+N more)" line must report the true sender count (3).
+  const events: CanonicalChatEvent[] = [
+    ...SEED,
+    ev({ id: "c1", senderId: "@carol", body: "hi there", timestamp: 5_000 }),
+  ];
+  await withIndexed(events, async (storage, indexer) => {
+    const tool = createUserActivityTool({
+      storage,
+      indexer,
+      currentTimelineKey: ROOM_A,
+      now: () => 1_000_000_000_000,
+    });
+    const res = await tool.execute("t1", { rooms: "all", last: "100000d", limit: 1 });
+    const text = toolText(res);
+    const details = res.details as {
+      senderCount: number;
+      senders: Array<{ senderId: string; total: number; perRoom: Array<{ room: string }> }>;
+    };
+    // Top-1 by global total is @alice with total 3 across BOTH her rooms.
+    assert.equal(details.senders.length, 1);
+    assert.equal(details.senders[0].senderId, "@alice");
+    assert.equal(details.senders[0].total, 3);
+    assert.equal(details.senders[0].perRoom.length, 2); // room A + room B, not cut mid-sender
+    // Overflow line reports the true total sender count (3), not the page size.
+    assert.equal(details.senderCount, 3);
+    assert.match(text, /\(\+2 more\)/);
+  });
+});
+
+test("user_activity single-user path is unchanged by the roster bounding (#6)", async () => {
+  await withIndexed(SEED, async (storage, indexer) => {
+    const tool = createUserActivityTool({
+      storage,
+      indexer,
+      currentTimelineKey: ROOM_A,
+      now: () => 1_000_000_000_000,
+    });
+    const res = await tool.execute("t1", { user: "@alice", rooms: "all", last: "100000d" });
+    const text = toolText(res);
+    assert.match(text, /@alice: 3 message\(s\) across 2 room\(s\)/);
+  });
+});
+
+test("resolveAbsence is honest when the user has been away longer than the horizon (#9)", async () => {
+  const NOW = 1_000_000_000_000;
+  const HORIZON = 30 * 24 * 60 * 60 * 1000;
+  // One message ~40 days ago (older than the 30-day horizon), none within it.
+  const events: CanonicalChatEvent[] = [
+    ev({ id: "old1", senderId: "@dora", body: "long ago", timestamp: NOW - 40 * 24 * 60 * 60 * 1000 }),
+  ];
+  await withIndexed(events, async (storage, indexer) => {
+    const absent = await resolveAbsence(storage, indexer, { senderId: "@dora", now: NOW });
+    assert.equal(absent.ambiguous, true);
+    assert.match(absent.basis, /away longer than the 30-day window/);
+
+    // A brand-new user with no messages at all keeps the genuine "no messages" basis.
+    const fresh = await resolveAbsence(storage, indexer, { senderId: "@nobody", now: NOW });
+    assert.match(fresh.basis, /no recent messages from you/);
+    assert.doesNotMatch(fresh.basis, /away longer than/);
+    // Sanity: the old message truly is outside the horizon.
+    assert.ok(NOW - 40 * 24 * 60 * 60 * 1000 < NOW - HORIZON);
   });
 });
 

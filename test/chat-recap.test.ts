@@ -25,6 +25,18 @@ test("detectAbsence with no messages falls back to the lookback window", () => {
   const r = detectAbsence([], absenceOpts());
   assert.equal(r.ambiguous, true);
   assert.equal(r.startTs, NOW - LOOKBACK);
+  // A brand-new user (no message anywhere) gets the genuine "no messages" basis.
+  assert.match(r.basis, /no recent messages from you/);
+});
+
+test("detectAbsence reports the horizon limit honestly when an older message exists (#9)", () => {
+  // Empty in-horizon set but a message exists beyond the look-back horizon: the basis
+  // must say the user has been away longer than the window, not "nothing happened".
+  const r = detectAbsence([], { ...absenceOpts(), hasOlderMessage: true });
+  assert.equal(r.ambiguous, true);
+  assert.equal(r.startTs, NOW - LOOKBACK);
+  assert.match(r.basis, /away longer than the 30-day window/);
+  assert.doesNotMatch(r.basis, /no recent messages from you/);
 });
 
 test("detectAbsence treats continuous presence as ambiguous (earliest known)", () => {

@@ -65,18 +65,42 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
       await context.indexer.ensureFreshForQuery();
 
       const timelineKeys = resolveRooms(args.rooms ?? "all", context.currentTimelineKey);
-      const hasExplicit = args.last !== undefined || args.after !== undefined;
+      // Inject the "30d" default ONLY when no bound at all is given. A lone `before`
+      // must leave the lower bound OPEN (all-time up to `before`) — otherwise the
+      // default `last:"30d"` injects `afterTs = now-30d`, which for a `before` older
+      // than 30 days inverts the window (afterTs > beforeTs) and matches nothing.
+      const hasExplicit =
+        args.last !== undefined || args.after !== undefined || args.before !== undefined;
       const window = resolveTimeWindow(
         { last: hasExplicit ? args.last : "30d", after: args.after, before: args.before },
         nowMs,
       );
 
-      const rows = context.storage.aggregateChatActivity({
-        senderId: args.user,
-        timelineKeys,
-        sinceTs: window.afterTs,
-        untilTs: window.beforeTs,
-      });
+      const limit = args.limit ?? 50;
+      // Single-user path: one sender's per-room breakdown (unbounded work is fine — it's
+      // one sender). Roster path: bound the work in SQL via `topChatActivity`, which ranks
+      // senders by global total and fetches per-room detail only for the top `limit`
+      // (review #6); `totalSenders` carries the true count for the "(+N more)" line.
+      let rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
+      let totalSenders: number;
+      if (args.user) {
+        rows = context.storage.aggregateChatActivity({
+          senderId: args.user,
+          timelineKeys,
+          sinceTs: window.afterTs,
+          untilTs: window.beforeTs,
+        });
+        totalSenders = rows.length > 0 ? 1 : 0;
+      } else {
+        const res = context.storage.topChatActivity({
+          timelineKeys,
+          sinceTs: window.afterTs,
+          untilTs: window.beforeTs,
+          limit,
+        });
+        rows = res.rows;
+        totalSenders = res.totalSenders;
+      }
 
       const bySender = new Map<string, SenderAgg>();
       for (const r of rows) {
@@ -89,9 +113,9 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
         agg.perRoom.push({ room: r.timelineKey, count: r.count, lastAt: r.lastAt });
         bySender.set(r.senderId, agg);
       }
-      const senders = [...bySender.values()].sort((a, b) => b.total - a.total);
-      const limit = args.limit ?? 50;
-      const shown = senders.slice(0, limit);
+      // `topChatActivity` already returns only the top `limit` senders (per-room rows for
+      // each), so `shown` is the full roster page; `totalSenders` is the true overflow base.
+      const shown = [...bySender.values()].sort((a, b) => b.total - a.total);
       const elapsedMs = Math.round(performance.now() - startedAt);
 
       const windowLabel =
@@ -121,8 +145,8 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
           (s, i) =>
             `${i + 1}. ${s.senderId} — ${s.total} msg(s), ${s.perRoom.length} room(s), last ${fmtTs(s.lastAt)}`,
         );
-        const more = senders.length > shown.length ? `\n(+${senders.length - shown.length} more)` : "";
-        text = `Activity roster (${senders.length} sender(s)):\n${lines.join("\n")}${more}\n\n(${trailer})`;
+        const more = totalSenders > shown.length ? `\n(+${totalSenders - shown.length} more)` : "";
+        text = `Activity roster (${totalSenders} sender(s)):\n${lines.join("\n")}${more}\n\n(${trailer})`;
       }
 
       return {
@@ -130,7 +154,7 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
         details: {
           window: { after: window.afterTs ?? null, before: window.beforeTs ?? null },
           elapsedMs,
-          senderCount: senders.length,
+          senderCount: totalSenders,
           ignoredBounds: window.ignored,
           senders: shown.map((s) => ({
             senderId: s.senderId,

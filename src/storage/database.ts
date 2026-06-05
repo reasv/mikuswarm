@@ -3442,6 +3442,89 @@ export class Storage {
     });
   }
 
+  /**
+   * Bounded roster for the all-users `user_activity` view (§9e, review #6). Ranking is by
+   * **total messages across all rooms** per sender, so a naive `LIMIT` on the per-(sender,
+   * room) rows would be wrong (it could cut mid-sender or drop a top sender's room). Instead
+   * this pushes the bound into SQL correctly in two passes over the same window:
+   *   1. rank senders by their global total (`group by sender_id`), take the top `limit`;
+   *   2. fetch the per-(sender, room) breakdown only for those sender ids.
+   * Also returns `totalSenders` — a cheap `count(distinct sender_id)` over the window — so the
+   * tool's "(+N more)" overflow line can report the true sender count without materializing
+   * every group. The per-room rows for one sender are contiguous; the tool aggregates them.
+   */
+  topChatActivity(opts: {
+    timelineKeys?: string[];
+    sinceTs?: number;
+    untilTs?: number;
+    limit: number;
+  }): {
+    rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
+    totalSenders: number;
+  } {
+    return this.read((db) => {
+      const where: string[] = [];
+      const params: Record<string, unknown> = {};
+      if (opts.timelineKeys && opts.timelineKeys.length > 0) {
+        const keys = opts.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`timeline_key in (${keys.join(", ")})`);
+      }
+      if (opts.sinceTs !== undefined) {
+        where.push("timestamp >= @sinceTs");
+        params.sinceTs = opts.sinceTs;
+      }
+      if (opts.untilTs !== undefined) {
+        where.push("timestamp < @untilTs");
+        params.untilTs = opts.untilTs;
+      }
+      const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+
+      const totalSenders = (
+        db
+          .prepare(`select count(distinct sender_id) as n from chat_index ${whereSql}`)
+          .get(params) as { n: number }
+      ).n;
+
+      // Pass 1: top-N senders by global total across rooms.
+      const top = db
+        .prepare(
+          `select sender_id as senderId from chat_index ${whereSql}
+           group by sender_id
+           order by count(*) desc, sender_id asc
+           limit @limit`,
+        )
+        .all({ ...params, limit: opts.limit }) as Array<{ senderId: string }>;
+      if (top.length === 0) return { rows: [], totalSenders };
+
+      // Pass 2: per-room breakdown for exactly those senders.
+      const senderParams: Record<string, unknown> = { ...params };
+      const senderPlaceholders = top.map((s, i) => {
+        senderParams[`sid${i}`] = s.senderId;
+        return `@sid${i}`;
+      });
+      const detailWhere = [...where, `sender_id in (${senderPlaceholders.join(", ")})`];
+      const rows = db
+        .prepare(
+          `select sender_id as senderId, timeline_key as timelineKey, count(*) as count,
+                  min(timestamp) as firstAt, max(timestamp) as lastAt
+           from chat_index where ${detailWhere.join(" and ")}
+           group by sender_id, timeline_key
+           order by sender_id asc, timeline_key asc`,
+        )
+        .all(senderParams) as Array<{
+        senderId: string;
+        timelineKey: string;
+        count: number;
+        firstAt: number;
+        lastAt: number;
+      }>;
+      return { rows, totalSenders };
+    });
+  }
+
   // ── Embedding queue (the `embed_status` column IS the queue, §7) ───
   // Mirrors the enrichment/caption/diary worker idiom: poll 'pending' → CAS-claim a
   // batch to 'processing' (attempts++) → embed → 'done' (or 'failed'/'skip').
