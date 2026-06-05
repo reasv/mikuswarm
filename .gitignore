@@ -21,3 +21,6 @@ workspaces/*
 !workspaces/.gitpreserve
 /tmp/
 tmp/
+
+# Review session scratch
+tmp/
