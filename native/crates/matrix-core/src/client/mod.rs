@@ -149,6 +149,13 @@ impl SharedState {
             .push_back(MatrixNativeEvent::Inbound { event });
     }
 
+    fn push_reaction(&self, event: crate::api::MatrixReactionStreamEvent) {
+        self.events
+            .lock()
+            .expect("matrix event queue mutex poisoned")
+            .push_back(MatrixNativeEvent::Reaction { event });
+    }
+
     fn set_sync_state(&self, state: MatrixSyncState) {
         let mut diagnostics = self
             .diagnostics
@@ -511,43 +518,171 @@ fn register_inbound_handler(client: &Client, shared: Arc<SharedState>, config: M
     });
 
     let reaction_config = config.clone();
+    let reaction_shared = shared.clone();
     client.add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
         let config = reaction_config.clone();
+        let shared = reaction_shared.clone();
         async move {
             let Ok(value) = raw.deserialize_as_unchecked::<Value>() else {
                 return;
             };
-            if value.get("type").and_then(Value::as_str) != Some("m.reaction") {
-                return;
+            match value.get("type").and_then(Value::as_str) {
+                Some("m.reaction") => {
+                    handle_reaction_add(&config, &shared, &room, &value).await;
+                }
+                Some("m.room.redaction") => {
+                    handle_reaction_redaction(&shared, &room, &value);
+                }
+                _ => {}
             }
-            if value
-                .get("unsigned")
-                .and_then(|unsigned| unsigned.get("redacted_because"))
-                .is_some()
-            {
-                return;
+        }
+    });
+}
+
+/// Surface an inbound `m.reaction` onto the passive-display stream *and* feed the
+/// custom-emoji catalog. The catalog write stays custom-only (mxc keys), but the
+/// stream carries every reaction kind (unicode/custom/text) so the agent can
+/// perceive all reactions, not just custom ones — matching what a human sees
+/// glancing at the icons under a message.
+async fn handle_reaction_add(
+    config: &MatrixClientConfig,
+    shared: &SharedState,
+    room: &Room,
+    value: &Value,
+) {
+    // A reaction that already arrives redacted is a no-op for display.
+    if value
+        .get("unsigned")
+        .and_then(|unsigned| unsigned.get("redacted_because"))
+        .is_some()
+    {
+        return;
+    }
+    let Some(decoded) = decode_reaction_event(value) else {
+        return;
+    };
+    let Some(target_event_id) = value
+        .get("content")
+        .and_then(|content| content.get("m.relates_to"))
+        .and_then(|relates_to| relates_to.get("event_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    // Resolve kind/display/shortcode/normalized exactly as the `react` and
+    // `list_reactions` tools do, so passive display matches on-demand display.
+    let now_ms = Utc::now().timestamp_millis();
+    let Ok(mut info) = reactions::resolve_reaction_key_info(
+        config,
+        &decoded.key,
+        Some(room.room_id().as_str()),
+        now_ms,
+    ) else {
+        // Unresolvable key (e.g. empty) — nothing meaningful to store/render.
+        return;
+    };
+    // Inbound custom reactions may carry a shortcode the local catalog has not
+    // learned yet; prefer it so display resolves to `:foo:` rather than a raw
+    // mxc fallback.
+    if info.shortcode.is_none() {
+        if let Some(shortcode) = decoded.shortcode.clone() {
+            if info.kind == crate::api::MatrixReactionKeyKind::Custom {
+                info.display = shortcode.clone();
             }
-            let Some(event) = decode_reaction_event(&value) else {
-                return;
-            };
-            if !event.key.starts_with("mxc://") {
-                return;
-            }
-            let Some(shortcode) = event.shortcode.clone() else {
-                return;
-            };
+            info.shortcode = Some(shortcode);
+        }
+    }
+
+    let sender_display = match UserId::parse(decoded.sender_id.as_str()) {
+        Ok(user_id) => room
+            .get_member_no_sync(&user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|member| member.name().to_string()),
+        Err(_) => None,
+    };
+
+    shared.push_reaction(crate::api::MatrixReactionStreamEvent {
+        action: crate::api::MatrixReactionStreamAction::Add,
+        reaction_event_id: decoded.event_id.clone(),
+        room_id: room.room_id().to_string(),
+        target_event_id: Some(target_event_id),
+        sender_id: decoded.sender_id.clone(),
+        sender_display,
+        reacted_at_ms: decoded.timestamp_ms,
+        kind: Some(info.kind),
+        display: Some(info.display.clone()),
+        shortcode: info.shortcode.clone(),
+        normalized_key: Some(info.normalized.clone()),
+    });
+
+    // Keep custom-emoji discovery working: record catalog usage for custom keys.
+    if decoded.key.starts_with("mxc://") {
+        if let Some(shortcode) = decoded.shortcode.clone() {
             let _ = emoji::record_usage(
-                &config,
+                config,
                 &crate::api::MatrixCustomEmojiUsageRequest {
                     emoji: vec![crate::api::MatrixCustomEmojiRef {
                         shortcode,
-                        mxc_url: event.key,
+                        mxc_url: decoded.key.clone(),
                     }],
                     room_id: Some(room.room_id().to_string()),
-                    observed_at_ms: Some(event.timestamp_ms),
+                    observed_at_ms: Some(decoded.timestamp_ms),
                 },
             );
         }
+    }
+}
+
+/// Forward an `m.room.redaction` to the reaction store as a removal signal.
+///
+/// We cannot tell here (without an extra event lookup) whether the redacted
+/// event was a reaction or an ordinary message, so every redaction is forwarded;
+/// the TS store tombstones by `reaction_event_id` and silently no-ops when the
+/// id is not a known reaction. This is stateless and self-correcting across
+/// restarts — a reaction persisted in a previous session is still tombstoned
+/// correctly — which an in-memory "surfaced ids" set could not guarantee.
+/// Message redaction/deletion is a separate concern handled elsewhere.
+fn handle_reaction_redaction(shared: &SharedState, room: &Room, value: &Value) {
+    // The redacted event id is top-level `redacts` (pre room v11) or
+    // `content.redacts` (room v11+, MSC2174).
+    let Some(redacts) = value
+        .get("redacts")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(|content| content.get("redacts"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let sender_id = value
+        .get("sender")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let reacted_at_ms = value
+        .get("origin_server_ts")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    shared.push_reaction(crate::api::MatrixReactionStreamEvent {
+        action: crate::api::MatrixReactionStreamAction::Remove,
+        reaction_event_id: redacts,
+        room_id: room.room_id().to_string(),
+        target_event_id: None,
+        sender_id,
+        sender_display: None,
+        reacted_at_ms,
+        kind: None,
+        display: None,
+        shortcode: None,
+        normalized_key: None,
     });
 }
 

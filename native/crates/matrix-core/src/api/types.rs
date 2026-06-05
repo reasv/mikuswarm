@@ -141,6 +141,53 @@ pub enum MatrixNativeEvent {
     Inbound {
         event: MatrixInboundEvent,
     },
+    Reaction {
+        event: MatrixReactionStreamEvent,
+    },
+}
+
+/// Whether a streamed reaction was added or removed (un-reacted).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixReactionStreamAction {
+    Add,
+    Remove,
+}
+
+/// A reaction (or un-reaction) observed on the live sync stream and surfaced to
+/// the TS side for passive display. This is *not* a timeline event — reactions
+/// are stored in their own table and injected at render time only.
+///
+/// For `action: Add` the resolver-derived fields (`kind`/`display`/`shortcode`/
+/// `normalized_key`) and `target_event_id` are populated. For `action: Remove`
+/// only `reaction_event_id` (the redacted reaction's own id) is meaningful —
+/// the redaction event does not carry the original target, and the store
+/// tombstones purely by `reaction_event_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixReactionStreamEvent {
+    pub action: MatrixReactionStreamAction,
+    /// The `m.reaction` event's own id (`$...`); the store's primary key.
+    pub reaction_event_id: String,
+    pub room_id: String,
+    /// The annotated message's id (`m.relates_to.event_id`). Present for `Add`;
+    /// absent for `Remove` (a redaction does not name the original target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_event_id: Option<String>,
+    /// Who reacted (for `Add`) or who issued the redaction (for `Remove`).
+    pub sender_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_display: Option<String>,
+    /// `origin_server_ts` of the reaction (`Add`) or the redaction (`Remove`).
+    pub reacted_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MatrixReactionKeyKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
