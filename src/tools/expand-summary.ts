@@ -121,6 +121,10 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
           return;
         }
         for (const child of lineage.children) {
+          // A superseded child is never expandable (§9e) — skip it rather than emit a
+          // drill affordance that would error. (Forward-compat: no path writes that
+          // status today.)
+          if (child.status === "superseded") continue;
           if (remainingDepth > 1) {
             walk(child.id, remainingDepth - 1);
           } else if (includeMessages && child.level === 1) {
@@ -141,26 +145,27 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
       }
 
       // Render in traversal order under the token cap. Always include at least the first
-      // item (so a single oversized constituent still returns something); once the cap is
-      // reached, stop and count the remainder as omitted.
+      // item (so a single oversized constituent still returns something); once adding the
+      // next item would exceed the cap, STOP — keeping strict traversal order — and count
+      // it plus everything after it as omitted (the tool then advises drilling a specific
+      // child). A "skip-but-keep-scanning" packer would admit a later, smaller item over
+      // an earlier dropped one, breaking the order the bot expects.
       const childBlocks: string[] = [];
       const messageBlocks: string[] = [];
       const childrenOut: Array<{ id: string; level: number; earliestTimestamp: number; latestTimestamp: number; eventCount: number; status: string }> = [];
       let estimatedTokens = 0;
       let omitted = 0;
-      for (const item of ordered) {
-        let block: string;
-        if (item.kind === "summary") {
-          block = `${summaryHeader(item.summary)}\n${item.summary.content}`;
-        } else {
-          const ev = hydratedById.get(item.event.id) ?? item.event;
-          block = renderCompactMessage(ev);
-        }
+      for (let i = 0; i < ordered.length; i++) {
+        const item = ordered[i]!;
+        const block =
+          item.kind === "summary"
+            ? `${summaryHeader(item.summary)}\n${item.summary.content}`
+            : renderCompactMessage(hydratedById.get(item.event.id) ?? item.event);
         const cost = estimateTokens(block);
         const have = childBlocks.length + messageBlocks.length;
         if (have > 0 && estimatedTokens + cost > tokenCap) {
-          omitted += 1;
-          continue;
+          omitted = ordered.length - i; // this item and everything after it
+          break;
         }
         estimatedTokens += cost;
         if (item.kind === "summary") {

@@ -177,6 +177,18 @@ test("depth above the configured max is capped with a note", async () => {
   });
 });
 
+test("a superseded child is skipped during a drill", async () => {
+  await withHierarchy(async (storage, tool) => {
+    await insertSummary(storage, { id: "L1c", content: "superseded child summary", level: 1, earliest: 5000, latest: 6000, eventIds: ["e1"], status: "superseded" });
+    await insertSummary(storage, { id: "L2b", content: "coarse summary with a superseded child", level: 2, earliest: 1000, latest: 6000, parentIds: ["L1a", "L1c"] });
+    const res = await tool.execute("c9", { id: "L2b" });
+    const details = res.details as { children: Array<{ id: string }> };
+    // L1c (superseded) is skipped; only the live child is offered as a drill affordance.
+    assert.deepEqual(details.children.map((c) => c.id), ["L1a"]);
+    assert.doesNotMatch((res.content[0] as { text: string }).text, /id=L1c/);
+  });
+});
+
 test("unknown and superseded ids return clear errors", async () => {
   await withHierarchy(async (storage, tool) => {
     const missing = await tool.execute("c7", { id: "nope" });
