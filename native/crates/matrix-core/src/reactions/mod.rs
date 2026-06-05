@@ -305,6 +305,21 @@ mod tests {
     }
 
     #[test]
+    fn inbound_text_reaction_classifies_as_text() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let config = sample_config(&root);
+        // A non-emoji literal reaction key resolves as kind Text, with the literal
+        // as both normalized and display and no shortcode.
+        let reaction = resolve_inbound_reaction_key_info(&config, "lgtm", None, None, 0).unwrap();
+        assert_eq!(reaction.kind, crate::api::MatrixReactionKeyKind::Text);
+        assert_eq!(reaction.normalized, "lgtm");
+        assert_eq!(reaction.display, "lgtm");
+        assert_eq!(reaction.shortcode, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn inbound_unicode_reaction_keeps_glyph_display() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();

@@ -182,6 +182,27 @@ test("falls back to sender id when no display name is known", () => {
   assert.match(lines[0].content, /^<reaction>@nodisplay:test reacted/);
 });
 
+test("multiple groups render in deterministic timestamp order across repeated calls", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", targetEventId: "$a1", normalizedKey: "👍", display: "👍", reactedAt: 3000 }),
+    discrete({ reactionEventId: "$r2", targetEventId: "$a1", normalizedKey: "😮", display: "😮", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r3", targetEventId: "$a2", normalizedKey: "👍", display: "👍", reactedAt: 2000 }),
+  ];
+  const targets = new Map<string, ReactionTarget>([
+    ["$a1", { body: "one", self: true }],
+    ["$a2", { body: "two", self: true }],
+  ]);
+  const first = synthesizeReactionLines(rows, targets, { nameCap: 8 });
+  const second = synthesizeReactionLines(rows, targets, { nameCap: 8 });
+  // Same input → identical output (deterministic-render invariant, §9).
+  assert.deepEqual(first, second);
+  // Ordered by the group's most recent reaction timestamp.
+  assert.deepEqual(
+    first.map((l) => l.timestamp),
+    [1000, 2000, 3000],
+  );
+});
+
 // --- View B integration: compaction interleaving ---
 
 test("reaction lines interleave chronologically into the rich tier", () => {
