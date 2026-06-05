@@ -130,15 +130,15 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       "returned as the FULL message (compact form); set format:snippet to scan many results as short " +
       "excerpts. Newest-first by default; use order:relevance for best-match ranking with a text query. " +
       'Set corpus:"summaries" to instead search the rolling conversation summaries by keyword (each hit ' +
-      "cites a summary id you can expand_summary on) — useful when you only hold a coarse summary and " +
-      "need the finer detail underneath a topic. For your own past notes (not chat), use recall_memory instead.",
+      "cites a summary id for follow-up) — useful when you only hold a coarse summary and want to find " +
+      "the right one. For your own past notes (not chat), use recall_memory instead.",
     parameters: Type.Object({
       corpus: Type.Optional(
         Type.Union([Type.Literal("messages"), Type.Literal("summaries")], {
           description:
             'Which corpus to search. "messages" (default) = the raw chat transcript. ' +
             '"summaries" = the rolling conversation summaries (§9b) by keyword, when you ' +
-            "hold only a coarse summary and want to find the right one to expand_summary on. " +
+            "hold only a coarse summary and want to find the right one for follow-up. " +
             "A call returns EITHER message hits OR summary hits, never both. With " +
             'corpus:"summaries", the message-only filters (from, mentions, quoted_user, ' +
             "is_reply, has_attachment, attachment_type, has_link, scope, since_user_absence, " +
@@ -403,8 +403,8 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
 /**
  * The `corpus:"summaries"` branch of `search_messages` (§9e): keyword search over the
  * rolling summaries (`summaries_fts`) instead of the raw transcript. Returns summary
- * hits — each citing its `id` for `expand_summary` — never message hits, so the two
- * corpora never interleave. Message-only filters are rejected up front (fail-fast).
+ * hits — each citing its `id` for follow-up — never message hits, so the two corpora
+ * never interleave. Message-only filters are rejected up front (fail-fast).
  */
 function runSummaryCorpus(
   context: SearchMessagesToolContext,
@@ -420,8 +420,8 @@ function runSummaryCorpus(
     const text =
       `error: these filters do not apply to corpus:"summaries": ${rejected.join(", ")}. ` +
       "Applicable parameters are: query, rooms, after/before/last, limit, cursor, order, " +
-      "level, min_level, status. (Searching summaries finds the summary to expand_summary on; " +
-      "to filter by sender/mentions/attachments, search the raw transcript with corpus:\"messages\".)";
+      "level, min_level, status. (To filter by sender/mentions/attachments, search the raw " +
+      "transcript with corpus:\"messages\".)";
     return {
       content: [{ type: "text", text }],
       details: { corpus: "summaries", error: "inapplicable_filters", rejected },
@@ -488,7 +488,7 @@ function runSummaryCorpus(
         : "";
     text =
       `${outcome.total} summary match(es)${orderNote}${dateNote} ` +
-      `(each id= is expandable with expand_summary):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})`;
+      `(each cites a summary id for follow-up):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})`;
   }
 
   return {

@@ -165,6 +165,50 @@ test("level / min_level / time / room filters apply to summary search", async ()
   });
 });
 
+test("relevance order ranks the better bm25 match first", async () => {
+  await withStorage(async (storage) => {
+    // Same matching term; the shorter document scores better under bm25.
+    await insertSummary(storage, { id: "short", content: "needle", earliest: 1000, latest: 2000 });
+    await insertSummary(storage, { id: "long", content: "needle haystack haystack haystack haystack haystack", earliest: 3000, latest: 4000 });
+    const res = storage.searchSummaries({ match: "{content} : (\"needle\")", limit: 10, order: "relevance" });
+    assert.equal(res.total, 2);
+    assert.deepEqual(res.hits.map((h) => h.id), ["short", "long"]);
+    // bm25 cost is populated only under relevance (lower = better → first).
+    assert.ok(res.hits[0]!.bm25 <= res.hits[1]!.bm25);
+  });
+});
+
+test("keyset pagination pages summaries by (latest_timestamp, rowid) cursor", async () => {
+  await withStorage(async (storage) => {
+    await insertSummary(storage, { id: "s1", content: "topic zebra", earliest: 1000, latest: 2000 });
+    await insertSummary(storage, { id: "s2", content: "topic zebra", earliest: 3000, latest: 4000 });
+    await insertSummary(storage, { id: "s3", content: "topic zebra", earliest: 5000, latest: 6000 });
+
+    const first = storage.searchSummaries({ match: "{content} : (\"zebra\")", limit: 2, order: "newest" });
+    assert.equal(first.total, 3);
+    assert.deepEqual(first.hits.map((h) => h.id), ["s3", "s2"]); // newest-first
+    const last = first.hits[first.hits.length - 1]!;
+    const second = storage.searchSummaries({
+      match: "{content} : (\"zebra\")",
+      limit: 2,
+      order: "newest",
+      cursor: { timestamp: last.latestTimestamp, rowid: last.rowid },
+    });
+    assert.deepEqual(second.hits.map((h) => h.id), ["s1"]);
+  });
+});
+
+test("metadata-only summary search (no query) filters by level and time without FTS", async () => {
+  await withStorage(async (storage) => {
+    await insertSummary(storage, { id: "a", content: "anything", level: 1, earliest: 1000, latest: 2000 });
+    await insertSummary(storage, { id: "b", content: "anything", level: 2, earliest: 3000, latest: 4000, parentIds: ["a"] });
+    // No match → metadata-only scan; level filter still applies, ordered oldest.
+    const res = storage.searchSummaries({ levels: [2], limit: 10, order: "oldest" });
+    assert.deepEqual(res.hits.map((h) => h.id), ["b"]);
+    assert.equal(res.hits[0]!.bm25, 0); // no FTS → bm25 defaults to 0
+  });
+});
+
 test("search_messages(corpus:summaries) returns summary hits and rejects message-only filters", async () => {
   await withStorage(async (storage) => {
     await insertSummary(storage, { id: "sum_abc", content: "release planning discussion", earliest: 1000, latest: 2000 });
@@ -175,7 +219,7 @@ test("search_messages(corpus:summaries) returns summary hits and rejects message
     const ok = await tool.execute("c1", { corpus: "summaries", query: "release", rooms: "all" });
     const okText = (ok.content[0] as { text: string }).text;
     assert.match(okText, /id: sum_abc/);
-    assert.match(okText, /expand_summary/);
+    assert.match(okText, /follow-up/);
     const okDetails = ok.details as { corpus: string; hits: Array<{ id: string }> };
     assert.equal(okDetails.corpus, "summaries");
     assert.equal(okDetails.hits[0]?.id, "sum_abc");
