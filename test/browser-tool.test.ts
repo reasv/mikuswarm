@@ -65,6 +65,8 @@ function makeFakePage(opts: FakePageOptions) {
         async selectOption() { return []; },
         async press() {},
         async scrollIntoViewIfNeeded() {},
+        // Element-screenshot capture goes through the locator (aria-ref=eN).
+        async screenshot() { if (opts.screenshotError) throw opts.screenshotError; return Buffer.from("\x89PNGfake"); },
       };
     },
   };
@@ -247,6 +249,48 @@ test("tool: a screenshot timeout surfaces as act_timeout (#8)", async () => {
     await assert.rejects(
       () => tool.execute("c1", { action: "screenshot" }),
       /browser:act_timeout/,
+    );
+  });
+});
+
+// ── #9: element-screenshot dispatch (ref-present branch) ─────────────────────
+
+test("tool: screenshot {ref, format:jpeg} returns an image/jpeg block with details.ref and fullPage=false (#9)", async () => {
+  await withTool(baseConfig(), {}, async (tool) => {
+    const result = await tool.execute("c1", { action: "screenshot", ref: "e3", format: "jpeg" }) as {
+      content: Array<{ type: string; mimeType?: string; data?: string }>;
+      details: { ref?: string; format?: string; fullPage?: boolean };
+    };
+    const image = result.content.find((c) => c.type === "image");
+    assert.ok(image, "has an image block");
+    // The jpeg format flows through boundScreenshot's mimeType (the small fake
+    // capture is under the cap, so it passes through with the requested format).
+    assert.equal(image!.mimeType, "image/jpeg");
+    assert.ok(image!.data && image!.data.length > 0, "base64 data present");
+    assert.equal(result.details.ref, "e3", "details echoes the element ref");
+    assert.equal(result.details.format, "jpeg");
+    assert.equal(result.details.fullPage, false, "fullPage is false for an element capture");
+  });
+});
+
+test("tool: screenshot with a malformed ref is a bad_request (#9)", async () => {
+  await withTool(baseConfig(), {}, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot", ref: "x" }),
+      /browser:bad_request/,
+    );
+  });
+});
+
+test("tool: a stale element ref on screenshot surfaces as ref_expired (#9)", async () => {
+  // A timeout-shaped capture error on a valid ref means the ref went stale; the
+  // dispatch maps it to ref_expired (take a fresh snapshot) rather than
+  // screenshot_failed.
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  await withTool(baseConfig(), { screenshotError: timeout }, async (tool) => {
+    await assert.rejects(
+      () => tool.execute("c1", { action: "screenshot", ref: "e3" }),
+      /browser:ref_expired/,
     );
   });
 });

@@ -252,6 +252,18 @@ test("act:wait condition timeout surfaces as act_timeout", async () => {
   );
 });
 
+test("act:wait non-timeout error (bad selector) surfaces as bad_request (#10)", async () => {
+  // A plain, non-timeout engine error (e.g. an unparseable CSS selector). The
+  // wait catch calls mapError(error, false): refUsed=false guarantees it is NOT
+  // misclassified as ref_expired, and a non-timeout falls through to bad_request.
+  const badSelector = new Error('Unknown engine "::" while parsing selector ::weird');
+  const page = recordingPage({ waitForError: badSelector });
+  await assert.rejects(
+    () => run(page, { kind: "wait", wait_selector: "::weird" }),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
+  );
+});
+
 // ── drag ─────────────────────────────────────────────────────────────────────
 
 test("act:drag drags source ref to target to_ref", async () => {
@@ -315,6 +327,38 @@ test("act:upload non-timeout set failure surfaces as upload_failed", async () =>
   await assert.rejects(
     () => run(page, { kind: "upload", ref: "e1", files: FILE }),
     (e: unknown) => (e as { code?: string }).code === "upload_failed",
+  );
+});
+
+test("act:upload TimeoutError on setInputFiles is NOT upload_failed — it routes through the timeout arm (#8)", async () => {
+  // A TimeoutError-shaped value (name "TimeoutError" + the canonical Playwright
+  // message) is what mapError's isTimeoutError detects, so the upload catch lets
+  // mapError handle it rather than degrading to upload_failed. Because the upload
+  // locator is ref-based (mapError refUsed=true), a timeout is treated as a stale
+  // ref and surfaces as ref_expired (see Other Observations: act.ts's comment
+  // claims act_timeout here, but the ref-based mapError never yields that code).
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: true, setFilesError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      // The key regression guard: a timeout must NOT be mis-bucketed as the
+      // generic upload_failed (which would hide the take-a-fresh-snapshot hint).
+      return code === "ref_expired" && code !== "upload_failed";
+    },
+  );
+});
+
+test("act:upload stale ref on setInputFiles surfaces as ref_expired (#8)", async () => {
+  // A synchronous "no node for aria-ref" failure (not a timeout): with a valid
+  // ref this means the ref went stale, so the upload catch must map it to
+  // ref_expired (take a fresh snapshot), never upload_failed.
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ isFileInput: true, setFilesError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
   );
 });
 
