@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { BrowserSession, type ConnectOverCdp } from "../src/browser/session.js";
+import {
+  BrowserSession,
+  CONSOLE_ENTRY_MAX_CHARS,
+  CONSOLE_TRUNCATION_MARKER,
+  type ConnectOverCdp,
+} from "../src/browser/session.js";
 import { isBrowserError } from "../src/browser/errors.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
@@ -1047,6 +1052,49 @@ test("session: console buffer is bounded to the last 200 messages", async () => 
       assert.equal(drained.length, 200, "capped at CONSOLE_BUFFER_MAX");
       assert.equal(drained[0]!.text, "m50", "oldest over the cap dropped");
       assert.equal(drained[199]!.text, "m249", "newest kept");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: a single huge console message is truncated to the per-entry cap on push", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      // 5 MB of console text — pre-fix this would sit in the buffer verbatim.
+      const huge = "x".repeat(5 * 1024 * 1024);
+      page.emit("console", { type: () => "log", text: () => huge });
+      const drained = session.drainConsole(page as never);
+      assert.equal(drained.length, 1);
+      const entry = drained[0]!;
+      assert.equal(
+        entry.text.length,
+        CONSOLE_ENTRY_MAX_CHARS + CONSOLE_TRUNCATION_MARKER.length,
+        "buffered entry is the per-message cap plus the truncation marker — never the full 5 MB",
+      );
+      assert.ok(entry.text.endsWith(CONSOLE_TRUNCATION_MARKER), "truncation marker appended");
+      assert.ok(entry.text.length < huge.length, "buffer never holds the full multi-MB string");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: a console message at/under the per-entry cap is kept verbatim", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      const exact = "y".repeat(CONSOLE_ENTRY_MAX_CHARS);
+      page.emit("console", { type: () => "log", text: () => exact });
+      const drained = session.drainConsole(page as never);
+      assert.equal(drained[0]!.text, exact, "no marker, no truncation at the boundary");
     } finally {
       await session.shutdown();
     }

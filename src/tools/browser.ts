@@ -12,6 +12,8 @@ import {
   aiSnapshot,
   assertBrowserUrl,
   BrowserError,
+  CONSOLE_DRAIN_MAX_CHARS,
+  CONSOLE_TRUNCATION_MARKER,
   isBrowserError,
   isTimeoutError,
   mapError,
@@ -19,6 +21,7 @@ import {
   type ActKind,
   type ActParams,
   type BrowserSession,
+  type ConsoleEntry,
   type DownloadRecord,
   type UploadFile,
 } from "../browser/index.js";
@@ -186,6 +189,29 @@ interface BrowserToolArgs {
   index?: number;
 }
 
+/**
+ * Render drained console entries as `[level] text` lines, bounding the TOTAL
+ * output to CONSOLE_DRAIN_MAX_CHARS. Each entry's text is already capped at push
+ * time (CONSOLE_ENTRY_MAX_CHARS), so this is a second layer: many bounded entries
+ * could still concatenate large, so we stop once the budget is spent and append a
+ * truncation marker rather than dumping the whole block into agent context.
+ */
+export function renderConsole(messages: ConsoleEntry[]): string {
+  const lines: string[] = [];
+  let used = 0;
+  for (const m of messages) {
+    const line = `[${m.level}] ${m.text}`;
+    // +1 accounts for the joining newline between lines.
+    if (used + line.length + (lines.length > 0 ? 1 : 0) > CONSOLE_DRAIN_MAX_CHARS) {
+      lines.push(CONSOLE_TRUNCATION_MARKER);
+      break;
+    }
+    used += line.length + (lines.length > 0 ? 1 : 0);
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
 async function dispatch(
   session: BrowserSession,
   sessionId: string,
@@ -343,7 +369,7 @@ async function dispatch(
       const page = await session.getActivePage(sessionId);
       const messages = session.drainConsole(page);
       const text = messages.length
-        ? messages.map((m) => `[${m.level}] ${m.text}`).join("\n")
+        ? renderConsole(messages)
         : "(no console messages since the last read)";
       return {
         content: [{ type: "text", text }],

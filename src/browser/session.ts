@@ -37,8 +37,28 @@ export interface ConsoleEntry {
   text: string;
 }
 
-/** Cap each page's console buffer so it can't grow without bound. */
+/** Cap the NUMBER of entries each page's console buffer holds. */
 const CONSOLE_BUFFER_MAX = 200;
+
+/**
+ * Cap the SIZE of a single console/pageerror entry's text, applied AT PUSH TIME.
+ * Without this, one `console.log(hugeString)` would park a multi-MB string in the
+ * buffer (CONSOLE_BUFFER_MAX only bounds entry count) and later dump it straight
+ * into agent context on drain. 4 KB is far above any legible diagnostic line; a
+ * fixed bound matches the codebase's other defensive caps (e.g. the `text` tool
+ * arg's `maxLength`), so no config knob is warranted.
+ */
+export const CONSOLE_ENTRY_MAX_CHARS = 4096;
+
+/**
+ * Second-layer cap on the TOTAL text the `console` action returns per drain. Even
+ * with each entry bounded, CONSOLE_BUFFER_MAX entries near the per-entry cap could
+ * still concatenate to ~800 KB; this keeps the rendered block context-friendly.
+ */
+export const CONSOLE_DRAIN_MAX_CHARS = 16384;
+
+/** Appended when an entry or the drained block is truncated. */
+export const CONSOLE_TRUNCATION_MARKER = "… [truncated]";
 
 interface SessionState {
   /** Tabs owned by this chat session, in open order. */
@@ -636,6 +656,14 @@ export class BrowserSession {
   private pushConsole(page: Page, entry: ConsoleEntry): void {
     const buf = this.consoleBuffers.get(page);
     if (!buf) return;
+    // Bound the per-entry text HERE (not just at drain) so the buffer itself can
+    // never retain an unbounded string — this is the real memory bound.
+    if (entry.text.length > CONSOLE_ENTRY_MAX_CHARS) {
+      entry = {
+        level: entry.level,
+        text: entry.text.slice(0, CONSOLE_ENTRY_MAX_CHARS) + CONSOLE_TRUNCATION_MARKER,
+      };
+    }
     buf.push(entry);
     if (buf.length > CONSOLE_BUFFER_MAX) buf.splice(0, buf.length - CONSOLE_BUFFER_MAX);
   }

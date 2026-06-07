@@ -9,7 +9,8 @@ import { writeFile, mkdir, symlink } from "node:fs/promises";
 import sharp from "sharp";
 
 import { BrowserSession, type ConnectOverCdp } from "../src/browser/session.js";
-import { createBrowserTool, boundScreenshot, resolveUploadFiles } from "../src/tools/browser.js";
+import { createBrowserTool, boundScreenshot, resolveUploadFiles, renderConsole } from "../src/tools/browser.js";
+import { CONSOLE_DRAIN_MAX_CHARS, CONSOLE_TRUNCATION_MARKER, type ConsoleEntry } from "../src/browser/session.js";
 import { aiSnapshot } from "../src/browser/snapshot.js";
 import { base64ByteSize } from "../src/tools/read-image.js";
 import type { BrowserConfig } from "../src/config/index.js";
@@ -816,4 +817,26 @@ test("tool: schema `kind` union includes drag, upload, clear_site_data, dialog",
   for (const k of ["drag", "upload", "clear_site_data", "dialog"]) {
     assert.ok(kinds.includes(k), `kind union includes ${k}`);
   }
+});
+
+test("renderConsole: total drained output is bounded to CONSOLE_DRAIN_MAX_CHARS", () => {
+  // 500 entries each at the per-entry cap (4 KB) → ~2 MB unbounded. Each entry is
+  // already capped at push time; renderConsole is the second layer that bounds the
+  // concatenated block the agent sees.
+  const messages: ConsoleEntry[] = [];
+  for (let i = 0; i < 500; i++) messages.push({ level: "log", text: "z".repeat(4096) });
+  const text = renderConsole(messages);
+  assert.ok(
+    text.length <= CONSOLE_DRAIN_MAX_CHARS + CONSOLE_TRUNCATION_MARKER.length + 1,
+    `drained block bounded (got ${text.length})`,
+  );
+  assert.ok(text.endsWith(CONSOLE_TRUNCATION_MARKER), "truncation marker appended when budget exhausted");
+});
+
+test("renderConsole: small message set is rendered verbatim with no marker", () => {
+  const text = renderConsole([
+    { level: "log", text: "hello" },
+    { level: "error", text: "boom" },
+  ]);
+  assert.equal(text, "[log] hello\n[error] boom");
 });

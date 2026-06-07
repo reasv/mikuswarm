@@ -1,4 +1,11 @@
-export { BrowserSession, type BrowserSessionOptions, type DownloadRecord } from "./session.js";
+export {
+  BrowserSession,
+  type BrowserSessionOptions,
+  type ConsoleEntry,
+  type DownloadRecord,
+  CONSOLE_DRAIN_MAX_CHARS,
+  CONSOLE_TRUNCATION_MARKER,
+} from "./session.js";
 export { BrowserError, isBrowserError, type BrowserErrorCode } from "./errors.js";
 export { aiSnapshot, type SnapshotResult } from "./snapshot.js";
 export {
