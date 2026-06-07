@@ -20,7 +20,8 @@ export type ActKind =
   | "evaluate"
   | "drag"
   | "upload"
-  | "clear_site_data";
+  | "clear_site_data"
+  | "dialog";
 
 /** A file to upload, shipped inline as bytes (never a host path — see §3.5). */
 export interface UploadFile {
@@ -69,11 +70,22 @@ export interface ActParams {
   wait_url?: string;
   /** `wait`: resolve when the page reaches this load state. */
   wait_load_state?: LoadState;
+  /** `dialog`: accept (true) or dismiss (false) the next JS dialog. */
+  accept?: boolean;
+  /** `dialog`: text to answer a `window.prompt()` with when accepting. */
+  prompt_text?: string;
 }
 
 export interface ActOptions {
   timeoutMs: number;
   evaluateEnabled: boolean;
+  /**
+   * Arm a one-shot override for the next JS dialog on the page (the `dialog`
+   * kind). Supplied by the tool layer, wired to the session's standing dialog
+   * handler. Absent in contexts without a session (the bare `act` unit tests can
+   * still assert the bad_request when it's missing).
+   */
+  armDialog?: (accept: boolean, promptText: string | undefined) => void;
 }
 
 // A ref handle is either a bare main-document `eN` or a frame-namespaced
@@ -305,6 +317,28 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
         await cdp.detach().catch(() => {});
       }
       return done(kind, `cleared site data for ${origin}`);
+    }
+
+    case "dialog": {
+      // Arm a one-shot override for the NEXT dialog, taking precedence over the
+      // standing dialog_policy for that one event. Returns immediately — the
+      // ergonomic flow is: arm `dialog`, THEN perform the act that triggers it
+      // (a JS dialog blocks the page, so it can't be triggered in this same
+      // call). The override is consumed by the next dialog or expires on the
+      // session side (see BrowserSession.armDialog) so it can't leak.
+      if (typeof params.accept !== "boolean") {
+        throw new BrowserError("bad_request", "act:dialog requires `accept` (boolean).");
+      }
+      if (!opts.armDialog) {
+        throw new BrowserError("bad_request", "act:dialog is not available in this context.");
+      }
+      opts.armDialog(params.accept, params.prompt_text);
+      const note = params.accept
+        ? params.prompt_text !== undefined
+          ? "accept with text"
+          : "accept"
+        : "dismiss";
+      return done(kind, `armed next dialog → ${note}`);
     }
 
     default:

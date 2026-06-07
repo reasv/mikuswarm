@@ -54,7 +54,7 @@ export interface BrowserToolContext {
 const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "tabs", "open", "close"] as const;
 const ACT_KINDS: ActKind[] = [
   "click", "type", "press", "hover", "select", "fill", "scroll", "wait", "back", "evaluate",
-  "drag", "upload", "clear_site_data",
+  "drag", "upload", "clear_site_data", "dialog",
 ];
 
 const DESCRIPTION = [
@@ -64,7 +64,7 @@ const DESCRIPTION = [
   "Pick an `action`:",
   "- navigate { url }: go to an http/https URL; returns the page's AI snapshot.",
   "- snapshot: return the current page's accessibility tree, with every interactive element tagged [ref=eN].",
-  "- act { kind, ... }: interact by ref. kinds: click|type|press|hover|select|fill|scroll|wait|back|evaluate|drag|upload|clear_site_data.",
+  "- act { kind, ... }: interact by ref. kinds: click|type|press|hover|select|fill|scroll|wait|back|evaluate|drag|upload|clear_site_data|dialog.",
   "    click takes `ref`, plus optional `button` (left|right|middle), `double` (double-click), `modifiers` (Alt/Control/Meta/Shift).",
   "    hover/fill/type/select/scroll take `ref` (and fill/type take `text`; select takes `value`). type takes optional `submit` to press Enter after typing.",
   "    press takes `key` (e.g. \"Enter\"), optional `ref`. scroll without `ref` scrolls the page by `delta_y`.",
@@ -72,6 +72,7 @@ const DESCRIPTION = [
   "    back navigates history. evaluate runs JS in `text` (only if enabled).",
   "    drag takes `ref` (source) and `to_ref` (target). upload takes `ref` (an <input type=file> or a button that opens the chooser) and `paths` (workspace-relative files).",
   "    clear_site_data discards cookies + all web storage for the CURRENT page's origin (a fresh start on this site; cookies are cleared by security origin, so parent-domain cookies set elsewhere may persist).",
+  "    dialog takes `accept` (true/false) and optional `prompt_text`; it arms the NEXT JS dialog — arm it BEFORE the click/act that triggers the dialog. Without it, dialogs are auto-handled by the deployment's dialog_policy.",
   "- screenshot { full_page?, ref?, format? }: return an image to look at. With `ref`, capture just that element (full_page is ignored). `format` is png (default) or jpeg.",
   "- open { url? }: open a new tab (optionally navigate it). close { index }: close a tab.",
   "- tabs: list this session's tabs; pass `index` to switch the active tab.",
@@ -125,6 +126,8 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
           description: "act:wait until the page reaches this load state.",
         }),
       ),
+      accept: Type.Optional(Type.Boolean({ description: "act:dialog — accept (true) or dismiss (false) the next JS dialog." })),
+      prompt_text: Type.Optional(Type.String({ description: "act:dialog — text to answer a window.prompt() with when accepting." })),
       full_page: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page (screenshot; ignored when ref is set)." })),
       format: Type.Optional(
         Type.Union(["png", "jpeg"].map((v) => Type.Literal(v)), { description: "Screenshot image format (default png)." }),
@@ -173,6 +176,8 @@ interface BrowserToolArgs {
   wait_selector?: string;
   wait_url?: string;
   wait_load_state?: "load" | "domcontentloaded" | "networkidle";
+  accept?: boolean;
+  prompt_text?: string;
   full_page?: boolean;
   format?: ScreenshotFormat;
   index?: number;
@@ -230,10 +235,18 @@ async function dispatch(
         wait_selector: args.wait_selector,
         wait_url: args.wait_url,
         wait_load_state: args.wait_load_state,
+        accept: args.accept,
+        prompt_text: args.prompt_text,
       };
-      const result = await act(page, actParams, { timeoutMs: actTimeoutMs, evaluateEnabled: config.evaluate_enabled });
-      // evaluate/wait don't change what's worth re-snapshotting; return terse.
-      if (args.kind === "evaluate" || args.kind === "wait") {
+      const result = await act(page, actParams, {
+        timeoutMs: actTimeoutMs,
+        evaluateEnabled: config.evaluate_enabled,
+        // act:dialog arms a one-shot override on this page; the next dialog (from
+        // a subsequent triggering act) is handled per the override.
+        armDialog: (accept, promptText) => session.armDialog(page, accept, promptText),
+      });
+      // evaluate/wait/dialog don't change what's worth re-snapshotting; return terse.
+      if (args.kind === "evaluate" || args.kind === "wait" || args.kind === "dialog") {
         const downloads = session.drainDownloads(sessionId);
         return {
           content: [{ type: "text", text: result.detail + renderDownloads(downloads) }],

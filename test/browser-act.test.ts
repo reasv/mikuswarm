@@ -135,6 +135,57 @@ function run(page: ReturnType<typeof recordingPage>, params: ActParams) {
   return act(page as never, params, OPTS);
 }
 
+// ── dialog (one-shot override arming) ──────────────────────────────────────────
+
+test("act:dialog accept arms the override and returns a terse note", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: true }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → accept");
+  assert.deepEqual(armed, [[true, undefined]]);
+});
+
+test("act:dialog accept with prompt_text passes the text through and notes it", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: true, prompt_text: "my answer" }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → accept with text");
+  assert.deepEqual(armed, [[true, "my answer"]]);
+});
+
+test("act:dialog accept:false arms a dismiss", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: false }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → dismiss");
+  assert.deepEqual(armed, [[false, undefined]]);
+});
+
+test("act:dialog without `accept` is a bad_request", async () => {
+  const page = recordingPage();
+  await assert.rejects(
+    () => act(page as never, { kind: "dialog" }, { ...OPTS, armDialog: () => {} }),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
+  );
+});
+
+test("act:dialog with no armDialog wired is a bad_request", async () => {
+  const page = recordingPage();
+  await assert.rejects(
+    () => act(page as never, { kind: "dialog", accept: true }, OPTS),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
+  );
+});
+
 // ── frame-namespaced refs ──────────────────────────────────────────────────────
 
 test("act on a bare ref still resolves against the main document", async () => {

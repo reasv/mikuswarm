@@ -116,6 +116,12 @@ export class BrowserSession {
   private lastConnectError: BrowserError | undefined;
 
   private readonly sessions = new Map<string, SessionState>();
+  /**
+   * One-shot per-page dialog overrides armed by the `act:dialog` kind (see
+   * armDialog). Keyed by Page so an override set on the active tab applies to
+   * that tab's next dialog. WeakMap → no cleanup needed when a page is GC'd.
+   */
+  private readonly dialogOverrides = new WeakMap<Page, { accept: boolean; promptText?: string; expiresAt: number }>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   private readonly connectOverCdp: ConnectOverCdp;
@@ -509,15 +515,29 @@ export class BrowserSession {
    */
   private trackPage(sessionId: string, state: SessionState, page: Page): void {
     page.on("dialog", (dialog: Dialog) => {
-      void this.handleDialog(dialog);
+      void this.handleDialog(page, dialog);
     });
     page.on("download", (download: Download) => {
       void this.handleDownload(sessionId, state, download);
     });
   }
 
-  private async handleDialog(dialog: Dialog): Promise<void> {
+  private async handleDialog(page: Page, dialog: Dialog): Promise<void> {
     try {
+      // A one-shot act:dialog override (armed on this page) takes precedence over
+      // the standing dialog_policy for exactly the next dialog. It's consumed
+      // (deleted) whether or not it's still valid; an expired one falls through
+      // to the default policy so an armed-but-never-triggered override can't
+      // hijack a later, unrelated dialog.
+      const override = this.dialogOverrides.get(page);
+      if (override) {
+        this.dialogOverrides.delete(page);
+        if (override.expiresAt >= Date.now()) {
+          if (override.accept) await dialog.accept(override.promptText);
+          else await dialog.dismiss();
+          return;
+        }
+      }
       // alert always accepts (there's nothing to dismiss); confirm/prompt follow
       // dialog_policy. Default "dismiss" is the safe choice — it won't, e.g.,
       // confirm a destructive action on the model's behalf.
@@ -532,6 +552,22 @@ export class BrowserSession {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /**
+   * Arm a one-shot override for the NEXT JS dialog on `page` (the `act:dialog`
+   * kind), overriding the standing dialog_policy for that one event. The
+   * override is consumed by the next dialog; if no dialog fires it expires after
+   * act_timeout_ms so it can't leak into a later, unrelated dialog. Coordinates
+   * with handleDialog via the dialogOverrides slot the default handler checks
+   * first.
+   */
+  armDialog(page: Page, accept: boolean, promptText: string | undefined): void {
+    this.dialogOverrides.set(page, {
+      accept,
+      promptText,
+      expiresAt: Date.now() + this.config.act_timeout_ms,
+    });
   }
 
   private async handleDownload(sessionId: string, state: SessionState, download: Download): Promise<void> {

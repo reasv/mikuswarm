@@ -614,7 +614,7 @@ test("resolveUploadFiles: rejects when total bytes exceed the cap (bad_request)"
 
 // ── new act kinds are exposed in the tool schema ─────────────────────────────
 
-test("tool: schema `kind` union includes drag, upload, clear_site_data", () => {
+test("tool: schema `kind` union includes drag, upload, clear_site_data, dialog", () => {
   const tool = createBrowserTool({
     session: undefined as never,
     agentSessionId: "s1",
@@ -624,7 +624,7 @@ test("tool: schema `kind` union includes drag, upload, clear_site_data", () => {
   });
   const params = tool.parameters as { properties: { kind: { anyOf: Array<{ const?: string }> } } };
   const kinds = params.properties.kind.anyOf.map((s) => s.const);
-  for (const k of ["drag", "upload", "clear_site_data"]) {
+  for (const k of ["drag", "upload", "clear_site_data", "dialog"]) {
     assert.ok(kinds.includes(k), `kind union includes ${k}`);
   }
 });

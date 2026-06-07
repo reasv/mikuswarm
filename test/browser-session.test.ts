@@ -745,6 +745,90 @@ for (const { name, suggested } of HOSTILE_FILENAMES) {
   });
 }
 
+// ── one-shot act:dialog override (armDialog + handleDialog) ──────────────────
+
+/** A fake Playwright Dialog recording accept(text?)/dismiss() calls. */
+function fakeDialog(type: "alert" | "confirm" | "prompt") {
+  const calls: Array<[string, string | undefined]> = [];
+  return {
+    type: () => type,
+    accept: async (t?: string) => { calls.push(["accept", t]); },
+    dismiss: async () => { calls.push(["dismiss", undefined]); },
+    calls,
+  };
+}
+
+type DialogPrivate = {
+  handleDialog(page: unknown, dialog: unknown): Promise<void>;
+  dialogOverrides: WeakMap<object, { accept: boolean; promptText?: string; expiresAt: number }>;
+};
+
+function newSession(ws: string, overrides: Partial<BrowserConfig> = {}): BrowserSession {
+  return new BrowserSession({
+    config: baseConfig(overrides), agentTimezone: "UTC", workspaceRoot: ws,
+    logger: silentLogger, connectOverCdp: async () => ({}) as never,
+  });
+}
+
+test("session: an armed accept override answers the next dialog with prompt_text, then is one-shot", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, true, "my answer");
+      const d1 = fakeDialog("prompt");
+      await priv.handleDialog(page, d1);
+      assert.deepEqual(d1.calls, [["accept", "my answer"]], "armed accept used, with text");
+
+      // One-shot: the override is consumed, so the NEXT dialog falls back to the
+      // default dialog_policy ("dismiss" for confirm).
+      const d2 = fakeDialog("confirm");
+      await priv.handleDialog(page, d2);
+      assert.deepEqual(d2.calls, [["dismiss", undefined]], "override did not persist to the next dialog");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: an armed dismiss override dismisses the next dialog", async () => {
+  await withWorkspace(async (ws) => {
+    // dialog_policy "accept" so the override (dismiss) is clearly distinguishable
+    // from the default behavior.
+    const session = newSession(ws, { dialog_policy: "accept" });
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, false, undefined);
+      const d = fakeDialog("confirm");
+      await priv.handleDialog(page, d);
+      assert.deepEqual(d.calls, [["dismiss", undefined]], "armed dismiss overrode the accept policy");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: an expired override falls back to the default dialog_policy", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws, { dialog_policy: "dismiss" });
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, true, "stale");
+      // Backdate the override so it's expired when the dialog fires.
+      priv.dialogOverrides.get(page)!.expiresAt = 0;
+      const d = fakeDialog("confirm");
+      await priv.handleDialog(page, d);
+      assert.deepEqual(d.calls, [["dismiss", undefined]], "expired override ignored; default policy applied");
+      assert.equal(priv.dialogOverrides.has(page), false, "expired override is cleared");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
 test("session: a down Manager surfaces backend_unavailable (graceful degradation)", async () => {
   await withWorkspace(async (ws) => {
     const manager = stubManager({ throwOnFetch: true });
