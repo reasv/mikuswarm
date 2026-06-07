@@ -11,6 +11,7 @@ interface FakeOpts {
   isFileInput?: boolean;
   clickError?: Error;
   waitForError?: Error;
+  waitForEventError?: Error;
   dragError?: Error;
   setFilesError?: Error;
   cdpSendError?: Error;
@@ -103,6 +104,9 @@ function recordingPage(opts: FakeOpts = {}) {
     },
     async waitForEvent(name: string, o: unknown) {
       calls.push(["waitForEvent", name, o]);
+      // Models a chooser that never opens (e.g. a styled button that does
+      // nothing): the filechooser wait rejects, typically with a TimeoutError.
+      if (opts.waitForEventError) throw opts.waitForEventError;
       return chooser;
     },
     keyboard: {
@@ -356,6 +360,49 @@ test("act:upload stale ref on setInputFiles surfaces as ref_expired (#8)", async
   // ref_expired (take a fresh snapshot), never upload_failed.
   const stale = new Error("No node found for selector: aria-ref=e1");
   const page = recordingPage({ isFileInput: true, setFilesError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
+
+test("act:upload chooser never opens (filechooser wait times out) → act_timeout, NOT ref_expired (#12)", async () => {
+  // A styled button whose click never opens a file chooser: page.waitForEvent
+  // ("filechooser") times out. This is NOT a stale ref — the chooser arm is
+  // mapped with refUsed=false, so a TimeoutError surfaces as act_timeout. Under
+  // the old code (refUsed=true for the whole block) this would have been
+  // mislabeled ref_expired, telling the model to re-snapshot a still-valid ref.
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: false, waitForEventError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      return code === "act_timeout" && code !== "ref_expired";
+    },
+  );
+});
+
+test("act:upload chooser.setFiles timeout → act_timeout, NOT ref_expired (#12)", async () => {
+  // The chooser opened but setting files on it timed out. Like the chooser arm,
+  // chooser.setFiles does not resolve the ref, so a timeout here is act_timeout,
+  // not a stale-ref signal.
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: false, setFilesError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      return code === "act_timeout" && code !== "ref_expired";
+    },
+  );
+});
+
+test("act:upload stale ref on the chooser-path click surfaces as ref_expired (#12)", async () => {
+  // The ref-resolving loc.click() in the chooser path keeps refUsed=true, so a
+  // genuinely stale ref there still maps to ref_expired (not act_timeout).
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ isFileInput: false, clickError: stale });
   await assert.rejects(
     () => run(page, { kind: "upload", ref: "e1", files: FILE }),
     (e: unknown) => (e as { code?: string }).code === "ref_expired",

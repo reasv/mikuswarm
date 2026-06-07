@@ -260,25 +260,36 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
       const isFileInput = await loc
         .evaluate((el) => el instanceof HTMLInputElement && el.type === "file")
         .catch(() => false);
-      try {
-        if (isFileInput) {
+      if (isFileInput) {
+        // Direct <input type=file>: setInputFiles resolves the ref, so a timeout
+        // / no-node failure here means the ref went stale → map with refUsed=true
+        // (ref_expired). Any other failure → upload_failed.
+        try {
           await loc.setInputFiles(files, { timeout: opts.timeoutMs });
-        } else {
-          const chooserP = page.waitForEvent("filechooser", { timeout: opts.timeoutMs });
+        } catch (error) {
+          throw uploadError(error, mapError(error, true, params.ref), params.ref);
+        }
+      } else {
+        // Styled button → file chooser. Only loc.click() resolves the ref; the
+        // chooser arm and chooser.setFiles do NOT, so they must not be mapped as
+        // stale-ref failures.
+        const chooserP = page.waitForEvent("filechooser", { timeout: opts.timeoutMs });
+        // click() resolves the ref — keep refUsed=true so a stale ref → ref_expired.
+        try {
           await loc.click({ timeout: opts.timeoutMs });
+        } catch (error) {
+          throw uploadError(error, mapError(error, true, params.ref), params.ref);
+        }
+        // The chooser never opening (a styled button that does nothing) or
+        // chooser.setFiles timing out is NOT a stale ref — map with refUsed=false
+        // so a timeout surfaces as act_timeout, not a misleading ref_expired that
+        // would tell the model to re-snapshot a still-valid ref.
+        try {
           const chooser = await chooserP;
           await chooser.setFiles(files, { timeout: opts.timeoutMs });
+        } catch (error) {
+          throw uploadError(error, mapError(error, false), params.ref);
         }
-      } catch (error) {
-        // Stale ref → ref_expired; chooser/set timeout → act_timeout; any other
-        // set/arm failure → upload_failed.
-        const mapped = mapError(error, true, params.ref);
-        if (mapped.code === "ref_expired" || mapped.code === "act_timeout") throw mapped;
-        throw new BrowserError(
-          "upload_failed",
-          `Upload to ${params.ref} failed: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
-        );
       }
       return done(kind, `uploaded ${files.length} file(s) to ${params.ref}`);
     }
@@ -402,6 +413,22 @@ export function mapError(error: unknown, refUsed: boolean, ref?: string): Browse
     return new BrowserError("act_timeout", `Action timed out: ${message}`, { cause: error });
   }
   return new BrowserError("bad_request", message, { cause: error });
+}
+
+/**
+ * Finalize an upload failure. `mapped` is the result of running the raw error
+ * through `mapError` with the refUsed value appropriate to the failing call
+ * (true for ref-resolving click/setInputFiles, false for the chooser arm /
+ * chooser.setFiles). Preserve the actionable `ref_expired` / `act_timeout`
+ * codes; collapse everything else to `upload_failed`.
+ */
+function uploadError(error: unknown, mapped: BrowserError, ref?: string): BrowserError {
+  if (mapped.code === "ref_expired" || mapped.code === "act_timeout") return mapped;
+  return new BrowserError(
+    "upload_failed",
+    `Upload to ${ref ?? ""} failed: ${error instanceof Error ? error.message : String(error)}`,
+    { cause: error },
+  );
 }
 
 function requireText(params: ActParams, kind: string): string {
