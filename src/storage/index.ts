@@ -40,6 +40,9 @@ export {
   type ChatSearchQuery,
   type ChatSearchHit,
   type ChatSearchResult,
+  type SummarySearchQuery,
+  type SummarySearchHit,
+  type SummarySearchResult,
 } from "./database.js";
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

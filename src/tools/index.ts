@@ -37,6 +37,7 @@ export { createPinsTool, type PinsToolContext } from "./pins.js";
 export { createListReactionsTool, type ListReactionsToolContext } from "./list-reactions.js";
 export { createReadMessagesTool, type ReadMessagesToolContext } from "./read-messages.js";
 export { createSearchMessagesTool, type SearchMessagesToolContext } from "./search-messages.js";
+export { createExpandSummaryTool, type ExpandSummaryToolContext } from "./expand-summary.js";
 export { createRecapTool, type RecapToolContext } from "./recap.js";
 export { createUserActivityTool, type UserActivityToolContext } from "./user-activity.js";
 export { createMemberInfoTool, type MemberInfoToolContext } from "./member-info.js";

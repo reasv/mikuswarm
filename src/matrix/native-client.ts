@@ -19,6 +19,8 @@ import type {
   MatrixListReactionsRequest,
   MatrixMemberInfo,
   MatrixMemberInfoRequest,
+  MatrixRoomMember,
+  MatrixRoomMembersRequest,
   MatrixMessageSummary,
   MatrixMessageSummaryRequest,
   MatrixNativeConfig,
@@ -62,6 +64,7 @@ type NativeBindingClient = {
   unpinMessage(requestJson: string): Promise<string>;
   listPins(requestJson: string): Promise<string>;
   memberInfo(requestJson: string): Promise<string>;
+  roomMembers(requestJson: string): Promise<string>;
   channelInfo(requestJson: string): Promise<string>;
   uploadMedia(requestJson: string): Promise<string>;
   downloadMedia(requestJson: string): Promise<string>;
@@ -141,6 +144,16 @@ export class MatrixNativeClient {
 
   async memberInfo(request: MatrixMemberInfoRequest): Promise<MatrixMemberInfo> {
     return parseNativeJson(await this.#client.memberInfo(JSON.stringify(request)), "memberInfo");
+  }
+
+  /**
+   * The currently-joined members of a room (§9e, `user_activity` `include_silent`).
+   * The native layer fetches members from the server first if a lazy-loading/encrypted
+   * room hasn't synced them yet, so this works even where membership was never eagerly
+   * loaded.
+   */
+  async roomMembers(request: MatrixRoomMembersRequest): Promise<MatrixRoomMember[]> {
+    return parseNativeJson(await this.#client.roomMembers(JSON.stringify(request)), "roomMembers");
   }
 
   async channelInfo(request: MatrixChannelInfoRequest): Promise<MatrixChannelInfo> {

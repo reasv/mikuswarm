@@ -329,6 +329,56 @@ export interface ChatSearchResult {
   total: number;
 }
 
+/**
+ * Query over the summary-content FTS index (`summaries_fts`), backing
+ * `search_messages(corpus:"summaries")` (ARCHITECTURE.md §9e). Orthogonal to
+ * `ChatSearchQuery` — only the corpus-agnostic axes (text, rooms, time, order,
+ * pagination) overlap; summaries add `levels`/`minLevel`/`statuses`. `superseded`
+ * summaries are NEVER returned regardless of `statuses` (filtered in SQL).
+ */
+export interface SummarySearchQuery {
+  /** Pre-built FTS5 MATCH expression scoped to the `content` column; undefined = metadata-only. */
+  match?: string;
+  timelineKeys?: string[];
+  /** Restrict to these levels (any-of); undefined = all levels. */
+  levels?: number[];
+  /** Restrict to level >= this (combinable with `levels`). */
+  minLevel?: number;
+  /**
+   * Allowed statuses; defaults to ['complete','truncated']. 'superseded' is silently
+   * dropped from this set — a superseded summary is never searchable (§9e).
+   */
+  statuses?: SummaryStatus[];
+  /** Summary overlaps the window when latest_timestamp >= afterTs and earliest_timestamp <= beforeTs. */
+  afterTs?: number;
+  beforeTs?: number;
+  limit: number;
+  /** Keyset cursor for newest/oldest order (ignored for relevance). */
+  cursor?: { timestamp: number; rowid: number };
+  order: "newest" | "oldest" | "relevance";
+}
+
+/** One summary-search hit. `content` is the full summary; the caller builds a snippet. */
+export interface SummarySearchHit {
+  rowid: number;
+  id: string;
+  timelineKey: string;
+  level: number;
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  eventCount: number;
+  tokenCount: number;
+  status: SummaryStatus;
+  content: string;
+  /** Raw bm25 cost when ordered by relevance (lower = better); 0 otherwise. */
+  bm25: number;
+}
+
+export interface SummarySearchResult {
+  hits: SummarySearchHit[];
+  total: number;
+}
+
 /** Sort key for events/summaries: (timestamp, received_at, id) ascending. */
 export interface TimelineCursor {
   timestamp: number;
@@ -3357,6 +3407,124 @@ export class Storage {
   }
 
   /**
+   * Keyword search over `summaries_fts` (ARCHITECTURE.md §9e), backing
+   * `search_messages(corpus:"summaries")`. Mirrors {@link searchChatIndex}: optional
+   * FTS join when `match` is set (else a metadata-only scan), keyset pagination on
+   * `(latest_timestamp, rowid)` for newest/oldest, and bm25 ordering for relevance.
+   * `superseded` is always excluded — it is dropped from the requested `statuses` set
+   * before the query, so it can never be returned. Pure read.
+   */
+  searchSummaries(q: SummarySearchQuery): SummarySearchResult {
+    return this.read((db) => {
+      const where: string[] = [];
+      const params: Record<string, unknown> = {};
+      const ftsJoin = q.match ? "join summaries_fts f on f.rowid = s.rowid" : "";
+      if (q.match) {
+        where.push("summaries_fts match @match");
+        params.match = q.match;
+      }
+      // Status: default complete+truncated; superseded is never searchable, so strip
+      // it from whatever was requested. An empty set after stripping matches nothing.
+      const statuses = (q.statuses ?? ["complete", "truncated"]).filter(
+        (st) => st !== "superseded",
+      );
+      const statusKeys = statuses.map((st, i) => {
+        params[`st${i}`] = st;
+        return `@st${i}`;
+      });
+      where.push(
+        statusKeys.length > 0 ? `s.status in (${statusKeys.join(", ")})` : "0",
+      );
+      if (q.timelineKeys && q.timelineKeys.length > 0) {
+        const keys = q.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`s.timeline_key in (${keys.join(", ")})`);
+      }
+      if (q.levels && q.levels.length > 0) {
+        const keys = q.levels.map((lv, i) => {
+          params[`lv${i}`] = lv;
+          return `@lv${i}`;
+        });
+        where.push(`s.level in (${keys.join(", ")})`);
+      }
+      if (q.minLevel !== undefined) {
+        where.push("s.level >= @minLevel");
+        params.minLevel = q.minLevel;
+      }
+      // Window overlap (not containment): a summary touches [after, before] if its span
+      // intersects it — mirrors getSummariesInWindow's overlap test.
+      if (q.afterTs !== undefined) {
+        where.push("s.latest_timestamp >= @afterTs");
+        params.afterTs = q.afterTs;
+      }
+      if (q.beforeTs !== undefined) {
+        where.push("s.earliest_timestamp <= @beforeTs");
+        params.beforeTs = q.beforeTs;
+      }
+
+      const whereSql = `where ${where.join(" and ")}`;
+      const totalRow = db
+        .prepare(`select count(*) as n from summaries s ${ftsJoin} ${whereSql}`)
+        .get(params) as { n: number };
+
+      const pageWhere = [...where];
+      const pageParams: Record<string, unknown> = { ...params, limit: q.limit };
+      let orderSql: string;
+      if (q.order === "relevance" && q.match) {
+        orderSql = "order by bm25(summaries_fts) asc";
+      } else {
+        const desc = q.order !== "oldest";
+        if (q.cursor) {
+          const cmp = desc ? "<" : ">";
+          pageWhere.push(
+            `(s.latest_timestamp ${cmp} @curTs or (s.latest_timestamp = @curTs and s.rowid ${cmp} @curRowid))`,
+          );
+          pageParams.curTs = q.cursor.timestamp;
+          pageParams.curRowid = q.cursor.rowid;
+        }
+        orderSql = desc
+          ? "order by s.latest_timestamp desc, s.rowid desc"
+          : "order by s.latest_timestamp asc, s.rowid asc";
+      }
+      const pageWhereSql = `where ${pageWhere.join(" and ")}`;
+      const bm25Sel = q.match ? "bm25(summaries_fts) as bm25" : "0 as bm25";
+      const hits = db
+        .prepare(
+          `select s.rowid as rowid, s.id as id, s.timeline_key as timelineKey,
+                  s.level as level, s.earliest_timestamp as earliestTimestamp,
+                  s.latest_timestamp as latestTimestamp, s.event_count as eventCount,
+                  s.token_count as tokenCount, s.status as status, s.content as content, ${bm25Sel}
+           from summaries s ${ftsJoin} ${pageWhereSql} ${orderSql} limit @limit`,
+        )
+        .all(pageParams) as SummarySearchHit[];
+      return { hits, total: totalRow.n };
+    });
+  }
+
+  /**
+   * Re-converge `summaries_fts` with the `summaries` table (ARCHITECTURE.md §9e). The
+   * insert/delete triggers keep the FTS live for new/removed summaries, and the v13->v14
+   * migration rebuilds it for pre-existing rows — this startup sweep is the
+   * belt-and-suspenders net that repairs any trigger gap (mirrors how the chat index
+   * reconciles on boot).
+   *
+   * It issues the FTS5 `'rebuild'` command rather than an anti-join: `summaries_fts` is
+   * an EXTERNAL-CONTENT table, so a `select … from summaries_fts where rowid = ?` probe
+   * reads column values back from the `summaries` content table — it cannot tell whether
+   * a given rowid is actually present in the FTS *index*, which makes a "rows not in FTS"
+   * anti-join silently a no-op. `'rebuild'` re-derives the entire index from the content
+   * table, which is the authoritative convergence primitive and is cheap here because
+   * summaries are deliberately few (hierarchical condensation), unlike raw events.
+   */
+  reconcileSummariesFts(): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`insert into summaries_fts(summaries_fts) values ('rebuild')`).run();
+    });
+  }
+
+  /**
    * A sender's message timestamps (descending), for absence-gap detection in `recap`
    * / `search_messages` since_user_absence (§9e). Reads the chat index (which carries
    * the (sender_id, timestamp) index); callers run `ensureFreshForQuery` first so a
@@ -3456,15 +3624,24 @@ export class Storage {
    * this pushes the bound into SQL correctly in two passes over the same window:
    *   1. rank senders by their global total (`group by sender_id`), take the top `limit`;
    *   2. fetch the per-(sender, room) breakdown only for those sender ids.
-   * Also returns `totalSenders` — a cheap `count(distinct sender_id)` over the window — so the
-   * tool's "(+N more)" overflow line can report the true sender count without materializing
-   * every group. The per-room rows for one sender are contiguous; the tool aggregates them.
+   * Also returns `totalSenders` — the count of senders matching the window (and the
+   * `maxMessages` threshold when set) — so the tool's "(+N more)" overflow line can report
+   * the true sender count without materializing every group. The per-room rows for one sender
+   * are contiguous; the tool aggregates them.
+   *
+   * `order` ranks senders by global total: `"most"` (default) for the most-active view,
+   * `"least"` for the inactive view (least-active first). `maxMessages` keeps only senders
+   * whose total is `<= maxMessages` (the "who's gone quiet below N" threshold). Both bound
+   * the *posting* roster; users who never posted have no `chat_index` row and are surfaced
+   * separately by the tool's `include_silent` membership union (§9e).
    */
   topChatActivity(opts: {
     timelineKeys?: string[];
     sinceTs?: number;
     untilTs?: number;
     limit: number;
+    order?: "most" | "least";
+    maxMessages?: number;
   }): {
     rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
     totalSenders: number;
@@ -3488,22 +3665,39 @@ export class Storage {
         params.untilTs = opts.untilTs;
       }
       const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+      const dir = opts.order === "least" ? "asc" : "desc";
+      const havingSql = opts.maxMessages !== undefined ? "having count(*) <= @maxMessages" : "";
 
-      const totalSenders = (
-        db
-          .prepare(`select count(distinct sender_id) as n from chat_index ${whereSql}`)
-          .get(params) as { n: number }
-      ).n;
+      // totalSenders honours the maxMessages threshold (so "(+N more)" counts only senders
+      // that pass the filter). Without it, a cheap count(distinct) suffices.
+      const totalSenders =
+        opts.maxMessages !== undefined
+          ? (
+              db
+                .prepare(
+                  `select count(*) as n from (
+                     select sender_id from chat_index ${whereSql}
+                     group by sender_id ${havingSql})`,
+                )
+                .get({ ...params, maxMessages: opts.maxMessages }) as { n: number }
+            ).n
+          : (
+              db
+                .prepare(`select count(distinct sender_id) as n from chat_index ${whereSql}`)
+                .get(params) as { n: number }
+            ).n;
 
-      // Pass 1: top-N senders by global total across rooms.
+      // Pass 1: the limit-N senders by global total across rooms, ranked per `order`.
+      const pass1Params: Record<string, unknown> = { ...params, limit: opts.limit };
+      if (opts.maxMessages !== undefined) pass1Params.maxMessages = opts.maxMessages;
       const top = db
         .prepare(
           `select sender_id as senderId from chat_index ${whereSql}
-           group by sender_id
-           order by count(*) desc, sender_id asc
+           group by sender_id ${havingSql}
+           order by count(*) ${dir}, sender_id asc
            limit @limit`,
         )
-        .all({ ...params, limit: opts.limit }) as Array<{ senderId: string }>;
+        .all(pass1Params) as Array<{ senderId: string }>;
       if (top.length === 0) return { rows: [], totalSenders };
 
       // Pass 2: per-room breakdown for exactly those senders.
@@ -4394,6 +4588,30 @@ begin
 end;
 `;
 
+// Summary-content search index (ARCHITECTURE.md §9e, "Summary search"). An
+// external-content FTS5 table over `summaries.content`, so a summary is reachable by
+// keyword — not only by time window via `recap`. Mirrors `memory_chunks_fts` /
+// `chat_index_fts`, but simpler: a summary's `content` is **immutable after insert**
+// (a summary row is created once by `insertSummaryWithLineage`; later only its
+// `status` flips — and only ever to `superseded`, which no code path writes today —
+// or the row is deleted). Immutable content means there is NO update trigger to guard:
+// plain insert/delete suffice. `superseded` rows stay in the FTS table and are filtered
+// out at QUERY time (`status in ('complete','truncated')`), which is simpler and safer
+// than mutating FTS on a (currently nonexistent) supersede. `summaries.id` is a TEXT
+// PK, but the table is not WITHOUT ROWID, so it has the implicit integer `rowid` the
+// external-content FTS docid maps onto.
+const SUMMARY_SEARCH_SCHEMA = `
+create virtual table if not exists summaries_fts using fts5(
+  content, content='summaries', content_rowid='rowid'
+);
+create trigger if not exists summaries_ai after insert on summaries begin
+  insert into summaries_fts(rowid, content) values (new.rowid, new.content);
+end;
+create trigger if not exists summaries_ad after delete on summaries begin
+  insert into summaries_fts(summaries_fts, rowid, content) values ('delete', old.rowid, old.content);
+end;
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -4775,13 +4993,14 @@ create index if not exists idx_agent_sessions_timeline
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
 ${RETRIEVAL_SCHEMA}
-${CHAT_SEARCH_SCHEMA}`;
+${CHAT_SEARCH_SCHEMA}
+${SUMMARY_SEARCH_SCHEMA}`;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 13;
+export const LATEST_SCHEMA_VERSION = 14;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5121,6 +5340,21 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
        end;
        insert into chat_index_fts(chat_index_fts) values ('rebuild');`,
     );
+  },
+  // index 13 (v13 -> v14): add the summary-content search index (ARCHITECTURE.md §9e,
+  // "Summary search") — the external-content FTS5 table `summaries_fts` over
+  // `summaries.content` plus its insert/delete sync triggers. Unlike the v11->v12
+  // chat index (created empty, backfilled by the reconciliation indexer), `summaries`
+  // already holds rows, so after creating the FTS table this step **rebuilds** it from
+  // the existing content (`insert into summaries_fts(summaries_fts) values ('rebuild')`)
+  // so pre-v14 summaries become searchable immediately. There is no update trigger:
+  // summary content is immutable after insert (see SUMMARY_SEARCH_SCHEMA). The same
+  // constant is interpolated into the base SCHEMA so fresh DBs build it directly;
+  // `create ... if not exists` makes the step harmless if a forward path already created
+  // any object. Fresh DBs get this directly from SCHEMA and never run this step.
+  (db) => {
+    db.exec(SUMMARY_SEARCH_SCHEMA);
+    db.exec(`insert into summaries_fts(summaries_fts) values ('rebuild');`);
   },
 ];
 

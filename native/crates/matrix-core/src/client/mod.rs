@@ -28,8 +28,8 @@ use matrix_sdk::{
         EventId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, RoomAliasId, RoomId,
         RoomOrAliasId, UInt, UserId,
     },
-    Client, Error as MatrixSdkError, HttpError, RefreshTokenError, Room, RoomDisplayName, RoomState,
-    SessionTokens,
+    Client, Error as MatrixSdkError, HttpError, RefreshTokenError, Room, RoomDisplayName,
+    RoomMemberships, RoomState, SessionTokens,
 };
 use serde_json::{json, Value};
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -43,7 +43,7 @@ use crate::{
         MatrixEditMessageRequest, MatrixEditMessageResult, MatrixJoinResult,
         MatrixKeyBackupState, MatrixListEmojiRequest,
         MatrixListPinsRequest, MatrixListReactionsRequest, MatrixMemberInfo,
-        MatrixMessageSummary,
+        MatrixMessageSummary, MatrixRoomMember,
         MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult,
         MatrixPollVoteRequest, MatrixPollVoteResult,
         MatrixReactRequest, MatrixReactResult, MatrixReactionSummary,
@@ -1006,6 +1006,31 @@ pub(crate) async fn member_info_internal(
         is_self: user_id == self_user_id,
         is_direct: room.is_direct().await.unwrap_or(false),
     })
+}
+
+/// The currently-JOINED members of a room (ARCHITECTURE.md §9e, `user_activity`
+/// `include_silent`). `room.members(JOIN)` returns the cached joined-member list,
+/// fetching it from the server first if the room is lazy-loading/encrypted and the
+/// members have not been synced yet — so a "who is lurking here" query works even for
+/// rooms whose membership was never eagerly loaded. Display name is the member's
+/// resolved name when set, else None (the caller falls back to the user id).
+pub(crate) async fn room_members_internal(
+    client: &Client,
+    room_id: &str,
+) -> MatrixResult<Vec<MatrixRoomMember>> {
+    let room_id: OwnedRoomId = RoomId::parse(room_id.trim())?.to_owned();
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| MatrixError::State(format!("room {room_id} is not known to the client")))?;
+    let members = room.members(RoomMemberships::JOIN).await?;
+    Ok(members
+        .into_iter()
+        .map(|member| MatrixRoomMember {
+            user_id: member.user_id().to_string(),
+            display_name: member.display_name().map(|name| name.to_string()),
+            membership: format!("{:?}", member.membership()).to_lowercase(),
+        })
+        .collect())
 }
 
 pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> MatrixResult<MatrixChannelInfo> {

@@ -271,6 +271,10 @@ absence_gap_ms = 10800000         # 3h: inter-message gap above which a user cou
 default_lookback_ms = 86400000    # 24h: recap/absence fallback window when a user has no recent messages
 recap_budget_tokens = 6000        # summary token budget recap returns before coarsening to higher levels
 
+[search.summaries]
+expand_token_cap = 4000           # max rendered tokens one expand_summary call accumulates before truncating
+expand_max_depth = 3              # hard cap on expand_summary's per-call drill depth
+
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]

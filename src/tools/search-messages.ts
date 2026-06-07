@@ -1,15 +1,19 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { Storage, ChatSearchHit } from "../storage/index.js";
+import type { Storage, ChatSearchHit, SummaryStatus } from "../storage/index.js";
 import type { ChatSearchIndexer } from "../search/index.js";
 import {
   sanitizeFtsMatch,
+  sanitizeSummaryFtsMatch,
   buildSnippet,
+  buildSummarySnippet,
   resolveRooms,
   decodeCursor,
   encodeCursor,
+  encodeSummaryCursor,
   queryTerms,
   runChatSearch,
+  runSummarySearch,
   resolveAbsence,
   type SearchScope,
 } from "../search/index.js";
@@ -49,6 +53,7 @@ const RICH_BODY_MAX = 6000;
 const RICH_AGGREGATE_MAX = 200_000;
 
 interface SearchMessagesArgs {
+  corpus?: "messages" | "summaries";
   query?: string;
   rooms?: string[] | "current" | "all";
   scope?: SearchScope;
@@ -67,7 +72,30 @@ interface SearchMessagesArgs {
   cursor?: string;
   order?: "newest" | "oldest" | "relevance";
   format?: "compact" | "snippet" | "rich";
+  // corpus:"summaries" only
+  level?: number | number[];
+  min_level?: number;
+  status?: SummaryStatus[];
 }
+
+/**
+ * Message-only / corpus-inapplicable params, keyed by the public arg name. When
+ * `corpus:"summaries"` these are rejected (fail-fast, naming the field) rather than
+ * silently ignored — they have no meaning for a summary, and a silent ignore would
+ * mask a malformed query. See §5.1.
+ */
+const SUMMARY_INAPPLICABLE_FIELDS = [
+  "scope",
+  "from",
+  "mentions",
+  "quoted_user",
+  "is_reply",
+  "has_attachment",
+  "attachment_type",
+  "has_link",
+  "since_user_absence",
+  "format",
+] as const;
 
 function fmtTs(ms: number): string {
   try {
@@ -101,8 +129,22 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       "its event_id — pass it to read_messages to see the surrounding thread. By default each match is " +
       "returned as the FULL message (compact form); set format:snippet to scan many results as short " +
       "excerpts. Newest-first by default; use order:relevance for best-match ranking with a text query. " +
-      "For your own past notes (not chat), use recall_memory instead.",
+      'Set corpus:"summaries" to instead search the rolling conversation summaries by keyword (each hit ' +
+      "cites a summary id you can pass to expand_summary) — useful when you only hold a coarse summary " +
+      "and need the finer detail underneath a topic. For your own past notes (not chat), use recall_memory instead.",
     parameters: Type.Object({
+      corpus: Type.Optional(
+        Type.Union([Type.Literal("messages"), Type.Literal("summaries")], {
+          description:
+            'Which corpus to search. "messages" (default) = the raw chat transcript. ' +
+            '"summaries" = the rolling conversation summaries (§9b) by keyword, when you ' +
+            "hold only a coarse summary and want to find the right one to expand_summary on. " +
+            "A call returns EITHER message hits OR summary hits, never both. With " +
+            'corpus:"summaries", the message-only filters (from, mentions, quoted_user, ' +
+            "is_reply, has_attachment, attachment_type, has_link, scope, since_user_absence, " +
+            "format) do not apply and are rejected; level/min_level/status apply instead.",
+        }),
+      ),
       query: Type.Optional(
         Type.String({
           description:
@@ -167,14 +209,37 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
             'How each match is rendered. "compact" (default) = the FULL message in the same compact ' +
             'form you see in context (sender, time, reply/attachment/caption context), with an id ' +
             'reference for follow-up. "snippet" = a short one-line excerpt around the match (use when ' +
-            'scanning many results). "rich" = the full XML message envelope.',
+            'scanning many results). "rich" = the full XML message envelope. (messages corpus only.)',
+        }),
+      ),
+      // ── corpus:"summaries" only ───────────────────────────────────────────────
+      level: Type.Optional(
+        Type.Union([Type.Number(), Type.Array(Type.Number())], {
+          description:
+            "corpus:\"summaries\" only. Restrict to summaries at this level (or any of these " +
+            "levels). Level 1 = finest (covers raw events); higher = coarser.",
+        }),
+      ),
+      min_level: Type.Optional(
+        Type.Number({
+          description: 'corpus:"summaries" only. Restrict to summaries at level >= this (e.g. only coarse summaries).',
+        }),
+      ),
+      status: Type.Optional(
+        Type.Array(Type.Union([Type.Literal("complete"), Type.Literal("truncated")]), {
+          description:
+            'corpus:"summaries" only. Which summary statuses to include (default both). ' +
+            '"truncated" summaries are lossy but still expandable; superseded summaries are never returned.',
         }),
       ),
     }),
     execute: async (_toolCallId, params) => {
       const args = params as SearchMessagesArgs;
-      const scope: SearchScope = args.scope ?? "text";
       const timelineKeys = resolveRooms(args.rooms, context.currentTimelineKey);
+      if ((args.corpus ?? "messages") === "summaries") {
+        return runSummaryCorpus(context, args, timelineKeys, now);
+      }
+      const scope: SearchScope = args.scope ?? "text";
       const window = resolveTimeWindow(args, now());
       // since_user_absence overrides the lower bound with the gap-detected boundary.
       let absenceNote = "";
@@ -331,6 +396,121 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
           })),
         },
       };
+    },
+  };
+}
+
+/**
+ * The `corpus:"summaries"` branch of `search_messages` (§9e): keyword search over the
+ * rolling summaries (`summaries_fts`) instead of the raw transcript. Returns summary
+ * hits — each citing its `id` for `expand_summary` — never message hits, so the two
+ * corpora never interleave. Message-only filters are rejected up front (fail-fast).
+ */
+function runSummaryCorpus(
+  context: SearchMessagesToolContext,
+  args: SearchMessagesArgs,
+  timelineKeys: string[] | undefined,
+  now: () => number,
+): AgentToolResult<unknown> {
+  // Fail-fast: reject any message-only / inapplicable filter rather than ignoring it.
+  const rejected = SUMMARY_INAPPLICABLE_FIELDS.filter(
+    (f) => (args as Record<string, unknown>)[f] !== undefined,
+  );
+  if (rejected.length > 0) {
+    const text =
+      `error: these filters do not apply to corpus:"summaries": ${rejected.join(", ")}. ` +
+      "Applicable parameters are: query, rooms, after/before/last, limit, cursor, order, " +
+      "level, min_level, status. (To filter by sender/mentions/attachments, search the raw " +
+      "transcript with corpus:\"messages\".)";
+    return {
+      content: [{ type: "text", text }],
+      details: { corpus: "summaries", error: "inapplicable_filters", rejected },
+    };
+  }
+
+  const window = resolveTimeWindow(args, now());
+  const match = args.query ? sanitizeSummaryFtsMatch(args.query) : undefined;
+
+  let order = args.order ?? "newest";
+  let orderNote = "";
+  if (order === "relevance" && !match) {
+    order = "newest";
+    orderNote = " (relevance needs a query — ordered newest instead)";
+  }
+  const limit = args.limit ?? 30;
+  const cursor = order === "relevance" ? undefined : decodeCursor(args.cursor);
+  const levels =
+    args.level === undefined ? undefined : Array.isArray(args.level) ? args.level : [args.level];
+
+  const outcome = runSummarySearch(context.storage, {
+    match,
+    timelineKeys,
+    levels,
+    minLevel: args.min_level,
+    statuses: args.status,
+    afterTs: window.afterTs,
+    beforeTs: window.beforeTs,
+    limit,
+    cursor,
+    order,
+  });
+
+  const terms = queryTerms(args.query);
+  const showRoom = outcome.roomCount !== 1;
+  const lines = outcome.hits.map((h) => {
+    const statusTag = h.status === "truncated" ? " · truncated" : "";
+    const header = `[L${h.level} · ${fmtTs(h.earliestTimestamp)} → ${fmtTs(h.latestTimestamp)} · ${h.eventCount} msgs${statusTag}]`;
+    const ref = `   ↳ id: ${h.id}${showRoom ? ` · {${h.timelineKey}}` : ""}`;
+    return `${header} ${buildSummarySnippet(h.content, terms)}\n${ref}`;
+  });
+
+  const nextCursor =
+    order !== "relevance" && outcome.hits.length === limit
+      ? encodeSummaryCursor(outcome.hits[outcome.hits.length - 1])
+      : undefined;
+
+  const dateNote =
+    window.ignored.length > 0
+      ? ` (ignored unparseable ${window.ignored.join(", ")} bound — use ISO or YYYY-MM-DD / a duration like 3d)`
+      : "";
+  const trailer =
+    `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`}, ` +
+    `${outcome.total} summary match(es) in ${outcome.elapsedMs} ms`;
+
+  let text: string;
+  if (outcome.hits.length === 0) {
+    text = `No matching summaries${orderNote}${dateNote}.\n(${trailer})`;
+  } else {
+    const more =
+      outcome.total > outcome.hits.length
+        ? `\nShowing ${outcome.hits.length} of ${outcome.total}.` +
+          (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
+        : "";
+    text =
+      `${outcome.total} summary match(es)${orderNote}${dateNote} ` +
+      `(pass any id to expand_summary to drill into it):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})`;
+  }
+
+  return {
+    content: [{ type: "text", text }],
+    details: {
+      corpus: "summaries",
+      total: outcome.total,
+      returned: outcome.hits.length,
+      elapsedMs: outcome.elapsedMs,
+      order,
+      nextCursor: nextCursor ?? null,
+      ignoredBounds: window.ignored,
+      hits: outcome.hits.map((h) => ({
+        id: h.id,
+        timelineKey: h.timelineKey,
+        level: h.level,
+        earliestTimestamp: h.earliestTimestamp,
+        latestTimestamp: h.latestTimestamp,
+        eventCount: h.eventCount,
+        tokenCount: h.tokenCount,
+        status: h.status,
+      })),
     },
   };
 }

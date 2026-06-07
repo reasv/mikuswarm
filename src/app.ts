@@ -32,6 +32,7 @@ import {
   createListReactionsTool,
   createReadMessagesTool,
   createSearchMessagesTool,
+  createExpandSummaryTool,
   createRecapTool,
   createUserActivityTool,
   createMediaTool,
@@ -138,6 +139,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       defaultLookbackMs: config.search?.default_lookback_ms ?? ABSENCE_LOOKBACK_DEFAULT_MS,
     },
     recapBudgetTokens: config.search?.recap_budget_tokens ?? 6000,
+    expand: {
+      tokenCap: config.search?.summaries?.expand_token_cap ?? 4000,
+      maxDepth: config.search?.summaries?.expand_max_depth ?? 3,
+    },
   };
 
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
@@ -858,6 +863,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         currentTimelineKey: session.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
       }),
+      // Summary drill-down (§9e). DB-backed (lineage tables + shared renderer), so like
+      // search/recap it's available regardless of roomId and is single-id (room implicit).
+      createExpandSummaryTool({ storage, defaults: chatSearchDefaults.expand }),
       createRecapTool({
         storage,
         indexer: chatSearchIndexer,
@@ -873,6 +881,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         storage,
         indexer: chatSearchIndexer,
         currentTimelineKey: session.timelineKey,
+        // Membership source for include_silent / never-posted users (§9e). Maps a
+        // timeline_key (`matrix:<account>:room:<roomId>[:thread:...]`) to the account's
+        // client and asks the native layer for the room's current joined members. A
+        // Matrix room id contains a colon (`!opaque:server`), so capture everything
+        // between `room:` and an optional `:thread:` suffix rather than splitting on `:`.
+        roomMembers: async (timelineKey) => {
+          const m = /^matrix:[^:]+:room:(.+?)(?::thread:.*)?$/.exec(timelineKey);
+          if (!m) return [];
+          const client = provider.getClient({ provider: "matrix", timelineKey });
+          const members = await client.roomMembers({ roomId: m[1] });
+          return members.map((mem) => ({ userId: mem.userId, displayName: mem.displayName }));
+        },
       }),
       createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
       createWebFetchTool(),
@@ -1138,6 +1158,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // Backfills existing events on first run after the v11 migration.
   void chatSearchIndexer.reconcileAll().catch((error) =>
     logger.warn("chat_index_sweep_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
+
+  // Backfill the summary-content search index (§9e). Insert/delete triggers keep
+  // `summaries_fts` live and the v13->v14 migration rebuilds it for pre-existing rows,
+  // so this is the belt-and-suspenders convergence net for any trigger gap (mirrors the
+  // chat-index sweep above). Issues the FTS5 'rebuild' command (an external-content
+  // anti-join can't detect un-indexed rowids); cheap because summaries are few.
+  // Fire-and-forget — summary search degrades to "miss a not-yet-indexed summary" at
+  // worst, never incorrectness.
+  void storage.reconcileSummariesFts().catch((error) =>
+    logger.warn("summaries_fts_sweep_failed", {
       error: error instanceof Error ? error.message : String(error),
     }),
   );

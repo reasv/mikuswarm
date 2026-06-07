@@ -687,6 +687,32 @@ begin
 end;
 `;
 
+// A real v12 database already has `summaries` (in the schema since v1); the v13->v14
+// step that now also runs creates `summaries_fts` over it and rebuilds. Include a
+// minimal summaries table so opening this fixture exercises the full v12->v14 chain.
+const V12_SUMMARIES = `
+create table summaries (
+  id text primary key,
+  timeline_key text not null,
+  level integer not null,
+  content text not null,
+  earliest_timestamp integer not null,
+  latest_timestamp integer not null,
+  latest_event_id text not null,
+  event_count integer not null,
+  token_count integer not null,
+  model_id text,
+  status text not null default 'complete'
+    check(status in ('complete', 'truncated', 'superseded')),
+  backfill_job_id text,
+  generated_at integer not null,
+  created_at integer not null,
+  diary_status text
+    check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed')),
+  diary_attempts integer not null default 0
+);
+`;
+
 test("v12 -> v13 migration adds the cascade FK, preserves rows, and keeps FTS consistent", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-chat-search-v13-"));
   const dbPath = path.join(dir, "legacy.db");
@@ -698,6 +724,7 @@ test("v12 -> v13 migration adds the cascade FK, preserves rows, and keeps FTS co
     const legacy = new Database(dbPath);
     legacy.exec(V12_TIMELINE_EVENTS);
     legacy.exec(V12_CHAT_SEARCH);
+    legacy.exec(V12_SUMMARIES);
     const now = Date.now();
     legacy
       .prepare(
@@ -804,6 +831,54 @@ test("v12 -> v13 migration adds the cascade FK, preserves rows, and keeps FTS co
           }).n,
       );
       assert.equal(afterDelete, 0, "cascade removes the migrated row on delete");
+    } finally {
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("v13 -> v14 migration creates summaries_fts and backfills existing summaries", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-summary-fts-v14-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    // A minimal v13 fixture: timeline_events (so the DB isn't classified as fresh) and
+    // a summaries table holding a row — but NO summaries_fts yet (it didn't exist at v13).
+    const legacy = new Database(dbPath);
+    legacy.exec(V12_TIMELINE_EVENTS);
+    legacy.exec(V12_SUMMARIES);
+    const now = Date.now();
+    legacy
+      .prepare(
+        `insert into summaries
+           (id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+            latest_event_id, event_count, token_count, model_id, status, generated_at, created_at)
+         values ('pre', ?, 1, 'preexisting summary about quarterly metrics', ?, ?, 'e1', 3, 10, 'm', 'complete', ?, ?)`,
+      )
+      .run(ROOM_A, now - 1000, now, now, now);
+    // No summaries_fts table exists at v13.
+    const hasFtsBefore = legacy
+      .prepare(`select count(*) as n from sqlite_master where name = 'summaries_fts'`)
+      .get() as { n: number };
+    assert.equal(hasFtsBefore.n, 0, "fixture must start without summaries_fts");
+    legacy.pragma("user_version = 13");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+      // The pre-existing summary was backfilled into the new FTS by the migration's rebuild.
+      const res = storage.searchSummaries({
+        match: "{content} : (\"quarterly\")",
+        limit: 10,
+        order: "newest",
+      });
+      assert.equal(res.total, 1);
+      assert.equal(res.hits[0]?.id, "pre");
     } finally {
       storage.close();
     }

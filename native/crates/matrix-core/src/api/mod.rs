@@ -17,6 +17,7 @@ pub use types::{
     MatrixReactRequest, MatrixReactResult, MatrixReactionInfo, MatrixReactionKeyKind,
     MatrixReactionSummary, MatrixReadMessagesRequest, MatrixReadMessagesResult,
     MatrixResolveLinkPreviewsRequest, MatrixResolveTargetRequest, MatrixResolveTargetResult,
+    MatrixRoomMember, MatrixRoomMembersRequest,
     MatrixSendRequest, MatrixSendResult, MatrixSetProfileRequest, MatrixSetProfileResult,
     MatrixStateLayout, MatrixSyncState, MatrixTypingRequest,
     MatrixUploadMediaRequest, MatrixUploadMediaResult, MatrixUploadMediaThumbnail,

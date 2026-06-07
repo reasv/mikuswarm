@@ -25,8 +25,8 @@ use crate::{
         MatrixListReactionsRequest, MatrixMemberInfoRequest, MatrixMessageSummaryRequest,
         MatrixPinMessageRequest, MatrixPollVoteRequest, MatrixReactRequest,
         MatrixReadMessagesRequest, MatrixResolveLinkPreviewsRequest,
-        MatrixResolveTargetRequest, MatrixSendRequest, MatrixSetProfileRequest,
-        MatrixTypingRequest, MatrixUploadMediaRequest,
+        MatrixResolveTargetRequest, MatrixRoomMembersRequest, MatrixSendRequest,
+        MatrixSetProfileRequest, MatrixTypingRequest, MatrixUploadMediaRequest,
     },
     client::{
         channel_info_internal, create_poll_internal, delete_message_internal,
@@ -34,7 +34,7 @@ use crate::{
         list_pins_internal, list_reactions_internal, member_info_internal,
         message_summary_internal, pin_message_internal, poll_vote_internal,
         react_message_internal, read_messages_internal, resolve_target_internal,
-        send_message_internal, set_profile_internal, set_typing_internal,
+        room_members_internal, send_message_internal, set_profile_internal, set_typing_internal,
         unpin_message_internal, upload_media_internal, MatrixCoreService,
     },
 };
@@ -336,6 +336,26 @@ impl MatrixCoreClient {
             inner.client().map_err(to_napi_error)?
         };
         let result = member_info_internal(&client, &request.room_id, &request.user_id)
+            .await
+            .map_err(to_napi_error)?;
+        serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
+    }
+
+    #[napi(js_name = "roomMembers")]
+    pub async fn room_members(&self, request_json: String) -> napi::Result<String> {
+        let request: MatrixRoomMembersRequest = serde_json::from_str(&request_json)
+            .map_err(|err| napi::Error::from_reason(err.to_string()))?;
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        let result = room_members_internal(&client, &request.room_id)
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
