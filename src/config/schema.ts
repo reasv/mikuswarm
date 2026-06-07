@@ -413,7 +413,10 @@ const BrowserSchema = Type.Object({
   // only (the pre-frames behavior). Child-frame content is appended under
   // [frame fN: url] boundaries with refs namespaced fN:eN, all still bounded by
   // snapshot_max_chars (a page full of ad iframes can't blow the budget).
-  snapshot_max_frames: Type.Integer({ minimum: 0 }),
+  // Ceiling of 256: descending into more than a few dozen frames is already
+  // absurd (and bounded by snapshot_max_chars anyway), so a few hundred is a
+  // generous hard cap that fail-fasts an obviously fat-fingered value.
+  snapshot_max_frames: Type.Integer({ minimum: 0, maximum: 256 }),
   // Per-navigation / per-action / connect (incl. first-launch cold start) timeouts.
   // Floor of 1000ms: a sub-second op/nav/connect timeout would spuriously fail
   // real work; the previous minimum of 1ms was a footgun, not a useful setting.

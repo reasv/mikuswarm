@@ -438,6 +438,7 @@ const BROWSER_OUT_OF_BOUNDS_CASES: Array<{ name: string; find: string; replace: 
   { name: "act_timeout_ms below floor (1000)", find: "act_timeout_ms = 15000", replace: "act_timeout_ms = 0" },
   { name: "connect_timeout_ms below floor (1000)", find: "connect_timeout_ms = 20000", replace: "connect_timeout_ms = 999" },
   { name: "snapshot_max_chars below floor (1000)", find: "snapshot_max_chars = 20000", replace: "snapshot_max_chars = 999" },
+  { name: "snapshot_max_frames above ceiling (256)", find: "snapshot_max_frames = 10", replace: "snapshot_max_frames = 257" },
 ];
 
 for (const { name, find, replace } of BROWSER_OUT_OF_BOUNDS_CASES) {
