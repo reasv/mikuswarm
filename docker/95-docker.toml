@@ -1,0 +1,61 @@
+# =============================================================================
+# 95-docker.toml — container-infrastructure overlay for the Compose deployment.
+#
+# Lives in docker/ (NOT config/) on purpose: native `tsx src/index.ts` runs read
+# config/ and must NOT pick this up. The agent Dockerfile bakes this file into
+# the image at /app/config/95-docker.toml, and docker-compose bind-mounts the
+# operator's identity config (config/90-local.toml) alongside it. Lexicographic
+# load order (src/config/loader.ts):
+#
+#     00-defaults.toml  <  90-local.toml  <  95-docker.toml
+#
+# SHALLOW-MERGE CONTRACT (loader.ts: Object.assign by top-level table): a
+# redefined top-level table REPLACES the earlier one wholesale — sibling keys
+# are not inherited. Each table below is therefore self-complete, and this
+# overlay deliberately owns ONLY the tables the container environment changes:
+#
+#   [workspace]            — absolute, path-parity workspace dir
+#   [observability.server] — bind 0.0.0.0 so the console container can reach it
+#   [sandbox]              — enabled, driving the host docker daemon
+#
+# Everything else (models, matrix account, captioning, retrieval, …) stays in
+# config/90-local.toml, untouched. Data paths (app.data_dir, storage.database_path,
+# matrix store_path) are left relative (./var → /app/var) and persisted by the
+# /app/var bind in docker-compose.yml — so they need no override here.
+# =============================================================================
+
+# Path parity. The agent shells out to `docker create -v <root_dir>:/workspace`
+# (src/sandbox/manager.ts), and that host path is resolved by the DAEMON, not by
+# this container. So root_dir must be a real host path that is ALSO bind-mounted
+# into this container at the IDENTICAL path. Keep this in sync with the workspace
+# bind in docker-compose.yml.
+[workspace]
+root_dir = "/srv/miku/workspace"
+
+# Observability console API (read-only HTTP + SSE). The console runs in a
+# separate container and reaches this over the compose network, so it must bind
+# all interfaces rather than loopback. The API is gated by the bearer token and
+# is NOT published to the host — only the console's own port is. MIKUSWARM_CONSOLE_TOKEN
+# is REQUIRED (a present-but-blank token is rejected at load, fail-fast).
+[observability.server]
+enabled = true
+bind = "0.0.0.0"
+port = 8799
+auth_token = "${MIKUSWARM_CONSOLE_TOKEN}"
+
+# Docker sandbox (ARCHITECTURE.md §11a). The agent drives the host docker daemon
+# (socket bind-mounted, docker CLI in the image) to create + exec a long-lived
+# sandbox container with the workspace bind-mounted at workspace_mount. The image
+# must already exist on the daemon — build it first with docker/build-sandbox.sh
+# or startup fails fast.
+[sandbox]
+enabled = true
+image = "mikuswarm-sandbox:24.04"
+container_name = "mikuswarm-sandbox"
+network = "mikuswarm-sandbox"
+workspace_mount = "/workspace"
+exec_timeout_ms = 120000
+max_output_bytes = 1048576
+stop_on_shutdown = false
+memory = "2g"
+cpus = 2

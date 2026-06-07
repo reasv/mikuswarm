@@ -1,0 +1,29 @@
+# Keep the agent build context lean and reproducible — host artifacts are
+# rebuilt inside the image, never copied in.
+.git
+node_modules
+# Keep the committed NAPI loader wrappers (npm/index.js, package.json,
+# index.d.ts) in context — they are required at runtime and `napi build` does not
+# regenerate them; only the platform .node binary is rebuilt in the image.
+npm/*.node
+native/target
+var
+workspaces
+debug
+tmp
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Secrets / operator-specific files must never enter the image. 90-local.toml is
+# bind-mounted at runtime by docker-compose, not baked.
+.env
+config/90-local.toml
+
+# The console builds from its own context (./console) with its own .dockerignore.
+console/node_modules
+console/build
+console/.svelte-kit
