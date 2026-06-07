@@ -60,6 +60,14 @@ max_output_bytes = 1048576
 stop_on_shutdown = false
 memory = "2g"
 cpus = 2
+# Additional isolation knobs (passed to `docker create`) are intentionally unset
+# — no shipped default, and leaving them off matches current behavior. This is
+# the [sandbox] table that is actually LIVE under Compose (it replaces
+# 90-local.toml's wholesale via the shallow merge), so set them HERE, not there:
+#   pids_limit = 512        # cap container PIDs (fork-bomb guard)
+#   read_only_root = true   # mount the container rootfs read-only
+#   env = { KEY = "value" }  # extra env vars inside the sandbox
+#   binds = ["/host:/ctr:ro"]  # extra bind mounts
 
 # Network egress (ARCHITECTURE.md "Network egress & SSRF"). In the Compose
 # deployment the agent's own bridge is hardened by docker/egress-rules.sh
