@@ -97,6 +97,16 @@ const SUMMARY_INAPPLICABLE_FIELDS = [
   "format",
 ] as const;
 
+/**
+ * Summary-only params, keyed by the public arg name. The mirror of
+ * `SUMMARY_INAPPLICABLE_FIELDS`: under the default `corpus:"messages"` these have no
+ * meaning, so they are rejected (fail-fast, naming the field) rather than silently
+ * dropped — a model that meant to search summaries but forgot `corpus:"summaries"`
+ * would otherwise get a plain message search with its level filter doing nothing and
+ * no signal. See §5.1.
+ */
+const MESSAGE_INAPPLICABLE_FIELDS = ["level", "min_level", "status"] as const;
+
 function fmtTs(ms: number): string {
   try {
     return formatAgentTimestamp(new Date(ms));
@@ -238,6 +248,24 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       const timelineKeys = resolveRooms(args.rooms, context.currentTimelineKey);
       if ((args.corpus ?? "messages") === "summaries") {
         return runSummaryCorpus(context, args, timelineKeys, now);
+      }
+      // Fail-fast: reject summary-only filters under corpus:"messages" rather than
+      // silently ignoring them (mirror of the summaries-branch rejection). See §5.1.
+      const rejectedSummaryOnly = MESSAGE_INAPPLICABLE_FIELDS.filter(
+        (f) => (args as Record<string, unknown>)[f] !== undefined,
+      );
+      if (rejectedSummaryOnly.length > 0) {
+        const text =
+          `error: these filters only apply to corpus:"summaries": ${rejectedSummaryOnly.join(", ")}. ` +
+          'To search the rolling conversation summaries by keyword, set corpus:"summaries".';
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            corpus: "messages",
+            error: "inapplicable_filters",
+            rejected: rejectedSummaryOnly,
+          },
+        };
       }
       const scope: SearchScope = args.scope ?? "text";
       const window = resolveTimeWindow(args, now());

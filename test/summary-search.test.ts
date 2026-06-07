@@ -133,6 +133,70 @@ test("reconcileSummariesFts repairs a summary inserted while the trigger was abs
   });
 });
 
+test("reconcileSummariesFts skips the rebuild when index counts already match", async () => {
+  await withStorage(async (storage) => {
+    // Normal insert → the summary IS indexed, so searchable count == indexed count.
+    await insertSummary(storage, { id: "kept", content: "stable indexed content", earliest: 1000, latest: 2000 });
+
+    // Tamper with the FTS index WITHOUT touching the summaries table or its row count:
+    // retract the row directly via the FTS 'delete' command. The searchable-summary count
+    // is still 1, but the index now holds 0 rows — counts MATCH only because we then
+    // re-add a wrong row so docsize stays at 1. We instead assert the cheaper invariant:
+    // since counts match, reconcile must NOT issue a 'rebuild', leaving the index as-is.
+    // To observe "no rebuild", we corrupt searchability while keeping the docid present:
+    // delete+reinsert the same rowid with different content. docsize count stays 1.
+    await storage.write((db) => {
+      const row = db.prepare(`select rowid from summaries where id = ?`).get("kept") as { rowid: number };
+      db.prepare(`insert into summaries_fts(summaries_fts, rowid, content) values ('delete', ?, ?)`).run(
+        row.rowid,
+        "stable indexed content",
+      );
+      db.prepare(`insert into summaries_fts(rowid, content) values (?, ?)`).run(row.rowid, "tampered token");
+    });
+
+    // Sanity: counts match (1 searchable summary, 1 indexed docid).
+    const counts = storage.read((db) => ({
+      searchable: (db.prepare(`select count(*) as n from summaries where status in ('complete','truncated')`).get() as { n: number }).n,
+      indexed: (db.prepare(`select count(*) as n from summaries_fts_docsize`).get() as { n: number }).n,
+    }));
+    assert.equal(counts.searchable, counts.indexed, "precondition: counts match so rebuild is gated off");
+
+    await storage.reconcileSummariesFts();
+
+    // Rebuild was SKIPPED: the tampered token is still searchable; the real word is not.
+    const tampered = storage.searchSummaries({ match: "{content} : (\"tampered\")", limit: 10, order: "newest" });
+    assert.equal(tampered.total, 1, "rebuild skipped → tampered index left intact");
+    const original = storage.searchSummaries({ match: "{content} : (\"stable\")", limit: 10, order: "newest" });
+    assert.equal(original.total, 0, "rebuild skipped → original content not re-derived");
+  });
+});
+
+test("reconcileSummariesFts rebuilds when a summary is missing from the index (count mismatch)", async () => {
+  await withStorage(async (storage) => {
+    await insertSummary(storage, { id: "present", content: "already indexed alpha", earliest: 1000, latest: 2000 });
+    // Trigger gap: drop the insert trigger, then insert → searchable count 2, indexed 1.
+    await storage.write((db) => db.exec(`drop trigger summaries_ai`));
+    await insertSummary(storage, { id: "missed", content: "missing beta content", earliest: 3000, latest: 4000 });
+
+    const before = storage.read((db) => ({
+      searchable: (db.prepare(`select count(*) as n from summaries where status in ('complete','truncated')`).get() as { n: number }).n,
+      indexed: (db.prepare(`select count(*) as n from summaries_fts_docsize`).get() as { n: number }).n,
+    }));
+    assert.equal(before.searchable, 2);
+    assert.equal(before.indexed, 1, "the trigger-gap row is un-indexed");
+    assert.notEqual(before.searchable, before.indexed, "precondition: counts differ → rebuild fires");
+
+    let res = storage.searchSummaries({ match: "{content} : (\"beta\")", limit: 10, order: "newest" });
+    assert.equal(res.total, 0, "missing before reconcile");
+
+    await storage.reconcileSummariesFts();
+
+    res = storage.searchSummaries({ match: "{content} : (\"beta\")", limit: 10, order: "newest" });
+    assert.equal(res.total, 1, "rebuild backfilled the missing summary");
+    assert.equal(res.hits[0]?.id, "missed");
+  });
+});
+
 test("level / min_level / time / room filters apply to summary search", async () => {
   await withStorage(async (storage) => {
     await insertSummary(storage, { id: "l1a", content: "topic apple", level: 1, earliest: 1000, latest: 2000 });
@@ -232,5 +296,34 @@ test("search_messages(corpus:summaries) returns summary hits and rejects message
     const badDetails = bad.details as { error: string; rejected: string[] };
     assert.equal(badDetails.error, "inapplicable_filters");
     assert.deepEqual(badDetails.rejected, ["from"]);
+  });
+});
+
+test("search_messages(corpus:messages) rejects summary-only filters, pointing at corpus:summaries", async () => {
+  await withStorage(async (storage) => {
+    const indexer = new ChatSearchIndexer({ storage });
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: TK, now: () => 10_000 });
+
+    // Default corpus is "messages": a summary-only filter must fail fast, not be ignored.
+    const bad = await tool.execute("c1", { query: "release", level: 2, status: ["complete"] });
+    const badText = (bad.content[0] as { text: string }).text;
+    assert.match(badText, /only apply to corpus:"summaries"/);
+    assert.match(badText, /level/);
+    assert.match(badText, /status/);
+    assert.match(badText, /set corpus:"summaries"/);
+    const badDetails = bad.details as { corpus: string; error: string; rejected: string[] };
+    assert.equal(badDetails.corpus, "messages");
+    assert.equal(badDetails.error, "inapplicable_filters");
+    assert.deepEqual(badDetails.rejected, ["level", "status"]);
+
+    // min_level is likewise rejected under the default corpus.
+    const bad2 = await tool.execute("c2", { query: "release", min_level: 3 });
+    const bad2Details = bad2.details as { rejected: string[] };
+    assert.deepEqual(bad2Details.rejected, ["min_level"]);
+
+    // A plain message search (no summary-only filters) is NOT rejected.
+    const ok = await tool.execute("c3", { query: "release" });
+    const okDetails = ok.details as { error?: string };
+    assert.equal(okDetails.error, undefined);
   });
 });

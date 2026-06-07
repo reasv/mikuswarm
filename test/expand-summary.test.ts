@@ -166,6 +166,71 @@ test("token_cap truncates and reports omitted constituents", async () => {
   }, 200);
 });
 
+test("raw-message overflow advises token_cap/read_messages, not 'expand a child'", async () => {
+  // Drill a level-1 summary to its raw messages under a tight cap so the second
+  // message overflows. The omitted items are raw messages (no child summaries),
+  // so the note must NOT tell the model to "expand a specific child by id".
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-expand-raw-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  try {
+    const timeline = new TimelineStore(storage);
+    const longBody = "this is a fairly long message body. ".repeat(20);
+    await timeline.append(event("m1", `first ${longBody}`, 1000));
+    await timeline.append(event("m2", `second ${longBody}`, 2000));
+    await insertSummary(storage, { id: "L1raw", content: "summary", level: 1, earliest: 1000, latest: 2000, eventIds: ["m1", "m2"] });
+
+    // Cap small enough that only the first raw message fits.
+    const tool = createExpandSummaryTool({ storage, defaults: { tokenCap: 120, maxDepth: 3 } });
+    const res = await tool.execute("craw", { id: "L1raw", token_cap: 120 });
+    const text = (res.content[0] as { text: string }).text;
+    const details = res.details as { truncated: boolean; omitted: number; children: unknown[]; messageCount: number };
+
+    assert.equal(details.truncated, true);
+    assert.ok(details.omitted >= 1);
+    assert.equal(details.children.length, 0); // pure raw-message output
+    assert.match(text, /Output cap reached/);
+    assert.match(text, /Raise token_cap, or narrow the window with read_messages/);
+    // The misleading child advice must NOT appear when there are no child summaries.
+    assert.doesNotMatch(text, /Expand a specific child by id/);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a single oversized constituent is shown in full with a note, but truncated stays false", async () => {
+  // One constituent whose rendered size alone exceeds token_cap. It is the only
+  // item, so nothing is omitted — truncated:false / omitted:0 must hold — yet the
+  // output must signal the budget was overrun.
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-expand-big-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  try {
+    const timeline = new TimelineStore(storage);
+    // A level-1 summary expands to its raw source events, so the rendered constituent
+    // is the message body — make THAT oversized (far over a 200-token cap).
+    const huge = "lots of content here. ".repeat(200);
+    await timeline.append(event("b1", `only message: ${huge}`, 1000));
+    await insertSummary(storage, { id: "L1big", content: "big summary", level: 1, earliest: 1000, latest: 2000, eventIds: ["b1"] });
+
+    const tool = createExpandSummaryTool({ storage, defaults: { tokenCap: 200, maxDepth: 3 } });
+    const res = await tool.execute("cbig", { id: "L1big", token_cap: 200 });
+    const text = (res.content[0] as { text: string }).text;
+    const details = res.details as { truncated: boolean; omitted: number; estimatedTokens: number };
+
+    // Structured flags stay truthful: nothing was actually omitted.
+    assert.equal(details.truncated, false);
+    assert.equal(details.omitted, 0);
+    assert.ok(details.estimatedTokens > 200); // budget was genuinely overrun
+    assert.match(text, /Single constituent exceeds token_cap; shown in full/);
+    assert.doesNotMatch(text, /Output cap reached/); // not a truncation
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("depth above the configured max is capped with a note", async () => {
   await withHierarchy(async (_storage, tool) => {
     // maxDepth is 3 in the harness; ask for 5.

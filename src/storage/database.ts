@@ -3558,17 +3558,51 @@ export class Storage {
    * belt-and-suspenders net that repairs any trigger gap (mirrors how the chat index
    * reconciles on boot).
    *
-   * It issues the FTS5 `'rebuild'` command rather than an anti-join: `summaries_fts` is
-   * an EXTERNAL-CONTENT table, so a `select … from summaries_fts where rowid = ?` probe
+   * Convergence uses the FTS5 `'rebuild'` command rather than an anti-join: `summaries_fts`
+   * is an EXTERNAL-CONTENT table, so a `select … from summaries_fts where rowid = ?` probe
    * reads column values back from the `summaries` content table — it cannot tell whether
    * a given rowid is actually present in the FTS *index*, which makes a "rows not in FTS"
    * anti-join silently a no-op. `'rebuild'` re-derives the entire index from the content
    * table, which is the authoritative convergence primitive and is cheap here because
    * summaries are deliberately few (hierarchical condensation), unlike raw events.
+   *
+   * The `'rebuild'` is gated behind a cheap count-mismatch check so an unchanged DB skips
+   * the O(all summaries) rewrite on every boot. We compare the number of searchable
+   * summaries (`status in ('complete','truncated')`) against the number of rows actually
+   * indexed in `summaries_fts`. For the *index* count we read the `summaries_fts_docsize`
+   * shadow table, NOT `select count(*) from summaries_fts`: on an external-content table
+   * the latter counts through to the `summaries` content table (so it can't reveal an
+   * un-indexed row), whereas `_docsize` holds exactly one row per indexed docid and so
+   * reflects the true index population. Every summary is inserted `complete`/`truncated`
+   * and the insert trigger indexes it, so in steady state the two counts are equal; they
+   * diverge only when a trigger gap (or a pre-existing/partially-built DB) left rows
+   * un-indexed — exactly when a rebuild is warranted. Any divergence (including the
+   * never-written `superseded` case, which would leave a stale FTS row) errs toward
+   * rebuilding, i.e. correctness over cost. If the `_docsize` probe ever fails we fall
+   * back to an unconditional rebuild rather than risk a stale index.
    */
   reconcileSummariesFts(): Promise<void> {
     return this.write((db) => {
-      db.prepare(`insert into summaries_fts(summaries_fts) values ('rebuild')`).run();
+      let needsRebuild = true;
+      try {
+        const searchable = (
+          db
+            .prepare(
+              `select count(*) as n from summaries where status in ('complete', 'truncated')`,
+            )
+            .get() as { n: number }
+        ).n;
+        const indexed = (
+          db.prepare(`select count(*) as n from summaries_fts_docsize`).get() as { n: number }
+        ).n;
+        needsRebuild = searchable !== indexed;
+      } catch {
+        // _docsize unavailable / probe failed → rebuild unconditionally (correctness over cost).
+        needsRebuild = true;
+      }
+      if (needsRebuild) {
+        db.prepare(`insert into summaries_fts(summaries_fts) values ('rebuild')`).run();
+      }
     });
   }
 

@@ -2,6 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { Storage } from "../storage/index.js";
 import { type ChatSearchIndexer, resolveRooms, resolveTimeWindow } from "../search/index.js";
+import { roomIdFromTimelineKey } from "../timeline/index.js";
 import { formatAgentTimestamp } from "../time/index.js";
 
 /** A current joined room member, as resolved from the Matrix client (§9e). */
@@ -204,14 +205,33 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
         // Full roster of posters in scope (bounded by participants for a concrete scope),
         // then union the current members; members absent from the posting set are
         // never-posted (per-scope semantics: "never posted in the scanned room(s)").
+        //
+        // Unbounded by design: aggregateChatActivity runs with no sender filter and no
+        // SQL LIMIT, materializing every poster in scope before the JS-side slice below.
+        // `limit` can't be pushed into SQL here because the never-posted view needs the
+        // FULL poster set first — the member union and the least-active re-sort happen
+        // after this fetch, so a SQL LIMIT would drop posters (or silent members) that
+        // belong in the final ranked window. This full-roster scan is an accepted cost of
+        // the silent/never-posted admin diagnostic (heavier than the bounded roster path).
         const rows = context.storage.aggregateChatActivity({
           timelineKeys,
           sinceTs: window.afterTs,
           untilTs: window.beforeTs,
         });
         const bySender = buildBySender(rows);
+        // Dedup timeline keys by resolved room id before fetching members: multiple
+        // timeline keys (e.g. thread keys) can map to the SAME underlying room, and
+        // roomMembers resolves the room internally — fetching once per timeline_key would
+        // fire duplicate native member fetches (possibly homeserver round-trips) for the
+        // same roster. Group by room id and fetch once per unique room with a representative
+        // key. (Keys that don't resolve to a room id keep their own key as the group bucket.)
+        const repByRoom = new Map<string, string>();
+        for (const tk of timelineKeys) {
+          const roomId = roomIdFromTimelineKey(tk) ?? tk;
+          if (!repByRoom.has(roomId)) repByRoom.set(roomId, tk);
+        }
         const memberLists = await Promise.all(
-          timelineKeys.map((tk) => context.roomMembers!(tk).catch(() => [] as RoomMemberLite[])),
+          [...repByRoom.values()].map((tk) => context.roomMembers!(tk).catch(() => [] as RoomMemberLite[])),
         );
         for (const members of memberLists) {
           for (const m of members) {
