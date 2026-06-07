@@ -197,12 +197,25 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
         // Should not happen for a valid non-superseded summary, but be explicit.
         text = `Summary ${id} (L${root.level}) has no expandable constituents.`;
       } else {
-        const truncNote = truncated
-          ? `\n\n(Output cap reached — ${omitted} more constituent(s) omitted. Expand a specific child by id, or raise token_cap.)`
-          : "";
+        // Two distinct over-budget signals that never co-occur:
+        //  - truncation note (#3): items were dropped (truncated/omitted > 0). When child
+        //    summaries are present, advise drilling a specific one by id; when the output is
+        //    pure raw messages (no child blocks), that advice is unactionable — point at
+        //    token_cap / read_messages instead.
+        //  - oversized-first note (#4): nothing was dropped (truncated:false/omitted:0) but the
+        //    single forced-first constituent alone blew the cap, so estimatedTokens > tokenCap.
+        let overflowNote = "";
+        if (truncated) {
+          overflowNote =
+            childBlocks.length === 0
+              ? `\n\n(Output cap reached — ${omitted} more constituent(s) omitted. Raise token_cap, or narrow the window with read_messages.)`
+              : `\n\n(Output cap reached — ${omitted} more constituent(s) omitted. Expand a specific child by id, or raise token_cap.)`;
+        } else if (estimatedTokens > tokenCap) {
+          overflowNote = `\n\n(Single constituent exceeds token_cap; shown in full.)`;
+        }
         text =
           `Expanded summary ${id} (L${root.level})${depthNote}, depth ${depth}:\n\n` +
-          `${sections.join("\n\n")}${truncNote}\n\n(~${estimatedTokens} tokens)`;
+          `${sections.join("\n\n")}${overflowNote}\n\n(~${estimatedTokens} tokens)`;
       }
 
       return {
