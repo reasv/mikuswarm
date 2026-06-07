@@ -11,9 +11,12 @@ interface FakeOpts {
   isFileInput?: boolean;
   clickError?: Error;
   waitForError?: Error;
+  waitForEventError?: Error;
   dragError?: Error;
   setFilesError?: Error;
   cdpSendError?: Error;
+  newCDPSessionError?: Error;
+  pressError?: Error;
 }
 
 function recordingPage(opts: FakeOpts = {}) {
@@ -54,6 +57,10 @@ function recordingPage(opts: FakeOpts = {}) {
       },
       async pressSequentially(t: string, o: unknown) {
         calls.push(["pressSequentially", selector, t, o]);
+      },
+      async press(k: string, o: unknown) {
+        calls.push(["press", selector, k, o]);
+        if (opts.pressError) throw opts.pressError;
       },
       async waitFor(o: unknown) {
         calls.push(["waitFor", selector, o]);
@@ -97,6 +104,9 @@ function recordingPage(opts: FakeOpts = {}) {
     },
     async waitForEvent(name: string, o: unknown) {
       calls.push(["waitForEvent", name, o]);
+      // Models a chooser that never opens (e.g. a styled button that does
+      // nothing): the filechooser wait rejects, typically with a TimeoutError.
+      if (opts.waitForEventError) throw opts.waitForEventError;
       return chooser;
     },
     keyboard: {
@@ -107,6 +117,7 @@ function recordingPage(opts: FakeOpts = {}) {
     context() {
       return {
         async newCDPSession() {
+          if (opts.newCDPSessionError) throw opts.newCDPSessionError;
           return cdp;
         },
       };
@@ -150,14 +161,27 @@ test("act:click left button omits the button note", async () => {
 
 // ── type {submit} ────────────────────────────────────────────────────────────
 
-test("act:type submit presses Enter after typing and notes it", async () => {
+test("act:type submit presses Enter on the typed locator (not page.keyboard) after typing", async () => {
   const page = recordingPage();
   const r = await run(page, { kind: "type", ref: "e1", text: "hello", submit: true });
   assert.equal(r.detail, "typed into e1 and submitted");
   const seq = page.calls.map((c) => c[0]);
   const typeIdx = seq.indexOf("pressSequentially");
-  const enterIdx = page.calls.findIndex((c) => c[0] === "keyboard.press" && c[1] === "Enter");
-  assert.ok(typeIdx >= 0 && enterIdx > typeIdx, "Enter pressed after typing");
+  // Enter is pressed on the LOCATOR (re-targeting the ref), not via page.keyboard.
+  const enterIdx = page.calls.findIndex(
+    (c) => c[0] === "press" && c[1] === "aria-ref=e1" && c[2] === "Enter",
+  );
+  assert.ok(typeIdx >= 0 && enterIdx > typeIdx, "Enter pressed on the locator after typing");
+  assert.ok(!page.calls.some((c) => c[0] === "keyboard.press"), "does not use global page.keyboard");
+});
+
+test("act:type submit on a stale ref surfaces as ref_expired", async () => {
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ pressError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "type", ref: "e1", text: "hello", submit: true }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
 });
 
 test("act:type without submit does not press Enter", async () => {
@@ -165,6 +189,7 @@ test("act:type without submit does not press Enter", async () => {
   const r = await run(page, { kind: "type", ref: "e1", text: "hello" });
   assert.equal(r.detail, "typed into e1");
   assert.ok(!page.calls.some((c) => c[0] === "keyboard.press"));
+  assert.ok(!page.calls.some((c) => c[0] === "press"));
 });
 
 // ── rich wait ────────────────────────────────────────────────────────────────
@@ -228,6 +253,18 @@ test("act:wait condition timeout surfaces as act_timeout", async () => {
   await assert.rejects(
     () => run(page, { kind: "wait", wait_selector: ".never" }),
     (e: unknown) => (e as { code?: string }).code === "act_timeout",
+  );
+});
+
+test("act:wait non-timeout error (bad selector) surfaces as bad_request (#10)", async () => {
+  // A plain, non-timeout engine error (e.g. an unparseable CSS selector). The
+  // wait catch calls mapError(error, false): refUsed=false guarantees it is NOT
+  // misclassified as ref_expired, and a non-timeout falls through to bad_request.
+  const badSelector = new Error('Unknown engine "::" while parsing selector ::weird');
+  const page = recordingPage({ waitForError: badSelector });
+  await assert.rejects(
+    () => run(page, { kind: "wait", wait_selector: "::weird" }),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
   );
 });
 
@@ -297,6 +334,81 @@ test("act:upload non-timeout set failure surfaces as upload_failed", async () =>
   );
 });
 
+test("act:upload TimeoutError on setInputFiles is NOT upload_failed — it routes through the timeout arm (#8)", async () => {
+  // A TimeoutError-shaped value (name "TimeoutError" + the canonical Playwright
+  // message) is what mapError's isTimeoutError detects, so the upload catch lets
+  // mapError handle it rather than degrading to upload_failed. Because the upload
+  // locator is ref-based (mapError refUsed=true), a timeout is treated as a stale
+  // ref and surfaces as ref_expired (see Other Observations: act.ts's comment
+  // claims act_timeout here, but the ref-based mapError never yields that code).
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: true, setFilesError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      // The key regression guard: a timeout must NOT be mis-bucketed as the
+      // generic upload_failed (which would hide the take-a-fresh-snapshot hint).
+      return code === "ref_expired" && code !== "upload_failed";
+    },
+  );
+});
+
+test("act:upload stale ref on setInputFiles surfaces as ref_expired (#8)", async () => {
+  // A synchronous "no node for aria-ref" failure (not a timeout): with a valid
+  // ref this means the ref went stale, so the upload catch must map it to
+  // ref_expired (take a fresh snapshot), never upload_failed.
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ isFileInput: true, setFilesError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
+
+test("act:upload chooser never opens (filechooser wait times out) → act_timeout, NOT ref_expired (#12)", async () => {
+  // A styled button whose click never opens a file chooser: page.waitForEvent
+  // ("filechooser") times out. This is NOT a stale ref — the chooser arm is
+  // mapped with refUsed=false, so a TimeoutError surfaces as act_timeout. Under
+  // the old code (refUsed=true for the whole block) this would have been
+  // mislabeled ref_expired, telling the model to re-snapshot a still-valid ref.
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: false, waitForEventError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      return code === "act_timeout" && code !== "ref_expired";
+    },
+  );
+});
+
+test("act:upload chooser.setFiles timeout → act_timeout, NOT ref_expired (#12)", async () => {
+  // The chooser opened but setting files on it timed out. Like the chooser arm,
+  // chooser.setFiles does not resolve the ref, so a timeout here is act_timeout,
+  // not a stale-ref signal.
+  const timeout = Object.assign(new Error("Timeout 15000ms exceeded."), { name: "TimeoutError" });
+  const page = recordingPage({ isFileInput: false, setFilesError: timeout });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => {
+      const code = (e as { code?: string }).code;
+      return code === "act_timeout" && code !== "ref_expired";
+    },
+  );
+});
+
+test("act:upload stale ref on the chooser-path click surfaces as ref_expired (#12)", async () => {
+  // The ref-resolving loc.click() in the chooser path keeps refUsed=true, so a
+  // genuinely stale ref there still maps to ref_expired (not act_timeout).
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ isFileInput: false, clickError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "upload", ref: "e1", files: FILE }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
+
 // ── clear_site_data ──────────────────────────────────────────────────────────
 
 test("act:clear_site_data clears the current origin via CDP", async () => {
@@ -325,4 +437,17 @@ test("act:clear_site_data CDP failure surfaces as clear_failed and still detache
     (e: unknown) => (e as { code?: string }).code === "clear_failed",
   );
   assert.ok(page.calls.some((c) => c[0] === "cdp.detach"), "detaches even on failure");
+});
+
+test("act:clear_site_data newCDPSession failure surfaces as clear_failed (no detach)", async () => {
+  const page = recordingPage({
+    url: "https://site.example",
+    newCDPSessionError: new Error("CDP session open boom"),
+  });
+  await assert.rejects(
+    () => run(page, { kind: "clear_site_data" }),
+    (e: unknown) => (e as { code?: string }).code === "clear_failed",
+  );
+  // The session never opened, so there is nothing to detach.
+  assert.ok(!page.calls.some((c) => c[0] === "cdp.detach"), "no detach when session never opened");
 });

@@ -23,6 +23,7 @@ import {
   type UploadFile,
 } from "../browser/index.js";
 import { base64ByteSize } from "./read-image.js";
+import { resolveWorkspacePath } from "./workspace.js";
 
 /** Upload bounds ship as code constants (proposal §9); promote to config if a deployment needs to tune them. */
 const MAX_UPLOAD_FILES = 10;
@@ -68,7 +69,7 @@ const DESCRIPTION = [
   "    click takes `ref`, plus optional `button` (left|right|middle), `double` (double-click), `modifiers` (Alt/Control/Meta/Shift).",
   "    hover/fill/type/select/scroll take `ref` (and fill/type take `text`; select takes `value`). type takes optional `submit` to press Enter after typing.",
   "    press takes `key` (e.g. \"Enter\"), optional `ref`. scroll without `ref` scrolls the page by `delta_y`.",
-  "    wait takes EXACTLY ONE of: ms, wait_text, wait_text_gone, wait_selector (CSS), wait_url (glob), wait_load_state (load|domcontentloaded|networkidle). With none, ms is a plain sleep.",
+  "    wait takes exactly one of the wait_* conditions (wait_text / wait_text_gone / wait_selector (CSS) / wait_url (glob) / wait_load_state (load|domcontentloaded|networkidle)); `ms` is the plain sleep used only when no condition is set.",
   "    back navigates history. evaluate runs JS in `text` (only if enabled).",
   "    drag takes `ref` (source) and `to_ref` (target). upload takes `ref` (an <input type=file> or a button that opens the chooser) and `paths` (workspace-relative files).",
   "    clear_site_data discards cookies + all web storage for the CURRENT page's origin (a fresh start on this site; cookies are cleared by security origin, so parent-domain cookies set elsewhere may persist).",
@@ -267,6 +268,10 @@ async function dispatch(
         // element ref surfaces as ref_expired (take a fresh snapshot).
         const message = error instanceof Error ? error.message : String(error);
         if (elementRef) {
+          // A stale element ref only surfaces as ref_expired when its error matches
+          // the timeout-or-REF_UNRESOLVED_RE heuristic; a stale-ref error of an
+          // unusual shape degrades to screenshot_failed below, consistent with the
+          // act-layer heuristic (issue #6).
           const mapped = mapError(error, true, elementRef);
           if (mapped.code === "ref_expired") throw mapped;
         }
@@ -455,12 +460,18 @@ export async function resolveUploadFiles(workspaceRoot: string, paths: string[] 
   if (paths.length > MAX_UPLOAD_FILES) {
     throw new BrowserError("bad_request", `upload accepts at most ${MAX_UPLOAD_FILES} files (got ${paths.length}).`);
   }
-  const root = path.resolve(workspaceRoot);
   const files: UploadFile[] = [];
   let totalBytes = 0;
   for (const p of paths) {
-    const resolved = path.resolve(root, p);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    // Use the shared realpath-based containment check (realpathSync.native) so a
+    // workspace-internal symlink pointing out of tree (e.g. leak -> ~/.ssh/id_rsa)
+    // is rejected rather than read and exfiltrated. A lexical prefix check would
+    // string-pass it; resolveWorkspacePath returns the resolved absolute path that
+    // stat/readFile then operate on.
+    let resolved: string;
+    try {
+      resolved = resolveWorkspacePath(workspaceRoot, p);
+    } catch {
       throw new BrowserError("bad_request", `upload path escapes the workspace: ${p}`);
     }
     let info;
