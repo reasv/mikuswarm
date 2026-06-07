@@ -28,8 +28,8 @@ const DEFAULT_OUTPUT_SUBDIR = "generated-images";
 const DEFAULT_TIMEOUT_MS = 120_000;
 /**
  * 🔑 Gemini emits the generated image AS output tokens (a 1K image ≈ 1290 tok;
- * Pro adds ~50 "thinking" tok). Through LlmGateway the effective default cap is
- * ~15 tokens, which silently truncates BEFORE any image is produced — HTTP 200,
+ * Pro adds ~50 "thinking" tok). Some gateways default this cap very low
+ * (~15 tokens), which silently truncates BEFORE any image is produced — HTTP 200,
  * `finishReason:"MAX_TOKENS"`, no image part. Setting this high is mandatory.
  */
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
@@ -382,9 +382,9 @@ async function postGenerate(input: {
         "content-type": "application/json",
         accept: "application/json",
         "user-agent": USER_AGENT,
-        // LlmGateway's /google path authenticates with the proxy key as a
-        // bearer token (it injects real Google creds downstream). Google's
-        // native x-goog-api-key header is NOT accepted through the proxy.
+        // The Gemini endpoint authenticates with the API key as a bearer token.
+        // (When an operator gateway fronts Google, it injects real Google creds
+        // downstream; Google's native x-goog-api-key header is not used here.)
         authorization: `Bearer ${input.apiKey}`,
       },
       body: JSON.stringify(input.body),

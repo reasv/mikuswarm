@@ -430,8 +430,8 @@ const BrowserSchema = Type.Object({
 
 export type BrowserConfig = Static<typeof BrowserSchema>;
 
-// Image generation/editing via Google's Gemini "nano banana" models, reached
-// through LlmGateway's /google endpoint. `base_url` is the endpoint root (the
+// Image generation/editing via Google's Gemini "nano banana" models. `base_url`
+// is the Gemini API endpoint root (the
 // tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
 // `Authorization: Bearer`. The `api_key` field name matches the secret regex so
 // it auto-registers for log redaction.

@@ -34,8 +34,8 @@ fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally an
 [models.default]
 id = "claude-opus-4-7"
 provider = "anthropic"
-endpoint = "${LLM_GATEWAY_URL}"
-api_key = "${LLM_GATEWAY_API_KEY}"
+endpoint = "${ANTHROPIC_BASE_URL}"
+api_key = "${LLM_API_KEY}"
 multimodal = true
 max_tokens = 16384
 reasoning = true
@@ -134,8 +134,8 @@ max_retries = 2
 
 [captioning.model]
 id = "google/gemini-3.5-flash"
-endpoint = "${LLM_GATEWAY_URL}/openrouter"
-api_key = "${LLM_GATEWAY_API_KEY}"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
 
 [captioning.image]
 prompt = "Describe the image."
@@ -177,17 +177,17 @@ max_regular_tags = 2
 default_limit = 20
 download_subdir = "downloads/danbooru"
 
-# Image generation / editing via Google's Gemini "nano banana" models, routed
-# through LlmGateway's /google endpoint. `base_url` is the endpoint ROOT — the
-# tool appends /v1beta/models/<model>:generateContent. NOTE: this is NOT
-# ${LLM_GATEWAY_URL} (that points at /anthropic); use the sibling /google path via
-# LLM_GATEWAY_GOOGLE_URL. `api_key` is sent as `Authorization: Bearer`.
+# Image generation / editing via Google's Gemini "nano banana" models.
+# `base_url` is the Gemini API endpoint ROOT — the tool appends
+# /v1beta/models/<model>:generateContent. This is the Google/Gemini API base
+# (GEMINI_BASE_URL), distinct from the Anthropic model endpoint. `api_key` is
+# sent as `Authorization: Bearer`.
 [image_gen]
-base_url = "${LLM_GATEWAY_GOOGLE_URL}"
-api_key = "${LLM_GATEWAY_API_KEY}"
+base_url = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
 timeout_ms = 120000
 # Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
-# Through LlmGateway the default cap is tiny and truncates before any image.
+# Many gateways default this cap low, truncating before any image is emitted.
 max_output_tokens = 32768
 output_subdir = "generated-images"
 
