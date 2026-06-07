@@ -39,7 +39,7 @@ export { createReadMessagesTool, type ReadMessagesToolContext } from "./read-mes
 export { createSearchMessagesTool, type SearchMessagesToolContext } from "./search-messages.js";
 export { createExpandSummaryTool, type ExpandSummaryToolContext } from "./expand-summary.js";
 export { createRecapTool, type RecapToolContext } from "./recap.js";
-export { createUserActivityTool, type UserActivityToolContext } from "./user-activity.js";
+export { createUserActivityTool, type UserActivityToolContext, type RoomMemberLite } from "./user-activity.js";
 export { createMemberInfoTool, type MemberInfoToolContext } from "./member-info.js";
 export { createChannelInfoTool, type ChannelInfoToolContext } from "./channel-info.js";
 export { createSetProfileTool, type SetProfileToolContext } from "./set-profile.js";

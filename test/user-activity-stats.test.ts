@@ -180,6 +180,36 @@ test("a member who later posts drops out of the never-posted set", async () => {
   });
 });
 
+test("include_silent fetches roomMembers once per UNIQUE room when thread keys collapse", async () => {
+  // Two timeline keys of the SAME room: the base room and a thread within it. Both
+  // resolve to room id `!a`, so the member roster must be fetched exactly once.
+  const ROOM_A_THREAD = `${ROOM_A}:thread:$root1`;
+  const events = [
+    ev("@a", ROOM_A, NOW - 1 * DAY, "ta1"),
+    ev("@b", ROOM_A_THREAD, NOW - 1 * DAY, "tb1"),
+  ];
+  const calls: string[] = [];
+  const members = async (tk: string): Promise<RoomMemberLite[]> => {
+    calls.push(tk);
+    return [{ userId: "@a" }, { userId: "@b" }, { userId: "@d", displayName: "Dee" }];
+  };
+  await withTool(events, members, async (tool) => {
+    const res = await tool.execute("c-dedup", {
+      rooms: [ROOM_A, ROOM_A_THREAD],
+      include_silent: true,
+    });
+    // Both keys collapse to room `!a` → exactly one native fetch.
+    assert.equal(calls.length, 1, `expected a single fetch per unique room, got ${calls.length}: ${calls.join(", ")}`);
+    // The union is still correct: @d (a member who never posted) surfaces at total 0.
+    const byId = new Map(
+      (res.details as { senders: Array<{ senderId: string; total: number; neverPosted: boolean }> }).senders.map((s) => [s.senderId, s]),
+    );
+    assert.equal(byId.get("@d")?.total, 0);
+    assert.equal(byId.get("@d")?.neverPosted, true);
+    assert.equal(byId.get("@a")?.neverPosted, false);
+  });
+});
+
 test("include_silent for rooms:all is rejected with a note (no concrete scope)", async () => {
   const members = async (): Promise<RoomMemberLite[]> => [{ userId: "@x" }];
   await withTool(RECENT, members, async (tool) => {
