@@ -63,6 +63,54 @@ test("aggregate dedups by distinct sender and orders by count desc, display asc"
   });
 });
 
+test("aggregate ordering is byte-for-byte deterministic on a (count, display) tie", async () => {
+  // Two distinct normalized_key groups with equal count (1) AND equal display
+  // ("👍" — different keys, same glyph): without a final normalized_key tiebreaker
+  // their relative order is SQLite-undefined. The order must be stable and identical
+  // every time (§9 byte-for-byte invariant).
+  await withStorage(async (storage) => {
+    await storage.upsertReaction(
+      reaction({ reactionEventId: "$rA", senderId: "@a:test", display: "👍", normalizedKey: "kZ" }),
+    );
+    await storage.upsertReaction(
+      reaction({ reactionEventId: "$rB", senderId: "@b:test", display: "👍", normalizedKey: "kA" }),
+    );
+
+    const first = storage.getReactionAggregates(["$msg1"]).get("$msg1");
+    const second = storage.getReactionAggregates(["$msg1"]).get("$msg1");
+    assert.deepEqual(first, second, "repeated calls must yield identical ordering");
+    // normalized_key asc is the final tiebreaker → kA before kZ.
+    assert.deepEqual(
+      first?.map((r) => r.normalizedKey),
+      ["kA", "kZ"],
+    );
+  });
+});
+
+test("aggregate picks a stable representative across a variation-selector split", async () => {
+  // Two rows share a normalized_key (variation-selector-stripped) but their `display`
+  // glyph differs ("❤️" with VS16 vs bare "❤"). The grouped `display` must be a
+  // deterministic representative (min(display)), not an arbitrary row's value.
+  await withStorage(async (storage) => {
+    const withVs = "❤️"; // ❤️
+    const bare = "❤"; // ❤
+    await storage.upsertReaction(
+      reaction({ reactionEventId: "$r1", senderId: "@a:test", display: withVs, normalizedKey: "❤" }),
+    );
+    await storage.upsertReaction(
+      reaction({ reactionEventId: "$r2", senderId: "@b:test", display: bare, normalizedKey: "❤" }),
+    );
+
+    const first = storage.getReactionAggregates(["$msg1"]).get("$msg1");
+    const second = storage.getReactionAggregates(["$msg1"]).get("$msg1");
+    assert.equal(first?.length, 1, "both rows fold into one normalized_key group");
+    assert.deepEqual(first, second, "the chosen glyph must be deterministic");
+    // min() of the two glyphs: bare "❤" (U+2764) sorts before "❤️" (U+2764 U+FE0F).
+    assert.equal(first?.[0].display, bare);
+    assert.equal(first?.[0].count, 2);
+  });
+});
+
 test("upsert is idempotent on duplicate delivery of the same reaction event id", async () => {
   await withStorage(async (storage) => {
     await storage.upsertReaction(reaction({ reactionEventId: "$r1" }));
