@@ -900,6 +900,61 @@ test("session: an expired override falls back to the default dialog_policy", asy
   });
 });
 
+// ── console buffer (console + pageerror ring) ────────────────────────────────
+
+/** A fake page that records on() handlers and can emit events to them. */
+function makeConsolePage() {
+  const handlers: Record<string, Array<(arg: unknown) => void>> = {};
+  return {
+    on(event: string, cb: (arg: unknown) => void) { (handlers[event] ??= []).push(cb); },
+    emit(event: string, arg: unknown) { for (const h of handlers[event] ?? []) h(arg); },
+    url: () => "https://example.com",
+  };
+}
+
+type TrackPrivate = {
+  trackPage(id: string, state: unknown, page: unknown): void;
+  getOrCreateState(id: string): unknown;
+};
+
+test("session: console buffer captures console + pageerror, drains once", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      page.emit("console", { type: () => "log", text: () => "hello" });
+      page.emit("pageerror", new Error("boom"));
+      assert.deepEqual(session.drainConsole(page as never), [
+        { level: "log", text: "hello" },
+        { level: "error", text: "boom" },
+      ]);
+      assert.deepEqual(session.drainConsole(page as never), [], "second drain is empty");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: console buffer is bounded to the last 200 messages", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      for (let i = 0; i < 250; i++) page.emit("console", { type: () => "log", text: () => `m${i}` });
+      const drained = session.drainConsole(page as never);
+      assert.equal(drained.length, 200, "capped at CONSOLE_BUFFER_MAX");
+      assert.equal(drained[0]!.text, "m50", "oldest over the cap dropped");
+      assert.equal(drained[199]!.text, "m249", "newest kept");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
 test("session: a down Manager surfaces backend_unavailable (graceful degradation)", async () => {
   await withWorkspace(async (ws) => {
     const manager = stubManager({ throwOnFetch: true });

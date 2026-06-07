@@ -141,7 +141,7 @@ test("browser docker: end-to-end navigate + snapshot + screenshot through the Ma
   }
 });
 
-test("browser docker: feature additions (rich-wait, element shot, modifiers, upload, clear, drag, dialog, pdf)", { skip, timeout: 240_000 }, async () => {
+test("browser docker: feature additions (rich-wait, element shot, modifiers, upload, clear, drag, dialog, pdf, console)", { skip, timeout: 240_000 }, async () => {
   spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
   execFileSync("docker", [
     "run", "-d", "--name", CONTAINER,
@@ -265,6 +265,16 @@ test("browser docker: feature additions (rich-wait, element shot, modifiers, upl
     const pdfBytes = await readFile(path.join(ws, pdfPath));
     assert.ok(pdfBytes.byteLength > 0, "pdf is non-empty");
     assert.equal(pdfBytes.subarray(0, 5).toString("latin1"), "%PDF-", "pdf has the magic header");
+
+    // ── console: console.log + an uncaught page error are buffered + drained ──
+    await exec({ action: "navigate", url: "https://example.com/" });
+    await evalText(`console.log('hello-from-page'); setTimeout(() => { throw new Error('console-test-error'); }, 0); 'logged'`);
+    await exec({ action: "act", kind: "wait", ms: 300 });
+    const consoleText = textOf(await exec({ action: "console" }));
+    assert.match(consoleText, /hello-from-page/, "console.log captured");
+    assert.match(consoleText, /console-test-error/, "uncaught page error captured");
+    // Drained: a second read has nothing new from before.
+    assert.match(textOf(await exec({ action: "console" })), /no console messages/, "buffer drained on read");
   } finally {
     if (session) await session.shutdown();
     spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });

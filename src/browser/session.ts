@@ -30,6 +30,16 @@ export interface DownloadRecord {
   url: string;
 }
 
+/** One buffered console/pageerror line, drained by the `console` action. */
+export interface ConsoleEntry {
+  /** console level (`log`/`info`/`warning`/`error`/…) or `error` for a pageerror. */
+  level: string;
+  text: string;
+}
+
+/** Cap each page's console buffer so it can't grow without bound. */
+const CONSOLE_BUFFER_MAX = 200;
+
 interface SessionState {
   /** Tabs owned by this chat session, in open order. */
   pages: Page[];
@@ -124,6 +134,12 @@ export class BrowserSession {
    * that tab's next dialog. WeakMap → no cleanup needed when a page is GC'd.
    */
   private readonly dialogOverrides = new WeakMap<Page, { accept: boolean; promptText?: string; expiresAt: number }>();
+  /**
+   * Per-page console + pageerror ring buffers, drained by the `console` action.
+   * Standing instrumentation wired at page setup; bounded at CONSOLE_BUFFER_MAX.
+   * WeakMap → buffers are GC'd with their page, no explicit cleanup.
+   */
+  private readonly consoleBuffers = new WeakMap<Page, ConsoleEntry[]>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   private readonly connectOverCdp: ConnectOverCdp;
@@ -572,6 +588,27 @@ export class BrowserSession {
     page.on("download", (download: Download) => {
       void this.handleDownload(sessionId, state, download);
     });
+    // Console + uncaught page errors → a bounded per-page buffer the agent can
+    // drain via the `console` action to self-diagnose a silently-failing page.
+    this.consoleBuffers.set(page, []);
+    page.on("console", (msg) => this.pushConsole(page, { level: msg.type(), text: msg.text() }));
+    page.on("pageerror", (err: Error) => this.pushConsole(page, { level: "error", text: err?.message ?? String(err) }));
+  }
+
+  private pushConsole(page: Page, entry: ConsoleEntry): void {
+    const buf = this.consoleBuffers.get(page);
+    if (!buf) return;
+    buf.push(entry);
+    if (buf.length > CONSOLE_BUFFER_MAX) buf.splice(0, buf.length - CONSOLE_BUFFER_MAX);
+  }
+
+  /** Drain (and clear) buffered console/pageerror messages for `page`. */
+  drainConsole(page: Page): ConsoleEntry[] {
+    const buf = this.consoleBuffers.get(page);
+    if (!buf || buf.length === 0) return [];
+    const out = buf.slice();
+    buf.length = 0;
+    return out;
   }
 
   private async handleDialog(page: Page, dialog: Dialog): Promise<void> {

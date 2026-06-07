@@ -51,7 +51,7 @@ export interface BrowserToolContext {
   workspaceRoot: string;
 }
 
-const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "pdf", "tabs", "open", "close"] as const;
+const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "pdf", "console", "tabs", "open", "close"] as const;
 const ACT_KINDS: ActKind[] = [
   "click", "type", "press", "hover", "select", "fill", "scroll", "wait", "back", "evaluate",
   "drag", "upload", "clear_site_data", "dialog",
@@ -75,6 +75,7 @@ const DESCRIPTION = [
   "    dialog takes `accept` (true/false) and optional `prompt_text`; it arms the NEXT JS dialog — arm it BEFORE the click/act that triggers the dialog. Without it, dialogs are auto-handled by the deployment's dialog_policy.",
   "- screenshot { full_page?, ref?, format? }: return an image to look at. With `ref`, capture just that element (full_page is ignored). `format` is png (default) or jpeg.",
   "- pdf: save the current page to the workspace as a PDF and return its path. You CANNOT read the PDF back — use it to save a page (article/receipt/report) and send the path to the user via the message tool.",
+  "- console: return buffered console + page-error messages since the last read, to diagnose why a page misbehaves. Prefer re-snapshot + retry first.",
   "- open { url? }: open a new tab (optionally navigate it). close { index }: close a tab.",
   "- tabs: list this session's tabs; pass `index` to switch the active tab.",
   "",
@@ -325,6 +326,18 @@ async function dispatch(
           },
         ],
         details: { action: "pdf", url: record.url, path: record.path, filename: record.filename },
+      };
+    }
+
+    case "console": {
+      const page = await session.getActivePage(sessionId);
+      const messages = session.drainConsole(page);
+      const text = messages.length
+        ? messages.map((m) => `[${m.level}] ${m.text}`).join("\n")
+        : "(no console messages since the last read)";
+      return {
+        content: [{ type: "text", text }],
+        details: { action: "console", url: page.url(), count: messages.length },
       };
     }
 
