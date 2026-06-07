@@ -70,6 +70,7 @@ function config(): BrowserConfig {
     geoip: false,
     dialog_policy: "dismiss",
     snapshot_max_chars: 20000,
+    snapshot_max_frames: 10,
     nav_timeout_ms: 45000,
     act_timeout_ms: 20000,
     connect_timeout_ms: 30000,

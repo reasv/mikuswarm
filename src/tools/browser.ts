@@ -15,7 +15,7 @@ import {
   isBrowserError,
   isTimeoutError,
   mapError,
-  REF_RE,
+  requireRefLocator,
   type ActKind,
   type ActParams,
   type BrowserSession,
@@ -248,13 +248,15 @@ async function dispatch(
       const format: ScreenshotFormat = args.format ?? "png";
       // With a `ref`, capture just that element; otherwise capture the page.
       // full_page has no meaning for an element capture, so it's ignored there.
+      // requireRefLocator validates the ref shape (bad_request) and resolves a
+      // frame-namespaced ref to its owning frame (missing frame → ref_expired),
+      // matching how `act` targets elements — it's called BEFORE the try so its
+      // structured errors propagate as-is rather than through the screenshot
+      // error mapper below.
       const elementRef = args.ref;
-      if (elementRef !== undefined && !REF_RE.test(elementRef)) {
-        throw new BrowserError("bad_request", `Invalid ref "${elementRef}" — expected a snapshot handle like "e12".`);
-      }
+      const target = elementRef ? requireRefLocator(page, elementRef, "screenshot") : page;
       let buffer: Buffer;
       try {
-        const target = elementRef ? page.locator(`aria-ref=${elementRef}`) : page;
         buffer = await target.screenshot({
           ...(elementRef ? {} : { fullPage: args.full_page ?? false }),
           type: format,
@@ -348,7 +350,7 @@ async function pageResult(
   config: BrowserConfig,
   header: string,
 ): Promise<AgentToolResult<unknown>> {
-  const snap = await aiSnapshot(page, config.snapshot_max_chars);
+  const snap = await aiSnapshot(page, config.snapshot_max_chars, config.snapshot_max_frames);
   const downloads = session.drainDownloads(sessionId);
   return {
     content: [{ type: "text", text: `${header}${renderDownloads(downloads)}\n\n${snap.text}` }],

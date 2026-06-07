@@ -76,7 +76,12 @@ export interface ActOptions {
   evaluateEnabled: boolean;
 }
 
-export const REF_RE = /^e\d+$/;
+// A ref handle is either a bare main-document `eN` or a frame-namespaced
+// `fN:eN` (N = index into page.frames()). REF_RE accepts both; BARE_REF_RE and
+// FRAME_REF_RE split the two cases when resolving the owning frame.
+export const REF_RE = /^(?:f\d+:)?e\d+$/;
+const BARE_REF_RE = /^e\d+$/;
+const FRAME_REF_RE = /^f(\d+):(e\d+)$/;
 const MAX_WAIT_MS = 30_000;
 
 export interface ActResult {
@@ -309,19 +314,38 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
 
 /**
  * Validate a `ref`'s shape and build its `aria-ref` locator. Shared by `withRef`
- * (single-target acts) and the multi-target acts (`drag` source + target) so a
- * malformed ref produces a consistent `bad_request` everywhere. Does NOT run the
- * action — the caller owns error mapping (stale-ref detection happens when the
- * locator fails to resolve).
+ * (single-target acts), the multi-target acts (`drag` source + target), and the
+ * tool-layer element screenshot, so a malformed ref produces a consistent
+ * `bad_request` everywhere. A frame-namespaced ref (`fN:eN`) resolves against
+ * `page.frames()[N]`; a missing/detached frame surfaces as `ref_expired` (take a
+ * fresh snapshot). A bare ref resolves against the main document exactly as
+ * before. Does NOT run the action — the caller owns error mapping for the
+ * resolved locator (stale element-ref detection happens when it fails to
+ * resolve).
  */
-function requireRefLocator(
+export function requireRefLocator(
   page: Page,
   ref: string | undefined,
   kindLabel: string,
 ): ReturnType<Page["locator"]> {
   if (!ref) throw new BrowserError("bad_request", `act:${kindLabel} requires a \`ref\` from the latest snapshot.`);
-  if (!REF_RE.test(ref)) {
-    throw new BrowserError("bad_request", `Invalid ref "${ref}" — expected a snapshot handle like "e12".`);
+  const framed = ref.match(FRAME_REF_RE);
+  if (framed) {
+    const frameIndex = Number(framed[1]);
+    const bareRef = framed[2]!;
+    const frame = page.frames()[frameIndex];
+    if (!frame) {
+      // Frame indices are snapshot-scoped: a frame that navigated/detached since
+      // the snapshot is gone from page.frames() → treat as expired (re-snapshot).
+      throw new BrowserError(
+        "ref_expired",
+        `Frame ref ${ref} did not resolve (frame f${frameIndex} likely navigated or detached). Take a fresh \`snapshot\` and retry with a current ref.`,
+      );
+    }
+    return frame.locator(`aria-ref=${bareRef}`);
+  }
+  if (!BARE_REF_RE.test(ref)) {
+    throw new BrowserError("bad_request", `Invalid ref "${ref}" — expected a snapshot handle like "e12" or "f1:e3".`);
   }
   return page.locator(`aria-ref=${ref}`);
 }

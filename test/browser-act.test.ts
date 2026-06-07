@@ -14,6 +14,8 @@ interface FakeOpts {
   dragError?: Error;
   setFilesError?: Error;
   cdpSendError?: Error;
+  /** Number of CHILD frames page.frames() exposes (index 0 is the main frame). */
+  frameCount?: number;
 }
 
 function recordingPage(opts: FakeOpts = {}) {
@@ -82,6 +84,16 @@ function recordingPage(opts: FakeOpts = {}) {
     locator(sel: string) {
       return makeLocator(sel);
     },
+    // frames()[0] is the main document; child frames tag their locator selectors
+    // with `frameN:` so a namespaced ref's resolution target is observable.
+    frames() {
+      const main = { locator: (sel: string) => makeLocator(sel) };
+      const children = [];
+      for (let i = 1; i <= (opts.frameCount ?? 0); i++) {
+        children.push({ locator: (sel: string) => makeLocator(`frame${i}:${sel}`) });
+      }
+      return [main, ...children];
+    },
     getByText(t: string) {
       calls.push(["getByText", t]);
       return makeLocator(`text=${t}`);
@@ -122,6 +134,31 @@ const OPTS = { timeoutMs: 15000, evaluateEnabled: false };
 function run(page: ReturnType<typeof recordingPage>, params: ActParams) {
   return act(page as never, params, OPTS);
 }
+
+// ── frame-namespaced refs ──────────────────────────────────────────────────────
+
+test("act on a bare ref still resolves against the main document", async () => {
+  const page = recordingPage({ frameCount: 2 });
+  await run(page, { kind: "click", ref: "e5" });
+  const call = page.calls.find((c) => c[0] === "click") as [string, string, unknown];
+  assert.equal(call[1], "aria-ref=e5", "bare ref hits the page-level locator");
+});
+
+test("act on a frame-namespaced ref (f1:e3) clicks inside that frame", async () => {
+  const page = recordingPage({ frameCount: 2 });
+  const r = await run(page, { kind: "click", ref: "f1:e3" });
+  assert.equal(r.detail, "clicked f1:e3");
+  const call = page.calls.find((c) => c[0] === "click") as [string, string, unknown];
+  assert.equal(call[1], "frame1:aria-ref=e3", "ref resolved against frames()[1]");
+});
+
+test("act on a ref for a missing/detached frame surfaces as ref_expired", async () => {
+  const page = recordingPage({ frameCount: 1 }); // only f1 exists
+  await assert.rejects(
+    () => run(page, { kind: "click", ref: "f2:e1" }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
 
 // ── click modifiers ──────────────────────────────────────────────────────────
 

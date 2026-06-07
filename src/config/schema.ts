@@ -388,6 +388,11 @@ const BrowserSchema = Type.Object({
   dialog_policy: Type.Union([Type.Literal("dismiss"), Type.Literal("accept")]),
   // Truncate AI snapshots to bound context cost.
   snapshot_max_chars: Type.Integer({ minimum: 1000 }),
+  // Max child frames (iframes) descended into per snapshot. 0 ⇒ main document
+  // only (the pre-frames behavior). Child-frame content is appended under
+  // [frame fN: url] boundaries with refs namespaced fN:eN, all still bounded by
+  // snapshot_max_chars (a page full of ad iframes can't blow the budget).
+  snapshot_max_frames: Type.Integer({ minimum: 0 }),
   // Per-navigation / per-action / connect (incl. first-launch cold start) timeouts.
   // Floor of 1000ms: a sub-second op/nav/connect timeout would spuriously fail
   // real work; the previous minimum of 1ms was a footgun, not a useful setting.
