@@ -283,8 +283,8 @@ export interface ReactionUpsert {
   targetEventId: string;
   senderId: string;
   senderDisplay: string | null;
-  /** 'unicode' | 'custom' | 'text' (mirrors MatrixReactionKind). */
-  kind: string;
+  /** Mirrors MatrixReactionKind; narrowed so a bad value can't reach the CHECK. */
+  kind: "unicode" | "custom" | "text";
   display: string;
   shortcode: string | null;
   normalizedKey: string;
@@ -4479,7 +4479,9 @@ export class Storage {
   /**
    * Upsert one reaction (action "add"). Idempotent on duplicate delivery:
    * `insert or ignore` keyed on the reaction's own event id leaves any existing
-   * row (including a tombstoned one) untouched.
+   * row (including a tombstoned one) untouched. Note `or ignore` also swallows
+   * CHECK-constraint failures (e.g. a `kind` outside the allowed set) silently —
+   * the narrowed `ReactionUpsert.kind` union is the compile-time guard against that.
    */
   upsertReaction(row: ReactionUpsert): Promise<void> {
     return this.write((db) => {
@@ -4536,13 +4538,24 @@ export class Storage {
         const placeholders = batch.map(() => "?").join(", ");
         const rows = db
           .prepare(
+            // Bare aggregates over a GROUP BY pick an arbitrary row in SQLite, so a
+            // normalized_key group whose rows differ only by a variation selector
+            // (`❤️` vs `❤`) would yield a non-deterministic glyph + sort key. Take a
+            // stable representative for each non-grouped column via min(). `kind` is
+            // constant within a normalized_key group (unicode glyph vs custom mxc://),
+            // so min(kind) is a coherent pairing, not an arbitrary cross-row mix.
+            // The final `normalized_key asc` is a total-order tiebreaker (the GROUP BY
+            // key is unique per group) so equal-(count, display) groups don't sort in
+            // SQLite-undefined order. Together this makes the result byte-for-byte
+            // deterministic (ARCHITECTURE.md §9 invariant).
             `select target_event_id as targetEventId, normalized_key as normalizedKey,
-                    kind, display, shortcode, count(distinct sender_id) as count
+                    min(kind) as kind, min(display) as display, min(shortcode) as shortcode,
+                    count(distinct sender_id) as count
              from reactions
              where target_event_id in (${placeholders})
                and redacted_at is null
              group by target_event_id, normalized_key
-             order by count desc, display asc`,
+             order by count desc, display asc, normalized_key asc`,
           )
           .all(...batch) as ReactionAggregateRow[];
         for (const row of rows) {
@@ -4809,7 +4822,7 @@ create trigger if not exists summaries_ad after delete on summaries begin
 end;
 `;
 
-// Passive reaction store (ARCHITECTURE.md §6/§9f, tmp/REACTIONS_DESIGN.md §4): the
+// Passive reaction store (ARCHITECTURE.md §6/§9f): the
 // source of truth for emoji reactions the agent passively perceives. Deliberately
 // NOT part of the timeline — a reaction is a mutable many-to-one relation (N
 // senders, add/remove over time) folded onto one target message, injected only at
@@ -4820,7 +4833,7 @@ end;
 // event id (== CanonicalChatEvent.externalId), not the internal `timeline_events.id`,
 // and a reaction may legitimately reference a message not (or no longer) stored.
 // `if not exists` makes this block safe to run both as the fresh-DB schema and as
-// the v13->v14 migration (which simply re-execs it), so the two cannot drift.
+// the v14->v15 migration (which simply re-execs it), so the two cannot drift.
 const REACTIONS_SCHEMA = `
 create table if not exists reactions (
   -- The m.reaction event's OWN id ($...). Redactions name this id, so an un-react
@@ -4856,8 +4869,10 @@ create table if not exists reactions (
 );
 -- Both views match by target_event_id (View A aggregates per target, View B fetches
 -- live rows for a target set). Partial on the live rows since tombstones never
--- render. Carries reacted_at so View B's oldest-first scan and View A's grouping
--- are served from the index without touching the heap for the ordering key.
+-- render. Carries reacted_at so View B's oldest-first scan is fully index-served and
+-- View A's target+live-row filter is index-served. View A's aggregation itself still
+-- hits the heap: it groups on normalized_key and counts distinct sender_id, neither
+-- of which is in the index. Fine at the rich tier's small row counts.
 create index if not exists idx_reactions_by_target
   on reactions(target_event_id, reacted_at) where redacted_at is null;
 `;
