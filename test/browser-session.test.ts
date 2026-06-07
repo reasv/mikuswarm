@@ -984,6 +984,26 @@ test("session: an armed dismiss override dismisses the next dialog", async () =>
   });
 });
 
+test("session: an armed dismiss override beats the alert auto-accept special-case", async () => {
+  await withWorkspace(async (ws) => {
+    // Alerts normally ALWAYS accept (nothing to dismiss) — see handleDialog's
+    // `dialog.type() === "alert"` branch. An armed dismiss override must run
+    // BEFORE that special-case and dismiss the alert. This guards against a
+    // future refactor moving the override check below the alert branch.
+    const session = newSession(ws, { dialog_policy: "dismiss" });
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, false, undefined);
+      const d = fakeDialog("alert");
+      await priv.handleDialog(page, d);
+      assert.deepEqual(d.calls, [["dismiss", undefined]], "armed dismiss overrode the alert auto-accept");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
 test("session: an expired override falls back to the default dialog_policy", async () => {
   await withWorkspace(async (ws) => {
     const session = newSession(ws, { dialog_policy: "dismiss" });

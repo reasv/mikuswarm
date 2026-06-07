@@ -370,7 +370,9 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
       // ergonomic flow is: arm `dialog`, THEN perform the act that triggers it
       // (a JS dialog blocks the page, so it can't be triggered in this same
       // call). The override is consumed by the next dialog or expires on the
-      // session side (see BrowserSession.armDialog) so it can't leak.
+      // session side (see BrowserSession.armDialog) so it can't leak. If no
+      // dialog ever fires, the override just expires silently — act:dialog does
+      // NOT wait for or time out on a dialog, so there is no act_timeout here.
       if (typeof params.accept !== "boolean") {
         throw new BrowserError("bad_request", "act:dialog requires `accept` (boolean).");
       }

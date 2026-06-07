@@ -702,6 +702,12 @@ export class BrowserSession {
       // hijack a later, unrelated dialog.
       const override = this.dialogOverrides.get(page);
       if (override) {
+        // Delete BEFORE the expiry check by design: an expired override is
+        // eagerly consumed even by an unrelated later dialog. That's the correct
+        // outcome — the override's window has passed, so this dialog must get the
+        // default policy AND the stale slot must not survive to hijack the next
+        // dialog after it. (Consuming an expired slot here only ever falls through
+        // to the same default policy that an absent slot would.)
         this.dialogOverrides.delete(page);
         if (override.expiresAt >= Date.now()) {
           if (override.accept) await dialog.accept(override.promptText);
@@ -732,6 +738,11 @@ export class BrowserSession {
    * act_timeout_ms so it can't leak into a later, unrelated dialog. Coordinates
    * with handleDialog via the dialogOverrides slot the default handler checks
    * first.
+   *
+   * The override binds to the tab passed here (the active tab at arm time). If a
+   * tab switch happens before the triggering act, the new tab's dialog has no
+   * override and falls through to the default dialog_policy with no error — so
+   * arm immediately before the triggering act on the same tab.
    */
   armDialog(page: Page, accept: boolean, promptText: string | undefined): void {
     this.dialogOverrides.set(page, {
