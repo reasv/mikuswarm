@@ -569,6 +569,12 @@ export const AppConfigSchema = Type.Object({
   })),
   network: Type.Optional(Type.Object({
     http_proxy_url: Type.Optional(Type.String()),
+    // App-layer SSRF guard (defense-in-depth). When true (default), outbound
+    // fetches from caller-supplied URLs resolve DNS and reject private/loopback/
+    // link-local/metadata addresses, re-validating every redirect hop. Set false
+    // only where the container/network firewall already blocks private egress
+    // (see docker/95-docker.toml + docker/egress-rules.sh).
+    ssrf_guard: Type.Optional(Type.Boolean()),
   })),
   image_gen: Type.Optional(ImageGenSchema),
   observability: Type.Optional(ObservabilitySchema),

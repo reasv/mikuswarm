@@ -1,9 +1,9 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { assertPublicHttpUrl } from "./ssrf.js";
+import { guardedFetch } from "./ssrf.js";
 
 const WEB_FETCH_SECURITY_NOTE =
-  "Blocks localhost/private IPs before each request and redirect. DNS is not pinned, so this is defense-in-depth rather than a complete SSRF sandbox.";
+  "When the egress guard is enabled, blocks localhost/private IPs before each request and redirect. DNS is not pinned, so this is defense-in-depth rather than a complete SSRF sandbox; the network firewall is the real boundary.";
 
 export function createWebFetchTool(): AgentTool {
   return {
@@ -17,7 +17,7 @@ export function createWebFetchTool(): AgentTool {
     execute: async (_toolCallId, params) => {
       const args = params as { url: string; max_chars?: number };
       const url = normalizeHttpUrl(args.url);
-      const response = await guardedFetch(url);
+      const response = await guardedFetch(url, { headers: { "user-agent": "mikuswarm/0.1" } });
       if (!response.ok) throw new Error(`Fetch failed with HTTP ${response.status}`);
       const contentType = response.headers.get("content-type") ?? "";
       const raw = await response.text();
@@ -89,25 +89,6 @@ function normalizeHttpUrl(value: string): string {
     throw new Error("Only http and https URLs are supported.");
   }
   return url.toString();
-}
-
-async function guardedFetch(url: string, redirects = 0): Promise<Response> {
-  if (redirects > 5) throw new Error("Too many redirects.");
-  await assertPublicHttpUrl(url);
-  const response = await fetch(url, {
-    headers: { "user-agent": "mikuswarm/0.1" },
-    redirect: "manual",
-  });
-  if (isRedirect(response.status)) {
-    const location = response.headers.get("location");
-    if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
-    return guardedFetch(new URL(location, url).toString(), redirects + 1);
-  }
-  return response;
-}
-
-function isRedirect(status: number): boolean {
-  return status >= 300 && status < 400;
 }
 
 function htmlToText(html: string): string {

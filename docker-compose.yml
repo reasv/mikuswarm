@@ -10,6 +10,10 @@
 #   2. Create host data dirs:  sudo mkdir -p /srv/miku/workspace /srv/miku/var
 #   3. Copy config/90-local.toml into place (identity/models/matrix) and
 #      cp .env.example .env, then fill in the secrets.
+#   4. After `up`, harden the agent's egress (operator root step — the network
+#      firewall is the SSRF boundary, since the app-layer guard is off in docker,
+#      docker/95-docker.toml):  sudo MIKUSWARM_AGENT_NETWORK=miku docker/agent-egress-rules.sh
+#      Reapply after reboot / `docker compose up` recreates the network.
 #
 # NOT started here (by design):
 #   - The sandbox container — created/driven by the agent via /var/run/docker.sock.
@@ -23,6 +27,10 @@ name: miku
 networks:
   miku:
     name: miku
+    # IPv6 off so docker/agent-egress-rules.sh gives a single closed IPv4
+    # boundary (its RFC1918 drops + DNS pin are IPv4); a v6-enabled bridge would
+    # route around them. Mirrors the sandbox/browser bridges.
+    enable_ipv6: false
 
 services:
   agent:
@@ -35,6 +43,14 @@ services:
     env_file: .env
     environment:
       MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+    # Pin external DNS to public resolvers so name resolution survives the
+    # agent-egress-rules.sh RFC1918 drops (the embedded resolver would otherwise
+    # forward to the host's LAN/loopback nameservers, which are blocked). Compose
+    # service names (agent/console) still resolve via docker's embedded DNS. Keep
+    # in sync with PUBLIC_RESOLVERS in docker/egress-rules.sh.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     extra_hosts:
       # Lets the agent reach the optional, host-published CloakBrowser-Manager
       # (127.0.0.1:8080) at http://host.docker.internal:8080. Harmless if unused.

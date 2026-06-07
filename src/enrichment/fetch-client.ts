@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { ProxyAgent, type Dispatcher } from "undici";
-import { assertPublicHttpUrl } from "../tools/ssrf.js";
+import { guardedFetch } from "../tools/ssrf.js";
 
 export interface FetchClientOptions {
   maxConcurrency: number;
@@ -40,22 +40,6 @@ export function buildProxyDispatcher(httpProxyUrl: string | undefined): Dispatch
 export interface FetchOptions {
   maxBytes?: number;
   outputPath?: string;
-  /**
-   * Opt-in SSRF redirect guard. When set, the fetch uses `redirect: "manual"`
-   * and re-validates every redirect `Location` hop with `assertPublicHttpUrl`
-   * before following it (capped at {@link MAX_REDIRECT_HOPS}). Callers that feed
-   * untrusted, caller-supplied URLs (e.g. image_generate reference images) must
-   * enable this so a public URL cannot 302-redirect to a private/metadata host.
-   * Off by default to preserve existing behavior for trusted callers.
-   */
-  ssrfGuard?: boolean;
-}
-
-/** Redirect-hop cap for the SSRF guard, mirroring `web.ts` guardedFetch. */
-const MAX_REDIRECT_HOPS = 5;
-
-function isRedirectStatus(status: number): boolean {
-  return status >= 300 && status < 400;
 }
 
 export class ConcurrencyLimitedFetchClient {
@@ -97,16 +81,13 @@ export class ConcurrencyLimitedFetchClient {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs);
       try {
-        const response = options?.ssrfGuard
-          ? await this.fetchGuarded(url, controller.signal)
-          : await globalThis.fetch(url, {
-              signal: controller.signal,
-              redirect: "follow",
-              headers: { "User-Agent": "MikuAgent/1.0" },
-              // Node's native fetch is built on undici and accepts a dispatcher
-              // here at runtime, but the type is not in the lib.dom Request init.
-              ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
-            } as RequestInit);
+        // All fetch-client callers pull caller/external-supplied asset URLs, so
+        // the egress guard always applies here (it self-gates on the global
+        // `network.ssrf_guard` switch). The dispatcher carries the shared proxy.
+        const response = await guardedFetch(url, {
+          signal: controller.signal,
+          dispatcher: this.dispatcher,
+        });
 
         const limit = options?.maxBytes ?? this.options.maxResponseBytes;
         const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);
@@ -156,33 +137,6 @@ export class ConcurrencyLimitedFetchClient {
     } finally {
       this.active--;
       this.processQueue();
-    }
-  }
-
-  /**
-   * SSRF-guarded fetch: resolves the redirect chain manually, re-validating
-   * each `Location` hop with `assertPublicHttpUrl` before following it. The
-   * proxy dispatcher, abort signal, and User-Agent match the unguarded path;
-   * only the redirect handling differs. Returns the final non-redirect
-   * `Response` so the caller can stream its body exactly as before.
-   */
-  private async fetchGuarded(url: string, signal: AbortSignal): Promise<Response> {
-    let current = url;
-    for (let hop = 0; ; hop++) {
-      if (hop > MAX_REDIRECT_HOPS) throw new Error("Too many redirects.");
-      await assertPublicHttpUrl(current);
-      const response = await globalThis.fetch(current, {
-        signal,
-        redirect: "manual",
-        headers: { "User-Agent": "MikuAgent/1.0" },
-        ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
-      } as RequestInit);
-      if (!isRedirectStatus(response.status)) return response;
-      const location = response.headers.get("location");
-      if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
-      // Discard the redirect response body before following the next hop.
-      await response.body?.cancel().catch(() => {});
-      current = new URL(location, current).toString();
     }
   }
 

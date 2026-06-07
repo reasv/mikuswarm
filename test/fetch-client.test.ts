@@ -3,21 +3,23 @@ import test from "node:test";
 import { rm } from "node:fs/promises";
 
 import { ConcurrencyLimitedFetchClient } from "../src/enrichment/fetch-client.js";
+import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 
 // ---------------------------------------------------------------------------
-// SSRF redirect guard (issue #1 / #5)
+// Egress guard redirect handling (issue #1 / #5)
 //
-// The per-hop guard lives in `fetchGuarded`: with `ssrfGuard:true` the client
-// switches to `redirect: "manual"` and re-runs `assertPublicHttpUrl` on every
-// `Location` hop before following it. The real risk is a *public* URL that
+// The client now always routes through the shared `guardedFetch`, which
+// self-gates on the global `network.ssrf_guard` switch (default ON). With the
+// guard ON it uses `redirect: "manual"` and re-runs `assertPublicHttpUrl` on
+// every `Location` hop before following it. The real risk is a *public* URL that
 // 302-redirects to a private/metadata host (169.254.169.254, loopback, ...).
 //
 // `assertPublicHttpUrl` blocks loopback (127.0.0.1) on the FIRST hop, so we
 // cannot start a real redirect chain from a loopback test server. Instead we
 // stub `globalThis.fetch` to play back the HTTP responses while keeping the
-// REAL `assertPublicHttpUrl` + REAL `fetchGuarded` redirect loop under test.
-// First hops use public IP literals (no DNS) so the guard passes them; the
-// redirect target is what we vary.
+// REAL guard + REAL redirect loop under test. First hops use public IP literals
+// (no DNS) so the guard passes them; the redirect target is what we vary. The
+// final test flips the switch OFF to prove the guard can be disabled.
 // ---------------------------------------------------------------------------
 
 /** A public IPv4 literal that `assertPublicHttpUrl` accepts without any DNS. */
@@ -64,7 +66,7 @@ function makeClient(): ConcurrencyLimitedFetchClient {
   });
 }
 
-test("ssrfGuard rejects a 302 redirect to a private/metadata host", async () => {
+test("egress guard rejects a 302 redirect to a private/metadata host", async () => {
   const stub = stubFetch((url) => {
     if (url.includes(PUBLIC_IP_A)) return { status: 302, location: `http://${METADATA_IP}/latest/meta-data/` };
     // The metadata host must never be fetched — if we get here the guard failed.
@@ -73,7 +75,7 @@ test("ssrfGuard rejects a 302 redirect to a private/metadata host", async () => 
   const client = makeClient();
   try {
     await assert.rejects(
-      client.fetch(`http://${PUBLIC_IP_A}/start`, { ssrfGuard: true }),
+      client.fetch(`http://${PUBLIC_IP_A}/start`),
       /private address is blocked|Local/i,
     );
     // The guard validated the first hop, saw the 302, and rejected the target
@@ -85,7 +87,7 @@ test("ssrfGuard rejects a 302 redirect to a private/metadata host", async () => 
   }
 });
 
-test("ssrfGuard follows a 302 between two public hops and returns the final 200", async () => {
+test("egress guard follows a 302 between two public hops and returns the final 200", async () => {
   const stub = stubFetch((url) => {
     if (url.includes(PUBLIC_IP_A)) return { status: 302, location: `http://${PUBLIC_IP_B}/final` };
     return { status: 200, body: Buffer.from("payload-bytes"), contentType: "image/png" };
@@ -93,7 +95,7 @@ test("ssrfGuard follows a 302 between two public hops and returns the final 200"
   const client = makeClient();
   let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
   try {
-    result = await client.fetch(`http://${PUBLIC_IP_A}/start`, { ssrfGuard: true });
+    result = await client.fetch(`http://${PUBLIC_IP_A}/start`);
     assert.equal(result.statusCode, 200);
     assert.equal(result.sizeBytes, Buffer.from("payload-bytes").byteLength);
     assert.equal(result.contentType, "image/png");
@@ -106,12 +108,12 @@ test("ssrfGuard follows a 302 between two public hops and returns the final 200"
   }
 });
 
-test("ssrfGuard passes through a direct (no-redirect) public 200 unchanged", async () => {
+test("egress guard passes through a direct (no-redirect) public 200 unchanged", async () => {
   const stub = stubFetch(() => ({ status: 200, body: Buffer.from("hello"), contentType: "image/jpeg" }));
   const client = makeClient();
   let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
   try {
-    result = await client.fetch(`http://${PUBLIC_IP_A}/direct`, { ssrfGuard: true });
+    result = await client.fetch(`http://${PUBLIC_IP_A}/direct`);
     assert.equal(result.statusCode, 200);
     assert.equal(result.contentType, "image/jpeg");
     assert.equal(result.sizeBytes, 5);
@@ -123,19 +125,40 @@ test("ssrfGuard passes through a direct (no-redirect) public 200 unchanged", asy
   }
 });
 
-test("ssrfGuard rejects the initial URL itself when it is a private host", async () => {
+test("egress guard rejects the initial URL itself when it is a private host", async () => {
   // No redirect needed: the very first assertPublicHttpUrl call must reject.
   const stub = stubFetch(() => ({ status: 200, body: Buffer.from("x") }));
   const client = makeClient();
   try {
     await assert.rejects(
-      client.fetch(`http://${METADATA_IP}/`, { ssrfGuard: true }),
+      client.fetch(`http://${METADATA_IP}/`),
       /private address is blocked|Local/i,
     );
     // No network request was made at all.
     assert.deepEqual(stub.requested, []);
   } finally {
     stub.restore();
+    client.stop();
+  }
+});
+
+test("with the egress guard disabled, a private host is NOT rejected (network layer is the boundary)", async () => {
+  // network.ssrf_guard=false (e.g. the docker deployment): the app does no
+  // address filtering and issues a single redirect:"follow" fetch. The same
+  // metadata IP that is rejected above is now requested. Restore the default
+  // (ON) afterwards so later tests keep their guarantees.
+  const stub = stubFetch(() => ({ status: 200, body: Buffer.from("ok"), contentType: "text/plain" }));
+  setEgressGuardEnabled(false);
+  const client = makeClient();
+  let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
+  try {
+    result = await client.fetch(`http://${METADATA_IP}/latest/meta-data/`);
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(stub.requested, [`http://${METADATA_IP}/latest/meta-data/`]);
+  } finally {
+    setEgressGuardEnabled(true);
+    stub.restore();
+    if (result) await rm(result.path, { force: true });
     client.stop();
   }
 });

@@ -4,7 +4,6 @@ import { randomBytes } from "node:crypto";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
-import { assertPublicHttpUrl } from "./ssrf.js";
 import {
   buildProxyDispatcher,
   type ConcurrencyLimitedFetchClient,
@@ -477,13 +476,11 @@ async function loadReferenceImages(
     const ref = raw.trim();
     if (!ref) continue;
     if (/^https?:\/\//i.test(ref)) {
-      // Defense in depth: validate the initial URL up front, and have the fetch
-      // client re-validate every redirect hop (ssrfGuard) so a public URL can't
-      // 302 to a private/metadata host.
-      await assertPublicHttpUrl(ref);
+      // The shared fetch client applies the egress guard (private/metadata block +
+      // per-hop redirect revalidation) when enabled, so a public URL can't 302 to
+      // a private/metadata host.
       const fetched = await context.fetchClient.fetch(ref, {
         maxBytes: context.downloadSizeLimit,
-        ssrfGuard: true,
       });
       let buffer: Buffer;
       try {

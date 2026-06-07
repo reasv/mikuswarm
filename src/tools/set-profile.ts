@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MatrixNativeClient } from "../matrix/native-client.js";
-import { assertPublicHttpUrl } from "./ssrf.js";
+import { guardedFetch } from "./ssrf.js";
 import { resolveWorkspacePath } from "./workspace.js";
 
 export interface SetProfileToolContext {
@@ -41,30 +41,19 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
           if (source.startsWith("mxc://")) {
             avatarUrl = source;
           } else if (/^https?:\/\//i.test(source)) {
-            try {
-              await assertPublicHttpUrl(source);
-            } catch (ssrfErr) {
-              const msg = ssrfErr instanceof Error ? ssrfErr.message : String(ssrfErr);
-              return {
-                content: [{ type: "text", text: `error: avatar URL blocked: ${msg}` }],
-                details: null,
-              };
-            }
-
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 30_000);
             let response: Response;
             try {
-              response = await globalThis.fetch(source, {
-                headers: { "User-Agent": "MikuAgent/1.0" },
-                redirect: "follow",
-                signal: controller.signal,
-              });
+              // Blocks private/metadata hosts (incl. redirect hops) when the egress
+              // guard is enabled; a single combined error covers both a blocked URL
+              // and a transport failure.
+              response = await guardedFetch(source, { signal: controller.signal });
             } catch (fetchErr) {
               clearTimeout(timeout);
               const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
               return {
-                content: [{ type: "text", text: `error: avatar download failed: ${msg}` }],
+                content: [{ type: "text", text: `error: avatar URL blocked or download failed: ${msg}` }],
                 details: null,
               };
             }

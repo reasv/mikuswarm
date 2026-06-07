@@ -12,7 +12,6 @@ import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.j
 import { buildAssetFetchError } from "./danbooru.js";
 import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
 import { escapeAttr, escapeXml } from "../context/xml.js";
-import { assertPublicHttpUrl } from "./ssrf.js";
 
 // Reject PNGs whose chunk table is structurally hostile before handing the
 // buffer to png-chunks-extract. That library pre-allocates a Uint8Array sized
@@ -1745,10 +1744,9 @@ async function loadImageSource(input: {
     sourceDescription = `workspace/local path \`${toWorkspaceRelativePath(input.workspaceRoot, absolutePath)}\``;
   } else {
     const url = requireString(input.imageUrl ?? "", "imageUrl");
-    // Block SSRF before any network call: same pattern as web_fetch /
-    // set-profile / send-message. Prevents AWS metadata, RFC1918, and
-    // localhost:<port> from being reachable via imageUrl.
-    await assertPublicHttpUrl(url);
+    // The shared fetch client applies the egress guard (private/metadata block +
+    // per-hop redirect revalidation) when enabled, so no separate pre-check is
+    // needed — AWS metadata, RFC1918, and localhost:<port> are unreachable.
     const fetched = await input.fetchClient.fetch(url, { maxBytes: input.downloadSizeLimit });
     try {
       if (fetched.statusCode < 200 || fetched.statusCode >= 300) {

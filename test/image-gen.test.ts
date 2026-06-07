@@ -13,11 +13,9 @@ import {
   extractImage,
   type ImageGenToolContext,
 } from "../src/tools/image-gen.js";
-import type {
-  ConcurrencyLimitedFetchClient,
-  FetchOptions,
-  FetchResult,
-} from "../src/enrichment/fetch-client.js";
+import { ConcurrencyLimitedFetchClient } from "../src/enrichment/fetch-client.js";
+import type { FetchOptions, FetchResult } from "../src/enrichment/fetch-client.js";
+import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 import type { ImageProcessingOptions } from "../src/media/index.js";
 
 // ---------------------------------------------------------------------------
@@ -300,11 +298,13 @@ test("image_generate rejects image_size '512' unless model is flash", async () =
 test("image_generate rejects a reference URL pointing at a private/loopback host", async () => {
   await withWorkspace(async (workspace) => {
     const server = await startGeminiServer(() => ({ json: { candidates: [] } }));
-    // IP literals so assertPublicHttpUrl's real DNS path is skipped and the
-    // block is deterministic (no network lookup).
-    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    // Use the REAL guarding fetch client (the production path): private IP
+    // literals are rejected by the egress guard inside the client — no DNS, no
+    // network — before any download. IP literals keep the block deterministic.
+    setEgressGuardEnabled(true);
+    const fetchClient = new ConcurrencyLimitedFetchClient({ maxConcurrency: 2, timeoutMs: 5_000, maxResponseBytes: 1024 });
     try {
-      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient }));
       for (const url of [
         "http://127.0.0.1:8080/x.png",
         "http://169.254.169.254/latest/meta-data/",
@@ -317,13 +317,11 @@ test("image_generate rejects a reference URL pointing at a private/loopback host
         assert.match(result.content[0].text, /Failed to load reference image/i);
         assert.ok(result.details.error);
       }
-      // The fetch client was never reached (rejected before download) and no
-      // Gemini generation request was sent.
-      assert.deepEqual(stub.calls, []);
+      // No Gemini generation request was sent.
       assert.equal(server.lastBody(), undefined);
     } finally {
+      fetchClient.stop();
       await server.close();
-      await stub.cleanup();
     }
   });
 });

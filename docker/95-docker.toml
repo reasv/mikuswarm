@@ -17,6 +17,7 @@
 #   [workspace]            — absolute, path-parity workspace dir
 #   [observability.server] — bind 0.0.0.0 so the console container can reach it
 #   [sandbox]              — enabled, driving the host docker daemon
+#   [network]              — ssrf_guard off; the bridge firewall is the boundary
 #
 # Everything else (models, matrix account, captioning, retrieval, …) stays in
 # config/90-local.toml, untouched. Data paths (app.data_dir, storage.database_path,
@@ -59,3 +60,16 @@ max_output_bytes = 1048576
 stop_on_shutdown = false
 memory = "2g"
 cpus = 2
+
+# Network egress (ARCHITECTURE.md "Network egress & SSRF"). In the Compose
+# deployment the agent's own bridge is hardened by docker/egress-rules.sh
+# (operator root step) — it drops RFC1918/link-local/loopback while allowing the
+# public internet, intra-compose traffic, and pinned DNS. That network firewall
+# is the real boundary, so the per-request app-layer guard is switched OFF here
+# to avoid the duplicate DNS + redirect-revalidation overhead.
+#
+# SHALLOW-MERGE CAVEAT: this table REPLACES [network] from 90-local.toml. If you
+# need an outbound proxy in the container, add http_proxy_url to THIS table (the
+# sibling key in 90-local.toml would otherwise be dropped).
+[network]
+ssrf_guard = false

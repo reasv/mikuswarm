@@ -125,6 +125,18 @@ trigger_group_lookback_ms = 20000
 [enrichment]
 trigger_wait_timeout_ms = 30000
 
+[network]
+# App-layer SSRF guard (defense-in-depth). When true, outbound fetches from
+# caller-supplied URLs (web_fetch, media downloads, image references, …) resolve
+# DNS and block private/loopback/link-local/metadata addresses, re-validating
+# every redirect hop. This is the only egress protection on a bare-metal `tsx`
+# run, so it defaults ON. Disable (false) ONLY where the container/network
+# firewall already blocks private egress — the Compose deployment does this via
+# docker/egress-rules.sh and flips this off in docker/95-docker.toml.
+ssrf_guard = true
+# Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
+# http_proxy_url = "http://proxy.internal:8080"
+
 [captioning]
 worker_count = 2
 caption_all = false
