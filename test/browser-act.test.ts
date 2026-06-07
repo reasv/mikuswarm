@@ -17,6 +17,8 @@ interface FakeOpts {
   cdpSendError?: Error;
   newCDPSessionError?: Error;
   pressError?: Error;
+  /** Number of CHILD frames page.frames() exposes (index 0 is the main frame). */
+  frameCount?: number;
 }
 
 function recordingPage(opts: FakeOpts = {}) {
@@ -89,6 +91,16 @@ function recordingPage(opts: FakeOpts = {}) {
     locator(sel: string) {
       return makeLocator(sel);
     },
+    // frames()[0] is the main document; child frames tag their locator selectors
+    // with `frameN:` so a namespaced ref's resolution target is observable.
+    frames() {
+      const main = { locator: (sel: string) => makeLocator(sel) };
+      const children = [];
+      for (let i = 1; i <= (opts.frameCount ?? 0); i++) {
+        children.push({ locator: (sel: string) => makeLocator(`frame${i}:${sel}`) });
+      }
+      return [main, ...children];
+    },
     getByText(t: string) {
       calls.push(["getByText", t]);
       return makeLocator(`text=${t}`);
@@ -133,6 +145,82 @@ const OPTS = { timeoutMs: 15000, evaluateEnabled: false };
 function run(page: ReturnType<typeof recordingPage>, params: ActParams) {
   return act(page as never, params, OPTS);
 }
+
+// ── dialog (one-shot override arming) ──────────────────────────────────────────
+
+test("act:dialog accept arms the override and returns a terse note", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: true }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → accept");
+  assert.deepEqual(armed, [[true, undefined]]);
+});
+
+test("act:dialog accept with prompt_text passes the text through and notes it", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: true, prompt_text: "my answer" }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → accept with text");
+  assert.deepEqual(armed, [[true, "my answer"]]);
+});
+
+test("act:dialog accept:false arms a dismiss", async () => {
+  const page = recordingPage();
+  const armed: Array<[boolean, string | undefined]> = [];
+  const r = await act(page as never, { kind: "dialog", accept: false }, {
+    ...OPTS,
+    armDialog: (a, p) => armed.push([a, p]),
+  });
+  assert.equal(r.detail, "armed next dialog → dismiss");
+  assert.deepEqual(armed, [[false, undefined]]);
+});
+
+test("act:dialog without `accept` is a bad_request", async () => {
+  const page = recordingPage();
+  await assert.rejects(
+    () => act(page as never, { kind: "dialog" }, { ...OPTS, armDialog: () => {} }),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
+  );
+});
+
+test("act:dialog with no armDialog wired is a bad_request", async () => {
+  const page = recordingPage();
+  await assert.rejects(
+    () => act(page as never, { kind: "dialog", accept: true }, OPTS),
+    (e: unknown) => (e as { code?: string }).code === "bad_request",
+  );
+});
+
+// ── frame-namespaced refs ──────────────────────────────────────────────────────
+
+test("act on a bare ref still resolves against the main document", async () => {
+  const page = recordingPage({ frameCount: 2 });
+  await run(page, { kind: "click", ref: "e5" });
+  const call = page.calls.find((c) => c[0] === "click") as [string, string, unknown];
+  assert.equal(call[1], "aria-ref=e5", "bare ref hits the page-level locator");
+});
+
+test("act on a frame-namespaced ref (f1:e3) clicks inside that frame", async () => {
+  const page = recordingPage({ frameCount: 2 });
+  const r = await run(page, { kind: "click", ref: "f1:e3" });
+  assert.equal(r.detail, "clicked f1:e3");
+  const call = page.calls.find((c) => c[0] === "click") as [string, string, unknown];
+  assert.equal(call[1], "frame1:aria-ref=e3", "ref resolved against frames()[1]");
+});
+
+test("act on a ref for a missing/detached frame surfaces as ref_expired", async () => {
+  const page = recordingPage({ frameCount: 1 }); // only f1 exists
+  await assert.rejects(
+    () => run(page, { kind: "click", ref: "f2:e1" }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
 
 // ── click modifiers ──────────────────────────────────────────────────────────
 

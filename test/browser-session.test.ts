@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -28,6 +28,7 @@ function baseConfig(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
     geoip: false,
     dialog_policy: "dismiss",
     snapshot_max_chars: 20000,
+    snapshot_max_frames: 10,
     nav_timeout_ms: 30000,
     act_timeout_ms: 15000,
     connect_timeout_ms: 20000,
@@ -743,6 +744,216 @@ for (const { name, suggested } of HOSTILE_FILENAMES) {
     });
   });
 }
+
+// ── pdf export (CDP Page.printToPDF → workspace) ─────────────────────────────
+
+/** A fake page whose CDP session returns a stubbed printToPDF payload. */
+function makePdfPage(opts: { printError?: Error; data?: string } = {}) {
+  const cdpCalls: string[] = [];
+  const cdp = {
+    async send(method: string) {
+      cdpCalls.push(method);
+      if (opts.printError) throw opts.printError;
+      return { data: opts.data ?? Buffer.from("%PDF-1.4 fake pdf").toString("base64") };
+    },
+    async detach() { cdpCalls.push("detach"); },
+  };
+  return {
+    url: () => "https://example.com/article",
+    context: () => ({ newCDPSession: async () => cdp }),
+    cdpCalls,
+  };
+}
+
+test("session: exportPdf writes a PDF to the workspace download dir and returns its record", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = makePdfPage();
+      const record = await session.exportPdf("s1", page as never);
+      assert.equal(record.path, path.join("browser-downloads", "s1", "page-1.pdf"));
+      assert.equal(record.filename, "page-1.pdf");
+      assert.equal(record.url, "https://example.com/article");
+      const bytes = await readFile(path.join(ws, record.path));
+      assert.equal(bytes.subarray(0, 5).toString("latin1"), "%PDF-", "file has the PDF magic");
+      assert.ok(page.cdpCalls.includes("Page.printToPDF"), "used CDP printToPDF");
+      assert.ok(page.cdpCalls.includes("detach"), "CDP session detached");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: exportPdf numbers successive exports (page-1, page-2)", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      // Create session state so pdfCount persists across exports.
+      (session as unknown as { getOrCreateState(id: string): unknown }).getOrCreateState("s1");
+      const r1 = await session.exportPdf("s1", makePdfPage() as never);
+      const r2 = await session.exportPdf("s1", makePdfPage() as never);
+      assert.equal(r1.filename, "page-1.pdf");
+      assert.equal(r2.filename, "page-2.pdf");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: exportPdf maps a printToPDF failure to pdf_failed and still detaches", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = makePdfPage({ printError: new Error("printToPDF unsupported") });
+      await assert.rejects(
+        () => session.exportPdf("s1", page as never),
+        (e: unknown) => isBrowserError(e) && e.code === "pdf_failed",
+      );
+      assert.ok(page.cdpCalls.includes("detach"), "detaches even on failure");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// ── one-shot act:dialog override (armDialog + handleDialog) ──────────────────
+
+/** A fake Playwright Dialog recording accept(text?)/dismiss() calls. */
+function fakeDialog(type: "alert" | "confirm" | "prompt") {
+  const calls: Array<[string, string | undefined]> = [];
+  return {
+    type: () => type,
+    accept: async (t?: string) => { calls.push(["accept", t]); },
+    dismiss: async () => { calls.push(["dismiss", undefined]); },
+    calls,
+  };
+}
+
+type DialogPrivate = {
+  handleDialog(page: unknown, dialog: unknown): Promise<void>;
+  dialogOverrides: WeakMap<object, { accept: boolean; promptText?: string; expiresAt: number }>;
+};
+
+function newSession(ws: string, overrides: Partial<BrowserConfig> = {}): BrowserSession {
+  return new BrowserSession({
+    config: baseConfig(overrides), agentTimezone: "UTC", workspaceRoot: ws,
+    logger: silentLogger, connectOverCdp: async () => ({}) as never,
+  });
+}
+
+test("session: an armed accept override answers the next dialog with prompt_text, then is one-shot", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, true, "my answer");
+      const d1 = fakeDialog("prompt");
+      await priv.handleDialog(page, d1);
+      assert.deepEqual(d1.calls, [["accept", "my answer"]], "armed accept used, with text");
+
+      // One-shot: the override is consumed, so the NEXT dialog falls back to the
+      // default dialog_policy ("dismiss" for confirm).
+      const d2 = fakeDialog("confirm");
+      await priv.handleDialog(page, d2);
+      assert.deepEqual(d2.calls, [["dismiss", undefined]], "override did not persist to the next dialog");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: an armed dismiss override dismisses the next dialog", async () => {
+  await withWorkspace(async (ws) => {
+    // dialog_policy "accept" so the override (dismiss) is clearly distinguishable
+    // from the default behavior.
+    const session = newSession(ws, { dialog_policy: "accept" });
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, false, undefined);
+      const d = fakeDialog("confirm");
+      await priv.handleDialog(page, d);
+      assert.deepEqual(d.calls, [["dismiss", undefined]], "armed dismiss overrode the accept policy");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: an expired override falls back to the default dialog_policy", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws, { dialog_policy: "dismiss" });
+    try {
+      const page = {};
+      const priv = session as unknown as DialogPrivate;
+      session.armDialog(page as never, true, "stale");
+      // Backdate the override so it's expired when the dialog fires.
+      priv.dialogOverrides.get(page)!.expiresAt = 0;
+      const d = fakeDialog("confirm");
+      await priv.handleDialog(page, d);
+      assert.deepEqual(d.calls, [["dismiss", undefined]], "expired override ignored; default policy applied");
+      assert.equal(priv.dialogOverrides.has(page), false, "expired override is cleared");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// ── console buffer (console + pageerror ring) ────────────────────────────────
+
+/** A fake page that records on() handlers and can emit events to them. */
+function makeConsolePage() {
+  const handlers: Record<string, Array<(arg: unknown) => void>> = {};
+  return {
+    on(event: string, cb: (arg: unknown) => void) { (handlers[event] ??= []).push(cb); },
+    emit(event: string, arg: unknown) { for (const h of handlers[event] ?? []) h(arg); },
+    url: () => "https://example.com",
+  };
+}
+
+type TrackPrivate = {
+  trackPage(id: string, state: unknown, page: unknown): void;
+  getOrCreateState(id: string): unknown;
+};
+
+test("session: console buffer captures console + pageerror, drains once", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      page.emit("console", { type: () => "log", text: () => "hello" });
+      page.emit("pageerror", new Error("boom"));
+      assert.deepEqual(session.drainConsole(page as never), [
+        { level: "log", text: "hello" },
+        { level: "error", text: "boom" },
+      ]);
+      assert.deepEqual(session.drainConsole(page as never), [], "second drain is empty");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: console buffer is bounded to the last 200 messages", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as TrackPrivate;
+      const page = makeConsolePage();
+      priv.trackPage("s1", priv.getOrCreateState("s1"), page);
+      for (let i = 0; i < 250; i++) page.emit("console", { type: () => "log", text: () => `m${i}` });
+      const drained = session.drainConsole(page as never);
+      assert.equal(drained.length, 200, "capped at CONSOLE_BUFFER_MAX");
+      assert.equal(drained[0]!.text, "m50", "oldest over the cap dropped");
+      assert.equal(drained[199]!.text, "m249", "newest kept");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
 
 test("session: a down Manager surfaces backend_unavailable (graceful degradation)", async () => {
   await withWorkspace(async (ws) => {

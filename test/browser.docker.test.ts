@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -70,6 +70,7 @@ function config(): BrowserConfig {
     geoip: false,
     dialog_policy: "dismiss",
     snapshot_max_chars: 20000,
+    snapshot_max_frames: 10,
     nav_timeout_ms: 45000,
     act_timeout_ms: 20000,
     connect_timeout_ms: 30000,
@@ -140,7 +141,7 @@ test("browser docker: end-to-end navigate + snapshot + screenshot through the Ma
   }
 });
 
-test("browser docker: feature additions (rich-wait, element shot, modifiers, upload, clear, drag)", { skip, timeout: 240_000 }, async () => {
+test("browser docker: feature additions (rich-wait, element shot, modifiers, upload, clear, drag, dialog, pdf, console)", { skip, timeout: 240_000 }, async () => {
   spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
   execFileSync("docker", [
     "run", "-d", "--name", CONTAINER,
@@ -242,6 +243,38 @@ test("browser docker: feature additions (rich-wait, element shot, modifiers, upl
     const snapD = await snapshot();
     await exec({ action: "act", kind: "drag", ref: refByName(snapD, "Src"), to_ref: refByName(snapD, "Dst") });
     assert.match(await evalText(`window.__dropped === true`), /true/);
+
+    // ── dialog: a one-shot override answers a confirm() armed before the click ─
+    await setBody(`<button id="cf" onclick="window.__ok = confirm('sure?')">Confirm</button>`);
+    const cfRef = refByName(await snapshot(), "Confirm");
+    await exec({ action: "act", kind: "dialog", accept: true });
+    await exec({ action: "act", kind: "click", ref: cfRef });
+    assert.match(await evalText(`window.__ok === true`), /true/, "armed accept answered the confirm()");
+    // A prompt() answered with specific text.
+    await setBody(`<button id="pr" onclick="window.__ans = prompt('name?')">Prompt</button>`);
+    const prRef = refByName(await snapshot(), "Prompt");
+    await exec({ action: "act", kind: "dialog", accept: true, prompt_text: "Miku" });
+    await exec({ action: "act", kind: "click", ref: prRef });
+    assert.match(await evalText(`window.__ans`), /Miku/, "armed prompt_text answered the prompt()");
+
+    // ── pdf: export the current page to the workspace; file has the PDF magic ──
+    await exec({ action: "navigate", url: "https://example.com/" });
+    const pdfRes = await exec({ action: "pdf" });
+    const pdfPath = (pdfRes.details?.path as string) ?? "";
+    assert.match(pdfPath, /browser-downloads\/.*\/page-1\.pdf$/, "pdf saved under the download dir");
+    const pdfBytes = await readFile(path.join(ws, pdfPath));
+    assert.ok(pdfBytes.byteLength > 0, "pdf is non-empty");
+    assert.equal(pdfBytes.subarray(0, 5).toString("latin1"), "%PDF-", "pdf has the magic header");
+
+    // ── console: console.log + an uncaught page error are buffered + drained ──
+    await exec({ action: "navigate", url: "https://example.com/" });
+    await evalText(`console.log('hello-from-page'); setTimeout(() => { throw new Error('console-test-error'); }, 0); 'logged'`);
+    await exec({ action: "act", kind: "wait", ms: 300 });
+    const consoleText = textOf(await exec({ action: "console" }));
+    assert.match(consoleText, /hello-from-page/, "console.log captured");
+    assert.match(consoleText, /console-test-error/, "uncaught page error captured");
+    // Drained: a second read has nothing new from before.
+    assert.match(textOf(await exec({ action: "console" })), /no console messages/, "buffer drained on read");
   } finally {
     if (session) await session.shutdown();
     spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });

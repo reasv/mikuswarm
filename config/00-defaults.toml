@@ -383,6 +383,7 @@ proxy = ""                              # optional http(s)://… or socks5://…
 geoip = false                           # match spoofed TZ/locale to the proxy exit IP
 dialog_policy = "dismiss"               # auto JS dialog handling: dismiss | accept (alert always accepts)
 snapshot_max_chars = 20000              # truncate AI snapshots to bound context cost
+snapshot_max_frames = 10                # max iframes descended per snapshot (0 ⇒ main document only)
 nav_timeout_ms = 30000                  # per-navigation timeout
 act_timeout_ms = 15000                  # per-action timeout
 connect_timeout_ms = 20000              # connectOverCDP + first-launch cold start

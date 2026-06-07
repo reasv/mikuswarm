@@ -14,7 +14,7 @@
 //   - Bounded growth: a session's tabs are closed when the session ends
 //     (closeSession) or after session_page_idle_ms of inactivity (idle sweeper).
 
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Dialog, type Download, type Page } from "playwright-core";
 
@@ -30,6 +30,16 @@ export interface DownloadRecord {
   url: string;
 }
 
+/** One buffered console/pageerror line, drained by the `console` action. */
+export interface ConsoleEntry {
+  /** console level (`log`/`info`/`warning`/`error`/…) or `error` for a pageerror. */
+  level: string;
+  text: string;
+}
+
+/** Cap each page's console buffer so it can't grow without bound. */
+const CONSOLE_BUFFER_MAX = 200;
+
 interface SessionState {
   /** Tabs owned by this chat session, in open order. */
   pages: Page[];
@@ -38,6 +48,8 @@ interface SessionState {
   lastUsed: number;
   /** Downloads captured since the last drain, surfaced in tool results. */
   pendingDownloads: DownloadRecord[];
+  /** Monotonic counter for naming exported PDFs (page-1.pdf, page-2.pdf, …). */
+  pdfCount: number;
   /**
    * Number of browser-tool operations currently in flight against this session
    * (issue #1). Bracketed by beginOp/endOp around every page-using tool op so
@@ -116,6 +128,18 @@ export class BrowserSession {
   private lastConnectError: BrowserError | undefined;
 
   private readonly sessions = new Map<string, SessionState>();
+  /**
+   * One-shot per-page dialog overrides armed by the `act:dialog` kind (see
+   * armDialog). Keyed by Page so an override set on the active tab applies to
+   * that tab's next dialog. WeakMap → no cleanup needed when a page is GC'd.
+   */
+  private readonly dialogOverrides = new WeakMap<Page, { accept: boolean; promptText?: string; expiresAt: number }>();
+  /**
+   * Per-page console + pageerror ring buffers, drained by the `console` action.
+   * Standing instrumentation wired at page setup; bounded at CONSOLE_BUFFER_MAX.
+   * WeakMap → buffers are GC'd with their page, no explicit cleanup.
+   */
+  private readonly consoleBuffers = new WeakMap<Page, ConsoleEntry[]>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   private readonly connectOverCdp: ConnectOverCdp;
@@ -392,7 +416,7 @@ export class BrowserSession {
   private getOrCreateState(sessionId: string): SessionState {
     let state = this.sessions.get(sessionId);
     if (!state) {
-      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [], inFlight: 0, closed: false };
+      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [], pdfCount: 0, inFlight: 0, closed: false };
       this.sessions.set(sessionId, state);
     }
     return state;
@@ -493,6 +517,56 @@ export class BrowserSession {
     state.lastUsed = Date.now();
   }
 
+  /**
+   * Export the active page to a PDF in the session's workspace download dir and
+   * return its record (path/filename/url). Uses CDP `Page.printToPDF` — NOT
+   * `page.pdf()`, which Chromium only supports in headless mode; the stealth
+   * browser runs headed, so the CDP path is the only one that works. Reuses the
+   * download-sink path policy (`browser-downloads/<session>/`) so a PDF looks
+   * like any other download. Write-only from the agent's view — miku has no PDF
+   * ingestion, so the caller forwards the returned path to the message tool.
+   * Throws `pdf_failed` if printToPDF is unsupported/errors or the file can't be
+   * written.
+   */
+  async exportPdf(sessionId: string, page: Page): Promise<DownloadRecord> {
+    const state = this.sessions.get(sessionId);
+    const n = state ? (state.pdfCount += 1) : 1;
+    const safeName = `page-${n}.pdf`;
+    const relDir = path.join("browser-downloads", sanitizeSessionId(sessionId));
+    const relPath = path.join(relDir, safeName);
+    const url = page.url();
+
+    const cdp = await page.context().newCDPSession(page);
+    let data: string;
+    try {
+      const result = (await cdp.send("Page.printToPDF", { printBackground: true })) as { data: string };
+      data = result.data;
+    } catch (error) {
+      throw new BrowserError(
+        "pdf_failed",
+        `PDF export failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+
+    try {
+      const absDir = path.join(this.workspaceRoot, relDir);
+      await mkdir(absDir, { recursive: true });
+      await writeFile(path.join(absDir, safeName), Buffer.from(data, "base64"));
+    } catch (error) {
+      throw new BrowserError(
+        "pdf_failed",
+        `PDF export could not be written to the workspace: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+
+    this.logger.info("browser_pdf_export", { sessionId, path: relPath, url });
+    return { path: relPath, filename: safeName, url };
+  }
+
   /** Drain (and clear) downloads captured for this session since the last call. */
   drainDownloads(sessionId: string): DownloadRecord[] {
     const state = this.sessions.get(sessionId);
@@ -509,15 +583,50 @@ export class BrowserSession {
    */
   private trackPage(sessionId: string, state: SessionState, page: Page): void {
     page.on("dialog", (dialog: Dialog) => {
-      void this.handleDialog(dialog);
+      void this.handleDialog(page, dialog);
     });
     page.on("download", (download: Download) => {
       void this.handleDownload(sessionId, state, download);
     });
+    // Console + uncaught page errors → a bounded per-page buffer the agent can
+    // drain via the `console` action to self-diagnose a silently-failing page.
+    this.consoleBuffers.set(page, []);
+    page.on("console", (msg) => this.pushConsole(page, { level: msg.type(), text: msg.text() }));
+    page.on("pageerror", (err: Error) => this.pushConsole(page, { level: "error", text: err?.message ?? String(err) }));
   }
 
-  private async handleDialog(dialog: Dialog): Promise<void> {
+  private pushConsole(page: Page, entry: ConsoleEntry): void {
+    const buf = this.consoleBuffers.get(page);
+    if (!buf) return;
+    buf.push(entry);
+    if (buf.length > CONSOLE_BUFFER_MAX) buf.splice(0, buf.length - CONSOLE_BUFFER_MAX);
+  }
+
+  /** Drain (and clear) buffered console/pageerror messages for `page`. */
+  drainConsole(page: Page): ConsoleEntry[] {
+    const buf = this.consoleBuffers.get(page);
+    if (!buf || buf.length === 0) return [];
+    const out = buf.slice();
+    buf.length = 0;
+    return out;
+  }
+
+  private async handleDialog(page: Page, dialog: Dialog): Promise<void> {
     try {
+      // A one-shot act:dialog override (armed on this page) takes precedence over
+      // the standing dialog_policy for exactly the next dialog. It's consumed
+      // (deleted) whether or not it's still valid; an expired one falls through
+      // to the default policy so an armed-but-never-triggered override can't
+      // hijack a later, unrelated dialog.
+      const override = this.dialogOverrides.get(page);
+      if (override) {
+        this.dialogOverrides.delete(page);
+        if (override.expiresAt >= Date.now()) {
+          if (override.accept) await dialog.accept(override.promptText);
+          else await dialog.dismiss();
+          return;
+        }
+      }
       // alert always accepts (there's nothing to dismiss); confirm/prompt follow
       // dialog_policy. Default "dismiss" is the safe choice — it won't, e.g.,
       // confirm a destructive action on the model's behalf.
@@ -532,6 +641,22 @@ export class BrowserSession {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /**
+   * Arm a one-shot override for the NEXT JS dialog on `page` (the `act:dialog`
+   * kind), overriding the standing dialog_policy for that one event. The
+   * override is consumed by the next dialog; if no dialog fires it expires after
+   * act_timeout_ms so it can't leak into a later, unrelated dialog. Coordinates
+   * with handleDialog via the dialogOverrides slot the default handler checks
+   * first.
+   */
+  armDialog(page: Page, accept: boolean, promptText: string | undefined): void {
+    this.dialogOverrides.set(page, {
+      accept,
+      promptText,
+      expiresAt: Date.now() + this.config.act_timeout_ms,
+    });
   }
 
   private async handleDownload(sessionId: string, state: SessionState, download: Download): Promise<void> {

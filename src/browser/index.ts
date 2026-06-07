@@ -5,6 +5,7 @@ export {
   act,
   isTimeoutError,
   mapError,
+  requireRefLocator,
   REF_RE,
   type ActKind,
   type ActParams,

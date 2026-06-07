@@ -25,7 +25,7 @@ function baseConfig(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
     enabled: true, manager_url: "http://127.0.0.1:8080", auth_token: "t",
     profile_name: "miku", platform: "windows", fingerprint_seed: 1, humanize: false,
     evaluate_enabled: false, proxy: "", geoip: false, dialog_policy: "dismiss",
-    snapshot_max_chars: 20000, nav_timeout_ms: 30000, act_timeout_ms: 15000,
+    snapshot_max_chars: 20000, snapshot_max_frames: 10, nav_timeout_ms: 30000, act_timeout_ms: 15000,
     connect_timeout_ms: 20000, session_page_idle_ms: 600000, ...overrides,
   };
 }
@@ -386,6 +386,70 @@ test("aiSnapshot: raw exactly at the cap (raw.length === maxChars) is NOT trunca
   assert.equal(result.refCount, 3, "all refs counted when not truncated");
 });
 
+// ── §1: frame (iframe) descent in aiSnapshot ─────────────────────────────────
+
+/**
+ * A page exposing a main snapshot plus child frames. frames()[0] is the main
+ * document (its locator is never used — main is captured via page.locator); each
+ * child carries its own url + AI snapshot (or throws to simulate detachment).
+ */
+function framedSnapshotPage(main: string, children: Array<{ url: string; snapshot?: string; throws?: boolean }>) {
+  const mainFrame = { url: () => "main", locator: () => ({ async ariaSnapshot() { return main; } }) };
+  const childFrames = children.map((c) => ({
+    url: () => c.url,
+    locator: () => ({
+      async ariaSnapshot() {
+        if (c.throws) throw new Error("frame detached");
+        return c.snapshot ?? "";
+      },
+    }),
+  }));
+  return {
+    locator: (_sel: string) => ({ async ariaSnapshot() { return main; } }),
+    frames: () => [mainFrame, ...childFrames],
+  } as never;
+}
+
+test("aiSnapshot: descends into a child frame, namespacing its refs under a boundary", async () => {
+  const main = '- generic [ref=e1]:\n  - heading "Host" [ref=e2]';
+  const child = '- button "Verify you are human" [ref=e3]';
+  const page = framedSnapshotPage(main, [{ url: "https://challenges.example/x", snapshot: child }]);
+  const result = await aiSnapshot(page, 20000, 10);
+  assert.ok(result.text.includes("[frame f1: https://challenges.example/x]"), "frame boundary present");
+  assert.ok(result.text.includes("[ref=f1:e3]"), "child ref namespaced to the frame");
+  assert.ok(result.text.includes("[ref=e1]"), "main-document bare refs preserved");
+  assert.equal(result.truncated, false);
+  assert.equal(result.refCount, 3, "counts bare e1/e2 plus namespaced f1:e3");
+});
+
+test("aiSnapshot: maxFrames=0 stays on the main document even when frames exist", async () => {
+  const main = '- generic [ref=e1]';
+  const page = framedSnapshotPage(main, [{ url: "https://x", snapshot: "- button [ref=e3]" }]);
+  const result = await aiSnapshot(page, 20000, 0);
+  assert.equal(result.text, main, "no frame content appended");
+  assert.ok(!result.text.includes("[frame"), "no frame boundary");
+});
+
+test("aiSnapshot: an inaccessible/detached frame is noted inline without throwing", async () => {
+  const main = "- generic [ref=e1]";
+  const page = framedSnapshotPage(main, [{ url: "https://x", throws: true }]);
+  const result = await aiSnapshot(page, 20000, 10);
+  assert.ok(result.text.includes("[frame f1: <inaccessible>]"), "inaccessible frame noted");
+});
+
+test("aiSnapshot: a frame budget below the frame count truncates and marks it", async () => {
+  const main = "- generic [ref=e1]";
+  const children = [
+    { url: "https://a", snapshot: "- button [ref=e1]" },
+    { url: "https://b", snapshot: "- button [ref=e1]" },
+  ];
+  const result = await aiSnapshot(framedSnapshotPage(main, children), 20000, 1);
+  assert.equal(result.truncated, true, "fewer frames rendered than exist → truncated");
+  assert.ok(result.text.includes("[frame f1:"), "first frame within budget rendered");
+  assert.ok(!result.text.includes("[frame f2:"), "second frame dropped by the frame cap");
+  assert.ok(result.text.includes("truncated"), "truncation marker present");
+});
+
 // ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
 
 test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {
@@ -615,7 +679,7 @@ test("resolveUploadFiles: rejects when total bytes exceed the cap (bad_request)"
 
 // ── new act kinds are exposed in the tool schema ─────────────────────────────
 
-test("tool: schema `kind` union includes drag, upload, clear_site_data", () => {
+test("tool: schema `kind` union includes drag, upload, clear_site_data, dialog", () => {
   const tool = createBrowserTool({
     session: undefined as never,
     agentSessionId: "s1",
@@ -625,7 +689,7 @@ test("tool: schema `kind` union includes drag, upload, clear_site_data", () => {
   });
   const params = tool.parameters as { properties: { kind: { anyOf: Array<{ const?: string }> } } };
   const kinds = params.properties.kind.anyOf.map((s) => s.const);
-  for (const k of ["drag", "upload", "clear_site_data"]) {
+  for (const k of ["drag", "upload", "clear_site_data", "dialog"]) {
     assert.ok(kinds.includes(k), `kind union includes ${k}`);
   }
 });

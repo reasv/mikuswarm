@@ -16,6 +16,7 @@ export type BrowserErrorCode =
   | "screenshot_failed" // a non-timeout screenshot capture failure
   | "upload_failed" // act:upload chooser arm/set failed (non-timeout, non-stale-ref)
   | "clear_failed" // act:clear_site_data CDP Storage.clearDataForOrigin failed
+  | "pdf_failed" // pdf export (CDP Page.printToPDF) unsupported or threw
   | "no_active_page" // no tab/page resolved for the session
   | "bad_request"; // malformed action/params
 

@@ -20,7 +20,8 @@ export type ActKind =
   | "evaluate"
   | "drag"
   | "upload"
-  | "clear_site_data";
+  | "clear_site_data"
+  | "dialog";
 
 /** A file to upload, shipped inline as bytes (never a host path — see §3.5). */
 export interface UploadFile {
@@ -69,14 +70,30 @@ export interface ActParams {
   wait_url?: string;
   /** `wait`: resolve when the page reaches this load state. */
   wait_load_state?: LoadState;
+  /** `dialog`: accept (true) or dismiss (false) the next JS dialog. */
+  accept?: boolean;
+  /** `dialog`: text to answer a `window.prompt()` with when accepting. */
+  prompt_text?: string;
 }
 
 export interface ActOptions {
   timeoutMs: number;
   evaluateEnabled: boolean;
+  /**
+   * Arm a one-shot override for the next JS dialog on the page (the `dialog`
+   * kind). Supplied by the tool layer, wired to the session's standing dialog
+   * handler. Absent in contexts without a session (the bare `act` unit tests can
+   * still assert the bad_request when it's missing).
+   */
+  armDialog?: (accept: boolean, promptText: string | undefined) => void;
 }
 
-export const REF_RE = /^e\d+$/;
+// A ref handle is either a bare main-document `eN` or a frame-namespaced
+// `fN:eN` (N = index into page.frames()). REF_RE accepts both; BARE_REF_RE and
+// FRAME_REF_RE split the two cases when resolving the owning frame.
+export const REF_RE = /^(?:f\d+:)?e\d+$/;
+const BARE_REF_RE = /^e\d+$/;
+const FRAME_REF_RE = /^f(\d+):(e\d+)$/;
 const MAX_WAIT_MS = 30_000;
 
 export interface ActResult {
@@ -336,6 +353,28 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
       return done(kind, `cleared site data for ${origin}`);
     }
 
+    case "dialog": {
+      // Arm a one-shot override for the NEXT dialog, taking precedence over the
+      // standing dialog_policy for that one event. Returns immediately — the
+      // ergonomic flow is: arm `dialog`, THEN perform the act that triggers it
+      // (a JS dialog blocks the page, so it can't be triggered in this same
+      // call). The override is consumed by the next dialog or expires on the
+      // session side (see BrowserSession.armDialog) so it can't leak.
+      if (typeof params.accept !== "boolean") {
+        throw new BrowserError("bad_request", "act:dialog requires `accept` (boolean).");
+      }
+      if (!opts.armDialog) {
+        throw new BrowserError("bad_request", "act:dialog is not available in this context.");
+      }
+      opts.armDialog(params.accept, params.prompt_text);
+      const note = params.accept
+        ? params.prompt_text !== undefined
+          ? "accept with text"
+          : "accept"
+        : "dismiss";
+      return done(kind, `armed next dialog → ${note}`);
+    }
+
     default:
       throw new BrowserError("bad_request", `Unknown act kind: ${String(kind)}`);
   }
@@ -343,19 +382,38 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
 
 /**
  * Validate a `ref`'s shape and build its `aria-ref` locator. Shared by `withRef`
- * (single-target acts) and the multi-target acts (`drag` source + target) so a
- * malformed ref produces a consistent `bad_request` everywhere. Does NOT run the
- * action — the caller owns error mapping (stale-ref detection happens when the
- * locator fails to resolve).
+ * (single-target acts), the multi-target acts (`drag` source + target), and the
+ * tool-layer element screenshot, so a malformed ref produces a consistent
+ * `bad_request` everywhere. A frame-namespaced ref (`fN:eN`) resolves against
+ * `page.frames()[N]`; a missing/detached frame surfaces as `ref_expired` (take a
+ * fresh snapshot). A bare ref resolves against the main document exactly as
+ * before. Does NOT run the action — the caller owns error mapping for the
+ * resolved locator (stale element-ref detection happens when it fails to
+ * resolve).
  */
-function requireRefLocator(
+export function requireRefLocator(
   page: Page,
   ref: string | undefined,
   kindLabel: string,
 ): ReturnType<Page["locator"]> {
   if (!ref) throw new BrowserError("bad_request", `act:${kindLabel} requires a \`ref\` from the latest snapshot.`);
-  if (!REF_RE.test(ref)) {
-    throw new BrowserError("bad_request", `Invalid ref "${ref}" — expected a snapshot handle like "e12".`);
+  const framed = ref.match(FRAME_REF_RE);
+  if (framed) {
+    const frameIndex = Number(framed[1]);
+    const bareRef = framed[2]!;
+    const frame = page.frames()[frameIndex];
+    if (!frame) {
+      // Frame indices are snapshot-scoped: a frame that navigated/detached since
+      // the snapshot is gone from page.frames() → treat as expired (re-snapshot).
+      throw new BrowserError(
+        "ref_expired",
+        `Frame ref ${ref} did not resolve (frame f${frameIndex} likely navigated or detached). Take a fresh \`snapshot\` and retry with a current ref.`,
+      );
+    }
+    return frame.locator(`aria-ref=${bareRef}`);
+  }
+  if (!BARE_REF_RE.test(ref)) {
+    throw new BrowserError("bad_request", `Invalid ref "${ref}" — expected a snapshot handle like "e12" or "f1:e3".`);
   }
   return page.locator(`aria-ref=${ref}`);
 }
