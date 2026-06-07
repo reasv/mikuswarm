@@ -35,6 +35,17 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
 /** Hard cap on the JSON response body (a 4K base64 image is several MB). */
 const RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * Per-reference byte budget for edit inputs. Reference images are billed as
+ * input tokens and inflate the request, so we bound them — but generously,
+ * since these are the source material for an edit and re-encoding degrades
+ * quality. A reference under this budget is sent as its ORIGINAL bytes
+ * (no conversion); only an over-budget reference is run through
+ * `conditionImageBufferForInference` (resize + JPEG) to bring it down. 6 MiB
+ * comfortably holds a high-quality multi-megapixel JPEG/PNG/WebP while still
+ * capping worst-case token/memory cost across up to MAX_INPUT_IMAGES refs.
+ */
+const REFERENCE_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const USER_AGENT = "MikuAgent/0.1 (mikuswarm image_generate)";
 
 const ASPECT_RATIOS = [
@@ -173,6 +184,15 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
   if (!proModel || !flashModel) {
     throw new Error("image_gen.models.pro and image_gen.models.flash must both be configured.");
   }
+  // modelId is interpolated into the request URL path; reject anything that
+  // could alter the path (slashes, dot-segments, etc.). Fail fast at construction.
+  const MODEL_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+  if (!MODEL_ID_PATTERN.test(proModel)) {
+    throw new Error(`image_gen.models.pro must match ${MODEL_ID_PATTERN}, got "${proModel}".`);
+  }
+  if (!MODEL_ID_PATTERN.test(flashModel)) {
+    throw new Error(`image_gen.models.flash must match ${MODEL_ID_PATTERN}, got "${flashModel}".`);
+  }
   const models: Record<ModelAlias, string> = { pro: proModel, flash: flashModel };
   const timeoutMs = context.config?.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxOutputTokens = context.config?.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
@@ -253,6 +273,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       // Inline preview so the model sees what it made. Conditioning failure is
       // non-fatal — the file is already saved and deliverable by path.
       let inline: { buffer: Buffer; mimeType: string } | undefined;
+      let inlineError: string | undefined;
       try {
         const rawByteBudget = Math.floor((context.inlineImageMaxBytes * 3) / 4);
         const conditioned = await conditionImageBufferForInference(rawBuffer, {
@@ -260,8 +281,14 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
           maxBytes: rawByteBudget,
         });
         inline = { buffer: conditioned.buffer, mimeType: conditioned.mimeType };
-      } catch {
+      } catch (error) {
+        // Non-fatal: the file is already saved and deliverable by path. Tools
+        // in this codebase receive no logger (cf. danbooru), so surface the
+        // diagnostic in the returned text rather than swallowing it silently —
+        // this is how a genuine inlineImageMaxBytes misconfiguration becomes
+        // visible instead of looking like the model just declined a preview.
         inline = undefined;
+        inlineError = errMessage(error);
       }
 
       const isEdit = refs.length > 0;
@@ -272,6 +299,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         ...(params.aspect_ratio ? [`- aspect ratio: ${params.aspect_ratio}`] : []),
         ...(params.image_size ? [`- size hint: ${params.image_size}`] : []),
         ...(isEdit ? [`- edited from ${refs.length} reference image(s)`] : []),
+        ...(inlineError ? [`- (inline preview unavailable: ${inlineError})`] : []),
         ...(extracted.text ? ["", `Model note: ${extracted.text.slice(0, 500)}`] : []),
         "",
         `To post this image to the chat, call \`send_message\` with \`media: "${relPath}"\`.`,
@@ -380,7 +408,18 @@ async function postGenerate(input: {
         ),
       };
     }
-    return (await readJsonCapped(response, controller)) as GeminiResponse;
+    try {
+      return (await readJsonCapped(response, controller)) as GeminiResponse;
+    } catch (error) {
+      // A timeout that fires mid-stream aborts `reader.read()` with an
+      // AbortError; surface the same friendly message as the fetch-level abort.
+      // The cap-exceeded guard throws a plain Error (not AbortError) with its
+      // own explicit message, so it is not clobbered here.
+      if ((error as { name?: string })?.name === "AbortError") {
+        throw new Error(`timed out after ${input.timeoutMs}ms`);
+      }
+      throw error;
+    }
   } finally {
     clearTimeout(timeout);
   }
@@ -438,8 +477,14 @@ async function loadReferenceImages(
     const ref = raw.trim();
     if (!ref) continue;
     if (/^https?:\/\//i.test(ref)) {
+      // Defense in depth: validate the initial URL up front, and have the fetch
+      // client re-validate every redirect hop (ssrfGuard) so a public URL can't
+      // 302 to a private/metadata host.
       await assertPublicHttpUrl(ref);
-      const fetched = await context.fetchClient.fetch(ref, { maxBytes: context.downloadSizeLimit });
+      const fetched = await context.fetchClient.fetch(ref, {
+        maxBytes: context.downloadSizeLimit,
+        ssrfGuard: true,
+      });
       let buffer: Buffer;
       try {
         if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
@@ -451,18 +496,41 @@ async function loadReferenceImages(
       }
       const mime =
         imageMimeFromContentType(fetched.contentType) ?? imageMimeFromExtension(ref) ?? "image/png";
-      out.push({ mimeType: mime, data: buffer.toString("base64") });
+      out.push(await boundReferenceImage(buffer, mime, context));
     } else {
       const abs = resolveWorkspacePath(context.workspaceRoot, ref);
       const buffer = await fs.readFile(abs);
       const mime = imageMimeFromExtension(ref) ?? "image/png";
-      out.push({ mimeType: mime, data: buffer.toString("base64") });
+      out.push(await boundReferenceImage(buffer, mime, context));
     }
   }
   if (out.length === 0) {
     throw new Error("no usable reference images were provided");
   }
   return out;
+}
+
+/**
+ * Bound a single reference image to {@link REFERENCE_IMAGE_MAX_BYTES}. When the
+ * raw bytes are already under budget they are sent untouched (original MIME) to
+ * preserve editing quality. Only an over-budget reference is conditioned
+ * (resize + JPEG re-encode) via `conditionImageBufferForInference`, which caps
+ * tokens and memory at the cost of one lossy pass on an image that was too big
+ * to send as-is anyway.
+ */
+async function boundReferenceImage(
+  buffer: Buffer,
+  mimeType: string,
+  context: ImageGenToolContext,
+): Promise<ReferenceImage> {
+  if (buffer.byteLength <= REFERENCE_IMAGE_MAX_BYTES) {
+    return { mimeType, data: buffer.toString("base64") };
+  }
+  const conditioned = await conditionImageBufferForInference(buffer, {
+    ...context.inferenceImageOptions,
+    maxBytes: REFERENCE_IMAGE_MAX_BYTES,
+  });
+  return { mimeType: conditioned.mimeType, data: conditioned.buffer.toString("base64") };
 }
 
 // ---------------------------------------------------------------------------
@@ -577,10 +645,11 @@ function mimeToExtension(mimeType: string): string {
       return "webp";
     case "image/gif":
       return "gif";
-    default: {
-      const sub = m.split("/")[1];
-      return sub && /^[a-z0-9]+$/.test(sub) ? sub : "png";
-    }
+    default:
+      // Allow-list only — mirror danbooru's inferExtension hardening. The MIME
+      // comes from the trusted Gemini response, but pinning the on-disk
+      // extension to a vetted set keeps an unexpected subtype from dictating it.
+      return "png";
   }
 }
 

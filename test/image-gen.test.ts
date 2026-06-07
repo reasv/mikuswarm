@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
@@ -286,6 +286,185 @@ test("image_generate rejects image_size '512' unless model is flash", async () =
       assert.match(blocked.content[0].text, /512.*flash/i);
       // The request must never have been sent.
       assert.equal(server.lastBody(), undefined);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSRF & path-traversal rejection of reference inputs (#5.1, #5.4)
+// ---------------------------------------------------------------------------
+
+test("image_generate rejects a reference URL pointing at a private/loopback host", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startGeminiServer(() => ({ json: { candidates: [] } }));
+    // IP literals so assertPublicHttpUrl's real DNS path is skipped and the
+    // block is deterministic (no network lookup).
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      for (const url of [
+        "http://127.0.0.1:8080/x.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/secret.png",
+      ]) {
+        const result: any = await tool.execute("ssrf", { prompt: "edit", images: [url] });
+        // Non-throwing error tool result mentioning the load failure.
+        assert.equal(result.content[0].type, "text");
+        assert.match(result.content[0].text, /error/i);
+        assert.match(result.content[0].text, /Failed to load reference image/i);
+        assert.ok(result.details.error);
+      }
+      // The fetch client was never reached (rejected before download) and no
+      // Gemini generation request was sent.
+      assert.deepEqual(stub.calls, []);
+      assert.equal(server.lastBody(), undefined);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+test("image_generate rejects a workspace-relative reference that escapes the root", async () => {
+  await withWorkspace(async (workspace) => {
+    // Plant a file OUTSIDE the workspace that "../outside.png" would resolve to,
+    // proving the rejection is from the path guard, not a missing-file error.
+    const outside = path.join(workspace, "..", "outside.png");
+    const outsidePng = await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: 1, g: 2, b: 3 } } }).png().toBuffer();
+    await writeFile(outside, outsidePng);
+    const server = await startGeminiServer(() => ({ json: { candidates: [] } }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      const result: any = await tool.execute("traversal", { prompt: "edit", images: ["../outside.png"] });
+      assert.equal(result.content[0].type, "text");
+      assert.match(result.content[0].text, /Failed to load reference image/i);
+      assert.ok(result.details.error);
+      // No generation request was sent.
+      assert.equal(server.lastBody(), undefined);
+    } finally {
+      await rm(outside, { force: true });
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Construction-time output_subdir traversal rejection (#5.4)
+// ---------------------------------------------------------------------------
+
+test("createImageGenTool throws when output_subdir escapes the workspace", () => {
+  for (const subdir of ["../evil", "/abs/evil", "a/../../etc", ".."]) {
+    assert.throws(
+      () =>
+        createImageGenTool({
+          workspaceRoot: "/tmp",
+          fetchClient: {} as any,
+          downloadSizeLimit: 1,
+          inlineImageMaxBytes: 1,
+          inferenceImageOptions: defaultInferenceImageOptions(1),
+          config: { base_url: "https://x.test", api_key: "k", models: { pro: "p", flash: "f" }, output_subdir: subdir },
+        }),
+      /output_subdir/,
+      `expected ${subdir} to be rejected`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// File-collision retry (#5.6)
+// ---------------------------------------------------------------------------
+
+test("image_generate skips existing filenames and picks the next free suffix", async () => {
+  await withWorkspace(async (workspace) => {
+    // Pre-create myname.png and myname-1.png so the writer must land on -2.
+    const outDir = path.join(workspace, "generated-images");
+    await mkdir(outDir, { recursive: true });
+    const sentinel0 = Buffer.from("PRE-EXISTING-0");
+    const sentinel1 = Buffer.from("PRE-EXISTING-1");
+    await writeFile(path.join(outDir, "myname.png"), sentinel0);
+    await writeFile(path.join(outDir, "myname-1.png"), sentinel1);
+
+    const b64 = await smallPngBase64();
+    const server = await startGeminiServer(() => ({ json: geminiImageResponse(b64) }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      const result: any = await tool.execute("collision", { prompt: "a square", filename: "myname" });
+      assert.equal(result.details.path, "./generated-images/myname-2.png");
+      // The new file exists and is a real PNG.
+      const written = await readFile(path.join(outDir, "myname-2.png"));
+      assert.deepEqual(written.subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      // Pre-existing files were left untouched.
+      assert.deepEqual(await readFile(path.join(outDir, "myname.png")), sentinel0);
+      assert.deepEqual(await readFile(path.join(outDir, "myname-1.png")), sentinel1);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reference bounding (#5.7 / issue #3)
+// ---------------------------------------------------------------------------
+
+test("image_generate sends an under-budget URL reference with its original content-type and bytes", async () => {
+  await withWorkspace(async (workspace) => {
+    // A small JPEG well under the 6 MiB reference budget: must be sent untouched
+    // (original MIME from content-type, original base64 bytes — no re-encode).
+    const refJpeg = await sharp({ create: { width: 12, height: 12, channels: 3, background: { r: 90, g: 120, b: 200 } } }).jpeg().toBuffer();
+    const out = await smallPngBase64();
+    const server = await startGeminiServer(() => ({ json: geminiImageResponse(out) }));
+    const stub = makeStubFetchClient({ buffer: refJpeg, contentType: "image/jpeg" });
+    try {
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      const result: any = await tool.execute("ref-url", { prompt: "make it warmer", images: ["https://example.com/ref.jpg"] });
+
+      // The URL was actually downloaded through the fetch client with the guard on.
+      assert.deepEqual(stub.calls, ["https://example.com/ref.jpg"]);
+
+      const body = server.lastBody();
+      assert.equal(body.contents[0].parts.length, 2);
+      // MIME comes from the content-type header; bytes are the ORIGINAL, unmodified.
+      assert.equal(body.contents[0].parts[0].inlineData.mimeType, "image/jpeg");
+      assert.equal(body.contents[0].parts[0].inlineData.data, refJpeg.toString("base64"));
+      assert.deepEqual(body.contents[0].parts[1], { text: "make it warmer" });
+      assert.equal(result.details.isEdit, true);
+      assert.equal(result.details.referenceImages, 1);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+// NOTE on the over-budget path: `boundReferenceImage` only re-encodes (resize +
+// JPEG via conditionImageBufferForInference) when a reference exceeds the 6 MiB
+// REFERENCE_IMAGE_MAX_BYTES budget. Producing a genuinely >6 MiB image in a unit
+// test is impractical (multi-megapixel buffers, slow sharp encodes), so the
+// over-budget branch is left to the conditionImageBufferForInference unit tests;
+// the under-budget untouched path (the security/quality-relevant default) is
+// covered above and by the existing workspace-reference edit-mode test.
+
+// ---------------------------------------------------------------------------
+// HTTP-error branch (#5.8)
+// ---------------------------------------------------------------------------
+
+test("image_generate surfaces an HTTP 429 from the endpoint as a non-throwing text error", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startGeminiServer(() => ({ status: 429, json: { error: "rate limited" } }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client }));
+      const result: any = await tool.execute("rate-limited", { prompt: "anything" });
+      assert.equal(result.content[0].type, "text");
+      assert.match(result.content[0].text, /HTTP 429/);
+      assert.ok(result.details.error);
     } finally {
       await server.close();
       await stub.cleanup();
