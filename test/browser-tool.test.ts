@@ -477,6 +477,103 @@ test("aiSnapshot: a frame budget below the frame count truncates and marks it", 
   assert.ok(result.text.includes("truncated"), "truncation marker present");
 });
 
+test("aiSnapshot: snapshot_max_frames caps the walk — frames past the cap are never traversed (#18)", async () => {
+  // More child frames than the cap; record which frames' ariaSnapshot gets
+  // invoked so we can assert the walk stops at the cap rather than touching
+  // every frame.
+  const main = "- generic [ref=e1]";
+  const touched: number[] = [];
+  const childFrames = [1, 2, 3, 4, 5].map((n) => ({
+    url: () => `https://f${n}.example/`,
+    locator: () => ({
+      async ariaSnapshot() {
+        touched.push(n);
+        return `- button [ref=e${n + 1}]`;
+      },
+    }),
+  }));
+  const mainFrame = { url: () => "main", locator: () => ({ async ariaSnapshot() { return main; } }) };
+  const page = {
+    locator: (_sel: string) => ({ async ariaSnapshot() { return main; } }),
+    frames: () => [mainFrame, ...childFrames],
+  } as never;
+
+  const cap = 2;
+  const result = await aiSnapshot(page, 20000, cap);
+
+  assert.deepEqual(touched, [1, 2], "only the first `cap` child frames are traversed");
+  assert.ok(result.text.includes("[frame f1:"), "first capped frame included");
+  assert.ok(result.text.includes("[frame f2:"), "second capped frame included");
+  assert.ok(!result.text.includes("[frame f3:"), "frame past the cap excluded");
+  assert.equal(result.truncated, true, "more frames exist than the cap → truncated");
+  assert.equal(result.frameUrls.size, cap, "only capped frames recorded in frameUrls");
+});
+
+test("aiSnapshot: a mid-ref clamp never emits a partial [ref=…] fragment (#4)", async () => {
+  // Construct a raw snapshot so that the truncation cut lands in the MIDDLE of a
+  // frame-namespaced ref token. The clamp budget is maxChars - MARKER.length;
+  // we place a `[ref=f1:e7]` token straddling that boundary so a naive slice
+  // would leave a dangling `[ref=f1:e` fragment.
+  const marker = MARKER.length;
+  const token = "[ref=f1:e7]";
+  // clampWithMarker slices the body to `budget = maxChars - marker`. Place the
+  // token so that this cut lands a few chars INTO it: pre ends a little before
+  // `budget`, the token straddles `budget`, and a long tail forces overflow
+  // (raw.length > maxChars) so truncation actually happens.
+  const maxChars = 200;
+  const budget = maxChars - marker; // slice point
+  const pre = "x".repeat(budget - 7); // token starts 7 chars before the cut
+  const raw = `${pre}${token}${" tail".repeat(40)}`; // overflow guarantees truncation
+  assert.ok(raw.length > maxChars, "raw must overflow to force truncation");
+  // The cut at `budget` lands 7 chars into the token (after `[ref=f1`), so a
+  // naive slice keeps an unclosed `[ref=f1` fragment — exactly the #4 bug.
+  assert.ok(pre.length < budget && budget < pre.length + token.length, "cut bisects the token");
+
+  const result = await aiSnapshot(snapshotPage(raw), maxChars);
+
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= maxChars, `output ${result.text.length} ≤ ${maxChars}`);
+  // No partial ref fragment: any `[ref=` that appears must be closed by a `]`
+  // before the truncation marker begins.
+  const body = result.text.slice(0, result.text.indexOf(MARKER) === -1 ? result.text.length : result.text.indexOf(MARKER));
+  const lastOpen = body.lastIndexOf("[ref=");
+  if (lastOpen !== -1) {
+    assert.ok(body.indexOf("]", lastOpen) !== -1, `partial ref fragment leaked: ${JSON.stringify(body.slice(lastOpen))}`);
+  }
+});
+
+test("aiSnapshot: main-doc-fills-budget path emits an omitted-frames hint when iframes exist (#8)", async () => {
+  // Main document alone overflows the budget AND child frames exist → the agent
+  // would otherwise be blind to the iframe content. Assert the hint is emitted,
+  // names the child-frame count (excluding the main frame), and the output stays
+  // within budget with no `fN:eN` refs (no frame was rendered).
+  const main = "- generic [ref=e1]\n".repeat(200); // far over the cap
+  const children = [
+    { url: "https://a.example/", snapshot: "- button [ref=e2]" },
+    { url: "https://b.example/", snapshot: "- button [ref=e3]" },
+  ];
+  const maxChars = 400;
+  const result = await aiSnapshot(framedSnapshotPage(main, children), maxChars, 10);
+
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= maxChars, `output ${result.text.length} ≤ ${maxChars}`);
+  assert.ok(/2 frames omitted/.test(result.text), `hint names child-frame count: ${JSON.stringify(result.text.slice(-120))}`);
+  assert.ok(/snapshot_max_chars/.test(result.text), "hint suggests raising snapshot_max_chars");
+  assert.ok(!result.text.includes("[frame f1:"), "no frame was actually rendered on this path");
+  assert.ok(result.frameUrls.size === 0, "no frame URLs recorded (no rendered frames)");
+});
+
+test("aiSnapshot: main-doc-fills-budget path emits NO hint when maxFrames=0 or no child frames (#8)", async () => {
+  const main = "- generic [ref=e1]\n".repeat(200);
+  const maxChars = 400;
+  // maxFrames = 0 → no descent, no hint.
+  const r1 = await aiSnapshot(framedSnapshotPage(main, [{ url: "https://a", snapshot: "x" }]), maxChars, 0);
+  assert.ok(!/omitted/.test(r1.text), "no hint when frame descent is disabled");
+  // No child frames → nothing to mention.
+  const r2 = await aiSnapshot(framedSnapshotPage(main, []), maxChars, 10);
+  assert.ok(!/omitted/.test(r2.text), "no hint when there are no child frames");
+});
+
 // ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
 
 test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {

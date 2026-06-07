@@ -40,8 +40,11 @@ export interface SnapshotResult {
 
 const TRUNCATION_MARKER = "\n[... snapshot truncated — scroll or interact to reveal more ...]";
 // Don't bother opening a frame boundary if fewer than this many chars remain in
-// the budget — there'd be no room for any useful child content under it.
-const MIN_FRAME_BUDGET = 80;
+// the budget — there'd be no room for any useful child content under it. Derived
+// from the marker length so the invariant MIN_FRAME_BUDGET >= TRUNCATION_MARKER
+// length holds by construction: a frame segment that fits within the remaining
+// budget always leaves room for the terminal clamp to append the marker.
+const MIN_FRAME_BUDGET = Math.max(80, TRUNCATION_MARKER.length + 16);
 
 export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): Promise<SnapshotResult> {
   const mainRaw = await page.locator("body").ariaSnapshot({ mode: "ai" });
@@ -52,7 +55,17 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
   // are rendered, so the frame-URL map is empty (no `fN:eN` refs to validate).
   if (mainRaw.length >= maxChars) {
     if (mainRaw.length > maxChars) {
-      const text = clampWithMarker(mainRaw, maxChars);
+      // If interactive iframe content exists but is being dropped for lack of
+      // budget, surface a tiny note so the agent knows to raise
+      // snapshot_max_chars rather than assume the iframes simply aren't there
+      // (#8). The hint must survive the clamp, so reserve room for it ahead of
+      // the (already-truncated) main content. Only emit it when it actually
+      // fits alongside the truncation marker; otherwise fall back to a plain
+      // clamp so the output still never exceeds maxChars.
+      const hint = omittedFramesHint(page, maxFrames);
+      const text = hint && hint.length + TRUNCATION_MARKER.length <= maxChars
+        ? clampWithMarker(mainRaw.slice(0, maxChars - hint.length), maxChars - hint.length) + hint
+        : clampWithMarker(mainRaw, maxChars);
       return { text, truncated: true, refCount: countRefs(text), frameUrls: new Map() };
     }
     return { text: mainRaw, truncated: false, refCount: countRefs(mainRaw), frameUrls: new Map() };
@@ -73,6 +86,13 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
   let appended = 0;
   // frames[0] is the main document (already captured above); child frames —
   // including nested ones, which page.frames() returns flattened — start at 1.
+  //
+  // Budget policy (#11): child frames are appended WHOLE, first-fit, in
+  // page.frames() order until the budget is exhausted — there is no per-frame
+  // fairness slice. So under a tight snapshot_max_chars, frame ORDER determines
+  // visibility: a large early frame can consume the remaining budget and starve
+  // later frames (which then count as truncated). This is intentional; slicing a
+  // frame mid-tree would leave a dangling `[frame fN:` boundary and bisected refs.
   for (let i = 1; i < frames.length; i++) {
     if (appended >= maxFrames) {
       truncated = true; // more frames exist than we're willing to render
@@ -116,6 +136,27 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
 }
 
 /**
+ * Build the "frames omitted" hint for the path where the main document alone
+ * fills the budget so no frame is rendered (#8). Returns "" when frame descent
+ * is disabled (maxFrames <= 0), when page.frames() is unavailable (hand-rolled
+ * fake), or when there are no child frames to mention — counting only would-be
+ * child frames (excluding the main document at index 0). The note tells the agent
+ * interactive iframe content exists but was dropped for lack of budget.
+ */
+function omittedFramesHint(page: Page, maxFrames: number): string {
+  if (maxFrames <= 0 || typeof page.frames !== "function") return "";
+  let childFrames: number;
+  try {
+    childFrames = Math.max(0, page.frames().length - 1);
+  } catch {
+    return "";
+  }
+  if (childFrames === 0) return "";
+  const noun = childFrames === 1 ? "frame" : "frames";
+  return `\n[${childFrames} ${noun} omitted — raise snapshot_max_chars to reveal iframe content]`;
+}
+
+/**
  * Capture one child frame's AI snapshot and frame it under a `[frame fN: url]`
  * boundary with its refs namespaced to `fN:eN`. Returns the rendered `text` and
  * the frame's snapshot-time `url` (the latter recorded by the caller for the
@@ -146,10 +187,31 @@ function namespaceRefs(snapshot: string, frameIndex: number): string {
 /**
  * Clamp `s` to `maxChars`, reserving room for the truncation marker but never
  * letting (slice + marker) exceed `maxChars` even when maxChars < marker length.
+ *
+ * The slice can land mid-token, leaving a dangling partial ref like `[ref=f1:e`
+ * that the model would misread as a (broken) handle (#4). Before appending the
+ * marker we strip any trailing partial `[ref=…` fragment — i.e. a `[ref=` that
+ * isn't closed by a `]` within the kept slice — so a ref token is never bisected.
+ * A complete `[ref=…]` is left intact.
  */
 function clampWithMarker(s: string, maxChars: number): string {
   const budget = Math.max(0, maxChars - TRUNCATION_MARKER.length);
-  return (s.slice(0, budget) + TRUNCATION_MARKER).slice(0, maxChars);
+  const sliced = stripPartialRef(s.slice(0, budget));
+  return (sliced + TRUNCATION_MARKER).slice(0, maxChars);
+}
+
+/**
+ * Remove a trailing, unterminated `[ref=…` fragment (one with no closing `]`)
+ * from the end of a clamped slice, so a truncation cut never emits a bisected
+ * ref token. Returns `s` unchanged when the last `[ref=` is properly closed (or
+ * absent).
+ */
+function stripPartialRef(s: string): string {
+  const open = s.lastIndexOf("[ref=");
+  if (open === -1) return s;
+  // A closing `]` after the last `[ref=` means the token is complete → keep it.
+  if (s.indexOf("]", open) !== -1) return s;
+  return s.slice(0, open);
 }
 
 function countRefs(snapshot: string): number {
