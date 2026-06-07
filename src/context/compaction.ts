@@ -1,6 +1,7 @@
 import type { AppConfig } from "../config/index.js";
 import type { TimelineCompactionState } from "../storage/index.js";
-import type { CanonicalChatEvent } from "../types.js";
+import type { CanonicalChatEvent, ChatRole } from "../types.js";
+import type { ReactionLine } from "./reactions.js";
 import { estimateTokens } from "./tokens.js";
 import type { ContextTurn } from "./turns.js";
 
@@ -25,7 +26,33 @@ export interface CompactTimelineOptions {
   timelineKey: string;
   state?: TimelineCompactionState;
   now?: number;
+  /**
+   * View B reaction lines (ARCHITECTURE.md §9f) to interleave into the rich-tier
+   * turn stream. They do NOT influence the compact/rich boundary (reaction lines
+   * are tiny — useless as a token-budget signal); only those whose timestamp
+   * falls within the rich tier's time span are injected, at their chronological
+   * position, merged into adjacent user turns.
+   */
+  reactionLines?: ReactionLine[];
+  /**
+   * View B horizon as a rich-tier message count: 0 (default) = the whole rich
+   * tier (horizon = oldest rich event); >0 = only the last N rich messages, so
+   * the horizon is the Nth-from-last rich event's timestamp. Past the horizon a
+   * reaction exists only as a View A count.
+   */
+  discreteHorizonMessages?: number;
 }
+
+/** A renderable unit fed to {@link buildTieredTurns}: a real event or a synthetic line. */
+type TurnUnit = {
+  role: ChatRole;
+  tier: "compact" | "rich";
+  content: string;
+  tokenEstimate: number;
+  timestamp: number;
+  /** Present for real events; absent for synthetic reaction lines. */
+  messageId?: string;
+};
 
 type PreparedEvent = {
   event: CanonicalChatEvent;
@@ -98,13 +125,46 @@ export function compactTimelineEvents(
     nextState.compactStartEventId !== (options.state?.compactStartEventId ?? null) ||
     nextState.richStartEventId !== (options.state?.richStartEventId ?? null);
 
+  const compactUnits: TurnUnit[] = compacted.map((item) => ({
+    role: item.event.role,
+    tier: "compact",
+    content: item.compactContent,
+    tokenEstimate: item.compactTokens,
+    timestamp: item.event.timestamp,
+    messageId: item.event.id,
+  }));
+  const richEventUnits: TurnUnit[] = rich.map((item) => ({
+    role: item.event.role,
+    tier: "rich",
+    content: item.richContent,
+    tokenEstimate: item.richTokens,
+    timestamp: item.event.timestamp,
+    messageId: item.event.id,
+  }));
+  // Inject only reaction lines within the rich tier's time span (§8 horizon).
+  // discreteHorizonMessages tightens it to the last N rich messages (0 = whole tier).
+  const richHorizon = computeReactionHorizon(rich, options.discreteHorizonMessages ?? 0);
+  const reactionUnits: TurnUnit[] = (options.reactionLines ?? [])
+    .filter((line) => line.timestamp >= richHorizon)
+    .map((line) => ({
+      role: "user" as ChatRole,
+      tier: "rich" as const,
+      content: line.content,
+      tokenEstimate: estimateTokens(line.content),
+      timestamp: line.timestamp,
+    }));
+  // Merge reaction lines into the rich region by timestamp; at equal timestamps a
+  // reaction sorts AFTER the message (a reaction can't predate its target). Real
+  // events already arrive in chronological order, and V8's sort is stable.
+  const richUnits = [...richEventUnits, ...reactionUnits].sort(
+    (a, b) => a.timestamp - b.timestamp || rankUnit(a) - rankUnit(b),
+  );
+  const reactionTokens = reactionUnits.reduce((sum, u) => sum + u.tokenEstimate, 0);
+
   return {
-    turns: buildTieredTurns([
-      ...compacted.map((item) => ({ item, tier: "compact" as const })),
-      ...rich.map((item) => ({ item, tier: "rich" as const })),
-    ]),
+    turns: buildTieredTurns([...compactUnits, ...richUnits]),
     compactTokens,
-    richTokens,
+    richTokens: richTokens + reactionTokens,
     compactedMessageIds: compacted
       .map((item) => item.event.id)
       .filter((id) => !originallyCompacted.has(id)),
@@ -167,28 +227,41 @@ function buildState(
   };
 }
 
-function buildTieredTurns(
-  events: Array<{ item: PreparedEvent; tier: "compact" | "rich" }>,
-): TieredTurn[] {
+/** Rank for sort tiebreak: real events (with a messageId) precede synthetic lines. */
+function rankUnit(unit: TurnUnit): number {
+  return unit.messageId ? 0 : 1;
+}
+
+/**
+ * The View B inclusion horizon: a reaction line renders only if its timestamp is
+ * >= this value. `n <= 0` (or n covering the whole tier) → the oldest rich event;
+ * `n > 0` → the Nth-from-last rich event, restricting lines to the last N rich
+ * messages' time span. With no rich tier, nothing can interleave (+Infinity).
+ */
+function computeReactionHorizon(rich: PreparedEvent[], n: number): number {
+  if (rich.length === 0) return Number.POSITIVE_INFINITY;
+  if (n <= 0 || n >= rich.length) return rich[0]!.event.timestamp;
+  return rich[rich.length - n]!.event.timestamp;
+}
+
+function buildTieredTurns(units: TurnUnit[]): TieredTurn[] {
   const turns: TieredTurn[] = [];
-  for (const { item, tier } of events) {
-    const content = tier === "compact" ? item.compactContent : item.richContent;
-    const tokenEstimate = tier === "compact" ? item.compactTokens : item.richTokens;
+  for (const unit of units) {
     const previous = turns.at(-1);
-    if (previous && previous.role === item.event.role) {
-      previous.messageIds.push(item.event.id);
-      previous.content = `${previous.content}\n\n---\n\n${content}`;
-      previous.timestamp = item.event.timestamp;
-      previous.tokenEstimate += tokenEstimate + estimateTokens("\n\n---\n\n");
-      if (previous.tier !== tier) previous.tier = "mixed";
+    if (previous && previous.role === unit.role) {
+      if (unit.messageId) previous.messageIds.push(unit.messageId);
+      previous.content = `${previous.content}\n\n---\n\n${unit.content}`;
+      previous.timestamp = unit.timestamp;
+      previous.tokenEstimate += unit.tokenEstimate + estimateTokens("\n\n---\n\n");
+      if (previous.tier !== unit.tier) previous.tier = "mixed";
     } else {
       turns.push({
-        role: item.event.role,
-        tier,
-        messageIds: [item.event.id],
-        content,
-        timestamp: item.event.timestamp,
-        tokenEstimate,
+        role: unit.role,
+        tier: unit.tier,
+        messageIds: unit.messageId ? [unit.messageId] : [],
+        content: unit.content,
+        timestamp: unit.timestamp,
+        tokenEstimate: unit.tokenEstimate,
       });
     }
   }

@@ -273,6 +273,54 @@ export interface ChatIndexUpsert {
   contentSig: string;
 }
 
+/**
+ * One reaction (or un-reaction) to persist in the `reactions` store. Built from a
+ * native MatrixReactionStreamEvent (action "add") in the provider ingest path.
+ */
+export interface ReactionUpsert {
+  reactionEventId: string;
+  timelineKey: string;
+  targetEventId: string;
+  senderId: string;
+  senderDisplay: string | null;
+  /** 'unicode' | 'custom' | 'text' (mirrors MatrixReactionKind). */
+  kind: string;
+  display: string;
+  shortcode: string | null;
+  normalizedKey: string;
+  reactedAt: number;
+  observedAt: number;
+}
+
+/**
+ * One row of View A — a deduped reaction count on a single target message,
+ * grouped by `normalizedKey`. `count` is the number of distinct senders.
+ */
+export interface ReactionAggregateRow {
+  targetEventId: string;
+  normalizedKey: string;
+  kind: string;
+  display: string;
+  shortcode: string | null;
+  count: number;
+}
+
+/**
+ * One live (non-tombstoned) reaction row, for View B discrete-line synthesis.
+ * Ordered by `reactedAt` ascending so "earliest reactors" fall out naturally.
+ */
+export interface DiscreteReactionRow {
+  reactionEventId: string;
+  targetEventId: string;
+  senderId: string;
+  senderDisplay: string | null;
+  normalizedKey: string;
+  kind: string;
+  display: string;
+  shortcode: string | null;
+  reactedAt: number;
+}
+
 /** Net effect of one chat-index reconcile batch (for logging). */
 export interface ChatIndexReconcileResult {
   inserted: number;
@@ -4392,6 +4440,121 @@ export class Storage {
     });
   }
 
+  // --- Passive reaction store (ARCHITECTURE.md §6/§9f) ---
+
+  /**
+   * Upsert one reaction (action "add"). Idempotent on duplicate delivery:
+   * `insert or ignore` keyed on the reaction's own event id leaves any existing
+   * row (including a tombstoned one) untouched.
+   */
+  upsertReaction(row: ReactionUpsert): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert or ignore into reactions (
+           reaction_event_id, timeline_key, target_event_id, sender_id, sender_display,
+           kind, display, shortcode, normalized_key, reacted_at, observed_at
+         ) values (
+           @reactionEventId, @timelineKey, @targetEventId, @senderId, @senderDisplay,
+           @kind, @display, @shortcode, @normalizedKey, @reactedAt, @observedAt
+         )`,
+      ).run(row);
+    });
+  }
+
+  /**
+   * Tombstone a reaction (un-react): set `redacted_at` once. The `redacted_at is
+   * null` guard makes a duplicate redaction a no-op and preserves the first
+   * removal's timestamp. Returns rows updated — 0 when the id is unknown (a
+   * redaction of a non-reaction event, or a reaction never surfaced) or already
+   * tombstoned.
+   */
+  tombstoneReaction(reactionEventId: string, redactedAt: number): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(
+            `update reactions set redacted_at = @redactedAt
+             where reaction_event_id = @reactionEventId and redacted_at is null`,
+          )
+          .run({ reactionEventId, redactedAt }).changes,
+    );
+  }
+
+  /**
+   * View A: deduped reaction counts for a batch of target messages, keyed by
+   * target event id. Each value is that message's reactions grouped by
+   * `normalizedKey` with a distinct-sender count, ordered count desc then display
+   * asc (matching `react`/`list_reactions`). Tombstoned rows are excluded; targets
+   * with no live reactions are simply absent from the map.
+   *
+   * Matches purely on `target_event_id` (a globally-unique Matrix event id) — not
+   * on timeline_key, which is not derivable from a reaction event (see the
+   * reactions schema). The caller passes the exact event ids it is rendering, so
+   * there is no cross-room leakage.
+   */
+  getReactionAggregates(targetEventIds: string[]): Map<string, ReactionAggregateRow[]> {
+    const result = new Map<string, ReactionAggregateRow[]>();
+    if (targetEventIds.length === 0) return result;
+    return this.read((db) => {
+      const batchSize = 500;
+      for (let i = 0; i < targetEventIds.length; i += batchSize) {
+        const batch = targetEventIds.slice(i, i + batchSize);
+        const placeholders = batch.map(() => "?").join(", ");
+        const rows = db
+          .prepare(
+            `select target_event_id as targetEventId, normalized_key as normalizedKey,
+                    kind, display, shortcode, count(distinct sender_id) as count
+             from reactions
+             where target_event_id in (${placeholders})
+               and redacted_at is null
+             group by target_event_id, normalized_key
+             order by count desc, display asc`,
+          )
+          .all(...batch) as ReactionAggregateRow[];
+        for (const row of rows) {
+          const list = result.get(row.targetEventId);
+          if (list) list.push(row);
+          else result.set(row.targetEventId, [row]);
+        }
+      }
+      return result;
+    });
+  }
+
+  /**
+   * View B: live (non-tombstoned) reactions on a batch of target messages, ordered
+   * oldest-first by `reacted_at`. The caller (context builder) coalesces these per
+   * (target, normalizedKey) and applies the recency horizon + name cap. Flat list
+   * across all targets. Matches on `target_event_id` only (see
+   * {@link getReactionAggregates}).
+   */
+  getDiscreteReactions(targetEventIds: string[]): DiscreteReactionRow[] {
+    if (targetEventIds.length === 0) return [];
+    return this.read((db) => {
+      const rows: DiscreteReactionRow[] = [];
+      const batchSize = 500;
+      for (let i = 0; i < targetEventIds.length; i += batchSize) {
+        const batch = targetEventIds.slice(i, i + batchSize);
+        const placeholders = batch.map(() => "?").join(", ");
+        rows.push(
+          ...(db
+            .prepare(
+              `select reaction_event_id as reactionEventId, target_event_id as targetEventId,
+                      sender_id as senderId, sender_display as senderDisplay,
+                      normalized_key as normalizedKey, kind, display, shortcode,
+                      reacted_at as reactedAt
+               from reactions
+               where target_event_id in (${placeholders})
+                 and redacted_at is null
+               order by reacted_at asc, reaction_event_id asc`,
+            )
+            .all(...batch) as DiscreteReactionRow[]),
+        );
+      }
+      return rows;
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -4610,6 +4773,59 @@ end;
 create trigger if not exists summaries_ad after delete on summaries begin
   insert into summaries_fts(summaries_fts, rowid, content) values ('delete', old.rowid, old.content);
 end;
+`;
+
+// Passive reaction store (ARCHITECTURE.md §6/§9f, tmp/REACTIONS_DESIGN.md §4): the
+// source of truth for emoji reactions the agent passively perceives. Deliberately
+// NOT part of the timeline — a reaction is a mutable many-to-one relation (N
+// senders, add/remove over time) folded onto one target message, injected only at
+// render time (Views A/B). Keeping reactions out of `timeline_events` keeps them
+// out of summarization, chat search, diary and recap, all of which iterate it.
+//
+// No foreign key to `timeline_events`: `target_event_id` is the *external* Matrix
+// event id (== CanonicalChatEvent.externalId), not the internal `timeline_events.id`,
+// and a reaction may legitimately reference a message not (or no longer) stored.
+// `if not exists` makes this block safe to run both as the fresh-DB schema and as
+// the v13->v14 migration (which simply re-execs it), so the two cannot drift.
+const REACTIONS_SCHEMA = `
+create table if not exists reactions (
+  -- The m.reaction event's OWN id ($...). Redactions name this id, so an un-react
+  -- is a single UPDATE ... where reaction_event_id = ? — no content matching.
+  reaction_event_id text primary key,
+  -- Room-level locality hint (matrix:{account}:room:{roomId}) — informational
+  -- only. A reaction event carries just a room id; the target message's
+  -- authoritative timeline_key (dm vs room vs :thread:root) is NOT derivable from
+  -- it, and there is an ingest-vs-persist race. So reactions are matched to their
+  -- target purely by the globally-unique target_event_id (a Matrix event id is
+  -- unique across rooms); this column is for debugging/console context, never the
+  -- join key.
+  timeline_key      text not null,
+  -- The annotated message's Matrix event id (== CanonicalChatEvent.externalId).
+  -- This, not timeline_key, is the authoritative match key for both views.
+  target_event_id   text not null,
+  sender_id         text not null,
+  -- Display name at observation time (untrusted; for View B prose lines only).
+  sender_display    text,
+  kind              text not null check(kind in ('unicode', 'custom', 'text')),
+  -- Glyph for unicode, :shortcode: for custom, literal for text.
+  display           text not null,
+  shortcode         text,
+  -- Canonical grouping key: mxc:// for custom, glyph without variation selectors
+  -- for unicode. Dedup/aggregation (View A) groups on this.
+  normalized_key    text not null,
+  reacted_at        integer not null,   -- origin_server_ts of the reaction
+  observed_at       integer not null,   -- when we ingested it
+  -- Non-NULL once removed (un-react): a tombstone. Tombstoned rows render in
+  -- neither view but are kept so the aggregate count stays honest and a duplicate
+  -- redaction is a no-op.
+  redacted_at       integer
+);
+-- Both views match by target_event_id (View A aggregates per target, View B fetches
+-- live rows for a target set). Partial on the live rows since tombstones never
+-- render. Carries reacted_at so View B's oldest-first scan and View A's grouping
+-- are served from the index without touching the heap for the ordering key.
+create index if not exists idx_reactions_by_target
+  on reactions(target_event_id, reacted_at) where redacted_at is null;
 `;
 
 // Canonical schema, version 1. This is the COMPLETE current schema with every
@@ -4994,13 +5210,14 @@ create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
-${SUMMARY_SEARCH_SCHEMA}`;
+${SUMMARY_SEARCH_SCHEMA}
+${REACTIONS_SCHEMA}`;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 14;
+export const LATEST_SCHEMA_VERSION = 15;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5355,6 +5572,18 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   (db) => {
     db.exec(SUMMARY_SEARCH_SCHEMA);
     db.exec(`insert into summaries_fts(summaries_fts) values ('rebuild');`);
+  },
+  // index 14 (v14 -> v15): add the `reactions` table — the passive reaction store
+  // (ARCHITECTURE.md §6/§9f). A standalone, additive table with no FK
+  // (target_event_id is an external Matrix id, not timeline_events.id), so the
+  // migration simply re-execs the canonical REACTIONS_SCHEMA, written with
+  // `create table/index if not exists` so the fresh-DB and migration paths share one
+  // source of truth and cannot drift. The index is the final (target_event_id,
+  // reacted_at) shape from the start — reactions are matched by the globally-unique
+  // Matrix event id, not timeline_key (a reaction event cannot derive its target's
+  // dm/room/thread key). Fresh DBs get it directly from SCHEMA and never run this step.
+  (db) => {
+    db.exec(REACTIONS_SCHEMA);
   },
 ];
 

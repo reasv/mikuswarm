@@ -15,6 +15,7 @@ pub use types::{
     MatrixMessageSummaryRequest, MatrixNativeEvent, MatrixPinMessageRequest, MatrixPinsResult,
     MatrixPollVoteRequest, MatrixPollVoteResult,
     MatrixReactRequest, MatrixReactResult, MatrixReactionInfo, MatrixReactionKeyKind,
+    MatrixReactionStreamAction, MatrixReactionStreamEvent,
     MatrixReactionSummary, MatrixReadMessagesRequest, MatrixReadMessagesResult,
     MatrixResolveLinkPreviewsRequest, MatrixResolveTargetRequest, MatrixResolveTargetResult,
     MatrixRoomMember, MatrixRoomMembersRequest,

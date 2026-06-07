@@ -43,6 +43,9 @@ export {
   type SummarySearchQuery,
   type SummarySearchHit,
   type SummarySearchResult,
+  type ReactionUpsert,
+  type ReactionAggregateRow,
+  type DiscreteReactionRow,
 } from "./database.js";
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

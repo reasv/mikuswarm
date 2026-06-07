@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
-import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type {
   Storage,
@@ -14,6 +14,7 @@ import { processImageForInference, cleanupProcessedImage, buildInferenceImageOpt
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { hydrateEvents as hydrateEventsShared, mediaAssetToAttachmentMeta } from "./hydrate.js";
+import { synthesizeReactionLines, type ReactionLine, type ReactionTarget } from "./reactions.js";
 import { estimateTokens, truncateToTokens } from "./tokens.js";
 import {
   selectSummaries,
@@ -171,6 +172,27 @@ export class ContextBuilder {
       }
     }
 
+    // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
+    // projections from the reaction store, attached now (after the grace wait has
+    // finalized the event set) and never persisted into event_json. Off for
+    // summarization builds — reactions must never leak into summaries (§4) — and
+    // gated by [reactions] config.
+    const rx = this.config.reactions ?? {};
+    const reactionsEnabled = !cutoff && rx.enabled !== false;
+    let reactionLines: ReactionLine[] = [];
+    if (reactionsEnabled) {
+      if (rx.show_aggregates !== false) {
+        compactionInput = this.attachReactionAggregates(compactionInput);
+        triggerEvents = this.attachReactionAggregates(triggerEvents);
+      }
+      if (rx.show_discrete !== false) {
+        reactionLines = this.buildDiscreteReactionLines(compactionInput, {
+          assistantOnly: rx.discrete_assistant_only !== false,
+          nameCap: rx.discrete_name_cap ?? 8,
+        });
+      }
+    }
+
     const compacted = compactTimelineEvents(
       compactionInput,
       renderRichMessage,
@@ -181,6 +203,8 @@ export class ContextBuilder {
         // A summarization build operates on a cut-down event set; never persist
         // its derived boundaries into the real compaction state.
         state: cutoff ? undefined : compactionState,
+        reactionLines,
+        discreteHorizonMessages: rx.discrete_horizon_messages ?? 0,
       },
     );
     if (!cutoff && compacted.stateChanged && compacted.state) {
@@ -586,7 +610,72 @@ export class ContextBuilder {
 
   private hydrateEvents(events: CanonicalChatEvent[]): CanonicalChatEvent[] {
     // Shared with search_messages (§9e) so search hits render at the same fidelity.
+    // Note: reaction aggregates (View A) are attached separately, on the live
+    // render path only (attachReactionAggregates) — NOT here — so search and
+    // summarization builds never carry them.
     return hydrateEventsShared(this.storage, events);
+  }
+
+  /**
+   * View A (ARCHITECTURE.md §9f): attach deduped reaction counts to each event
+   * that has reactions, as a render-time derivation. Only the rich renderer emits
+   * them; compact/dropped events carry them harmlessly. Events are returned
+   * unchanged when they have no external id or no live reactions.
+   */
+  private attachReactionAggregates(events: CanonicalChatEvent[]): CanonicalChatEvent[] {
+    const externalIds = events
+      .map((e) => e.externalId)
+      .filter((id): id is string => id !== undefined);
+    if (externalIds.length === 0) return events;
+    const aggregates = this.storage.getReactionAggregates(externalIds);
+    if (aggregates.size === 0) return events;
+    return events.map((event) => {
+      if (!event.externalId) return event;
+      const rows = aggregates.get(event.externalId);
+      if (!rows || rows.length === 0) return event;
+      const reactions: ReactionAggregate[] = rows.map((r) => ({
+        normalizedKey: r.normalizedKey,
+        kind: r.kind as ReactionAggregate["kind"],
+        display: r.display,
+        shortcode: r.shortcode ?? undefined,
+        count: r.count,
+      }));
+      return { ...event, reactions };
+    });
+  }
+
+  /**
+   * View B (ARCHITECTURE.md §9f): synthesize discrete reaction lines for messages
+   * among `events`. By default only the assistant's own messages are targeted
+   * (`assistantOnly`); when false, any sender's recent messages qualify and the
+   * line reads "<author>'s message" instead of "your message". The store is
+   * queried for all such targets; compaction injects only the lines whose
+   * timestamp falls within the rich tier's time span. Returns [] when there are no
+   * targets or no live reactions on them.
+   */
+  private buildDiscreteReactionLines(
+    events: CanonicalChatEvent[],
+    opts: { assistantOnly: boolean; nameCap: number },
+  ): ReactionLine[] {
+    const targets = events.filter(
+      (e) => e.externalId !== undefined && (!opts.assistantOnly || e.role === "assistant"),
+    );
+    const externalIds = targets
+      .map((e) => e.externalId)
+      .filter((id): id is string => id !== undefined);
+    if (externalIds.length === 0) return [];
+    const rows = this.storage.getDiscreteReactions(externalIds);
+    if (rows.length === 0) return [];
+    const targetInfo = new Map<string, ReactionTarget>();
+    for (const target of targets) {
+      if (!target.externalId) continue;
+      targetInfo.set(target.externalId, {
+        body: target.body,
+        self: target.role === "assistant",
+        authorDisplay: target.sender.displayName ?? undefined,
+      });
+    }
+    return synthesizeReactionLines(rows, targetInfo, { nameCap: opts.nameCap });
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

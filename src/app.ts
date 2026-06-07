@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, type ConsoleServer } from "./observability/index.js";
-import { MatrixProvider, RoomLabelCache } from "./matrix/index.js";
+import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
   ActivationCoordinator,
@@ -346,6 +346,32 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         state: "state" in event ? event.state : undefined,
         stage: "stage" in event ? event.stage : undefined,
       }),
+    // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
+    // store only — never wake a session. Writes are fire-and-forget through the
+    // single-writer queue; a failure is logged but must not stall the poll loop.
+    onReaction: (event, context) => {
+      // Master switch: when reactions are disabled, don't even persist (the views
+      // are gated independently in the context builder).
+      if (config.reactions?.enabled === false) return;
+      void ingestReactionEvent(storage, context.accountId, event, Date.now())
+        .then((outcome) => {
+          if (outcome.action === "skipped") {
+            logger.warn("reaction_add_incomplete", {
+              ...context,
+              reactionEventId: event.reactionEventId,
+              reason: outcome.reason,
+            });
+          }
+        })
+        .catch((error) =>
+          logger.error("reaction_ingest_failed", {
+            ...context,
+            reactionEventId: event.reactionEventId,
+            action: event.action,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    },
     onDiagnostics: (diagnostics, context) =>
       logger.info("matrix_diagnostics", {
         ...context,

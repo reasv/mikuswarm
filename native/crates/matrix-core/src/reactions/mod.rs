@@ -66,6 +66,40 @@ pub fn resolve_reaction_key_info(
     })
 }
 
+/// Resolve display metadata for an *inbound* reaction key.
+///
+/// [`resolve_reaction_key_info`] is built for the outbound direction — a user
+/// types `:foo:` or a glyph and we resolve it forward. Inbound custom reactions
+/// instead arrive as a raw `mxc://` key plus an optional `:shortcode:` carried
+/// in the reaction's `m.relates_to` metadata. Feeding that mxc key to the
+/// outbound resolver yields the mxc URL itself as the "shortcode"/"display" (it
+/// can only map shortcode → mxc, never the reverse). So here we trust the key
+/// for `kind`/`normalized`, but take `shortcode`/`display` from the inbound
+/// metadata, falling back to the same `[custom reaction …]` form the outbound
+/// resolver uses when no shortcode is known.
+pub fn resolve_inbound_reaction_key_info(
+    config: &MatrixClientConfig,
+    key: &str,
+    metadata_shortcode: Option<&str>,
+    room_id: Option<&str>,
+    now_ms: i64,
+) -> MatrixResult<MatrixReactionInfo> {
+    let mut info = resolve_reaction_key_info(config, key, room_id, now_ms)?;
+    // For an inbound key the outbound resolver leaves `shortcode` set to the key
+    // itself when nothing resolves (the mxc url for custom, the glyph for
+    // unicode) — neither is a real `:shortcode:`. The only trustworthy shortcode
+    // is the one the reaction carried in its `m.relates_to` metadata, so adopt
+    // it unconditionally (typically absent for unicode/text).
+    let metadata_shortcode = metadata_shortcode.and_then(emoji::normalize_shortcode);
+    if info.kind == MatrixReactionKeyKind::Custom {
+        info.display = metadata_shortcode
+            .clone()
+            .unwrap_or_else(|| format!("[custom reaction {}]", describe_mxc_uri(&info.normalized)));
+    }
+    info.shortcode = metadata_shortcode;
+    Ok(info)
+}
+
 pub fn serialize_shortcode_metadata(shortcode: Option<&str>) -> Option<String> {
     let normalized = shortcode.and_then(emoji::normalize_shortcode)?;
     Some(
@@ -150,7 +184,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{read_reaction_shortcode, resolve_reaction_key_info, serialize_shortcode_metadata};
+    use super::{
+        read_reaction_shortcode, resolve_inbound_reaction_key_info, resolve_reaction_key_info,
+        serialize_shortcode_metadata,
+    };
 
     fn unique_root() -> PathBuf {
         std::env::temp_dir().join(format!("openclaw-matrix-rust-reactions-{}", Uuid::new_v4()))
@@ -227,6 +264,72 @@ mod tests {
         assert_eq!(reaction.raw, "😂");
         assert_eq!(reaction.normalized, "😂");
         assert_eq!(reaction.shortcode.as_deref(), Some(":joy:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbound_custom_reaction_prefers_metadata_shortcode_over_mxc_key() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let config = sample_config(&root);
+        // Inbound custom reaction: the key is the raw mxc url, the shortcode
+        // arrives via m.relates_to metadata and the local catalog has never
+        // seen it. Display/shortcode must resolve to `:blobwave:`, not the mxc.
+        let reaction = resolve_inbound_reaction_key_info(
+            &config,
+            "mxc://example/blobwave",
+            Some(":blobwave:"),
+            Some("!room:example"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(reaction.kind, crate::api::MatrixReactionKeyKind::Custom);
+        assert_eq!(reaction.normalized, "mxc://example/blobwave");
+        assert_eq!(reaction.display, ":blobwave:");
+        assert_eq!(reaction.shortcode.as_deref(), Some(":blobwave:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbound_custom_reaction_without_metadata_falls_back_to_descriptor() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let config = sample_config(&root);
+        let reaction =
+            resolve_inbound_reaction_key_info(&config, "mxc://example/mystery", None, None, 0)
+                .unwrap();
+        assert_eq!(reaction.kind, crate::api::MatrixReactionKeyKind::Custom);
+        assert_eq!(reaction.display, "[custom reaction example/mystery]");
+        assert_eq!(reaction.shortcode, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbound_text_reaction_classifies_as_text() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let config = sample_config(&root);
+        // A non-emoji literal reaction key resolves as kind Text, with the literal
+        // as both normalized and display and no shortcode.
+        let reaction = resolve_inbound_reaction_key_info(&config, "lgtm", None, None, 0).unwrap();
+        assert_eq!(reaction.kind, crate::api::MatrixReactionKeyKind::Text);
+        assert_eq!(reaction.normalized, "lgtm");
+        assert_eq!(reaction.display, "lgtm");
+        assert_eq!(reaction.shortcode, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbound_unicode_reaction_keeps_glyph_display() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let config = sample_config(&root);
+        let reaction =
+            resolve_inbound_reaction_key_info(&config, "⚡️", None, None, 0).unwrap();
+        assert_eq!(reaction.kind, crate::api::MatrixReactionKeyKind::Unicode);
+        assert_eq!(reaction.normalized, "⚡");
+        assert_eq!(reaction.display, "⚡");
+        assert_eq!(reaction.shortcode, None);
         let _ = fs::remove_dir_all(root);
     }
 

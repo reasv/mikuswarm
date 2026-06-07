@@ -72,6 +72,10 @@ export type MatrixNativeEvent =
   | {
       type: "inbound";
       event: MatrixInboundEvent;
+    }
+  | {
+      type: "reaction";
+      event: MatrixReactionStreamEvent;
     };
 
 export type MatrixNativeDiagnostics = {
@@ -384,6 +388,36 @@ export type MatrixReactionInfo = {
   display: string;
   kind: MatrixReactionKind;
   shortcode?: string;
+};
+
+export type MatrixReactionStreamAction = "add" | "remove";
+
+/**
+ * A reaction (or un-reaction) observed on the live sync stream and surfaced for
+ * passive display. Emitted as the `reaction` variant of {@link MatrixNativeEvent}.
+ *
+ * For `action: "add"` the resolver-derived fields (`kind`/`display`/`shortcode`/
+ * `normalizedKey`) and `targetEventId` are populated. For `action: "remove"`
+ * only `reactionEventId` (the redacted reaction's own id) is meaningful — the
+ * redaction event does not carry the original target, and the store tombstones
+ * purely by `reactionEventId`.
+ */
+export type MatrixReactionStreamEvent = {
+  action: MatrixReactionStreamAction;
+  /** The `m.reaction` event's own id (`$...`); the store's primary key. */
+  reactionEventId: string;
+  roomId: string;
+  /** The annotated message's id. Present for "add"; absent for "remove". */
+  targetEventId?: string;
+  /** Who reacted ("add") or who issued the redaction ("remove"). */
+  senderId: string;
+  senderDisplay?: string;
+  /** `origin_server_ts` of the reaction ("add") or the redaction ("remove"). */
+  reactedAtMs: number;
+  kind?: MatrixReactionKind;
+  display?: string;
+  shortcode?: string;
+  normalizedKey?: string;
 };
 
 export type MatrixReactionSummary = {
