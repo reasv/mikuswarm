@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, mkdir, symlink } from "node:fs/promises";
 
 import sharp from "sharp";
 
@@ -517,6 +517,27 @@ test("resolveUploadFiles: rejects a directory (not a regular file)", async () =>
       () => resolveUploadFiles(root, ["adir"]),
       (e: unknown) => (e as { code?: string }).code === "bad_request" && /not a regular file/.test((e as Error).message),
     );
+  });
+});
+
+test("resolveUploadFiles: rejects a workspace-internal symlink pointing out of tree (bad_request) (#7)", async () => {
+  await withWorkspace(async (root) => {
+    // A symlink that lives inside the workspace but resolves to a host file
+    // outside it: a lexical prefix check string-passes it, the realpath-based
+    // resolveWorkspacePath rejects it before it can be read and exfiltrated.
+    const outOfTree = await mkdtemp(path.join(os.tmpdir(), "miku-upload-secret-"));
+    try {
+      const secret = path.join(outOfTree, "id_rsa");
+      await writeFile(secret, "PRIVATE KEY");
+      await symlink(secret, path.join(root, "leak"));
+      await assert.rejects(
+        () => resolveUploadFiles(root, ["leak"]),
+        (e: unknown) =>
+          (e as { code?: string }).code === "bad_request" && /escapes the workspace/.test((e as Error).message),
+      );
+    } finally {
+      await rm(outOfTree, { recursive: true, force: true });
+    }
   });
 });
 
