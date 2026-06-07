@@ -640,7 +640,9 @@ async fn handle_reaction_add(
 /// id is not a known reaction. This is stateless and self-correcting across
 /// restarts — a reaction persisted in a previous session is still tombstoned
 /// correctly — which an in-memory "surfaced ids" set could not guarantee.
-/// Message redaction/deletion is a separate concern handled elsewhere.
+/// A redaction that targets an ordinary message (not a reaction) tombstones 0
+/// reaction rows and is otherwise dropped here; message deletion handling, if
+/// any, is out of scope for this handler.
 fn handle_reaction_redaction(shared: &SharedState, room: &Room, value: &Value) {
     // The redacted event id is top-level `redacts` (pre room v11) or
     // `content.redacts` (room v11+, MSC2174).

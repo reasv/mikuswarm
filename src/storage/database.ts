@@ -4788,7 +4788,7 @@ create trigger if not exists summaries_ad after delete on summaries begin
 end;
 `;
 
-// Passive reaction store (ARCHITECTURE.md §6/§9f, tmp/REACTIONS_DESIGN.md §4): the
+// Passive reaction store (ARCHITECTURE.md §6/§9f): the
 // source of truth for emoji reactions the agent passively perceives. Deliberately
 // NOT part of the timeline — a reaction is a mutable many-to-one relation (N
 // senders, add/remove over time) folded onto one target message, injected only at
@@ -4799,7 +4799,7 @@ end;
 // event id (== CanonicalChatEvent.externalId), not the internal `timeline_events.id`,
 // and a reaction may legitimately reference a message not (or no longer) stored.
 // `if not exists` makes this block safe to run both as the fresh-DB schema and as
-// the v13->v14 migration (which simply re-execs it), so the two cannot drift.
+// the v14->v15 migration (which simply re-execs it), so the two cannot drift.
 const REACTIONS_SCHEMA = `
 create table if not exists reactions (
   -- The m.reaction event's OWN id ($...). Redactions name this id, so an un-react
@@ -4835,8 +4835,10 @@ create table if not exists reactions (
 );
 -- Both views match by target_event_id (View A aggregates per target, View B fetches
 -- live rows for a target set). Partial on the live rows since tombstones never
--- render. Carries reacted_at so View B's oldest-first scan and View A's grouping
--- are served from the index without touching the heap for the ordering key.
+-- render. Carries reacted_at so View B's oldest-first scan is fully index-served and
+-- View A's target+live-row filter is index-served. View A's aggregation itself still
+-- hits the heap: it groups on normalized_key and counts distinct sender_id, neither
+-- of which is in the index. Fine at the rich tier's small row counts.
 create index if not exists idx_reactions_by_target
   on reactions(target_event_id, reacted_at) where redacted_at is null;
 `;
