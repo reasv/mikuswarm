@@ -177,6 +177,24 @@ max_regular_tags = 2
 default_limit = 20
 download_subdir = "downloads/danbooru"
 
+# Image generation / editing via Google's Gemini "nano banana" models, routed
+# through LlmGateway's /google endpoint. `base_url` is the endpoint ROOT — the
+# tool appends /v1beta/models/<model>:generateContent. NOTE: this is NOT
+# ${LLM_GATEWAY_URL} (that points at /anthropic); use the sibling /google path via
+# LLM_GATEWAY_GOOGLE_URL. `api_key` is sent as `Authorization: Bearer`.
+[image_gen]
+base_url = "${LLM_GATEWAY_GOOGLE_URL}"
+api_key = "${LLM_GATEWAY_API_KEY}"
+timeout_ms = 120000
+# Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
+# Through LlmGateway the default cap is tiny and truncates before any image.
+max_output_tokens = 32768
+output_subdir = "generated-images"
+
+[image_gen.models]
+pro = "gemini-3-pro-image"
+flash = "gemini-3.1-flash-image"
+
 [summarization]
 enabled = true
 worker_count = 1

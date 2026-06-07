@@ -29,6 +29,7 @@ import {
   createDelegateToSessionTool,
   createEditMessageTool,
   createEmojiListTool,
+  createImageGenTool,
   createListReactionsTool,
   createReadMessagesTool,
   createSearchMessagesTool,
@@ -971,6 +972,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         httpProxyUrl: config.network?.http_proxy_url,
         config: config.danbooru,
       }),
+      ...(config.image_gen
+        ? [createImageGenTool({
+            workspaceRoot,
+            fetchClient,
+            downloadSizeLimit,
+            inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+            inferenceImageOptions,
+            httpProxyUrl: config.network?.http_proxy_url,
+            config: config.image_gen,
+          })]
+        : []),
       createUserProfileReadTool({
         workspaceRoot,
         provider: inbound.provider,
