@@ -14,6 +14,8 @@ interface FakeOpts {
   dragError?: Error;
   setFilesError?: Error;
   cdpSendError?: Error;
+  newCDPSessionError?: Error;
+  pressError?: Error;
 }
 
 function recordingPage(opts: FakeOpts = {}) {
@@ -54,6 +56,10 @@ function recordingPage(opts: FakeOpts = {}) {
       },
       async pressSequentially(t: string, o: unknown) {
         calls.push(["pressSequentially", selector, t, o]);
+      },
+      async press(k: string, o: unknown) {
+        calls.push(["press", selector, k, o]);
+        if (opts.pressError) throw opts.pressError;
       },
       async waitFor(o: unknown) {
         calls.push(["waitFor", selector, o]);
@@ -107,6 +113,7 @@ function recordingPage(opts: FakeOpts = {}) {
     context() {
       return {
         async newCDPSession() {
+          if (opts.newCDPSessionError) throw opts.newCDPSessionError;
           return cdp;
         },
       };
@@ -150,14 +157,27 @@ test("act:click left button omits the button note", async () => {
 
 // ── type {submit} ────────────────────────────────────────────────────────────
 
-test("act:type submit presses Enter after typing and notes it", async () => {
+test("act:type submit presses Enter on the typed locator (not page.keyboard) after typing", async () => {
   const page = recordingPage();
   const r = await run(page, { kind: "type", ref: "e1", text: "hello", submit: true });
   assert.equal(r.detail, "typed into e1 and submitted");
   const seq = page.calls.map((c) => c[0]);
   const typeIdx = seq.indexOf("pressSequentially");
-  const enterIdx = page.calls.findIndex((c) => c[0] === "keyboard.press" && c[1] === "Enter");
-  assert.ok(typeIdx >= 0 && enterIdx > typeIdx, "Enter pressed after typing");
+  // Enter is pressed on the LOCATOR (re-targeting the ref), not via page.keyboard.
+  const enterIdx = page.calls.findIndex(
+    (c) => c[0] === "press" && c[1] === "aria-ref=e1" && c[2] === "Enter",
+  );
+  assert.ok(typeIdx >= 0 && enterIdx > typeIdx, "Enter pressed on the locator after typing");
+  assert.ok(!page.calls.some((c) => c[0] === "keyboard.press"), "does not use global page.keyboard");
+});
+
+test("act:type submit on a stale ref surfaces as ref_expired", async () => {
+  const stale = new Error("No node found for selector: aria-ref=e1");
+  const page = recordingPage({ pressError: stale });
+  await assert.rejects(
+    () => run(page, { kind: "type", ref: "e1", text: "hello", submit: true }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
 });
 
 test("act:type without submit does not press Enter", async () => {
@@ -165,6 +185,7 @@ test("act:type without submit does not press Enter", async () => {
   const r = await run(page, { kind: "type", ref: "e1", text: "hello" });
   assert.equal(r.detail, "typed into e1");
   assert.ok(!page.calls.some((c) => c[0] === "keyboard.press"));
+  assert.ok(!page.calls.some((c) => c[0] === "press"));
 });
 
 // ── rich wait ────────────────────────────────────────────────────────────────
@@ -325,4 +346,17 @@ test("act:clear_site_data CDP failure surfaces as clear_failed and still detache
     (e: unknown) => (e as { code?: string }).code === "clear_failed",
   );
   assert.ok(page.calls.some((c) => c[0] === "cdp.detach"), "detaches even on failure");
+});
+
+test("act:clear_site_data newCDPSession failure surfaces as clear_failed (no detach)", async () => {
+  const page = recordingPage({
+    url: "https://site.example",
+    newCDPSessionError: new Error("CDP session open boom"),
+  });
+  await assert.rejects(
+    () => run(page, { kind: "clear_site_data" }),
+    (e: unknown) => (e as { code?: string }).code === "clear_failed",
+  );
+  // The session never opened, so there is nothing to detach.
+  assert.ok(!page.calls.some((c) => c[0] === "cdp.detach"), "no detach when session never opened");
 });

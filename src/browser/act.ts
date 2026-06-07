@@ -110,7 +110,13 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
     case "type": {
       const text = requireText(params, "type");
       await withRef(page, params, opts, (loc) => loc.pressSequentially(text, { timeout: opts.timeoutMs }));
-      if (params.submit) await page.keyboard.press("Enter");
+      // Submit by pressing Enter on the same LOCATOR (not page.keyboard) so the
+      // ref is re-targeted: a focus loss or DOM change between typing and submit
+      // surfaces as ref_expired via withRef's mapError, rather than a blind
+      // global keypress landing on the wrong element.
+      if (params.submit) {
+        await withRef(page, params, opts, (loc) => loc.press("Enter", { timeout: opts.timeoutMs }));
+      }
       return done(kind, params.submit ? `typed into ${params.ref} and submitted` : `typed into ${params.ref}`);
     }
 
@@ -246,6 +252,11 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
       // Detect a direct <input type=file> vs. a styled button that opens the
       // chooser. A fixed predicate (not agent-supplied JS) — the evaluate_enabled
       // gate doesn't apply.
+      // The `.catch(() => false)` deliberately treats any probe failure as "not a
+      // file input" and falls through to the chooser path. A genuinely stale ref
+      // makes the probe throw, but rather than mapping it here we let the
+      // subsequent `loc.click(...)` fail and surface as ref_expired via its
+      // mapError — so a single, consistent stale-ref error reaches the model.
       const isFileInput = await loc
         .evaluate((el) => el instanceof HTMLInputElement && el.type === "file")
         .catch(() => false);
@@ -287,7 +298,19 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
           "clear_site_data needs a page on an http(s) origin (current page has none).",
         );
       }
-      const cdp = await page.context().newCDPSession(page);
+      // Opening the CDP session is itself a failure point: if it throws, it must
+      // surface as a structured clear_failed (not a raw error) so the tool layer
+      // can map it. Declare `cdp` first and only run detach once it's defined.
+      let cdp: Awaited<ReturnType<ReturnType<Page["context"]>["newCDPSession"]>>;
+      try {
+        cdp = await page.context().newCDPSession(page);
+      } catch (error) {
+        throw new BrowserError(
+          "clear_failed",
+          `Failed to open a CDP session to clear ${origin}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
       try {
         await cdp.send("Storage.clearDataForOrigin", { origin, storageTypes: "all" });
       } catch (error) {
