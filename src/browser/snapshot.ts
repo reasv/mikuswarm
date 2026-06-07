@@ -24,6 +24,18 @@ export interface SnapshotResult {
    * past the cut — so the model is never told about refs it can't reach.
    */
   refCount: number;
+  /**
+   * The URL of each child frame at the moment its segment was appended, keyed by
+   * its `page.frames()` index (the `N` in an `fN:eN` ref). The subsequent `act`
+   * consults this to detect frame REORDERING between snapshot and act: if the
+   * live `page.frames()[N].url()` no longer matches the recorded URL, index N now
+   * points at a DIFFERENT frame (which may hold its own valid `eN`), so the ref
+   * is stale → `ref_expired`. In-place navigation is already caught by the
+   * detached-node timeout; this closes the reorder hole (see ARCHITECTURE.md
+   * §11b "frame ref staleness"). Only frames actually rendered into the snapshot
+   * are recorded — refs the model can't see can't be acted on.
+   */
+  frameUrls: Map<number, string>;
 }
 
 const TRUNCATION_MARKER = "\n[... snapshot truncated — scroll or interact to reveal more ...]";
@@ -36,24 +48,28 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
 
   // Main document alone fills (or overflows) the budget: don't descend into
   // frames (no room anyway). Overflow truncates with a marker; exactly-at-cap
-  // passes through verbatim (the original boundary contract).
+  // passes through verbatim (the original boundary contract). No child frames
+  // are rendered, so the frame-URL map is empty (no `fN:eN` refs to validate).
   if (mainRaw.length >= maxChars) {
     if (mainRaw.length > maxChars) {
       const text = clampWithMarker(mainRaw, maxChars);
-      return { text, truncated: true, refCount: countRefs(text) };
+      return { text, truncated: true, refCount: countRefs(text), frameUrls: new Map() };
     }
-    return { text: mainRaw, truncated: false, refCount: countRefs(mainRaw) };
+    return { text: mainRaw, truncated: false, refCount: countRefs(mainRaw), frameUrls: new Map() };
   }
 
   // page.frames() may be absent on a hand-rolled fake; with maxFrames === 0 we
   // never touch it, preserving the pre-frames contract.
   if (maxFrames <= 0 || typeof page.frames !== "function") {
-    return { text: mainRaw, truncated: false, refCount: countRefs(mainRaw) };
+    return { text: mainRaw, truncated: false, refCount: countRefs(mainRaw), frameUrls: new Map() };
   }
 
   let text = mainRaw;
   let truncated = false;
   const frames = page.frames();
+  // index → URL captured at the moment we walk that frame, so it aligns with the
+  // `N` in the `fN:eN` refs we emit and the next act reads from page.frames()[N].
+  const frameUrls = new Map<number, string>();
   let appended = 0;
   // frames[0] is the main document (already captured above); child frames —
   // including nested ones, which page.frames() returns flattened — start at 1.
@@ -71,6 +87,7 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
     const segment = await frameSegment(frame, i);
     if (segment === undefined) {
       // Inaccessible/detached frame — note it inline if there's room, else stop.
+      // No usable refs come out of it, so it's not recorded in frameUrls.
       const note = `\n\n[frame f${i}: <inaccessible>]`;
       if (note.length <= maxChars - text.length) {
         text += note;
@@ -80,26 +97,32 @@ export async function aiSnapshot(page: Page, maxChars: number, maxFrames = 0): P
       truncated = true;
       break;
     }
-    if (segment.length > maxChars - text.length) {
+    if (segment.text.length > maxChars - text.length) {
       // Child doesn't fit whole: take what fits and stop (avoids slicing a later
-      // frame mid-way and leaving a dangling boundary).
+      // frame mid-way and leaving a dangling boundary). Not recorded — its refs
+      // aren't in the returned text.
       truncated = true;
       break;
     }
-    text += segment;
+    text += segment.text;
+    // Record the frame's snapshot-time URL only once it's actually in `text`, so
+    // the map describes exactly the `fN:eN` refs the model can see and reuse.
+    frameUrls.set(i, segment.url);
     appended++;
   }
 
   if (truncated) text = clampWithMarker(text, maxChars);
-  return { text, truncated, refCount: countRefs(text) };
+  return { text, truncated, refCount: countRefs(text), frameUrls };
 }
 
 /**
  * Capture one child frame's AI snapshot and frame it under a `[frame fN: url]`
- * boundary with its refs namespaced to `fN:eN`. Returns `undefined` when the
- * frame can't be snapshotted (detached/navigated mid-walk).
+ * boundary with its refs namespaced to `fN:eN`. Returns the rendered `text` and
+ * the frame's snapshot-time `url` (the latter recorded by the caller for the
+ * frame-reorder staleness check). Returns `undefined` when the frame can't be
+ * snapshotted (detached/navigated mid-walk).
  */
-async function frameSegment(frame: Frame, index: number): Promise<string | undefined> {
+async function frameSegment(frame: Frame, index: number): Promise<{ text: string; url: string } | undefined> {
   let url: string;
   try {
     url = frame.url() || "?";
@@ -112,7 +135,7 @@ async function frameSegment(frame: Frame, index: number): Promise<string | undef
   } catch {
     return undefined;
   }
-  return `\n\n[frame f${index}: ${url}]\n${namespaceRefs(child, index)}`;
+  return { text: `\n\n[frame f${index}: ${url}]\n${namespaceRefs(child, index)}`, url };
 }
 
 /** Rewrite a child frame's page-scoped `[ref=eN]` handles to `[ref=fN:eN]`. */

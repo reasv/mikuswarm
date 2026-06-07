@@ -86,6 +86,17 @@ export interface ActOptions {
    * still assert the bad_request when it's missing).
    */
   armDialog?: (accept: boolean, promptText: string | undefined) => void;
+  /**
+   * Snapshot-time URL of each child frame, keyed by its `page.frames()` index
+   * (the `N` in an `fN:eN` ref) — the `frameUrls` map from the most recent
+   * `aiSnapshot`. Supplied by the tool layer from per-page session state. Used to
+   * detect frame REORDERING between snapshot and act: a frame ref resolves
+   * against `page.frames()[N]`, but if the live frame at N no longer carries the
+   * recorded URL, index N now points at a DIFFERENT frame and the ref is stale
+   * (`ref_expired`). Absent in contexts without snapshot state (bare unit tests),
+   * where frame refs keep the missing-frame-only guard.
+   */
+  frameUrls?: Map<number, string>;
 }
 
 // A ref handle is either a bare main-document `eN` or a frame-namespaced
@@ -249,8 +260,8 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
     }
 
     case "drag": {
-      const source = requireRefLocator(page, params.ref, "drag");
-      const target = requireRefLocator(page, params.to_ref, "drag (to_ref)");
+      const source = requireRefLocator(page, params.ref, "drag", opts.frameUrls);
+      const target = requireRefLocator(page, params.to_ref, "drag (to_ref)", opts.frameUrls);
       try {
         await source.dragTo(target, { timeout: opts.timeoutMs });
       } catch (error) {
@@ -261,7 +272,7 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
     }
 
     case "upload": {
-      const loc = requireRefLocator(page, params.ref, "upload");
+      const loc = requireRefLocator(page, params.ref, "upload", opts.frameUrls);
       const files = params.files;
       if (!files || files.length === 0) {
         throw new BrowserError("bad_request", "act:upload requires resolved files.");
@@ -390,11 +401,22 @@ export async function act(page: Page, params: ActParams, opts: ActOptions): Prom
  * before. Does NOT run the action — the caller owns error mapping for the
  * resolved locator (stale element-ref detection happens when it fails to
  * resolve).
+ *
+ * `frameUrls` (the most recent snapshot's per-index frame URLs) closes the frame
+ * REORDER hole: in-place navigation is already caught by the detached aria-ref
+ * node timing out, but reordering can land index N on a DIFFERENT live frame
+ * that still holds a valid `eN`, which would otherwise silently act on the wrong
+ * element. When `frameUrls` is supplied and records index N, we compare the live
+ * `page.frames()[N].url()` to the snapshot-time URL and throw `ref_expired` on
+ * mismatch BEFORE building the locator. When it's absent (no snapshot context,
+ * e.g. bare unit tests) the check is skipped and only the missing-frame guard
+ * applies. Bare `eN` refs are unaffected.
  */
 export function requireRefLocator(
   page: Page,
   ref: string | undefined,
   kindLabel: string,
+  frameUrls?: Map<number, string>,
 ): ReturnType<Page["locator"]> {
   if (!ref) throw new BrowserError("bad_request", `act:${kindLabel} requires a \`ref\` from the latest snapshot.`);
   const framed = ref.match(FRAME_REF_RE);
@@ -410,6 +432,27 @@ export function requireRefLocator(
         `Frame ref ${ref} did not resolve (frame f${frameIndex} likely navigated or detached). Take a fresh \`snapshot\` and retry with a current ref.`,
       );
     }
+    // Frame-reorder staleness: if the snapshot recorded a URL for this index and
+    // the live frame there no longer carries it, index N now points at a
+    // different frame — the ref is stale even though page.frames()[N] exists and
+    // may hold its own valid `eN`. Catch it here, before acting on the wrong
+    // element. A read of frame.url() that throws (detaching frame) is itself
+    // treated as a mismatch → expired.
+    const recordedUrl = frameUrls?.get(frameIndex);
+    if (recordedUrl !== undefined) {
+      let liveUrl: string | undefined;
+      try {
+        liveUrl = frame.url();
+      } catch {
+        liveUrl = undefined;
+      }
+      if (liveUrl !== recordedUrl) {
+        throw new BrowserError(
+          "ref_expired",
+          `Frame ref ${ref} is stale (frame f${frameIndex} is now ${liveUrl ?? "<detached>"}, not ${recordedUrl} as at snapshot time — the frames were reordered or navigated). Take a fresh \`snapshot\` and retry with a current ref.`,
+        );
+      }
+    }
     return frame.locator(`aria-ref=${bareRef}`);
   }
   if (!BARE_REF_RE.test(ref)) {
@@ -421,10 +464,10 @@ export function requireRefLocator(
 async function withRef(
   page: Page,
   params: ActParams,
-  _opts: ActOptions,
+  opts: ActOptions,
   fn: (loc: ReturnType<Page["locator"]>) => Promise<unknown>,
 ): Promise<void> {
-  const locator = requireRefLocator(page, params.ref, params.kind);
+  const locator = requireRefLocator(page, params.ref, params.kind, opts.frameUrls);
   try {
     await fn(locator);
   } catch (error) {

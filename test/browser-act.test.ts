@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { act, type ActParams } from "../src/browser/act.js";
+import { act, requireRefLocator, type ActParams } from "../src/browser/act.js";
 
 // A structural fake Page/Locator that records calls. act() only depends on the
 // Playwright surface it actually touches, so a hand-rolled fake exercises the
@@ -19,6 +19,15 @@ interface FakeOpts {
   pressError?: Error;
   /** Number of CHILD frames page.frames() exposes (index 0 is the main frame). */
   frameCount?: number;
+  /**
+   * Per-CHILD-frame live URL, keyed by frames() index (1-based for children).
+   * Lets a test model a frame whose live URL differs from the snapshot-time URL
+   * (frame reorder) so the requireRefLocator staleness check fires. A child frame
+   * with no entry reports a fixed placeholder URL.
+   */
+  frameUrls?: Record<number, string>;
+  /** Child-frame indices whose url() throws (models a detaching frame). */
+  frameUrlThrows?: number[];
 }
 
 function recordingPage(opts: FakeOpts = {}) {
@@ -92,12 +101,20 @@ function recordingPage(opts: FakeOpts = {}) {
       return makeLocator(sel);
     },
     // frames()[0] is the main document; child frames tag their locator selectors
-    // with `frameN:` so a namespaced ref's resolution target is observable.
+    // with `frameN:` so a namespaced ref's resolution target is observable, and
+    // expose a url() so the requireRefLocator reorder/staleness check is testable.
     frames() {
-      const main = { locator: (sel: string) => makeLocator(sel) };
+      const main = { url: () => this._url, locator: (sel: string) => makeLocator(sel) };
       const children = [];
       for (let i = 1; i <= (opts.frameCount ?? 0); i++) {
-        children.push({ locator: (sel: string) => makeLocator(`frame${i}:${sel}`) });
+        const idx = i;
+        children.push({
+          url: () => {
+            if (opts.frameUrlThrows?.includes(idx)) throw new Error("frame detached");
+            return opts.frameUrls?.[idx] ?? `https://frame-${idx}.example/`;
+          },
+          locator: (sel: string) => makeLocator(`frame${idx}:${sel}`),
+        });
       }
       return [main, ...children];
     },
@@ -221,6 +238,86 @@ test("act on a ref for a missing/detached frame surfaces as ref_expired", async 
     (e: unknown) => (e as { code?: string }).code === "ref_expired",
   );
 });
+
+// ── #1/#15: frame-reorder staleness (live frame URL ≠ snapshot-time URL) ────────
+
+test("#15: a frame ref whose live URL differs from snapshot time → ref_expired (reorder)", async () => {
+  // The frame at index 1 was https://a.example/ when the snapshot was taken, but
+  // a reorder has put a DIFFERENT live frame there (https://evil.example/) that
+  // still holds a valid e3. Without the URL check this would silently click the
+  // wrong frame's element; with it, the ref is correctly reported stale.
+  const page = recordingPage({ frameCount: 2, frameUrls: { 1: "https://evil.example/" } });
+  const frameUrls = new Map<number, string>([[1, "https://a.example/"]]);
+  await assert.rejects(
+    () => act(page as never, { kind: "click", ref: "f1:e3" }, { ...OPTS, frameUrls }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+  // It must reject BEFORE building/clicking the locator — no click landed on the
+  // wrong frame.
+  assert.ok(!page.calls.some((c) => c[0] === "click"), "no click reached the reordered frame");
+});
+
+test("#15: a frame ref whose live URL still matches snapshot time → proceeds normally", async () => {
+  const page = recordingPage({ frameCount: 2, frameUrls: { 1: "https://a.example/" } });
+  const frameUrls = new Map<number, string>([[1, "https://a.example/"]]);
+  const r = await act(page as never, { kind: "click", ref: "f1:e3" }, { ...OPTS, frameUrls });
+  assert.equal(r.detail, "clicked f1:e3");
+  const call = page.calls.find((c) => c[0] === "click") as [string, string, unknown];
+  assert.equal(call[1], "frame1:aria-ref=e3", "resolved against the (still-correct) frame");
+});
+
+test("#15: a frame whose url() throws (detaching) is treated as stale → ref_expired", async () => {
+  const page = recordingPage({ frameCount: 2, frameUrlThrows: [1] });
+  const frameUrls = new Map<number, string>([[1, "https://a.example/"]]);
+  await assert.rejects(
+    () => act(page as never, { kind: "click", ref: "f1:e3" }, { ...OPTS, frameUrls }),
+    (e: unknown) => (e as { code?: string }).code === "ref_expired",
+  );
+});
+
+test("#15: without recorded frameUrls (no snapshot context) the reorder check is skipped", async () => {
+  // Bare unit-test context (no session/snapshot): the URL check can't run, so a
+  // frame ref keeps the prior missing-frame-only behavior and resolves normally.
+  const page = recordingPage({ frameCount: 2, frameUrls: { 1: "https://anything.example/" } });
+  const r = await run(page, { kind: "click", ref: "f1:e3" });
+  assert.equal(r.detail, "clicked f1:e3");
+});
+
+// ── #16: requireRefLocator positive acceptance of a frame-qualified ref ─────────
+
+test("#16: requireRefLocator accepts a frame-qualified ref (f2:e7) and targets that frame", () => {
+  const page = recordingPage({ frameCount: 3 });
+  const loc = requireRefLocator(page as never, "f2:e7", "click") as unknown as { selector: string };
+  assert.equal(loc.selector, "frame2:aria-ref=e7", "resolved against frames()[2]");
+});
+
+test("#16: requireRefLocator accepts a bare ref (e7) against the main document", () => {
+  const page = recordingPage({ frameCount: 1 });
+  const loc = requireRefLocator(page as never, "e7", "click") as unknown as { selector: string };
+  assert.equal(loc.selector, "aria-ref=e7", "bare ref hits the page-level locator");
+});
+
+// ── #17: requireRefLocator rejects malformed / near-miss refs ───────────────────
+
+for (const bad of [
+  "x12", // wrong element prefix
+  "f1e3", // missing the `:` frame separator
+  "f1:x3", // frame qualifier but non-`e` element
+  "ff1:e3", // malformed frame prefix
+  "e12 ", // trailing whitespace junk
+  "e12;drop", // trailing junk
+  "f1:e3:e4", // extra qualifier
+]) {
+  test(`#17: requireRefLocator rejects a ref-shaped-but-invalid string ${JSON.stringify(bad)} as bad_request`, () => {
+    const page = recordingPage({ frameCount: 2 });
+    assert.throws(
+      () => requireRefLocator(page as never, bad, "click"),
+      (e: unknown) =>
+        (e as { code?: string }).code === "bad_request" &&
+        /expected a snapshot handle/.test((e as Error).message),
+    );
+  });
+}
 
 // ── click modifiers ──────────────────────────────────────────────────────────
 

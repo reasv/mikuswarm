@@ -140,6 +140,14 @@ export class BrowserSession {
    * WeakMap → buffers are GC'd with their page, no explicit cleanup.
    */
   private readonly consoleBuffers = new WeakMap<Page, ConsoleEntry[]>();
+  /**
+   * Per-page snapshot-time frame URLs (index → URL), the `frameUrls` map from the
+   * most recent `aiSnapshot` of that page. Recorded by recordFrameUrls() after
+   * each snapshot and consulted by the next `act` (via frameUrlsFor) to detect
+   * frame reordering between snapshot and act (a reused index landing on a
+   * different live frame → `ref_expired`). WeakMap → cleared with the page on GC.
+   */
+  private readonly frameUrls = new WeakMap<Page, Map<number, string>>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   private readonly connectOverCdp: ConnectOverCdp;
@@ -600,6 +608,22 @@ export class BrowserSession {
     if (!buf) return;
     buf.push(entry);
     if (buf.length > CONSOLE_BUFFER_MAX) buf.splice(0, buf.length - CONSOLE_BUFFER_MAX);
+  }
+
+  /**
+   * Record the snapshot-time frame URLs for `page` (the `frameUrls` from the
+   * `aiSnapshot` just rendered). The next `act` on this page reads them via
+   * frameUrlsFor() to detect frame reordering (see requireRefLocator). Each
+   * snapshot fully replaces the previous map so a stale entry can't outlive the
+   * snapshot it described.
+   */
+  recordFrameUrls(page: Page, urls: Map<number, string>): void {
+    this.frameUrls.set(page, urls);
+  }
+
+  /** The most recently recorded snapshot-time frame URLs for `page` (or undefined). */
+  frameUrlsFor(page: Page): Map<number, string> | undefined {
+    return this.frameUrls.get(page);
   }
 
   /** Drain (and clear) buffered console/pageerror messages for `page`. */

@@ -420,6 +420,33 @@ test("aiSnapshot: descends into a child frame, namespacing its refs under a boun
   assert.ok(result.text.includes("[ref=e1]"), "main-document bare refs preserved");
   assert.equal(result.truncated, false);
   assert.equal(result.refCount, 3, "counts bare e1/e2 plus namespaced f1:e3");
+  // The frame's snapshot-time URL is recorded by its frames() index so the next
+  // act can detect a reorder (#1/#15). Only rendered frames are recorded.
+  assert.deepEqual([...result.frameUrls.entries()], [[1, "https://challenges.example/x"]]);
+});
+
+test("aiSnapshot: frameUrls records only rendered child frames, keyed by frames() index", async () => {
+  const main = "- generic [ref=e1]";
+  const page = framedSnapshotPage(main, [
+    { url: "https://a.example/", snapshot: "- button [ref=e3]" },
+    { url: "https://b.example/", snapshot: "- button [ref=e4]" },
+  ]);
+  const result = await aiSnapshot(page, 20000, 10);
+  assert.deepEqual(
+    [...result.frameUrls.entries()],
+    [
+      [1, "https://a.example/"],
+      [2, "https://b.example/"],
+    ],
+    "each rendered frame recorded at its frames() index",
+  );
+});
+
+test("aiSnapshot: an inaccessible frame is NOT recorded in frameUrls (no usable refs)", async () => {
+  const main = "- generic [ref=e1]";
+  const page = framedSnapshotPage(main, [{ url: "https://x", throws: true }]);
+  const result = await aiSnapshot(page, 20000, 10);
+  assert.equal(result.frameUrls.size, 0, "inaccessible frame yields no recorded URL");
 });
 
 test("aiSnapshot: maxFrames=0 stays on the main document even when frames exist", async () => {

@@ -247,6 +247,9 @@ async function dispatch(
         // act:dialog arms a one-shot override on this page; the next dialog (from
         // a subsequent triggering act) is handled per the override.
         armDialog: (accept, promptText) => session.armDialog(page, accept, promptText),
+        // Snapshot-time frame URLs for this page → lets requireRefLocator catch a
+        // reordered frame ref (fN index now on a different live frame) as stale.
+        frameUrls: session.frameUrlsFor(page),
       });
       // evaluate/wait/dialog don't change what's worth re-snapshotting; return terse.
       if (args.kind === "evaluate" || args.kind === "wait" || args.kind === "dialog") {
@@ -270,7 +273,9 @@ async function dispatch(
       // structured errors propagate as-is rather than through the screenshot
       // error mapper below.
       const elementRef = args.ref;
-      const target = elementRef ? requireRefLocator(page, elementRef, "screenshot") : page;
+      const target = elementRef
+        ? requireRefLocator(page, elementRef, "screenshot", session.frameUrlsFor(page))
+        : page;
       let buffer: Buffer;
       try {
         buffer = await target.screenshot({
@@ -397,6 +402,11 @@ async function pageResult(
   header: string,
 ): Promise<AgentToolResult<unknown>> {
   const snap = await aiSnapshot(page, config.snapshot_max_chars, config.snapshot_max_frames);
+  // Record the snapshot's per-index frame URLs so the NEXT act on this page can
+  // detect frame reordering (a reused fN index landing on a different live frame
+  // → ref_expired; see requireRefLocator). Each snapshot replaces the previous
+  // map, matching the snapshot-scoped staleness contract of the refs themselves.
+  session.recordFrameUrls(page, snap.frameUrls);
   const downloads = session.drainDownloads(sessionId);
   return {
     content: [{ type: "text", text: `${header}${renderDownloads(downloads)}\n\n${snap.text}` }],
