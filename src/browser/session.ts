@@ -14,7 +14,7 @@
 //   - Bounded growth: a session's tabs are closed when the session ends
 //     (closeSession) or after session_page_idle_ms of inactivity (idle sweeper).
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Dialog, type Download, type Page } from "playwright-core";
 
@@ -535,13 +535,20 @@ export class BrowserSession {
    * ingestion, so the caller forwards the returned path to the message tool.
    * Throws `pdf_failed` if printToPDF is unsupported/errors or the file can't be
    * written.
+   *
+   * The `page-<n>.pdf` name is collision-proof against the *on-disk* state, not
+   * the in-memory counter (issue #2): `pdfCount` resets to 0 whenever SessionState
+   * is destroyed (idle-reap ~10 min, disconnect), but the download dir + its
+   * `page-*.pdf` files persist — so trusting the counter alone would let a
+   * post-reset export reuse `page-1.pdf` and silently clobber the earlier file.
+   * Instead the number is bumped until free against the directory contents (seeded
+   * from any existing `page-*.pdf`) and committed to `pdfCount` only AFTER a
+   * successful write, so a failed export never advances the counter.
    */
   async exportPdf(sessionId: string, page: Page): Promise<DownloadRecord> {
     const state = this.sessions.get(sessionId);
-    const n = state ? (state.pdfCount += 1) : 1;
-    const safeName = `page-${n}.pdf`;
     const relDir = path.join("browser-downloads", sanitizeSessionId(sessionId));
-    const relPath = path.join(relDir, safeName);
+    const absDir = path.join(this.workspaceRoot, relDir);
     const url = page.url();
 
     const cdp = await page.context().newCDPSession(page);
@@ -559,10 +566,28 @@ export class BrowserSession {
       await cdp.detach().catch(() => {});
     }
 
+    let n: number;
+    let safeName: string;
     try {
-      const absDir = path.join(this.workspaceRoot, relDir);
       await mkdir(absDir, { recursive: true });
-      await writeFile(path.join(absDir, safeName), Buffer.from(data, "base64"));
+      // Bump-until-free: start from max(in-memory counter, highest existing
+      // page-<n>.pdf on disk) and walk forward to the first free name. The disk
+      // scan makes a reset counter (idle-reap/disconnect, issue #2) unable to
+      // clobber an earlier export; the `wx` (write-exclusive) flag is the final
+      // guard so even a concurrent export can't land on the same name. The
+      // single-writer model means the loop converges in one step in practice.
+      n = Math.max(state?.pdfCount ?? 0, await highestPdfIndex(absDir));
+      for (;;) {
+        n += 1;
+        safeName = `page-${n}.pdf`;
+        try {
+          await writeFile(path.join(absDir, safeName), Buffer.from(data, "base64"), { flag: "wx" });
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+          throw error;
+        }
+      }
     } catch (error) {
       throw new BrowserError(
         "pdf_failed",
@@ -571,6 +596,11 @@ export class BrowserSession {
       );
     }
 
+    // Commit the chosen number only AFTER a successful write — so a failed export
+    // never advances the counter, and the next export in this live session can
+    // skip the rescan.
+    if (state) state.pdfCount = n;
+    const relPath = path.join(relDir, safeName);
     this.logger.info("browser_pdf_export", { sessionId, path: relPath, url });
     return { path: relPath, filename: safeName, url };
   }
@@ -781,9 +811,39 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Filesystem-safe session id for the per-session download directory. */
+/**
+ * Filesystem-safe session id for the per-session download directory. Strips
+ * everything outside `[A-Za-z0-9._-]`, then — because that charset still permits
+ * `.` — collapses a result that is only dots (`.`, `..`, `...`) to "session" so a
+ * `..`-bearing id can never become a `..` path segment that escapes
+ * `browser-downloads/` (issue #12, defense-in-depth; today's ids are `s-<nanoid>`
+ * and are unaffected). A single segment can't introduce a separator, so collapsing
+ * the all-dots case is sufficient.
+ */
 function sanitizeSessionId(sessionId: string): string {
-  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || "session";
+  const cleaned = sessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+  if (cleaned === "" || /^\.+$/.test(cleaned)) return "session";
+  return cleaned;
+}
+
+/**
+ * Highest N among existing `page-<N>.pdf` files in `dir` (0 if none / dir
+ * missing). Lets exportPdf seed its counter from disk so a reset in-memory
+ * counter can't clobber an earlier export (issue #2).
+ */
+async function highestPdfIndex(dir: string): Promise<number> {
+  let max = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    const m = /^page-(\d+)\.pdf$/.exec(name);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max;
 }
 
 /**

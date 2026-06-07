@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -745,6 +745,49 @@ for (const { name, suggested } of HOSTILE_FILENAMES) {
   });
 }
 
+// ── #12: a dot-only / ".." session id cannot escape browser-downloads ────────
+
+const TRAVERSAL_SESSION_IDS: Array<{ name: string; id: string }> = [
+  { name: "bare ..", id: ".." },
+  { name: "single .", id: "." },
+  { name: "triple dots", id: "..." },
+];
+
+for (const { name, id } of TRAVERSAL_SESSION_IDS) {
+  test(`session #12: a ${name} session id is collapsed and stays under browser-downloads`, async () => {
+    await withWorkspace(async (ws) => {
+      const captured: CapturedHandlers = {};
+      const manager = stubManager({ profiles: [{ id: "p1", name: "miku", status: "running" }], status: "running" });
+      const connect: ConnectOverCdp = async () =>
+        makeHandlerCapturingBrowser(captured) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+      const session = new BrowserSession({
+        config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect,
+      });
+      try {
+        await session.getActivePage(id);
+        assert.ok(captured.download, "download handler registered");
+        const dl = makeFakeDownload("file.bin", "https://example.com/file");
+        captured.download!(dl);
+        await new Promise((r) => setTimeout(r, 20));
+
+        assert.ok(dl.savedTo, "saveAs was called");
+        const downloadsRoot = path.join(ws, "browser-downloads");
+        const rel = path.relative(downloadsRoot, dl.savedTo!);
+        // Must stay UNDER browser-downloads: no leading ".." and not absolute.
+        assert.ok(!path.isAbsolute(rel), `saved path escaped browser-downloads: ${rel}`);
+        const parts = rel.split(path.sep);
+        assert.ok(!parts.includes(".."), `a ".." segment escaped the dir: ${rel}`);
+        // The session segment was collapsed to the safe sentinel, not "..".
+        assert.equal(parts[0], "session", "dot-only id collapsed to 'session'");
+        assert.equal(parts.length, 2, `expected <session>/<file>, got "${rel}"`);
+      } finally {
+        manager.restore();
+        await session.shutdown();
+      }
+    });
+  });
+}
+
 // ── pdf export (CDP Page.printToPDF → workspace) ─────────────────────────────
 
 /** A fake page whose CDP session returns a stubbed printToPDF payload. */
@@ -794,6 +837,61 @@ test("session: exportPdf numbers successive exports (page-1, page-2)", async () 
       const r2 = await session.exportPdf("s1", makePdfPage() as never);
       assert.equal(r1.filename, "page-1.pdf");
       assert.equal(r2.filename, "page-2.pdf");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #2: two exports across a SessionState reset produce distinct, non-clobbering files", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      // First export with live state → page-1.pdf.
+      (session as unknown as { getOrCreateState(id: string): unknown }).getOrCreateState("s1");
+      const r1 = await session.exportPdf("s1", makePdfPage({ data: Buffer.from("%PDF-first").toString("base64") }) as never);
+      assert.equal(r1.filename, "page-1.pdf");
+
+      // Simulate an idle-reap / disconnect: SessionState (and its pdfCount) is
+      // destroyed, but the download dir + page-1.pdf persist on disk.
+      const sessions = (session as unknown as { sessions: Map<string, unknown> }).sessions;
+      sessions.delete("s1");
+      // A fresh state for the same id starts pdfCount back at 0 — the exact
+      // condition that used to clobber page-1.pdf (issue #2).
+      (session as unknown as { getOrCreateState(id: string): unknown }).getOrCreateState("s1");
+
+      const r2 = await session.exportPdf("s1", makePdfPage({ data: Buffer.from("%PDF-second").toString("base64") }) as never);
+      assert.notEqual(r2.filename, r1.filename, "post-reset export must not reuse the earlier name");
+      assert.equal(r2.filename, "page-2.pdf", "bumped past the existing page-1.pdf on disk");
+
+      // The earlier file is intact (not clobbered) and the second is its own file.
+      const b1 = await readFile(path.join(ws, r1.path));
+      const b2 = await readFile(path.join(ws, r2.path));
+      assert.equal(b1.toString("latin1"), "%PDF-first", "earlier PDF survived the second export");
+      assert.equal(b2.toString("latin1"), "%PDF-second", "second PDF is its own file");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session #19: a printToPDF that SUCCEEDS but a workspace write that FAILS maps to pdf_failed", async () => {
+  await withWorkspace(async (ws) => {
+    // Point the session's workspace at a path whose parent is a *file*, so mkdir
+    // (and thus the write) fails even though printToPDF returns data — exercising
+    // the write-failure branch distinct from the printToPDF-throws branch.
+    const blocker = path.join(ws, "blocker");
+    await writeFile(blocker, "not a dir");
+    const session = newSession(blocker); // workspaceRoot is a file, not a dir
+    try {
+      const page = makePdfPage(); // printToPDF succeeds (returns data)
+      await assert.rejects(
+        () => session.exportPdf("s1", page as never),
+        (e: unknown) => isBrowserError(e) && e.code === "pdf_failed",
+      );
+      // printToPDF was attempted and the CDP session still detached.
+      assert.ok(page.cdpCalls.includes("Page.printToPDF"), "printToPDF was called (it succeeded)");
+      assert.ok(page.cdpCalls.includes("detach"), "CDP session detached before the write failure");
     } finally {
       await session.shutdown();
     }
