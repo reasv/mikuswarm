@@ -14,7 +14,7 @@
 //   - Bounded growth: a session's tabs are closed when the session ends
 //     (closeSession) or after session_page_idle_ms of inactivity (idle sweeper).
 
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Dialog, type Download, type Page } from "playwright-core";
 
@@ -38,6 +38,8 @@ interface SessionState {
   lastUsed: number;
   /** Downloads captured since the last drain, surfaced in tool results. */
   pendingDownloads: DownloadRecord[];
+  /** Monotonic counter for naming exported PDFs (page-1.pdf, page-2.pdf, …). */
+  pdfCount: number;
   /**
    * Number of browser-tool operations currently in flight against this session
    * (issue #1). Bracketed by beginOp/endOp around every page-using tool op so
@@ -398,7 +400,7 @@ export class BrowserSession {
   private getOrCreateState(sessionId: string): SessionState {
     let state = this.sessions.get(sessionId);
     if (!state) {
-      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [], inFlight: 0, closed: false };
+      state = { pages: [], activeIndex: 0, lastUsed: Date.now(), pendingDownloads: [], pdfCount: 0, inFlight: 0, closed: false };
       this.sessions.set(sessionId, state);
     }
     return state;
@@ -497,6 +499,56 @@ export class BrowserSession {
     state.pages.splice(index, 1);
     if (state.activeIndex >= state.pages.length) state.activeIndex = Math.max(0, state.pages.length - 1);
     state.lastUsed = Date.now();
+  }
+
+  /**
+   * Export the active page to a PDF in the session's workspace download dir and
+   * return its record (path/filename/url). Uses CDP `Page.printToPDF` — NOT
+   * `page.pdf()`, which Chromium only supports in headless mode; the stealth
+   * browser runs headed, so the CDP path is the only one that works. Reuses the
+   * download-sink path policy (`browser-downloads/<session>/`) so a PDF looks
+   * like any other download. Write-only from the agent's view — miku has no PDF
+   * ingestion, so the caller forwards the returned path to the message tool.
+   * Throws `pdf_failed` if printToPDF is unsupported/errors or the file can't be
+   * written.
+   */
+  async exportPdf(sessionId: string, page: Page): Promise<DownloadRecord> {
+    const state = this.sessions.get(sessionId);
+    const n = state ? (state.pdfCount += 1) : 1;
+    const safeName = `page-${n}.pdf`;
+    const relDir = path.join("browser-downloads", sanitizeSessionId(sessionId));
+    const relPath = path.join(relDir, safeName);
+    const url = page.url();
+
+    const cdp = await page.context().newCDPSession(page);
+    let data: string;
+    try {
+      const result = (await cdp.send("Page.printToPDF", { printBackground: true })) as { data: string };
+      data = result.data;
+    } catch (error) {
+      throw new BrowserError(
+        "pdf_failed",
+        `PDF export failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+
+    try {
+      const absDir = path.join(this.workspaceRoot, relDir);
+      await mkdir(absDir, { recursive: true });
+      await writeFile(path.join(absDir, safeName), Buffer.from(data, "base64"));
+    } catch (error) {
+      throw new BrowserError(
+        "pdf_failed",
+        `PDF export could not be written to the workspace: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+
+    this.logger.info("browser_pdf_export", { sessionId, path: relPath, url });
+    return { path: relPath, filename: safeName, url };
   }
 
   /** Drain (and clear) downloads captured for this session since the last call. */

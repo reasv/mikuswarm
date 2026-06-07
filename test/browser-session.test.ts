@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -744,6 +744,77 @@ for (const { name, suggested } of HOSTILE_FILENAMES) {
     });
   });
 }
+
+// ── pdf export (CDP Page.printToPDF → workspace) ─────────────────────────────
+
+/** A fake page whose CDP session returns a stubbed printToPDF payload. */
+function makePdfPage(opts: { printError?: Error; data?: string } = {}) {
+  const cdpCalls: string[] = [];
+  const cdp = {
+    async send(method: string) {
+      cdpCalls.push(method);
+      if (opts.printError) throw opts.printError;
+      return { data: opts.data ?? Buffer.from("%PDF-1.4 fake pdf").toString("base64") };
+    },
+    async detach() { cdpCalls.push("detach"); },
+  };
+  return {
+    url: () => "https://example.com/article",
+    context: () => ({ newCDPSession: async () => cdp }),
+    cdpCalls,
+  };
+}
+
+test("session: exportPdf writes a PDF to the workspace download dir and returns its record", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = makePdfPage();
+      const record = await session.exportPdf("s1", page as never);
+      assert.equal(record.path, path.join("browser-downloads", "s1", "page-1.pdf"));
+      assert.equal(record.filename, "page-1.pdf");
+      assert.equal(record.url, "https://example.com/article");
+      const bytes = await readFile(path.join(ws, record.path));
+      assert.equal(bytes.subarray(0, 5).toString("latin1"), "%PDF-", "file has the PDF magic");
+      assert.ok(page.cdpCalls.includes("Page.printToPDF"), "used CDP printToPDF");
+      assert.ok(page.cdpCalls.includes("detach"), "CDP session detached");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: exportPdf numbers successive exports (page-1, page-2)", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      // Create session state so pdfCount persists across exports.
+      (session as unknown as { getOrCreateState(id: string): unknown }).getOrCreateState("s1");
+      const r1 = await session.exportPdf("s1", makePdfPage() as never);
+      const r2 = await session.exportPdf("s1", makePdfPage() as never);
+      assert.equal(r1.filename, "page-1.pdf");
+      assert.equal(r2.filename, "page-2.pdf");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: exportPdf maps a printToPDF failure to pdf_failed and still detaches", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const page = makePdfPage({ printError: new Error("printToPDF unsupported") });
+      await assert.rejects(
+        () => session.exportPdf("s1", page as never),
+        (e: unknown) => isBrowserError(e) && e.code === "pdf_failed",
+      );
+      assert.ok(page.cdpCalls.includes("detach"), "detaches even on failure");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
 
 // ── one-shot act:dialog override (armDialog + handleDialog) ──────────────────
 

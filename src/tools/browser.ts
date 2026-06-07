@@ -51,7 +51,7 @@ export interface BrowserToolContext {
   workspaceRoot: string;
 }
 
-const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "tabs", "open", "close"] as const;
+const ACTION_VALUES = ["navigate", "snapshot", "act", "screenshot", "pdf", "tabs", "open", "close"] as const;
 const ACT_KINDS: ActKind[] = [
   "click", "type", "press", "hover", "select", "fill", "scroll", "wait", "back", "evaluate",
   "drag", "upload", "clear_site_data", "dialog",
@@ -74,6 +74,7 @@ const DESCRIPTION = [
   "    clear_site_data discards cookies + all web storage for the CURRENT page's origin (a fresh start on this site; cookies are cleared by security origin, so parent-domain cookies set elsewhere may persist).",
   "    dialog takes `accept` (true/false) and optional `prompt_text`; it arms the NEXT JS dialog — arm it BEFORE the click/act that triggers the dialog. Without it, dialogs are auto-handled by the deployment's dialog_policy.",
   "- screenshot { full_page?, ref?, format? }: return an image to look at. With `ref`, capture just that element (full_page is ignored). `format` is png (default) or jpeg.",
+  "- pdf: save the current page to the workspace as a PDF and return its path. You CANNOT read the PDF back — use it to save a page (article/receipt/report) and send the path to the user via the message tool.",
   "- open { url? }: open a new tab (optionally navigate it). close { index }: close a tab.",
   "- tabs: list this session's tabs; pass `index` to switch the active tab.",
   "",
@@ -310,6 +311,20 @@ async function dispatch(
           downscaled: bounded.downscaled,
           base64Bytes: bounded.base64Bytes,
         },
+      };
+    }
+
+    case "pdf": {
+      const page = await session.getActivePage(sessionId);
+      const record = await session.exportPdf(sessionId, page);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `saved page as PDF: ${record.path}\n(you can't read this PDF back — send the path to the user via the message tool)`,
+          },
+        ],
+        details: { action: "pdf", url: record.url, path: record.path, filename: record.filename },
       };
     }
 
