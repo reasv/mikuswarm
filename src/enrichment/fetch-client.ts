@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { ProxyAgent, type Dispatcher } from "undici";
+import { guardedFetch } from "../tools/ssrf.js";
 
 export interface FetchClientOptions {
   maxConcurrency: number;
@@ -80,14 +81,13 @@ export class ConcurrencyLimitedFetchClient {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs);
       try {
-        const response = await globalThis.fetch(url, {
+        // All fetch-client callers pull caller/external-supplied asset URLs, so
+        // the egress guard always applies here (it self-gates on the global
+        // `network.ssrf_guard` switch). The dispatcher carries the shared proxy.
+        const response = await guardedFetch(url, {
           signal: controller.signal,
-          redirect: "follow",
-          headers: { "User-Agent": "MikuAgent/1.0" },
-          // Node's native fetch is built on undici and accepts a dispatcher
-          // here at runtime, but the type is not in the lib.dom Request init.
-          ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
-        } as RequestInit);
+          dispatcher: this.dispatcher,
+        });
 
         const limit = options?.maxBytes ?? this.options.maxResponseBytes;
         const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);

@@ -189,6 +189,7 @@ export class ContextBuilder {
         reactionLines = this.buildDiscreteReactionLines(compactionInput, {
           assistantOnly: rx.discrete_assistant_only !== false,
           nameCap: rx.discrete_name_cap ?? 8,
+          selfUserId: this.resolveSelfUserId(options.timelineKey),
         });
       }
     }
@@ -653,9 +654,22 @@ export class ContextBuilder {
    * timestamp falls within the rich tier's time span. Returns [] when there are no
    * targets or no live reactions on them.
    */
+  /**
+   * Resolve the bot's own Matrix user id for a build from its timelineKey
+   * (`matrix:{account}:room:{roomId}` / `:dm:` / with `:thread:` suffix — the
+   * account is the 2nd colon-segment) via `config.matrix.accounts[account].user_id`
+   * (same lookup as src/app.ts). Returns undefined when it can't be resolved; the
+   * caller then falls back to the reactor's display name.
+   */
+  private resolveSelfUserId(timelineKey: string): string | undefined {
+    const accountId = timelineKey.split(":")[1];
+    if (accountId === undefined) return undefined;
+    return this.config.matrix.accounts[accountId]?.user_id;
+  }
+
   private buildDiscreteReactionLines(
     events: CanonicalChatEvent[],
-    opts: { assistantOnly: boolean; nameCap: number },
+    opts: { assistantOnly: boolean; nameCap: number; selfUserId?: string },
   ): ReactionLine[] {
     const targets = events.filter(
       (e) => e.externalId !== undefined && (!opts.assistantOnly || e.role === "assistant"),
@@ -675,7 +689,10 @@ export class ContextBuilder {
         authorDisplay: target.sender.displayName ?? undefined,
       });
     }
-    return synthesizeReactionLines(rows, targetInfo, { nameCap: opts.nameCap });
+    return synthesizeReactionLines(rows, targetInfo, {
+      nameCap: opts.nameCap,
+      selfUserId: opts.selfUserId,
+    });
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

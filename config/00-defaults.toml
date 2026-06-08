@@ -34,8 +34,8 @@ fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally an
 [models.default]
 id = "claude-opus-4-7"
 provider = "anthropic"
-endpoint = "${LLM_GATEWAY_URL}"
-api_key = "${LLM_GATEWAY_API_KEY}"
+endpoint = "${ANTHROPIC_BASE_URL}"
+api_key = "${LLM_API_KEY}"
 multimodal = true
 max_tokens = 16384
 reasoning = true
@@ -125,6 +125,18 @@ trigger_group_lookback_ms = 20000
 [enrichment]
 trigger_wait_timeout_ms = 30000
 
+[network]
+# App-layer SSRF guard (defense-in-depth). When true, outbound fetches from
+# caller-supplied URLs (web_fetch, media downloads, image references, …) resolve
+# DNS and block private/loopback/link-local/metadata addresses, re-validating
+# every redirect hop. This is the only egress protection on a bare-metal `tsx`
+# run, so it defaults ON. Disable (false) ONLY where the container/network
+# firewall already blocks private egress — the Compose deployment does this via
+# docker/egress-rules.sh and flips this off in docker/95-docker.toml.
+ssrf_guard = true
+# Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
+# http_proxy_url = "http://proxy.internal:8080"
+
 [captioning]
 worker_count = 2
 caption_all = false
@@ -134,8 +146,8 @@ max_retries = 2
 
 [captioning.model]
 id = "google/gemini-3.5-flash"
-endpoint = "${LLM_GATEWAY_URL}/openrouter"
-api_key = "${LLM_GATEWAY_API_KEY}"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
 
 [captioning.image]
 prompt = "Describe the image."
@@ -176,6 +188,24 @@ base_url = "https://danbooru.donmai.us"
 max_regular_tags = 2
 default_limit = 20
 download_subdir = "downloads/danbooru"
+
+# Image generation / editing via Google's Gemini "nano banana" models.
+# `base_url` is the Gemini API endpoint ROOT — the tool appends
+# /v1beta/models/<model>:generateContent. This is the Google/Gemini API base
+# (GEMINI_BASE_URL), distinct from the Anthropic model endpoint. `api_key` is
+# sent as `Authorization: Bearer`.
+[image_gen]
+base_url = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+timeout_ms = 120000
+# Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
+# Many gateways default this cap low, truncating before any image is emitted.
+max_output_tokens = 32768
+output_subdir = "generated-images"
+
+[image_gen.models]
+pro = "gemini-3-pro-image"
+flash = "gemini-3.1-flash-image"
 
 [summarization]
 enabled = true

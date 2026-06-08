@@ -29,6 +29,7 @@ import {
   createDelegateToSessionTool,
   createEditMessageTool,
   createEmojiListTool,
+  createImageGenTool,
   createListReactionsTool,
   createReadMessagesTool,
   createSearchMessagesTool,
@@ -57,6 +58,7 @@ import {
   createWebSearchTool,
   createWriteMemoryTool,
 } from "./tools/index.js";
+import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import type { InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
@@ -82,6 +84,16 @@ export interface MikuAgentRuntime {
 
 export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntime> {
   const logger = createLogger("mikuswarm", config.app.log_level);
+
+  // App-layer SSRF guard (defense-in-depth) for every caller-supplied outbound
+  // fetch. Default ON for bare-metal `tsx` runs where nothing else blocks private
+  // egress; set network.ssrf_guard=false where the container/network firewall
+  // (docker/egress-rules.sh) is the boundary, to drop the per-request DNS +
+  // redirect-revalidation overhead. See ARCHITECTURE.md "Network egress & SSRF".
+  const egressGuardEnabled = config.network?.ssrf_guard ?? true;
+  setEgressGuardEnabled(egressGuardEnabled);
+  logger.info("egress_guard_configured", { enabled: egressGuardEnabled });
+
   const storage = await Storage.open({
     databasePath: config.storage.database_path,
     logger: logger.child("storage"),
@@ -971,6 +983,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         httpProxyUrl: config.network?.http_proxy_url,
         config: config.danbooru,
       }),
+      ...(config.image_gen
+        ? [createImageGenTool({
+            workspaceRoot,
+            fetchClient,
+            downloadSizeLimit,
+            inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+            inferenceImageOptions,
+            httpProxyUrl: config.network?.http_proxy_url,
+            config: config.image_gen,
+          })]
+        : []),
       createUserProfileReadTool({
         workspaceRoot,
         provider: inbound.provider,

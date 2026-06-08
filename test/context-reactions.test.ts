@@ -182,6 +182,45 @@ test("falls back to sender id when no display name is known", () => {
   assert.match(lines[0].content, /^<reaction>@nodisplay:test reacted/);
 });
 
+test("a self-reactor renders as \"You\" (§9f View B polish)", () => {
+  const lines = synthesizeReactionLines(
+    [discrete({ reactionEventId: "$r1", senderId: "@miku:example.org", senderDisplay: "Miku" })],
+    selfTarget("$a1", "hi"),
+    { nameCap: 8, selfUserId: "@miku:example.org" },
+  );
+  assert.equal(lines[0].content, `<reaction>You reacted 👍 to your message [$a1]: "hi"</reaction>`);
+});
+
+test("a non-self reactor still renders its display name when selfUserId is set", () => {
+  const lines = synthesizeReactionLines(
+    [discrete({ reactionEventId: "$r1", senderId: "@alice:test", senderDisplay: "Alice" })],
+    selfTarget("$a1", "hi"),
+    { nameCap: 8, selfUserId: "@miku:example.org" },
+  );
+  assert.match(lines[0].content, /^<reaction>Alice reacted/);
+});
+
+test("mixed self + others: \"You\" composes with correct grammar", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@miku:example.org", senderDisplay: "Miku", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@alice:test", senderDisplay: "Alice", reactedAt: 1100 }),
+  ];
+  const lines = synthesizeReactionLines(rows, selfTarget("$a1", "hi"), {
+    nameCap: 8,
+    selfUserId: "@miku:example.org",
+  });
+  assert.equal(lines[0].content, `<reaction>You and Alice reacted 👍 to your message [$a1]: "hi"</reaction>`);
+});
+
+test("without selfUserId, a self-reactor falls back to its display name (no crash)", () => {
+  const lines = synthesizeReactionLines(
+    [discrete({ reactionEventId: "$r1", senderId: "@miku:example.org", senderDisplay: "Miku" })],
+    selfTarget("$a1", "hi"),
+    { nameCap: 8 },
+  );
+  assert.match(lines[0].content, /^<reaction>Miku reacted/);
+});
+
 test("multiple groups render in deterministic timestamp order across repeated calls", () => {
   const rows = [
     discrete({ reactionEventId: "$r1", targetEventId: "$a1", normalizedKey: "👍", display: "👍", reactedAt: 3000 }),

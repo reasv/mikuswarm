@@ -1,0 +1,92 @@
+# MikuSwarm — agent + observability console.
+#
+# One command brings up the agent and its console:
+#     docker compose up -d --build
+#
+# Prerequisites (see ARCHITECTURE.md "Running in Docker"):
+#   1. Build the sandbox image on the host daemon:  docker/build-sandbox.sh
+#      (the agent creates the sandbox container at runtime via the mounted
+#      socket; the image must already exist or startup fails fast).
+#   2. Create host data dirs:  sudo mkdir -p /srv/miku/workspace /srv/miku/var
+#   3. Copy config/90-local.toml into place (identity/models/matrix) and
+#      cp .env.example .env, then fill in the secrets.
+#   4. After `up`, harden the agent's egress (operator root step — the network
+#      firewall is the SSRF boundary, since the app-layer guard is off in docker,
+#      docker/95-docker.toml):  sudo MIKUSWARM_AGENT_NETWORK=miku docker/agent-egress-rules.sh
+#      Reapply after reboot / `docker compose up` recreates the network.
+#
+# NOT started here (by design):
+#   - The sandbox container — created/driven by the agent via /var/run/docker.sock.
+#   - The CloakBrowser-Manager — a separately operated sibling service
+#     (docker/docker-compose.browser.yml). If you enable [browser] in
+#     90-local.toml, set manager_url = "http://host.docker.internal:8080" so the
+#     agent reaches the Manager's loopback-published port on the host.
+
+name: miku
+
+networks:
+  miku:
+    name: miku
+    # IPv6 off so docker/agent-egress-rules.sh gives a single closed IPv4
+    # boundary (its RFC1918 drops + DNS pin are IPv4); a v6-enabled bridge would
+    # route around them. Mirrors the sandbox/browser bridges.
+    enable_ipv6: false
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mikuswarm:latest
+    container_name: mikuswarm
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+    # Pin external DNS to public resolvers so name resolution survives the
+    # agent-egress-rules.sh RFC1918 drops (the embedded resolver would otherwise
+    # forward to the host's LAN/loopback nameservers, which are blocked). Compose
+    # service names (agent/console) still resolve via docker's embedded DNS. Keep
+    # in sync with PUBLIC_RESOLVERS in docker/egress-rules.sh.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    extra_hosts:
+      # Lets the agent reach the optional, host-published CloakBrowser-Manager
+      # (127.0.0.1:8080) at http://host.docker.internal:8080. Harmless if unused.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Drive the host docker daemon to create/exec the sandbox container.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # PATH PARITY: identical host & container path so the sandbox bind mount
+      # (docker create -v <this>:/workspace) resolves on the daemon. Keep in sync
+      # with [workspace].root_dir in docker/95-docker.toml.
+      - /srv/miku/workspace:/srv/miku/workspace
+      # Persistent data under the agent's data_dir (./var → /app/var): SQLite DB,
+      # Matrix E2EE crypto store, and the fastembed model cache.
+      - /srv/miku/var:/app/var
+      # Operator identity config (gitignored): models, matrix account, captioning…
+      # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).
+      - ./config/90-local.toml:/app/config/90-local.toml:ro
+    networks: [miku]
+
+  console:
+    build:
+      context: ./console
+      dockerfile: Dockerfile
+    image: mikuswarm-console:latest
+    container_name: mikuswarm-console
+    restart: unless-stopped
+    environment:
+      # Server→server hop over the compose network to the agent's read API.
+      MIKUSWARM_CONSOLE_API_URL: "http://agent:8799"
+      # Must match the agent's observability.server.auth_token (95-docker.toml).
+      MIKUSWARM_CONSOLE_TOKEN: "${MIKUSWARM_CONSOLE_TOKEN:?set MIKUSWARM_CONSOLE_TOKEN in .env}"
+      HOST: "0.0.0.0"
+      PORT: "5173"
+    ports:
+      # The single externally published surface (token-gated). Override the host
+      # port with MIKUSWARM_CONSOLE_PUBLISH in .env.
+      - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
+    depends_on: [agent]
+    networks: [miku]

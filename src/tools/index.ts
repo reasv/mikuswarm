@@ -18,6 +18,7 @@ export { createMediaTool, type MediaToolContext } from "./media.js";
 export { createReadImageTool, type ReadImageToolContext } from "./read-image.js";
 export { createWebFetchTool, createWebSearchTool } from "./web.js";
 export { createDanbooruTool, type DanbooruToolContext } from "./danbooru.js";
+export { createImageGenTool, type ImageGenToolContext } from "./image-gen.js";
 export {
   createUserProfileReadTool,
   createUserProfileEditTool,

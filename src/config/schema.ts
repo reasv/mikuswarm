@@ -433,6 +433,25 @@ const BrowserSchema = Type.Object({
 
 export type BrowserConfig = Static<typeof BrowserSchema>;
 
+// Image generation/editing via Google's Gemini "nano banana" models. `base_url`
+// is the Gemini API endpoint root (the
+// tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
+// `Authorization: Bearer`. The `api_key` field name matches the secret regex so
+// it auto-registers for log redaction.
+const ImageGenSchema = Type.Object({
+  base_url: Type.String({ minLength: 1 }),
+  api_key: Type.String({ minLength: 1 }),
+  models: Type.Object({
+    pro: Type.String({ minLength: 1 }),
+    flash: Type.String({ minLength: 1 }),
+  }),
+  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  // Gemini emits the image as output tokens; this must be high or generation is
+  // truncated before any image is produced (see src/tools/image-gen.ts).
+  max_output_tokens: Type.Optional(Type.Number({ minimum: 256 })),
+  output_subdir: Type.Optional(Type.String()),
+});
+
 export const AppConfigSchema = Type.Object({
   app: Type.Object({
     name: Type.String(),
@@ -553,7 +572,14 @@ export const AppConfigSchema = Type.Object({
   })),
   network: Type.Optional(Type.Object({
     http_proxy_url: Type.Optional(Type.String()),
+    // App-layer SSRF guard (defense-in-depth). When true (default), outbound
+    // fetches from caller-supplied URLs resolve DNS and reject private/loopback/
+    // link-local/metadata addresses, re-validating every redirect hop. Set false
+    // only where the container/network firewall already blocks private egress
+    // (see docker/95-docker.toml + docker/egress-rules.sh).
+    ssrf_guard: Type.Optional(Type.Boolean()),
   })),
+  image_gen: Type.Optional(ImageGenSchema),
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
 });
@@ -564,3 +590,4 @@ export type DiaryConfig = Static<typeof DiarySchema>;
 export type RetrievalConfig = Static<typeof RetrievalSchema>;
 export type SearchConfig = Static<typeof SearchSchema>;
 export type ReactionsConfig = Static<typeof ReactionsSchema>;
+export type ImageGenConfig = Static<typeof ImageGenSchema>;

@@ -10,7 +10,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
-import { assertPublicHttpUrl } from "./ssrf.js";
+import { guardedFetch } from "./ssrf.js";
 import { chunkMarkdownText } from "./chunk.js";
 
 /** Safe content budget for body + formatted_body within Matrix's 65 536-byte event limit. */
@@ -221,15 +221,13 @@ async function downloadMediaUrl(
   url: string,
   maxBytes: number,
 ): Promise<{ attachment: AttachmentMeta; tempPath: string }> {
-  await assertPublicHttpUrl(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    const response = await globalThis.fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: { "User-Agent": "MikuAgent/1.0" },
-    });
+    // guardedFetch blocks private/metadata hosts (incl. every redirect hop) when
+    // the egress guard is enabled, and degrades to a plain follow-fetch when the
+    // network firewall is the boundary instead.
+    const response = await guardedFetch(url, { signal: controller.signal });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
