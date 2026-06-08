@@ -322,7 +322,8 @@ function schedulerConfig(): AppConfig {
     proactive: {
       enabled: true,
       session_type: "proactive",
-      // Tiny mean + zero floor so the first arm fires within a few ms under mock timers.
+      // Tiny mean + zero configured floor; the absolute anti-busy-poll backstop
+      // (60s) still applies, so callers advance mock time past it.
       daily_posts: 1_000_000,
       min_gap_ms: 0,
       min_user_messages: 1,
@@ -370,7 +371,9 @@ test("ProactiveScheduler: a full pass acquires a slot and launches a proactive s
   });
 
   scheduler.start();
-  t.mock.timers.tick(500); // fire the first armed tick(s)
+  // The reschedule applies an absolute anti-busy-poll floor (PROACTIVE_ABSOLUTE_MIN_GAP_MS,
+  // 60s) on top of min_gap_ms, so the first arm fires at ~60s of mock time — advance past it.
+  t.mock.timers.tick(60_000); // fire the first armed tick(s)
   scheduler.stop();
 
   assert.equal(launches.length, 1, "exactly one proactive session launched");

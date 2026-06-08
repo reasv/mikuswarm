@@ -1192,8 +1192,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           error: error instanceof Error ? error.message : String(error),
         });
         // Release the per-timeline slot acquired via tryAcquire so future triggers
-        // aren't permanently blocked (launchSession's own .finally never ran).
-        triggerCoordinator.complete(inbound.timelineKey);
+        // aren't permanently blocked (launchSession threw before its own .finally
+        // could run). Forward any trigger queued during the proactive run into the
+        // launcher, mirroring every other release site so a real reply still drains.
+        if (draining) return;
+        const next = triggerCoordinator.complete(inbound.timelineKey);
+        if (next) void launchSession(next, true).catch((err) => {
+          logger.error("queued_session_launch_failed", {
+            timelineKey: next.timelineKey,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          triggerCoordinator.complete(next.timelineKey);
+        });
       });
     },
     isDraining: () => draining,

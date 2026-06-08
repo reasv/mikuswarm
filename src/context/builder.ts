@@ -609,7 +609,11 @@ export class ContextBuilder {
    * 00-defaults.toml, so this is only a safety net).
    */
   private renderProactiveKickoff(now: number): string {
-    const template = this.config.proactive?.kickoff_prompt ?? DEFAULT_PROACTIVE_KICKOFF;
+    // Treat an empty/whitespace-only configured prompt as absent: an empty kickoff
+    // would be `filter(Boolean)`-dropped from finalUserContent, silently removing the
+    // final "decide now / NO_REPLY" user turn, so fall back to the built-in default.
+    const configured = this.config.proactive?.kickoff_prompt;
+    const template = configured?.trim() ? configured : DEFAULT_PROACTIVE_KICKOFF;
     return template.replaceAll("{time}", formatAgentTimestamp(now)).trim();
   }
 

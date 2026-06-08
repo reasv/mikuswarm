@@ -30,6 +30,16 @@ import { agentDayEndMs, agentDayStartMs, agentHourOfDayMs } from "../time/index.
  * spacing tightens the more often attempts are skipped, floored by `min_gap_ms`.
  */
 
+/**
+ * Absolute anti-busy-poll backstop on the reschedule gap, applied in
+ * `rescheduleChannel` regardless of the configurable `min_gap_ms` (which the
+ * schema permits down to 0). Each tick runs a timeline query, so even a
+ * deployment that sets `min_gap_ms = 0` must never busy-loop late in a window:
+ * the effective floor is `max(min_gap_ms, this)`. 60s is well above per-tick DB
+ * cost while still letting legitimate small configs space attempts tightly.
+ */
+const PROACTIVE_ABSOLUTE_MIN_GAP_MS = 60_000; // 1m
+
 /** Hardcoded fallbacks when neither a per-channel nor a global value is set. */
 const DEFAULTS = {
   dailyPosts: 3,
@@ -327,7 +337,9 @@ export class ProactiveScheduler {
         windowEnd: win.windowEnd,
         nextWindowOpen: win.nextOpen,
         remaining,
-        minGapMs: eff.minGapMs,
+        // Floor by the configured min_gap_ms AND the absolute backstop, so a
+        // `min_gap_ms = 0` config still can't busy-poll (each tick hits the DB).
+        minGapMs: Math.max(eff.minGapMs, PROACTIVE_ABSOLUTE_MIN_GAP_MS),
         random: this.randomFn,
       });
     }
@@ -360,6 +372,17 @@ export class ProactiveScheduler {
   /** Run the budget/gate/concurrency checks and launch on a full pass. */
   private evaluate(eff: EffectiveChannelConfig): TickDecision {
     const now = this.nowFn();
+    // Budget is DERIVED by counting `agent_sessions` rows. `createPlaceholder`
+    // inserts that row through the single-writer queue, so the count below LAGS a
+    // just-launched session until the write lands. This lag cannot cause a
+    // double-post: two checks below serialize launches per timeline. (1) The
+    // synchronous `activeForTimeline` check rejects a tick while a session for this
+    // timeline is still in flight (the placeholder is in-memory immediately, before
+    // the row write). (2) `tryAcquire` holds the per-timeline trigger slot for the
+    // whole run (released only in launchSession's `.finally`), so a second tick
+    // can't even reach launch until the first session has fully settled — by which
+    // point its row is durably counted. The stale count therefore only ever
+    // *undercounts* across already-serialized launches, never races a fresh one.
     const consumed = this.consumedToday(eff.timelineKey, now);
     const remaining = eff.dailyPosts - consumed;
     const base = { consumed, remaining };
@@ -383,6 +406,14 @@ export class ProactiveScheduler {
     const inbound = this.buildSyntheticInbound(eff.timelineKey, now);
     if (!inbound) {
       // Could not resolve account/room from the timeline key — release the slot.
+      // `complete()`'s returned queued trigger is intentionally discarded here:
+      // reaching this point means `tryAcquire` just succeeded, i.e. the active
+      // count was below the per-timeline limit, so no real reply is running and the
+      // queue (which only fills once the slot is at the limit) is necessarily empty.
+      // Unlike the other release sites, the scheduler's launcher only accepts
+      // proactive synthetics — it cannot re-launch a real queued inbound — so there
+      // is nothing to drain. This whole branch is also synchronous from `tryAcquire`,
+      // so nothing can enqueue between the acquire and here.
       this.options.triggerCoordinator.complete(eff.timelineKey);
       return { decision: "skip_unresolved", reason: "invalid_timeline_key", ...base };
     }
