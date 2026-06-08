@@ -23,6 +23,14 @@ export class SessionRunnerError extends Error {
 export interface SessionRunnerOptions {
   provider?: ChatProvider;
   target?: OutboundTarget;
+  /**
+   * Suppress the typing indicator for the whole run (ARCHITECTURE.md §9g).
+   * Proactive sessions set this: the message should appear spontaneously, and a
+   * `NO_REPLY` must leave no "tried and failed to type" artifact. `send_message`
+   * delivers immediately, so a "type only while sending" variant would be
+   * meaningless — typing is simply never started.
+   */
+  suppressTyping?: boolean;
 }
 
 const TYPING_KEEPALIVE_MS = 4_000;
@@ -45,7 +53,7 @@ export class SessionRunner {
     // is still honored (#2). Cleared in finally once the run settles.
     lifecycle?.markRunInProgress();
     try {
-      if (this.options.provider && this.options.target) {
+      if (this.options.provider && this.options.target && !this.options.suppressTyping) {
         await this.options.provider.setTyping(this.options.target, true);
         const provider = this.options.provider;
         const target = this.options.target;
@@ -90,7 +98,7 @@ export class SessionRunner {
       // (correctly) reported as "not running" and defers to the terminal handler.
       lifecycle?.clearRunInProgress();
       if (typingInterval) clearInterval(typingInterval);
-      if (this.options.provider && this.options.target) {
+      if (this.options.provider && this.options.target && !this.options.suppressTyping) {
         await this.options.provider.setTyping(this.options.target, false).catch(() => undefined);
       }
     }

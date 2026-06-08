@@ -195,6 +195,52 @@ function zoneOffsetMs(tz: string, utcMs: number): number {
 }
 
 /**
+ * Local wall-clock midnight (ms) that STARTS the configured-zone calendar day
+ * containing `nowMs` — i.e. "most recent local midnight at/before now". Used by
+ * the proactive scheduler's day-boundary budget reset (ARCHITECTURE.md §9g).
+ * Falls back to a naive UTC-day floor only if the zone round-trip fails (it
+ * shouldn't for a validated zone).
+ */
+export function agentDayStartMs(nowMs: number): number {
+  const stamp = agentDateStamp(nowMs);
+  const ms = parseZonedWallClock(`${stamp} 00:00`, configuredTimezone);
+  return ms ?? nowMs - (nowMs % 86_400_000);
+}
+
+/**
+ * Local wall-clock midnight (ms) that ENDS the configured-zone calendar day
+ * containing `nowMs` (== the next day's start). Computed by stepping ~36h past
+ * this day's start (safely into the next calendar day across any DST shift) and
+ * flooring that to its local midnight.
+ */
+export function agentDayEndMs(nowMs: number): number {
+  const start = agentDayStartMs(nowMs);
+  return agentDayStartMs(start + 36 * 3_600_000);
+}
+
+/**
+ * The configured-zone instant (ms) of local `hour` (0–23) on the calendar day
+ * containing `dayContainingMs`. Used to resolve proactive `active_hours` window
+ * boundaries (ARCHITECTURE.md §9g).
+ */
+export function agentHourOfDayMs(dayContainingMs: number, hour: number): number {
+  const stamp = agentDateStamp(dayContainingMs);
+  const hh = String(hour).padStart(2, "0");
+  const ms = parseZonedWallClock(`${stamp} ${hh}:00`, configuredTimezone);
+  return ms ?? agentDayStartMs(dayContainingMs) + hour * 3_600_000;
+}
+
+/**
+ * Shift a `YYYY-MM-DD` date stamp by `days` calendar days in the configured zone,
+ * returning the resulting stamp. DST-safe (anchors at local noon before adding).
+ */
+export function shiftAgentDateStamp(stamp: string, days: number): string {
+  const noon = parseZonedWallClock(`${stamp} 12:00`, configuredTimezone);
+  if (noon == null) return stamp;
+  return agentDateStamp(noon + days * 86_400_000);
+}
+
+/**
  * Inverse of {@link compactAgentTimestamp}: parse a `YYYY-MM-DD HH:MM` wall-clock
  * string interpreted in the **given** IANA zone `tz` back to an epoch (ms). The
  * zone is passed explicitly (not read from module state) because callers parse

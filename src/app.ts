@@ -66,6 +66,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationWorkerPool } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
+import { ProactiveScheduler } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
   ChatSearchIndexer,
@@ -479,6 +480,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  // Proactive posting (ARCHITECTURE.md §9g). Same fail-fast validation as the
+  // worker pools: when opted in (enabled + ≥1 channel), the configured session
+  // type and its model must exist, so a misconfigured proactive run can't silently
+  // fall back to the default chat agent.
+  if (config.proactive?.enabled === true && (config.proactive.channels?.length ?? 0) > 0) {
+    const typeName = config.proactive.session_type ?? "proactive";
+    const sessionType = config.agent.session_types?.[typeName];
+    if (!sessionType) {
+      throw new Error(
+        `proactive posting enabled but session type "${typeName}" is not configured under [agent.session_types]`,
+      );
+    }
+    const modelKey = sessionType.model ?? "default";
+    if (!config.models[modelKey]) {
+      throw new Error(
+        `proactive session type "${typeName}" references model "${modelKey}" which is not in config.models`,
+      );
+    }
+  }
+
   // Map a (per-room) timeline key to its account + room id and ask that account's
   // Matrix client for a human room label. Shared by the diary header and the
   // RoomLabelCache (which feeds the observability console room list). Rejects on a
@@ -839,10 +860,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return ok;
   }
 
-  async function launchSession(inbound: InboundChatEvent, duplicate: boolean): Promise<void> {
-    const session = sessions.createPlaceholder(inbound);
+  async function launchSession(
+    inbound: InboundChatEvent,
+    duplicate: boolean,
+    opts?: { proactive?: boolean },
+  ): Promise<void> {
+    // Proactive sessions (ARCHITECTURE.md §9g) reuse this launcher verbatim; the
+    // only branches are the session type (counted for budget), the proactive
+    // context-build mode, and typing suppression. Everything else — tool assembly,
+    // capture, slot release, queued-trigger drainage — is shared.
+    const proactive = opts?.proactive === true;
+    const session = proactive
+      ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
+      : sessions.createPlaceholder(inbound);
     sessions.markRunning(session.id);
-    logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey });
+    logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
     const target = inbound.outboundTarget;
     if (!target) {
       sessions.markDiscarded(session.id);
@@ -1018,7 +1050,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
     try {
-      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(session, tools));
+      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
+        session,
+        tools,
+        proactive ? { proactive: true } : undefined,
+      ));
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
     } catch (error) {
@@ -1052,7 +1088,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       tokenEstimate,
       logger,
     });
-    const runner = new SessionRunner({ provider, target });
+    const runner = new SessionRunner({ provider, target, suppressTyping: proactive });
 
     const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(session.id))
@@ -1136,6 +1172,32 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     },
     isDraining: () => draining,
     logger,
+  });
+
+  // Proactive posting scheduler (ARCHITECTURE.md §9g). Inert unless opted in
+  // (config.proactive.enabled + ≥1 channel); `start()` no-ops otherwise. Produces
+  // synthetic inbounds for the existing launchSession on a self-compressing
+  // per-channel schedule. Started alongside the other pools below; stopped first
+  // during drain so no new proactive run begins while the runtime tears down.
+  const proactiveScheduler = new ProactiveScheduler({
+    config,
+    timeline,
+    sessions,
+    triggerCoordinator,
+    storage,
+    launchSession: (inbound, duplicate, opts) => {
+      void launchSession(inbound, duplicate, opts).catch((error) => {
+        logger.error("proactive_session_launch_failed", {
+          timelineKey: inbound.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Release the per-timeline slot acquired via tryAcquire so future triggers
+        // aren't permanently blocked (launchSession's own .finally never ran).
+        triggerCoordinator.complete(inbound.timelineKey);
+      });
+    },
+    isDraining: () => draining,
+    logger: logger.child("proactive"),
   });
 
   // Re-decryption sweeper (issue #11): periodically retries stored UTD events to
@@ -1248,6 +1310,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (diaryPool) await diaryPool.start();
   if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
+  proactiveScheduler.start();
 
   if (retentionDays > 0) {
     void runInactiveRetention();
@@ -1288,6 +1351,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Stop the proactive scheduler first: clear its per-channel timers so no
+        // new proactive run is launched while the rest of the runtime tears down.
+        proactiveScheduler.stop();
         // Stop the console first: it stops accepting requests and tears down any
         // open SSE streams before the live state it reads begins shutting down.
         if (consoleServer) await consoleServer.stop();
