@@ -294,10 +294,29 @@ test("SessionRunner: suppressTyping makes zero setTyping calls across send and N
     async continue() {},
     async waitForIdle() {},
   };
-  const runner = new SessionRunner({ provider, target, suppressTyping: true });
-  const result = await runner.run(noReplyAgent as any, { id: "s-1" } as any, 0, { role: "user", content: "x", timestamp: 1 } as any);
-  assert.equal(result.noReply, true);
-  assert.equal(typingCalls, 0, "no typing indicator for a suppressed run");
+  const noReplyRunner = new SessionRunner({ provider, target, suppressTyping: true });
+  const noReplyResult = await noReplyRunner.run(noReplyAgent as any, { id: "s-1" } as any, 0, { role: "user", content: "x", timestamp: 1 } as any);
+  assert.equal(noReplyResult.noReply, true);
+  assert.equal(typingCalls, 0, "no typing indicator for a suppressed NO_REPLY run");
+
+  // Send path: the agent actually emits a send_message tool call. `isTerminallyValid`
+  // treats this as a valid terminal turn (runner.ts:198) → noReply=false. Typing must
+  // still be suppressed across start, keepalive, and stop.
+  const sendAgent = {
+    state: { messages: [] as any[] },
+    async prompt() {
+      this.state.messages.push({
+        role: "assistant",
+        content: [{ type: "toolCall", name: "send_message", input: { body: "hi" } }],
+      });
+    },
+    async continue() {},
+    async waitForIdle() {},
+  };
+  const sendRunner = new SessionRunner({ provider, target, suppressTyping: true });
+  const sendResult = await sendRunner.run(sendAgent as any, { id: "s-2" } as any, 0, { role: "user", content: "x", timestamp: 1 } as any);
+  assert.equal(sendResult.noReply, false, "a send_message turn is not a NO_REPLY");
+  assert.equal(typingCalls, 0, "no typing indicator for a suppressed send run either (§12)");
 });
 
 // ── Integration: a full pass launches a proactive session ────────────
@@ -385,6 +404,94 @@ test("ProactiveScheduler: a full pass acquires a slot and launches a proactive s
   assert.equal(inbound.outboundTarget?.accountId, "miku");
   assert.ok(inbound.event.id.startsWith("proactive-"));
   assert.equal(inbound.event.sender.isSelf, true);
+});
+
+// A logger that records `proactive_tick` decisions so tick branches can be asserted
+// the same way the spec's observability (§8) surfaces them.
+function tickRecordingLogger(sink: Array<Record<string, unknown>>): any {
+  const l: any = {
+    info: (event: string, fields?: Record<string, unknown>) => {
+      if (event === "proactive_tick") sink.push(fields ?? {});
+    },
+    warn: () => {}, error: () => {}, debug: () => {},
+    child: () => l,
+  };
+  return l;
+}
+
+test("ProactiveScheduler: skip_active when a session is already active for the timeline", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  configureAgentTimezone("UTC");
+  t.after(() => resetAgentTimezone());
+
+  const now = Date.UTC(2026, 5, 2, 12, 0, 0);
+  const ticks: Array<Record<string, unknown>> = [];
+  let launched = 0;
+  let acquires = 0;
+  const scheduler = new ProactiveScheduler({
+    config: schedulerConfig(),
+    // A non-empty active list short-circuits before the gate/coordinator are touched.
+    sessions: { activeForTimeline: () => [{ id: "in-flight" }] } as any,
+    triggerCoordinator: { tryAcquire: () => { acquires++; return true; }, complete: () => undefined } as any,
+    storage: { countSessionsByType: () => 0 } as any,
+    timeline: { query: () => { throw new Error("gate must not be scanned when a session is active"); } } as any,
+    launchSession: () => { launched++; },
+    isDraining: () => false,
+    logger: tickRecordingLogger(ticks),
+    now: () => now,
+    random: () => 0,
+  });
+
+  scheduler.start();
+  t.mock.timers.tick(60_000); // fire the first armed tick past the absolute floor
+  scheduler.stop();
+
+  assert.ok(ticks.length >= 1, "at least one tick fired");
+  assert.equal(ticks[0]!.decision, "skip_active");
+  assert.equal(launched, 0, "no session launched while one is active");
+  assert.equal(acquires, 0, "tryAcquire not reached — no slot acquired, no budget spent");
+});
+
+test("ProactiveScheduler: skip_busy_slot when tryAcquire is refused (and complete() is NOT called)", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  configureAgentTimezone("UTC");
+  t.after(() => resetAgentTimezone());
+
+  const now = Date.UTC(2026, 5, 2, 12, 0, 0);
+  const ticks: Array<Record<string, unknown>> = [];
+  let launched = 0;
+  let completes = 0;
+  const scheduler = new ProactiveScheduler({
+    config: schedulerConfig(),
+    sessions: { activeForTimeline: () => [] } as any,
+    // Budget remains, channel is active, gate passes — but the per-timeline slot is
+    // busy (a real reply just started), so tryAcquire refuses without enqueuing.
+    triggerCoordinator: {
+      tryAcquire: () => false,
+      complete: () => { completes++; return undefined; },
+    } as any,
+    storage: { countSessionsByType: () => 0 } as any,
+    timeline: {
+      query: () => [
+        ev("u1", now - 1000, "user"),
+        ev("u2", now - 500, "user"),
+      ],
+    } as any,
+    launchSession: () => { launched++; },
+    isDraining: () => false,
+    logger: tickRecordingLogger(ticks),
+    now: () => now,
+    random: () => 0,
+  });
+
+  scheduler.start();
+  t.mock.timers.tick(60_000);
+  scheduler.stop();
+
+  assert.ok(ticks.length >= 1, "at least one tick fired");
+  assert.equal(ticks[0]!.decision, "skip_busy_slot");
+  assert.equal(launched, 0, "no session launched when the slot is busy");
+  assert.equal(completes, 0, "complete() must NOT be called — the slot was never acquired");
 });
 
 test("ProactiveScheduler: inert when disabled or no channels (start is a no-op)", (t) => {
