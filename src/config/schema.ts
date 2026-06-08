@@ -191,6 +191,38 @@ const RetrievalSchema = Type.Object({
   embedding: Type.Optional(RetrievalEmbeddingSchema),
 });
 
+// Proactive posting (ARCHITECTURE.md §9g). Opt-in only: inert unless `enabled =
+// true` AND at least one channel is listed. Global fields are defaults overridable
+// per channel (effective value = channel ?? global ?? hardcoded default).
+const ProactiveActiveHoursSchema = Type.Object({
+  // Local hours (agent.timezone). Posting is only scheduled within [start, end).
+  // Wraps past midnight when end <= start (e.g. start=9, end=1 → 09:00–01:00).
+  start: Type.Integer({ minimum: 0, maximum: 23 }),
+  end: Type.Integer({ minimum: 0, maximum: 23 }),
+});
+
+const ProactiveChannelSchema = Type.Object({
+  timeline_key: Type.String({ minLength: 1 }), // required; exact match
+  daily_posts: Type.Optional(Type.Integer({ minimum: 0 })),
+  min_user_messages: Type.Optional(Type.Integer({ minimum: 0 })),
+  dead_channel_backstop_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  min_gap_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  active_hours: Type.Optional(ProactiveActiveHoursSchema),
+});
+
+const ProactiveSchema = Type.Object({
+  enabled: Type.Optional(Type.Boolean()), // global master switch
+  session_type: Type.Optional(Type.String({ minLength: 1 })), // session_types key; default "proactive"
+  kickoff_prompt: Type.Optional(Type.String()), // final user turn template ({time} substituted)
+  // Global defaults, overridable per channel:
+  daily_posts: Type.Optional(Type.Integer({ minimum: 0 })),
+  min_user_messages: Type.Optional(Type.Integer({ minimum: 0 })),
+  dead_channel_backstop_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  min_gap_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  active_hours: Type.Optional(ProactiveActiveHoursSchema),
+  channels: Type.Optional(Type.Array(ProactiveChannelSchema)),
+});
+
 const TimelineSchema = Type.Object({
   // How many messages to fetch on first trigger (initial backfill). 0 = none.
   initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
@@ -541,6 +573,7 @@ export const AppConfigSchema = Type.Object({
   retrieval: Type.Optional(RetrievalSchema),
   search: Type.Optional(SearchSchema),
   reactions: Type.Optional(ReactionsSchema),
+  proactive: Type.Optional(ProactiveSchema),
   sillytavern: Type.Optional(Type.Object({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -588,3 +621,5 @@ export type RetrievalConfig = Static<typeof RetrievalSchema>;
 export type SearchConfig = Static<typeof SearchSchema>;
 export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
+export type ProactiveConfig = Static<typeof ProactiveSchema>;
+export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;

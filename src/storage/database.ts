@@ -4181,6 +4181,28 @@ export class Storage {
   }
 
   /**
+   * Count `agent_sessions` rows for a timeline of a given session type created
+   * at/after `since` (ARCHITECTURE.md §9g). Backs the proactive scheduler's
+   * derived daily budget: because the placeholder row is inserted at session
+   * start and persists regardless of outcome, this count includes sent AND
+   * `NO_REPLY` (and even crash-discarded) proactive sessions with no extra state.
+   * Read-only. The `idx_agent_sessions_timeline(timeline_key, created_at)` index
+   * covers the timeline+time predicate; session_type is filtered in-row (the
+   * per-tick frequency is far too low to warrant a dedicated index).
+   */
+  countSessionsByType(timelineKey: string, sessionType: string, since: number): number {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select count(*) as n from agent_sessions
+           where timeline_key = ? and session_type = ? and created_at >= ?`,
+        )
+        .get(timelineKey, sessionType, since) as { n: number };
+      return row.n;
+    });
+  }
+
+  /**
    * One row per timeline for the console room list (spec §8, `GET /api/rooms`),
    * reverse-chron by latest activity. The anchor set is the UNION of timelines
    * that have `timeline_events` OR have `agent_sessions` rows (issue #6): a

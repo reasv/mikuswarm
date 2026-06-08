@@ -7,6 +7,8 @@ export type {
   RetrievalConfig,
   ObservabilityServerConfig,
   BrowserConfig,
+  ProactiveConfig,
+  ProactiveChannelConfig,
 } from "./schema.js";
 export {
   redactSecrets,

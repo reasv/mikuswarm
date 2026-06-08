@@ -27,7 +27,7 @@ import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js"
 import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
-import { agentDateStamp } from "../time/index.js";
+import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
 import { nanoid } from "nanoid";
 import type { Logger } from "../observability/index.js";
 
@@ -60,6 +60,15 @@ export interface BuildContextOptions {
     /** Cut context at this timestamp — no events past it are rendered. */
     endTimestamp: number;
   };
+  /**
+   * When true, build context for a proactive check-in (ARCHITECTURE.md §9g): the
+   * live conversation renders as usual (recent timeline, summary/diary layers,
+   * auto-retrieval) but no events are pulled out as a trigger group and the final
+   * user turn is a synthetic "decide now" kickoff (`proactive.kickoff_prompt`,
+   * `{time}` substituted) rather than a triggering message. Mutually exclusive
+   * with `summarizationCutoff`.
+   */
+  proactive?: boolean;
   /** Optional signal to cancel a grace wait early (e.g. on shutdown). */
   abortSignal?: AbortSignal;
 }
@@ -71,6 +80,18 @@ export interface BuiltContext {
   richTokens: number;
   imageBlocks: ImageBlock[];
 }
+
+/**
+ * Fallback proactive kickoff prompt (§9g) when `proactive.kickoff_prompt` is
+ * unset. The shipped default lives in 00-defaults.toml; this only guards a config
+ * that enables proactive without supplying the template.
+ */
+const DEFAULT_PROACTIVE_KICKOFF =
+  "It is {time}. No message is addressed to you right now — you have not been triggered. " +
+  "Read the recent conversation above and decide, honestly, whether you have something " +
+  "genuinely worth adding right now. If you do, say it with send_message — one message, " +
+  "natural, not forced. If you do not, output exactly NO_REPLY. Staying quiet is the normal, " +
+  "common outcome; only post when it actually adds something.";
 
 export class ContextBuilder {
   /** Called after a level-1 summarization job is enqueued (§4 threshold). */
@@ -95,8 +116,12 @@ export class ContextBuilder {
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
     const cutoff = options.summarizationCutoff;
+    // Proactive check-in (§9g): live context as usual, but no trigger group and a
+    // synthetic kickoff as the final user turn. Distinct from `cutoff`, which cuts
+    // the whole context at a timestamp for summarization.
+    const proactive = options.proactive === true;
     const now = options.trigger.timestamp;
-    const triggerGroupIds = cutoff ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
+    const triggerGroupIds = cutoff || proactive ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
     const compactionState = this.store.getCompactionState(options.timelineKey);
 
     // 1. Select summaries and derive the event-ID coverage cursor (§4).
@@ -218,7 +243,8 @@ export class ContextBuilder {
       await this.maybeEnqueueLevel1(options.timelineKey, compacted.compactEvents);
     }
 
-    const imageBlocks = cutoff ? [] : await this.selectImageBlocks(options.trigger);
+    // Proactive's synthetic trigger carries no attachments — no image blocks.
+    const imageBlocks = cutoff || proactive ? [] : await this.selectImageBlocks(options.trigger);
     const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
 
     this.markImageBlocks(triggerEvents, imageBlockIds);
@@ -298,9 +324,14 @@ export class ContextBuilder {
           });
 
     const systemBlock = `<system>\n${satellite}\n</system>`;
+    // For a proactive build there are no trigger events; the immediate "decide now"
+    // prompt is the kickoff (§9g). Standing framing (default to silence, don't
+    // announce yourself) lives in the proactive session type's session_instruction,
+    // rendered inside the satellite block above — two knobs, distinct roles.
+    const finalTurnTail = proactive ? this.renderProactiveKickoff(now) : triggerContent;
     const finalUserContent = cutoff
       ? systemBlock
-      : [retrievedMemory, systemBlock, triggerContent].filter(Boolean).join("\n\n");
+      : [retrievedMemory, systemBlock, finalTurnTail].filter(Boolean).join("\n\n");
 
     const messages: ContextMessage[] = [
       {
@@ -568,6 +599,18 @@ export class ContextBuilder {
       inputTokens: running,
     });
     this.onJobEnqueued?.();
+  }
+
+  /**
+   * Render the proactive kickoff — the final user turn for a proactive build
+   * (§9g). Substitutes `{time}` in `proactive.kickoff_prompt` with the
+   * agent-formatted anchor time (the trigger timestamp = wake-up moment). Falls
+   * back to a built-in prompt if the config value is absent (the default ships in
+   * 00-defaults.toml, so this is only a safety net).
+   */
+  private renderProactiveKickoff(now: number): string {
+    const template = this.config.proactive?.kickoff_prompt ?? DEFAULT_PROACTIVE_KICKOFF;
+    return template.replaceAll("{time}", formatAgentTimestamp(now)).trim();
   }
 
   private resolveTriggerGroupIds(trigger: CanonicalChatEvent): Set<string> {

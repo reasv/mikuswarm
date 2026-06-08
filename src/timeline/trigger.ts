@@ -38,6 +38,23 @@ export class TriggerCoordinator {
     return { action: "queued", queueLength: queue.length };
   }
 
+  /**
+   * No-queue acquire for proactive posting (ARCHITECTURE.md §9g): claim a
+   * per-timeline slot iff one is free, returning `true` (and incrementing the
+   * active count) — otherwise return `false` WITHOUT enqueuing. A proactive
+   * session must never queue behind, or race ahead of, a real reply; on a miss
+   * the scheduler simply reschedules. Release uses the existing
+   * {@link complete} (called from `launchSession`'s `.finally`), so a real
+   * trigger that queued during the proactive run still drains normally.
+   */
+  tryAcquire(timelineKey: string): boolean {
+    const limit = this.limitFor(timelineKey);
+    const active = this.activeByTimeline.get(timelineKey) ?? 0;
+    if (active >= limit) return false;
+    this.activeByTimeline.set(timelineKey, active + 1);
+    return true;
+  }
+
   complete(timelineKey: string): InboundChatEvent | undefined {
     const active = Math.max(0, (this.activeByTimeline.get(timelineKey) ?? 1) - 1);
     this.activeByTimeline.set(timelineKey, active);

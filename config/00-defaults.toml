@@ -315,6 +315,34 @@ discrete_assistant_only = true    # View B targets: true = only the agent's own 
 discrete_horizon_messages = 0     # View B horizon: 0 = whole rich tier; >0 = last N rich messages
 discrete_name_cap = 8             # >N senders on one reaction → first 4 + "(and N others)"
 
+# Proactive posting (ARCHITECTURE.md §9g): let the bot post on its own initiative
+# on a self-adjusting random schedule, for an explicitly opted-in set of channels.
+# Opt-in ONLY — inert unless enabled = true AND at least one [[proactive.channels]]
+# is listed (there is deliberately no "all rooms" mode). Every run counts against
+# the daily budget, including NO_REPLY; skipped gate attempts do not. The global
+# fields here are defaults, overridable per channel.
+[proactive]
+enabled = false
+session_type = "proactive"             # session_types key used for proactive runs
+daily_posts = 3                        # target proactive sessions/day per channel
+min_user_messages = 10                 # human messages since the bot last spoke before it may post again
+dead_channel_backstop_ms = 21600000    # 6h: skip if the newest message is older than this (no necro-bumping)
+min_gap_ms = 1800000                   # 30m floor between attempts (anti busy-poll)
+# active_hours = { start = 9, end = 1 } # optional local-hour window; wraps midnight when end <= start
+# channels = []                        # opt specific rooms in via [[proactive.channels]] in local config
+kickoff_prompt = """
+It is {time}. No message is addressed to you right now — you have not been triggered. Read the recent conversation above and decide, honestly, whether you have something genuinely worth adding: a thought, a follow-up, a reaction, something that fits the moment. If you do, say it with send_message — one message, natural, not forced. If you do not, output exactly NO_REPLY. Staying quiet is the normal, common outcome; only post when it actually adds something.
+"""
+
+# The proactive session type: identical to a default chat session (all tools, same
+# model) plus a standing instruction. No `tools` allowlist ⇒ inherits all tools, so
+# a proactive check-in can search, recap, react, browse, etc. just like a reply.
+[agent.session_types.proactive]
+model = "default"
+session_instruction = """
+You are running a proactive check-in, not responding to anyone. Default to silence. Do not greet, do not announce yourself, do not ask "is anyone there", do not repeat a point you already made. Contribute only if it genuinely improves the conversation; otherwise output exactly NO_REPLY.
+"""
+
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]

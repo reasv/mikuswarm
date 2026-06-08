@@ -89,6 +89,12 @@ export interface CreateAgentOptions {
   /** When set, build context for a summarization session cut at this timestamp. */
   summarizationCutoff?: { endTimestamp: number };
   /**
+   * When true, build context in proactive check-in mode (ARCHITECTURE.md §9g): no
+   * trigger group, a synthetic kickoff as the final user turn, no image blocks.
+   * Threaded straight into {@link ContextBuilder.build}.
+   */
+  proactive?: boolean;
+  /**
    * Resume seam (designed-for, not yet wired — see ARCHITECTURE.md "Appendix: Deferred designs" §B).
    * When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
    * frozen prefix and `transcript` seeds the live message array. The caller is expected
@@ -220,6 +226,7 @@ export class AgentSessionFactory {
         sessionType: sessionTypeConfig,
         fallbackPrompt,
         summarizationCutoff: opts?.summarizationCutoff,
+        proactive: opts?.proactive,
       });
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
@@ -354,6 +361,7 @@ export class AgentSessionFactory {
     sessionType: SessionTypeConfig | undefined;
     fallbackPrompt: string | undefined;
     summarizationCutoff?: { endTimestamp: number };
+    proactive?: boolean;
   }): Promise<BuiltContext> {
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
@@ -365,6 +373,7 @@ export class AgentSessionFactory {
       sessionType: args.sessionType,
       fallbackPrompt: args.fallbackPrompt,
       summarizationCutoff: args.summarizationCutoff,
+      proactive: args.proactive,
     });
   }
 
