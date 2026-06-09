@@ -6,6 +6,7 @@ import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuil
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
+import { withRequestRetry } from "./request-retry.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage } from "../storage/index.js";
@@ -183,7 +184,26 @@ export class AgentSessionFactory {
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     const model = createModelFromConfig(modelConfig);
-    const streamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    // Layer-1 transparent request retry (spec §6.1) wraps the chosen stream fn so a
+    // mechanical blip re-issues the exact same request before it can discard a live
+    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` returns
+    // the base fn unwrapped, so this is a no-op when recovery is unconfigured-to-zero.
+    const recovery = this.options.config.recovery;
+    const baseStreamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    const streamFn = withRequestRetry(
+      baseStreamFn,
+      {
+        retries: recovery?.llm_request_retries ?? 4,
+        backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
+        backoffMaxMs: recovery?.llm_request_backoff_max_ms ?? 15_000,
+      },
+      {
+        logger: this.options.logger,
+        sessionId: session.id,
+        timelineKey: session.timelineKey,
+        sessionType: session.sessionType,
+      },
+    );
 
     // Load workspace files from disk at session creation time
     const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);

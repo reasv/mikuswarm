@@ -484,6 +484,20 @@ const ImageGenSchema = Type.Object({
   output_subdir: Type.Optional(Type.String()),
 });
 
+// Recovery — request- and session-level resilience (spec CONCURRENCY-AND-RATE-LIMITING §6/§9.6).
+// Only the Layer-1 (transparent request-level retry) knobs are implemented today; the
+// Layer-2 session resume-in-place knobs (`session_auto_resume_*`) are NOT yet wired and
+// are therefore deliberately absent from the schema until that code lands (per CLAUDE.md:
+// config describes only implemented behaviour).
+const RecoverySchema = Type.Object({
+  // Layer 1 — transparent per-request retry for mechanical LLM failures
+  // (network/stream reset, timeout, 5xx, 429). Re-issues the exact same request
+  // before the run is allowed to fail. See src/agent/request-retry.ts.
+  llm_request_retries: Type.Optional(Type.Number({ minimum: 0 })),
+  llm_request_backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  llm_request_backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
 export const AppConfigSchema = Type.Object({
   app: Type.Object({
     name: Type.String(),
@@ -615,6 +629,7 @@ export const AppConfigSchema = Type.Object({
   image_gen: Type.Optional(ImageGenSchema),
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
+  recovery: Type.Optional(RecoverySchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
