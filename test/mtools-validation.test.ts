@@ -6,7 +6,7 @@ import {
   createUserProfileEditTool,
 } from "../src/tools/user-profile.js";
 import {
-  ConcurrencyLimitedFetchClient,
+  FetchClient,
   buildProxyDispatcher,
 } from "../src/enrichment/fetch-client.js";
 import {
@@ -14,9 +14,8 @@ import {
   type SillyTavernCardToolContext,
 } from "../src/tools/sillytavern-card.js";
 
-function makeFetchClient(): ConcurrencyLimitedFetchClient {
-  return new ConcurrencyLimitedFetchClient({
-    maxConcurrency: 1,
+function makeFetchClient(): FetchClient {
+  return new FetchClient({
     timeoutMs: 1_000,
     maxResponseBytes: 1_000,
   });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { rm } from "node:fs/promises";
 
-import { ConcurrencyLimitedFetchClient } from "../src/enrichment/fetch-client.js";
+import { FetchClient } from "../src/enrichment/fetch-client.js";
 import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 
 // ---------------------------------------------------------------------------
@@ -58,9 +58,8 @@ function stubFetch(routes: (url: string) => StubResponse): {
   return { requested, restore: () => void (globalThis.fetch = original) };
 }
 
-function makeClient(): ConcurrencyLimitedFetchClient {
-  return new ConcurrencyLimitedFetchClient({
-    maxConcurrency: 2,
+function makeClient(): FetchClient {
+  return new FetchClient({
     timeoutMs: 5_000,
     maxResponseBytes: 10 * 1024 * 1024,
   });
@@ -93,7 +92,7 @@ test("egress guard follows a 302 between two public hops and returns the final 2
     return { status: 200, body: Buffer.from("payload-bytes"), contentType: "image/png" };
   });
   const client = makeClient();
-  let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
+  let result: Awaited<ReturnType<FetchClient["fetch"]>> | undefined;
   try {
     result = await client.fetch(`http://${PUBLIC_IP_A}/start`);
     assert.equal(result.statusCode, 200);
@@ -111,7 +110,7 @@ test("egress guard follows a 302 between two public hops and returns the final 2
 test("egress guard passes through a direct (no-redirect) public 200 unchanged", async () => {
   const stub = stubFetch(() => ({ status: 200, body: Buffer.from("hello"), contentType: "image/jpeg" }));
   const client = makeClient();
-  let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
+  let result: Awaited<ReturnType<FetchClient["fetch"]>> | undefined;
   try {
     result = await client.fetch(`http://${PUBLIC_IP_A}/direct`);
     assert.equal(result.statusCode, 200);
@@ -150,7 +149,7 @@ test("with the egress guard disabled, a private host is NOT rejected (network la
   const stub = stubFetch(() => ({ status: 200, body: Buffer.from("ok"), contentType: "text/plain" }));
   setEgressGuardEnabled(false);
   const client = makeClient();
-  let result: Awaited<ReturnType<ConcurrencyLimitedFetchClient["fetch"]>> | undefined;
+  let result: Awaited<ReturnType<FetchClient["fetch"]>> | undefined;
   try {
     result = await client.fetch(`http://${METADATA_IP}/latest/meta-data/`);
     assert.equal(result.statusCode, 200);

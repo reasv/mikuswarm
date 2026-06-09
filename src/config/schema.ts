@@ -332,7 +332,6 @@ const McpSchema = Type.Object({
 
 const EnrichmentSchema = Type.Object({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
-  fetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
   max_previews_per_message: Type.Optional(Type.Number({ minimum: 0 })),
@@ -484,6 +483,26 @@ const ImageGenSchema = Type.Object({
   output_subdir: Type.Optional(Type.String()),
 });
 
+// Rate limiting (spec CONCURRENCY-AND-RATE-LIMITING §8/§9.5). Only the HTTP per-host
+// limiter is implemented today; the LLM request scheduler (`[rate_limits.llm.*]`,
+// Design A) is not yet built and is therefore absent from the schema until it lands.
+const RateLimitsSchema = Type.Object({
+  // Per-host HTTP egress limiting, enforced at the `guardedFetch` chokepoint
+  // (src/tools/http-limiter.ts). State is keyed per host and shared across callers.
+  http: Type.Optional(Type.Object({
+    // Generous per-host admission cap (NOT a cross-domain cap). The old
+    // `enrichment.fetch_concurrency` cross-domain cap of 6 is removed.
+    default_max_in_flight_per_host: Type.Optional(Type.Number({ minimum: 1 })),
+    // Optional pure degenerate backstop across all hosts; set far above normal load.
+    global_ceiling_max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
+    // 429/503 + Retry-After backoff is always on (§5.3); these only tune it.
+    backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    // Optional per-host concurrency overrides, keyed by lowercase hostname.
+    per_host_max_in_flight: Type.Optional(Type.Record(Type.String(), Type.Number({ minimum: 1 }))),
+  })),
+});
+
 // Recovery — request- and session-level resilience (spec CONCURRENCY-AND-RATE-LIMITING §6/§9.6).
 // Only the Layer-1 (transparent request-level retry) knobs are implemented today; the
 // Layer-2 session resume-in-place knobs (`session_auto_resume_*`) are NOT yet wired and
@@ -616,6 +635,10 @@ export const AppConfigSchema = Type.Object({
     default_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
     default_order: Type.Optional(Type.String()),
     download_subdir: Type.Optional(Type.String()),
+    // In-tool rate limiter (spec Design D §8.2): paces the JSON API + asset CDN as
+    // one account-level budget. Defaults: 500 ms between starts, 2 in flight.
+    min_request_interval_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
   })),
   network: Type.Optional(Type.Object({
     http_proxy_url: Type.Optional(Type.String()),
@@ -630,6 +653,7 @@ export const AppConfigSchema = Type.Object({
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),
+  rate_limits: Type.Optional(RateLimitsSchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

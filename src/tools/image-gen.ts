@@ -6,8 +6,9 @@ import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
 import {
   buildProxyDispatcher,
-  type ConcurrencyLimitedFetchClient,
+  type FetchClient,
 } from "../enrichment/fetch-client.js";
+import { guardedFetch } from "./ssrf.js";
 import type { Dispatcher } from "undici";
 import {
   conditionImageBufferForInference,
@@ -91,7 +92,7 @@ type GeminiResponse = {
 export interface ImageGenToolContext {
   workspaceRoot: string;
   /** Used to download `images` reference inputs given as http(s) URLs. */
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   /** Hard fetch ceiling for reference-image downloads. */
   downloadSizeLimit: number;
   /**
@@ -374,7 +375,11 @@ async function postGenerate(input: {
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
   let response: Response;
   try {
-    response = await globalThis.fetch(input.url, {
+    // Route through the shared egress chokepoint: SSRF guard + per-host admission
+    // and the unconditional 429/503 backoff (spec Design D). Since image-gen shares
+    // the Gemini/LlmGateway host with no other heavy traffic, the per-host limiter is
+    // effectively just the backoff safety net here.
+    response = await guardedFetch(input.url, {
       method: "POST",
       signal: controller.signal,
       headers: {
@@ -388,8 +393,8 @@ async function postGenerate(input: {
       },
       body: JSON.stringify(input.body),
       // undici accepts `dispatcher` at runtime; routes through the proxy when set.
-      ...(input.dispatcher ? { dispatcher: input.dispatcher } : {}),
-    } as RequestInit);
+      dispatcher: input.dispatcher,
+    });
   } catch (error) {
     clearTimeout(timeout);
     if ((error as { name?: string })?.name === "AbortError") {

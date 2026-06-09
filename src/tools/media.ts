@@ -4,7 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
 import type { ConcurrencyLimitedInferenceClient } from "../captioning/inference-client.js";
 import type { MediaModality } from "../captioning/describe.js";
-import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import type { FetchClient } from "../enrichment/fetch-client.js";
 
 export interface MediaToolContext {
   workspaceRoot: string;
@@ -12,7 +12,7 @@ export interface MediaToolContext {
   defaultPrompts: Map<MediaModality, string>;
   modelHasVision: boolean;
   maxFetchBytes: number;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
 }
 
 export function createMediaTool(context: MediaToolContext): AgentTool {
@@ -95,7 +95,7 @@ interface LoadedMedia {
 
 const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
 
-async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number, fetchClient: ConcurrencyLimitedFetchClient): Promise<LoadedMedia> {
+async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number, fetchClient: FetchClient): Promise<LoadedMedia> {
   if (isUrl(source)) {
     const fetched = await fetchClient.fetch(source, { maxBytes: maxFetchBytes });
     if (fetched.statusCode < 200 || fetched.statusCode >= 300) {

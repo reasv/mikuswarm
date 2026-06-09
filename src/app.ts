@@ -59,8 +59,9 @@ import {
   createWriteMemoryTool,
 } from "./tools/index.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
+import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { InboundChatEvent } from "./types.js";
-import { EnrichmentWorkerPool, ConcurrencyLimitedFetchClient } from "./enrichment/index.js";
+import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
@@ -94,6 +95,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const egressGuardEnabled = config.network?.ssrf_guard ?? true;
   setEgressGuardEnabled(egressGuardEnabled);
   logger.info("egress_guard_configured", { enabled: egressGuardEnabled });
+
+  // Per-host HTTP egress limiter (spec Design D), enforced at the guardedFetch
+  // chokepoint: generous per-host admission + a high global backstop + unconditional
+  // 429/503 backoff. Replaces the old cross-domain fetch-concurrency cap.
+  const httpLimits = config.rate_limits?.http;
+  configureHttpLimiter({
+    defaultMaxInFlightPerHost: httpLimits?.default_max_in_flight_per_host,
+    globalCeiling: httpLimits?.global_ceiling_max_in_flight,
+    backoffBaseMs: httpLimits?.backoff_base_ms,
+    backoffMaxMs: httpLimits?.backoff_max_ms,
+    perHostMaxInFlight: httpLimits?.per_host_max_in_flight,
+  });
 
   const storage = await Storage.open({
     databasePath: config.storage.database_path,
@@ -216,8 +229,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
-  const fetchClient = new ConcurrencyLimitedFetchClient({
-    maxConcurrency: config.enrichment?.fetch_concurrency ?? 6,
+  const fetchClient = new FetchClient({
     timeoutMs: config.enrichment?.fetch_timeout_ms ?? 10_000,
     maxResponseBytes: downloadSizeLimit,
     httpProxyUrl: config.network?.http_proxy_url,

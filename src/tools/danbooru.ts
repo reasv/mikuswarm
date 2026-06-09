@@ -6,9 +6,10 @@ import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
 import {
   buildProxyDispatcher,
-  type ConcurrencyLimitedFetchClient,
+  type FetchClient,
   type FetchResult,
 } from "../enrichment/fetch-client.js";
+import { guardedFetch } from "./ssrf.js";
 import type { Dispatcher } from "undici";
 import {
   conditionImageBufferForInference,
@@ -224,7 +225,7 @@ export interface DanbooruToolContext {
    * convert pipeline (re-encode to JPEG, downscale on overflow).
    */
   inferenceImageOptions: ImageProcessingOptions;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   /**
    * Optional http(s) proxy URL applied to JSON metadata requests in this
    * tool. Binary asset fetches go through `fetchClient`, which is configured
@@ -239,6 +240,10 @@ export interface DanbooruToolContext {
     default_limit?: number;
     default_order?: string;
     download_subdir?: string;
+    /** Minimum ms between Danbooru request starts (API + CDN, one budget). */
+    min_request_interval_ms?: number;
+    /** Max concurrent in-flight Danbooru requests (API + CDN, one budget). */
+    max_in_flight?: number;
   };
 }
 
@@ -396,6 +401,12 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
 
   const authHeader = buildAuthHeader(config);
   const dispatcher = buildProxyDispatcher(context.httpProxyUrl);
+  // Tool-owned limiter pacing BOTH the JSON API and asset-CDN hosts as one budget
+  // (spec §8.2). Constructed once per tool; shared across all actions.
+  const limiter = new DanbooruRateLimiter({
+    minIntervalMs: context.config?.min_request_interval_ms ?? DANBOORU_DEFAULT_MIN_INTERVAL_MS,
+    maxInFlight: context.config?.max_in_flight ?? DANBOORU_DEFAULT_MAX_IN_FLIGHT,
+  });
 
   if (authHeader) {
     // Refuse to send Basic credentials over plaintext HTTP. The operator may
@@ -435,14 +446,14 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       const action = params.action ?? "search";
 
       if (action === "download") {
-        return executeDownload({ context, config, authHeader, dispatcher, params });
+        return executeDownload({ context, config, authHeader, dispatcher, limiter, params });
       }
 
       if (action === "preview") {
-        return executePreview({ context, config, authHeader, dispatcher, params });
+        return executePreview({ context, config, authHeader, dispatcher, limiter, params });
       }
 
-      return executeSearch({ config, authHeader, dispatcher, params });
+      return executeSearch({ config, authHeader, dispatcher, limiter, params });
     },
   };
 }
@@ -455,6 +466,7 @@ async function executeSearch(input: {
   config: DanbooruConfig;
   authHeader: string | undefined;
   dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
   params: DanbooruToolParams;
 }) {
   const query = buildSearchQuery(input.params, input.config);
@@ -472,6 +484,7 @@ async function executeSearch(input: {
     searchParams,
     input.authHeader,
     input.dispatcher,
+    input.limiter,
   );
   const lines = buildSearchOutput({ query, posts, config: input.config });
 
@@ -498,6 +511,7 @@ async function executePreview(input: {
   config: DanbooruConfig;
   authHeader: string | undefined;
   dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
   params: DanbooruToolParams;
 }) {
   const postId = resolveTargetPostId(input.params, "preview");
@@ -507,6 +521,7 @@ async function executePreview(input: {
     new URLSearchParams(),
     input.authHeader,
     input.dispatcher,
+    input.limiter,
   );
   const variant = input.params.previewVariant ?? "preview";
   const assetUrl = resolveDownloadUrl(post, variant);
@@ -514,9 +529,13 @@ async function executePreview(input: {
     return textError(`Post #${postId} does not expose a ${variant} asset URL for your account.`);
   }
 
-  const fetched = await input.context.fetchClient.fetch(assetUrl, {
-    maxBytes: input.context.downloadSizeLimit,
-  });
+  // The CDN asset share the tool's one budget (spec §8.2): pace it through the
+  // same limiter. The fetch itself still routes via guardedFetch inside the client.
+  const fetched = await input.limiter.run(() =>
+    input.context.fetchClient.fetch(assetUrl, {
+      maxBytes: input.context.downloadSizeLimit,
+    }),
+  );
   let rawBuffer: Buffer;
   try {
     if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
@@ -614,6 +633,7 @@ async function executeDownload(input: {
   config: DanbooruConfig;
   authHeader: string | undefined;
   dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
   params: DanbooruToolParams;
 }) {
   const postId = resolveTargetPostId(input.params, "download");
@@ -623,6 +643,7 @@ async function executeDownload(input: {
     new URLSearchParams(),
     input.authHeader,
     input.dispatcher,
+    input.limiter,
   );
   const variant = input.params.downloadVariant ?? "original";
   const assetUrl = resolveDownloadUrl(post, variant);
@@ -634,9 +655,12 @@ async function executeDownload(input: {
   const outputDir = resolveWorkspacePath(input.context.workspaceRoot, outputSubdir);
   await fs.mkdir(outputDir, { recursive: true });
 
-  const fetched = await input.context.fetchClient.fetch(assetUrl, {
-    maxBytes: input.context.downloadSizeLimit,
-  });
+  // CDN asset on the tool's one budget (spec §8.2).
+  const fetched = await input.limiter.run(() =>
+    input.context.fetchClient.fetch(assetUrl, {
+      maxBytes: input.context.downloadSizeLimit,
+    }),
+  );
   let buffer: Buffer;
   try {
     if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
@@ -708,12 +732,60 @@ const DANBOORU_FETCH_TIMEOUT_MS = 30_000;
  */
 const DANBOORU_FETCH_MAX_BYTES = 4 * 1024 * 1024;
 
+/** Default pacing for the in-tool Danbooru limiter (see {@link DanbooruRateLimiter}). */
+const DANBOORU_DEFAULT_MIN_INTERVAL_MS = 500; // ≈2 req/s start rate — conservative
+const DANBOORU_DEFAULT_MAX_IN_FLIGHT = 2;
+
+/**
+ * Danbooru's own rate limiter (spec Design D §8.2). Danbooru is the one HTTP
+ * caller whose site and documented limits we know ahead of time, and whose JSON
+ * API and asset CDN are *different hosts* that must be paced as ONE account-level
+ * budget — something the generic per-host limiter at `guardedFetch` cannot model.
+ * So the tool owns this limiter and runs both its API and CDN egress through it.
+ *
+ * It enforces a minimum interval between request *starts* plus a max in-flight
+ * count. Danbooru egress still flows through `guardedFetch` for SSRF safety and the
+ * unconditional 429/503 backoff (belt-and-suspenders); this limiter sets the pace.
+ */
+export class DanbooruRateLimiter {
+  private active = 0;
+  private lastStartMs = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly opts: { minIntervalMs: number; maxInFlight: number }) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.active >= this.opts.maxInFlight) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    const wait = this.lastStartMs + this.opts.minIntervalMs - Date.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    this.lastStartMs = Date.now();
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    this.waiters.shift()?.();
+  }
+}
+
 async function fetchJson<T>(
   baseUrl: string,
   pathname: string,
   params: URLSearchParams,
   authHeader: string | undefined,
   dispatcher: Dispatcher | undefined,
+  limiter: DanbooruRateLimiter,
 ): Promise<T> {
   const url = new URL(pathname, baseUrl);
   url.search = params.toString();
@@ -721,18 +793,22 @@ async function fetchJson<T>(
   const timeout = setTimeout(() => controller.abort(), DANBOORU_FETCH_TIMEOUT_MS);
   let response: Response;
   try {
-    response = await globalThis.fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        accept: "application/json",
-        "user-agent": DANBOORU_USER_AGENT,
-        ...(authHeader ? { authorization: authHeader } : {}),
-      },
-      // Node's native fetch (undici) accepts `dispatcher` at runtime; routes
-      // this call through `network.http_proxy_url` when configured.
-      ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit);
+    // Through the shared egress chokepoint (SSRF + unconditional 429/503 backoff),
+    // paced by the tool's own limiter so the API + CDN share one budget.
+    response = await limiter.run(() =>
+      guardedFetch(url.toString(), {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json",
+          "user-agent": DANBOORU_USER_AGENT,
+          ...(authHeader ? { authorization: authHeader } : {}),
+        },
+        // undici accepts `dispatcher` at runtime; routes this call through
+        // `network.http_proxy_url` when configured.
+        dispatcher,
+      }),
+    );
   } catch (error) {
     clearTimeout(timeout);
     if ((error as { name?: string })?.name === "AbortError") {

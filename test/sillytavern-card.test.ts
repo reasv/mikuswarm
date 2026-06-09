@@ -13,7 +13,7 @@ import {
   createSillyTavernCardReadTool,
   type SillyTavernCardToolContext,
 } from "../src/tools/sillytavern-card.js";
-import { ConcurrencyLimitedFetchClient } from "../src/enrichment/fetch-client.js";
+import { FetchClient } from "../src/enrichment/fetch-client.js";
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -36,8 +36,7 @@ function buildContext(workspaceRoot: string): SillyTavernCardToolContext {
     workspaceRoot,
     // The fetch client is unused in path-based tests; we still construct one
     // for completeness so the tool factories receive a real instance.
-    fetchClient: new ConcurrencyLimitedFetchClient({
-      maxConcurrency: 1,
+    fetchClient: new FetchClient({
       timeoutMs: 5_000,
       maxResponseBytes: 1_000_000,
     }),

@@ -4,7 +4,7 @@ import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { EnrichmentCapabilities, EnrichmentConfig } from "./types.js";
-import type { ConcurrencyLimitedFetchClient } from "./fetch-client.js";
+import type { FetchClient } from "./fetch-client.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 
@@ -12,7 +12,7 @@ export interface EnrichmentWorkerPoolOptions {
   storage: Storage;
   timeline: TimelineStore;
   providerCapabilities: Map<string, EnrichmentCapabilities>;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   workspaceRoot: string;
   downloadSizeLimit?: number;
   config: EnrichmentConfig;

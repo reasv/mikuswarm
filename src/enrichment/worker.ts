@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises";
 import type { CanonicalChatEvent } from "../types.js";
 import type { MediaAssetRow, LinkPreviewRow, ReplyContextRow, Storage } from "../storage/index.js";
 import type { EnrichmentCapabilities, EnrichmentResult } from "./types.js";
-import type { ConcurrencyLimitedFetchClient } from "./fetch-client.js";
+import type { FetchClient } from "./fetch-client.js";
 import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 import { extractLinkedMediaUrls } from "./linked-media.js";
 import { detectCharacterCard } from "./card-detect.js";
@@ -12,7 +12,7 @@ import path from "node:path";
 export interface EnrichmentWorkerOptions {
   storage: Storage;
   capabilities: EnrichmentCapabilities;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   workspaceRoot: string;
   maxPreviewsPerMessage: number;
   downloadSizeLimit?: number;

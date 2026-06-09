@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach, afterEach } from "node:test";
 import http from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -13,10 +13,17 @@ import {
   extractImage,
   type ImageGenToolContext,
 } from "../src/tools/image-gen.js";
-import { ConcurrencyLimitedFetchClient } from "../src/enrichment/fetch-client.js";
+import { FetchClient } from "../src/enrichment/fetch-client.js";
 import type { FetchOptions, FetchResult } from "../src/enrichment/fetch-client.js";
 import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 import type { ImageProcessingOptions } from "../src/media/index.js";
+
+// The image-gen endpoint POST now routes through `guardedFetch` (spec Design D), so
+// the SSRF address guard — ON by default — would block the loopback Gemini stub
+// these tests use. Disable it per-test; the one test that asserts reference-URL SSRF
+// rejection re-enables it explicitly.
+beforeEach(() => setEgressGuardEnabled(false));
+afterEach(() => setEgressGuardEnabled(true));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,7 +53,7 @@ function makeStubFetchClient(input: {
   buffer: Buffer;
   contentType?: string;
   statusCode?: number;
-}): { client: ConcurrencyLimitedFetchClient; calls: string[]; cleanup: () => Promise<void> } {
+}): { client: FetchClient; calls: string[]; cleanup: () => Promise<void> } {
   const calls: string[] = [];
   const tmpFiles: string[] = [];
   const client = {
@@ -64,7 +71,7 @@ function makeStubFetchClient(input: {
       };
     },
     stop() {},
-  } as unknown as ConcurrencyLimitedFetchClient;
+  } as unknown as FetchClient;
   return {
     client,
     calls,
@@ -113,7 +120,7 @@ async function smallPngBase64(): Promise<string> {
 function baseContext(input: {
   workspaceRoot: string;
   serverUrl: string;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
 }): ImageGenToolContext {
   const inlineImageMaxBytes = 60_000;
   return {
@@ -302,7 +309,7 @@ test("image_generate rejects a reference URL pointing at a private/loopback host
     // literals are rejected by the egress guard inside the client — no DNS, no
     // network — before any download. IP literals keep the block deterministic.
     setEgressGuardEnabled(true);
-    const fetchClient = new ConcurrencyLimitedFetchClient({ maxConcurrency: 2, timeoutMs: 5_000, maxResponseBytes: 1024 });
+    const fetchClient = new FetchClient({ timeoutMs: 5_000, maxResponseBytes: 1024 });
     try {
       const tool = createImageGenTool(baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient }));
       for (const url of [

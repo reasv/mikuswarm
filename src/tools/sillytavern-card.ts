@@ -8,7 +8,7 @@ import extractPngChunks from "png-chunks-extract";
 import encodePngChunks from "png-chunks-encode";
 import pngTextChunk from "png-chunk-text";
 import sharp from "sharp";
-import type { ConcurrencyLimitedFetchClient } from "../enrichment/fetch-client.js";
+import type { FetchClient } from "../enrichment/fetch-client.js";
 import { buildAssetFetchError } from "./danbooru.js";
 import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
 import { escapeAttr, escapeXml } from "../context/xml.js";
@@ -33,7 +33,7 @@ const TEXT_INPUT_FILE_MAX_BYTES = 1024 * 1024;
 
 export interface SillyTavernCardToolContext {
   workspaceRoot: string;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   downloadSizeLimit: number;
   config?: {
     output_subdir?: string;
@@ -700,7 +700,7 @@ export function createSillyTavernCardEditTool(context: SillyTavernCardToolContex
 async function executeCreate(input: {
   workspaceRoot: string;
   config: ResolvedSillyTavernConfig;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   downloadSizeLimit: number;
   params: CardCreateParams;
 }) {
@@ -856,7 +856,7 @@ async function executeRead(input: {
 async function executeEdit(input: {
   workspaceRoot: string;
   config: ResolvedSillyTavernConfig;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   downloadSizeLimit: number;
   params: CardEditParams;
 }) {
@@ -1719,14 +1719,14 @@ async function loadCardFile(workspaceRoot: string, rawPath: string): Promise<Par
 }
 
 // ---------------------------------------------------------------------------
-// Image loading (adapted for ConcurrencyLimitedFetchClient)
+// Image loading (adapted for FetchClient)
 // ---------------------------------------------------------------------------
 
 async function loadImageSource(input: {
   workspaceRoot: string;
   imagePath?: string;
   imageUrl?: string;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   downloadSizeLimit: number;
 }): Promise<ImageLoadResult> {
   const hasPath = Boolean(input.imagePath);

@@ -137,6 +137,18 @@ trigger_group_lookback_ms = 20000
 [enrichment]
 trigger_wait_timeout_ms = 30000
 
+# Per-host HTTP egress limiting (spec Design D), enforced at the guardedFetch
+# chokepoint and keyed per host (shared across all callers). This is NOT a
+# cross-domain cap (the old enrichment.fetch_concurrency cap of 6 is removed): each
+# host gets a generous admission cap, with a high global backstop and unconditional
+# 429/503 + Retry-After backoff. Danbooru is deliberately NOT configured here — it
+# owns an internal limiter in its tool ([danbooru].min_request_interval_ms / max_in_flight).
+[rate_limits.http]
+default_max_in_flight_per_host = 8   # generous per-host guard, not across domains
+global_ceiling_max_in_flight = 256   # pure degenerate backstop (many-channels); far above normal load
+backoff_base_ms = 500                # 429/Retry-After backoff is always on; these tune it
+backoff_max_ms = 30000
+
 [network]
 # App-layer SSRF guard (defense-in-depth). When true, outbound fetches from
 # caller-supplied URLs (web_fetch, media downloads, image references, …) resolve

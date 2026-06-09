@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { before, after } from "node:test";
 import http from "node:http";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -8,8 +8,9 @@ import { randomBytes } from "node:crypto";
 import sharp from "sharp";
 
 import { createDanbooruTool, type DanbooruToolContext } from "../src/tools/danbooru.js";
+import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 import type {
-  ConcurrencyLimitedFetchClient,
+  FetchClient,
   FetchOptions,
   FetchResult,
 } from "../src/enrichment/fetch-client.js";
@@ -18,6 +19,12 @@ import type { ImageProcessingOptions } from "../src/media/index.js";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// The tool's JSON fetch now routes through `guardedFetch` (spec Design D); these
+// tests point `base_url` at a loopback stub server, which the SSRF address guard
+// (ON by default) would block. No Danbooru test exercises SSRF, so disable it here.
+before(() => setEgressGuardEnabled(false));
+after(() => setEgressGuardEnabled(true));
 
 async function withWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-danbooru-"));
@@ -64,7 +71,7 @@ function makeStubFetchClient(input: {
   buffer: Buffer;
   contentType?: string;
   statusCode?: number;
-}): { client: ConcurrencyLimitedFetchClient; calls: Array<{ url: string; options?: FetchOptions }>; cleanup: () => Promise<void> } {
+}): { client: FetchClient; calls: Array<{ url: string; options?: FetchOptions }>; cleanup: () => Promise<void> } {
   const calls: Array<{ url: string; options?: FetchOptions }> = [];
   const tmpFiles: string[] = [];
   const client = {
@@ -82,7 +89,7 @@ function makeStubFetchClient(input: {
       };
     },
     stop() {},
-  } as unknown as ConcurrencyLimitedFetchClient;
+  } as unknown as FetchClient;
   return {
     client,
     calls,
@@ -98,7 +105,7 @@ function makeStubFetchClient(input: {
 function buildContext(input: {
   workspaceRoot: string;
   serverUrl: string;
-  fetchClient: ConcurrencyLimitedFetchClient;
+  fetchClient: FetchClient;
   downloadSizeLimit?: number;
   inlineImageMaxBytes?: number;
   inferenceImageOptions?: ImageProcessingOptions;

@@ -1,12 +1,13 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
+import { acquireHttpSlot, noteHttpResponse } from "./http-limiter.js";
 
 // =============================================================================
 // App-layer egress guard (defense-in-depth SSRF protection).
 //
 // This is the single home for the application-layer SSRF guard. Every
 // caller-supplied outbound fetch routes through `guardedFetch` (directly, or via
-// `ConcurrencyLimitedFetchClient`), so the redirect-revalidation loop and the
+// `FetchClient`), so the redirect-revalidation loop and the
 // private-address predicate exist in exactly one place.
 //
 // The guard is DEFENSE-IN-DEPTH, not the real boundary: DNS is resolved here but
@@ -67,6 +68,10 @@ export async function assertPublicHttpUrl(value: string): Promise<void> {
 
 export interface GuardedFetchOptions {
   signal?: AbortSignal;
+  /** HTTP method; defaults to GET. */
+  method?: string;
+  /** Request body (e.g. a JSON string for a POST). */
+  body?: BodyInit;
   /** Extra request headers (e.g. a tool-specific User-Agent). */
   headers?: Record<string, string>;
   /**
@@ -92,24 +97,39 @@ export interface GuardedFetchOptions {
  * firewall is the boundary.
  *
  * Returns the final non-redirect `Response` so callers stream the body as usual.
+ *
+ * Every call also passes through the per-host HTTP limiter (`http-limiter.ts`):
+ * it acquires a per-host admission slot (bounded by the per-host + global caps and
+ * any active backoff) before the request and records the response status so a
+ * 429/503 from a host backs off all subsequent callers to that host. This is the
+ * single egress chokepoint, so the limiter applies whether or not the SSRF address
+ * guard is enabled.
  */
 export async function guardedFetch(url: string, options: GuardedFetchOptions = {}): Promise<Response> {
-  if (!egressGuardEnabled) {
-    await assertPublicHttpUrl(url);
-    return globalThis.fetch(url, buildInit(options, "follow"));
-  }
-  const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS;
-  let current = url;
-  for (let hop = 0; ; hop++) {
-    if (hop > maxHops) throw new Error("Too many redirects.");
-    await assertPublicHttpUrl(current);
-    const response = await globalThis.fetch(current, buildInit(options, "manual"));
-    if (!isRedirectStatus(response.status)) return response;
-    const location = response.headers.get("location");
-    if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
-    // Discard the redirect response body before following the next hop.
-    await response.body?.cancel().catch(() => {});
-    current = new URL(location, current).toString();
+  const release = await acquireHttpSlot(url, options.signal);
+  try {
+    if (!egressGuardEnabled) {
+      await assertPublicHttpUrl(url);
+      const response = await globalThis.fetch(url, buildInit(options, "follow"));
+      noteHttpResponse(url, response.status, response.headers.get("retry-after"));
+      return response;
+    }
+    const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS;
+    let current = url;
+    for (let hop = 0; ; hop++) {
+      if (hop > maxHops) throw new Error("Too many redirects.");
+      await assertPublicHttpUrl(current);
+      const response = await globalThis.fetch(current, buildInit(options, "manual"));
+      noteHttpResponse(current, response.status, response.headers.get("retry-after"));
+      if (!isRedirectStatus(response.status)) return response;
+      const location = response.headers.get("location");
+      if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
+      // Discard the redirect response body before following the next hop.
+      await response.body?.cancel().catch(() => {});
+      current = new URL(location, current).toString();
+    }
+  } finally {
+    release();
   }
 }
 
@@ -117,11 +137,22 @@ function buildInit(options: GuardedFetchOptions, redirect: RequestRedirect): Req
   return {
     signal: options.signal,
     redirect,
-    headers: { "User-Agent": "MikuAgent/1.0", ...options.headers },
+    ...(options.method ? { method: options.method } : {}),
+    ...(options.body !== undefined ? { body: options.body } : {}),
+    // Default a User-Agent only when the caller didn't supply one (case-insensitive),
+    // so a tool's own User-Agent isn't duplicated under a different-case key.
+    headers: withDefaultUserAgent(options.headers),
     // Node's native fetch is built on undici and accepts a dispatcher at runtime,
     // but the type is not in the lib.dom Request init.
     ...(options.dispatcher ? { dispatcher: options.dispatcher } : {}),
   } as RequestInit;
+}
+
+function withDefaultUserAgent(headers: Record<string, string> | undefined): Record<string, string> {
+  const merged: Record<string, string> = { ...headers };
+  const hasUserAgent = Object.keys(merged).some((key) => key.toLowerCase() === "user-agent");
+  if (!hasUserAgent) merged["User-Agent"] = "MikuAgent/1.0";
+  return merged;
 }
 
 function isRedirectStatus(status: number): boolean {

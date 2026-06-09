@@ -9,7 +9,6 @@ import { ProxyAgent, type Dispatcher } from "undici";
 import { guardedFetch } from "../tools/ssrf.js";
 
 export interface FetchClientOptions {
-  maxConcurrency: number;
   timeoutMs: number;
   maxResponseBytes: number;
   httpProxyUrl?: string;
@@ -42,14 +41,17 @@ export interface FetchOptions {
   outputPath?: string;
 }
 
-export class ConcurrencyLimitedFetchClient {
-  private active = 0;
-  private readonly queue: Array<{
-    resolve: (value: FetchResult) => void;
-    reject: (reason: unknown) => void;
-    url: string;
-    options?: FetchOptions;
-  }> = [];
+/**
+ * Streams a caller/external-supplied asset URL to disk under per-request timeout
+ * and response-size caps, routing the shared HTTP proxy dispatcher.
+ *
+ * It does NOT cap concurrency: cross-domain/per-host admission and the
+ * unconditional 429/503 backoff now live at the `guardedFetch` chokepoint
+ * (`src/tools/ssrf.ts` + `src/tools/http-limiter.ts`, spec Design D). This client
+ * keeps only its orthogonal concerns — byte-size caps, proxy dispatcher, and the
+ * stream-to-disk pipeline.
+ */
+export class FetchClient {
   private stopped = false;
   private readonly dispatcher: Dispatcher | undefined;
 
@@ -59,91 +61,70 @@ export class ConcurrencyLimitedFetchClient {
 
   async fetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     if (this.stopped) throw new Error("FetchClient is stopped");
-    if (this.active < this.options.maxConcurrency) {
-      return this.doFetch(url, options);
-    }
-    return new Promise<FetchResult>((resolve, reject) => {
-      this.queue.push({ resolve, reject, url, options });
-    });
+    return this.doFetch(url, options);
   }
 
   stop(): void {
     this.stopped = true;
-    while (this.queue.length > 0) {
-      const item = this.queue.shift()!;
-      item.reject(new Error("FetchClient stopped"));
-    }
   }
 
   private async doFetch(url: string, options?: FetchOptions): Promise<FetchResult> {
-    this.active++;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs);
-      try {
-        // All fetch-client callers pull caller/external-supplied asset URLs, so
-        // the egress guard always applies here (it self-gates on the global
-        // `network.ssrf_guard` switch). The dispatcher carries the shared proxy.
-        const response = await guardedFetch(url, {
-          signal: controller.signal,
-          dispatcher: this.dispatcher,
-        });
+      // All fetch-client callers pull caller/external-supplied asset URLs, so
+      // the egress guard always applies here (it self-gates on the global
+      // `network.ssrf_guard` switch). The dispatcher carries the shared proxy;
+      // per-host admission + backoff are enforced inside guardedFetch.
+      const response = await guardedFetch(url, {
+        signal: controller.signal,
+        dispatcher: this.dispatcher,
+      });
 
-        const limit = options?.maxBytes ?? this.options.maxResponseBytes;
-        const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);
+      const limit = options?.maxBytes ?? this.options.maxResponseBytes;
+      const outputPath = options?.outputPath ?? join(tmpdir(), `miku-fetch-${randomBytes(8).toString("hex")}`);
 
-        if (!response.body) {
-          await writeFile(outputPath, Buffer.alloc(0));
-          return {
-            path: outputPath,
-            sizeBytes: 0,
-            contentType: response.headers.get("content-type") ?? undefined,
-            finalUrl: response.url,
-            statusCode: response.status,
-          };
-        }
-
-        const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
-        let totalBytes = 0;
-        const sizeGuard = new Transform({
-          transform(chunk: Buffer, _encoding, callback) {
-            totalBytes += chunk.byteLength;
-            if (totalBytes > limit) {
-              controller.abort();
-              callback(new Error(`Response exceeded ${limit} bytes`));
-            } else {
-              callback(null, chunk);
-            }
-          },
-        });
-
-        try {
-          await pipeline(nodeStream, sizeGuard, createWriteStream(outputPath));
-        } catch (error) {
-          await unlink(outputPath).catch(() => {});
-          throw error;
-        }
-
+      if (!response.body) {
+        await writeFile(outputPath, Buffer.alloc(0));
         return {
           path: outputPath,
-          sizeBytes: totalBytes,
+          sizeBytes: 0,
           contentType: response.headers.get("content-type") ?? undefined,
           finalUrl: response.url,
           statusCode: response.status,
         };
-      } finally {
-        clearTimeout(timeout);
       }
-    } finally {
-      this.active--;
-      this.processQueue();
-    }
-  }
 
-  private processQueue(): void {
-    while (this.queue.length > 0 && this.active < this.options.maxConcurrency) {
-      const item = this.queue.shift()!;
-      this.doFetch(item.url, item.options).then(item.resolve, item.reject);
+      const nodeStream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+      let totalBytes = 0;
+      const sizeGuard = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          totalBytes += chunk.byteLength;
+          if (totalBytes > limit) {
+            controller.abort();
+            callback(new Error(`Response exceeded ${limit} bytes`));
+          } else {
+            callback(null, chunk);
+          }
+        },
+      });
+
+      try {
+        await pipeline(nodeStream, sizeGuard, createWriteStream(outputPath));
+      } catch (error) {
+        await unlink(outputPath).catch(() => {});
+        throw error;
+      }
+
+      return {
+        path: outputPath,
+        sizeBytes: totalBytes,
+        contentType: response.headers.get("content-type") ?? undefined,
+        finalUrl: response.url,
+        statusCode: response.status,
+      };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 }
