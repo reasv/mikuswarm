@@ -73,7 +73,7 @@ import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
-import { SummarizationIndexer, SummarizationWorkerPool } from "./summarization/index.js";
+import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
@@ -471,6 +471,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
+  // Drain cancellation for context builds (spec §7.2): a build waiting on a
+  // summarization job has no wall clock — once the worker pool stops, nothing
+  // can ever drive the waited job to terminal, so stop() aborts this signal
+  // FIRST (before any pool teardown) and the waiting build rejects cleanly
+  // (AbortError → launchSession's factory-failure path) instead of polling
+  // until storage.close() makes it throw.
+  const drainAbort = new AbortController();
   let stopPromise: Promise<void> | undefined;
   const factory = new AgentSessionFactory({
     config,
@@ -555,25 +562,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   if (summarizationPool) {
     // Priority inheritance (spec §5.5): one injected callback does all three
-    // writes, in order — job row (claim order), scheduler entry (a request
-    // already queued at background), pool wake (so an idle worker claims the
-    // escalated job immediately). The scheduler escalation is sticky, so it
-    // also covers a request that registers AFTER this runs (claim/admission race).
-    contextBuilder.escalateSummary = (jobId, priority) => {
-      void storage
-        .escalateSummarizationJob(jobId, priority)
-        .then(() => {
-          llmScheduler.escalate(`sumjob:${jobId}`, priority);
-          summarizationPool.notifyNewWork();
-        })
-        .catch((error) =>
-          logger.error("summary_escalation_failed", {
-            jobId,
-            priority,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
-    };
+    // writes — job row, scheduler entry, pool wake — with the escalate-vs-
+    // terminal race guard (a late scheduler escalation after clearEscalation
+    // would otherwise leak a permanent sticky entry). See createEscalateSummary.
+    contextBuilder.escalateSummary = createEscalateSummary({
+      storage,
+      escalateScheduled: (key, priority) => llmScheduler.escalate(key, priority),
+      notifyPool: () => summarizationPool.notifyNewWork(),
+      logger,
+    });
 
     // Wait-or-omit's coverage re-check (spec §7.2/§7.3): when an over-budget
     // build finds no job covering its oldest events, it runs ONE awaited
@@ -1410,7 +1407,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
         session,
         tools,
-        proactive ? { proactive: true } : undefined,
+        {
+          proactive: proactive ? true : undefined,
+          // Drain cancellation (spec §7.2): a build waiting on a summary job
+          // aborts cleanly at shutdown instead of out-living the worker pool.
+          abortSignal: drainAbort.signal,
+        },
       ));
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
@@ -1738,6 +1740,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Cancel context builds waiting on summarization jobs BEFORE any pool
+        // teardown: once the summarization pool stops, nothing can drive a
+        // waited job to terminal, so a waiting build would otherwise poll until
+        // storage.close() made it throw. The abort surfaces inside
+        // factory.create as a clean AbortError → launchSession discards the
+        // never-started session via its factory-failure path.
+        drainAbort.abort();
         // Stop the proactive scheduler first: clear its per-channel timers so no
         // new proactive run is launched while the rest of the runtime tears down.
         proactiveScheduler.stop();

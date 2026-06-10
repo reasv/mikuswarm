@@ -359,6 +359,75 @@ test("wait-or-omit: a live build escalates and waits for the covering job, then 
   }
 });
 
+test("wait-or-omit (issue #6): a proactive build escalates the covering job at its OWN class, not interactive", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage);
+    const builder = new ContextBuilder(timeline, overflowConfig(), storage);
+    await insertJob(storage, "job_pro", "ev0000", "ev0018");
+
+    const escalations: Array<{ jobId: string; priority: string }> = [];
+    builder.escalateSummary = (jobId, priority) => escalations.push({ jobId, priority });
+
+    const completeLater = (async () => {
+      await new Promise((r) => setTimeout(r, 300));
+      await completeJob(storage, "job_pro", "sum_pro", "summarized backlog", 0, 18);
+    })();
+
+    const trigger = testEvent({ id: "trigger-p", body: "", timestamp: 2000 });
+    await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      proactive: true,
+      priority: "proactive",
+    });
+    await completeLater;
+
+    assert.deepEqual(
+      escalations,
+      [{ jobId: "job_pro", priority: "proactive" }],
+      "spec §5.5: the waiting class is the building session's own class",
+    );
+  } finally {
+    storage.close();
+  }
+});
+
+test("wait-or-omit (issue #7): aborting the drain signal rejects a waiting build cleanly with AbortError", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage);
+    const builder = new ContextBuilder(timeline, overflowConfig(), storage);
+    // A pending covering job that NO worker will ever finish (shutdown shape:
+    // the pool is being torn down).
+    await insertJob(storage, "job_stuck", "ev0000", "ev0018");
+    builder.escalateSummary = () => {};
+
+    const drain = new AbortController();
+    const pending = builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "trigger-a", body: "hi", timestamp: 2000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      abortSignal: drain.signal,
+    });
+    // Let the build enter the wait loop, then fire the drain abort.
+    setTimeout(() => drain.abort(), 150);
+
+    await assert.rejects(pending, (err: Error) => {
+      assert.equal(err.name, "AbortError", "clean AbortError, not a hang or unhandled rejection");
+      assert.match(err.message, /aborted/);
+      return true;
+    });
+    // The job is untouched — the build never terminalized or dropped anything.
+    assert.equal(storage.getSummarizationJobById("job_stuck")?.status, "pending");
+  } finally {
+    storage.close();
+  }
+});
+
 test("wait-or-omit: a terminally failed range renders an explicit placeholder, not a silent gap", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

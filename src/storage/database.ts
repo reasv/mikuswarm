@@ -3114,6 +3114,21 @@ export class Storage {
     });
   }
 
+  /**
+   * Read a level-1 summary's current diary status. Undefined when the summary
+   * row is missing or carries no diary status (level 2+). Used by the diary
+   * worker's post-claim terminality guard to avoid overwriting a row that
+   * already left 'processing'.
+   */
+  getDiaryStatus(summaryId: string): DiaryStatus | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select diary_status from summaries where id = ?`).get(summaryId) as
+        | { diary_status: string | null }
+        | undefined,
+    );
+    return (row?.diary_status ?? undefined) as DiaryStatus | undefined;
+  }
+
   /** Set a level-1 summary's diary status (done / skipped / failed / pending-retry). */
   setDiaryStatus(summaryId: string, status: DiaryStatus): Promise<void> {
     return this.write((db) => {

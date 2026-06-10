@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
+import type { PriorityClass } from "../agent/scheduler.js";
 import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type {
@@ -68,7 +69,22 @@ export interface BuildContextOptions {
    * with `summarizationCutoff`.
    */
   proactive?: boolean;
-  /** Optional signal to cancel a grace wait early (e.g. on shutdown). */
+  /**
+   * Resolved scheduler priority class of the building session (spec §5.5: the
+   * waiting class is the building session's OWN class). A summary job this
+   * build must wait on is escalated to exactly this class — so a proactive
+   * build escalates at `proactive` and never outranks live replies. Defaults
+   * to `interactive` when unset (unknown callers are user-facing until
+   * configured otherwise, matching `defaultPriorityForSessionType`).
+   */
+  priority?: PriorityClass;
+  /**
+   * Cancel a wait-or-omit wait early (shutdown drain, spec §7.2). When the
+   * signal fires while the build is waiting on a summarization job, the build
+   * REJECTS with an `AbortError` — a clean session-creation failure — instead
+   * of polling a job that no worker will ever drive to terminal once the pool
+   * stops.
+   */
   abortSignal?: AbortSignal;
 }
 
@@ -101,10 +117,7 @@ export class ContextBuilder {
    * request already queued at `background`) — then wakes the pool. Called when
    * a live build must wait on a specific summary job.
    */
-  escalateSummary?: (
-    jobId: string,
-    priority: "interactive" | "proactive" | "background" | "background_low",
-  ) => void;
+  escalateSummary?: (jobId: string, priority: PriorityClass) => void;
 
   /**
    * Eager-indexer reconcile hook (spec §7.2/§7.3): injected by app wiring to
@@ -215,6 +228,7 @@ export class ContextBuilder {
         timelineEvents,
         triggerGroupIds,
         selection,
+        options.priority ?? "interactive",
         options.abortSignal,
       );
       compactionInput = resolved.events;
@@ -245,7 +259,7 @@ export class ContextBuilder {
     }
 
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
-    // projections from the reaction store, attached now (after the grace wait has
+    // projections from the reaction store, attached now (after wait-or-omit has
     // finalized the event set) and never persisted into event_json. Off for
     // summarization builds — reactions must never leak into summaries (§4) — and
     // gated by [reactions] config.
@@ -514,8 +528,9 @@ export class ContextBuilder {
    * the compact tier is over `compact_max_tokens`, branch on the state of the
    * job covering the oldest at-risk events:
    *
-   * - **pending / processing** → escalate it to the waiter's class (priority
-   *   inheritance, §5.5) and wait until it reaches a TERMINAL state. No
+   * - **pending / processing** → escalate it to the waiter's class
+   *   (`waiterClass` — the building session's own resolved class, spec §5.5;
+   *   priority inheritance) and wait until it reaches a TERMINAL state. No
    *   wall-clock deadline — the wait is bounded by the job itself (Layer-1
    *   mechanical retries + Layer-3 semantic retries always end in `complete`
    *   or `failed`). At terminal, re-select + re-query: a completed summary's
@@ -534,12 +549,17 @@ export class ContextBuilder {
    * (summarization disabled, or its generation threshold genuinely not
    * crossed) does the set pass through unchanged and compaction's ordinary
    * bounds apply. Cutoff (summarization) builds never enter here.
+   *
+   * When `abortSignal` fires (shutdown drain) the wait cannot ever finish —
+   * the worker pool is about to stop — so this THROWS an `AbortError`, failing
+   * the build (and the session creation around it) cleanly.
    */
   private async resolveCompactionOverflow(
     timelineKey: string,
     events: CanonicalChatEvent[],
     triggerGroupIds: Set<string>,
     selection: SummarySelection,
+    waiterClass: PriorityClass,
     abortSignal?: AbortSignal,
   ): Promise<{
     events: CanonicalChatEvent[];
@@ -559,7 +579,7 @@ export class ContextBuilder {
     // most once per distinct oldest event, or breaks — so the loop terminates.
     let lastReconciledOldestId: string | null = null;
     for (;;) {
-      if (abortSignal?.aborted) break;
+      if (abortSignal?.aborted) throw buildAbortError();
       if (current.events.length === 0) break;
       if (this.estimateCompactTierTokens(current.events) <= compactMax) break;
 
@@ -571,19 +591,21 @@ export class ContextBuilder {
         .getActiveSummarizationJobs(timelineKey, 1)
         .find((job) => this.jobCoversCursor(timelineKey, job, oldestCursor));
       if (covering) {
-        // Priority inheritance (spec §5.5): this live build is now waiting on
-        // the covering job — promote it to the waiter's class so it is claimed
-        // next and its LLM request is admitted ahead of unrelated background
-        // work. Only live builds reach here, so the waiter's class is
-        // `interactive`.
-        this.escalateSummary?.(covering.id, "interactive");
+        // Priority inheritance (spec §5.5): this build is now waiting on the
+        // covering job — promote it to the waiter's OWN class (threaded from
+        // the session type via the factory: live builds escalate at
+        // `interactive`, proactive builds at `proactive`) so it is claimed
+        // next and its LLM request is admitted ahead of lower-priority work
+        // without outranking higher-priority sessions.
+        this.escalateSummary?.(covering.id, waiterClass);
         this.logger?.info("context_build_waiting_on_summary", {
           timelineKey,
           jobId: covering.id,
           jobStatus: covering.status,
+          waiterClass,
         });
         const outcome = await this.waitForJobTerminal(covering.id, abortSignal);
-        if (outcome === "aborted") break;
+        if (outcome === "aborted") throw buildAbortError();
         // Terminal either way: re-select + re-query. A completed summary (or a
         // failed job's placeholder) advances the coverage cursor and trims the
         // raw set; the events move from the raw turns into the summary layer
@@ -927,5 +949,16 @@ function cursorAfter(a: TimelineCursor, b: TimelineCursor): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Error thrown when a build's wait-or-omit wait is cancelled by
+ * `BuildContextOptions.abortSignal` (shutdown drain). Named `AbortError` so
+ * callers can distinguish a clean drain cancellation from a real build failure.
+ */
+function buildAbortError(): Error {
+  const error = new Error("context build aborted while waiting on a summarization job (shutdown drain)");
+  error.name = "AbortError";
+  return error;
 }
 

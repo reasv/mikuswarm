@@ -143,6 +143,18 @@ export interface CreateAgentOptions {
    * attempt; the job id is stable).
    */
   escalationKey?: string;
+  /**
+   * Drain/cancel signal threaded into the context build (spec §7.2 wait-or-omit).
+   * When it fires while the build is waiting on a summarization job, the build —
+   * and therefore `create()` — rejects with an `AbortError` instead of polling a
+   * job that no worker will drive to terminal once the pool stops. `app.ts`
+   * passes its drain controller's signal for every `launchSession` create (live,
+   * queued, and proactive — the only builds that can enter the wait loop).
+   * Synthetic creates need no signal: summarize/condense builds use
+   * `summarizationCutoff` (which skips wait-or-omit entirely) and diary/resume
+   * creates skip the build altogether (`resume` mode).
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface CreatedAgent {
@@ -291,6 +303,11 @@ export class AgentSessionFactory {
         fallbackPrompt,
         summarizationCutoff: opts?.summarizationCutoff,
         proactive: opts?.proactive,
+        // The session's resolved class doubles as the wait-or-omit escalation
+        // class (spec §5.5: the waiting class is the building session's own
+        // class), and the drain signal cancels a waiting build cleanly (§7.2).
+        priority,
+        abortSignal: opts?.abortSignal,
       });
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
@@ -426,6 +443,8 @@ export class AgentSessionFactory {
     fallbackPrompt: string | undefined;
     summarizationCutoff?: { endTimestamp: number };
     proactive?: boolean;
+    priority?: PriorityClass;
+    abortSignal?: AbortSignal;
   }): Promise<BuiltContext> {
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
@@ -438,6 +457,8 @@ export class AgentSessionFactory {
       fallbackPrompt: args.fallbackPrompt,
       summarizationCutoff: args.summarizationCutoff,
       proactive: args.proactive,
+      priority: args.priority,
+      abortSignal: args.abortSignal,
     });
   }
 

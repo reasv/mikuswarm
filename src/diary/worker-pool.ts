@@ -170,7 +170,55 @@ export class DiaryWorkerPool {
     if (this.running) this.schedulePoll(100);
   }
 
+  /**
+   * Post-claim terminality guard, mirroring the summarization pool (spec §6.3
+   * covers both pools): `runJob` terminalizes its own agent-run failures, but
+   * its storage/filesystem awaits (insertAgentSession, updateAgentSessionStatus,
+   * memoryWriter.appendEntry, recentMemoryWindow, …) can reject outside that
+   * guarded path. Without this, poll()'s log-only catch swallows the rejection
+   * and the summary row stays `diary_status='processing'` for the process
+   * lifetime (only startup healing resets stale claims).
+   */
   private async processJob(job: DiaryJob): Promise<void> {
+    try {
+      await this.runJob(job);
+    } catch (err) {
+      await this.terminalizeEscapedRejection(job, err);
+    }
+  }
+
+  private async terminalizeEscapedRejection(job: DiaryJob, err: unknown): Promise<void> {
+    const { storage, config, logger } = this.options;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("diary_unexpected_rejection", {
+      summaryId: job.summaryId,
+      attempt: job.attempts,
+      error: errMsg,
+    });
+    try {
+      // The rejection may have escaped AFTER the row left 'processing' (e.g. a
+      // late await rejected once the status was already written). Only a row
+      // still claimed is stranded — never overwrite a terminal or re-pending row.
+      if (storage.getDiaryStatus(job.summaryId) !== "processing") return;
+      const maxRetries = config.max_retries ?? DEFAULT_MAX_RETRIES;
+      if (job.attempts <= maxRetries) {
+        await storage.setDiaryStatus(job.summaryId, "pending");
+        this.emit(job, "retried", "pending");
+      } else {
+        await storage.setDiaryStatus(job.summaryId, "failed");
+        this.options.onError?.(job.summaryId, new Error(errMsg));
+        this.emit(job, "failed", "failed");
+      }
+    } catch (writeErr) {
+      logger.error("diary_terminalize_write_failed", {
+        summaryId: job.summaryId,
+        originalError: errMsg,
+        writeError: writeErr instanceof Error ? writeErr.message : String(writeErr),
+      });
+    }
+  }
+
+  private async runJob(job: DiaryJob): Promise<void> {
     const { storage, factory, memoryWriter, config, logger } = this.options;
     const started = Date.now();
     logger.debug("diary_job_claimed", {
