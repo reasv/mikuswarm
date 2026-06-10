@@ -21,6 +21,7 @@ import {
   LlmScheduler,
   SessionManager,
   SessionRunner,
+  autoResumeSession,
   isResumableRunError,
   loadResumeMaterial,
   type AgentSessionRecord,
@@ -1179,7 +1180,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   ): Promise<{ outcome: "completed" | "mechanical" | "fatal" | "unresumable"; error?: string }> {
     const row = storage.getAgentSession(record.id);
     if (!row) return { outcome: "unresumable", error: "session row missing" };
-    const material = loadResumeMaterial(row);
+    // Image refs externalized at capture time are rehydrated through the media
+    // store here (issue #13) — without this, an image-bearing snapshot would
+    // re-issue malformed `{type:"image"}` blocks and 400 fatally.
+    const material = await loadResumeMaterial(row, { media: storage, workspaceRoot, logger });
     if (!material) return { outcome: "unresumable", error: "no resumable snapshot/transcript" };
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
@@ -1243,53 +1247,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * promise chain so the per-timeline trigger slot stays held for the whole
    * recovery — no second session can race the resumed one. Returns true when the
    * failure was handled (resumed, parked, or discarded here); false hands the
-   * failure back to the ordinary discard path.
+   * failure back to the ordinary discard path. The policy loop — including the
+   * park-over-discard rules for `attempts = 0`, draining-at-entry, and a
+   * fatal-at-shutdown attempt (issue #15) — lives in `autoResumeSession`
+   * (src/agent/recovery.ts) where it is unit-testable.
    */
-  async function maybeAutoResumeSession(
+  function maybeAutoResumeSession(
     session: AgentSessionRecord,
     error: unknown,
   ): Promise<boolean> {
-    const attempts = config.recovery?.session_auto_resume_attempts ?? 2;
-    if (attempts <= 0 || draining) return false;
-    if (!isResumableRunError(error)) return false;
-    const initialError = error instanceof Error ? error.message : String(error);
-    sessions.markResuming(session.id, { error: initialError });
-    logger.warn("session_auto_resume_started", {
+    return autoResumeSession(error, {
       sessionId: session.id,
       timelineKey: session.timelineKey,
-      error: initialError,
+      attempts: config.recovery?.session_auto_resume_attempts ?? 2,
+      backoffBaseMs: config.recovery?.session_auto_resume_backoff_ms ?? 5000,
+      isDraining: () => draining,
+      runAttempt: (attempt) => resumeSessionRun(session, session.trigger, attempt),
+      markResuming: (err) => sessions.markResuming(session.id, { error: err }),
+      markFailedResumable: (err) => sessions.markFailedResumable(session.id, { error: err }),
+      markDiscarded: (err) => sessions.markDiscarded(session.id, { error: err }),
+      logger,
     });
-
-    const backoffBase = config.recovery?.session_auto_resume_backoff_ms ?? 5000;
-    let lastError = initialError;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, backoffBase * 2 ** (attempt - 1)));
-      if (draining) break;
-      const { outcome, error: attemptError } = await resumeSessionRun(session, session.trigger, attempt);
-      if (outcome === "completed") return true;
-      lastError = attemptError ?? lastError;
-      if (outcome === "fatal" || outcome === "unresumable") {
-        sessions.markDiscarded(session.id, { error: lastError });
-        logger.error("session_resume_failed_terminal", {
-          sessionId: session.id,
-          attempt,
-          outcome,
-          error: lastError,
-        });
-        return true;
-      }
-      // mechanical → another attempt (or park below)
-      sessions.markResuming(session.id, { error: lastError });
-      logger.warn("session_auto_resume_retry", { sessionId: session.id, attempt, error: lastError });
-    }
-
-    sessions.markFailedResumable(session.id, { error: lastError });
-    logger.error("session_parked_failed_resumable", {
-      sessionId: session.id,
-      timelineKey: session.timelineKey,
-      error: lastError,
-    });
-    return true;
   }
 
   /**

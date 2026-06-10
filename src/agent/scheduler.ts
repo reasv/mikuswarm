@@ -473,7 +473,11 @@ export function withSchedulerAdmission(
         // (run abort / drain) synthesizes `stopReason:"aborted"` and a scheduler
         // stop a "scheduler stopped" message — both classified FATAL by Layer-1
         // (`classifyLlmError`), so shutdown never burns futile backed-off
-        // re-acquire cycles on a gate that can only reject (#11).
+        // re-acquire cycles on a gate that can only reject (#11). These
+        // synthesized errors COUNT as LLM-request-layer errors for Layer-2
+        // classification (Decision C / #14): admission composes INSIDE
+        // `withRequestRetry`, so they flow through it and receive the
+        // `LLM_REQUEST_FAILURE_MARKER` tag there — no tagging needed here.
         const aborted = err instanceof Error && err.name === "AbortError";
         outer.push(
           synthesizeErrorEvent(

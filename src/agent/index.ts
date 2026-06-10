@@ -27,4 +27,13 @@ export {
   isExplicitNoReply,
   type SessionRunResult,
 } from "./runner.js";
-export { loadResumeMaterial, stripFailedTail, type ResumeMaterial } from "./recovery.js";
+export {
+  loadResumeMaterial,
+  stripFailedTail,
+  autoResumeSession,
+  RESUME_IMAGE_PLACEHOLDER,
+  type ResumeMaterial,
+  type ResumeMaterialDeps,
+  type ResumeAttemptResult,
+  type AutoResumeDeps,
+} from "./recovery.js";

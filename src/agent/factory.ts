@@ -240,8 +240,10 @@ export class AgentSessionFactory {
     const model = createModelFromConfig(modelConfig);
     // Layer-1 transparent request retry (spec §6.1) wraps the chosen stream fn so a
     // mechanical blip re-issues the exact same request before it can discard a live
-    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` returns
-    // the base fn unwrapped, so this is a no-op when recovery is unconfigured-to-zero.
+    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` means a
+    // single attempt but the wrapper STILL applies — it owns the Layer-1 origin tag
+    // (`LLM_REQUEST_FAILURE_MARKER`) that the runner's mechanical classification and
+    // Layer-2 resume-in-place depend on (Decision C / #14).
     const recovery = this.options.config.recovery;
     const baseStreamFn = withSdkRetriesDisabled(
       (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
