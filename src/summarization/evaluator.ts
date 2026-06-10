@@ -22,9 +22,9 @@ function summaryAfter(a: Summary, b: Summary): boolean {
  * After a summary completes, look for contiguous runs of same-level summaries
  * long enough to condense, and enqueue level+1 jobs for them (§9). A run is
  * "contiguous" when no summary at the same or higher level sits strictly between
- * two consecutive members, AND no terminally failed level-1 range sits in the
- * gap. Cascades naturally: the level+1 completion re-runs this evaluator at
- * level+1.
+ * two consecutive members, AND no terminally failed range (of any level <= the
+ * input level) sits in the gap. Cascades naturally: the level+1 completion
+ * re-runs this evaluator at level+1.
  */
 export async function evaluateCondensation(options: CondensationEvaluatorOptions): Promise<void> {
   const { storage, config, timelineKey, level, logger } = options;
@@ -33,21 +33,41 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
   const summaries = storage.getSummariesByLevel(timelineKey, level);
   if (summaries.length < fanout) return;
 
-  // Terminally failed level-1 ranges interrupt runs at EVERY level: their
-  // failure placeholders (spec §7.2) are synthesized at selection time, never
-  // persisted, and selection prunes any summary fully covered by a selected
+  // Terminally failed ranges interrupt runs at EVERY level above them: a
+  // level-1 failure's placeholder (spec §7.2) is synthesized at selection
+  // time, never persisted, and a level-2+ condensation failure permanently
+  // strands its input summaries between their condensed neighbors. In both
+  // cases selection prunes any summary fully covered by a selected
   // higher-level one — so a condensed summary whose span crossed a failed
-  // range would permanently erase the failure marker from context. Mirrors
-  // the indexer's `failedCoveredEventIds` chunk guard. Unresolvable ranges
-  // (boundary events retention-deleted) are skipped, symmetric with
-  // `synthesizeFailurePlaceholders` — no placeholder will ever render for
-  // them, so there is no marker to protect.
+  // range would permanently erase the failure marker (level 1) or the
+  // stranded input summaries' content (level 2+) from context. At input
+  // level N the evaluator therefore consults failed jobs at every level <= N
+  // (failed level N+1 jobs are the chunk-skip below, not run interrupters):
+  // level-1 ranges resolve via their boundary events' cursors, level-2+
+  // ranges via their input summaries' spans. Mirrors the indexer's
+  // `failedCoveredEventIds` chunk guard. Unresolvable ranges (boundary
+  // events retention-deleted; input summaries gone) are skipped, symmetric
+  // with `synthesizeFailurePlaceholders` and the chunk-skip's failed-side
+  // handling — nothing renders or remains selectable for them, so there is
+  // nothing to protect.
   const failedRanges: Array<{ earliestTimestamp: number; latestTimestamp: number }> = [];
-  for (const job of storage.getFailedSummarizationJobs(timelineKey, 1)) {
-    const start = storage.getEventCursor(timelineKey, job.inputStartId);
-    const end = storage.getEventCursor(timelineKey, job.inputEndId);
-    if (!start || !end) continue;
-    failedRanges.push({ earliestTimestamp: start.timestamp, latestTimestamp: end.timestamp });
+  for (let failedLevel = 1; failedLevel <= level; failedLevel++) {
+    for (const job of storage.getFailedSummarizationJobs(timelineKey, failedLevel)) {
+      if (failedLevel === 1) {
+        const start = storage.getEventCursor(timelineKey, job.inputStartId);
+        const end = storage.getEventCursor(timelineKey, job.inputEndId);
+        if (!start || !end) continue;
+        failedRanges.push({ earliestTimestamp: start.timestamp, latestTimestamp: end.timestamp });
+      } else {
+        const start = storage.getSummaryById(job.inputStartId);
+        const end = storage.getSummaryById(job.inputEndId);
+        if (!start || !end) continue;
+        failedRanges.push({
+          earliestTimestamp: start.earliestTimestamp,
+          latestTimestamp: end.latestTimestamp,
+        });
+      }
+    }
   }
   const failedRangeInGap = (prev: Summary, next: Summary): boolean =>
     failedRanges.some(

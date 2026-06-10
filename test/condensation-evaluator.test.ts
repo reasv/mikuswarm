@@ -463,6 +463,46 @@ test("1b-1: a terminally failed level-2 condensation job is never re-enqueued; d
   storage.close();
 });
 
+test("1c: a terminally failed level-2 range interrupts level-3 evaluation — never spanned; both sides still condense", async () => {
+  const storage = await openStorage();
+  // Thirteen level-2 summaries that would otherwise form one run of 13 whose
+  // second fanout-sized chunk [l2_5..l2_9] would SPAN the failed level-2 range
+  // below — producing a level-3 summary covering the range's timestamps
+  // without its content. Selection's covered-by-higher prune would then drop
+  // the failed job's stranded level-1 input summaries, silently erasing their
+  // content from coverage one level up from the 1b-1 scenario.
+  for (let i = 0; i < 13; i++) {
+    await insertSummary(storage, {
+      id: `l2_${i}`,
+      level: 2,
+      earliestTimestamp: i * 1000,
+      latestTimestamp: i * 1000 + 500,
+    });
+  }
+  // The failed level-2 job's inputs are level-1 summaries stranded strictly
+  // between l2_5 (latest=5500) and l2_6 (earliest=6000) — invisible to
+  // hasSummaryBetween(level>=2), so only the failed-range interrupter sees
+  // them. Its range resolves via the input summaries' spans (5600..5900).
+  await insertSummary(storage, { id: "l1f0", level: 1, earliestTimestamp: 5600, latestTimestamp: 5650 });
+  await insertSummary(storage, { id: "l1f1", level: 1, earliestTimestamp: 5800, latestTimestamp: 5900 });
+  await insertFailedJob(storage, { id: "failed_l2_range", level: 2, startId: "l1f0", endId: "l1f1" });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 2, logger: silentLogger });
+
+  // The failed range splits the run into [l2_0..l2_5] and [l2_6..l2_12]:
+  // exactly one fanout-sized chunk condenses on each side, neither spanning
+  // the failed range. (Pre-fix: one run of 13 → chunks [l2_0..l2_4] and
+  // [l2_5..l2_9], the second spanning 5600..5900.)
+  const jobs = storage.getActiveSummarizationJobs(TK, 3);
+  assert.equal(jobs.length, 2, "both sides of the failed level-2 range still condense");
+  const ranges = jobs.map((j) => [j.inputStartId, j.inputEndId]).sort();
+  assert.deepEqual(ranges, [
+    ["l2_0", "l2_4"],
+    ["l2_6", "l2_10"],
+  ]);
+  storage.close();
+});
+
 test("1b-1: a failed level-2 job with unresolvable input summaries does not block condensation", async () => {
   const storage = await openStorage();
   for (let i = 0; i < 5; i++) {
