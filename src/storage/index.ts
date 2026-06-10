@@ -14,6 +14,7 @@ export {
   type SummaryInsert,
   type SummarizationJob,
   type SummarizationJobStatus,
+  type SummarizationJobPriority,
   type SummarizationJobInsert,
   type DiaryStatus,
   type DiaryJob,

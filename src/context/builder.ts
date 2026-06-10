@@ -98,6 +98,19 @@ export class ContextBuilder {
   onJobEnqueued?: () => void;
 
   /**
+   * Priority inheritance (spec CONCURRENCY-AND-RATE-LIMITING §5.5): injected by
+   * app wiring (the builder must not import the scheduler or the worker pool).
+   * Raises the named summarization job to the waiting build's class at BOTH
+   * ordering points — the job row (claim order) and the scheduler entry (a
+   * request already queued at `background`) — then wakes the pool. Called when
+   * a live build must wait on a specific summary job.
+   */
+  escalateSummary?: (
+    jobId: string,
+    priority: "interactive" | "proactive" | "background" | "background_low",
+  ) => void;
+
+  /**
    * Auto-retrieval dependencies (ARCHITECTURE.md §9d / design §8c). Set when the
    * retrieval subsystem is enabled AND `retrieval.auto_retrieval` is on; otherwise
    * undefined and no auto-retrieval block is built.
@@ -509,6 +522,13 @@ export class ContextBuilder {
       return start != null && end != null && !cursorAfter(start, oldestCursor) && !cursorAfter(oldestCursor, end);
     });
     if (!covering) return unchanged;
+
+    // Priority inheritance (spec §5.5): this live build is now waiting on the
+    // covering job — promote it to the waiter's class so it is claimed next and
+    // its LLM request is admitted ahead of unrelated background work. The
+    // grace-wait path only runs for live builds (cutoff builds skip it), so the
+    // waiter's class is `interactive`.
+    this.escalateSummary?.(covering.id, "interactive");
 
     const timeoutMs = this.config.summarization?.summary_wait_timeout_ms ?? 5000;
     const deadline = Date.now() + timeoutMs;

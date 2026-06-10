@@ -229,7 +229,16 @@ export class SummarizationWorkerPool {
       const { agent, finalTurn, snapshot, tokenEstimate } = await factory.create(
         syntheticSession,
         [summaryTool],
-        { summarizationCutoff: { endTimestamp: input.cutoffTimestamp } },
+        {
+          summarizationCutoff: { endTimestamp: input.cutoffTimestamp },
+          // Priority inheritance, scheduler half (spec §5.5): the job row's
+          // (possibly escalated) class admits this session's LLM request, and
+          // the stable job-keyed escalation key lets a waiter raise a request
+          // already queued — the synthetic session id is regenerated per
+          // attempt, so the job id is the only stable handle.
+          priority: job.priority,
+          escalationKey: `sumjob:${job.id}`,
+        },
       );
       // Attach snapshot + transcript capture so summarization sessions are
       // inspectable too (spec §5). Detached after the run settles.

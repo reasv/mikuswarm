@@ -146,11 +146,25 @@ export interface Summary {
 
 export type SummarizationJobStatus = "pending" | "processing" | "complete" | "failed";
 
+/**
+ * Scheduler priority class carried on a summarization job row (spec
+ * CONCURRENCY-AND-RATE-LIMITING §5.5). Mirrors `PriorityClass`
+ * (src/agent/scheduler.ts); declared independently so storage stays
+ * import-free of the agent layer. Almost always `background`; raised by
+ * priority inheritance when a live context build waits on the job.
+ */
+export type SummarizationJobPriority =
+  | "interactive"
+  | "proactive"
+  | "background"
+  | "background_low";
+
 export interface SummarizationJob {
   id: string;
   timelineKey: string;
   level: number;
   status: SummarizationJobStatus;
+  priority: SummarizationJobPriority;
   inputStartId: string;
   inputEndId: string;
   inputTokenCount: number | null;
@@ -456,6 +470,7 @@ interface SummarizationJobRow {
   timeline_key: string;
   level: number;
   status: SummarizationJobStatus;
+  priority: SummarizationJobPriority;
   input_start_id: string;
   input_end_id: string;
   input_token_count: number | null;
@@ -494,6 +509,7 @@ function mapJobRow(row: SummarizationJobRow): SummarizationJob {
     timelineKey: row.timeline_key,
     level: row.level,
     status: row.status,
+    priority: row.priority,
     inputStartId: row.input_start_id,
     inputEndId: row.input_end_id,
     inputTokenCount: row.input_token_count,
@@ -539,6 +555,8 @@ export interface SummarizationJobInsert {
   inputTokenCount: number | null;
   targetTokenCount: number;
   maxRetries: number;
+  /** Scheduler class (spec §5.5). Unset = `background` (the normal case). */
+  priority?: SummarizationJobPriority;
 }
 
 /**
@@ -2738,17 +2756,18 @@ export class Storage {
       const now = Date.now();
       db.prepare(
         `insert into summarization_jobs (
-          id, timeline_key, level, status, input_start_id, input_end_id,
+          id, timeline_key, level, status, priority, input_start_id, input_end_id,
           input_token_count, target_token_count, attempts, max_retries,
           created_at, updated_at
         ) values (
-          @id, @timelineKey, @level, 'pending', @inputStartId, @inputEndId,
+          @id, @timelineKey, @level, 'pending', @priority, @inputStartId, @inputEndId,
           @inputTokenCount, @targetTokenCount, 0, @maxRetries, @createdAt, @updatedAt
         )`,
       ).run({
         id: job.id,
         timelineKey: job.timelineKey,
         level: job.level,
+        priority: job.priority ?? "background",
         inputStartId: job.inputStartId,
         inputEndId: job.inputEndId,
         inputTokenCount: job.inputTokenCount,
@@ -2798,9 +2817,12 @@ export class Storage {
   }
 
   /**
-   * Claim the oldest pending job via CAS (pending → processing). The SAME
-   * transaction increments attempts (first claim => attempts = 1), bounding
-   * crash-loops. Returns the claimed job (post-update) or undefined.
+   * Claim the highest-priority, oldest pending job via CAS (pending →
+   * processing). Priority order is the scheduler class ranking (spec §5.5):
+   * an escalated job is claimed ahead of unrelated background work; FIFO
+   * (created_at) within a class. The SAME transaction increments attempts
+   * (first claim => attempts = 1), bounding crash-loops. Returns the claimed
+   * job (post-update) or undefined.
    */
   claimNextSummarizationJob(): Promise<SummarizationJob | undefined> {
     return this.readAndWrite((db) => {
@@ -2808,7 +2830,13 @@ export class Storage {
         .prepare(
           `select * from summarization_jobs
            where status = 'pending'
-           order by created_at asc
+           order by case priority
+                      when 'interactive' then 3
+                      when 'proactive' then 2
+                      when 'background' then 1
+                      else 0
+                    end desc,
+                    created_at asc
            limit 1`,
         )
         .get() as SummarizationJobRow | undefined;
@@ -2823,6 +2851,40 @@ export class Storage {
         .run(now, row.id);
       if (result.changes === 0) return undefined;
       return mapJobRow({ ...row, status: "processing", attempts: row.attempts + 1, updated_at: now });
+    });
+  }
+
+  /**
+   * Priority inheritance, job-row half (spec §5.5): raise a job's priority so
+   * `claimNextSummarizationJob` picks it next and the worker admits its LLM
+   * request at the waiter's class. Raise-only — a job already at or above the
+   * requested class is left unchanged (escalation never demotes) — and only
+   * non-terminal (pending/processing) rows are touched. Returns true when the
+   * row was actually raised.
+   */
+  escalateSummarizationJob(jobId: string, priority: SummarizationJobPriority): Promise<boolean> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update summarization_jobs
+           set priority = @priority, updated_at = @now
+           where id = @jobId
+             and status in ('pending', 'processing')
+             and (case priority
+                    when 'interactive' then 3
+                    when 'proactive' then 2
+                    when 'background' then 1
+                    else 0
+                  end)
+               < (case @priority
+                    when 'interactive' then 3
+                    when 'proactive' then 2
+                    when 'background' then 1
+                    else 0
+                  end)`,
+        )
+        .run({ jobId, priority, now: Date.now() });
+      return result.changes > 0;
     });
   }
 
@@ -5188,6 +5250,8 @@ create table if not exists summarization_jobs (
   level integer not null,
   status text not null default 'pending'
     check(status in ('pending', 'processing', 'complete', 'failed')),
+  priority text not null default 'background'
+    check(priority in ('interactive', 'proactive', 'background', 'background_low')),
   input_start_id text not null,
   input_end_id text not null,
   input_token_count integer,
@@ -5288,7 +5352,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 15;
+export const LATEST_SCHEMA_VERSION = 16;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5655,6 +5719,31 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // dm/room/thread key). Fresh DBs get it directly from SCHEMA and never run this step.
   (db) => {
     db.exec(REACTIONS_SCHEMA);
+  },
+  // index 15 (v15 -> v16): add `priority` to `summarization_jobs` — the job-row
+  // half of priority inheritance (spec CONCURRENCY-AND-RATE-LIMITING §5.5).
+  // `claimNextSummarizationJob` orders by it (class rank desc, then created_at)
+  // and `escalateSummarizationJob` raises it when a live context build waits on
+  // the job. ADD COLUMN with a NOT NULL default backfills existing rows to
+  // 'background' (the universal pre-escalation value). Guarded for idempotence
+  // (the ALTER has no IF NOT EXISTS form): skipped when the table is absent —
+  // a real pre-v16 DB always has it (base schema since v1), but minimal legacy
+  // test fixtures don't, and SCHEMA (which runs after the steps on an existing
+  // DB) then creates it directly at the latest shape — or when the column
+  // already exists (a forward path added it). Fresh DBs get this directly from
+  // SCHEMA above and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'summarization_jobs'`)
+      .get();
+    if (!table) return;
+    const columns = db.pragma(`table_info(summarization_jobs)`) as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "priority")) return;
+    db.exec(
+      `alter table summarization_jobs
+         add column priority text not null default 'background'
+           check(priority in ('interactive', 'proactive', 'background', 'background_low'));`,
+    );
   },
 ];
 

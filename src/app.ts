@@ -509,12 +509,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         config: config.summarization ?? {},
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
+          // The job is terminal — drop any sticky escalation pinned to it (§5.5).
+          llmScheduler.clearEscalation(`sumjob:${jobId}`);
           summarizationPool!.notifyNewWork();
           // A completed level-1 summary just queued a diary job (diary_status =
           // 'pending'); wake the diary pool so it doesn't wait for its next poll.
           diaryPool?.notifyNewWork();
         },
-        onError: (jobId, error) => logger.error("summarization_failed", { jobId, error: error.message }),
+        onError: (jobId, error) => {
+          llmScheduler.clearEscalation(`sumjob:${jobId}`);
+          logger.error("summarization_failed", { jobId, error: error.message });
+        },
         activityBus: pipelineActivityBus,
         logger: logger.child("summarization"),
       })
@@ -522,6 +527,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   if (summarizationPool) {
     contextBuilder.onJobEnqueued = () => summarizationPool.notifyNewWork();
+    // Priority inheritance (spec §5.5): one injected callback does all three
+    // writes, in order — job row (claim order), scheduler entry (a request
+    // already queued at background), pool wake (so an idle worker claims the
+    // escalated job immediately). The scheduler escalation is sticky, so it
+    // also covers a request that registers AFTER this runs (claim/admission race).
+    contextBuilder.escalateSummary = (jobId, priority) => {
+      void storage
+        .escalateSummarizationJob(jobId, priority)
+        .then(() => {
+          llmScheduler.escalate(`sumjob:${jobId}`, priority);
+          summarizationPool.notifyNewWork();
+        })
+        .catch((error) =>
+          logger.error("summary_escalation_failed", {
+            jobId,
+            priority,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    };
   }
 
   // Diary worker pool (ARCHITECTURE.md §9c). Same fail-fast validation as
