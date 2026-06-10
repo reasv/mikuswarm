@@ -765,6 +765,41 @@ test("manual resume: interrupted session WITHOUT material is a 409 and its statu
   assert.deepEqual(rec.slotAcquires, []);
 });
 
+test("manual resume: a crash-interrupted SYNTHETIC worker session is a 409 — never re-driven as chat (#19 follow-up)", async () => {
+  for (const sessionType of ["summarize", "condense", "diary"] as const) {
+    let materialLoads = 0;
+    const { deps, rec } = manualResumeHarness({
+      getSessionRow: () => row({ status: "interrupted", session_type: sessionType }),
+      loadMaterial: async () => {
+        materialLoads++;
+        return FAKE_MATERIAL;
+      },
+    });
+    const result = await createManualResumeSession(deps)("s-resume0001");
+    assert.equal(result.ok, false);
+    assert.equal(result.status, "interrupted", "row status reported as-is, untouched");
+    assert.match(result.reason!, /synthetic .* not resumable/);
+    assert.equal(materialLoads, 0, "rejected before the viability gate");
+    assert.deepEqual(rec.adopted, [], "row never adopted");
+    assert.deepEqual(rec.attempts, [], "no chat run driven");
+    assert.deepEqual(rec.slotAcquires, []);
+    assert.deepEqual(rec.parked, [], "NOT converted to failed-resumable");
+    assert.deepEqual(rec.discarded, []);
+  }
+});
+
+test("manual resume: interrupted user-facing sessions (default + proactive) with material stay resumable (#19 follow-up)", async () => {
+  for (const sessionType of ["default", "proactive"] as const) {
+    const { deps, rec } = manualResumeHarness({
+      getSessionRow: () => row({ status: "interrupted", session_type: sessionType }),
+    });
+    const result = await createManualResumeSession(deps)("s-resume0001");
+    assert.deepEqual(result, { ok: true, status: "completed" });
+    assert.equal(rec.attempts.length, 1);
+    assert.equal(rec.adopted[0].sessionType, sessionType);
+  }
+});
+
 test("manual resume: draining at entry rejects before any work (#20)", async () => {
   const { deps, rec } = manualResumeHarness({ isDraining: () => true });
   const result = await createManualResumeSession(deps)("s-resume0001");

@@ -110,11 +110,13 @@ export type AbortSessionResponse = Schema.Schema.Type<typeof AbortSessionRespons
 
 /**
  * POST /api/sessions/:id/resume — manual resume-in-place of a parked
- * `failed-resumable` or `interrupted` session (spec
- * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D). On a 200 the resume ran to
+ * `failed-resumable` or `interrupted` session of a user-facing type (spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D; synthetic
+ * summarize/condense/diary sessions are rejected). On a 200 the resume ran to
  * completion (`{ sessionId, status: "completed" }`); a 409 (not resumable /
- * resume failed again, with the resulting `sessionStatus`) is mapped to a
- * thrown `HttpError` by the API client before this schema is reached.
+ * synthetic session type / resume failed again, with the resulting
+ * `sessionStatus`) is mapped to a thrown `HttpError` by the API client before
+ * this schema is reached.
  */
 export const ResumeSessionResponse = Schema.Struct({
 	sessionId: Schema.String,

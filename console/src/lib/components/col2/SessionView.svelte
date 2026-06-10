@@ -79,7 +79,8 @@
 	// agent re-creates the parked (`failed-resumable`) or `interrupted` run from
 	// its persisted snapshot + transcript and redoes the failed request,
 	// long-polling until the resumed run settles. A 409 means the resume failed
-	// again (re-parked), the session is no longer resumable, a resume is already
+	// again (re-parked), the session is no longer resumable, the session is a
+	// synthetic worker-pool one (summarize/condense/diary), a resume is already
 	// in flight, the timeline is busy, or there is nothing to redo.
 	async function handleResume() {
 		const id = activeId;
@@ -119,10 +120,16 @@
 	// Resumable statuses (spec CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D):
 	// `failed-resumable` (parked by Layer-2 exhaustion) and `interrupted` (healed
 	// after a crash/stop) both carry the snapshot + transcript a resume needs; the
-	// agent 409s when the transcript has nothing to redo.
+	// agent 409s when the transcript has nothing to redo. Synthetic worker-pool
+	// sessions (summarize/condense/diary — ARCHITECTURE.md §9b/§9c) are never
+	// chat-resumable: the agent 409s them outright (the pools own their own
+	// retries), so don't offer the button at all. Mirrors SYNTHETIC_SESSION_TYPES
+	// in src/agent/recovery.ts.
+	const SYNTHETIC_SESSION_TYPES = new Set(['summarize', 'condense', 'diary']);
 	const isResumable = $derived(
-		session.data?.session.status === 'failed-resumable' ||
-			session.data?.session.status === 'interrupted'
+		(session.data?.session.status === 'failed-resumable' ||
+			session.data?.session.status === 'interrupted') &&
+			!SYNTHETIC_SESSION_TYPES.has(session.data?.session.sessionType ?? '')
 	);
 
 	$effect(() => {

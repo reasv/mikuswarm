@@ -469,6 +469,27 @@ export const MANUAL_RESUME_STATUSES: ReadonlySet<string> = new Set([
   "interrupted",
 ]);
 
+/**
+ * Session types whose `agent_sessions` rows are written directly by synthetic
+ * worker pools — summarization (`"summarize"`/`"condense"`, §9b) and diary
+ * (`"diary"`, §9c) — never by the chat launch path. These literals are
+ * hardcoded at the pools' insertion sites (src/summarization/worker-pool.ts,
+ * src/diary/worker-pool.ts), so a denylist keyed on them is exact and needs
+ * no config plumbing (unlike an allowlist: the proactive type is a
+ * configurable `session_types` key). A crash mid-worker-run leaves such a row
+ * `running` → startup healing flips it `interrupted` — but resuming it here
+ * would re-drive a summarization/diary transcript as a *chat* session (chat
+ * tools, `send_message` into the real room, bot identity), so manual resume
+ * rejects these types outright; the worker pools own their own job-level
+ * retries. Unknown future types default to resumable (user-facing), matching
+ * `defaultPriorityForSessionType`'s unknown → interactive rule.
+ */
+export const SYNTHETIC_SESSION_TYPES: ReadonlySet<string> = new Set([
+  "summarize",
+  "condense",
+  "diary",
+]);
+
 export interface ManualResumeDeps {
   /** Live drain flag (read per decision point). */
   isDraining: () => boolean;
@@ -539,6 +560,12 @@ export interface ManualResumeDeps {
  *   accepted alongside `failed-resumable` — same re-issue mechanism, no extra
  *   turn injected. Viability is gated up front by `loadMaterial`; a row with
  *   nothing to redo is rejected (409) with its status untouched.
+ * - **Synthetic-session gate (issue #19 follow-up).** Rows whose
+ *   `session_type` is a synthetic worker-pool type (`SYNTHETIC_SESSION_TYPES`:
+ *   summarize/condense/diary) are rejected (409, status untouched) right
+ *   after the status gate — a crash-interrupted worker row must not be
+ *   re-driven as a chat session. The session-type column is the
+ *   discriminator; sender columns are NOT (proactive legacy rows share NULL).
  * - **Shutdown safety (issue #20).** Draining rejects up front, and a `fatal`
  *   attempt outcome WHILE draining re-parks `failed-resumable` instead of
  *   discarding (the fatality is shutdown-caused — scheduler stopped — not
@@ -571,6 +598,16 @@ export function createManualResumeSession(
           ok: false,
           status: row.status,
           reason: `session is '${row.status}', not resumable (failed-resumable | interrupted)`,
+        };
+      }
+      // Session-type gate: synthetic worker-pool rows (summarize/condense/
+      // diary) are never resumable as chat sessions — see
+      // SYNTHETIC_SESSION_TYPES. Rejecting leaves the row's status untouched.
+      if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) {
+        return {
+          ok: false,
+          status: row.status,
+          reason: `synthetic ${row.session_type} session — not resumable (worker pools own their own retries)`,
         };
       }
       if (deps.isDraining()) {
