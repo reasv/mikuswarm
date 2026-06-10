@@ -134,6 +134,13 @@ export interface Summary {
   content: string;
   earliestTimestamp: number;
   latestTimestamp: number;
+  /**
+   * In-memory only — set on synthesized failure placeholders (§9b wait-or-omit)
+   * so the contiguity probe (`hasEventsBetweenSummaries`) gets an exact start
+   * cursor without lineage rows. Not a column; undefined on rows loaded from
+   * the summaries table (whose earliest event resolves through lineage).
+   */
+  earliestEventId?: string;
   latestEventId: string;
   eventCount: number;
   tokenCount: number;
@@ -2673,6 +2680,83 @@ export class Storage {
         }) as SummaryRow[],
     );
     return rows.map(mapSummaryRow);
+  }
+
+  /**
+   * The (timestamp, received_at, id) cursor of a summary's earliest covered raw
+   * event, resolved through the lineage tables: a recursive ordinal-0 walk down
+   * `summary_parents` to the chronologically-first level-1 descendant, then its
+   * ordinal-0 `summary_events` row. Undefined when lineage is missing or the
+   * event row itself is gone (e.g. retention-deleted).
+   */
+  getSummaryEarliestEventCursor(timelineKey: string, summaryId: string): TimelineCursor | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `with recursive chain(summary_id) as (
+             select @summaryId
+             union all
+             select sp.parent_id from summary_parents sp
+               join chain on sp.summary_id = chain.summary_id
+              where sp.ordinal = 0
+           )
+           select se.event_id as event_id from summary_events se
+             join chain on se.summary_id = chain.summary_id
+            where se.ordinal = 0
+            limit 1`,
+        )
+        .get({ summaryId }) as { event_id: string } | undefined,
+    );
+    if (!row) return undefined;
+    return this.getEventCursor(timelineKey, row.event_id);
+  }
+
+  /**
+   * True when at least one raw timeline event exists strictly BETWEEN two
+   * summaries' coverage — i.e. after `prev`'s last covered event and before
+   * `next`'s first covered event. This is the contiguity test behind the
+   * summary-layer coverage cursor (§9b, `makeContiguityProbe`): the cursor may
+   * advance across `next` only when nothing un-covered would be skipped.
+   * Bounds resolve to full (timestamp, received_at, id) cursors via
+   * `prev.latestEventId` and `next`'s lineage (or its in-memory
+   * `earliestEventId` for synthesized placeholders); when a bound cannot be
+   * resolved (lineage absent, or the event row retention-deleted), it degrades
+   * to a timestamp-only bound in the conservative direction — for the start
+   * bound `timestamp > prev.latestTimestamp`, for the end bound `timestamp <=
+   * next.earliestTimestamp` — so collision-adjacent events count as "between"
+   * and the cursor stops rather than silently skipping them.
+   */
+  hasEventsBetweenSummaries(timelineKey: string, prev: Summary, next: Summary): boolean {
+    const after = this.getEventCursor(timelineKey, prev.latestEventId);
+    const before = next.earliestEventId
+      ? this.getEventCursor(timelineKey, next.earliestEventId)
+      : this.getSummaryEarliestEventCursor(timelineKey, next.id);
+    const afterCond = after
+      ? `(timestamp > @aTs
+          or (timestamp = @aTs and received_at > @aRcv)
+          or (timestamp = @aTs and received_at = @aRcv and id > @aId))`
+      : `timestamp > @aTs`;
+    const beforeCond = before
+      ? `(timestamp < @bTs
+          or (timestamp = @bTs and received_at < @bRcv)
+          or (timestamp = @bTs and received_at = @bRcv and id < @bId))`
+      : `timestamp <= @bTs`;
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select 1 as hit from timeline_events
+           where timeline_key = @timelineKey and ${afterCond} and ${beforeCond}
+           limit 1`,
+        )
+        .get({
+          timelineKey,
+          aTs: after?.timestamp ?? prev.latestTimestamp,
+          ...(after ? { aRcv: after.receivedAt, aId: after.id } : {}),
+          bTs: before?.timestamp ?? next.earliestTimestamp,
+          ...(before ? { bRcv: before.receivedAt, bId: before.id } : {}),
+        }) as { hit: number } | undefined,
+    );
+    return row != null;
   }
 
   /** True if any summary at level >= minLevel falls between two timestamps (inclusive). */

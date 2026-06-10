@@ -17,10 +17,13 @@ export {
 export { dumpBuiltContext, CACHE_BOUNDARIES } from "./dump.js";
 export {
   selectSummaries,
+  makeContiguityProbe,
   computeRecencyLabel,
   resolveRecencyLabels,
   renderSummaryLayer,
   type SummarySelection,
+  type SummaryContiguityProbe,
+  type SummaryAdjacencyStore,
   type SummaryLabelCache,
   type ResolvedLabels,
 } from "./summary-layer.js";

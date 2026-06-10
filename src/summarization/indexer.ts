@@ -5,7 +5,7 @@ import type { SummarizationConfig, AppConfig } from "../config/index.js";
 import type { Logger } from "../observability/logger.js";
 import { estimateTokens } from "../context/tokens.js";
 import { renderCompactMessage, renderRichMessage } from "../context/renderer.js";
-import { selectSummaries } from "../context/summary-layer.js";
+import { selectSummaryCoverage } from "../context/summary-layer.js";
 import { hydrateEvents } from "../context/hydrate.js";
 
 // =============================================================================
@@ -90,6 +90,21 @@ export class SummarizationIndexer {
   }
 
   /**
+   * Awaited single-timeline reconcile, for the context builder's wait-or-omit
+   * loop (via the injected `reconcileSummaries` callback): when a build is over
+   * budget but finds no job covering its oldest events, it must not conclude
+   * "nothing covers them" while this indexer simply hasn't caught up — it asks
+   * for one reconcile pass and re-checks. Serialized on the same FIFO tail;
+   * unlike `enqueueReconcileTimeline` it is NOT fire-and-forget (the caller
+   * awaits completion) and does not coalesce (an awaited pass must actually
+   * run). Errors propagate to the awaiter (app wiring catches and logs).
+   */
+  reconcileTimeline(timelineKey: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    return this.enqueue(() => this.reconcileTimelineInner(timelineKey));
+  }
+
+  /**
    * Startup sweep over every active timeline — catches thresholds crossed while
    * the process was down (the eager equivalent of the chat index's
    * `reconcileAll`). Serialized on the tail like everything else.
@@ -130,7 +145,16 @@ export class SummarizationIndexer {
     const generationThreshold = config.generation_threshold_tokens ?? 6000;
 
     // Un-summarized raw events: strictly after the summary coverage cursor.
-    const selection = selectSummaries(storage.getSummaryCandidates(timelineKey));
+    // The shared selection (same as the builder's) chains with event-existence
+    // contiguity — without it the cursor would stall at the first summary and
+    // already-summarized ranges would be re-counted and re-enqueued — and
+    // includes failure placeholders for terminally failed ranges, so a failed
+    // range is terminal for its RANGE (spec §7.2): the cursor advances over
+    // it, its events are never counted or re-enqueued, and the builder renders
+    // the placeholder. (There is deliberately NO automatic retry; the manual
+    // override is deleting the failed job row, after which the next reconcile
+    // re-enqueues the range.)
+    const selection = selectSummaryCoverage(storage, timelineKey);
     const rawEvents = selection.coverageEndEventId
       ? store.queryAfterContext(timelineKey, selection.coverageEndEventId)
       : store.queryForContext(timelineKey, store.getCompactionState(timelineKey));
@@ -162,11 +186,18 @@ export class SummarizationIndexer {
     // Oldest chunk: accumulate until the running sum first reaches
     // leaf_input_tokens; the crossing event is included, so a single large event
     // naturally overshoots (capped in practice by the oversized-event truncation
-    // at generation-build time).
+    // at generation-build time). Defense-in-depth: the chunk stops BEFORE any
+    // event covered by a terminally failed job — normally such events sit
+    // behind the coverage cursor (their placeholder links the chain) and never
+    // appear here, but a failed range stranded past a genuine coverage gap
+    // (retention/corruption) must not be re-enqueued; the chunk then covers
+    // only the gap, whose summary re-links the chain on the next reconcile.
+    const failedCovered = this.failedCoveredEventIds(timelineKey);
     const leafInput = config.leaf_input_tokens ?? 4000;
     const chunk: typeof compactEvents = [];
     let running = 0;
     for (const e of compactEvents) {
+      if (failedCovered.has(e.id)) break;
       chunk.push(e);
       running += e.compactTokens;
       if (running >= leafInput) break;
@@ -210,6 +241,25 @@ export class SummarizationIndexer {
       inputTokens: running,
     });
     this.options.onJobEnqueued?.();
+  }
+
+  /**
+   * Event ids covered by terminally failed level-1 jobs — the chunk guard's
+   * input (failed is terminal for the range; see `reconcileTimelineInner`).
+   * Unresolvable ranges (boundary events gone) are skipped.
+   */
+  private failedCoveredEventIds(timelineKey: string): Set<string> {
+    const { storage } = this.options;
+    const ids = new Set<string>();
+    for (const job of storage.getFailedSummarizationJobs(timelineKey, 1)) {
+      const start = storage.getEventCursor(timelineKey, job.inputStartId);
+      const end = storage.getEventCursor(timelineKey, job.inputEndId);
+      if (!start || !end) continue;
+      for (const e of storage.getTimelineEventsBetween(timelineKey, start, end)) {
+        ids.add(e.id);
+      }
+    }
+    return ids;
   }
 }
 

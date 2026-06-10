@@ -73,18 +73,70 @@ function minimalConfig(overrides?: Partial<AppConfig>): AppConfig {
   } as AppConfig;
 }
 
-async function seedTimeline(storage: Storage, count = 20): Promise<TimelineStore> {
+async function seedTimeline(storage: Storage, count = 20, spacingMs = 1): Promise<TimelineStore> {
   const timeline = new TimelineStore(storage);
   for (let i = 0; i < count; i++) {
     await timeline.append(
       testEvent({
         id: `ev${String(i).padStart(4, "0")}`,
         body: `message content with some words ${i}`,
-        timestamp: 1000 + i,
+        timestamp: 1000 + i * spacingMs,
       }),
     );
   }
   return timeline;
+}
+
+/** Insert a pending level-1 job covering [startId, endId]. */
+async function insertJob(
+  storage: Storage,
+  id: string,
+  startId: string,
+  endId: string,
+): Promise<void> {
+  await storage.insertSummarizationJob({
+    id,
+    timelineKey: TK,
+    level: 1,
+    inputStartId: startId,
+    inputEndId: endId,
+    inputTokenCount: 100,
+    targetTokenCount: 50,
+    maxRetries: 2,
+  });
+}
+
+/** Complete a job by inserting its summary with full lineage over [from, to]. */
+async function completeJob(
+  storage: Storage,
+  jobId: string,
+  summaryId: string,
+  content: string,
+  fromIndex: number,
+  toIndex: number,
+  spacingMs = 1,
+): Promise<string[]> {
+  const eventIds = Array.from(
+    { length: toIndex - fromIndex + 1 },
+    (_, i) => `ev${String(fromIndex + i).padStart(4, "0")}`,
+  );
+  await storage.insertSummaryWithLineage({
+    id: summaryId,
+    timelineKey: TK,
+    level: 1,
+    content,
+    earliestTimestamp: 1000 + fromIndex * spacingMs,
+    latestTimestamp: 1000 + toIndex * spacingMs,
+    latestEventId: eventIds[eventIds.length - 1]!,
+    eventCount: eventIds.length,
+    tokenCount: estimateTokens(content),
+    modelId: "test-model",
+    status: "complete",
+    generatedAt: Date.now(),
+    eventIds,
+    jobId,
+  });
+  return eventIds;
 }
 
 function makeIndexer(
@@ -350,6 +402,270 @@ test("wait-or-omit: a terminally failed range renders an explicit placeholder, n
       .join("\n");
     assert.ok(!chatContent.includes("words 3"), "covered events are omitted from the raw turns");
     assert.ok(chatContent.includes("words 17"), "uncovered newer events remain");
+  } finally {
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Regressions for the Design C correctness review (issues #1-#3):
+//   #1 — the coverage cursor must advance past a waited summary (event-based
+//        contiguity, not the old 1ms timestamp tolerance), so completion of a
+//        waited job trims the raw set instead of double-rendering + dropping.
+//   #2 — a terminally failed range is terminal: never re-enqueued; its
+//        placeholder takes over the slot.
+//   #3 — a deep multi-chunk backlog build triggers awaited indexer reconciles
+//        instead of concluding "nothing covers the oldest" and dropping.
+// ---------------------------------------------------------------------------
+
+const SPACING = 10_000; // realistic inter-message interval (10s), >> the old 1ms tolerance
+
+test("issue #1: waited-summary completion advances coverage past an adjacent summary — no drop, no double render", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage, 20, SPACING);
+    const builder = new ContextBuilder(timeline, overflowConfig(), storage);
+
+    // S1 already covers ev0000..ev0009 (a previous chunk). J2 covers the next
+    // chunk ev0010..ev0018 and is still pending when the build starts.
+    await insertJob(storage, "j1", "ev0000", "ev0009");
+    await completeJob(storage, "j1", "sum_1", "first chunk summary", 0, 9, SPACING);
+    await insertJob(storage, "j2", "ev0010", "ev0018");
+
+    const escalations: Array<{ jobId: string; priority: string }> = [];
+    builder.escalateSummary = (jobId, priority) => escalations.push({ jobId, priority });
+
+    const completeLater = (async () => {
+      await new Promise((r) => setTimeout(r, 300));
+      await completeJob(storage, "j2", "sum_2", "second chunk summary", 10, 18, SPACING);
+    })();
+
+    const trigger = testEvent({ id: "trigger-adv", body: "hi", timestamp: 1000 + 25 * SPACING });
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+    await completeLater;
+
+    assert.deepEqual(escalations, [{ jobId: "j2", priority: "interactive" }]);
+
+    // Both summaries render in the layer (the chain crossed the real
+    // inter-message interval between them).
+    const layer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "summary layer present");
+    assert.match(layer!.content, /first chunk summary/);
+    assert.match(layer!.content, /second chunk summary/, "waited summary renders in the layer");
+
+    const chatContent = built.messages
+      .filter((m) => m.type === "chatEvent")
+      .map((m) => m.content)
+      .join("\n");
+    // No double render: events covered by the waited summary must not render raw.
+    for (let i = 10; i <= 18; i++) {
+      assert.ok(!chatContent.includes(`words ${i}<`) && !chatContent.includes(`words ${i}\n`) && !new RegExp(`words ${i}\\b`).test(chatContent),
+        `covered event ${i} must not render raw`);
+    }
+    // No silent drop: the only uncovered timeline event still renders raw.
+    assert.match(chatContent, /words 19\b/, "uncovered newest event remains raw");
+  } finally {
+    storage.close();
+  }
+});
+
+test("issue #1 (indexer side): adjacent summaries do not get their ranges re-counted or re-enqueued", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage, 20, SPACING);
+    await insertJob(storage, "j1", "ev0000", "ev0009");
+    await completeJob(storage, "j1", "sum_1", "first chunk summary", 0, 9, SPACING);
+    await insertJob(storage, "j2", "ev0010", "ev0018");
+    await completeJob(storage, "j2", "sum_2", "second chunk summary", 10, 18, SPACING);
+
+    // Remaining un-summarized: ev0019 only (and it is the rich tail). With the
+    // old timestamp-tolerance cursor the indexer re-counted ev0010..ev0019 as
+    // un-summarized and re-enqueued an already-summarized range.
+    const indexer = makeIndexer(storage, timeline, {
+      generation_threshold_tokens: 50,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    });
+    indexer.enqueueReconcileTimeline(TK);
+    await drainTail(indexer);
+
+    assert.equal(
+      storage.getActiveSummarizationJobs(TK, 1).length,
+      0,
+      "no job enqueued over already-summarized ranges",
+    );
+  } finally {
+    storage.close();
+  }
+});
+
+test("issue #2: a terminally failed range is never re-enqueued; the next chunk starts after it; builds render the placeholder", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage, 20, SPACING);
+    await insertJob(storage, "job_dead", "ev0000", "ev0015");
+    await storage.failSummarizationJob("job_dead", "model exploded");
+
+    const indexer = makeIndexer(storage, timeline, {
+      generation_threshold_tokens: 1,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    });
+    indexer.enqueueReconcileTimeline(TK);
+    await drainTail(indexer);
+
+    // The failed range is terminal: the new chunk starts strictly after it.
+    const active = storage.getActiveSummarizationJobs(TK, 1);
+    assert.equal(active.length, 1, "exactly one new job");
+    assert.equal(active[0]!.inputStartId, "ev0016", "chunk starts after the failed range");
+
+    // A second reconcile is a no-op (active overlap + failed terminality).
+    const indexer2 = makeIndexer(storage, timeline, {
+      generation_threshold_tokens: 1,
+      leaf_input_tokens: 10,
+      leaf_target_tokens: 5,
+    });
+    indexer2.enqueueReconcileTimeline(TK);
+    await drainTail(indexer2);
+    assert.equal(storage.getActiveSummarizationJobs(TK, 1).length, 1, "no duplicate job");
+
+    // An under-budget build renders the placeholder deterministically and
+    // omits the failed range's raw events (the placeholder advanced the
+    // cursor) — no wait on the unrelated active job is needed.
+    const builder = new ContextBuilder(timeline, overflowConfig(100000, 50000), storage);
+    const trigger = testEvent({ id: "trigger-f2", body: "hi", timestamp: 1000 + 25 * SPACING });
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+    const layer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "placeholder renders in the summary layer slot");
+    assert.match(layer!.content, /could not be generated/);
+    assert.match(layer!.content, /events="16"/);
+    const chatContent = built.messages
+      .filter((m) => m.type === "chatEvent")
+      .map((m) => m.content)
+      .join("\n");
+    assert.ok(!/words 3\b/.test(chatContent), "failed-covered events omitted from raw turns");
+    assert.match(chatContent, /words 17\b/, "events after the failed range remain raw");
+  } finally {
+    storage.close();
+  }
+});
+
+test("issue #3: deep multi-chunk backlog — the build reconciles, waits each chunk, and never drops events", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const count = 36;
+    const timeline = new TimelineStore(storage);
+    for (let i = 0; i < count; i++) {
+      await timeline.append(
+        testEvent({
+          id: `ev${String(i).padStart(4, "0")}`,
+          body: `unique marker-${i}.`,
+          timestamp: 1000 + i * SPACING,
+        }),
+      );
+    }
+
+    const config = minimalConfig({
+      summarization: {
+        enabled: true,
+        generation_threshold_tokens: 30,
+        leaf_input_tokens: 60,
+        leaf_target_tokens: 5,
+      },
+      context: {
+        tiers: {
+          rich_target_tokens: 1,
+          rich_max_tokens: 1,
+          compact_target_tokens: 40,
+          compact_max_tokens: 80,
+        },
+      },
+    } as any);
+    const builder = new ContextBuilder(timeline, config, storage);
+    const indexer = new SummarizationIndexer({
+      storage,
+      store: timeline,
+      config: (config as any).summarization,
+      tiers: (config as any).context.tiers,
+    });
+    // NO jobs exist up front and there is no app-level onComplete reconcile in
+    // this harness — chunk N+1 only ever appears because the builder asks for
+    // an awaited reconcile (the fix for the onComplete race).
+    builder.reconcileSummaries = (tl) => indexer.reconcileTimeline(tl).catch(() => {});
+
+    // Fake worker: claim each job and complete it with a real lineage summary.
+    const coveredIds = new Set<string>();
+    let stopWorker = false;
+    const worker = (async () => {
+      while (!stopWorker) {
+        const job = await storage.claimNextSummarizationJob();
+        if (!job) {
+          await new Promise((r) => setTimeout(r, 20));
+          continue;
+        }
+        const start = storage.getEventCursor(TK, job.inputStartId)!;
+        const end = storage.getEventCursor(TK, job.inputEndId)!;
+        const events = storage.getTimelineEventsBetween(TK, start, end);
+        await storage.insertSummaryWithLineage({
+          id: `sum_${job.id}`,
+          timelineKey: TK,
+          level: 1,
+          content: `summary of ${job.inputStartId}..${job.inputEndId}`,
+          earliestTimestamp: events[0]!.timestamp,
+          latestTimestamp: events[events.length - 1]!.timestamp,
+          latestEventId: events[events.length - 1]!.id,
+          eventCount: events.length,
+          tokenCount: 10,
+          modelId: "test-model",
+          status: "complete",
+          generatedAt: Date.now(),
+          eventIds: events.map((e) => e.id),
+          jobId: job.id,
+        });
+        for (const e of events) coveredIds.add(e.id);
+      }
+    })();
+
+    const trigger = testEvent({ id: "trigger-deep", body: "hi", timestamp: 1000 + 50 * SPACING });
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+    stopWorker = true;
+    await worker;
+
+    assert.ok(coveredIds.size > 0, "the backlog required at least one summarization wait");
+
+    const chatContent = built.messages
+      .filter((m) => m.type === "chatEvent")
+      .map((m) => m.content)
+      .join("\n");
+    // NO event may be silently dropped: every seeded event renders raw or is
+    // covered by a summary that the layer renders. And no covered event may
+    // double-render raw.
+    const layer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "summary layer present");
+    for (let i = 0; i < count; i++) {
+      const id = `ev${String(i).padStart(4, "0")}`;
+      const inChat = chatContent.includes(`marker-${i}.`);
+      if (coveredIds.has(id)) {
+        assert.ok(!inChat, `covered event ${id} must not double-render raw`);
+      } else {
+        assert.ok(inChat, `uncovered event ${id} must render raw (was silently dropped)`);
+      }
+    }
   } finally {
     storage.close();
   }

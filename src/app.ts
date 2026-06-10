@@ -574,6 +574,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           }),
         );
     };
+
+    // Wait-or-omit's coverage re-check (spec §7.2/§7.3): when an over-budget
+    // build finds no job covering its oldest events, it runs ONE awaited
+    // indexer reconcile before concluding nothing covers them — closing the
+    // race against the pool-onComplete fire-and-forget reconcile on deep
+    // multi-chunk backlogs. Job creation stays with the indexer; errors are
+    // logged here and never reach the build (the builder then proceeds as if
+    // the reconcile found nothing).
+    contextBuilder.reconcileSummaries = (timelineKey) =>
+      summarizationIndexer!.reconcileTimeline(timelineKey).catch((error) => {
+        logger.error("summary_reconcile_for_build_failed", {
+          timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   // Diary worker pool (ARCHITECTURE.md §9c). Same fail-fast validation as
