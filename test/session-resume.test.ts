@@ -6,11 +6,14 @@ import path from "node:path";
 
 import {
   autoResumeSession,
+  createManualResumeSession,
   loadResumeMaterial,
   stripFailedTail,
   RESUME_IMAGE_PLACEHOLDER,
   type AutoResumeDeps,
+  type ManualResumeDeps,
   type ResumeAttemptResult,
+  type ResumeMaterial,
   type ResumeMaterialDeps,
 } from "../src/agent/recovery.js";
 import { externalizeImages } from "../src/agent/session-capture.js";
@@ -19,6 +22,7 @@ import { SessionRunner, SessionRunnerError, isResumableRunError } from "../src/a
 import { SessionManager } from "../src/agent/session-manager.js";
 import { Storage, type AgentSessionRow } from "../src/storage/index.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
+import type { InboundChatEvent } from "../src/types.js";
 
 /** Deps stub for image-free rows: no media store hits expected. */
 const NO_MEDIA_DEPS: ResumeMaterialDeps = {
@@ -43,6 +47,8 @@ function row(overrides: Partial<AgentSessionRow> = {}): AgentSessionRow {
     trigger_event_id: "ev-1",
     trigger_external_id: null,
     trigger_body: "hi",
+    trigger_sender_id: "@alice:example.org",
+    trigger_sender_display_name: "Alice",
     context_snapshot_json: JSON.stringify([
       { type: "system", role: "system", content: "prompt", tier: "system", tokenEstimate: 1 },
       { type: "chatEvent", role: "user", content: "<message>history</message>", tier: "compact", tokenEstimate: 1 },
@@ -556,4 +562,267 @@ test("autoResumeSession: completion resumes; exhaustion parks", async () => {
   assert.deepEqual(rec.attemptsRun, [1, 2]);
   assert.deepEqual(rec.parked, ["529 again"]);
   assert.deepEqual(rec.discarded, []);
+});
+
+// ---------------------------------------------------------------------------
+// Manual console resume (issues #16-#20): double-POST guard, status +
+// viability gates, per-timeline slot, sender reconstruction from the durable
+// row, and shutdown re-park.
+// ---------------------------------------------------------------------------
+
+const FAKE_MATERIAL: ResumeMaterial = { snapshot: [], transcript: [] };
+const SELF_USER_ID = "@miku:example.org";
+
+interface ManualRecorded {
+  adopted: AgentSessionRecord[];
+  attempts: Array<{ record: AgentSessionRecord; inbound: InboundChatEvent }>;
+  parked: Array<string | undefined>;
+  discarded: Array<string | undefined>;
+  slotAcquires: string[];
+  slotReleases: string[];
+}
+
+function manualResumeHarness(overrides: Partial<ManualResumeDeps> = {}): {
+  deps: ManualResumeDeps;
+  rec: ManualRecorded;
+} {
+  const rec: ManualRecorded = {
+    adopted: [],
+    attempts: [],
+    parked: [],
+    discarded: [],
+    slotAcquires: [],
+    slotReleases: [],
+  };
+  const deps: ManualResumeDeps = {
+    isDraining: () => false,
+    getSessionRow: () => row(),
+    loadMaterial: async () => FAKE_MATERIAL,
+    hasLiveSession: () => false,
+    adopt: (record) => rec.adopted.push(record),
+    tryAcquireTimelineSlot: (key) => {
+      rec.slotAcquires.push(key);
+      return true;
+    },
+    releaseTimelineSlot: (key) => rec.slotReleases.push(key),
+    selfUserIdForAccount: (accountId) => (accountId === "miku" ? SELF_USER_ID : undefined),
+    runAttempt: async (record, inbound) => {
+      rec.attempts.push({ record, inbound });
+      return { outcome: "completed" };
+    },
+    markFailedResumable: (_id, error) => rec.parked.push(error),
+    markDiscarded: (_id, error) => rec.discarded.push(error),
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    ...overrides,
+  };
+  return { deps, rec };
+}
+
+test("manual resume happy path: completes, slot held for the run, sender is the PERSISTED user (#16-#18)", async () => {
+  const { deps, rec } = manualResumeHarness();
+  const resume = createManualResumeSession(deps);
+  const result = await resume("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+
+  // Timeline slot (#17): acquired before the run, released after.
+  assert.deepEqual(rec.slotAcquires, ["matrix:miku:room:!room"]);
+  assert.deepEqual(rec.slotReleases, ["matrix:miku:room:!room"]);
+
+  // The reconstructed record was adopted and drives the same attempt.
+  assert.equal(rec.adopted.length, 1);
+  assert.equal(rec.adopted[0].id, "s-resume0001");
+  assert.equal(rec.adopted[0].status, "resuming");
+  assert.equal(rec.attempts.length, 1);
+
+  // Sender identity (#18): the persisted trigger sender, NOT the bot — and
+  // isSelf is never claimed for a user-triggered session.
+  const sender = rec.attempts[0].inbound.event.sender;
+  assert.equal(sender.id, "@alice:example.org");
+  assert.equal(sender.displayName, "Alice");
+  assert.equal(sender.isSelf, undefined);
+  // Outbound target reconstructed from the timeline key.
+  assert.equal(rec.attempts[0].inbound.outboundTarget?.roomId, "!room");
+  assert.equal(rec.attempts[0].inbound.outboundTarget?.accountId, "miku");
+  assert.deepEqual(rec.parked, []);
+  assert.deepEqual(rec.discarded, []);
+});
+
+test("manual resume: a bot-triggered (proactive) or legacy NULL sender reconstructs as self (#18)", async () => {
+  // Proactive sessions persist the bot as the trigger sender; isSelf is then true.
+  const proactive = manualResumeHarness({
+    getSessionRow: () =>
+      row({ trigger_sender_id: SELF_USER_ID, trigger_sender_display_name: null }),
+  });
+  await createManualResumeSession(proactive.deps)("s-resume0001");
+  assert.equal(proactive.rec.attempts[0].inbound.event.sender.id, SELF_USER_ID);
+  assert.equal(proactive.rec.attempts[0].inbound.event.sender.isSelf, true);
+
+  // Defensive pre-v18 fallback (NULL columns): bot identity, honestly self.
+  const legacy = manualResumeHarness({
+    getSessionRow: () => row({ trigger_sender_id: null, trigger_sender_display_name: null }),
+  });
+  await createManualResumeSession(legacy.deps)("s-resume0001");
+  assert.equal(legacy.rec.attempts[0].inbound.event.sender.id, SELF_USER_ID);
+  assert.equal(legacy.rec.attempts[0].inbound.event.sender.isSelf, true);
+});
+
+test("manual resume: wrong state is rejected without side effects (409)", async () => {
+  for (const status of ["completed", "running", "discarded", "created"] as const) {
+    const { deps, rec } = manualResumeHarness({ getSessionRow: () => row({ status }) });
+    const result = await createManualResumeSession(deps)("s-resume0001");
+    assert.equal(result.ok, false);
+    assert.equal(result.status, status);
+    assert.match(result.reason!, /not resumable/);
+    assert.deepEqual(rec.adopted, []);
+    assert.deepEqual(rec.slotAcquires, []);
+    assert.deepEqual(rec.attempts, []);
+  }
+  // Unknown session.
+  const { deps } = manualResumeHarness({ getSessionRow: () => undefined });
+  const unknown = await createManualResumeSession(deps)("s-nope");
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.status, "unknown");
+});
+
+test("manual resume: double POST is rejected synchronously while the first is in flight (#16)", async () => {
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const { deps, rec } = manualResumeHarness({
+    runAttempt: async (record, inbound) => {
+      rec.attempts.push({ record, inbound });
+      await gate; // hold the first resume mid-run
+      return { outcome: "completed" };
+    },
+  });
+  const resume = createManualResumeSession(deps);
+  const first = resume("s-resume0001");
+  const second = await resume("s-resume0001"); // before the first settles
+  assert.equal(second.ok, false);
+  assert.equal(second.status, "resuming");
+  assert.match(second.reason!, /already in flight/);
+  release!();
+  assert.deepEqual(await first, { ok: true, status: "completed" });
+  assert.equal(rec.attempts.length, 1, "only one run was driven");
+  assert.equal(rec.adopted.length, 1, "only one adopt");
+
+  // After the first settles the guard clears: a new resume is admitted again.
+  const third = await resume("s-resume0001");
+  assert.equal(third.ok, true);
+});
+
+test("manual resume: an in-memory live record for the id also rejects (#16)", async () => {
+  const { deps, rec } = manualResumeHarness({ hasLiveSession: () => true });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.match(result.reason!, /already in flight/);
+  assert.deepEqual(rec.attempts, []);
+});
+
+test("manual resume: timeline busy is a clean 409 — no run, no marks, no release (#17)", async () => {
+  const { deps, rec } = manualResumeHarness({ tryAcquireTimelineSlot: () => false });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "failed-resumable");
+  assert.match(result.reason!, /timeline busy/);
+  assert.deepEqual(rec.attempts, []);
+  assert.deepEqual(rec.adopted, []);
+  assert.deepEqual(rec.slotReleases, [], "never-acquired slot must not be released");
+  assert.deepEqual(rec.parked, []);
+});
+
+test("manual resume: slot is released even when the attempt fails (#17)", async () => {
+  const { deps, rec } = manualResumeHarness({
+    runAttempt: async () => ({ outcome: "mechanical", error: "529 again" }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "failed-resumable");
+  assert.deepEqual(rec.parked, ["529 again"]);
+  assert.deepEqual(rec.slotReleases, ["matrix:miku:room:!room"]);
+});
+
+test("manual resume: interrupted session WITH viable material resumes transparently (#19)", async () => {
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ status: "interrupted" }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+  assert.equal(rec.attempts.length, 1, "same re-issue mechanism, no extra turn");
+});
+
+test("manual resume: interrupted session WITHOUT material is a 409 and its status is untouched (#19)", async () => {
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ status: "interrupted" }),
+    loadMaterial: async () => null,
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "interrupted", "row status reported as-is");
+  assert.match(result.reason!, /nothing to redo/);
+  assert.deepEqual(rec.adopted, [], "row never adopted");
+  assert.deepEqual(rec.parked, [], "NOT converted to failed-resumable");
+  assert.deepEqual(rec.discarded, []);
+  assert.deepEqual(rec.slotAcquires, []);
+});
+
+test("manual resume: draining at entry rejects before any work (#20)", async () => {
+  const { deps, rec } = manualResumeHarness({ isDraining: () => true });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.match(result.reason!, /shutting down/);
+  assert.deepEqual(rec.attempts, []);
+  assert.deepEqual(rec.slotAcquires, []);
+});
+
+test("manual resume: a fatal outcome WHILE DRAINING re-parks instead of discarding (#20)", async () => {
+  // Shutdown begins mid-attempt: the scheduler gate rejects the request, which
+  // Layer-1 classifies fatal — but the material is intact, so park.
+  let draining = false;
+  const { deps, rec } = manualResumeHarness({
+    isDraining: () => draining,
+    runAttempt: async (record, inbound) => {
+      rec.attempts.push({ record, inbound });
+      draining = true;
+      return { outcome: "fatal", error: "LLM scheduler stopped" };
+    },
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "failed-resumable");
+  assert.deepEqual(rec.parked, ["LLM scheduler stopped"]);
+  assert.deepEqual(rec.discarded, [], "never discarded at shutdown");
+});
+
+test("manual resume: fatal on a live runtime discards; unresumable re-parks", async () => {
+  const fatal = manualResumeHarness({
+    runAttempt: async () => ({ outcome: "fatal", error: "400 malformed" }),
+  });
+  const fatalResult = await createManualResumeSession(fatal.deps)("s-resume0001");
+  assert.equal(fatalResult.status, "discarded");
+  assert.deepEqual(fatal.rec.discarded, ["400 malformed"]);
+  assert.deepEqual(fatal.rec.parked, []);
+
+  const unresumable = manualResumeHarness({
+    runAttempt: async () => ({ outcome: "unresumable", error: "session row missing" }),
+  });
+  const unresumableResult = await createManualResumeSession(unresumable.deps)("s-resume0001");
+  assert.equal(unresumableResult.status, "failed-resumable");
+  assert.deepEqual(unresumable.rec.parked, ["session row missing"]);
+});
+
+test("manual resume: unparseable timeline key / unknown account rejects before the slot", async () => {
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ timeline_key: "discord:guild:123" }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.match(result.reason!, /cannot reconstruct outbound target/);
+  assert.deepEqual(rec.slotAcquires, []);
+
+  const unknownAccount = manualResumeHarness({
+    getSessionRow: () => row({ timeline_key: "matrix:other:room:!room" }),
+  });
+  const accountResult = await createManualResumeSession(unknownAccount.deps)("s-resume0001");
+  assert.equal(accountResult.ok, false);
+  assert.match(accountResult.reason!, /cannot reconstruct outbound target/);
 });

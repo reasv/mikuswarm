@@ -4,8 +4,11 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentSessionRow } from "../storage/index.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { Logger } from "../observability/logger.js";
+import type { InboundChatEvent, SenderInfo } from "../types.js";
+import { parseMatrixTimelineKey } from "../proactive/index.js";
 import { mapBuiltMessages } from "./factory.js";
 import { isResumableRunError } from "./runner.js";
+import type { AgentSessionRecord } from "./session-manager.js";
 import type { ImageRef } from "./session-capture.js";
 
 // =============================================================================
@@ -43,8 +46,10 @@ import type { ImageRef } from "./session-capture.js";
 //   at the user/tool-result message whose answer never committed —
 //   `agent.continue()` then re-issues exactly that request.
 //
-// It also owns the auto-resume policy loop (`autoResumeSession`) — extracted
-// from `app.ts` so the park/discard decisions are unit-testable.
+// It also owns the two resume policy surfaces — the auto-resume loop
+// (`autoResumeSession`) and the manual console resume
+// (`createManualResumeSession`) — both extracted from `app.ts` so the
+// park/discard/guard decisions are unit-testable with injected deps.
 // =============================================================================
 
 export interface ResumeMaterial {
@@ -441,4 +446,251 @@ export async function autoResumeSession(error: unknown, deps: AutoResumeDeps): P
     error: lastError,
   });
   return true;
+}
+
+// ─── Manual console resume (spec §6.2; issues #16–#20) ───────────────────────
+
+/** Result envelope of a manual resume — mapped to HTTP by the console route. */
+export interface ManualResumeResult {
+  ok: boolean;
+  /** The session's resulting (or current, on rejection) status. */
+  status: string;
+  reason?: string;
+}
+
+/**
+ * Session statuses a manual resume accepts (Decision D): `failed-resumable`
+ * (parked by Layer-2 exhaustion) and `interrupted` (healed by startup after a
+ * crash) carry the same snapshot/transcript material; viability is decided by
+ * `loadResumeMaterial`, not the status label. Auto-resume-on-startup stays off.
+ */
+export const MANUAL_RESUME_STATUSES: ReadonlySet<string> = new Set([
+  "failed-resumable",
+  "interrupted",
+]);
+
+export interface ManualResumeDeps {
+  /** Live drain flag (read per decision point). */
+  isDraining: () => boolean;
+  /** Durable row read (storage.getAgentSession). */
+  getSessionRow: (sessionId: string) => AgentSessionRow | undefined;
+  /**
+   * Viability gate: `loadResumeMaterial` bound to the app's media/workspace
+   * deps. `null` means there is nothing to redo (transcript ends at a clean
+   * boundary, or material is missing/unusable) → the resume is rejected
+   * WITHOUT touching the row's status.
+   */
+  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
+  /**
+   * True when the SessionManager already holds an in-memory record for the id
+   * (a live run, or a resume mid-flight). Belt-and-suspenders next to the
+   * factory's own in-flight set (issue #16).
+   */
+  hasLiveSession: (sessionId: string) => boolean;
+  /** SessionManager.adopt — re-register the reconstructed record. */
+  adopt: (record: AgentSessionRecord) => void;
+  /**
+   * Claim the per-timeline trigger slot (TriggerCoordinator.tryAcquire,
+   * issue #17): a manual resume must never run concurrently with a live
+   * session on the same timeline. `false` → 409 "timeline busy".
+   */
+  tryAcquireTimelineSlot: (timelineKey: string) => boolean;
+  /**
+   * Release the slot claimed above (TriggerCoordinator.complete) AND drain the
+   * next queued trigger, mirroring `launchSession`'s `.finally` (app-side).
+   */
+  releaseTimelineSlot: (timelineKey: string) => void;
+  /** Bot user id for a Matrix account (config.matrix.accounts[id].user_id). */
+  selfUserIdForAccount: (accountId: string) => string | undefined;
+  /** One resume attempt (app.ts `resumeSessionRun`, attempt 0). */
+  runAttempt: (
+    record: AgentSessionRecord,
+    inbound: InboundChatEvent,
+  ) => Promise<ResumeAttemptResult>;
+  markFailedResumable: (sessionId: string, error?: string) => void;
+  markDiscarded: (sessionId: string, error?: string) => void;
+  logger: Pick<Logger, "info" | "warn" | "error">;
+}
+
+/**
+ * Build the manual-resume action (spec §6.2 "manual park" — the only operator
+ * surface; there are no chat commands). Factory form so the double-POST guard
+ * (the in-flight set, issue #16) is per-runtime state, and so the whole policy
+ * is unit-testable with injected deps (issue #21).
+ *
+ * The returned function reconstructs the session record + a synthetic inbound
+ * from the durable row alone (the original in-memory record was evicted,
+ * possibly in a previous process), then redoes the same resume once:
+ *
+ * - **Double-POST guard (issue #16).** A synchronous in-memory check —
+ *   in-flight set + SessionManager presence — rejects a concurrent resume of
+ *   the same session before any async work (the durable status read alone
+ *   cannot: `markRunning` commits through the async write queue).
+ * - **Timeline slot (issue #17).** The per-timeline trigger slot is claimed
+ *   via `tryAcquireTimelineSlot` (409 "timeline busy" when held) and released
+ *   in a `finally` that also drains the queued trigger, so the resumed run
+ *   can never post concurrently with a live session on its timeline.
+ * - **Original sender identity (issue #18).** The synthetic inbound's sender
+ *   is the PERSISTED trigger sender (`trigger_sender_id`/`…_display_name`),
+ *   so sender-bound tools (user_profile_read/edit, recap's asker) bind to the
+ *   same user the failed session had. `isSelf` is claimed only when that
+ *   sender IS the bot (proactive sessions) — never for user-triggered ones.
+ * - **Interrupted sessions (issue #19, Decision D).** `interrupted` rows are
+ *   accepted alongside `failed-resumable` — same re-issue mechanism, no extra
+ *   turn injected. Viability is gated up front by `loadMaterial`; a row with
+ *   nothing to redo is rejected (409) with its status untouched.
+ * - **Shutdown safety (issue #20).** Draining rejects up front, and a `fatal`
+ *   attempt outcome WHILE draining re-parks `failed-resumable` instead of
+ *   discarding (the fatality is shutdown-caused — scheduler stopped — not
+ *   content-caused; mirrors `autoResumeSession`'s park-over-discard rule).
+ *
+ * Outcomes: completed → `{ok:true}`; mechanical / unresumable → re-park
+ * `failed-resumable`; fatal → discard (live) or re-park (draining).
+ */
+export function createManualResumeSession(
+  deps: ManualResumeDeps,
+): (sessionId: string) => Promise<ManualResumeResult> {
+  const inFlight = new Set<string>();
+
+  return async function manualResumeSession(sessionId: string): Promise<ManualResumeResult> {
+    // Issue #16: synchronous guard FIRST — checked and inserted before any
+    // await, so two near-simultaneous POSTs cannot both pass.
+    if (inFlight.has(sessionId) || deps.hasLiveSession(sessionId)) {
+      return {
+        ok: false,
+        status: "resuming",
+        reason: "a resume (or live run) for this session is already in flight",
+      };
+    }
+    inFlight.add(sessionId);
+    try {
+      const row = deps.getSessionRow(sessionId);
+      if (!row) return { ok: false, status: "unknown", reason: `unknown session: ${sessionId}` };
+      if (!MANUAL_RESUME_STATUSES.has(row.status)) {
+        return {
+          ok: false,
+          status: row.status,
+          reason: `session is '${row.status}', not resumable (failed-resumable | interrupted)`,
+        };
+      }
+      if (deps.isDraining()) {
+        return { ok: false, status: row.status, reason: "runtime is shutting down" };
+      }
+      // Issue #19: viability gate. Rejecting here leaves the row's status
+      // untouched — an interrupted session with nothing to redo stays
+      // `interrupted`, it is NOT converted into a parked `failed-resumable`.
+      const material = await deps.loadMaterial(row);
+      if (!material) {
+        return {
+          ok: false,
+          status: row.status,
+          reason:
+            "nothing to redo: the transcript ends at a clean boundary, or the resume material is missing/unusable",
+        };
+      }
+      const parsed = parseMatrixTimelineKey(row.timeline_key);
+      const selfUserId = parsed ? deps.selfUserIdForAccount(parsed.accountId) : undefined;
+      if (!parsed || !selfUserId) {
+        return {
+          ok: false,
+          status: row.status,
+          reason: "cannot reconstruct outbound target from timeline key",
+        };
+      }
+      // Issue #17: claim the per-timeline trigger slot before running.
+      if (!deps.tryAcquireTimelineSlot(row.timeline_key)) {
+        return {
+          ok: false,
+          status: row.status,
+          reason: "timeline busy: another session holds this timeline's slot",
+        };
+      }
+      try {
+        // Issue #18: the synthetic inbound carries the PERSISTED trigger
+        // sender. The selfUserId fallback only covers pre-v18 rows (no
+        // deployed instances; defensive) — and then isSelf is honestly true.
+        const senderId = row.trigger_sender_id ?? selfUserId;
+        const sender: SenderInfo = { id: senderId };
+        if (row.trigger_sender_display_name) {
+          sender.displayName = row.trigger_sender_display_name;
+        }
+        if (senderId === selfUserId) sender.isSelf = true;
+        const now = Date.now();
+        const inbound: InboundChatEvent = {
+          provider: "matrix",
+          timelineKey: row.timeline_key,
+          event: {
+            id: row.trigger_event_id ?? `resume-${sessionId}`,
+            externalId: row.trigger_external_id ?? undefined,
+            timelineKey: row.timeline_key,
+            provider: "matrix",
+            role: "user",
+            sender,
+            body: row.trigger_body ?? "",
+            timestamp: now,
+            receivedAt: now,
+          },
+          outboundTarget: {
+            provider: "matrix",
+            timelineKey: row.timeline_key,
+            accountId: parsed.accountId,
+            roomId: parsed.roomId,
+            threadId: parsed.threadId,
+          },
+        };
+        const record: AgentSessionRecord = {
+          id: row.id,
+          timelineKey: row.timeline_key,
+          sessionType: row.session_type,
+          status: "resuming",
+          trigger: inbound,
+          createdAt: row.created_at,
+          startedAt: row.started_at ?? undefined,
+        };
+        deps.adopt(record);
+        deps.logger.info("session_manual_resume_started", {
+          sessionId,
+          timelineKey: row.timeline_key,
+          fromStatus: row.status,
+        });
+        const { outcome, error } = await deps.runAttempt(record, inbound);
+        switch (outcome) {
+          case "completed":
+            return { ok: true, status: "completed" };
+          case "mechanical":
+            deps.markFailedResumable(sessionId, error);
+            return {
+              ok: false,
+              status: "failed-resumable",
+              reason: `resume failed mechanically again: ${error}`,
+            };
+          case "unresumable":
+            deps.markFailedResumable(sessionId, error);
+            return { ok: false, status: "failed-resumable", reason: error };
+          case "fatal":
+            // Issue #20 (group-4 flagged hazard): a fatal outcome WHILE
+            // draining is shutdown-caused (scheduler stopped) — re-park, the
+            // material is intact. Only a live-runtime fatal discards.
+            if (deps.isDraining()) {
+              deps.markFailedResumable(sessionId, error);
+              return {
+                ok: false,
+                status: "failed-resumable",
+                reason: `resume aborted by shutdown: ${error}`,
+              };
+            }
+            deps.markDiscarded(sessionId, error);
+            return {
+              ok: false,
+              status: "discarded",
+              reason: `resume failed (non-mechanical): ${error}`,
+            };
+        }
+      } finally {
+        deps.releaseTimelineSlot(row.timeline_key);
+      }
+    } finally {
+      inFlight.delete(sessionId);
+    }
+  };
 }

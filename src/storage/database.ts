@@ -609,6 +609,15 @@ export interface AgentSessionInsert {
   triggerEventId?: string | null;
   triggerExternalId?: string | null;
   triggerBody?: string | null;
+  /**
+   * The ORIGINAL trigger sender's durable identity (id + display name) — the
+   * identity sender-bound tools (`user_profile_read`/`user_profile_edit`,
+   * `recap`'s asker) bind to. Persisted so a manual resume reconstructs the
+   * exact same tool bindings instead of substituting the bot's own identity
+   * (spec CONCURRENCY-AND-RATE-LIMITING §6.2 "redo the exact same request").
+   */
+  triggerSenderId?: string | null;
+  triggerSenderDisplayName?: string | null;
   createdAt: number;
   startedAt?: number | null;
   updatedAt: number;
@@ -628,6 +637,8 @@ export interface AgentSessionRow {
   trigger_event_id: string | null;
   trigger_external_id: string | null;
   trigger_body: string | null;
+  trigger_sender_id: string | null;
+  trigger_sender_display_name: string | null;
   context_snapshot_json: string | null;
   context_dump_path: string | null;
   transcript_json: string | null;
@@ -4193,10 +4204,12 @@ export class Storage {
         `insert into agent_sessions (
           id, timeline_key, session_type, status, model_id,
           trigger_event_id, trigger_external_id, trigger_body,
+          trigger_sender_id, trigger_sender_display_name,
           no_reply, created_at, started_at, updated_at
         ) values (
           @id, @timelineKey, @sessionType, @status, @modelId,
           @triggerEventId, @triggerExternalId, @triggerBody,
+          @triggerSenderId, @triggerSenderDisplayName,
           0, @createdAt, @startedAt, @updatedAt
         )`,
       ).run({
@@ -4208,6 +4221,8 @@ export class Storage {
         triggerEventId: row.triggerEventId ?? null,
         triggerExternalId: row.triggerExternalId ?? null,
         triggerBody: row.triggerBody ?? null,
+        triggerSenderId: row.triggerSenderId ?? null,
+        triggerSenderDisplayName: row.triggerSenderDisplayName ?? null,
         createdAt: row.createdAt,
         startedAt: row.startedAt ?? null,
         updatedAt: row.updatedAt,
@@ -4349,10 +4364,12 @@ export class Storage {
   /**
    * Startup healing (spec §4): flip any session left mid-flight (`running` or
    * `created`) to `interrupted`, before the provider delivers events. No
-   * auto-resume. A session that died while `resuming` (mid auto-resume) is
-   * healed to `failed-resumable` instead — its snapshot + transcript are intact,
-   * so it stays manually resumable from the console (spec
-   * CONCURRENCY-AND-RATE-LIMITING §6.2). Mirrors
+   * auto-resume — but an `interrupted` row with viable resume material stays
+   * MANUALLY resumable from the console (Decision D; the resume endpoint
+   * accepts `failed-resumable` and `interrupted` alike). A session that died
+   * while `resuming` (mid auto-resume) is healed to `failed-resumable` instead
+   * — its snapshot + transcript are intact, so it too stays manually resumable
+   * (spec CONCURRENCY-AND-RATE-LIMITING §6.2). Mirrors
    * `resetStaleActivations`/`resetStaleSummarizationJobs`. Returns the number of
    * rows healed.
    */
@@ -5487,6 +5504,8 @@ create table if not exists agent_sessions (
   trigger_event_id text,
   trigger_external_id text,
   trigger_body text,
+  trigger_sender_id text,
+  trigger_sender_display_name text,
   context_snapshot_json text,
   context_dump_path text,
   transcript_json text,
@@ -5513,7 +5532,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 17;
+export const LATEST_SCHEMA_VERSION = 18;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5913,10 +5932,15 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   // the standard table-redefinition procedure: rebuild the table with the
   // widened CHECK (identical columns otherwise), copy every row, and recreate
   // the two indexes. No FK references agent_sessions (timeline_events carries a
-  // plain agent_session_id text column), so no FK juggling is needed. Skipped
-  // when the table is absent (minimal legacy fixtures; SCHEMA, which runs after
-  // the steps on an existing DB, then builds it at the latest shape). Fresh DBs
-  // get the widened CHECK directly from SCHEMA and never run this step.
+  // plain agent_session_id text column), so no FK juggling is needed. The row
+  // copy names the v17 columns EXPLICITLY (rather than `select *`) so the step
+  // stays harmless when re-run against a later-shaped table (test fixtures
+  // rewind `user_version` on a current DB; any post-v17 columns are dropped by
+  // the rebuild and re-added by their own later, presence-guarded steps).
+  // Skipped when the table is absent (minimal legacy fixtures; SCHEMA, which
+  // runs after the steps on an existing DB, then builds it at the latest
+  // shape). Fresh DBs get the widened CHECK directly from SCHEMA and never run
+  // this step.
   (db) => {
     const table = db
       .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
@@ -5946,12 +5970,47 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
          updated_at integer not null,
          completed_at integer
        );
-       insert into agent_sessions select * from agent_sessions_old;
+       insert into agent_sessions (
+         id, timeline_key, session_type, status, model_id,
+         trigger_event_id, trigger_external_id, trigger_body,
+         context_snapshot_json, context_dump_path, transcript_json,
+         token_estimate, no_reply, error, created_at, started_at, updated_at, completed_at
+       ) select
+         id, timeline_key, session_type, status, model_id,
+         trigger_event_id, trigger_external_id, trigger_body,
+         context_snapshot_json, context_dump_path, transcript_json,
+         token_estimate, no_reply, error, created_at, started_at, updated_at, completed_at
+       from agent_sessions_old;
        drop table agent_sessions_old;
        create index if not exists idx_agent_sessions_timeline
          on agent_sessions(timeline_key, created_at desc);
        create index if not exists idx_agent_sessions_status
          on agent_sessions(status, updated_at desc);`,
+    );
+  },
+  // index 17 (v17 -> v18): add the durable trigger-sender identity columns to
+  // `agent_sessions` (`trigger_sender_id`, `trigger_sender_display_name`).
+  // A manual resume reconstructs its synthetic inbound from the row alone; the
+  // original sender's identity must be durable so sender-bound tools
+  // (user_profile_read/edit, recap's asker) bind to the SAME user the failed
+  // session had — not the bot's own identity (spec CONCURRENCY-AND-RATE-LIMITING
+  // §6.2 "redo the exact same request"). Nullable ADD COLUMNs: existing rows
+  // backfill to NULL (resume then falls back to the bot identity, the pre-v18
+  // behaviour). Skipped when the table is absent (minimal legacy fixtures;
+  // SCHEMA then builds it at the latest shape) or when the columns already
+  // exist (a current DB whose user_version was rewound by a test fixture —
+  // mirrors the v15→v16 presence guard). Fresh DBs get the columns directly
+  // from SCHEMA and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
+      .get();
+    if (!table) return;
+    const columns = db.pragma(`table_info(agent_sessions)`) as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "trigger_sender_id")) return;
+    db.exec(
+      `alter table agent_sessions add column trigger_sender_id text;
+       alter table agent_sessions add column trigger_sender_display_name text;`,
     );
   },
 ];

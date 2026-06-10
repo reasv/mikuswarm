@@ -22,9 +22,11 @@ import {
   SessionManager,
   SessionRunner,
   autoResumeSession,
+  createManualResumeSession,
   isResumableRunError,
   loadResumeMaterial,
   type AgentSessionRecord,
+  type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
@@ -76,7 +78,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
-import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
+import { ProactiveScheduler } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
   ChatSearchIndexer,
@@ -1271,74 +1273,59 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
-   * Manual console resume of a parked `failed-resumable` session (spec §6.2 —
-   * the only operator action; there are no chat commands). Reconstructs the
-   * session record + a synthetic inbound from the durable row (the original
-   * in-memory record was evicted, possibly in a previous process), then redoes
-   * the same resume once. On another mechanical failure the session is
-   * re-parked (still resumable); on a fatal one it is discarded.
+   * Manual console resume of a parked `failed-resumable` or `interrupted`
+   * session (spec §6.2 / Decision D — the only operator action; there are no
+   * chat commands). The whole policy — double-POST guard, status + viability
+   * gates, per-timeline slot, sender reconstruction from the durable row, and
+   * the park/discard outcome handling (issues #16–#20) — lives in
+   * `createManualResumeSession` (src/agent/recovery.ts) where it is
+   * unit-testable; this wiring injects the runtime deps.
    */
-  async function manualResumeSession(
-    sessionId: string,
-  ): Promise<{ ok: boolean; status: string; reason?: string }> {
-    if (draining) return { ok: false, status: "failed-resumable", reason: "runtime is shutting down" };
-    const row = storage.getAgentSession(sessionId);
-    if (!row) return { ok: false, status: "unknown", reason: `unknown session: ${sessionId}` };
-    if (row.status !== "failed-resumable") {
-      return { ok: false, status: row.status, reason: `session is '${row.status}', not 'failed-resumable'` };
-    }
-    const parsed = parseMatrixTimelineKey(row.timeline_key);
-    const selfUserId = parsed ? config.matrix.accounts[parsed.accountId]?.user_id : undefined;
-    if (!parsed || !selfUserId) {
-      return { ok: false, status: row.status, reason: "cannot reconstruct outbound target from timeline key" };
-    }
-    const now = Date.now();
-    const inbound: InboundChatEvent = {
-      provider: "matrix",
-      timelineKey: row.timeline_key,
-      event: {
-        id: row.trigger_event_id ?? `resume-${sessionId}`,
-        externalId: row.trigger_external_id ?? undefined,
-        timelineKey: row.timeline_key,
-        provider: "matrix",
-        role: "user",
-        sender: { id: selfUserId, isSelf: true },
-        body: row.trigger_body ?? "",
-        timestamp: now,
-        receivedAt: now,
-      },
-      outboundTarget: {
-        provider: "matrix",
-        timelineKey: row.timeline_key,
-        accountId: parsed.accountId,
-        roomId: parsed.roomId,
-        threadId: parsed.threadId,
-      },
-    };
-    const record: AgentSessionRecord = {
-      id: row.id,
-      timelineKey: row.timeline_key,
-      sessionType: row.session_type,
-      status: "resuming",
-      trigger: inbound,
-      createdAt: row.created_at,
-      startedAt: row.started_at ?? undefined,
-    };
-    sessions.adopt(record);
-    logger.info("session_manual_resume_started", { sessionId, timelineKey: row.timeline_key });
-    const { outcome, error } = await resumeSessionRun(record, inbound, 0);
-    switch (outcome) {
-      case "completed":
-        return { ok: true, status: "completed" };
-      case "mechanical":
-        sessions.markFailedResumable(sessionId, { error });
-        return { ok: false, status: "failed-resumable", reason: `resume failed mechanically again: ${error}` };
-      case "unresumable":
-        sessions.markFailedResumable(sessionId, { error });
-        return { ok: false, status: "failed-resumable", reason: error };
-      case "fatal":
-        sessions.markDiscarded(sessionId, { error });
-        return { ok: false, status: "discarded", reason: `resume failed (non-mechanical): ${error}` };
+  const runManualResume = createManualResumeSession({
+    isDraining: () => draining,
+    getSessionRow: (id) => storage.getAgentSession(id),
+    loadMaterial: (row) => loadResumeMaterial(row, { media: storage, workspaceRoot, logger }),
+    hasLiveSession: (id) => sessions.get(id) !== undefined,
+    adopt: (record) => sessions.adopt(record),
+    tryAcquireTimelineSlot: (timelineKey) => triggerCoordinator.tryAcquire(timelineKey),
+    // Mirror launchSession's `.finally`: release the slot AND drain the next
+    // queued trigger (issue #17). During drain the coordinator is cleared by
+    // stop(), so skip — same as launchSession does.
+    releaseTimelineSlot: (timelineKey) => {
+      if (draining) return;
+      const next = triggerCoordinator.complete(timelineKey);
+      if (next) void launchSession(next, true).catch((error) => {
+        logger.error("queued_session_launch_failed", {
+          timelineKey: next.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Release the per-timeline slot so future triggers aren't permanently blocked
+        triggerCoordinator.complete(next.timelineKey);
+      });
+    },
+    selfUserIdForAccount: (accountId) => config.matrix.accounts[accountId]?.user_id,
+    runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
+    markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
+    markDiscarded: (id, error) => sessions.markDiscarded(id, { error }),
+    logger,
+  });
+
+  /**
+   * The console-facing wrapper tracks the in-flight resume in `activeRuns`
+   * (issue #20) so `stop()`'s `waitForRuns` awaits it before the scheduler and
+   * storage tear down — mirroring `launchSession`'s run tracking.
+   */
+  async function manualResumeSession(sessionId: string): Promise<ManualResumeResult> {
+    const run = runManualResume(sessionId);
+    const tracked: Promise<void> = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    activeRuns.add(tracked);
+    try {
+      return await run;
+    } finally {
+      activeRuns.delete(tracked);
     }
   }
 

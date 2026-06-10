@@ -29,12 +29,13 @@ export const abortSession = command(SessionId, (id) =>
 );
 
 /**
- * Manually resume a parked `failed-resumable` session (spec
- * CONCURRENCY-AND-RATE-LIMITING §6.2): the agent re-creates the run from the
- * persisted snapshot + transcript and redoes the failed request. The request
- * long-polls until the resumed run reaches a terminal state; the agent returns
- * 409 when the session isn't parked or the resume failed again (re-parked or
- * discarded — the body's message says which).
+ * Manually resume a parked `failed-resumable` or `interrupted` session (spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D): the agent re-creates the
+ * run from the persisted snapshot + transcript and redoes the failed request.
+ * The request long-polls until the resumed run reaches a terminal state; the
+ * agent returns 409 when the session isn't resumable (wrong status, resume
+ * already in flight, timeline busy, or nothing to redo) or the resume failed
+ * again (re-parked or discarded — the body's message says which).
  */
 export const resumeSession = command(SessionId, (id) =>
 	apiPost(`/api/sessions/${encodeURIComponent(id)}/resume`, ResumeSessionResponse)

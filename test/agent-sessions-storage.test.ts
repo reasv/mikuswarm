@@ -121,6 +121,8 @@ function baseInsert(overrides: Partial<AgentSessionInsert> = {}): AgentSessionIn
     triggerEventId: "evt-1",
     triggerExternalId: "$server-1",
     triggerBody: "hello there",
+    triggerSenderId: "@alice:example.org",
+    triggerSenderDisplayName: "Alice",
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -141,6 +143,10 @@ test("fresh DB has agent_sessions table: insert + getAgentSession round-trips", 
     assert.equal(row.trigger_event_id, "evt-1");
     assert.equal(row.trigger_external_id, "$server-1");
     assert.equal(row.trigger_body, "hello there");
+    // The durable trigger-sender identity (v18, issue #18): manual resume
+    // reconstructs sender-bound tools from these.
+    assert.equal(row.trigger_sender_id, "@alice:example.org");
+    assert.equal(row.trigger_sender_display_name, "Alice");
     // Unset columns default appropriately.
     assert.equal(row.context_snapshot_json, null);
     assert.equal(row.context_dump_path, null);
@@ -276,8 +282,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 17", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 17);
+test("LATEST_SCHEMA_VERSION is 18", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 18);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1032,4 +1038,207 @@ test("saveAgentSessionSnapshot leaves an already-written transcript untouched", 
     // Transcript survives the snapshot write.
     assert.equal(row.transcript_json, '[{"role":"user"},{"role":"assistant"}]');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Populated-row migration coverage (issue #21): the v16→v17 CHECK-widening
+// step REBUILDS agent_sessions (rename → create → insert…select * → drop),
+// and the v17→v18 step ALTERs in the trigger-sender columns. The pre-existing
+// chain test only exercised them on an EMPTY table — these run with rows.
+// ---------------------------------------------------------------------------
+
+/** The v5..v16 `agent_sessions` shape: narrow status CHECK, no sender columns. */
+const V16_AGENT_SESSIONS = `create table agent_sessions (
+   id text primary key,
+   timeline_key text not null,
+   session_type text not null default 'default',
+   status text not null
+     check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended')),
+   model_id text,
+   trigger_event_id text,
+   trigger_external_id text,
+   trigger_body text,
+   context_snapshot_json text,
+   context_dump_path text,
+   transcript_json text,
+   token_estimate integer,
+   no_reply integer not null default 0,
+   error text,
+   created_at integer not null,
+   started_at integer,
+   updated_at integer not null,
+   completed_at integer
+ );
+ create index idx_agent_sessions_timeline on agent_sessions(timeline_key, created_at desc);
+ create index idx_agent_sessions_status on agent_sessions(status, updated_at desc);`;
+
+/** The v17 shape: widened CHECK (resume states), still no sender columns. */
+const V17_AGENT_SESSIONS = V16_AGENT_SESSIONS.replace(
+  `'interrupted', 'suspended'))`,
+  `'interrupted', 'suspended',
+                      'resuming', 'failed-resumable'))`,
+);
+
+const FULL_ROW_INSERT = `insert into agent_sessions (
+   id, timeline_key, session_type, status, model_id,
+   trigger_event_id, trigger_external_id, trigger_body,
+   context_snapshot_json, context_dump_path, transcript_json,
+   token_estimate, no_reply, error, created_at, started_at, updated_at, completed_at
+ ) values (
+   @id, @timelineKey, @sessionType, @status, @modelId,
+   @triggerEventId, @triggerExternalId, @triggerBody,
+   @snapshot, @dumpPath, @transcript,
+   @tokenEstimate, @noReply, @error, @createdAt, @startedAt, @updatedAt, @completedAt
+ )`;
+
+function legacyRow(id: string, status: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    timelineKey: "matrix:miku:room:!room",
+    sessionType: "default",
+    status,
+    modelId: "anthropic/claude",
+    triggerEventId: `evt-${id}`,
+    triggerExternalId: `$server-${id}`,
+    triggerBody: "hello there",
+    snapshot: '[{"type":"system"}]',
+    dumpPath: `/dumps/${id}.json`,
+    transcript: '[{"role":"user"}]',
+    tokenEstimate: 42,
+    noReply: 0,
+    error: null,
+    createdAt: 1_000,
+    startedAt: 1_100,
+    updatedAt: 2_000,
+    completedAt: 3_000,
+    ...overrides,
+  };
+}
+
+test("v16 -> v17 table rebuild preserves populated agent_sessions rows (and v18 adds sender columns)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v16-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS); // fresh-vs-existing probe keys on this table
+    legacy.exec(V16_AGENT_SESSIONS);
+    const insert = legacy.prepare(FULL_ROW_INSERT);
+    insert.run(legacyRow("s-mig-a", "completed", { noReply: 1 }));
+    insert.run(legacyRow("s-mig-b", "interrupted", { error: "stopped", completedAt: null }));
+    insert.run(legacyRow("s-mig-c", "discarded", { error: "boom" }));
+    legacy.pragma("user_version = 16");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => db.pragma("user_version", { simple: true }) as number);
+      assert.equal(version, LATEST_SCHEMA_VERSION);
+
+      // Every row survived the rebuild with its values intact.
+      const count = storage.read(
+        (db) => (db.prepare(`select count(*) as n from agent_sessions`).get() as { n: number }).n,
+      );
+      assert.equal(count, 3);
+      const a = storage.getAgentSession("s-mig-a");
+      assert.ok(a);
+      assert.equal(a.status, "completed");
+      assert.equal(a.model_id, "anthropic/claude");
+      assert.equal(a.trigger_event_id, "evt-s-mig-a");
+      assert.equal(a.trigger_external_id, "$server-s-mig-a");
+      assert.equal(a.trigger_body, "hello there");
+      assert.equal(a.context_snapshot_json, '[{"type":"system"}]');
+      assert.equal(a.context_dump_path, "/dumps/s-mig-a.json");
+      assert.equal(a.transcript_json, '[{"role":"user"}]');
+      assert.equal(a.token_estimate, 42);
+      assert.equal(a.no_reply, 1);
+      assert.equal(a.error, null);
+      assert.equal(a.created_at, 1_000);
+      assert.equal(a.started_at, 1_100);
+      assert.equal(a.updated_at, 2_000);
+      assert.equal(a.completed_at, 3_000);
+      const b = storage.getAgentSession("s-mig-b");
+      assert.equal(b?.status, "interrupted");
+      assert.equal(b?.error, "stopped");
+      assert.equal(b?.completed_at, null);
+      assert.equal(storage.getAgentSession("s-mig-c")?.error, "boom");
+
+      // v18 columns exist and backfilled to NULL on legacy rows.
+      assert.equal(a.trigger_sender_id, null);
+      assert.equal(a.trigger_sender_display_name, null);
+
+      // The widened CHECK accepts the resume states on a migrated row.
+      await storage.updateAgentSessionStatus("s-mig-b", "resuming", { error: "529" });
+      assert.equal(storage.getAgentSession("s-mig-b")?.status, "resuming");
+      await storage.updateAgentSessionStatus("s-mig-b", "failed-resumable", { error: "529" });
+      assert.equal(storage.getAgentSession("s-mig-b")?.status, "failed-resumable");
+
+      // Both indexes were recreated by the rebuild.
+      const indexes = storage.read((db) =>
+        (
+          db
+            .prepare(`select name from sqlite_master where type = 'index' and tbl_name = 'agent_sessions'`)
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      );
+      assert.ok(indexes.includes("idx_agent_sessions_timeline"));
+      assert.ok(indexes.includes("idx_agent_sessions_status"));
+
+      // A fresh insert with the sender identity round-trips on the migrated DB.
+      await storage.insertAgentSession(baseInsert({ id: "s-post-mig-1" }));
+      const fresh = storage.getAgentSession("s-post-mig-1");
+      assert.equal(fresh?.trigger_sender_id, "@alice:example.org");
+      assert.equal(fresh?.trigger_sender_display_name, "Alice");
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("v17 -> v18 ALTER adds the trigger-sender columns with populated rows intact (issue #18)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v17-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS);
+    legacy.exec(V17_AGENT_SESSIONS);
+    const insert = legacy.prepare(FULL_ROW_INSERT);
+    // A parked resume row — exactly what a manual resume reads post-migration.
+    insert.run(legacyRow("s-parked-01", "failed-resumable", { error: "529 overloaded", completedAt: null }));
+    insert.run(legacyRow("s-done-0001", "completed", { noReply: 1 }));
+    legacy.pragma("user_version = 17");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => db.pragma("user_version", { simple: true }) as number);
+      assert.equal(version, LATEST_SCHEMA_VERSION);
+
+      const parked = storage.getAgentSession("s-parked-01");
+      assert.ok(parked);
+      assert.equal(parked.status, "failed-resumable");
+      assert.equal(parked.error, "529 overloaded");
+      assert.equal(parked.context_snapshot_json, '[{"type":"system"}]');
+      assert.equal(parked.transcript_json, '[{"role":"user"}]');
+      // New columns backfill to NULL (resume then falls back to the bot identity).
+      assert.equal(parked.trigger_sender_id, null);
+      assert.equal(parked.trigger_sender_display_name, null);
+      assert.equal(storage.getAgentSession("s-done-0001")?.no_reply, 1);
+
+      // New writes carry the sender identity.
+      await storage.insertAgentSession(
+        baseInsert({ id: "s-post-mig-2", triggerSenderId: "@bob:example.org", triggerSenderDisplayName: "Bob" }),
+      );
+      const fresh = storage.getAgentSession("s-post-mig-2");
+      assert.equal(fresh?.trigger_sender_id, "@bob:example.org");
+      assert.equal(fresh?.trigger_sender_display_name, "Bob");
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
