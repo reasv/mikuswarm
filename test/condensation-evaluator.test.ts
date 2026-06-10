@@ -5,6 +5,7 @@ import type { Summary } from "../src/storage/index.js";
 import { evaluateCondensation } from "../src/summarization/index.js";
 import type { SummarizationConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/index.js";
+import type { CanonicalChatEvent } from "../src/types.js";
 
 const TK = "matrix:test:room:!room";
 
@@ -307,5 +308,184 @@ test("oversized run is chunked into fanout-sized segments", async () => {
   assert.ok(job2, "second job should start at s5");
   assert.equal(job2.inputEndId, "s9");
 
+  storage.close();
+});
+
+// ── §7.2 failed-range terminality (group-1b follow-ups) ──────────────────────
+
+function timelineEvent(o: { id: string; timestamp: number }): CanonicalChatEvent {
+  return {
+    id: o.id,
+    timelineKey: TK,
+    provider: "matrix",
+    role: "user",
+    sender: { id: "alice", displayName: "Alice" },
+    body: `event ${o.id}`,
+    timestamp: o.timestamp,
+    receivedAt: o.timestamp,
+  };
+}
+
+/** Insert + terminally fail a summarization job over [startId, endId]. */
+async function insertFailedJob(
+  storage: Storage,
+  o: { id: string; level: number; startId: string; endId: string },
+): Promise<void> {
+  await storage.insertSummarizationJob({
+    id: o.id,
+    timelineKey: TK,
+    level: o.level,
+    inputStartId: o.startId,
+    inputEndId: o.endId,
+    inputTokenCount: 500,
+    targetTokenCount: 800,
+    maxRetries: 2,
+  });
+  await storage.failSummarizationJob(o.id, "content-determined failure");
+}
+
+test("1b-1: a terminally failed level-1 range interrupts the run — condensation never spans it", async () => {
+  const storage = await openStorage();
+  // Six level-1 summaries that would otherwise form one run of 6, whose first
+  // fanout-sized chunk [s0..s4] would SPAN the failed range below — producing a
+  // level-2 summary that covers the range's timestamps without its content,
+  // which selection would then prefer over the (never-persisted) failure
+  // placeholder, silently erasing the §7.2 marker.
+  for (let i = 0; i < 6; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  // A terminally failed level-1 job over events at ts 260–290 — strictly
+  // between s2 (latest=250) and s3 (earliest=300).
+  await storage.appendTimelineEvent(timelineEvent({ id: "fe0", timestamp: 260 }));
+  await storage.appendTimelineEvent(timelineEvent({ id: "fe1", timestamp: 290 }));
+  await insertFailedJob(storage, { id: "failed_l1", level: 1, startId: "fe0", endId: "fe1" });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  // The failed range splits the run into [s0..s2] and [s3..s5] (both < fanout=5):
+  // no condensation job may span the failed range.
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "no level-2 job may span a terminally failed level-1 range",
+  );
+  storage.close();
+});
+
+test("1b-1: condensation still proceeds on both sides of a failed range", async () => {
+  const storage = await openStorage();
+  // Ten level-1 summaries with a failed range between s4 and s5: the split
+  // yields runs [s0..s4] and [s5..s9], each exactly fanout-sized — the guard
+  // must not over-block condensation that does not span the range.
+  for (let i = 0; i < 10; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  await storage.appendTimelineEvent(timelineEvent({ id: "fe0", timestamp: 460 }));
+  await storage.appendTimelineEvent(timelineEvent({ id: "fe1", timestamp: 490 }));
+  await insertFailedJob(storage, { id: "failed_l1", level: 1, startId: "fe0", endId: "fe1" });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 2, "both fanout-sized runs beside the failed range condense");
+  const ranges = jobs.map((j) => [j.inputStartId, j.inputEndId]).sort();
+  assert.deepEqual(ranges, [
+    ["s0", "s4"],
+    ["s5", "s9"],
+  ]);
+  storage.close();
+});
+
+test("1b-1: a failed level-1 range with unresolvable boundaries does not interrupt the run", async () => {
+  const storage = await openStorage();
+  // The failed job's boundary events are gone (retention-deleted): no failure
+  // placeholder will ever render for the range (synthesizeFailurePlaceholders
+  // skips it), so there is no marker to protect — condensation proceeds.
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  await insertFailedJob(storage, { id: "failed_gone", level: 1, startId: "gone0", endId: "gone1" });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  assert.equal(storage.getActiveSummarizationJobs(TK, 2).length, 1);
+  storage.close();
+});
+
+test("1b-1: a terminally failed level-2 condensation job is never re-enqueued; deleting the row re-enables the chunk", async () => {
+  const storage = await openStorage();
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  // A level-2 condensation job over [s0..s4] that exhausted its retries.
+  await insertFailedJob(storage, { id: "failed_l2", level: 2, startId: "s0", endId: "s4" });
+
+  // The evaluator must NOT re-enqueue the doomed chunk (failed is terminal for
+  // the condensation range — re-running a content-determined failure would
+  // loop forever on the background budget).
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "a chunk overlapping a terminally failed condensation job is not re-enqueued",
+  );
+
+  // Manual override: delete the failed job row → the next evaluation
+  // re-enqueues the chunk.
+  await storage.write((db) =>
+    db.prepare(`delete from summarization_jobs where id = 'failed_l2'`).run(),
+  );
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 1, "deleting the failed row re-enables the chunk");
+  assert.equal(jobs[0]!.inputStartId, "s0");
+  assert.equal(jobs[0]!.inputEndId, "s4");
+  storage.close();
+});
+
+test("1b-1: a failed level-2 job with unresolvable input summaries does not block condensation", async () => {
+  const storage = await openStorage();
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  // A failed level-2 job whose input summary ids no longer resolve: a chunk
+  // built from EXISTING summaries cannot be the same doomed input, so the
+  // failed row must not block (contrast: an unresolvable ACTIVE job range
+  // conservatively blocks — see the ghost_job test above).
+  await insertFailedJob(storage, {
+    id: "failed_ghost",
+    level: 2,
+    startId: "deleted_s0",
+    endId: "deleted_s4",
+  });
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  assert.equal(storage.getActiveSummarizationJobs(TK, 2).length, 1);
   storage.close();
 });

@@ -957,6 +957,70 @@ test("saveBestEffortDraft overwrites a previous draft", async () => {
   }
 });
 
+// ── hasEventsBetweenSummaries fallback bounds (1b-2) ───────────────
+
+test("hasEventsBetweenSummaries start-bound fallback is inclusive: a same-ms sibling of a deleted boundary event stops the cursor", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev1", body: "a", timestamp: 1000 }));
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev2", body: "b", timestamp: 2000 }));
+    // Same-millisecond sibling of ev2 (Matrix timestamp collision).
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev2b", body: "b2", timestamp: 2000 }));
+    await storage.appendTimelineEvent(assistantEvent({ id: "ev3", body: "c", timestamp: 3000 }));
+
+    const base = {
+      timelineKey: TK,
+      level: 1,
+      content: "x",
+      eventCount: 1,
+      tokenCount: 10,
+      modelId: null,
+      status: "complete" as const,
+      backfillJobId: null,
+      generatedAt: 0,
+      createdAt: 0,
+    };
+    const prev: Summary = {
+      ...base,
+      id: "sum_prev",
+      earliestTimestamp: 1000,
+      latestTimestamp: 2000,
+      latestEventId: "ev2",
+    };
+    const next: Summary = {
+      ...base,
+      id: "sum_next",
+      earliestTimestamp: 3000,
+      latestTimestamp: 3000,
+      earliestEventId: "ev3",
+      latestEventId: "ev3",
+    };
+
+    // Resolvable boundary: ev2b sits strictly between ev2 and ev3.
+    assert.equal(storage.hasEventsBetweenSummaries(TK, prev, next), true);
+
+    // Retention deletes the boundary event ev2 but not its same-ms sibling.
+    // The start bound degrades to the INCLUSIVE timestamp-only fallback
+    // (timestamp >= prev.latestTimestamp): ev2b — which the probe can no
+    // longer prove was covered by prev — must count as "between" and stop the
+    // cursor (the no-drop direction; an exclusive `>` bound would let it slip
+    // behind the cursor and vanish from context).
+    await storage.write((db) => db.prepare(`delete from timeline_events where id = 'ev2'`).run());
+    assert.equal(
+      storage.hasEventsBetweenSummaries(TK, prev, next),
+      true,
+      "a surviving same-ms sibling of the deleted boundary event must stop the cursor",
+    );
+
+    // With the sibling gone too, nothing renderable sits between — contiguous.
+    await storage.write((db) => db.prepare(`delete from timeline_events where id = 'ev2b'`).run());
+    assert.equal(storage.hasEventsBetweenSummaries(TK, prev, next), false);
+  } finally {
+    storage.close();
+  }
+});
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function insertSummary(

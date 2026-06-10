@@ -2721,10 +2721,16 @@ export class Storage {
    * `prev.latestEventId` and `next`'s lineage (or its in-memory
    * `earliestEventId` for synthesized placeholders); when a bound cannot be
    * resolved (lineage absent, or the event row retention-deleted), it degrades
-   * to a timestamp-only bound in the conservative direction — for the start
-   * bound `timestamp > prev.latestTimestamp`, for the end bound `timestamp <=
-   * next.earliestTimestamp` — so collision-adjacent events count as "between"
-   * and the cursor stops rather than silently skipping them.
+   * to a timestamp-only INCLUSIVE bound — for the start bound `timestamp >=
+   * prev.latestTimestamp`, for the end bound `timestamp <=
+   * next.earliestTimestamp` — so collision-adjacent events (including a
+   * surviving same-millisecond sibling of a deleted boundary event) count as
+   * "between" and the cursor stops rather than silently skipping them. This
+   * errs in the no-drop direction: an event at exactly the boundary timestamp
+   * that prev actually covered stalls the cursor at prev and double-renders
+   * (layer + raw) until retention removes it — degraded but safe; the
+   * alternative (exclusive start) would let an un-covered same-ms sibling
+   * slip behind the cursor and vanish from context.
    */
   hasEventsBetweenSummaries(timelineKey: string, prev: Summary, next: Summary): boolean {
     const after = this.getEventCursor(timelineKey, prev.latestEventId);
@@ -2735,7 +2741,7 @@ export class Storage {
       ? `(timestamp > @aTs
           or (timestamp = @aTs and received_at > @aRcv)
           or (timestamp = @aTs and received_at = @aRcv and id > @aId))`
-      : `timestamp > @aTs`;
+      : `timestamp >= @aTs`;
     const beforeCond = before
       ? `(timestamp < @bTs
           or (timestamp = @bTs and received_at < @bRcv)
