@@ -1,6 +1,6 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
-import { acquireHttpSlot, noteHttpResponse } from "./http-limiter.js";
+import { acquireHttpSlot, hostOf, noteHttpResponse } from "./http-limiter.js";
 
 // =============================================================================
 // App-layer egress guard (defense-in-depth SSRF protection).
@@ -90,58 +90,139 @@ export interface GuardedFetchOptions {
  *
  * Guard ENABLED: uses `redirect: "manual"` and re-runs `assertPublicHttpUrl` on
  * every `Location` hop before following it, so a public URL cannot 302 to a
- * private/metadata host. Capped at `maxHops` redirects.
+ * private/metadata host. Capped at `maxHops` redirects. The manual loop mirrors
+ * WHATWG fetch redirect semantics (what undici's native `redirect: "follow"`
+ * does): on a cross-origin hop (scheme+host+port, compared hop-by-hop against the
+ * previous URL) it strips credential headers (`authorization`,
+ * `proxy-authorization`, `cookie`, `host` — undici's exact strip list) so a
+ * redirect cannot exfiltrate a caller's credentials to a third-party host; and a
+ * 303 (or a 301/302 answering a POST) is followed as a bodyless GET with the
+ * body-describing headers dropped — only 307/308 preserve method + body.
  *
  * Guard DISABLED: validates only scheme/credentials, then issues one native
  * `redirect: "follow"` fetch (no DNS, no per-hop revalidation) — the network
- * firewall is the boundary.
+ * firewall is the boundary, and undici applies the same redirect semantics
+ * natively.
  *
  * Returns the final non-redirect `Response` so callers stream the body as usual.
  *
  * Every call also passes through the per-host HTTP limiter (`http-limiter.ts`):
  * it acquires a per-host admission slot (bounded by the per-host + global caps and
  * any active backoff) before the request and records the response status so a
- * 429/503 from a host backs off all subsequent callers to that host. This is the
- * single egress chokepoint, so the limiter applies whether or not the SSRF address
- * guard is enabled.
+ * 429/503 from a host backs off all subsequent callers to that host. In the
+ * guard-enabled loop the slot follows the chain: when a hop lands on a different
+ * host, the previous host's slot is released and a slot on the hop host is
+ * acquired (gating on THAT host's backoff) before the hop is fetched — so a
+ * backed-off host is not reachable via redirects and per-host concurrency counts
+ * the host actually being hit. In the guard-disabled path the (single) final
+ * response's status is recorded against the final URL (`response.url`), not the
+ * original one, for the same reason. This is the single egress chokepoint, so the
+ * limiter applies whether or not the SSRF address guard is enabled.
  */
 export async function guardedFetch(url: string, options: GuardedFetchOptions = {}): Promise<Response> {
-  const release = await acquireHttpSlot(url, options.signal);
-  try {
-    if (!egressGuardEnabled) {
+  if (!egressGuardEnabled) {
+    const release = await acquireHttpSlot(url, options.signal);
+    try {
       await assertPublicHttpUrl(url);
-      const response = await globalThis.fetch(url, buildInit(options, "follow"));
-      noteHttpResponse(url, response.status, response.headers.get("retry-after"));
+      const response = await globalThis.fetch(
+        url,
+        buildInit(options, "follow", options.method, options.body, withDefaultUserAgent(options.headers)),
+      );
+      // Native "follow" lands on the final URL; attribute the status to the host
+      // that actually produced it, not the original one.
+      noteHttpResponse(response.url || url, response.status, response.headers.get("retry-after"));
       return response;
+    } finally {
+      release();
     }
-    const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS;
-    let current = url;
+  }
+  const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS;
+  let current = url;
+  let currentHost = hostOf(current);
+  let method = options.method;
+  let body = options.body;
+  const headers = withDefaultUserAgent(options.headers);
+  // Per-host slot accounting across the chain: exactly one slot is held at a time;
+  // it is released either when the chain moves to a different host (swap below) or
+  // in the single `finally`. Releases are idempotent, so the abort/error paths
+  // (acquire rejection mid-swap, fetch failure mid-chain) can never double-count.
+  let release = await acquireHttpSlot(current, options.signal);
+  try {
     for (let hop = 0; ; hop++) {
       if (hop > maxHops) throw new Error("Too many redirects.");
       await assertPublicHttpUrl(current);
-      const response = await globalThis.fetch(current, buildInit(options, "manual"));
+      const response = await globalThis.fetch(current, buildInit(options, "manual", method, body, headers));
       noteHttpResponse(current, response.status, response.headers.get("retry-after"));
       if (!isRedirectStatus(response.status)) return response;
       const location = response.headers.get("location");
       if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
       // Discard the redirect response body before following the next hop.
       await response.body?.cancel().catch(() => {});
-      current = new URL(location, current).toString();
+      const next = new URL(location, current).toString();
+
+      // WHATWG fetch redirect semantics: a 303 — or a 301/302 answering a POST —
+      // is followed as a bodyless GET; only 307/308 preserve method + body.
+      const effectiveMethod = (method ?? "GET").toUpperCase();
+      if (
+        (response.status === 303 && effectiveMethod !== "GET" && effectiveMethod !== "HEAD") ||
+        ((response.status === 301 || response.status === 302) && effectiveMethod === "POST")
+      ) {
+        method = "GET";
+        body = undefined;
+        deleteHeaders(headers, REQUEST_BODY_HEADERS);
+      }
+      // Cross-origin hop (vs the PREVIOUS url, not the first): strip credential
+      // headers, mirroring undici's native redirect handling.
+      if (new URL(current).origin !== new URL(next).origin) {
+        deleteHeaders(headers, CROSS_ORIGIN_STRIPPED_HEADERS);
+      }
+      // Hop host change: release the previous host's slot and gate on the hop
+      // host's backoff/caps before fetching it.
+      const nextHost = hostOf(next);
+      if (nextHost !== currentHost) {
+        release();
+        release = await acquireHttpSlot(next, options.signal);
+        currentHost = nextHost;
+      }
+      current = next;
     }
   } finally {
     release();
   }
 }
 
-function buildInit(options: GuardedFetchOptions, redirect: RequestRedirect): RequestInit {
+/**
+ * Credential-bearing headers stripped on a cross-origin redirect hop. This is
+ * undici's exact list for native `redirect: "follow"` (the WHATWG spec mandates
+ * `authorization`; undici additionally strips `proxy-authorization`, `cookie`,
+ * and `host`, and we mirror it so guard-on and guard-off behave identically).
+ */
+const CROSS_ORIGIN_STRIPPED_HEADERS = ["authorization", "proxy-authorization", "cookie", "host"];
+
+/** Body-describing headers dropped when a redirect converts the request to GET. */
+const REQUEST_BODY_HEADERS = ["content-encoding", "content-language", "content-location", "content-type", "content-length"];
+
+function deleteHeaders(headers: Record<string, string>, names: readonly string[]): void {
+  for (const key of Object.keys(headers)) {
+    if (names.includes(key.toLowerCase())) delete headers[key];
+  }
+}
+
+function buildInit(
+  options: GuardedFetchOptions,
+  redirect: RequestRedirect,
+  method: string | undefined,
+  body: BodyInit | undefined,
+  headers: Record<string, string>,
+): RequestInit {
   return {
     signal: options.signal,
     redirect,
-    ...(options.method ? { method: options.method } : {}),
-    ...(options.body !== undefined ? { body: options.body } : {}),
+    ...(method ? { method } : {}),
+    ...(body !== undefined ? { body } : {}),
     // Default a User-Agent only when the caller didn't supply one (case-insensitive),
     // so a tool's own User-Agent isn't duplicated under a different-case key.
-    headers: withDefaultUserAgent(options.headers),
+    headers,
     // Node's native fetch is built on undici and accepts a dispatcher at runtime,
     // but the type is not in the lib.dom Request init.
     ...(options.dispatcher ? { dispatcher: options.dispatcher } : {}),
