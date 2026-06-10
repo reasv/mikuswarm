@@ -19,9 +19,12 @@ export {
 } from "./scheduler.js";
 export {
   SessionRunner,
+  SessionRunnerError,
+  isResumableRunError,
   extractLastAssistantText,
   stripThinkingContamination,
   isTerminallyValid,
   isExplicitNoReply,
   type SessionRunResult,
 } from "./runner.js";
+export { loadResumeMaterial, stripFailedTail, type ResumeMaterial } from "./recovery.js";

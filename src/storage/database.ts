@@ -567,6 +567,10 @@ export interface SummarizationJobInsert {
  *   - `discarded`   failed/aborted (terminal)
  *   - `interrupted` process stopped mid-run; healed on startup (reserved)
  *   - `suspended`   paused awaiting external input (reserved, future §7)
+ *   - `resuming`    auto-resume in progress after a mechanical run failure
+ *                   (spec CONCURRENCY-AND-RATE-LIMITING §6.2)
+ *   - `failed-resumable` auto-resume exhausted; parked for a manual console
+ *                   resume (snapshot + transcript retained; §6.2)
  */
 export type AgentSessionStatus =
   | "created"
@@ -574,7 +578,9 @@ export type AgentSessionStatus =
   | "completed"
   | "discarded"
   | "interrupted"
-  | "suspended";
+  | "suspended"
+  | "resuming"
+  | "failed-resumable";
 
 /**
  * Initial-insert shape for an `agent_sessions` row (spec §4, §5). The runner
@@ -4238,18 +4244,29 @@ export class Storage {
   /**
    * Startup healing (spec §4): flip any session left mid-flight (`running` or
    * `created`) to `interrupted`, before the provider delivers events. No
-   * auto-resume. Mirrors `resetStaleActivations`/`resetStaleSummarizationJobs`.
-   * Returns the number of rows healed.
+   * auto-resume. A session that died while `resuming` (mid auto-resume) is
+   * healed to `failed-resumable` instead — its snapshot + transcript are intact,
+   * so it stays manually resumable from the console (spec
+   * CONCURRENCY-AND-RATE-LIMITING §6.2). Mirrors
+   * `resetStaleActivations`/`resetStaleSummarizationJobs`. Returns the number of
+   * rows healed.
    */
   resetStaleSessions(): Promise<number> {
     return this.write((db) => {
-      const result = db
+      const now = Date.now();
+      const interrupted = db
         .prepare(
           `update agent_sessions set status = 'interrupted', updated_at = ?
            where status in ('running', 'created')`,
         )
-        .run(Date.now());
-      return result.changes;
+        .run(now);
+      const parked = db
+        .prepare(
+          `update agent_sessions set status = 'failed-resumable', updated_at = ?
+           where status = 'resuming'`,
+        )
+        .run(now);
+      return interrupted.changes + parked.changes;
     });
   }
 
@@ -5359,7 +5376,8 @@ create table if not exists agent_sessions (
   timeline_key text not null,
   session_type text not null default 'default',
   status text not null
-    check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended')),
+    check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended',
+                     'resuming', 'failed-resumable')),
   model_id text,
   trigger_event_id text,
   trigger_external_id text,
@@ -5390,7 +5408,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 16;
+export const LATEST_SCHEMA_VERSION = 17;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -5781,6 +5799,54 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       `alter table summarization_jobs
          add column priority text not null default 'background'
            check(priority in ('interactive', 'proactive', 'background', 'background_low'));`,
+    );
+  },
+  // index 16 (v16 -> v17): widen the `agent_sessions.status` CHECK with the two
+  // resume-in-place states (spec CONCURRENCY-AND-RATE-LIMITING §6.2): `resuming`
+  // (auto-resume in progress) and `failed-resumable` (parked for a manual
+  // console resume). SQLite cannot ALTER a CHECK constraint, so the step follows
+  // the standard table-redefinition procedure: rebuild the table with the
+  // widened CHECK (identical columns otherwise), copy every row, and recreate
+  // the two indexes. No FK references agent_sessions (timeline_events carries a
+  // plain agent_session_id text column), so no FK juggling is needed. Skipped
+  // when the table is absent (minimal legacy fixtures; SCHEMA, which runs after
+  // the steps on an existing DB, then builds it at the latest shape). Fresh DBs
+  // get the widened CHECK directly from SCHEMA and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
+      .get();
+    if (!table) return;
+    db.exec(
+      `alter table agent_sessions rename to agent_sessions_old;
+       create table agent_sessions (
+         id text primary key,
+         timeline_key text not null,
+         session_type text not null default 'default',
+         status text not null
+           check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended',
+                            'resuming', 'failed-resumable')),
+         model_id text,
+         trigger_event_id text,
+         trigger_external_id text,
+         trigger_body text,
+         context_snapshot_json text,
+         context_dump_path text,
+         transcript_json text,
+         token_estimate integer,
+         no_reply integer not null default 0,
+         error text,
+         created_at integer not null,
+         started_at integer,
+         updated_at integer not null,
+         completed_at integer
+       );
+       insert into agent_sessions select * from agent_sessions_old;
+       drop table agent_sessions_old;
+       create index if not exists idx_agent_sessions_timeline
+         on agent_sessions(timeline_key, created_at desc);
+       create index if not exists idx_agent_sessions_status
+         on agent_sessions(status, updated_at desc);`,
     );
   },
 ];

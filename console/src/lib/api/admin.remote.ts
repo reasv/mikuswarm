@@ -3,6 +3,7 @@ import { Schema } from 'effect';
 import { apiPost } from '$lib/server/api/runtime';
 import {
 	AbortSessionResponse,
+	ResumeSessionResponse,
 	PipelineId,
 	RetryPipelineItemResponse,
 	RetryFailedResponse
@@ -25,6 +26,18 @@ const SessionId = Schema.standardSchemaV1(Schema.NonEmptyString);
  */
 export const abortSession = command(SessionId, (id) =>
 	apiPost(`/api/sessions/${encodeURIComponent(id)}/abort`, AbortSessionResponse)
+);
+
+/**
+ * Manually resume a parked `failed-resumable` session (spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2): the agent re-creates the run from the
+ * persisted snapshot + transcript and redoes the failed request. The request
+ * long-polls until the resumed run reaches a terminal state; the agent returns
+ * 409 when the session isn't parked or the resume failed again (re-parked or
+ * discarded — the body's message says which).
+ */
+export const resumeSession = command(SessionId, (id) =>
+	apiPost(`/api/sessions/${encodeURIComponent(id)}/resume`, ResumeSessionResponse)
 );
 
 /**

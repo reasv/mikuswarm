@@ -1,5 +1,6 @@
 export {
   ProactiveScheduler,
+  parseMatrixTimelineKey,
   resolveChannelConfig,
   evaluateGate,
   computeNextAttempt,

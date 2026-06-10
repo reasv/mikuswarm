@@ -42,6 +42,12 @@ fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally an
 llm_request_retries = 4            # additional attempts after the first (total = 5)
 llm_request_backoff_base_ms = 500
 llm_request_backoff_max_ms = 15000
+# Layer 2 (spec §6.2): when a LIVE session's run dies mechanically after Layer 1
+# exhausts, re-create the agent from the persisted snapshot + transcript and redo
+# the exact same request (auto-resume, exponential backoff), then park it
+# `failed-resumable` for a manual console resume. 0 disables auto-resume.
+session_auto_resume_attempts = 2
+session_auto_resume_backoff_ms = 5000
 
 [models.default]
 id = "claude-opus-4-7"

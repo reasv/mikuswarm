@@ -28,6 +28,13 @@ export interface ConsoleServerDeps {
   activityBus?: PipelineActivityBus;
   /** Workspace root; media `local_path`s are resolved beneath it. */
   workspaceRoot: string;
+  /**
+   * Manual resume-in-place of a parked `failed-resumable` session (spec
+   * CONCURRENCY-AND-RATE-LIMITING §6.2). Injected by app wiring; optional so
+   * existing callers/tests that don't exercise the resume route need not
+   * provide it (the route then 503s).
+   */
+  resumeSession?: (sessionId: string) => Promise<{ ok: boolean; status: string; reason?: string }>;
   logger: Logger;
 }
 

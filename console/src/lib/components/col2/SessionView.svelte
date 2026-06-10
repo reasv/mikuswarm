@@ -2,12 +2,13 @@
 	import { useQueryClient } from '@tanstack/svelte-query';
 	import { toast } from 'svelte-sonner';
 	import OctagonXIcon from '@lucide/svelte/icons/octagon-x';
+	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
 	import { sessionQuery } from '$lib/query/sessions';
 	import { keys } from '$lib/query/keys';
 	import { selection } from '$lib/stores/selection.svelte';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage } from '$lib/rollout';
-	import { abortSession } from '$lib/api/admin.remote';
+	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
 	import VerbatimContext from '$lib/components/verbatim/VerbatimContext.svelte';
 	import Rollout from '$lib/components/rollout/Rollout.svelte';
@@ -30,6 +31,7 @@
 	const session = sessionQuery(() => activeId);
 
 	let stopping = $state(false);
+	let resuming = $state(false);
 
 	/** Invalidate the affected caches after a stop / stream-end. */
 	function refreshAfterMutation(id: string) {
@@ -73,6 +75,32 @@
 		}
 	}
 
+	// Resume button → POST resume (spec CONCURRENCY-AND-RATE-LIMITING §6.2): the
+	// agent re-creates the parked run from its persisted snapshot + transcript and
+	// redoes the failed request, long-polling until the resumed run settles. A 409
+	// means the resume failed again (re-parked) or the session is no longer parked.
+	async function handleResume() {
+		const id = activeId;
+		if (!id || resuming) return;
+		resuming = true;
+		toast.info('Resuming session…', { description: 'Redoing the failed request.' });
+		try {
+			const { status } = await resumeSession(id);
+			if (status === 'completed') {
+				toast.success('Session resumed and completed');
+			} else {
+				toast.warning('Session resume returned an unexpected status', { description: status });
+			}
+		} catch (err) {
+			toast.error('Resume failed', {
+				description: (err as { body?: { message?: string } })?.body?.message
+			});
+		} finally {
+			resuming = false;
+			refreshAfterMutation(id);
+		}
+	}
+
 	// Verbatim input = frozen snapshot prefix + the transcript's head final user turn
 	// (spec §3 / §10a). Rollout = the rest of the transcript (spec §10b).
 	const inputMessages = $derived.by(() => {
@@ -86,6 +114,7 @@
 		return d ? d.transcript.slice(d.rolloutStartIndex) : [];
 	});
 	const isRunning = $derived(session.data?.session.status === 'running');
+	const isResumable = $derived(session.data?.session.status === 'failed-resumable');
 
 	$effect(() => {
 		const d = session.data;
@@ -136,6 +165,17 @@
 				>
 					<OctagonXIcon class="size-3" />
 					{stopping ? 'Stopping…' : 'Stop'}
+				</Button>
+			{:else if isResumable}
+				<Button
+					variant="outline"
+					size="sm"
+					class="h-6 px-2 text-[10px]"
+					disabled={resuming}
+					onclick={handleResume}
+				>
+					<RotateCcwIcon class="size-3" />
+					{resuming ? 'Resuming…' : 'Resume'}
 				</Button>
 			{/if}
 		</div>

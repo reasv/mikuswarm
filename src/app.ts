@@ -16,7 +16,15 @@ import {
   TimelineStore,
   TriggerCoordinator,
 } from "./timeline/index.js";
-import { AgentSessionFactory, LlmScheduler, SessionManager, SessionRunner } from "./agent/index.js";
+import {
+  AgentSessionFactory,
+  LlmScheduler,
+  SessionManager,
+  SessionRunner,
+  isResumableRunError,
+  loadResumeMaterial,
+  type AgentSessionRecord,
+} from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -67,7 +75,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
-import { ProactiveScheduler } from "./proactive/index.js";
+import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
   ChatSearchIndexer,
@@ -979,47 +987,24 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return ok;
   }
 
-  async function launchSession(
+  /**
+   * Assemble the full per-session tool set. Shared by the fresh-launch path
+   * (`launchSession`) and resume-in-place (`resumeSessionRun`, spec
+   * CONCURRENCY-AND-RATE-LIMITING §6.2), which must rebuild the SAME tool set
+   * for a session reconstructed from its durable row.
+   */
+  function buildSessionTools(
     inbound: InboundChatEvent,
-    duplicate: boolean,
-    opts?: { proactive?: boolean },
-  ): Promise<void> {
-    // Proactive sessions (ARCHITECTURE.md §9g) reuse this launcher verbatim; the
-    // only branches are the session type (counted for budget), the proactive
-    // context-build mode, and typing suppression. Everything else — tool assembly,
-    // capture, slot release, queued-trigger drainage — is shared.
-    const proactive = opts?.proactive === true;
-    const session = proactive
-      ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
-      : sessions.createPlaceholder(inbound);
-    sessions.markRunning(session.id);
-    logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
-    const target = inbound.outboundTarget;
-    if (!target) {
-      sessions.markDiscarded(session.id);
-      logger.error("session_missing_outbound_target", {
-        sessionId: session.id,
-        timelineKey: session.timelineKey,
-        provider: inbound.provider,
-      });
-      const next = triggerCoordinator.complete(session.timelineKey);
-      if (next && !draining) void launchSession(next, true).catch((error) => {
-        logger.error("queued_session_launch_failed", {
-          timelineKey: next.timelineKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Release the per-timeline slot so future triggers aren't permanently blocked
-        triggerCoordinator.complete(next.timelineKey);
-      });
-      return;
-    }
+    sessionId: string,
+    target: NonNullable<InboundChatEvent["outboundTarget"]>,
+  ) {
     const roomId = target.roomId;
-    const tools = [
+    return [
       createSendMessageTool({
         provider,
         target,
         timeline,
-        agentSessionId: session.id,
+        agentSessionId: sessionId,
         workspaceRoot,
         mediaMaxBytes: downloadSizeLimit,
       }),
@@ -1049,7 +1034,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSearchMessagesTool({
         storage,
         indexer: chatSearchIndexer,
-        currentTimelineKey: session.timelineKey,
+        currentTimelineKey: inbound.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
       }),
       // Summary drill-down (§9e). DB-backed (lineage tables + shared renderer), so like
@@ -1058,7 +1043,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createRecapTool({
         storage,
         indexer: chatSearchIndexer,
-        currentTimelineKey: session.timelineKey,
+        currentTimelineKey: inbound.timelineKey,
         askerId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         defaults: {
           budgetTokens: chatSearchDefaults.recapBudgetTokens,
@@ -1069,7 +1054,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createUserActivityTool({
         storage,
         indexer: chatSearchIndexer,
-        currentTimelineKey: session.timelineKey,
+        currentTimelineKey: inbound.timelineKey,
         // Membership source for include_silent / never-posted users (§9e). Maps a
         // timeline_key (`matrix:<account>:room:<roomId>[:thread:...]`) to the account's
         // client and asks the native layer for the room's current joined members. A
@@ -1089,7 +1074,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(browserSession && config.browser
         ? [createBrowserTool({
             session: browserSession,
-            agentSessionId: session.id,
+            agentSessionId: sessionId,
             config: config.browser,
             // Same shared per-model base64 cap read_image uses, so inline
             // screenshots respect the model's per-image budget (issue #2).
@@ -1165,6 +1150,243 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSillyTavernCardEditTool({ workspaceRoot, fetchClient, downloadSizeLimit, config: config.sillytavern }),
       ...mcpTools,
     ].filter((t) => !disabledTools.has(t.name));
+  }
+
+  /**
+   * Run one resume-in-place attempt for a session (spec
+   * CONCURRENCY-AND-RATE-LIMITING §6.2): rebuild the tool set, re-create the
+   * agent from the persisted snapshot + transcript (skipping the context build
+   * entirely), and drive the runner in continue-mode so it re-issues the exact
+   * request that failed. Shared by auto-resume (in the failed run's promise
+   * chain, while the timeline slot is still held) and the manual console resume.
+   */
+  async function resumeSessionRun(
+    record: AgentSessionRecord,
+    inbound: InboundChatEvent,
+    attempt: number,
+  ): Promise<{ outcome: "completed" | "mechanical" | "fatal" | "unresumable"; error?: string }> {
+    const row = storage.getAgentSession(record.id);
+    if (!row) return { outcome: "unresumable", error: "session row missing" };
+    const material = loadResumeMaterial(row);
+    if (!material) return { outcome: "unresumable", error: "no resumable snapshot/transcript" };
+    const target = inbound.outboundTarget;
+    if (!target) return { outcome: "unresumable", error: "no outbound target" };
+
+    let agent;
+    try {
+      ({ agent } = await factory.create(record, buildSessionTools(inbound, record.id, target), {
+        resume: material,
+      }));
+    } catch (error) {
+      return {
+        outcome: "fatal",
+        error: `resume factory failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    sessions.markRunning(record.id);
+    sessions.attachAgent(record.id, agent);
+    // Snapshot deliberately omitted: the durable row already holds it (written
+    // once at original creation); only the transcript keeps flushing.
+    const captureHandle = attachSessionCapture(agent, {
+      storage,
+      sessionId: record.id,
+      logger,
+    });
+    const runner = new SessionRunner({
+      provider,
+      target,
+      suppressTyping: record.sessionType === (config.proactive?.session_type ?? "proactive"),
+    });
+    try {
+      const result = await runner.run(
+        agent,
+        record,
+        config.agent.sessions.forced_completion_retries,
+        undefined, // continue-mode: redo the failed request from the transcript tail
+        sessions.runLifecycle(record.id),
+      );
+      sessions.markCompleted(record.id, { noReply: result.noReply });
+      logger.info("session_resumed_completed", {
+        sessionId: record.id,
+        attempt,
+        noReply: result.noReply,
+      });
+      return { outcome: "completed" };
+    } catch (error) {
+      try {
+        await captureHandle.flushNow();
+      } catch {
+        // flush is best-effort; the original error wins
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      return { outcome: isResumableRunError(error) ? "mechanical" : "fatal", error: message };
+    } finally {
+      captureHandle.detach();
+    }
+  }
+
+  /**
+   * Auto-resume (spec §6.2): bounded, backed-off resume attempts for a live run
+   * that died mechanically (Layer-1 exhausted). Runs INSIDE the failed run's
+   * promise chain so the per-timeline trigger slot stays held for the whole
+   * recovery — no second session can race the resumed one. Returns true when the
+   * failure was handled (resumed, parked, or discarded here); false hands the
+   * failure back to the ordinary discard path.
+   */
+  async function maybeAutoResumeSession(
+    session: AgentSessionRecord,
+    error: unknown,
+  ): Promise<boolean> {
+    const attempts = config.recovery?.session_auto_resume_attempts ?? 2;
+    if (attempts <= 0 || draining) return false;
+    if (!isResumableRunError(error)) return false;
+    const initialError = error instanceof Error ? error.message : String(error);
+    sessions.markResuming(session.id, { error: initialError });
+    logger.warn("session_auto_resume_started", {
+      sessionId: session.id,
+      timelineKey: session.timelineKey,
+      error: initialError,
+    });
+
+    const backoffBase = config.recovery?.session_auto_resume_backoff_ms ?? 5000;
+    let lastError = initialError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, backoffBase * 2 ** (attempt - 1)));
+      if (draining) break;
+      const { outcome, error: attemptError } = await resumeSessionRun(session, session.trigger, attempt);
+      if (outcome === "completed") return true;
+      lastError = attemptError ?? lastError;
+      if (outcome === "fatal" || outcome === "unresumable") {
+        sessions.markDiscarded(session.id, { error: lastError });
+        logger.error("session_resume_failed_terminal", {
+          sessionId: session.id,
+          attempt,
+          outcome,
+          error: lastError,
+        });
+        return true;
+      }
+      // mechanical → another attempt (or park below)
+      sessions.markResuming(session.id, { error: lastError });
+      logger.warn("session_auto_resume_retry", { sessionId: session.id, attempt, error: lastError });
+    }
+
+    sessions.markFailedResumable(session.id, { error: lastError });
+    logger.error("session_parked_failed_resumable", {
+      sessionId: session.id,
+      timelineKey: session.timelineKey,
+      error: lastError,
+    });
+    return true;
+  }
+
+  /**
+   * Manual console resume of a parked `failed-resumable` session (spec §6.2 —
+   * the only operator action; there are no chat commands). Reconstructs the
+   * session record + a synthetic inbound from the durable row (the original
+   * in-memory record was evicted, possibly in a previous process), then redoes
+   * the same resume once. On another mechanical failure the session is
+   * re-parked (still resumable); on a fatal one it is discarded.
+   */
+  async function manualResumeSession(
+    sessionId: string,
+  ): Promise<{ ok: boolean; status: string; reason?: string }> {
+    if (draining) return { ok: false, status: "failed-resumable", reason: "runtime is shutting down" };
+    const row = storage.getAgentSession(sessionId);
+    if (!row) return { ok: false, status: "unknown", reason: `unknown session: ${sessionId}` };
+    if (row.status !== "failed-resumable") {
+      return { ok: false, status: row.status, reason: `session is '${row.status}', not 'failed-resumable'` };
+    }
+    const parsed = parseMatrixTimelineKey(row.timeline_key);
+    const selfUserId = parsed ? config.matrix.accounts[parsed.accountId]?.user_id : undefined;
+    if (!parsed || !selfUserId) {
+      return { ok: false, status: row.status, reason: "cannot reconstruct outbound target from timeline key" };
+    }
+    const now = Date.now();
+    const inbound: InboundChatEvent = {
+      provider: "matrix",
+      timelineKey: row.timeline_key,
+      event: {
+        id: row.trigger_event_id ?? `resume-${sessionId}`,
+        externalId: row.trigger_external_id ?? undefined,
+        timelineKey: row.timeline_key,
+        provider: "matrix",
+        role: "user",
+        sender: { id: selfUserId, isSelf: true },
+        body: row.trigger_body ?? "",
+        timestamp: now,
+        receivedAt: now,
+      },
+      outboundTarget: {
+        provider: "matrix",
+        timelineKey: row.timeline_key,
+        accountId: parsed.accountId,
+        roomId: parsed.roomId,
+        threadId: parsed.threadId,
+      },
+    };
+    const record: AgentSessionRecord = {
+      id: row.id,
+      timelineKey: row.timeline_key,
+      sessionType: row.session_type,
+      status: "resuming",
+      trigger: inbound,
+      createdAt: row.created_at,
+      startedAt: row.started_at ?? undefined,
+    };
+    sessions.adopt(record);
+    logger.info("session_manual_resume_started", { sessionId, timelineKey: row.timeline_key });
+    const { outcome, error } = await resumeSessionRun(record, inbound, 0);
+    switch (outcome) {
+      case "completed":
+        return { ok: true, status: "completed" };
+      case "mechanical":
+        sessions.markFailedResumable(sessionId, { error });
+        return { ok: false, status: "failed-resumable", reason: `resume failed mechanically again: ${error}` };
+      case "unresumable":
+        sessions.markFailedResumable(sessionId, { error });
+        return { ok: false, status: "failed-resumable", reason: error };
+      case "fatal":
+        sessions.markDiscarded(sessionId, { error });
+        return { ok: false, status: "discarded", reason: `resume failed (non-mechanical): ${error}` };
+    }
+  }
+
+  async function launchSession(
+    inbound: InboundChatEvent,
+    duplicate: boolean,
+    opts?: { proactive?: boolean },
+  ): Promise<void> {
+    // Proactive sessions (ARCHITECTURE.md §9g) reuse this launcher verbatim; the
+    // only branches are the session type (counted for budget), the proactive
+    // context-build mode, and typing suppression. Everything else — tool assembly,
+    // capture, slot release, queued-trigger drainage — is shared.
+    const proactive = opts?.proactive === true;
+    const session = proactive
+      ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
+      : sessions.createPlaceholder(inbound);
+    sessions.markRunning(session.id);
+    logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
+    const target = inbound.outboundTarget;
+    if (!target) {
+      sessions.markDiscarded(session.id);
+      logger.error("session_missing_outbound_target", {
+        sessionId: session.id,
+        timelineKey: session.timelineKey,
+        provider: inbound.provider,
+      });
+      const next = triggerCoordinator.complete(session.timelineKey);
+      if (next && !draining) void launchSession(next, true).catch((error) => {
+        logger.error("queued_session_launch_failed", {
+          timelineKey: next.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Release the per-timeline slot so future triggers aren't permanently blocked
+        triggerCoordinator.complete(next.timelineKey);
+      });
+      return;
+    }
+    const tools = buildSessionTools(inbound, session.id, target);
     let agent;
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
@@ -1221,11 +1443,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         });
       })
       .catch(async (error) => {
-        // Best-effort transcript flush before marking the session discarded
-        // (issue #1): if the run rejected before any turn_end, the only durable
-        // copy of the kickoff turn (+ any partial assistant message) is the live
-        // state. flushNow() never throws, but wrap it so it can never mask the
-        // original run error.
+        // Best-effort transcript flush BEFORE any recovery decision (issue #1 +
+        // spec §6.2 persist-at-failure): if the run rejected before any
+        // turn_end, the only durable copy of the kickoff turn (+ any partial
+        // assistant message) is the live state — and resume-in-place seeds from
+        // exactly this flush. flushNow() never throws, but wrap it so it can
+        // never mask the original run error.
         try {
           await captureHandle.flushNow();
         } catch (flushErr) {
@@ -1234,6 +1457,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             error: flushErr instanceof Error ? flushErr.message : String(flushErr),
           });
         }
+        // Layer-2 resume-in-place (spec §6.2): a mechanical run death (Layer-1
+        // exhausted) is auto-resumed from the persisted snapshot + transcript,
+        // inside this promise chain so the timeline slot stays held throughout.
+        if (await maybeAutoResumeSession(session, error)) return;
         sessions.markDiscarded(session.id, {
           error: error instanceof Error ? error.message : String(error),
         });
@@ -1483,6 +1710,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       },
       activityBus: pipelineActivityBus,
       workspaceRoot,
+      // Manual resume of a parked failed-resumable session (spec §6.2) — the
+      // console's second mutating action, next to abort.
+      resumeSession: manualResumeSession,
       logger: logger.child("console"),
     });
     await consoleServer.start();

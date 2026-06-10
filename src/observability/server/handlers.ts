@@ -205,6 +205,45 @@ export function abortSession(
 }
 
 /**
+ * POST /api/sessions/:id/resume — manual resume-in-place of a parked
+ * `failed-resumable` session (spec CONCURRENCY-AND-RATE-LIMITING §6.2). The
+ * console's second mutating route, mirroring `abortSession`'s envelope
+ * conventions.
+ *
+ * - 200 `{ sessionId, status }` — the resume ran to completion (`status:
+ *   "completed"`).
+ * - 404 — no such session row.
+ * - 409 — the session isn't `failed-resumable`, or the resume attempt itself
+ *   failed (re-parked or discarded); `sessionStatus` carries the resulting
+ *   state and `message` the reason.
+ * - 503 — the runtime didn't inject a resume action (read-only deployment).
+ *
+ * The resume runs the session to a terminal state before responding, so the
+ * operator gets the definitive outcome (a session run is seconds-to-minutes;
+ * the console client tolerates a long-poll here).
+ */
+export async function resumeSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): Promise<void> {
+  const id = ctx.params.id;
+  const resume = ctx.deps.resumeSession;
+  if (!resume) return sendError(res, 503, "Resume is not available in this deployment");
+  const row = ctx.deps.storage.getAgentSession(id);
+  if (!row) return sendError(res, 404, `Unknown session: ${id}`);
+
+  const result = await resume(id);
+  if (!result.ok) {
+    return sendError(res, 409, result.reason ?? `Session could not be resumed: ${id}`, {
+      sessionId: id,
+      sessionStatus: result.status,
+    });
+  }
+  sendJson(res, 200, { sessionId: id, status: result.status });
+}
+
+/**
  * GET /api/media/:ref — bytes for an externalized image ref. `:ref` is the media
  * asset id (= `attachmentId`). Resolved beneath the workspace root with a
  * path-traversal guard.

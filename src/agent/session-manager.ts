@@ -10,7 +10,9 @@ export type AgentSessionStatus =
   | "completed"
   | "discarded"
   | "interrupted"
-  | "suspended";
+  | "suspended"
+  | "resuming"
+  | "failed-resumable";
 
 /** Trigger body is truncated before persisting to keep the row small. */
 const MAX_TRIGGER_BODY = 500;
@@ -137,6 +139,56 @@ export class SessionManager {
       }),
     );
     this.evict(sessionId);
+  }
+
+  /**
+   * Mark a session as auto-resuming after a mechanical run failure (spec
+   * CONCURRENCY-AND-RATE-LIMITING §6.2). NOT terminal: the record stays in the
+   * map (the resume loop re-marks it `running` per attempt), and the prior
+   * agent ref is dropped so the SSE stream can't reach the dead run.
+   */
+  markResuming(sessionId: string, opts: { error?: string } = {}): void {
+    if (this.sessions.get(sessionId)?.status === "interrupted") return;
+    this.update(sessionId, (session) => ({ ...session, status: "resuming" }));
+    this.agents.delete(sessionId);
+    this.persist("session status resuming", sessionId, (storage) =>
+      storage.updateAgentSessionStatus(sessionId, "resuming", { error: opts.error }),
+    );
+  }
+
+  /**
+   * Park a session whose auto-resume attempts are exhausted (spec §6.2): a
+   * manual console action can redo the same resume on demand. Terminal for the
+   * in-memory lifecycle (evicted like the other terminal states); the durable
+   * row keeps the snapshot + transcript the manual resume needs.
+   */
+  markFailedResumable(sessionId: string, opts: { error?: string } = {}): void {
+    if (this.sessions.get(sessionId)?.status === "interrupted") {
+      this.evict(sessionId);
+      return;
+    }
+    const completedAt = Date.now();
+    this.update(sessionId, (session) => ({ ...session, status: "failed-resumable", completedAt }));
+    this.persist("session status failed-resumable", sessionId, (storage) =>
+      storage.updateAgentSessionStatus(sessionId, "failed-resumable", {
+        completedAt,
+        error: opts.error,
+      }),
+    );
+    this.evict(sessionId);
+  }
+
+  /**
+   * Re-register a session record reconstructed from its durable row (the manual
+   * console resume of a parked `failed-resumable` session, possibly after a
+   * restart — the original in-memory record was evicted). The caller drives the
+   * normal lifecycle from here (`markRunning` → `attachAgent` → run).
+   */
+  adopt(record: AgentSessionRecord): void {
+    this.sessions.set(record.id, record);
+    const ids = this.byTimeline.get(record.timelineKey) ?? new Set<string>();
+    ids.add(record.id);
+    this.byTimeline.set(record.timelineKey, ids);
   }
 
   markDiscarded(sessionId: string, opts: { error?: string } = {}): void {

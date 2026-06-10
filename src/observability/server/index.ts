@@ -10,6 +10,7 @@ import {
   sessionDetail,
   sessionStream,
   abortSession,
+  resumeSession,
   media,
   summaryDetail,
 } from "./handlers.js";
@@ -53,8 +54,10 @@ export interface ConsoleServer {
  * no new dependencies. Every request is bearer-authorized (when a token is
  * configured) and every JSON body is secret-redacted on the way out.
  *
- * Read-only except for the single operator mutation `POST /api/sessions/:id/abort`
- * (the Stop button, spec §13), which aborts a live run via `SessionManager`. All
+ * Read-only except for the operator mutations `POST /api/sessions/:id/abort`
+ * (the Stop button, spec §13), `POST /api/sessions/:id/resume` (manual
+ * resume-in-place of a parked `failed-resumable` session, spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2), and the pipeline retry actions. All
  * other routes are GET observability reads.
  */
 export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServer {
@@ -67,6 +70,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/sessions/:id", sessionDetail)
     .add("GET", "/api/sessions/:id/stream", sessionStream)
     .add("POST", "/api/sessions/:id/abort", abortSession)
+    .add("POST", "/api/sessions/:id/resume", resumeSession)
     .add("GET", "/api/media/:ref", media)
     .add("GET", "/api/summaries/:id", summaryDetail)
     .add("GET", "/api/pipelines", listPipelines)

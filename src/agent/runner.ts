@@ -2,6 +2,7 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
+import { classifyLlmError } from "./request-retry.js";
 
 export interface SessionRunResult {
   sessionId: string;
@@ -12,12 +13,23 @@ export interface SessionRunResult {
 export class SessionRunnerError extends Error {
   constructor(
     message: string,
-    readonly phase: "prompt" | "wait" | "force_completion",
+    readonly phase: "prompt" | "wait" | "force_completion" | "mechanical",
     options?: { cause?: unknown },
   ) {
     super(message, options);
     this.name = "SessionRunnerError";
   }
+}
+
+/**
+ * True for the run failures Layer-2 resume-in-place can fix (spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2): the runner surfaced a `"mechanical"`
+ * SessionRunnerError — the model's turn died on a retryable transport/upstream
+ * failure after Layer-1 exhausted. Everything else (semantic run problems,
+ * aborts, programming errors) is not improved by re-issuing the same request.
+ */
+export function isResumableRunError(error: unknown): boolean {
+  return error instanceof SessionRunnerError && error.phase === "mechanical";
 }
 
 export interface SessionRunnerOptions {
@@ -38,11 +50,18 @@ const TYPING_KEEPALIVE_MS = 4_000;
 export class SessionRunner {
   constructor(private readonly options: SessionRunnerOptions = {}) {}
 
+  /**
+   * Drive a session run to a terminal state. `kickoff` is the frozen final user
+   * turn for a fresh session; `undefined` means **continue-mode** (resume-in-place,
+   * spec §6.2): the transcript was seeded from the persisted record and the run
+   * re-issues from its current tail via `agent.continue()` — redoing the exact
+   * request that failed rather than starting a new turn.
+   */
   async run(
     agent: Agent,
     session: AgentSessionRecord,
     maxRetries: number,
-    kickoff: AgentMessage,
+    kickoff: AgentMessage | undefined,
     lifecycle?: SessionRunLifecycle,
   ): Promise<SessionRunResult> {
     let retries = 0;
@@ -65,8 +84,15 @@ export class SessionRunner {
       // Kick the loop with the frozen final user turn (the rich `triggerGroup` popped
       // off the prefix by the factory, §2b). It becomes the first turn of the
       // transcript — delivered once, not echoed as a separate raw user message.
-      await promptAgent(agent, kickoff);
+      // Continue-mode (resume, §6.2): no new turn — re-issue from the seeded
+      // transcript's tail.
+      if (kickoff !== undefined) {
+        await promptAgent(agent, kickoff);
+      } else {
+        await continueAgent(agent);
+      }
       await waitForAgentIdle(agent);
+      throwIfMechanicalFailure(agent, lifecycle);
 
       while (
         !isTerminallyValid(agent.state.messages) &&
@@ -84,6 +110,7 @@ export class SessionRunner {
         retries += 1;
         await forceCompletion(agent);
         await waitForAgentIdle(agent);
+        throwIfMechanicalFailure(agent, lifecycle);
       }
 
       const noReply = !isTerminallyValid(agent.state.messages) ||
@@ -133,6 +160,36 @@ async function promptAgent(agent: Agent, message: unknown): Promise<void> {
   await agent.prompt(message as any).catch((error) => {
     throw new SessionRunnerError("Agent prompt failed", "prompt", { cause: error });
   });
+}
+
+async function continueAgent(agent: Agent): Promise<void> {
+  await agent.continue().catch((error) => {
+    throw new SessionRunnerError("Agent continue failed", "prompt", { cause: error });
+  });
+}
+
+/**
+ * Surface a mechanically failed run as a typed rejection (spec §6.2). pi-agent-core
+ * RESOLVES a failed run — it synthesizes a `stopReason:"error"` assistant message
+ * and records the failure in `AgentState.errorMessage` — so without this check a
+ * live session whose upstream died (after Layer-1 retry exhausted) would settle as
+ * a silent `NO_REPLY` completion. A retryable failure (transport/5xx/429) throws
+ * `phase:"mechanical"`, which the app-level recovery routes to resume-in-place.
+ * Intentional aborts (operator Stop, tool/turn caps) and fatal errors (auth,
+ * malformed request) keep today's settle-in-place behaviour — re-issuing the same
+ * request cannot help them.
+ */
+function throwIfMechanicalFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void {
+  const errorMessage = agent.state.errorMessage;
+  if (!errorMessage || errorMessage.length === 0) return;
+  if (lifecycle?.isInterrupted()) return;
+  const last = findLastAssistantMessage(agent.state.messages) as
+    | { stopReason?: string }
+    | undefined;
+  const stopReason = typeof last?.stopReason === "string" ? last.stopReason : undefined;
+  if (stopReason === "aborted") return;
+  if (classifyLlmError(errorMessage, stopReason) !== "retryable") return;
+  throw new SessionRunnerError(`agent run failed mechanically: ${errorMessage}`, "mechanical");
 }
 
 async function waitForAgentIdle(agent: Agent): Promise<void> {

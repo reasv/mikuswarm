@@ -550,10 +550,6 @@ const RateLimitsSchema = Type.Object({
 });
 
 // Recovery — request- and session-level resilience (spec CONCURRENCY-AND-RATE-LIMITING §6/§9.6).
-// Only the Layer-1 (transparent request-level retry) knobs are implemented today; the
-// Layer-2 session resume-in-place knobs (`session_auto_resume_*`) are NOT yet wired and
-// are therefore deliberately absent from the schema until that code lands (per CLAUDE.md:
-// config describes only implemented behaviour).
 const RecoverySchema = Type.Object({
   // Layer 1 — transparent per-request retry for mechanical LLM failures
   // (network/stream reset, timeout, 5xx, 429). Re-issues the exact same request
@@ -561,6 +557,14 @@ const RecoverySchema = Type.Object({
   llm_request_retries: Type.Optional(Type.Number({ minimum: 0 })),
   llm_request_backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
   llm_request_backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Layer 2 — session resume-in-place (§6.2): when a LIVE session's run dies
+  // mechanically after Layer 1 exhausts, re-create the agent from the persisted
+  // snapshot + transcript and redo the same request, this many times (with
+  // backoff) before parking the session `failed-resumable` for a manual console
+  // resume. 0 disables auto-resume (failures park immediately... still resumable
+  // manually). See src/agent/recovery.ts.
+  session_auto_resume_attempts: Type.Optional(Type.Number({ minimum: 0 })),
+  session_auto_resume_backoff_ms: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
 export const AppConfigSchema = Type.Object({

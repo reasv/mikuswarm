@@ -231,8 +231,12 @@ export function computeNextAttempt(p: {
   return next;
 }
 
-/** Parse a Matrix per-room timeline key into account/room/thread parts. */
-function parseMatrixTimelineKey(
+/**
+ * Parse a Matrix per-room timeline key into account/room/thread parts. Also
+ * used by session resume-in-place (src/app.ts) to reconstruct an outbound
+ * target for a parked session whose original inbound is gone.
+ */
+export function parseMatrixTimelineKey(
   timelineKey: string,
 ): { accountId: string; roomId: string; threadId?: string } | null {
   const m = /^matrix:([^:]+):room:(.+?)(?::thread:(.*))?$/.exec(timelineKey);

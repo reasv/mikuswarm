@@ -6,7 +6,9 @@
 		discarded: 'border-transparent bg-red-500/15 text-red-600 dark:text-red-400',
 		interrupted: 'border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400',
 		suspended: 'border-transparent bg-violet-500/15 text-violet-600 dark:text-violet-400',
-		created: 'border-transparent bg-zinc-500/15 text-zinc-600 dark:text-zinc-400'
+		created: 'border-transparent bg-zinc-500/15 text-zinc-600 dark:text-zinc-400',
+		resuming: 'border-transparent bg-cyan-500/15 text-cyan-600 dark:text-cyan-400',
+		'failed-resumable': 'border-transparent bg-orange-500/15 text-orange-600 dark:text-orange-400'
 	};
 </script>
 
