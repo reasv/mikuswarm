@@ -647,9 +647,10 @@ test("summarizationCutoff: image blocks are skipped", async () => {
   }
 });
 
-test("summarizationCutoff: no job enqueueing during summarization build", async () => {
+test("builds never create summarization jobs (job creation moved to SummarizationIndexer)", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
-  // Set a very low generation threshold so a normal build would enqueue.
+  // A very low generation threshold: under the OLD lazy design this build would
+  // have enqueued a level-1 job; the build path is now read-only w.r.t. jobs.
   const config = minimalConfig({
     summarization: {
       enabled: true,
@@ -662,7 +663,6 @@ test("summarizationCutoff: no job enqueueing during summarization build", async 
   const builder = new ContextBuilder(timeline, config, storage);
   const TK = "matrix:miku:room:!room";
   try {
-    // Insert enough events to exceed the threshold.
     for (let i = 0; i < 20; i++) {
       await timeline.append(testEvent({
         id: `ev${i}`,
@@ -671,23 +671,25 @@ test("summarizationCutoff: no job enqueueing during summarization build", async 
       }));
     }
 
-    let jobEnqueued = false;
-    builder.onJobEnqueued = () => { jobEnqueued = true; };
-
-    const trigger = testEvent({ id: "summarize:test5", body: "Summarize", timestamp: 1019 });
+    // Both a live build and a summarization-cutoff build leave the queue alone.
+    const liveTrigger = testEvent({ id: "trigger-ro", body: "hi", timestamp: 2000 });
     await builder.build({
       timelineKey: TK,
-      trigger,
+      trigger: liveTrigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+    const cutoffTrigger = testEvent({ id: "summarize:test5", body: "Summarize", timestamp: 1019 });
+    await builder.build({
+      timelineKey: TK,
+      trigger: cutoffTrigger,
       activeSessions: [],
       workspace: emptyWorkspace,
       summarizationCutoff: { endTimestamp: 1019 },
     });
 
-    assert.equal(jobEnqueued, false, "no job should be enqueued during a summarization build");
-
-    // Double-check: no jobs in the database.
     const jobs = storage.getActiveSummarizationJobs(TK, 1);
-    assert.equal(jobs.length, 0, "no summarization jobs should exist in DB");
+    assert.equal(jobs.length, 0, "the build path must not create summarization jobs");
   } finally {
     storage.close();
   }
@@ -719,162 +721,5 @@ test("summarizationCutoff: final message type is 'satellite' not 'triggerGroup'"
   }
 });
 
-// ── enabled predicate: undefined means enabled (#1) ──────────────────
-
-test("maybeEnqueueLevel1 enqueues when summarization.enabled is explicitly undefined", async () => {
-  const storage = await Storage.open({ databasePath: ":memory:" });
-  // summarization key present but enabled is not set; low threshold + tiny rich tier
-  // so events land in the compact tier and exceed the threshold.
-  const config = minimalConfig({
-    summarization: {
-      generation_threshold_tokens: 1,
-      leaf_input_tokens: 10,
-      leaf_target_tokens: 5,
-    },
-    context: {
-      tiers: {
-        rich_target_tokens: 1,
-        rich_max_tokens: 1,
-        compact_target_tokens: 40000,
-        compact_max_tokens: 80000,
-      },
-    },
-  } as any);
-  const timeline = new TimelineStore(storage);
-  const builder = new ContextBuilder(timeline, config, storage);
-  const TK = "matrix:miku:room:!room";
-  try {
-    for (let i = 0; i < 20; i++) {
-      await timeline.append(testEvent({
-        id: `ev${String(i).padStart(4, "0")}`,
-        body: `message content with some words ${i}`,
-        timestamp: 1000 + i,
-      }));
-    }
-
-    let jobEnqueued = false;
-    builder.onJobEnqueued = () => { jobEnqueued = true; };
-
-    const trigger = testEvent({ id: "trigger2", body: "hi", timestamp: 2000, role: "user" });
-    await builder.build({
-      timelineKey: TK,
-      trigger,
-      activeSessions: [],
-      workspace: emptyWorkspace,
-    });
-
-    assert.equal(jobEnqueued, true, "job should be enqueued when enabled key is missing (defaults to true)");
-  } finally {
-    storage.close();
-  }
-});
-
-test("maybeEnqueueLevel1 does not enqueue a duplicate when a pending job covers the same range", async () => {
-  const storage = await Storage.open({ databasePath: ":memory:" });
-  const config = minimalConfig({
-    summarization: {
-      generation_threshold_tokens: 1,
-      leaf_input_tokens: 10,
-      leaf_target_tokens: 5,
-    },
-    context: {
-      tiers: {
-        rich_target_tokens: 1,
-        rich_max_tokens: 1,
-        compact_target_tokens: 40000,
-        compact_max_tokens: 80000,
-      },
-    },
-  } as any);
-  const timeline = new TimelineStore(storage);
-  const builder = new ContextBuilder(timeline, config, storage);
-  const TK = "matrix:miku:room:!room";
-  try {
-    for (let i = 0; i < 20; i++) {
-      await timeline.append(testEvent({
-        id: `ev${String(i).padStart(4, "0")}`,
-        body: `message content with some words ${i}`,
-        timestamp: 1000 + i,
-      }));
-    }
-
-    // Pre-populate a pending level-1 job covering the range that maybeEnqueueLevel1
-    // would target (the oldest compact events).
-    await storage.insertSummarizationJob({
-      id: "existing_job",
-      timelineKey: TK,
-      level: 1,
-      inputStartId: "ev0000",
-      inputEndId: "ev0009",
-      inputTokenCount: 50,
-      targetTokenCount: 5,
-      maxRetries: 2,
-    });
-
-    let jobEnqueued = false;
-    builder.onJobEnqueued = () => { jobEnqueued = true; };
-
-    const trigger = testEvent({ id: "trigger_dedup", body: "hi", timestamp: 2000, role: "user" });
-    await builder.build({
-      timelineKey: TK,
-      trigger,
-      activeSessions: [],
-      workspace: emptyWorkspace,
-    });
-
-    assert.equal(jobEnqueued, false, "no duplicate job should be enqueued when a pending job covers the range");
-    // Confirm only the pre-existing job is in the DB.
-    const jobs = storage.getActiveSummarizationJobs(TK, 1);
-    assert.equal(jobs.length, 1, "should still have exactly one active job");
-    assert.equal(jobs[0]!.id, "existing_job");
-  } finally {
-    storage.close();
-  }
-});
-
-test("maybeEnqueueLevel1 skips when summarization.enabled is explicitly false", async () => {
-  const storage = await Storage.open({ databasePath: ":memory:" });
-  const config = minimalConfig({
-    summarization: {
-      enabled: false,
-      generation_threshold_tokens: 1,
-      leaf_input_tokens: 10,
-      leaf_target_tokens: 5,
-    },
-    context: {
-      tiers: {
-        rich_target_tokens: 1,
-        rich_max_tokens: 1,
-        compact_target_tokens: 40000,
-        compact_max_tokens: 80000,
-      },
-    },
-  } as any);
-  const timeline = new TimelineStore(storage);
-  const builder = new ContextBuilder(timeline, config, storage);
-  const TK = "matrix:miku:room:!room";
-  try {
-    for (let i = 0; i < 20; i++) {
-      await timeline.append(testEvent({
-        id: `ev${String(i).padStart(4, "0")}`,
-        body: `message content with some words ${i}`,
-        timestamp: 1000 + i,
-      }));
-    }
-
-    let jobEnqueued = false;
-    builder.onJobEnqueued = () => { jobEnqueued = true; };
-
-    const trigger = testEvent({ id: "trigger3", body: "hi", timestamp: 2000, role: "user" });
-    await builder.build({
-      timelineKey: TK,
-      trigger,
-      activeSessions: [],
-      workspace: emptyWorkspace,
-    });
-
-    assert.equal(jobEnqueued, false, "no job should be enqueued when enabled is explicitly false");
-  } finally {
-    storage.close();
-  }
-});
+// The generation-threshold enqueue tests moved to test/summarization-indexer.test.ts
+// (spec C: job creation now lives in SummarizationIndexer, off the build path).

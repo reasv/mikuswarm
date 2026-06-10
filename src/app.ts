@@ -65,7 +65,7 @@ import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
-import { SummarizationWorkerPool } from "./summarization/index.js";
+import { SummarizationIndexer, SummarizationWorkerPool } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
@@ -512,6 +512,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
           llmScheduler.clearEscalation(`sumjob:${jobId}`);
           summarizationPool!.notifyNewWork();
+          // Re-reconcile the timeline (spec §7.3): the next chunk that crossed
+          // threshold while this one was generating is enqueued immediately,
+          // replacing the old implicit "the next build enqueues the next chunk".
+          const job = storage.getSummarizationJobById(jobId);
+          if (job) summarizationIndexer?.enqueueReconcileTimeline(job.timelineKey);
           // A completed level-1 summary just queued a diary job (diary_status =
           // 'pending'); wake the diary pool so it doesn't wait for its next poll.
           diaryPool?.notifyNewWork();
@@ -525,8 +530,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       })
     : null;
 
+  // Eager level-1 summarization (spec §7.1/§7.3): a per-timeline reconciliation
+  // indexer owns the generation-threshold evaluation, fired off the persist seam
+  // and the pool's completion callback (plus a startup sweep below). The context
+  // builder no longer creates jobs — ingestion writes them, builds consume them.
+  const summarizationIndexer = summarizationPool
+    ? new SummarizationIndexer({
+        storage,
+        store: timeline,
+        config: config.summarization ?? {},
+        tiers: config.context.tiers,
+        onJobEnqueued: () => summarizationPool.notifyNewWork(),
+        logger: logger.child("summarization-indexer"),
+      })
+    : null;
+
   if (summarizationPool) {
-    contextBuilder.onJobEnqueued = () => summarizationPool.notifyNewWork();
     // Priority inheritance (spec §5.5): one injected callback does all three
     // writes, in order — job row (claim order), scheduler entry (a request
     // already queued at background), pool wake (so an idle worker claims the
@@ -684,6 +703,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
     const routed = await router.route(inbound, enrichmentStatus);
+    // Eager summarization (spec §7.1): events just persisted — recompute the
+    // timeline's un-summarized compact-tier size off the hot path and enqueue a
+    // level-1 job the moment it crosses threshold. Fire-and-forget,
+    // self-coalescing per timeline.
+    summarizationIndexer?.enqueueReconcileTimeline(inbound.timelineKey);
     if (steerReplyToActiveSession(inbound)) return;
 
     if (enrichmentStatus === "pending") {
@@ -759,6 +783,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // enrichment/caption onComplete hooks never fire for it. The content_sig set-diff in
     // upsertChatIndexRows makes this a no-op when nothing actually changed.
     chatSearchIndexer.enqueueReconcileEvent(result.event.id);
+    // An edit changes the event's rendered size — re-evaluate the summarization
+    // threshold too (spec §7.1).
+    summarizationIndexer?.enqueueReconcileTimeline(result.event.timelineKey);
 
     // Re-arm work consistently with the STORED status (inactive timelines defer to
     // the activation bulk-flip; active timelines nudge enrichment when 'pending'
@@ -1376,6 +1403,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }),
   );
 
+  // Eager-summarization startup sweep (spec §7.3): re-evaluate every active
+  // timeline's generation threshold, catching crossings that happened while the
+  // process was down. Fire-and-forget — a missed enqueue here is converged by
+  // the next inbound event's reconcile.
+  if (summarizationIndexer) {
+    void summarizationIndexer.reconcileAll().catch((error) =>
+      logger.warn("summarization_index_sweep_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  }
+
   // Backfill the summary-content search index (§9e). Insert/delete triggers keep
   // `summaries_fts` live and the v13->v14 migration rebuilds it for pre-existing rows,
   // so this is the belt-and-suspenders convergence net for any trigger gap (mirrors the
@@ -1474,6 +1513,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // (§9e). Ordered after the pools whose onComplete hooks enqueue into it, so
         // no enqueue can arrive after the indexer has stopped accepting work.
         await chatSearchIndexer.stop();
+        // Same drain contract for the eager-summarization indexer: ordered after
+        // the summarization pool (whose onComplete enqueues into it), before
+        // storage.close().
+        if (summarizationIndexer) await summarizationIndexer.stop();
         await mcpPool.stop();
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();

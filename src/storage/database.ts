@@ -1310,6 +1310,25 @@ export class Storage {
   }
 
   /**
+   * Every timeline that has been activated (has a `timeline_compaction_state`
+   * row in state `'active'`). Drives the eager summarization indexer's startup
+   * sweep (`SummarizationIndexer.reconcileAll`) — inactive/never-triggered
+   * timelines have no sessions and need no summaries.
+   */
+  listActiveTimelineKeys(): string[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select timeline_key from timeline_compaction_state
+           where timeline_state = 'active'
+           order by timeline_key`,
+        )
+        .all() as Array<{ timeline_key: string }>,
+    );
+    return rows.map((row) => row.timeline_key);
+  }
+
+  /**
    * Set a timeline's lifecycle state, upserting the compaction-state row. The
    * insert seeds a minimal valid `state_json`; the on-conflict path touches only
    * `timeline_state`/`updated_at`, preserving the compaction cursors and any
@@ -2795,6 +2814,25 @@ export class Storage {
         .prepare(
           `select * from summarization_jobs
            where timeline_key = ? and level = ? and status in ('pending', 'processing')
+           order by created_at asc`,
+        )
+        .all(timelineKey, level) as SummarizationJobRow[],
+    );
+    return rows.map(mapJobRow);
+  }
+
+  /**
+   * Terminally failed level-N jobs for a timeline. Drives the builder's
+   * wait-or-omit failure placeholder (spec §7.2): a range whose job exhausted
+   * retries with no salvageable draft renders as an explicit "couldn't
+   * summarize" marker in the summary layer instead of silently dropping events.
+   */
+  getFailedSummarizationJobs(timelineKey: string, level: number): SummarizationJob[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summarization_jobs
+           where timeline_key = ? and level = ? and status = 'failed'
            order by created_at asc`,
         )
         .all(timelineKey, level) as SummarizationJobRow[],

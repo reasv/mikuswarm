@@ -260,7 +260,6 @@ leaf_target_tokens = 600
 condense_fanout = 5
 condense_target_tokens = 800
 summary_max_overage_factor = 2.5
-summary_wait_timeout_ms = 5000
 max_retries = 2
 label_cache_ttl_ms = 600000
 

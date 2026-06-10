@@ -28,7 +28,6 @@ import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
-import { nanoid } from "nanoid";
 import type { Logger } from "../observability/index.js";
 
 export interface ContextMessage {
@@ -94,9 +93,6 @@ const DEFAULT_PROACTIVE_KICKOFF =
   "common outcome; only post when it actually adds something.";
 
 export class ContextBuilder {
-  /** Called after a level-1 summarization job is enqueued (§4 threshold). */
-  onJobEnqueued?: () => void;
-
   /**
    * Priority inheritance (spec CONCURRENCY-AND-RATE-LIMITING §5.5): injected by
    * app wiring (the builder must not import the scheduler or the worker pool).
@@ -187,27 +183,34 @@ export class ContextBuilder {
     const timelineEvents = events.filter((e) => !triggerGroupIds.has(e.id));
     let triggerEvents = events.filter((e) => triggerGroupIds.has(e.id));
 
-    // 3. Grace wait: if a drop is imminent and a processing job covers the
-    //    oldest events, wait briefly for it (§11). Skipped for summarization builds.
+    // 3. Wait-or-omit (spec CONCURRENCY-AND-RATE-LIMITING §7.2): if the compact
+    //    tier is over budget, the ONLY outcomes are (a) use a completed summary,
+    //    (b) wait — until the covering job reaches a terminal state, no wall
+    //    clock; priority inheritance promotes it for the duration — or (c) for a
+    //    genuinely *failed* job, render an explicit failure placeholder in the
+    //    summary slot. There is no "truncate oldest to fit" step. Skipped for
+    //    summarization builds.
     let compactionInput = timelineEvents;
+    let failurePlaceholders: Summary[] = [];
     if (!cutoff) {
-      const waited = await this.graceWaitForDrop(
+      const resolved = await this.resolveCompactionOverflow(
         options.timelineKey,
         timelineEvents,
         triggerGroupIds,
         selection,
         options.abortSignal,
       );
-      compactionInput = waited.events;
+      compactionInput = resolved.events;
       // Adopt the post-wait selection so the summary layer renders the summary
       // whose completion just trimmed the raw set — otherwise those events would
       // be dropped from both the raw turns and the layer (a coverage gap).
-      selection = waited.selection;
+      selection = resolved.selection;
       // Refresh trigger events from the re-queried set so they reflect any
       // enrichment that landed during the wait (issue #3).
-      if (waited.triggerEvents) {
-        triggerEvents = waited.triggerEvents;
+      if (resolved.triggerEvents) {
+        triggerEvents = resolved.triggerEvents;
       }
+      failurePlaceholders = resolved.placeholders;
     }
 
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
@@ -250,11 +253,10 @@ export class ContextBuilder {
       await this.store.saveCompactionState(compacted.state);
     }
 
-    // 4. Threshold evaluation: enqueue a level-1 job if compact tier is large
-    //    enough (§4, §11). Skipped for summarization builds.
-    if (!cutoff) {
-      await this.maybeEnqueueLevel1(options.timelineKey, compacted.compactEvents);
-    }
+    // NOTE: level-1 job creation no longer happens here. The build path is
+    // read-only w.r.t. summarization jobs — ingestion writes them eagerly
+    // (`SummarizationIndexer`, src/summarization/indexer.ts); builds only
+    // consume summaries and wait on / escalate jobs (spec §7.1/§7.3).
 
     // Proactive's synthetic trigger carries no attachments — no image blocks.
     const imageBlocks = cutoff || proactive ? [] : await this.selectImageBlocks(options.trigger);
@@ -283,9 +285,18 @@ export class ContextBuilder {
     );
     const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
 
+    // Failure placeholders (§7.2) render inside the summary layer, in their
+    // chronological slot, with the usual envelope — an explicit "couldn't
+    // summarize this range" marker, not a silent gap.
+    const layerSummaries =
+      failurePlaceholders.length === 0
+        ? selection.summaries
+        : [...selection.summaries, ...failurePlaceholders].sort(
+            (a, b) => a.earliestTimestamp - b.earliestTimestamp,
+          );
     const summaryLayer = await this.buildSummaryLayerMessage(
       options.timelineKey,
-      selection.summaries,
+      layerSummaries,
       now,
       cutoff != null,
     );
@@ -473,26 +484,105 @@ export class ContextBuilder {
   }
 
   /**
-   * One-shot bounded grace wait (§11): if compaction is about to drop the oldest
-   * events and a processing job covers them, poll up to summary_wait_timeout_ms
-   * for that job to complete, then re-query once so the new summary's cursor
-   * excludes those events.
+   * Wait-or-omit (spec §7.2, replaces the old grace-wait-then-truncate): while
+   * the compact tier is over `compact_max_tokens`, branch on the state of the
+   * job covering the oldest at-risk events:
+   *
+   * - **pending / processing** → escalate it to the waiter's class (priority
+   *   inheritance, §5.5) and wait until it reaches a TERMINAL state. No
+   *   wall-clock deadline — the wait is bounded by the job itself (Layer-1
+   *   mechanical retries + Layer-3 semantic retries always end in `complete`
+   *   or `failed`). On completion, re-select + re-query so the new summary's
+   *   coverage trims the raw set.
+   * - **failed** (terminal, no salvageable draft) → substitute the range with
+   *   an explicit failure-placeholder summary (rendered in the summary layer's
+   *   normal slot) and omit its raw events — a surfaced failure, not a silent
+   *   gap, and never a "truncate oldest to fit".
+   *
+   * Only when NOTHING covers the oldest events (summarization disabled, or the
+   * eager indexer hasn't enqueued the range yet) does the set pass through
+   * unchanged and compaction's ordinary bounds apply. Cutoff (summarization)
+   * builds never enter here.
    */
-  private async graceWaitForDrop(
+  private async resolveCompactionOverflow(
     timelineKey: string,
     events: CanonicalChatEvent[],
     triggerGroupIds: Set<string>,
     selection: SummarySelection,
     abortSignal?: AbortSignal,
-  ): Promise<{ events: CanonicalChatEvent[]; selection: SummarySelection; triggerEvents?: CanonicalChatEvent[] }> {
-    const unchanged = { events, selection };
-    if (this.config.summarization?.enabled === false) return unchanged;
+  ): Promise<{
+    events: CanonicalChatEvent[];
+    selection: SummarySelection;
+    triggerEvents?: CanonicalChatEvent[];
+    placeholders: Summary[];
+  }> {
+    const placeholders: Summary[] = [];
+    let current: {
+      events: CanonicalChatEvent[];
+      selection: SummarySelection;
+      triggerEvents?: CanonicalChatEvent[];
+    } = { events, selection };
+    if (this.config.summarization?.enabled === false) return { ...current, placeholders };
     const compactMax = this.config.context.tiers.compact_max_tokens;
-    // Estimate the compact-tier token count by subtracting the rich-tier tail.
-    // Compaction determines the rich boundary by accumulating rich-rendered
-    // tokens from the newest events until reaching rich_target_tokens.
-    // Mirror that here: use rich rendering for the tail to find how many
-    // events land in the rich tier, then subtract their compact cost.
+
+    // Each iteration strictly shrinks the raw set (completion advances coverage;
+    // a failed substitution removes >= 1 event) or breaks — so the loop
+    // terminates. A job waited on is terminal afterwards and leaves the active
+    // set, so no job is waited on twice.
+    for (;;) {
+      if (abortSignal?.aborted) break;
+      if (current.events.length === 0) break;
+      if (this.estimateCompactTierTokens(current.events) <= compactMax) break;
+
+      const oldest = current.events[0]!;
+      const oldestCursor = this.storage.getEventCursor(timelineKey, oldest.id);
+      if (!oldestCursor) break;
+
+      const covering = this.storage
+        .getActiveSummarizationJobs(timelineKey, 1)
+        .find((job) => this.jobCoversCursor(timelineKey, job, oldestCursor));
+      if (covering) {
+        // Priority inheritance (spec §5.5): this live build is now waiting on
+        // the covering job — promote it to the waiter's class so it is claimed
+        // next and its LLM request is admitted ahead of unrelated background
+        // work. Only live builds reach here, so the waiter's class is
+        // `interactive`.
+        this.escalateSummary?.(covering.id, "interactive");
+        this.logger?.info("context_build_waiting_on_summary", {
+          timelineKey,
+          jobId: covering.id,
+          jobStatus: covering.status,
+        });
+        const outcome = await this.waitForJobTerminal(covering.id, abortSignal);
+        if (outcome === "aborted") break;
+        if (outcome === "complete") {
+          const requeried = this.requeryAfterCoverageAdvance(timelineKey, triggerGroupIds);
+          current = requeried ?? current;
+        }
+        // failed → next iteration finds it in the failed set and placeholders it.
+        continue;
+      }
+
+      const failed = this.storage
+        .getFailedSummarizationJobs(timelineKey, 1)
+        .find((job) => this.jobCoversCursor(timelineKey, job, oldestCursor));
+      if (!failed) break;
+      const substituted = this.substituteFailedRange(timelineKey, failed, current.events);
+      if (!substituted) break;
+      placeholders.push(substituted.placeholder);
+      current = { ...current, events: substituted.events };
+    }
+
+    return { ...current, placeholders };
+  }
+
+  /**
+   * Compact-tier token estimate without running compaction: total compact-
+   * rendered tokens minus the rich tail's compact cost. Mirrors the compaction
+   * boundary (rich tokens accumulated from the newest event up to
+   * rich_target_tokens).
+   */
+  private estimateCompactTierTokens(events: CanonicalChatEvent[]): number {
     const perEventCompact = events.map((e) => estimateTokens(renderCompactMessage(e)));
     const totalCompactRendered = perEventCompact.reduce((sum, t) => sum + t, 0);
     const richTarget = this.config.context.tiers.rich_target_tokens;
@@ -504,121 +594,113 @@ export class ContextBuilder {
       richTailStart = i;
     }
     const richTailCompactCost = perEventCompact.slice(richTailStart).reduce((sum, t) => sum + t, 0);
-    const compactSum = Math.max(0, totalCompactRendered - richTailCompactCost);
-    if (compactSum <= compactMax) return unchanged;
-
-    const processing = this.storage.getProcessingSummarizationJobs(timelineKey);
-    if (processing.length === 0) return unchanged;
-
-    // The oldest events are the ones at risk of being dropped. A processing job
-    // covers them if its input range starts at or before the oldest event.
-    const oldest = events[0];
-    if (!oldest) return unchanged;
-    const oldestCursor = this.storage.getEventCursor(timelineKey, oldest.id);
-    if (!oldestCursor) return unchanged;
-    const covering = processing.find((job) => {
-      const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
-      const end = this.storage.getEventCursor(timelineKey, job.inputEndId);
-      return start != null && end != null && !cursorAfter(start, oldestCursor) && !cursorAfter(oldestCursor, end);
-    });
-    if (!covering) return unchanged;
-
-    // Priority inheritance (spec §5.5): this live build is now waiting on the
-    // covering job — promote it to the waiter's class so it is claimed next and
-    // its LLM request is admitted ahead of unrelated background work. The
-    // grace-wait path only runs for live builds (cutoff builds skip it), so the
-    // waiter's class is `interactive`.
-    this.escalateSummary?.(covering.id, "interactive");
-
-    const timeoutMs = this.config.summarization?.summary_wait_timeout_ms ?? 5000;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (abortSignal?.aborted) break;
-      await delay(250);
-      const job = this.storage.getSummarizationJobById(covering.id);
-      if (!job || job.status === "complete") {
-        // Re-select and re-query against the new coverage cursor ONCE. The raw
-        // events AND the summary-layer selection must move together, or the
-        // newly-covered events would be dropped from both (a coverage gap).
-        const reselected = selectSummaries(this.storage.getSummaryCandidates(timelineKey));
-        if (!reselected.coverageEndEventId) return { events, selection: reselected };
-        const allRequeried = this.hydrateEvents(
-          this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId),
-        );
-        const requeriedTimeline = allRequeried.filter((e) => !triggerGroupIds.has(e.id));
-        const requeriedTrigger = allRequeried.filter((e) => triggerGroupIds.has(e.id));
-        return {
-          events: requeriedTimeline,
-          selection: reselected,
-          triggerEvents: requeriedTrigger,
-        };
-      }
-      if (job.status === "failed") break;
-    }
-    return unchanged;
+    return Math.max(0, totalCompactRendered - richTailCompactCost);
   }
 
-  /** Enqueue a level-1 summarization job for the oldest compact chunk (§4 threshold). */
-  private async maybeEnqueueLevel1(
+  /** Does the job's input range cover the given event cursor? */
+  private jobCoversCursor(
     timelineKey: string,
-    compactEvents: Array<{ id: string; timestamp: number; compactTokens: number }>,
-  ): Promise<void> {
-    if (this.config.summarization?.enabled === false) return;
-    const cfg = this.config.summarization ?? {};
-    const generationThreshold = cfg.generation_threshold_tokens ?? 6000;
-    const compactTotal = compactEvents.reduce((sum, e) => sum + e.compactTokens, 0);
-    if (compactTotal <= generationThreshold) return;
+    job: { inputStartId: string; inputEndId: string },
+    cursor: TimelineCursor,
+  ): boolean {
+    const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
+    const end = this.storage.getEventCursor(timelineKey, job.inputEndId);
+    return start != null && end != null && !cursorAfter(start, cursor) && !cursorAfter(cursor, end);
+  }
 
-    const leafInput = cfg.leaf_input_tokens ?? 4000;
-    const chunk: typeof compactEvents = [];
-    let running = 0;
-    for (const e of compactEvents) {
-      // Accumulate until the running sum first reaches leaf_input_tokens; the
-      // crossing event is included, so a single large event naturally overshoots
-      // (capped in practice by the oversized-event truncation at build time).
-      chunk.push(e);
-      running += e.compactTokens;
-      if (running >= leafInput) break;
+  /**
+   * Poll the job until it reaches a terminal state (§7.2 — no wall-clock
+   * deadline; termination is guaranteed by Design B's bounded retries). A job
+   * row that vanishes is treated as complete (matches the old grace-wait).
+   */
+  private async waitForJobTerminal(
+    jobId: string,
+    abortSignal?: AbortSignal,
+  ): Promise<"complete" | "failed" | "aborted"> {
+    for (;;) {
+      if (abortSignal?.aborted) return "aborted";
+      const job = this.storage.getSummarizationJobById(jobId);
+      if (!job || job.status === "complete") return "complete";
+      if (job.status === "failed") return "failed";
+      await delay(250);
     }
-    if (chunk.length === 0) return;
+  }
 
-    const first = chunk[0]!;
-    const last = chunk[chunk.length - 1]!;
+  /**
+   * Re-select and re-query against the (possibly advanced) coverage cursor ONCE
+   * after a summary lands. The raw events AND the summary-layer selection must
+   * move together, or the newly-covered events would be dropped from both (a
+   * coverage gap). Returns null when there is still no coverage cursor (keep
+   * the current raw set, adopt the fresh selection via the caller).
+   */
+  private requeryAfterCoverageAdvance(
+    timelineKey: string,
+    triggerGroupIds: Set<string>,
+  ): {
+    events: CanonicalChatEvent[];
+    selection: SummarySelection;
+    triggerEvents?: CanonicalChatEvent[];
+  } | null {
+    const reselected = selectSummaries(this.storage.getSummaryCandidates(timelineKey));
+    if (!reselected.coverageEndEventId) return null;
+    const allRequeried = this.hydrateEvents(
+      this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId),
+    );
+    return {
+      events: allRequeried.filter((e) => !triggerGroupIds.has(e.id)),
+      selection: reselected,
+      triggerEvents: allRequeried.filter((e) => triggerGroupIds.has(e.id)),
+    };
+  }
 
-    // Skip if a pending/processing level-1 job already covers this range.
-    // If cursors are missing, the timeline is in an inconsistent state — skip
-    // enqueueing rather than bypass the overlap check and risk duplicates.
-    const active = this.storage.getActiveSummarizationJobs(timelineKey, 1);
-    const firstCursor = this.storage.getEventCursor(timelineKey, first.id);
-    const lastCursor = this.storage.getEventCursor(timelineKey, last.id);
-    if (!firstCursor || !lastCursor) return;
-    const overlaps = active.some((job) => {
-      const jobStart = this.storage.getEventCursor(timelineKey, job.inputStartId);
-      const jobEnd = this.storage.getEventCursor(timelineKey, job.inputEndId);
-      if (!jobStart || !jobEnd) return false;
-      // Ranges overlap unless one is entirely before the other.
-      return !cursorAfter(firstCursor, jobEnd) && !cursorAfter(jobStart, lastCursor);
-    });
-    if (overlaps) return;
+  /**
+   * Failure placeholder (§7.2): omit the failed job's raw events from the build
+   * and stand in a synthetic summary occupying the same compact-tier slot — the
+   * usual envelope (time range, level, event count) with a "couldn't summarize"
+   * body. Never persisted; re-synthesized deterministically on every build while
+   * the job stays failed (stable id `sumfail_<jobId>`, so the label cache holds).
+   */
+  private substituteFailedRange(
+    timelineKey: string,
+    job: { id: string; level: number; inputStartId: string; inputEndId: string; updatedAt: number },
+    events: CanonicalChatEvent[],
+  ): { events: CanonicalChatEvent[]; placeholder: Summary } | null {
+    const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
+    const end = this.storage.getEventCursor(timelineKey, job.inputEndId);
+    if (!start || !end) return null;
+    const covered = this.storage.getTimelineEventsBetween(timelineKey, start, end);
+    if (covered.length === 0) return null;
+    const coveredIds = new Set(covered.map((e) => e.id));
+    const remaining = events.filter((e) => !coveredIds.has(e.id));
+    if (remaining.length === events.length) return null;
 
-    const jobId = `sumjob_${nanoid(10)}`;
-    await this.storage.insertSummarizationJob({
-      id: jobId,
+    const content =
+      "[Summary for this range could not be generated — summarization failed after retries; " +
+      "the underlying messages are omitted from context.]";
+    const first = covered[0]!;
+    const last = covered[covered.length - 1]!;
+    const placeholder: Summary = {
+      id: `sumfail_${job.id}`,
       timelineKey,
-      level: 1,
-      inputStartId: first.id,
-      inputEndId: last.id,
-      inputTokenCount: running,
-      targetTokenCount: cfg.leaf_target_tokens ?? 600,
-      maxRetries: cfg.max_retries ?? 2,
-    });
-    this.logger?.info("summarization_job_enqueued", {
-      jobId,
+      level: job.level,
+      content,
+      earliestTimestamp: first.timestamp,
+      latestTimestamp: last.timestamp,
+      latestEventId: last.id,
+      eventCount: covered.length,
+      tokenCount: estimateTokens(content),
+      modelId: null,
+      status: "complete",
+      backfillJobId: null,
+      generatedAt: job.updatedAt,
+      createdAt: job.updatedAt,
+    };
+    this.logger?.warn("summary_failure_placeholder_rendered", {
       timelineKey,
-      level: 1,
-      inputTokens: running,
+      jobId: job.id,
+      omittedEvents: covered.length,
     });
-    this.onJobEnqueued?.();
+    return { events: remaining, placeholder };
   }
 
   /**

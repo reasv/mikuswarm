@@ -60,7 +60,9 @@ const SummarizationSchema = Type.Object({
   condense_fanout: Type.Optional(Type.Integer({ minimum: 2 })),
   condense_target_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
   summary_max_overage_factor: Type.Optional(Type.Number({ minimum: 1 })),
-  summary_wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // NOTE: summary_wait_timeout_ms was removed with wait-or-omit (spec
+  // CONCURRENCY-AND-RATE-LIMITING §7.2): a build now waits until the covering
+  // job is terminal — bounded by the job's own retries, not a wall clock.
   max_retries: Type.Optional(Type.Integer({ minimum: 0 })),
   label_cache_ttl_ms: Type.Optional(Type.Integer({ minimum: 0 })),
 });
