@@ -116,8 +116,10 @@ export function classifyLlmError(
  * a leading 3-digit token; we also accept an explicit `status: NNN` / `status code
  * NNN` label. We deliberately do NOT scan arbitrary embedded numbers (a JSON body
  * may contain unrelated 3-digit values), to avoid a false fatal/retryable verdict.
+ * Expects a lowercased message. Also used by the scheduler's unconditional 429/503
+ * backoff (src/agent/scheduler.ts, spec §5.3) so both layers parse identically.
  */
-function extractStatus(msg: string): number | undefined {
+export function extractStatus(msg: string): number | undefined {
   const leading = msg.match(/^\s*(\d{3})\b/);
   if (leading) {
     const n = Number(leading[1]);

@@ -7,6 +7,12 @@ import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { withRequestRetry } from "./request-retry.js";
+import {
+  defaultPriorityForSessionType,
+  withSchedulerAdmission,
+  type LlmScheduler,
+  type PriorityClass,
+} from "./scheduler.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage } from "../storage/index.js";
@@ -60,6 +66,14 @@ export interface AgentFactoryOptions {
    * without one.
    */
   logger?: Logger;
+  /**
+   * LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A).
+   * When set, every session's stream fn acquires a slot in its model's
+   * rate-limit group (priority from the session type) before issuing the HTTP
+   * call — admission composes INSIDE the Layer-1 retry (§5.4). Optional so
+   * tests can construct a factory without one (no scheduling, prior behaviour).
+   */
+  scheduler?: LlmScheduler;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -115,6 +129,20 @@ export interface CreateAgentOptions {
    * `snapshot`; it does NOT re-project it.
    */
   resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
+  /**
+   * LLM-scheduler priority override (spec §5.5/§9.3). When set, replaces the
+   * session type's (configured or default) class — the summarization worker
+   * passes the job row's possibly-escalated priority here so an escalated job's
+   * requests are admitted at the waiter's class.
+   */
+  priority?: PriorityClass;
+  /**
+   * Stable scheduler escalation key (spec §5.5). The summarization worker passes
+   * `"sumjob:" + job.id` so `LlmScheduler.escalate` can target this session's
+   * queued request across attempts (the synthetic session id is regenerated per
+   * attempt; the job id is stable).
+   */
+  escalationKey?: string;
 }
 
 export interface CreatedAgent {
@@ -190,8 +218,24 @@ export class AgentSessionFactory {
     // the base fn unwrapped, so this is a no-op when recovery is unconfigured-to-zero.
     const recovery = this.options.config.recovery;
     const baseStreamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    // Scheduler admission (spec §5.4): group from the model
+    // (`rate_limit_group`, unset = `default`), priority from the session type
+    // (override > configured > built-in default). Admission wraps the BASE fn,
+    // *inside* the retry, so each Layer-1 attempt re-acquires a fresh slot at
+    // the same (group, priority) and no slot is held across backoff sleeps.
+    const scheduler = this.options.scheduler;
+    const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
+    const priority =
+      opts?.priority ?? sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
+    const admittedStreamFn = scheduler
+      ? withSchedulerAdmission(baseStreamFn, scheduler, {
+          group: rateLimitGroup,
+          priority,
+          key: opts?.escalationKey,
+        })
+      : baseStreamFn;
     const streamFn = withRequestRetry(
-      baseStreamFn,
+      admittedStreamFn,
       {
         retries: recovery?.llm_request_retries ?? 4,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,

@@ -40,7 +40,14 @@ export interface ResolvedRetrievalConfig {
     /** Resolved active provider: remote iff a remote block is configured (§5a). */
     provider: "local" | "remote";
     local: { model: string; dim: number };
-    remote: { id: string; endpoint: string; apiKey: string; dim: number } | null;
+    remote: {
+      id: string;
+      endpoint: string;
+      apiKey: string;
+      dim: number;
+      /** LLM rate-limit group (spec §9.4); unset = `default`. */
+      rateLimitGroup?: string;
+    } | null;
   };
 }
 
@@ -90,6 +97,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
             endpoint: remoteBlock.endpoint,
             apiKey: remoteBlock.api_key,
             dim: remoteBlock.dim,
+            rateLimitGroup: remoteBlock.rate_limit_group,
           }
         : null,
     },

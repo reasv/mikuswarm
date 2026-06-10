@@ -14,6 +14,18 @@ const SessionTypeSchema = Type.Object({
   ),
   // Model key from the `models` record. Defaults to "default".
   model: Type.Optional(Type.String()),
+  // LLM-scheduler priority class (spec CONCURRENCY-AND-RATE-LIMITING §9.3).
+  // Priority attaches to the session type (the workload), NOT the model: two
+  // session types can share one model/budget yet differ in urgency. Built-in
+  // defaults (src/agent/scheduler.ts defaultPriorityForSessionType): default →
+  // interactive, proactive → proactive, summarize/condense → background,
+  // diary → background_low; unknown types → interactive.
+  priority: Type.Optional(Type.Union([
+    Type.Literal("interactive"),
+    Type.Literal("proactive"),
+    Type.Literal("background"),
+    Type.Literal("background_low"),
+  ])),
   // Per-session-type runaway loop-breakers (ARCHITECTURE.md §9c, §4). When set,
   // they override the global `agent.sessions.max_tool_calls` for sessions of this
   // type and add a turn-count cap. NOT a wall-clock timeout — purely a guard
@@ -126,6 +138,9 @@ const RetrievalEmbeddingRemoteSchema = Type.Object({
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
   dim: Type.Integer({ minimum: 1 }),
+  // LLM rate-limit group (spec §9.4): only meaningful when remote embedding is
+  // the active provider (local ONNX never touches the scheduler). Unset = `default`.
+  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const RetrievalEmbeddingSchema = Type.Object({
@@ -269,6 +284,13 @@ const ModelSchema = Type.Object({
     cache_write: Type.Number({ minimum: 0 }),
   })),
   streaming: Type.Optional(Type.Boolean()),
+  // LLM rate-limit group (spec CONCURRENCY-AND-RATE-LIMITING §9.2): which shared
+  // upstream budget this model's requests draw from. Group attaches to the
+  // model/endpoint. Unset = `default` — not an error. NEVER derived from the
+  // endpoint host (a gateway can multiplex several provider hosts onto one
+  // rate-limited account). A non-default value must name a group declared in
+  // `[rate_limits.llm.*]` (validated fail-fast at app wiring).
+  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
   compat: Type.Optional(Type.Object({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
@@ -342,6 +364,11 @@ const CaptioningModelSchema = Type.Object({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
+  // LLM rate-limit group (spec §9.2/§9.4). Captioning typically sits on a
+  // separate, generous budget (OpenRouter) — declare that group under
+  // `[rate_limits.llm.*]` and name it here. Unset = `default` (shares the
+  // scarce main budget — usually NOT what you want for captioning).
+  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const ModalityConfigSchema = Type.Object({
@@ -483,10 +510,27 @@ const ImageGenSchema = Type.Object({
   output_subdir: Type.Optional(Type.String()),
 });
 
-// Rate limiting (spec CONCURRENCY-AND-RATE-LIMITING §8/§9.5). Only the HTTP per-host
-// limiter is implemented today; the LLM request scheduler (`[rate_limits.llm.*]`,
-// Design A) is not yet built and is therefore absent from the schema until it lands.
+// One LLM rate-limit group = one shared upstream budget (spec §9.2). There is one
+// `default` group and everything lands in it unless a model opts into another via
+// `rate_limit_group`; extra groups exist only for genuinely separate budgets.
+// `max_in_flight` is the only lever (shallow upstream queue → effective priority);
+// there is deliberately NO `max_rpm` (§5.1) — the upstream-hard-limit case is
+// handled reactively by the unconditional 429/503 backoff (§5.3), which these
+// backoff knobs only tune, never enable/disable.
+const LlmRateLimitGroupSchema = Type.Object({
+  max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
+  backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
+// Rate limiting (spec CONCURRENCY-AND-RATE-LIMITING §5/§8/§9). Two independent
+// subsystems: the per-host HTTP egress limiter (`[rate_limits.http]`, Design D)
+// and the LLM request scheduler's group declarations (`[rate_limits.llm.*]`,
+// Design A — src/agent/scheduler.ts).
 const RateLimitsSchema = Type.Object({
+  // LLM rate-limit groups, keyed by group name (§9.2). Declaring `default` tunes
+  // the built-in group; other names become available to `rate_limit_group`.
+  llm: Type.Optional(Type.Record(Type.String(), LlmRateLimitGroupSchema)),
   // Per-host HTTP egress limiting, enforced at the `guardedFetch` chokepoint
   // (src/tools/http-limiter.ts). State is keyed per host and shared across callers.
   http: Type.Optional(Type.Object({

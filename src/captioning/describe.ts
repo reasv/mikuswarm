@@ -68,7 +68,9 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
 
     if (!response.ok) {
       const errorBody = await response.text().catch(() => "");
-      throw new Error(`Caption API returned ${response.status}: ${errorBody.slice(0, 500)}`);
+      // "status NNN" phrasing is load-bearing: the scheduler's unconditional
+      // 429/503 backoff parses it via extractStatus (src/agent/request-retry.ts).
+      throw new Error(`Caption API returned status ${response.status}: ${errorBody.slice(0, 500)}`);
     }
 
     const result = (await response.json()) as {

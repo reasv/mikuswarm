@@ -16,7 +16,7 @@ import {
   TimelineStore,
   TriggerCoordinator,
 } from "./timeline/index.js";
-import { AgentSessionFactory, SessionManager, SessionRunner } from "./agent/index.js";
+import { AgentSessionFactory, LlmScheduler, SessionManager, SessionRunner } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -108,6 +108,42 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     perHostMaxInFlight: httpLimits?.per_host_max_in_flight,
   });
 
+  // LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A): one
+  // process-wide admission gate, one priority queue per rate-limit group. Every
+  // LLM request — agent sessions, captioning, the image-gen tool, remote
+  // embedding — acquires a slot in its group before the HTTP call. Fail-fast
+  // cross-field validation (§9.7, app wiring per project convention): a
+  // `rate_limit_group` naming a group not declared in `[rate_limits.llm.*]` is a
+  // typo; an UNSET group is fine (it means `default`), and `default` itself needs
+  // no declaration (declaring it merely tunes it).
+  const llmGroups = config.rate_limits?.llm ?? {};
+  {
+    const groupRefs: Array<{ group: string | undefined; source: string }> = [
+      ...Object.entries(config.models).map(([key, model]) => ({
+        group: model.rate_limit_group,
+        source: `models.${key}`,
+      })),
+      { group: config.captioning?.model?.rate_limit_group, source: "captioning.model" },
+      ...(["image", "video", "audio"] as const).map((modality) => ({
+        group: config.captioning?.[modality]?.model?.rate_limit_group,
+        source: `captioning.${modality}.model`,
+      })),
+      { group: config.retrieval?.embedding?.remote?.rate_limit_group, source: "retrieval.embedding.remote" },
+    ];
+    for (const { group, source } of groupRefs) {
+      if (group && group !== "default" && !llmGroups[group]) {
+        throw new Error(
+          `${source}.rate_limit_group = "${group}" does not name a group declared in [rate_limits.llm.*]; ` +
+            `declare [rate_limits.llm.${group}] or remove the reference`,
+        );
+      }
+    }
+  }
+  const llmScheduler = new LlmScheduler({
+    groups: llmGroups,
+    logger: logger.child("llm-scheduler"),
+  });
+
   const storage = await Storage.open({
     databasePath: config.storage.database_path,
     logger: logger.child("storage"),
@@ -138,6 +174,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       dataDir: config.app.data_dir,
       config: retrievalConfig,
       httpProxyUrl: config.network?.http_proxy_url,
+      scheduler: llmScheduler,
       logger: logger.child("retrieval"),
     });
     // Reconcile the touched file after every memory mutation (diary append /
@@ -250,6 +287,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     };
   }
 
+  // Rate-limit group for a captioning modality (spec §9.4): the group attaches to
+  // the model BLOCK actually in use — a modality override's own group field wins;
+  // else the shared captioning model's; only when no captioning model block exists
+  // at all (full fallback onto models.default) does the default model's group
+  // apply. Unset resolves to `default` inside the scheduler.
+  function resolveModalityRateLimitGroup(modalityConfig?: { model?: { rate_limit_group?: string } }): string | undefined {
+    if (modalityConfig?.model) return modalityConfig.model.rate_limit_group;
+    if (captioningConfig.model) return captioningConfig.model.rate_limit_group;
+    return config.models.default.rate_limit_group;
+  }
+
   const imageConfig = captioningConfig.image ?? {};
   const videoConfig = captioningConfig.video ?? {};
   const audioConfig = captioningConfig.audio ?? {};
@@ -271,6 +319,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
       maxConcurrency: imageConfig.concurrency,
+      scheduler: llmScheduler,
+      rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
       imageProcessing: inferenceImageOptions,
     })],
     ["video", new ConcurrencyLimitedInferenceClient({
@@ -280,6 +330,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxChars: videoConfig.max_chars ?? 500,
       maxTokens: videoConfig.max_tokens ?? 2048,
       maxConcurrency: videoConfig.concurrency,
+      scheduler: llmScheduler,
+      rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
         maxResolution: mediaVideoConfig.max_resolution ?? 480,
@@ -299,6 +351,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       maxConcurrency: audioConfig.concurrency,
+      scheduler: llmScheduler,
+      rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {
         maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
@@ -416,6 +470,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     getActiveSessions: (timelineKey) => sessions.activeForTimeline(timelineKey),
     storage,
     logger,
+    scheduler: llmScheduler,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -1035,6 +1090,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             inlineImageMaxBytes: resolveReadImageMaxBytes(config),
             inferenceImageOptions,
             httpProxyUrl: config.network?.http_proxy_url,
+            scheduler: llmScheduler,
             config: config.image_gen,
           })]
         : []),
@@ -1397,6 +1453,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         fetchClient.stop();
         for (const client of captionClients.values()) client.stop();
         await waitForRuns(activeRuns);
+        // Reject any LLM requests still queued for admission AFTER in-flight runs
+        // drain (a queued waiter belongs to a run; stopping earlier would surface
+        // synthetic errors into runs that could still finish cleanly).
+        llmScheduler.stop();
         // After in-flight runs drain, disconnect the browser (closes our CDP link
         // and any lingering tabs; does NOT stop the operator-run Manager).
         if (browserSession) await browserSession.shutdown();

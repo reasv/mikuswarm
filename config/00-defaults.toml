@@ -149,6 +149,26 @@ global_ceiling_max_in_flight = 256   # pure degenerate backstop (many-channels);
 backoff_base_ms = 500                # 429/Retry-After backoff is always on; these tune it
 backoff_max_ms = 30000
 
+# LLM request scheduling (spec Design A, src/agent/scheduler.ts). One admission
+# queue per rate-limit GROUP (= one shared upstream budget); requests are served
+# by priority class (interactive > proactive > background > background_low, from
+# the session type / workload), FIFO within a class. `max_in_flight` is the only
+# lever: outstanding requests held by the group — SMALL for a scarce budget so
+# the upstream queue stays shallow and local priority is meaningful; raise it for
+# a generous budget. There is deliberately NO max_rpm (an idle budget is never
+# slowed); 429/503 backoff is unconditional in code, the knobs below only tune it.
+# Everything (all agent session types, image_generate, captioning, remote
+# embedding) lands in `default` unless its model block sets `rate_limit_group` to
+# another group declared here — e.g. captioning on a separate OpenRouter budget:
+#   [rate_limits.llm.openrouter]
+#   max_in_flight = 16
+#   [captioning.model]
+#   rate_limit_group = "openrouter"
+[rate_limits.llm.default]
+max_in_flight = 2
+backoff_base_ms = 1000
+backoff_max_ms = 60000
+
 [network]
 # App-layer SSRF guard (defense-in-depth). When true, outbound fetches from
 # caller-supplied URLs (web_fetch, media downloads, image references, …) resolve

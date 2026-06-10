@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
+import type { LlmScheduler } from "../agent/scheduler.js";
 import { MemoryIndexer } from "./indexer.js";
 import { MemorySearch } from "./search.js";
 import { EmbedWorkerPool } from "./embed-worker.js";
@@ -31,6 +32,8 @@ export interface CreateSubsystemOptions {
   dataDir: string;
   config: ResolvedRetrievalConfig;
   httpProxyUrl?: string;
+  /** LLM scheduler — joined only by the remote provider (spec §5.4). */
+  scheduler?: LlmScheduler;
   logger?: Logger;
 }
 
@@ -92,6 +95,7 @@ export async function createRetrievalSubsystem(
     const p = createEmbeddingProvider(config, {
       cacheDir,
       httpProxyUrl: opts.httpProxyUrl,
+      scheduler: opts.scheduler,
       logger,
     });
 

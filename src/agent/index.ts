@@ -10,6 +10,14 @@ export type {
 export { convertToLlm } from "./convert.js";
 export { AgentSessionFactory, createModel, assertRunSettledCleanly, type AgentFactoryOptions } from "./factory.js";
 export {
+  LlmScheduler,
+  withSchedulerAdmission,
+  defaultPriorityForSessionType,
+  type PriorityClass,
+  type LlmGroupConfig,
+  type LlmSchedulerOptions,
+} from "./scheduler.js";
+export {
   SessionRunner,
   extractLastAssistantText,
   stripThinkingContamination,

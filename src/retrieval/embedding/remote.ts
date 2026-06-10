@@ -1,5 +1,6 @@
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
 import type { Logger } from "../../observability/logger.js";
+import type { LlmScheduler } from "../../agent/scheduler.js";
 import { type EmbeddingProvider, l2normalize } from "./provider.js";
 
 export interface RemoteProviderOptions {
@@ -11,6 +12,15 @@ export interface RemoteProviderOptions {
   httpProxyUrl?: string;
   timeoutMs?: number;
   logger?: Logger;
+  /**
+   * LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5.4): remote
+   * embedding draws on a real upstream budget, so each batch acquires a slot in
+   * `rateLimitGroup` at `background` priority. The local ONNX provider never
+   * touches the scheduler (no network).
+   */
+  scheduler?: LlmScheduler;
+  /** Rate-limit group for embedding requests. Unset = `default`. */
+  rateLimitGroup?: string;
 }
 
 interface EmbeddingsResponse {
@@ -73,6 +83,12 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       if (stopSignal.aborted) controller.abort();
       else stopSignal.addEventListener("abort", onStop, { once: true });
     }
+    // Scheduler admission (spec §5.4) around the network call; the group's
+    // unconditional 429/503 backoff (§5.3) is fed with the response status.
+    const group = this.options.rateLimitGroup ?? "default";
+    const release = this.options.scheduler
+      ? await this.options.scheduler.acquire({ group, priority: "background", signal: controller.signal })
+      : undefined;
     try {
       const res = await fetch(url, {
         method: "POST",
@@ -84,8 +100,9 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
         signal: controller.signal,
         dispatcher: this.dispatcher,
       });
+      this.options.scheduler?.noteStatus(group, res.ok ? undefined : res.status);
       if (!res.ok) {
-        throw new Error(`embeddings endpoint ${res.status}: ${(await res.text()).slice(0, 200)}`);
+        throw new Error(`embeddings endpoint status ${res.status}: ${(await res.text()).slice(0, 200)}`);
       }
       // Lightweight response-size guard: the abort timeout bounds wall-clock, not
       // bytes. A misbehaving (operator-configured) endpoint advertising an absurd
@@ -140,6 +157,7 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       // permutation, so the non-null assertion is safe.
       return out.map((v) => v!);
     } finally {
+      release?.();
       clearTimeout(timeout);
       if (stopSignal) stopSignal.removeEventListener("abort", onStop);
     }

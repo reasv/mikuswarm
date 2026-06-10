@@ -1,5 +1,6 @@
 import { readFile, unlink } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
+import type { LlmScheduler } from "../agent/scheduler.js";
 import {
   processImageForInference,
   processVideoForInference,
@@ -17,7 +18,22 @@ export interface InferenceClientOptions {
   prompt: string;
   maxChars: number;
   maxTokens: number;
+  /**
+   * DEPRECATED (spec CONCURRENCY-AND-RATE-LIMITING §9.4): the per-modality
+   * concurrency cap is superseded by the captioning rate-limit group's
+   * `max_in_flight` (scheduler admission below). Still honoured when set, as a
+   * transitional alias for one release.
+   */
   maxConcurrency?: number;
+  /**
+   * LLM request scheduler (spec §5.4): when set, every caption inference call
+   * acquires a slot in `rateLimitGroup` (at `background` priority — captioning
+   * sits on its own budget and needs no per-workload split, §9.4) around the
+   * network call only, not the local media processing.
+   */
+  scheduler?: LlmScheduler;
+  /** Rate-limit group for caption inference. Unset = `default`. */
+  rateLimitGroup?: string;
   imageProcessing?: ImageProcessingOptions;
   videoProcessing?: VideoProcessingOptions;
   audioProcessing?: AudioProcessingOptions;
@@ -117,16 +133,37 @@ export class ConcurrencyLimitedInferenceClient {
         data = await readFile(request.filePath);
       }
 
-      const result = await describeMedia({
-        modality: this.options.modality,
-        data,
-        mimeType,
-        prompt: request.prompt ?? this.options.prompt,
-        model: this.options.model,
-        maxChars: this.options.maxChars,
-        maxTokens: this.options.maxTokens,
-        timeoutMs: this.options.timeoutMs,
-      });
+      // Scheduler admission (spec §5.4) wraps the network call only — media
+      // processing above runs unscheduled. The group's unconditional 429/503
+      // backoff (§5.3) is fed from the error message on failure.
+      const release = this.options.scheduler
+        ? await this.options.scheduler.acquire({
+            group: this.options.rateLimitGroup ?? "default",
+            priority: "background",
+          })
+        : undefined;
+      let result;
+      try {
+        result = await describeMedia({
+          modality: this.options.modality,
+          data,
+          mimeType,
+          prompt: request.prompt ?? this.options.prompt,
+          model: this.options.model,
+          maxChars: this.options.maxChars,
+          maxTokens: this.options.maxTokens,
+          timeoutMs: this.options.timeoutMs,
+        });
+        this.options.scheduler?.noteResult(this.options.rateLimitGroup ?? "default");
+      } catch (err) {
+        this.options.scheduler?.noteResult(
+          this.options.rateLimitGroup ?? "default",
+          err instanceof Error ? err.message : String(err),
+        );
+        throw err;
+      } finally {
+        release?.();
+      }
 
       let caption = result.text;
       if (processed?.truncated && processed.processedRange && processed.totalDuration) {

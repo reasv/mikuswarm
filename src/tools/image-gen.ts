@@ -14,6 +14,7 @@ import {
   conditionImageBufferForInference,
   type ImageProcessingOptions,
 } from "../media/index.js";
+import type { LlmScheduler } from "../agent/scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -106,6 +107,16 @@ export interface ImageGenToolContext {
   inferenceImageOptions: ImageProcessingOptions;
   /** Optional http(s) proxy applied to the generation POST. */
   httpProxyUrl?: string;
+  /**
+   * LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5.6). Image-gen
+   * shares the scarce `default` budget (the gateway routes Gemini and the main
+   * provider through ONE rate-limited account), so the generation POST must be
+   * admitted like any agent request. pi-agent-core hands tools no caller
+   * context, so the class cannot be inherited at runtime — image-gen admits at
+   * a fixed `default`@`interactive`, which matches every real caller (its only
+   * session types are user-facing). Optional so tests construct the tool bare.
+   */
+  scheduler?: LlmScheduler;
   config?: {
     base_url?: string;
     api_key?: string;
@@ -237,15 +248,38 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       const body = buildRequestBody({ prompt, refs, aspectRatio: params.aspect_ratio, imageSize: params.image_size, maxOutputTokens });
       const url = `${baseUrl}/v1beta/models/${modelId}:generateContent`;
 
-      let result: GeminiResponse | { httpError: ToolTextResult };
+      // Scheduler admission at fixed `default`@`interactive` (spec §5.6): the
+      // POST draws on the same scarce budget as live agent requests, so it must
+      // be admitted — an uncoordinated image-gen call would starve a live reply.
+      // Orthogonal to the per-host limiter inside guardedFetch (it bounds the
+      // Gemini *host*; the scheduler bounds the *budget*).
+      let release: (() => void) | undefined;
+      if (context.scheduler) {
+        try {
+          release = await context.scheduler.acquire({
+            group: "default",
+            priority: "interactive",
+            key: "image-gen",
+          });
+        } catch (error) {
+          return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
+        }
+      }
+      let result: GeminiResponse | { httpError: ToolTextResult; status: number };
       try {
         result = await postGenerate({ url, apiKey, body, dispatcher, timeoutMs });
       } catch (error) {
+        context.scheduler?.noteResult("default", errMessage(error));
         return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
+      } finally {
+        release?.();
       }
       if ("httpError" in result) {
+        // Feed the group's unconditional 429/503 backoff (§5.3) with the real status.
+        context.scheduler?.noteStatus("default", result.status);
         return result.httpError;
       }
+      context.scheduler?.noteStatus("default", undefined);
 
       const extracted = extractImage(result);
       if (!extracted.image) {
@@ -370,7 +404,7 @@ async function postGenerate(input: {
   body: Record<string, unknown>;
   dispatcher: Dispatcher | undefined;
   timeoutMs: number;
-}): Promise<GeminiResponse | { httpError: ToolTextResult }> {
+}): Promise<GeminiResponse | { httpError: ToolTextResult; status: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
   let response: Response;
@@ -405,11 +439,13 @@ async function postGenerate(input: {
   try {
     if (!response.ok) {
       const snippet = await safeReadText(response);
-      // Tagged error object so the caller can return it as a tool result.
+      // Tagged error object so the caller can return it as a tool result; the
+      // status rides along so the caller can feed the scheduler's backoff.
       return {
         httpError: textError(
           `Image generation failed: HTTP ${response.status}${snippet ? ` (${snippet})` : ""}.`,
         ),
+        status: response.status,
       };
     }
     try {

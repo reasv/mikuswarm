@@ -73,4 +73,10 @@ export interface SessionTypeConfig {
    */
   max_tool_calls?: number;
   max_turns?: number;
+  /**
+   * LLM-scheduler priority class (spec CONCURRENCY-AND-RATE-LIMITING §9.3).
+   * Unset → the built-in per-session-type default
+   * (src/agent/scheduler.ts defaultPriorityForSessionType).
+   */
+  priority?: "interactive" | "proactive" | "background" | "background_low";
 }

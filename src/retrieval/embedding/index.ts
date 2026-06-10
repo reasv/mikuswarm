@@ -1,4 +1,5 @@
 import type { Logger } from "../../observability/logger.js";
+import type { LlmScheduler } from "../../agent/scheduler.js";
 import type { ResolvedRetrievalConfig } from "../config.js";
 import { type EmbeddingProvider, LocalEmbeddingProvider } from "./provider.js";
 import { RemoteEmbeddingProvider } from "./remote.js";
@@ -11,6 +12,8 @@ export interface CreateProviderOptions {
   cacheDir: string;
   /** Optional HTTP proxy URL for the remote provider. */
   httpProxyUrl?: string;
+  /** LLM scheduler — only the remote provider participates (spec §5.4). */
+  scheduler?: LlmScheduler;
   logger?: Logger;
 }
 
@@ -33,6 +36,8 @@ export function createEmbeddingProvider(
       dim: config.embedding.remote.dim,
       batchSize: config.index.embedBatchSize,
       httpProxyUrl: opts.httpProxyUrl,
+      scheduler: opts.scheduler,
+      rateLimitGroup: config.embedding.remote.rateLimitGroup,
       logger: opts.logger,
     });
   }
