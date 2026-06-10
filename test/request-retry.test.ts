@@ -115,6 +115,10 @@ test("classifyLlmError: auth keywords without a status are fatal", () => {
   assert.equal(classifyLlmError("authentication failed", "error"), "fatal");
 });
 
+test("classifyLlmError: the scheduler-stopped marker is fatal (#11)", () => {
+  assert.equal(classifyLlmError("LLM scheduler stopped", "error"), "fatal");
+});
+
 test("classifyLlmError: a 3-digit token inside a body is not mistaken for a status", () => {
   // No leading/labelled status → falls through to keyword/default. "tokens: 500"
   // must NOT be read as HTTP 500 (it would be retryable anyway, but the point is
@@ -173,6 +177,62 @@ test("withRequestRetry: retries=0 returns the base fn unwrapped", () => {
   const { fn } = scriptedBase([{ events: [doneEvent()] }]);
   const wrapped = withRequestRetry(fn, { retries: 0, ...FAST });
   assert.equal(wrapped, fn);
+});
+
+test("withRequestRetry: a throwing base is surfaced as a terminal error and classified, not an unhandled rejection (#12)", async () => {
+  // A scheduler-less composition (the documented test path) passes the raw base
+  // fn straight to the retry wrapper; a synchronous throw used to escape the
+  // void-IIFE as a process-fatal unhandled rejection AND leave `outer` without a
+  // terminal event (hung consumer). It must instead synthesize the terminal
+  // error and feed the normal classify/retry logic (retryable → bounded retries).
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    throw new Error("ECONNRESET socket hang up");
+  };
+  const wrapped = withRequestRetry(fn, { retries: 2, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 3, "retryable throw consumes the bounded attempts");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "error");
+  assert.match(err.errorMessage ?? "", /ECONNRESET/);
+});
+
+test("withRequestRetry: a thrown AbortError is fatal — single attempt, stopReason aborted (#12)", async () => {
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    const err = new Error("operation aborted");
+    err.name = "AbortError";
+    throw err;
+  };
+  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 1, "aborted is never retried");
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "aborted");
+});
+
+test("withRequestRetry: a mid-iteration throw after commit terminates the stream without retrying (#12)", async () => {
+  // Content forwarded, then the inner stream THROWS (rather than emitting an
+  // error event). Cannot replay (committed); the consumer must still receive a
+  // terminal error event instead of hanging.
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    return (async function* () {
+      yield startEvent();
+      yield textDeltaEvent("partial");
+      throw new Error("socket reset mid-stream");
+    })() as unknown as AssistantMessageEventStream;
+  };
+  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 1, "committed → no retry");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "error"]);
+  const err = (events[2] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.match(err.errorMessage ?? "", /mid-stream/);
 });
 
 test("withRequestRetry: an empty inner stream yields a synthesized terminal error", async () => {

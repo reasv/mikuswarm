@@ -75,6 +75,11 @@ const FATAL_KEYWORDS = [
   "permission",
   "forbidden",
   "invalid_request_error",
+  // Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
+  // admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can
+  // only ever reject again, so retrying would spin out the full backed-off
+  // attempt budget per straggler during teardown (#11).
+  "scheduler stopped",
 ];
 
 /**
@@ -157,29 +162,48 @@ export function withRequestRetry(
 
     void (async () => {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const inner = await base(model, context, streamOptions);
         let committed = false;
         const buffered: AssistantMessageEvent[] = [];
         let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
 
-        for await (const event of inner) {
+        try {
+          const inner = await base(model, context, streamOptions);
+          for await (const event of inner) {
+            if (committed) {
+              // Past the commit point: forward verbatim. A terminal `done`/`error`
+              // here auto-finalizes `outer` (EventStream.push resolves on it).
+              outer.push(event);
+              continue;
+            }
+            if (event.type === "error") {
+              errorEvent = event;
+              break;
+            }
+            buffered.push(event);
+            if (event.type !== "start") {
+              // First real content (or a `done`): this attempt has produced output.
+              // Commit — flush the buffered prologue and switch to pass-through.
+              committed = true;
+              flush(outer, buffered);
+              buffered.length = 0;
+            }
+          }
+        } catch (err) {
+          // The base fn (or its stream iteration) THREW instead of emitting a
+          // terminal `error` event — e.g. a synchronously-failing base in a
+          // scheduler-less composition. Without this guard the throw escapes the
+          // void-IIFE as an unhandled rejection (process-fatal) and `outer` never
+          // terminates (hung consumer) (#12). Synthesize the terminal error and
+          // feed it through the SAME classification/retry logic below; an
+          // AbortError keeps its `aborted` stop reason (never retried).
+          const message = err instanceof Error ? err.message : String(err);
+          const aborted = err instanceof Error && err.name === "AbortError";
+          errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
           if (committed) {
-            // Past the commit point: forward verbatim. A terminal `done`/`error`
-            // here auto-finalizes `outer` (EventStream.push resolves on it).
-            outer.push(event);
-            continue;
-          }
-          if (event.type === "error") {
-            errorEvent = event;
-            break;
-          }
-          buffered.push(event);
-          if (event.type !== "start") {
-            // First real content (or a `done`): this attempt has produced output.
-            // Commit — flush the buffered prologue and switch to pass-through.
-            committed = true;
-            flush(outer, buffered);
-            buffered.length = 0;
+            // Content already forwarded — cannot replay (Layer-2 territory), but
+            // the consumer still needs a terminal event.
+            outer.push(errorEvent);
+            return;
           }
         }
 
@@ -268,6 +292,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 function synthesizeErrorEvent(
   model: Parameters<StreamFn>[0],
   message: string,
+  stopReason: "error" | "aborted" = "error",
 ): Extract<AssistantMessageEvent, { type: "error" }> {
   const error: AssistantMessage = {
     role: "assistant",
@@ -276,9 +301,9 @@ function synthesizeErrorEvent(
     provider: model.provider ?? "unknown",
     model: model.id,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    stopReason: "error",
+    stopReason,
     errorMessage: message,
     timestamp: Date.now(),
   };
-  return { type: "error", reason: "error", error };
+  return { type: "error", reason: stopReason, error };
 }

@@ -48,6 +48,20 @@ const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   return stream;
 };
 
+/**
+ * Pin `maxRetries: 0` onto every stream call so Layer-1 (`withRequestRetry`) is
+ * the SOLE retry authority (spec §5.4/§6.1). The provider SDKs pi-ai delegates
+ * to (Anthropic, OpenAI) silently default to 2 internal HTTP retries — pi-ai
+ * forwards `maxRetries` to them only when defined — whose backoff sleeps would
+ * run INSIDE the held scheduler slot and whose absorbed 429s would never reach
+ * the group backoff (`noteResult`/`onResponse`), while their attempt count
+ * multiplies with Layer-1's. Providers without client-side retries ignore the
+ * option, so this is safe for non-SDK providers too.
+ */
+export function withSdkRetriesDisabled(base: StreamFn): StreamFn {
+  return (model, context, options) => base(model, context, { ...options, maxRetries: 0 });
+}
+
 export interface AgentFactoryOptions {
   config: AppConfig;
   contextBuilder: ContextBuilder;
@@ -229,7 +243,9 @@ export class AgentSessionFactory {
     // session or burn a synthetic job's semantic-retry attempt. `retries: 0` returns
     // the base fn unwrapped, so this is a no-op when recovery is unconfigured-to-zero.
     const recovery = this.options.config.recovery;
-    const baseStreamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    const baseStreamFn = withSdkRetriesDisabled(
+      (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
+    );
     // Scheduler admission (spec §5.4): group from the model
     // (`rate_limit_group`, unset = `default`), priority from the session type
     // (override > configured > built-in default). Admission wraps the BASE fn,

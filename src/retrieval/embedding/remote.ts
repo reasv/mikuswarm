@@ -1,6 +1,6 @@
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
 import type { Logger } from "../../observability/logger.js";
-import type { LlmScheduler } from "../../agent/scheduler.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
 import { type EmbeddingProvider, l2normalize } from "./provider.js";
 
 export interface RemoteProviderOptions {
@@ -73,23 +73,29 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
 
   private async embedBatch(input: string[], stopSignal?: AbortSignal): Promise<Float32Array[]> {
     const url = `${this.options.endpoint.replace(/\/$/, "")}/embeddings`;
-    // Per-request timeout (always applies) combined with the optional external stop
-    // signal (shutdown), so SIGTERM aborts an in-flight fetch without waiting the full
-    // timeout, while a normal request still bounds itself by the timeout alone (#11).
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
-    const onStop = () => controller.abort();
-    if (stopSignal) {
-      if (stopSignal.aborted) controller.abort();
-      else stopSignal.addEventListener("abort", onStop, { once: true });
-    }
-    // Scheduler admission (spec §5.4) around the network call; the group's
-    // unconditional 429/503 backoff (§5.3) is fed with the response status.
+    // Scheduler admission (spec §5.4) FIRST, before the HTTP timeout is armed: a
+    // queue wait or group backoff under contention must not burn the request's
+    // wall-clock budget (a long wait would otherwise abort the fetch the moment
+    // it was finally admitted). The external stop signal (shutdown) is the only
+    // thing that can abort the admission wait; a rejected acquire arms nothing,
+    // so there is no timer or listener to leak on that path (#10).
     const group = this.options.rateLimitGroup ?? "default";
     const release = this.options.scheduler
-      ? await this.options.scheduler.acquire({ group, priority: "background", signal: controller.signal })
+      ? await this.options.scheduler.acquire({ group, priority: "background", signal: stopSignal })
       : undefined;
+    // Per-request timeout (armed only once admitted) combined with the optional
+    // external stop signal, so SIGTERM aborts an in-flight fetch without waiting
+    // the full timeout, while a normal request still bounds itself by the
+    // timeout alone (#11). Everything armed below is torn down in `finally`.
+    const controller = new AbortController();
+    const onStop = () => controller.abort();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      if (stopSignal) {
+        if (stopSignal.aborted) controller.abort();
+        else stopSignal.addEventListener("abort", onStop, { once: true });
+      }
+      timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
       const res = await fetch(url, {
         method: "POST",
         headers: {
@@ -100,7 +106,14 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
         signal: controller.signal,
         dispatcher: this.dispatcher,
       });
-      this.options.scheduler?.noteStatus(group, res.ok ? undefined : res.status);
+      // Feed the group's unconditional 429/503 backoff (§5.3) with the response
+      // status — and, since we hold the actual response here, the server's
+      // Retry-After (clamped by the scheduler to the group's backoff_max_ms).
+      this.options.scheduler?.noteStatus(
+        group,
+        res.ok ? undefined : res.status,
+        res.ok ? undefined : parseRetryAfterMs(res.headers),
+      );
       if (!res.ok) {
         throw new Error(`embeddings endpoint status ${res.status}: ${(await res.text()).slice(0, 200)}`);
       }
@@ -158,7 +171,7 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       return out.map((v) => v!);
     } finally {
       release?.();
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
       if (stopSignal) stopSignal.removeEventListener("abort", onStop);
     }
   }
