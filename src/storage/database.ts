@@ -3042,6 +3042,26 @@ export class Storage {
     });
   }
 
+  /**
+   * Return a cleanly-DRAINED job to 'pending' with the claim-time attempts
+   * increment compensated (spec LLM-FAILURE-HANDLING §7): a drain abort is not
+   * a semantic failure — the work never produced a judged draft — so it must
+   * not consume the job's retry budget. Only the clean drain path compensates;
+   * a hard process crash never reaches this decrement, so a job that *crashes*
+   * the worker repeatedly still walks to 'failed' (the crash-loop bound).
+   * Guarded on `status = 'processing'` so it can never double-decrement or
+   * overwrite a terminal/re-pending row.
+   */
+  returnSummarizationJobToPending(jobId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update summarization_jobs
+         set status = 'pending', attempts = max(attempts - 1, 0), updated_at = ?
+         where id = ? and status = 'processing'`,
+      ).run(Date.now(), jobId);
+    });
+  }
+
   failSummarizationJob(jobId: string, error: string): Promise<void> {
     return this.write((db) => {
       db.prepare(
@@ -3144,6 +3164,22 @@ export class Storage {
   setDiaryStatus(summaryId: string, status: DiaryStatus): Promise<void> {
     return this.write((db) => {
       db.prepare(`update summaries set diary_status = ? where id = ?`).run(status, summaryId);
+    });
+  }
+
+  /**
+   * Diary twin of {@link returnSummarizationJobToPending} (spec
+   * LLM-FAILURE-HANDLING §7): return a cleanly-drained diary job to 'pending'
+   * with the claim-time `diary_attempts` increment compensated. Guarded on
+   * `diary_status = 'processing'` — never touches a terminal or re-pending row.
+   */
+  returnDiaryJobToPending(summaryId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update summaries
+         set diary_status = 'pending', diary_attempts = max(diary_attempts - 1, 0)
+         where id = ? and diary_status = 'processing'`,
+      ).run(summaryId);
     });
   }
 

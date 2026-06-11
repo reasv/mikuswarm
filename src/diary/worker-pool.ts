@@ -1,6 +1,12 @@
 import { nanoid } from "nanoid";
 import type { Storage, DiaryJob, MemoryFileWriter } from "../storage/index.js";
-import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
+import {
+  assertRunSettledCleanly,
+  wasRunAborted,
+  WorkerDrainAbortError,
+  type AgentSessionFactory,
+  type AgentSessionRecord,
+} from "../agent/index.js";
 import type { DiaryConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
@@ -53,6 +59,8 @@ Then write your entry below it (markdown is fine; be concise). Use the diary_too
 export class DiaryWorkerPool {
   private running = false;
   private readonly activeWorkers = new Set<Promise<void>>();
+  /** Live agents of in-flight runs, aborted at drain (spec LLM-FAILURE-HANDLING §7). */
+  private readonly activeAgents = new Set<{ abort(): void }>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
 
@@ -71,6 +79,18 @@ export class DiaryWorkerPool {
     this.running = false;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.wakeResolve) this.wakeResolve();
+    // Abort in-flight runs (spec §7): background-class LLM requests retry
+    // without bound at Layer-0, so an in-flight diary run could otherwise wait
+    // out an outage in the admission queue and hang this stop() forever. The
+    // abort surfaces as a drain abort → the job returns to 'pending' with its
+    // claim-time diary_attempts increment compensated.
+    for (const agent of this.activeAgents) {
+      try {
+        agent.abort();
+      } catch {
+        /* best-effort */
+      }
+    }
     await Promise.allSettled([...this.activeWorkers]);
   }
 
@@ -348,7 +368,11 @@ export class DiaryWorkerPool {
         tokenEstimate,
         logger,
       });
+      this.activeAgents.add(agent);
       try {
+        // Drain gate: stop() may have fired between create and prompt (the
+        // agent was not yet in activeAgents for the abort sweep).
+        if (!this.running) throw new WorkerDrainAbortError("pool draining before run start");
         // Deliver the popped satellite final turn followed by the kickoff,
         // mirroring the summarize worker's `[finalTurn, instruction]` shape.
         const promptInput = finalTurn
@@ -356,13 +380,20 @@ export class DiaryWorkerPool {
           : kickoff;
         await agent.prompt(promptInput as any);
         await agent.waitForIdle();
+        // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7): a DRAIN abort
+        // returns the job to 'pending' with its claim-time attempts increment
+        // compensated; a CAP abort (pool still running) stays semantic.
+        if (wasRunAborted(agent) && !this.running) {
+          throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
+        }
         // pi-agent-core resolves the run promise even when the cap-driven abort
         // (§8c) or a stream error fires — it synthesizes a final message with
         // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
         // throwing. Surface that as a throw HERE so a runaway/errored run routes to
         // the failure → retry path below instead of committing a partial draft. A
         // clean completion (including the legitimate empty-draft skip) leaves
-        // `errorMessage` unset and does not throw.
+        // `errorMessage` unset and does not throw. Environmental LLM failures
+        // can no longer reach this point — absorbed (unbounded) at Layer-0.
         assertRunSettledCleanly(agent);
       } catch (err) {
         try {
@@ -375,10 +406,28 @@ export class DiaryWorkerPool {
         }
         throw err;
       } finally {
+        this.activeAgents.delete(agent);
         capture.detach();
       }
     } catch (err) {
       agentError = err;
+    }
+
+    // Drain abort (spec LLM-FAILURE-HANDLING §7): not judged — the job returns
+    // to 'pending' with its claim-time diary_attempts increment compensated.
+    if (agentError instanceof WorkerDrainAbortError) {
+      await storage.updateAgentSessionStatus(syntheticSession.id, "interrupted", {
+        completedAt: Date.now(),
+        error: agentError.message,
+      });
+      await storage.returnDiaryJobToPending(job.summaryId);
+      logger.info("diary_drain_requeued", {
+        summaryId: job.summaryId,
+        timelineKey: job.timelineKey,
+        attempt: job.attempts,
+      });
+      this.emit(job, "retried", "pending");
+      return;
     }
 
     const created = draft.isCreated();

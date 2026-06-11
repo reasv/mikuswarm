@@ -152,21 +152,6 @@ export class SessionManager {
   }
 
   /**
-   * Mark a session as auto-resuming after a mechanical run failure (spec
-   * CONCURRENCY-AND-RATE-LIMITING §6.2). NOT terminal: the record stays in the
-   * map (the resume loop re-marks it `running` per attempt), and the prior
-   * agent ref is dropped so the SSE stream can't reach the dead run.
-   */
-  markResuming(sessionId: string, opts: { error?: string } = {}): void {
-    if (this.sessions.get(sessionId)?.status === "interrupted") return;
-    this.update(sessionId, (session) => ({ ...session, status: "resuming" }));
-    this.agents.delete(sessionId);
-    this.persist("session status resuming", sessionId, (storage) =>
-      storage.updateAgentSessionStatus(sessionId, "resuming", { error: opts.error }),
-    );
-  }
-
-  /**
    * Park a session whose auto-resume attempts are exhausted (spec §6.2): a
    * manual console action can redo the same resume on demand. Terminal for the
    * in-memory lifecycle (evicted like the other terminal states); the durable

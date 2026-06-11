@@ -190,7 +190,7 @@ test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP tim
         await new Promise((r) => setTimeout(r, 120));
         return () => {};
       },
-      noteStatus: () => {},
+      noteOutcome: () => {},
     } as unknown as LlmScheduler;
     const provider = new RemoteEmbeddingProvider({
       id: "test-embed",
@@ -214,7 +214,7 @@ test("RemoteEmbeddingProvider: a rejected admission leaks no stop-signal listene
     acquire: async () => {
       throw new Error("LLM scheduler stopped");
     },
-    noteStatus: () => {},
+    noteOutcome: () => {},
   } as unknown as LlmScheduler;
   const provider = new RemoteEmbeddingProvider({
     id: "test-embed",
@@ -247,11 +247,17 @@ test("RemoteEmbeddingProvider feeds status + Retry-After to the scheduler backof
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as AddressInfo).port;
   try {
-    const noted: Array<[string, number | undefined, number | undefined]> = [];
+    const noted: Array<[string, string | undefined, string | undefined, number | undefined, number | undefined]> = [];
     const scheduler = {
       acquire: async () => () => {},
-      noteStatus: (group: string, status: number | undefined, retryAfterMs: number | undefined) => {
-        noted.push([group, status, retryAfterMs]);
+      noteOutcome: (
+        group: string,
+        modelKey: string | undefined,
+        classification: string | undefined,
+        status: number | undefined,
+        retryAfterMs: number | undefined,
+      ) => {
+        noted.push([group, modelKey, classification, status, retryAfterMs]);
       },
     } as unknown as LlmScheduler;
     const provider = new RemoteEmbeddingProvider({
@@ -263,7 +269,9 @@ test("RemoteEmbeddingProvider feeds status + Retry-After to the scheduler backof
       scheduler,
     });
     await assert.rejects(() => provider.embedQuery("x"), /status 429/);
-    assert.deepEqual(noted, [["default", 429, 7000]]);
+    assert.deepEqual(noted, [
+      ["default", `http://127.0.0.1:${port}::test-embed`, "environmental", 429, 7000],
+    ]);
     await provider.close();
   } finally {
     await new Promise<void>((r) => server.close(() => r()));

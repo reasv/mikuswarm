@@ -6,9 +6,10 @@ import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuil
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
-import { withRequestRetry } from "./request-retry.js";
+import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
+  modelHealthKey,
   withSchedulerAdmission,
   type LlmScheduler,
   type PriorityClass,
@@ -17,6 +18,8 @@ import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
+import type { SessionLiveEventBus } from "../observability/live-events.js";
+import type { LlmRequestRing } from "./request-ring.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
@@ -88,6 +91,20 @@ export interface AgentFactoryOptions {
    * tests can construct a factory without one (no scheduling, prior behaviour).
    */
   scheduler?: LlmScheduler;
+  /**
+   * Per-session tentative-event bus (spec LLM-FAILURE-HANDLING §4.2). When
+   * set, the Layer-0 observability tap publishes every raw attempt event (and
+   * attempt-discard notices) keyed by session id, so the console SSE can
+   * render tokens live even though the authoritative stream is buffered to
+   * the terminal event. Optional: absent = no tap (tests, headless).
+   */
+  liveEvents?: SessionLiveEventBus;
+  /**
+   * In-memory LLM request ring (spec LLM-FAILURE-HANDLING §9.2): every settled
+   * Layer-0 attempt is recorded with session/priority attribution and the
+   * admission wait. Optional: absent = no recording (tests, headless).
+   */
+  requestRing?: LlmRequestRing;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -247,12 +264,12 @@ export class AgentSessionFactory {
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     const model = createModelFromConfig(modelConfig);
-    // Layer-1 transparent request retry (spec §6.1) wraps the chosen stream fn so a
-    // mechanical blip re-issues the exact same request before it can discard a live
-    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` means a
-    // single attempt but the wrapper STILL applies — it owns the Layer-1 origin tag
-    // (`LLM_REQUEST_FAILURE_MARKER`) that the runner's mechanical classification and
-    // Layer-2 resume-in-place depend on (Decision C / #14).
+    // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
+    // chosen stream fn so an environmental failure re-issues the exact same
+    // request — buffered to the terminal event, partials discarded — before the
+    // run is allowed to fail. The wrapper ALWAYS applies: it owns the Layer-0
+    // origin + class tags (`[llm-request:<class>]`) the runner's typed
+    // `phase:"llm"` rejection depends on (Decision C / #14).
     const recovery = this.options.config.recovery;
     const baseStreamFn = withSdkRetriesDisabled(
       (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
@@ -264,19 +281,39 @@ export class AgentSessionFactory {
     // the same (group, priority) and no slot is held across backoff sleeps.
     const scheduler = this.options.scheduler;
     const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
-    const priority =
-      opts?.priority ?? sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
+    // The session type's OWN class — the workload category. `opts.priority` (a
+    // priority-inheritance escalation, e.g. a summarization job raised by a
+    // waiting build) overrides the QUEUE RANK only, never the retry budget
+    // (spec LLM-FAILURE-HANDLING §6): an escalated background job is still
+    // background work and still waits out an outage.
+    const basePriority =
+      sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
+    const priority = opts?.priority ?? basePriority;
+    // Holder for the admission wait of the in-flight attempt (ring
+    // attribution, §9.2): the agent issues one request at a time per session,
+    // so a single slot per created agent is race-free.
+    const admissionWait: { last?: number } = {};
     const admittedStreamFn = scheduler
       ? withSchedulerAdmission(baseStreamFn, scheduler, {
           group: rateLimitGroup,
           priority,
           key: opts?.escalationKey,
+          sessionId: session.id,
+          sessionType: session.sessionType,
+          onAdmissionWait: (waitMs) => {
+            admissionWait.last = waitMs;
+          },
         })
       : baseStreamFn;
+    // Per-class retry budget (spec §6): interactive-class work (live chat +
+    // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
+    // class work (summaries, diaries — must eventually exist) is unbounded.
+    const interactiveBudget = basePriority === "interactive" || basePriority === "proactive";
+    const healthKey = modelHealthKey(model);
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
-        retries: recovery?.llm_request_retries ?? 4,
+        maxWaitMs: interactiveBudget ? (recovery?.llm_request_max_wait_ms ?? 120_000) : undefined,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
         backoffMaxMs: recovery?.llm_request_backoff_max_ms ?? 15_000,
       },
@@ -285,6 +322,31 @@ export class AgentSessionFactory {
         sessionId: session.id,
         timelineKey: session.timelineKey,
         sessionType: session.sessionType,
+        group: rateLimitGroup,
+        // No double-waiting (§4.3): once the model is unhealthy or the group
+        // throttled, the admission queue paces re-admission and the local
+        // inter-attempt backoff collapses to ~0.
+        ...(scheduler
+          ? { isQueueWaitPoint: () => scheduler.isQueueWaitPoint(rateLimitGroup, healthKey) }
+          : {}),
+        // Request-ring attribution (spec §9.2).
+        priority,
+        ...(this.options.requestRing ? { ring: this.options.requestRing } : {}),
+        takeAdmissionWaitMs: () => {
+          const waited = admissionWait.last;
+          admissionWait.last = undefined;
+          return waited;
+        },
+        // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
+        // events → per-session tentative bus → console SSE. Observe-only.
+        ...(this.options.liveEvents
+          ? {
+              onAttemptEvent: (attempt: number, event: unknown) =>
+                this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
+              onAttemptDiscarded: (attempt: number, reason: string) =>
+                this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
+            }
+          : {}),
       },
     );
 
@@ -558,6 +620,44 @@ export function assertRunSettledCleanly(agent: { state: { errorMessage?: string 
   if (errorMessage && errorMessage.length > 0) {
     throw new Error(`agent run did not complete cleanly: ${errorMessage}`);
   }
+}
+
+/**
+ * Thrown by a worker pool when a run was aborted BY THE POOL'S OWN DRAIN (spec
+ * LLM-FAILURE-HANDLING §7): the job returns to `pending` with the claim-time
+ * attempts increment compensated — a drain is not a semantic failure and must
+ * not consume the job's retry budget. A cap abort (runaway tool/turn loop,
+ * pool still running) deliberately does NOT use this class — a degenerate run
+ * is an output problem and stays on the semantic-attempts path.
+ */
+export class WorkerDrainAbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerDrainAbortError";
+  }
+}
+
+/**
+ * True when the settled run's failure is an intentional ABORT (the agent's
+ * last assistant turn carries `stopReason:"aborted"`, or the flattened error
+ * is class-tagged `aborted` — e.g. a scheduler-stop admission rejection that
+ * produced no turn). Worker pools combine this with their own `running` flag
+ * to distinguish a drain abort (→ {@link WorkerDrainAbortError}, job back to
+ * pending) from a cap abort (→ semantic retry path).
+ */
+export function wasRunAborted(agent: {
+  state: { errorMessage?: string; messages?: unknown[] };
+}): boolean {
+  const errorMessage = agent.state.errorMessage;
+  if (!errorMessage || errorMessage.length === 0) return false;
+  const messages = agent.state.messages ?? [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const candidate = messages[i] as { role?: unknown; stopReason?: unknown } | undefined;
+    if (candidate?.role !== "assistant") continue;
+    if (candidate.stopReason === "aborted") return true;
+    break;
+  }
+  return extractLlmRequestClass(errorMessage) === "aborted";
 }
 
 /**

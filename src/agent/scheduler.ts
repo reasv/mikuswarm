@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
-import { extractStatus } from "./request-retry.js";
+import { classifyLlmError, extractStatus, type LlmErrorClass } from "./request-retry.js";
 
 // =============================================================================
 // Local LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A).
@@ -56,6 +56,13 @@ function rankOf(priority: PriorityClass): number {
   return CLASS_RANK[priority] ?? 0;
 }
 
+function classOfRank(rank: number): PriorityClass {
+  for (const [cls, r] of Object.entries(CLASS_RANK) as Array<[PriorityClass, number]>) {
+    if (r === rank) return cls;
+  }
+  return "background_low";
+}
+
 /**
  * Built-in priority defaults per session type (§9.3). Used when the session
  * type config carries no explicit `priority`, so existing configs need no change.
@@ -91,7 +98,16 @@ export interface LlmGroupConfig {
 export interface LlmSchedulerOptions {
   /** Declared groups (`[rate_limits.llm.*]`). `default` is created regardless. */
   groups?: Record<string, LlmGroupConfig>;
+  /** Per-model health tuning (spec LLM-FAILURE-HANDLING §5; `[recovery]`). */
+  health?: ModelHealthOptions;
   logger?: Logger;
+}
+
+export interface ModelHealthOptions {
+  /** Consecutive environmental failures before a model turns unhealthy. `recovery.llm_unhealthy_threshold`. */
+  unhealthyThreshold?: number;
+  /** Fixed probe cadence while unhealthy (never grows). `recovery.llm_probe_interval_ms`. */
+  probeIntervalMs?: number;
 }
 
 export interface AcquireOptions {
@@ -105,21 +121,95 @@ export interface AcquireOptions {
    * before registration is adopted at acquire time.
    */
   key?: string;
+  /**
+   * Model-health key (spec LLM-FAILURE-HANDLING §5): the request's failure
+   * domain, derived from `(endpoint/baseUrl, model id)` via
+   * {@link modelHealthKey}. Entries without a key are always model-admissible
+   * (health gating off — legacy callers, tests).
+   */
+  modelKey?: string;
+  /** Attribution for the console scheduler view (spec §9.1). */
+  sessionId?: string;
+  /** Session type, or a pool label for non-session callers (captioning, …). */
+  sessionType?: string;
   /** Abort waiting for a slot (shutdown / run abort). */
   signal?: AbortSignal;
+}
+
+/**
+ * Derive a model's health key — the FAILURE DOMAIN, distinct from the
+ * rate-limit group (the budget axis). `(endpoint/baseUrl, model id)` as
+ * carried by the `Model` object every stream call already receives, so agent
+ * sessions, captioning clients, image-gen, and remote embedding all land in
+ * the correct domain with zero config plumbing, and config entries pointing
+ * at the same upstream model share one health state (§5).
+ */
+export function modelHealthKey(model: { baseUrl?: string; id: string }): string {
+  return `${model.baseUrl ?? "unknown"}::${model.id}`;
 }
 
 /** Idempotent slot release. MUST be called (in a `finally`) when the request settles. */
 export type ReleaseFn = () => void;
 
+/** Shape of {@link LlmScheduler.snapshot} (spec LLM-FAILURE-HANDLING §9.1). */
+export interface LlmSchedulerSnapshot {
+  groups: Array<{
+    name: string;
+    maxInFlight: number;
+    /** Throttle backoff, epoch ms; 0 = none. */
+    backoffUntil: number;
+    active: Array<{
+      sessionId: string | null;
+      sessionType: string | null;
+      model: string | null;
+      priority: PriorityClass;
+      key: string | null;
+      heldMs: number;
+    }>;
+    queue: Array<{
+      sessionId: string | null;
+      sessionType: string | null;
+      model: string | null;
+      priority: PriorityClass;
+      key: string | null;
+      waitingMs: number;
+    }>;
+    stickyEscalations: Array<{ key: string; priority: PriorityClass }>;
+  }>;
+  models: Array<{
+    key: string;
+    health: "healthy" | "unhealthy";
+    consecutiveFailures: number;
+    probeInFlight: boolean;
+    /** Epoch ms of the next admissible probe; 0 when healthy/immediate. */
+    nextProbeAt: number;
+    lastFailure: { ts: number; status?: number; class: LlmErrorClass } | null;
+    waiters: number;
+  }>;
+}
+
 interface QueueEntry {
   rank: number;
   seq: number;
   key?: string;
+  modelKey?: string;
+  sessionId?: string;
+  sessionType?: string;
+  enqueuedAt: number;
   resolve: (release: ReleaseFn) => void;
   reject: (err: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+}
+
+/** An admitted (in-flight) request, tracked for the console snapshot (§9.1). */
+interface ActiveEntry {
+  rank: number;
+  key?: string;
+  modelKey?: string;
+  sessionId?: string;
+  sessionType?: string;
+  admittedAt: number;
 }
 
 interface GroupState {
@@ -128,16 +218,42 @@ interface GroupState {
   backoffBaseMs: number;
   backoffMaxMs: number;
   active: number;
+  /** In-flight entries (console attribution); size always equals `active`. */
+  activeEntries: Set<ActiveEntry>;
   queue: QueueEntry[];
   /** Epoch ms before which no new admission may happen. 0 = none. */
   backoffUntil: number;
   consecutiveThrottles: number;
   backoffTimer?: ReturnType<typeof setTimeout>;
+  /** Re-pump when the earliest blocked model's probe window opens (§5.2). */
+  probeTimer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Per-model health state (spec LLM-FAILURE-HANDLING §5.1). The model — not the
+ * group — is the failure domain: one broken model must never gate healthy
+ * models sharing its budget, and a gateway 429 says nothing about a model's
+ * health.
+ */
+interface ModelHealthState {
+  key: string;
+  state: "healthy" | "unhealthy";
+  /** Consecutive environmental failures (429s excluded — budget, not health). */
+  consecutiveFailures: number;
+  /** True while the single half-open probe request is in flight. */
+  probeInFlight: boolean;
+  /** Epoch ms before which no probe may be admitted. 0 = immediately. */
+  nextProbeAt: number;
+  /** Epoch ms the model turned unhealthy (for recovery logging). 0 = healthy. */
+  unhealthySince: number;
+  lastFailure?: { ts: number; status?: number; class: LlmErrorClass };
 }
 
 const DEFAULT_MAX_IN_FLIGHT = 2;
 const DEFAULT_BACKOFF_BASE_MS = 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60_000;
+const DEFAULT_UNHEALTHY_THRESHOLD = 3;
+const DEFAULT_PROBE_INTERVAL_MS = 60_000;
 
 function abortError(): Error {
   const error = new Error("LLM scheduler wait aborted");
@@ -147,6 +263,10 @@ function abortError(): Error {
 
 export class LlmScheduler {
   private readonly groups = new Map<string, GroupState>();
+  /** Per-model health, independent of (alongside) the groups (§5). */
+  private readonly health = new Map<string, ModelHealthState>();
+  private readonly unhealthyThreshold: number;
+  private readonly probeIntervalMs: number;
   private readonly logger?: Logger;
   /** Sticky escalations for keys not yet registered (§5.5). */
   private readonly stickyEscalations = new Map<string, PriorityClass>();
@@ -155,6 +275,8 @@ export class LlmScheduler {
 
   constructor(options: LlmSchedulerOptions = {}) {
     this.logger = options.logger;
+    this.unhealthyThreshold = options.health?.unhealthyThreshold ?? DEFAULT_UNHEALTHY_THRESHOLD;
+    this.probeIntervalMs = options.health?.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS;
     for (const [name, cfg] of Object.entries(options.groups ?? {})) {
       this.groups.set(name, this.makeGroup(name, cfg));
     }
@@ -170,6 +292,7 @@ export class LlmScheduler {
       backoffBaseMs: cfg.backoff_base_ms ?? DEFAULT_BACKOFF_BASE_MS,
       backoffMaxMs: cfg.backoff_max_ms ?? DEFAULT_BACKOFF_MAX_MS,
       active: 0,
+      activeEntries: new Set(),
       queue: [],
       backoffUntil: 0,
       consecutiveThrottles: 0,
@@ -219,6 +342,10 @@ export class LlmScheduler {
         rank,
         seq: this.seqCounter++,
         key: opts.key,
+        modelKey: opts.modelKey,
+        sessionId: opts.sessionId,
+        sessionType: opts.sessionType,
+        enqueuedAt: Date.now(),
         resolve,
         reject,
         signal: opts.signal,
@@ -275,15 +402,16 @@ export class LlmScheduler {
   }
 
   /**
-   * Observe a request outcome for backoff purposes. A 429/503 (parsed from the
-   * flattened error message — pi-ai surfaces SDK errors status-prefixed) pauses
-   * the group's admissions with exponential backoff + jitter; any other outcome
-   * resets the group's throttle streak. Unconditional (§5.3): always applied,
-   * independent of config. This is the string-sniffing FALLBACK seam — the
-   * Anthropic provider is SDK-based and throws on non-2xx before pi-ai's
-   * `onResponse` hook fires, so its 429s only ever arrive here as flattened
-   * messages (no headers, so no `Retry-After`). Callers that hold the actual
-   * response use {@link noteStatus} with the parsed `Retry-After` instead.
+   * Observe a request outcome for backoff purposes — the GROUP (budget) axis
+   * only. A 429/503 (parsed from the flattened error message — pi-ai surfaces
+   * SDK errors status-prefixed) pauses the group's admissions with exponential
+   * backoff + jitter; any other outcome resets the group's throttle streak.
+   * Unconditional (§5.3): always applied, independent of config. This is the
+   * string-sniffing FALLBACK seam — the Anthropic provider is SDK-based and
+   * throws on non-2xx before pi-ai's `onResponse` hook fires, so its 429s only
+   * ever arrive here as flattened messages (no headers, so no `Retry-After`).
+   * Callers that also hold the model key use {@link noteOutcome} so the
+   * failure feeds the model-health axis too.
    */
   noteResult(groupName: string, errorMessage?: string): void {
     const status = errorMessage ? extractStatus(errorMessage.toLowerCase()) : undefined;
@@ -296,9 +424,37 @@ export class LlmScheduler {
    * {@link parseRetryAfterMs}), the server-specified wait replaces the
    * exponential window — clamped to the group's `backoff_max_ms` so a hostile
    * or absurd header can never black-hole the group beyond what config allows
-   * the exponential path itself (§5.3).
+   * the exponential path itself (§5.3). Group axis only.
    */
   noteStatus(groupName: string, status: number | undefined, retryAfterMs?: number): void {
+    this.noteOutcome(groupName, undefined, status === undefined ? undefined : "environmental", status, retryAfterMs);
+  }
+
+  /**
+   * Observe a settled request on BOTH axes (spec LLM-FAILURE-HANDLING §5):
+   *
+   * - **Group (budget):** a 429/503 status pauses the group's admissions
+   *   (throttle backoff, `Retry-After` honoured, clamped) — unchanged shipped
+   *   behaviour; any other outcome resets the throttle streak.
+   * - **Model (failure domain), when `modelKey` is given:** a clean success
+   *   (`classification === undefined`) resets the model's consecutive-failure
+   *   streak and re-awakens an unhealthy model (the mass resume — all waiters
+   *   become admissible, paced by group `max_in_flight`). An `environmental`
+   *   failure feeds the streak — EXCEPT a plain 429, which is the shared
+   *   budget talking, not evidence the model is unwell (503/529 feed both
+   *   axes). At `llm_unhealthy_threshold` consecutive failures the model turns
+   *   unhealthy: half-open admission, one probe per `llm_probe_interval_ms`
+   *   (fixed cadence — recovery is detected within one window of the outage
+   *   ending, P6b). `content`/`aborted` outcomes are neutral — neither count
+   *   nor reset (one session's oversized context must not pause the model).
+   */
+  noteOutcome(
+    groupName: string,
+    modelKey: string | undefined,
+    classification: LlmErrorClass | undefined,
+    status?: number,
+    retryAfterMs?: number,
+  ): void {
     const group = this.getGroup(groupName);
     if (status === 429 || status === 503) {
       group.consecutiveThrottles += 1;
@@ -327,6 +483,183 @@ export class LlmScheduler {
     } else {
       group.consecutiveThrottles = 0;
     }
+
+    if (modelKey !== undefined) {
+      this.noteModelOutcome(modelKey, classification, status);
+    }
+  }
+
+  /** The model-health half of {@link noteOutcome}. */
+  private noteModelOutcome(
+    modelKey: string,
+    classification: LlmErrorClass | undefined,
+    status?: number,
+  ): void {
+    const now = Date.now();
+    let health = this.health.get(modelKey);
+
+    if (classification === undefined) {
+      // Clean success: streak reset; an unhealthy model recovers — the probe
+      // succeeded (or a pre-outage straggler came back clean, equally good
+      // evidence). All of the model's waiters become admissible and drain in
+      // priority order, paced by their groups' max_in_flight (the mass resume).
+      if (!health) return;
+      health.consecutiveFailures = 0;
+      health.probeInFlight = false;
+      if (health.state === "unhealthy") {
+        const outageMs = health.unhealthySince > 0 ? now - health.unhealthySince : 0;
+        health.state = "healthy";
+        health.unhealthySince = 0;
+        health.nextProbeAt = 0;
+        this.logger?.info("llm_model_recovered", {
+          model: modelKey,
+          outageMs,
+          waiters: this.countModelWaiters(modelKey),
+        });
+        for (const group of this.groups.values()) this.pump(group);
+      }
+      return;
+    }
+
+    if (classification === "content" || classification === "aborted") {
+      // Neutral (§3): neither counts nor resets. If this settled the probe,
+      // the probe was inconclusive — clear the in-flight flag; `nextProbeAt`
+      // is left as-is (already elapsed), so the next pump re-probes promptly.
+      if (health?.probeInFlight) health.probeInFlight = false;
+      return;
+    }
+
+    // Environmental failure. A plain 429 feeds only the group's throttle
+    // backoff — shared-budget pressure is not evidence the model is unwell —
+    // but it still settles an in-flight probe inconclusively (next window).
+    if (status === 429) {
+      if (health?.probeInFlight) {
+        health.probeInFlight = false;
+        health.nextProbeAt = now + this.probeIntervalMs;
+      }
+      return;
+    }
+
+    if (!health) {
+      health = {
+        key: modelKey,
+        state: "healthy",
+        consecutiveFailures: 0,
+        probeInFlight: false,
+        nextProbeAt: 0,
+        unhealthySince: 0,
+      };
+      this.health.set(modelKey, health);
+    }
+    health.consecutiveFailures += 1;
+    health.lastFailure = { ts: now, status, class: classification };
+
+    if (health.state === "healthy") {
+      if (health.consecutiveFailures >= this.unhealthyThreshold) {
+        health.state = "unhealthy";
+        health.unhealthySince = now;
+        health.probeInFlight = false;
+        health.nextProbeAt = now + this.probeIntervalMs;
+        this.logger?.warn("llm_model_unhealthy", {
+          model: modelKey,
+          consecutiveFailures: health.consecutiveFailures,
+          status,
+          waiters: this.countModelWaiters(modelKey),
+        });
+      }
+      return;
+    }
+
+    // Already unhealthy: this settles the probe (the half-open admission rule
+    // means at most one in-flight request exists for the model, so the settling
+    // failure IS the probe — a pre-outage straggler failing here merely
+    // schedules the next window a little later, which is harmless).
+    health.probeInFlight = false;
+    health.nextProbeAt = now + this.probeIntervalMs;
+    this.logger?.warn("llm_model_probe", {
+      model: modelKey,
+      success: false,
+      status,
+      nextProbeAt: health.nextProbeAt,
+      waiters: this.countModelWaiters(modelKey),
+    });
+  }
+
+  /**
+   * True when waiting in the admission queue is the effective wait point for
+   * this (group, model): the group is in throttle backoff or the model is
+   * unhealthy. Layer-0 collapses its local inter-attempt backoff to ~0 then —
+   * the queue already paces re-admission, and sleeping locally on top would
+   * double-wait (spec §4.3).
+   */
+  isQueueWaitPoint(groupName: string, modelKey?: string): boolean {
+    const group = this.groups.get(groupName);
+    if (group && group.backoffUntil > Date.now()) return true;
+    if (modelKey) {
+      const health = this.health.get(modelKey);
+      if (health && health.state === "unhealthy") return true;
+    }
+    return false;
+  }
+
+  /** Count queued entries (across groups) waiting on the given model. */
+  private countModelWaiters(modelKey: string): number {
+    let count = 0;
+    for (const group of this.groups.values()) {
+      for (const entry of group.queue) {
+        if (entry.modelKey === modelKey) count += 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Point-in-time snapshot for the console scheduler view (spec
+   * LLM-FAILURE-HANDLING §9.1): per-group budget state (active/queued entries
+   * with attribution, throttle backoff, sticky escalations) beside per-model
+   * health (streak, probe state, waiter counts). Read-only; safe to call from
+   * the console request path.
+   */
+  snapshot(): LlmSchedulerSnapshot {
+    const now = Date.now();
+    return {
+      groups: [...this.groups.values()].map((group) => ({
+        name: group.name,
+        maxInFlight: group.maxInFlight,
+        backoffUntil: group.backoffUntil > now ? group.backoffUntil : 0,
+        active: [...group.activeEntries].map((entry) => ({
+          sessionId: entry.sessionId ?? null,
+          sessionType: entry.sessionType ?? null,
+          model: entry.modelKey ?? null,
+          priority: classOfRank(entry.rank),
+          key: entry.key ?? null,
+          heldMs: now - entry.admittedAt,
+        })),
+        queue: [...group.queue]
+          .sort((a, b) => (b.rank - a.rank) || (a.seq - b.seq))
+          .map((entry) => ({
+            sessionId: entry.sessionId ?? null,
+            sessionType: entry.sessionType ?? null,
+            model: entry.modelKey ?? null,
+            priority: classOfRank(entry.rank),
+            key: entry.key ?? null,
+            waitingMs: now - entry.enqueuedAt,
+          })),
+        stickyEscalations: [...this.stickyEscalations.entries()].map(([key, priority]) => ({
+          key,
+          priority,
+        })),
+      })),
+      models: [...this.health.values()].map((health) => ({
+        key: health.key,
+        health: health.state,
+        consecutiveFailures: health.consecutiveFailures,
+        probeInFlight: health.probeInFlight,
+        nextProbeAt: health.state === "unhealthy" ? health.nextProbeAt : 0,
+        lastFailure: health.lastFailure ?? null,
+        waiters: this.countModelWaiters(health.key),
+      })),
+    };
   }
 
   /** Reject all queued waiters (shutdown). In-flight requests are unaffected. */
@@ -334,6 +667,7 @@ export class LlmScheduler {
     this.stopped = true;
     for (const group of this.groups.values()) {
       if (group.backoffTimer) clearTimeout(group.backoffTimer);
+      if (group.probeTimer) clearTimeout(group.probeTimer);
       const queued = group.queue.splice(0);
       for (const entry of queued) {
         entry.signal?.removeEventListener("abort", entry.onAbort!);
@@ -354,6 +688,18 @@ export class LlmScheduler {
     group.backoffTimer.unref?.();
   }
 
+  /**
+   * True when an entry's model permits admission right now (§5.2): healthy (or
+   * untracked / no key), or unhealthy with no probe in flight and an elapsed
+   * probe window — in which case the admission IS the probe.
+   */
+  private modelAdmissible(modelKey: string | undefined, now: number): boolean {
+    if (!modelKey) return true;
+    const health = this.health.get(modelKey);
+    if (!health || health.state === "healthy") return true;
+    return !health.probeInFlight && now >= health.nextProbeAt;
+  }
+
   /** Admit queued entries while capacity allows and no backoff is active. */
   private pump(group: GroupState): void {
     for (;;) {
@@ -364,29 +710,88 @@ export class LlmScheduler {
         this.armBackoffTimer(group);
         return;
       }
-      // Highest rank wins; FIFO (lowest seq) within a rank. Queues are tiny
-      // (a handful of pending requests), so a linear scan is the simplest
+      // Per-entry admissibility selection (§5.2): highest rank wins, FIFO
+      // (lowest seq) within a rank — among ADMISSIBLE entries only. An
+      // unhealthy model's waiters are skipped over, not waited behind, so they
+      // never head-of-line-block healthy models sharing the group. Queues are
+      // tiny (a handful of pending requests), so a linear scan is the simplest
       // correct structure.
-      let best = 0;
-      for (let i = 1; i < group.queue.length; i++) {
+      let best = -1;
+      for (let i = 0; i < group.queue.length; i++) {
         const candidate = group.queue[i]!;
+        if (!this.modelAdmissible(candidate.modelKey, now)) continue;
+        if (best === -1) {
+          best = i;
+          continue;
+        }
         const current = group.queue[best]!;
         if (candidate.rank > current.rank || (candidate.rank === current.rank && candidate.seq < current.seq)) {
           best = i;
         }
       }
+      if (best === -1) {
+        // Every queued entry is gated behind an unhealthy model's probe
+        // window. Arm a timer for the earliest window so the pump re-runs
+        // exactly when the next probe becomes admissible.
+        this.armProbeTimer(group, now);
+        return;
+      }
       const entry = group.queue.splice(best, 1)[0]!;
       entry.signal?.removeEventListener("abort", entry.onAbort!);
+      // Admitting a waiter of an UNHEALTHY model makes this request the probe
+      // (§5.1): the highest-priority waiter for the model, at most one in
+      // flight, regardless of its class (a background waiter probes when no
+      // interactive one is queued — open question resolved as proposed).
+      if (entry.modelKey) {
+        const health = this.health.get(entry.modelKey);
+        if (health && health.state === "unhealthy") {
+          health.probeInFlight = true;
+          this.logger?.info("llm_model_probe", {
+            model: entry.modelKey,
+            success: undefined,
+            phase: "launched",
+            waiters: this.countModelWaiters(entry.modelKey),
+          });
+        }
+      }
       group.active += 1;
+      const activeEntry: ActiveEntry = {
+        rank: entry.rank,
+        key: entry.key,
+        modelKey: entry.modelKey,
+        sessionId: entry.sessionId,
+        sessionType: entry.sessionType,
+        admittedAt: now,
+      };
+      group.activeEntries.add(activeEntry);
       let released = false;
       const release: ReleaseFn = () => {
         if (released) return;
         released = true;
         group.active = Math.max(0, group.active - 1);
+        group.activeEntries.delete(activeEntry);
         this.pump(group);
       };
       entry.resolve(release);
     }
+  }
+
+  /** Re-pump when the earliest blocked probe window opens (§5.2). */
+  private armProbeTimer(group: GroupState, now: number): void {
+    let earliest = Infinity;
+    for (const entry of group.queue) {
+      if (!entry.modelKey) continue;
+      const health = this.health.get(entry.modelKey);
+      if (!health || health.state !== "unhealthy" || health.probeInFlight) continue;
+      earliest = Math.min(earliest, health.nextProbeAt);
+    }
+    if (!Number.isFinite(earliest)) return; // blocked on in-flight probes → their settle pumps
+    if (group.probeTimer) clearTimeout(group.probeTimer);
+    group.probeTimer = setTimeout(() => {
+      group.probeTimer = undefined;
+      this.pump(group);
+    }, Math.max(0, earliest - now) + 1);
+    group.probeTimer.unref?.();
   }
 }
 
@@ -395,6 +800,15 @@ export interface AdmissionOptions {
   priority: PriorityClass;
   /** Escalation key registered for the whole wait (§5.5). */
   key?: string;
+  /** Attribution for the console scheduler view (spec §9.1). */
+  sessionId?: string;
+  sessionType?: string;
+  /**
+   * Called with the admission-queue wait of each attempt (ms), right after a
+   * slot is acquired. The factory uses it to stamp `admissionWaitMs` onto the
+   * request ring entry (spec §9.2) — the one number llm-gateway cannot see.
+   */
+  onAdmissionWait?: (waitMs: number) => void;
 }
 
 /**
@@ -459,15 +873,30 @@ export function withSchedulerAdmission(
     const opts = streamOptions as SimpleStreamOptions | undefined;
     const signal = opts?.signal;
 
+    // The failure domain (§5): derived from the Model object in hand at call
+    // time — zero config plumbing, and every Layer-0 retry attempt re-enters
+    // admission under the same key (this is what makes N waiting sessions
+    // produce one probe during an outage instead of N retry loops).
+    const modelKey = modelHealthKey(model);
+
     void (async () => {
       let release: ReleaseFn;
+      const acquireStart = Date.now();
       try {
         release = await scheduler.acquire({
           group: options.group,
           priority: options.priority,
           key: options.key,
+          modelKey,
+          sessionId: options.sessionId,
+          sessionType: options.sessionType,
           signal,
         });
+        try {
+          options.onAdmissionWait?.(Date.now() - acquireStart);
+        } catch {
+          /* observe-only */
+        }
       } catch (err) {
         // Admission failed without any request being issued. An aborted wait
         // (run abort / drain) synthesizes `stopReason:"aborted"` and a scheduler
@@ -500,7 +929,15 @@ export function withSchedulerAdmission(
         onResponse: (response, responseModel) => {
           if (response.status === 429 || response.status === 503) {
             throttleNoted = true;
-            scheduler.noteStatus(options.group, response.status, parseRetryAfterMs(response.headers));
+            // Both axes (§5): 503 feeds the model streak too; a plain 429 is
+            // excluded from the streak inside noteOutcome (budget, not health).
+            scheduler.noteOutcome(
+              options.group,
+              modelKey,
+              "environmental",
+              response.status,
+              parseRetryAfterMs(response.headers),
+            );
           }
           return prevOnResponse?.(response, responseModel);
         },
@@ -510,10 +947,20 @@ export function withSchedulerAdmission(
         for await (const event of inner) {
           if (event.type === "error") {
             // Skip the fallback when the hook already counted this request's
-            // throttle — double-counting would inflate the exponential streak.
-            if (!throttleNoted) scheduler.noteResult(options.group, event.error?.errorMessage);
+            // throttle — double-counting would inflate the exponential streak
+            // (and the model streak alike).
+            if (!throttleNoted) {
+              const failure = event.error;
+              const message = failure?.errorMessage;
+              scheduler.noteOutcome(
+                options.group,
+                modelKey,
+                classifyLlmError(message, failure?.stopReason),
+                message ? extractStatus(message.toLowerCase()) : undefined,
+              );
+            }
           } else if (event.type === "done") {
-            scheduler.noteResult(options.group);
+            scheduler.noteOutcome(options.group, modelKey, undefined);
           }
           outer.push(event);
         }
@@ -521,7 +968,14 @@ export function withSchedulerAdmission(
         // The base fn itself threw (not via a terminal `error` event). Surface a
         // terminal error so the consumer always sees one, and count it for backoff.
         const message = err instanceof Error ? err.message : String(err);
-        if (!throttleNoted) scheduler.noteResult(options.group, message);
+        if (!throttleNoted) {
+          scheduler.noteOutcome(
+            options.group,
+            modelKey,
+            classifyLlmError(message, undefined),
+            extractStatus(message.toLowerCase()),
+          );
+        }
         outer.push(synthesizeErrorEvent(model, message));
       } finally {
         release();

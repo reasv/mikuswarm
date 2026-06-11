@@ -6,46 +6,63 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
+import type { LlmRequestRing } from "./request-ring.js";
+import type { PriorityClass } from "./scheduler.js";
 
 // =============================================================================
-// Layer 1 — transparent request-level LLM retry (mechanical failures).
+// Layer 0 — transparent request-level LLM retry.
 //
-// Spec: CONCURRENCY-AND-RATE-LIMITING §6.1. The agent's stream function
-// (`streamSimple`, or `wrapCompleteAsStream` for non-streaming models) can fail
-// for mechanical reasons that are frequent and normal: a connection reset, a
-// timeout, a 5xx, an upstream 429. Today such a blip synthesizes a
-// `stopReason:"error"` message, which discards a live session and burns a
-// synthetic job's coarse semantic-retry attempt.
+// Spec: LLM-FAILURE-HANDLING §4 (supersedes CONCURRENCY-AND-RATE-LIMITING
+// §6.1's pre-commit-only retry). The agent's stream function (`streamSimple`,
+// or `wrapCompleteAsStream` for non-streaming models) can fail for
+// environmental reasons that are frequent and normal: a connection reset, a
+// timeout, a 5xx, an upstream 429, a stream that starts producing tokens and
+// dies in an error event. Inference failures must be invisible to the session
+// (P1): the session's log and context are never modified by an API-level
+// failure, and a success after N failed attempts is byte-equivalent to a
+// success on the first attempt.
 //
-// `withRequestRetry` wraps any {@link StreamFn} so that, when the underlying
-// stream terminates with an `error` event BEFORE producing any output, the exact
-// same request is re-issued (bounded, with exponential backoff + jitter) before
-// the failure is allowed to surface. This is invisible to the session and to
-// pi-agent-core; a mechanical blip is absorbed here rather than escalating.
+// `withRequestRetry` therefore buffers ALL events of an attempt and forwards
+// them to the consumer (pi-agent-core) only when the attempt terminates in a
+// clean `done` — the commit point IS the terminal event (§4.1). A terminal
+// `error` at ANY point — before or after tokens were produced — discards the
+// buffered partial and re-enters the retry loop as if the request had failed
+// from the start. pi-agent-core never sees a failed attempt unless this layer
+// gives up; the synthetic `stopReason:"error"` turn and the Layer-2 rebuild
+// stop being the mid-stream recovery path. Buffering a full response is
+// bounded by `max_tokens` — no meaningful memory concern.
 //
-// Crucially it only retries failures that occur *before* the stream commits any
-// content. Once tokens (or a tool call, or a clean `done`) have been forwarded to
-// the consumer, the request is "committed" — a later mid-stream failure cannot be
-// transparently replayed and is forwarded as-is. That mid-stream case is the
-// province of Layer 2 (session resume-in-place, spec §6.2 — not yet wired).
+// Live token streaming is preserved via the observability tap (§4.2): the
+// context's `onAttemptEvent` is invoked synchronously with every raw event as
+// it arrives (best-effort, exceptions swallowed — the tap can never affect the
+// run), and `onAttemptDiscarded` fires when a partial attempt is thrown away,
+// so the console can render tentative tokens and clear them on retry. Nothing
+// product-level consumes partials.
 //
 // This wrapper does NOT distinguish a 429 originating at the gateway (LlmGateway,
 // which already retries internally) from a 429 at the true upstream: it backs off
 // and retries either way, which is always safe (spec §5.3 — 429 backoff is an
-// unconditional invariant). The origin distinction (spec §6.1) is a deferred
-// optimization, not a correctness requirement.
+// unconditional invariant).
 // =============================================================================
 
 export interface RequestRetryOptions {
   /**
-   * Number of *additional* attempts after the first. Total attempts =
-   * `retries + 1`. `0` disables retry (a single attempt) — the wrapper still
-   * applies, because it owns the Layer-1 origin tagging (see
-   * {@link LLM_REQUEST_FAILURE_MARKER}) that Layer-2 resume classification
-   * depends on. Maps to `recovery.llm_request_retries`.
+   * Wall-clock budget for environmental retries (spec LLM-FAILURE-HANDLING
+   * §6), measured from the first attempt of the failing request. `undefined`
+   * = UNBOUNDED — background-class work keeps re-entering admission until it
+   * succeeds, is drained/aborted, or reclassifies (P3: downtime is routine
+   * and background work waits it out). Interactive-class callers pass
+   * `recovery.llm_request_max_wait_ms`. A fixed attempt count is meaningless
+   * under scheduler gating — attempts can elapse in seconds or hours
+   * depending on group/model state — so there is no `retries` knob anymore.
    */
-  retries: number;
-  /** Base for exponential backoff between attempts. `recovery.llm_request_backoff_base_ms`. */
+  maxWaitMs?: number;
+  /**
+   * Base for the local inter-attempt backoff. Applies only while the request's
+   * model is healthy and its group unthrottled — once the admission queue is
+   * the wait point (`ctx.isQueueWaitPoint`), the local sleep collapses to ~0
+   * (no double-waiting, §4.3). `recovery.llm_request_backoff_base_ms`.
+   */
   backoffBaseMs: number;
   /** Ceiling for the (pre-jitter) backoff delay. `recovery.llm_request_backoff_max_ms`. */
   backoffMaxMs: number;
@@ -56,9 +73,53 @@ export interface RequestRetryContext {
   sessionId?: string;
   timelineKey?: string;
   sessionType?: string;
+  /** Rate-limit group of the wrapped calls (for `llm_request_attempt_failed` logs). */
+  group?: string;
+  /**
+   * Observability tap (spec LLM-FAILURE-HANDLING §4.2): invoked synchronously
+   * with every raw event of every attempt as it arrives — including events of
+   * attempts that are later discarded. Best-effort: exceptions are swallowed;
+   * the tap can never affect the run. Attempt numbers are 1-based.
+   */
+  onAttemptEvent?: (attempt: number, event: AssistantMessageEvent) => void;
+  /**
+   * Fired when a (possibly partial) attempt is discarded and the request will
+   * be retried — the console clears tentative tokens and shows
+   * "attempt n failed (reason), retrying".
+   */
+  onAttemptDiscarded?: (attempt: number, reason: string) => void;
+  /**
+   * True when the admission queue is the effective wait point (group throttle
+   * backoff active, or the model unhealthy): the local inter-attempt backoff
+   * then collapses to ~0 so the wrapper never double-waits (§4.3). The
+   * factory binds `LlmScheduler.isQueueWaitPoint(group, modelKey)`.
+   */
+  isQueueWaitPoint?: () => boolean;
+  /** Priority class of the wrapped calls (ring attribution, spec §9.2). */
+  priority?: PriorityClass;
+  /** In-memory request ring; every settled attempt is recorded (spec §9.2). */
+  ring?: LlmRequestRing;
+  /**
+   * Drain-and-reset read of the last attempt's admission-queue wait, filled by
+   * `withSchedulerAdmission`'s `onAdmissionWait` via a factory-owned holder.
+   */
+  takeAdmissionWaitMs?: () => number | undefined;
 }
 
-export type LlmErrorClass = "retryable" | "fatal";
+/**
+ * Failure class of an LLM request (spec LLM-FAILURE-HANDLING §3).
+ *
+ * - `environmental` — session-independent; the model/account/gateway is unwell
+ *   or throttling. Expected to clear (possibly after operator action: an auth/
+ *   grant failure is endpoint-level and fixed out-of-band, so 401/403 land here
+ *   too — the fixed-cadence probe detects recovery automatically). Retried.
+ * - `content` — caused by *this request's* content (oversized context,
+ *   malformed payload); replay is deterministic. Never retried at this layer;
+ *   escalated to the semantic layer.
+ * - `aborted` — intentional (drain, operator Stop, tool/turn caps, scheduler
+ *   stop). Never retried; surfaced as an abort.
+ */
+export type LlmErrorClass = "environmental" | "content" | "aborted";
 
 // ─── Layer-1 origin tagging (Decision C / review issue #14) ──────────────────
 //
@@ -88,11 +149,28 @@ export type LlmErrorClass = "retryable" | "fatal";
 /** Marker appended to terminal error messages that originated in the LLM request layer. */
 export const LLM_REQUEST_FAILURE_MARKER = "[llm-request]";
 
-/** Append the Layer-1 origin marker (idempotent). */
-export function tagLlmRequestError(message: string | undefined): string {
+/**
+ * Machine-readable class marker (spec LLM-FAILURE-HANDLING §4.3), e.g.
+ * `[llm-request:content]`. A marker-in-string because pi-agent-core flattens
+ * everything to `errorMessage` (Decision C) — a structured side-channel is not
+ * available without forking the runtime.
+ */
+export function llmRequestClassMarker(cls: LlmErrorClass): string {
+  return `[llm-request:${cls}]`;
+}
+
+const CLASS_MARKER_RE = /\[llm-request:(environmental|content|aborted)\]/;
+
+/**
+ * Append the Layer-1 origin marker, plus the machine-readable class marker when
+ * a class is given (idempotent; an already-tagged message is never re-tagged,
+ * so the FIRST classification at the surfacing point wins).
+ */
+export function tagLlmRequestError(message: string | undefined, cls?: LlmErrorClass): string {
   const msg = message ?? "";
   if (msg.includes(LLM_REQUEST_FAILURE_MARKER)) return msg;
-  return msg.length > 0 ? `${msg} ${LLM_REQUEST_FAILURE_MARKER}` : LLM_REQUEST_FAILURE_MARKER;
+  const markers = cls ? `${LLM_REQUEST_FAILURE_MARKER} ${llmRequestClassMarker(cls)}` : LLM_REQUEST_FAILURE_MARKER;
+  return msg.length > 0 ? `${msg} ${markers}` : markers;
 }
 
 /** True when the flattened error message carries the Layer-1 origin marker. */
@@ -100,66 +178,76 @@ export function isLlmRequestError(message: string | undefined): boolean {
   return (message ?? "").includes(LLM_REQUEST_FAILURE_MARKER);
 }
 
-/** Remove the Layer-1 origin marker for display/classification. */
-export function stripLlmRequestTag(message: string): string {
-  return message.split(LLM_REQUEST_FAILURE_MARKER).join("").replace(/\s+$/, "").trim();
+/** Parse the class marker out of a tagged error message, if present. */
+export function extractLlmRequestClass(message: string | undefined): LlmErrorClass | undefined {
+  const m = CLASS_MARKER_RE.exec(message ?? "");
+  return m ? (m[1] as LlmErrorClass) : undefined;
 }
 
-// 4xx that indicate a request the model/gateway will reject identically on replay
-// (auth, malformed, not-found, payload-too-large, unprocessable). Never retried.
-const FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 413, 422]);
-// Transient statuses worth re-issuing: request timeout, conflict, too-early,
-// rate-limit, and the 5xx family incl. Anthropic's 529 "overloaded".
-const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529]);
+/** Remove the Layer-1 origin + class markers for display/classification. */
+export function stripLlmRequestTag(message: string): string {
+  return message
+    .replace(CLASS_MARKER_RE, "")
+    .split(LLM_REQUEST_FAILURE_MARKER)
+    .join("")
+    .replace(/\s+$/, "")
+    .trim();
+}
 
-// Substrings that mark a definitively fatal error even without a parseable status
-// (e.g. an SDK auth error whose message carries no leading code).
-const FATAL_KEYWORDS = [
-  "invalid api key",
-  "invalid x-api-key",
-  "authentication",
-  "unauthorized",
-  "permission",
-  "forbidden",
-  "invalid_request_error",
-  // Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
-  // admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can
-  // only ever reject again, so retrying would spin out the full backed-off
-  // attempt budget per straggler during teardown (#11).
-  "scheduler stopped",
+// Statuses caused by THIS request's content — the upstream will reject an
+// identical replay deterministically (malformed, payload-too-large,
+// unprocessable). Everything else parseable is environmental (spec §3): the
+// 408/409/425/429/5xx transients, but also 401/403/404/405 — an auth/grant
+// failure is endpoint-level, fixed out-of-band, and recovery is detected by the
+// model-health probe rather than by refusing to retry.
+const CONTENT_STATUSES = new Set([400, 413, 422]);
+
+// Substrings that positively identify a content failure even without a
+// parseable status (context-length violations are the dominant real case).
+const CONTENT_KEYWORDS = [
+  "prompt is too long",
+  "context_length_exceeded",
+  "context length exceeded",
+  "maximum context length",
+  "request_too_large",
+  "payload too large",
 ];
 
+// Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
+// admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can only
+// ever reject again, so this is intentional-teardown, classified `aborted` —
+// retrying would spin out backed-off attempts per straggler during drain (#11).
+const SCHEDULER_STOPPED_KEYWORD = "scheduler stopped";
+
 /**
- * Classify an LLM stream failure as a mechanical (retryable) blip or a fatal error.
+ * Classify an LLM stream failure (spec LLM-FAILURE-HANDLING §3): three-way
+ * `environmental` / `content` / `aborted` replacing the old retryable/fatal
+ * binary.
  *
  * Inputs are the terminal `error` AssistantMessage's `errorMessage` (a flattened
  * string — pi-ai stores `error.message` here, so an SDK `APIError` arrives status-
  * prefixed, e.g. `"429 {...}"`) and its `stopReason`.
  *
- * An intentional `aborted` (tool-call/turn cap, shutdown) is never retried. With a
- * parseable HTTP status we honour the known fatal/retryable sets (other 4xx → fatal,
- * other 5xx → retryable). With no status we treat explicit auth/validation keywords
- * as fatal and DEFAULT EVERYTHING ELSE TO RETRYABLE — mechanical failures (socket
- * resets, timeouts, transient parse errors, empty/unknown errors) dominate this path
- * and the bounded attempt count caps the cost of a wrong guess.
+ * An intentional `aborted` (tool-call/turn cap, shutdown, scheduler stop) is
+ * never retried. `content` requires positive evidence — a 400/413/422 status or
+ * an explicit context-length keyword. EVERYTHING ELSE IS `environmental`:
+ * timeouts, resets, empty streams, every other status (5xx, 429, and the
+ * 401/403/404/405 endpoint-level failures), auth keywords, and anything
+ * unparseable — mechanical blips dominate that path, and the scheduler's
+ * model-health gating bounds the cost of a wrong guess.
  */
 export function classifyLlmError(
   errorMessage: string | undefined,
   stopReason: string | undefined,
 ): LlmErrorClass {
-  if (stopReason === "aborted") return "fatal";
+  if (stopReason === "aborted") return "aborted";
   const msg = (errorMessage ?? "").toLowerCase();
+  if (msg.includes(SCHEDULER_STOPPED_KEYWORD)) return "aborted";
 
   const status = extractStatus(msg);
-  if (status !== undefined) {
-    if (RETRYABLE_STATUSES.has(status)) return "retryable";
-    if (FATAL_STATUSES.has(status)) return "fatal";
-    if (status >= 400 && status < 500) return "fatal";
-    if (status >= 500) return "retryable";
-  }
-
-  if (FATAL_KEYWORDS.some((keyword) => msg.includes(keyword))) return "fatal";
-  return "retryable";
+  if (status !== undefined && CONTENT_STATUSES.has(status)) return "content";
+  if (CONTENT_KEYWORDS.some((keyword) => msg.includes(keyword))) return "content";
+  return "environmental";
 }
 
 /**
@@ -192,124 +280,241 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
 }
 
 /**
- * Wrap a {@link StreamFn} with Layer-1 transparent request retry. `retries: 0`
- * means a single attempt, but the wrapper still applies: every terminal error
- * it surfaces is tagged with {@link LLM_REQUEST_FAILURE_MARKER} (Decision C),
- * which Layer-2 resume classification depends on — returning the base fn
- * unwrapped would silently disable resume-in-place.
+ * Wrap a {@link StreamFn} with Layer-0 transparent request retry (spec
+ * LLM-FAILURE-HANDLING §4/§6). The commit point is the TERMINAL event (§4.1):
+ * all events of an attempt are buffered and forwarded only on a clean `done`;
+ * a terminal `error` at any point — even after tokens streamed — discards the
+ * buffered partial and retries as if the request had failed from the start.
+ *
+ * Retry budget (§6): environmental failures retry indefinitely when
+ * `maxWaitMs` is unset (background-class — downtime is waited out), or until
+ * the wall-clock budget elapses (interactive-class), measured from the first
+ * attempt. The budget also cuts short an in-progress ADMISSION wait — expiry
+ * mid-queue aborts the acquire via a composed signal — so a request queued
+ * behind an unhealthy model's probe window cannot overstay its budget.
+ *
+ * The wrapper always applies: every terminal error it surfaces is tagged with
+ * {@link LLM_REQUEST_FAILURE_MARKER} + the class marker (Decision C / §4.3),
+ * which the runner's typed `phase:"llm"` rejection depends on.
  */
 export function withRequestRetry(
   base: StreamFn,
   options: RequestRetryOptions,
   ctx: RequestRetryContext = {},
 ): StreamFn {
-  const maxAttempts = Math.max(1, Math.floor(options.retries) + 1);
-
   return (model, context, streamOptions) => {
     const outer = createAssistantMessageEventStream();
-    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    const callerSignal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+
+    // Wall-clock budget (§6). The budget signal composes with the caller's own
+    // signal so expiry aborts an in-flight attempt or admission wait; the
+    // surfaced abort is then re-labelled as budget exhaustion below (the
+    // caller did not abort — the clock did).
+    const maxWaitMs = options.maxWaitMs;
+    const deadline = maxWaitMs === undefined ? Infinity : Date.now() + maxWaitMs;
+    let budgetCtrl: AbortController | undefined;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+    let effectiveOptions = streamOptions;
+    if (maxWaitMs !== undefined) {
+      budgetCtrl = new AbortController();
+      budgetTimer = setTimeout(() => budgetCtrl!.abort(), maxWaitMs);
+      budgetTimer.unref?.();
+      const combined = callerSignal
+        ? AbortSignal.any([callerSignal, budgetCtrl.signal])
+        : budgetCtrl.signal;
+      effectiveOptions = {
+        ...((streamOptions as object | undefined) ?? {}),
+        signal: combined,
+      } as typeof streamOptions;
+    }
+    const sleepSignal =
+      (effectiveOptions as { signal?: AbortSignal } | undefined)?.signal ?? callerSignal;
+
+    const tap = (attempt: number, event: AssistantMessageEvent): void => {
+      try {
+        ctx.onAttemptEvent?.(attempt, event);
+      } catch {
+        /* observe-only: the tap can never affect the run */
+      }
+    };
+    const tapDiscarded = (attempt: number, reason: string): void => {
+      try {
+        ctx.onAttemptDiscarded?.(attempt, reason);
+      } catch {
+        /* observe-only */
+      }
+    };
+    /** Record one settled attempt on the in-memory ring (spec §9.2). */
+    const recordAttempt = (
+      attempt: number,
+      startedAt: number,
+      outcome: "done" | "error" | "aborted",
+      details?: { status?: number; cls?: LlmErrorClass; errorMessage?: string },
+    ): void => {
+      try {
+        ctx.ring?.record({
+          ts: Date.now(),
+          sessionId: ctx.sessionId,
+          sessionType: ctx.sessionType,
+          group: ctx.group,
+          model: (model as { id?: string }).id ?? "unknown",
+          priority: ctx.priority,
+          attempt,
+          admissionWaitMs: ctx.takeAdmissionWaitMs?.(),
+          durationMs: Date.now() - startedAt,
+          outcome,
+          status: details?.status,
+          class: details?.cls,
+          errorMessage: details?.errorMessage,
+        });
+      } catch {
+        /* observe-only */
+      }
+    };
+
+    /** Surface the terminal error (tagged) and finalize `outer`. */
+    const surface = (
+      event: Extract<AssistantMessageEvent, { type: "error" }>,
+      cls: LlmErrorClass,
+    ): void => {
+      outer.push(tagErrorEvent(event, cls));
+    };
 
     void (async () => {
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        let committed = false;
-        const buffered: AssistantMessageEvent[] = [];
-        let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
+      try {
+        for (let attempt = 0; ; attempt++) {
+          const attemptStart = Date.now();
+          const buffered: AssistantMessageEvent[] = [];
+          let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
+          let producedTokens = false;
 
-        try {
-          const inner = await base(model, context, streamOptions);
-          for await (const event of inner) {
-            if (committed) {
-              // Past the commit point: forward verbatim — except a terminal
-              // `error` (a mid-stream death, Layer-2 territory), which is
-              // tagged as LLM-request-layer-originated like every other
-              // terminal error this wrapper emits. A terminal `done`/`error`
-              // here auto-finalizes `outer` (EventStream.push resolves on it).
-              outer.push(event.type === "error" ? tagErrorEvent(event) : event);
-              continue;
+          try {
+            const inner = await base(model, context, effectiveOptions);
+            for await (const event of inner) {
+              tap(attempt + 1, event);
+              if (event.type === "error") {
+                // Terminal error — before OR after tokens. The buffered partial
+                // is discarded below; the retry loop owns recovery (§4.1).
+                errorEvent = event;
+                break;
+              }
+              buffered.push(event);
+              if (event.type !== "start") producedTokens = true;
+              // A clean terminal `done` ends the inner iteration on its own.
             }
-            if (event.type === "error") {
-              errorEvent = event;
-              break;
-            }
-            buffered.push(event);
-            if (event.type !== "start") {
-              // First real content (or a `done`): this attempt has produced output.
-              // Commit — flush the buffered prologue and switch to pass-through.
-              committed = true;
+          } catch (err) {
+            // The base fn (or its stream iteration) THREW instead of emitting a
+            // terminal `error` event — e.g. a synchronously-failing base in a
+            // scheduler-less composition. Without this guard the throw escapes
+            // the void-IIFE as an unhandled rejection (process-fatal) and
+            // `outer` never terminates (hung consumer) (#12). Synthesize the
+            // terminal error and feed it through the SAME classification/retry
+            // logic below; an AbortError keeps its `aborted` stop reason.
+            const message = err instanceof Error ? err.message : String(err);
+            const aborted = err instanceof Error && err.name === "AbortError";
+            errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
+            tap(attempt + 1, errorEvent);
+          }
+
+          if (!errorEvent) {
+            const terminal = buffered[buffered.length - 1];
+            if (terminal && terminal.type === "done") {
+              // Clean terminal `done`: the attempt commits as a whole (§4.1).
+              // Flushing forwards the terminal event last, which finalizes
+              // `outer` (EventStream.push resolves on it). A success after N
+              // failed attempts is byte-equivalent to a first-attempt success.
+              recordAttempt(attempt + 1, attemptStart, "done");
               flush(outer, buffered);
-              buffered.length = 0;
+              return;
             }
-          }
-        } catch (err) {
-          // The base fn (or its stream iteration) THREW instead of emitting a
-          // terminal `error` event — e.g. a synchronously-failing base in a
-          // scheduler-less composition. Without this guard the throw escapes the
-          // void-IIFE as an unhandled rejection (process-fatal) and `outer` never
-          // terminates (hung consumer) (#12). Synthesize the terminal error and
-          // feed it through the SAME classification/retry logic below; an
-          // AbortError keeps its `aborted` stop reason (never retried).
-          const message = err instanceof Error ? err.message : String(err);
-          const aborted = err instanceof Error && err.name === "AbortError";
-          errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
-          if (committed) {
-            // Content already forwarded — cannot replay (Layer-2 territory), but
-            // the consumer still needs a terminal event.
-            outer.push(tagErrorEvent(errorEvent));
-            return;
-          }
-        }
-
-        if (committed) return; // terminal already forwarded → `outer` is complete
-
-        if (errorEvent) {
-          const failure = errorEvent.error;
-          const verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
-          const lastAttempt = attempt >= maxAttempts - 1;
-          if (verdict === "retryable" && !lastAttempt) {
-            const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
-            ctx.logger?.warn("llm_request_retry", {
+            // Degenerate: the inner stream ended with no terminal event. An
+            // "empty stream" is explicitly environmental (§3), so it re-enters
+            // the same retry loop instead of surfacing immediately.
+            ctx.logger?.warn("llm_request_empty_stream", {
               sessionId: ctx.sessionId,
               timelineKey: ctx.timelineKey,
               sessionType: ctx.sessionType,
               attempt: attempt + 1,
-              maxAttempts,
-              delayMs: Math.round(delay),
-              errorMessage: failure?.errorMessage,
             });
+            errorEvent = synthesizeErrorEvent(model, "stream ended without a terminal event");
+            tap(attempt + 1, errorEvent);
+          }
+
+          const failure = errorEvent.error;
+          let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
+
+          // Budget expiry mid-attempt/mid-admission arrives as an abort of the
+          // composed signal. When the CALLER did not abort, the clock did:
+          // re-label as environmental wait-exhaustion rather than an
+          // intentional abort, so the failure parks instead of settling.
+          const budgetExpired = budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true;
+          if (verdict === "aborted" && budgetExpired) {
+            verdict = "environmental";
+            errorEvent = synthesizeErrorEvent(
+              model,
+              `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
+            );
+          }
+          recordAttempt(attempt + 1, attemptStart, verdict === "aborted" ? "aborted" : "error", {
+            status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
+            cls: verdict,
+            errorMessage: errorEvent.error?.errorMessage,
+          });
+
+          if (verdict === "environmental") {
+            // Every environmental failure is logged — including the first
+            // attempt (spec §9.3 closes the audit gap where first-attempt
+            // failures logged nothing).
+            ctx.logger?.warn("llm_request_attempt_failed", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              group: ctx.group,
+              class: verdict,
+              status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
+              attempt: attempt + 1,
+              producedTokens,
+              errorMessage: errorEvent.error?.errorMessage,
+            });
+            if (Date.now() >= deadline || budgetExpired) {
+              ctx.logger?.warn("llm_request_wait_exhausted", {
+                sessionId: ctx.sessionId,
+                timelineKey: ctx.timelineKey,
+                sessionType: ctx.sessionType,
+                maxWaitMs,
+                attempts: attempt + 1,
+                errorMessage: errorEvent.error?.errorMessage,
+              });
+              surface(errorEvent, verdict);
+              return;
+            }
+            tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "request failed");
+            // Local backoff applies only while the admission queue is NOT the
+            // wait point (§4.3) — an unhealthy model / throttled group already
+            // paces re-admission, and double-waiting would slow recovery.
+            let delay = ctx.isQueueWaitPoint?.() ? 0 : backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
+            if (Number.isFinite(deadline)) delay = Math.min(delay, Math.max(0, deadline - Date.now()));
             try {
-              await sleep(delay, signal);
+              await sleep(delay, sleepSignal);
             } catch {
-              // Aborted mid-backoff (shutdown / cap): surface the original error.
-              flush(outer, buffered);
-              outer.push(tagErrorEvent(errorEvent));
+              // Aborted mid-backoff. Caller abort (shutdown/Stop) surfaces the
+              // original error; budget expiry loops once more and exits via
+              // the wait-exhausted path above.
+              if (budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true) {
+                continue;
+              }
+              surface(errorEvent, verdict);
               return;
             }
             continue;
           }
-          if (verdict === "retryable") {
-            ctx.logger?.warn("llm_request_retries_exhausted", {
-              sessionId: ctx.sessionId,
-              timelineKey: ctx.timelineKey,
-              sessionType: ctx.sessionType,
-              attempts: maxAttempts,
-              errorMessage: failure?.errorMessage,
-            });
-          }
-          flush(outer, buffered);
-          outer.push(tagErrorEvent(errorEvent));
+
+          // `content` and `aborted` surface immediately — never retried (§4.3).
+          surface(errorEvent, verdict);
           return;
         }
-
-        // Degenerate: the inner stream ended with neither content nor a terminal
-        // event. Synthesize a terminal error so the consumer always sees one.
-        ctx.logger?.warn("llm_request_empty_stream", {
-          sessionId: ctx.sessionId,
-          timelineKey: ctx.timelineKey,
-          sessionType: ctx.sessionType,
-        });
-        flush(outer, buffered);
-        outer.push(tagErrorEvent(synthesizeErrorEvent(model, "stream ended without a terminal event")));
-        return;
+      } finally {
+        if (budgetTimer) clearTimeout(budgetTimer);
       }
     })();
 
@@ -341,15 +546,19 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Copy a terminal `error` event with the Layer-1 origin marker appended to its
+ * Copy a terminal `error` event with the Layer-1 origin marker (and the §4.3
+ * class marker, when the class is known at the surfacing point) appended to its
  * `errorMessage` (Decision C / #14). Never mutates the provider's event.
  */
 function tagErrorEvent(
   event: Extract<AssistantMessageEvent, { type: "error" }>,
+  cls?: LlmErrorClass,
 ): Extract<AssistantMessageEvent, { type: "error" }> {
+  const failure = event.error;
+  const resolved = cls ?? classifyLlmError(failure?.errorMessage, failure?.stopReason);
   return {
     ...event,
-    error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage) },
+    error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage, resolved) },
   };
 }
 

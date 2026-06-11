@@ -13,6 +13,8 @@ import {
   resumeSession,
   media,
   summaryDetail,
+  schedulerSnapshot,
+  llmRequests,
 } from "./handlers.js";
 import {
   listPipelines,
@@ -73,6 +75,8 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("POST", "/api/sessions/:id/resume", resumeSession)
     .add("GET", "/api/media/:ref", media)
     .add("GET", "/api/summaries/:id", summaryDetail)
+    .add("GET", "/api/scheduler", schedulerSnapshot)
+    .add("GET", "/api/llm-requests", llmRequests)
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)
     .add("GET", "/api/pipelines/:pool/items", pipelineItems)

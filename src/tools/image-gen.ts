@@ -14,7 +14,8 @@ import {
   conditionImageBufferForInference,
   type ImageProcessingOptions,
 } from "../media/index.js";
-import { parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
+import { modelHealthKey, parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
+import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -253,6 +254,9 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       // be admitted — an uncoordinated image-gen call would starve a live reply.
       // Orthogonal to the per-host limiter inside guardedFetch (it bounds the
       // Gemini *host*; the scheduler bounds the *budget*).
+      // Health key (spec LLM-FAILURE-HANDLING §5): the image model's failure
+      // domain, derived the same way as agent sessions' — endpoint + model id.
+      const healthKey = modelHealthKey({ baseUrl, id: modelId });
       let release: (() => void) | undefined;
       if (context.scheduler) {
         try {
@@ -260,6 +264,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
             group: "default",
             priority: "interactive",
             key: "image-gen",
+            modelKey: healthKey,
           });
         } catch (error) {
           return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
@@ -269,18 +274,31 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       try {
         result = await postGenerate({ url, apiKey, body, dispatcher, timeoutMs });
       } catch (error) {
-        context.scheduler?.noteResult("default", errMessage(error));
-        return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
+        const message = errMessage(error);
+        context.scheduler?.noteOutcome(
+          "default",
+          healthKey,
+          classifyLlmError(message, undefined),
+          extractStatus(message.toLowerCase()),
+        );
+        return textError(`Image generation request failed (model ${modelId}): ${message}`);
       } finally {
         release?.();
       }
       if ("httpError" in result) {
         // Feed the group's unconditional 429/503 backoff (§5.3) with the real
-        // status and the server's Retry-After (clamped by the scheduler).
-        context.scheduler?.noteStatus("default", result.status, result.retryAfterMs);
+        // status and the server's Retry-After (clamped by the scheduler), and
+        // the model-health streak (§5; 429 excluded inside noteOutcome).
+        context.scheduler?.noteOutcome(
+          "default",
+          healthKey,
+          classifyLlmError(`${result.status} image generation failed`, undefined),
+          result.status,
+          result.retryAfterMs,
+        );
         return result.httpError;
       }
-      context.scheduler?.noteStatus("default", undefined);
+      context.scheduler?.noteOutcome("default", healthKey, undefined);
 
       const extracted = extractImage(result);
       if (!extracted.image) {

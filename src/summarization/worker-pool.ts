@@ -1,6 +1,12 @@
 import { nanoid } from "nanoid";
 import type { Storage, SummarizationJob } from "../storage/index.js";
-import { assertRunSettledCleanly, type AgentSessionFactory, type AgentSessionRecord } from "../agent/index.js";
+import {
+  assertRunSettledCleanly,
+  wasRunAborted,
+  WorkerDrainAbortError,
+  type AgentSessionFactory,
+  type AgentSessionRecord,
+} from "../agent/index.js";
 import type { SummarizationConfig } from "../config/index.js";
 import type { Logger } from "../observability/index.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
@@ -39,6 +45,8 @@ interface ResolvedInput {
 export class SummarizationWorkerPool {
   private running = false;
   private readonly activeWorkers = new Set<Promise<void>>();
+  /** Live agents of in-flight runs, aborted at drain (spec LLM-FAILURE-HANDLING §7). */
+  private readonly activeAgents = new Set<{ abort(): void }>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
 
@@ -57,6 +65,20 @@ export class SummarizationWorkerPool {
     this.running = false;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.wakeResolve) this.wakeResolve();
+    // Abort in-flight runs (spec §7): a background-class LLM request retries
+    // WITHOUT BOUND at Layer-0 — during an outage an in-flight worker would
+    // otherwise wait in the admission queue forever and this stop() would
+    // never settle. The abort surfaces as a drain abort; the job returns to
+    // 'pending' with its claim-time attempts increment compensated, and a
+    // restart re-claims and re-runs it from scratch (the job queue is the
+    // durable unit; mid-session inference state is deliberately not persisted).
+    for (const agent of this.activeAgents) {
+      try {
+        agent.abort();
+      } catch {
+        /* best-effort */
+      }
+    }
     await Promise.allSettled([...this.activeWorkers]);
   }
 
@@ -309,7 +331,12 @@ export class SummarizationWorkerPool {
         tokenEstimate,
         logger,
       });
+      this.activeAgents.add(agent);
       try {
+        // Drain gate: stop() may have fired between create and prompt (the
+        // agent was not yet in activeAgents for the abort sweep). Don't start
+        // a run the drain can no longer cancel.
+        if (!this.running) throw new WorkerDrainAbortError("pool draining before run start");
         // Drive the agent directly — SessionRunner is hardwired to chat semantics
         // (send_message / NO_REPLY) and would fight a summary_tool-only session.
         // Frozen sessions (§2b) pop the final turn off the prefix; for a cutoff build
@@ -320,12 +347,23 @@ export class SummarizationWorkerPool {
           : syntheticTrigger.body;
         await agent.prompt(kickoff as any);
         await agent.waitForIdle();
+        // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7). A DRAIN abort
+        // (pool stopping) is not a semantic failure: the job goes back to
+        // 'pending' with its claim-time attempts increment compensated. A CAP
+        // abort (runaway tool/turn loop, pool still running) stays on the
+        // semantic path — a degenerate run is an output problem.
+        if (wasRunAborted(agent) && !this.running) {
+          throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
+        }
         // pi-agent-core resolves the run promise even when the cap-driven abort
         // (§8c) or a stream error fires — it synthesizes a final message with
         // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
         // throwing. Surface that as a throw HERE so a runaway/errored run routes to
         // the failure → retry path below (a partial summary is load-bearing for
         // context reconstruction, so committing one is worse than retrying).
+        // Environmental LLM failures can no longer reach this point — they are
+        // absorbed (unbounded) at Layer-0; what remains is content failures,
+        // cap aborts, and our own code throwing — all semantic.
         assertRunSettledCleanly(agent);
       } catch (err) {
         // The run rejected (possibly before any turn_end). Best-effort flush the
@@ -342,10 +380,31 @@ export class SummarizationWorkerPool {
         }
         throw err;
       } finally {
+        this.activeAgents.delete(agent);
         capture.detach();
       }
     } catch (err) {
       agentError = err;
+    }
+
+    // Drain abort (spec LLM-FAILURE-HANDLING §7): the run was cancelled by the
+    // pool's own stop(), not judged. The job returns to 'pending' with its
+    // claim-time attempts increment compensated; a restart re-claims and
+    // re-runs from scratch. Any partial draft is discarded (it was produced by
+    // an aborted run); the session row records the interruption.
+    if (agentError instanceof WorkerDrainAbortError) {
+      await storage.updateAgentSessionStatus(syntheticSession.id, "interrupted", {
+        completedAt: Date.now(),
+        error: agentError.message,
+      });
+      await storage.returnSummarizationJobToPending(job.id);
+      logger.info("summarization_drain_requeued", {
+        jobId: job.id,
+        level: job.level,
+        attempt: job.attempts,
+      });
+      this.emit(job, "retried", "pending");
+      return;
     }
 
     const content = draft.getContent();

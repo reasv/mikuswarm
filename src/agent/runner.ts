@@ -2,7 +2,13 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
-import { classifyLlmError, isLlmRequestError, stripLlmRequestTag } from "./request-retry.js";
+import {
+  classifyLlmError,
+  extractLlmRequestClass,
+  isLlmRequestError,
+  stripLlmRequestTag,
+  type LlmErrorClass,
+} from "./request-retry.js";
 
 export interface SessionRunResult {
   sessionId: string;
@@ -11,25 +17,39 @@ export interface SessionRunResult {
 }
 
 export class SessionRunnerError extends Error {
+  /** Failure class (spec LLM-FAILURE-HANDLING §3); set only for `phase:"llm"`. */
+  readonly llmClass?: LlmErrorClass;
+
   constructor(
     message: string,
-    readonly phase: "prompt" | "wait" | "force_completion" | "mechanical",
-    options?: { cause?: unknown },
+    readonly phase: "prompt" | "wait" | "force_completion" | "llm",
+    options?: { cause?: unknown; llmClass?: LlmErrorClass },
   ) {
-    super(message, options);
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "SessionRunnerError";
+    this.llmClass = options?.llmClass;
   }
 }
 
 /**
- * True for the run failures Layer-2 resume-in-place can fix (spec
- * CONCURRENCY-AND-RATE-LIMITING §6.2): the runner surfaced a `"mechanical"`
- * SessionRunnerError — the model's turn died on a retryable transport/upstream
- * failure after Layer-1 exhausted. Everything else (semantic run problems,
- * aborts, programming errors) is not improved by re-issuing the same request.
+ * True when the run failed at the LLM request layer (spec LLM-FAILURE-HANDLING
+ * §8): the runner surfaced a `phase:"llm"` SessionRunnerError. These failures
+ * never destroy the session (P5) — `launchSession` parks them
+ * `failed-resumable` with the error recorded, for manual console resume.
+ */
+export function isLlmRunFailure(error: unknown): error is SessionRunnerError & { phase: "llm" } {
+  return error instanceof SessionRunnerError && error.phase === "llm";
+}
+
+/**
+ * True for the run failures resume-in-place can fix by re-issuing the same
+ * request: an *environmental* LLM-layer failure (the upstream was unwell; the
+ * request itself is fine). A `content` failure is deterministic on replay and
+ * is parked without auto-retry; everything else (semantic run problems, aborts,
+ * programming errors) is not improved by re-issuing the same request.
  */
 export function isResumableRunError(error: unknown): boolean {
-  return error instanceof SessionRunnerError && error.phase === "mechanical";
+  return isLlmRunFailure(error) && error.llmClass === "environmental";
 }
 
 export interface SessionRunnerOptions {
@@ -92,7 +112,7 @@ export class SessionRunner {
         await continueAgent(agent);
       }
       await waitForAgentIdle(agent);
-      throwIfMechanicalFailure(agent, lifecycle);
+      throwIfLlmFailure(agent, lifecycle);
 
       while (
         !isTerminallyValid(agent.state.messages) &&
@@ -110,7 +130,7 @@ export class SessionRunner {
         retries += 1;
         await forceCompletion(agent);
         await waitForAgentIdle(agent);
-        throwIfMechanicalFailure(agent, lifecycle);
+        throwIfLlmFailure(agent, lifecycle);
       }
 
       const noReply = !isTerminallyValid(agent.state.messages) ||
@@ -169,28 +189,32 @@ async function continueAgent(agent: Agent): Promise<void> {
 }
 
 /**
- * Surface a mechanically failed run as a typed rejection (spec §6.2). pi-agent-core
- * RESOLVES a failed run — it synthesizes a `stopReason:"error"` assistant message
- * and records the failure in `AgentState.errorMessage` — so without this check a
- * live session whose upstream died (after Layer-1 retry exhausted) would settle as
- * a silent `NO_REPLY` completion. A retryable failure (transport/5xx/429) throws
- * `phase:"mechanical"`, which the app-level recovery routes to resume-in-place.
- * Intentional aborts (operator Stop, tool/turn caps) and fatal errors (auth,
- * malformed request) keep today's settle-in-place behaviour — re-issuing the same
- * request cannot help them.
+ * Surface a run that failed at the LLM request layer as a typed rejection (spec
+ * LLM-FAILURE-HANDLING §8.1). pi-agent-core RESOLVES a failed run — it
+ * synthesizes a `stopReason:"error"` assistant message and records the failure
+ * in `AgentState.errorMessage` — so without this check a live session whose
+ * upstream died would enter the forced-completion loop (doomed paid re-prompts
+ * against an API failure) and finally settle as a silent `NO_REPLY` completion
+ * with no error recorded anywhere (audit defect #1).
  *
- * Only errors TAGGED at the Layer-1 seam count (Decision C / #14): pi-agent-core's
- * `handleRunFailure` flattens ANY executor throw — including programming errors in
- * `transformContext`/tool plumbing — into the same `errorMessage` string, and those
- * carry no status/keyword, so the lean-retryable default would misclassify them as
- * mechanical and burn doomed resume attempts. `withRequestRetry` appends
- * `LLM_REQUEST_FAILURE_MARKER` to every terminal error that genuinely originated in
- * the LLM request layer (provider/SDK failures and scheduler-admission failures
- * alike); an untagged error is our own code throwing and settles as a plain
- * failure (pre-B.2 behaviour). The retryable default is unchanged WITHIN tagged
- * errors — ambiguous upstream failures remain resumable.
+ * EVERY tagged LLM failure throws here — environmental (Layer-0 budget
+ * exhausted) and content (oversized/malformed request) alike — BEFORE
+ * `isTerminallyValid` or the forced-completion loop is consulted. Forced
+ * completion fires only for *clean* turns with invalid output, its original
+ * output-contract purpose (P1/P2). The thrown error carries the §3 class so
+ * `launchSession` can park the session with an accurate record.
+ *
+ * Only errors TAGGED at the Layer-0 seam count (Decision C / #14):
+ * pi-agent-core's `handleRunFailure` flattens ANY executor throw — including
+ * programming errors in `transformContext`/tool plumbing — into the same
+ * `errorMessage` string. `withRequestRetry` appends
+ * `LLM_REQUEST_FAILURE_MARKER` (+ the class marker) to every terminal error
+ * that genuinely originated in the LLM request layer (provider/SDK failures
+ * and scheduler-admission failures alike); an untagged error is our own code
+ * throwing and settles as a plain failure. Intentional aborts (operator Stop,
+ * tool/turn caps, drain) keep today's settle-in-place behaviour.
  */
-function throwIfMechanicalFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void {
+function throwIfLlmFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void {
   const errorMessage = agent.state.errorMessage;
   if (!errorMessage || errorMessage.length === 0) return;
   if (lifecycle?.isInterrupted()) return;
@@ -201,8 +225,13 @@ function throwIfMechanicalFailure(agent: Agent, lifecycle?: SessionRunLifecycle)
   const stopReason = typeof last?.stopReason === "string" ? last.stopReason : undefined;
   if (stopReason === "aborted") return;
   const message = stripLlmRequestTag(errorMessage);
-  if (classifyLlmError(message, stopReason) !== "retryable") return;
-  throw new SessionRunnerError(`agent run failed mechanically: ${message}`, "mechanical");
+  // Prefer the class marker stamped at the surfacing point; fall back to
+  // re-classifying the stripped message (e.g. errors tagged by older rows).
+  const cls = extractLlmRequestClass(errorMessage) ?? classifyLlmError(message, stopReason);
+  if (cls === "aborted") return;
+  throw new SessionRunnerError(`agent run failed at the LLM layer (${cls}): ${message}`, "llm", {
+    llmClass: cls,
+  });
 }
 
 async function waitForAgentIdle(agent: Agent): Promise<void> {

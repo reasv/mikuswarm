@@ -16,5 +16,8 @@ export const keys = {
 	pipelines: () => ['pipelines'] as const,
 	pipelineItems: (pool: string, filters: Record<string, unknown> = {}) =>
 		['pipelines', pool, 'items', filters] as const,
-	pipelineItem: (pool: string, id: string) => ['pipelines', pool, 'items', id] as const
+	pipelineItem: (pool: string, id: string) => ['pipelines', pool, 'items', id] as const,
+	// Scheduler view (spec LLM-FAILURE-HANDLING §9.1/§9.2) — polled snapshots.
+	scheduler: () => ['scheduler'] as const,
+	llmRequests: () => ['llm-requests'] as const
 };

@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { createLogger, createObservabilityServer, PipelineActivityBus, type ConsoleServer } from "./observability/index.js";
+import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
@@ -19,9 +19,11 @@ import {
 import {
   AgentSessionFactory,
   LlmScheduler,
+  LlmRequestRing,
+  DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
   SessionRunner,
-  autoResumeSession,
+  isLlmRunFailure,
   createManualResumeSession,
   isResumableRunError,
   loadResumeMaterial,
@@ -152,6 +154,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
+    // Per-model health (spec LLM-FAILURE-HANDLING §5): global thresholds —
+    // the failure-domain key is derived from endpoint+id, so there is no
+    // natural per-model config block.
+    health: {
+      unhealthyThreshold: config.recovery?.llm_unhealthy_threshold,
+      probeIntervalMs: config.recovery?.llm_probe_interval_ms,
+    },
     logger: logger.child("llm-scheduler"),
   });
 
@@ -479,6 +488,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // until storage.close() makes it throw.
   const drainAbort = new AbortController();
   let stopPromise: Promise<void> | undefined;
+  // Per-session tentative-event bus (spec LLM-FAILURE-HANDLING §4.2): Layer-0
+  // buffers attempts to the terminal event, so live tokens reach the console
+  // only through this tap → SSE merge. Observe-only; nothing is persisted.
+  const liveEvents = new SessionLiveEventBus();
+
+  // In-memory Layer-0 attempt ring (spec §9.2) — console attribution only;
+  // llm-gateway keeps the durable wire log upstream.
+  const llmRequestRing = new LlmRequestRing(
+    config.observability?.llm_request_ring_size ?? DEFAULT_LLM_REQUEST_RING_SIZE,
+  );
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -486,6 +506,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     storage,
     logger,
     scheduler: llmScheduler,
+    liveEvents,
+    requestRing: llmRequestRing,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -1176,7 +1198,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     record: AgentSessionRecord,
     inbound: InboundChatEvent,
     attempt: number,
-  ): Promise<{ outcome: "completed" | "mechanical" | "fatal" | "unresumable"; error?: string }> {
+  ): Promise<{ outcome: "completed" | "mechanical" | "content" | "fatal" | "unresumable"; error?: string }> {
     const row = storage.getAgentSession(record.id);
     if (!row) return { outcome: "unresumable", error: "session row missing" };
     // Image refs externalized at capture time are rehydrated through the media
@@ -1234,39 +1256,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // flush is best-effort; the original error wins
       }
       const message = error instanceof Error ? error.message : String(error);
-      return { outcome: isResumableRunError(error) ? "mechanical" : "fatal", error: message };
+      // Three-way outcome (spec LLM-FAILURE-HANDLING §3/§8.2): environmental →
+      // mechanical (retryable resume), other LLM-layer classes → content (park,
+      // never discard — P5), untagged (our own code) → fatal.
+      const outcome = isResumableRunError(error)
+        ? "mechanical"
+        : isLlmRunFailure(error)
+          ? "content"
+          : "fatal";
+      return { outcome, error: message };
     } finally {
       captureHandle.detach();
     }
-  }
-
-  /**
-   * Auto-resume (spec §6.2): bounded, backed-off resume attempts for a live run
-   * that died mechanically (Layer-1 exhausted). Runs INSIDE the failed run's
-   * promise chain so the per-timeline trigger slot stays held for the whole
-   * recovery — no second session can race the resumed one. Returns true when the
-   * failure was handled (resumed, parked, or discarded here); false hands the
-   * failure back to the ordinary discard path. The policy loop — including the
-   * park-over-discard rules for `attempts = 0`, draining-at-entry, and a
-   * fatal-at-shutdown attempt (issue #15) — lives in `autoResumeSession`
-   * (src/agent/recovery.ts) where it is unit-testable.
-   */
-  function maybeAutoResumeSession(
-    session: AgentSessionRecord,
-    error: unknown,
-  ): Promise<boolean> {
-    return autoResumeSession(error, {
-      sessionId: session.id,
-      timelineKey: session.timelineKey,
-      attempts: config.recovery?.session_auto_resume_attempts ?? 2,
-      backoffBaseMs: config.recovery?.session_auto_resume_backoff_ms ?? 5000,
-      isDraining: () => draining,
-      runAttempt: (attempt) => resumeSessionRun(session, session.trigger, attempt),
-      markResuming: (err) => sessions.markResuming(session.id, { error: err }),
-      markFailedResumable: (err) => sessions.markFailedResumable(session.id, { error: err }),
-      markDiscarded: (err) => sessions.markDiscarded(session.id, { error: err }),
-      logger,
-    });
   }
 
   /**
@@ -1326,6 +1327,31 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  /**
+   * Configurable user-facing failure notice (spec LLM-FAILURE-HANDLING §8.3):
+   * when `recovery.failure_notice` is a non-empty phrase, it is sent verbatim
+   * to the session's outbound target when a USER-TRIGGERED chat session stops
+   * trying on its own — it parked `failed-resumable`, or its build timed out
+   * waiting on summary coverage during an outage. Best-effort: a send failure
+   * is logged and never affects the park/discard. The actual error is NEVER
+   * included — the phrase is static. Callers suppress it for proactive
+   * sessions (nobody asked them anything); synthetic sessions never reach
+   * these paths (no room audience).
+   */
+  function sendFailureNotice(
+    target: NonNullable<InboundChatEvent["outboundTarget"]> | undefined,
+    sessionId: string,
+  ): void {
+    const phrase = config.recovery?.failure_notice;
+    if (!phrase || phrase.length === 0 || !target) return;
+    void provider.send(target, { body: phrase, agentSessionId: sessionId }).catch((error) => {
+      logger.warn("failure_notice_send_failed", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
   async function launchSession(
     inbound: InboundChatEvent,
     duplicate: boolean,
@@ -1379,11 +1405,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
     } catch (error) {
-      sessions.markDiscarded(session.id);
-      logger.error("session_factory_failed", {
-        sessionId: session.id,
+      // Build-wait timeout (spec LLM-FAILURE-HANDLING §7.1): the build blocked
+      // on summary coverage for the whole interactive wall-clock budget (a
+      // model outage backing up the summarization queue). Discard — there is
+      // no snapshot/transcript yet, so there is genuinely nothing to park; the
+      // waited job is untouched and completes when its model recovers.
+      const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      sessions.markDiscarded(session.id, {
         error: error instanceof Error ? error.message : String(error),
       });
+      logger.error(buildTimeout ? "session_build_wait_timeout" : "session_factory_failed", {
+        sessionId: session.id,
+        timelineKey: session.timelineKey,
+        proactive,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // §8.3: a user asked and the bot is giving up — say so when configured.
+      // Only for the coverage-wait timeout (a routine outage symptom), not for
+      // arbitrary factory bugs; never for proactive launches (the proactive
+      // scheduler simply fires again next cadence).
+      if (buildTimeout && !proactive) sendFailureNotice(target, session.id);
       const next = triggerCoordinator.complete(session.timelineKey);
       if (next && !draining) void launchSession(next, true).catch((error) => {
         logger.error("queued_session_launch_failed", {
@@ -1436,10 +1477,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             error: flushErr instanceof Error ? flushErr.message : String(flushErr),
           });
         }
-        // Layer-2 resume-in-place (spec §6.2): a mechanical run death (Layer-1
-        // exhausted) is auto-resumed from the persisted snapshot + transcript,
-        // inside this promise chain so the timeline slot stays held throughout.
-        if (await maybeAutoResumeSession(session, error)) return;
+        // Park, never discard (spec LLM-FAILURE-HANDLING §8.2 / P5): ANY
+        // LLM-layer failure — environmental (interactive wall-clock budget
+        // exhausted) and content (oversized request) alike — is operator- or
+        // upstream-fixable; nothing about the session itself is unresumable.
+        // Layer-0 now owns ALL in-run retrying (the old Layer-2 auto-resume
+        // loop is deleted): once the budget is exhausted the maintainer
+        // explicitly does NOT want delayed automatic replies (P3) — the manual
+        // console resume is the sole resume path. `markDiscarded` remains only
+        // for untagged errors (our own code throwing) below.
+        if (isLlmRunFailure(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          sessions.markFailedResumable(session.id, { error: message });
+          logger.error("session_parked_failed_resumable", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            class: error.llmClass,
+            elapsedMs: Date.now() - (session.startedAt ?? session.createdAt),
+            error: message,
+          });
+          // §8.3: user-triggered sessions may announce the give-up; proactive
+          // sessions never do — nobody asked them anything.
+          if (!proactive) sendFailureNotice(target, session.id);
+          return;
+        }
         sessions.markDiscarded(session.id, {
           error: error instanceof Error ? error.message : String(error),
         });
@@ -1688,6 +1749,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         diary: diaryPool?.stats() ?? null,
       },
       activityBus: pipelineActivityBus,
+      // Tentative-token merge for the session SSE (spec LLM-FAILURE-HANDLING §4.2).
+      liveEvents,
+      // Scheduler snapshot + request ring (spec §9.1/§9.2).
+      scheduler: llmScheduler,
+      llmRequestRing,
       workspaceRoot,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
       // console's second mutating action, next to abort.

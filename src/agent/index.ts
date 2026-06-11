@@ -8,19 +8,30 @@ export type {
   InterjectionMessage,
 } from "./messages.js";
 export { convertToLlm } from "./convert.js";
-export { AgentSessionFactory, createModel, assertRunSettledCleanly, type AgentFactoryOptions } from "./factory.js";
+export {
+  AgentSessionFactory,
+  createModel,
+  assertRunSettledCleanly,
+  wasRunAborted,
+  WorkerDrainAbortError,
+  type AgentFactoryOptions,
+} from "./factory.js";
 export {
   LlmScheduler,
   withSchedulerAdmission,
   defaultPriorityForSessionType,
+  modelHealthKey,
   type PriorityClass,
   type LlmGroupConfig,
   type LlmSchedulerOptions,
+  type LlmSchedulerSnapshot,
 } from "./scheduler.js";
+export { LlmRequestRing, DEFAULT_LLM_REQUEST_RING_SIZE, type LlmRequestRecord } from "./request-ring.js";
 export {
   SessionRunner,
   SessionRunnerError,
   isResumableRunError,
+  isLlmRunFailure,
   extractLastAssistantText,
   stripThinkingContamination,
   isTerminallyValid,
@@ -30,14 +41,12 @@ export {
 export {
   loadResumeMaterial,
   stripFailedTail,
-  autoResumeSession,
   createManualResumeSession,
   MANUAL_RESUME_STATUSES,
   RESUME_IMAGE_PLACEHOLDER,
   type ResumeMaterial,
   type ResumeMaterialDeps,
   type ResumeAttemptResult,
-  type AutoResumeDeps,
   type ManualResumeDeps,
   type ManualResumeResult,
 } from "./recovery.js";
