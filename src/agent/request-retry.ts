@@ -56,9 +56,24 @@ export interface RequestRetryContext {
   sessionId?: string;
   timelineKey?: string;
   sessionType?: string;
+  /** Rate-limit group of the wrapped calls (for `llm_request_attempt_failed` logs). */
+  group?: string;
 }
 
-export type LlmErrorClass = "retryable" | "fatal";
+/**
+ * Failure class of an LLM request (spec LLM-FAILURE-HANDLING §3).
+ *
+ * - `environmental` — session-independent; the model/account/gateway is unwell
+ *   or throttling. Expected to clear (possibly after operator action: an auth/
+ *   grant failure is endpoint-level and fixed out-of-band, so 401/403 land here
+ *   too — the fixed-cadence probe detects recovery automatically). Retried.
+ * - `content` — caused by *this request's* content (oversized context,
+ *   malformed payload); replay is deterministic. Never retried at this layer;
+ *   escalated to the semantic layer.
+ * - `aborted` — intentional (drain, operator Stop, tool/turn caps, scheduler
+ *   stop). Never retried; surfaced as an abort.
+ */
+export type LlmErrorClass = "environmental" | "content" | "aborted";
 
 // ─── Layer-1 origin tagging (Decision C / review issue #14) ──────────────────
 //
@@ -88,11 +103,28 @@ export type LlmErrorClass = "retryable" | "fatal";
 /** Marker appended to terminal error messages that originated in the LLM request layer. */
 export const LLM_REQUEST_FAILURE_MARKER = "[llm-request]";
 
-/** Append the Layer-1 origin marker (idempotent). */
-export function tagLlmRequestError(message: string | undefined): string {
+/**
+ * Machine-readable class marker (spec LLM-FAILURE-HANDLING §4.3), e.g.
+ * `[llm-request:content]`. A marker-in-string because pi-agent-core flattens
+ * everything to `errorMessage` (Decision C) — a structured side-channel is not
+ * available without forking the runtime.
+ */
+export function llmRequestClassMarker(cls: LlmErrorClass): string {
+  return `[llm-request:${cls}]`;
+}
+
+const CLASS_MARKER_RE = /\[llm-request:(environmental|content|aborted)\]/;
+
+/**
+ * Append the Layer-1 origin marker, plus the machine-readable class marker when
+ * a class is given (idempotent; an already-tagged message is never re-tagged,
+ * so the FIRST classification at the surfacing point wins).
+ */
+export function tagLlmRequestError(message: string | undefined, cls?: LlmErrorClass): string {
   const msg = message ?? "";
   if (msg.includes(LLM_REQUEST_FAILURE_MARKER)) return msg;
-  return msg.length > 0 ? `${msg} ${LLM_REQUEST_FAILURE_MARKER}` : LLM_REQUEST_FAILURE_MARKER;
+  const markers = cls ? `${LLM_REQUEST_FAILURE_MARKER} ${llmRequestClassMarker(cls)}` : LLM_REQUEST_FAILURE_MARKER;
+  return msg.length > 0 ? `${msg} ${markers}` : markers;
 }
 
 /** True when the flattened error message carries the Layer-1 origin marker. */
@@ -100,66 +132,76 @@ export function isLlmRequestError(message: string | undefined): boolean {
   return (message ?? "").includes(LLM_REQUEST_FAILURE_MARKER);
 }
 
-/** Remove the Layer-1 origin marker for display/classification. */
-export function stripLlmRequestTag(message: string): string {
-  return message.split(LLM_REQUEST_FAILURE_MARKER).join("").replace(/\s+$/, "").trim();
+/** Parse the class marker out of a tagged error message, if present. */
+export function extractLlmRequestClass(message: string | undefined): LlmErrorClass | undefined {
+  const m = CLASS_MARKER_RE.exec(message ?? "");
+  return m ? (m[1] as LlmErrorClass) : undefined;
 }
 
-// 4xx that indicate a request the model/gateway will reject identically on replay
-// (auth, malformed, not-found, payload-too-large, unprocessable). Never retried.
-const FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 413, 422]);
-// Transient statuses worth re-issuing: request timeout, conflict, too-early,
-// rate-limit, and the 5xx family incl. Anthropic's 529 "overloaded".
-const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529]);
+/** Remove the Layer-1 origin + class markers for display/classification. */
+export function stripLlmRequestTag(message: string): string {
+  return message
+    .replace(CLASS_MARKER_RE, "")
+    .split(LLM_REQUEST_FAILURE_MARKER)
+    .join("")
+    .replace(/\s+$/, "")
+    .trim();
+}
 
-// Substrings that mark a definitively fatal error even without a parseable status
-// (e.g. an SDK auth error whose message carries no leading code).
-const FATAL_KEYWORDS = [
-  "invalid api key",
-  "invalid x-api-key",
-  "authentication",
-  "unauthorized",
-  "permission",
-  "forbidden",
-  "invalid_request_error",
-  // Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
-  // admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can
-  // only ever reject again, so retrying would spin out the full backed-off
-  // attempt budget per straggler during teardown (#11).
-  "scheduler stopped",
+// Statuses caused by THIS request's content — the upstream will reject an
+// identical replay deterministically (malformed, payload-too-large,
+// unprocessable). Everything else parseable is environmental (spec §3): the
+// 408/409/425/429/5xx transients, but also 401/403/404/405 — an auth/grant
+// failure is endpoint-level, fixed out-of-band, and recovery is detected by the
+// model-health probe rather than by refusing to retry.
+const CONTENT_STATUSES = new Set([400, 413, 422]);
+
+// Substrings that positively identify a content failure even without a
+// parseable status (context-length violations are the dominant real case).
+const CONTENT_KEYWORDS = [
+  "prompt is too long",
+  "context_length_exceeded",
+  "context length exceeded",
+  "maximum context length",
+  "request_too_large",
+  "payload too large",
 ];
 
+// Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
+// admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can only
+// ever reject again, so this is intentional-teardown, classified `aborted` —
+// retrying would spin out backed-off attempts per straggler during drain (#11).
+const SCHEDULER_STOPPED_KEYWORD = "scheduler stopped";
+
 /**
- * Classify an LLM stream failure as a mechanical (retryable) blip or a fatal error.
+ * Classify an LLM stream failure (spec LLM-FAILURE-HANDLING §3): three-way
+ * `environmental` / `content` / `aborted` replacing the old retryable/fatal
+ * binary.
  *
  * Inputs are the terminal `error` AssistantMessage's `errorMessage` (a flattened
  * string — pi-ai stores `error.message` here, so an SDK `APIError` arrives status-
  * prefixed, e.g. `"429 {...}"`) and its `stopReason`.
  *
- * An intentional `aborted` (tool-call/turn cap, shutdown) is never retried. With a
- * parseable HTTP status we honour the known fatal/retryable sets (other 4xx → fatal,
- * other 5xx → retryable). With no status we treat explicit auth/validation keywords
- * as fatal and DEFAULT EVERYTHING ELSE TO RETRYABLE — mechanical failures (socket
- * resets, timeouts, transient parse errors, empty/unknown errors) dominate this path
- * and the bounded attempt count caps the cost of a wrong guess.
+ * An intentional `aborted` (tool-call/turn cap, shutdown, scheduler stop) is
+ * never retried. `content` requires positive evidence — a 400/413/422 status or
+ * an explicit context-length keyword. EVERYTHING ELSE IS `environmental`:
+ * timeouts, resets, empty streams, every other status (5xx, 429, and the
+ * 401/403/404/405 endpoint-level failures), auth keywords, and anything
+ * unparseable — mechanical blips dominate that path, and the scheduler's
+ * model-health gating bounds the cost of a wrong guess.
  */
 export function classifyLlmError(
   errorMessage: string | undefined,
   stopReason: string | undefined,
 ): LlmErrorClass {
-  if (stopReason === "aborted") return "fatal";
+  if (stopReason === "aborted") return "aborted";
   const msg = (errorMessage ?? "").toLowerCase();
+  if (msg.includes(SCHEDULER_STOPPED_KEYWORD)) return "aborted";
 
   const status = extractStatus(msg);
-  if (status !== undefined) {
-    if (RETRYABLE_STATUSES.has(status)) return "retryable";
-    if (FATAL_STATUSES.has(status)) return "fatal";
-    if (status >= 400 && status < 500) return "fatal";
-    if (status >= 500) return "retryable";
-  }
-
-  if (FATAL_KEYWORDS.some((keyword) => msg.includes(keyword))) return "fatal";
-  return "retryable";
+  if (status !== undefined && CONTENT_STATUSES.has(status)) return "content";
+  if (CONTENT_KEYWORDS.some((keyword) => msg.includes(keyword))) return "content";
+  return "environmental";
 }
 
 /**
@@ -264,29 +306,36 @@ export function withRequestRetry(
         if (errorEvent) {
           const failure = errorEvent.error;
           const verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
-          const lastAttempt = attempt >= maxAttempts - 1;
-          if (verdict === "retryable" && !lastAttempt) {
-            const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
-            ctx.logger?.warn("llm_request_retry", {
+          // Every environmental failure is logged — including the first attempt
+          // and the deterministic single-attempt path (spec §9.3 closes the
+          // audit gap where first-attempt failures logged nothing).
+          if (verdict === "environmental") {
+            ctx.logger?.warn("llm_request_attempt_failed", {
               sessionId: ctx.sessionId,
               timelineKey: ctx.timelineKey,
               sessionType: ctx.sessionType,
+              group: ctx.group,
+              class: verdict,
+              status: extractStatus((failure?.errorMessage ?? "").toLowerCase()),
               attempt: attempt + 1,
               maxAttempts,
-              delayMs: Math.round(delay),
               errorMessage: failure?.errorMessage,
             });
+          }
+          const lastAttempt = attempt >= maxAttempts - 1;
+          if (verdict === "environmental" && !lastAttempt) {
+            const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
             try {
               await sleep(delay, signal);
             } catch {
               // Aborted mid-backoff (shutdown / cap): surface the original error.
               flush(outer, buffered);
-              outer.push(tagErrorEvent(errorEvent));
+              outer.push(tagErrorEvent(errorEvent, verdict));
               return;
             }
             continue;
           }
-          if (verdict === "retryable") {
+          if (verdict === "environmental") {
             ctx.logger?.warn("llm_request_retries_exhausted", {
               sessionId: ctx.sessionId,
               timelineKey: ctx.timelineKey,
@@ -296,7 +345,7 @@ export function withRequestRetry(
             });
           }
           flush(outer, buffered);
-          outer.push(tagErrorEvent(errorEvent));
+          outer.push(tagErrorEvent(errorEvent, verdict));
           return;
         }
 
@@ -341,15 +390,19 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Copy a terminal `error` event with the Layer-1 origin marker appended to its
+ * Copy a terminal `error` event with the Layer-1 origin marker (and the §4.3
+ * class marker, when the class is known at the surfacing point) appended to its
  * `errorMessage` (Decision C / #14). Never mutates the provider's event.
  */
 function tagErrorEvent(
   event: Extract<AssistantMessageEvent, { type: "error" }>,
+  cls?: LlmErrorClass,
 ): Extract<AssistantMessageEvent, { type: "error" }> {
+  const failure = event.error;
+  const resolved = cls ?? classifyLlmError(failure?.errorMessage, failure?.stopReason);
   return {
     ...event,
-    error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage) },
+    error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage, resolved) },
   };
 }
 

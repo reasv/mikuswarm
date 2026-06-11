@@ -309,25 +309,53 @@ test("SessionRunner: an UNTAGGED error (programming throw) settles as a plain fa
   assert.equal(result.noReply, true, "settles via the ordinary loop (plain failure)");
 });
 
-test("SessionRunner does NOT reject mechanically on fatal or aborted runs", async () => {
-  // Fatal (auth) error — tagged, since it surfaced through Layer-1 — settles
-  // via the ordinary loop, no mechanical rejection.
-  const fatalTagged = tagLlmRequestError("401 unauthorized");
-  const fatalMessages: any[] = [];
-  const fatalAgent: any = {
-    state: { messages: fatalMessages, errorMessage: undefined as string | undefined },
+test("SessionRunner rejects on EVERY tagged LLM failure — content class included (spec §8.1)", async () => {
+  // A content failure (oversized request) used to settle as a silent NO_REPLY
+  // after doomed forced-completion re-prompts (audit defect #1). It must now
+  // throw phase "llm" with class "content" BEFORE the forced-completion loop —
+  // a typed rejection launchSession parks, never discards.
+  const contentTagged = tagLlmRequestError("413 prompt is too long", "content");
+  const contentMessages: any[] = [];
+  let prompts = 0;
+  const contentAgent: any = {
+    state: { messages: contentMessages, errorMessage: undefined as string | undefined },
     async prompt() {
-      fatalMessages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: fatalTagged });
-      fatalAgent.state.errorMessage = fatalTagged;
+      prompts += 1;
+      contentMessages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: contentTagged });
+      contentAgent.state.errorMessage = contentTagged;
     },
     async continue() {},
     async waitForIdle() {},
   };
-  const result = await new SessionRunner().run(fatalAgent, session, 0, kickoff);
-  assert.equal(result.noReply, true);
+  await assert.rejects(
+    new SessionRunner().run(contentAgent, session, 3, kickoff),
+    (err: unknown) =>
+      err instanceof SessionRunnerError &&
+      err.phase === "llm" &&
+      err.llmClass === "content" &&
+      !isResumableRunError(err),
+  );
+  assert.equal(prompts, 1, "no forced-completion re-prompt after an API failure (P1)");
+
+  // 401, previously "fatal": endpoint-level → environmental → resumable.
+  const authTagged = tagLlmRequestError("401 unauthorized", "environmental");
+  const authMessages: any[] = [];
+  const authAgent: any = {
+    state: { messages: authMessages, errorMessage: undefined as string | undefined },
+    async prompt() {
+      authMessages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: authTagged });
+      authAgent.state.errorMessage = authTagged;
+    },
+    async continue() {},
+    async waitForIdle() {},
+  };
+  await assert.rejects(
+    new SessionRunner().run(authAgent, session, 0, kickoff),
+    (err: unknown) => isResumableRunError(err),
+  );
 
   // Aborted run (tagged — e.g. an aborted scheduler admission surfaced through
-  // Layer-1): also settles normally (interrupt/cap semantics unchanged).
+  // Layer-1): settles normally (interrupt/cap semantics unchanged).
   const abortedMessages: any[] = [];
   const abortedAgent: any = {
     state: { messages: abortedMessages, errorMessage: undefined as string | undefined },
@@ -364,8 +392,9 @@ test("SessionRunner continue-mode kicks via agent.continue() instead of a new pr
   assert.equal(result.noReply, false);
 });
 
-test("isResumableRunError only matches the mechanical phase", () => {
-  assert.equal(isResumableRunError(new SessionRunnerError("x", "mechanical")), true);
+test("isResumableRunError only matches environmental llm-phase failures", () => {
+  assert.equal(isResumableRunError(new SessionRunnerError("x", "llm", { llmClass: "environmental" })), true);
+  assert.equal(isResumableRunError(new SessionRunnerError("x", "llm", { llmClass: "content" })), false);
   assert.equal(isResumableRunError(new SessionRunnerError("x", "prompt")), false);
   assert.equal(isResumableRunError(new Error("boom")), false);
 });
@@ -439,7 +468,9 @@ test("SessionManager: markResuming keeps the record; markFailedResumable evicts;
 // draining-at-entry, and fatal-at-shutdown.
 // ---------------------------------------------------------------------------
 
-const MECHANICAL = new SessionRunnerError("agent run failed mechanically: 529", "mechanical");
+const MECHANICAL = new SessionRunnerError("agent run failed at the LLM layer (environmental): 529", "llm", {
+  llmClass: "environmental",
+});
 
 interface Recorded {
   resuming: string[];

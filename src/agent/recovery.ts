@@ -347,7 +347,14 @@ export async function rehydrateImages(value: unknown, resolve: ImageRefResolver)
 
 /** Terminal verdict of one resume attempt (`resumeSessionRun` in app.ts). */
 export interface ResumeAttemptResult {
-  outcome: "completed" | "mechanical" | "fatal" | "unresumable";
+  /**
+   * `mechanical` — environmental LLM-layer failure (retry can fix);
+   * `content` — non-environmental LLM-layer failure (deterministic on replay;
+   * parks, never discards — spec LLM-FAILURE-HANDLING P5);
+   * `fatal` — untagged failure (our own code threw);
+   * `unresumable` — resume material missing/unusable.
+   */
+  outcome: "completed" | "mechanical" | "content" | "fatal" | "unresumable";
   error?: string;
 }
 
@@ -419,6 +426,7 @@ export async function autoResumeSession(error: unknown, deps: AutoResumeDeps): P
     const { outcome, error: attemptError } = await deps.runAttempt(attempt);
     if (outcome === "completed") return true;
     lastError = attemptError ?? lastError;
+    if (outcome === "content") break; // deterministic on replay: park, never discard (P5)
     if (outcome === "unresumable" || (outcome === "fatal" && !deps.isDraining())) {
       deps.markDiscarded(lastError);
       deps.logger.error("session_resume_failed_terminal", {
@@ -700,6 +708,15 @@ export function createManualResumeSession(
               ok: false,
               status: "failed-resumable",
               reason: `resume failed mechanically again: ${error}`,
+            };
+          case "content":
+            // Deterministic on replay (oversized/malformed request), but still
+            // operator-/upstream-fixable: re-park, never discard (P5).
+            deps.markFailedResumable(sessionId, error);
+            return {
+              ok: false,
+              status: "failed-resumable",
+              reason: `resume failed on request content: ${error}`,
             };
           case "unresumable":
             deps.markFailedResumable(sessionId, error);

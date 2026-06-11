@@ -21,6 +21,7 @@ export {
   SessionRunner,
   SessionRunnerError,
   isResumableRunError,
+  isLlmRunFailure,
   extractLastAssistantText,
   stripThinkingContamination,
   isTerminallyValid,

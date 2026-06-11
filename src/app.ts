@@ -21,6 +21,7 @@ import {
   LlmScheduler,
   SessionManager,
   SessionRunner,
+  isLlmRunFailure,
   autoResumeSession,
   createManualResumeSession,
   isResumableRunError,
@@ -1176,7 +1177,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     record: AgentSessionRecord,
     inbound: InboundChatEvent,
     attempt: number,
-  ): Promise<{ outcome: "completed" | "mechanical" | "fatal" | "unresumable"; error?: string }> {
+  ): Promise<{ outcome: "completed" | "mechanical" | "content" | "fatal" | "unresumable"; error?: string }> {
     const row = storage.getAgentSession(record.id);
     if (!row) return { outcome: "unresumable", error: "session row missing" };
     // Image refs externalized at capture time are rehydrated through the media
@@ -1234,7 +1235,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // flush is best-effort; the original error wins
       }
       const message = error instanceof Error ? error.message : String(error);
-      return { outcome: isResumableRunError(error) ? "mechanical" : "fatal", error: message };
+      // Three-way outcome (spec LLM-FAILURE-HANDLING §3/§8.2): environmental →
+      // mechanical (retryable resume), other LLM-layer classes → content (park,
+      // never discard — P5), untagged (our own code) → fatal.
+      const outcome = isResumableRunError(error)
+        ? "mechanical"
+        : isLlmRunFailure(error)
+          ? "content"
+          : "fatal";
+      return { outcome, error: message };
     } finally {
       captureHandle.detach();
     }
@@ -1440,6 +1449,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // exhausted) is auto-resumed from the persisted snapshot + transcript,
         // inside this promise chain so the timeline slot stays held throughout.
         if (await maybeAutoResumeSession(session, error)) return;
+        // Park, never discard (spec LLM-FAILURE-HANDLING §8.2 / P5): ANY
+        // LLM-layer failure — content (oversized request) included — is
+        // operator- or upstream-fixable; nothing about the session itself is
+        // unresumable. `markDiscarded` remains only for untagged errors (our
+        // own code throwing) below.
+        if (isLlmRunFailure(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          sessions.markFailedResumable(session.id, { error: message });
+          logger.error("session_parked_failed_resumable", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            class: error.llmClass,
+            error: message,
+          });
+          return;
+        }
         sessions.markDiscarded(session.id, {
           error: error instanceof Error ? error.message : String(error),
         });

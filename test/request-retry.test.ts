@@ -11,6 +11,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 import {
   classifyLlmError,
+  extractLlmRequestClass,
   isLlmRequestError,
   stripLlmRequestTag,
   tagLlmRequestError,
@@ -89,48 +90,56 @@ const FAST = { backoffBaseMs: 0, backoffMaxMs: 0 } as const;
 const MODEL = message() as never;
 const CONTEXT = { messages: [] } as never;
 
-test("classifyLlmError: aborted is fatal", () => {
-  assert.equal(classifyLlmError("Request was aborted", "aborted"), "fatal");
+test("classifyLlmError: aborted stop reason is class aborted", () => {
+  assert.equal(classifyLlmError("Request was aborted", "aborted"), "aborted");
 });
 
-test("classifyLlmError: auth/validation statuses are fatal", () => {
-  assert.equal(classifyLlmError("401 {\"type\":\"error\"}", "error"), "fatal");
-  assert.equal(classifyLlmError("400 invalid request", "error"), "fatal");
-  assert.equal(classifyLlmError("403 forbidden", "error"), "fatal");
-  assert.equal(classifyLlmError("404 not found", "error"), "fatal");
-  assert.equal(classifyLlmError("422 unprocessable", "error"), "fatal");
+test("classifyLlmError: content statuses (400/413/422) are class content", () => {
+  assert.equal(classifyLlmError("400 invalid request", "error"), "content");
+  assert.equal(classifyLlmError("413 payload too large", "error"), "content");
+  assert.equal(classifyLlmError("422 unprocessable", "error"), "content");
 });
 
-test("classifyLlmError: rate-limit and 5xx are retryable", () => {
-  assert.equal(classifyLlmError("429 {\"type\":\"rate_limit_error\"}", "error"), "retryable");
-  assert.equal(classifyLlmError("500 internal", "error"), "retryable");
-  assert.equal(classifyLlmError("502 bad gateway", "error"), "retryable");
-  assert.equal(classifyLlmError("503 unavailable", "error"), "retryable");
-  assert.equal(classifyLlmError("529 overloaded_error", "error"), "retryable");
+test("classifyLlmError: context-length keywords are class content", () => {
+  assert.equal(classifyLlmError("prompt is too long: 250000 tokens", "error"), "content");
+  assert.equal(classifyLlmError("context_length_exceeded", "error"), "content");
 });
 
-test("classifyLlmError: network/timeout/unknown default to retryable", () => {
-  assert.equal(classifyLlmError("Connection error.", "error"), "retryable");
-  assert.equal(classifyLlmError("Request timed out.", "error"), "retryable");
-  assert.equal(classifyLlmError("An unknown error occurred", "error"), "retryable");
-  assert.equal(classifyLlmError("Anthropic stream ended before message_stop", "error"), "retryable");
-  assert.equal(classifyLlmError(undefined, "error"), "retryable");
+test("classifyLlmError: endpoint-level 4xx (auth/grant/not-found) are environmental (spec §3)", () => {
+  // 401/403/404/405 are endpoint-level, operator-fixable out-of-band; the
+  // model-health probe detects recovery automatically, so they retry.
+  assert.equal(classifyLlmError("401 {\"type\":\"error\"}", "error"), "environmental");
+  assert.equal(classifyLlmError("403 forbidden", "error"), "environmental");
+  assert.equal(classifyLlmError("404 not found", "error"), "environmental");
 });
 
-test("classifyLlmError: auth keywords without a status are fatal", () => {
-  assert.equal(classifyLlmError("invalid api key provided", "error"), "fatal");
-  assert.equal(classifyLlmError("authentication failed", "error"), "fatal");
+test("classifyLlmError: rate-limit and 5xx are environmental", () => {
+  assert.equal(classifyLlmError("429 {\"type\":\"rate_limit_error\"}", "error"), "environmental");
+  assert.equal(classifyLlmError("500 internal", "error"), "environmental");
+  assert.equal(classifyLlmError("502 bad gateway", "error"), "environmental");
+  assert.equal(classifyLlmError("503 unavailable", "error"), "environmental");
+  assert.equal(classifyLlmError("529 overloaded_error", "error"), "environmental");
 });
 
-test("classifyLlmError: the scheduler-stopped marker is fatal (#11)", () => {
-  assert.equal(classifyLlmError("LLM scheduler stopped", "error"), "fatal");
+test("classifyLlmError: network/timeout/unknown/auth-keyword default to environmental", () => {
+  assert.equal(classifyLlmError("Connection error.", "error"), "environmental");
+  assert.equal(classifyLlmError("Request timed out.", "error"), "environmental");
+  assert.equal(classifyLlmError("An unknown error occurred", "error"), "environmental");
+  assert.equal(classifyLlmError("Anthropic stream ended before message_stop", "error"), "environmental");
+  assert.equal(classifyLlmError(undefined, "error"), "environmental");
+  assert.equal(classifyLlmError("invalid api key provided", "error"), "environmental");
+  assert.equal(classifyLlmError("authentication failed", "error"), "environmental");
+});
+
+test("classifyLlmError: the scheduler-stopped marker is class aborted (#11)", () => {
+  assert.equal(classifyLlmError("LLM scheduler stopped", "error"), "aborted");
 });
 
 test("classifyLlmError: a 3-digit token inside a body is not mistaken for a status", () => {
-  // No leading/labelled status → falls through to keyword/default. "tokens: 500"
-  // must NOT be read as HTTP 500 (it would be retryable anyway, but the point is
-  // the value is ignored as a status). A bare body number near auth wording stays fatal.
-  assert.equal(classifyLlmError("error: account suspended, unauthorized after 404 strikes", "error"), "fatal");
+  // No leading/labelled status → falls through to keyword/default. "after 404
+  // strikes" must NOT be read as HTTP 404; either way the verdict here is the
+  // environmental default, but the point is the embedded value is ignored.
+  assert.equal(classifyLlmError("error: account suspended, terminated after 422 strikes", "error"), "environmental");
 });
 
 test("withRequestRetry: retries a pre-commit retryable failure then succeeds", async () => {
@@ -148,14 +157,14 @@ test("withRequestRetry: retries a pre-commit retryable failure then succeeds", a
   assert.equal(final.stopReason, "stop");
 });
 
-test("withRequestRetry: a fatal error is forwarded without retrying", async () => {
+test("withRequestRetry: a content error is forwarded without retrying", async () => {
   const { fn, calls } = scriptedBase([
-    { events: [errorEvent("401 unauthorized")] },
+    { events: [errorEvent("413 prompt is too long")] },
     { events: [doneEvent()] },
   ]);
   const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 1, "no retry on fatal");
+  assert.equal(calls(), 1, "no retry on content");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
 });
 
@@ -216,11 +225,24 @@ test("tagLlmRequestError/isLlmRequestError/stripLlmRequestTag round-trip (#14)",
 
 test("tag does not change classification: status prefix and keywords still parse (#14)", () => {
   // Marker is a suffix, so extractStatus's leading-status parse is unaffected,
-  // and its text matches no fatal keyword.
-  assert.equal(classifyLlmError(tagLlmRequestError("429 rate limited"), "error"), "retryable");
-  assert.equal(classifyLlmError(tagLlmRequestError("401 unauthorized"), "error"), "fatal");
-  assert.equal(classifyLlmError(tagLlmRequestError("LLM scheduler stopped"), "error"), "fatal");
-  assert.equal(classifyLlmError(LLM_REQUEST_FAILURE_MARKER, "error"), "retryable");
+  // and its text matches no classification keyword.
+  assert.equal(classifyLlmError(tagLlmRequestError("429 rate limited"), "error"), "environmental");
+  assert.equal(classifyLlmError(tagLlmRequestError("400 invalid request"), "error"), "content");
+  assert.equal(classifyLlmError(tagLlmRequestError("LLM scheduler stopped"), "error"), "aborted");
+  assert.equal(classifyLlmError(LLM_REQUEST_FAILURE_MARKER, "error"), "environmental");
+});
+
+test("class marker round-trip: tagged errors carry a parseable class (spec §4.3)", () => {
+  const tagged = tagLlmRequestError("503 unavailable", "environmental");
+  assert.ok(isLlmRequestError(tagged));
+  assert.equal(extractLlmRequestClass(tagged), "environmental");
+  assert.equal(stripLlmRequestTag(tagged), "503 unavailable");
+  const content = tagLlmRequestError("413 prompt is too long", "content");
+  assert.equal(extractLlmRequestClass(content), "content");
+  // Re-tagging never stacks or rewrites the class: first surfacing wins.
+  assert.equal(tagLlmRequestError(content, "environmental"), content);
+  // Class-less legacy tags parse as undefined.
+  assert.equal(extractLlmRequestClass(tagLlmRequestError("529 overloaded")), undefined);
 });
 
 test("withRequestRetry: exhausted retries surface a TAGGED terminal error (#14)", async () => {

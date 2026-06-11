@@ -276,6 +276,7 @@ export class AgentSessionFactory {
         sessionId: session.id,
         timelineKey: session.timelineKey,
         sessionType: session.sessionType,
+        group: rateLimitGroup,
       },
     );
 
