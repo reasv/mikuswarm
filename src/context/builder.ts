@@ -573,6 +573,17 @@ export class ContextBuilder {
     } = { events, selection };
     if (this.config.summarization?.enabled === false) return current;
     const compactMax = this.config.context.tiers.compact_max_tokens;
+    // Build-wait deadline (spec LLM-FAILURE-HANDLING §7.1): the wait is
+    // transitively an inference wait, so it gets the same patience as the
+    // inference request itself — the interactive wall-clock budget, measured
+    // from wait entry. Every build that can enter this loop today is
+    // interactive-class (live chat + proactive; cutoff builds skip wait-or-omit
+    // and diary/resume skip the build), but a hypothetical background-class
+    // build would wait unboundedly, consistent with §6.
+    const interactiveWaiter = waiterClass === "interactive" || waiterClass === "proactive";
+    const maxWaitMs = this.config.recovery?.llm_request_max_wait_ms ?? 120_000;
+    const waitStart = Date.now();
+    const deadline = interactiveWaiter ? waitStart + maxWaitMs : Infinity;
 
     // Each iteration waits a job to terminal (it leaves the active set, so no
     // job is waited on twice; the requery shrinks the raw set), reconciles at
@@ -604,8 +615,17 @@ export class ContextBuilder {
           jobStatus: covering.status,
           waiterClass,
         });
-        const outcome = await this.waitForJobTerminal(covering.id, abortSignal);
+        const outcome = await this.waitForJobTerminal(covering.id, abortSignal, deadline);
         if (outcome === "aborted") throw buildAbortError();
+        if (outcome === "timeout") {
+          this.logger?.warn("context_build_wait_timeout", {
+            timelineKey,
+            jobId: covering.id,
+            waiterClass,
+            waitedMs: Date.now() - waitStart,
+          });
+          throw new BuildWaitTimeoutError(covering.id, Date.now() - waitStart);
+        }
         // Terminal either way: re-select + re-query. A completed summary (or a
         // failed job's placeholder) advances the coverage cursor and trims the
         // raw set; the events move from the raw turns into the summary layer
@@ -667,19 +687,24 @@ export class ContextBuilder {
   }
 
   /**
-   * Poll the job until it reaches a terminal state (§7.2 — no wall-clock
-   * deadline; termination is guaranteed by Design B's bounded retries). A job
-   * row that vanishes is treated as complete (matches the old grace-wait).
+   * Poll the job until it reaches a terminal state, the abort signal fires, or
+   * the wall-clock deadline passes (spec LLM-FAILURE-HANDLING §7.1: under this
+   * spec a job is legitimately non-terminal for the whole duration of a model
+   * outage, so an interactive build's wait must be bounded; `Infinity` for a
+   * background-class waiter). A job row that vanishes is treated as complete
+   * (matches the old grace-wait).
    */
   private async waitForJobTerminal(
     jobId: string,
-    abortSignal?: AbortSignal,
-  ): Promise<"complete" | "failed" | "aborted"> {
+    abortSignal: AbortSignal | undefined,
+    deadline: number,
+  ): Promise<"complete" | "failed" | "aborted" | "timeout"> {
     for (;;) {
       if (abortSignal?.aborted) return "aborted";
       const job = this.storage.getSummarizationJobById(jobId);
       if (!job || job.status === "complete") return "complete";
       if (job.status === "failed") return "failed";
+      if (Date.now() >= deadline) return "timeout";
       await delay(250);
     }
   }
@@ -960,5 +985,24 @@ function buildAbortError(): Error {
   const error = new Error("context build aborted while waiting on a summarization job (shutdown drain)");
   error.name = "AbortError";
   return error;
+}
+
+/**
+ * Thrown when an interactive-class build's wait on summary coverage exceeds
+ * the wall-clock budget (spec LLM-FAILURE-HANDLING §7.1): during a model
+ * outage a covering job is legitimately non-terminal for the whole outage, and
+ * an indefinite block would fire the reply hours late on recovery. The build
+ * rejects, `launchSession` discards the never-started session (there is no
+ * snapshot/transcript yet — genuinely nothing to park), and the JOB IS
+ * UNTOUCHED: still queued, completed when its model recovers, improving every
+ * later build on the timeline. Coverage is never faked — no degraded context.
+ */
+export class BuildWaitTimeoutError extends Error {
+  constructor(jobId: string, waitedMs: number) {
+    super(
+      `context build timed out after ${Math.round(waitedMs)}ms waiting on summarization job ${jobId} (llm_request_max_wait_ms)`,
+    );
+    this.name = "BuildWaitTimeoutError";
+  }
 }
 

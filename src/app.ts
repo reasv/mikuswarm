@@ -1371,9 +1371,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
     } catch (error) {
-      sessions.markDiscarded(session.id);
-      logger.error("session_factory_failed", {
+      // Build-wait timeout (spec LLM-FAILURE-HANDLING §7.1): the build blocked
+      // on summary coverage for the whole interactive wall-clock budget (a
+      // model outage backing up the summarization queue). Discard — there is
+      // no snapshot/transcript yet, so there is genuinely nothing to park; the
+      // waited job is untouched and completes when its model recovers.
+      const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      sessions.markDiscarded(session.id, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      logger.error(buildTimeout ? "session_build_wait_timeout" : "session_factory_failed", {
         sessionId: session.id,
+        timelineKey: session.timelineKey,
+        proactive,
         error: error instanceof Error ? error.message : String(error),
       });
       const next = triggerCoordinator.complete(session.timelineKey);

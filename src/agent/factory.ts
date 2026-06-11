@@ -6,7 +6,7 @@ import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuil
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
-import { withRequestRetry } from "./request-retry.js";
+import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
   modelHealthKey,
@@ -583,6 +583,44 @@ export function assertRunSettledCleanly(agent: { state: { errorMessage?: string 
   if (errorMessage && errorMessage.length > 0) {
     throw new Error(`agent run did not complete cleanly: ${errorMessage}`);
   }
+}
+
+/**
+ * Thrown by a worker pool when a run was aborted BY THE POOL'S OWN DRAIN (spec
+ * LLM-FAILURE-HANDLING §7): the job returns to `pending` with the claim-time
+ * attempts increment compensated — a drain is not a semantic failure and must
+ * not consume the job's retry budget. A cap abort (runaway tool/turn loop,
+ * pool still running) deliberately does NOT use this class — a degenerate run
+ * is an output problem and stays on the semantic-attempts path.
+ */
+export class WorkerDrainAbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerDrainAbortError";
+  }
+}
+
+/**
+ * True when the settled run's failure is an intentional ABORT (the agent's
+ * last assistant turn carries `stopReason:"aborted"`, or the flattened error
+ * is class-tagged `aborted` — e.g. a scheduler-stop admission rejection that
+ * produced no turn). Worker pools combine this with their own `running` flag
+ * to distinguish a drain abort (→ {@link WorkerDrainAbortError}, job back to
+ * pending) from a cap abort (→ semantic retry path).
+ */
+export function wasRunAborted(agent: {
+  state: { errorMessage?: string; messages?: unknown[] };
+}): boolean {
+  const errorMessage = agent.state.errorMessage;
+  if (!errorMessage || errorMessage.length === 0) return false;
+  const messages = agent.state.messages ?? [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const candidate = messages[i] as { role?: unknown; stopReason?: unknown } | undefined;
+    if (candidate?.role !== "assistant") continue;
+    if (candidate.stopReason === "aborted") return true;
+    break;
+  }
+  return extractLlmRequestClass(errorMessage) === "aborted";
 }
 
 /**

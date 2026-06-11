@@ -739,3 +739,37 @@ test("issue #3: deep multi-chunk backlog — the build reconciles, waits each ch
     storage.close();
   }
 });
+
+test("wait-or-omit (spec LLM-FAILURE-HANDLING §7.1): an interactive build's wait is bounded by the wall-clock budget", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = await seedTimeline(storage);
+    const cfg = overflowConfig();
+    // Tiny interactive wall-clock budget: the covering job never completes
+    // (model-outage shape), so the wait must reject with the typed timeout —
+    // never block indefinitely, never proceed on degraded context.
+    (cfg as any).recovery = { llm_request_max_wait_ms: 400 };
+    const builder = new ContextBuilder(timeline, cfg, storage);
+    await insertJob(storage, "job_outage", "ev0000", "ev0018");
+    builder.escalateSummary = () => {};
+
+    await assert.rejects(
+      builder.build({
+        timelineKey: TK,
+        trigger: testEvent({ id: "trigger-t", body: "hi", timestamp: 2000 }),
+        activeSessions: [],
+        workspace: emptyWorkspace,
+      }),
+      (err: Error) => {
+        assert.equal(err.name, "BuildWaitTimeoutError", "typed timeout, not a hang");
+        assert.match(err.message, /job_outage/);
+        return true;
+      },
+    );
+    // The job is UNTOUCHED: still queued, completed whenever its model
+    // recovers, improving every later build on this timeline.
+    assert.equal(storage.getSummarizationJobById("job_outage")?.status, "pending");
+  } finally {
+    storage.close();
+  }
+});

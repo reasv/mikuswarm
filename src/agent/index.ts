@@ -8,7 +8,14 @@ export type {
   InterjectionMessage,
 } from "./messages.js";
 export { convertToLlm } from "./convert.js";
-export { AgentSessionFactory, createModel, assertRunSettledCleanly, type AgentFactoryOptions } from "./factory.js";
+export {
+  AgentSessionFactory,
+  createModel,
+  assertRunSettledCleanly,
+  wasRunAborted,
+  WorkerDrainAbortError,
+  type AgentFactoryOptions,
+} from "./factory.js";
 export {
   LlmScheduler,
   withSchedulerAdmission,

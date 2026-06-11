@@ -312,3 +312,170 @@ test("issue #4 (diary mirror): a storage rejection with retry budget left re-pen
     assert.equal(ctx.storage.getDiaryStatus("sum_diary_retry"), "done", "second attempt finished the job");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Drain-abort accounting (spec LLM-FAILURE-HANDLING §7): a pool-stop abort
+// returns the job to 'pending' with the claim-time attempts increment
+// compensated — a drain is not a semantic failure. A cap-style abort while the
+// pool is RUNNING stays on the semantic path (a degenerate run is an output
+// problem). Covers both pools.
+// ---------------------------------------------------------------------------
+
+/**
+ * Fake factory whose agent blocks in prompt() until abort() fires, then
+ * settles exactly like pi-agent-core does for an aborted run: errorMessage
+ * set (Layer-0-tagged, class aborted) + a synthetic aborted assistant turn.
+ */
+function makeAbortableFactory(extra: Record<string, unknown> = {}) {
+  return {
+    resolveModelId: () => "test-model",
+    resolveSessionType: () => undefined,
+    ...extra,
+    create: async () => {
+      let abortResolve!: () => void;
+      const abortedRun = new Promise<void>((r) => {
+        abortResolve = r;
+      });
+      const agent: any = {
+        state: { messages: [] as unknown[], errorMessage: undefined as string | undefined },
+        prompt: async () => {
+          await abortedRun;
+        },
+        waitForIdle: async () => {},
+        subscribe: () => () => {},
+        abort: () => {
+          agent.state.errorMessage = "Request was aborted [llm-request] [llm-request:aborted]";
+          agent.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+          abortResolve();
+        },
+      };
+      return { agent };
+    },
+  } as any;
+}
+
+test("drain abort (spec §7): pool.stop() re-pends the claimed job with the attempts increment compensated", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_drain", 2);
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory: makeAbortableFactory(),
+      config: { worker_count: 1, max_retries: 2 },
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("job_drain")?.status === "processing");
+    // Drain: aborts the in-flight agent; the run settles aborted with the pool
+    // no longer running → the job returns to pending, attempts compensated.
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("job_drain")!;
+    assert.equal(job.status, "pending", "drained job re-pends for the next process");
+    assert.equal(job.attempts, 0, "claim-time attempts increment compensated — no budget consumed");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("cap abort (spec §7): an abort while the pool is RUNNING stays on the semantic-attempts path", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_cap", 0);
+    // The agent aborts ITSELF mid-run (tool/turn cap shape) — the pool is
+    // still running, so this is a degenerate-output problem, not a drain.
+    const factory = {
+      resolveModelId: () => "test-model",
+      create: async () => {
+        const agent: any = {
+          state: { messages: [] as unknown[], errorMessage: undefined as string | undefined },
+          prompt: async () => {
+            agent.state.errorMessage = "Request was aborted [llm-request] [llm-request:aborted]";
+            agent.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+          },
+          waitForIdle: async () => {},
+          subscribe: () => () => {},
+          abort: () => {},
+        };
+        return { agent };
+      },
+    } as any;
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 },
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => {
+      const j = storage.getSummarizationJobById("job_cap");
+      return j?.status === "failed" || (j?.status === "pending" && j.attempts > 0);
+    });
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("job_cap")!;
+    assert.equal(job.status, "failed", "cap abort consumes the semantic budget (max_retries 0 → failed)");
+    assert.equal(job.attempts, 1, "the claim-time increment is NOT compensated for a cap abort");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("drain abort (diary mirror, spec §7): stop() re-pends with diary_attempts compensated", async () => {
+  await withDiaryFixture(async (ctx) => {
+    await seedDiaryJob(ctx.storage, "sum_diary_drain");
+    const pool = new DiaryWorkerPool({
+      storage: ctx.storage,
+      factory: makeAbortableFactory(),
+      memoryWriter: ctx.memoryWriter,
+      config: { worker_count: 1, max_retries: 3, per_session_budget_tokens: 1000 },
+      workspaceRoot: ctx.workspaceRoot,
+      resolveChannelLabel: async () => "Test Room (Earendil)",
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => ctx.storage.getDiaryStatus("sum_diary_drain") === "processing");
+    await pool.stop();
+
+    assert.equal(ctx.storage.getDiaryStatus("sum_diary_drain"), "pending", "drained diary job re-pends");
+    const job = await ctx.storage.claimNextDiaryJob();
+    assert.equal(job?.summaryId, "sum_diary_drain");
+    assert.equal(job?.attempts, 1, "fresh claim after a compensated drain is attempt 1, not 2");
+  });
+});
+
+test("returnSummarizationJobToPending / returnDiaryJobToPending never touch non-processing rows", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_guard", 2);
+    // Job is 'pending' (never claimed): the compensation is a no-op.
+    await storage.returnSummarizationJobToPending("job_guard");
+    const job = storage.getSummarizationJobById("job_guard")!;
+    assert.equal(job.status, "pending");
+    assert.equal(job.attempts, 0);
+
+    // Claim (attempts → 1), fail terminally, then attempt the compensation:
+    // the terminal row must be untouched.
+    await storage.claimNextSummarizationJob();
+    await storage.failSummarizationJob("job_guard", "boom");
+    await storage.returnSummarizationJobToPending("job_guard");
+    const failed = storage.getSummarizationJobById("job_guard")!;
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.attempts, 1);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
