@@ -15,6 +15,7 @@ import {
   modelHealthKey,
   parseRetryAfterMs,
   withSchedulerAdmission,
+  type ReleaseFn,
 } from "../src/agent/scheduler.js";
 import { withRequestRetry } from "../src/agent/request-retry.js";
 
@@ -317,6 +318,18 @@ function errorStream(errorMessage: string): AssistantMessageEventStream {
   const msg = message({ stopReason: "error", errorMessage });
   stream.push({ type: "error", reason: "error", error: msg });
   stream.end(msg);
+  return stream;
+}
+
+/**
+ * A degenerate base stream that ends WITHOUT forwarding a terminal `done`/`error`
+ * event (an "empty stream", classified environmental §3) — the failure mode that
+ * wedges the consumer and the half-open probe if the admission wrapper does not
+ * synthesize a terminal (#1).
+ */
+function emptyStream(): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  stream.end(message());
   return stream;
 }
 
@@ -631,6 +644,56 @@ test("model health: content and aborted outcomes are neutral", async () => {
   scheduler.stop();
 });
 
+test("composed stack: an empty-ending probe stream settles the probe and never hangs the consumer (#1)", async () => {
+  // The exact wedge from #1: admission INSIDE retry, an UNHEALTHY model, and a
+  // base stream that ends with NO terminal event. The admitted request is the
+  // half-open probe. Before the fix the wrapper neither pushed a terminal event
+  // (consumer blocks forever on `outer`) nor called `noteOutcome` (probe never
+  // settles → every later waiter for the model is gated until restart).
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 20 },
+  });
+  const MODEL_KEY = modelHealthKey(MODEL);
+  failEnvironmental(scheduler, MODEL_KEY, 1); // → unhealthy; next admission is the probe
+  assert.equal(scheduler.snapshot().models.find((m) => m.key === MODEL_KEY)?.health, "unhealthy");
+
+  let baseCalls = 0;
+  const base: StreamFn = () => {
+    baseCalls += 1;
+    return emptyStream();
+  };
+  // Interactive-class wall-clock budget so the retry loop terminates instead of
+  // re-probing forever; without the #1 fix this never resolves at all.
+  const wrapped = withRequestRetry(
+    withSchedulerAdmission(base, scheduler, { group: "default", priority: "interactive" }),
+    { maxWaitMs: 80, backoffBaseMs: 0, backoffMaxMs: 0 },
+  );
+
+  const events = await Promise.race([
+    drain(wrapped(MODEL, [], undefined as never)),
+    sleep(2000).then(() => "HUNG" as const),
+  ]);
+  assert.notEqual(events, "HUNG", "the empty-ending probe stream must NOT hang the consumer");
+  const list = events as AssistantMessageEvent[];
+  assert.equal(list[list.length - 1]?.type, "error", "a terminal error must finalize the stream");
+  assert.ok(baseCalls >= 1, "the probe attempt ran");
+
+  // The probe settled: no probe is left in flight, so the model is admissible
+  // again once its window elapses (the wedge would leave probeInFlight=true).
+  const model = scheduler.snapshot().models.find((m) => m.key === MODEL_KEY)!;
+  assert.equal(model.probeInFlight, false, "the probe must be settled on the empty-ending stream");
+
+  await sleep(30); // let the probe window elapse
+  const release = await Promise.race([
+    scheduler.acquire({ priority: "interactive", modelKey: MODEL_KEY }),
+    sleep(1000).then(() => "WEDGED" as const),
+  ]);
+  assert.notEqual(release, "WEDGED", "a subsequent waiter must be admissible — the probe is not wedged");
+  (release as ReleaseFn)();
+  scheduler.stop();
+});
+
 test("modelHealthKey derives from endpoint + id", () => {
   assert.equal(
     modelHealthKey({ baseUrl: "https://gw.example/anthropic", id: "claude-x" }),
@@ -688,5 +751,50 @@ test("snapshot exposes group budget state, queued waiters with attribution, and 
   await queued;
   const after = scheduler.snapshot();
   assert.equal(after.groups.find((g) => g.name === "default")!.active.length, 0, "released entries leave the active set");
+  scheduler.stop();
+});
+
+test("snapshot does not duplicate a group's sticky escalation onto other groups (#10)", async () => {
+  // `stickyEscalations` is one scheduler-wide map. A key belongs to whichever
+  // group has its queued/active entry; emitting the whole map under every group
+  // would misattribute the escalation to unrelated group cards. Each escalation
+  // must appear ONLY under the group holding its entry.
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 }, other: { max_in_flight: 1 } },
+  });
+  // Saturate both groups so the keyed entries queue (and thus carry their keys).
+  const holdDefault = await scheduler.acquire({ group: "default", priority: "interactive" });
+  const holdOther = await scheduler.acquire({ group: "other", priority: "interactive" });
+
+  const qDefault = scheduler
+    .acquire({ group: "default", priority: "background", key: "sumjob:default" })
+    .then((r) => r())
+    .catch(() => {});
+  const qOther = scheduler
+    .acquire({ group: "other", priority: "background", key: "diaryjob:other" })
+    .then((r) => r())
+    .catch(() => {});
+  await tick();
+  scheduler.escalate("sumjob:default", "interactive");
+  scheduler.escalate("diaryjob:other", "interactive");
+
+  const snap = scheduler.snapshot();
+  const def = snap.groups.find((g) => g.name === "default")!;
+  const other = snap.groups.find((g) => g.name === "other")!;
+
+  assert.deepEqual(
+    def.stickyEscalations.map((e) => e.key),
+    ["sumjob:default"],
+    "the default group shows only its own escalation",
+  );
+  assert.deepEqual(
+    other.stickyEscalations.map((e) => e.key),
+    ["diaryjob:other"],
+    "the other group shows only its own escalation — no cross-group duplication",
+  );
+
+  holdDefault();
+  holdOther();
+  await Promise.all([qDefault, qOther]);
   scheduler.stop();
 });

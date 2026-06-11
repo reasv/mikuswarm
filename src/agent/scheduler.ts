@@ -586,6 +586,30 @@ export class LlmScheduler {
   }
 
   /**
+   * Probe-settle safety net (#1): if a model's half-open probe is still marked
+   * in-flight when its slot is released, settle it as an inconclusive
+   * (neutral/environmental) probe outcome and re-arm the next probe window.
+   * Called from `release()` for a slot admitted AS the probe, so a missing or
+   * forgotten `noteOutcome` at any call site can never permanently gate the
+   * model. Idempotent with {@link noteModelOutcome}: when the normal path
+   * already cleared `probeInFlight`, this is a no-op (no double-settle).
+   */
+  private settleStaleProbe(modelKey: string): void {
+    const health = this.health.get(modelKey);
+    if (!health || health.state !== "unhealthy" || !health.probeInFlight) return;
+    const now = Date.now();
+    health.probeInFlight = false;
+    health.nextProbeAt = now + this.probeIntervalMs;
+    this.logger?.warn("llm_model_probe", {
+      model: modelKey,
+      success: false,
+      phase: "settled_on_release",
+      nextProbeAt: health.nextProbeAt,
+      waiters: this.countModelWaiters(modelKey),
+    });
+  }
+
+  /**
    * True when waiting in the admission queue is the effective wait point for
    * this (group, model): the group is in throttle backoff or the model is
    * unhealthy. Layer-0 collapses its local inter-attempt backoff to ~0 then —
@@ -623,33 +647,46 @@ export class LlmScheduler {
   snapshot(): LlmSchedulerSnapshot {
     const now = Date.now();
     return {
-      groups: [...this.groups.values()].map((group) => ({
-        name: group.name,
-        maxInFlight: group.maxInFlight,
-        backoffUntil: group.backoffUntil > now ? group.backoffUntil : 0,
-        active: [...group.activeEntries].map((entry) => ({
-          sessionId: entry.sessionId ?? null,
-          sessionType: entry.sessionType ?? null,
-          model: entry.modelKey ?? null,
-          priority: classOfRank(entry.rank),
-          key: entry.key ?? null,
-          heldMs: now - entry.admittedAt,
-        })),
-        queue: [...group.queue]
-          .sort((a, b) => (b.rank - a.rank) || (a.seq - b.seq))
-          .map((entry) => ({
+      groups: [...this.groups.values()].map((group) => {
+        // `stickyEscalations` is one scheduler-wide map (a key registers in
+        // exactly one group at a time), so emitting the whole map under every
+        // group would misattribute every escalation to every group card
+        // (#10). Restrict it to the keys with an active or queued entry in
+        // THIS group — the wire shape (per-group array) is unchanged, so the
+        // console schema needs no migration.
+        const groupKeys = new Set<string>();
+        for (const entry of group.activeEntries) if (entry.key) groupKeys.add(entry.key);
+        for (const entry of group.queue) if (entry.key) groupKeys.add(entry.key);
+        return {
+          name: group.name,
+          maxInFlight: group.maxInFlight,
+          backoffUntil: group.backoffUntil > now ? group.backoffUntil : 0,
+          active: [...group.activeEntries].map((entry) => ({
             sessionId: entry.sessionId ?? null,
             sessionType: entry.sessionType ?? null,
             model: entry.modelKey ?? null,
             priority: classOfRank(entry.rank),
             key: entry.key ?? null,
-            waitingMs: now - entry.enqueuedAt,
+            heldMs: now - entry.admittedAt,
           })),
-        stickyEscalations: [...this.stickyEscalations.entries()].map(([key, priority]) => ({
-          key,
-          priority,
-        })),
-      })),
+          queue: [...group.queue]
+            .sort((a, b) => (b.rank - a.rank) || (a.seq - b.seq))
+            .map((entry) => ({
+              sessionId: entry.sessionId ?? null,
+              sessionType: entry.sessionType ?? null,
+              model: entry.modelKey ?? null,
+              priority: classOfRank(entry.rank),
+              key: entry.key ?? null,
+              waitingMs: now - entry.enqueuedAt,
+            })),
+          stickyEscalations: [...this.stickyEscalations.entries()]
+            .filter(([key]) => groupKeys.has(key))
+            .map(([key, priority]) => ({
+              key,
+              priority,
+            })),
+        };
+      }),
       models: [...this.health.values()].map((health) => ({
         key: health.key,
         health: health.state,
@@ -742,10 +779,12 @@ export class LlmScheduler {
       // (§5.1): the highest-priority waiter for the model, at most one in
       // flight, regardless of its class (a background waiter probes when no
       // interactive one is queued — open question resolved as proposed).
+      let admittedAsProbe = false;
       if (entry.modelKey) {
         const health = this.health.get(entry.modelKey);
         if (health && health.state === "unhealthy") {
           health.probeInFlight = true;
+          admittedAsProbe = true;
           this.logger?.info("llm_model_probe", {
             model: entry.modelKey,
             success: undefined,
@@ -770,6 +809,17 @@ export class LlmScheduler {
         released = true;
         group.active = Math.max(0, group.active - 1);
         group.activeEntries.delete(activeEntry);
+        // Probe-settle safety net (#1): a slot admitted AS the half-open probe
+        // must ALWAYS settle that probe when released, even if no `noteOutcome`
+        // ever ran for it (a forgotten/missing call site, an empty-ending
+        // stream that bypassed counting). Without this, `probeInFlight` stays
+        // set and `modelAdmissible` rejects every waiter for the model until
+        // restart. This is idempotent with the normal path: if `noteOutcome`
+        // already settled the probe, `probeInFlight` is already false and this
+        // is a no-op — no double-settle.
+        if (admittedAsProbe && entry.modelKey) {
+          this.settleStaleProbe(entry.modelKey);
+        }
         this.pump(group);
       };
       entry.resolve(release);
@@ -944,8 +994,10 @@ export function withSchedulerAdmission(
       };
       try {
         const inner = await base(model, context, innerOptions);
+        let sawTerminal = false;
         for await (const event of inner) {
           if (event.type === "error") {
+            sawTerminal = true;
             // Skip the fallback when the hook already counted this request's
             // throttle — double-counting would inflate the exponential streak
             // (and the model streak alike).
@@ -960,23 +1012,48 @@ export function withSchedulerAdmission(
               );
             }
           } else if (event.type === "done") {
+            sawTerminal = true;
             scheduler.noteOutcome(options.group, modelKey, undefined);
           }
           outer.push(event);
         }
+        if (!sawTerminal) {
+          // The base stream ENDED without forwarding a terminal `done`/`error`
+          // event (an "empty stream", classified environmental §3). pi-ai's
+          // EventStream only terminates on a terminal push or `end()`, so
+          // without a synthesized terminal here `outer` never finalizes and the
+          // consumer (the retry wrapper, the runner) blocks forever — and if
+          // this admission was the half-open probe, `noteOutcome` was never
+          // called, so `probeInFlight` stays set and `modelAdmissible` would
+          // reject every waiter for the model until restart (#1). Feed the
+          // environmental streak (settling the probe) AND push a terminal error
+          // so `outer` finalizes and the retry wrapper's environmental path
+          // takes over.
+          if (!throttleNoted) {
+            scheduler.noteOutcome(options.group, modelKey, "environmental");
+          }
+          outer.push(synthesizeErrorEvent(model, "stream ended without a terminal event"));
+        }
       } catch (err) {
         // The base fn itself threw (not via a terminal `error` event). Surface a
         // terminal error so the consumer always sees one, and count it for backoff.
+        // A thrown AbortError (or a request that aborts via the caller's signal)
+        // is intentional teardown, NOT an environmental failure: mirror the retry
+        // wrapper (request-retry.ts) — synthesize `stopReason:"aborted"` and pass
+        // a NEUTRAL outcome to `noteOutcome` so it neither feeds the model streak
+        // nor triggers a futile re-admission (#8). Defensive: pi-ai providers emit
+        // `aborted` internally today, so this catch rarely sees a raw AbortError.
         const message = err instanceof Error ? err.message : String(err);
+        const aborted = (err instanceof Error && err.name === "AbortError") || signal?.aborted === true;
         if (!throttleNoted) {
           scheduler.noteOutcome(
             options.group,
             modelKey,
-            classifyLlmError(message, undefined),
-            extractStatus(message.toLowerCase()),
+            aborted ? "aborted" : classifyLlmError(message, undefined),
+            aborted ? undefined : extractStatus(message.toLowerCase()),
           );
         }
-        outer.push(synthesizeErrorEvent(model, message));
+        outer.push(synthesizeErrorEvent(model, message, aborted ? "aborted" : "error"));
       } finally {
         release();
       }

@@ -124,7 +124,11 @@ export class SessionRunner {
         !lifecycle?.isInterrupted() &&
         // Fast path / fallback when no lifecycle is wired (e.g. summarization
         // path, unit tests): pi-agent-core resolves an aborted run with a
-        // synthetic `stopReason:"aborted"` turn (#5).
+        // synthetic `stopReason:"aborted"` turn (#5). A drain-caused
+        // scheduler-stop admission rejection (class-tagged `aborted` but with
+        // `stopReason:"error"`) is handled one step earlier by
+        // `throwIfLlmFailure`, which throws BEFORE this loop is entered (#2), so
+        // it can never reach forced completion.
         !wasAborted(agent.state.messages)
       ) {
         retries += 1;
@@ -211,8 +215,19 @@ async function continueAgent(agent: Agent): Promise<void> {
  * `LLM_REQUEST_FAILURE_MARKER` (+ the class marker) to every terminal error
  * that genuinely originated in the LLM request layer (provider/SDK failures
  * and scheduler-admission failures alike); an untagged error is our own code
- * throwing and settles as a plain failure. Intentional aborts (operator Stop,
- * tool/turn caps, drain) keep today's settle-in-place behaviour.
+ * throwing and settles as a plain failure. Genuine in-turn aborts — operator
+ * Stop (`lifecycle.isInterrupted()`) and tool/turn caps (the synthetic turn
+ * carries `stopReason:"aborted"`) — keep today's settle-in-place behaviour.
+ *
+ * A drain-caused scheduler-stop admission rejection is the exception (#2): it
+ * is class-tagged `aborted` but lands on a synthetic turn with
+ * `stopReason:"error"` (no operator interrupt), so it reaches the final branch
+ * below. The maintainer chose PARK-over-discard for it (it's an environmental-
+ * adjacent shutdown event, the pending user message must survive), so it THROWS
+ * `phase:"llm"` like every other tagged failure — `launchSession` then parks it
+ * `failed-resumable`. Re-entering forced completion against a stopped gate that
+ * can only reject again would add a P1-violating user turn per iteration and
+ * finally mask the drop as a `NO_REPLY` completion.
  */
 function throwIfLlmFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void {
   const errorMessage = agent.state.errorMessage;
@@ -228,7 +243,6 @@ function throwIfLlmFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void 
   // Prefer the class marker stamped at the surfacing point; fall back to
   // re-classifying the stripped message (e.g. errors tagged by older rows).
   const cls = extractLlmRequestClass(errorMessage) ?? classifyLlmError(message, stopReason);
-  if (cls === "aborted") return;
   throw new SessionRunnerError(`agent run failed at the LLM layer (${cls}): ${message}`, "llm", {
     llmClass: cls,
   });

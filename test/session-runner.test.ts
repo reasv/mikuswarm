@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SessionRunner } from "../src/agent/runner.js";
+import { SessionRunner, SessionRunnerError, isLlmRunFailure } from "../src/agent/runner.js";
 import { SessionManager } from "../src/agent/session-manager.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
+import { tagLlmRequestError } from "../src/agent/request-retry.js";
 import type { InboundChatEvent } from "../src/types.js";
 
 /**
@@ -135,6 +136,49 @@ test("SessionRunner: an interrupt across the run terminates the loop with no ext
   assert.equal(result.noReply, true, "an interrupted non-terminal run yields no reply");
   // The session status set by interrupt() is the authoritative terminal state.
   assert.equal(sessions.get(record.id)?.status, "interrupted");
+});
+
+test("SessionRunner: a scheduler-stop admission rejection parks (throws phase:'llm') with NO forced-completion turn (#2)", async () => {
+  // Models the drain-at-shutdown path: `llmScheduler.stop()` rejects the live
+  // chat run's admission with "LLM scheduler stopped". `withSchedulerAdmission`
+  // synthesizes a terminal error (stopReason:"error"); `withRequestRetry` tags it
+  // `[llm-request] [llm-request:aborted]`; pi-agent-core resolves the run, recording
+  // a synthetic assistant turn with stopReason:"error" and copying the tagged
+  // message into AgentState.errorMessage. Before the fix the runner fell through
+  // (cls === "aborted" returned without throwing) and `wasAborted` missed the
+  // stopReason:"error" turn, so the forced-completion loop re-prompted a stopped
+  // gate (P1-violating turns) and finally settled a masking NO_REPLY completion.
+  const errorMessage = tagLlmRequestError("LLM scheduler stopped", "aborted");
+  let prompts = 0;
+  let continues = 0;
+  const messages: any[] = [];
+  const agent: any = {
+    state: { messages, errorMessage },
+    async prompt() {
+      prompts += 1;
+      // pi-agent-core's handleRunFailure shape for a surfaced terminal error:
+      // a synthetic assistant turn with stopReason "error" (NOT "aborted").
+      messages.push({ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error" });
+    },
+    async continue() {
+      continues += 1;
+    },
+    async waitForIdle() {},
+  };
+
+  const runner = new SessionRunner();
+  await assert.rejects(
+    () => runner.run(agent, session, /* maxRetries */ 3, kickoff),
+    (err: unknown) => {
+      assert.ok(err instanceof SessionRunnerError, "must be a SessionRunnerError");
+      assert.equal(err.phase, "llm", "phase:'llm' routes launchSession to markFailedResumable (park)");
+      assert.equal(err.llmClass, "aborted", "carries the drain-abort class");
+      assert.ok(isLlmRunFailure(err), "isLlmRunFailure → launchSession parks failed-resumable");
+      return true;
+    },
+  );
+  assert.equal(prompts, 1, "only the kickoff prompt — NO forced-completion re-prompt against the stopped gate");
+  assert.equal(continues, 0, "agent.continue() must not run");
 });
 
 test("SessionRunner returns cleanly when the kickoff turn is already terminal", async () => {
