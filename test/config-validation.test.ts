@@ -651,11 +651,21 @@ const SHIPPED_TOML_ENV: Record<string, string> = {
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
 test("config: shipped config/00-defaults.toml validates under strict unknown-key checking (issue #29)", async () => {
-  await withEnv(SHIPPED_TOML_ENV, async () => {
-    const config = await loadConfig(path.join(REPO_ROOT, "config"), { env: false });
-    assert.equal(config.app.name, "mikuswarm");
-    assert.equal(config.captioning?.worker_count, 2);
-  });
+  // Copy ONLY the shipped defaults into a temp dir: loading the repo's
+  // config/ directory directly would lexicographically merge any git-ignored
+  // local deployment overlay (e.g. config/90-local.toml) into the load,
+  // coupling this test to the developer's machine.
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-config-defaults-"));
+  try {
+    await copyFile(path.join(REPO_ROOT, "config", "00-defaults.toml"), path.join(dir, "00-defaults.toml"));
+    await withEnv(SHIPPED_TOML_ENV, async () => {
+      const config = await loadConfig(dir, { env: false });
+      assert.equal(config.app.name, "mikuswarm");
+      assert.equal(config.captioning?.worker_count, 2);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("config: shipped docker/95-docker.toml overlay validates under strict unknown-key checking (issue #29)", async () => {
