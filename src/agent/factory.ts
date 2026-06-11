@@ -310,10 +310,16 @@ export class AgentSessionFactory {
     // class work (summaries, diaries — must eventually exist) is unbounded.
     const interactiveBudget = basePriority === "interactive" || basePriority === "proactive";
     const healthKey = modelHealthKey(model);
+    // Per-model override of the interactive wall-clock budget (spec §6): a model
+    // slow to FIRST token can be granted a larger pre-first-token budget on its
+    // model config entry; unset falls back to the global recovery value. The
+    // budget only bounds waiting + a zero-token attempt, never a streaming one.
+    const interactiveMaxWaitMs =
+      modelConfig.llm_request_max_wait_ms ?? recovery?.llm_request_max_wait_ms ?? 120_000;
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
-        maxWaitMs: interactiveBudget ? (recovery?.llm_request_max_wait_ms ?? 120_000) : undefined,
+        maxWaitMs: interactiveBudget ? interactiveMaxWaitMs : undefined,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
         backoffMaxMs: recovery?.llm_request_backoff_max_ms ?? 15_000,
       },

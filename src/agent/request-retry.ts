@@ -286,12 +286,17 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
  * a terminal `error` at any point — even after tokens streamed — discards the
  * buffered partial and retries as if the request had failed from the start.
  *
- * Retry budget (§6): environmental failures retry indefinitely when
- * `maxWaitMs` is unset (background-class — downtime is waited out), or until
- * the wall-clock budget elapses (interactive-class), measured from the first
- * attempt. The budget also cuts short an in-progress ADMISSION wait — expiry
- * mid-queue aborts the acquire via a composed signal — so a request queued
- * behind an unhealthy model's probe window cannot overstay its budget.
+ * Retry budget (§6, maintainer decision): the wall-clock budget bounds only the
+ * WAITING — admission-queue waits and inter-attempt backoff sleeps — and a
+ * STUCK attempt that has produced zero tokens by the deadline. It NEVER aborts a
+ * token-producing attempt: the first model-produced event of any kind (text,
+ * reasoning/thinking, or tool-call delta — `start` is the opener, not content)
+ * makes the attempt immune for the rest of its life, so a healthy generation of
+ * any length completes. `maxWaitMs` unset = unbounded (background-class — an
+ * outage is waited out); set = interactive-class, measured from the first
+ * attempt. Expiry mid-admission-wait still aborts the acquire (the one wait the
+ * spec sanctioned cutting short), so a request queued behind an unhealthy
+ * model's probe window cannot overstay its budget before producing a token.
  *
  * The wrapper always applies: every terminal error it surfaces is tagged with
  * {@link LLM_REQUEST_FAILURE_MARKER} + the class marker (Decision C / §4.3),
@@ -306,29 +311,37 @@ export function withRequestRetry(
     const outer = createAssistantMessageEventStream();
     const callerSignal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
 
-    // Wall-clock budget (§6). The budget signal composes with the caller's own
-    // signal so expiry aborts an in-flight attempt or admission wait; the
-    // surfaced abort is then re-labelled as budget exhaustion below (the
-    // caller did not abort — the clock did).
+    // Wall-clock budget (§6, maintainer decision). The budget bounds only the
+    // WAITING — admission-queue waits and inter-attempt backoff sleeps — and a
+    // STUCK attempt that produces zero tokens by the deadline. It must NEVER
+    // abort an attempt that has produced ≥1 token (incl. reasoning/thinking):
+    // a working generation may take arbitrarily long, and killing it mid-stream
+    // discards a nearly-complete paid response. So the budget signal is NOT
+    // composed unconditionally into every attempt. Instead each attempt gets its
+    // own controller (`attemptCtrl`); the budget's abort is forwarded into it
+    // only while the attempt has produced no tokens. The first token of any kind
+    // detaches the budget listener for the rest of that attempt, making it
+    // immune. The caller's own abort (drain/Stop) is always forwarded. The
+    // surfaced budget abort is re-labelled as wait-exhaustion below (the caller
+    // did not abort — the clock did).
     const maxWaitMs = options.maxWaitMs;
     const deadline = maxWaitMs === undefined ? Infinity : Date.now() + maxWaitMs;
     let budgetCtrl: AbortController | undefined;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
-    let effectiveOptions = streamOptions;
     if (maxWaitMs !== undefined) {
       budgetCtrl = new AbortController();
       budgetTimer = setTimeout(() => budgetCtrl!.abort(), maxWaitMs);
       budgetTimer.unref?.();
-      const combined = callerSignal
-        ? AbortSignal.any([callerSignal, budgetCtrl.signal])
-        : budgetCtrl.signal;
-      effectiveOptions = {
-        ...((streamOptions as object | undefined) ?? {}),
-        signal: combined,
-      } as typeof streamOptions;
     }
+    const budgetSignal = budgetCtrl?.signal;
+    // The inter-attempt backoff sleep is pure waiting and produces no tokens, so
+    // BOTH the caller's abort and the budget expiry must cut it short (§6). The
+    // sleep is the one place the budget always composes — the immunity rule
+    // applies only to a token-producing attempt, never to a wait.
     const sleepSignal =
-      (effectiveOptions as { signal?: AbortSignal } | undefined)?.signal ?? callerSignal;
+      callerSignal && budgetSignal
+        ? AbortSignal.any([callerSignal, budgetSignal])
+        : (callerSignal ?? budgetSignal);
 
     const tap = (attempt: number, event: AssistantMessageEvent): void => {
       try {
@@ -388,8 +401,39 @@ export function withRequestRetry(
           let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
           let producedTokens = false;
 
+          // Per-attempt abort: the caller's abort (drain/Stop) always reaches
+          // the inner stream; the budget's abort reaches it ONLY while the
+          // attempt has produced no tokens (a stuck/silent attempt). `start` is
+          // the stream opener, not content; the first event of any other kind —
+          // text, thinking/reasoning, or tool-call delta — is "first token" and
+          // detaches the budget listener, making the attempt immune for the rest
+          // of its life. The admission-queue wait happens inside `base` before
+          // any event, so a budget expiry mid-admission still aborts the acquire
+          // (the one wait the spec sanctioned cutting short).
+          const attemptCtrl = new AbortController();
+          const onCallerAbort = () => attemptCtrl.abort();
+          const onBudgetAbort = () => attemptCtrl.abort();
+          if (callerSignal) {
+            if (callerSignal.aborted) attemptCtrl.abort();
+            else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+          }
+          if (budgetSignal) {
+            if (budgetSignal.aborted) attemptCtrl.abort();
+            else budgetSignal.addEventListener("abort", onBudgetAbort, { once: true });
+          }
+          const detachBudget = () => {
+            budgetSignal?.removeEventListener("abort", onBudgetAbort);
+          };
+          const detachCaller = () => {
+            callerSignal?.removeEventListener("abort", onCallerAbort);
+          };
+          const attemptOptions = {
+            ...((streamOptions as object | undefined) ?? {}),
+            signal: attemptCtrl.signal,
+          } as typeof streamOptions;
+
           try {
-            const inner = await base(model, context, effectiveOptions);
+            const inner = await base(model, context, attemptOptions);
             for await (const event of inner) {
               tap(attempt + 1, event);
               if (event.type === "error") {
@@ -399,7 +443,12 @@ export function withRequestRetry(
                 break;
               }
               buffered.push(event);
-              if (event.type !== "start") producedTokens = true;
+              if (event.type !== "start" && !producedTokens) {
+                // First model-produced content of any kind (incl. reasoning):
+                // the attempt is now immune to the wall-clock budget.
+                producedTokens = true;
+                detachBudget();
+              }
               // A clean terminal `done` ends the inner iteration on its own.
             }
           } catch (err) {
@@ -414,6 +463,12 @@ export function withRequestRetry(
             const aborted = err instanceof Error && err.name === "AbortError";
             errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
             tap(attempt + 1, errorEvent);
+          } finally {
+            // Detach the per-attempt listeners so neither signal leaks across
+            // the retry loop (the budget listener may already be detached if a
+            // token arrived).
+            detachBudget();
+            detachCaller();
           }
 
           if (!errorEvent) {
@@ -443,10 +498,12 @@ export function withRequestRetry(
           const failure = errorEvent.error;
           let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
 
-          // Budget expiry mid-attempt/mid-admission arrives as an abort of the
-          // composed signal. When the CALLER did not abort, the clock did:
-          // re-label as environmental wait-exhaustion rather than an
-          // intentional abort, so the failure parks instead of settling.
+          // Budget expiry on a ZERO-token attempt (a stuck/silent stream or a
+          // mid-admission wait) arrives as an abort of the per-attempt signal.
+          // When the CALLER did not abort, the clock did: re-label as
+          // environmental wait-exhaustion rather than an intentional abort, so
+          // the failure parks instead of settling. A token-producing attempt
+          // detached the budget listener, so its abort never reaches here (§6).
           const budgetExpired = budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true;
           if (verdict === "aborted" && budgetExpired) {
             verdict = "environmental";

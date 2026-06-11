@@ -314,6 +314,16 @@ const ModelSchema = StrictObject({
   // rate-limited account). A non-default value must name a group declared in
   // `[rate_limits.llm.*]` (validated fail-fast at app wiring).
   rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
+  // Per-model override of the interactive-class wall-clock retry budget (spec
+  // LLM-FAILURE-HANDLING §6, maintainer decision). The budget bounds only
+  // WAITING (admission-queue waits + inter-attempt backoff) and a STUCK attempt
+  // that produces zero tokens by the deadline — it never aborts a streaming
+  // attempt that has emitted any token (incl. reasoning). A model that is slow
+  // to FIRST token can be granted a larger pre-first-token budget here. Unset =
+  // fall back to `recovery.llm_request_max_wait_ms`. Only affects
+  // interactive-class sessions (chat/proactive); background-class work is
+  // unbounded regardless.
+  llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
   compat: Type.Optional(StrictObject({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),

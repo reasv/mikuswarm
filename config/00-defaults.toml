@@ -67,6 +67,13 @@ context_window = 128000
 # bytes; raw inflates ~4/3 in base64). 5 MB ≈ 3.75 MB raw, under Anthropic's
 # per-image inline cap.
 image_input_bytes = 5242880
+# Per-model override of the interactive-class wall-clock retry budget
+# (recovery.llm_request_max_wait_ms). The budget bounds only WAITING (admission
+# queue + inter-attempt backoff) and a STUCK attempt that emits zero tokens by
+# the deadline — it never aborts a streaming attempt that has produced any token
+# (incl. reasoning). Set a larger value for a model that is slow to FIRST token.
+# Defaults to the recovery value; shipped explicitly per the explicit-config rule.
+llm_request_max_wait_ms = 120000
 
 [models.default.cost]
 input = 0

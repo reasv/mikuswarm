@@ -413,6 +413,181 @@ test("withRequestRetry: a mid-iteration throw is retried like any mid-stream dea
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
+// ---------------------------------------------------------------------------
+// Budget semantics (spec §6, maintainer decision / review issue #3): the
+// wall-clock budget bounds only the WAITING (admission-queue waits +
+// inter-attempt backoff sleeps) and a STUCK zero-token attempt. It must NEVER
+// abort an attempt that has produced ≥1 token (incl. reasoning).
+// ---------------------------------------------------------------------------
+
+const thinkingDeltaEvent = (delta: string): AssistantMessageEvent => ({
+  type: "thinking_delta",
+  contentIndex: 0,
+  delta,
+  partial: message(),
+});
+
+/**
+ * A StreamFn whose single attempt emits an opening event, then (optionally) a
+ * first content event, then — only AFTER `firstTokenDelayMs` — keeps the stream
+ * open until either it is aborted (resolving to a thrown AbortError) or
+ * `holdMs` elapses and it emits `done`. Lets a test drive an attempt past the
+ * budget deadline and observe whether the budget signal reaches it.
+ */
+function lateStream(opts: {
+  firstEvent?: AssistantMessageEvent; // emitted ~immediately if present
+  holdMs: number; // how long the stream stays open after the first event before `done`
+}): { fn: StreamFn; aborted: () => boolean; calls: () => number } {
+  let abortedFlag = false;
+  let calls = 0;
+  const fn: StreamFn = (_model, _context, streamOptions) => {
+    calls += 1;
+    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    return (async function* () {
+      yield startEvent();
+      if (opts.firstEvent) yield opts.firstEvent;
+      // Stay open. If the (per-attempt) signal fires while we are open, throw an
+      // AbortError exactly as a pi-ai provider would on a cancelled fetch.
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, opts.holdMs);
+        if (signal) {
+          if (signal.aborted) {
+            clearTimeout(timer);
+            abortedFlag = true;
+            const e = new Error("aborted");
+            e.name = "AbortError";
+            reject(e);
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              abortedFlag = true;
+              const e = new Error("aborted");
+              e.name = "AbortError";
+              reject(e);
+            },
+            { once: true },
+          );
+        }
+      });
+      yield doneEvent();
+    })() as unknown as AssistantMessageEventStream;
+  };
+  return { fn, aborted: () => abortedFlag, calls: () => calls };
+}
+
+test("withRequestRetry: a healthy stream that emits a token then runs past the deadline is NOT aborted (spec §6 / #3)", async () => {
+  // First a text token arrives well within the budget, THEN the stream stays
+  // open far past the deadline. The budget must not touch it — it completes.
+  const stream = lateStream({ firstEvent: textDeltaEvent("hi"), holdMs: 80 });
+  const wrapped = withRequestRetry(stream.fn, { maxWaitMs: 20, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(stream.aborted(), false, "the budget never aborted the token-producing attempt");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+  assert.equal(stream.calls(), 1, "no retry — the first attempt completed");
+});
+
+test("withRequestRetry: a REASONING token also makes the attempt budget-immune (first token incl. thinking) (spec §6 / #3)", async () => {
+  // The only content the model emits before the deadline is a thinking delta.
+  // Reasoning counts as first-token, so the attempt is immune and completes.
+  const stream = lateStream({ firstEvent: thinkingDeltaEvent("let me think"), holdMs: 80 });
+  const wrapped = withRequestRetry(stream.fn, { maxWaitMs: 20, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(stream.aborted(), false, "reasoning is first-token — attempt immune");
+  assert.deepEqual(events.map((e) => e.type), ["start", "thinking_delta", "done"]);
+});
+
+test("withRequestRetry: a ZERO-token attempt IS aborted at the deadline and parks (environmental) (spec §6 / #3)", async () => {
+  // The attempt emits only `start` (the opener — not content) and stays silent.
+  // The budget aborts it; the surfaced failure is environmental wait-exhaustion
+  // (parks failed-resumable), never an intentional abort.
+  const stream = lateStream({ holdMs: 1000 });
+  const wrapped = withRequestRetry(stream.fn, { maxWaitMs: 20, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(stream.aborted(), true, "the silent attempt was aborted by the budget");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "error", "re-labelled environmental, not an abort");
+  assert.equal(extractLlmRequestClass(err.errorMessage), "environmental");
+  assert.match(err.errorMessage ?? "", /wall-clock budget/);
+});
+
+test("withRequestRetry: budget expiry mid-ADMISSION-wait aborts the acquire (zero-token) (spec §6 / #3)", async () => {
+  // Model the admission wait: `base` blocks inside `await base(...)` (before any
+  // event) until the signal fires. A budget expiry here MUST abort the acquire
+  // and surface environmental wait-exhaustion (the one wait the spec sanctions).
+  let aborted = false;
+  const fn: StreamFn = (_model, _context, streamOptions) => {
+    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    return (async function* () {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            aborted = true;
+            const e = new Error("admission acquire aborted");
+            e.name = "AbortError";
+            reject(e);
+          },
+          { once: true },
+        );
+      });
+      yield doneEvent();
+    })() as unknown as AssistantMessageEventStream;
+  };
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 15, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(aborted, true, "the admission acquire was aborted by the budget");
+  const err = (events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(extractLlmRequestClass(err.errorMessage), "environmental");
+  assert.match(err.errorMessage ?? "", /wall-clock budget/);
+});
+
+test("withRequestRetry: a larger budget lets a slow-to-first-token attempt survive where a small one parks (#3 override effect)", async () => {
+  // Same stream — emits its first token only after ~40ms. With a 15ms budget it
+  // is aborted before the token (parks); with a 200ms budget (the per-model
+  // override) the token arrives first and the attempt completes. This is exactly
+  // what threading a larger per-model `maxWaitMs` buys at the deadline.
+  const slow = () =>
+    ((_model: never, _context: never, streamOptions: never) => {
+      const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+      return (async function* () {
+        yield startEvent();
+        // Wait ~40ms before the first token, but bail early if aborted.
+        const tokenArrived = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(true), 40);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve(false);
+            },
+            { once: true },
+          );
+        });
+        if (!tokenArrived) {
+          const e = new Error("aborted");
+          e.name = "AbortError";
+          throw e;
+        }
+        yield textDeltaEvent("late");
+        yield doneEvent();
+      })() as unknown as AssistantMessageEventStream;
+    }) as unknown as StreamFn;
+
+  // Small budget: aborted before the token → environmental park.
+  const smallEvents = await drain(withRequestRetry(slow(), { maxWaitMs: 15, ...FAST })(MODEL, CONTEXT, undefined));
+  assert.deepEqual(smallEvents.map((e) => e.type), ["error"], "small budget parks before first token");
+  const smallErr = (smallEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(extractLlmRequestClass(smallErr.errorMessage), "environmental");
+
+  // Larger budget (per-model override): the token arrives first → completes.
+  const largeEvents = await drain(withRequestRetry(slow(), { maxWaitMs: 200, ...FAST })(MODEL, CONTEXT, undefined));
+  assert.deepEqual(largeEvents.map((e) => e.type), ["start", "text_delta", "done"], "larger budget survives to first token");
+});
+
 test("withRequestRetry: an empty inner stream is environmental — retried like any failure", async () => {
   // "Empty streams" are an explicit environmental example (spec §3): the
   // synthesized terminal error re-enters the retry loop like any other.
