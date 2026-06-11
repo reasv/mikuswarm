@@ -7,7 +7,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import sharp from "sharp";
 
-import { createDanbooruTool, type DanbooruToolContext } from "../src/tools/danbooru.js";
+import { createDanbooruTool, DanbooruRateLimiter, type DanbooruToolContext } from "../src/tools/danbooru.js";
 import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 import type {
   FetchClient,
@@ -748,6 +748,149 @@ test("danbooru search surfaces createdAt, fileSize, and source on each post", as
       assert.ok(text.includes("size=120.6KB") || text.includes("size=123456B"), "rendered text should include fileSize");
     } finally {
       await cleanup();
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DanbooruRateLimiter — pacing + slot accounting (spec Design D rollout item 6
+// verification: min-interval between starts, maxInFlight, one shared budget).
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("limiter: two concurrent runs start at least minIntervalMs apart", async () => {
+  const limiter = new DanbooruRateLimiter({ minIntervalMs: 80, maxInFlight: 4 });
+  const starts: number[] = [];
+  await Promise.all(
+    [0, 1].map(() =>
+      limiter.run(async () => {
+        starts.push(Date.now());
+      }),
+    ),
+  );
+  assert.equal(starts.length, 2);
+  const gap = Math.abs(starts[1]! - starts[0]!);
+  assert.ok(gap >= 70, `concurrent starts must be paced >= minIntervalMs apart, got ${gap}ms`);
+});
+
+test("limiter: third run waits while maxInFlight runs are in flight", async () => {
+  const limiter = new DanbooruRateLimiter({ minIntervalMs: 0, maxInFlight: 2 });
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+  let releaseSecond!: () => void;
+  const secondGate = new Promise<void>((resolve) => (releaseSecond = resolve));
+
+  let thirdStarted = false;
+  const first = limiter.run(() => firstGate);
+  const second = limiter.run(() => secondGate);
+  const third = limiter.run(async () => {
+    thirdStarted = true;
+  });
+
+  await sleep(20);
+  assert.equal(thirdStarted, false, "third run must wait at maxInFlight=2");
+  releaseFirst();
+  await first;
+  await third;
+  assert.equal(thirdStarted, true, "a release admits the queued third run");
+  releaseSecond();
+  await second;
+});
+
+test("limiter: released slot is handed to the queued waiter FIFO — never double-granted", async () => {
+  const limiter = new DanbooruRateLimiter({ minIntervalMs: 0, maxInFlight: 1 });
+  let inFlight = 0;
+  let maxObserved = 0;
+  const startOrder: number[] = [];
+  const tasks = [0, 1, 2, 3, 4].map((id) =>
+    limiter.run(async () => {
+      startOrder.push(id);
+      inFlight += 1;
+      maxObserved = Math.max(maxObserved, inFlight);
+      await sleep(5);
+      inFlight -= 1;
+    }),
+  );
+  await Promise.all(tasks);
+  assert.equal(maxObserved, 1, `maxInFlight=1 must never be exceeded, observed ${maxObserved}`);
+  assert.deepEqual(startOrder, [0, 1, 2, 3, 4], "waiters are admitted FIFO");
+});
+
+test("limiter: API and CDN requests share one budget (preview paces JSON + asset fetch)", async () => {
+  await withWorkspace(async (workspace) => {
+    const png = await sharp({
+      create: { width: 32, height: 32, channels: 3, background: { r: 1, g: 2, b: 3 } },
+    })
+      .png()
+      .toBuffer();
+
+    let apiHitAt = 0;
+    const server = await startServer((req, res) => {
+      apiHitAt = Date.now();
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: 99,
+          rating: "g",
+          score: 1,
+          fav_count: 0,
+          file_ext: "png",
+          file_url: "http://upstream/a.png",
+          large_file_url: "http://upstream/a-large.png",
+          preview_file_url: "http://upstream/a-preview.png",
+          image_width: 32,
+          image_height: 32,
+        }),
+      );
+    });
+
+    const calls: Array<{ url: string; options?: FetchOptions }> = [];
+    let cdnHitAt = 0;
+    const tmpFiles: string[] = [];
+    const client = {
+      async fetch(url: string, options?: FetchOptions): Promise<FetchResult> {
+        cdnHitAt = Date.now();
+        calls.push({ url, options });
+        const tmpPath = path.join(os.tmpdir(), `miku-danbooru-budget-${randomBytes(6).toString("hex")}`);
+        await writeFile(tmpPath, png);
+        tmpFiles.push(tmpPath);
+        return {
+          path: tmpPath,
+          sizeBytes: png.byteLength,
+          contentType: "image/png",
+          finalUrl: url,
+          statusCode: 200,
+        };
+      },
+      stop() {},
+    } as unknown as FetchClient;
+
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { base_url: server.url, max_regular_tags: 3, min_request_interval_ms: 120, max_in_flight: 2 },
+        }),
+      );
+      const result = await tool.execute("t-budget", {
+        action: "preview",
+        postId: 99,
+        previewVariant: "original",
+      });
+      assert.ok(result.content.some((c: { type: string }) => c.type === "image"), "preview succeeds");
+      assert.equal(calls.length, 1, "exactly one CDN asset fetch");
+      assert.ok(apiHitAt > 0 && cdnHitAt > 0);
+      const gap = cdnHitAt - apiHitAt;
+      assert.ok(
+        gap >= 90,
+        `the CDN fetch must be paced behind the API call by the shared budget (~120ms), got ${gap}ms`,
+      );
+    } finally {
+      await Promise.all(tmpFiles.map((p) => rm(p, { force: true }).catch(() => {})));
       await server.close();
     }
   });

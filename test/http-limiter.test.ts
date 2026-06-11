@@ -5,6 +5,7 @@ import {
   acquireHttpSlot,
   configureHttpLimiter,
   hostOf,
+  httpLimiterHostCount,
   noteHttpResponse,
   resetHttpLimiter,
 } from "../src/tools/http-limiter.js";
@@ -191,8 +192,13 @@ test("redirect hop to a different host swaps the per-host slot (old released, ne
     releaseHopFetch();
     const response = await pending;
     assert.equal(response.status, 200);
-    (await probeB)(); // hop settled → slot freed → probe acquires
-    assert.equal(acquiredB, true, "hop host slot is released when the chain settles");
+    // The final response's slot is tied to BODY settlement now, not headers:
+    // still held after the response resolves, freed once the body is consumed.
+    await delay(20);
+    assert.equal(acquiredB, false, "final host slot is held until the body settles");
+    await response.text();
+    (await probeB)(); // body consumed → slot freed → probe acquires
+    assert.equal(acquiredB, true, "hop host slot is released when the body settles");
   } finally {
     stub.restore();
     resetHttpLimiter();
@@ -345,4 +351,196 @@ test("guardedFetch records a host 429 so the next call to that host backs off", 
     setEgressGuardEnabled(true);
     resetHttpLimiter();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Body-settlement slot release (issue: caps must bound the streaming socket
+// phase, not just TTFB), Retry-After clamping, lossless eviction, and the
+// pure-defaults "unconditional with no config" invariant.
+// ---------------------------------------------------------------------------
+
+test("final response slot is held until the body is consumed (cap bounds the streaming phase)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/file`);
+    let probed = false;
+    const probe = acquireHttpSlot(`https://${HOST_A}/next`).then((release) => {
+      probed = true;
+      return release;
+    });
+    await delay(20);
+    assert.equal(probed, false, "slot must still be held while the body is unread");
+    assert.equal(await response.text(), "payload");
+    (await probe)();
+    assert.equal(probed, true, "consuming the body releases the slot");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("cancelling the response body releases the slot", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/file`);
+    await response.body!.cancel();
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("aborting the caller's signal releases the slot of an abandoned body", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const controller = new AbortController();
+    await guardedFetch(`https://${HOST_A}/file`, { signal: controller.signal });
+    // Caller abandons the body (e.g. error path) and its timeout fires.
+    controller.abort();
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("a bodyless response releases the slot immediately", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response(null, { status: 200 }));
+  try {
+    await guardedFetch(`https://${HOST_A}/head`);
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("3xx with a missing Location header cancels the body and frees the slot", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  let bodyCancelled = false;
+  const stub = stubFetch(() => {
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    return new Response(body, { status: 302 });
+  });
+  try {
+    await assert.rejects(() => guardedFetch(`https://${HOST_A}/start`), /missing location header/);
+    assert.equal(bodyCancelled, true, "the redirect's body must be cancelled before the throw");
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("non-redirect 3xx (304) is returned to the caller, not followed", async () => {
+  resetHttpLimiter();
+  const stub = stubFetch(() => new Response(null, { status: 304, headers: { location: `https://${HOST_B}/elsewhere` } }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/conditional`);
+    assert.equal(response.status, 304);
+    assert.equal(stub.calls.length, 1, "a 304 must not be followed even with a Location header");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("Retry-After is clamped to backoff_max_ms (hostile header can't blackhole a host)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 50, backoffMaxMs: 120 });
+  const url = "https://hostile.example/x";
+  noteHttpResponse(url, 429, "999999999"); // ~31 years
+  const start = Date.now();
+  (await acquireHttpSlot(url))();
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 100, `backoff must still apply (waited ${elapsed}ms)`);
+  assert.ok(elapsed < 2000, `Retry-After must be clamped to backoff_max_ms (waited ${elapsed}ms)`);
+  resetHttpLimiter();
+});
+
+test("zero-information host states are evicted (acquire/release and non-throttle responses)", async () => {
+  resetHttpLimiter();
+  assert.equal(httpLimiterHostCount(), 0);
+  // A plain acquire/release cycle leaves no state behind.
+  const release = await acquireHttpSlot("https://ephemeral-1.example/a");
+  assert.equal(httpLimiterHostCount(), 1);
+  release();
+  assert.equal(httpLimiterHostCount(), 0, "released zero-info state must be evicted");
+  // A non-throttle response leaves no state behind either.
+  noteHttpResponse("https://ephemeral-2.example/b", 200, null);
+  assert.equal(httpLimiterHostCount(), 0, "non-throttle note must not pin a state");
+  // Unparseable inputs (keyed by the full string) are evicted the same way.
+  noteHttpResponse("not a url at all", 200, null);
+  assert.equal(httpLimiterHostCount(), 0);
+  resetHttpLimiter();
+});
+
+test("backed-off host state is retained until the information expires", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 40, backoffMaxMs: 80 });
+  const url = "https://throttler.example/x";
+  noteHttpResponse(url, 429, null);
+  assert.equal(httpLimiterHostCount(), 1, "a throttled host's state is information — keep it");
+  // Wait out the backoff, then a success + release cycle returns it to zero-info.
+  const release = await acquireHttpSlot(url);
+  noteHttpResponse(url, 200, null);
+  release();
+  assert.equal(httpLimiterHostCount(), 0, "state evicted once streak reset and slot released");
+  resetHttpLimiter();
+});
+
+test("an aborted acquire does not leave a zero-information state behind", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const held = await acquireHttpSlot("https://busy.example/a");
+  const controller = new AbortController();
+  const pending = acquireHttpSlot("https://busy.example/b", controller.signal);
+  await delay(10);
+  controller.abort();
+  await assert.rejects(() => pending);
+  held();
+  assert.equal(httpLimiterHostCount(), 0, "abort while waiting must not pin the state");
+  resetHttpLimiter();
+});
+
+test("429 backoff is enforced with pure defaults (no config at all)", async () => {
+  resetHttpLimiter(); // pure built-in defaults — backoffBaseMs 500
+  const url = "https://unconfigured.example/x";
+  noteHttpResponse(url, 429, null);
+  const start = Date.now();
+  (await acquireHttpSlot(url))();
+  const elapsed = Date.now() - start;
+  // First throttle: ceiling 500ms, jitter floor at half → at least ~250ms.
+  assert.ok(elapsed >= 200, `unconditional backoff must apply with no config (waited ${elapsed}ms)`);
+  resetHttpLimiter();
+});
+
+test("configureHttpLimiter floors backoff tuning at 1ms (invariant not disableable)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ backoffBaseMs: 0, backoffMaxMs: 0 } as never);
+  const url = "https://floored.example/x";
+  noteHttpResponse(url, 429, null);
+  noteHttpResponse(url, 429, null);
+  // With a floor of 1ms the window is tiny but non-zero; mainly assert no NaN /
+  // negative math and that acquisition still succeeds.
+  (await acquireHttpSlot(url))();
+  resetHttpLimiter();
 });

@@ -229,11 +229,14 @@ async function downloadMediaUrl(
     // network firewall is the boundary instead.
     const response = await guardedFetch(url, { signal: controller.signal });
     if (!response.ok) {
+      // Settle the unread body so the per-host limiter slot is freed promptly.
+      await response.body?.cancel().catch(() => {});
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
 
     const declaredLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      await response.body?.cancel().catch(() => {});
       throw new Error(`declared content-length ${declaredLength} exceeds size limit (${maxBytes} bytes)`);
     }
 

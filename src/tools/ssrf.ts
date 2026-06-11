@@ -2,6 +2,16 @@ import { lookup } from "node:dns/promises";
 import net from "node:net";
 import { acquireHttpSlot, hostOf, noteHttpResponse } from "./http-limiter.js";
 
+/**
+ * WHATWG redirect statuses the manual loop follows. Other 3xx (300, 304, 305,
+ * 306) are NOT redirects to follow — e.g. a 304 answers a conditional request —
+ * and are returned to the caller like any final response.
+ */
+const REDIRECT_FOLLOW_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Statuses whose responses carry no body per the fetch spec. */
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
 // =============================================================================
 // App-layer egress guard (defense-in-depth SSRF protection).
 //
@@ -118,6 +128,15 @@ export interface GuardedFetchOptions {
  * response's status is recorded against the final URL (`response.url`), not the
  * original one, for the same reason. This is the single egress chokepoint, so the
  * limiter applies whether or not the SSRF address guard is enabled.
+ *
+ * The FINAL response's slot is NOT released when headers arrive: it is tied to
+ * body settlement (close/error/cancel — see {@link tieReleaseToBodySettlement}),
+ * so the per-host/global caps bound the whole socket phase of a download, not
+ * just time-to-first-byte. Followed redirect responses still release eagerly at
+ * the host swap (their bodies are cancelled before the hop). Callers must
+ * therefore consume or cancel the body of every returned response — all in-repo
+ * callers do; as a backstop the slot is also released when the caller's `signal`
+ * aborts (the underlying body is dead at that point anyway).
  */
 export async function guardedFetch(url: string, options: GuardedFetchOptions = {}): Promise<Response> {
   if (!egressGuardEnabled) {
@@ -131,9 +150,10 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
       // Native "follow" lands on the final URL; attribute the status to the host
       // that actually produced it, not the original one.
       noteHttpResponse(response.url || url, response.status, response.headers.get("retry-after"));
-      return response;
-    } finally {
+      return tieReleaseToBodySettlement(response, release, options.signal);
+    } catch (error) {
       release();
+      throw error;
     }
   }
   const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS;
@@ -143,8 +163,9 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
   let body = options.body;
   const headers = withDefaultUserAgent(options.headers);
   // Per-host slot accounting across the chain: exactly one slot is held at a time;
-  // it is released either when the chain moves to a different host (swap below) or
-  // in the single `finally`. Releases are idempotent, so the abort/error paths
+  // it is released either when the chain moves to a different host (swap below),
+  // when the final response's body settles (wrapper on the return path), or in
+  // the `catch` on failure. Releases are idempotent, so the abort/error paths
   // (acquire rejection mid-swap, fetch failure mid-chain) can never double-count.
   let release = await acquireHttpSlot(current, options.signal);
   try {
@@ -153,9 +174,15 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
       await assertPublicHttpUrl(current);
       const response = await globalThis.fetch(current, buildInit(options, "manual", method, body, headers));
       noteHttpResponse(current, response.status, response.headers.get("retry-after"));
-      if (!isRedirectStatus(response.status)) return response;
+      if (!REDIRECT_FOLLOW_STATUSES.has(response.status)) {
+        return tieReleaseToBodySettlement(response, release, options.signal);
+      }
       const location = response.headers.get("location");
-      if (!location) throw new Error(`Redirect ${response.status} missing location header.`);
+      if (!location) {
+        // Don't leak the response socket on the error path.
+        await response.body?.cancel().catch(() => {});
+        throw new Error(`Redirect ${response.status} missing location header.`);
+      }
       // Discard the redirect response body before following the next hop.
       await response.body?.cancel().catch(() => {});
       const next = new URL(location, current).toString();
@@ -186,9 +213,64 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
       }
       current = next;
     }
-  } finally {
+  } catch (error) {
     release();
+    throw error;
   }
+}
+
+/**
+ * Tie a per-host limiter slot's release to the settlement of `response`'s body,
+ * so the slot is held for the whole streaming phase (caps bound sockets, not
+ * just TTFB — spec §8.2/§9.5). Release fires when the body closes (fully read),
+ * errors, or is cancelled; immediately when there is no body to stream. As a
+ * backstop it also fires when `signal` aborts — an abort kills the underlying
+ * body whether or not anyone is reading, so an abandoned response behind a
+ * caller's timeout controller can't hold the slot. `release` is idempotent.
+ */
+function tieReleaseToBodySettlement(response: Response, release: () => void, signal?: AbortSignal): Response {
+  const body = response.body;
+  if (!body || NULL_BODY_STATUSES.has(response.status)) {
+    // Nothing to stream (or a null-body status from a stub): settle now.
+    void body?.cancel().catch(() => {});
+    release();
+    return response;
+  }
+  const reader = body.getReader();
+  const releaseAndUnhook = () => {
+    signal?.removeEventListener("abort", releaseAndUnhook);
+    release();
+  };
+  const wrapped = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          releaseAndUnhook();
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        releaseAndUnhook();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      releaseAndUnhook();
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
+  const wrappedResponse = new Response(wrapped, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  // The Response constructor can't carry these; preserve what callers read.
+  Object.defineProperty(wrappedResponse, "url", { value: response.url });
+  Object.defineProperty(wrappedResponse, "redirected", { value: response.redirected });
+  signal?.addEventListener("abort", releaseAndUnhook, { once: true });
+  return wrappedResponse;
 }
 
 /**
@@ -234,10 +316,6 @@ function withDefaultUserAgent(headers: Record<string, string> | undefined): Reco
   const hasUserAgent = Object.keys(merged).some((key) => key.toLowerCase() === "user-agent");
   if (!hasUserAgent) merged["User-Agent"] = "MikuAgent/1.0";
   return merged;
-}
-
-function isRedirectStatus(status: number): boolean {
-  return status >= 300 && status < 400;
 }
 
 function isBlockedAddress(address: string): boolean {

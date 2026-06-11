@@ -473,6 +473,8 @@ async function postGenerate(input: {
 async function readJsonCapped(response: Response, controller: AbortController): Promise<unknown> {
   const declared = Number(response.headers.get("content-length") ?? "");
   if (Number.isFinite(declared) && declared > RESPONSE_MAX_BYTES) {
+    // Settle the unread body so the per-host limiter slot is freed promptly.
+    await response.body?.cancel().catch(() => {});
     throw new Error(`response too large: declared content-length ${declared} > ${RESPONSE_MAX_BYTES} bytes`);
   }
   const reader = response.body?.getReader();

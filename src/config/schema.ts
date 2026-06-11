@@ -521,8 +521,10 @@ const ImageGenSchema = Type.Object({
 // backoff knobs only tune, never enable/disable.
 const LlmRateLimitGroupSchema = Type.Object({
   max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
-  backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
-  backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // minimum:1 (not 0): backoff is the unconditional §5.3 invariant — a 0 base/max
+  // would compute a 0 window for every throttle, disabling it via config.
+  backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
 // Rate limiting (spec CONCURRENCY-AND-RATE-LIMITING §5/§8/§9). Two independent
@@ -542,8 +544,10 @@ const RateLimitsSchema = Type.Object({
     // Optional pure degenerate backstop across all hosts; set far above normal load.
     global_ceiling_max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
     // 429/503 + Retry-After backoff is always on (§5.3); these only tune it.
-    backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
-    backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    // minimum:1 (and floored in configureHttpLimiter): a 0 base/max would compute
+    // a 0 window for every throttle, disabling the invariant via config.
+    backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+    backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
     // Optional per-host concurrency overrides, keyed by lowercase hostname.
     per_host_max_in_flight: Type.Optional(Type.Record(Type.String(), Type.Number({ minimum: 1 }))),
   })),
