@@ -118,14 +118,23 @@ export interface CreateAgentOptions {
   /** When set, build context for a summarization session cut at this timestamp. */
   summarizationCutoff?: { endTimestamp: number };
   /**
+   * When set, build context for a diary session over a level-1 summary range
+   * (spec DIARY-CONTEXT-PARITY §3; ARCHITECTURE.md §9c): the summarize-style
+   * prefix with coverage bounded at the range START — prior chunks' summaries
+   * form the layer, the range's raw events render as real prefix turns, and
+   * the range's own summary (`summaryId`) is excluded. Mutually exclusive with
+   * `summarizationCutoff`; threaded straight into {@link ContextBuilder.build}.
+   */
+  diaryRange?: { earliestTimestamp: number; latestTimestamp: number; summaryId: string };
+  /**
    * When true, build context in proactive check-in mode (ARCHITECTURE.md §9g): no
    * trigger group, a synthetic kickoff as the final user turn, no image blocks.
    * Threaded straight into {@link ContextBuilder.build}.
    */
   proactive?: boolean;
   /**
-   * Resume seam (designed-for, not yet wired — see ARCHITECTURE.md "Appendix: Deferred designs" §B).
-   * When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
+   * Resume seam (Layer-2 resume-in-place — ARCHITECTURE.md §8; used by the recovery
+   * path in app.ts). When set, `ContextBuilder.build()` is skipped entirely: `snapshot` is reused as the
    * frozen prefix and `transcript` seeds the live message array. The caller is expected
    * to append the awaited input as a new user turn before continuing.
    *
@@ -165,8 +174,8 @@ export interface CreateAgentOptions {
    * passes its drain controller's signal for every `launchSession` create (live,
    * queued, and proactive — the only builds that can enter the wait loop).
    * Synthetic creates need no signal: summarize/condense builds use
-   * `summarizationCutoff` (which skips wait-or-omit entirely) and diary/resume
-   * creates skip the build altogether (`resume` mode).
+   * `summarizationCutoff` and diary builds use `diaryRange` (both skip
+   * wait-or-omit entirely); resume creates skip the build altogether.
    */
   abortSignal?: AbortSignal;
 }
@@ -320,6 +329,7 @@ export class AgentSessionFactory {
         sessionType: sessionTypeConfig,
         fallbackPrompt,
         summarizationCutoff: opts?.summarizationCutoff,
+        diaryRange: opts?.diaryRange,
         proactive: opts?.proactive,
         // The session's resolved class doubles as the wait-or-omit escalation
         // class (spec §5.5: the waiting class is the building session's own
@@ -450,7 +460,8 @@ export class AgentSessionFactory {
    * ({@link create}) and the room-context preview ({@link buildPreview}). Keeping
    * one call site is what guarantees the preview is byte-faithful to what a real
    * session would build (spec §1) — the two cannot drift in their build inputs.
-   * `activeSessions` is empty for a summarization cutoff (mirrors the original
+   * `activeSessions` is empty for the generation modes (summarization cutoff
+   * and diary range — both suppress runtime state anyway; mirrors the original
    * inline logic).
    */
   private buildContext(args: {
@@ -460,6 +471,7 @@ export class AgentSessionFactory {
     sessionType: SessionTypeConfig | undefined;
     fallbackPrompt: string | undefined;
     summarizationCutoff?: { endTimestamp: number };
+    diaryRange?: { earliestTimestamp: number; latestTimestamp: number; summaryId: string };
     proactive?: boolean;
     priority?: PriorityClass;
     abortSignal?: AbortSignal;
@@ -467,13 +479,14 @@ export class AgentSessionFactory {
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
       trigger: args.trigger,
-      activeSessions: args.summarizationCutoff
+      activeSessions: args.summarizationCutoff || args.diaryRange
         ? []
         : this.options.getActiveSessions(args.timelineKey),
       workspace: args.workspace,
       sessionType: args.sessionType,
       fallbackPrompt: args.fallbackPrompt,
       summarizationCutoff: args.summarizationCutoff,
+      diaryRange: args.diaryRange,
       proactive: args.proactive,
       priority: args.priority,
       abortSignal: args.abortSignal,

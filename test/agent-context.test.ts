@@ -721,6 +721,289 @@ test("summarizationCutoff: final message type is 'satellite' not 'triggerGroup'"
   }
 });
 
+// ── diaryRange path in ContextBuilder.build() (spec DIARY-CONTEXT-PARITY) ──────
+
+/** Insert a complete level-1 summary row directly (the tests above use the same SQL). */
+async function insertSummaryRow(
+  storage: Storage,
+  opts: { id: string; earliest: number; latest: number; latestEventId: string; content?: string },
+): Promise<void> {
+  await storage.write((db) => {
+    db.prepare(
+      `insert into summaries (id, timeline_key, level, content, earliest_timestamp,
+       latest_timestamp, latest_event_id, event_count, token_count, model_id,
+       status, generated_at, created_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      opts.id,
+      "matrix:miku:room:!room",
+      1,
+      opts.content ?? `content of ${opts.id}`,
+      opts.earliest,
+      opts.latest,
+      opts.latestEventId,
+      2,
+      50,
+      "model",
+      "complete",
+      0,
+      0,
+    );
+  });
+}
+
+// The spec's §1 made executable: a diary-range build over a state where the
+// range's own summary EXISTS must be message-for-message identical to the
+// summarize-cutoff build that produced that summary (built before it existed) —
+// same system prompt, same summary layer (prior chunks only), same raw range
+// turns, same satellite final turn.
+test("diaryRange parity: identical to the summarize-cutoff build over the same range", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Prior chunk e1–e2 (summarized), work range e3–e4.
+    for (let i = 1; i <= 4; i++) {
+      await timeline.append(testEvent({ id: `ev${i}`, body: `event ${i}`, timestamp: i * 1000 }));
+    }
+    await insertSummaryRow(storage, { id: "sum_prev", earliest: 1000, latest: 2000, latestEventId: "ev2" });
+
+    // The summarize build for the range, in the state the summarize session saw
+    // it (the range's own summary does not exist yet).
+    const cutoffBuild = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "summarize:range", body: "Summarize", timestamp: 4000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      summarizationCutoff: { endTimestamp: 4000 },
+    });
+
+    // The range's summary lands (the diary trigger state); later events arrive too.
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 3000, latest: 4000, latestEventId: "ev4" });
+    await timeline.append(testEvent({ id: "ev5", body: "event 5 after the range", timestamp: 5000 }));
+
+    const diaryBuild = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:sum_range", body: "Write your diary entry.", timestamp: 4000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      diaryRange: { earliestTimestamp: 3000, latestTimestamp: 4000, summaryId: "sum_range" },
+    });
+
+    // Full parity: same trigger timestamp + same workspace/sessionType → the
+    // message arrays are identical (the satellite content only differs when the
+    // session types differ).
+    assert.deepEqual(diaryBuild.messages, cutoffBuild.messages);
+
+    // Shape sanity: prior summary in the layer, range raw, own summary excluded,
+    // post-range event cut, satellite last.
+    const layer = diaryBuild.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "prior chunk's summary forms the layer");
+    assert.match(layer!.content, /content of sum_prev/);
+    assert.ok(!layer!.content.includes("content of sum_range"), "the range's own summary is excluded");
+    const bodies = diaryBuild.messages.filter((m) => m.type === "chatEvent").map((m) => m.content);
+    assert.ok(bodies.some((b) => b.includes("event 3")) && bodies.some((b) => b.includes("event 4")));
+    assert.ok(!bodies.some((b) => b.includes("event 1")), "covered events stay in the layer");
+    assert.ok(!bodies.some((b) => b.includes("event 5")), "events past the range end are cut");
+    assert.equal(diaryBuild.messages[diaryBuild.messages.length - 1]?.type, "satellite");
+    assert.ok(!diaryBuild.messages.some((m) => m.type === "diaryLayer"), "no recent-diary layer in the prefix");
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange: satellite omits the session_instruction template; cutoff keeps it", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    await timeline.append(testEvent({ id: "ev1", body: "hello", timestamp: 1000 }));
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 1000, latest: 1000, latestEventId: "ev1" });
+    const sessionType = { session_instruction: "TEMPLATE {{header}}" } as any;
+
+    const diaryBuild = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:x", body: "Write your diary entry.", timestamp: 1000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      sessionType,
+      diaryRange: { earliestTimestamp: 1000, latestTimestamp: 1000, summaryId: "sum_range" },
+    });
+    const diarySatellite = diaryBuild.messages[diaryBuild.messages.length - 1]!;
+    assert.equal(diarySatellite.type, "satellite");
+    assert.ok(
+      !diarySatellite.content.includes("TEMPLATE"),
+      "the per-job instruction template is delivered substituted in the kickoff, not raw in the satellite",
+    );
+
+    const cutoffBuild = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "summarize:x", body: "Summarize", timestamp: 1000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      sessionType,
+      summarizationCutoff: { endTimestamp: 1000 },
+    });
+    const cutoffSatellite = cutoffBuild.messages[cutoffBuild.messages.length - 1]!;
+    assert.match(cutoffSatellite.content, /TEMPLATE/, "the cutoff satellite renders the session instruction as before");
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange: single-event range whose own summary sits exactly on the bound is still excluded", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    await timeline.append(testEvent({ id: "ev1", body: "earlier message", timestamp: 1000 }));
+    await timeline.append(testEvent({ id: "ev2", body: "the single range event", timestamp: 2000 }));
+    await insertSummaryRow(storage, { id: "sum_prev", earliest: 1000, latest: 1000, latestEventId: "ev1" });
+    // Single-event range: earliest == latest == 2000 — the inclusive
+    // beforeTimestamp bound alone would admit the range's own summary.
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 2000, latest: 2000, latestEventId: "ev2" });
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:1", body: "Write your diary entry.", timestamp: 2000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      diaryRange: { earliestTimestamp: 2000, latestTimestamp: 2000, summaryId: "sum_range" },
+    });
+
+    const layer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "prior summary still renders");
+    assert.match(layer!.content, /content of sum_prev/);
+    assert.ok(!layer!.content.includes("content of sum_range"), "own summary excluded despite the inclusive bound");
+    const bodies = built.messages.filter((m) => m.type === "chatEvent").map((m) => m.content);
+    assert.ok(bodies.some((b) => b.includes("the single range event")), "range event renders raw");
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange: a prior chunk's summary sharing a millisecond boundary with the range start is kept", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Matrix batch send: the prior chunk's last event and the range's first
+    // event share timestamp 2000.
+    await timeline.append(testEvent({ id: "ev1", body: "prior chunk start", timestamp: 1000 }));
+    await timeline.append(testEvent({ id: "ev2", body: "prior chunk end", timestamp: 2000 }));
+    await timeline.append(testEvent({ id: "ev3", body: "range start collision", timestamp: 2000 }));
+    await timeline.append(testEvent({ id: "ev4", body: "range end", timestamp: 3000 }));
+    await insertSummaryRow(storage, { id: "sum_prev", earliest: 1000, latest: 2000, latestEventId: "ev2" });
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 2000, latest: 3000, latestEventId: "ev4" });
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:1", body: "Write your diary entry.", timestamp: 3000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      diaryRange: { earliestTimestamp: 2000, latestTimestamp: 3000, summaryId: "sum_range" },
+    });
+
+    const layer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(layer, "millisecond-boundary prior summary still forms the layer");
+    assert.match(layer!.content, /content of sum_prev/);
+    assert.ok(!layer!.content.includes("content of sum_range"));
+    const bodies = built.messages.filter((m) => m.type === "chatEvent").map((m) => m.content);
+    assert.ok(bodies.some((b) => b.includes("range start collision")), "the range's collision event renders raw");
+    assert.ok(bodies.some((b) => b.includes("range end")));
+    assert.ok(!bodies.some((b) => b.includes("prior chunk start")), "covered events stay in the layer");
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange: range at the very start of a timeline renders a raw-only prefix (no summary layer)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    await timeline.append(testEvent({ id: "ev1", body: "first ever", timestamp: 1000 }));
+    await timeline.append(testEvent({ id: "ev2", body: "second ever", timestamp: 2000 }));
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 1000, latest: 2000, latestEventId: "ev2" });
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:1", body: "Write your diary entry.", timestamp: 2000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      diaryRange: { earliestTimestamp: 1000, latestTimestamp: 2000, summaryId: "sum_range" },
+    });
+
+    assert.ok(!built.messages.some((m) => m.type === "summaryLayer"), "no prior summaries → no layer");
+    const bodies = built.messages.filter((m) => m.type === "chatEvent").map((m) => m.content);
+    assert.ok(bodies.some((b) => b.includes("first ever")) && bodies.some((b) => b.includes("second ever")));
+    assert.equal(built.messages[built.messages.length - 1]?.type, "satellite");
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange: uncovered pre-range events ride along as raw turns", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    // ev0 was never summarized (no coverage); the range is ev1–ev2.
+    await timeline.append(testEvent({ id: "ev0", body: "uncovered straggler", timestamp: 500 }));
+    await timeline.append(testEvent({ id: "ev1", body: "range first", timestamp: 1000 }));
+    await timeline.append(testEvent({ id: "ev2", body: "range last", timestamp: 2000 }));
+    await insertSummaryRow(storage, { id: "sum_range", earliest: 1000, latest: 2000, latestEventId: "ev2" });
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "diary:1", body: "Write your diary entry.", timestamp: 2000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      diaryRange: { earliestTimestamp: 1000, latestTimestamp: 2000, summaryId: "sum_range" },
+    });
+
+    const bodies = built.messages.filter((m) => m.type === "chatEvent").map((m) => m.content);
+    assert.ok(bodies.some((b) => b.includes("uncovered straggler")), "pre-range raw events render (benign continuity)");
+    assert.ok(bodies.some((b) => b.includes("range first")) && bodies.some((b) => b.includes("range last")));
+  } finally {
+    storage.close();
+  }
+});
+
+test("diaryRange and summarizationCutoff are mutually exclusive", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  try {
+    await assert.rejects(
+      builder.build({
+        timelineKey: "matrix:miku:room:!room",
+        trigger: testEvent({ id: "x", body: "x", timestamp: 1000 }),
+        activeSessions: [],
+        workspace: emptyWorkspace,
+        summarizationCutoff: { endTimestamp: 1000 },
+        diaryRange: { earliestTimestamp: 0, latestTimestamp: 1000, summaryId: "s" },
+      }),
+      /mutually exclusive/,
+    );
+  } finally {
+    storage.close();
+  }
+});
+
 // The generation-threshold enqueue tests moved to test/summarization-indexer.test.ts
 // (spec C: job creation now lives in SummarizationIndexer, off the build path).
 

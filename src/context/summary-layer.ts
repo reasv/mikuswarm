@@ -123,6 +123,25 @@ export function synthesizeFailurePlaceholders(
 }
 
 /**
+ * Explicit candidate exclusion for the diary-range build mode (spec
+ * DIARY-CONTEXT-PARITY §3): drop any summary whose coverage extends INTO the
+ * work range — belt-and-suspenders against millisecond-collision edges where
+ * the inclusive `beforeTimestamp` bound alone would admit the range's own
+ * summary (e.g. a single-event range whose earliest == latest equals the
+ * bound). `summaryId` (the range's own summary) is also excluded by id
+ * explicitly. A prior chunk's summary that merely SHARES a millisecond
+ * boundary with the range start (its `latestTimestamp` equals
+ * `earliestTimestamp` while it begins before the range) is deliberately
+ * KEPT — the same inclusive semantics the cutoff path uses to prevent a
+ * coverage gap on Matrix batch-send timestamp collisions.
+ */
+export interface SummaryRangeExclusion {
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  summaryId?: string;
+}
+
+/**
  * The production coverage selection (§9b): persisted summary candidates plus
  * synthesized failure placeholders, chained with the event-existence
  * contiguity probe. The single entry point shared by the context builder and
@@ -132,13 +151,29 @@ export function selectSummaryCoverage(
   storage: SummaryCoverageStore,
   timelineKey: string,
   beforeTimestamp?: number,
+  excludeRange?: SummaryRangeExclusion,
 ): SummarySelection {
   const candidates = storage.getSummaryCandidates(timelineKey, beforeTimestamp);
   const placeholders = synthesizeFailurePlaceholders(storage, timelineKey, beforeTimestamp);
-  const merged =
+  let merged =
     placeholders.length === 0
       ? candidates
       : [...candidates, ...placeholders].sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
+  if (excludeRange) {
+    const { earliestTimestamp: rangeStart, latestTimestamp: rangeEnd } = excludeRange;
+    merged = merged.filter((s) => {
+      if (s.id === excludeRange.summaryId) return false;
+      // Begins inside the range → the range's own coverage (never a prior
+      // chunk's), including the single-event edge where earliest == latest ==
+      // rangeStart, which the inclusive beforeTimestamp bound alone admits.
+      const beginsWithin = s.earliestTimestamp >= rangeStart && s.earliestTimestamp <= rangeEnd;
+      // Extends strictly past the range start into the range. STRICT at the
+      // start boundary: a prior chunk whose latestTimestamp == rangeStart
+      // (millisecond collision) must stay selected.
+      const extendsInto = s.latestTimestamp > rangeStart && s.earliestTimestamp <= rangeEnd;
+      return !beginsWithin && !extendsInto;
+    });
+  }
   return selectSummaries(merged, makeContiguityProbe(storage, timelineKey));
 }
 

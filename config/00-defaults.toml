@@ -400,7 +400,7 @@ skills = "none"
 max_tool_calls = 30
 max_turns = 15
 session_instruction = """
-You are writing in your own first-person diary. Above you can see, in <your_recent_memory>, your existing recent diary entries (read-only, for continuity), and in <conversation>, a stretch of conversation from {{room}} with timestamps.
+You are writing in your own first-person diary. The conversation you are writing about is the stretch of chat from {{room}} shown above as regular messages (summaries of earlier history may precede it, for continuity). In <your_recent_memory> you can see your existing recent diary entries (read-only, for continuity).
 
 Write a NEW diary entry about YOUR OWN part in that conversation: what you said and did, how you reacted, opinions you formed, running bits, things you promised to do. A neutral record of what happened already exists elsewhere — do not recap the room or narrate other people; write only your own thread, in your own voice. Build on your existing entries rather than restating them ("X did Y again", ongoing threads, etc.).
 
