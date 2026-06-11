@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { createLogger, createObservabilityServer, PipelineActivityBus, type ConsoleServer } from "./observability/index.js";
+import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter } from "./storage/index.js";
 import {
@@ -480,6 +480,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // until storage.close() makes it throw.
   const drainAbort = new AbortController();
   let stopPromise: Promise<void> | undefined;
+  // Per-session tentative-event bus (spec LLM-FAILURE-HANDLING §4.2): Layer-0
+  // buffers attempts to the terminal event, so live tokens reach the console
+  // only through this tap → SSE merge. Observe-only; nothing is persisted.
+  const liveEvents = new SessionLiveEventBus();
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -487,6 +492,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     storage,
     logger,
     scheduler: llmScheduler,
+    liveEvents,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -1713,6 +1719,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         diary: diaryPool?.stats() ?? null,
       },
       activityBus: pipelineActivityBus,
+      // Tentative-token merge for the session SSE (spec LLM-FAILURE-HANDLING §4.2).
+      liveEvents,
       workspaceRoot,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
       // console's second mutating action, next to abort.

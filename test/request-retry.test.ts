@@ -176,17 +176,60 @@ test("withRequestRetry: exhausts attempts then forwards the last error", async (
   assert.deepEqual(events.map((e) => e.type), ["error"]);
 });
 
-test("withRequestRetry: a mid-stream failure after commit is NOT retried", async () => {
-  // Content forwarded, THEN the stream drops. Layer 1 cannot replay; the error is
-  // surfaced (Layer-2 resume territory), and the base is called only once.
+test("withRequestRetry: a mid-stream failure IS retried — partial discarded (spec §4.1)", async () => {
+  // Tokens streamed, THEN the stream died in an error event. The commit point is
+  // the terminal event, so the partial is discarded and the request re-issued;
+  // the consumer sees ONLY the clean second attempt — byte-equivalent to a
+  // first-attempt success (P1).
   const { fn, calls } = scriptedBase([
     { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
-    { events: [doneEvent()] },
+    { events: [startEvent(), textDeltaEvent("clean"), doneEvent()] },
   ]);
   const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 1, "committed → no retry");
-  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "error"]);
+  assert.equal(calls(), 2, "mid-stream death → retried");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+  assert.equal(
+    (events[1] as Extract<AssistantMessageEvent, { type: "text_delta" }>).delta,
+    "clean",
+    "the failed attempt's partial never reaches the consumer",
+  );
+});
+
+test("withRequestRetry: tap sees every attempt's raw events + the discard notice (spec §4.2)", async () => {
+  const { fn } = scriptedBase([
+    { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
+    { events: [startEvent(), textDeltaEvent("clean"), doneEvent()] },
+  ]);
+  const tapped: Array<{ attempt: number; type: string }> = [];
+  const discarded: Array<{ attempt: number; reason: string }> = [];
+  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST }, {
+    onAttemptEvent: (attempt, event) => tapped.push({ attempt, type: event.type }),
+    onAttemptDiscarded: (attempt, reason) => discarded.push({ attempt, reason }),
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.deepEqual(tapped, [
+    { attempt: 1, type: "start" },
+    { attempt: 1, type: "text_delta" },
+    { attempt: 1, type: "error" },
+    { attempt: 2, type: "start" },
+    { attempt: 2, type: "text_delta" },
+    { attempt: 2, type: "done" },
+  ]);
+  assert.equal(discarded.length, 1);
+  assert.equal(discarded[0]!.attempt, 1);
+  assert.match(discarded[0]!.reason, /Connection error/);
+});
+
+test("withRequestRetry: a throwing tap never affects the run", async () => {
+  const { fn } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { retries: 0, ...FAST }, {
+    onAttemptEvent: () => {
+      throw new Error("tap exploded");
+    },
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
 test("withRequestRetry: retries=0 still wraps — single attempt, error tagged (#14)", async () => {
@@ -254,21 +297,24 @@ test("withRequestRetry: exhausted retries surface a TAGGED terminal error (#14)"
   assert.equal(stripLlmRequestTag(err.errorMessage ?? ""), "500 internal");
 });
 
-test("withRequestRetry: fatal and mid-stream (committed) errors are also tagged (#14)", async () => {
-  // Fatal pre-commit.
-  const fatal = scriptedBase([{ events: [errorEvent("401 unauthorized")] }]);
-  const fatalEvents = await drain(withRequestRetry(fatal.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
-  const fatalErr = (fatalEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
-  assert.ok(isLlmRequestError(fatalErr.errorMessage), "fatal path tags");
+test("withRequestRetry: content and exhausted mid-stream errors are tagged with their class (#14/§4.3)", async () => {
+  // Content failure: surfaced in one attempt, tagged with class.
+  const content = scriptedBase([{ events: [errorEvent("413 prompt is too long")] }]);
+  const contentEvents = await drain(withRequestRetry(content.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
+  const contentErr = (contentEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(contentErr.errorMessage), "content path tags");
+  assert.equal(extractLlmRequestClass(contentErr.errorMessage), "content");
 
-  // Mid-stream after commit (Layer-2 territory — exactly the error the runner
-  // must recognize as LLM-layer-originated).
+  // Mid-stream death on every attempt: retried to exhaustion, then ONE terminal
+  // error surfaces (no partial events forwarded) carrying the class marker.
   const mid = scriptedBase([
     { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
   ]);
-  const midEvents = await drain(withRequestRetry(mid.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
-  const midErr = (midEvents.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error;
-  assert.ok(isLlmRequestError(midErr.errorMessage), "committed pass-through tags");
+  const midEvents = await drain(withRequestRetry(mid.fn, { retries: 1, ...FAST })(MODEL, CONTEXT, undefined));
+  assert.deepEqual(midEvents.map((e) => e.type), ["error"], "partials discarded on the exhaust path too");
+  const midErr = (midEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(midErr.errorMessage), "exhaust path tags");
+  assert.equal(extractLlmRequestClass(midErr.errorMessage), "environmental");
 });
 
 test("withRequestRetry: a throwing base is surfaced as a terminal error and classified, not an unhandled rejection (#12)", async () => {
@@ -306,35 +352,37 @@ test("withRequestRetry: a thrown AbortError is fatal — single attempt, stopRea
   assert.equal(err.stopReason, "aborted");
 });
 
-test("withRequestRetry: a mid-iteration throw after commit terminates the stream without retrying (#12)", async () => {
-  // Content forwarded, then the inner stream THROWS (rather than emitting an
-  // error event). Cannot replay (committed); the consumer must still receive a
-  // terminal error event instead of hanging.
+test("withRequestRetry: a mid-iteration throw is retried like any mid-stream death (#12/§4.1)", async () => {
+  // Tokens buffered, then the inner stream THROWS (rather than emitting an
+  // error event). The partial is discarded and the request retried; the clean
+  // second attempt is all the consumer sees.
   let calls = 0;
   const fn: StreamFn = () => {
     calls += 1;
-    return (async function* () {
-      yield startEvent();
-      yield textDeltaEvent("partial");
-      throw new Error("socket reset mid-stream");
-    })() as unknown as AssistantMessageEventStream;
+    if (calls === 1) {
+      return (async function* () {
+        yield startEvent();
+        yield textDeltaEvent("partial");
+        throw new Error("socket reset mid-stream");
+      })() as unknown as AssistantMessageEventStream;
+    }
+    return scriptedStream([startEvent(), textDeltaEvent("clean"), doneEvent()]);
   };
   const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls, 1, "committed → no retry");
-  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "error"]);
-  const err = (events[2] as Extract<AssistantMessageEvent, { type: "error" }>).error;
-  assert.match(err.errorMessage ?? "", /mid-stream/);
+  assert.equal(calls, 2, "mid-iteration throw → retried");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
-test("withRequestRetry: an empty inner stream yields a synthesized terminal error", async () => {
+test("withRequestRetry: an empty inner stream is environmental — retried, then surfaced tagged", async () => {
+  // "Empty streams" are an explicit environmental example (spec §3): the
+  // synthesized terminal error re-enters the retry loop like any other.
   const { fn, calls } = scriptedBase([{ events: [], endWithoutTerminal: true }]);
-  // The empty stream is not an `error` event, so it is not retried — it is
-  // surfaced once (as a synthesized, tagged terminal error).
   const wrapped = withRequestRetry(fn, { retries: 1, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 1);
+  assert.equal(calls(), 2, "1 initial + 1 retry");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
-  const final = await events[0] && (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  const final = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.equal(final.stopReason, "error");
+  assert.ok(isLlmRequestError(final.errorMessage));
 });

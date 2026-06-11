@@ -17,6 +17,7 @@ import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
+import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
@@ -88,6 +89,14 @@ export interface AgentFactoryOptions {
    * tests can construct a factory without one (no scheduling, prior behaviour).
    */
   scheduler?: LlmScheduler;
+  /**
+   * Per-session tentative-event bus (spec LLM-FAILURE-HANDLING §4.2). When
+   * set, the Layer-0 observability tap publishes every raw attempt event (and
+   * attempt-discard notices) keyed by session id, so the console SSE can
+   * render tokens live even though the authoritative stream is buffered to
+   * the terminal event. Optional: absent = no tap (tests, headless).
+   */
+  liveEvents?: SessionLiveEventBus;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -277,6 +286,16 @@ export class AgentSessionFactory {
         timelineKey: session.timelineKey,
         sessionType: session.sessionType,
         group: rateLimitGroup,
+        // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
+        // events → per-session tentative bus → console SSE. Observe-only.
+        ...(this.options.liveEvents
+          ? {
+              onAttemptEvent: (attempt: number, event: unknown) =>
+                this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
+              onAttemptDiscarded: (attempt: number, reason: string) =>
+                this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
+            }
+          : {}),
       },
     );
 

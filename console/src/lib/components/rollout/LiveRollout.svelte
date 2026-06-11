@@ -8,19 +8,48 @@
 
 	let messages = $state<RolloutMsg[]>([]);
 	let streaming = $state<RolloutMsg | null>(null);
+	// Tentative tokens (spec LLM-FAILURE-HANDLING §4.2): Layer-0 buffers each LLM
+	// attempt to its terminal event, so tokens stream live ONLY via the tap's
+	// `tentative_event`s — not yet committed. An `attempt_discarded` clears them
+	// and shows a retry notice; authoritative events always win over tentative.
+	let tentative = $state<RolloutMsg | null>(null);
+	let retryNotice = $state<string | null>(null);
 
 	// Fold a live AgentEvent into the accumulating message list (spec §10b). The
 	// per-event payloads are `any` upstream, so we narrow defensively.
 	function fold(evt: { type: string; [k: string]: unknown }) {
 		switch (evt.type) {
+			case 'tentative_event': {
+				const inner = evt.event as { type?: string; partial?: RolloutMsg } | undefined;
+				if (!inner) break;
+				if (inner.type === 'done' || inner.type === 'error') {
+					// Terminal: a clean done commits (authoritative events follow at
+					// once); an error either retries (an attempt_discarded follows) or
+					// surfaces through the authoritative stream. Clear the partial.
+					tentative = null;
+				} else if (inner.partial) {
+					tentative = inner.partial;
+					retryNotice = null;
+				}
+				break;
+			}
+			case 'attempt_discarded': {
+				tentative = null;
+				const reason = typeof evt.reason === 'string' ? evt.reason : 'request failed';
+				retryNotice = `attempt ${evt.attempt} failed (${reason.slice(0, 200)}) — retrying`;
+				break;
+			}
 			case 'turn_end': {
 				if (evt.message) messages.push(evt.message as RolloutMsg);
 				for (const tr of (evt.toolResults as RolloutMsg[]) ?? []) messages.push(tr);
 				streaming = null;
+				tentative = null;
+				retryNotice = null;
 				break;
 			}
 			case 'message_update':
 				streaming = (evt.message as RolloutMsg) ?? null;
+				tentative = null;
 				break;
 			case 'message_end':
 				streaming = null;
@@ -35,6 +64,7 @@
 				// view with no flicker (spec §10b: "on completion it is identical to the
 				// persisted record").
 				streaming = null;
+				tentative = null;
 				break;
 		}
 	}
@@ -48,6 +78,8 @@
 		const id = sessionId;
 		messages = [];
 		streaming = null;
+		tentative = null;
+		retryNotice = null;
 		contextSummary.set({ live: true });
 		let stop = false;
 		const iter = streamSession(id)[Symbol.asyncIterator]();
@@ -75,7 +107,22 @@
 		};
 	});
 
+	// Authoritative streaming wins; a tentative partial renders only while no
+	// committed update is in flight (visually dimmed below).
 	const rows = $derived(streaming ? [...messages, streaming] : messages);
 </script>
 
 <Rollout messages={rows} />
+{#if !streaming && tentative}
+	<div class="px-3 opacity-60" title="Tentative — this attempt has not committed yet">
+		<div
+			class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase"
+		>
+			Tentative (streaming, uncommitted)
+		</div>
+		<Rollout messages={[tentative]} />
+	</div>
+{/if}
+{#if retryNotice}
+	<div class="px-3 py-1 text-xs text-amber-600 dark:text-amber-400">{retryNotice}</div>
+{/if}

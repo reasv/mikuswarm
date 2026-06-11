@@ -5,6 +5,7 @@ import type { AgentSessionFactory } from "../../agent/factory.js";
 import type { SessionManager } from "../../agent/session-manager.js";
 import type { Logger } from "../logger.js";
 import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
+import type { SessionLiveEventBus } from "../live-events.js";
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -26,6 +27,14 @@ export interface ConsoleServerDeps {
   pipelines?: PipelineRegistry;
   /** In-process activity bus the pools publish to; backs the `/api/pipelines/stream` SSE. */
   activityBus?: PipelineActivityBus;
+  /**
+   * Per-session tentative-event bus (spec LLM-FAILURE-HANDLING §4.2): the
+   * Layer-0 tap's raw attempt events, merged into the session SSE as
+   * `tentative_event` / `attempt_discarded` — kinds distinct from the
+   * authoritative agent events. Optional so existing callers/tests need not
+   * provide it (the stream then carries committed events only).
+   */
+  liveEvents?: SessionLiveEventBus;
   /** Workspace root; media `local_path`s are resolved beneath it. */
   workspaceRoot: string;
   /**

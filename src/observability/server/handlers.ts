@@ -149,6 +149,20 @@ export function sessionStream(
   });
   stream.onClose(unsubscribe);
 
+  // Tentative-token merge (spec LLM-FAILURE-HANDLING §4.2): Layer-0 buffers
+  // attempts to the terminal event, so live tokens only exist on the tap bus.
+  // Forwarded under their own event kinds (`tentative_event` /
+  // `attempt_discarded`) so the client can render-then-clear partials without
+  // ever confusing them with authoritative agent events. Same redaction/
+  // externalization path as everything else (the SSE layer owns it).
+  if (ctx.deps.liveEvents) {
+    const unsubscribeLive = ctx.deps.liveEvents.subscribe(id, (event) => {
+      if (stream.closed) return;
+      stream.send(event.type, event);
+    });
+    stream.onClose(unsubscribeLive);
+  }
+
   // Late-subscribe race: `Agent.subscribe` only delivers FUTURE events and does
   // not replay the terminal `agent_end`. The agent is evicted from the map only
   // AFTER its run settles, so `getAgent(id)` can return an agent whose run has

@@ -8,32 +8,39 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
 
 // =============================================================================
-// Layer 1 — transparent request-level LLM retry (mechanical failures).
+// Layer 0 — transparent request-level LLM retry.
 //
-// Spec: CONCURRENCY-AND-RATE-LIMITING §6.1. The agent's stream function
-// (`streamSimple`, or `wrapCompleteAsStream` for non-streaming models) can fail
-// for mechanical reasons that are frequent and normal: a connection reset, a
-// timeout, a 5xx, an upstream 429. Today such a blip synthesizes a
-// `stopReason:"error"` message, which discards a live session and burns a
-// synthetic job's coarse semantic-retry attempt.
+// Spec: LLM-FAILURE-HANDLING §4 (supersedes CONCURRENCY-AND-RATE-LIMITING
+// §6.1's pre-commit-only retry). The agent's stream function (`streamSimple`,
+// or `wrapCompleteAsStream` for non-streaming models) can fail for
+// environmental reasons that are frequent and normal: a connection reset, a
+// timeout, a 5xx, an upstream 429, a stream that starts producing tokens and
+// dies in an error event. Inference failures must be invisible to the session
+// (P1): the session's log and context are never modified by an API-level
+// failure, and a success after N failed attempts is byte-equivalent to a
+// success on the first attempt.
 //
-// `withRequestRetry` wraps any {@link StreamFn} so that, when the underlying
-// stream terminates with an `error` event BEFORE producing any output, the exact
-// same request is re-issued (bounded, with exponential backoff + jitter) before
-// the failure is allowed to surface. This is invisible to the session and to
-// pi-agent-core; a mechanical blip is absorbed here rather than escalating.
+// `withRequestRetry` therefore buffers ALL events of an attempt and forwards
+// them to the consumer (pi-agent-core) only when the attempt terminates in a
+// clean `done` — the commit point IS the terminal event (§4.1). A terminal
+// `error` at ANY point — before or after tokens were produced — discards the
+// buffered partial and re-enters the retry loop as if the request had failed
+// from the start. pi-agent-core never sees a failed attempt unless this layer
+// gives up; the synthetic `stopReason:"error"` turn and the Layer-2 rebuild
+// stop being the mid-stream recovery path. Buffering a full response is
+// bounded by `max_tokens` — no meaningful memory concern.
 //
-// Crucially it only retries failures that occur *before* the stream commits any
-// content. Once tokens (or a tool call, or a clean `done`) have been forwarded to
-// the consumer, the request is "committed" — a later mid-stream failure cannot be
-// transparently replayed and is forwarded as-is. That mid-stream case is the
-// province of Layer 2 (session resume-in-place, spec §6.2 — not yet wired).
+// Live token streaming is preserved via the observability tap (§4.2): the
+// context's `onAttemptEvent` is invoked synchronously with every raw event as
+// it arrives (best-effort, exceptions swallowed — the tap can never affect the
+// run), and `onAttemptDiscarded` fires when a partial attempt is thrown away,
+// so the console can render tentative tokens and clear them on retry. Nothing
+// product-level consumes partials.
 //
 // This wrapper does NOT distinguish a 429 originating at the gateway (LlmGateway,
 // which already retries internally) from a 429 at the true upstream: it backs off
 // and retries either way, which is always safe (spec §5.3 — 429 backoff is an
-// unconditional invariant). The origin distinction (spec §6.1) is a deferred
-// optimization, not a correctness requirement.
+// unconditional invariant).
 // =============================================================================
 
 export interface RequestRetryOptions {
@@ -58,6 +65,19 @@ export interface RequestRetryContext {
   sessionType?: string;
   /** Rate-limit group of the wrapped calls (for `llm_request_attempt_failed` logs). */
   group?: string;
+  /**
+   * Observability tap (spec LLM-FAILURE-HANDLING §4.2): invoked synchronously
+   * with every raw event of every attempt as it arrives — including events of
+   * attempts that are later discarded. Best-effort: exceptions are swallowed;
+   * the tap can never affect the run. Attempt numbers are 1-based.
+   */
+  onAttemptEvent?: (attempt: number, event: AssistantMessageEvent) => void;
+  /**
+   * Fired when a (possibly partial) attempt is discarded and the request will
+   * be retried — the console clears tentative tokens and shows
+   * "attempt n failed (reason), retrying".
+   */
+  onAttemptDiscarded?: (attempt: number, reason: string) => void;
 }
 
 /**
@@ -234,11 +254,17 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
 }
 
 /**
- * Wrap a {@link StreamFn} with Layer-1 transparent request retry. `retries: 0`
- * means a single attempt, but the wrapper still applies: every terminal error
- * it surfaces is tagged with {@link LLM_REQUEST_FAILURE_MARKER} (Decision C),
- * which Layer-2 resume classification depends on — returning the base fn
- * unwrapped would silently disable resume-in-place.
+ * Wrap a {@link StreamFn} with Layer-0 transparent request retry (spec
+ * LLM-FAILURE-HANDLING §4). The commit point is the TERMINAL event (§4.1): all
+ * events of an attempt are buffered and forwarded only on a clean `done`; a
+ * terminal `error` at any point — even after tokens streamed — discards the
+ * buffered partial and retries as if the request had failed from the start.
+ *
+ * `retries: 0` means a single attempt, but the wrapper still applies: every
+ * terminal error it surfaces is tagged with {@link LLM_REQUEST_FAILURE_MARKER}
+ * + the class marker (Decision C / §4.3), which the runner's typed
+ * `phase:"llm"` rejection depends on — returning the base fn unwrapped would
+ * silently disable that gate.
  */
 export function withRequestRetry(
   base: StreamFn,
@@ -251,36 +277,40 @@ export function withRequestRetry(
     const outer = createAssistantMessageEventStream();
     const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
 
+    const tap = (attempt: number, event: AssistantMessageEvent): void => {
+      try {
+        ctx.onAttemptEvent?.(attempt, event);
+      } catch {
+        /* observe-only: the tap can never affect the run */
+      }
+    };
+    const tapDiscarded = (attempt: number, reason: string): void => {
+      try {
+        ctx.onAttemptDiscarded?.(attempt, reason);
+      } catch {
+        /* observe-only */
+      }
+    };
+
     void (async () => {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        let committed = false;
         const buffered: AssistantMessageEvent[] = [];
         let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
+        let producedTokens = false;
 
         try {
           const inner = await base(model, context, streamOptions);
           for await (const event of inner) {
-            if (committed) {
-              // Past the commit point: forward verbatim — except a terminal
-              // `error` (a mid-stream death, Layer-2 territory), which is
-              // tagged as LLM-request-layer-originated like every other
-              // terminal error this wrapper emits. A terminal `done`/`error`
-              // here auto-finalizes `outer` (EventStream.push resolves on it).
-              outer.push(event.type === "error" ? tagErrorEvent(event) : event);
-              continue;
-            }
+            tap(attempt + 1, event);
             if (event.type === "error") {
+              // Terminal error — before OR after tokens. The buffered partial
+              // is discarded below; the retry loop owns recovery (§4.1).
               errorEvent = event;
               break;
             }
             buffered.push(event);
-            if (event.type !== "start") {
-              // First real content (or a `done`): this attempt has produced output.
-              // Commit — flush the buffered prologue and switch to pass-through.
-              committed = true;
-              flush(outer, buffered);
-              buffered.length = 0;
-            }
+            if (event.type !== "start") producedTokens = true;
+            // A clean terminal `done` ends the inner iteration on its own.
           }
         } catch (err) {
           // The base fn (or its stream iteration) THREW instead of emitting a
@@ -293,71 +323,79 @@ export function withRequestRetry(
           const message = err instanceof Error ? err.message : String(err);
           const aborted = err instanceof Error && err.name === "AbortError";
           errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
-          if (committed) {
-            // Content already forwarded — cannot replay (Layer-2 territory), but
-            // the consumer still needs a terminal event.
-            outer.push(tagErrorEvent(errorEvent));
+          tap(attempt + 1, errorEvent);
+        }
+
+        if (!errorEvent) {
+          const terminal = buffered[buffered.length - 1];
+          if (terminal && terminal.type === "done") {
+            // Clean terminal `done`: the attempt commits as a whole (§4.1).
+            // Flushing forwards the terminal event last, which finalizes
+            // `outer` (EventStream.push resolves on it). A success after N
+            // failed attempts is byte-equivalent to a first-attempt success.
+            flush(outer, buffered);
             return;
           }
+          // Degenerate: the inner stream ended with no terminal event. An
+          // "empty stream" is explicitly environmental (§3), so it re-enters
+          // the same retry loop instead of surfacing immediately.
+          ctx.logger?.warn("llm_request_empty_stream", {
+            sessionId: ctx.sessionId,
+            timelineKey: ctx.timelineKey,
+            sessionType: ctx.sessionType,
+            attempt: attempt + 1,
+          });
+          errorEvent = synthesizeErrorEvent(model, "stream ended without a terminal event");
+          tap(attempt + 1, errorEvent);
         }
 
-        if (committed) return; // terminal already forwarded → `outer` is complete
-
-        if (errorEvent) {
-          const failure = errorEvent.error;
-          const verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
-          // Every environmental failure is logged — including the first attempt
-          // and the deterministic single-attempt path (spec §9.3 closes the
-          // audit gap where first-attempt failures logged nothing).
-          if (verdict === "environmental") {
-            ctx.logger?.warn("llm_request_attempt_failed", {
-              sessionId: ctx.sessionId,
-              timelineKey: ctx.timelineKey,
-              sessionType: ctx.sessionType,
-              group: ctx.group,
-              class: verdict,
-              status: extractStatus((failure?.errorMessage ?? "").toLowerCase()),
-              attempt: attempt + 1,
-              maxAttempts,
-              errorMessage: failure?.errorMessage,
-            });
-          }
-          const lastAttempt = attempt >= maxAttempts - 1;
-          if (verdict === "environmental" && !lastAttempt) {
-            const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
-            try {
-              await sleep(delay, signal);
-            } catch {
-              // Aborted mid-backoff (shutdown / cap): surface the original error.
-              flush(outer, buffered);
-              outer.push(tagErrorEvent(errorEvent, verdict));
-              return;
-            }
-            continue;
-          }
-          if (verdict === "environmental") {
-            ctx.logger?.warn("llm_request_retries_exhausted", {
-              sessionId: ctx.sessionId,
-              timelineKey: ctx.timelineKey,
-              sessionType: ctx.sessionType,
-              attempts: maxAttempts,
-              errorMessage: failure?.errorMessage,
-            });
-          }
-          flush(outer, buffered);
-          outer.push(tagErrorEvent(errorEvent, verdict));
-          return;
+        const failure = errorEvent.error;
+        const verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
+        // Every environmental failure is logged — including the first attempt
+        // and the deterministic single-attempt path (spec §9.3 closes the
+        // audit gap where first-attempt failures logged nothing).
+        if (verdict === "environmental") {
+          ctx.logger?.warn("llm_request_attempt_failed", {
+            sessionId: ctx.sessionId,
+            timelineKey: ctx.timelineKey,
+            sessionType: ctx.sessionType,
+            group: ctx.group,
+            class: verdict,
+            status: extractStatus((failure?.errorMessage ?? "").toLowerCase()),
+            attempt: attempt + 1,
+            maxAttempts,
+            producedTokens,
+            errorMessage: failure?.errorMessage,
+          });
         }
-
-        // Degenerate: the inner stream ended with neither content nor a terminal
-        // event. Synthesize a terminal error so the consumer always sees one.
-        ctx.logger?.warn("llm_request_empty_stream", {
-          sessionId: ctx.sessionId,
-          timelineKey: ctx.timelineKey,
-          sessionType: ctx.sessionType,
-        });
-        flush(outer, buffered);
-        outer.push(tagErrorEvent(synthesizeErrorEvent(model, "stream ended without a terminal event")));
+        const lastAttempt = attempt >= maxAttempts - 1;
+        if (verdict === "environmental" && !lastAttempt) {
+          tapDiscarded(attempt + 1, failure?.errorMessage ?? "request failed");
+          const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
+          try {
+            await sleep(delay, signal);
+          } catch {
+            // Aborted mid-backoff (shutdown / cap): surface the original error.
+            // The buffered partial stays discarded (P1 — partials never reach
+            // the consumer on a failed attempt).
+            outer.push(tagErrorEvent(errorEvent, verdict));
+            return;
+          }
+          continue;
+        }
+        if (verdict === "environmental") {
+          ctx.logger?.warn("llm_request_retries_exhausted", {
+            sessionId: ctx.sessionId,
+            timelineKey: ctx.timelineKey,
+            sessionType: ctx.sessionType,
+            attempts: maxAttempts,
+            errorMessage: failure?.errorMessage,
+          });
+        }
+        // Surface exactly ONE terminal error event; this attempt's buffered
+        // partial is discarded (P1) — pi-agent-core synthesizes its error turn
+        // from the terminal event alone, never from partial content.
+        outer.push(tagErrorEvent(errorEvent, verdict));
         return;
       }
     })();
