@@ -6,7 +6,6 @@ import type { Logger } from "../observability/index.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createDiaryTool } from "../tools/index.js";
-import { renderRichMessage } from "../context/index.js";
 import { roomIdFromTimelineKey } from "../timeline/index.js";
 import { attachSessionCapture } from "../agent/session-capture.js";
 import { agentDateStamp } from "../time/index.js";
@@ -229,7 +228,9 @@ export class DiaryWorkerPool {
 
     const maxRetries = config.max_retries ?? DEFAULT_MAX_RETRIES;
 
-    // Load the range's events via lineage (ordered by ordinal).
+    // Load the range's events via lineage — consulted ONLY for the skip-gate
+    // below; the session's context comes from the diary-range build, not from
+    // lineage rendering (spec DIARY-CONTEXT-PARITY §3).
     const lineage = storage.getSummaryLineage(job.summaryId);
     const events = lineage.events;
 
@@ -312,24 +313,33 @@ export class DiaryWorkerPool {
       .replaceAll("{{date}}", targetDate)
       .replaceAll("{{header}}", header);
 
-    const renderedConversation = events.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
     const continuityBlock = continuity.trim().length > 0 ? continuity : "(no earlier diary entries yet)";
+    // The kickoff is recent-memory window + instruction only (spec
+    // DIARY-CONTEXT-PARITY §3): the range's raw events live in the built
+    // prefix as real chat turns, not rendered into this final turn. The
+    // recent-diary window deliberately stays HERE (final-turn packaging),
+    // not as the interactive-style diary layer after the system prompt —
+    // maintainer decision; it keeps the generation builds' "no memory
+    // entries in the prefix" rule clean.
     const kickoff =
       `<your_recent_memory>\n${continuityBlock}\n</your_recent_memory>\n\n` +
-      `<conversation room="${roomLabel}">\n${renderedConversation}\n</conversation>\n\n` +
       instruction;
 
     let agentError: unknown;
     try {
-      // Resume mode (empty frozen prefix): ContextBuilder.build() is skipped, so the
-      // diary session sees ONLY its system prompt (from the `diary` session type's
-      // workspace files) plus the kickoff turn we deliver — the raw range events and
-      // the continuity window ride in that last user turn (§8), NOT the normal
-      // recency/summary layers. This is deliberately different from the chat-side
-      // surfacing (§10a). Using the summarization cutoff path here would instead fold
-      // the (already-persisted) range into its own summary layer — exactly wrong.
-      const { agent, snapshot, tokenEstimate } = await factory.create(syntheticSession, [diaryTool], {
-        resume: { snapshot: [] },
+      // Diary-range build (spec DIARY-CONTEXT-PARITY §3): the summarize-style
+      // prefix — system prompt, prior chunks' summaries bounded at the range
+      // START (the range's own already-persisted summary excluded), the range's
+      // raw events as real chat turns — ending in a popped `satellite` final
+      // turn, exactly like the summarize worker's cutoff build. The build also
+      // yields a real snapshot, so diary sessions gain context_snapshot_json
+      // observability parity with summarize sessions.
+      const { agent, finalTurn, snapshot, tokenEstimate } = await factory.create(syntheticSession, [diaryTool], {
+        diaryRange: {
+          earliestTimestamp: job.earliestTimestamp,
+          latestTimestamp: job.latestTimestamp,
+          summaryId: job.summaryId,
+        },
       });
       const capture = attachSessionCapture(agent, {
         storage,
@@ -339,7 +349,12 @@ export class DiaryWorkerPool {
         logger,
       });
       try {
-        await agent.prompt(kickoff);
+        // Deliver the popped satellite final turn followed by the kickoff,
+        // mirroring the summarize worker's `[finalTurn, instruction]` shape.
+        const promptInput = finalTurn
+          ? [finalTurn, { role: "user", content: kickoff, timestamp: syntheticTrigger.timestamp }]
+          : kickoff;
+        await agent.prompt(promptInput as any);
         await agent.waitForIdle();
         // pi-agent-core resolves the run promise even when the cap-driven abort
         // (§8c) or a stream error fires — it synthesizes a final message with

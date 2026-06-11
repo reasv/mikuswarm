@@ -64,25 +64,41 @@ interface FakeAgentState {
 
 type Behavior = (tool: AgentTool, kickoff: string, state: FakeAgentState) => Promise<void>;
 
-/** A fake factory that drives the diary tool from the agent's prompt(kickoff). */
-function makeFakeFactory(behavior: Behavior, createdRef?: { created: boolean }) {
+/**
+ * A fake factory that drives the diary tool from the agent's prompt kickoff.
+ * Mirrors the real create contract for a diary-range build: it returns a popped
+ * `satellite` finalTurn, so the worker delivers `[finalTurn, kickoff]` and the
+ * fake extracts the kickoff from the second element (the real prompt-input
+ * shape). `optsRef` captures the CreateAgentOptions the worker passed.
+ */
+function makeFakeFactory(
+  behavior: Behavior,
+  createdRef?: { created: boolean },
+  optsRef?: { opts?: any; promptInput?: unknown },
+) {
   return {
     resolveModelId: () => "test-model",
     resolveSessionType: () => ({
       session_instruction: "Write your entry. Begin with EXACTLY this header:\n{{header}}\n(room {{room}}, date {{date}})",
     }),
-    create: async (_session: unknown, tools: AgentTool[]) => {
+    create: async (_session: unknown, tools: AgentTool[], opts?: unknown) => {
       if (createdRef) createdRef.created = true;
+      if (optsRef) optsRef.opts = opts;
       const tool = tools[0]!;
       const state: FakeAgentState = { messages: [] };
       return {
         agent: {
-          prompt: async (kickoff: string) => behavior(tool, kickoff, state),
+          prompt: async (input: unknown) => {
+            if (optsRef) optsRef.promptInput = input;
+            const kickoff = typeof input === "string" ? input : ((input as any[])[1]?.content ?? "");
+            return behavior(tool, kickoff, state);
+          },
           waitForIdle: async () => {},
           subscribe: () => () => {},
           state,
           abort: () => {},
         },
+        finalTurn: { type: "satellite", content: "<system>diary satellite</system>" },
         snapshot: undefined,
         tokenEstimate: undefined,
       };
@@ -195,6 +211,42 @@ test("a participated range writes a diary entry and marks the summary done", asy
     assert.match(content, /# .* Daily Memory/);
     assert.match(content, /· Test Room \(Earendil\)/);
     assert.match(content, /I helped out today\./);
+  });
+});
+
+// ── Diary context parity (spec DIARY-CONTEXT-PARITY §3) ──────────────────────
+
+test("the worker creates the session with a diaryRange build and a conversation-free kickoff", async () => {
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("u0", 1000), event("a0", 2000, "assistant")]);
+
+    const header = expectedHeader({ earliestTimestamp: 1000, latestTimestamp: 2000 });
+    const optsRef: { opts?: any; promptInput?: unknown } = {};
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      // The kickoff is recent-memory window + instruction ONLY — the range's
+      // raw events now live in the built prefix, not in this turn.
+      assert.ok(kickoff.includes("<your_recent_memory>"), "kickoff carries the recent-memory window");
+      assert.ok(!kickoff.includes("<conversation"), "kickoff no longer embeds the rendered range");
+      assert.ok(kickoff.includes(header), "kickoff still carries the dictated header");
+      await tool.execute("t", { command: "create", file_text: `${header}\nparity entry.`, finalize: true });
+    }, undefined, optsRef);
+    const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    // The worker passed the diary-range build mode (not resume) to the factory.
+    assert.deepEqual(optsRef.opts, {
+      diaryRange: { earliestTimestamp: 1000, latestTimestamp: 2000, summaryId: "sum1" },
+    });
+    // The popped satellite final turn is delivered first, then the kickoff —
+    // mirroring the summarize worker's [finalTurn, instruction] shape.
+    assert.ok(Array.isArray(optsRef.promptInput), "prompt input is [finalTurn, kickoff]");
+    const [first, second] = optsRef.promptInput as any[];
+    assert.equal(first?.type, "satellite");
+    assert.equal(second?.role, "user");
+    assert.match(second?.content, /<your_recent_memory>/);
   });
 });
 

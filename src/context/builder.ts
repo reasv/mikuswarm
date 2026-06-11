@@ -61,6 +61,24 @@ export interface BuildContextOptions {
     endTimestamp: number;
   };
   /**
+   * When set, build context for a diary session over a level-1 summary range
+   * (spec DIARY-CONTEXT-PARITY §3; ARCHITECTURE.md §9c). A sibling of
+   * `summarizationCutoff` (the two are mutually exclusive — validated) that
+   * differs from it ONLY in bounds: the summary layer is bounded at the range
+   * START (`earliestTimestamp`, same inclusive semantics as the cutoff path)
+   * with any range-overlapping summary — in particular `summaryId`, the
+   * range's own already-persisted summary — explicitly excluded, and raw
+   * events are cut at `latestTimestamp`. The range therefore renders as real
+   * prefix chat turns under the prior chunks' summaries, exactly as a chat
+   * session cut at `earliestTimestamp` would see them.
+   */
+  diaryRange?: {
+    earliestTimestamp: number;
+    latestTimestamp: number;
+    /** The range's own summary id (the diary queue rides on `summaries` rows). */
+    summaryId: string;
+  };
+  /**
    * When true, build context for a proactive check-in (ARCHITECTURE.md §9g): the
    * live conversation renders as usual (recent timeline, summary/diary layers,
    * auto-retrieval) but no events are pulled out as a trigger group and the final
@@ -151,12 +169,23 @@ export class ContextBuilder {
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
     const cutoff = options.summarizationCutoff;
+    const diaryRange = options.diaryRange;
+    if (cutoff && diaryRange) {
+      throw new Error("summarizationCutoff and diaryRange are mutually exclusive build modes");
+    }
+    // A "generation" build (summarize/condense cutoff, or the diary-range mode)
+    // produces memory artifacts over a past range rather than answering a live
+    // trigger: no trigger group, no diary layer, no auto-retrieval, no reactions,
+    // no wait-or-omit, runtime state suppressed, satellite final turn. The two
+    // modes differ ONLY in their bounds (cut at range end vs. coverage bounded
+    // at range start) — spec DIARY-CONTEXT-PARITY §3.
+    const generation = cutoff != null || diaryRange != null;
     // Proactive check-in (§9g): live context as usual, but no trigger group and a
-    // synthetic kickoff as the final user turn. Distinct from `cutoff`, which cuts
-    // the whole context at a timestamp for summarization.
+    // synthetic kickoff as the final user turn. Distinct from the generation
+    // modes, which re-bound the whole context to a past range.
     const proactive = options.proactive === true;
     const now = options.trigger.timestamp;
-    const triggerGroupIds = cutoff || proactive ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
+    const triggerGroupIds = generation || proactive ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
     const compactionState = this.store.getCompactionState(options.timelineKey);
 
     // 1. Select summaries and derive the event-ID coverage cursor (§4). The
@@ -198,6 +227,29 @@ export class ContextBuilder {
       }
     }
 
+    if (diaryRange) {
+      // Diary-range mode (spec DIARY-CONTEXT-PARITY §3): same shape as the
+      // cutoff path above, but coverage is bounded at the range START — the
+      // diary runs AFTER its range's summary exists, so a naive end-bounded
+      // selection would fold the work range into its own summary layer. The
+      // inclusive `beforeTimestamp` keeps a prior chunk's summary that shares
+      // a millisecond boundary with the range start; the explicit range
+      // exclusion drops anything extending INTO the range (always including
+      // the range's own summary). Raw events are cut at the range
+      // end; uncovered pre-range events ride along as raw turns (benign
+      // continuity, same as the summarize build).
+      selection = selectSummaryCoverage(this.storage, options.timelineKey, diaryRange.earliestTimestamp, diaryRange);
+      if (selection.coverageEndEventId) {
+        events = this.store
+          .queryAfterContext(options.timelineKey, selection.coverageEndEventId)
+          .filter((e) => e.timestamp <= diaryRange.latestTimestamp);
+      } else {
+        events = this.store
+          .queryForContext(options.timelineKey, compactionState)
+          .filter((e) => e.timestamp <= diaryRange.latestTimestamp);
+      }
+    }
+
     this.logger?.debug("summary_coverage_resolved", {
       timelineKey: options.timelineKey,
       coverageEndEventId: selection.coverageEndEventId,
@@ -206,7 +258,7 @@ export class ContextBuilder {
 
     events = this.hydrateEvents(events);
 
-    if (cutoff) {
+    if (generation) {
       events = events.map((e) => this.truncateOversizedEvent(e));
     }
 
@@ -219,10 +271,12 @@ export class ContextBuilder {
     //    clock; priority inheritance promotes it for the duration — or (c) for a
     //    genuinely *failed* job, its failure placeholder takes over the range
     //    (synthesized into the selection above / by the post-wait re-query).
-    //    There is no "truncate oldest to fit" step. Skipped for summarization
-    //    builds.
+    //    There is no "truncate oldest to fit" step. Skipped for generation
+    //    builds (cutoff AND diary-range — the range is the work product, and
+    //    prior chunks' summaries are normally complete because jobs process
+    //    oldest-first; a gap simply renders raw — never wait, never fake).
     let compactionInput = timelineEvents;
-    if (!cutoff) {
+    if (!generation) {
       const resolved = await this.resolveCompactionOverflow(
         options.timelineKey,
         timelineEvents,
@@ -246,7 +300,7 @@ export class ContextBuilder {
 
     // Surfaced failures (§7.2): placeholders ride inside the selection; log so
     // a failed range is a visible, recurring signal while it stays failed.
-    if (!cutoff) {
+    if (!generation) {
       const placeholderIds = selection.summaries
         .filter((s) => s.id.startsWith("sumfail_"))
         .map((s) => s.id);
@@ -261,10 +315,10 @@ export class ContextBuilder {
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
     // projections from the reaction store, attached now (after wait-or-omit has
     // finalized the event set) and never persisted into event_json. Off for
-    // summarization builds — reactions must never leak into summaries (§4) — and
-    // gated by [reactions] config.
+    // generation builds — reactions must never leak into summaries or diary
+    // entries (§4) — and gated by [reactions] config.
     const rx = this.config.reactions ?? {};
-    const reactionsEnabled = !cutoff && rx.enabled !== false;
+    const reactionsEnabled = !generation && rx.enabled !== false;
     let reactionLines: ReactionLine[] = [];
     if (reactionsEnabled) {
       if (rx.show_aggregates !== false) {
@@ -287,14 +341,14 @@ export class ContextBuilder {
       this.config.context.tiers,
       {
         timelineKey: options.timelineKey,
-        // A summarization build operates on a cut-down event set; never persist
+        // A generation build operates on a re-bounded event set; never persist
         // its derived boundaries into the real compaction state.
-        state: cutoff ? undefined : compactionState,
+        state: generation ? undefined : compactionState,
         reactionLines,
         discreteHorizonMessages: rx.discrete_horizon_messages ?? 0,
       },
     );
-    if (!cutoff && compacted.stateChanged && compacted.state) {
+    if (!generation && compacted.stateChanged && compacted.state) {
       await this.store.saveCompactionState(compacted.state);
     }
 
@@ -304,7 +358,7 @@ export class ContextBuilder {
     // consume summaries and wait on / escalate jobs (spec §7.1/§7.3).
 
     // Proactive's synthetic trigger carries no attachments — no image blocks.
-    const imageBlocks = cutoff || proactive ? [] : await this.selectImageBlocks(options.trigger);
+    const imageBlocks = generation || proactive ? [] : await this.selectImageBlocks(options.trigger);
     const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
 
     this.markImageBlocks(triggerEvents, imageBlockIds);
@@ -323,10 +377,21 @@ export class ContextBuilder {
     // pi-agent-core on every API call), and this one populates the system message in
     // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(options.workspace, options.fallbackPrompt);
+    // The diary session type's session_instruction is a per-job TEMPLATE
+    // ({{room}}/{{date}}/{{header}} are substituted by the diary worker) and is
+    // delivered, substituted, inside the worker's kickoff turn right after this
+    // satellite (spec DIARY-CONTEXT-PARITY §3). Rendering it here too would put
+    // the raw, un-substituted template into the context — so the diary-range
+    // satellite omits it; everything else (tail instructions) renders as
+    // configured.
+    const satelliteSessionType =
+      diaryRange && options.sessionType
+        ? { ...options.sessionType, session_instruction: undefined }
+        : options.sessionType;
     const satellite = renderSatelliteBlock(
-      { ...options, suppressRuntimeState: cutoff != null },
+      { ...options, suppressRuntimeState: generation },
       options.workspace,
-      options.sessionType,
+      satelliteSessionType,
     );
     const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
 
@@ -338,14 +403,16 @@ export class ContextBuilder {
       options.timelineKey,
       selection.summaries,
       now,
-      cutoff != null,
+      generation,
     );
 
     // Recent-diary surfacing (§10a): a layer after the system prompt and before the
     // summaries layer (top-to-bottom: system → diary → summaries), so the agent
-    // reads back what it wrote. Omitted from generation builds (summarizer cutoff) —
-    // temporally wrong (they operate on past ranges) and a feedback risk. The diary
-    // session itself never goes through here (it uses resume mode, no build).
+    // reads back what it wrote. Omitted from generation builds (summarizer cutoff
+    // AND diary-range) — temporally wrong (they operate on past ranges) and a
+    // feedback risk. The diary session's own recent-memory window deliberately
+    // rides in its final-turn kickoff (worker packaging), NOT here — the "no
+    // memory entries in the prefix" rule for generation builds stays clean.
     //
     // The anchor `now` is the trigger's timestamp (set above), used deliberately
     // rather than wall-clock Date.now(): it is deterministic and stable across
@@ -354,12 +421,13 @@ export class ContextBuilder {
     // chronologically. Any cross-midnight divergence from §10a's literal "latest
     // in-context message day" wording is cosmetic: recentMemoryWindow only surfaces
     // existing files ≤ the anchor and never shows empty days.
-    const diaryLayer = cutoff ? null : await this.buildDiaryLayerMessage(now);
+    const diaryLayer = generation ? null : await this.buildDiaryLayerMessage(now);
 
     // Auto-retrieval (§8c): a small, cited block of relevant-but-not-recent memory,
     // riding INSIDE the final user turn (cache-safe) BEFORE the trigger messages, so
     // the trigger stays last (most-attended). Deduped against the recency layer.
-    // Omitted from generation builds (cutoff) — temporally wrong, a feedback risk.
+    // Omitted from generation builds (cutoff and diary-range) — temporally wrong,
+    // a feedback risk.
     //
     // The retrieval QUERY is the plain message body the user typed — the bare
     // `body` of each trigger event joined by newlines, NOT `triggerContent` (the
@@ -374,7 +442,7 @@ export class ContextBuilder {
       .filter(Boolean)
       .join("\n");
     const retrievedMemory =
-      cutoff || !this.autoRetrieval
+      generation || !this.autoRetrieval
         ? null
         : await buildAutoRetrievalBlock(this.autoRetrieval, {
             query: retrievalQuery,
@@ -393,7 +461,7 @@ export class ContextBuilder {
     // announce yourself) lives in the proactive session type's session_instruction,
     // rendered inside the satellite block above — two knobs, distinct roles.
     const finalTurnTail = proactive ? this.renderProactiveKickoff(now) : triggerContent;
-    const finalUserContent = cutoff
+    const finalUserContent = generation
       ? systemBlock
       : [retrievedMemory, systemBlock, finalTurnTail].filter(Boolean).join("\n\n");
 
@@ -409,7 +477,7 @@ export class ContextBuilder {
       ...(summaryLayer ? [summaryLayer] : []),
       ...chatMessages,
       {
-        type: cutoff ? "satellite" : "triggerGroup",
+        type: generation ? "satellite" : "triggerGroup",
         role: "user",
         content: finalUserContent,
         tier: "trigger",
@@ -428,19 +496,20 @@ export class ContextBuilder {
 
   /**
    * Render the summary-layer message (§4). For normal builds the recency-label
-   * cache is read/written to keep the prefix byte-stable (§5); summarization
-   * builds compute labels directly and never touch the cache.
+   * cache is read/written to keep the prefix byte-stable (§5); generation
+   * builds (cutoff and diary-range) compute labels directly and never touch
+   * the cache (their labels would pollute the shared per-timeline entry).
    */
   private async buildSummaryLayerMessage(
     timelineKey: string,
     summaries: Summary[],
     now: number,
-    isSummarizationBuild: boolean,
+    isGenerationBuild: boolean,
   ): Promise<ContextMessage | null> {
     if (summaries.length === 0) return null;
 
     let labels: string[];
-    if (isSummarizationBuild) {
+    if (isGenerationBuild) {
       const resolved = resolveRecencyLabels(summaries, null, now, 0);
       labels = resolved.labels;
     } else {
