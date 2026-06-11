@@ -1327,6 +1327,31 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  /**
+   * Configurable user-facing failure notice (spec LLM-FAILURE-HANDLING §8.3):
+   * when `recovery.failure_notice` is a non-empty phrase, it is sent verbatim
+   * to the session's outbound target when a USER-TRIGGERED chat session stops
+   * trying on its own — it parked `failed-resumable`, or its build timed out
+   * waiting on summary coverage during an outage. Best-effort: a send failure
+   * is logged and never affects the park/discard. The actual error is NEVER
+   * included — the phrase is static. Callers suppress it for proactive
+   * sessions (nobody asked them anything); synthetic sessions never reach
+   * these paths (no room audience).
+   */
+  function sendFailureNotice(
+    target: NonNullable<InboundChatEvent["outboundTarget"]> | undefined,
+    sessionId: string,
+  ): void {
+    const phrase = config.recovery?.failure_notice;
+    if (!phrase || phrase.length === 0 || !target) return;
+    void provider.send(target, { body: phrase, agentSessionId: sessionId }).catch((error) => {
+      logger.warn("failure_notice_send_failed", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
   async function launchSession(
     inbound: InboundChatEvent,
     duplicate: boolean,
@@ -1395,6 +1420,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         proactive,
         error: error instanceof Error ? error.message : String(error),
       });
+      // §8.3: a user asked and the bot is giving up — say so when configured.
+      // Only for the coverage-wait timeout (a routine outage symptom), not for
+      // arbitrary factory bugs; never for proactive launches (the proactive
+      // scheduler simply fires again next cadence).
+      if (buildTimeout && !proactive) sendFailureNotice(target, session.id);
       const next = triggerCoordinator.complete(session.timelineKey);
       if (next && !draining) void launchSession(next, true).catch((error) => {
         logger.error("queued_session_launch_failed", {
@@ -1466,6 +1496,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             elapsedMs: Date.now() - (session.startedAt ?? session.createdAt),
             error: message,
           });
+          // §8.3: user-triggered sessions may announce the give-up; proactive
+          // sessions never do — nobody asked them anything.
+          if (!proactive) sendFailureNotice(target, session.id);
           return;
         }
         sessions.markDiscarded(session.id, {

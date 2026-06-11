@@ -601,6 +601,13 @@ const RecoverySchema = StrictObject({
   // while unhealthy (never grows — recovery is detected within one window).
   llm_unhealthy_threshold: Type.Optional(Type.Number({ minimum: 1 })),
   llm_probe_interval_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // User-facing failure notice (spec §8.3): when non-empty, sent verbatim to
+  // the session's room when a USER-TRIGGERED chat session stops trying on its
+  // own (parked failed-resumable, or its build timed out waiting on summary
+  // coverage). Static phrase only — the actual error is never included.
+  // Empty/absent = today's silence. Suppressed for proactive and synthetic
+  // sessions.
+  failure_notice: Type.Optional(Type.String()),
 });
 
 export const AppConfigSchema = StrictObject({

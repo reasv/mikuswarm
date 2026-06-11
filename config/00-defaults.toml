@@ -49,6 +49,10 @@ llm_request_max_wait_ms = 120000    # interactive-class wall-clock budget (~the 
 # request per fixed interval; on probe success every waiter resumes together.
 llm_unhealthy_threshold = 3
 llm_probe_interval_ms = 60000
+# Optional static phrase sent to the room when a user-triggered session gives
+# up (parks failed-resumable / build-wait timeout). Empty = silent (default).
+# The actual error is never included. Proactive/synthetic sessions never send it.
+failure_notice = ""
 
 [models.default]
 id = "claude-opus-4-7"
