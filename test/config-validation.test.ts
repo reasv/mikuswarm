@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -498,4 +498,179 @@ discrete_horizon_messages = -1
   await withConfigDir(toml, async (dir) => {
     await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|minimum/i);
   });
+});
+
+// --- #29 (decision E): strict validation — unknown config keys fail-fast ---
+
+// Temporarily set env vars (restoring on exit) so shipped TOMLs that reference
+// `${...}` placeholders can be loaded without a .env file.
+async function withEnv(
+  vars: Record<string, string>,
+  fn: () => Promise<void>,
+): Promise<void> {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("config: unknown TOP-LEVEL section is rejected with a path-naming error (issue #29)", async () => {
+  const toml = `${BASE_CONFIG}
+[nonsense]
+foo = 1
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /nonsense is not a recognized config key/,
+      "an unknown top-level table must fail-fast, naming the offending path",
+    );
+  });
+});
+
+// Nested unknown keys — including exactly the stale knobs that motivated the
+// issue (enrichment.fetch_concurrency, summarization.summary_wait_timeout_ms)
+// and the removed captioning per-modality `concurrency` alias.
+const UNKNOWN_KEY_CASES: Array<{ name: string; block: string; path: string }> = [
+  { name: "stale enrichment.fetch_concurrency", block: `[enrichment]\nfetch_concurrency = 6\n`, path: "enrichment\\.fetch_concurrency" },
+  { name: "removed captioning image concurrency alias", block: `[captioning.image]\nconcurrency = 2\n`, path: "captioning\\.image\\.concurrency" },
+  { name: "removed captioning audio concurrency alias", block: `[captioning.audio]\nconcurrency = 1\n`, path: "captioning\\.audio\\.concurrency" },
+  { name: "typo in [observability.server]", block: `[observability.server]\nenabled = false\nbind = "127.0.0.1"\nport = 8799\nporrt = 8800\n`, path: "observability\\.server\\.porrt" },
+  { name: "deeply nested typo in [retrieval.query]", block: `[retrieval.query]\nmax_resuts = 6\n`, path: "retrieval\\.query\\.max_resuts" },
+];
+
+// The removed summarization knob needs its key INSIDE the [summarization] table
+// BASE_CONFIG already defines (TOML forbids redefining a table).
+test("config: unknown nested key rejected — stale summarization.summary_wait_timeout_ms (issue #29)", async () => {
+  const toml = BASE_CONFIG.replace(
+    "[summarization]\nenabled = false",
+    "[summarization]\nenabled = false\nsummary_wait_timeout_ms = 1000",
+  );
+  assert.ok(toml.includes("summary_wait_timeout_ms"), "precondition: the stale knob was injected");
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /summarization\.summary_wait_timeout_ms is not a recognized config key/,
+    );
+  });
+});
+
+for (const { name, block, path: keyPath } of UNKNOWN_KEY_CASES) {
+  test(`config: unknown nested key rejected — ${name} (issue #29)`, async () => {
+    const toml = `${BASE_CONFIG}
+${block}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        new RegExp(`${keyPath} is not a recognized config key`),
+        `${name} must fail-fast with an error naming the offending path`,
+      );
+    });
+  });
+}
+
+// Unknown keys inside a DICTIONARY-valued section's VALUE: the dictionary level
+// accepts arbitrary names (model names, session-type names, rate-limit group
+// names, matrix account names), but each value object is still strict.
+const DICT_VALUE_UNKNOWN_KEY_CASES: Array<{ name: string; block: string; path: string }> = [
+  { name: "[rate_limits.llm.<group>] max_rpm (deliberately unsupported)", block: `[rate_limits.llm.openrouter]\nmax_in_flight = 16\nmax_rpm = 60\n`, path: "rate_limits\\.llm\\.openrouter\\.max_rpm" },
+  { name: "[agent.session_types.<type>] bogus knob", block: `[agent.session_types.custom]\nmodel = "default"\nbogus_knob = 1\n`, path: "agent\\.session_types\\.custom\\.bogus_knob" },
+  { name: "[models.<name>] bogus knob", block: `[models.alt]\nid = "m"\nprovider = "test"\nendpoint = "http://localhost"\napi_key = "k"\nmultimodal = false\nmax_tokens = 1024\nbogus = true\n`, path: "models\\.alt\\.bogus" },
+  { name: "[matrix.accounts.<name>] bogus knob", block: `[matrix.accounts.second]\nhomeserver = "http://localhost"\nuser_id = "@x:localhost"\nstore_path = "./var/x"\nbogus = "y"\n`, path: "matrix\\.accounts\\.second\\.bogus" },
+];
+
+for (const { name, block, path: keyPath } of DICT_VALUE_UNKNOWN_KEY_CASES) {
+  test(`config: unknown key inside a dictionary VALUE rejected — ${name} (issue #29)`, async () => {
+    const toml = `${BASE_CONFIG}
+${block}`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(
+        () => loadConfig(dir, { env: false }),
+        new RegExp(`${keyPath} is not a recognized config key`),
+        `${name} must fail-fast with an error naming the offending path`,
+      );
+    });
+  });
+}
+
+test("config: dictionary sections still accept arbitrary names at the dictionary level (issue #29)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.fancy_alt_model]
+id = "alt"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "k"
+multimodal = false
+max_tokens = 512
+
+[agent.session_types.totally_custom_type]
+model = "fancy_alt_model"
+priority = "background"
+
+[rate_limits.llm.openrouter]
+max_in_flight = 16
+
+[matrix.accounts.second]
+homeserver = "http://localhost"
+user_id = "@second:localhost"
+store_path = "./var/second"
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal((config.models as Record<string, { id: string }>).fancy_alt_model.id, "alt");
+    assert.equal(config.agent.session_types?.totally_custom_type?.priority, "background");
+    assert.equal(config.rate_limits?.llm?.openrouter?.max_in_flight, 16);
+    assert.equal(config.matrix.accounts.second?.user_id, "@second:localhost");
+  });
+});
+
+// The env vars the shipped TOMLs reference via ${...} placeholders.
+const SHIPPED_TOML_ENV: Record<string, string> = {
+  ANTHROPIC_BASE_URL: "http://localhost/anthropic",
+  OPENROUTER_BASE_URL: "http://localhost/openrouter",
+  GEMINI_BASE_URL: "http://localhost/google",
+  LLM_API_KEY: "test-key",
+  MATRIX_HOMESERVER: "http://localhost",
+  MATRIX_ACCESS_TOKEN: "tok",
+  MATRIX_PASSWORD: "pw",
+  MATRIX_RECOVERY_KEY: "rk",
+  MATRIX_USER_ID: "@miku:localhost",
+  MATRIX_DEVICE_ID: "DEV",
+  MIKUSWARM_CONSOLE_TOKEN: "console-token",
+};
+
+const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+
+test("config: shipped config/00-defaults.toml validates under strict unknown-key checking (issue #29)", async () => {
+  await withEnv(SHIPPED_TOML_ENV, async () => {
+    const config = await loadConfig(path.join(REPO_ROOT, "config"), { env: false });
+    assert.equal(config.app.name, "mikuswarm");
+    assert.equal(config.captioning?.worker_count, 2);
+  });
+});
+
+test("config: shipped docker/95-docker.toml overlay validates under strict unknown-key checking (issue #29)", async () => {
+  // The overlay is merged on top of the defaults exactly as the agent image
+  // does (lexicographic order: 00-defaults.toml < 95-docker.toml).
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-config-docker-"));
+  try {
+    await copyFile(path.join(REPO_ROOT, "config", "00-defaults.toml"), path.join(dir, "00-defaults.toml"));
+    await copyFile(path.join(REPO_ROOT, "docker", "95-docker.toml"), path.join(dir, "95-docker.toml"));
+    await withEnv(SHIPPED_TOML_ENV, async () => {
+      const config = await loadConfig(dir, { env: false });
+      assert.equal(config.sandbox?.enabled, true);
+      assert.equal(config.network?.ssrf_guard, false);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

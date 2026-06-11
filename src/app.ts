@@ -73,7 +73,7 @@ import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
-import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
+import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
@@ -322,25 +322,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // image-block path all use the same defaults.
   const inferenceImageOptions = buildInferenceImageOptions(mediaImageConfig);
 
-  const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
-    ["image", new ConcurrencyLimitedInferenceClient({
+  const captionClients = new Map<MediaModality, InferenceClient>([
+    ["image", new InferenceClient({
       modality: "image",
       model: resolveModalityModel(imageConfig),
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
-      maxConcurrency: imageConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
       imageProcessing: inferenceImageOptions,
     })],
-    ["video", new ConcurrencyLimitedInferenceClient({
+    ["video", new InferenceClient({
       modality: "video",
       model: resolveModalityModel(videoConfig),
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
       maxTokens: videoConfig.max_tokens ?? 2048,
-      maxConcurrency: videoConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
       timeoutMs: videoConfig.timeout_ms,
@@ -355,13 +353,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
       },
     })],
-    ["audio", new ConcurrencyLimitedInferenceClient({
+    ["audio", new InferenceClient({
       modality: "audio",
       model: resolveModalityModel(audioConfig),
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
-      maxConcurrency: audioConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
       timeoutMs: audioConfig.timeout_ms,

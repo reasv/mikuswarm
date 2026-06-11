@@ -1,5 +1,5 @@
 import type { MediaAssetRow, Storage } from "../storage/index.js";
-import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
+import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { CaptionWorker } from "./worker.js";
@@ -14,7 +14,7 @@ export interface CaptionConfig {
 
 export interface CaptionWorkerPoolOptions {
   storage: Storage;
-  clients: Map<MediaModality, ConcurrencyLimitedInferenceClient>;
+  clients: Map<MediaModality, InferenceClient>;
   workspaceRoot: string;
   config: CaptionConfig;
   onComplete?: (eventId: string) => void;
@@ -56,22 +56,13 @@ export class CaptionWorkerPool {
     }
   }
 
-  /**
-   * Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). Surfaces
-   * the per-modality concurrency caps (image/video/audio) when configured.
-   */
+  /** Read-only stats seam for the pipeline monitor (ARCHITECTURE.md §11). */
   stats(): PipelineStats {
-    const concurrency: Record<string, number> = {};
-    for (const [modality, client] of this.options.clients) {
-      const cap = client.maxConcurrency;
-      if (cap != null) concurrency[modality] = cap;
-    }
     return {
       pool: "captioning",
       workerCount: this.options.config.worker_count ?? 2,
       maxRetries: this.options.config.max_retries ?? 2,
       inFlight: () => this.activeWorkers.size,
-      concurrency: Object.keys(concurrency).length > 0 ? concurrency : undefined,
       notify: () => this.notifyNewWork(),
     };
   }

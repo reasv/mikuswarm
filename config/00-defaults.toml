@@ -187,6 +187,9 @@ ssrf_guard = true
 # Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
 # http_proxy_url = "http://proxy.internal:8080"
 
+# Caption-inference concurrency is governed by the model's LLM rate-limit group
+# (`max_in_flight` under [rate_limits.llm.*], via [captioning.model].rate_limit_group);
+# there is no per-modality concurrency knob.
 [captioning]
 worker_count = 2
 caption_all = false
@@ -202,18 +205,15 @@ api_key = "${LLM_API_KEY}"
 [captioning.image]
 prompt = "Describe the image."
 max_chars = 500
-concurrency = 2
 
 [captioning.video]
 prompt = "Describe the video."
 max_chars = 500
-concurrency = 1
 timeout_ms = 120000
 
 [captioning.audio]
 prompt = "Transcribe and describe the audio."
 max_chars = 2000
-concurrency = 1
 timeout_ms = 60000
 
 [sillytavern]

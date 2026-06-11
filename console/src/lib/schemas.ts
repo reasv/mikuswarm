@@ -160,7 +160,6 @@ export const PipelineHealth = Schema.Struct({
 	enabled: Schema.Boolean,
 	workerCount: Schema.Number,
 	maxRetries: Schema.Number,
-	concurrency: Schema.NullOr(Schema.Record({ key: Schema.String, value: Schema.Number })),
 	inFlight: Schema.Number,
 	counts: PipelineCounts
 });

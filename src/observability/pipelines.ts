@@ -5,15 +5,13 @@ import type { PipelineId } from "../storage/index.js";
  * pipeline monitor (ARCHITECTURE.md §11). Counts-by-status are derived from the DB
  * (the single source of truth that survives restart); the only genuinely live
  * number here is `inFlight()` (the pool's `activeWorkers.size`). `workerCount`/
- * `maxRetries` come from config; `concurrency` is captioning's per-modality limit
- * map (image/video/audio), absent for the other pools.
+ * `maxRetries` come from config.
  */
 export interface PipelineStats {
   readonly pool: PipelineId;
   workerCount: number;
   maxRetries: number;
   inFlight(): number;
-  concurrency?: Record<string, number>;
   /**
    * Wake the pool's poll loop so a manually re-enqueued item (Phase 5 retry) is
    * claimed immediately rather than on the next 1s tick. Optional so test stubs and
