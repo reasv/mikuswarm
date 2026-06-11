@@ -1,6 +1,27 @@
-import { Type, type Static } from "@sinclair/typebox";
+import {
+  Type,
+  type ObjectOptions,
+  type Static,
+  type TObject,
+  type TProperties,
+} from "@sinclair/typebox";
 
-const SessionTypeSchema = Type.Object({
+/**
+ * Strict object schema: unknown keys FAIL validation at load (review issue #29,
+ * decision E). Every fixed-shape object in the config tree is built with this
+ * helper so a misspelled or stale key (e.g. `enrichment.fetch_concurrency`)
+ * fail-fasts with a path-naming error instead of being silently ignored.
+ *
+ * Dictionary-shaped sections — `Type.Record(...)` like `[models.*]`,
+ * `[agent.session_types.*]`, `[rate_limits.llm.*]`, `[matrix.accounts.*]`,
+ * `[mcp.servers.*]` — deliberately keep arbitrary keys at the dictionary level;
+ * only their VALUE schemas are strict.
+ */
+function StrictObject<T extends TProperties>(properties: T, options: ObjectOptions = {}): TObject<T> {
+  return Type.Object(properties, { ...options, additionalProperties: false });
+}
+
+const SessionTypeSchema = StrictObject({
   workspace_files: Type.Optional(Type.Array(Type.String())),
   tail_file: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   session_instruction: Type.Optional(Type.String()),
@@ -36,7 +57,7 @@ const SessionTypeSchema = Type.Object({
   max_turns: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
-const DiarySchema = Type.Object({
+const DiarySchema = StrictObject({
   // When false, the diary worker pool does not drain — level-1 summaries still
   // accumulate `diary_status='pending'` and flush if it is later enabled.
   enabled: Type.Optional(Type.Boolean()),
@@ -51,7 +72,7 @@ const DiarySchema = Type.Object({
   recency_file_count: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
-const SummarizationSchema = Type.Object({
+const SummarizationSchema = StrictObject({
   enabled: Type.Optional(Type.Boolean()),
   worker_count: Type.Optional(Type.Integer({ minimum: 1 })),
   generation_threshold_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -75,7 +96,7 @@ const SummarizationSchema = Type.Object({
 // src/search/absence.ts (the absence resolver's look-back window); duplicated here as
 // a literal to avoid a config → search module dependency. 30 days in ms.
 const SEARCH_HORIZON_MS = 30 * 24 * 60 * 60 * 1000;
-const SearchSchema = Type.Object({
+const SearchSchema = StrictObject({
   // Numeric knobs carry both minimum AND maximum bounds (review issue #7), mirroring
   // [retrieval]: an unbounded value degrades silently rather than failing fast at
   // load. The two *_ms fields are capped at SEARCH_HORIZON_MS (30 days) — the absence
@@ -97,7 +118,7 @@ const SearchSchema = Type.Object({
   // like the others (an unbounded expansion of a high-level summary could fan out into
   // hundreds of events).
   summaries: Type.Optional(
-    Type.Object({
+    StrictObject({
       // Max rendered tokens one expand_summary call accumulates before it stops and
       // reports how many constituents were omitted. Default 4000; max mirrors
       // recap_budget_tokens (100k) as the ceiling on a single tool's output.
@@ -111,7 +132,7 @@ const SearchSchema = Type.Object({
 
 // Passive reaction surfacing (ARCHITECTURE.md §9f). All optional; defaults ship in
 // 00-defaults.toml. `enabled` is the master switch for both ingest and the two views.
-const ReactionsSchema = Type.Object({
+const ReactionsSchema = StrictObject({
   // Master switch: persist inbound reactions AND surface them in context.
   enabled: Type.Optional(Type.Boolean()),
   // View A: deduped key×count on rich-tier messages.
@@ -133,7 +154,7 @@ const ReactionsSchema = Type.Object({
 // Memory retrieval — hybrid lexical+semantic search over `memory/*.md`, plus
 // auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
 // configs stay valid; `enabled` is the master switch for the whole index.
-const RetrievalEmbeddingRemoteSchema = Type.Object({
+const RetrievalEmbeddingRemoteSchema = StrictObject({
   // OpenRouter-compatible embeddings endpoint (§5d). `dim` is REQUIRED when remote
   // is the active provider — it governs the vector index width (§5a/§6).
   id: Type.String({ minLength: 1 }),
@@ -145,12 +166,12 @@ const RetrievalEmbeddingRemoteSchema = Type.Object({
   rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
 });
 
-const RetrievalEmbeddingSchema = Type.Object({
+const RetrievalEmbeddingSchema = StrictObject({
   // Active-model resolution (§5a): 'remote' if the [remote] block is set, else the
   // bundled 'local' ONNX model (the zero-config default + safety net).
   provider: Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("remote")])),
   local: Type.Optional(
-    Type.Object({
+    StrictObject({
       model: Type.Optional(Type.String({ minLength: 1 })),
       dim: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
@@ -158,7 +179,7 @@ const RetrievalEmbeddingSchema = Type.Object({
   remote: Type.Optional(RetrievalEmbeddingRemoteSchema),
 });
 
-const RetrievalSchema = Type.Object({
+const RetrievalSchema = StrictObject({
   enabled: Type.Optional(Type.Boolean()),
   // §8c — inject the small relevant-memory block inside each trigger's final user
   // turn. Independently disablable (cache-safe placement; risk is distraction).
@@ -173,7 +194,7 @@ const RetrievalSchema = Type.Object({
   // field constraint that TypeBox can't express (fallback_chunk_tokens <=
   // max_chunk_tokens) is enforced in resolveRetrievalConfig (issue #14).
   index: Type.Optional(
-    Type.Object({
+    StrictObject({
       worker_count: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
       max_retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
       embed_batch_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 2048 })),
@@ -185,7 +206,7 @@ const RetrievalSchema = Type.Object({
     }),
   ),
   query: Type.Optional(
-    Type.Object({
+    StrictObject({
       max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       vector_weight: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
@@ -198,7 +219,7 @@ const RetrievalSchema = Type.Object({
     }),
   ),
   auto: Type.Optional(
-    Type.Object({
+    StrictObject({
       max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       max_tokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
@@ -211,14 +232,14 @@ const RetrievalSchema = Type.Object({
 // Proactive posting (ARCHITECTURE.md §9g). Opt-in only: inert unless `enabled =
 // true` AND at least one channel is listed. Global fields are defaults overridable
 // per channel (effective value = channel ?? global ?? hardcoded default).
-const ProactiveActiveHoursSchema = Type.Object({
+const ProactiveActiveHoursSchema = StrictObject({
   // Local hours (agent.timezone). Posting is only scheduled within [start, end).
   // Wraps past midnight when end <= start (e.g. start=9, end=1 → 09:00–01:00).
   start: Type.Integer({ minimum: 0, maximum: 23 }),
   end: Type.Integer({ minimum: 0, maximum: 23 }),
 });
 
-const ProactiveChannelSchema = Type.Object({
+const ProactiveChannelSchema = StrictObject({
   timeline_key: Type.String({ minLength: 1 }), // required; exact match
   daily_posts: Type.Optional(Type.Integer({ minimum: 0 })),
   min_user_messages: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -227,7 +248,7 @@ const ProactiveChannelSchema = Type.Object({
   active_hours: Type.Optional(ProactiveActiveHoursSchema),
 });
 
-const ProactiveSchema = Type.Object({
+const ProactiveSchema = StrictObject({
   enabled: Type.Optional(Type.Boolean()), // global master switch
   session_type: Type.Optional(Type.String({ minLength: 1 })), // session_types key; default "proactive"
   kickoff_prompt: Type.Optional(Type.String()), // final user turn template ({time} substituted)
@@ -240,7 +261,7 @@ const ProactiveSchema = Type.Object({
   channels: Type.Optional(Type.Array(ProactiveChannelSchema)),
 });
 
-const TimelineSchema = Type.Object({
+const TimelineSchema = StrictObject({
   // How many messages to fetch on first trigger (initial backfill). 0 = none.
   initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
   // Max history window for initial backfill (ms), measured back from the trigger
@@ -264,7 +285,7 @@ const TimelineSchema = Type.Object({
   inactive_event_retention_days: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
-const ModelSchema = Type.Object({
+const ModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
   provider: Type.String({ minLength: 1 }),
   endpoint: Type.String(),
@@ -279,7 +300,7 @@ const ModelSchema = Type.Object({
   // `preview` action's inline emission. Anthropic's per-image inline cap is
   // 5 MB base64 — values up to that ceiling are safe.
   image_input_bytes: Type.Optional(Type.Number({ minimum: 1 })),
-  cost: Type.Optional(Type.Object({
+  cost: Type.Optional(StrictObject({
     input: Type.Number({ minimum: 0 }),
     output: Type.Number({ minimum: 0 }),
     cache_read: Type.Number({ minimum: 0 }),
@@ -293,7 +314,7 @@ const ModelSchema = Type.Object({
   // rate-limited account). A non-default value must name a group declared in
   // `[rate_limits.llm.*]` (validated fail-fast at app wiring).
   rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
-  compat: Type.Optional(Type.Object({
+  compat: Type.Optional(StrictObject({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
     supports_eager_tool_input_streaming: Type.Optional(Type.Boolean()),
@@ -301,7 +322,7 @@ const ModelSchema = Type.Object({
   })),
 });
 
-const MatrixAccountSchema = Type.Object({
+const MatrixAccountSchema = StrictObject({
   homeserver: Type.String(),
   access_token: Type.Optional(Type.String()),
   password: Type.Optional(Type.String()),
@@ -311,7 +332,7 @@ const MatrixAccountSchema = Type.Object({
   store_path: Type.String(),
 });
 
-const MediaImageSchema = Type.Object({
+const MediaImageSchema = StrictObject({
   max_total_pixels: Type.Optional(Type.Number({ minimum: 1 })),
   max_total_pixels_hard: Type.Optional(Type.Number({ minimum: 1 })),
   min_shortest_side: Type.Optional(Type.Number({ minimum: 1 })),
@@ -319,7 +340,7 @@ const MediaImageSchema = Type.Object({
   mozjpeg: Type.Optional(Type.Boolean()),
 });
 
-const MediaVideoSchema = Type.Object({
+const MediaVideoSchema = StrictObject({
   max_resolution: Type.Optional(Type.Number({ minimum: 1 })),
   max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
@@ -329,19 +350,19 @@ const MediaVideoSchema = Type.Object({
   cache_target_bytes: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
-const MediaAudioSchema = Type.Object({
+const MediaAudioSchema = StrictObject({
   max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
   max_duration_seconds: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
-const MediaSchema = Type.Object({
+const MediaSchema = StrictObject({
   download_size_limit: Type.Optional(Type.Number({ minimum: 1 })),
   image: Type.Optional(MediaImageSchema),
   video: Type.Optional(MediaVideoSchema),
   audio: Type.Optional(MediaAudioSchema),
 });
 
-const McpServerSchema = Type.Object({
+const McpServerSchema = StrictObject({
   url: Type.String({ minLength: 1 }),
   transport: Type.Optional(Type.Union([
     Type.Literal("streamable-http"),
@@ -350,11 +371,11 @@ const McpServerSchema = Type.Object({
   headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 });
 
-const McpSchema = Type.Object({
+const McpSchema = StrictObject({
   servers: Type.Record(Type.String(), McpServerSchema),
 });
 
-const EnrichmentSchema = Type.Object({
+const EnrichmentSchema = StrictObject({
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   trigger_wait_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
@@ -362,7 +383,7 @@ const EnrichmentSchema = Type.Object({
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
-const CaptioningModelSchema = Type.Object({
+const CaptioningModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
@@ -373,16 +394,18 @@ const CaptioningModelSchema = Type.Object({
   rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
 });
 
-const ModalityConfigSchema = Type.Object({
+// NOTE: the per-modality `concurrency` alias (deprecated transitional knob) was
+// removed (review issue #29): caption-inference concurrency is governed by the
+// captioning rate-limit group's `max_in_flight` ([rate_limits.llm.*], spec §9.4).
+const ModalityConfigSchema = StrictObject({
   prompt: Type.Optional(Type.String()),
   max_chars: Type.Optional(Type.Number({ minimum: 1 })),
   max_tokens: Type.Optional(Type.Number({ minimum: 1 })),
-  concurrency: Type.Optional(Type.Number({ minimum: 1 })),
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
   model: Type.Optional(CaptioningModelSchema),
 });
 
-const CaptioningSchema = Type.Object({
+const CaptioningSchema = StrictObject({
   model: Type.Optional(CaptioningModelSchema),
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
@@ -394,7 +417,7 @@ const CaptioningSchema = Type.Object({
   audio: Type.Optional(ModalityConfigSchema),
 });
 
-const ObservabilityServerSchema = Type.Object({
+const ObservabilityServerSchema = StrictObject({
   // Off by default; the operator opts in via local config (memory:
   // feedback_explicit_deployment_config — ship defaults, set real values
   // explicitly). When false, no server is started.
@@ -415,7 +438,7 @@ const ObservabilityServerSchema = Type.Object({
   auth_token: Type.Optional(Type.String({ minLength: 1 })),
 });
 
-const ObservabilitySchema = Type.Object({
+const ObservabilitySchema = StrictObject({
   server: Type.Optional(ObservabilityServerSchema),
 });
 
@@ -426,7 +449,7 @@ export type ObservabilityServerConfig = Static<typeof ObservabilityServerSchema>
 // over HTTP and degrades gracefully if it is down (it does NOT manage the
 // container). All fields are set explicitly in local config per the
 // explicit-deployment-config convention.
-const BrowserSchema = Type.Object({
+const BrowserSchema = StrictObject({
   enabled: Type.Boolean(),
   // CloakBrowser-Manager base URL (loopback-published REST + CDP-WS proxy).
   manager_url: Type.String({ minLength: 1 }),
@@ -498,10 +521,10 @@ export type BrowserConfig = Static<typeof BrowserSchema>;
 // tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
 // `Authorization: Bearer`. The `api_key` field name matches the secret regex so
 // it auto-registers for log redaction.
-const ImageGenSchema = Type.Object({
+const ImageGenSchema = StrictObject({
   base_url: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
-  models: Type.Object({
+  models: StrictObject({
     pro: Type.String({ minLength: 1 }),
     flash: Type.String({ minLength: 1 }),
   }),
@@ -519,38 +542,42 @@ const ImageGenSchema = Type.Object({
 // there is deliberately NO `max_rpm` (§5.1) — the upstream-hard-limit case is
 // handled reactively by the unconditional 429/503 backoff (§5.3), which these
 // backoff knobs only tune, never enable/disable.
-const LlmRateLimitGroupSchema = Type.Object({
+const LlmRateLimitGroupSchema = StrictObject({
   max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
-  backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
-  backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // minimum:1 (not 0): backoff is the unconditional §5.3 invariant — a 0 base/max
+  // would compute a 0 window for every throttle, disabling it via config.
+  backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
 // Rate limiting (spec CONCURRENCY-AND-RATE-LIMITING §5/§8/§9). Two independent
 // subsystems: the per-host HTTP egress limiter (`[rate_limits.http]`, Design D)
 // and the LLM request scheduler's group declarations (`[rate_limits.llm.*]`,
 // Design A — src/agent/scheduler.ts).
-const RateLimitsSchema = Type.Object({
+const RateLimitsSchema = StrictObject({
   // LLM rate-limit groups, keyed by group name (§9.2). Declaring `default` tunes
   // the built-in group; other names become available to `rate_limit_group`.
   llm: Type.Optional(Type.Record(Type.String(), LlmRateLimitGroupSchema)),
   // Per-host HTTP egress limiting, enforced at the `guardedFetch` chokepoint
   // (src/tools/http-limiter.ts). State is keyed per host and shared across callers.
-  http: Type.Optional(Type.Object({
+  http: Type.Optional(StrictObject({
     // Generous per-host admission cap (NOT a cross-domain cap). The old
     // `enrichment.fetch_concurrency` cross-domain cap of 6 is removed.
     default_max_in_flight_per_host: Type.Optional(Type.Number({ minimum: 1 })),
     // Optional pure degenerate backstop across all hosts; set far above normal load.
     global_ceiling_max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
     // 429/503 + Retry-After backoff is always on (§5.3); these only tune it.
-    backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
-    backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    // minimum:1 (and floored in configureHttpLimiter): a 0 base/max would compute
+    // a 0 window for every throttle, disabling the invariant via config.
+    backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+    backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
     // Optional per-host concurrency overrides, keyed by lowercase hostname.
     per_host_max_in_flight: Type.Optional(Type.Record(Type.String(), Type.Number({ minimum: 1 }))),
   })),
 });
 
 // Recovery — request- and session-level resilience (spec CONCURRENCY-AND-RATE-LIMITING §6/§9.6).
-const RecoverySchema = Type.Object({
+const RecoverySchema = StrictObject({
   // Layer 1 — transparent per-request retry for mechanical LLM failures
   // (network/stream reset, timeout, 5xx, 429). Re-issues the exact same request
   // before the run is allowed to fail. See src/agent/request-retry.ts.
@@ -567,8 +594,8 @@ const RecoverySchema = Type.Object({
   session_auto_resume_backoff_ms: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
-export const AppConfigSchema = Type.Object({
-  app: Type.Object({
+export const AppConfigSchema = StrictObject({
+  app: StrictObject({
     name: Type.String(),
     data_dir: Type.String(),
     log_level: Type.Union([
@@ -579,8 +606,8 @@ export const AppConfigSchema = Type.Object({
     ]),
     context_dump_dir: Type.String(),
   }),
-  agent: Type.Object({
-    sessions: Type.Object({
+  agent: StrictObject({
+    sessions: StrictObject({
       max_concurrent: Type.Number({ minimum: 1 }),
       max_concurrent_dm: Type.Number({ minimum: 1 }),
       max_queued_per_timeline: Type.Optional(Type.Number({ minimum: 1 })),
@@ -590,7 +617,7 @@ export const AppConfigSchema = Type.Object({
       // the model emits tool calls). Set a number only if you want a guardrail.
       max_tool_calls: Type.Optional(Type.Number({ minimum: 1 })),
     }),
-    system: Type.Object({
+    system: StrictObject({
       fallback_prompt: Type.Optional(Type.String()),
     }),
     session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
@@ -602,12 +629,17 @@ export const AppConfigSchema = Type.Object({
     // rejected (see configureAgentTimezone in src/time).
     timezone: Type.Optional(Type.String({ minLength: 1 })),
   }),
+  // NOT StrictObject: `models` is a dictionary (arbitrary model names) with a
+  // required `default` entry. A strict `{ default }` arm would reject every
+  // other model name at the intersect level; the Record arm validates all
+  // values (including `default`) against the strict ModelSchema, so unknown
+  // keys INSIDE a model block still fail.
   models: Type.Intersect([
     Type.Object({ default: ModelSchema }),
     Type.Record(Type.String(), ModelSchema),
   ]),
-  context: Type.Object({
-    tiers: Type.Object({
+  context: StrictObject({
+    tiers: StrictObject({
       rich_target_tokens: Type.Number({ minimum: 1 }),
       rich_max_tokens: Type.Number({ minimum: 1 }),
       compact_target_tokens: Type.Number({ minimum: 1 }),
@@ -615,10 +647,10 @@ export const AppConfigSchema = Type.Object({
     }),
   }),
   media: Type.Optional(MediaSchema),
-  storage: Type.Object({
+  storage: StrictObject({
     database_path: Type.String(),
   }),
-  workspace: Type.Object({
+  workspace: StrictObject({
     root_dir: Type.String(),
   }),
   // Docker sandbox: when enabled, shell-shaped tool calls (the `bash` tool and
@@ -627,7 +659,7 @@ export const AppConfigSchema = Type.Object({
   // tools stay in-process on the same bind-mounted files. See ARCHITECTURE.md §11a.
   // Optional so existing configs stay valid; when enabled, startup fails fast if
   // Docker/the image/the container are unavailable.
-  sandbox: Type.Optional(Type.Object({
+  sandbox: Type.Optional(StrictObject({
     enabled: Type.Boolean(),
     image: Type.String(),
     container_name: Type.String(),
@@ -644,7 +676,7 @@ export const AppConfigSchema = Type.Object({
     env: Type.Optional(Type.Record(Type.String(), Type.String())),
     binds: Type.Optional(Type.Array(Type.String())),
   })),
-  matrix: Type.Object({
+  matrix: StrictObject({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),
     trigger_group_lookback_ms: Type.Optional(Type.Number({ minimum: 0 })),
@@ -660,14 +692,14 @@ export const AppConfigSchema = Type.Object({
   search: Type.Optional(SearchSchema),
   reactions: Type.Optional(ReactionsSchema),
   proactive: Type.Optional(ProactiveSchema),
-  sillytavern: Type.Optional(Type.Object({
+  sillytavern: Type.Optional(StrictObject({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
     default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
     max_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
     max_summary_entries: Type.Optional(Type.Number({ minimum: 1 })),
   })),
-  user_profiles: Type.Optional(Type.Object({
+  user_profiles: Type.Optional(StrictObject({
     root_dir: Type.Optional(Type.String()),
     default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
     max_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),
@@ -677,7 +709,7 @@ export const AppConfigSchema = Type.Object({
     // record notes about other room members on the requester's behalf.
     allow_cross_user_targets: Type.Optional(Type.Boolean()),
   })),
-  danbooru: Type.Optional(Type.Object({
+  danbooru: Type.Optional(StrictObject({
     base_url: Type.Optional(Type.String()),
     login: Type.Optional(Type.String()),
     api_key: Type.Optional(Type.String()),
@@ -690,7 +722,7 @@ export const AppConfigSchema = Type.Object({
     min_request_interval_ms: Type.Optional(Type.Number({ minimum: 0 })),
     max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
   })),
-  network: Type.Optional(Type.Object({
+  network: Type.Optional(StrictObject({
     http_proxy_url: Type.Optional(Type.String()),
     // App-layer SSRF guard (defense-in-depth). When true (default), outbound
     // fetches from caller-supplied URLs resolve DNS and reject private/loopback/

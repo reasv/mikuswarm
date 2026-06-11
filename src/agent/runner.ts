@@ -2,7 +2,7 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
-import { classifyLlmError } from "./request-retry.js";
+import { classifyLlmError, isLlmRequestError, stripLlmRequestTag } from "./request-retry.js";
 
 export interface SessionRunResult {
   sessionId: string;
@@ -178,18 +178,31 @@ async function continueAgent(agent: Agent): Promise<void> {
  * Intentional aborts (operator Stop, tool/turn caps) and fatal errors (auth,
  * malformed request) keep today's settle-in-place behaviour — re-issuing the same
  * request cannot help them.
+ *
+ * Only errors TAGGED at the Layer-1 seam count (Decision C / #14): pi-agent-core's
+ * `handleRunFailure` flattens ANY executor throw — including programming errors in
+ * `transformContext`/tool plumbing — into the same `errorMessage` string, and those
+ * carry no status/keyword, so the lean-retryable default would misclassify them as
+ * mechanical and burn doomed resume attempts. `withRequestRetry` appends
+ * `LLM_REQUEST_FAILURE_MARKER` to every terminal error that genuinely originated in
+ * the LLM request layer (provider/SDK failures and scheduler-admission failures
+ * alike); an untagged error is our own code throwing and settles as a plain
+ * failure (pre-B.2 behaviour). The retryable default is unchanged WITHIN tagged
+ * errors — ambiguous upstream failures remain resumable.
  */
 function throwIfMechanicalFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void {
   const errorMessage = agent.state.errorMessage;
   if (!errorMessage || errorMessage.length === 0) return;
   if (lifecycle?.isInterrupted()) return;
+  if (!isLlmRequestError(errorMessage)) return;
   const last = findLastAssistantMessage(agent.state.messages) as
     | { stopReason?: string }
     | undefined;
   const stopReason = typeof last?.stopReason === "string" ? last.stopReason : undefined;
   if (stopReason === "aborted") return;
-  if (classifyLlmError(errorMessage, stopReason) !== "retryable") return;
-  throw new SessionRunnerError(`agent run failed mechanically: ${errorMessage}`, "mechanical");
+  const message = stripLlmRequestTag(errorMessage);
+  if (classifyLlmError(message, stopReason) !== "retryable") return;
+  throw new SessionRunnerError(`agent run failed mechanically: ${message}`, "mechanical");
 }
 
 async function waitForAgentIdle(agent: Agent): Promise<void> {

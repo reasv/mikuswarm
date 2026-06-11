@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import http from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -6,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { AddressInfo } from "node:net";
 import { Storage } from "../src/storage/index.js";
+import type { LlmScheduler } from "../src/agent/scheduler.js";
 import {
   MemoryIndexer,
   VectorStore,
@@ -161,6 +163,107 @@ test("RemoteEmbeddingProvider throws on an out-of-range / duplicated index", asy
       () => provider.embedDocuments(["alpha", "beta"]),
       /duplicate index 0/,
     );
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP timeout (#10)", async () => {
+  // Admission takes LONGER than timeoutMs. Before the fix the timer was armed
+  // before acquire (and its controller doubled as the acquire signal), so the
+  // queue wait aborted the request before the fetch ever started. Now the
+  // timeout is armed only once admitted, so the request succeeds.
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: [{ embedding: [1, 0, 0, 0], index: 0 }] }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const scheduler = {
+      acquire: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        return () => {};
+      },
+      noteStatus: () => {},
+    } as unknown as LlmScheduler;
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+      timeoutMs: 50,
+      scheduler,
+    });
+    const vec = await provider.embedQuery("x");
+    assert.equal(vec.length, 4);
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("RemoteEmbeddingProvider: a rejected admission leaks no stop-signal listener or timer (#10)", async () => {
+  const scheduler = {
+    acquire: async () => {
+      throw new Error("LLM scheduler stopped");
+    },
+    noteStatus: () => {},
+  } as unknown as LlmScheduler;
+  const provider = new RemoteEmbeddingProvider({
+    id: "test-embed",
+    endpoint: "http://127.0.0.1:9",
+    apiKey: "k",
+    dim: 4,
+    batchSize: 8,
+    scheduler,
+  });
+  const controller = new AbortController();
+  await assert.rejects(() => provider.embedDocuments(["x"], controller.signal), /scheduler stopped/);
+  assert.equal(
+    getEventListeners(controller.signal, "abort").length,
+    0,
+    "the stop-signal abort listener must not leak on admission rejection",
+  );
+  await provider.close();
+});
+
+test("RemoteEmbeddingProvider feeds status + Retry-After to the scheduler backoff (#9)", async () => {
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.statusCode = 429;
+      res.setHeader("retry-after", "7");
+      res.end("slow down");
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const noted: Array<[string, number | undefined, number | undefined]> = [];
+    const scheduler = {
+      acquire: async () => () => {},
+      noteStatus: (group: string, status: number | undefined, retryAfterMs: number | undefined) => {
+        noted.push([group, status, retryAfterMs]);
+      },
+    } as unknown as LlmScheduler;
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+      scheduler,
+    });
+    await assert.rejects(() => provider.embedQuery("x"), /status 429/);
+    assert.deepEqual(noted, [["default", 429, 7000]]);
     await provider.close();
   } finally {
     await new Promise<void>((r) => server.close(() => r()));

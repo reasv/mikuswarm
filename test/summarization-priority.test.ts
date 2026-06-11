@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Storage } from "../src/storage/index.js";
+import { createEscalateSummary } from "../src/summarization/index.js";
+import type { Logger } from "../src/observability/index.js";
 
 // ---------------------------------------------------------------------------
 // Priority inheritance, job-row half (spec CONCURRENCY-AND-RATE-LIMITING §5.5):
@@ -89,6 +91,105 @@ test("escalation is raise-only and skips terminal jobs", async () => {
     const terminal = await storage.escalateSummarizationJob("job-dead", "interactive");
     assert.equal(terminal, false);
     assert.equal(storage.getSummarizationJobById("job-dead")?.priority, "background");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// createEscalateSummary — the app-wiring callback (review issue #5): the
+// escalate-vs-terminal race must not re-insert a sticky scheduler entry after
+// the pool's clearEscalation already ran (job ids are never reused, so a late
+// sticky insert would leak forever).
+// ---------------------------------------------------------------------------
+
+const silentLogger: Logger = {
+  debug() {}, info() {}, warn() {}, error() {},
+  child() { return silentLogger; },
+};
+
+function waitForMicrotasks(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 30));
+}
+
+test("issue #5: escalateSummary escalates the scheduler + wakes the pool for a live job", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.insertSummarizationJob(jobInsert("job-live"));
+    await storage.claimNextSummarizationJob();
+
+    const escalated: Array<{ key: string; priority: string }> = [];
+    let woken = 0;
+    const escalateSummary = createEscalateSummary({
+      storage,
+      escalateScheduled: (key, priority) => escalated.push({ key, priority }),
+      notifyPool: () => { woken += 1; },
+      logger: silentLogger,
+    });
+
+    escalateSummary("job-live", "interactive");
+    await waitForMicrotasks();
+
+    assert.equal(storage.getSummarizationJobById("job-live")?.priority, "interactive");
+    assert.deepEqual(escalated, [{ key: "sumjob:job-live", priority: "interactive" }]);
+    assert.equal(woken, 1);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("issue #5: a job that reaches terminal between the row write and the continuation never re-pins the scheduler", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.insertSummarizationJob(jobInsert("job-race"));
+    await storage.claimNextSummarizationJob();
+
+    const escalated: string[] = [];
+    let woken = 0;
+    const escalateSummary = createEscalateSummary({
+      storage: {
+        // Deterministic race: the job goes terminal (and the pool's onComplete
+        // would run clearEscalation) AFTER the row write resolves but BEFORE
+        // the callback's continuation runs.
+        escalateSummarizationJob: async (jobId, priority) => {
+          const raised = await storage.escalateSummarizationJob(jobId, priority);
+          await storage.failSummarizationJob(jobId, "completed during the race window");
+          return raised;
+        },
+        getSummarizationJobById: (id) => storage.getSummarizationJobById(id),
+      },
+      escalateScheduled: (key) => escalated.push(key),
+      notifyPool: () => { woken += 1; },
+      logger: silentLogger,
+    });
+
+    escalateSummary("job-race", "interactive");
+    await waitForMicrotasks();
+
+    assert.deepEqual(escalated, [], "no late sticky escalation after the job is terminal");
+    assert.equal(woken, 0, "no pool wake for a terminal job");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("issue #5: a vanished job id is skipped without throwing", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const escalated: string[] = [];
+    const escalateSummary = createEscalateSummary({
+      storage,
+      escalateScheduled: (key) => escalated.push(key),
+      notifyPool: () => {},
+      logger: silentLogger,
+    });
+
+    escalateSummary("job-ghost", "interactive");
+    await waitForMicrotasks();
+    assert.deepEqual(escalated, []);
   } finally {
     await storage.waitForIdle();
     storage.close();

@@ -1,4 +1,4 @@
-import { Value } from "@sinclair/typebox/value";
+import { Value, ValueErrorType } from "@sinclair/typebox/value";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { parse } from "smol-toml";
@@ -54,10 +54,30 @@ function registerSecretsByKey(value: unknown, pathParts: string[] = []): void {
   }
 }
 
+/** JSON-pointer path → dotted config path ("/enrichment/fetch_concurrency" → "enrichment.fetch_concurrency"). */
+function dottedPath(pointer: string): string {
+  return pointer
+    .split("/")
+    .filter((part) => part.length > 0)
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .join(".");
+}
+
 function formatValidationErrors(config: unknown): string {
-  return [...Value.Errors(AppConfigSchema, config)]
-    .map((error) => `${error.path || "/"} ${error.message}`)
-    .join("; ");
+  // Validation is strict (schema.ts StrictObject, review issue #29): an unknown
+  // key anywhere in the config tree surfaces as an "unexpected property" error.
+  // Render those as "<path> is not a recognized config key" so a typo or stale
+  // knob names exactly the offending key. Deduped: an intersect (models) can
+  // report the same property from both arms.
+  const messages = new Set<string>();
+  for (const error of Value.Errors(AppConfigSchema, config)) {
+    if (error.type === ValueErrorType.ObjectAdditionalProperties) {
+      messages.add(`${dottedPath(error.path)} is not a recognized config key`);
+    } else {
+      messages.add(`${error.path || "/"} ${error.message}`);
+    }
+  }
+  return [...messages].join("; ");
 }
 
 export interface ConfigLoadOptions {

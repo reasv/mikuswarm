@@ -38,7 +38,7 @@ export interface CapturableAgent {
       signal: AbortSignal,
     ) => void | Promise<void>,
   ): () => void;
-  state: { messages: AgentMessage[] };
+  state: { messages: AgentMessage[]; errorMessage?: string };
 }
 
 /**
@@ -376,7 +376,16 @@ export function attachSessionCapture(
     // payload; prefer it so capture is decoupled from the agent's internal
     // `state.messages` field (which a future loop could trim post-emit). Fall
     // back to `state.messages` when the payload is absent (e.g. `turn_end`).
-    const messages = event.messages ?? agent.state.messages;
+    //
+    // Failure-path guard: pi-agent-core's `handleRunFailure` emits `agent_end`
+    // with `messages: [failureMessage]` ONLY — preferring that payload would
+    // overwrite the persisted transcript with a one-element array, leaving the
+    // resume material's correctness to the error-path `flushNow()` repair that
+    // follows. When the run failed (`state.errorMessage` set), the canonical
+    // source is the live state, which holds the full transcript including the
+    // failed turn.
+    const messages =
+      event.messages && !agent.state.errorMessage ? event.messages : agent.state.messages;
     await flushTranscript(messages, event.type);
   });
 

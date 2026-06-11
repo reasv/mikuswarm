@@ -9,7 +9,14 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
-import { classifyLlmError, withRequestRetry } from "../src/agent/request-retry.js";
+import {
+  classifyLlmError,
+  isLlmRequestError,
+  stripLlmRequestTag,
+  tagLlmRequestError,
+  withRequestRetry,
+  LLM_REQUEST_FAILURE_MARKER,
+} from "../src/agent/request-retry.js";
 
 // ---------------------------------------------------------------------------
 // Layer-1 transparent request retry (spec CONCURRENCY-AND-RATE-LIMITING §6.1).
@@ -115,6 +122,10 @@ test("classifyLlmError: auth keywords without a status are fatal", () => {
   assert.equal(classifyLlmError("authentication failed", "error"), "fatal");
 });
 
+test("classifyLlmError: the scheduler-stopped marker is fatal (#11)", () => {
+  assert.equal(classifyLlmError("LLM scheduler stopped", "error"), "fatal");
+});
+
 test("classifyLlmError: a 3-digit token inside a body is not mistaken for a status", () => {
   // No leading/labelled status → falls through to keyword/default. "tokens: 500"
   // must NOT be read as HTTP 500 (it would be retryable anyway, but the point is
@@ -169,16 +180,135 @@ test("withRequestRetry: a mid-stream failure after commit is NOT retried", async
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "error"]);
 });
 
-test("withRequestRetry: retries=0 returns the base fn unwrapped", () => {
-  const { fn } = scriptedBase([{ events: [doneEvent()] }]);
+test("withRequestRetry: retries=0 still wraps — single attempt, error tagged (#14)", async () => {
+  // Pre-#14 this returned the base fn unwrapped; now the wrapper must ALWAYS
+  // apply because it owns the Layer-1 origin tag the runner's mechanical
+  // classification (Layer-2 resume) depends on. Behaviour: exactly one attempt.
+  const { fn, calls } = scriptedBase([{ events: [errorEvent("503 unavailable")] }]);
   const wrapped = withRequestRetry(fn, { retries: 0, ...FAST });
-  assert.equal(wrapped, fn);
+  assert.notEqual(wrapped, fn, "wrapper applies even at retries=0");
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1, "retries=0 → single attempt");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(err.errorMessage), "terminal error carries the Layer-1 tag");
+});
+
+// ---------------------------------------------------------------------------
+// Layer-1 origin tagging (Decision C / #14): every terminal error surfaced by
+// the wrapper marks "originated in the LLM request layer"; the runner treats
+// only tagged errors as mechanical (resume candidates).
+// ---------------------------------------------------------------------------
+
+test("tagLlmRequestError/isLlmRequestError/stripLlmRequestTag round-trip (#14)", () => {
+  const tagged = tagLlmRequestError("529 overloaded");
+  assert.ok(tagged.includes(LLM_REQUEST_FAILURE_MARKER));
+  assert.ok(isLlmRequestError(tagged));
+  assert.equal(isLlmRequestError("529 overloaded"), false);
+  assert.equal(isLlmRequestError(undefined), false);
+  assert.equal(stripLlmRequestTag(tagged), "529 overloaded");
+  // Idempotent: re-tagging (e.g. an admission error flowing through the retry
+  // wrapper after being synthesized below it) does not stack markers.
+  assert.equal(tagLlmRequestError(tagged), tagged);
+  // An empty/undefined message still gains the marker (the tag IS the signal).
+  assert.equal(tagLlmRequestError(undefined), LLM_REQUEST_FAILURE_MARKER);
+});
+
+test("tag does not change classification: status prefix and keywords still parse (#14)", () => {
+  // Marker is a suffix, so extractStatus's leading-status parse is unaffected,
+  // and its text matches no fatal keyword.
+  assert.equal(classifyLlmError(tagLlmRequestError("429 rate limited"), "error"), "retryable");
+  assert.equal(classifyLlmError(tagLlmRequestError("401 unauthorized"), "error"), "fatal");
+  assert.equal(classifyLlmError(tagLlmRequestError("LLM scheduler stopped"), "error"), "fatal");
+  assert.equal(classifyLlmError(LLM_REQUEST_FAILURE_MARKER, "error"), "retryable");
+});
+
+test("withRequestRetry: exhausted retries surface a TAGGED terminal error (#14)", async () => {
+  const { fn } = scriptedBase([{ events: [errorEvent("500 internal")] }]);
+  const wrapped = withRequestRetry(fn, { retries: 1, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  const err = (events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(err.errorMessage), "exhaust path tags");
+  assert.equal(stripLlmRequestTag(err.errorMessage ?? ""), "500 internal");
+});
+
+test("withRequestRetry: fatal and mid-stream (committed) errors are also tagged (#14)", async () => {
+  // Fatal pre-commit.
+  const fatal = scriptedBase([{ events: [errorEvent("401 unauthorized")] }]);
+  const fatalEvents = await drain(withRequestRetry(fatal.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
+  const fatalErr = (fatalEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(fatalErr.errorMessage), "fatal path tags");
+
+  // Mid-stream after commit (Layer-2 territory — exactly the error the runner
+  // must recognize as LLM-layer-originated).
+  const mid = scriptedBase([
+    { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
+  ]);
+  const midEvents = await drain(withRequestRetry(mid.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
+  const midErr = (midEvents.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(midErr.errorMessage), "committed pass-through tags");
+});
+
+test("withRequestRetry: a throwing base is surfaced as a terminal error and classified, not an unhandled rejection (#12)", async () => {
+  // A scheduler-less composition (the documented test path) passes the raw base
+  // fn straight to the retry wrapper; a synchronous throw used to escape the
+  // void-IIFE as a process-fatal unhandled rejection AND leave `outer` without a
+  // terminal event (hung consumer). It must instead synthesize the terminal
+  // error and feed the normal classify/retry logic (retryable → bounded retries).
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    throw new Error("ECONNRESET socket hang up");
+  };
+  const wrapped = withRequestRetry(fn, { retries: 2, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 3, "retryable throw consumes the bounded attempts");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "error");
+  assert.match(err.errorMessage ?? "", /ECONNRESET/);
+});
+
+test("withRequestRetry: a thrown AbortError is fatal — single attempt, stopReason aborted (#12)", async () => {
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    const err = new Error("operation aborted");
+    err.name = "AbortError";
+    throw err;
+  };
+  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 1, "aborted is never retried");
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "aborted");
+});
+
+test("withRequestRetry: a mid-iteration throw after commit terminates the stream without retrying (#12)", async () => {
+  // Content forwarded, then the inner stream THROWS (rather than emitting an
+  // error event). Cannot replay (committed); the consumer must still receive a
+  // terminal error event instead of hanging.
+  let calls = 0;
+  const fn: StreamFn = () => {
+    calls += 1;
+    return (async function* () {
+      yield startEvent();
+      yield textDeltaEvent("partial");
+      throw new Error("socket reset mid-stream");
+    })() as unknown as AssistantMessageEventStream;
+  };
+  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 1, "committed → no retry");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "error"]);
+  const err = (events[2] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.match(err.errorMessage ?? "", /mid-stream/);
 });
 
 test("withRequestRetry: an empty inner stream yields a synthesized terminal error", async () => {
   const { fn, calls } = scriptedBase([{ events: [], endWithoutTerminal: true }]);
-  // retries=0 would just return base; use 1 so the wrapper is active. The empty
-  // stream is not an `error` event, so it is not retried — it is surfaced once.
+  // The empty stream is not an `error` event, so it is not retried — it is
+  // surfaced once (as a synthesized, tagged terminal error).
   const wrapped = withRequestRetry(fn, { retries: 1, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls(), 1);

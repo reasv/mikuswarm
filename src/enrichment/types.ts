@@ -51,7 +51,6 @@ export interface EnrichmentCapabilities {
 
 export interface EnrichmentConfig {
   worker_count?: number;
-  fetch_concurrency?: number;
   fetch_timeout_ms?: number;
   trigger_wait_timeout_ms?: number;
   max_previews_per_message?: number;

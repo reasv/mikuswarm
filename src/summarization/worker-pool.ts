@@ -154,7 +154,67 @@ export class SummarizationWorkerPool {
     if (this.running) this.schedulePoll(100);
   }
 
+  /**
+   * Post-claim terminality guard (spec §6.3 / §7.2): the wait-or-omit builder
+   * polls a claimed job until it reaches a terminal state with no wall clock,
+   * so a job stranded at 'processing' would stall every build on its timeline
+   * for the process lifetime (only startup healing resets stale claims).
+   * `runJob` terminalizes its own agent-run failures, but its storage awaits
+   * (insertAgentSession, updateAgentSessionStatus, insertSummaryWithLineage, …)
+   * can reject outside that guarded path — route ANY escaped rejection to the
+   * same retry/fail terminalization instead of letting poll()'s log-only catch
+   * swallow it.
+   */
   private async processJob(job: SummarizationJob): Promise<void> {
+    try {
+      await this.runJob(job);
+    } catch (err) {
+      await this.terminalizeEscapedRejection(job, err);
+    }
+  }
+
+  private async terminalizeEscapedRejection(job: SummarizationJob, err: unknown): Promise<void> {
+    const { storage, logger } = this.options;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("summarization_unexpected_rejection", {
+      jobId: job.id,
+      attempt: job.attempts,
+      error: errMsg,
+    });
+    try {
+      // The rejection may have escaped AFTER the row left 'processing' (e.g. an
+      // onComplete callback threw once the job was already complete, or the
+      // retry write landed before a later await rejected). Only a row still
+      // claimed is stranded — never overwrite a terminal or re-pending row.
+      const current = storage.getSummarizationJobById(job.id);
+      if (!current || current.status !== "processing") return;
+      if (job.attempts <= job.maxRetries) {
+        await storage.retrySummarizationJob(job.id, errMsg);
+        this.emit(job, "retried", "pending");
+      } else {
+        await storage.failSummarizationJob(job.id, errMsg);
+        this.options.onError(job.id, new Error(errMsg));
+        this.emit(job, "failed", "failed");
+      }
+    } catch (writeErr) {
+      logger.error("summarization_terminalize_write_failed", {
+        jobId: job.id,
+        originalError: errMsg,
+        writeError: writeErr instanceof Error ? writeErr.message : String(writeErr),
+      });
+      // Last resort: best-effort fail so the job cannot stay 'processing'.
+      try {
+        await storage.failSummarizationJob(job.id, errMsg);
+      } catch (failErr) {
+        logger.error("summarization_fail_fallback_failed", {
+          jobId: job.id,
+          error: failErr instanceof Error ? failErr.message : String(failErr),
+        });
+      }
+    }
+  }
+
+  private async runJob(job: SummarizationJob): Promise<void> {
     const { storage, factory, config, logger } = this.options;
     const started = Date.now();
     logger.debug("summarization_job_claimed", {

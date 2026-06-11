@@ -12,6 +12,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
   LlmScheduler,
   defaultPriorityForSessionType,
+  parseRetryAfterMs,
   withSchedulerAdmission,
 } from "../src/agent/scheduler.js";
 import { withRequestRetry } from "../src/agent/request-retry.js";
@@ -197,6 +198,49 @@ test("non-throttle errors do not back off the group", async () => {
   release();
 });
 
+test("Retry-After drives the group backoff window (#9)", async () => {
+  const scheduler = new LlmScheduler({
+    // Tiny exponential tuning so any wait observed must come from Retry-After.
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 1, backoff_max_ms: 5000 } },
+  });
+  scheduler.noteStatus("default", 429, 80);
+  const start = Date.now();
+  const release = await scheduler.acquire({ priority: "interactive" });
+  const waited = Date.now() - start;
+  assert.ok(waited >= 50, `server-specified wait must govern (waited ${waited}ms)`);
+  release();
+});
+
+test("Retry-After is clamped to the group's backoff_max_ms (#9)", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 1, backoff_max_ms: 50 } },
+  });
+  // A hostile/absurd Retry-After must not black-hole the group beyond config.
+  scheduler.noteStatus("default", 429, 3_600_000);
+  const start = Date.now();
+  const release = await scheduler.acquire({});
+  assert.ok(Date.now() - start < 1000, "wait must be clamped to backoff_max_ms");
+  release();
+});
+
+test("parseRetryAfterMs handles ms header, delta-seconds, HTTP-date, and garbage", () => {
+  assert.equal(parseRetryAfterMs({ "retry-after-ms": "1500" }), 1500);
+  // retry-after-ms wins over retry-after.
+  assert.equal(parseRetryAfterMs({ "retry-after-ms": "100", "retry-after": "9" }), 100);
+  assert.equal(parseRetryAfterMs({ "retry-after": "7" }), 7000);
+  const date = new Date(Date.now() + 30_000).toUTCString();
+  const fromDate = parseRetryAfterMs({ "retry-after": date });
+  assert.ok(fromDate !== undefined && fromDate > 25_000 && fromDate <= 31_000);
+  // A past HTTP-date floors at 0 (retry immediately), not a negative wait.
+  assert.equal(parseRetryAfterMs({ "retry-after": new Date(Date.now() - 60_000).toUTCString() }), 0);
+  assert.equal(parseRetryAfterMs({ "retry-after": "soon" }), undefined);
+  assert.equal(parseRetryAfterMs({}), undefined);
+  assert.equal(parseRetryAfterMs(undefined), undefined);
+  // Headers-like objects (`.get`) are accepted too (the remote-embedding caller).
+  const headers = new Headers({ "retry-after": "2" });
+  assert.equal(parseRetryAfterMs(headers), 2000);
+});
+
 test("abort signal rejects a queued acquire and removes it from the queue", async () => {
   const scheduler = new LlmScheduler({ groups: { default: { max_in_flight: 1 } } });
   const releaseHeld = await scheduler.acquire({});
@@ -313,6 +357,100 @@ test("admission wrapper releases on error and feeds the group backoff", async ()
   const release = await scheduler.acquire({ priority: "interactive" });
   assert.ok(Date.now() - start >= 10, "acquire should have waited out the 429 backoff");
   release();
+});
+
+test("injected onResponse feeds precise status + Retry-After once (no double count with the error event) (#9)", async () => {
+  const scheduler = new LlmScheduler({
+    // Exponential window would be [200,400]ms; the hook's Retry-After is 40ms.
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 400, backoff_max_ms: 400 } },
+  });
+  const callerOnResponse: number[] = [];
+  const base: StreamFn = (model, _context, streamOptions) => {
+    const onResponse = (streamOptions as { onResponse?: (r: unknown, m: unknown) => unknown })?.onResponse;
+    // Simulate a fetch-based provider surfacing the throttle response to the hook
+    // before emitting the terminal error event.
+    void onResponse?.({ status: 429, headers: { "retry-after-ms": "40" } }, model);
+    return errorStream("429 too many requests");
+  };
+  const wrapped = withSchedulerAdmission(base, scheduler, { group: "default", priority: "background" });
+  const events = await drain(
+    wrapped(MODEL, [], {
+      // A caller-provided hook must still be chained through.
+      onResponse: (response: { status: number }) => {
+        callerOnResponse.push(response.status);
+      },
+    } as never),
+  );
+  assert.equal(events[events.length - 1]?.type, "error");
+  assert.deepEqual(callerOnResponse, [429], "caller onResponse chained");
+
+  // The server-specified 40ms governs. If the terminal error event were ALSO
+  // string-sniffed into the backoff, the second count's exponential window
+  // ([200,400]ms) would extend the wait well past this bound.
+  const start = Date.now();
+  const release = await scheduler.acquire({ priority: "interactive" });
+  const waited = Date.now() - start;
+  assert.ok(waited >= 20, `Retry-After honoured (waited ${waited}ms)`);
+  assert.ok(waited < 150, `no double count: waited ${waited}ms, expected ~40ms`);
+  release();
+});
+
+test("aborted admission wait synthesizes stopReason 'aborted' — no retry spin (#11)", async () => {
+  const scheduler = new LlmScheduler({ groups: { default: { max_in_flight: 1 } } });
+  const hold = await scheduler.acquire({ priority: "interactive" });
+  let baseCalls = 0;
+  const base: StreamFn = () => {
+    baseCalls += 1;
+    return doneStream();
+  };
+  let admissionAttempts = 0;
+  const admitted = withSchedulerAdmission(base, scheduler, { group: "default", priority: "interactive" });
+  const counted: StreamFn = (model, context, streamOptions) => {
+    admissionAttempts += 1;
+    return admitted(model, context, streamOptions);
+  };
+  const wrapped = withRequestRetry(counted, { retries: 4, backoffBaseMs: 1000, backoffMaxMs: 1000 });
+
+  const controller = new AbortController();
+  const out = wrapped(MODEL, [], { signal: controller.signal } as never);
+  setTimeout(() => controller.abort(), 5);
+  const events = await drain(out);
+  const last = events[events.length - 1];
+  assert.equal(last?.type, "error");
+  assert.equal(
+    (last as Extract<AssistantMessageEvent, { type: "error" }>).error.stopReason,
+    "aborted",
+    "an aborted admission wait must carry stopReason 'aborted' (fatal to Layer-1)",
+  );
+  assert.equal(admissionAttempts, 1, "fatal → no backed-off re-acquire cycle");
+  assert.equal(baseCalls, 0, "the base fn never ran");
+  hold();
+});
+
+test("scheduler-stopped admission failure is fatal — no retry spin at shutdown (#11)", async () => {
+  const scheduler = new LlmScheduler({ groups: { default: { max_in_flight: 1 } } });
+  scheduler.stop();
+  let admissionAttempts = 0;
+  const admitted = withSchedulerAdmission(() => doneStream(), scheduler, {
+    group: "default",
+    priority: "background",
+  });
+  const counted: StreamFn = (model, context, streamOptions) => {
+    admissionAttempts += 1;
+    return admitted(model, context, streamOptions);
+  };
+  const wrapped = withRequestRetry(counted, { retries: 4, backoffBaseMs: 1000, backoffMaxMs: 1000 });
+
+  const start = Date.now();
+  const events = await drain(wrapped(MODEL, [], undefined as never));
+  const last = events[events.length - 1];
+  assert.equal(last?.type, "error");
+  assert.match(
+    (last as Extract<AssistantMessageEvent, { type: "error" }>).error.errorMessage ?? "",
+    /scheduler stopped/i,
+  );
+  assert.equal(admissionAttempts, 1, "stopped gate must be classified fatal, not retried");
+  assert.ok(Date.now() - start < 500, "no backoff sleeps at shutdown");
 });
 
 test("composed with withRequestRetry, each attempt re-acquires (no slot held across backoff)", async () => {

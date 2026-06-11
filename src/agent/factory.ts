@@ -48,6 +48,20 @@ const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   return stream;
 };
 
+/**
+ * Pin `maxRetries: 0` onto every stream call so Layer-1 (`withRequestRetry`) is
+ * the SOLE retry authority (spec §5.4/§6.1). The provider SDKs pi-ai delegates
+ * to (Anthropic, OpenAI) silently default to 2 internal HTTP retries — pi-ai
+ * forwards `maxRetries` to them only when defined — whose backoff sleeps would
+ * run INSIDE the held scheduler slot and whose absorbed 429s would never reach
+ * the group backoff (`noteResult`/`onResponse`), while their attempt count
+ * multiplies with Layer-1's. Providers without client-side retries ignore the
+ * option, so this is safe for non-SDK providers too.
+ */
+export function withSdkRetriesDisabled(base: StreamFn): StreamFn {
+  return (model, context, options) => base(model, context, { ...options, maxRetries: 0 });
+}
+
 export interface AgentFactoryOptions {
   config: AppConfig;
   contextBuilder: ContextBuilder;
@@ -143,6 +157,18 @@ export interface CreateAgentOptions {
    * attempt; the job id is stable).
    */
   escalationKey?: string;
+  /**
+   * Drain/cancel signal threaded into the context build (spec §7.2 wait-or-omit).
+   * When it fires while the build is waiting on a summarization job, the build —
+   * and therefore `create()` — rejects with an `AbortError` instead of polling a
+   * job that no worker will drive to terminal once the pool stops. `app.ts`
+   * passes its drain controller's signal for every `launchSession` create (live,
+   * queued, and proactive — the only builds that can enter the wait loop).
+   * Synthetic creates need no signal: summarize/condense builds use
+   * `summarizationCutoff` (which skips wait-or-omit entirely) and diary/resume
+   * creates skip the build altogether (`resume` mode).
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface CreatedAgent {
@@ -214,10 +240,14 @@ export class AgentSessionFactory {
     const model = createModelFromConfig(modelConfig);
     // Layer-1 transparent request retry (spec §6.1) wraps the chosen stream fn so a
     // mechanical blip re-issues the exact same request before it can discard a live
-    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` returns
-    // the base fn unwrapped, so this is a no-op when recovery is unconfigured-to-zero.
+    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` means a
+    // single attempt but the wrapper STILL applies — it owns the Layer-1 origin tag
+    // (`LLM_REQUEST_FAILURE_MARKER`) that the runner's mechanical classification and
+    // Layer-2 resume-in-place depend on (Decision C / #14).
     const recovery = this.options.config.recovery;
-    const baseStreamFn = (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream;
+    const baseStreamFn = withSdkRetriesDisabled(
+      (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
+    );
     // Scheduler admission (spec §5.4): group from the model
     // (`rate_limit_group`, unset = `default`), priority from the session type
     // (override > configured > built-in default). Admission wraps the BASE fn,
@@ -291,6 +321,11 @@ export class AgentSessionFactory {
         fallbackPrompt,
         summarizationCutoff: opts?.summarizationCutoff,
         proactive: opts?.proactive,
+        // The session's resolved class doubles as the wait-or-omit escalation
+        // class (spec §5.5: the waiting class is the building session's own
+        // class), and the drain signal cancels a waiting build cleanly (§7.2).
+        priority,
+        abortSignal: opts?.abortSignal,
       });
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
@@ -426,6 +461,8 @@ export class AgentSessionFactory {
     fallbackPrompt: string | undefined;
     summarizationCutoff?: { endTimestamp: number };
     proactive?: boolean;
+    priority?: PriorityClass;
+    abortSignal?: AbortSignal;
   }): Promise<BuiltContext> {
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
@@ -438,6 +475,8 @@ export class AgentSessionFactory {
       fallbackPrompt: args.fallbackPrompt,
       summarizationCutoff: args.summarizationCutoff,
       proactive: args.proactive,
+      priority: args.priority,
+      abortSignal: args.abortSignal,
     });
   }
 

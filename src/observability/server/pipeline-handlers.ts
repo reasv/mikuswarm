@@ -29,7 +29,7 @@ function parseLimit(raw: string | null): number | undefined {
 
 /**
  * GET /api/pipelines — one row per pool for the dashboard (ARCHITECTURE.md §11):
- * `{ pool, enabled, workerCount, maxRetries, concurrency, inFlight, counts }`.
+ * `{ pool, enabled, workerCount, maxRetries, inFlight, counts }`.
  * `counts` are DB aggregates (survive restart); `inFlight` is the one live number
  * (the pool's `activeWorkers.size`). A pool disabled by config reports
  * `enabled: false`, `inFlight: 0`, and zero worker count, but still surfaces its
@@ -48,7 +48,6 @@ export function listPipelines(
       enabled: stats != null,
       workerCount: stats?.workerCount ?? 0,
       maxRetries: stats?.maxRetries ?? FALLBACK_MAX_RETRIES[pool],
-      concurrency: stats?.concurrency ?? null,
       inFlight: stats ? stats.inFlight() : 0,
       counts: ctx.deps.storage.getPipelineCounts(pool),
     };

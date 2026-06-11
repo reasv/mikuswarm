@@ -2,6 +2,7 @@ import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type AssistantMessageEvent,
+  type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
@@ -278,29 +279,47 @@ export class LlmScheduler {
    * flattened error message — pi-ai surfaces SDK errors status-prefixed) pauses
    * the group's admissions with exponential backoff + jitter; any other outcome
    * resets the group's throttle streak. Unconditional (§5.3): always applied,
-   * independent of config.
+   * independent of config. This is the string-sniffing FALLBACK seam — the
+   * Anthropic provider is SDK-based and throws on non-2xx before pi-ai's
+   * `onResponse` hook fires, so its 429s only ever arrive here as flattened
+   * messages (no headers, so no `Retry-After`). Callers that hold the actual
+   * response use {@link noteStatus} with the parsed `Retry-After` instead.
    */
   noteResult(groupName: string, errorMessage?: string): void {
     const status = errorMessage ? extractStatus(errorMessage.toLowerCase()) : undefined;
     this.noteStatus(groupName, status);
   }
 
-  /** Like {@link noteResult}, for callers that hold the HTTP status directly. */
-  noteStatus(groupName: string, status: number | undefined): void {
+  /**
+   * Like {@link noteResult}, for callers that hold the HTTP status directly.
+   * When the response carried a `Retry-After`/`retry-after-ms` (parsed via
+   * {@link parseRetryAfterMs}), the server-specified wait replaces the
+   * exponential window — clamped to the group's `backoff_max_ms` so a hostile
+   * or absurd header can never black-hole the group beyond what config allows
+   * the exponential path itself (§5.3).
+   */
+  noteStatus(groupName: string, status: number | undefined, retryAfterMs?: number): void {
     const group = this.getGroup(groupName);
     if (status === 429 || status === 503) {
       group.consecutiveThrottles += 1;
-      const ceiling = Math.min(
-        group.backoffMaxMs,
-        group.backoffBaseMs * 2 ** (group.consecutiveThrottles - 1),
-      );
-      // Partial jitter with a floor of half the ceiling, mirroring the HTTP
-      // limiter, so backoff never collapses to ~0.
-      const backoffMs = ceiling / 2 + Math.random() * (ceiling / 2);
+      let backoffMs: number;
+      if (retryAfterMs !== undefined) {
+        // Honour the server's requested wait (spec §5.3), clamped (see docstring).
+        backoffMs = Math.min(retryAfterMs, group.backoffMaxMs);
+      } else {
+        const ceiling = Math.min(
+          group.backoffMaxMs,
+          group.backoffBaseMs * 2 ** (group.consecutiveThrottles - 1),
+        );
+        // Partial jitter with a floor of half the ceiling, mirroring the HTTP
+        // limiter, so backoff never collapses to ~0.
+        backoffMs = ceiling / 2 + Math.random() * (ceiling / 2);
+      }
       group.backoffUntil = Math.max(group.backoffUntil, Date.now() + backoffMs);
       this.logger?.warn("llm_scheduler_backoff", {
         group: group.name,
         status,
+        retryAfterMs,
         backoffMs: Math.round(backoffMs),
         consecutiveThrottles: group.consecutiveThrottles,
       });
@@ -379,6 +398,38 @@ export interface AdmissionOptions {
 }
 
 /**
+ * Parse a `Retry-After`/`retry-after-ms` header pair into milliseconds.
+ * Accepts either a `Headers`-like object (`.get(name)`) or a plain lowercased
+ * record (the shape pi-ai's `onResponse` hook delivers). `retry-after-ms`
+ * (non-standard, milliseconds) wins over `retry-after` (delta-seconds or an
+ * HTTP-date). Returns `undefined` when neither header parses.
+ */
+export function parseRetryAfterMs(
+  headers: Record<string, string> | { get(name: string): string | null } | undefined,
+): number | undefined {
+  if (!headers) return undefined;
+  const get = (name: string): string | undefined => {
+    if (typeof (headers as { get?: unknown }).get === "function") {
+      return (headers as { get(name: string): string | null }).get(name) ?? undefined;
+    }
+    return (headers as Record<string, string>)[name];
+  };
+  const ms = get("retry-after-ms");
+  if (ms !== undefined) {
+    const n = Number(ms);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  const ra = get("retry-after");
+  if (ra !== undefined) {
+    const seconds = Number(ra);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const date = Date.parse(ra);
+    if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  }
+  return undefined;
+}
+
+/**
  * Wrap a {@link StreamFn} with scheduler admission: acquire a slot in the
  * request's group before invoking the base fn, release when the stream settles,
  * and report the outcome for the group's unconditional 429/503 backoff (§5.3).
@@ -388,6 +439,15 @@ export interface AdmissionOptions {
  * — so each Layer-1 retry attempt re-acquires a fresh slot at the same
  * `(group, priority)` and no slot is held across backoff sleeps (which would
  * defeat the shallow-queue invariant of §2).
+ *
+ * Backoff feeding is two-tier. The wrapper injects a pi-ai `onResponse` hook so
+ * a throttle response observed at the HTTP layer reports its PRECISE status and
+ * `Retry-After` to the group (fetch-based providers surface error statuses
+ * there). The terminal-`error`-event path stays as the fallback for providers
+ * whose SDK throws before the hook fires (Anthropic), where only the flattened,
+ * status-prefixed message survives — string-sniffed by `noteResult`, with no
+ * `Retry-After` available. A throttle already counted via the hook is NOT
+ * counted again when its terminal error event arrives.
  */
 export function withSchedulerAdmission(
   base: StreamFn,
@@ -396,7 +456,8 @@ export function withSchedulerAdmission(
 ): StreamFn {
   return (model, context, streamOptions) => {
     const outer = createAssistantMessageEventStream();
-    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    const opts = streamOptions as SimpleStreamOptions | undefined;
+    const signal = opts?.signal;
 
     void (async () => {
       let release: ReleaseFn;
@@ -408,16 +469,49 @@ export function withSchedulerAdmission(
           signal,
         });
       } catch (err) {
+        // Admission failed without any request being issued. An aborted wait
+        // (run abort / drain) synthesizes `stopReason:"aborted"` and a scheduler
+        // stop a "scheduler stopped" message — both classified FATAL by Layer-1
+        // (`classifyLlmError`), so shutdown never burns futile backed-off
+        // re-acquire cycles on a gate that can only reject (#11). These
+        // synthesized errors COUNT as LLM-request-layer errors for Layer-2
+        // classification (Decision C / #14): admission composes INSIDE
+        // `withRequestRetry`, so they flow through it and receive the
+        // `LLM_REQUEST_FAILURE_MARKER` tag there — no tagging needed here.
+        const aborted = err instanceof Error && err.name === "AbortError";
         outer.push(
-          synthesizeErrorEvent(model, err instanceof Error ? err.message : String(err)),
+          synthesizeErrorEvent(
+            model,
+            err instanceof Error ? err.message : String(err),
+            aborted ? "aborted" : "error",
+          ),
         );
         return;
       }
+      // Precise throttle observation (§5.3): pi-ai invokes `onResponse` with the
+      // HTTP status + lowercased headers before consuming the body, so a 429/503
+      // reaching it feeds the group backoff with the real status AND the
+      // server's `Retry-After` — no string sniffing. Chained in front of any
+      // caller-provided hook.
+      let throttleNoted = false;
+      const prevOnResponse = opts?.onResponse;
+      const innerOptions: SimpleStreamOptions = {
+        ...opts,
+        onResponse: (response, responseModel) => {
+          if (response.status === 429 || response.status === 503) {
+            throttleNoted = true;
+            scheduler.noteStatus(options.group, response.status, parseRetryAfterMs(response.headers));
+          }
+          return prevOnResponse?.(response, responseModel);
+        },
+      };
       try {
-        const inner = await base(model, context, streamOptions);
+        const inner = await base(model, context, innerOptions);
         for await (const event of inner) {
           if (event.type === "error") {
-            scheduler.noteResult(options.group, event.error?.errorMessage);
+            // Skip the fallback when the hook already counted this request's
+            // throttle — double-counting would inflate the exponential streak.
+            if (!throttleNoted) scheduler.noteResult(options.group, event.error?.errorMessage);
           } else if (event.type === "done") {
             scheduler.noteResult(options.group);
           }
@@ -427,7 +521,7 @@ export function withSchedulerAdmission(
         // The base fn itself threw (not via a terminal `error` event). Surface a
         // terminal error so the consumer always sees one, and count it for backoff.
         const message = err instanceof Error ? err.message : String(err);
-        scheduler.noteResult(options.group, message);
+        if (!throttleNoted) scheduler.noteResult(options.group, message);
         outer.push(synthesizeErrorEvent(model, message));
       } finally {
         release();
@@ -442,6 +536,7 @@ export function withSchedulerAdmission(
 function synthesizeErrorEvent(
   model: Parameters<StreamFn>[0],
   message: string,
+  stopReason: "error" | "aborted" = "error",
 ): Extract<AssistantMessageEvent, { type: "error" }> {
   const error: AssistantMessage = {
     role: "assistant",
@@ -450,9 +545,9 @@ function synthesizeErrorEvent(
     provider: model.provider ?? "unknown",
     model: model.id,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    stopReason: "error",
+    stopReason,
     errorMessage: message,
     timestamp: Date.now(),
   };
-  return { type: "error", reason: "error", error };
+  return { type: "error", reason: stopReason, error };
 }

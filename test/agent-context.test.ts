@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "../src/agent/convert.js";
-import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext } from "../src/agent/factory.js";
+import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext, withSdkRetriesDisabled } from "../src/agent/factory.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import type { BuiltContext } from "../src/context/index.js";
 import { ContextBuilder, type BuildContextOptions } from "../src/context/builder.js";
@@ -723,3 +723,28 @@ test("summarizationCutoff: final message type is 'satellite' not 'triggerGroup'"
 
 // The generation-threshold enqueue tests moved to test/summarization-indexer.test.ts
 // (spec C: job creation now lives in SummarizationIndexer, off the build path).
+
+// #8 (concurrency review): Layer-1 is the sole retry authority — the factory pins
+// `maxRetries: 0` onto every base stream call so the provider SDK's silent default
+// of 2 internal retries (backoff inside the held scheduler slot, 429s invisible to
+// the group backoff) is disabled.
+test("withSdkRetriesDisabled pins maxRetries: 0 while preserving other stream options (#8)", () => {
+  const seen: Array<Record<string, unknown> | undefined> = [];
+  const base = ((_model: unknown, _context: unknown, options?: Record<string, unknown>) => {
+    seen.push(options);
+    return undefined as never;
+  }) as unknown as Parameters<typeof withSdkRetriesDisabled>[0];
+
+  const wrapped = withSdkRetriesDisabled(base);
+  const signal = new AbortController().signal;
+  wrapped({} as never, {} as never, { signal, temperature: 0.5, maxRetries: 7 } as never);
+  // Caller options survive; maxRetries is force-overridden (the SDK default of 2
+  // applies whenever the option is left undefined, so it must be pinned, not merged).
+  assert.equal(seen[0]?.maxRetries, 0);
+  assert.equal(seen[0]?.temperature, 0.5);
+  assert.equal(seen[0]?.signal, signal);
+
+  // No options at all still yields the pin.
+  wrapped({} as never, {} as never, undefined);
+  assert.equal(seen[1]?.maxRetries, 0);
+});

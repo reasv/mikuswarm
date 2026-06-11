@@ -2,13 +2,13 @@ import { open, unlink } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
-import type { ConcurrencyLimitedInferenceClient } from "../captioning/inference-client.js";
+import type { InferenceClient } from "../captioning/inference-client.js";
 import type { MediaModality } from "../captioning/describe.js";
 import type { FetchClient } from "../enrichment/fetch-client.js";
 
 export interface MediaToolContext {
   workspaceRoot: string;
-  clients: Map<MediaModality, ConcurrencyLimitedInferenceClient>;
+  clients: Map<MediaModality, InferenceClient>;
   defaultPrompts: Map<MediaModality, string>;
   modelHasVision: boolean;
   maxFetchBytes: number;

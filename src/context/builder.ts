@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
+import type { PriorityClass } from "../agent/scheduler.js";
 import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import type {
@@ -17,7 +18,7 @@ import { hydrateEvents as hydrateEventsShared, mediaAssetToAttachmentMeta } from
 import { synthesizeReactionLines, type ReactionLine, type ReactionTarget } from "./reactions.js";
 import { estimateTokens, truncateToTokens } from "./tokens.js";
 import {
-  selectSummaries,
+  selectSummaryCoverage,
   resolveRecencyLabels,
   renderSummaryLayer,
   type SummaryLabelCache,
@@ -68,7 +69,22 @@ export interface BuildContextOptions {
    * with `summarizationCutoff`.
    */
   proactive?: boolean;
-  /** Optional signal to cancel a grace wait early (e.g. on shutdown). */
+  /**
+   * Resolved scheduler priority class of the building session (spec §5.5: the
+   * waiting class is the building session's OWN class). A summary job this
+   * build must wait on is escalated to exactly this class — so a proactive
+   * build escalates at `proactive` and never outranks live replies. Defaults
+   * to `interactive` when unset (unknown callers are user-facing until
+   * configured otherwise, matching `defaultPriorityForSessionType`).
+   */
+  priority?: PriorityClass;
+  /**
+   * Cancel a wait-or-omit wait early (shutdown drain, spec §7.2). When the
+   * signal fires while the build is waiting on a summarization job, the build
+   * REJECTS with an `AbortError` — a clean session-creation failure — instead
+   * of polling a job that no worker will ever drive to terminal once the pool
+   * stops.
+   */
   abortSignal?: AbortSignal;
 }
 
@@ -101,10 +117,20 @@ export class ContextBuilder {
    * request already queued at `background`) — then wakes the pool. Called when
    * a live build must wait on a specific summary job.
    */
-  escalateSummary?: (
-    jobId: string,
-    priority: "interactive" | "proactive" | "background" | "background_low",
-  ) => void;
+  escalateSummary?: (jobId: string, priority: PriorityClass) => void;
+
+  /**
+   * Eager-indexer reconcile hook (spec §7.2/§7.3): injected by app wiring to
+   * run ONE awaited `SummarizationIndexer.reconcileTimeline` pass. Called by
+   * the wait-or-omit loop when the compact tier is over budget but no
+   * active/failed job covers the oldest events — which usually means the
+   * indexer simply hasn't caught up yet (e.g. the previous summary's
+   * pool-onComplete reconcile is still queued, or startup's `reconcileAll`
+   * hasn't reached this timeline). The builder remains read-only w.r.t. job
+   * CREATION — the indexer owns it; this only asks it to look now. Must never
+   * reject (app wiring catches and logs).
+   */
+  reconcileSummaries?: (timelineKey: string) => Promise<void>;
 
   /**
    * Auto-retrieval dependencies (ARCHITECTURE.md §9d / design §8c). Set when the
@@ -133,8 +159,14 @@ export class ContextBuilder {
     const triggerGroupIds = cutoff || proactive ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
     const compactionState = this.store.getCompactionState(options.timelineKey);
 
-    // 1. Select summaries and derive the event-ID coverage cursor (§4).
-    let selection = selectSummaries(this.storage.getSummaryCandidates(options.timelineKey));
+    // 1. Select summaries and derive the event-ID coverage cursor (§4). The
+    //    selection includes synthesized failure placeholders for terminally
+    //    failed level-1 ranges (spec §7.2 — surfaced failure, never a silent
+    //    gap), and its contiguity chain is event-existence based (§9b): the
+    //    cursor advances across adjacent summaries (which are separated by
+    //    real inter-message intervals) and stops only at a genuine gap of
+    //    un-covered raw events.
+    let selection = selectSummaryCoverage(this.storage, options.timelineKey);
 
     // 2. Query events starting strictly after the coverage cursor.
     let events = selection.coverageEndEventId
@@ -149,9 +181,7 @@ export class ContextBuilder {
       // precision timestamp collisions from Matrix batch sends).
       events = events.filter((e) => e.timestamp <= cutoff.endTimestamp);
       const earliest = events[0]?.timestamp ?? cutoff.endTimestamp + 1;
-      selection = selectSummaries(
-        this.storage.getSummaryCandidates(options.timelineKey, earliest),
-      );
+      selection = selectSummaryCoverage(this.storage, options.timelineKey, earliest);
 
       // Re-query events against the corrected coverage cursor. The re-selection
       // may have moved the cursor earlier (fewer summaries qualify with the
@@ -187,34 +217,49 @@ export class ContextBuilder {
     //    tier is over budget, the ONLY outcomes are (a) use a completed summary,
     //    (b) wait — until the covering job reaches a terminal state, no wall
     //    clock; priority inheritance promotes it for the duration — or (c) for a
-    //    genuinely *failed* job, render an explicit failure placeholder in the
-    //    summary slot. There is no "truncate oldest to fit" step. Skipped for
-    //    summarization builds.
+    //    genuinely *failed* job, its failure placeholder takes over the range
+    //    (synthesized into the selection above / by the post-wait re-query).
+    //    There is no "truncate oldest to fit" step. Skipped for summarization
+    //    builds.
     let compactionInput = timelineEvents;
-    let failurePlaceholders: Summary[] = [];
     if (!cutoff) {
       const resolved = await this.resolveCompactionOverflow(
         options.timelineKey,
         timelineEvents,
         triggerGroupIds,
         selection,
+        options.priority ?? "interactive",
         options.abortSignal,
       );
       compactionInput = resolved.events;
       // Adopt the post-wait selection so the summary layer renders the summary
-      // whose completion just trimmed the raw set — otherwise those events would
-      // be dropped from both the raw turns and the layer (a coverage gap).
+      // (or failure placeholder) whose arrival just trimmed the raw set —
+      // otherwise those events would be dropped from both the raw turns and
+      // the layer (a coverage gap).
       selection = resolved.selection;
       // Refresh trigger events from the re-queried set so they reflect any
       // enrichment that landed during the wait (issue #3).
       if (resolved.triggerEvents) {
         triggerEvents = resolved.triggerEvents;
       }
-      failurePlaceholders = resolved.placeholders;
+    }
+
+    // Surfaced failures (§7.2): placeholders ride inside the selection; log so
+    // a failed range is a visible, recurring signal while it stays failed.
+    if (!cutoff) {
+      const placeholderIds = selection.summaries
+        .filter((s) => s.id.startsWith("sumfail_"))
+        .map((s) => s.id);
+      if (placeholderIds.length > 0) {
+        this.logger?.warn("summary_failure_placeholder_rendered", {
+          timelineKey: options.timelineKey,
+          placeholderIds,
+        });
+      }
     }
 
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
-    // projections from the reaction store, attached now (after the grace wait has
+    // projections from the reaction store, attached now (after wait-or-omit has
     // finalized the event set) and never persisted into event_json. Off for
     // summarization builds — reactions must never leak into summaries (§4) — and
     // gated by [reactions] config.
@@ -285,18 +330,13 @@ export class ContextBuilder {
     );
     const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
 
-    // Failure placeholders (§7.2) render inside the summary layer, in their
-    // chronological slot, with the usual envelope — an explicit "couldn't
-    // summarize this range" marker, not a silent gap.
-    const layerSummaries =
-      failurePlaceholders.length === 0
-        ? selection.summaries
-        : [...selection.summaries, ...failurePlaceholders].sort(
-            (a, b) => a.earliestTimestamp - b.earliestTimestamp,
-          );
+    // Failure placeholders (§7.2) are part of the selection itself and render
+    // inside the summary layer, in their chronological slot, with the usual
+    // envelope — an explicit "couldn't summarize this range" marker, not a
+    // silent gap.
     const summaryLayer = await this.buildSummaryLayerMessage(
       options.timelineKey,
-      layerSummaries,
+      selection.summaries,
       now,
       cutoff != null,
     );
@@ -488,49 +528,58 @@ export class ContextBuilder {
    * the compact tier is over `compact_max_tokens`, branch on the state of the
    * job covering the oldest at-risk events:
    *
-   * - **pending / processing** → escalate it to the waiter's class (priority
-   *   inheritance, §5.5) and wait until it reaches a TERMINAL state. No
+   * - **pending / processing** → escalate it to the waiter's class
+   *   (`waiterClass` — the building session's own resolved class, spec §5.5;
+   *   priority inheritance) and wait until it reaches a TERMINAL state. No
    *   wall-clock deadline — the wait is bounded by the job itself (Layer-1
    *   mechanical retries + Layer-3 semantic retries always end in `complete`
-   *   or `failed`). On completion, re-select + re-query so the new summary's
-   *   coverage trims the raw set.
-   * - **failed** (terminal, no salvageable draft) → substitute the range with
-   *   an explicit failure-placeholder summary (rendered in the summary layer's
-   *   normal slot) and omit its raw events — a surfaced failure, not a silent
-   *   gap, and never a "truncate oldest to fit".
+   *   or `failed`). At terminal, re-select + re-query: a completed summary's
+   *   coverage trims the raw set; a failed job's synthesized placeholder
+   *   (selectSummaryCoverage) advances the cursor over the range, omitting
+   *   its events — a surfaced failure, not a silent gap, and never a
+   *   "truncate oldest to fit".
+   * - **no covering job at all** → ask the eager indexer for ONE awaited
+   *   reconcile and re-check (the indexer may simply not have caught up —
+   *   chunk N+1's job is normally created by the pool's fire-and-forget
+   *   onComplete reconcile, which this loop's previous wait easily outruns on
+   *   deep multi-chunk backlogs). The builder stays read-only w.r.t. job
+   *   creation (spec §7.3) — the indexer owns it.
    *
-   * Only when NOTHING covers the oldest events (summarization disabled, or the
-   * eager indexer hasn't enqueued the range yet) does the set pass through
-   * unchanged and compaction's ordinary bounds apply. Cutoff (summarization)
-   * builds never enter here.
+   * Only when even a fresh reconcile leaves nothing covering the oldest events
+   * (summarization disabled, or its generation threshold genuinely not
+   * crossed) does the set pass through unchanged and compaction's ordinary
+   * bounds apply. Cutoff (summarization) builds never enter here.
+   *
+   * When `abortSignal` fires (shutdown drain) the wait cannot ever finish —
+   * the worker pool is about to stop — so this THROWS an `AbortError`, failing
+   * the build (and the session creation around it) cleanly.
    */
   private async resolveCompactionOverflow(
     timelineKey: string,
     events: CanonicalChatEvent[],
     triggerGroupIds: Set<string>,
     selection: SummarySelection,
+    waiterClass: PriorityClass,
     abortSignal?: AbortSignal,
   ): Promise<{
     events: CanonicalChatEvent[];
     selection: SummarySelection;
     triggerEvents?: CanonicalChatEvent[];
-    placeholders: Summary[];
   }> {
-    const placeholders: Summary[] = [];
     let current: {
       events: CanonicalChatEvent[];
       selection: SummarySelection;
       triggerEvents?: CanonicalChatEvent[];
     } = { events, selection };
-    if (this.config.summarization?.enabled === false) return { ...current, placeholders };
+    if (this.config.summarization?.enabled === false) return current;
     const compactMax = this.config.context.tiers.compact_max_tokens;
 
-    // Each iteration strictly shrinks the raw set (completion advances coverage;
-    // a failed substitution removes >= 1 event) or breaks — so the loop
-    // terminates. A job waited on is terminal afterwards and leaves the active
-    // set, so no job is waited on twice.
+    // Each iteration waits a job to terminal (it leaves the active set, so no
+    // job is waited on twice; the requery shrinks the raw set), reconciles at
+    // most once per distinct oldest event, or breaks — so the loop terminates.
+    let lastReconciledOldestId: string | null = null;
     for (;;) {
-      if (abortSignal?.aborted) break;
+      if (abortSignal?.aborted) throw buildAbortError();
       if (current.events.length === 0) break;
       if (this.estimateCompactTierTokens(current.events) <= compactMax) break;
 
@@ -542,38 +591,47 @@ export class ContextBuilder {
         .getActiveSummarizationJobs(timelineKey, 1)
         .find((job) => this.jobCoversCursor(timelineKey, job, oldestCursor));
       if (covering) {
-        // Priority inheritance (spec §5.5): this live build is now waiting on
-        // the covering job — promote it to the waiter's class so it is claimed
-        // next and its LLM request is admitted ahead of unrelated background
-        // work. Only live builds reach here, so the waiter's class is
-        // `interactive`.
-        this.escalateSummary?.(covering.id, "interactive");
+        // Priority inheritance (spec §5.5): this build is now waiting on the
+        // covering job — promote it to the waiter's OWN class (threaded from
+        // the session type via the factory: live builds escalate at
+        // `interactive`, proactive builds at `proactive`) so it is claimed
+        // next and its LLM request is admitted ahead of lower-priority work
+        // without outranking higher-priority sessions.
+        this.escalateSummary?.(covering.id, waiterClass);
         this.logger?.info("context_build_waiting_on_summary", {
           timelineKey,
           jobId: covering.id,
           jobStatus: covering.status,
+          waiterClass,
         });
         const outcome = await this.waitForJobTerminal(covering.id, abortSignal);
-        if (outcome === "aborted") break;
-        if (outcome === "complete") {
-          const requeried = this.requeryAfterCoverageAdvance(timelineKey, triggerGroupIds);
-          current = requeried ?? current;
-        }
-        // failed → next iteration finds it in the failed set and placeholders it.
+        if (outcome === "aborted") throw buildAbortError();
+        // Terminal either way: re-select + re-query. A completed summary (or a
+        // failed job's placeholder) advances the coverage cursor and trims the
+        // raw set; the events move from the raw turns into the summary layer
+        // together — never dropped from both.
+        const requeried = this.requeryAfterCoverageAdvance(timelineKey, triggerGroupIds);
+        current = requeried ?? current;
         continue;
       }
 
-      const failed = this.storage
-        .getFailedSummarizationJobs(timelineKey, 1)
-        .find((job) => this.jobCoversCursor(timelineKey, job, oldestCursor));
-      if (!failed) break;
-      const substituted = this.substituteFailedRange(timelineKey, failed, current.events);
-      if (!substituted) break;
-      placeholders.push(substituted.placeholder);
-      current = { ...current, events: substituted.events };
+      // Nothing covers the oldest at-risk events: run ONE awaited indexer
+      // reconcile and re-check (at most once per distinct oldest event, so the
+      // loop still terminates when the indexer genuinely has nothing to
+      // enqueue).
+      if (this.reconcileSummaries && lastReconciledOldestId !== oldest.id) {
+        lastReconciledOldestId = oldest.id;
+        this.logger?.info("context_build_reconcile_for_coverage", {
+          timelineKey,
+          oldestEventId: oldest.id,
+        });
+        await this.reconcileSummaries(timelineKey);
+        continue;
+      }
+      break;
     }
 
-    return { ...current, placeholders };
+    return current;
   }
 
   /**
@@ -628,10 +686,13 @@ export class ContextBuilder {
 
   /**
    * Re-select and re-query against the (possibly advanced) coverage cursor ONCE
-   * after a summary lands. The raw events AND the summary-layer selection must
-   * move together, or the newly-covered events would be dropped from both (a
-   * coverage gap). Returns null when there is still no coverage cursor (keep
-   * the current raw set, adopt the fresh selection via the caller).
+   * after a waited job reaches terminal. The raw events AND the summary-layer
+   * selection must move together, or the newly-covered events would be dropped
+   * from both (a coverage gap). The re-selection includes synthesized failure
+   * placeholders, so a job that terminally failed during the wait advances the
+   * cursor the same way a completed summary does. Returns null when there is
+   * still no coverage cursor (keep the current raw set, adopt the fresh
+   * selection via the caller).
    */
   private requeryAfterCoverageAdvance(
     timelineKey: string,
@@ -641,7 +702,7 @@ export class ContextBuilder {
     selection: SummarySelection;
     triggerEvents?: CanonicalChatEvent[];
   } | null {
-    const reselected = selectSummaries(this.storage.getSummaryCandidates(timelineKey));
+    const reselected = selectSummaryCoverage(this.storage, timelineKey);
     if (!reselected.coverageEndEventId) return null;
     const allRequeried = this.hydrateEvents(
       this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId),
@@ -651,56 +712,6 @@ export class ContextBuilder {
       selection: reselected,
       triggerEvents: allRequeried.filter((e) => triggerGroupIds.has(e.id)),
     };
-  }
-
-  /**
-   * Failure placeholder (§7.2): omit the failed job's raw events from the build
-   * and stand in a synthetic summary occupying the same compact-tier slot — the
-   * usual envelope (time range, level, event count) with a "couldn't summarize"
-   * body. Never persisted; re-synthesized deterministically on every build while
-   * the job stays failed (stable id `sumfail_<jobId>`, so the label cache holds).
-   */
-  private substituteFailedRange(
-    timelineKey: string,
-    job: { id: string; level: number; inputStartId: string; inputEndId: string; updatedAt: number },
-    events: CanonicalChatEvent[],
-  ): { events: CanonicalChatEvent[]; placeholder: Summary } | null {
-    const start = this.storage.getEventCursor(timelineKey, job.inputStartId);
-    const end = this.storage.getEventCursor(timelineKey, job.inputEndId);
-    if (!start || !end) return null;
-    const covered = this.storage.getTimelineEventsBetween(timelineKey, start, end);
-    if (covered.length === 0) return null;
-    const coveredIds = new Set(covered.map((e) => e.id));
-    const remaining = events.filter((e) => !coveredIds.has(e.id));
-    if (remaining.length === events.length) return null;
-
-    const content =
-      "[Summary for this range could not be generated — summarization failed after retries; " +
-      "the underlying messages are omitted from context.]";
-    const first = covered[0]!;
-    const last = covered[covered.length - 1]!;
-    const placeholder: Summary = {
-      id: `sumfail_${job.id}`,
-      timelineKey,
-      level: job.level,
-      content,
-      earliestTimestamp: first.timestamp,
-      latestTimestamp: last.timestamp,
-      latestEventId: last.id,
-      eventCount: covered.length,
-      tokenCount: estimateTokens(content),
-      modelId: null,
-      status: "complete",
-      backfillJobId: null,
-      generatedAt: job.updatedAt,
-      createdAt: job.updatedAt,
-    };
-    this.logger?.warn("summary_failure_placeholder_rendered", {
-      timelineKey,
-      jobId: job.id,
-      omittedEvents: covered.length,
-    });
-    return { events: remaining, placeholder };
   }
 
   /**
@@ -938,5 +949,16 @@ function cursorAfter(a: TimelineCursor, b: TimelineCursor): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Error thrown when a build's wait-or-omit wait is cancelled by
+ * `BuildContextOptions.abortSignal` (shutdown drain). Named `AbortError` so
+ * callers can distinguish a clean drain cancellation from a real build failure.
+ */
+function buildAbortError(): Error {
+  const error = new Error("context build aborted while waiting on a summarization job (shutdown drain)");
+  error.name = "AbortError";
+  return error;
 }
 

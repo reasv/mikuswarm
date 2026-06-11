@@ -206,16 +206,20 @@ export function abortSession(
 
 /**
  * POST /api/sessions/:id/resume — manual resume-in-place of a parked
- * `failed-resumable` session (spec CONCURRENCY-AND-RATE-LIMITING §6.2). The
- * console's second mutating route, mirroring `abortSession`'s envelope
- * conventions.
+ * `failed-resumable` or `interrupted` session (spec
+ * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D; both statuses carry the
+ * same snapshot/transcript material). The console's second mutating route,
+ * mirroring `abortSession`'s envelope conventions.
  *
  * - 200 `{ sessionId, status }` — the resume ran to completion (`status:
  *   "completed"`).
  * - 404 — no such session row.
- * - 409 — the session isn't `failed-resumable`, or the resume attempt itself
- *   failed (re-parked or discarded); `sessionStatus` carries the resulting
- *   state and `message` the reason.
+ * - 409 — the session isn't resumable (wrong status; a synthetic worker-pool
+ *   session type — summarize/condense/diary, never chat-resumable; a resume
+ *   already in flight; the timeline slot is held by a live session; or there
+ *   is nothing to redo — the transcript ends at a clean boundary), or the
+ *   resume attempt itself failed (re-parked or discarded); `sessionStatus`
+ *   carries the resulting state and `message` the reason.
  * - 503 — the runtime didn't inject a resume action (read-only deployment).
  *
  * The resume runs the session to a terminal state before responding, so the

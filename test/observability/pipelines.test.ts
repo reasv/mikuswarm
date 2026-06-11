@@ -20,7 +20,7 @@ import { CaptionWorkerPool } from "../../src/captioning/index.js";
 import type {
   CaptionRequest,
   CaptionResponse,
-  ConcurrencyLimitedInferenceClient,
+  InferenceClient,
   MediaModality,
 } from "../../src/captioning/index.js";
 import { registerSecret, resetRedactionRegistry } from "../../src/config/index.js";
@@ -69,7 +69,7 @@ function stubStats(pool: PipelineId, overrides: Partial<PipelineStats> = {}): Pi
 function fullRegistry(overrides: Partial<PipelineRegistry> = {}): PipelineRegistry {
   return {
     enrichment: stubStats("enrichment"),
-    captioning: stubStats("captioning", { concurrency: { image: 4, audio: 1 } }),
+    captioning: stubStats("captioning"),
     summarization: stubStats("summarization"),
     diary: stubStats("diary"),
     ...overrides,
@@ -509,7 +509,10 @@ test("GET /api/pipelines returns one row per pool with counts + live inFlight", 
       assert.equal(enr.counts.done, 1);
 
       const cap = body.pipelines.find((p) => p.pool === "captioning");
-      assert.deepEqual(cap.concurrency, { image: 4, audio: 1 });
+      assert.equal(cap.enabled, true);
+      // The per-modality concurrency map was removed with the deprecated
+      // captioning `concurrency` alias (review issue #29).
+      assert.equal("concurrency" in cap, false);
 
       // A disabled (null) pool still appears, with history but not running.
       const diary = body.pipelines.find((p) => p.pool === "diary");
@@ -838,16 +841,15 @@ test("GET /api/pipelines/stream opens and idles when no activity bus is wired", 
 // non-existent path `isAnimatedImage` falls back to `false` and goes straight to
 // `client.caption(...)`, so no real media/inference work happens.
 
-/** A fake inference client; only `caption()` and `maxConcurrency` are touched. */
+/** A fake inference client; only `caption()` is touched. */
 function fakeInferenceClient(
   caption: (req: CaptionRequest) => Promise<CaptionResponse>,
-): ConcurrencyLimitedInferenceClient {
+): InferenceClient {
   return {
     modality: "image" as MediaModality,
-    maxConcurrency: undefined,
     caption,
     stop() {},
-  } as unknown as ConcurrencyLimitedInferenceClient;
+  } as unknown as InferenceClient;
 }
 
 /** Seed a claim-eligible (trigger_group_id set) pending image asset for captioning. */
@@ -884,7 +886,7 @@ function makeCaptionPool(
 ): CaptionWorkerPool {
   return new CaptionWorkerPool({
     storage,
-    clients: new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
+    clients: new Map<MediaModality, InferenceClient>([
       ["image", fakeInferenceClient(caption)],
     ]),
     workspaceRoot: "/tmp",

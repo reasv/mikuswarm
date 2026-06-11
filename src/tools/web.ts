@@ -5,6 +5,14 @@ import { guardedFetch } from "./ssrf.js";
 const WEB_FETCH_SECURITY_NOTE =
   "When the egress guard is enabled, blocks localhost/private IPs before each request and redirect. DNS is not pinned, so this is defense-in-depth rather than a complete SSRF sandbox; the network firewall is the real boundary.";
 
+/**
+ * Per-request wall-clock timeout. web_fetch runs inside a LIVE agent session, so
+ * without this a slow host — or one sitting in the per-host limiter's backoff —
+ * would block the session indefinitely. Same 30s default as the other direct
+ * guardedFetch callers (send_message media, set_profile avatars, danbooru JSON).
+ */
+const WEB_FETCH_TIMEOUT_MS = 30_000;
+
 export function createWebFetchTool(): AgentTool {
   return {
     name: "web_fetch",
@@ -17,17 +25,39 @@ export function createWebFetchTool(): AgentTool {
     execute: async (_toolCallId, params) => {
       const args = params as { url: string; max_chars?: number };
       const url = normalizeHttpUrl(args.url);
-      const response = await guardedFetch(url, { headers: { "user-agent": "mikuswarm/0.1" } });
-      if (!response.ok) throw new Error(`Fetch failed with HTTP ${response.status}`);
-      const contentType = response.headers.get("content-type") ?? "";
-      const raw = await response.text();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+      let contentType: string;
+      let raw: string;
+      let status: number;
+      try {
+        const response = await guardedFetch(url, {
+          signal: controller.signal,
+          headers: { "user-agent": "mikuswarm/0.1" },
+        });
+        if (!response.ok) {
+          // Settle the body so the per-host limiter slot is freed promptly.
+          await response.body?.cancel().catch(() => {});
+          throw new Error(`Fetch failed with HTTP ${response.status}`);
+        }
+        contentType = response.headers.get("content-type") ?? "";
+        status = response.status;
+        raw = await response.text();
+      } catch (error) {
+        if ((error as { name?: string })?.name === "AbortError") {
+          throw new Error(`Fetch timed out after ${WEB_FETCH_TIMEOUT_MS}ms`);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
       const text = contentType.includes("html") ? htmlToText(raw) : raw;
       const maxChars = args.max_chars ?? 50_000;
       return {
         content: [{ type: "text", text: text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text }],
         details: {
           url,
-          status: response.status,
+          status,
           contentType,
           truncated: text.length > maxChars,
           securityNote: WEB_FETCH_SECURITY_NOTE,

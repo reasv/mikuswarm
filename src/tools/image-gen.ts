@@ -14,7 +14,7 @@ import {
   conditionImageBufferForInference,
   type ImageProcessingOptions,
 } from "../media/index.js";
-import type { LlmScheduler } from "../agent/scheduler.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -265,7 +265,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
           return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
         }
       }
-      let result: GeminiResponse | { httpError: ToolTextResult; status: number };
+      let result: GeminiResponse | { httpError: ToolTextResult; status: number; retryAfterMs?: number };
       try {
         result = await postGenerate({ url, apiKey, body, dispatcher, timeoutMs });
       } catch (error) {
@@ -275,8 +275,9 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         release?.();
       }
       if ("httpError" in result) {
-        // Feed the group's unconditional 429/503 backoff (§5.3) with the real status.
-        context.scheduler?.noteStatus("default", result.status);
+        // Feed the group's unconditional 429/503 backoff (§5.3) with the real
+        // status and the server's Retry-After (clamped by the scheduler).
+        context.scheduler?.noteStatus("default", result.status, result.retryAfterMs);
         return result.httpError;
       }
       context.scheduler?.noteStatus("default", undefined);
@@ -404,7 +405,7 @@ async function postGenerate(input: {
   body: Record<string, unknown>;
   dispatcher: Dispatcher | undefined;
   timeoutMs: number;
-}): Promise<GeminiResponse | { httpError: ToolTextResult; status: number }> {
+}): Promise<GeminiResponse | { httpError: ToolTextResult; status: number; retryAfterMs?: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
   let response: Response;
@@ -440,12 +441,14 @@ async function postGenerate(input: {
     if (!response.ok) {
       const snippet = await safeReadText(response);
       // Tagged error object so the caller can return it as a tool result; the
-      // status rides along so the caller can feed the scheduler's backoff.
+      // status (and any Retry-After, since we hold the response here) rides
+      // along so the caller can feed the scheduler's backoff (§8a).
       return {
         httpError: textError(
           `Image generation failed: HTTP ${response.status}${snippet ? ` (${snippet})` : ""}.`,
         ),
         status: response.status,
+        retryAfterMs: parseRetryAfterMs(response.headers),
       };
     }
     try {
@@ -470,6 +473,8 @@ async function postGenerate(input: {
 async function readJsonCapped(response: Response, controller: AbortController): Promise<unknown> {
   const declared = Number(response.headers.get("content-length") ?? "");
   if (Number.isFinite(declared) && declared > RESPONSE_MAX_BYTES) {
+    // Settle the unread body so the per-host limiter slot is freed promptly.
+    await response.body?.cancel().catch(() => {});
     throw new Error(`response too large: declared content-length ${declared} > ${RESPONSE_MAX_BYTES} bytes`);
   }
   const reader = response.body?.getReader();

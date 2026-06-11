@@ -21,9 +21,12 @@ import {
   LlmScheduler,
   SessionManager,
   SessionRunner,
+  autoResumeSession,
+  createManualResumeSession,
   isResumableRunError,
   loadResumeMaterial,
   type AgentSessionRecord,
+  type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
@@ -70,12 +73,12 @@ import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
-import { CaptionWorkerPool, ConcurrencyLimitedInferenceClient, type MediaModality } from "./captioning/index.js";
+import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
-import { SummarizationIndexer, SummarizationWorkerPool } from "./summarization/index.js";
+import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
-import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
+import { ProactiveScheduler } from "./proactive/index.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
   ChatSearchIndexer,
@@ -319,25 +322,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // image-block path all use the same defaults.
   const inferenceImageOptions = buildInferenceImageOptions(mediaImageConfig);
 
-  const captionClients = new Map<MediaModality, ConcurrencyLimitedInferenceClient>([
-    ["image", new ConcurrencyLimitedInferenceClient({
+  const captionClients = new Map<MediaModality, InferenceClient>([
+    ["image", new InferenceClient({
       modality: "image",
       model: resolveModalityModel(imageConfig),
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
-      maxConcurrency: imageConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
       imageProcessing: inferenceImageOptions,
     })],
-    ["video", new ConcurrencyLimitedInferenceClient({
+    ["video", new InferenceClient({
       modality: "video",
       model: resolveModalityModel(videoConfig),
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
       maxTokens: videoConfig.max_tokens ?? 2048,
-      maxConcurrency: videoConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
       timeoutMs: videoConfig.timeout_ms,
@@ -352,13 +353,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
       },
     })],
-    ["audio", new ConcurrencyLimitedInferenceClient({
+    ["audio", new InferenceClient({
       modality: "audio",
       model: resolveModalityModel(audioConfig),
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
-      maxConcurrency: audioConfig.concurrency,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
       timeoutMs: audioConfig.timeout_ms,
@@ -471,6 +471,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
+  // Drain cancellation for context builds (spec §7.2): a build waiting on a
+  // summarization job has no wall clock — once the worker pool stops, nothing
+  // can ever drive the waited job to terminal, so stop() aborts this signal
+  // FIRST (before any pool teardown) and the waiting build rejects cleanly
+  // (AbortError → launchSession's factory-failure path) instead of polling
+  // until storage.close() makes it throw.
+  const drainAbort = new AbortController();
   let stopPromise: Promise<void> | undefined;
   const factory = new AgentSessionFactory({
     config,
@@ -555,25 +562,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   if (summarizationPool) {
     // Priority inheritance (spec §5.5): one injected callback does all three
-    // writes, in order — job row (claim order), scheduler entry (a request
-    // already queued at background), pool wake (so an idle worker claims the
-    // escalated job immediately). The scheduler escalation is sticky, so it
-    // also covers a request that registers AFTER this runs (claim/admission race).
-    contextBuilder.escalateSummary = (jobId, priority) => {
-      void storage
-        .escalateSummarizationJob(jobId, priority)
-        .then(() => {
-          llmScheduler.escalate(`sumjob:${jobId}`, priority);
-          summarizationPool.notifyNewWork();
-        })
-        .catch((error) =>
-          logger.error("summary_escalation_failed", {
-            jobId,
-            priority,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
-    };
+    // writes — job row, scheduler entry, pool wake — with the escalate-vs-
+    // terminal race guard (a late scheduler escalation after clearEscalation
+    // would otherwise leak a permanent sticky entry). See createEscalateSummary.
+    contextBuilder.escalateSummary = createEscalateSummary({
+      storage,
+      escalateScheduled: (key, priority) => llmScheduler.escalate(key, priority),
+      notifyPool: () => summarizationPool.notifyNewWork(),
+      logger,
+    });
+
+    // Wait-or-omit's coverage re-check (spec §7.2/§7.3): when an over-budget
+    // build finds no job covering its oldest events, it runs ONE awaited
+    // indexer reconcile before concluding nothing covers them — closing the
+    // race against the pool-onComplete fire-and-forget reconcile on deep
+    // multi-chunk backlogs. Job creation stays with the indexer; errors are
+    // logged here and never reach the build (the builder then proceeds as if
+    // the reconcile found nothing).
+    contextBuilder.reconcileSummaries = (timelineKey) =>
+      summarizationIndexer!.reconcileTimeline(timelineKey).catch((error) => {
+        logger.error("summary_reconcile_for_build_failed", {
+          timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   // Diary worker pool (ARCHITECTURE.md §9c). Same fail-fast validation as
@@ -1167,7 +1179,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   ): Promise<{ outcome: "completed" | "mechanical" | "fatal" | "unresumable"; error?: string }> {
     const row = storage.getAgentSession(record.id);
     if (!row) return { outcome: "unresumable", error: "session row missing" };
-    const material = loadResumeMaterial(row);
+    // Image refs externalized at capture time are rehydrated through the media
+    // store here (issue #13) — without this, an image-bearing snapshot would
+    // re-issue malformed `{type:"image"}` blocks and 400 fatally.
+    const material = await loadResumeMaterial(row, { media: storage, workspaceRoot, logger });
     if (!material) return { outcome: "unresumable", error: "no resumable snapshot/transcript" };
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
@@ -1231,124 +1246,83 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * promise chain so the per-timeline trigger slot stays held for the whole
    * recovery — no second session can race the resumed one. Returns true when the
    * failure was handled (resumed, parked, or discarded here); false hands the
-   * failure back to the ordinary discard path.
+   * failure back to the ordinary discard path. The policy loop — including the
+   * park-over-discard rules for `attempts = 0`, draining-at-entry, and a
+   * fatal-at-shutdown attempt (issue #15) — lives in `autoResumeSession`
+   * (src/agent/recovery.ts) where it is unit-testable.
    */
-  async function maybeAutoResumeSession(
+  function maybeAutoResumeSession(
     session: AgentSessionRecord,
     error: unknown,
   ): Promise<boolean> {
-    const attempts = config.recovery?.session_auto_resume_attempts ?? 2;
-    if (attempts <= 0 || draining) return false;
-    if (!isResumableRunError(error)) return false;
-    const initialError = error instanceof Error ? error.message : String(error);
-    sessions.markResuming(session.id, { error: initialError });
-    logger.warn("session_auto_resume_started", {
+    return autoResumeSession(error, {
       sessionId: session.id,
       timelineKey: session.timelineKey,
-      error: initialError,
+      attempts: config.recovery?.session_auto_resume_attempts ?? 2,
+      backoffBaseMs: config.recovery?.session_auto_resume_backoff_ms ?? 5000,
+      isDraining: () => draining,
+      runAttempt: (attempt) => resumeSessionRun(session, session.trigger, attempt),
+      markResuming: (err) => sessions.markResuming(session.id, { error: err }),
+      markFailedResumable: (err) => sessions.markFailedResumable(session.id, { error: err }),
+      markDiscarded: (err) => sessions.markDiscarded(session.id, { error: err }),
+      logger,
     });
-
-    const backoffBase = config.recovery?.session_auto_resume_backoff_ms ?? 5000;
-    let lastError = initialError;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, backoffBase * 2 ** (attempt - 1)));
-      if (draining) break;
-      const { outcome, error: attemptError } = await resumeSessionRun(session, session.trigger, attempt);
-      if (outcome === "completed") return true;
-      lastError = attemptError ?? lastError;
-      if (outcome === "fatal" || outcome === "unresumable") {
-        sessions.markDiscarded(session.id, { error: lastError });
-        logger.error("session_resume_failed_terminal", {
-          sessionId: session.id,
-          attempt,
-          outcome,
-          error: lastError,
-        });
-        return true;
-      }
-      // mechanical → another attempt (or park below)
-      sessions.markResuming(session.id, { error: lastError });
-      logger.warn("session_auto_resume_retry", { sessionId: session.id, attempt, error: lastError });
-    }
-
-    sessions.markFailedResumable(session.id, { error: lastError });
-    logger.error("session_parked_failed_resumable", {
-      sessionId: session.id,
-      timelineKey: session.timelineKey,
-      error: lastError,
-    });
-    return true;
   }
 
   /**
-   * Manual console resume of a parked `failed-resumable` session (spec §6.2 —
-   * the only operator action; there are no chat commands). Reconstructs the
-   * session record + a synthetic inbound from the durable row (the original
-   * in-memory record was evicted, possibly in a previous process), then redoes
-   * the same resume once. On another mechanical failure the session is
-   * re-parked (still resumable); on a fatal one it is discarded.
+   * Manual console resume of a parked `failed-resumable` or `interrupted`
+   * session (spec §6.2 / Decision D — the only operator action; there are no
+   * chat commands). The whole policy — double-POST guard, status + viability
+   * gates, per-timeline slot, sender reconstruction from the durable row, and
+   * the park/discard outcome handling (issues #16–#20) — lives in
+   * `createManualResumeSession` (src/agent/recovery.ts) where it is
+   * unit-testable; this wiring injects the runtime deps.
    */
-  async function manualResumeSession(
-    sessionId: string,
-  ): Promise<{ ok: boolean; status: string; reason?: string }> {
-    if (draining) return { ok: false, status: "failed-resumable", reason: "runtime is shutting down" };
-    const row = storage.getAgentSession(sessionId);
-    if (!row) return { ok: false, status: "unknown", reason: `unknown session: ${sessionId}` };
-    if (row.status !== "failed-resumable") {
-      return { ok: false, status: row.status, reason: `session is '${row.status}', not 'failed-resumable'` };
-    }
-    const parsed = parseMatrixTimelineKey(row.timeline_key);
-    const selfUserId = parsed ? config.matrix.accounts[parsed.accountId]?.user_id : undefined;
-    if (!parsed || !selfUserId) {
-      return { ok: false, status: row.status, reason: "cannot reconstruct outbound target from timeline key" };
-    }
-    const now = Date.now();
-    const inbound: InboundChatEvent = {
-      provider: "matrix",
-      timelineKey: row.timeline_key,
-      event: {
-        id: row.trigger_event_id ?? `resume-${sessionId}`,
-        externalId: row.trigger_external_id ?? undefined,
-        timelineKey: row.timeline_key,
-        provider: "matrix",
-        role: "user",
-        sender: { id: selfUserId, isSelf: true },
-        body: row.trigger_body ?? "",
-        timestamp: now,
-        receivedAt: now,
-      },
-      outboundTarget: {
-        provider: "matrix",
-        timelineKey: row.timeline_key,
-        accountId: parsed.accountId,
-        roomId: parsed.roomId,
-        threadId: parsed.threadId,
-      },
-    };
-    const record: AgentSessionRecord = {
-      id: row.id,
-      timelineKey: row.timeline_key,
-      sessionType: row.session_type,
-      status: "resuming",
-      trigger: inbound,
-      createdAt: row.created_at,
-      startedAt: row.started_at ?? undefined,
-    };
-    sessions.adopt(record);
-    logger.info("session_manual_resume_started", { sessionId, timelineKey: row.timeline_key });
-    const { outcome, error } = await resumeSessionRun(record, inbound, 0);
-    switch (outcome) {
-      case "completed":
-        return { ok: true, status: "completed" };
-      case "mechanical":
-        sessions.markFailedResumable(sessionId, { error });
-        return { ok: false, status: "failed-resumable", reason: `resume failed mechanically again: ${error}` };
-      case "unresumable":
-        sessions.markFailedResumable(sessionId, { error });
-        return { ok: false, status: "failed-resumable", reason: error };
-      case "fatal":
-        sessions.markDiscarded(sessionId, { error });
-        return { ok: false, status: "discarded", reason: `resume failed (non-mechanical): ${error}` };
+  const runManualResume = createManualResumeSession({
+    isDraining: () => draining,
+    getSessionRow: (id) => storage.getAgentSession(id),
+    loadMaterial: (row) => loadResumeMaterial(row, { media: storage, workspaceRoot, logger }),
+    hasLiveSession: (id) => sessions.get(id) !== undefined,
+    adopt: (record) => sessions.adopt(record),
+    tryAcquireTimelineSlot: (timelineKey) => triggerCoordinator.tryAcquire(timelineKey),
+    // Mirror launchSession's `.finally`: release the slot AND drain the next
+    // queued trigger (issue #17). During drain the coordinator is cleared by
+    // stop(), so skip — same as launchSession does.
+    releaseTimelineSlot: (timelineKey) => {
+      if (draining) return;
+      const next = triggerCoordinator.complete(timelineKey);
+      if (next) void launchSession(next, true).catch((error) => {
+        logger.error("queued_session_launch_failed", {
+          timelineKey: next.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Release the per-timeline slot so future triggers aren't permanently blocked
+        triggerCoordinator.complete(next.timelineKey);
+      });
+    },
+    selfUserIdForAccount: (accountId) => config.matrix.accounts[accountId]?.user_id,
+    runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
+    markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
+    markDiscarded: (id, error) => sessions.markDiscarded(id, { error }),
+    logger,
+  });
+
+  /**
+   * The console-facing wrapper tracks the in-flight resume in `activeRuns`
+   * (issue #20) so `stop()`'s `waitForRuns` awaits it before the scheduler and
+   * storage tear down — mirroring `launchSession`'s run tracking.
+   */
+  async function manualResumeSession(sessionId: string): Promise<ManualResumeResult> {
+    const run = runManualResume(sessionId);
+    const tracked: Promise<void> = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    activeRuns.add(tracked);
+    try {
+      return await run;
+    } finally {
+      activeRuns.delete(tracked);
     }
   }
 
@@ -1395,7 +1369,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
         session,
         tools,
-        proactive ? { proactive: true } : undefined,
+        {
+          proactive: proactive ? true : undefined,
+          // Drain cancellation (spec §7.2): a build waiting on a summary job
+          // aborts cleanly at shutdown instead of out-living the worker pool.
+          abortSignal: drainAbort.signal,
+        },
       ));
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
@@ -1723,6 +1702,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Cancel context builds waiting on summarization jobs BEFORE any pool
+        // teardown: once the summarization pool stops, nothing can drive a
+        // waited job to terminal, so a waiting build would otherwise poll until
+        // storage.close() made it throw. The abort surfaces inside
+        // factory.create as a clean AbortError → launchSession discards the
+        // never-started session via its factory-failure path.
+        drainAbort.abort();
         // Stop the proactive scheduler first: clear its per-channel timers so no
         // new proactive run is launched while the rest of the runtime tears down.
         proactiveScheduler.stop();

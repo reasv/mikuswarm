@@ -38,7 +38,7 @@ function baseInsert(overrides: Partial<AgentSessionInsert> = {}): AgentSessionIn
  * exposes a mutable `state.messages`. Structurally a `CapturableAgent`.
  */
 class FakeAgent implements CapturableAgent {
-  state: { messages: AgentMessage[] } = { messages: [] };
+  state: { messages: AgentMessage[]; errorMessage?: string } = { messages: [] };
   private listener:
     | ((event: { type: string }, signal: AbortSignal) => void | Promise<void>)
     | null = null;
@@ -624,6 +624,38 @@ test("#12 turn_end (no payload) falls back to state.messages", async () => {
     const parsed = JSON.parse(json);
     assert.equal(parsed.length, 1);
     assert.equal(parsed[0].content, "from-state");
+  });
+});
+
+test("failed run: agent_end's 1-message failure payload is ignored in favour of the full state", async () => {
+  await withStorage(async (storage) => {
+    // pi-agent-core's handleRunFailure emits `agent_end` with
+    // `messages: [failureMessage]` ONLY. Preferring that payload would
+    // overwrite the transcript with a one-element array — destroying the
+    // resume material until the error-path flushNow() repair. When
+    // state.errorMessage is set (the run failed), state.messages is canonical.
+    await storage.insertAgentSession(baseInsert());
+
+    const agent = new FakeAgent();
+    const failureMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      stopReason: "error",
+      errorMessage: "529 overloaded",
+    } as unknown as AgentMessage;
+    agent.state.messages = [
+      { type: "triggerGroup", content: "kickoff" },
+      failureMessage,
+    ] as unknown as AgentMessage[];
+    agent.state.errorMessage = "529 overloaded";
+
+    attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
+    await agent.fire("agent_end", { messages: [failureMessage] });
+    await settle(storage);
+
+    const parsed = JSON.parse(storage.getAgentSession("s-abc1234567")!.transcript_json!);
+    assert.equal(parsed.length, 2, "full live state persisted, not the 1-msg failure payload");
+    assert.equal(parsed[0].content, "kickoff");
   });
 });
 

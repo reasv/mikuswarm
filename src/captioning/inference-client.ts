@@ -19,13 +19,6 @@ export interface InferenceClientOptions {
   maxChars: number;
   maxTokens: number;
   /**
-   * DEPRECATED (spec CONCURRENCY-AND-RATE-LIMITING §9.4): the per-modality
-   * concurrency cap is superseded by the captioning rate-limit group's
-   * `max_in_flight` (scheduler admission below). Still honoured when set, as a
-   * transitional alias for one release.
-   */
-  maxConcurrency?: number;
-  /**
    * LLM request scheduler (spec §5.4): when set, every caption inference call
    * acquires a slot in `rateLimitGroup` (at `background` priority — captioning
    * sits on its own budget and needs no per-workload split, §9.4) around the
@@ -54,13 +47,13 @@ export interface CaptionResponse {
   model: string;
 }
 
-export class ConcurrencyLimitedInferenceClient {
-  private active = 0;
-  private readonly queue: Array<{
-    resolve: (value: CaptionResponse) => void;
-    reject: (reason: unknown) => void;
-    request: CaptionRequest;
-  }> = [];
+/**
+ * Per-modality caption inference client. It does NOT cap concurrency: in-flight
+ * caption calls are governed by the LLM scheduler's rate-limit-group admission
+ * (`max_in_flight`, spec §9.4). The old per-modality `concurrency` knob (a
+ * deprecated transitional alias) was removed — review issue #29.
+ */
+export class InferenceClient {
   private stopped = false;
 
   constructor(private readonly options: InferenceClientOptions) {}
@@ -69,120 +62,87 @@ export class ConcurrencyLimitedInferenceClient {
     return this.options.modality;
   }
 
-  /** Configured concurrency cap for this modality, or undefined when unbounded. */
-  get maxConcurrency(): number | undefined {
-    return this.options.maxConcurrency;
+  stop(): void {
+    this.stopped = true;
   }
 
   async caption(request: CaptionRequest): Promise<CaptionResponse> {
     if (this.stopped) throw new Error("InferenceClient is stopped");
 
-    const limit = this.options.maxConcurrency;
-    if (limit == null || this.active < limit) {
-      return this.doCaption(request);
-    }
-    return new Promise<CaptionResponse>((resolve, reject) => {
-      this.queue.push({ resolve, reject, request });
-    });
-  }
+    let processed: ProcessedMedia | undefined;
+    let data: Buffer;
+    let mimeType = request.mimeType;
 
-  stop(): void {
-    this.stopped = true;
-    while (this.queue.length > 0) {
-      const item = this.queue.shift()!;
-      item.reject(new Error("InferenceClient stopped"));
-    }
-  }
-
-  private async doCaption(request: CaptionRequest): Promise<CaptionResponse> {
-    this.active++;
-    try {
-      let processed: ProcessedMedia | undefined;
-      let data: Buffer;
-      let mimeType = request.mimeType;
-
-      if (this.options.modality === "image" && this.options.imageProcessing) {
-        processed = await processImageForInference(request.filePath, this.options.imageProcessing);
-        try {
-          data = await readFile(processed.path);
-          mimeType = processed.mimeType;
-        } finally {
-          await cleanupProcessedImage(processed);
-        }
-      } else if (this.options.modality === "video" && this.options.videoProcessing) {
-        const videoOpts = { ...this.options.videoProcessing };
-        if (request.startTime != null) videoOpts.startTime = request.startTime;
-        processed = await processVideoForInference(request.filePath, videoOpts);
-        try {
-          data = await readFile(processed.path);
-          mimeType = processed.mimeType;
-        } finally {
-          await unlink(processed.path).catch(() => {});
-        }
-      } else if (this.options.modality === "audio" && this.options.audioProcessing) {
-        const audioOpts = { ...this.options.audioProcessing };
-        if (request.startTime != null) audioOpts.startTime = request.startTime;
-        processed = await processAudioForInference(request.filePath, audioOpts);
-        try {
-          data = await readFile(processed.path);
-          mimeType = processed.mimeType;
-        } finally {
-          await unlink(processed.path).catch(() => {});
-        }
-      } else {
-        data = await readFile(request.filePath);
-      }
-
-      // Scheduler admission (spec §5.4) wraps the network call only — media
-      // processing above runs unscheduled. The group's unconditional 429/503
-      // backoff (§5.3) is fed from the error message on failure.
-      const release = this.options.scheduler
-        ? await this.options.scheduler.acquire({
-            group: this.options.rateLimitGroup ?? "default",
-            priority: "background",
-          })
-        : undefined;
-      let result;
+    if (this.options.modality === "image" && this.options.imageProcessing) {
+      processed = await processImageForInference(request.filePath, this.options.imageProcessing);
       try {
-        result = await describeMedia({
-          modality: this.options.modality,
-          data,
-          mimeType,
-          prompt: request.prompt ?? this.options.prompt,
-          model: this.options.model,
-          maxChars: this.options.maxChars,
-          maxTokens: this.options.maxTokens,
-          timeoutMs: this.options.timeoutMs,
-        });
-        this.options.scheduler?.noteResult(this.options.rateLimitGroup ?? "default");
-      } catch (err) {
-        this.options.scheduler?.noteResult(
-          this.options.rateLimitGroup ?? "default",
-          err instanceof Error ? err.message : String(err),
-        );
-        throw err;
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
       } finally {
-        release?.();
+        await cleanupProcessedImage(processed);
       }
-
-      let caption = result.text;
-      if (processed?.truncated && processed.processedRange && processed.totalDuration) {
-        caption = formatTruncationWarning(caption, processed, request.context ?? "pipeline");
+    } else if (this.options.modality === "video" && this.options.videoProcessing) {
+      const videoOpts = { ...this.options.videoProcessing };
+      if (request.startTime != null) videoOpts.startTime = request.startTime;
+      processed = await processVideoForInference(request.filePath, videoOpts);
+      try {
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
+      } finally {
+        await unlink(processed.path).catch(() => {});
       }
+    } else if (this.options.modality === "audio" && this.options.audioProcessing) {
+      const audioOpts = { ...this.options.audioProcessing };
+      if (request.startTime != null) audioOpts.startTime = request.startTime;
+      processed = await processAudioForInference(request.filePath, audioOpts);
+      try {
+        data = await readFile(processed.path);
+        mimeType = processed.mimeType;
+      } finally {
+        await unlink(processed.path).catch(() => {});
+      }
+    } else {
+      data = await readFile(request.filePath);
+    }
 
-      return { caption, model: result.model };
+    // Scheduler admission (spec §5.4) wraps the network call only — media
+    // processing above runs unscheduled. The group's unconditional 429/503
+    // backoff (§5.3) is fed from the error message on failure.
+    const release = this.options.scheduler
+      ? await this.options.scheduler.acquire({
+          group: this.options.rateLimitGroup ?? "default",
+          priority: "background",
+        })
+      : undefined;
+    let result;
+    try {
+      result = await describeMedia({
+        modality: this.options.modality,
+        data,
+        mimeType,
+        prompt: request.prompt ?? this.options.prompt,
+        model: this.options.model,
+        maxChars: this.options.maxChars,
+        maxTokens: this.options.maxTokens,
+        timeoutMs: this.options.timeoutMs,
+      });
+      this.options.scheduler?.noteResult(this.options.rateLimitGroup ?? "default");
+    } catch (err) {
+      this.options.scheduler?.noteResult(
+        this.options.rateLimitGroup ?? "default",
+        err instanceof Error ? err.message : String(err),
+      );
+      throw err;
     } finally {
-      this.active--;
-      this.processQueue();
+      release?.();
     }
-  }
 
-  private processQueue(): void {
-    const limit = this.options.maxConcurrency;
-    while (this.queue.length > 0 && (limit == null || this.active < limit)) {
-      const item = this.queue.shift()!;
-      this.doCaption(item.request).then(item.resolve, item.reject);
+    let caption = result.text;
+    if (processed?.truncated && processed.processedRange && processed.totalDuration) {
+      caption = formatTruncationWarning(caption, processed, request.context ?? "pipeline");
     }
+
+    return { caption, model: result.model };
   }
 }
 

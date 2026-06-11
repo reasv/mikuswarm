@@ -39,8 +39,10 @@ import type { Logger } from "../observability/logger.js";
 export interface RequestRetryOptions {
   /**
    * Number of *additional* attempts after the first. Total attempts =
-   * `retries + 1`. `0` disables retry (the base stream function is returned
-   * unwrapped). Maps to `recovery.llm_request_retries`.
+   * `retries + 1`. `0` disables retry (a single attempt) — the wrapper still
+   * applies, because it owns the Layer-1 origin tagging (see
+   * {@link LLM_REQUEST_FAILURE_MARKER}) that Layer-2 resume classification
+   * depends on. Maps to `recovery.llm_request_retries`.
    */
   retries: number;
   /** Base for exponential backoff between attempts. `recovery.llm_request_backoff_base_ms`. */
@@ -57,6 +59,51 @@ export interface RequestRetryContext {
 }
 
 export type LlmErrorClass = "retryable" | "fatal";
+
+// ─── Layer-1 origin tagging (Decision C / review issue #14) ──────────────────
+//
+// pi-agent-core's `handleRunFailure` catches ANY executor throw — including
+// programming errors in `transformContext`/tool plumbing — and flattens it into
+// the same `AgentState.errorMessage` string a genuine LLM failure lands in. By
+// the time the SessionRunner inspects the failure, the string is ALL that
+// survives (pi-ai stores `error.message`; pi-agent-core copies it verbatim at
+// `turn_end`), so origin must be encoded in the string itself.
+//
+// `withRequestRetry` is the outermost wrapper of the LLM request layer: every
+// terminal `error` event it emits — a provider/SDK failure, a scheduler
+// admission failure synthesized by `withSchedulerAdmission` (composed INSIDE
+// it, so those flow through and are tagged here too), or its own synthesized
+// throw-guard/empty-stream errors — by definition originated in that layer. It
+// appends this marker to the terminal error's `errorMessage`; the runner's
+// mechanical classification (`throwIfMechanicalFailure`) treats ONLY tagged
+// errors as resume candidates, so an our-own-code throw can never be
+// misclassified as a mechanical upstream failure. The lean-retryable default of
+// `classifyLlmError` is deliberately unchanged WITHIN tagged errors: ambiguous
+// upstream failures stay resumable.
+//
+// The marker is a suffix so `extractStatus`'s leading-status parse still sees
+// the SDK's status prefix, and its text deliberately matches no FATAL_KEYWORDS
+// entry.
+
+/** Marker appended to terminal error messages that originated in the LLM request layer. */
+export const LLM_REQUEST_FAILURE_MARKER = "[llm-request]";
+
+/** Append the Layer-1 origin marker (idempotent). */
+export function tagLlmRequestError(message: string | undefined): string {
+  const msg = message ?? "";
+  if (msg.includes(LLM_REQUEST_FAILURE_MARKER)) return msg;
+  return msg.length > 0 ? `${msg} ${LLM_REQUEST_FAILURE_MARKER}` : LLM_REQUEST_FAILURE_MARKER;
+}
+
+/** True when the flattened error message carries the Layer-1 origin marker. */
+export function isLlmRequestError(message: string | undefined): boolean {
+  return (message ?? "").includes(LLM_REQUEST_FAILURE_MARKER);
+}
+
+/** Remove the Layer-1 origin marker for display/classification. */
+export function stripLlmRequestTag(message: string): string {
+  return message.split(LLM_REQUEST_FAILURE_MARKER).join("").replace(/\s+$/, "").trim();
+}
 
 // 4xx that indicate a request the model/gateway will reject identically on replay
 // (auth, malformed, not-found, payload-too-large, unprocessable). Never retried.
@@ -75,6 +122,11 @@ const FATAL_KEYWORDS = [
   "permission",
   "forbidden",
   "invalid_request_error",
+  // Synthesized by withSchedulerAdmission when LlmScheduler.stop() rejects an
+  // admission wait at shutdown ("LLM scheduler stopped"). A stopped gate can
+  // only ever reject again, so retrying would spin out the full backed-off
+  // attempt budget per straggler during teardown (#11).
+  "scheduler stopped",
 ];
 
 /**
@@ -140,8 +192,11 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
 }
 
 /**
- * Wrap a {@link StreamFn} with Layer-1 transparent request retry. When `retries`
- * is `0` the base function is returned unwrapped (no overhead, no behaviour change).
+ * Wrap a {@link StreamFn} with Layer-1 transparent request retry. `retries: 0`
+ * means a single attempt, but the wrapper still applies: every terminal error
+ * it surfaces is tagged with {@link LLM_REQUEST_FAILURE_MARKER} (Decision C),
+ * which Layer-2 resume classification depends on — returning the base fn
+ * unwrapped would silently disable resume-in-place.
  */
 export function withRequestRetry(
   base: StreamFn,
@@ -149,7 +204,6 @@ export function withRequestRetry(
   ctx: RequestRetryContext = {},
 ): StreamFn {
   const maxAttempts = Math.max(1, Math.floor(options.retries) + 1);
-  if (maxAttempts === 1) return base;
 
   return (model, context, streamOptions) => {
     const outer = createAssistantMessageEventStream();
@@ -157,29 +211,51 @@ export function withRequestRetry(
 
     void (async () => {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const inner = await base(model, context, streamOptions);
         let committed = false;
         const buffered: AssistantMessageEvent[] = [];
         let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
 
-        for await (const event of inner) {
+        try {
+          const inner = await base(model, context, streamOptions);
+          for await (const event of inner) {
+            if (committed) {
+              // Past the commit point: forward verbatim — except a terminal
+              // `error` (a mid-stream death, Layer-2 territory), which is
+              // tagged as LLM-request-layer-originated like every other
+              // terminal error this wrapper emits. A terminal `done`/`error`
+              // here auto-finalizes `outer` (EventStream.push resolves on it).
+              outer.push(event.type === "error" ? tagErrorEvent(event) : event);
+              continue;
+            }
+            if (event.type === "error") {
+              errorEvent = event;
+              break;
+            }
+            buffered.push(event);
+            if (event.type !== "start") {
+              // First real content (or a `done`): this attempt has produced output.
+              // Commit — flush the buffered prologue and switch to pass-through.
+              committed = true;
+              flush(outer, buffered);
+              buffered.length = 0;
+            }
+          }
+        } catch (err) {
+          // The base fn (or its stream iteration) THREW instead of emitting a
+          // terminal `error` event — e.g. a synchronously-failing base in a
+          // scheduler-less composition. Without this guard the throw escapes the
+          // void-IIFE as an unhandled rejection (process-fatal) and `outer` never
+          // terminates (hung consumer) (#12). Synthesize the terminal error and
+          // feed it through the SAME classification/retry logic below; an
+          // AbortError keeps its `aborted` stop reason (never retried).
+          const message = err instanceof Error ? err.message : String(err);
+          const aborted = err instanceof Error && err.name === "AbortError";
+          errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
           if (committed) {
-            // Past the commit point: forward verbatim. A terminal `done`/`error`
-            // here auto-finalizes `outer` (EventStream.push resolves on it).
-            outer.push(event);
-            continue;
-          }
-          if (event.type === "error") {
-            errorEvent = event;
-            break;
-          }
-          buffered.push(event);
-          if (event.type !== "start") {
-            // First real content (or a `done`): this attempt has produced output.
-            // Commit — flush the buffered prologue and switch to pass-through.
-            committed = true;
-            flush(outer, buffered);
-            buffered.length = 0;
+            // Content already forwarded — cannot replay (Layer-2 territory), but
+            // the consumer still needs a terminal event.
+            outer.push(tagErrorEvent(errorEvent));
+            return;
           }
         }
 
@@ -205,7 +281,7 @@ export function withRequestRetry(
             } catch {
               // Aborted mid-backoff (shutdown / cap): surface the original error.
               flush(outer, buffered);
-              outer.push(errorEvent);
+              outer.push(tagErrorEvent(errorEvent));
               return;
             }
             continue;
@@ -220,7 +296,7 @@ export function withRequestRetry(
             });
           }
           flush(outer, buffered);
-          outer.push(errorEvent);
+          outer.push(tagErrorEvent(errorEvent));
           return;
         }
 
@@ -232,7 +308,7 @@ export function withRequestRetry(
           sessionType: ctx.sessionType,
         });
         flush(outer, buffered);
-        outer.push(synthesizeErrorEvent(model, "stream ended without a terminal event"));
+        outer.push(tagErrorEvent(synthesizeErrorEvent(model, "stream ended without a terminal event")));
         return;
       }
     })();
@@ -264,10 +340,24 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Copy a terminal `error` event with the Layer-1 origin marker appended to its
+ * `errorMessage` (Decision C / #14). Never mutates the provider's event.
+ */
+function tagErrorEvent(
+  event: Extract<AssistantMessageEvent, { type: "error" }>,
+): Extract<AssistantMessageEvent, { type: "error" }> {
+  return {
+    ...event,
+    error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage) },
+  };
+}
+
 /** Build a terminal `error` event mirroring the shape pi-ai providers emit. */
 function synthesizeErrorEvent(
   model: Parameters<StreamFn>[0],
   message: string,
+  stopReason: "error" | "aborted" = "error",
 ): Extract<AssistantMessageEvent, { type: "error" }> {
   const error: AssistantMessage = {
     role: "assistant",
@@ -276,9 +366,9 @@ function synthesizeErrorEvent(
     provider: model.provider ?? "unknown",
     model: model.id,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    stopReason: "error",
+    stopReason,
     errorMessage: message,
     timestamp: Date.now(),
   };
-  return { type: "error", reason: "error", error };
+  return { type: "error", reason: stopReason, error };
 }

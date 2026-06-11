@@ -59,6 +59,8 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
             }
             if (!response.ok) {
               clearTimeout(timeout);
+              // Settle the unread body so the per-host limiter slot is freed promptly.
+              await response.body?.cancel().catch(() => {});
               return {
                 content: [{ type: "text", text: `error: avatar download failed: HTTP ${response.status}` }],
                 details: null,
@@ -68,6 +70,7 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
             const declaredLength = Number(response.headers.get("content-length"));
             if (Number.isFinite(declaredLength) && declaredLength > MAX_AVATAR_BYTES) {
               clearTimeout(timeout);
+              await response.body?.cancel().catch(() => {});
               return {
                 content: [{ type: "text", text: `error: avatar exceeds 10 MB limit (${declaredLength} bytes)` }],
                 details: null,

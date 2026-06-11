@@ -1,5 +1,6 @@
 import type { Summary } from "../storage/index.js";
 import { escapeAttr, escapeXml } from "./xml.js";
+import { estimateTokens } from "./tokens.js";
 import { formatAgentTimestamp } from "../time/index.js";
 
 export interface SummarySelection {
@@ -7,6 +8,138 @@ export interface SummarySelection {
   summaries: Summary[];
   /** Event-ID cut cursor: raw rendering starts strictly after this event. Null if no summaries. */
   coverageEndEventId: string | null;
+}
+
+/**
+ * Contiguity test for the coverage-cursor chain walk: does `next` follow `prev`
+ * with no un-covered raw events between them? "Between" means strictly after
+ * `prev`'s last covered event and strictly before `next`'s first covered event —
+ * an *event-existence* question, never a timestamp-interval one (adjacent
+ * worker-produced summaries are separated by real inter-message intervals, and
+ * genuinely disjoint summaries over retention-deleted ranges have nothing left
+ * to render between them).
+ */
+export type SummaryContiguityProbe = (prev: Summary, next: Summary) => boolean;
+
+/** The storage capability {@link makeContiguityProbe} needs (implemented by `Storage`). */
+export interface SummaryAdjacencyStore {
+  hasEventsBetweenSummaries(timelineKey: string, prev: Summary, next: Summary): boolean;
+}
+
+/**
+ * The production {@link SummaryContiguityProbe}: two summaries are contiguous
+ * exactly when no raw timeline event exists strictly between their coverage
+ * (level-1 job ranges abut by construction — each chunk starts at the first
+ * event after the coverage cursor — and a retention-deleted gap is equally
+ * contiguous: nothing un-covered would be skipped by advancing the cursor).
+ */
+export function makeContiguityProbe(
+  storage: SummaryAdjacencyStore,
+  timelineKey: string,
+): SummaryContiguityProbe {
+  return (prev, next) => !storage.hasEventsBetweenSummaries(timelineKey, prev, next);
+}
+
+/**
+ * The storage surface {@link selectSummaryCoverage} needs (implemented by
+ * `Storage`); structural so the pure selection logic stays storage-agnostic.
+ */
+export interface SummaryCoverageStore extends SummaryAdjacencyStore {
+  getSummaryCandidates(timelineKey: string, beforeTimestamp?: number): Summary[];
+  getFailedSummarizationJobs(
+    timelineKey: string,
+    level: number,
+  ): Array<{ id: string; level: number; inputStartId: string; inputEndId: string; updatedAt: number }>;
+  getEventCursor(
+    timelineKey: string,
+    eventId: string,
+  ): { timestamp: number; receivedAt: number; id: string } | undefined;
+  getTimelineEventsBetween(
+    timelineKey: string,
+    start: { timestamp: number; receivedAt: number; id: string },
+    end: { timestamp: number; receivedAt: number; id: string },
+  ): Array<{ id: string; timestamp: number }>;
+}
+
+/** Body of a synthesized failure-placeholder summary (spec §7.2). */
+export const FAILURE_PLACEHOLDER_CONTENT =
+  "[Summary for this range could not be generated — summarization failed after retries; " +
+  "the underlying messages are omitted from context.]";
+
+/**
+ * Failure placeholders (spec §7.2): one synthetic summary per terminally
+ * `failed` level-1 job, occupying the slot the real summary would have — usual
+ * envelope (time range, level, event count), body replaced by an explicit
+ * "could not be generated" marker. Never persisted; re-synthesized
+ * deterministically while the job stays failed (stable id `sumfail_<jobId>`,
+ * stable timestamps from the job row, so recency-label caching holds).
+ *
+ * These participate in coverage selection as first-class candidates: the
+ * coverage cursor advances THROUGH a failed range (its placeholder links the
+ * contiguity chain), which is what makes `failed` terminal for the range —
+ * builds omit the raw events and render the marker, and the eager indexer
+ * never re-counts or re-enqueues the range. There is deliberately NO automatic
+ * retry; the manual override is deleting the failed job row, after which the
+ * next reconcile re-enqueues the range.
+ *
+ * Ranges that no longer resolve (boundary events retention-deleted) are
+ * skipped — there is nothing left to stand in for.
+ */
+export function synthesizeFailurePlaceholders(
+  storage: SummaryCoverageStore,
+  timelineKey: string,
+  beforeTimestamp?: number,
+): Summary[] {
+  const placeholders: Summary[] = [];
+  for (const job of storage.getFailedSummarizationJobs(timelineKey, 1)) {
+    const start = storage.getEventCursor(timelineKey, job.inputStartId);
+    const end = storage.getEventCursor(timelineKey, job.inputEndId);
+    if (!start || !end) continue;
+    const covered = storage.getTimelineEventsBetween(timelineKey, start, end);
+    if (covered.length === 0) continue;
+    const first = covered[0]!;
+    const last = covered[covered.length - 1]!;
+    // Mirror getSummaryCandidates' inclusive `latest_timestamp <= beforeTimestamp`.
+    if (beforeTimestamp != null && last.timestamp > beforeTimestamp) continue;
+    placeholders.push({
+      id: `sumfail_${job.id}`,
+      timelineKey,
+      level: job.level,
+      content: FAILURE_PLACEHOLDER_CONTENT,
+      earliestTimestamp: first.timestamp,
+      latestTimestamp: last.timestamp,
+      earliestEventId: first.id,
+      latestEventId: last.id,
+      eventCount: covered.length,
+      tokenCount: estimateTokens(FAILURE_PLACEHOLDER_CONTENT),
+      modelId: null,
+      status: "complete",
+      backfillJobId: null,
+      generatedAt: job.updatedAt,
+      createdAt: job.updatedAt,
+    });
+  }
+  return placeholders;
+}
+
+/**
+ * The production coverage selection (§9b): persisted summary candidates plus
+ * synthesized failure placeholders, chained with the event-existence
+ * contiguity probe. The single entry point shared by the context builder and
+ * the eager `SummarizationIndexer`, so both always agree on what is covered.
+ */
+export function selectSummaryCoverage(
+  storage: SummaryCoverageStore,
+  timelineKey: string,
+  beforeTimestamp?: number,
+): SummarySelection {
+  const candidates = storage.getSummaryCandidates(timelineKey, beforeTimestamp);
+  const placeholders = synthesizeFailurePlaceholders(storage, timelineKey, beforeTimestamp);
+  const merged =
+    placeholders.length === 0
+      ? candidates
+      : [...candidates, ...placeholders].sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
+  return selectSummaries(merged, makeContiguityProbe(storage, timelineKey));
 }
 
 /**
@@ -18,9 +151,13 @@ export interface SummarySelection {
  *
  * Selection ordering uses timestamps (not unique under Matrix collisions), but the
  * returned cut cursor is always an event ID — so a borderline selection can never
- * make an event render both inside a summary and raw.
+ * make an event render both inside a summary and raw. The cursor chain is walked
+ * with `isContiguous` (event-existence based, see {@link SummaryContiguityProbe}).
  */
-export function selectSummaries(candidates: Summary[]): SummarySelection {
+export function selectSummaries(
+  candidates: Summary[],
+  isContiguous: SummaryContiguityProbe,
+): SummarySelection {
   let coverageEnd = 0;
   const selected: Summary[] = [];
 
@@ -52,17 +189,19 @@ export function selectSummaries(candidates: Summary[]): SummarySelection {
   pruned.sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
 
   // Derive the cursor from the contiguous prefix of summaries. Walk
-  // chronologically; if one summary's earliestTimestamp is significantly past
-  // the previous summary's latestTimestamp (more than 1ms tolerance), stop the
-  // contiguous chain. Summaries after the gap are still rendered (they contain
-  // useful context) but don't drive the cursor past the gap, so events in the
-  // gap are queried and rendered raw.
-  const GAP_TOLERANCE_MS = 1;
+  // chronologically, consulting the contiguity probe: the chain extends across
+  // a summary only when no un-covered raw events sit between it and the current
+  // coverage end (event-existence, NOT timestamp distance — adjacent chunk
+  // summaries are separated by real inter-message intervals and must still
+  // advance the cursor, or a freshly waited-on summary would double-render and
+  // the build would silently drop history). Summaries after a genuine gap are
+  // still rendered (they contain useful context) but don't drive the cursor
+  // past the gap, so the gap's events are queried and rendered raw.
   let contiguousCursor: Summary | null = null;
   for (const s of pruned) {
     if (contiguousCursor === null) {
       contiguousCursor = s;
-    } else if (s.earliestTimestamp <= contiguousCursor.latestTimestamp + GAP_TOLERANCE_MS) {
+    } else if (isContiguous(contiguousCursor, s)) {
       // This summary follows contiguously (or overlaps) — extend the chain.
       if (s.latestTimestamp > contiguousCursor.latestTimestamp) {
         contiguousCursor = s;

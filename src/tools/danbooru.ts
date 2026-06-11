@@ -749,7 +749,8 @@ const DANBOORU_DEFAULT_MAX_IN_FLIGHT = 2;
  */
 export class DanbooruRateLimiter {
   private active = 0;
-  private lastStartMs = 0;
+  /** Next free instant in the pacing schedule (epoch ms). */
+  private nextStartMs = 0;
   private readonly waiters: Array<() => void> = [];
 
   constructor(private readonly opts: { minIntervalMs: number; maxInFlight: number }) {}
@@ -764,18 +765,36 @@ export class DanbooruRateLimiter {
   }
 
   private async acquire(): Promise<void> {
-    if (this.active >= this.opts.maxInFlight) {
+    // Slot admission: FIFO, with DIRECT HANDOFF on release. A caller queues when
+    // the limiter is saturated (or anyone is already queued — no overtaking);
+    // `release` then transfers slot ownership to the head waiter WITHOUT
+    // decrementing `active`, so a fresh caller arriving between the release and
+    // the waiter's resumption can never double-grant the freed slot past
+    // `maxInFlight`.
+    if (this.active >= this.opts.maxInFlight || this.waiters.length > 0) {
       await new Promise<void>((resolve) => this.waiters.push(resolve));
+      // Slot ownership was handed over in release(); `active` already counts us.
+    } else {
+      this.active += 1;
     }
-    this.active += 1;
-    const wait = this.lastStartMs + this.opts.minIntervalMs - Date.now();
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    this.lastStartMs = Date.now();
+    // Pacing: reserve this request's start instant SYNCHRONOUSLY (before any
+    // await), so concurrent acquirers each claim a distinct slot in the schedule
+    // instead of reading the same stale "last start" and waking together.
+    const now = Date.now();
+    const startAt = Math.max(now, this.nextStartMs);
+    this.nextStartMs = startAt + this.opts.minIntervalMs;
+    if (startAt > now) await new Promise((resolve) => setTimeout(resolve, startAt - now));
   }
 
   private release(): void {
-    this.active = Math.max(0, this.active - 1);
-    this.waiters.shift()?.();
+    const next = this.waiters.shift();
+    if (next) {
+      // Direct handoff: the slot stays counted in `active` and now belongs to
+      // the head waiter.
+      next();
+      return;
+    }
+    this.active -= 1;
   }
 }
 
@@ -825,6 +844,8 @@ async function fetchJson<T>(
     // Pre-flight: refuse early when the server declared an oversized body.
     const declared = Number(response.headers.get("content-length") ?? "");
     if (Number.isFinite(declared) && declared > DANBOORU_FETCH_MAX_BYTES) {
+      // Settle the unread body so the per-host limiter slot is freed promptly.
+      await response.body?.cancel().catch(() => {});
       throw new Error(
         `Danbooru response too large: declared content-length ${declared} > ${DANBOORU_FETCH_MAX_BYTES} bytes.`,
       );

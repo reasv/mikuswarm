@@ -47,6 +47,10 @@ test("SessionManager persists the full status lifecycle through the write queue"
     assert.equal(row!.trigger_event_id, "evt-1");
     assert.equal(row!.trigger_external_id, "ext-1");
     assert.equal(row!.trigger_body, "hello there");
+    // Trigger-sender identity (v18, issue #18): persisted so a manual resume
+    // rebuilds the same sender-bound tool set from the durable row.
+    assert.equal(row!.trigger_sender_id, "u1");
+    assert.equal(row!.trigger_sender_display_name, "User");
     assert.equal(row!.no_reply, 0);
 
     sessions.markRunning(record.id);
@@ -80,6 +84,29 @@ test("SessionManager.markDiscarded persists discarded status with error", async 
     assert.equal(row!.status, "discarded");
     assert.equal(row!.error, "boom");
     assert.ok(typeof row!.completed_at === "number" && row!.completed_at! > 0, "completed_at set");
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager persists the trigger's triggeredBy over the event sender when present (#18)", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    // Mirrors buildSessionTools' resolution: a grouped trigger may carry a
+    // different effective sender (`triggeredBy`) than the raw event.
+    const trigger = makeTrigger();
+    trigger.trigger = {
+      type: "mention",
+      reason: "mentioned",
+      triggeredBy: { id: "u2", displayName: "Trigger User" },
+    };
+    const record = sessions.createPlaceholder(trigger, "default");
+    await storage.waitForIdle();
+    const row = storage.getAgentSession(record.id);
+    assert.equal(row!.trigger_sender_id, "u2");
+    assert.equal(row!.trigger_sender_display_name, "Trigger User");
   } finally {
     storage.close();
     await rm(dir, { recursive: true, force: true });

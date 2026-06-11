@@ -88,6 +88,14 @@ export class SessionManager {
 
     // Fire-and-forget durable row. FIFO write queue guarantees this insert
     // settles before any later status update for the same id.
+    //
+    // The trigger SENDER identity is persisted alongside the trigger body so a
+    // manual resume can rebuild the SAME sender-bound tool set (user_profile_*,
+    // recap's asker) from the durable row alone (spec
+    // CONCURRENCY-AND-RATE-LIMITING §6.2). The resolution mirrors
+    // buildSessionTools: the trigger's `triggeredBy` when present, else the
+    // event sender.
+    const triggerSender = trigger.trigger?.triggeredBy ?? trigger.event.sender;
     this.persist("session row insert", record.id, (storage) =>
       storage.insertAgentSession({
         id: record.id,
@@ -97,6 +105,8 @@ export class SessionManager {
         triggerEventId: trigger.event.id,
         triggerExternalId: trigger.event.externalId,
         triggerBody: trigger.event.body?.slice(0, MAX_TRIGGER_BODY),
+        triggerSenderId: triggerSender.id,
+        triggerSenderDisplayName: triggerSender.displayName,
         createdAt: record.createdAt,
         updatedAt: record.createdAt,
       }),

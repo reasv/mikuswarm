@@ -1,12 +1,12 @@
 import path from "node:path";
 import type { MediaAssetRow, Storage } from "../storage/index.js";
-import type { ConcurrencyLimitedInferenceClient } from "./inference-client.js";
+import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import { isAnimatedImage, convertAnimatedToVideo, extractFirstFrame } from "./animated.js";
 
 export interface CaptionWorkerOptions {
   storage: Storage;
-  clients: Map<MediaModality, ConcurrencyLimitedInferenceClient>;
+  clients: Map<MediaModality, InferenceClient>;
   workspaceRoot: string;
 }
 

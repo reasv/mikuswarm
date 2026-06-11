@@ -5,6 +5,7 @@ import {
   acquireHttpSlot,
   configureHttpLimiter,
   hostOf,
+  httpLimiterHostCount,
   noteHttpResponse,
   resetHttpLimiter,
 } from "../src/tools/http-limiter.js";
@@ -128,6 +129,212 @@ test("acquiring with an already-aborted signal rejects", async () => {
   resetHttpLimiter();
 });
 
+// ---------------------------------------------------------------------------
+// guardedFetch redirect-chain behaviour (per-hop slots + WHATWG redirect
+// semantics). Guard-enabled tests use public IP-literal hosts so
+// assertPublicHttpUrl never touches DNS; fetch is stubbed throughout.
+// ---------------------------------------------------------------------------
+
+// Distinct public (TEST-NET) hosts; different origins.
+const HOST_A = "203.0.113.1";
+const HOST_B = "198.51.100.2";
+
+interface RecordedCall {
+  url: string;
+  init: RequestInit & { headers: Record<string, string> };
+}
+
+function stubFetch(handler: (url: string, init: RequestInit) => Promise<Response> | Response): {
+  calls: RecordedCall[];
+  restore: () => void;
+} {
+  const original = globalThis.fetch;
+  const calls: RecordedCall[] = [];
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    // Snapshot headers — guardedFetch mutates its headers object across hops.
+    const snapshot = { ...(init ?? {}), headers: { ...(init as { headers?: Record<string, string> } | undefined)?.headers } };
+    calls.push({ url, init: snapshot as RecordedCall["init"] });
+    return handler(url, init ?? {});
+  }) as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
+
+function redirectResponse(status: number, location: string): Response {
+  return new Response(null, { status, headers: { location } });
+}
+
+test("redirect hop to a different host swaps the per-host slot (old released, new held)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  let releaseHopFetch!: () => void;
+  const hopFetchGate = new Promise<void>((resolve) => { releaseHopFetch = resolve; });
+  const stub = stubFetch(async (url) => {
+    if (url.includes(HOST_A)) return redirectResponse(302, `https://${HOST_B}/target`);
+    await hopFetchGate; // hold the hop fetch open so we can inspect slot state
+    return new Response("ok", { status: 200 });
+  });
+  try {
+    const pending = guardedFetch(`https://${HOST_A}/start`);
+    // Wait until the hop fetch (host B) is in flight.
+    while (stub.calls.length < 2) await delay(5);
+    // Host A's slot must be free again (cap is 1) ...
+    const releaseA = await acquireHttpSlot(`https://${HOST_A}/probe`);
+    releaseA();
+    // ... and host B's slot must be held by the in-flight hop.
+    let acquiredB = false;
+    const probeB = acquireHttpSlot(`https://${HOST_B}/probe`).then((release) => {
+      acquiredB = true;
+      return release;
+    });
+    await delay(20);
+    assert.equal(acquiredB, false, "hop host slot is held while the hop is in flight");
+    releaseHopFetch();
+    const response = await pending;
+    assert.equal(response.status, 200);
+    // The final response's slot is tied to BODY settlement now, not headers:
+    // still held after the response resolves, freed once the body is consumed.
+    await delay(20);
+    assert.equal(acquiredB, false, "final host slot is held until the body settles");
+    await response.text();
+    (await probeB)(); // body consumed → slot freed → probe acquires
+    assert.equal(acquiredB, true, "hop host slot is released when the body settles");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("redirect hop respects the hop host's backoff (backed-off host not reachable via redirects)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100 });
+  noteHttpResponse(`https://${HOST_B}/x`, 429, "2"); // host B backed off for 2s
+  const stub = stubFetch((url) =>
+    url.includes(HOST_A) ? redirectResponse(302, `https://${HOST_B}/target`) : new Response("ok", { status: 200 }),
+  );
+  try {
+    const controller = new AbortController();
+    const pending = guardedFetch(`https://${HOST_A}/start`, { signal: controller.signal });
+    const settled = pending.then(
+      () => "resolved",
+      () => "rejected",
+    );
+    await delay(60);
+    assert.equal(stub.calls.length, 1, "the hop to the backed-off host must not be fetched yet");
+    controller.abort();
+    assert.equal(await settled, "rejected", "abort while gated on the hop host's backoff rejects");
+    assert.equal(stub.calls.length, 1, "the backed-off host was never fetched");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("guard-disabled path records the throttle against the FINAL host, not the original", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 80, backoffMaxMs: 200 });
+  setEgressGuardEnabled(false);
+  const stub = stubFetch(() => {
+    const response = new Response("", { status: 429 });
+    Object.defineProperty(response, "url", { value: "https://final.example/landed" });
+    return response;
+  });
+  try {
+    await guardedFetch("https://original.example/start");
+    // Original host: no backoff recorded → immediate acquire.
+    const startOriginal = Date.now();
+    (await acquireHttpSlot("https://original.example/again"))();
+    assert.ok(Date.now() - startOriginal < 25, "original host must not be backed off");
+    // Final host: 429 recorded there → acquire waits out the backoff.
+    const startFinal = Date.now();
+    (await acquireHttpSlot("https://final.example/again"))();
+    assert.ok(Date.now() - startFinal >= 30, "final host carries the backoff");
+  } finally {
+    stub.restore();
+    setEgressGuardEnabled(true);
+    resetHttpLimiter();
+  }
+});
+
+test("cross-origin redirect strips authorization/cookie/proxy-authorization but keeps other headers", async () => {
+  resetHttpLimiter();
+  const stub = stubFetch((url) =>
+    url.includes(HOST_A) ? redirectResponse(302, `https://${HOST_B}/target`) : new Response("ok", { status: 200 }),
+  );
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/start`, {
+      headers: {
+        Authorization: "Bearer secret",
+        Cookie: "session=abc",
+        "Proxy-Authorization": "Basic xyz",
+        "X-Custom": "kept",
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(stub.calls.length, 2);
+    const first = stub.calls[0]!.init.headers;
+    assert.equal(first["Authorization"], "Bearer secret", "first hop carries the credential");
+    const hop = stub.calls[1]!.init.headers;
+    const hopKeys = Object.keys(hop).map((key) => key.toLowerCase());
+    assert.ok(!hopKeys.includes("authorization"), "authorization stripped cross-origin");
+    assert.ok(!hopKeys.includes("cookie"), "cookie stripped cross-origin");
+    assert.ok(!hopKeys.includes("proxy-authorization"), "proxy-authorization stripped cross-origin");
+    assert.equal(hop["X-Custom"], "kept", "non-credential headers survive");
+    assert.ok(hopKeys.includes("user-agent"), "default User-Agent survives");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("303 on POST converts the hop to GET with the body and content headers dropped", async () => {
+  resetHttpLimiter();
+  const stub = stubFetch((url) =>
+    url.endsWith("/start") ? redirectResponse(303, `https://${HOST_A}/result`) : new Response("ok", { status: 200 }),
+  );
+  try {
+    await guardedFetch(`https://${HOST_A}/start`, {
+      method: "POST",
+      body: '{"a":1}',
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+    });
+    assert.equal(stub.calls.length, 2);
+    assert.equal(stub.calls[0]!.init.method, "POST");
+    const hop = stub.calls[1]!.init;
+    assert.equal(hop.method, "GET", "303 follows as GET");
+    assert.equal(hop.body, undefined, "body dropped on the GET conversion");
+    const hopKeys = Object.keys(hop.headers).map((key) => key.toLowerCase());
+    assert.ok(!hopKeys.includes("content-type"), "content-type dropped with the body");
+    assert.equal(hop.headers["Authorization"], "Bearer secret", "same-origin hop keeps the credential");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("307 same-origin redirect preserves method, body, and authorization", async () => {
+  resetHttpLimiter();
+  const stub = stubFetch((url) =>
+    url.endsWith("/start") ? redirectResponse(307, `https://${HOST_A}/retry`) : new Response("ok", { status: 200 }),
+  );
+  try {
+    await guardedFetch(`https://${HOST_A}/start`, {
+      method: "POST",
+      body: '{"a":1}',
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+    });
+    assert.equal(stub.calls.length, 2);
+    const hop = stub.calls[1]!.init;
+    assert.equal(hop.method, "POST", "307 preserves the method");
+    assert.equal(hop.body, '{"a":1}', "307 preserves the body");
+    assert.equal(hop.headers["Authorization"], "Bearer secret", "same-origin 307 keeps the credential");
+    assert.equal(hop.headers["Content-Type"], "application/json", "content headers preserved");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
 test("guardedFetch records a host 429 so the next call to that host backs off", async () => {
   resetHttpLimiter();
   configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 80, backoffMaxMs: 200 });
@@ -144,4 +351,196 @@ test("guardedFetch records a host 429 so the next call to that host backs off", 
     setEgressGuardEnabled(true);
     resetHttpLimiter();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Body-settlement slot release (issue: caps must bound the streaming socket
+// phase, not just TTFB), Retry-After clamping, lossless eviction, and the
+// pure-defaults "unconditional with no config" invariant.
+// ---------------------------------------------------------------------------
+
+test("final response slot is held until the body is consumed (cap bounds the streaming phase)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/file`);
+    let probed = false;
+    const probe = acquireHttpSlot(`https://${HOST_A}/next`).then((release) => {
+      probed = true;
+      return release;
+    });
+    await delay(20);
+    assert.equal(probed, false, "slot must still be held while the body is unread");
+    assert.equal(await response.text(), "payload");
+    (await probe)();
+    assert.equal(probed, true, "consuming the body releases the slot");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("cancelling the response body releases the slot", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/file`);
+    await response.body!.cancel();
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("aborting the caller's signal releases the slot of an abandoned body", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response("payload", { status: 200 }));
+  try {
+    const controller = new AbortController();
+    await guardedFetch(`https://${HOST_A}/file`, { signal: controller.signal });
+    // Caller abandons the body (e.g. error path) and its timeout fires.
+    controller.abort();
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("a bodyless response releases the slot immediately", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const stub = stubFetch(() => new Response(null, { status: 200 }));
+  try {
+    await guardedFetch(`https://${HOST_A}/head`);
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("3xx with a missing Location header cancels the body and frees the slot", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  let bodyCancelled = false;
+  const stub = stubFetch(() => {
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    return new Response(body, { status: 302 });
+  });
+  try {
+    await assert.rejects(() => guardedFetch(`https://${HOST_A}/start`), /missing location header/);
+    assert.equal(bodyCancelled, true, "the redirect's body must be cancelled before the throw");
+    const release = await acquireHttpSlot(`https://${HOST_A}/next`);
+    release();
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("non-redirect 3xx (304) is returned to the caller, not followed", async () => {
+  resetHttpLimiter();
+  const stub = stubFetch(() => new Response(null, { status: 304, headers: { location: `https://${HOST_B}/elsewhere` } }));
+  try {
+    const response = await guardedFetch(`https://${HOST_A}/conditional`);
+    assert.equal(response.status, 304);
+    assert.equal(stub.calls.length, 1, "a 304 must not be followed even with a Location header");
+  } finally {
+    stub.restore();
+    resetHttpLimiter();
+  }
+});
+
+test("Retry-After is clamped to backoff_max_ms (hostile header can't blackhole a host)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 50, backoffMaxMs: 120 });
+  const url = "https://hostile.example/x";
+  noteHttpResponse(url, 429, "999999999"); // ~31 years
+  const start = Date.now();
+  (await acquireHttpSlot(url))();
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 100, `backoff must still apply (waited ${elapsed}ms)`);
+  assert.ok(elapsed < 2000, `Retry-After must be clamped to backoff_max_ms (waited ${elapsed}ms)`);
+  resetHttpLimiter();
+});
+
+test("zero-information host states are evicted (acquire/release and non-throttle responses)", async () => {
+  resetHttpLimiter();
+  assert.equal(httpLimiterHostCount(), 0);
+  // A plain acquire/release cycle leaves no state behind.
+  const release = await acquireHttpSlot("https://ephemeral-1.example/a");
+  assert.equal(httpLimiterHostCount(), 1);
+  release();
+  assert.equal(httpLimiterHostCount(), 0, "released zero-info state must be evicted");
+  // A non-throttle response leaves no state behind either.
+  noteHttpResponse("https://ephemeral-2.example/b", 200, null);
+  assert.equal(httpLimiterHostCount(), 0, "non-throttle note must not pin a state");
+  // Unparseable inputs (keyed by the full string) are evicted the same way.
+  noteHttpResponse("not a url at all", 200, null);
+  assert.equal(httpLimiterHostCount(), 0);
+  resetHttpLimiter();
+});
+
+test("backed-off host state is retained until the information expires", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 40, backoffMaxMs: 80 });
+  const url = "https://throttler.example/x";
+  noteHttpResponse(url, 429, null);
+  assert.equal(httpLimiterHostCount(), 1, "a throttled host's state is information — keep it");
+  // Wait out the backoff, then a success + release cycle returns it to zero-info.
+  const release = await acquireHttpSlot(url);
+  noteHttpResponse(url, 200, null);
+  release();
+  assert.equal(httpLimiterHostCount(), 0, "state evicted once streak reset and slot released");
+  resetHttpLimiter();
+});
+
+test("an aborted acquire does not leave a zero-information state behind", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 1, globalCeiling: 100 });
+  const held = await acquireHttpSlot("https://busy.example/a");
+  const controller = new AbortController();
+  const pending = acquireHttpSlot("https://busy.example/b", controller.signal);
+  await delay(10);
+  controller.abort();
+  await assert.rejects(() => pending);
+  held();
+  assert.equal(httpLimiterHostCount(), 0, "abort while waiting must not pin the state");
+  resetHttpLimiter();
+});
+
+test("429 backoff is enforced with pure defaults (no config at all)", async () => {
+  resetHttpLimiter(); // pure built-in defaults — backoffBaseMs 500
+  const url = "https://unconfigured.example/x";
+  noteHttpResponse(url, 429, null);
+  const start = Date.now();
+  (await acquireHttpSlot(url))();
+  const elapsed = Date.now() - start;
+  // First throttle: ceiling 500ms, jitter floor at half → at least ~250ms.
+  assert.ok(elapsed >= 200, `unconditional backoff must apply with no config (waited ${elapsed}ms)`);
+  resetHttpLimiter();
+});
+
+test("configureHttpLimiter floors backoff tuning at 1ms (invariant not disableable)", async () => {
+  resetHttpLimiter();
+  configureHttpLimiter({ backoffBaseMs: 0, backoffMaxMs: 0 } as never);
+  const url = "https://floored.example/x";
+  noteHttpResponse(url, 429, null);
+  noteHttpResponse(url, 429, null);
+  // With a floor of 1ms the window is tiny but non-zero; mainly assert no NaN /
+  // negative math and that acquisition still succeeds.
+  (await acquireHttpSlot(url))();
+  resetHttpLimiter();
 });
