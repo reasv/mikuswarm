@@ -7,7 +7,6 @@ import type { Logger } from "../observability/logger.js";
 import type { InboundChatEvent, SenderInfo } from "../types.js";
 import { parseMatrixTimelineKey } from "../proactive/index.js";
 import { mapBuiltMessages } from "./factory.js";
-import { isResumableRunError } from "./runner.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import type { ImageRef } from "./session-capture.js";
 
@@ -46,10 +45,10 @@ import type { ImageRef } from "./session-capture.js";
 //   at the user/tool-result message whose answer never committed —
 //   `agent.continue()` then re-issues exactly that request.
 //
-// It also owns the two resume policy surfaces — the auto-resume loop
-// (`autoResumeSession`) and the manual console resume
-// (`createManualResumeSession`) — both extracted from `app.ts` so the
-// park/discard/guard decisions are unit-testable with injected deps.
+// It also owns the manual console resume (`createManualResumeSession`) — the
+// SOLE resume path since the Layer-2 auto-resume loop was deleted (spec
+// LLM-FAILURE-HANDLING §8.2) — extracted from `app.ts` so the park/discard/
+// guard decisions are unit-testable with injected deps.
 // =============================================================================
 
 export interface ResumeMaterial {
@@ -343,7 +342,15 @@ export async function rehydrateImages(value: unknown, resolve: ImageRefResolver)
   return out;
 }
 
-// ─── Auto-resume policy loop (spec §6.2; issue #15) ──────────────────────────
+// ─── Resume attempt outcome vocabulary ───────────────────────────────────────────
+//
+// The Layer-2 AUTO-resume loop is deleted (spec LLM-FAILURE-HANDLING §8.2):
+// Layer-0 now owns all in-run retrying (unbounded for background work,
+// wall-clock-bounded for interactive), and once an interactive budget is
+// exhausted the maintainer explicitly does NOT want delayed automatic replies
+// (P3) — a bot answering long after it was asked is useless at best, and a
+// herd of backed-up sessions resuming together is a disaster. The manual
+// console resume below is the SOLE resume path for parked sessions.
 
 /** Terminal verdict of one resume attempt (`resumeSessionRun` in app.ts). */
 export interface ResumeAttemptResult {
@@ -356,104 +363,6 @@ export interface ResumeAttemptResult {
    */
   outcome: "completed" | "mechanical" | "content" | "fatal" | "unresumable";
   error?: string;
-}
-
-export interface AutoResumeDeps {
-  sessionId: string;
-  timelineKey: string;
-  /** `recovery.session_auto_resume_attempts`: 0 = park immediately (still manually resumable). */
-  attempts: number;
-  /** `recovery.session_auto_resume_backoff_ms` (exponential base). */
-  backoffBaseMs: number;
-  /** Live drain flag (read per decision point, not snapshotted at entry). */
-  isDraining: () => boolean;
-  /** Run one resume attempt (app.ts `resumeSessionRun`, bound to the session). */
-  runAttempt: (attempt: number) => Promise<ResumeAttemptResult>;
-  markResuming: (error: string) => void;
-  markFailedResumable: (error: string) => void;
-  markDiscarded: (error: string) => void;
-  logger: Pick<Logger, "warn" | "error">;
-  /** Injectable for tests; defaults to setTimeout. */
-  sleep?: (ms: number) => Promise<void>;
-}
-
-/**
- * Auto-resume (spec §6.2): bounded, backed-off resume attempts for a live run
- * that died mechanically (Layer-1 exhausted). Returns true when the failure was
- * handled here (resumed, parked, or discarded); false hands a NON-resumable
- * failure back to the caller's ordinary discard path.
- *
- * Park-over-discard rules (issue #15):
- * - `attempts <= 0` (auto-resume disabled) or draining at entry: a resumable
- *   failure parks `failed-resumable` immediately — never discarded — matching
- *   the config contract ("failures park immediately… still resumable manually").
- * - A `fatal` attempt outcome **while draining** also parks: shutdown kills the
- *   attempt's LLM request at the scheduler gate ("LLM scheduler stopped" /
- *   aborted admission), which Layer-1 deliberately classifies FATAL so teardown
- *   never spins futile retries — but that fatality is shutdown-caused, not
- *   content-caused, and the persisted resume material is intact. Only a fatal
- *   outcome on a live (non-draining) runtime discards.
- * - `unresumable` (material missing/unusable) always discards — the row cannot
- *   service a manual resume either, so parking would be a lie.
- */
-export async function autoResumeSession(error: unknown, deps: AutoResumeDeps): Promise<boolean> {
-  if (!isResumableRunError(error)) return false;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const initialError = error instanceof Error ? error.message : String(error);
-
-  if (deps.attempts <= 0 || deps.isDraining()) {
-    deps.markFailedResumable(initialError);
-    deps.logger.error("session_parked_failed_resumable", {
-      sessionId: deps.sessionId,
-      timelineKey: deps.timelineKey,
-      error: initialError,
-      reason: deps.attempts <= 0 ? "auto_resume_disabled" : "draining",
-    });
-    return true;
-  }
-
-  deps.markResuming(initialError);
-  deps.logger.warn("session_auto_resume_started", {
-    sessionId: deps.sessionId,
-    timelineKey: deps.timelineKey,
-    error: initialError,
-  });
-
-  let lastError = initialError;
-  for (let attempt = 1; attempt <= deps.attempts; attempt++) {
-    await sleep(deps.backoffBaseMs * 2 ** (attempt - 1));
-    if (deps.isDraining()) break; // park below — resumable after restart
-    const { outcome, error: attemptError } = await deps.runAttempt(attempt);
-    if (outcome === "completed") return true;
-    lastError = attemptError ?? lastError;
-    if (outcome === "content") break; // deterministic on replay: park, never discard (P5)
-    if (outcome === "unresumable" || (outcome === "fatal" && !deps.isDraining())) {
-      deps.markDiscarded(lastError);
-      deps.logger.error("session_resume_failed_terminal", {
-        sessionId: deps.sessionId,
-        attempt,
-        outcome,
-        error: lastError,
-      });
-      return true;
-    }
-    if (outcome === "fatal") break; // fatal-at-shutdown: park, material is intact
-    // mechanical → another attempt (or park below)
-    deps.markResuming(lastError);
-    deps.logger.warn("session_auto_resume_retry", {
-      sessionId: deps.sessionId,
-      attempt,
-      error: lastError,
-    });
-  }
-
-  deps.markFailedResumable(lastError);
-  deps.logger.error("session_parked_failed_resumable", {
-    sessionId: deps.sessionId,
-    timelineKey: deps.timelineKey,
-    error: lastError,
-  });
-  return true;
 }
 
 // ─── Manual console resume (spec §6.2; issues #16–#20) ───────────────────────

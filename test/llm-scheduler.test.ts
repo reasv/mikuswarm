@@ -12,6 +12,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
   LlmScheduler,
   defaultPriorityForSessionType,
+  modelHealthKey,
   parseRetryAfterMs,
   withSchedulerAdmission,
 } from "../src/agent/scheduler.js";
@@ -476,4 +477,164 @@ test("composed with withRequestRetry, each attempt re-acquires (no slot held acr
   // instantly even though the retry loop is mid-flight elsewhere.
   const release = await scheduler.acquire({});
   release();
+});
+
+// ---------------------------------------------------------------------------
+// Per-model health (spec LLM-FAILURE-HANDLING §5): the failure-domain axis —
+// unhealthy after N consecutive environmental failures, half-open probing at a
+// fixed cadence, mass re-awakening on a clean success, and no head-of-line
+// blocking of healthy models sharing the group.
+// ---------------------------------------------------------------------------
+
+const MODEL_A = "https://gw.example/anthropic::claude-x";
+const MODEL_B = "https://gw.example/google::gemini-y";
+
+function failEnvironmental(scheduler: LlmScheduler, modelKey: string, times = 1, status?: number): void {
+  for (let i = 0; i < times; i++) {
+    scheduler.noteOutcome("default", modelKey, "environmental", status);
+  }
+}
+
+test("model health: threshold consecutive environmental failures turn the model unhealthy and gate admission", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 3, probeIntervalMs: 50_000 },
+  });
+  failEnvironmental(scheduler, MODEL_A, 3);
+
+  let admitted = false;
+  const waiter = scheduler.acquire({ priority: "interactive", modelKey: MODEL_A }).then((r) => {
+    admitted = true;
+    r();
+  });
+  waiter.catch(() => {}); // rejected by the teardown stop() below
+  await tick();
+  assert.equal(admitted, false, "unhealthy model with an unelapsed probe window admits nothing");
+  assert.equal(scheduler.isQueueWaitPoint("default", MODEL_A), true);
+  scheduler.stop();
+});
+
+test("model health: an unhealthy model never head-of-line-blocks a healthy model in the same group", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+  });
+  failEnvironmental(scheduler, MODEL_A, 1);
+
+  const order: string[] = [];
+  // The unhealthy model's waiter is INTERACTIVE (outranks), the healthy one
+  // background — yet the healthy one must be admitted (skipped over, not
+  // waited behind).
+  scheduler
+    .acquire({ priority: "interactive", modelKey: MODEL_A })
+    .then((r) => {
+      order.push("unhealthy");
+      r();
+    })
+    .catch(() => {}); // rejected by the teardown stop() below
+  const releaseB = await scheduler.acquire({ priority: "background", modelKey: MODEL_B });
+  order.push("healthy");
+  releaseB();
+  assert.deepEqual(order, ["healthy"]);
+  scheduler.stop();
+});
+
+test("model health: probe window elapses → exactly ONE probe admitted; success re-awakens all waiters", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 2 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 20 },
+  });
+  failEnvironmental(scheduler, MODEL_A, 1);
+
+  const admitted: string[] = [];
+  const all = Promise.all([
+    scheduler.acquire({ priority: "interactive", modelKey: MODEL_A }).then((r) => {
+      admitted.push("probe");
+      // The probe succeeds: a clean outcome recovers the model and pumps the
+      // remaining waiters (the mass resume).
+      scheduler.noteOutcome("default", MODEL_A, undefined);
+      r();
+    }),
+    scheduler.acquire({ priority: "background", modelKey: MODEL_A }).then((r) => {
+      admitted.push("waiter-1");
+      r();
+    }),
+    scheduler.acquire({ priority: "background_low", modelKey: MODEL_A }).then((r) => {
+      admitted.push("waiter-2");
+      r();
+    }),
+  ]);
+  await tick();
+  assert.deepEqual(admitted, [], "nothing admitted before the probe window opens");
+  await sleep(40); // window opens → probe timer fires → ONE probe admitted
+  await all;
+  assert.deepEqual(admitted, ["probe", "waiter-1", "waiter-2"]);
+  assert.equal(scheduler.isQueueWaitPoint("default", MODEL_A), false, "recovered");
+  scheduler.stop();
+});
+
+test("model health: a failed probe stays unhealthy and schedules the next fixed window", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 25 },
+  });
+  failEnvironmental(scheduler, MODEL_A, 1);
+
+  const admitted: number[] = [];
+  let probes = 0;
+  const done = (async () => {
+    for (;;) {
+      const release = await scheduler.acquire({ priority: "background", modelKey: MODEL_A });
+      probes += 1;
+      admitted.push(Date.now());
+      if (probes < 2) {
+        scheduler.noteOutcome("default", MODEL_A, "environmental", 503);
+        release();
+        continue;
+      }
+      scheduler.noteOutcome("default", MODEL_A, undefined);
+      release();
+      return;
+    }
+  })();
+  await done;
+  assert.equal(probes, 2, "first probe fails, second succeeds");
+  scheduler.stop();
+});
+
+test("model health: a plain 429 feeds the group throttle but never the model streak", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 1, backoff_max_ms: 2 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+  });
+  // Three 429s — with threshold 1, ANY streak contribution would flip the
+  // model unhealthy. It must stay healthy (the budget is talking, not the model).
+  failEnvironmental(scheduler, MODEL_A, 3, 429);
+  await sleep(10); // wait out the tiny group backoff
+  const release = await scheduler.acquire({ priority: "background", modelKey: MODEL_A });
+  release();
+  scheduler.stop();
+});
+
+test("model health: content and aborted outcomes are neutral", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 2, probeIntervalMs: 50_000 },
+  });
+  scheduler.noteOutcome("default", MODEL_A, "environmental");
+  scheduler.noteOutcome("default", MODEL_A, "content");
+  scheduler.noteOutcome("default", MODEL_A, "aborted");
+  // Neutral outcomes neither count (streak would be 3 ≥ 2) nor reset (a
+  // subsequent environmental failure completes the original streak of 2).
+  scheduler.noteOutcome("default", MODEL_A, "environmental");
+  assert.equal(scheduler.isQueueWaitPoint("default", MODEL_A), true, "streak of 2 reached across neutral outcomes");
+  scheduler.stop();
+});
+
+test("modelHealthKey derives from endpoint + id", () => {
+  assert.equal(
+    modelHealthKey({ baseUrl: "https://gw.example/anthropic", id: "claude-x" }),
+    "https://gw.example/anthropic::claude-x",
+  );
+  assert.equal(modelHealthKey({ id: "claude-x" }), "unknown::claude-x");
 });

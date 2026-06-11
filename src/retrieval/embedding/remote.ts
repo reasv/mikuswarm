@@ -1,6 +1,7 @@
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
 import type { Logger } from "../../observability/logger.js";
-import { parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
+import { modelHealthKey, parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
+import { classifyLlmError } from "../../agent/request-retry.js";
 import { type EmbeddingProvider, l2normalize } from "./provider.js";
 
 export interface RemoteProviderOptions {
@@ -80,8 +81,11 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     // thing that can abort the admission wait; a rejected acquire arms nothing,
     // so there is no timer or listener to leak on that path (#10).
     const group = this.options.rateLimitGroup ?? "default";
+    // Health key (spec LLM-FAILURE-HANDLING §5): the embedding model's failure
+    // domain, derived the same way as agent sessions' — endpoint + model id.
+    const healthKey = modelHealthKey({ baseUrl: this.options.endpoint, id: this.options.id });
     const release = this.options.scheduler
-      ? await this.options.scheduler.acquire({ group, priority: "background", signal: stopSignal })
+      ? await this.options.scheduler.acquire({ group, priority: "background", modelKey: healthKey, signal: stopSignal })
       : undefined;
     // Per-request timeout (armed only once admitted) combined with the optional
     // external stop signal, so SIGTERM aborts an in-flight fetch without waiting
@@ -106,11 +110,14 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
         signal: controller.signal,
         dispatcher: this.dispatcher,
       });
-      // Feed the group's unconditional 429/503 backoff (§5.3) with the response
-      // status — and, since we hold the actual response here, the server's
-      // Retry-After (clamped by the scheduler to the group's backoff_max_ms).
-      this.options.scheduler?.noteStatus(
+      // Feed BOTH scheduler axes (spec LLM-FAILURE-HANDLING §5) with the
+      // response status — the group's unconditional 429/503 throttle backoff
+      // (with the server's Retry-After, clamped to the group's backoff_max_ms)
+      // and the embedding model's health streak (429 excluded inside).
+      this.options.scheduler?.noteOutcome(
         group,
+        healthKey,
+        res.ok ? undefined : classifyLlmError(`${res.status} embeddings request failed`, undefined),
         res.ok ? undefined : res.status,
         res.ok ? undefined : parseRetryAfterMs(res.headers),
       );

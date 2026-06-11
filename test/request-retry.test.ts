@@ -147,7 +147,7 @@ test("withRequestRetry: retries a pre-commit retryable failure then succeeds", a
     { events: [errorEvent("503 unavailable")] },
     { events: [startEvent(), textDeltaEvent("hi"), doneEvent()] },
   ]);
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const wrapped = withRequestRetry(fn, { ...FAST });
   const out = wrapped(MODEL, CONTEXT, undefined);
   const events = await drain(out);
   assert.equal(calls(), 2, "base re-issued exactly once");
@@ -162,18 +162,58 @@ test("withRequestRetry: a content error is forwarded without retrying", async ()
     { events: [errorEvent("413 prompt is too long")] },
     { events: [doneEvent()] },
   ]);
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const wrapped = withRequestRetry(fn, { ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls(), 1, "no retry on content");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
 });
 
-test("withRequestRetry: exhausts attempts then forwards the last error", async () => {
+test("withRequestRetry: an exhausted wall-clock budget forwards the last error (spec §6)", async () => {
+  // maxWaitMs 0: the budget is already exhausted when the first failure
+  // settles, so exactly one attempt is made and the error surfaces tagged.
   const { fn, calls } = scriptedBase([{ events: [errorEvent("500 internal")] }]);
-  const wrapped = withRequestRetry(fn, { retries: 2, ...FAST });
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 3, "1 initial + 2 retries");
+  assert.equal(calls(), 1, "budget exhausted after the first failure");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(extractLlmRequestClass(err.errorMessage), "environmental");
+});
+
+test("withRequestRetry: no maxWaitMs = unbounded — keeps retrying until success (spec §6)", async () => {
+  // Background-class budget: five straight failures, then success. A fixed
+  // attempt count would have given up; the unbounded budget never does.
+  const failures = Array.from({ length: 5 }, () => ({ events: [errorEvent("503 unavailable")] }));
+  const { fn, calls } = scriptedBase([...failures, { events: [startEvent(), textDeltaEvent("ok"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, FAST);
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 6, "retried through all five failures");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+});
+
+test("withRequestRetry: budget expiry mid-wait is re-labelled environmental, not aborted (spec §6)", async () => {
+  // The budget signal aborts an in-flight attempt (or admission wait). The
+  // caller did not abort — the clock did — so the surfaced failure must be
+  // environmental wait-exhaustion (parks), never an intentional abort.
+  let calls = 0;
+  const fn: StreamFn = (_model, _context, streamOptions) => {
+    calls += 1;
+    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    return (async function* () {
+      await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      const err = new Error("LLM scheduler wait aborted");
+      err.name = "AbortError";
+      throw err;
+    })() as unknown as AssistantMessageEventStream;
+  };
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 25, ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls, 1);
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "error", "not an abort");
+  assert.equal(extractLlmRequestClass(err.errorMessage), "environmental");
+  assert.match(err.errorMessage ?? "", /wall-clock budget/);
 });
 
 test("withRequestRetry: a mid-stream failure IS retried — partial discarded (spec §4.1)", async () => {
@@ -185,7 +225,7 @@ test("withRequestRetry: a mid-stream failure IS retried — partial discarded (s
     { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
     { events: [startEvent(), textDeltaEvent("clean"), doneEvent()] },
   ]);
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const wrapped = withRequestRetry(fn, { ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls(), 2, "mid-stream death → retried");
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
@@ -203,7 +243,7 @@ test("withRequestRetry: tap sees every attempt's raw events + the discard notice
   ]);
   const tapped: Array<{ attempt: number; type: string }> = [];
   const discarded: Array<{ attempt: number; reason: string }> = [];
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST }, {
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
     onAttemptEvent: (attempt, event) => tapped.push({ attempt, type: event.type }),
     onAttemptDiscarded: (attempt, reason) => discarded.push({ attempt, reason }),
   });
@@ -223,7 +263,7 @@ test("withRequestRetry: tap sees every attempt's raw events + the discard notice
 
 test("withRequestRetry: a throwing tap never affects the run", async () => {
   const { fn } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
-  const wrapped = withRequestRetry(fn, { retries: 0, ...FAST }, {
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
     onAttemptEvent: () => {
       throw new Error("tap exploded");
     },
@@ -232,15 +272,14 @@ test("withRequestRetry: a throwing tap never affects the run", async () => {
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
-test("withRequestRetry: retries=0 still wraps — single attempt, error tagged (#14)", async () => {
-  // Pre-#14 this returned the base fn unwrapped; now the wrapper must ALWAYS
-  // apply because it owns the Layer-1 origin tag the runner's mechanical
-  // classification (Layer-2 resume) depends on. Behaviour: exactly one attempt.
+test("withRequestRetry: maxWaitMs=0 still wraps — single attempt, error tagged (#14)", async () => {
+  // The wrapper must ALWAYS apply because it owns the Layer-0 origin tag the
+  // runner's phase-llm rejection depends on. Behaviour: exactly one attempt.
   const { fn, calls } = scriptedBase([{ events: [errorEvent("503 unavailable")] }]);
-  const wrapped = withRequestRetry(fn, { retries: 0, ...FAST });
-  assert.notEqual(wrapped, fn, "wrapper applies even at retries=0");
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST });
+  assert.notEqual(wrapped, fn, "wrapper applies even at maxWaitMs=0");
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 1, "retries=0 → single attempt");
+  assert.equal(calls(), 1, "maxWaitMs=0 → single attempt");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
   const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.ok(isLlmRequestError(err.errorMessage), "terminal error carries the Layer-1 tag");
@@ -288,9 +327,9 @@ test("class marker round-trip: tagged errors carry a parseable class (spec §4.3
   assert.equal(extractLlmRequestClass(tagLlmRequestError("529 overloaded")), undefined);
 });
 
-test("withRequestRetry: exhausted retries surface a TAGGED terminal error (#14)", async () => {
+test("withRequestRetry: an exhausted budget surfaces a TAGGED terminal error (#14)", async () => {
   const { fn } = scriptedBase([{ events: [errorEvent("500 internal")] }]);
-  const wrapped = withRequestRetry(fn, { retries: 1, ...FAST });
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   const err = (events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.ok(isLlmRequestError(err.errorMessage), "exhaust path tags");
@@ -300,7 +339,7 @@ test("withRequestRetry: exhausted retries surface a TAGGED terminal error (#14)"
 test("withRequestRetry: content and exhausted mid-stream errors are tagged with their class (#14/§4.3)", async () => {
   // Content failure: surfaced in one attempt, tagged with class.
   const content = scriptedBase([{ events: [errorEvent("413 prompt is too long")] }]);
-  const contentEvents = await drain(withRequestRetry(content.fn, { retries: 4, ...FAST })(MODEL, CONTEXT, undefined));
+  const contentEvents = await drain(withRequestRetry(content.fn, { ...FAST })(MODEL, CONTEXT, undefined));
   const contentErr = (contentEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.ok(isLlmRequestError(contentErr.errorMessage), "content path tags");
   assert.equal(extractLlmRequestClass(contentErr.errorMessage), "content");
@@ -310,7 +349,7 @@ test("withRequestRetry: content and exhausted mid-stream errors are tagged with 
   const mid = scriptedBase([
     { events: [startEvent(), textDeltaEvent("partial"), errorEvent("Connection error.")] },
   ]);
-  const midEvents = await drain(withRequestRetry(mid.fn, { retries: 1, ...FAST })(MODEL, CONTEXT, undefined));
+  const midEvents = await drain(withRequestRetry(mid.fn, { maxWaitMs: 0, ...FAST })(MODEL, CONTEXT, undefined));
   assert.deepEqual(midEvents.map((e) => e.type), ["error"], "partials discarded on the exhaust path too");
   const midErr = (midEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.ok(isLlmRequestError(midErr.errorMessage), "exhaust path tags");
@@ -328,9 +367,9 @@ test("withRequestRetry: a throwing base is surfaced as a terminal error and clas
     calls += 1;
     throw new Error("ECONNRESET socket hang up");
   };
-  const wrapped = withRequestRetry(fn, { retries: 2, ...FAST });
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls, 3, "retryable throw consumes the bounded attempts");
+  assert.equal(calls, 1, "environmental throw surfaces once the budget is exhausted");
   assert.deepEqual(events.map((e) => e.type), ["error"]);
   const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
   assert.equal(err.stopReason, "error");
@@ -345,7 +384,7 @@ test("withRequestRetry: a thrown AbortError is fatal — single attempt, stopRea
     err.name = "AbortError";
     throw err;
   };
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const wrapped = withRequestRetry(fn, { ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls, 1, "aborted is never retried");
   const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
@@ -368,21 +407,21 @@ test("withRequestRetry: a mid-iteration throw is retried like any mid-stream dea
     }
     return scriptedStream([startEvent(), textDeltaEvent("clean"), doneEvent()]);
   };
-  const wrapped = withRequestRetry(fn, { retries: 4, ...FAST });
+  const wrapped = withRequestRetry(fn, { ...FAST });
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls, 2, "mid-iteration throw → retried");
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
-test("withRequestRetry: an empty inner stream is environmental — retried, then surfaced tagged", async () => {
+test("withRequestRetry: an empty inner stream is environmental — retried like any failure", async () => {
   // "Empty streams" are an explicit environmental example (spec §3): the
   // synthesized terminal error re-enters the retry loop like any other.
-  const { fn, calls } = scriptedBase([{ events: [], endWithoutTerminal: true }]);
-  const wrapped = withRequestRetry(fn, { retries: 1, ...FAST });
+  const { fn, calls } = scriptedBase([
+    { events: [], endWithoutTerminal: true },
+    { events: [startEvent(), textDeltaEvent("ok"), doneEvent()] },
+  ]);
+  const wrapped = withRequestRetry(fn, FAST);
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-  assert.equal(calls(), 2, "1 initial + 1 retry");
-  assert.deepEqual(events.map((e) => e.type), ["error"]);
-  const final = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
-  assert.equal(final.stopReason, "error");
-  assert.ok(isLlmRequestError(final.errorMessage));
+  assert.equal(calls(), 2, "1 empty attempt + 1 clean retry");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });

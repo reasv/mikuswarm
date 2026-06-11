@@ -45,14 +45,22 @@ import type { Logger } from "../observability/logger.js";
 
 export interface RequestRetryOptions {
   /**
-   * Number of *additional* attempts after the first. Total attempts =
-   * `retries + 1`. `0` disables retry (a single attempt) — the wrapper still
-   * applies, because it owns the Layer-1 origin tagging (see
-   * {@link LLM_REQUEST_FAILURE_MARKER}) that Layer-2 resume classification
-   * depends on. Maps to `recovery.llm_request_retries`.
+   * Wall-clock budget for environmental retries (spec LLM-FAILURE-HANDLING
+   * §6), measured from the first attempt of the failing request. `undefined`
+   * = UNBOUNDED — background-class work keeps re-entering admission until it
+   * succeeds, is drained/aborted, or reclassifies (P3: downtime is routine
+   * and background work waits it out). Interactive-class callers pass
+   * `recovery.llm_request_max_wait_ms`. A fixed attempt count is meaningless
+   * under scheduler gating — attempts can elapse in seconds or hours
+   * depending on group/model state — so there is no `retries` knob anymore.
    */
-  retries: number;
-  /** Base for exponential backoff between attempts. `recovery.llm_request_backoff_base_ms`. */
+  maxWaitMs?: number;
+  /**
+   * Base for the local inter-attempt backoff. Applies only while the request's
+   * model is healthy and its group unthrottled — once the admission queue is
+   * the wait point (`ctx.isQueueWaitPoint`), the local sleep collapses to ~0
+   * (no double-waiting, §4.3). `recovery.llm_request_backoff_base_ms`.
+   */
   backoffBaseMs: number;
   /** Ceiling for the (pre-jitter) backoff delay. `recovery.llm_request_backoff_max_ms`. */
   backoffMaxMs: number;
@@ -78,6 +86,13 @@ export interface RequestRetryContext {
    * "attempt n failed (reason), retrying".
    */
   onAttemptDiscarded?: (attempt: number, reason: string) => void;
+  /**
+   * True when the admission queue is the effective wait point (group throttle
+   * backoff active, or the model unhealthy): the local inter-attempt backoff
+   * then collapses to ~0 so the wrapper never double-waits (§4.3). The
+   * factory binds `LlmScheduler.isQueueWaitPoint(group, modelKey)`.
+   */
+  isQueueWaitPoint?: () => boolean;
 }
 
 /**
@@ -255,27 +270,54 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
 
 /**
  * Wrap a {@link StreamFn} with Layer-0 transparent request retry (spec
- * LLM-FAILURE-HANDLING §4). The commit point is the TERMINAL event (§4.1): all
- * events of an attempt are buffered and forwarded only on a clean `done`; a
- * terminal `error` at any point — even after tokens streamed — discards the
+ * LLM-FAILURE-HANDLING §4/§6). The commit point is the TERMINAL event (§4.1):
+ * all events of an attempt are buffered and forwarded only on a clean `done`;
+ * a terminal `error` at any point — even after tokens streamed — discards the
  * buffered partial and retries as if the request had failed from the start.
  *
- * `retries: 0` means a single attempt, but the wrapper still applies: every
- * terminal error it surfaces is tagged with {@link LLM_REQUEST_FAILURE_MARKER}
- * + the class marker (Decision C / §4.3), which the runner's typed
- * `phase:"llm"` rejection depends on — returning the base fn unwrapped would
- * silently disable that gate.
+ * Retry budget (§6): environmental failures retry indefinitely when
+ * `maxWaitMs` is unset (background-class — downtime is waited out), or until
+ * the wall-clock budget elapses (interactive-class), measured from the first
+ * attempt. The budget also cuts short an in-progress ADMISSION wait — expiry
+ * mid-queue aborts the acquire via a composed signal — so a request queued
+ * behind an unhealthy model's probe window cannot overstay its budget.
+ *
+ * The wrapper always applies: every terminal error it surfaces is tagged with
+ * {@link LLM_REQUEST_FAILURE_MARKER} + the class marker (Decision C / §4.3),
+ * which the runner's typed `phase:"llm"` rejection depends on.
  */
 export function withRequestRetry(
   base: StreamFn,
   options: RequestRetryOptions,
   ctx: RequestRetryContext = {},
 ): StreamFn {
-  const maxAttempts = Math.max(1, Math.floor(options.retries) + 1);
-
   return (model, context, streamOptions) => {
     const outer = createAssistantMessageEventStream();
-    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    const callerSignal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+
+    // Wall-clock budget (§6). The budget signal composes with the caller's own
+    // signal so expiry aborts an in-flight attempt or admission wait; the
+    // surfaced abort is then re-labelled as budget exhaustion below (the
+    // caller did not abort — the clock did).
+    const maxWaitMs = options.maxWaitMs;
+    const deadline = maxWaitMs === undefined ? Infinity : Date.now() + maxWaitMs;
+    let budgetCtrl: AbortController | undefined;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+    let effectiveOptions = streamOptions;
+    if (maxWaitMs !== undefined) {
+      budgetCtrl = new AbortController();
+      budgetTimer = setTimeout(() => budgetCtrl!.abort(), maxWaitMs);
+      budgetTimer.unref?.();
+      const combined = callerSignal
+        ? AbortSignal.any([callerSignal, budgetCtrl.signal])
+        : budgetCtrl.signal;
+      effectiveOptions = {
+        ...((streamOptions as object | undefined) ?? {}),
+        signal: combined,
+      } as typeof streamOptions;
+    }
+    const sleepSignal =
+      (effectiveOptions as { signal?: AbortSignal } | undefined)?.signal ?? callerSignal;
 
     const tap = (attempt: number, event: AssistantMessageEvent): void => {
       try {
@@ -292,111 +334,142 @@ export function withRequestRetry(
       }
     };
 
+    /** Surface the terminal error (tagged) and finalize `outer`. */
+    const surface = (
+      event: Extract<AssistantMessageEvent, { type: "error" }>,
+      cls: LlmErrorClass,
+    ): void => {
+      outer.push(tagErrorEvent(event, cls));
+    };
+
     void (async () => {
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const buffered: AssistantMessageEvent[] = [];
-        let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
-        let producedTokens = false;
+      try {
+        for (let attempt = 0; ; attempt++) {
+          const buffered: AssistantMessageEvent[] = [];
+          let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
+          let producedTokens = false;
 
-        try {
-          const inner = await base(model, context, streamOptions);
-          for await (const event of inner) {
-            tap(attempt + 1, event);
-            if (event.type === "error") {
-              // Terminal error — before OR after tokens. The buffered partial
-              // is discarded below; the retry loop owns recovery (§4.1).
-              errorEvent = event;
-              break;
-            }
-            buffered.push(event);
-            if (event.type !== "start") producedTokens = true;
-            // A clean terminal `done` ends the inner iteration on its own.
-          }
-        } catch (err) {
-          // The base fn (or its stream iteration) THREW instead of emitting a
-          // terminal `error` event — e.g. a synchronously-failing base in a
-          // scheduler-less composition. Without this guard the throw escapes the
-          // void-IIFE as an unhandled rejection (process-fatal) and `outer` never
-          // terminates (hung consumer) (#12). Synthesize the terminal error and
-          // feed it through the SAME classification/retry logic below; an
-          // AbortError keeps its `aborted` stop reason (never retried).
-          const message = err instanceof Error ? err.message : String(err);
-          const aborted = err instanceof Error && err.name === "AbortError";
-          errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
-          tap(attempt + 1, errorEvent);
-        }
-
-        if (!errorEvent) {
-          const terminal = buffered[buffered.length - 1];
-          if (terminal && terminal.type === "done") {
-            // Clean terminal `done`: the attempt commits as a whole (§4.1).
-            // Flushing forwards the terminal event last, which finalizes
-            // `outer` (EventStream.push resolves on it). A success after N
-            // failed attempts is byte-equivalent to a first-attempt success.
-            flush(outer, buffered);
-            return;
-          }
-          // Degenerate: the inner stream ended with no terminal event. An
-          // "empty stream" is explicitly environmental (§3), so it re-enters
-          // the same retry loop instead of surfacing immediately.
-          ctx.logger?.warn("llm_request_empty_stream", {
-            sessionId: ctx.sessionId,
-            timelineKey: ctx.timelineKey,
-            sessionType: ctx.sessionType,
-            attempt: attempt + 1,
-          });
-          errorEvent = synthesizeErrorEvent(model, "stream ended without a terminal event");
-          tap(attempt + 1, errorEvent);
-        }
-
-        const failure = errorEvent.error;
-        const verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
-        // Every environmental failure is logged — including the first attempt
-        // and the deterministic single-attempt path (spec §9.3 closes the
-        // audit gap where first-attempt failures logged nothing).
-        if (verdict === "environmental") {
-          ctx.logger?.warn("llm_request_attempt_failed", {
-            sessionId: ctx.sessionId,
-            timelineKey: ctx.timelineKey,
-            sessionType: ctx.sessionType,
-            group: ctx.group,
-            class: verdict,
-            status: extractStatus((failure?.errorMessage ?? "").toLowerCase()),
-            attempt: attempt + 1,
-            maxAttempts,
-            producedTokens,
-            errorMessage: failure?.errorMessage,
-          });
-        }
-        const lastAttempt = attempt >= maxAttempts - 1;
-        if (verdict === "environmental" && !lastAttempt) {
-          tapDiscarded(attempt + 1, failure?.errorMessage ?? "request failed");
-          const delay = backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
           try {
-            await sleep(delay, signal);
-          } catch {
-            // Aborted mid-backoff (shutdown / cap): surface the original error.
-            // The buffered partial stays discarded (P1 — partials never reach
-            // the consumer on a failed attempt).
-            outer.push(tagErrorEvent(errorEvent, verdict));
-            return;
+            const inner = await base(model, context, effectiveOptions);
+            for await (const event of inner) {
+              tap(attempt + 1, event);
+              if (event.type === "error") {
+                // Terminal error — before OR after tokens. The buffered partial
+                // is discarded below; the retry loop owns recovery (§4.1).
+                errorEvent = event;
+                break;
+              }
+              buffered.push(event);
+              if (event.type !== "start") producedTokens = true;
+              // A clean terminal `done` ends the inner iteration on its own.
+            }
+          } catch (err) {
+            // The base fn (or its stream iteration) THREW instead of emitting a
+            // terminal `error` event — e.g. a synchronously-failing base in a
+            // scheduler-less composition. Without this guard the throw escapes
+            // the void-IIFE as an unhandled rejection (process-fatal) and
+            // `outer` never terminates (hung consumer) (#12). Synthesize the
+            // terminal error and feed it through the SAME classification/retry
+            // logic below; an AbortError keeps its `aborted` stop reason.
+            const message = err instanceof Error ? err.message : String(err);
+            const aborted = err instanceof Error && err.name === "AbortError";
+            errorEvent = synthesizeErrorEvent(model, message, aborted ? "aborted" : "error");
+            tap(attempt + 1, errorEvent);
           }
-          continue;
+
+          if (!errorEvent) {
+            const terminal = buffered[buffered.length - 1];
+            if (terminal && terminal.type === "done") {
+              // Clean terminal `done`: the attempt commits as a whole (§4.1).
+              // Flushing forwards the terminal event last, which finalizes
+              // `outer` (EventStream.push resolves on it). A success after N
+              // failed attempts is byte-equivalent to a first-attempt success.
+              flush(outer, buffered);
+              return;
+            }
+            // Degenerate: the inner stream ended with no terminal event. An
+            // "empty stream" is explicitly environmental (§3), so it re-enters
+            // the same retry loop instead of surfacing immediately.
+            ctx.logger?.warn("llm_request_empty_stream", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              attempt: attempt + 1,
+            });
+            errorEvent = synthesizeErrorEvent(model, "stream ended without a terminal event");
+            tap(attempt + 1, errorEvent);
+          }
+
+          const failure = errorEvent.error;
+          let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
+
+          // Budget expiry mid-attempt/mid-admission arrives as an abort of the
+          // composed signal. When the CALLER did not abort, the clock did:
+          // re-label as environmental wait-exhaustion rather than an
+          // intentional abort, so the failure parks instead of settling.
+          const budgetExpired = budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true;
+          if (verdict === "aborted" && budgetExpired) {
+            verdict = "environmental";
+            errorEvent = synthesizeErrorEvent(
+              model,
+              `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
+            );
+          }
+
+          if (verdict === "environmental") {
+            // Every environmental failure is logged — including the first
+            // attempt (spec §9.3 closes the audit gap where first-attempt
+            // failures logged nothing).
+            ctx.logger?.warn("llm_request_attempt_failed", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              group: ctx.group,
+              class: verdict,
+              status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
+              attempt: attempt + 1,
+              producedTokens,
+              errorMessage: errorEvent.error?.errorMessage,
+            });
+            if (Date.now() >= deadline || budgetExpired) {
+              ctx.logger?.warn("llm_request_wait_exhausted", {
+                sessionId: ctx.sessionId,
+                timelineKey: ctx.timelineKey,
+                sessionType: ctx.sessionType,
+                maxWaitMs,
+                attempts: attempt + 1,
+                errorMessage: errorEvent.error?.errorMessage,
+              });
+              surface(errorEvent, verdict);
+              return;
+            }
+            tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "request failed");
+            // Local backoff applies only while the admission queue is NOT the
+            // wait point (§4.3) — an unhealthy model / throttled group already
+            // paces re-admission, and double-waiting would slow recovery.
+            let delay = ctx.isQueueWaitPoint?.() ? 0 : backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
+            if (Number.isFinite(deadline)) delay = Math.min(delay, Math.max(0, deadline - Date.now()));
+            try {
+              await sleep(delay, sleepSignal);
+            } catch {
+              // Aborted mid-backoff. Caller abort (shutdown/Stop) surfaces the
+              // original error; budget expiry loops once more and exits via
+              // the wait-exhausted path above.
+              if (budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true) {
+                continue;
+              }
+              surface(errorEvent, verdict);
+              return;
+            }
+            continue;
+          }
+
+          // `content` and `aborted` surface immediately — never retried (§4.3).
+          surface(errorEvent, verdict);
+          return;
         }
-        if (verdict === "environmental") {
-          ctx.logger?.warn("llm_request_retries_exhausted", {
-            sessionId: ctx.sessionId,
-            timelineKey: ctx.timelineKey,
-            sessionType: ctx.sessionType,
-            attempts: maxAttempts,
-            errorMessage: failure?.errorMessage,
-          });
-        }
-        // Surface exactly ONE terminal error event; this attempt's buffered
-        // partial is discarded (P1) — pi-agent-core synthesizes its error turn
-        // from the terminal event alone, never from partial content.
-        outer.push(tagErrorEvent(errorEvent, verdict));
-        return;
+      } finally {
+        if (budgetTimer) clearTimeout(budgetTimer);
       }
     })();
 

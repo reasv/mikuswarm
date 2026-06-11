@@ -22,7 +22,6 @@ import {
   SessionManager,
   SessionRunner,
   isLlmRunFailure,
-  autoResumeSession,
   createManualResumeSession,
   isResumableRunError,
   loadResumeMaterial,
@@ -153,6 +152,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
+    // Per-model health (spec LLM-FAILURE-HANDLING §5): global thresholds —
+    // the failure-domain key is derived from endpoint+id, so there is no
+    // natural per-model config block.
+    health: {
+      unhealthyThreshold: config.recovery?.llm_unhealthy_threshold,
+      probeIntervalMs: config.recovery?.llm_probe_interval_ms,
+    },
     logger: logger.child("llm-scheduler"),
   });
 
@@ -1256,35 +1262,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
-   * Auto-resume (spec §6.2): bounded, backed-off resume attempts for a live run
-   * that died mechanically (Layer-1 exhausted). Runs INSIDE the failed run's
-   * promise chain so the per-timeline trigger slot stays held for the whole
-   * recovery — no second session can race the resumed one. Returns true when the
-   * failure was handled (resumed, parked, or discarded here); false hands the
-   * failure back to the ordinary discard path. The policy loop — including the
-   * park-over-discard rules for `attempts = 0`, draining-at-entry, and a
-   * fatal-at-shutdown attempt (issue #15) — lives in `autoResumeSession`
-   * (src/agent/recovery.ts) where it is unit-testable.
-   */
-  function maybeAutoResumeSession(
-    session: AgentSessionRecord,
-    error: unknown,
-  ): Promise<boolean> {
-    return autoResumeSession(error, {
-      sessionId: session.id,
-      timelineKey: session.timelineKey,
-      attempts: config.recovery?.session_auto_resume_attempts ?? 2,
-      backoffBaseMs: config.recovery?.session_auto_resume_backoff_ms ?? 5000,
-      isDraining: () => draining,
-      runAttempt: (attempt) => resumeSessionRun(session, session.trigger, attempt),
-      markResuming: (err) => sessions.markResuming(session.id, { error: err }),
-      markFailedResumable: (err) => sessions.markFailedResumable(session.id, { error: err }),
-      markDiscarded: (err) => sessions.markDiscarded(session.id, { error: err }),
-      logger,
-    });
-  }
-
-  /**
    * Manual console resume of a parked `failed-resumable` or `interrupted`
    * session (spec §6.2 / Decision D — the only operator action; there are no
    * chat commands). The whole policy — double-POST guard, status + viability
@@ -1451,15 +1428,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             error: flushErr instanceof Error ? flushErr.message : String(flushErr),
           });
         }
-        // Layer-2 resume-in-place (spec §6.2): a mechanical run death (Layer-1
-        // exhausted) is auto-resumed from the persisted snapshot + transcript,
-        // inside this promise chain so the timeline slot stays held throughout.
-        if (await maybeAutoResumeSession(session, error)) return;
         // Park, never discard (spec LLM-FAILURE-HANDLING §8.2 / P5): ANY
-        // LLM-layer failure — content (oversized request) included — is
-        // operator- or upstream-fixable; nothing about the session itself is
-        // unresumable. `markDiscarded` remains only for untagged errors (our
-        // own code throwing) below.
+        // LLM-layer failure — environmental (interactive wall-clock budget
+        // exhausted) and content (oversized request) alike — is operator- or
+        // upstream-fixable; nothing about the session itself is unresumable.
+        // Layer-0 now owns ALL in-run retrying (the old Layer-2 auto-resume
+        // loop is deleted): once the budget is exhausted the maintainer
+        // explicitly does NOT want delayed automatic replies (P3) — the manual
+        // console resume is the sole resume path. `markDiscarded` remains only
+        // for untagged errors (our own code throwing) below.
         if (isLlmRunFailure(error)) {
           const message = error instanceof Error ? error.message : String(error);
           sessions.markFailedResumable(session.id, { error: message });
@@ -1467,6 +1444,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             sessionId: session.id,
             timelineKey: session.timelineKey,
             class: error.llmClass,
+            elapsedMs: Date.now() - (session.startedAt ?? session.createdAt),
             error: message,
           });
           return;

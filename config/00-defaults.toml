@@ -31,23 +31,24 @@ forced_completion_retries = 3
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 
-# Recovery — request- and session-level resilience.
-# Layer 1 (implemented): transparent per-request retry for MECHANICAL LLM failures
-# (connection reset, timeout, 5xx, 429). The exact same request is re-issued, with
-# exponential backoff + full jitter, before the failure is allowed to surface — so a
-# blip no longer discards a live session or burns a synthetic job's semantic-retry
-# attempt. Failures that occur AFTER the stream has produced output are not replayed
-# here (that is Layer-2 resume-in-place, not yet implemented).
+# Recovery — request-level resilience (spec LLM-FAILURE-HANDLING).
+# Layer 0: transparent per-request retry for ENVIRONMENTAL LLM failures
+# (connection reset, timeout, 5xx, 429, mid-stream deaths — partials discarded).
+# The exact same request is re-issued; a success after N failures is
+# byte-equivalent to a first-attempt success. The budget is wall-clock, not a
+# count: interactive-class sessions (live chat, proactive) retry within
+# llm_request_max_wait_ms then park `failed-resumable` for manual console
+# resume; background-class work (summaries, diaries) retries WITHOUT BOUND —
+# inference downtime is routine and background work waits it out.
 [recovery]
-llm_request_retries = 4            # additional attempts after the first (total = 5)
-llm_request_backoff_base_ms = 500
+llm_request_backoff_base_ms = 500   # local backoff (healthy model, unthrottled group only)
 llm_request_backoff_max_ms = 15000
-# Layer 2 (spec §6.2): when a LIVE session's run dies mechanically after Layer 1
-# exhausts, re-create the agent from the persisted snapshot + transcript and redo
-# the exact same request (auto-resume, exponential backoff), then park it
-# `failed-resumable` for a manual console resume. 0 disables auto-resume.
-session_auto_resume_attempts = 2
-session_auto_resume_backoff_ms = 5000
+llm_request_max_wait_ms = 120000    # interactive-class wall-clock budget (~the edge of a reply still being useful)
+# Per-model health (failure domain, derived from endpoint+model id): after this
+# many consecutive environmental failures the model turns unhealthy — one probe
+# request per fixed interval; on probe success every waiter resumes together.
+llm_unhealthy_threshold = 3
+llm_probe_interval_ms = 60000
 
 [models.default]
 id = "claude-opus-4-7"

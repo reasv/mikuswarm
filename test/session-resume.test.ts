@@ -5,14 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
-  autoResumeSession,
   createManualResumeSession,
   loadResumeMaterial,
   stripFailedTail,
   RESUME_IMAGE_PLACEHOLDER,
-  type AutoResumeDeps,
   type ManualResumeDeps,
-  type ResumeAttemptResult,
   type ResumeMaterial,
   type ResumeMaterialDeps,
 } from "../src/agent/recovery.js";
@@ -432,7 +429,7 @@ test("storage accepts the resume states and resetStaleSessions parks mid-resume 
   }
 });
 
-test("SessionManager: markResuming keeps the record; markFailedResumable evicts; adopt re-registers", () => {
+test("SessionManager: markFailedResumable evicts; adopt re-registers", () => {
   const sessions = new SessionManager();
   const record = sessions.createPlaceholder({
     provider: "test",
@@ -450,9 +447,6 @@ test("SessionManager: markResuming keeps the record; markFailedResumable evicts;
   } as any);
   sessions.markRunning(record.id);
 
-  sessions.markResuming(record.id, { error: "529" });
-  assert.equal(sessions.get(record.id)?.status, "resuming");
-
   sessions.markFailedResumable(record.id, { error: "529" });
   assert.equal(sessions.get(record.id), undefined, "parked sessions are evicted from memory");
 
@@ -461,138 +455,6 @@ test("SessionManager: markResuming keeps the record; markFailedResumable evicts;
   assert.equal(sessions.get(record.id)?.status, "resuming");
   sessions.markRunning(record.id);
   assert.equal(sessions.get(record.id)?.status, "running");
-});
-
-// ---------------------------------------------------------------------------
-// Auto-resume policy loop (issue #15): park-over-discard for attempts=0,
-// draining-at-entry, and fatal-at-shutdown.
-// ---------------------------------------------------------------------------
-
-const MECHANICAL = new SessionRunnerError("agent run failed at the LLM layer (environmental): 529", "llm", {
-  llmClass: "environmental",
-});
-
-interface Recorded {
-  resuming: string[];
-  parked: string[];
-  discarded: string[];
-  attemptsRun: number[];
-}
-
-function autoResumeHarness(overrides: Partial<AutoResumeDeps> = {}): { deps: AutoResumeDeps; rec: Recorded } {
-  const rec: Recorded = { resuming: [], parked: [], discarded: [], attemptsRun: [] };
-  const deps: AutoResumeDeps = {
-    sessionId: "s-auto1",
-    timelineKey: "tl:room1",
-    attempts: 2,
-    backoffBaseMs: 0,
-    isDraining: () => false,
-    runAttempt: async (attempt): Promise<ResumeAttemptResult> => {
-      rec.attemptsRun.push(attempt);
-      return { outcome: "mechanical", error: "529 again" };
-    },
-    markResuming: (err) => rec.resuming.push(err),
-    markFailedResumable: (err) => rec.parked.push(err),
-    markDiscarded: (err) => rec.discarded.push(err),
-    logger: { warn: () => {}, error: () => {} },
-    sleep: async () => {},
-    ...overrides,
-  };
-  return { deps, rec };
-}
-
-test("autoResumeSession: non-resumable errors are handed back (false), nothing marked", async () => {
-  const { deps, rec } = autoResumeHarness();
-  assert.equal(await autoResumeSession(new Error("transform bug"), deps), false);
-  assert.equal(await autoResumeSession(new SessionRunnerError("x", "prompt"), deps), false);
-  assert.deepEqual(rec.parked, []);
-  assert.deepEqual(rec.discarded, []);
-  assert.deepEqual(rec.attemptsRun, []);
-});
-
-test("autoResumeSession: attempts=0 parks immediately, still manually resumable (#15)", async () => {
-  // Config contract (schema.ts session_auto_resume_attempts): "0 disables
-  // auto-resume (failures park immediately... still resumable manually)".
-  const { deps, rec } = autoResumeHarness({ attempts: 0 });
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true, "handled here, not discarded by caller");
-  assert.deepEqual(rec.parked, [MECHANICAL.message]);
-  assert.deepEqual(rec.discarded, []);
-  assert.deepEqual(rec.attemptsRun, [], "no doomed attempt is run");
-  assert.deepEqual(rec.resuming, [], "parks directly, never enters resuming");
-});
-
-test("autoResumeSession: draining at entry parks instead of discarding (#15)", async () => {
-  const { deps, rec } = autoResumeHarness({ isDraining: () => true });
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true);
-  assert.deepEqual(rec.parked, [MECHANICAL.message]);
-  assert.deepEqual(rec.discarded, []);
-  assert.deepEqual(rec.attemptsRun, []);
-});
-
-test("autoResumeSession: fatal attempt outcome WHILE DRAINING parks — shutdown-caused fatality keeps resume material (#15)", async () => {
-  // Group-3 interaction: scheduler.stop() makes in-flight admission reject
-  // ("LLM scheduler stopped"), which Layer-1 deliberately classifies FATAL so
-  // teardown never spins retries. That fatality is shutdown-caused, not
-  // content-caused — the parked row must stay manually resumable.
-  let draining = false;
-  const { deps, rec } = autoResumeHarness({
-    isDraining: () => draining,
-    runAttempt: async (attempt) => {
-      rec.attemptsRun.push(attempt);
-      draining = true; // shutdown begins mid-attempt
-      return { outcome: "fatal", error: "LLM scheduler stopped" };
-    },
-  });
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true);
-  assert.deepEqual(rec.attemptsRun, [1]);
-  assert.deepEqual(rec.parked, ["LLM scheduler stopped"]);
-  assert.deepEqual(rec.discarded, [], "never discarded at shutdown");
-});
-
-test("autoResumeSession: fatal outcome on a live runtime still discards", async () => {
-  const { deps, rec } = autoResumeHarness({
-    runAttempt: async (attempt) => {
-      rec.attemptsRun.push(attempt);
-      return { outcome: "fatal", error: "400 malformed" };
-    },
-  });
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true);
-  assert.deepEqual(rec.discarded, ["400 malformed"]);
-  assert.deepEqual(rec.parked, []);
-});
-
-test("autoResumeSession: draining mid-backoff parks without running the attempt", async () => {
-  let draining = false;
-  const { deps, rec } = autoResumeHarness({
-    sleep: async () => {
-      draining = true; // shutdown lands during the backoff sleep
-    },
-    isDraining: () => draining,
-  });
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true);
-  assert.deepEqual(rec.attemptsRun, []);
-  assert.deepEqual(rec.parked, [MECHANICAL.message]);
-});
-
-test("autoResumeSession: completion resumes; exhaustion parks", async () => {
-  // Completed on the second attempt.
-  const ok = autoResumeHarness({
-    runAttempt: async (attempt) => {
-      ok.rec.attemptsRun.push(attempt);
-      return attempt === 2 ? { outcome: "completed" } : { outcome: "mechanical", error: "529" };
-    },
-  } as Partial<AutoResumeDeps>);
-  assert.equal(await autoResumeSession(MECHANICAL, ok.deps), true);
-  assert.deepEqual(ok.rec.attemptsRun, [1, 2]);
-  assert.deepEqual(ok.rec.parked, []);
-  assert.deepEqual(ok.rec.discarded, []);
-
-  // Mechanical every time → exhaustion → park.
-  const { deps, rec } = autoResumeHarness();
-  assert.equal(await autoResumeSession(MECHANICAL, deps), true);
-  assert.deepEqual(rec.attemptsRun, [1, 2]);
-  assert.deepEqual(rec.parked, ["529 again"]);
-  assert.deepEqual(rec.discarded, []);
 });
 
 // ---------------------------------------------------------------------------

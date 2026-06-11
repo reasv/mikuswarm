@@ -31,14 +31,12 @@ export {
 export {
   loadResumeMaterial,
   stripFailedTail,
-  autoResumeSession,
   createManualResumeSession,
   MANUAL_RESUME_STATUSES,
   RESUME_IMAGE_PLACEHOLDER,
   type ResumeMaterial,
   type ResumeMaterialDeps,
   type ResumeAttemptResult,
-  type AutoResumeDeps,
   type ManualResumeDeps,
   type ManualResumeResult,
 } from "./recovery.js";

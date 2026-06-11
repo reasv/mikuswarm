@@ -576,22 +576,26 @@ const RateLimitsSchema = StrictObject({
   })),
 });
 
-// Recovery — request- and session-level resilience (spec CONCURRENCY-AND-RATE-LIMITING §6/§9.6).
+// Recovery — request-level resilience (spec LLM-FAILURE-HANDLING §4–§6/§10).
 const RecoverySchema = StrictObject({
-  // Layer 1 — transparent per-request retry for mechanical LLM failures
-  // (network/stream reset, timeout, 5xx, 429). Re-issues the exact same request
-  // before the run is allowed to fail. See src/agent/request-retry.ts.
-  llm_request_retries: Type.Optional(Type.Number({ minimum: 0 })),
+  // Layer 0 — transparent per-request retry for environmental LLM failures
+  // (network/stream reset, timeout, 5xx, 429, mid-stream deaths). Re-issues the
+  // exact same request before the run is allowed to fail; the attempt budget is
+  // wall-clock (below), not a count. See src/agent/request-retry.ts.
+  // Local inter-attempt backoff, applied only while the model is healthy and
+  // the group unthrottled (the admission queue is the wait point otherwise).
   llm_request_backoff_base_ms: Type.Optional(Type.Number({ minimum: 0 })),
   llm_request_backoff_max_ms: Type.Optional(Type.Number({ minimum: 0 })),
-  // Layer 2 — session resume-in-place (§6.2): when a LIVE session's run dies
-  // mechanically after Layer 1 exhausts, re-create the agent from the persisted
-  // snapshot + transcript and redo the same request, this many times (with
-  // backoff) before parking the session `failed-resumable` for a manual console
-  // resume. 0 disables auto-resume (failures park immediately... still resumable
-  // manually). See src/agent/recovery.ts.
-  session_auto_resume_attempts: Type.Optional(Type.Number({ minimum: 0 })),
-  session_auto_resume_backoff_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Interactive-class wall-clock retry budget (spec §6): live chat + proactive
+  // requests keep retrying within this window, then the session parks
+  // `failed-resumable` for manual console resume. Background-class work
+  // (summaries/diaries) is deliberately unbounded — it waits out any outage.
+  llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Per-model health (spec §5): consecutive environmental failures before the
+  // model turns unhealthy (half-open admission), and the FIXED probe cadence
+  // while unhealthy (never grows — recovery is detected within one window).
+  llm_unhealthy_threshold: Type.Optional(Type.Number({ minimum: 1 })),
+  llm_probe_interval_ms: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
 export const AppConfigSchema = StrictObject({

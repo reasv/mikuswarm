@@ -9,6 +9,7 @@ import { convertToLlm } from "./convert.js";
 import { withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
+  modelHealthKey,
   withSchedulerAdmission,
   type LlmScheduler,
   type PriorityClass,
@@ -247,12 +248,12 @@ export class AgentSessionFactory {
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     const model = createModelFromConfig(modelConfig);
-    // Layer-1 transparent request retry (spec §6.1) wraps the chosen stream fn so a
-    // mechanical blip re-issues the exact same request before it can discard a live
-    // session or burn a synthetic job's semantic-retry attempt. `retries: 0` means a
-    // single attempt but the wrapper STILL applies — it owns the Layer-1 origin tag
-    // (`LLM_REQUEST_FAILURE_MARKER`) that the runner's mechanical classification and
-    // Layer-2 resume-in-place depend on (Decision C / #14).
+    // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
+    // chosen stream fn so an environmental failure re-issues the exact same
+    // request — buffered to the terminal event, partials discarded — before the
+    // run is allowed to fail. The wrapper ALWAYS applies: it owns the Layer-0
+    // origin + class tags (`[llm-request:<class>]`) the runner's typed
+    // `phase:"llm"` rejection depends on (Decision C / #14).
     const recovery = this.options.config.recovery;
     const baseStreamFn = withSdkRetriesDisabled(
       (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
@@ -264,8 +265,14 @@ export class AgentSessionFactory {
     // the same (group, priority) and no slot is held across backoff sleeps.
     const scheduler = this.options.scheduler;
     const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
-    const priority =
-      opts?.priority ?? sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
+    // The session type's OWN class — the workload category. `opts.priority` (a
+    // priority-inheritance escalation, e.g. a summarization job raised by a
+    // waiting build) overrides the QUEUE RANK only, never the retry budget
+    // (spec LLM-FAILURE-HANDLING §6): an escalated background job is still
+    // background work and still waits out an outage.
+    const basePriority =
+      sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
+    const priority = opts?.priority ?? basePriority;
     const admittedStreamFn = scheduler
       ? withSchedulerAdmission(baseStreamFn, scheduler, {
           group: rateLimitGroup,
@@ -273,10 +280,15 @@ export class AgentSessionFactory {
           key: opts?.escalationKey,
         })
       : baseStreamFn;
+    // Per-class retry budget (spec §6): interactive-class work (live chat +
+    // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
+    // class work (summaries, diaries — must eventually exist) is unbounded.
+    const interactiveBudget = basePriority === "interactive" || basePriority === "proactive";
+    const healthKey = modelHealthKey(model);
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
-        retries: recovery?.llm_request_retries ?? 4,
+        maxWaitMs: interactiveBudget ? (recovery?.llm_request_max_wait_ms ?? 120_000) : undefined,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
         backoffMaxMs: recovery?.llm_request_backoff_max_ms ?? 15_000,
       },
@@ -286,6 +298,12 @@ export class AgentSessionFactory {
         timelineKey: session.timelineKey,
         sessionType: session.sessionType,
         group: rateLimitGroup,
+        // No double-waiting (§4.3): once the model is unhealthy or the group
+        // throttled, the admission queue paces re-admission and the local
+        // inter-attempt backoff collapses to ~0.
+        ...(scheduler
+          ? { isQueueWaitPoint: () => scheduler.isQueueWaitPoint(rateLimitGroup, healthKey) }
+          : {}),
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
         // events → per-session tentative bus → console SSE. Observe-only.
         ...(this.options.liveEvents

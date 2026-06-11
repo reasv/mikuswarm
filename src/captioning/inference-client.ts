@@ -1,6 +1,7 @@
 import { readFile, unlink } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
-import type { LlmScheduler } from "../agent/scheduler.js";
+import { modelHealthKey, type LlmScheduler } from "../agent/scheduler.js";
+import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
 import {
   processImageForInference,
   processVideoForInference,
@@ -106,12 +107,20 @@ export class InferenceClient {
     }
 
     // Scheduler admission (spec §5.4) wraps the network call only — media
-    // processing above runs unscheduled. The group's unconditional 429/503
-    // backoff (§5.3) is fed from the error message on failure.
+    // processing above runs unscheduled. Outcomes feed BOTH scheduler axes
+    // (spec LLM-FAILURE-HANDLING §5): the group's unconditional 429/503
+    // throttle backoff and the caption model's health streak — the health key
+    // derives from (endpoint, model id), the same failure domain agent
+    // sessions use, so a broken caption model trips half-open probing here
+    // too while this client's own pool-level retries stay in charge of the
+    // job lifecycle.
+    const group = this.options.rateLimitGroup ?? "default";
+    const healthKey = modelHealthKey({ baseUrl: this.options.model.endpoint, id: this.options.model.id });
     const release = this.options.scheduler
       ? await this.options.scheduler.acquire({
-          group: this.options.rateLimitGroup ?? "default",
+          group,
           priority: "background",
+          modelKey: healthKey,
         })
       : undefined;
     let result;
@@ -126,11 +135,14 @@ export class InferenceClient {
         maxTokens: this.options.maxTokens,
         timeoutMs: this.options.timeoutMs,
       });
-      this.options.scheduler?.noteResult(this.options.rateLimitGroup ?? "default");
+      this.options.scheduler?.noteOutcome(group, healthKey, undefined);
     } catch (err) {
-      this.options.scheduler?.noteResult(
-        this.options.rateLimitGroup ?? "default",
-        err instanceof Error ? err.message : String(err),
+      const message = err instanceof Error ? err.message : String(err);
+      this.options.scheduler?.noteOutcome(
+        group,
+        healthKey,
+        classifyLlmError(message, undefined),
+        extractStatus(message.toLowerCase()),
       );
       throw err;
     } finally {
