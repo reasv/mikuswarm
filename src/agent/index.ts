@@ -20,10 +20,13 @@ export {
   LlmScheduler,
   withSchedulerAdmission,
   defaultPriorityForSessionType,
+  modelHealthKey,
   type PriorityClass,
   type LlmGroupConfig,
   type LlmSchedulerOptions,
+  type LlmSchedulerSnapshot,
 } from "./scheduler.js";
+export { LlmRequestRing, DEFAULT_LLM_REQUEST_RING_SIZE, type LlmRequestRecord } from "./request-ring.js";
 export {
   SessionRunner,
   SessionRunnerError,

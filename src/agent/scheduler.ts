@@ -56,6 +56,13 @@ function rankOf(priority: PriorityClass): number {
   return CLASS_RANK[priority] ?? 0;
 }
 
+function classOfRank(rank: number): PriorityClass {
+  for (const [cls, r] of Object.entries(CLASS_RANK) as Array<[PriorityClass, number]>) {
+    if (r === rank) return cls;
+  }
+  return "background_low";
+}
+
 /**
  * Built-in priority defaults per session type (§9.3). Used when the session
  * type config carries no explicit `priority`, so existing configs need no change.
@@ -121,6 +128,10 @@ export interface AcquireOptions {
    * (health gating off — legacy callers, tests).
    */
   modelKey?: string;
+  /** Attribution for the console scheduler view (spec §9.1). */
+  sessionId?: string;
+  /** Session type, or a pool label for non-session callers (captioning, …). */
+  sessionType?: string;
   /** Abort waiting for a slot (shutdown / run abort). */
   signal?: AbortSignal;
 }
@@ -140,15 +151,65 @@ export function modelHealthKey(model: { baseUrl?: string; id: string }): string 
 /** Idempotent slot release. MUST be called (in a `finally`) when the request settles. */
 export type ReleaseFn = () => void;
 
+/** Shape of {@link LlmScheduler.snapshot} (spec LLM-FAILURE-HANDLING §9.1). */
+export interface LlmSchedulerSnapshot {
+  groups: Array<{
+    name: string;
+    maxInFlight: number;
+    /** Throttle backoff, epoch ms; 0 = none. */
+    backoffUntil: number;
+    active: Array<{
+      sessionId: string | null;
+      sessionType: string | null;
+      model: string | null;
+      priority: PriorityClass;
+      key: string | null;
+      heldMs: number;
+    }>;
+    queue: Array<{
+      sessionId: string | null;
+      sessionType: string | null;
+      model: string | null;
+      priority: PriorityClass;
+      key: string | null;
+      waitingMs: number;
+    }>;
+    stickyEscalations: Array<{ key: string; priority: PriorityClass }>;
+  }>;
+  models: Array<{
+    key: string;
+    health: "healthy" | "unhealthy";
+    consecutiveFailures: number;
+    probeInFlight: boolean;
+    /** Epoch ms of the next admissible probe; 0 when healthy/immediate. */
+    nextProbeAt: number;
+    lastFailure: { ts: number; status?: number; class: LlmErrorClass } | null;
+    waiters: number;
+  }>;
+}
+
 interface QueueEntry {
   rank: number;
   seq: number;
   key?: string;
   modelKey?: string;
+  sessionId?: string;
+  sessionType?: string;
+  enqueuedAt: number;
   resolve: (release: ReleaseFn) => void;
   reject: (err: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+}
+
+/** An admitted (in-flight) request, tracked for the console snapshot (§9.1). */
+interface ActiveEntry {
+  rank: number;
+  key?: string;
+  modelKey?: string;
+  sessionId?: string;
+  sessionType?: string;
+  admittedAt: number;
 }
 
 interface GroupState {
@@ -157,6 +218,8 @@ interface GroupState {
   backoffBaseMs: number;
   backoffMaxMs: number;
   active: number;
+  /** In-flight entries (console attribution); size always equals `active`. */
+  activeEntries: Set<ActiveEntry>;
   queue: QueueEntry[];
   /** Epoch ms before which no new admission may happen. 0 = none. */
   backoffUntil: number;
@@ -229,6 +292,7 @@ export class LlmScheduler {
       backoffBaseMs: cfg.backoff_base_ms ?? DEFAULT_BACKOFF_BASE_MS,
       backoffMaxMs: cfg.backoff_max_ms ?? DEFAULT_BACKOFF_MAX_MS,
       active: 0,
+      activeEntries: new Set(),
       queue: [],
       backoffUntil: 0,
       consecutiveThrottles: 0,
@@ -279,6 +343,9 @@ export class LlmScheduler {
         seq: this.seqCounter++,
         key: opts.key,
         modelKey: opts.modelKey,
+        sessionId: opts.sessionId,
+        sessionType: opts.sessionType,
+        enqueuedAt: Date.now(),
         resolve,
         reject,
         signal: opts.signal,
@@ -546,6 +613,55 @@ export class LlmScheduler {
     return count;
   }
 
+  /**
+   * Point-in-time snapshot for the console scheduler view (spec
+   * LLM-FAILURE-HANDLING §9.1): per-group budget state (active/queued entries
+   * with attribution, throttle backoff, sticky escalations) beside per-model
+   * health (streak, probe state, waiter counts). Read-only; safe to call from
+   * the console request path.
+   */
+  snapshot(): LlmSchedulerSnapshot {
+    const now = Date.now();
+    return {
+      groups: [...this.groups.values()].map((group) => ({
+        name: group.name,
+        maxInFlight: group.maxInFlight,
+        backoffUntil: group.backoffUntil > now ? group.backoffUntil : 0,
+        active: [...group.activeEntries].map((entry) => ({
+          sessionId: entry.sessionId ?? null,
+          sessionType: entry.sessionType ?? null,
+          model: entry.modelKey ?? null,
+          priority: classOfRank(entry.rank),
+          key: entry.key ?? null,
+          heldMs: now - entry.admittedAt,
+        })),
+        queue: [...group.queue]
+          .sort((a, b) => (b.rank - a.rank) || (a.seq - b.seq))
+          .map((entry) => ({
+            sessionId: entry.sessionId ?? null,
+            sessionType: entry.sessionType ?? null,
+            model: entry.modelKey ?? null,
+            priority: classOfRank(entry.rank),
+            key: entry.key ?? null,
+            waitingMs: now - entry.enqueuedAt,
+          })),
+        stickyEscalations: [...this.stickyEscalations.entries()].map(([key, priority]) => ({
+          key,
+          priority,
+        })),
+      })),
+      models: [...this.health.values()].map((health) => ({
+        key: health.key,
+        health: health.state,
+        consecutiveFailures: health.consecutiveFailures,
+        probeInFlight: health.probeInFlight,
+        nextProbeAt: health.state === "unhealthy" ? health.nextProbeAt : 0,
+        lastFailure: health.lastFailure ?? null,
+        waiters: this.countModelWaiters(health.key),
+      })),
+    };
+  }
+
   /** Reject all queued waiters (shutdown). In-flight requests are unaffected. */
   stop(): void {
     this.stopped = true;
@@ -639,11 +755,21 @@ export class LlmScheduler {
         }
       }
       group.active += 1;
+      const activeEntry: ActiveEntry = {
+        rank: entry.rank,
+        key: entry.key,
+        modelKey: entry.modelKey,
+        sessionId: entry.sessionId,
+        sessionType: entry.sessionType,
+        admittedAt: now,
+      };
+      group.activeEntries.add(activeEntry);
       let released = false;
       const release: ReleaseFn = () => {
         if (released) return;
         released = true;
         group.active = Math.max(0, group.active - 1);
+        group.activeEntries.delete(activeEntry);
         this.pump(group);
       };
       entry.resolve(release);
@@ -674,6 +800,15 @@ export interface AdmissionOptions {
   priority: PriorityClass;
   /** Escalation key registered for the whole wait (§5.5). */
   key?: string;
+  /** Attribution for the console scheduler view (spec §9.1). */
+  sessionId?: string;
+  sessionType?: string;
+  /**
+   * Called with the admission-queue wait of each attempt (ms), right after a
+   * slot is acquired. The factory uses it to stamp `admissionWaitMs` onto the
+   * request ring entry (spec §9.2) — the one number llm-gateway cannot see.
+   */
+  onAdmissionWait?: (waitMs: number) => void;
 }
 
 /**
@@ -746,14 +881,22 @@ export function withSchedulerAdmission(
 
     void (async () => {
       let release: ReleaseFn;
+      const acquireStart = Date.now();
       try {
         release = await scheduler.acquire({
           group: options.group,
           priority: options.priority,
           key: options.key,
           modelKey,
+          sessionId: options.sessionId,
+          sessionType: options.sessionType,
           signal,
         });
+        try {
+          options.onAdmissionWait?.(Date.now() - acquireStart);
+        } catch {
+          /* observe-only */
+        }
       } catch (err) {
         // Admission failed without any request being issued. An aborted wait
         // (run abort / drain) synthesizes `stopReason:"aborted"` and a scheduler

@@ -19,6 +19,7 @@ import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js"
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
+import type { LlmRequestRing } from "./request-ring.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
@@ -98,6 +99,12 @@ export interface AgentFactoryOptions {
    * the terminal event. Optional: absent = no tap (tests, headless).
    */
   liveEvents?: SessionLiveEventBus;
+  /**
+   * In-memory LLM request ring (spec LLM-FAILURE-HANDLING §9.2): every settled
+   * Layer-0 attempt is recorded with session/priority attribution and the
+   * admission wait. Optional: absent = no recording (tests, headless).
+   */
+  requestRing?: LlmRequestRing;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -273,11 +280,20 @@ export class AgentSessionFactory {
     const basePriority =
       sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
     const priority = opts?.priority ?? basePriority;
+    // Holder for the admission wait of the in-flight attempt (ring
+    // attribution, §9.2): the agent issues one request at a time per session,
+    // so a single slot per created agent is race-free.
+    const admissionWait: { last?: number } = {};
     const admittedStreamFn = scheduler
       ? withSchedulerAdmission(baseStreamFn, scheduler, {
           group: rateLimitGroup,
           priority,
           key: opts?.escalationKey,
+          sessionId: session.id,
+          sessionType: session.sessionType,
+          onAdmissionWait: (waitMs) => {
+            admissionWait.last = waitMs;
+          },
         })
       : baseStreamFn;
     // Per-class retry budget (spec §6): interactive-class work (live chat +
@@ -304,6 +320,14 @@ export class AgentSessionFactory {
         ...(scheduler
           ? { isQueueWaitPoint: () => scheduler.isQueueWaitPoint(rateLimitGroup, healthKey) }
           : {}),
+        // Request-ring attribution (spec §9.2).
+        priority,
+        ...(this.options.requestRing ? { ring: this.options.requestRing } : {}),
+        takeAdmissionWaitMs: () => {
+          const waited = admissionWait.last;
+          admissionWait.last = undefined;
+          return waited;
+        },
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
         // events → per-session tentative bus → console SSE. Observe-only.
         ...(this.options.liveEvents

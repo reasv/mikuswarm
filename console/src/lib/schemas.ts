@@ -259,3 +259,86 @@ export const PipelineActivityEvent = Schema.Struct({
 	ts: Schema.Number
 });
 export type PipelineActivityEvent = Schema.Schema.Type<typeof PipelineActivityEvent>;
+
+// ── Scheduler view (spec LLM-FAILURE-HANDLING §9.1/§9.2) ────────────────────
+
+/** One admitted (in-flight) request in a group (GET /api/scheduler). */
+export const SchedulerActiveEntry = Schema.Struct({
+	sessionId: Schema.NullOr(Schema.String),
+	sessionType: Schema.NullOr(Schema.String),
+	model: Schema.NullOr(Schema.String),
+	priority: Schema.String,
+	key: Schema.NullOr(Schema.String),
+	heldMs: Schema.Number
+});
+export type SchedulerActiveEntry = Schema.Schema.Type<typeof SchedulerActiveEntry>;
+
+/** One queued waiter in a group (GET /api/scheduler). */
+export const SchedulerQueuedEntry = Schema.Struct({
+	sessionId: Schema.NullOr(Schema.String),
+	sessionType: Schema.NullOr(Schema.String),
+	model: Schema.NullOr(Schema.String),
+	priority: Schema.String,
+	key: Schema.NullOr(Schema.String),
+	waitingMs: Schema.Number
+});
+export type SchedulerQueuedEntry = Schema.Schema.Type<typeof SchedulerQueuedEntry>;
+
+export const SchedulerGroup = Schema.Struct({
+	name: Schema.String,
+	maxInFlight: Schema.Number,
+	/** Throttle backoff, epoch ms; 0 = none. */
+	backoffUntil: Schema.Number,
+	active: Schema.Array(SchedulerActiveEntry),
+	queue: Schema.Array(SchedulerQueuedEntry),
+	stickyEscalations: Schema.Array(
+		Schema.Struct({ key: Schema.String, priority: Schema.String })
+	)
+});
+export type SchedulerGroup = Schema.Schema.Type<typeof SchedulerGroup>;
+
+export const SchedulerModel = Schema.Struct({
+	key: Schema.String,
+	health: Schema.String,
+	consecutiveFailures: Schema.Number,
+	probeInFlight: Schema.Boolean,
+	nextProbeAt: Schema.Number,
+	lastFailure: Schema.NullOr(
+		Schema.Struct({
+			ts: Schema.Number,
+			status: Schema.optional(Schema.Number),
+			class: Schema.String
+		})
+	),
+	waiters: Schema.Number
+});
+export type SchedulerModel = Schema.Schema.Type<typeof SchedulerModel>;
+
+export const SchedulerSnapshot = Schema.Struct({
+	groups: Schema.Array(SchedulerGroup),
+	models: Schema.Array(SchedulerModel)
+});
+export type SchedulerSnapshot = Schema.Schema.Type<typeof SchedulerSnapshot>;
+
+/** One settled Layer-0 attempt (GET /api/llm-requests, newest-first). */
+export const LlmRequestRecord = Schema.Struct({
+	ts: Schema.Number,
+	sessionId: Schema.optional(Schema.String),
+	sessionType: Schema.optional(Schema.String),
+	group: Schema.optional(Schema.String),
+	model: Schema.String,
+	priority: Schema.optional(Schema.String),
+	attempt: Schema.Number,
+	admissionWaitMs: Schema.optional(Schema.Number),
+	durationMs: Schema.Number,
+	outcome: Schema.String,
+	status: Schema.optional(Schema.Number),
+	class: Schema.optional(Schema.String),
+	errorMessage: Schema.optional(Schema.String)
+});
+export type LlmRequestRecord = Schema.Schema.Type<typeof LlmRequestRecord>;
+
+export const LlmRequestsResponse = Schema.Struct({
+	requests: Schema.Array(LlmRequestRecord)
+});
+export type LlmRequestsResponse = Schema.Schema.Type<typeof LlmRequestsResponse>;

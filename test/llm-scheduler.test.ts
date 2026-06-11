@@ -638,3 +638,55 @@ test("modelHealthKey derives from endpoint + id", () => {
   );
   assert.equal(modelHealthKey({ id: "claude-x" }), "unknown::claude-x");
 });
+
+// ---------------------------------------------------------------------------
+// Console snapshot (spec LLM-FAILURE-HANDLING §9.1) + request ring (§9.2).
+// ---------------------------------------------------------------------------
+
+test("snapshot exposes group budget state, queued waiters with attribution, and model health", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+  });
+  const release = await scheduler.acquire({
+    priority: "interactive",
+    modelKey: MODEL_A,
+    sessionId: "s-active",
+    sessionType: "default",
+  });
+  const queued = scheduler
+    .acquire({
+      priority: "background",
+      modelKey: MODEL_A,
+      key: "sumjob:7",
+      sessionId: "s-queued",
+      sessionType: "summarize",
+    })
+    .then((r) => r())
+    .catch(() => {});
+  await tick();
+  scheduler.noteOutcome("default", MODEL_B, "environmental", 503);
+
+  const snap = scheduler.snapshot();
+  const group = snap.groups.find((g) => g.name === "default")!;
+  assert.equal(group.maxInFlight, 1);
+  assert.equal(group.active.length, 1);
+  assert.equal(group.active[0]!.sessionId, "s-active");
+  assert.equal(group.active[0]!.priority, "interactive");
+  assert.equal(group.queue.length, 1);
+  assert.equal(group.queue[0]!.sessionId, "s-queued");
+  assert.equal(group.queue[0]!.sessionType, "summarize");
+  assert.equal(group.queue[0]!.key, "sumjob:7");
+  assert.ok(group.queue[0]!.waitingMs >= 0);
+
+  const model = snap.models.find((m) => m.key === MODEL_B)!;
+  assert.equal(model.health, "unhealthy");
+  assert.equal(model.consecutiveFailures, 1);
+  assert.equal(model.lastFailure?.status, 503);
+
+  release();
+  await queued;
+  const after = scheduler.snapshot();
+  assert.equal(after.groups.find((g) => g.name === "default")!.active.length, 0, "released entries leave the active set");
+  scheduler.stop();
+});

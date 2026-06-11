@@ -11,7 +11,13 @@
 	import { cn } from '$lib/utils';
 
 	// Active area from the URL so deep-links + back/forward reflect the right view.
-	const area = $derived(page.url.pathname.startsWith('/pipelines') ? 'pipelines' : 'conversations');
+	const area = $derived(
+		page.url.pathname.startsWith('/pipelines')
+			? 'pipelines'
+			: page.url.pathname.startsWith('/scheduler')
+				? 'scheduler'
+				: 'conversations'
+	);
 </script>
 
 <header class="flex h-10 shrink-0 items-center gap-2 border-b px-3 text-sm">
@@ -41,11 +47,26 @@
 		>
 			Pipelines
 		</a>
+		<a
+			href="/scheduler"
+			class={cn(
+				'rounded px-2 py-0.5 transition-colors',
+				area === 'scheduler'
+					? 'bg-background font-medium text-foreground shadow-sm'
+					: 'text-muted-foreground hover:text-foreground'
+			)}
+		>
+			Scheduler
+		</a>
 	</nav>
 
 	<span class="text-muted-foreground">/</span>
 
-	{#if area === 'conversations'}
+	{#if area === 'scheduler'}
+		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
+			<span>llm scheduler</span>
+		</nav>
+	{:else if area === 'conversations'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			{#if selection.roomKey}
 				<span class="max-w-[20rem] truncate text-foreground">{selection.roomKey}</span>
@@ -95,7 +116,7 @@
 				live
 			</span>
 		{/if}
-	{:else if pipelineSummary.failing != null}
+	{:else if area === 'pipelines' && pipelineSummary.failing != null}
 		<div class="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
 			{#if pipelineSummary.inFlight > 0}
 				<span class="flex items-center gap-1 text-blue-500" title="in flight across pools">

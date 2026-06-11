@@ -19,6 +19,8 @@ import {
 import {
   AgentSessionFactory,
   LlmScheduler,
+  LlmRequestRing,
+  DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
   SessionRunner,
   isLlmRunFailure,
@@ -491,6 +493,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // only through this tap → SSE merge. Observe-only; nothing is persisted.
   const liveEvents = new SessionLiveEventBus();
 
+  // In-memory Layer-0 attempt ring (spec §9.2) — console attribution only;
+  // llm-gateway keeps the durable wire log upstream.
+  const llmRequestRing = new LlmRequestRing(
+    config.observability?.llm_request_ring_size ?? DEFAULT_LLM_REQUEST_RING_SIZE,
+  );
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -499,6 +507,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger,
     scheduler: llmScheduler,
     liveEvents,
+    requestRing: llmRequestRing,
   });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
@@ -1709,6 +1718,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       activityBus: pipelineActivityBus,
       // Tentative-token merge for the session SSE (spec LLM-FAILURE-HANDLING §4.2).
       liveEvents,
+      // Scheduler snapshot + request ring (spec §9.1/§9.2).
+      scheduler: llmScheduler,
+      llmRequestRing,
       workspaceRoot,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
       // console's second mutating action, next to abort.

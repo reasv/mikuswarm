@@ -6,6 +6,8 @@ import type { SessionManager } from "../../agent/session-manager.js";
 import type { Logger } from "../logger.js";
 import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
 import type { SessionLiveEventBus } from "../live-events.js";
+import type { LlmScheduler } from "../../agent/scheduler.js";
+import type { LlmRequestRing } from "../../agent/request-ring.js";
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -35,6 +37,16 @@ export interface ConsoleServerDeps {
    * provide it (the stream then carries committed events only).
    */
   liveEvents?: SessionLiveEventBus;
+  /**
+   * The LLM request scheduler, for the `GET /api/scheduler` snapshot (spec
+   * LLM-FAILURE-HANDLING §9.1). Optional: absent = the route 503s.
+   */
+  scheduler?: LlmScheduler;
+  /**
+   * In-memory Layer-0 attempt ring backing `GET /api/llm-requests` (spec
+   * §9.2). Optional: absent = the route 503s.
+   */
+  llmRequestRing?: LlmRequestRing;
   /** Workspace root; media `local_path`s are resolved beneath it. */
   workspaceRoot: string;
   /**

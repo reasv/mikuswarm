@@ -440,6 +440,11 @@ const ObservabilityServerSchema = StrictObject({
 
 const ObservabilitySchema = StrictObject({
   server: Type.Optional(ObservabilityServerSchema),
+  // Capacity of the in-memory LLM request ring backing GET /api/llm-requests
+  // (spec LLM-FAILURE-HANDLING §9.2). Not durable by design — llm-gateway holds
+  // the authoritative wire log; this adds session/priority attribution,
+  // admission wait, attempt numbering, and failures that never hit the wire.
+  llm_request_ring_size: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
 export type ObservabilityServerConfig = Static<typeof ObservabilityServerSchema>;

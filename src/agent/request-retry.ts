@@ -6,6 +6,8 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
+import type { LlmRequestRing } from "./request-ring.js";
+import type { PriorityClass } from "./scheduler.js";
 
 // =============================================================================
 // Layer 0 — transparent request-level LLM retry.
@@ -93,6 +95,15 @@ export interface RequestRetryContext {
    * factory binds `LlmScheduler.isQueueWaitPoint(group, modelKey)`.
    */
   isQueueWaitPoint?: () => boolean;
+  /** Priority class of the wrapped calls (ring attribution, spec §9.2). */
+  priority?: PriorityClass;
+  /** In-memory request ring; every settled attempt is recorded (spec §9.2). */
+  ring?: LlmRequestRing;
+  /**
+   * Drain-and-reset read of the last attempt's admission-queue wait, filled by
+   * `withSchedulerAdmission`'s `onAdmissionWait` via a factory-owned holder.
+   */
+  takeAdmissionWaitMs?: () => number | undefined;
 }
 
 /**
@@ -333,6 +344,33 @@ export function withRequestRetry(
         /* observe-only */
       }
     };
+    /** Record one settled attempt on the in-memory ring (spec §9.2). */
+    const recordAttempt = (
+      attempt: number,
+      startedAt: number,
+      outcome: "done" | "error" | "aborted",
+      details?: { status?: number; cls?: LlmErrorClass; errorMessage?: string },
+    ): void => {
+      try {
+        ctx.ring?.record({
+          ts: Date.now(),
+          sessionId: ctx.sessionId,
+          sessionType: ctx.sessionType,
+          group: ctx.group,
+          model: (model as { id?: string }).id ?? "unknown",
+          priority: ctx.priority,
+          attempt,
+          admissionWaitMs: ctx.takeAdmissionWaitMs?.(),
+          durationMs: Date.now() - startedAt,
+          outcome,
+          status: details?.status,
+          class: details?.cls,
+          errorMessage: details?.errorMessage,
+        });
+      } catch {
+        /* observe-only */
+      }
+    };
 
     /** Surface the terminal error (tagged) and finalize `outer`. */
     const surface = (
@@ -345,6 +383,7 @@ export function withRequestRetry(
     void (async () => {
       try {
         for (let attempt = 0; ; attempt++) {
+          const attemptStart = Date.now();
           const buffered: AssistantMessageEvent[] = [];
           let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
           let producedTokens = false;
@@ -384,6 +423,7 @@ export function withRequestRetry(
               // Flushing forwards the terminal event last, which finalizes
               // `outer` (EventStream.push resolves on it). A success after N
               // failed attempts is byte-equivalent to a first-attempt success.
+              recordAttempt(attempt + 1, attemptStart, "done");
               flush(outer, buffered);
               return;
             }
@@ -415,6 +455,11 @@ export function withRequestRetry(
               `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
             );
           }
+          recordAttempt(attempt + 1, attemptStart, verdict === "aborted" ? "aborted" : "error", {
+            status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
+            cls: verdict,
+            errorMessage: errorEvent.error?.errorMessage,
+          });
 
           if (verdict === "environmental") {
             // Every environmental failure is logged — including the first

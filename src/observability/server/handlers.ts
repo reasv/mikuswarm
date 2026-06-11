@@ -118,6 +118,40 @@ function rolloutStartIndex(transcript: unknown[]): number {
 }
 
 /**
+ * GET /api/scheduler — point-in-time scheduler snapshot (spec
+ * LLM-FAILURE-HANDLING §9.1): per-group budget state (active/queued waiters
+ * with attribution, throttle backoff, sticky escalations) beside per-model
+ * health (streak, probe countdown, waiter counts). The "who is waiting on
+ * what, and which model is down" screen for a starvation/outage event.
+ * Polling is sufficient; SSE optional later.
+ */
+export function schedulerSnapshot(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const scheduler = ctx.deps.scheduler;
+  if (!scheduler) return sendError(res, 503, "scheduler not wired");
+  sendJson(res, 200, scheduler.snapshot());
+}
+
+/**
+ * GET /api/llm-requests — the in-memory Layer-0 attempt ring (spec §9.2),
+ * newest-first. Deliberately not durable: llm-gateway holds the authoritative
+ * wire log; this adds session/priority attribution, admission wait, attempt
+ * numbering, and failures that never reached the wire.
+ */
+export function llmRequests(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const ring = ctx.deps.llmRequestRing;
+  if (!ring) return sendError(res, 503, "llm request ring not wired");
+  sendJson(res, 200, { requests: ring.list() });
+}
+
+/**
  * GET /api/sessions/:id/stream — SSE of live `AgentEvent`s for a running session
  * (spec §8). If the session isn't live (terminal/evicted), emit one `not_live`
  * event and close; the console then renders from `GET /api/sessions/:id`.
