@@ -284,7 +284,7 @@ const DanbooruToolSchema = Type.Object(
         type: "string",
         enum: ["search", "download", "preview", "tags"],
         description:
-          "Use 'search' to query posts, 'preview' to return an inline image for a chosen post, 'download' to save a chosen post into the workspace, or 'tags' to look up real Danbooru tag names from a guess/keyword (use this when a search returns nothing because you are unsure of the exact tag).",
+          "Use 'search' to query posts, 'preview' to return an inline image for a chosen post, or 'download' to save a chosen post into the workspace. Even if unsure of a tag, just 'search' — a zero-result search auto-suggests real, similar tags. 'tags' is a secondary lookup that resolves a guess/keyword into real tag names WITHOUT searching; reach for it only when search-and-read-the-suggestions isn't enough (e.g. browsing/disambiguating candidates).",
       }),
     ),
     query: Type.Optional(
@@ -481,7 +481,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       "Search calls query /posts.json and returns Danbooru post URLs plus preview/sample/original asset URLs and key metadata. " +
       previewDescription +
       " Download calls save a chosen post into the agent workspace. " +
-      "Tags calls resolve a guess or keyword into real Danbooru tag names ranked by popularity — use them when you are unsure of the exact tag; a zero-result search also auto-suggests real tags.",
+      "Prefer searching directly even when unsure of a tag: a zero-result search automatically suggests real, similar tags to retry with. The 'tags' action is a secondary lookup that resolves a guess/keyword into real tag names without running a search.",
     parameters: DanbooruToolSchema,
     execute: async (_toolCallId, rawParams) => {
       const params = rawParams as DanbooruToolParams;
