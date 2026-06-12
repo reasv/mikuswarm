@@ -159,7 +159,7 @@ test("a non-self target reads \"<author>'s message\" (discrete_assistant_only = 
   );
   assert.equal(
     lines[0].content,
-    `<reaction>Fleur reacted 👍 to Bob&apos;s message [$u9]: "someone else said this"</reaction>`,
+    `<reaction>Fleur reacted 👍 to Bob's message [$u9]: "someone else said this"</reaction>`,
   );
 });
 
