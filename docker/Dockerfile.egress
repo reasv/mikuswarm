@@ -1,0 +1,22 @@
+# mikuswarm-egress — firewall sidecar for the compose deployment (docker-compose.yml
+# `egress` service). Applies/reconciles the bridge egress rules
+# (docker/egress-rules.sh) from inside the HOST network namespace
+# (network_mode: host + CAP_NET_ADMIN), replacing the former manual
+# `sudo docker/agent-egress-rules.sh` operator step. See egress-entrypoint.sh.
+#
+# Build context is docker/ (compose sets context: ./docker).
+FROM alpine:3.21
+
+# bash       : egress-rules.sh uses bashisms (mapfile)
+# iptables   : both backends (iptables-nft + iptables-legacy) and ip6tables —
+#              the entrypoint picks the one the host daemon's DOCKER-USER lives in
+# docker-cli : resolve network ID → bridge name via the mounted socket
+RUN apk add --no-cache bash iptables docker-cli
+
+COPY egress-rules.sh egress-entrypoint.sh /opt/egress/
+RUN chmod +x /opt/egress/egress-rules.sh /opt/egress/egress-entrypoint.sh
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD test -f /tmp/egress-applied
+
+ENTRYPOINT ["/opt/egress/egress-entrypoint.sh"]

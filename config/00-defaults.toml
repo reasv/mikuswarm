@@ -136,6 +136,12 @@ image = "mikuswarm-sandbox:24.04"
 container_name = "mikuswarm-sandbox"
 network = "mikuswarm-sandbox"
 workspace_mount = "/workspace"
+# Bind-source mode for the sandbox's workspace mount: "host" = the workspace
+# path is a host path the daemon can resolve directly (native runs). "container"
+# = the agent itself runs in a container; the host-side source is resolved at
+# startup from the agent's own container mounts (set by docker/95-docker.toml —
+# never needed for native runs).
+workspace_bind_source = "host"
 exec_timeout_ms = 120000      # default per-command timeout (overridable per bash call)
 max_output_bytes = 1048576    # cap on captured stdout/stderr per stream
 stop_on_shutdown = false      # leave the container running across restarts

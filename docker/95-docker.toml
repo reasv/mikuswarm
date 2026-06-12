@@ -14,24 +14,18 @@
 # are not inherited. Each table below is therefore self-complete, and this
 # overlay deliberately owns ONLY the tables the container environment changes:
 #
-#   [workspace]            — absolute, path-parity workspace dir
 #   [observability.server] — bind 0.0.0.0 so the console container can reach it
 #   [sandbox]              — enabled, driving the host docker daemon
 #   [network]              — ssrf_guard off; the bridge firewall is the boundary
 #
 # Everything else (models, matrix account, captioning, retrieval, …) stays in
-# config/90-local.toml, untouched. Data paths (app.data_dir, storage.database_path,
-# matrix store_path) are left relative (./var → /app/var) and persisted by the
-# /app/var bind in docker-compose.yml — so they need no override here.
+# config/90-local.toml, untouched. NO PATH IS OVERRIDDEN: data paths
+# (app.data_dir, storage.database_path, matrix store_path) and the workspace
+# root stay relative (./var → /app/var, ./workspaces/miku → /app/workspaces/miku)
+# and are covered by the relative binds in docker-compose.yml. No absolute host
+# path appears anywhere — the compose project is self-contained and relocatable
+# (copy the folder, `docker compose up`).
 # =============================================================================
-
-# Path parity. The agent shells out to `docker create -v <root_dir>:/workspace`
-# (src/sandbox/manager.ts), and that host path is resolved by the DAEMON, not by
-# this container. So root_dir must be a real host path that is ALSO bind-mounted
-# into this container at the IDENTICAL path. Keep this in sync with the workspace
-# bind in docker-compose.yml.
-[workspace]
-root_dir = "/srv/miku/workspace"
 
 # Observability console API (read-only HTTP + SSE). The console runs in a
 # separate container and reaches this over the compose network, so it must bind
@@ -49,12 +43,22 @@ auth_token = "${MIKUSWARM_CONSOLE_TOKEN}"
 # sandbox container with the workspace bind-mounted at workspace_mount. The image
 # must already exist on the daemon — build it first with docker/build-sandbox.sh
 # or startup fails fast.
+#
+# workspace_bind_source = "container": the sandbox is a SIBLING container, so the
+# `-v` source the agent hands the daemon must be a HOST path — but this agent is
+# itself containerized and its paths mean nothing to the daemon. Instead of
+# configuring a host path (which would pin the project to one machine), the agent
+# resolves it at startup by inspecting its OWN container's mounts over the socket
+# and translating the workspace root through the covering bind. Requires the
+# compose service to keep its default hostname (= container ID) and the workspace
+# bind in docker-compose.yml. Fail-fast if resolution is impossible.
 [sandbox]
 enabled = true
 image = "mikuswarm-sandbox:24.04"
 container_name = "mikuswarm-sandbox"
 network = "mikuswarm-sandbox"
 workspace_mount = "/workspace"
+workspace_bind_source = "container"
 exec_timeout_ms = 120000
 max_output_bytes = 1048576
 stop_on_shutdown = false

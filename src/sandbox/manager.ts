@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { Logger } from "../observability/logger.js";
 import { createDockerExecBackend } from "./docker-exec-backend.js";
 import type { ExecBackend, ExecOptions, ExecResult } from "./exec-backend.js";
+import { resolveWorkspaceBindSource } from "./host-path.js";
 
 /**
  * Runs a single `docker` CLI invocation to completion and returns its captured
@@ -14,8 +15,17 @@ export interface SandboxManagerOptions {
   image: string;
   containerName: string;
   network: string;
-  /** Absolute host path bind-mounted into the container. */
+  /**
+   * Workspace path bind-mounted into the sandbox. With `workspaceBindSource`
+   * "host" (default) this IS the host path the daemon resolves. With
+   * "container" it is the agent-side path, translated to its host-side mount
+   * source at ensure() time by inspecting the agent's own container
+   * (src/sandbox/host-path.ts) — the agent is then itself containerized and
+   * its paths mean nothing to the daemon.
+   */
   workspaceHostDir: string;
+  /** How workspaceHostDir maps to the daemon's namespace ([sandbox].workspace_bind_source). */
+  workspaceBindSource?: "host" | "container";
   /** Container path the workspace is mounted at, e.g. "/workspace". */
   workspaceMount: string;
   uid: number;
@@ -188,7 +198,8 @@ export class SandboxManager implements ExecBackend {
     return run;
   }
 
-  private static async ensureUnguarded(options: SandboxManagerOptions): Promise<SandboxManager> {
+  private static async ensureUnguarded(requested: SandboxManagerOptions): Promise<SandboxManager> {
+    const options = await SandboxManager.withResolvedBindSource(requested);
     const { logger } = options;
     await SandboxManager.ensureNetwork(options);
     await SandboxManager.assertImageExists(options);
@@ -209,6 +220,28 @@ export class SandboxManager implements ExecBackend {
       env: options.env,
     });
     return new SandboxManager(options, backend);
+  }
+
+  /**
+   * In "container" bind-source mode, replaces workspaceHostDir with the host
+   * path the daemon has on record for the agent's own workspace mount. Runs
+   * before any container state is touched so the mismatch re-validation
+   * (containerMismatch) compares host paths on both sides. A resolution
+   * failure aborts startup (fail-fast) — see resolveWorkspaceBindSource.
+   */
+  private static async withResolvedBindSource(
+    options: SandboxManagerOptions,
+  ): Promise<SandboxManagerOptions> {
+    if (options.workspaceBindSource !== "container") return options;
+    const hostDir = await resolveWorkspaceBindSource({
+      runDocker: SandboxManager.runner(options),
+      containerPath: options.workspaceHostDir,
+    });
+    options.logger.info("sandbox_workspace_bind_resolved", {
+      workspacePath: options.workspaceHostDir,
+      hostDir,
+    });
+    return { ...options, workspaceHostDir: hostDir };
   }
 
   private static async ensureNetwork(options: SandboxManagerOptions): Promise<void> {

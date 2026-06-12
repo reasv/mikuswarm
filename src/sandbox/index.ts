@@ -10,3 +10,8 @@ export {
   type RawExecResult,
 } from "./docker-exec-backend.js";
 export { SandboxManager, type SandboxManagerOptions } from "./manager.js";
+export {
+  translateContainerPathToHost,
+  resolveWorkspaceBindSource,
+  type ContainerMount,
+} from "./host-path.js";

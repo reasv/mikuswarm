@@ -691,6 +691,15 @@ export const AppConfigSchema = StrictObject({
     container_name: Type.String(),
     network: Type.String(),
     workspace_mount: Type.String(),
+    // How the sandbox bind source (`docker create -v <src>`) is derived from the
+    // workspace root. "host" (default): the resolved path is used as-is — the
+    // agent runs on the daemon's own filesystem. "container": the agent itself
+    // runs in a container, so the path is translated at startup by inspecting
+    // the agent's OWN container mounts over the socket (src/sandbox/host-path.ts)
+    // — no host path appears in any config; the compose project stays relocatable.
+    workspace_bind_source: Type.Optional(
+      Type.Union([Type.Literal("host"), Type.Literal("container")]),
+    ),
     exec_timeout_ms: Type.Number({ minimum: 1 }),
     max_output_bytes: Type.Number({ minimum: 1 }),
     stop_on_shutdown: Type.Optional(Type.Boolean()),

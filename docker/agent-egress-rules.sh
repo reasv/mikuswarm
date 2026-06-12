@@ -18,6 +18,10 @@ set -euo pipefail
 # so name resolution survives the RFC1918 drops. See docker/egress-rules.sh for
 # the full rule set and operational notes.
 #
+# Under Compose this is normally NOT needed: the `egress` sidecar service
+# applies/reconciles these rules automatically (docker/egress-entrypoint.sh).
+# Kept for manual/debug use.
+#
 # Usage: sudo MIKUSWARM_AGENT_NETWORK=miku docker/agent-egress-rules.sh
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

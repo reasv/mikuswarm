@@ -238,6 +238,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       containerName: config.sandbox.container_name,
       network: config.sandbox.network,
       workspaceHostDir: path.resolve(workspaceRoot),
+      workspaceBindSource: config.sandbox.workspace_bind_source,
       workspaceMount: config.sandbox.workspace_mount,
       uid: process.getuid?.() ?? 0,
       gid: process.getgid?.() ?? 0,

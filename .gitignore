@@ -16,7 +16,9 @@ config/90-local.toml
 *.sqlite3-wal
 debug/
 msg-attach/
-var/matrix/
+# The whole data dir: SQLite DB (+ set-aside relics), Matrix E2EE store,
+# fastembed model cache. Runtime state, never tracked.
+/var/
 workspaces/*
 !workspaces/.gitpreserve
 /tmp/

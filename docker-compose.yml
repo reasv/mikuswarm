@@ -3,17 +3,27 @@
 # One command brings up the agent and its console:
 #     docker compose up -d --build
 #
+# SELF-CONTAINED: all state lives in this project folder (./workspaces/miku,
+# ./var) and every bind below is relative — no absolute host path appears in any
+# config or compose file. Copy the folder to any Docker host and `up` works; the
+# one host path the sandbox needs (its workspace bind source) is resolved by the
+# agent AT RUNTIME from its own container's mounts (workspace_bind_source =
+# "container", docker/95-docker.toml). Corollary: do NOT set `hostname:` on the
+# agent service — self-inspection relies on the default hostname (container ID).
+#
 # Prerequisites (see ARCHITECTURE.md "Running in Docker"):
 #   1. Build the sandbox image on the host daemon:  docker/build-sandbox.sh
 #      (the agent creates the sandbox container at runtime via the mounted
 #      socket; the image must already exist or startup fails fast).
-#   2. Create host data dirs:  sudo mkdir -p /srv/miku/workspace /srv/miku/var
-#   3. Copy config/90-local.toml into place (identity/models/matrix) and
+#   2. config/90-local.toml in place (identity/models/matrix) and
 #      cp .env.example .env, then fill in the secrets.
-#   4. After `up`, harden the agent's egress (operator root step — the network
-#      firewall is the SSRF boundary, since the app-layer guard is off in docker,
-#      docker/95-docker.toml):  sudo MIKUSWARM_AGENT_NETWORK=miku docker/agent-egress-rules.sh
-#      Reapply after reboot / `docker compose up` recreates the network.
+#
+# Egress hardening is NOT a manual step: the `egress` sidecar below applies and
+# reconciles the bridge firewall (docker/egress-rules.sh — the SSRF boundary,
+# since the app-layer guard is off in docker, docker/95-docker.toml) from inside
+# the host network namespace. The agent depends_on it being healthy, so the
+# stack is fail-closed: no firewall, no agent. Reboots and network recreation
+# self-heal via the reconcile loop.
 #
 # NOT started here (by design):
 #   - The sandbox container — created/driven by the agent via /var/run/docker.sock.
@@ -33,6 +43,29 @@ networks:
     enable_ipv6: false
 
 services:
+  # Firewall sidecar: applies/reconciles the bridge egress rules from the HOST
+  # network namespace. This is the privileged piece the agent itself must never
+  # be (the confined workload can't own its own firewall); it runs a pinned
+  # 50-line script, nothing else. network_mode: host + NET_ADMIN are granted by
+  # the daemon — no sudo, travels with the folder. Healthy ⇔ the agent-bridge
+  # rules are in place (the sandbox bridge is reconciled too once the agent
+  # creates it). See docker/egress-entrypoint.sh.
+  egress:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.egress
+    image: mikuswarm-egress:latest
+    container_name: mikuswarm-egress
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      MIKUSWARM_AGENT_NETWORK: miku
+      MIKUSWARM_SANDBOX_NETWORK: mikuswarm-sandbox
+    volumes:
+      # Resolve network IDs → bridge names (read-only daemon queries).
+      - /var/run/docker.sock:/var/run/docker.sock
+
   agent:
     build:
       context: .
@@ -40,6 +73,11 @@ services:
     image: mikuswarm:latest
     container_name: mikuswarm
     restart: unless-stopped
+    # Fail-closed: do not start the agent until the egress firewall is verified
+    # in place (the app-layer SSRF guard is off under compose).
+    depends_on:
+      egress:
+        condition: service_healthy
     env_file: .env
     environment:
       MIKUSWARM_AGENT_CONFIG_DIR: /app/config
@@ -58,13 +96,17 @@ services:
     volumes:
       # Drive the host docker daemon to create/exec the sandbox container.
       - /var/run/docker.sock:/var/run/docker.sock
-      # PATH PARITY: identical host & container path so the sandbox bind mount
-      # (docker create -v <this>:/workspace) resolves on the daemon. Keep in sync
-      # with [workspace].root_dir in docker/95-docker.toml.
-      - /srv/miku/workspace:/srv/miku/workspace
+      # Workspace, mounted where the relative [workspace].root_dir resolves
+      # in-container (cwd /app + ./workspaces/miku). The agent translates this
+      # mount back to its host-side source at runtime to bind the same dir into
+      # the sandbox (workspace_bind_source = "container", docker/95-docker.toml).
+      - ./workspaces/miku:/app/workspaces/miku
       # Persistent data under the agent's data_dir (./var → /app/var): SQLite DB,
       # Matrix E2EE crypto store, and the fastembed model cache.
-      - /srv/miku/var:/app/var
+      - ./var:/app/var
+      # Context dumps (app.context_dump_dir ./debug/context) — kept on the host
+      # so observability output survives container recreation.
+      - ./debug:/app/debug
       # Operator identity config (gitignored): models, matrix account, captioning…
       # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).
       - ./config/90-local.toml:/app/config/90-local.toml:ro

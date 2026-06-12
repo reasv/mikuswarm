@@ -26,13 +26,20 @@ set -euo pipefail
 # the host-gateway (host.docker.internal) keep working while the rest of RFC1918
 # is still blocked. Sandbox/browser bridges need no peers, so they omit it.
 #
-# NOT run by the harness (which has no root). Run once after the network exists;
-# reapply on reboot (e.g. systemd) unless you persist iptables rules. IMPORTANT:
-# also reapply after every network (re)creation — the bridge name derives from
-# the network ID, so recreating the network yields a new bridge and rules keyed
-# on the old bridge go stale. The flush-by-comment below removes our previous
-# rules and re-derives them for the current bridge on every run, so re-running is
-# always safe and self-correcting.
+# NOT run by the harness (which has no root — the confined workload must never
+# own its own firewall). Two callers:
+#   - The `egress` compose sidecar (docker/Dockerfile.egress +
+#     egress-entrypoint.sh) reconciles the agent + sandbox bridges on a loop
+#     from the host network namespace — the normal path under Compose; reboots
+#     and network recreation self-heal, no operator action.
+#   - Operator-run with sudo (the wrappers above) for the browser bridge and for
+#     native/non-compose deployments. Rules are NOT persistent: reapply on
+#     reboot, and after every network (re)creation — the bridge name derives
+#     from the network ID, so a recreated network yields a new bridge and rules
+#     keyed on the old one go stale.
+# The flush-by-comment below removes this script's previous rules and re-derives
+# them for the current bridge on every run, so re-running (from either caller,
+# in any order) is always safe and self-correcting.
 # =============================================================================
 
 NETWORK_NAME="${1:-${MIKUSWARM_EGRESS_NETWORK:-}}"

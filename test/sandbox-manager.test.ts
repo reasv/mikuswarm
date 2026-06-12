@@ -234,6 +234,91 @@ test("waitForReady: surfaces the last probe's exit code and stderr on failure", 
   );
 });
 
+test("ensure: workspaceBindSource container resolves the bind source from own mounts", async () => {
+  const { logger, calls } = recordingLogger();
+  let createArgs: string[] = [];
+  const { run } = fakeRunner((args) => {
+    if (args[0] === "network" && args[1] === "inspect") return ok();
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    if (args[0] === "inspect" && args[2] === "{{json .Mounts}}") {
+      // self-inspect: agent's own container mounts
+      return ok(JSON.stringify([{ Source: "/anywhere/repo/workspaces/miku", Destination: "/app/workspaces/miku" }]));
+    }
+    if (args[0] === "inspect") return fail("No such object", 1); // sandbox does not exist yet
+    if (args[0] === "create") {
+      createArgs = args;
+      return ok();
+    }
+    if (args[0] === "start" || args[0] === "exec") return ok();
+    return ok();
+  });
+
+  await SandboxManager.ensure(
+    baseOptions({
+      runDocker: run,
+      logger,
+      workspaceHostDir: "/app/workspaces/miku",
+      workspaceBindSource: "container",
+    }),
+  );
+  const volSpecs = createArgs.filter((_, i) => createArgs[i - 1] === "-v");
+  assert.ok(
+    volSpecs.includes("/anywhere/repo/workspaces/miku:/workspace"),
+    `sandbox bind uses the translated host source (got: ${volSpecs.join(", ")})`,
+  );
+  const resolved = calls.find((c) => c.message === "sandbox_workspace_bind_resolved");
+  assert.equal(resolved?.fields?.hostDir, "/anywhere/repo/workspaces/miku");
+});
+
+test("ensure: workspaceBindSource container reuse compares the RESOLVED host source", async () => {
+  const { logger, calls } = recordingLogger();
+  const seq: string[] = [];
+  const { run } = fakeRunner((args) => {
+    seq.push(args[0]);
+    if (args[0] === "network" && args[1] === "inspect") return ok();
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    if (args[0] === "inspect" && args[2] === "{{json .Mounts}}") {
+      return ok(JSON.stringify([{ Source: "/anywhere/repo/workspaces/miku", Destination: "/app/workspaces/miku" }]));
+    }
+    // existing sandbox container already mounts the same resolved host dir
+    if (args[0] === "inspect") return ok(`true\t${IMAGE_ID}\t/anywhere/repo/workspaces/miku`);
+    if (args[0] === "exec") return ok();
+    return ok();
+  });
+
+  await SandboxManager.ensure(
+    baseOptions({
+      runDocker: run,
+      logger,
+      workspaceHostDir: "/app/workspaces/miku",
+      workspaceBindSource: "container",
+    }),
+  );
+  assert.ok(!seq.includes("rm"), "matching resolved source is not treated as a mismatch");
+  assert.ok(calls.some((c) => c.message === "sandbox_container_reused"));
+});
+
+test("ensure: workspaceBindSource container fails fast when no mount covers the workspace", async () => {
+  const { run } = fakeRunner((args) => {
+    if (args[0] === "inspect" && args[2] === "{{json .Mounts}}") {
+      return ok(JSON.stringify([{ Source: "/anywhere/repo/var", Destination: "/app/var" }]));
+    }
+    return ok();
+  });
+
+  await assert.rejects(
+    () =>
+      SandboxManager.ensure(
+        baseOptions({
+          runDocker: run,
+          workspaceHostDir: "/app/workspaces/miku",
+          workspaceBindSource: "container",
+        }),
+      ),
+    /no mount on own container .* covers the workspace path \/app\/workspaces\/miku/,
+  );
+});
+
 test("shutdown: uses `docker stop -t 1` to skip the 10s grace", async () => {
   const seq: string[][] = [];
   const { run } = fakeRunner((args) => {
