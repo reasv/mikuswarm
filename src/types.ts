@@ -73,6 +73,13 @@ export interface LinkPreviewMeta {
   media?: AttachmentMeta[];
   sourceKind?: string;
   fetchedAt?: number;
+  /**
+   * Structured X-tweet payload for `sourceKind === "fx_twitter"` previews
+   * (ARCHITECTURE.md §7a). Parsed from `link_previews.payload_json` at hydrate
+   * time; the rich renderer branches on it, falling back to the flat
+   * `description` when absent/malformed.
+   */
+  payload?: import("./fxtwitter/types.js").XTweetPayload;
 }
 
 export interface MentionInfo {

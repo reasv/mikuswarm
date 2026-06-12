@@ -85,6 +85,13 @@ export interface LinkPreviewRow {
   fetched_at?: number | null;
   fetch_status: string;
   error?: string | null;
+  /**
+   * Structured preview payload for rich renderers (ARCHITECTURE.md §7a). NULL
+   * for plain Synapse previews; for `source_kind = 'fx_twitter'` it carries the
+   * serialized XTweetPayload (src/fxtwitter/types.ts) the rich renderer
+   * consumes. `description` stays the flat-text fallback + FTS source.
+   */
+  payload_json?: string | null;
   created_at: number;
 }
 
@@ -2075,10 +2082,12 @@ export class Storage {
       db.prepare(
         `insert or replace into link_previews (
           id, event_id, context, url, title, description, site_name,
-          source_kind, preview_index, fetched_at, fetch_status, error, created_at
+          source_kind, preview_index, fetched_at, fetch_status, error,
+          payload_json, created_at
         ) values (
           @id, @eventId, @context, @url, @title, @description, @siteName,
-          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error, @createdAt
+          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error,
+          @payloadJson, @createdAt
         )`,
       ).run({
         id: row.id,
@@ -2093,6 +2102,7 @@ export class Storage {
         fetchedAt: row.fetched_at ?? null,
         fetchStatus: row.fetch_status,
         error: row.error ?? null,
+        payloadJson: row.payload_json ?? null,
         createdAt: row.created_at,
       });
     });
@@ -2180,10 +2190,12 @@ export class Storage {
       const insertPreview = db.prepare(
         `insert or replace into link_previews (
           id, event_id, context, url, title, description, site_name,
-          source_kind, preview_index, fetched_at, fetch_status, error, created_at
+          source_kind, preview_index, fetched_at, fetch_status, error,
+          payload_json, created_at
         ) values (
           @id, @eventId, @context, @url, @title, @description, @siteName,
-          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error, @createdAt
+          @sourceKind, @previewIndex, @fetchedAt, @fetchStatus, @error,
+          @payloadJson, @createdAt
         )`,
       );
       for (const lp of result.linkPreviews) {
@@ -2200,6 +2212,7 @@ export class Storage {
           fetchedAt: lp.fetched_at ?? null,
           fetchStatus: lp.fetch_status,
           error: lp.error ?? null,
+          payloadJson: lp.payload_json ?? null,
           createdAt: lp.created_at,
         });
       }
@@ -5314,6 +5327,7 @@ create table if not exists link_previews (
   fetched_at integer,
   fetch_status text not null,
   error text,
+  payload_json text,
   created_at integer not null
 );
 
@@ -5568,7 +5582,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 18;
+export const LATEST_SCHEMA_VERSION = 19;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6048,6 +6062,24 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       `alter table agent_sessions add column trigger_sender_id text;
        alter table agent_sessions add column trigger_sender_display_name text;`,
     );
+  },
+  // index 18 (v18 -> v19): add `payload_json` to `link_previews` — the
+  // structured X-tweet payload the rich renderer consumes (ARCHITECTURE.md §7a
+  // "X.com enrichment via FxTwitter"). Nullable ADD COLUMN: existing rows
+  // (plain Synapse previews) backfill to NULL and render exactly as before.
+  // Skipped when the table is absent (minimal legacy fixtures; SCHEMA then
+  // builds it at the latest shape) or when the column already exists (a
+  // current DB whose user_version was rewound by a test fixture — mirrors the
+  // v17→v18 presence guard). Fresh DBs get the column directly from SCHEMA and
+  // never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'link_previews'`)
+      .get();
+    if (!table) return;
+    const columns = db.pragma(`table_info(link_previews)`) as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "payload_json")) return;
+    db.exec(`alter table link_previews add column payload_json text;`);
   },
 ];
 

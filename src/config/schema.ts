@@ -423,6 +423,41 @@ const EnrichmentSchema = StrictObject({
   max_retries: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
+// X.com enrichment via the FxTwitter API + the x_fetch tool (ARCHITECTURE.md
+// §7a/§10). Top-level rather than [enrichment.fxtwitter]: two consumers share
+// it (the enrichment worker and the x_fetch tool), and the shallow
+// top-level-table merge makes nested additions to [enrichment] a foot-gun for
+// existing local configs. No byte caps here — all media fetches ride the
+// global media.download_size_limit. The compact-tier truncation (280/140) is
+// a renderer constant, not config. Cross-field sanity (default_max_chars <=
+// max_chars_limit <= max_total_chars) is validated at app wiring.
+const FxTwitterSchema = StrictObject({
+  // false → X status URLs are NOT previewed at all (no Synapse fallback —
+  // deliberately: the Synapse og-card for X is noise, not signal).
+  enabled: Type.Optional(Type.Boolean()),
+  // Self-hostable mirror override.
+  api_base: Type.Optional(Type.String({ minLength: 1 })),
+  fetch_timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  // Rich-tier text cap, applied independently per tweet node (text and
+  // community note each). Generous-but-bounded: X premium long posts exceed it.
+  max_text_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  // false → individual photo assets instead of the mosaic collage.
+  prefer_mosaic: Type.Optional(Type.Boolean()),
+  // Per node (tweet and quote each); X's own per-post max is 4.
+  max_videos_per_tweet: Type.Optional(Type.Integer({ minimum: 0 })),
+  tool: Type.Optional(StrictObject({
+    // Registers x_fetch — independent of the enrichment enable.
+    enabled: Type.Optional(Type.Boolean()),
+    default_max_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+    max_chars_limit: Type.Optional(Type.Integer({ minimum: 1 })),
+    // Cap on the assembled document (paginated via offset); the total must
+    // accommodate long-form posts, hence well above any single window.
+    max_total_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+    // Image blocks per call via view_media.
+    max_view_blocks: Type.Optional(Type.Integer({ minimum: 1 })),
+  })),
+});
+
 const CaptioningModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
@@ -750,6 +785,7 @@ export const AppConfigSchema = StrictObject({
   timeline: Type.Optional(TimelineSchema),
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
+  fxtwitter: Type.Optional(FxTwitterSchema),
   captioning: Type.Optional(CaptioningSchema),
   summarization: Type.Optional(SummarizationSchema),
   diary: Type.Optional(DiarySchema),
@@ -810,5 +846,6 @@ export type RetrievalConfig = Static<typeof RetrievalSchema>;
 export type SearchConfig = Static<typeof SearchSchema>;
 export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
+export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;

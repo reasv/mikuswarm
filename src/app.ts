@@ -70,11 +70,13 @@ import {
   createWebFetchTool,
   createWebSearchTool,
   createWriteMemoryTool,
+  createXFetchTool,
 } from "./tools/index.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
+import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
@@ -163,6 +165,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           `set reasoning = true (thinking-capable) or thinking_level = "off"`,
       );
     }
+  }
+  // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
+  // per-window default must fit under the per-window hard cap, which must fit
+  // under the assembled-document cap — anything else is a config typo that
+  // would silently clamp at runtime.
+  const fxTwitterConfig = resolveFxTwitterConfig(config.fxtwitter);
+  if (fxTwitterConfig.tool.defaultMaxChars > fxTwitterConfig.tool.maxCharsLimit) {
+    throw new Error(
+      `fxtwitter.tool: default_max_chars (${fxTwitterConfig.tool.defaultMaxChars}) must be <= max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit})`,
+    );
+  }
+  if (fxTwitterConfig.tool.maxCharsLimit > fxTwitterConfig.tool.maxTotalChars) {
+    throw new Error(
+      `fxtwitter.tool: max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit}) must be <= max_total_chars (${fxTwitterConfig.tool.maxTotalChars})`,
+    );
   }
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
@@ -305,6 +322,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     httpProxyUrl: config.network?.http_proxy_url,
   });
 
+  // One FxTwitter API client shared by the enrichment X stage and the x_fetch
+  // tool (ARCHITECTURE.md §7a/§10). Constructed unconditionally (it is just a
+  // dispatcher handle): the enrichment partition must run even with
+  // `fxtwitter.enabled = false` — a disabled stage means X URLs are NOT
+  // previewed at all, never that they fall back to the Synapse og-card.
+  const fxTwitterClient = new FxTwitterClient({
+    apiBase: fxTwitterConfig.apiBase,
+    timeoutMs: fxTwitterConfig.fetchTimeoutMs,
+    httpProxyUrl: config.network?.http_proxy_url,
+  });
+
   const captioningConfig = config.captioning ?? {};
   const sharedModel = {
     id: captioningConfig.model?.id ?? "google/gemini-3.5-flash",
@@ -412,6 +440,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     fetchClient,
     workspaceRoot,
     downloadSizeLimit,
+    fxtwitter: { client: fxTwitterClient, config: fxTwitterConfig },
     config: config.enrichment ?? {},
     onComplete: (eventId) => {
       enrichmentEmitter.emit(`complete:${eventId}`);
@@ -1166,6 +1195,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         httpProxyUrl: config.network?.http_proxy_url,
         config: config.danbooru,
       }),
+      ...(fxTwitterConfig.tool.enabled
+        ? [createXFetchTool({
+            workspaceRoot,
+            fetchClient,
+            client: fxTwitterClient,
+            // Same shared per-model base64 cap + conditioning pipeline as
+            // read_image / the danbooru preview path, so view_media blocks
+            // respect the model's per-image budget.
+            maxImageBytes: resolveReadImageMaxBytes(config),
+            inferenceImageOptions,
+            config: fxTwitterConfig.tool,
+          })]
+        : []),
       ...(config.image_gen
         ? [createImageGenTool({
             workspaceRoot,

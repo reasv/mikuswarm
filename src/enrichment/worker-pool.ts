@@ -5,6 +5,8 @@ import type { TimelineStore } from "../timeline/index.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { EnrichmentCapabilities, EnrichmentConfig } from "./types.js";
 import type { FetchClient } from "./fetch-client.js";
+import type { FxTwitterClient } from "../fxtwitter/client.js";
+import type { FxTwitterConfig } from "../fxtwitter/types.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 
@@ -15,6 +17,8 @@ export interface EnrichmentWorkerPoolOptions {
   fetchClient: FetchClient;
   workspaceRoot: string;
   downloadSizeLimit?: number;
+  /** X.com enrichment via FxTwitter (ARCHITECTURE.md §7a); unset = legacy Synapse-only previews. */
+  fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
   config: EnrichmentConfig;
   onComplete?: (eventId: string) => void;
   onError?: (eventId: string, error: unknown) => void;
@@ -175,6 +179,7 @@ export class EnrichmentWorkerPool {
       workspaceRoot: this.options.workspaceRoot,
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
       downloadSizeLimit: this.options.downloadSizeLimit,
+      fxtwitter: this.options.fxtwitter,
       logger: this.options.logger,
     });
 

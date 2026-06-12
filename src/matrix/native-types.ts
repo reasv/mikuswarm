@@ -5,7 +5,11 @@ export type MatrixVerificationState = "disabled" | "pending" | "verified";
 export type MatrixKeyBackupState = "disabled" | "pending" | "enabled";
 export type MatrixChatType = "direct" | "channel" | "thread";
 export type MatrixMediaKind = "image" | "video" | "audio" | "file";
-export type MatrixLinkPreviewSourceKind = "synapse" | "fx_twitter";
+// The Synapse /preview_url scraper is the only preview source the native layer
+// resolves in production. (The Rust FxTwitter branch is unreachable dead code —
+// X.com enrichment lives in the TS layer; its "fx_twitter" source_kind is an
+// enrichment constant in src/fxtwitter/types.ts, not a Matrix-layer member.)
+export type MatrixLinkPreviewSourceKind = "synapse";
 
 export type MatrixNativeConfig = {
   accountId: string;
@@ -371,7 +375,6 @@ export type MatrixResolveLinkPreviewsRequest = {
   bodyText: string;
   maxBytes?: number;
   includeImages?: boolean;
-  xPreviewViaFxTwitter?: boolean;
 };
 
 export type MatrixLinkPreviewResult = {

@@ -180,6 +180,31 @@ trigger_group_lookback_ms = 20000
 [enrichment]
 trigger_wait_timeout_ms = 30000
 
+# X.com enrichment via the FxTwitter API + the x_fetch tool (ARCHITECTURE.md
+# §7a/§10). X status URLs are partitioned away from the Synapse preview path
+# and enriched into a rich structured preview (tweet + quote, stats, polls,
+# media through the captioning pipeline). enabled = false turns X previews off
+# entirely (no Synapse fallback — its og-card for X is noise). There are no
+# byte caps here: all media fetches ride media.download_size_limit. The
+# compact-tier truncation (280/140 chars) is a renderer constant, not config.
+[fxtwitter]
+enabled = true
+api_base = "https://api.fxtwitter.com"  # self-hostable mirror override
+fetch_timeout_ms = 15000
+max_text_chars = 2000                   # rich tier, per tweet node (text & community note each)
+prefer_mosaic = true                    # false → individual photo assets instead of the mosaic collage
+max_videos_per_tweet = 4                # per node (tweet and quote each); X's own per-post max
+
+# The x_fetch tool: manual tweet fetching (web_fetch is blocked by X
+# server-side), paginated text plus list/download/view access to tweet media —
+# the escape hatch to individual photos behind an enrichment mosaic.
+[fxtwitter.tool]
+enabled = true                          # registers x_fetch (independent of the enrichment enable)
+default_max_chars = 4000                # per returned window
+max_chars_limit = 16000                 # hard cap per returned window
+max_total_chars = 32768                 # cap on the assembled document (paginated via offset)
+max_view_blocks = 4                     # image blocks per call via view_media
+
 # Per-host HTTP egress limiting (spec Design D), enforced at the guardedFetch
 # chokepoint and keyed per host (shared across all callers). This is NOT a
 # cross-domain cap (the old enrichment.fetch_concurrency cap of 6 is removed): each
