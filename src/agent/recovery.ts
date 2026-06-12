@@ -58,6 +58,16 @@ export interface ResumeMaterial {
   transcript: AgentMessage[];
 }
 
+/**
+ * Discriminated viability verdict of {@link loadResumeMaterial}. `continue`
+ * carries the replay material; `fresh` means the transcript never flushed —
+ * nothing committed, so the resume rebuilds the context from the durable
+ * trigger row and re-runs like a launch (see the function doc).
+ */
+export type ResumeMaterialResult =
+  | ({ mode: "continue" } & ResumeMaterial)
+  | { mode: "fresh" };
+
 /** Text substituted wherever a persisted image ref cannot be rehydrated. */
 export const RESUME_IMAGE_PLACEHOLDER = "[image omitted on resume]";
 
@@ -83,17 +93,33 @@ export interface ResumeMaterialDeps {
  * Load and project a session row's persisted snapshot + transcript into the
  * shape `factory.create({ resume })` expects, rehydrating externalized image
  * refs back into base64 payloads (or text placeholders when unresolvable).
- * Returns null when the row cannot be resumed: missing/corrupt snapshot or
- * transcript, an unexpected rehydration failure, or a transcript that — after
- * stripping the failed tail — no longer ends at a user/tool-result message
- * (nothing to re-issue). A null parks the session rather than issuing a doomed
- * attempt.
+ *
+ * Three-way result:
+ * - `{mode:"continue", snapshot, transcript}` — the normal replay material:
+ *   re-create the agent from the persisted prefix + transcript and redo the
+ *   failed request via continue-mode.
+ * - `{mode:"fresh"}` — the transcript was NEVER flushed (a hard crash before
+ *   the first `turn_end`/`flushNow`, e.g. a process kill mid-first-request).
+ *   No turn ever committed, so there are no side effects to duplicate and no
+ *   transcript to replay — but the session is still resumable: the durable
+ *   row's trigger fields point at the original trigger event (still in the
+ *   timeline store), so `resumeSessionRun` rebuilds the context fresh and
+ *   re-runs the session like a launch, reusing the same row.
+ * - `null` — genuinely nothing to redo or unusable: the transcript ends at a
+ *   clean boundary (the run committed), corrupt persisted JSON, a transcript
+ *   without its snapshot (violates the capture ordering — treat as corrupt,
+ *   turns may have committed), or an unexpected rehydration failure. A null
+ *   rejects/parks the session rather than issuing a doomed attempt.
  */
 export async function loadResumeMaterial(
   row: AgentSessionRow,
   deps: ResumeMaterialDeps,
-): Promise<ResumeMaterial | null> {
-  if (!row.context_snapshot_json || !row.transcript_json) return null;
+): Promise<ResumeMaterialResult | null> {
+  if (!row.transcript_json) return { mode: "fresh" };
+  // A transcript without a snapshot can't happen through capture (the first
+  // transcript flush is chained behind the snapshot enqueue) — corruption, and
+  // committed turns may exist, so neither replay nor fresh rebuild is safe.
+  if (!row.context_snapshot_json) return null;
 
   let snapshotRaw: ContextMessage[];
   let transcriptRaw: AgentMessage[];
@@ -104,6 +130,9 @@ export async function loadResumeMaterial(
     return null;
   }
   if (!Array.isArray(snapshotRaw) || !Array.isArray(transcriptRaw)) return null;
+  // A flushed-but-empty transcript is the same "nothing ever committed" case
+  // as a missing one.
+  if (transcriptRaw.length === 0) return { mode: "fresh" };
 
   // Rehydrate externalized image refs in BOTH trees (issue #13): the snapshot's
   // `imageBlocks` and the transcript's trigger/toolResult image blocks. An
@@ -132,10 +161,11 @@ export async function loadResumeMaterial(
   });
 
   const transcript = stripFailedTail(transcriptRaw);
-  if (transcript.length === 0) return null;
+  // Only failed tails with no committed turn beneath — same as never-flushed.
+  if (transcript.length === 0) return { mode: "fresh" };
   if (!endsAwaitingAssistant(transcript)) return null;
 
-  return { snapshot, transcript };
+  return { mode: "continue", snapshot, transcript };
 }
 
 /**
@@ -415,10 +445,11 @@ export interface ManualResumeDeps {
   /**
    * Viability gate: `loadResumeMaterial` bound to the app's media/workspace
    * deps. `null` means there is nothing to redo (transcript ends at a clean
-   * boundary, or material is missing/unusable) → the resume is rejected
-   * WITHOUT touching the row's status.
+   * boundary, or material is unusable) → the resume is rejected WITHOUT
+   * touching the row's status. A `fresh` verdict (transcript never flushed)
+   * is viable — `runAttempt` rebuilds the context and re-runs from scratch.
    */
-  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
+  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterialResult | null>;
   /**
    * True when the SessionManager already holds an in-memory record for the id
    * (a live run, or a resume mid-flight). Belt-and-suspenders next to the
@@ -476,7 +507,10 @@ export interface ManualResumeDeps {
  * - **Interrupted sessions (issue #19, Decision D).** `interrupted` rows are
  *   accepted alongside `failed-resumable` — same re-issue mechanism, no extra
  *   turn injected. Viability is gated up front by `loadMaterial`; a row with
- *   nothing to redo is rejected (409) with its status untouched.
+ *   nothing to redo is rejected (409) with its status untouched. A row whose
+ *   transcript never flushed (hard crash mid-first-request) is NOT rejected —
+ *   it resumes in `fresh` mode (context rebuilt from the durable trigger row;
+ *   see `loadResumeMaterial`).
  * - **Synthetic-session gate (issue #19 follow-up).** Rows whose
  *   `session_type` is a synthetic worker-pool type (`SYNTHETIC_SESSION_TYPES`:
  *   summarize/condense/diary) are rejected (409, status untouched) right
@@ -539,7 +573,7 @@ export function createManualResumeSession(
           ok: false,
           status: row.status,
           reason:
-            "nothing to redo: the transcript ends at a clean boundary, or the resume material is missing/unusable",
+            "nothing to redo: the transcript ends at a clean boundary, or the resume material is unusable",
         };
       }
       const parsed = parseMatrixTimelineKey(row.timeline_key);
@@ -606,6 +640,7 @@ export function createManualResumeSession(
           sessionId,
           timelineKey: row.timeline_key,
           fromStatus: row.status,
+          mode: material.mode,
         });
         // `runAttempt` (resumeSessionRun) returns a three-way outcome on the
         // happy path, but its pre-run wiring — markRunning/attachAgent/

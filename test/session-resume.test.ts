@@ -10,7 +10,7 @@ import {
   stripFailedTail,
   RESUME_IMAGE_PLACEHOLDER,
   type ManualResumeDeps,
-  type ResumeMaterial,
+  type ResumeMaterialResult,
   type ResumeMaterialDeps,
 } from "../src/agent/recovery.js";
 import { externalizeImages } from "../src/agent/session-capture.js";
@@ -69,19 +69,20 @@ function row(overrides: Partial<AgentSessionRow> = {}): AgentSessionRow {
 test("loadResumeMaterial projects the snapshot vocabulary and strips the failed tail", async () => {
   const material = await loadResumeMaterial(row(), NO_MEDIA_DEPS);
   assert.ok(material, "row with snapshot+transcript is resumable");
+  assert.equal(material!.mode, "continue");
+  const m = material as Extract<NonNullable<typeof material>, { mode: "continue" }>;
   // mapBuiltMessages contract: the system block is dropped from the runtime prefix.
-  assert.equal(material!.snapshot.length, 1);
-  assert.equal((material!.snapshot[0] as any).type, "chatEvent");
+  assert.equal(m.snapshot.length, 1);
+  assert.equal((m.snapshot[0] as any).type, "chatEvent");
   // The synthetic error assistant turn is stripped; the transcript ends at the
   // un-answered final user turn, ready for agent.continue().
-  assert.equal(material!.transcript.length, 1);
-  assert.equal((material!.transcript[0] as any).type, "triggerGroup");
+  assert.equal(m.transcript.length, 1);
+  assert.equal((m.transcript[0] as any).type, "triggerGroup");
 });
 
 test("loadResumeMaterial rejects rows that cannot be redone", async () => {
-  // Missing material.
+  // A transcript without its snapshot violates the capture ordering — corrupt.
   assert.equal(await loadResumeMaterial(row({ context_snapshot_json: null }), NO_MEDIA_DEPS), null);
-  assert.equal(await loadResumeMaterial(row({ transcript_json: null }), NO_MEDIA_DEPS), null);
   // Corrupt JSON.
   assert.equal(await loadResumeMaterial(row({ transcript_json: "{nope" }), NO_MEDIA_DEPS), null);
   // A transcript whose last turn committed cleanly: nothing failed to redo.
@@ -97,8 +98,28 @@ test("loadResumeMaterial rejects rows that cannot be redone", async () => {
     ),
     null,
   );
-  // Stripping everything leaves nothing to re-issue.
-  assert.equal(
+});
+
+test("loadResumeMaterial: a never-flushed transcript resolves to FRESH, not a rejection", async () => {
+  // Hard crash before the first turn_end/flushNow (e.g. process kill
+  // mid-first-request): no transcript row at all. Nothing committed → fresh
+  // rebuild from the durable trigger row, regardless of snapshot presence.
+  assert.deepEqual(await loadResumeMaterial(row({ transcript_json: null }), NO_MEDIA_DEPS), {
+    mode: "fresh",
+  });
+  assert.deepEqual(
+    await loadResumeMaterial(
+      row({ transcript_json: null, context_snapshot_json: null }),
+      NO_MEDIA_DEPS,
+    ),
+    { mode: "fresh" },
+  );
+  // A flushed-but-empty transcript is the same "nothing committed" case.
+  assert.deepEqual(await loadResumeMaterial(row({ transcript_json: "[]" }), NO_MEDIA_DEPS), {
+    mode: "fresh",
+  });
+  // Only failed tails with no committed turn beneath — also fresh.
+  assert.deepEqual(
     await loadResumeMaterial(
       row({
         transcript_json: JSON.stringify([
@@ -107,7 +128,7 @@ test("loadResumeMaterial rejects rows that cannot be redone", async () => {
       }),
       NO_MEDIA_DEPS,
     ),
-    null,
+    { mode: "fresh" },
   );
 });
 
@@ -463,7 +484,7 @@ test("SessionManager: markFailedResumable evicts; adopt re-registers", () => {
 // row, and shutdown re-park.
 // ---------------------------------------------------------------------------
 
-const FAKE_MATERIAL: ResumeMaterial = { snapshot: [], transcript: [] };
+const FAKE_MATERIAL: ResumeMaterialResult = { mode: "continue", snapshot: [], transcript: [] };
 const SELF_USER_ID = "@miku:example.org";
 
 interface ManualRecorded {
@@ -641,6 +662,18 @@ test("manual resume: interrupted session WITH viable material resumes transparen
   const result = await createManualResumeSession(deps)("s-resume0001");
   assert.deepEqual(result, { ok: true, status: "completed" });
   assert.equal(rec.attempts.length, 1, "same re-issue mechanism, no extra turn");
+});
+
+test("manual resume: interrupted session with a NEVER-FLUSHED transcript resumes in fresh mode", async () => {
+  // Hard crash before the first transcript flush: loadMaterial says `fresh`,
+  // and the resume proceeds (rebuild-and-relaunch) instead of rejecting.
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ status: "interrupted" }),
+    loadMaterial: async () => ({ mode: "fresh" }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+  assert.equal(rec.attempts.length, 1, "the attempt runs; resumeSessionRun owns the rebuild");
 });
 
 test("manual resume: interrupted session WITHOUT material is a 409 and its status is untouched (#19)", async () => {

@@ -1206,7 +1206,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * CONCURRENCY-AND-RATE-LIMITING §6.2): rebuild the tool set, re-create the
    * agent from the persisted snapshot + transcript (skipping the context build
    * entirely), and drive the runner in continue-mode so it re-issues the exact
-   * request that failed. Shared by auto-resume (in the failed run's promise
+   * request that failed. When the transcript never flushed (`fresh` material —
+   * a hard crash before the first turn committed), there is nothing to replay:
+   * the context is rebuilt from the durable trigger row and the session re-runs
+   * like a launch instead. Shared by auto-resume (in the failed run's promise
    * chain, while the timeline slot is still held) and the manual console resume.
    */
   async function resumeSessionRun(
@@ -1224,24 +1227,58 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
 
+    const tools = buildSessionTools(inbound, record.id, target);
     let agent;
-    try {
-      ({ agent } = await factory.create(record, buildSessionTools(inbound, record.id, target), {
-        resume: material,
-      }));
-    } catch (error) {
-      return {
-        outcome: "fatal",
-        error: `resume factory failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
+    // Fresh mode only: the rebuilt context's kickoff turn + persistence
+    // snapshot — run and persisted exactly like a launch.
+    let kickoff;
+    let snapshot: ContextMessage[] | undefined;
+    let tokenEstimate: number | undefined;
+    if (material.mode === "fresh") {
+      // The transcript never flushed (hard crash before the first turn_end —
+      // e.g. a kill mid-first-request): no turn committed, so no side effect
+      // can be duplicated. There is no transcript to replay, but the durable
+      // row's trigger still points at the original timeline event — rebuild
+      // the context fresh and re-run the session like a launch, reusing the
+      // same row. The rebuild sees the timeline as of NOW (including messages
+      // that arrived after the crash), which a launch would too.
+      try {
+        ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(record, tools, {
+          proactive:
+            record.sessionType === (config.proactive?.session_type ?? "proactive") ? true : undefined,
+          abortSignal: drainAbort.signal,
+        }));
+        if (!kickoff) throw new Error("context build produced no final user turn");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // A build-wait timeout is environmental (an outage backing up summary
+        // coverage) — mechanical, so the manual resume re-parks instead of
+        // discarding; anything else thrown here is our own code → fatal.
+        return error instanceof Error && error.name === "BuildWaitTimeoutError"
+          ? { outcome: "mechanical", error: message }
+          : { outcome: "fatal", error: `resume rebuild failed: ${message}` };
+      }
+    } else {
+      try {
+        ({ agent } = await factory.create(record, tools, { resume: material }));
+      } catch (error) {
+        return {
+          outcome: "fatal",
+          error: `resume factory failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
     }
     sessions.markRunning(record.id);
     sessions.attachAgent(record.id, agent);
-    // Snapshot deliberately omitted: the durable row already holds it (written
-    // once at original creation); only the transcript keeps flushing.
+    // Continue-mode: snapshot omitted — the durable row already holds it
+    // (written once at original creation); only the transcript keeps flushing.
+    // Fresh mode: pass the REBUILT snapshot so the row reflects the context
+    // this run actually used (overwriting the stale original).
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: record.id,
+      snapshot,
+      tokenEstimate,
       logger,
     });
     const runner = new SessionRunner({
@@ -1254,13 +1291,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         agent,
         record,
         config.agent.sessions.forced_completion_retries,
-        undefined, // continue-mode: redo the failed request from the transcript tail
+        // Fresh mode prompts the rebuilt kickoff turn; continue-mode passes
+        // undefined → agent.continue() redoes the failed request from the
+        // transcript tail.
+        kickoff,
         sessions.runLifecycle(record.id),
       );
       sessions.markCompleted(record.id, { noReply: result.noReply });
       logger.info("session_resumed_completed", {
         sessionId: record.id,
         attempt,
+        mode: material.mode,
         noReply: result.noReply,
       });
       return { outcome: "completed" };

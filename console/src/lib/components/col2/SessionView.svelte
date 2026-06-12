@@ -77,11 +77,13 @@
 
 	// Resume button → POST resume (spec CONCURRENCY-AND-RATE-LIMITING §6.2): the
 	// agent re-creates the parked (`failed-resumable`) or `interrupted` run from
-	// its persisted snapshot + transcript and redoes the failed request,
-	// long-polling until the resumed run settles. A 409 means the resume failed
-	// again (re-parked), the session is no longer resumable, the session is a
-	// synthetic worker-pool one (summarize/condense/diary), a resume is already
-	// in flight, the timeline is busy, or there is nothing to redo.
+	// its persisted snapshot + transcript and redoes the failed request (or, when
+	// the transcript never flushed — crash before the first turn — rebuilds the
+	// context fresh and re-runs), long-polling until the resumed run settles. A
+	// 409 means the resume failed again (re-parked), the session is no longer
+	// resumable, the session is a synthetic worker-pool one (summarize/condense/
+	// diary), a resume is already in flight, the timeline is busy, or there is
+	// nothing to redo.
 	async function handleResume() {
 		const id = activeId;
 		if (!id || resuming) return;

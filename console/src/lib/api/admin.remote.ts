@@ -31,7 +31,9 @@ export const abortSession = command(SessionId, (id) =>
 /**
  * Manually resume a parked `failed-resumable` or `interrupted` session (spec
  * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D): the agent re-creates the
- * run from the persisted snapshot + transcript and redoes the failed request.
+ * run from the persisted snapshot + transcript and redoes the failed request
+ * (or rebuilds the context fresh and re-runs when the transcript never
+ * flushed — a crash before the first turn committed).
  * Only user-facing session types are eligible — synthetic worker-pool
  * sessions (summarize/condense/diary) are rejected outright. The request
  * long-polls until the resumed run reaches a terminal state; the agent

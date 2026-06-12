@@ -263,7 +263,9 @@ export function abortSession(
  * POST /api/sessions/:id/resume — manual resume-in-place of a parked
  * `failed-resumable` or `interrupted` session (spec
  * CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D; both statuses carry the
- * same snapshot/transcript material). The console's second mutating route,
+ * same snapshot/transcript material — and a crash-interrupted row whose
+ * transcript never flushed resumes via a fresh context rebuild instead of a
+ * replay, see `loadResumeMaterial`). The console's second mutating route,
  * mirroring `abortSession`'s envelope conventions.
  *
  * - 200 `{ sessionId, status }` — the resume ran to completion (`status:
