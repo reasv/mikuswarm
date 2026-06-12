@@ -65,7 +65,19 @@ export interface SessionRunnerOptions {
   suppressTyping?: boolean;
 }
 
-const TYPING_KEEPALIVE_MS = 4_000;
+// matrix-sdk sends typing notices to the homeserver with a fixed 4s server-side
+// expiry (`TYPING_NOTICE_TIMEOUT`), and internally dedups repeated calls,
+// only actually re-sending once ≥3s have elapsed since the last send
+// (`TYPING_NOTICE_RESEND_TIMEOUT`). That leaves a narrow (3s, 4s) window in
+// which a refresh must land to keep the indicator continuous. A keepalive equal
+// to the 4s expiry systematically lands the refresh *after* the server already
+// dropped the indicator (interval drift + NAPI/network latency push it past 4s),
+// producing the "typing flickers on and off / barely shows" symptom. Poll well
+// inside the window so matrix-sdk's own resend fires as soon as its 3s gate opens
+// (~3s elapsed), comfortably before the 4s server expiry. The sub-window calls
+// are cheap: matrix-sdk dedups them, so only ~one real request per ~3.5s hits the
+// wire regardless of how often we poll.
+const TYPING_KEEPALIVE_MS = 1_000;
 
 export class SessionRunner {
   constructor(private readonly options: SessionRunnerOptions = {}) {}

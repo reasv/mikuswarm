@@ -58,6 +58,16 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         };
       }
 
+      // A send with no text, no HTML, and no media has nothing to deliver — it would
+      // produce an empty Matrix event (or, historically, silently send nothing). If you
+      // have nothing to say, terminate the turn by outputting exactly NO_REPLY instead.
+      if (!args.message.trim() && !args.html?.trim() && !args.media?.trim()) {
+        return {
+          content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, output exactly NO_REPLY to end your turn silently." }],
+          details: null,
+        };
+      }
+
       const effectiveTarget: OutboundTarget = { ...context.target };
       if (args.is_reply) {
         effectiveTarget.replyToId = args.reply_to_id!.trim();
@@ -132,6 +142,12 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
 
         // No custom HTML — chunk the plaintext message as before.
         const chunks = chunkMarkdownText(body, 4000);
+        // Media-only send: an empty body chunks to zero entries, so the send loop
+        // below would never run and the attachment would be silently dropped.
+        // Emit a single empty-body event to carry the attachment.
+        if (chunks.length === 0 && attachments) {
+          chunks.push("");
+        }
         const eventIds: string[] = [];
 
         for (let i = 0; i < chunks.length; i++) {
