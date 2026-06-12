@@ -658,10 +658,11 @@ describe("system prompt rendering — XML attribute escaping", () => {
     const prompt = renderSystemPrompt(workspace);
     assert.ok(prompt.includes('name="skill&quot;with&lt;special&gt;"'),
       "skill name with special chars should be escaped");
-    // Description is element content — the shared escapeXml escapes all 5 XML
-    // special characters including quotes, which is safe for element content too.
-    assert.ok(prompt.includes("A skill with &lt;tags&gt; &amp; &quot;quotes&quot;"),
-      "skill description should escape XML entities in element content");
+    // Description is element content — escapeXml escapes only the structurally
+    // significant characters (&, <, >). Quotes are left verbatim because they
+    // carry no meaning in element content (see src/context/xml.ts).
+    assert.ok(prompt.includes('A skill with &lt;tags&gt; &amp; "quotes"'),
+      "skill description should escape structural XML entities but leave quotes verbatim");
   });
 
   it("escapes special characters in inlined skill attributes", () => {
