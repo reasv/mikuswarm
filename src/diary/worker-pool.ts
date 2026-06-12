@@ -61,6 +61,13 @@ export class DiaryWorkerPool {
   private readonly activeWorkers = new Set<Promise<void>>();
   /** Live agents of in-flight runs, aborted at drain (spec LLM-FAILURE-HANDLING §7). */
   private readonly activeAgents = new Set<{ abort(): void }>();
+  /**
+   * Agents the drain sweep in {@link stop} actually aborted (issue #13). The
+   * drain-vs-cap bifurcation tests membership HERE rather than inferring a drain
+   * from `!running`, so a cap abort (runaway tool/turn loop) that settles while
+   * `stop()` is in progress is not misread as a drain and refunded an attempt.
+   */
+  private readonly drainSwept = new WeakSet<{ abort(): void }>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
 
@@ -85,6 +92,10 @@ export class DiaryWorkerPool {
     // abort surfaces as a drain abort → the job returns to 'pending' with its
     // claim-time diary_attempts increment compensated.
     for (const agent of this.activeAgents) {
+      // Record the agent as drain-swept BEFORE aborting so the run's
+      // post-`waitForIdle` bifurcation can tell a drain abort apart from a cap
+      // abort that merely coincided with the drain (issue #13).
+      this.drainSwept.add(agent);
       try {
         agent.abort();
       } catch {
@@ -381,9 +392,12 @@ export class DiaryWorkerPool {
         await agent.prompt(promptInput as any);
         await agent.waitForIdle();
         // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7): a DRAIN abort
-        // returns the job to 'pending' with its claim-time attempts increment
-        // compensated; a CAP abort (pool still running) stays semantic.
-        if (wasRunAborted(agent) && !this.running) {
+        // (this agent was swept by stop()) returns the job to 'pending' with its
+        // claim-time attempts increment compensated; a CAP abort stays semantic.
+        // We test the explicit drain-swept set rather than `!this.running` so a
+        // cap abort that settles WHILE stop() is in progress is not misread as a
+        // drain (issue #13).
+        if (wasRunAborted(agent) && this.drainSwept.has(agent)) {
           throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
         }
         // pi-agent-core resolves the run promise even when the cap-driven abort

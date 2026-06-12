@@ -47,6 +47,15 @@ export class SummarizationWorkerPool {
   private readonly activeWorkers = new Set<Promise<void>>();
   /** Live agents of in-flight runs, aborted at drain (spec LLM-FAILURE-HANDLING §7). */
   private readonly activeAgents = new Set<{ abort(): void }>();
+  /**
+   * Agents the drain sweep in {@link stop} actually aborted (issue #13). The
+   * drain-vs-cap bifurcation tests membership HERE rather than inferring a drain
+   * from `!running`: a genuine cap abort (runaway tool/turn loop) that settles
+   * while `stop()` is in progress would otherwise read as a drain and earn a
+   * free attempt refund across restart. An agent is in this set iff `stop()`
+   * called `abort()` on it.
+   */
+  private readonly drainSwept = new WeakSet<{ abort(): void }>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
 
@@ -73,6 +82,10 @@ export class SummarizationWorkerPool {
     // restart re-claims and re-runs it from scratch (the job queue is the
     // durable unit; mid-session inference state is deliberately not persisted).
     for (const agent of this.activeAgents) {
+      // Record the agent as drain-swept BEFORE aborting so the run's
+      // post-`waitForIdle` bifurcation can tell a drain abort apart from a cap
+      // abort that merely coincided with the drain (issue #13).
+      this.drainSwept.add(agent);
       try {
         agent.abort();
       } catch {
@@ -348,11 +361,14 @@ export class SummarizationWorkerPool {
         await agent.prompt(kickoff as any);
         await agent.waitForIdle();
         // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7). A DRAIN abort
-        // (pool stopping) is not a semantic failure: the job goes back to
-        // 'pending' with its claim-time attempts increment compensated. A CAP
-        // abort (runaway tool/turn loop, pool still running) stays on the
-        // semantic path — a degenerate run is an output problem.
-        if (wasRunAborted(agent) && !this.running) {
+        // (this agent was swept by stop()) is not a semantic failure: the job
+        // goes back to 'pending' with its claim-time attempts increment
+        // compensated. A CAP abort (runaway tool/turn loop) stays on the
+        // semantic path — a degenerate run is an output problem. We test the
+        // explicit drain-swept set rather than `!this.running` so a cap abort
+        // that settles WHILE stop() is in progress is not misread as a drain
+        // (issue #13).
+        if (wasRunAborted(agent) && this.drainSwept.has(agent)) {
           throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
         }
         // pi-agent-core resolves the run promise even when the cap-driven abort

@@ -431,6 +431,72 @@ test("cap abort (spec §7): an abort while the pool is RUNNING stays on the sema
   }
 });
 
+test("cap abort racing pool stop (spec §7 / #13): a cap abort that settles while running is already false stays SEMANTIC (not refunded as a drain)", async () => {
+  // The #13 race: `stop()` flips `running` to false synchronously, then sweeps
+  // the in-flight agents. There is a window where `running === false` but THIS
+  // agent has not been swept. A cap abort (runaway tool/turn loop) settling in
+  // that window must NOT be misread as a drain — under the old `!running`
+  // predicate it was refunded a free attempt across restart. The fix tests the
+  // explicit drain-swept set, so an agent the sweep never touched stays semantic.
+  //
+  // We reproduce the window deterministically: the agent self-cap-aborts in
+  // prompt(), and its waitForIdle() flips the pool's `running` to false WITHOUT
+  // running stop()'s sweep — so the agent is never recorded as drain-swept while
+  // `running` is already false at the bifurcation point.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_cap_race", 0);
+    let pool!: SummarizationWorkerPool;
+    const factory = {
+      resolveModelId: () => "test-model",
+      create: async () => {
+        const agent: any = {
+          state: { messages: [] as unknown[], errorMessage: undefined as string | undefined },
+          prompt: async () => {
+            // Cap-abort shape: settled aborted turn + Layer-0 aborted-class tag.
+            agent.state.errorMessage = "Request was aborted [llm-request] [llm-request:aborted]";
+            agent.state.messages.push({ role: "assistant", content: [], stopReason: "aborted" });
+          },
+          waitForIdle: async () => {
+            // Open the race window: running is now false (as stop() would set it)
+            // but the drain sweep has NOT run — this agent is never swept.
+            (pool as any).running = false;
+          },
+          subscribe: () => () => {},
+          abort: () => {},
+        };
+        return { agent };
+      },
+    } as any;
+    pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 },
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => {
+      const j = storage.getSummarizationJobById("job_cap_race");
+      return j?.status === "failed" || (j?.status === "pending" && j.attempts > 0);
+    });
+
+    const job = storage.getSummarizationJobById("job_cap_race")!;
+    assert.equal(
+      job.status,
+      "failed",
+      "a cap abort settling in the running-false window is semantic — NOT a drain (old code re-pended it)",
+    );
+    assert.equal(job.attempts, 1, "the claim-time increment is NOT refunded for a cap abort");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
 test("drain abort (diary mirror, spec §7): stop() re-pends with diary_attempts compensated", async () => {
   await withDiaryFixture(async (ctx) => {
     await seedDiaryJob(ctx.storage, "sum_diary_drain");

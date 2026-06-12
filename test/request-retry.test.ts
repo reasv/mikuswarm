@@ -588,6 +588,88 @@ test("withRequestRetry: a larger budget lets a slow-to-first-token attempt survi
   assert.deepEqual(largeEvents.map((e) => e.type), ["start", "text_delta", "done"], "larger budget survives to first token");
 });
 
+// ---------------------------------------------------------------------------
+// Drain abort DURING the inter-attempt backoff sleep (spec §6/§7 / review issue
+// #4). When a caller abort (pool drain / operator Stop) lands while the wrapper
+// is sleeping between attempts, the surfaced terminal event MUST be `aborted`
+// (stopReason "aborted" + the [llm-request:aborted] class marker) so that
+// `wasRunAborted()` reads true in the worker pools and the drained job takes the
+// §7 job-pending path — NOT the stale environmental error of the attempt that
+// preceded the sleep. A BUDGET expiry of the same sleep stays environmental
+// (genuine wait-exhaustion). This path is distinct from the existing drain tests,
+// which fake the aborted shape directly; here the abort is genuinely delivered
+// mid-sleep.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `body` with `Math.random` pinned to `value`, restoring it afterwards.
+ * Full-jitter backoff is `random() * ceiling`, so pinning random to ~1 makes the
+ * inter-attempt sleep deterministically the full `backoffMaxMs` — a real (not
+ * collapsed-to-~0) sleep window the abort can reliably land inside.
+ */
+async function withPinnedRandom(value: number, body: () => Promise<void>): Promise<void> {
+  const original = Math.random;
+  Math.random = () => value;
+  try {
+    await body();
+  } finally {
+    Math.random = original;
+  }
+}
+
+test("withRequestRetry: a caller abort landing DURING the backoff sleep surfaces `aborted`, not the stale environmental error (spec §6/§7 / #4)", async () => {
+  // The first attempt fails environmentally (503), so the wrapper enters the
+  // local backoff sleep. While it is sleeping, the caller aborts (a pool drain).
+  // The catch must surface an `aborted` event, not the 503 it was carrying.
+  // Random is pinned high so the backoff is the full 200ms — a genuine sleep the
+  // abort lands inside (NOT the pre-baked aborted shape the pool drain tests use).
+  await withPinnedRandom(0.999, async () => {
+    const controller = new AbortController();
+    const { fn, calls } = scriptedBase([
+      { events: [errorEvent("503 unavailable")] },
+      // A clean retry IS scripted, but the abort must fire first so it is never
+      // reached — proving the abort short-circuits the backoff, not the retry.
+      { events: [startEvent(), textDeltaEvent("should-not-appear"), doneEvent()] },
+    ]);
+    const wrapped = withRequestRetry(fn, { backoffBaseMs: 200, backoffMaxMs: 200 });
+    const out = wrapped(MODEL, CONTEXT, { signal: controller.signal } as never);
+    // Fire the caller abort after the first failure has settled and the wrapper
+    // is sleeping (well within the ~200ms backoff window).
+    setTimeout(() => controller.abort(), 40);
+    const events = await drain(out);
+    assert.equal(calls(), 1, "the retry attempt was never issued — abort short-circuited the backoff");
+    assert.deepEqual(events.map((e) => e.type), ["error"]);
+    const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+    assert.equal(err.stopReason, "aborted", "a mid-sleep caller abort surfaces an abort, not the 503");
+    assert.equal(
+      extractLlmRequestClass(err.errorMessage),
+      "aborted",
+      "the class marker is `aborted` so wasRunAborted() reads true and drain compensation fires",
+    );
+  });
+});
+
+test("withRequestRetry: a BUDGET expiry during the backoff sleep stays environmental (not aborted) (spec §6 / #4)", async () => {
+  // Same mid-sleep abort, but driven by the wall-clock budget rather than the
+  // caller. This is genuine wait-exhaustion, so it must keep environmental
+  // semantics (parks failed-resumable) — only a CALLER abort surfaces `aborted`.
+  await withPinnedRandom(0.999, async () => {
+    const { fn, calls } = scriptedBase([{ events: [errorEvent("503 unavailable")] }]);
+    // backoff (200ms) outlasts the budget (25ms): the budget aborts the sleep.
+    const wrapped = withRequestRetry(fn, { maxWaitMs: 25, backoffBaseMs: 200, backoffMaxMs: 200 });
+    const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+    // The budget-expiry catch `continue`s; the loop re-enters, the now-expired
+    // budget aborts the next attempt immediately, and it exits via the
+    // wait-exhausted path. (The CALLER-abort case short-circuits at calls()===1;
+    // the budget case deliberately does not — that asymmetry is the fix.)
+    assert.equal(calls(), 2, "budget case loops once more then exits wait-exhausted");
+    assert.deepEqual(events.map((e) => e.type), ["error"]);
+    const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+    assert.equal(err.stopReason, "error", "budget expiry is wait-exhaustion, not an abort");
+    assert.equal(extractLlmRequestClass(err.errorMessage), "environmental");
+  });
+});
+
 test("withRequestRetry: an empty inner stream is environmental — retried like any failure", async () => {
   // "Empty streams" are an explicit environmental example (spec §3): the
   // synthesized terminal error re-enters the retry loop like any other.

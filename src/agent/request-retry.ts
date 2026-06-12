@@ -554,11 +554,40 @@ export function withRequestRetry(
             try {
               await sleep(delay, sleepSignal);
             } catch {
-              // Aborted mid-backoff. Caller abort (shutdown/Stop) surfaces the
-              // original error; budget expiry loops once more and exits via
-              // the wait-exhausted path above.
+              // Aborted mid-backoff. `sleepSignal` is (caller ∨ budget), so an
+              // abort here is one of two distinct events that MUST be told apart
+              // (issue #4):
+              //
+              //  - BUDGET expiry (caller did NOT abort): genuine wait-exhaustion,
+              //    not a drain. Loop once more and exit via the wait-exhausted
+              //    path above, preserving the environmental semantics (parks
+              //    failed-resumable).
+              //
+              //  - CALLER abort (drain / operator Stop): this is an intentional
+              //    abort. Surfacing the STALE environmental error here would make
+              //    `wasRunAborted()` read false in the worker pools, sending a
+              //    drained job down the SEMANTIC failure path — the claim-time
+              //    attempts increment is then NOT compensated, and at the retry
+              //    edge a routine restart can terminally fail a diary job or
+              //    permanently commit a `truncated` summary (spec §6/§7). Instead
+              //    synthesize an `aborted` event (matching the in-attempt
+              //    AbortError path's `stopReason:"aborted"` + `[llm-request:aborted]`
+              //    class marker), so the drain compensation fires.
               if (budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true) {
                 continue;
+              }
+              if (callerSignal?.aborted === true) {
+                const aborted = synthesizeErrorEvent(
+                  model,
+                  errorEvent.error?.errorMessage ?? "aborted",
+                  "aborted",
+                );
+                recordAttempt(attempt + 1, attemptStart, "aborted", {
+                  cls: "aborted",
+                  errorMessage: aborted.error?.errorMessage,
+                });
+                surface(aborted, "aborted");
+                return;
               }
               surface(errorEvent, verdict);
               return;
