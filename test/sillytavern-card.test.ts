@@ -99,6 +99,27 @@ test("sillytavern_card_read accepts normal workspace-relative paths", async () =
   });
 });
 
+test("sillytavern_card_create/read works with a relative workspace root (regression)", async () => {
+  // Production configures `root_dir = "./workspaces/miku"` — a *relative* path.
+  // resolveReadablePath/resolveWorkspaceWritePath build absolute paths via
+  // path.resolve(workspaceRoot, …); the containment guard must compare against
+  // the resolved root, not the raw relative string, or every card sub-tool
+  // wrongly throws "Refusing to write outside the workspace." for valid paths.
+  await withWorkspace(async (workspace) => {
+    const relativeRoot = path.relative(process.cwd(), workspace);
+    assert.ok(!path.isAbsolute(relativeRoot), "test must drive a relative root");
+
+    // create: reads imagePath and writes outputPath, both relative — the path
+    // that failed in production.
+    await buildBaseCardPng(relativeRoot, "cards/sillytavern/base.png");
+
+    const read = createSillyTavernCardReadTool(buildContext(relativeRoot));
+    const result = await read.execute("t1", { path: "cards/sillytavern/base.png" });
+    const text = (result.content[0] as { text: string }).text;
+    assert.match(text, /SillyTavern Card Summary/);
+  });
+});
+
 test("sillytavern_card_edit set_field_from_file rejects path traversal", async () => {
   await withWorkspace(async (workspace) => {
     await buildBaseCardPng(workspace, "base.png");

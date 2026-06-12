@@ -2021,8 +2021,16 @@ function normalizeWorkspaceOutputPath(rawPath: string): string {
 }
 
 function assertPathInsideWorkspace(workspaceRoot: string, absolutePath: string) {
-  const rootWithSep = workspaceRoot.endsWith(path.sep) ? workspaceRoot : `${workspaceRoot}${path.sep}`;
-  if (absolutePath !== workspaceRoot && !absolutePath.startsWith(rootWithSep)) {
+  // `workspaceRoot` may be configured as a relative or otherwise non-canonical
+  // path (e.g. `root_dir = "./workspaces/miku"`). Every caller builds
+  // `absolutePath` via `path.resolve(workspaceRoot, …)`, which yields an
+  // absolute, normalized path — so comparing it against the *raw* root string
+  // with `startsWith` spuriously rejects valid in-workspace paths (an absolute
+  // path never string-prefixes a `./relative` root). Resolve the root first and
+  // compare via `path.relative`, mirroring the canonical guard in workspace.ts.
+  const root = path.resolve(workspaceRoot);
+  const relative = path.relative(root, absolutePath);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error("Refusing to write outside the workspace.");
   }
 }

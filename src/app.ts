@@ -201,7 +201,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);
   const sessions = new SessionManager({ storage, logger });
-  const workspaceRoot = config.workspace.root_dir;
+  // Canonicalize once at the source. `config.workspace.root_dir` is commonly
+  // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
+  // means every tool downstream receives an absolute, normalized root. That
+  // keeps path-containment guards correct regardless of how they compare paths,
+  // so a tool can't reintroduce the "absolute path never string-prefixes a
+  // relative root" class of false-rejection bug. Idempotent for the sandbox,
+  // which already calls path.resolve(workspaceRoot) for its bind mount below.
+  const workspaceRoot = path.resolve(config.workspace.root_dir);
   await mkdir(workspaceRoot, { recursive: true });
 
   // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
