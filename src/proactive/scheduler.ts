@@ -232,14 +232,16 @@ export function computeNextAttempt(p: {
 }
 
 /**
- * Parse a Matrix per-room timeline key into account/room/thread parts. Also
- * used by session resume-in-place (src/app.ts) to reconstruct an outbound
- * target for a parked session whose original inbound is gone.
+ * Parse a Matrix per-room timeline key into account/room/thread parts. Accepts
+ * both `room` and `dm` keys (DM timelines use `matrix:<account>:dm:<roomId>`,
+ * see timelineKeyForMatrixEvent) — the same shape roomIdFromTimelineKey
+ * accepts. Also used by session resume-in-place (src/app.ts) to reconstruct an
+ * outbound target for a parked session whose original inbound is gone.
  */
 export function parseMatrixTimelineKey(
   timelineKey: string,
 ): { accountId: string; roomId: string; threadId?: string } | null {
-  const m = /^matrix:([^:]+):room:(.+?)(?::thread:(.*))?$/.exec(timelineKey);
+  const m = /^matrix:([^:]+):(?:room|dm):(.+?)(?::thread:(.*))?$/.exec(timelineKey);
   if (!m) return null;
   return { accountId: m[1]!, roomId: m[2]!, threadId: m[3] };
 }

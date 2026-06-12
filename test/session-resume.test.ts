@@ -843,6 +843,22 @@ test("manual resume: runAttempt throwing WHILE DRAINING re-parks (not discards) 
   assert.equal(live, false, "record evicted");
 });
 
+test("manual resume: DM timeline key reconstructs the outbound target", async () => {
+  // DM sessions use `matrix:<account>:dm:<roomId>` keys (timelineKeyForMatrixEvent),
+  // and the room id itself contains a colon. Regression: these 409'd as
+  // "cannot reconstruct outbound target" because the parser only matched :room:.
+  const dmKey = "matrix:miku:dm:!klfGPmhzdKaOinFDgO:example.org";
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ timeline_key: dmKey }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+  assert.deepEqual(rec.slotAcquires, [dmKey]);
+  assert.equal(rec.attempts[0].inbound.outboundTarget?.accountId, "miku");
+  assert.equal(rec.attempts[0].inbound.outboundTarget?.roomId, "!klfGPmhzdKaOinFDgO:example.org");
+  assert.equal(rec.attempts[0].inbound.outboundTarget?.threadId, undefined);
+});
+
 test("manual resume: unparseable timeline key / unknown account rejects before the slot", async () => {
   const { deps, rec } = manualResumeHarness({
     getSessionRow: () => row({ timeline_key: "discord:guild:123" }),
