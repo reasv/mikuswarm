@@ -215,6 +215,26 @@ export function sessionStream(
   if (!stream.closed && !ctx.deps.sessions.isAgentLive(id)) {
     stream.send("not_live", { sessionId: id, status: row.status });
     stream.close();
+    return;
+  }
+
+  // Seed: `Agent.subscribe` delivers only future events, so a console attaching
+  // mid-run would otherwise render an empty rollout until the next turn lands.
+  // Send the canonical accumulated state (`agent.state.messages` — the same
+  // array the per-turn transcript flush serializes) as one `rollout_seed` the
+  // client folds as its starting message list. This handler runs synchronously
+  // after the subscribes above, so no agent event can interleave before the
+  // seed: the client always sees seed → live events, race-free, no duplicates.
+  // `rolloutStartIndex` mirrors the session-detail contract (head final-turn
+  // messages belong to the verbatim input view, not the rollout).
+  if (!stream.closed) {
+    const messages = agent.state.messages;
+    stream.send("rollout_seed", {
+      type: "rollout_seed",
+      sessionId: id,
+      messages,
+      rolloutStartIndex: rolloutStartIndex(messages),
+    });
   }
 }
 

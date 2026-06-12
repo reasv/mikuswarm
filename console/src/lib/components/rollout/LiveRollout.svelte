@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { streamSession } from '$lib/api/sessions.remote';
+	import { streamSessionEvents } from '$lib/api/live';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import type { RolloutMsg } from '$lib/rollout';
 	import Rollout from './Rollout.svelte';
@@ -19,6 +19,18 @@
 	// per-event payloads are `any` upstream, so we narrow defensively.
 	function fold(evt: { type: string; [k: string]: unknown }) {
 		switch (evt.type) {
+			case 'rollout_seed': {
+				// The handler's mid-run catch-up: the canonical accumulated state at
+				// stream-open (`agent.state.messages`), sent before any live event
+				// (Agent.subscribe is future-only, so without this an attach mid-run
+				// rendered empty until the next turn). Wholesale replace; the head
+				// final-turn messages belong to the verbatim input view, so slice at
+				// the server-computed rolloutStartIndex (same contract as getSession).
+				const msgs = Array.isArray(evt.messages) ? (evt.messages as RolloutMsg[]) : [];
+				const start = typeof evt.rolloutStartIndex === 'number' ? evt.rolloutStartIndex : 0;
+				messages = msgs.slice(start);
+				break;
+			}
 			case 'tentative_event': {
 				const inner = evt.event as { type?: string; partial?: RolloutMsg } | undefined;
 				if (!inner) break;
@@ -69,11 +81,14 @@
 		}
 	}
 
-	// Consume the live stream for the current session. On teardown we acquire and close
-	// the iterator explicitly (`iter.return()`), which aborts the upstream fetch so the
-	// agent releases its subscription immediately — independent of whether another event
-	// ever arrives (a quiet running session would otherwise leak the SSE connection and
-	// the `Agent.subscribe` listener until `agent_end`; spec §3.3 / §14).
+	// Consume the live SSE stream for the current session ($lib/api/live.ts — a real
+	// event-log byte stream, NOT a query.live: live queries keep only the latest
+	// pending value under backpressure, which dropped burst-committed events like
+	// `turn_end` and left this view empty). Teardown aborts the controller, which
+	// kills the fetch end-to-end so the agent releases its `Agent.subscribe`
+	// listener immediately — independent of whether another event ever arrives (a
+	// quiet running session would otherwise leak the SSE connection until
+	// `agent_end`; spec §3.3 / §14).
 	$effect(() => {
 		const id = sessionId;
 		messages = [];
@@ -82,13 +97,12 @@
 		retryNotice = null;
 		contextSummary.set({ live: true });
 		let stop = false;
-		const iter = streamSession(id)[Symbol.asyncIterator]();
+		const controller = new AbortController();
 		(async () => {
 			try {
-				for (;;) {
-					const { value, done } = await iter.next();
-					if (done || stop) break;
-					fold(value);
+				for await (const evt of streamSessionEvents(id, controller.signal)) {
+					if (stop) break;
+					fold(evt);
 				}
 			} catch {
 				/* aborted on teardown / disconnect — ignore */
@@ -100,9 +114,9 @@
 		})();
 		return () => {
 			stop = true;
-			// Close the iterator so the live generator's `finally` runs now, tearing down
-			// the upstream SSE + agent subscription without waiting for the next event.
-			void iter.return?.();
+			// Abort the fetch so the SSE + agent subscription tears down now, without
+			// waiting for the next event.
+			controller.abort();
 			contextSummary.set({ live: false });
 		};
 	});

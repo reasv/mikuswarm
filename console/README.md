@@ -18,12 +18,19 @@ browser ──(same-origin, no token)──▶ SvelteKit BFF ──(Bearer token
 ```
 
 - **Remote functions** (`src/lib/api/*.remote.ts`) are the typed client/server boundary:
-  `query` for reads, `query.live` for the session SSE stream, `command` for admin
-  (Phase 5, stub). Their bodies are **Effect** programs (`src/lib/server/api/`) that proxy
-  the agent API and decode every response with **Effect Schema** (`src/lib/schemas.ts`) —
-  a wire-shape drift surfaces as a `DecodeError` at the BFF, not a silent UI bug.
+  `query` for reads, `command` for admin actions. Their bodies are **Effect** programs
+  (`src/lib/server/api/`) that proxy the agent API and decode every response with
+  **Effect Schema** (`src/lib/schemas.ts`) — a wire-shape drift surfaces as a
+  `DecodeError` at the BFF, not a silent UI bug.
+- **Live streams are NOT remote functions.** The session rollout stream and the pipeline
+  activity firehose are same-origin **SSE proxy routes** (`src/routes/api/sessions/[id]/
+  stream/+server.ts`, `src/routes/api/pipelines/stream/+server.ts`) that pipe the agent's
+  event-stream bytes verbatim; the browser parses the records itself (`src/lib/sse.ts` +
+  `src/lib/api/live.ts`). `query.live` cannot carry them: SvelteKit live queries are
+  latest-value channels that drop intermediate values under backpressure ("live streams
+  are not event logs"), and the rollout fold / activity listener need every event.
 - **TanStack Query** is the single client-side cache/invalidation authority; it wraps the
-  non-streaming remote queries. `query.live` is consumed directly for the live rollout.
+  non-streaming remote queries. The SSE streams are consumed directly, outside TanStack.
 - The bearer token lives only in `src/lib/server/config.ts` (`$env/dynamic/private`); it is
   never sent to the browser. All upstream hops are server→server, so there is no CORS.
 

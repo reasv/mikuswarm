@@ -14,7 +14,7 @@ export const GET: RequestHandler = async ({ params, fetch, setHeaders, request }
 		headers: authHeaders(),
 		// Forward the client's abort signal so a browser-cancelled image request
 		// (navigation away, <img> removed) aborts the upstream fetch/stream too —
-		// mirrors the SSE path's signal handling (see lib/server/api/sse.ts).
+		// mirrors the SSE proxy routes' signal handling (../../sessions/[id]/stream).
 		signal: request.signal
 	});
 	if (!upstream.ok || !upstream.body) {

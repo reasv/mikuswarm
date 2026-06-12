@@ -5,8 +5,8 @@ import { keys } from './keys';
 
 /**
  * TanStack wrapper over the session detail remote query (persisted snapshot +
- * transcript). The live rollout stream (`streamSession`) is consumed directly via
- * `query.live` in the Rollout component, outside TanStack (spec plan §5).
+ * transcript). The live rollout stream is consumed directly in LiveRollout via
+ * the SSE proxy route + `$lib/api/live.ts`, outside TanStack (spec plan §5).
  */
 export function sessionQuery(id: () => string | null) {
 	return createQuery(() => {

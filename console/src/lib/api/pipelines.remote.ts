@@ -1,7 +1,6 @@
 import { query } from '$app/server';
 import { Schema } from 'effect';
 import { apiGet } from '$lib/server/api/runtime';
-import { streamPipelineActivity as streamPipelineActivityUpstream } from '$lib/server/api/sse';
 import {
 	PipelineId,
 	PipelinesResponse,
@@ -13,7 +12,9 @@ import {
  * Pipeline-monitor read endpoints (ARCHITECTURE.md §11), exposed as type-safe
  * remote queries. Bodies run on the BFF, proxy to the in-process agent API, and
  * decode through Effect Schema (the fidelity guard). The live activity stream
- * (`streamPipelineActivity`) is added in Phase 4.
+ * is NOT a remote function: it is a same-origin SSE proxy route
+ * (`routes/api/pipelines/stream/+server.ts`) consumed by `$lib/api/live.ts` —
+ * `query.live` is a latest-value channel that drops events under backpressure.
  */
 
 /** GET /api/pipelines — the four-pool dashboard feed. */
@@ -56,11 +57,3 @@ export const getPipelineItem = query(PipelineItemArg, (arg) =>
 	)
 );
 
-/**
- * GET /api/pipelines/stream — the cross-pool activity firehose as a `query.live`
- * async generator (mirroring `streamSession`). A single consumer patches the
- * affected pool's counts + visible rows on top of the 5s poll.
- */
-export const streamPipelineActivity = query.live(() =>
-	streamPipelineActivityUpstream('/api/pipelines/stream')
-);

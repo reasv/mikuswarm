@@ -465,7 +465,7 @@ test("SSE: terminal session yields a not_live event and event-stream headers", a
  * delivers FUTURE events, matching the real contract the late-subscribe race
  * relies on.
  */
-function fakeAgent(opts: { live: boolean } = { live: true }): {
+function fakeAgent(opts: { live: boolean; messages?: any[] } = { live: true }): {
   agent: any;
   emit: (event: any) => void;
 } {
@@ -474,6 +474,8 @@ function fakeAgent(opts: { live: boolean } = { live: true }): {
     get signal() {
       return opts.live ? new AbortController().signal : undefined;
     },
+    // The accumulated canonical messages the rollout_seed snapshot reads.
+    state: { messages: opts.messages ?? [] },
     subscribe(listener: (event: any) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -540,6 +542,45 @@ test("SSE: live session streams events and closes on agent_end", async () => {
       assert.match(text, /event: turn_end/);
       assert.match(text, /event: agent_end/);
       assert.doesNotMatch(text, /event: not_live/);
+      // The seed must precede the live events on the wire.
+      assert.ok(
+        text.indexOf("event: rollout_seed") < text.indexOf("event: turn_end"),
+        "rollout_seed must be sent before any live event",
+      );
+    });
+  });
+});
+
+test("SSE: mid-run attach is seeded with the accumulated state messages", async () => {
+  await withStorage(async (storage) => {
+    const sessions = new SessionManager();
+    // Two head final-turn messages + one already-completed assistant turn: a
+    // console attaching now must receive them in the seed (Agent.subscribe is
+    // future-only) with rolloutStartIndex skipping the head final turn.
+    const { agent, emit } = fakeAgent({
+      live: true,
+      messages: [
+        { type: "triggerGroup", role: "user", content: "trigger" },
+        { role: "assistant", content: [{ type: "text", text: "earlier turn" }] },
+      ],
+    });
+    const id = await attachRunningSession(storage, sessions, agent);
+
+    await withServer({ storage, sessions }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/${id}/stream`);
+      assert.equal(res.status, 200);
+      emit({ type: "agent_end", messages: [] });
+      const text = await res.text();
+      assert.match(text, /event: rollout_seed/);
+      const seedData = text
+        .split("\n")
+        .find((l) => l.startsWith("data: ") && l.includes("rollout_seed"));
+      assert.ok(seedData, "seed record must carry data");
+      const seed = JSON.parse(seedData.slice("data: ".length));
+      assert.equal(seed.sessionId, id);
+      assert.equal(seed.rolloutStartIndex, 1); // skips the head triggerGroup turn
+      assert.equal(seed.messages.length, 2);
+      assert.equal(seed.messages[1].content[0].text, "earlier turn");
     });
   });
 });
