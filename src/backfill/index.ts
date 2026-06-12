@@ -27,7 +27,12 @@ export interface InitialBackfillOptions {
   selfUserId: string;
   /** Stop after this many newly-stored messages. 0 → no backfill. */
   maxMessages: number;
-  /** Stop once a fetched page reaches this far before the activation anchor (ms). */
+  /**
+   * Stop at the first kept message older than this far before the activation
+   * anchor (ms); that message is NOT stored. Enforced per message, not per
+   * page, so a single sparse page spanning months cannot smuggle old history
+   * past the window.
+   */
   windowMs: number;
   /**
    * The activation moment — the trigger event's timestamp. The window floor is
@@ -81,10 +86,15 @@ class BackfillTimeoutError extends Error {}
  * activation must not leave enrichable rows under an inactive timeline; the
  * post-readiness `activateTimelineEvents` bulk-flip activates them on success.
  *
- * Stops at the first of: `maxMessages` newly stored, a page crossing the window
- * floor (`anchorTimestamp - windowMs`, anchored to the activation moment),
- * history exhausted (or its pagination token failing to advance), a read
- * failure, or the timeout — the trigger is held until then.
+ * Stops at the first of: `maxMessages` newly stored, a kept message older than
+ * the window floor (`anchorTimestamp - windowMs`, anchored to the activation
+ * moment — checked per message BEFORE storing, so nothing older than the window
+ * is ever persisted), history exhausted (or its pagination token failing to
+ * advance), a read failure, or the timeout — the trigger is held until then.
+ * Backward `/messages` pages are reverse-chronological, so breaking at the
+ * first too-old kept message is a clean stop; anything after it in the page is
+ * older still (modulo origin_server_ts jitter, which can at worst drop a
+ * borderline in-window message — acceptable for a window heuristic).
  *
  * `readMessages` returns the whole room timeline (thread child events and edits
  * included), so messages are filtered to the activated timeline: a thread
@@ -183,7 +193,6 @@ export async function performInitialBackfill(
       break;
     }
 
-    let pageMinTimestamp = Infinity;
     for (const summary of page.messages) {
       result.fetched++;
       const parsed = Date.parse(summary.timestamp);
@@ -198,12 +207,17 @@ export async function performInitialBackfill(
       });
       if (!classified) continue; // not part of the activated timeline (thread filtering)
 
-      // Fold into the window floor for everything kept for this timeline — edits
-      // included (#1): `readMessages` returns the whole room timeline, so a page
-      // dominated by non-thread traffic would otherwise drag `pageMinTimestamp`
-      // past the floor and stop thread backfill short. A fully-filtered page
-      // leaves `pageMinTimestamp = Infinity` and paging continues on the token.
-      pageMinTimestamp = Math.min(pageMinTimestamp, timestamp);
+      // Window floor, enforced per kept message BEFORE storing (edits included
+      // — an edit older than the floor targets an even older message). Only
+      // messages kept for this timeline are checked (#1): `readMessages`
+      // returns the whole room timeline, so a page dominated by non-thread
+      // traffic must not stop thread backfill short; a fully-filtered page
+      // keeps paging on the token. Checking per message (not per page) is what
+      // keeps a single sparse page spanning months from being stored wholesale.
+      if (timestamp < windowFloor) {
+        result.reachedWindow = true;
+        break;
+      }
 
       if (classified.kind === "edit") {
         // An `m.replace` is not a standalone message and never counts toward the
@@ -267,12 +281,7 @@ export async function performInitialBackfill(
         break;
       }
     }
-    if (result.reachedCount || result.haltedOnUtd) break;
-
-    if (pageMinTimestamp < windowFloor) {
-      result.reachedWindow = true;
-      break;
-    }
+    if (result.reachedCount || result.haltedOnUtd || result.reachedWindow) break;
 
     const nextBefore = page.nextBatch ?? undefined;
     if (!nextBefore) {

@@ -188,7 +188,7 @@ test("stops after maxMessages newly-stored and threads the backward pagination t
   });
 });
 
-test("stops once a page crosses the window floor (anchored to activation time)", async () => {
+test("stops at the first kept message older than the window floor, without storing it", async () => {
   await withStores(async (store, storage) => {
     // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const client = new ScriptedClient([
@@ -201,7 +201,8 @@ test("stops once a page crosses the window floor (anchored to activation time)",
       windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
     });
     assert.equal(result.reachedWindow, true);
-    assert.equal(result.stored, 4, "the crossing page is stored in full before stopping");
+    assert.equal(result.stored, 3, "the floor-crossing message and everything after it are not stored");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$d`), undefined, "the floor-crossing message must not be persisted");
     assert.equal(client.calls.length, 2, "should not fetch past the window-crossing page");
   });
 });
@@ -224,7 +225,7 @@ test("window is anchored to activation time, not the oldest stored event", async
       windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
     });
     assert.equal(result.reachedWindow, true, "the window cap must bite despite old inactive history");
-    assert.equal(result.stored, 4, "crossing page stored in full; later pages not fetched");
+    assert.equal(result.stored, 2, "only in-window messages stored; the crossing message and later pages are not");
     assert.equal(client.calls.length, 2, "should stop at the window-crossing page, not paginate to exhaustion");
   });
 });
@@ -261,10 +262,10 @@ test("#1: the window-floor stop is not tripped by filtered-out (non-matching) me
       client, store, storage, timelineKey: threadTk, ...BASE,
       windowMs: 5000, anchorTimestamp: 1_000_000, maxMessages: 100,
     });
-    assert.equal(result.stored, 3, "all three thread messages stored; noise excluded");
+    assert.equal(result.stored, 2, "in-window thread messages stored; noise and the floor-crossing message excluded");
     assert.equal(result.reachedWindow, true, "stops only when a KEPT thread message crosses the floor");
     assert.equal(client.calls.length, 3, "non-thread noise below the floor must not stop backfill early");
-    assert.ok(store.getById(`matrix:${ACCOUNT}:$t3`), "the floor-crossing thread message is stored");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$t3`), undefined, "the floor-crossing thread message is not persisted");
     assert.equal(store.getById(`matrix:${ACCOUNT}:$noise1`), undefined, "non-thread noise is not stored on a thread timeline");
   });
 });
@@ -272,8 +273,8 @@ test("#1: the window-floor stop is not tripped by filtered-out (non-matching) me
 test("#1: a fully-filtered page leaves the floor untouched and paging continues on the token", async () => {
   await withStores(async (store, storage) => {
     // A thread timeline whose first page is ENTIRELY non-thread traffic, all
-    // below the window floor. pageMinTimestamp stays Infinity, so the floor stop
-    // does not fire and paging continues on the advancing token.
+    // below the window floor. The floor is checked only against kept messages,
+    // so the stop does not fire and paging continues on the advancing token.
     // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
     const client = new ScriptedClient([
@@ -291,6 +292,37 @@ test("#1: a fully-filtered page leaves the floor untouched and paging continues 
     assert.equal(result.exhausted, true, "paging continues past the filtered page to exhaustion");
     assert.equal(result.stored, 1, "only the in-thread message is stored");
     assert.equal(client.calls.length, 2, "the second page is fetched on the advancing token");
+  });
+});
+
+test("a single sparse page spanning months stores only in-window messages (no old UTD stubs)", async () => {
+  await withStores(async (store, storage) => {
+    // Regression for the real-world failure: a quiet DM whose ENTIRE history fits
+    // in one backward page. Under the old page-granular window check, the whole
+    // page was stored (months-old permanently-UTD stubs included) before the
+    // floor was ever consulted; the per-message check must stop at the first
+    // kept message older than the floor and persist nothing beyond it.
+    // anchorTimestamp = 10_000_000; windowMs = 3_600_000 → floor = 6_400_000.
+    const oldUtds = Array.from({ length: 10 }, (_, i) => utdSummary(`$utd${i}`, 1_000_000 - i * 1000));
+    const client = new ScriptedClient([
+      page([
+        summary({ eventId: "$recent1", timestamp: 9_999_000 }),
+        summary({ eventId: "$recent2", timestamp: 9_998_000 }),
+        summary({ eventId: "$stale", timestamp: 5_000_000 }),
+        ...oldUtds,
+      ], "tok1"),
+      page([], null),
+    ]);
+    const result = await performInitialBackfill({
+      client, store, storage, timelineKey: ROOM_TK, ...BASE,
+      windowMs: 3_600_000, anchorTimestamp: 10_000_000, maxMessages: 200,
+    });
+    assert.equal(result.reachedWindow, true);
+    assert.equal(result.stored, 2, "only the two in-window messages are stored");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$stale`), undefined, "the first too-old message is not persisted");
+    assert.equal(store.getById(`matrix:${ACCOUNT}:$utd0`), undefined, "old UTD stubs are never persisted");
+    assert.equal(result.haltedOnUtd, false, "the window stops the run before the UTD counter matters");
+    assert.equal(client.calls.length, 1, "no further pages are fetched");
   });
 });
 

@@ -11,7 +11,7 @@ use chrono::Utc;
 use matrix_sdk::{
     config::RequestConfig,
     deserialized_responses::SyncOrStrippedState,
-    encryption::EncryptionSettings,
+    encryption::{BackupDownloadStrategy, EncryptionSettings},
     room::{edit::EditedContent, IncludeRelations, MessagesOptions, ParentSpace, RelationsOptions},
     ruma::{
         api::Direction,
@@ -1581,7 +1581,14 @@ async fn build_client(config: &MatrixClientConfig) -> MatrixResult<Client> {
     let encryption_settings = EncryptionSettings {
         auto_enable_cross_signing: false,
         auto_enable_backups: false,
-        ..Default::default()
+        // Bulk-download all room keys from the server-side key backup as soon as
+        // the backup decryption key is imported — which `restore_recovery`'s
+        // `recovery().recover()` does from secret storage on every startup. The
+        // SDK default (`Manual`) never downloads any room keys, leaving history
+        // from before this device existed permanently undecryptable even though
+        // the keys sit in the backup; the re-decryption sweeper then heals stored
+        // UTD rows once the downloaded keys land in the crypto store.
+        backup_download_strategy: BackupDownloadStrategy::OneShot,
     };
 
     Ok(Client::builder()
