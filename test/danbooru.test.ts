@@ -607,7 +607,13 @@ test("rating:* does NOT count against the max_regular_tags budget", async () => 
   await withWorkspace(async (workspace) => {
     let seenTags: string | undefined;
     const server = await startServer((req, res) => {
-      seenTags = new URL(req.url ?? "", "http://x").searchParams.get("tags") ?? undefined;
+      const parsed = new URL(req.url ?? "", "http://x");
+      // Capture only the /posts.json query — the empty result also triggers the
+      // tag-suggestion recovery path, whose autocomplete requests must not
+      // clobber what we're asserting about the search query itself.
+      if (parsed.pathname === "/posts.json") {
+        seenTags = parsed.searchParams.get("tags") ?? undefined;
+      }
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify([]));
     });
@@ -618,7 +624,9 @@ test("rating:* does NOT count against the max_regular_tags budget", async () => 
           workspaceRoot: workspace,
           serverUrl: server.url,
           fetchClient: client,
-          config: { max_regular_tags: 2 },
+          // Keep suggestion lookups instant so the recovery path doesn't pace
+          // this test out to several seconds.
+          config: { max_regular_tags: 2, min_request_interval_ms: 0, max_in_flight: 4 },
         }),
       );
       await tool.execute("t-rating-budget", {
@@ -966,6 +974,217 @@ test("danbooru search surfaces createdAt, fileSize, and source on each post", as
       const text = (result.content[0] as { text: string }).text;
       assert.ok(text.includes("https://example.com/illustration"), "rendered text should include source");
       assert.ok(text.includes("size=120.6KB") || text.includes("size=123456B"), "rendered text should include fileSize");
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag suggestions ("did you mean") — autocomplete-backed recovery + tags action
+// ---------------------------------------------------------------------------
+
+/**
+ * Stand up a server that serves /posts.json, /autocomplete.json and /tags.json.
+ * `autocomplete` maps a `search[query]` value to canned entries; `posts`
+ * defaults to [] so the recovery path engages. Records every path+query hit.
+ */
+async function startSuggestServer(input: {
+  posts?: unknown[];
+  autocomplete: Record<string, Array<Record<string, unknown>>>;
+  tags?: Record<string, Array<Record<string, unknown>>>;
+}): Promise<{
+  url: string;
+  close: () => Promise<void>;
+  hits: Array<{ path: string; query: string }>;
+}> {
+  const hits: Array<{ path: string; query: string }> = [];
+  const { url, close } = await startServer((req, res) => {
+    const parsed = new URL(req.url ?? "", "http://x");
+    res.setHeader("content-type", "application/json");
+    if (parsed.pathname === "/posts.json") {
+      hits.push({ path: parsed.pathname, query: parsed.searchParams.get("tags") ?? "" });
+      res.end(JSON.stringify(input.posts ?? []));
+      return;
+    }
+    if (parsed.pathname === "/autocomplete.json") {
+      const q = parsed.searchParams.get("search[query]") ?? "";
+      hits.push({ path: parsed.pathname, query: q });
+      res.end(JSON.stringify(input.autocomplete[q] ?? []));
+      return;
+    }
+    if (parsed.pathname === "/tags.json") {
+      const q = parsed.searchParams.get("search[name_matches]") ?? "";
+      hits.push({ path: parsed.pathname, query: q });
+      res.end(JSON.stringify(input.tags?.[q] ?? []));
+      return;
+    }
+    res.statusCode = 404;
+    res.end("[]");
+  });
+  return { url, close, hits };
+}
+
+/** Suggestion lookups should not be paced apart in tests — keep them instant. */
+const FAST_SUGGEST_CONFIG = { min_request_interval_ms: 0, max_in_flight: 4 };
+
+test("tags action resolves a multi-word guess into real tags via per-word lookup", async () => {
+  await withWorkspace(async (workspace) => {
+    // The whole guess autocompletes to nothing; each word resolves on its own.
+    const server = await startSuggestServer({
+      autocomplete: {
+        mordred_pendragon: [],
+        mordred: [{ value: "mordred_(fate)", category: 4, post_count: 6511 }],
+        pendragon: [{ value: "artoria_pendragon_(fate)", category: 4, post_count: 45201 }],
+      },
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { ...FAST_SUGGEST_CONFIG },
+        }),
+      );
+      const result = await tool.execute("t-tags", { action: "tags", query: "mordred pendragon" });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("mordred_(fate)"), "should surface the real character tag");
+      assert.ok(text.includes("artoria_pendragon_(fate)"), "should surface the other real tag");
+      assert.ok(/character/.test(text), "should label the category");
+      const details = result.details as { count: number; suggestions: Array<{ name: string }> };
+      assert.equal(details.count, 2);
+      // Two-token matches rank by post count: artoria (45201) before mordred (6511).
+      assert.deepEqual(
+        details.suggestions.map((s) => s.name),
+        ["artoria_pendragon_(fate)", "mordred_(fate)"],
+      );
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("tags action requires a query", async () => {
+  await withWorkspace(async (workspace) => {
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({ workspaceRoot: workspace, serverUrl: "https://example.test", fetchClient: client }),
+      );
+      const result = await tool.execute("t-tags-noq", { action: "tags" });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(/query.*required/i.test(text), "should explain query is required");
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+test("zero-result search appends 'did you mean' suggestions for an invalid tag", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startSuggestServer({
+      posts: [],
+      autocomplete: {
+        "mordred_pendragon_(fate)": [],
+        mordred: [{ value: "mordred_(fate)", category: 4, post_count: 6511 }],
+        pendragon: [{ value: "artoria_pendragon_(fate)", category: 4, post_count: 45201 }],
+        fate: [{ value: "fate_(series)", category: 3, post_count: 999999 }],
+      },
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { ...FAST_SUGGEST_CONFIG },
+        }),
+      );
+      const result = await tool.execute("t-empty-suggest", {
+        action: "search",
+        includeTags: ["mordred_pendragon_(fate)"],
+      });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("No posts matched."), "still reports the empty result");
+      assert.ok(/Did you mean/i.test(text), "appends a did-you-mean block");
+      assert.ok(text.includes("mordred_(fate)"), "suggests the real tag");
+      const details = result.details as { suggestions?: { allValid: boolean } };
+      assert.ok(details.suggestions, "recovery report present in details");
+      assert.equal(details.suggestions!.allValid, false);
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("zero-result search with all-valid tags notes a combination problem, not a typo", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startSuggestServer({
+      posts: [],
+      autocomplete: {
+        "mordred_(fate)": [{ value: "mordred_(fate)", category: 4, post_count: 6511 }],
+        "artoria_pendragon_(fate)": [
+          { value: "artoria_pendragon_(fate)", category: 4, post_count: 45201 },
+        ],
+      },
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { ...FAST_SUGGEST_CONFIG },
+        }),
+      );
+      const result = await tool.execute("t-allvalid", {
+        action: "search",
+        includeTags: ["mordred_(fate)", "artoria_pendragon_(fate)"],
+      });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(/combination/i.test(text), "explains the tags are valid but don't co-occur");
+      assert.ok(!/Did you mean/i.test(text), "must not offer a correction for valid tags");
+      const details = result.details as { suggestions?: { allValid: boolean } };
+      assert.equal(details.suggestions!.allValid, true);
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("suggest_on_empty=false skips the recovery lookups entirely", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startSuggestServer({
+      posts: [],
+      autocomplete: { whatever: [{ value: "whatever", category: 0, post_count: 1 }] },
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { ...FAST_SUGGEST_CONFIG, suggest_on_empty: false },
+        }),
+      );
+      const result = await tool.execute("t-off", { action: "search", includeTags: ["whatever"] });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("No posts matched."));
+      assert.ok(!/Did you mean/i.test(text), "no suggestions when disabled");
+      // Only /posts.json should have been hit — no autocomplete probing.
+      assert.ok(
+        server.hits.every((h) => h.path === "/posts.json"),
+        `expected only /posts.json hits, got: ${server.hits.map((h) => h.path).join(",")}`,
+      );
     } finally {
       await cleanup();
       await server.close();

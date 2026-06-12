@@ -826,6 +826,15 @@ export const AppConfigSchema = StrictObject({
     // one account-level budget. Defaults: 500 ms between starts, 2 in flight.
     min_request_interval_ms: Type.Optional(Type.Number({ minimum: 0 })),
     max_in_flight: Type.Optional(Type.Number({ minimum: 1 })),
+    // Tag-suggestion ("did you mean") support. When `suggest_on_empty` is true
+    // (default), a search that returns zero posts resolves each supplied
+    // includeTag through Danbooru's autocomplete + tag-wildcard endpoints and
+    // appends real, similar tag names to the result — the agent's recovery hint
+    // when it guessed a tag that does not exist. The same resolver backs the
+    // explicit `action: "tags"` lookup. `max_suggestions` caps how many
+    // candidates each lookup returns (default 6).
+    suggest_on_empty: Type.Optional(Type.Boolean()),
+    max_suggestions: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
   })),
   network: Type.Optional(StrictObject({
     http_proxy_url: Type.Optional(Type.String()),

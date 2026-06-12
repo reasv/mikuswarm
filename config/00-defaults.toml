@@ -301,6 +301,12 @@ base_url = "https://danbooru.donmai.us"
 max_regular_tags = 2
 default_limit = 20
 download_subdir = "downloads/danbooru"
+# Tag-suggestion ("did you mean") support. On a zero-result search, resolve each
+# supplied includeTag through Danbooru's autocomplete + tag-wildcard endpoints
+# and append real, similar tag names — the agent's recovery hint when it guessed
+# a tag that does not exist. The same resolver backs `action = "tags"`.
+suggest_on_empty = true
+max_suggestions = 6
 
 # Image generation / editing via Google's Gemini "nano banana" models.
 # `base_url` is the Gemini API endpoint ROOT — the tool appends

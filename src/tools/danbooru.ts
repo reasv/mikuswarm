@@ -159,10 +159,15 @@ type DanbooruConfig = {
   downloadSubdir: string;
   login?: string;
   apiKey?: string;
+  /** Append "did you mean" tag suggestions to zero-result searches. */
+  suggestOnEmpty: boolean;
+  /** Max candidates returned per tag-suggestion lookup. */
+  maxSuggestions: number;
 };
 
 type DanbooruToolParams = {
-  action?: "search" | "download" | "preview";
+  action?: "search" | "download" | "preview" | "tags";
+  query?: string;
   includeTags?: string[];
   excludeTags?: string[];
   extraTerms?: string[];
@@ -261,6 +266,10 @@ export interface DanbooruToolContext {
     min_request_interval_ms?: number;
     /** Max concurrent in-flight Danbooru requests (API + CDN, one budget). */
     max_in_flight?: number;
+    /** Append "did you mean" tag suggestions to zero-result searches (default true). */
+    suggest_on_empty?: boolean;
+    /** Max candidates returned per tag-suggestion lookup (default 6). */
+    max_suggestions?: number;
   };
 }
 
@@ -271,11 +280,19 @@ export interface DanbooruToolContext {
 const DanbooruToolSchema = Type.Object(
   {
     action: Type.Optional(
-      Type.Unsafe<"search" | "download" | "preview">({
+      Type.Unsafe<"search" | "download" | "preview" | "tags">({
         type: "string",
-        enum: ["search", "download", "preview"],
+        enum: ["search", "download", "preview", "tags"],
         description:
-          "Use 'search' to query posts, 'preview' to return an inline image for a chosen post, or 'download' to save a chosen post into the workspace.",
+          "Use 'search' to query posts, 'preview' to return an inline image for a chosen post, 'download' to save a chosen post into the workspace, or 'tags' to look up real Danbooru tag names from a guess/keyword (use this when a search returns nothing because you are unsure of the exact tag).",
+      }),
+    ),
+    query: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: MAX_TERM_LENGTH,
+        description:
+          "Required for action='tags'. A tag guess, character/series name, or keyword to resolve into real Danbooru tags (e.g. 'mordred pendragon' → mordred_(fate)). Underscores and spaces are both accepted.",
       }),
     ),
     includeTags: Type.Optional(
@@ -414,6 +431,8 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
     downloadSubdir: context.config?.download_subdir ?? "downloads/danbooru",
     login,
     apiKey,
+    suggestOnEmpty: context.config?.suggest_on_empty ?? true,
+    maxSuggestions: clampSuggestionCount(context.config?.max_suggestions),
   };
 
   const authHeader = buildAuthHeader(config);
@@ -461,7 +480,8 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       "order becomes order:*, and extraTerms are appended verbatim. " +
       "Search calls query /posts.json and returns Danbooru post URLs plus preview/sample/original asset URLs and key metadata. " +
       previewDescription +
-      " Download calls save a chosen post into the agent workspace.",
+      " Download calls save a chosen post into the agent workspace. " +
+      "Tags calls resolve a guess or keyword into real Danbooru tag names ranked by popularity — use them when you are unsure of the exact tag; a zero-result search also auto-suggests real tags.",
     parameters: DanbooruToolSchema,
     execute: async (_toolCallId, rawParams) => {
       const params = rawParams as DanbooruToolParams;
@@ -473,6 +493,10 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
 
       if (action === "preview") {
         return executePreview({ context, config, authHeader, dispatcher, limiter, params });
+      }
+
+      if (action === "tags") {
+        return executeTags({ config, authHeader, dispatcher, limiter, params });
       }
 
       return executeSearch({ config, authHeader, dispatcher, limiter, params });
@@ -510,6 +534,34 @@ async function executeSearch(input: {
   );
   const lines = buildSearchOutput({ query, posts, config: input.config });
 
+  // Zero-result recovery: when the search matched nothing AND the caller
+  // supplied positive tags, the most common cause is a guessed tag that does
+  // not exist (e.g. `mordred_pendragon_(fate)` — the real tag is
+  // `mordred_(fate)`). Resolve each include tag through the shared suggestion
+  // engine and append a "did you mean" block so the agent can re-query with a
+  // real tag without having to know to look one up. Best-effort: a failure
+  // here must never turn a successful (if empty) search into a tool error.
+  let recovery: TagRecoveryReport | undefined;
+  if (
+    posts.length === 0 &&
+    input.config.suggestOnEmpty &&
+    query.includeTags.length > 0
+  ) {
+    try {
+      recovery = await buildEmptySearchRecovery({
+        includeTags: query.includeTags,
+        config: input.config,
+        authHeader: input.authHeader,
+        dispatcher: input.dispatcher,
+        limiter: input.limiter,
+      });
+      appendRecoveryLines(lines, recovery);
+    } catch {
+      // Suggestions are a nicety; swallow and return the plain empty result.
+      recovery = undefined;
+    }
+  }
+
   return {
     content: [{ type: "text" as const, text: lines.join("\n") }],
     details: {
@@ -520,7 +572,50 @@ async function executeSearch(input: {
       page: query.page,
       count: posts.length,
       posts: posts.map((post) => summarizePost(post, input.config)),
+      ...(recovery ? { suggestions: recovery } : {}),
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Execute: tags (deliberate tag lookup)
+// ---------------------------------------------------------------------------
+
+async function executeTags(input: {
+  config: DanbooruConfig;
+  authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
+  params: DanbooruToolParams;
+}) {
+  const raw = input.params.query?.trim();
+  if (!raw) {
+    return textError("`query` is required when action='tags'. Pass a tag guess, character/series name, or keyword.");
+  }
+  const suggestions = await resolveTagSuggestions({
+    query: raw,
+    config: input.config,
+    authHeader: input.authHeader,
+    dispatcher: input.dispatcher,
+    limiter: input.limiter,
+  });
+
+  const lines = ["## Danbooru Tags", "", `Lookup: \`${raw}\``, ""];
+  if (suggestions.length === 0) {
+    lines.push("No matching tags found. Try a shorter or differently-spelled keyword.");
+  } else {
+    lines.push("Closest real tags (most-used first):");
+    lines.push("");
+    for (const s of suggestions) {
+      lines.push(`- ${formatSuggestionLine(s)}`);
+    }
+    lines.push("");
+    lines.push("Pass an exact tag above as an `includeTags` entry to search.");
+  }
+
+  return {
+    content: [{ type: "text" as const, text: lines.join("\n") }],
+    details: { action: "tags", query: raw, count: suggestions.length, suggestions },
   };
 }
 
@@ -1259,6 +1354,300 @@ function formatFileSize(bytes: number | null | undefined): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+// ---------------------------------------------------------------------------
+// Tag suggestions ("did you mean")
+// ---------------------------------------------------------------------------
+
+/** Default cap on candidates returned per tag-suggestion lookup. */
+const SUGGESTION_DEFAULT_MAX = 6;
+/** Per-word autocomplete fan-out cap when the whole query doesn't resolve. */
+const SUGGESTION_MAX_TOKENS = 5;
+/** How many include tags an empty search resolves (bounds added requests). */
+const SUGGESTION_MAX_RECOVERY_TAGS = 4;
+/** Per-lookup row cap requested from each Danbooru suggestion endpoint. */
+const SUGGESTION_FETCH_LIMIT = 10;
+
+type TagSuggestion = {
+  name: string;
+  category: number | null;
+  categoryLabel: string;
+  postCount: number;
+  /** When the query matched this tag via an alias, the alias text we matched. */
+  via?: string;
+};
+
+type TagRecoveryReport = {
+  /** Per supplied include tag: real candidates (empty when the tag itself is valid). */
+  perTag: Array<{ tag: string; valid: boolean; suggestions: TagSuggestion[] }>;
+  /** True when every supplied include tag already exists on Danbooru. */
+  allValid: boolean;
+};
+
+/** Shape of one `/autocomplete.json` entry (tag_query type). */
+type DanbooruAutocompleteEntry = {
+  value?: string;
+  category?: number;
+  post_count?: number;
+  antecedent?: string | null;
+  tag?: { is_deprecated?: boolean } | null;
+};
+
+/** Shape of one `/tags.json` row. */
+type DanbooruTagRow = {
+  name?: string;
+  post_count?: number;
+  category?: number;
+  is_deprecated?: boolean;
+};
+
+type SuggestionLookupInput = {
+  query: string;
+  config: DanbooruConfig;
+  authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
+};
+
+function clampSuggestionCount(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) return SUGGESTION_DEFAULT_MAX;
+  return Math.max(1, Math.min(50, Math.floor(value)));
+}
+
+/** Danbooru tag-category code → human label. */
+function tagCategoryLabel(category: number | null | undefined): string {
+  switch (category) {
+    case 0:
+      return "general";
+    case 1:
+      return "artist";
+    case 3:
+      return "copyright";
+    case 4:
+      return "character";
+    case 5:
+      return "meta";
+    default:
+      return "tag";
+  }
+}
+
+/** Lowercase + collapse spaces to underscores — the canonical Danbooru tag form. */
+function normalizeTagQuery(query: string): string {
+  return query.trim().toLowerCase().replace(/\s+/g, "_");
+}
+
+/**
+ * Significant word tokens for the per-word fallback. A guessed tag like
+ * `mordred_pendragon_(fate)` autocompletes to NOTHING as a whole (the word
+ * "pendragon" isn't in the real `mordred_(fate)` tag), so we split it into
+ * words and look each up individually. Drops short/numeric noise and dedups.
+ */
+function tokenizeTagQuery(query: string): string[] {
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const piece of query.toLowerCase().split(/[\s_()/]+/)) {
+    const token = piece.trim();
+    if (token.length <= 2) continue;
+    if (/^\d+$/.test(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+async function fetchAutocomplete(input: SuggestionLookupInput): Promise<DanbooruAutocompleteEntry[]> {
+  const params = new URLSearchParams({
+    "search[query]": input.query,
+    "search[type]": "tag_query",
+    limit: String(SUGGESTION_FETCH_LIMIT),
+  });
+  const data = await fetchJson<DanbooruAutocompleteEntry[]>(
+    input.config.baseUrl,
+    "/autocomplete.json",
+    params,
+    input.authHeader,
+    input.dispatcher,
+    input.limiter,
+  );
+  return Array.isArray(data) ? data : [];
+}
+
+async function fetchTagWildcard(
+  input: Omit<SuggestionLookupInput, "query"> & { token: string },
+): Promise<DanbooruTagRow[]> {
+  const params = new URLSearchParams({
+    "search[name_matches]": `*${input.token}*`,
+    "search[order]": "count",
+    limit: String(SUGGESTION_FETCH_LIMIT),
+  });
+  const data = await fetchJson<DanbooruTagRow[]>(
+    input.config.baseUrl,
+    "/tags.json",
+    params,
+    input.authHeader,
+    input.dispatcher,
+    input.limiter,
+  );
+  return Array.isArray(data) ? data : [];
+}
+
+function upsertSuggestion(map: Map<string, TagSuggestion>, suggestion: TagSuggestion): void {
+  const existing = map.get(suggestion.name);
+  if (!existing) {
+    map.set(suggestion.name, suggestion);
+    return;
+  }
+  if (suggestion.postCount > existing.postCount) existing.postCount = suggestion.postCount;
+  if (!existing.via && suggestion.via) existing.via = suggestion.via;
+  if (existing.category == null && suggestion.category != null) {
+    existing.category = suggestion.category;
+    existing.categoryLabel = suggestion.categoryLabel;
+  }
+}
+
+/**
+ * Resolve a free-text guess/keyword into real Danbooru tags, ranked best-first.
+ * Strategy (each step paced through the tool's one budget via `fetchJson`):
+ *   1. autocomplete the whole normalized query (handles typos + aliases);
+ *   2. if that found no exact tag, autocomplete each significant word — recovers
+ *      multi-word guesses whose words exist but not in that combination;
+ *   3. if still empty, a `*token*` wildcard on /tags.json (in-word typos).
+ * Candidates are deduped, then ranked by how many query words they contain
+ * (so `mordred_(fate)` beats a generic high-count `fate_(series)`), then by
+ * post count.
+ */
+async function resolveTagSuggestions(input: SuggestionLookupInput): Promise<TagSuggestion[]> {
+  const normalized = normalizeTagQuery(input.query);
+  const tokens = tokenizeTagQuery(input.query);
+  const candidates = new Map<string, TagSuggestion>();
+
+  const addEntry = (entry: DanbooruAutocompleteEntry): void => {
+    const name = (entry.value ?? "").trim();
+    if (!name || entry.tag?.is_deprecated) return;
+    upsertSuggestion(candidates, {
+      name,
+      category: entry.category ?? null,
+      categoryLabel: tagCategoryLabel(entry.category),
+      postCount: entry.post_count ?? 0,
+      via: entry.antecedent && entry.antecedent !== name ? entry.antecedent : undefined,
+    });
+  };
+  const addRow = (row: DanbooruTagRow): void => {
+    const name = (row.name ?? "").trim();
+    if (!name || row.is_deprecated) return;
+    upsertSuggestion(candidates, {
+      name,
+      category: row.category ?? null,
+      categoryLabel: tagCategoryLabel(row.category),
+      postCount: row.post_count ?? 0,
+    });
+  };
+
+  for (const entry of await fetchAutocomplete({ ...input, query: normalized })) addEntry(entry);
+
+  if (!candidates.has(normalized) && tokens.length > 1) {
+    for (const token of tokens.slice(0, SUGGESTION_MAX_TOKENS)) {
+      for (const entry of await fetchAutocomplete({ ...input, query: token })) addEntry(entry);
+    }
+  }
+
+  if (candidates.size === 0) {
+    const longest = [...tokens].sort((a, b) => b.length - a.length)[0] ?? normalized;
+    if (longest) {
+      for (const row of await fetchTagWildcard({ ...input, token: longest })) addRow(row);
+    }
+  }
+
+  return rankSuggestions([...candidates.values()], tokens, input.config.maxSuggestions);
+}
+
+function rankSuggestions(
+  list: TagSuggestion[],
+  tokens: string[],
+  max: number,
+): TagSuggestion[] {
+  const matchCount = (name: string): number =>
+    tokens.reduce((count, token) => (name.includes(token) ? count + 1 : count), 0);
+  return list
+    .map((suggestion) => ({ suggestion, matches: matchCount(suggestion.name) }))
+    .sort(
+      (a, b) =>
+        b.matches - a.matches ||
+        b.suggestion.postCount - a.suggestion.postCount ||
+        a.suggestion.name.localeCompare(b.suggestion.name),
+    )
+    .slice(0, max)
+    .map((ranked) => ranked.suggestion);
+}
+
+/**
+ * Build the per-tag recovery report for a zero-result search. For each supplied
+ * include tag (capped) we resolve suggestions; a tag is "valid" when it appears
+ * among its own suggestions (so we don't "correct" a real tag). When every tag
+ * is valid the empty result is a combination/filter problem, not a bad tag.
+ */
+async function buildEmptySearchRecovery(input: {
+  includeTags: string[];
+  config: DanbooruConfig;
+  authHeader: string | undefined;
+  dispatcher: Dispatcher | undefined;
+  limiter: DanbooruRateLimiter;
+}): Promise<TagRecoveryReport> {
+  const perTag: TagRecoveryReport["perTag"] = [];
+  for (const tag of input.includeTags.slice(0, SUGGESTION_MAX_RECOVERY_TAGS)) {
+    const suggestions = await resolveTagSuggestions({
+      query: tag,
+      config: input.config,
+      authHeader: input.authHeader,
+      dispatcher: input.dispatcher,
+      limiter: input.limiter,
+    });
+    const normalized = normalizeTagQuery(tag);
+    const valid = suggestions.some((suggestion) => suggestion.name === normalized);
+    perTag.push({ tag, valid, suggestions: valid ? [] : suggestions });
+  }
+  const allValid = perTag.length > 0 && perTag.every((entry) => entry.valid);
+  return { perTag, allValid };
+}
+
+function appendRecoveryLines(lines: string[], recovery: TagRecoveryReport): void {
+  if (recovery.allValid) {
+    lines.push("");
+    lines.push(
+      "Every supplied tag exists on Danbooru, so nothing matches this *combination*. " +
+        "Try removing a tag, loosening rating filters, or a different `order`.",
+    );
+    return;
+  }
+  const correctable = recovery.perTag.filter(
+    (entry) => !entry.valid && entry.suggestions.length > 0,
+  );
+  if (correctable.length === 0) return;
+  lines.push("");
+  lines.push("Did you mean? (couldn't find an exact tag for some of your terms)");
+  for (const entry of correctable) {
+    lines.push(`- \`${entry.tag}\` →`);
+    for (const suggestion of entry.suggestions) {
+      lines.push(`    ${formatSuggestionLine(suggestion)}`);
+    }
+  }
+  lines.push("");
+  lines.push(
+    'Re-run `search` with one of the real tags above (or use `action: "tags"` to look up more).',
+  );
+}
+
+function formatSuggestionLine(suggestion: TagSuggestion): string {
+  const via = suggestion.via ? ` (via alias \`${suggestion.via}\`)` : "";
+  return `${suggestion.name}  —  ${suggestion.categoryLabel}, ${formatPostCount(suggestion.postCount)} posts${via}`;
+}
+
+function formatPostCount(count: number): string {
+  if (!Number.isFinite(count) || count < 0) return "0";
+  return Math.floor(count).toLocaleString("en-US");
 }
 
 // ---------------------------------------------------------------------------
