@@ -45,8 +45,20 @@ browser ──(same-origin, no token)──▶ SvelteKit BFF ──(Bearer token
    cp .env.example .env        # set MIKUSWARM_CONSOLE_API_URL + the same MIKUSWARM_CONSOLE_TOKEN
    pnpm install
    pnpm dev                    # dev server
-   # or: pnpm build && node build/index.js   (adapter-node, production)
+   # or, production (adapter-node) — note `node` does NOT read .env itself:
+   #   pnpm build && node --env-file=.env build/index.js
    ```
+
+   > **Production gotcha — mutating buttons 403 ("Cross-site remote requests are
+   > forbidden").** Under `pnpm dev` SvelteKit skips its remote-function origin
+   > check, but the built adapter-node server enforces it: it rejects any non-GET
+   > remote `command` (the resume/abort/retry buttons) whose browser `Origin`
+   > doesn't match the server's computed origin. With no `ORIGIN` set, adapter-node
+   > assumes `https`, so plain-http access mismatches on scheme and every button
+   > 403s while GET reads still work. Set `ORIGIN` to the exact URL you load in the
+   > browser (see `.env.example`); behind a TLS proxy use `PROTOCOL_HEADER`/
+   > `HOST_HEADER` instead. `node` won't read `.env` on its own — pass
+   > `--env-file=.env` or export the vars.
 
 ## Scripts
 

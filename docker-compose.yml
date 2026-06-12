@@ -146,6 +146,15 @@ services:
       MIKUSWARM_CONSOLE_TOKEN: "${MIKUSWARM_CONSOLE_TOKEN:?set MIKUSWARM_CONSOLE_TOKEN in .env}"
       HOST: "0.0.0.0"
       PORT: "5173"
+      # Public URL you load the console at in the browser. adapter-node uses this
+      # to compute its own origin for SvelteKit's remote-function CSRF check;
+      # WITHOUT it adapter-node assumes `https`, so plain-http access mismatches on
+      # scheme and every mutating button (resume/abort/retry) 403s with
+      # "Cross-site remote requests are forbidden" while GET reads still work.
+      # Must equal scheme+host+published-port as seen by the browser — override
+      # MIKUSWARM_CONSOLE_ORIGIN in .env if you change MIKUSWARM_CONSOLE_PUBLISH, reach the
+      # console via a non-loopback host, or front it with an https reverse proxy.
+      ORIGIN: "${MIKUSWARM_CONSOLE_ORIGIN:-http://127.0.0.1:5173}"
     ports:
       # The single externally published surface (token-gated). Override the host
       # port with MIKUSWARM_CONSOLE_PUBLISH in .env.
