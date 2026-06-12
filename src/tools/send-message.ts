@@ -37,7 +37,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
       media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),
       as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })),
-      final: Type.Optional(Type.Boolean({ description: "Whether this is the final message of your turn. Defaults to true. Set to false only when you intend to do more work and send additional messages after this one." })),
+      final: Type.Boolean({ description: "Whether this is the final message of your turn. Set true if you are done — sending the message ends your turn. Set false ONLY when you will keep working and send more this turn (e.g. a progress update before a multi-step tool sequence); your turn stays open. There is no default — you must decide every time, just like is_reply." }),
     }),
     execute: async (_toolCallId, params) => {
       const args = params as {
@@ -47,9 +47,9 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         reply_to_id?: string;
         media?: string;
         as_voice?: boolean;
-        final?: boolean;
+        final: boolean;
       };
-      const isFinal = args.final !== false;
+      const isFinal = args.final;
 
       if (args.is_reply && !args.reply_to_id?.trim()) {
         return {
