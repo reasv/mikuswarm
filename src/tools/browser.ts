@@ -595,8 +595,15 @@ function mimeFromExt(name: string): string {
 
 function renderDownloads(downloads: DownloadRecord[]): string {
   if (downloads.length === 0) return "";
-  const lines = downloads.map((d) => `  - ${d.path} (from ${d.url})`);
-  return `\n[downloaded ${downloads.length} file(s) to the workspace]\n${lines.join("\n")}`;
+  // Failed records (canceled / over the size cap / copy failure) are surfaced
+  // explicitly so the model learns the click didn't produce a file (§11b).
+  const lines = downloads.map((d) =>
+    d.failed ? `  - [download failed: ${d.filename} (${d.url})]` : `  - ${d.path} (from ${d.url})`,
+  );
+  const saved = downloads.filter((d) => !d.failed).length;
+  const header =
+    saved > 0 ? `\n[downloaded ${saved} file(s) to the workspace]` : "\n[download(s) failed — no file produced]";
+  return `${header}\n${lines.join("\n")}`;
 }
 
 function renderTabs(tabs: Array<{ index: number; url: string; title: string; active: boolean }>): string {

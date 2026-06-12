@@ -158,6 +158,13 @@ services:
       # Context dumps (app.context_dump_dir ./debug/context) — kept on the host
       # so observability output survives container recreation.
       - ./debug:/app/debug
+      # Browser-download staging (ARCHITECTURE.md §11b): the agent-side view of
+      # the volume the Manager's Chromium downloads into ([browser]
+      # downloads_local_dir = "var/browser-downloads" in 90-local.toml).
+      # Deliberately OUTSIDE the workspace bind so in-flight, root-owned,
+      # guid-named files are invisible to the file tools and the sandbox; the
+      # agent copies finalized files into workspaces/miku/browser-downloads/.
+      - ./var/browser-downloads:/app/var/browser-downloads
       # Operator identity config (gitignored): models, matrix account, captioning…
       # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).
       - ./config/90-local.toml:/app/config/90-local.toml:ro
@@ -237,6 +244,13 @@ services:
       # root-owned (the Manager runs as root, above) — the one exception to the
       # otherwise host-uid-owned tree; it holds only the regenerable browser profile.
       - ./var/browser-data:/data
+      # Browser-download staging (ARCHITECTURE.md §11b): Chromium writes
+      # guid-named downloads here ([browser] downloads_dir = "/downloads"); the
+      # agent sees the same storage at /app/var/browser-downloads, copies
+      # completed files into the workspace, and unlinks the staging guid. The
+      # host dir is host-uid-owned (compose/agent creates it); root can always
+      # write into it. Steady-state empty.
+      - ./var/browser-downloads:/downloads
     # mikuswarm-browser: hardened egress bridge (default route — browsing goes here).
     # mikuswarm-browser-ctl: internal control link so the agent reaches it by name.
     networks: [mikuswarm-browser, mikuswarm-browser-ctl]

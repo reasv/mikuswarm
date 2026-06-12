@@ -596,6 +596,18 @@ const BrowserSchema = StrictObject({
   // op, racing live tool calls (issue #1). Shipped default is 600000, well above
   // this floor.
   session_page_idle_ms: Type.Integer({ minimum: 30000 }),
+  // Browser downloads (ARCHITECTURE.md §11b "Downloads"): the shared staging dir
+  // AS SEEN BY THE BROWSER container — sent verbatim over CDP in
+  // Browser.setDownloadBehavior. Set BOTH downloads keys or NEITHER (cross-field
+  // validated in app.ts, not the loader, per the proactive-posting precedent);
+  // both unset ⇒ downloads disabled, an explicit opt-in that must match the
+  // deployment's mount topology (the bytes land in the browser container's fs).
+  downloads_dir: Type.Optional(Type.String({ minLength: 1 })),
+  // The SAME storage as seen by the agent process; relative paths resolve against
+  // cwd like the other dir keys. Two keys rather than one because only the compose
+  // topology mounts both sides at one identical path — standalone (agent on host)
+  // inherently sees the staging dir at a different path than the browser does.
+  downloads_local_dir: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 export type BrowserConfig = Static<typeof BrowserSchema>;

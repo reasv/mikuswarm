@@ -48,6 +48,13 @@ services:
       # Defaults to a named volume; set MIKUSWARM_BROWSER_DATA_DIR to an ABSOLUTE host
       # path to bind-mount instead (compose does not expand ~ in bind paths).
       - ${MIKUSWARM_BROWSER_DATA_DIR:-mikuswarm-browser-data}:/data
+      # Browser-download staging (ARCHITECTURE.md §11b): Chromium writes guid-named
+      # downloads here ([browser] downloads_dir = "/downloads"); the host-side
+      # agent sees the same dir at the bind source ([browser] downloads_local_dir
+      # — default ../var/browser-downloads relative to this file, i.e. the project
+      # var/ tree). Set MIKUSWARM_BROWSER_DOWNLOADS_DIR to an absolute host path to
+      # relocate it; keep downloads_local_dir pointing at the same place.
+      - ${MIKUSWARM_BROWSER_DOWNLOADS_DIR:-../var/browser-downloads}:/downloads
     networks:
       - mikuswarm-browser
     # Pin DNS to the same public resolvers the egress hardening permits

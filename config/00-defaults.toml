@@ -578,3 +578,9 @@ nav_timeout_ms = 30000                  # per-navigation timeout
 act_timeout_ms = 15000                  # per-action timeout
 connect_timeout_ms = 20000              # connectOverCDP + first-launch cold start
 session_page_idle_ms = 600000           # close a session's tab after this idle (bounds tab growth)
+# downloads_dir / downloads_local_dir are intentionally unset here: BOTH unset ⇒
+# browser downloads are DISABLED (an explicit opt-in that must match the
+# deployment's mount topology — the bytes land in the browser container's fs).
+# Set both in local config to the shared staging volume's two views: downloads_dir
+# as the browser container sees it, downloads_local_dir as the agent sees it
+# (see config/90-local.toml). Setting exactly one is a startup error.

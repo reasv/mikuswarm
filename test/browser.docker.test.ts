@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { BrowserSession } from "../src/browser/index.js";
+import { BrowserSession, type DownloadRecord } from "../src/browser/index.js";
 import { createBrowserTool } from "../src/tools/browser.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
@@ -56,7 +56,7 @@ const silentLogger: Logger = {
   child() { return silentLogger; },
 };
 
-function config(): BrowserConfig {
+function config(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
   return {
     enabled: true,
     manager_url: `http://127.0.0.1:${PORT}`,
@@ -75,6 +75,7 @@ function config(): BrowserConfig {
     act_timeout_ms: 20000,
     connect_timeout_ms: 30000,
     session_page_idle_ms: 600000,
+    ...overrides,
   };
 }
 
@@ -279,5 +280,78 @@ test("browser docker: feature additions (rich-wait, element shot, modifiers, upl
     if (session) await session.shutdown();
     spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
     await rm(ws, { recursive: true, force: true });
+  }
+});
+
+test("browser docker: downloads cross the container boundary via the shared staging volume", { skip, timeout: 240_000 }, async () => {
+  // The §2.7 verification point: a REAL root-run Chromium writes the staging
+  // guid (asserting the 0644 world-readable assumption — the agent-side copy
+  // fails with EACCES otherwise), the agent copies it into the workspace
+  // uid-owned, unlinks the guid, and the record surfaces via drainDownloads.
+  const root = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-browser-dl-docker-"));
+  const ws = path.join(root, "workspace");
+  const staging = path.join(root, "staging");
+  await mkdir(ws, { recursive: true });
+  await mkdir(staging, { recursive: true });
+
+  spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
+  execFileSync("docker", [
+    "run", "-d", "--name", CONTAINER,
+    "-p", `127.0.0.1:${PORT}:8080`,
+    "-e", `AUTH_TOKEN=${AUTH_TOKEN}`,
+    "--shm-size=1g",
+    // The shared staging volume: the browser sees it at /downloads (the
+    // downloads_dir sent over CDP), this process sees it at `staging`.
+    "-v", `${staging}:/downloads`,
+    image!,
+  ], { stdio: "ignore" });
+
+  let session: BrowserSession | undefined;
+  try {
+    await waitForHealth(90_000);
+    const cfg = config({ downloads_dir: "/downloads", downloads_local_dir: staging });
+    session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger });
+    const tool = createBrowserTool({ session, agentSessionId: "docker-dl", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+
+    type ToolResult = { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> };
+    const exec = (args: Record<string, unknown>) => tool.execute("c1", args) as Promise<ToolResult>;
+
+    await exec({ action: "navigate", url: "https://example.com/" });
+
+    // Trigger a real download with no network dependency: an a[download] blob link.
+    const clickRes = await exec({
+      action: "act", kind: "evaluate",
+      text: `const a = document.createElement('a');
+a.href = URL.createObjectURL(new Blob(['hello download'], { type: 'application/octet-stream' }));
+a.download = 'dl-test.txt';
+document.body.appendChild(a);
+a.click();
+'clicked'`,
+    });
+
+    // Collect the record: the triggering act's own drain may already carry it,
+    // otherwise poll the session (completion is async relative to the click).
+    const records: DownloadRecord[] = [...((clickRes.details?.downloads as DownloadRecord[] | undefined) ?? [])];
+    const deadline = Date.now() + 30_000;
+    while (records.length === 0 && Date.now() < deadline) {
+      await sleep(250);
+      records.push(...session.drainDownloads("docker-dl"));
+    }
+
+    assert.equal(records.length, 1, "exactly one download record surfaced");
+    const record = records[0]!;
+    assert.ok(!record.failed, `download must not be a failure record (${record.url})`);
+    assert.equal(record.filename, "dl-test.txt");
+    assert.match(record.path, /^browser-downloads\/docker-dl\/dl-test\.txt$/);
+    // readFile succeeding from the agent process IS the permission assertion:
+    // the workspace copy is owned by this uid (not the container's root).
+    const bytes = await readFile(path.join(ws, record.path));
+    assert.equal(bytes.toString(), "hello download", "payload crossed the container boundary intact");
+    // Staging hygiene: the guid file was unlinked after the copy.
+    assert.deepEqual(await readdir(staging), [], "staging dir is empty after finalization");
+  } finally {
+    if (session) await session.shutdown();
+    spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
+    await rm(root, { recursive: true, force: true });
   }
 });

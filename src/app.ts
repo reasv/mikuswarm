@@ -294,6 +294,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
   }
 
+  // Shared media size cap — applied to automatic media downloads, tool fetches,
+  // and browser downloads alike.
+  const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
+
   // Browser-use backend (spec/BROWSER-USE.md). Unlike the sandbox, this does NOT
   // connect or fail-fast at startup: the CloakBrowser-Manager is an operator-run
   // service the harness only reaches lazily on first browser-tool use, degrading
@@ -301,10 +305,34 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // config + the per-session tab map; no I/O happens until a tool runs.
   let browserSession: BrowserSession | undefined;
   if (config.browser?.enabled) {
+    // Downloads cross-field validation (same fail-fast convention as the
+    // proactive/rate-limit checks above; ARCHITECTURE.md §11b "Downloads"): the
+    // two keys describe ONE shared staging volume from two containers'
+    // viewpoints, so setting exactly one is a broken topology, not a partial
+    // opt-in. Both unset ⇒ downloads disabled (explicit opt-in).
+    const hasDownloadsDir = config.browser.downloads_dir !== undefined;
+    const hasDownloadsLocalDir = config.browser.downloads_local_dir !== undefined;
+    if (hasDownloadsDir !== hasDownloadsLocalDir) {
+      throw new Error(
+        "browser.downloads_dir and browser.downloads_local_dir must be set together — they are the " +
+          "one shared download staging volume as seen by the browser container and by the agent " +
+          `(got ${hasDownloadsDir ? "downloads_dir" : "downloads_local_dir"} alone); ` +
+          "set both, or neither to disable browser downloads",
+      );
+    }
+    // Create the agent-side staging dir up front so it is owned by the agent's
+    // uid (root — the Manager — can write into it regardless), and so the first
+    // download doesn't race a missing directory.
+    if (config.browser.downloads_local_dir !== undefined) {
+      await mkdir(path.resolve(config.browser.downloads_local_dir), { recursive: true });
+    }
     browserSession = new BrowserSession({
       config: config.browser,
       agentTimezone: getConfiguredTimezone(),
       workspaceRoot,
+      // Browser downloads share the global media size cap; on breach the
+      // in-flight download is canceled (§11b).
+      downloadSizeLimit,
       logger: logger.child("browser"),
     });
   }
@@ -321,7 +349,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       : undefined,
   );
 
-  const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
   const fetchClient = new FetchClient({
