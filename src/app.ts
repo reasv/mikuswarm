@@ -1225,6 +1225,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         downloadSizeLimit,
         inlineImageMaxBytes: resolveReadImageMaxBytes(config),
         inferenceImageOptions,
+        // When the default model lacks vision, `preview` describes the asset via
+        // the captioning model instead of emitting an unusable image block.
+        modelHasVision: config.models.default.multimodal,
+        imageCaptionClient: captionClients.get("image"),
         fetchClient,
         httpProxyUrl: config.network?.http_proxy_url,
         config: config.danbooru,

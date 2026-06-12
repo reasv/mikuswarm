@@ -15,6 +15,7 @@ import {
   conditionImageBufferForInference,
   type ImageProcessingOptions,
 } from "../media/index.js";
+import type { InferenceClient } from "../captioning/inference-client.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -225,6 +226,22 @@ export interface DanbooruToolContext {
    * convert pipeline (re-encode to JPEG, downscale on overflow).
    */
   inferenceImageOptions: ImageProcessingOptions;
+  /**
+   * Whether the agent's default model can receive inline image blocks. When
+   * false, `preview` must NOT emit an image block the model cannot read (and
+   * must not narrate it as if the model can see it). Instead it routes the
+   * asset through {@link imageCaptionClient} and returns a text description —
+   * the non-vision equivalent of "showing" the image (the same way the inline
+   * path hands the image to the model, this hands it to a captioning model).
+   */
+  modelHasVision: boolean;
+  /**
+   * Image-captioning client — the same one backing the `media` tool. Used by
+   * the non-vision `preview` path to describe the fetched asset. Optional: when
+   * captioning is not configured, `preview` degrades to returning the asset
+   * URLs plus a pointer to the `media` tool rather than a description.
+   */
+  imageCaptionClient?: InferenceClient;
   fetchClient: FetchClient;
   /**
    * Optional http(s) proxy URL applied to JSON metadata requests in this
@@ -431,6 +448,10 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
     }
   }
 
+  const previewDescription = context.modelHasVision
+    ? "Preview calls return an inline image block for a chosen post."
+    : "Preview calls return a text description of a chosen post, produced by the captioning model (this agent's model can't view images directly); ask the `media` tool about a post's asset URL for specific questions.";
+
   return {
     name: "danbooru",
     label: "Danbooru",
@@ -439,7 +460,8 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       "includeTags become positive terms, excludeTags become -tag terms, includeRatings and excludeRatings become rating metatags, " +
       "order becomes order:*, and extraTerms are appended verbatim. " +
       "Search calls query /posts.json and returns Danbooru post URLs plus preview/sample/original asset URLs and key metadata. " +
-      "Preview calls return an inline image block for a chosen post. Download calls save a chosen post into the agent workspace.",
+      previewDescription +
+      " Download calls save a chosen post into the agent workspace.",
     parameters: DanbooruToolSchema,
     execute: async (_toolCallId, rawParams) => {
       const params = rawParams as DanbooruToolParams;
@@ -523,18 +545,42 @@ async function executePreview(input: {
     input.dispatcher,
     input.limiter,
   );
-  const variant = input.params.previewVariant ?? "preview";
+  // Without vision the model gets a text description rather than an image
+  // block, so prefer the larger `sample` asset by default — the 180px
+  // `preview` thumbnail is too small to caption well. The vision path keeps
+  // `preview` as its default (small, fits the per-image cap cheaply).
+  const variant =
+    input.params.previewVariant ?? (input.context.modelHasVision ? "preview" : "sample");
   const assetUrl = resolveDownloadUrl(post, variant);
   if (!assetUrl) {
     return textError(`Post #${postId} does not expose a ${variant} asset URL for your account.`);
   }
 
-  // The CDN asset share the tool's one budget (spec §8.2): pace it through the
+  if (!input.context.modelHasVision) {
+    return describePreview({ context: input.context, config: input.config, limiter: input.limiter, post, variant, assetUrl });
+  }
+  return inlinePreview({ context: input.context, config: input.config, limiter: input.limiter, post, variant, assetUrl });
+}
+
+/**
+ * Vision path: fetch the asset, condition it under the per-image base64 cap,
+ * and return it as an inline image block. The accompanying text is intentionally
+ * terse — the model can see the image, so step-by-step narration is wasted
+ * tokens; we keep only the asset URLs for follow-up (download/media).
+ */
+async function inlinePreview(input: {
+  context: DanbooruToolContext;
+  config: DanbooruConfig;
+  limiter: DanbooruRateLimiter;
+  post: DanbooruPost;
+  variant: DanbooruAssetVariant;
+  assetUrl: string;
+}) {
+  const { context, config, limiter, post, variant, assetUrl } = input;
+  // The CDN asset shares the tool's one budget (spec §8.2): pace it through the
   // same limiter. The fetch itself still routes via guardedFetch inside the client.
-  const fetched = await input.limiter.run(() =>
-    input.context.fetchClient.fetch(assetUrl, {
-      maxBytes: input.context.downloadSizeLimit,
-    }),
+  const fetched = await limiter.run(() =>
+    context.fetchClient.fetch(assetUrl, { maxBytes: context.downloadSizeLimit }),
   );
   let rawBuffer: Buffer;
   try {
@@ -546,14 +592,10 @@ async function executePreview(input: {
     await fs.unlink(fetched.path).catch(() => {});
   }
 
-  const sourceMimeType = resolveImageMimeType({
-    assetUrl,
-    contentType: fetched.contentType,
-    post,
-  });
+  const sourceMimeType = resolveImageMimeType({ assetUrl, contentType: fetched.contentType, post });
   if (!sourceMimeType) {
     return textError(
-      `Post #${postId} ${variant} asset is not an image that can be returned inline to the model.`,
+      `Post #${post.id} ${variant} asset is not an image that can be returned inline to the model.`,
     );
   }
 
@@ -566,9 +608,9 @@ async function executePreview(input: {
   // `inlineImageMaxBytes` is a base64-encoded byte budget (what providers
   // measure), but `ImageProcessingOptions.maxBytes` is the raw output JPEG
   // size the conditioning loop targets. Convert: raw = floor(base64 * 3 / 4).
-  const rawByteBudget = Math.floor((input.context.inlineImageMaxBytes * 3) / 4);
+  const rawByteBudget = Math.floor((context.inlineImageMaxBytes * 3) / 4);
   const inlineOptions: ImageProcessingOptions = {
-    ...input.context.inferenceImageOptions,
+    ...context.inferenceImageOptions,
     maxBytes: rawByteBudget,
   };
   let conditioned: { buffer: Buffer; mimeType: string; sizeBytes: number };
@@ -577,29 +619,15 @@ async function executePreview(input: {
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return textError(
-      `Post #${postId} ${variant} asset could not be conditioned for inline preview: ${detail}`,
+      `Post #${post.id} ${variant} asset could not be conditioned for inline preview: ${detail}`,
     );
   }
 
-  const pageUrl = buildPostUrl(input.config, post.id);
-  const conditionedKb = (conditioned.sizeBytes / 1024).toFixed(1);
+  const pageUrl = buildPostUrl(config, post.id);
   const text = [
-    "## Danbooru Preview",
+    `## Danbooru post #${post.id} (image below)`,
     "",
-    `Showing post #${post.id} inline from the ${variant} asset.`,
-    "",
-    "How this worked:",
-    `- fetched metadata from \`/posts/${post.id}.json\``,
-    `- selected the ${variant} asset URL`,
-    `- fetched the binary asset (source type: ${sourceMimeType})`,
-    `- re-encoded to ${conditioned.mimeType} at ${conditionedKb} KB to fit the per-image cap`,
-    `- returned the asset as an inline image block in the tool result`,
-    "",
-    "Useful URLs:",
-    `- page: ${pageUrl}`,
-    `- original: ${post.file_url ?? "(not available)"}`,
-    `- sample: ${post.large_file_url ?? "(not available)"}`,
-    `- preview: ${post.preview_file_url ?? "(not available)"}`,
+    ...assetUrlLines(post, pageUrl),
   ].join("\n");
 
   return {
@@ -613,7 +641,8 @@ async function executePreview(input: {
     ],
     details: {
       action: "preview",
-      post: summarizePost(post, input.config),
+      mode: "inline-image",
+      post: summarizePost(post, config),
       variant,
       assetUrl,
       sourceMimeType,
@@ -622,6 +651,109 @@ async function executePreview(input: {
       pageUrl,
     },
   };
+}
+
+/**
+ * Non-vision path: the model can't read an image block, so describe the asset
+ * with the captioning model instead — the equivalent of the inline path handing
+ * the image to the model, except here it goes to a model that *can* see. The
+ * result is the caption text plus the asset URLs and a pointer to the `media`
+ * tool for specific follow-up questions. If no caption client is configured,
+ * degrade to URLs + the `media` pointer rather than emitting an unusable block.
+ */
+async function describePreview(input: {
+  context: DanbooruToolContext;
+  config: DanbooruConfig;
+  limiter: DanbooruRateLimiter;
+  post: DanbooruPost;
+  variant: DanbooruAssetVariant;
+  assetUrl: string;
+}) {
+  const { context, config, limiter, post, variant, assetUrl } = input;
+  const pageUrl = buildPostUrl(config, post.id);
+  const mediaHint =
+    "This agent's model can't view images directly; the description above came from the captioning model. " +
+    "To ask something specific about this image, call the `media` tool with the sample or original URL and your question.";
+
+  const captionClient = context.imageCaptionClient;
+  if (!captionClient) {
+    const text = [
+      `## Danbooru post #${post.id}`,
+      "",
+      "This agent's model can't view images directly and no captioning model is configured, so the image can't be described here. Use the URLs below.",
+      "",
+      ...assetUrlLines(post, pageUrl),
+    ].join("\n");
+    return {
+      content: [{ type: "text" as const, text }],
+      details: { action: "preview", mode: "urls-only", post: summarizePost(post, config), variant, assetUrl, pageUrl },
+    };
+  }
+
+  // Fetch the asset (one budget with the JSON API, spec §8.2) and caption it.
+  const fetched = await limiter.run(() =>
+    context.fetchClient.fetch(assetUrl, { maxBytes: context.downloadSizeLimit }),
+  );
+  let caption: string;
+  let captionModel: string;
+  try {
+    if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+      throw new Error(await buildAssetFetchError("Preview fetch", fetched));
+    }
+    const sourceMimeType = resolveImageMimeType({ assetUrl, contentType: fetched.contentType, post });
+    if (!sourceMimeType) {
+      return textError(
+        `Post #${post.id} ${variant} asset is not an image that can be described.`,
+      );
+    }
+    const result = await captionClient.caption({
+      filePath: fetched.path,
+      mimeType: sourceMimeType,
+      filename: `danbooru-${post.id}.${post.file_ext ?? "jpg"}`,
+      context: "tool",
+    });
+    caption = result.caption;
+    captionModel = result.model;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return textError(`Post #${post.id} ${variant} asset could not be described: ${detail}`);
+  } finally {
+    await fs.unlink(fetched.path).catch(() => {});
+  }
+
+  const text = [
+    `## Danbooru post #${post.id}`,
+    "",
+    caption,
+    "",
+    ...assetUrlLines(post, pageUrl),
+    "",
+    mediaHint,
+  ].join("\n");
+
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {
+      action: "preview",
+      mode: "described",
+      post: summarizePost(post, config),
+      variant,
+      assetUrl,
+      pageUrl,
+      captionModel,
+    },
+  };
+}
+
+/** Shared asset-URL block appended to preview output. */
+function assetUrlLines(post: DanbooruPost, pageUrl: string): string[] {
+  return [
+    "URLs:",
+    `- page: ${pageUrl}`,
+    `- original: ${post.file_url ?? "(not available)"}`,
+    `- sample: ${post.large_file_url ?? "(not available)"}`,
+    `- preview: ${post.preview_file_url ?? "(not available)"}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -686,17 +818,7 @@ async function executeDownload(input: {
     "",
     `Saved post #${post.id} (${variant}) to \`${relativePath}\`.`,
     "",
-    "How this worked:",
-    `- fetched metadata from \`/posts/${post.id}.json\``,
-    `- selected the ${variant} asset URL`,
-    `- downloaded the file through the configured HTTP client`,
-    `- wrote the file inside the agent workspace at \`${relativePath}\``,
-    "",
-    "Useful URLs:",
-    `- page: ${pageUrl}`,
-    `- original: ${post.file_url ?? "(not available)"}`,
-    `- sample: ${post.large_file_url ?? "(not available)"}`,
-    `- preview: ${post.preview_file_url ?? "(not available)"}`,
+    ...assetUrlLines(post, pageUrl),
   ];
 
   return {
@@ -887,13 +1009,31 @@ function buildAuthHeader(config: DanbooruConfig): string | undefined {
   return `Basic ${Buffer.from(`${login}:${apiKey}`, "utf8").toString("base64")}`;
 }
 
+/**
+ * Pull a human-readable detail out of a parsed Danbooru JSON error body.
+ * Danbooru's API returns `{ success:false, error:"PostQuery::TagLimitError",
+ * message:"You cannot search for more than 2 tags at a time." }` — note it
+ * uses `message`/`error`, NOT `reason`. Earlier code only checked `reason`, so
+ * every API error (e.g. the 422 tag-limit error) surfaced as a bare HTTP code
+ * with no explanation. Prefer `message`, then `error`, then legacy `reason`.
+ */
+function extractDanbooruJsonDetail(json: Record<string, unknown>): string | undefined {
+  for (const key of ["message", "error", "reason"] as const) {
+    const value = json[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
 async function buildDanbooruHttpError(response: DanbooruFetchResponse): Promise<string> {
   const contentType = response.headers.get("content-type") ?? "";
   let detail = "";
   try {
     if (contentType.includes("application/json")) {
       const json = (await response.json()) as Record<string, unknown>;
-      const reason = typeof json.reason === "string" ? json.reason : undefined;
+      const reason = extractDanbooruJsonDetail(json);
       detail = reason ? ` (${reason})` : "";
     } else {
       const text = (await response.text()).trim();
@@ -925,7 +1065,7 @@ export async function buildAssetFetchError(
     if (contentType.includes("application/json")) {
       try {
         const json = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
-        const reason = typeof json.reason === "string" ? json.reason : undefined;
+        const reason = extractDanbooruJsonDetail(json);
         if (reason) {
           detail = ` (${reason})`;
         }
@@ -967,24 +1107,36 @@ function buildSearchQuery(
   const excludeTags = normalizeTagTerms(params.excludeTags, true);
   const extraTerms = normalizeFreeformTerms(params.extraTerms);
   validateExtraTerms(extraTerms);
+  const order = params.order ?? config.defaultOrder;
   // `extraTerms` are arbitrary Danbooru search terms (e.g. `score:>100`).
   // Each entry contributes one term to the final query, so it must count
   // against the same budget as `includeTags` / `excludeTags` — otherwise a
   // caller could route an unlimited number of tag-equivalent expressions
   // through `extraTerms` and bypass the regular-tag cap entirely.
-  const regularTagCount = includeTags.length + excludeTags.length + extraTerms.length;
+  //
+  // The auto-appended `order:*` metatag ALSO counts: Danbooru enforces its
+  // per-account tag limit over the `order:` metatag too (empirically, an
+  // anonymous account 422s on `2 regular tags + order:*` but accepts the same
+  // two tags without an order). `rating:*` metatags, by contrast, are exempt
+  // from that limit, so they do NOT count here. If we left `order` out of the
+  // budget, a search using the full regular-tag budget plus an order — the
+  // common case, since `default_order`/`order` is usually set — would pass our
+  // check yet 422 at Danbooru with a bare, unexplained error.
+  const orderTagCost = order ? 1 : 0;
+  const regularTagCount =
+    includeTags.length + excludeTags.length + extraTerms.length + orderTagCost;
   if (regularTagCount > config.maxRegularTags) {
     throw new Error(
       `This workspace is configured for at most ${config.maxRegularTags} regular tags per search ` +
-        `(includeTags + excludeTags + extraTerms). ` +
-        `Reduce these or raise max_regular_tags if your account tier allows more.`,
+        `(includeTags + excludeTags + extraTerms, plus order:* which Danbooru counts as a tag). ` +
+        `Reduce these${order ? " (an order:* term is in use — drop it or a tag)" : ""} or raise ` +
+        `max_regular_tags if your account tier allows more.`,
     );
   }
 
   const includeRatings = normalizeRatings(params.includeRatings);
   const excludeRatings = normalizeRatings(params.excludeRatings);
   validateRatingSelections(includeRatings, excludeRatings);
-  const order = params.order ?? config.defaultOrder;
   const queryTerms = [
     ...includeTags,
     ...excludeTags.map((tag) => `-${tag}`),
@@ -1027,28 +1179,11 @@ function buildSearchOutput(input: {
   const lines: string[] = [];
   lines.push("## Danbooru Search");
   lines.push("");
-  lines.push(
-    "This tool turns structured fields into a Danbooru tag query, then calls `GET /posts.json` and formats the results for follow-up.",
-  );
-  lines.push("");
-  lines.push("How the query was built:");
-  lines.push(`- includeTags: ${formatList(input.query.includeTags)}`);
-  lines.push(`- excludeTags: ${formatList(input.query.excludeTags)}`);
-  lines.push(`- extraTerms: ${formatList(input.query.extraTerms)}`);
-  lines.push(
-    `- includeRatings: ${input.query.includeRatings.length > 0 ? formatList(input.query.includeRatings) : "(none)"}`,
-  );
-  lines.push(
-    `- excludeRatings: ${input.query.excludeRatings.length > 0 ? formatList(input.query.excludeRatings) : "(none)"}`,
-  );
-  lines.push(`- order metatag: ${input.query.order ? `order:${input.query.order}` : "(site default)"}`);
-  lines.push(`- limit: ${input.query.limit}`);
-  lines.push(`- page: ${input.query.page ?? "(default)"}`);
-  lines.push(
-    `- regular tag budget in this workspace: ${input.config.maxRegularTags} include/exclude tags`,
-  );
-  lines.push("");
-  lines.push(`Final query: \`${input.query.queryText}\``);
+  // One compact line with the exact query Danbooru ran (the operator's debugging
+  // anchor) plus paging — no step-by-step narration, which is wasted tokens. The
+  // full structured breakdown lives in the tool-call `details` for the console.
+  const pageSuffix = input.query.page ? `, page ${input.query.page}` : "";
+  lines.push(`Query: \`${input.query.queryText}\` (limit ${input.query.limit}${pageSuffix})`);
   lines.push("");
 
   if (input.posts.length === 0) {
@@ -1115,10 +1250,6 @@ function summarizePost(post: DanbooruPost, config: DanbooruConfig) {
 
 function buildPostUrl(config: DanbooruConfig, postId: number): string {
   return `${config.baseUrl.replace(/\/+$/, "")}/posts/${postId}`;
-}
-
-function formatList(values: readonly string[]): string {
-  return values.length > 0 ? values.map((value) => `\`${value}\``).join(", ") : "(none)";
 }
 
 function formatFileSize(bytes: number | null | undefined): string {

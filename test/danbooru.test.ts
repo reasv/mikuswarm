@@ -109,6 +109,8 @@ function buildContext(input: {
   downloadSizeLimit?: number;
   inlineImageMaxBytes?: number;
   inferenceImageOptions?: ImageProcessingOptions;
+  modelHasVision?: boolean;
+  imageCaptionClient?: DanbooruToolContext["imageCaptionClient"];
   config?: DanbooruToolContext["config"];
 }): DanbooruToolContext {
   const inlineImageMaxBytes = input.inlineImageMaxBytes ?? 60_000;
@@ -118,6 +120,9 @@ function buildContext(input: {
     inlineImageMaxBytes,
     inferenceImageOptions:
       input.inferenceImageOptions ?? defaultInferenceImageOptions(inlineImageMaxBytes),
+    // Default to a vision model so existing preview tests keep getting image blocks.
+    modelHasVision: input.modelHasVision ?? true,
+    imageCaptionClient: input.imageCaptionClient,
     fetchClient: input.fetchClient,
     config: { base_url: input.serverUrl, max_regular_tags: 3, ...input.config },
   };
@@ -192,6 +197,127 @@ test("danbooru preview re-encodes oversized images to fit inlineImageMaxBytes", 
       assert.equal(imageBlock.mimeType, "image/jpeg");
     } finally {
       await cleanup();
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Non-vision preview — describe via captioning model, never emit image blocks
+// ---------------------------------------------------------------------------
+
+/** Minimal InferenceClient stub recording caption requests. */
+function makeStubCaptionClient(caption: string): {
+  client: DanbooruToolContext["imageCaptionClient"];
+  calls: Array<{ filePath: string; mimeType: string }>;
+} {
+  const calls: Array<{ filePath: string; mimeType: string }> = [];
+  const client = {
+    modality: "image" as const,
+    stop() {},
+    async caption(req: { filePath: string; mimeType: string }) {
+      calls.push({ filePath: req.filePath, mimeType: req.mimeType });
+      return { caption, model: "stub-vision-model" };
+    },
+  } as unknown as DanbooruToolContext["imageCaptionClient"];
+  return { client, calls };
+}
+
+test("non-vision preview returns a caption, never an image block", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: 555,
+          rating: "g",
+          score: 3,
+          fav_count: 0,
+          file_ext: "png",
+          file_url: "http://upstream/orig.png",
+          large_file_url: "http://upstream/sample.jpg",
+          preview_file_url: "http://upstream/preview.jpg",
+        }),
+      );
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(16), contentType: "image/png" });
+    const { client: captionClient, calls: captionCalls } = makeStubCaptionClient("A blonde knight in armor.");
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          modelHasVision: false,
+          imageCaptionClient: captionClient,
+        }),
+      );
+      const result = await tool.execute("t-desc", { action: "preview", postId: 555 });
+      assert.ok(
+        !result.content.some((c: { type: string }) => c.type === "image"),
+        "non-vision preview must NOT emit an image block",
+      );
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("A blonde knight in armor."), "caption text should be present");
+      assert.ok(/\bmedia\b/.test(text), "should point the model at the media tool");
+      assert.equal(captionCalls.length, 1, "asset should be captioned exactly once");
+      assert.equal((result.details as { mode: string }).mode, "described");
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("non-vision preview without a caption client degrades to URLs + media pointer", async () => {
+  await withWorkspace(async (workspace) => {
+    let cdnFetched = false;
+    const server = await startServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: 777,
+          rating: "g",
+          score: 0,
+          fav_count: 0,
+          file_ext: "jpg",
+          file_url: "http://upstream/orig.jpg",
+          large_file_url: "http://upstream/sample.jpg",
+          preview_file_url: "http://upstream/preview.jpg",
+        }),
+      );
+    });
+    const tmpFiles: string[] = [];
+    const client = {
+      async fetch(url: string): Promise<FetchResult> {
+        cdnFetched = true;
+        const tmpPath = path.join(os.tmpdir(), `miku-danbooru-nocap-${randomBytes(6).toString("hex")}`);
+        await writeFile(tmpPath, Buffer.alloc(8));
+        tmpFiles.push(tmpPath);
+        return { path: tmpPath, sizeBytes: 8, contentType: "image/jpeg", finalUrl: url, statusCode: 200 };
+      },
+      stop() {},
+    } as unknown as FetchClient;
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          modelHasVision: false,
+          // no imageCaptionClient
+        }),
+      );
+      const result = await tool.execute("t-nocap", { action: "preview", postId: 777 });
+      assert.ok(!result.content.some((c: { type: string }) => c.type === "image"), "no image block");
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("http://upstream/sample.jpg"), "asset URLs should be present");
+      // With no caption client configured, the `media` tool (same client) can't
+      // caption either — so this path must NOT promise it; it just gives URLs.
+      assert.equal(cdnFetched, false, "must not fetch the asset when it cannot be described");
+      assert.equal((result.details as { mode: string }).mode, "urls-only");
+    } finally {
+      await Promise.all(tmpFiles.map((p) => rm(p, { force: true }).catch(() => {})));
       await server.close();
     }
   });
@@ -441,6 +567,100 @@ test("extraTerms count against max_regular_tags budget", async () => {
       );
     } finally {
       await cleanup();
+    }
+  });
+});
+
+test("order:* counts against the max_regular_tags budget", async () => {
+  // Danbooru counts the `order:*` metatag toward its per-account tag limit, so
+  // a search using the full regular-tag budget PLUS an order would 422 at
+  // Danbooru. The tool must reject it locally with a clear message instead.
+  await withWorkspace(async (workspace) => {
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: "https://example.test",
+          fetchClient: client,
+          config: { max_regular_tags: 2 },
+        }),
+      );
+      await assert.rejects(
+        () =>
+          tool.execute("t-order-budget", {
+            action: "search",
+            includeTags: ["mordred_(fate)", "artoria_pendragon_(fate)"],
+            order: "score",
+          }),
+        /at most 2 regular tags/i,
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+test("rating:* does NOT count against the max_regular_tags budget", async () => {
+  // Danbooru exempts `rating:*` metatags from its tag limit, so two regular
+  // tags plus a rating filter must be accepted (and must reach the server).
+  await withWorkspace(async (workspace) => {
+    let seenTags: string | undefined;
+    const server = await startServer((req, res) => {
+      seenTags = new URL(req.url ?? "", "http://x").searchParams.get("tags") ?? undefined;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify([]));
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { max_regular_tags: 2 },
+        }),
+      );
+      await tool.execute("t-rating-budget", {
+        action: "search",
+        includeTags: ["mordred_(fate)", "artoria_pendragon_(fate)"],
+        includeRatings: ["sensitive"],
+      });
+      assert.ok(seenTags?.includes("rating:s"), `expected rating metatag in query, got: ${seenTags}`);
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("HTTP error surfaces Danbooru's JSON message, not a bare code", async () => {
+  // Danbooru error bodies use `message`/`error`, never `reason`. The tool must
+  // extract them so the agent sees why a request failed (e.g. the tag limit).
+  await withWorkspace(async (workspace) => {
+    const server = await startServer((_req, res) => {
+      res.statusCode = 422;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          success: false,
+          error: "PostQuery::TagLimitError",
+          message: "You cannot search for more than 2 tags at a time.",
+        }),
+      );
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: client }),
+      );
+      await assert.rejects(
+        () => tool.execute("t-422", { action: "search", includeTags: ["solo"] }),
+        /HTTP 422.*more than 2 tags/s,
+      );
+    } finally {
+      await cleanup();
+      await server.close();
     }
   });
 });
