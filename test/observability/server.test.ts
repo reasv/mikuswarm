@@ -526,7 +526,7 @@ test("SSE: late subscribe after run already settled self-closes with not_live", 
   });
 });
 
-test("SSE: live session streams events and closes on agent_end", async () => {
+test("SSE: stream spans the whole run and closes on settlement, not agent_end", async () => {
   await withStorage(async (storage) => {
     const sessions = new SessionManager();
     const { agent, emit } = fakeAgent({ live: true });
@@ -535,12 +535,22 @@ test("SSE: live session streams events and closes on agent_end", async () => {
     await withServer({ storage, sessions }, async (base) => {
       const res = await fetch(`${base}/api/sessions/${id}/stream`);
       assert.equal(res.status, 200);
-      // Drive a terminal event so the read below completes.
+      // First agent-loop invocation (the kickoff) ends with an agent_end — which
+      // must NOT close the stream. A run can drive several: here a forced
+      // completion follows, injecting a user turn (emitted as message_start, as
+      // pi-agent-core does) and producing a second assistant turn + agent_end.
       emit({ type: "turn_end", message: { role: "assistant", content: [] }, toolResults: [] });
       emit({ type: "agent_end", messages: [] });
+      emit({ type: "message_start", message: { role: "user", content: "forced" } });
+      emit({ type: "turn_end", message: { role: "assistant", content: [] }, toolResults: [] });
+      emit({ type: "agent_end", messages: [] });
+      // The run settles — THIS closes the stream (evict → onSettle).
+      sessions.markCompleted(id);
       const text = await res.text();
-      assert.match(text, /event: turn_end/);
-      assert.match(text, /event: agent_end/);
+      // Both turns and both agent_ends made it through one continuous stream.
+      assert.equal((text.match(/event: agent_end/g) ?? []).length, 2);
+      assert.equal((text.match(/event: turn_end/g) ?? []).length, 2);
+      assert.match(text, /event: message_start/); // the injected forced-completion turn
       assert.doesNotMatch(text, /event: not_live/);
       // The seed must precede the live events on the wire.
       assert.ok(
@@ -557,7 +567,7 @@ test("SSE: mid-run attach is seeded with the accumulated state messages", async 
     // Two head final-turn messages + one already-completed assistant turn: a
     // console attaching now must receive them in the seed (Agent.subscribe is
     // future-only) with rolloutStartIndex skipping the head final turn.
-    const { agent, emit } = fakeAgent({
+    const { agent } = fakeAgent({
       live: true,
       messages: [
         { type: "triggerGroup", role: "user", content: "trigger" },
@@ -569,7 +579,9 @@ test("SSE: mid-run attach is seeded with the accumulated state messages", async 
     await withServer({ storage, sessions }, async (base) => {
       const res = await fetch(`${base}/api/sessions/${id}/stream`);
       assert.equal(res.status, 200);
-      emit({ type: "agent_end", messages: [] });
+      // Settle the run to close the stream so the read completes (agent_end no
+      // longer terminates it — the stream spans the whole run).
+      sessions.markCompleted(id);
       const text = await res.text();
       assert.match(text, /event: rollout_seed/);
       const seedData = text

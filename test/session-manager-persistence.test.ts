@@ -284,6 +284,57 @@ test("SessionManager.interrupt returns false when no run is in progress", () => 
   assert.equal(sessions.interrupt("s-nope"), false);
 });
 
+test("SessionManager.onSettle fires once when the run settles (evict)", () => {
+  const sessions = new SessionManager();
+  const record = sessions.createPlaceholder(makeTrigger(), "default");
+  sessions.markRunning(record.id);
+  sessions.attachAgent(record.id, fakeAbortableAgent().agent);
+
+  let fired = 0;
+  sessions.onSettle(record.id, () => {
+    fired += 1;
+  });
+  assert.equal(fired, 0, "must not fire before settlement");
+
+  sessions.markCompleted(record.id);
+  assert.equal(fired, 1, "fires exactly once on settle");
+});
+
+test("SessionManager.onSettle fires for every terminal path and supports unsubscribe", () => {
+  for (const settle of [
+    (s: SessionManager, id: string) => s.markDiscarded(id),
+    (s: SessionManager, id: string) => s.markFailedResumable(id),
+    (s: SessionManager, id: string) => {
+      s.interrupt(id); // sets interrupted; the run promise settles via markCompleted
+      s.markCompleted(id);
+    },
+  ]) {
+    const sessions = new SessionManager();
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    sessions.markRunning(record.id);
+    sessions.attachAgent(record.id, fakeAbortableAgent().agent);
+    let fired = 0;
+    sessions.onSettle(record.id, () => {
+      fired += 1;
+    });
+    settle(sessions, record.id);
+    assert.equal(fired, 1, "every terminal path fires settle once");
+  }
+
+  // Unsubscribe before settlement → never fires.
+  const sessions = new SessionManager();
+  const record = sessions.createPlaceholder(makeTrigger(), "default");
+  sessions.markRunning(record.id);
+  sessions.attachAgent(record.id, fakeAbortableAgent().agent);
+  let fired = 0;
+  const unsubscribe = sessions.onSettle(record.id, () => {
+    fired += 1;
+  });
+  unsubscribe();
+  sessions.markCompleted(record.id);
+  assert.equal(fired, 0, "unsubscribed listener does not fire");
+});
+
 test("SessionManager without storage is a no-op and never throws", () => {
   const sessions = new SessionManager();
   const record = sessions.createPlaceholder(makeTrigger(), "default");

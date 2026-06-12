@@ -43,9 +43,14 @@ function parseAgentEvent(data: string): AgentEventWire | null {
 
 /**
  * Live `AgentEvent`s for a running session (spec §8 `/api/sessions/:id/stream`).
- * Ends on the upstream terminators: a synthetic `not_live` (session already
- * terminal/evicted — the caller falls back to the persisted record) or the
- * authoritative `agent_end` (yielded, then the generator returns).
+ * Ends when the server closes the stream — which it does on **run settlement**,
+ * not on `agent_end`. A single run drives several agent-loop invocations (kickoff
+ * + forced-completion prompts), each emitting its own `agent_end`; returning on
+ * the first would truncate the live view after one turn (the server spans the
+ * whole run, ARCHITECTURE.md §11). So `agent_end` is yielded like any other event
+ * and the loop runs until the byte stream ends (settlement) or a synthetic
+ * `not_live` (the session was already terminal/evicted at attach — fall back to
+ * the persisted record).
  */
 export async function* streamSessionEvents(
 	sessionId: string,
@@ -61,7 +66,6 @@ export async function* streamSessionEvents(
 		const evt = parseAgentEvent(rec.data);
 		if (!evt) continue;
 		yield evt;
-		if (evt.type === 'agent_end') return;
 	}
 }
 

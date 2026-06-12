@@ -63,6 +63,8 @@ export class SessionManager {
   private readonly agents = new Map<string, Agent>();
   private readonly byTimeline = new Map<string, Set<string>>();
   private readonly runStates = new Map<string, RunState>();
+  /** Per-session "run settled" listeners, fired once on {@link evict}. */
+  private readonly settleListeners = new Map<string, Set<() => void>>();
 
   /**
    * Storage and logger are optional so existing unit tests that construct
@@ -276,6 +278,57 @@ export class SessionManager {
     return agent.signal !== undefined;
   }
 
+  /**
+   * Subscribe to a session's **run settlement** — fired exactly once when the
+   * run finishes and the agent is evicted (`markCompleted`/`markFailedResumable`/
+   * `markDiscarded` → {@link evict}). Returns an unsubscribe function.
+   *
+   * This is the signal the observability SSE stream closes on, deliberately
+   * *not* the agent's per-prompt `agent_end`: a single `run()` can drive several
+   * agent-loop invocations (the kickoff plus forced-completion prompts), each
+   * emitting its own `agent_end`, so closing on `agent_end` would truncate the
+   * live view after the first turn. The run is the unit that settles; the stream
+   * spans it. If the run has already settled (the agent is gone), there is
+   * nothing to fire — the caller's own liveness re-check ({@link isAgentLive})
+   * handles that race and renders the persisted record instead.
+   */
+  onSettle(sessionId: string, listener: () => void): () => void {
+    let set = this.settleListeners.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.settleListeners.set(sessionId, set);
+    }
+    set.add(listener);
+    return () => {
+      const current = this.settleListeners.get(sessionId);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.settleListeners.delete(sessionId);
+    };
+  }
+
+  /**
+   * Fire and clear a session's settle listeners. Snapshots the set and drops the
+   * map entry before invoking, so a listener that unsubscribes (or the eviction
+   * being observed) cannot mutate the set mid-iteration. Observe-only: a throwing
+   * listener is swallowed so it can never break {@link evict}.
+   */
+  private fireSettle(sessionId: string): void {
+    const set = this.settleListeners.get(sessionId);
+    if (!set) return;
+    this.settleListeners.delete(sessionId);
+    for (const listener of [...set]) {
+      try {
+        listener();
+      } catch (err) {
+        this.deps.logger?.error("session manager: settle listener failed", {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   steer(sessionId: string, message: AgentMessage): boolean {
     const session = this.sessions.get(sessionId);
     const agent = this.agents.get(sessionId);
@@ -370,6 +423,9 @@ export class SessionManager {
     this.agents.delete(sessionId);
     this.sessions.delete(sessionId);
     this.runStates.delete(sessionId);
+    // Notify run-settlement observers (the SSE stream) AFTER the maps are torn
+    // down: a listener that re-checks liveness must observe the settled state.
+    this.fireSettle(sessionId);
     if (!session) return;
     const ids = this.byTimeline.get(session.timelineKey);
     ids?.delete(sessionId);

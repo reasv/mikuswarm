@@ -1,10 +1,19 @@
 <script lang="ts">
 	import { streamSessionEvents } from '$lib/api/live';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
-	import type { RolloutMsg } from '$lib/rollout';
+	import { isInjectedUserTurn, type RolloutMsg } from '$lib/rollout';
 	import Rollout from './Rollout.svelte';
 
-	let { sessionId, onEnd }: { sessionId: string; onEnd?: () => void } = $props();
+	// `onHead` surfaces the seed's sliced-off leading final-turn messages (the
+	// trigger turn) to the parent. They belong to the verbatim input view, not the
+	// rollout, but the persisted transcript head isn't flushed until the first
+	// turn_end and the session query isn't refetched mid-run — so without this the
+	// trigger turn is missing from the verbatim view until the run completes.
+	let {
+		sessionId,
+		onEnd,
+		onHead
+	}: { sessionId: string; onEnd?: () => void; onHead?: (head: RolloutMsg[]) => void } = $props();
 
 	let messages = $state<RolloutMsg[]>([]);
 	let streaming = $state<RolloutMsg | null>(null);
@@ -29,6 +38,9 @@
 				const msgs = Array.isArray(evt.messages) ? (evt.messages as RolloutMsg[]) : [];
 				const start = typeof evt.rolloutStartIndex === 'number' ? evt.rolloutStartIndex : 0;
 				messages = msgs.slice(start);
+				// Hand the leading final-turn messages (trigger turn) to the parent for
+				// the verbatim input view; the rollout itself begins at `start`.
+				onHead?.(msgs.slice(0, start));
 				break;
 			}
 			case 'tentative_event': {
@@ -59,6 +71,24 @@
 				retryNotice = null;
 				break;
 			}
+			case 'message_start': {
+				// Injected user turns (interjections — `{type:'interjection'}` — and
+				// forced-completion prompts — `{role:'user'}`) are committed mid-run:
+				// pi-agent-core emits message_start/message_end carrying the message
+				// before pushing it to state, but the following `turn_end` carries the
+				// *assistant* reply, not this user turn. So without folding it here it
+				// would be missing from the live rollout until the run completes and the
+				// persisted record refetches. Assistant messages also fire message_start
+				// (streamed via message_update → turn_end) — `isInjectedUserTurn` filters
+				// them out. Exclude the leading trigger turn (`triggerGroup`/`satellite`,
+				// also `role:'user'`): it belongs to the verbatim input view (`onHead`),
+				// not the rollout, and an early attach can surface its message_start here.
+				const m = evt.message as RolloutMsg | undefined;
+				if (m && isInjectedUserTurn(m) && m.type !== 'triggerGroup' && m.type !== 'satellite') {
+					messages.push(m);
+				}
+				break;
+			}
 			case 'message_update':
 				streaming = (evt.message as RolloutMsg) ?? null;
 				tentative = null;
@@ -67,13 +97,18 @@
 				streaming = null;
 				break;
 			case 'agent_end':
-				// Deliberately ignore `evt.messages` (the whole `agent.state.messages`, which
-				// still carries the leading final user turn). Replacing `messages` wholesale
-				// here would briefly render that trigger turn as raw JSON before the
-				// persisted-fallback switch. Instead we keep the folded rollout as-is; `onEnd`
-				// refetches the persisted record, which SessionView then renders via the
-				// non-live `Rollout` (transcript.slice(rolloutStartIndex)) — identical to this
-				// view with no flicker (spec §10b: "on completion it is identical to the
+				// A turn boundary, NOT the end of the stream: a run emits one `agent_end`
+				// per agent-loop invocation (kickoff + each forced-completion prompt), and
+				// the server keeps the stream open across all of them, closing only on run
+				// settlement (ARCHITECTURE.md §11). So just clear the per-turn ephemeral
+				// state and keep folding — the next turn's injected user turn / assistant
+				// reply still arrive on this same stream. `evt.messages` (the whole
+				// `agent.state.messages`, still carrying the leading trigger turn) is
+				// deliberately ignored: replacing `messages` wholesale would briefly render
+				// that trigger turn as raw JSON. When the stream finally closes, `onEnd`
+				// refetches the persisted record, which SessionView renders via the non-live
+				// `Rollout` (transcript.slice(rolloutStartIndex)) — identical to this view
+				// with no flicker (spec §10b: "on completion it is identical to the
 				// persisted record").
 				streaming = null;
 				tentative = null;

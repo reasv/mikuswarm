@@ -7,7 +7,7 @@
 	import { keys } from '$lib/query/keys';
 	import { selection } from '$lib/stores/selection.svelte';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
-	import { coerceContextMessage } from '$lib/rollout';
+	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
 	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
 	import VerbatimContext from '$lib/components/verbatim/VerbatimContext.svelte';
@@ -32,6 +32,19 @@
 
 	let stopping = $state(false);
 	let resuming = $state(false);
+
+	// Live trigger turn for the verbatim input view (spec §10a). During a run the
+	// persisted transcript head isn't flushed until the first turn_end and this
+	// session query isn't refetched mid-run, so the trigger turn would be missing
+	// from the verbatim view until the rollout completes. `LiveRollout` hands us the
+	// seed's head (the leading final-turn messages) so we can show it immediately.
+	let liveHead = $state<RolloutMsg[] | null>(null);
+	// Reset when switching sessions so a previous run's head can't bleed through
+	// before the new stream's seed arrives.
+	$effect(() => {
+		activeId;
+		liveHead = null;
+	});
 
 	/** Invalidate the affected caches after a stop / stream-end. */
 	function refreshAfterMutation(id: string) {
@@ -111,7 +124,14 @@
 	const inputMessages = $derived.by(() => {
 		const d = session.data;
 		if (!d) return [];
-		const head = d.transcript.slice(0, d.rolloutStartIndex).map(coerceContextMessage);
+		// While running, prefer the live seed's head (the trigger turn) — the
+		// persisted transcript head isn't flushed until the first turn_end and this
+		// query isn't refetched mid-run, so it would otherwise be empty until the
+		// run completes. Falls back to the persisted head (terminal record, or before
+		// the seed arrives).
+		const headSource =
+			isRunning && liveHead ? liveHead : d.transcript.slice(0, d.rolloutStartIndex);
+		const head = headSource.map(coerceContextMessage);
 		return [...d.contextSnapshot, ...head];
 	});
 	const rolloutMessages = $derived.by(() => {
@@ -199,7 +219,7 @@
 		</div>
 		{#if isRunning && activeId}
 			{#key activeId}
-				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} />
+				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} onHead={(h) => (liveHead = h)} />
 			{/key}
 		{:else}
 			<Rollout messages={rolloutMessages} />

@@ -182,13 +182,28 @@ export function sessionStream(
   }
 
   // Forward every AgentEvent verbatim (redacted + images externalized by the SSE
-  // layer). Close on agent_end — the persisted transcript is then authoritative.
+  // layer). Deliberately does NOT close on `agent_end`: a single `run()` drives
+  // several agent-loop invocations — the kickoff plus any forced-completion
+  // prompts — each emitting its own `agent_end` (with the injected user turn that
+  // begins the next one in between). Closing on the first would truncate the live
+  // view after one turn and drop the forced-completion exchange. The stream spans
+  // the whole run and closes on settlement instead (`onSettle` below).
   const unsubscribe = agent.subscribe((event: AgentEvent) => {
     if (stream.closed) return;
     stream.send(event.type, event);
-    if (event.type === "agent_end") stream.close();
   });
   stream.onClose(unsubscribe);
+
+  // Close when the run settles — completed/failed-resumable/discarded all evict
+  // the agent, which fires this once. This (not `agent_end`) is the stream's
+  // terminal signal, and it fires AFTER the terminal status is persisted, so the
+  // client's settle-driven refetch reads the terminal record (not a still-running
+  // one). Registered before the liveness re-check below so a settlement landing in
+  // that window still closes the stream.
+  const unsubscribeSettle = ctx.deps.sessions.onSettle(id, () => {
+    if (!stream.closed) stream.close();
+  });
+  stream.onClose(unsubscribeSettle);
 
   // Tentative-token merge (spec LLM-FAILURE-HANDLING §4.2): Layer-0 buffers
   // attempts to the terminal event, so live tokens only exist on the tap bus.
@@ -204,14 +219,14 @@ export function sessionStream(
     stream.onClose(unsubscribeLive);
   }
 
-  // Late-subscribe race: `Agent.subscribe` only delivers FUTURE events and does
-  // not replay the terminal `agent_end`. The agent is evicted from the map only
-  // AFTER its run settles, so `getAgent(id)` can return an agent whose run has
-  // already ended — we'd then forward nothing and never close, leaking the SSE.
-  // Subscribe FIRST (above) so an `agent_end` firing between this check and the
-  // subscribe isn't lost, THEN re-check liveness: if the run already settled,
-  // synthesize a terminal `not_live` event and close so the client falls back to
-  // the persisted record.
+  // Late-subscribe race: `Agent.subscribe` delivers only FUTURE events, and a
+  // run that settled between `getAgent` (above) and `onSettle` registration fired
+  // its settle notification with no listener attached — so neither the event
+  // forward nor `onSettle` would ever close this stream, leaking it. Subscribe
+  // and register settle FIRST (above), THEN re-check liveness: if the run already
+  // settled, synthesize a terminal `not_live` event and close so the client falls
+  // back to the persisted record. (A settlement landing AFTER this check fires
+  // `onSettle`, which closes the stream.)
   if (!stream.closed && !ctx.deps.sessions.isAgentLive(id)) {
     stream.send("not_live", { sessionId: id, status: row.status });
     stream.close();
