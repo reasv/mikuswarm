@@ -115,6 +115,44 @@ fn build_custom_emoji_placeholder(attrs: &str) -> String {
     "[custom emoji]".to_string()
 }
 
+/// Strip the legacy rich-reply fallback quote from a plain-text `body`: the
+/// leading `>`-prefixed lines plus the blank separator line that follows them
+/// (Matrix spec, "Fallbacks for rich replies"). Callers must gate this on the
+/// event actually carrying an `m.in_reply_to` relation — a non-reply message
+/// that happens to start with `> ` is a legitimate markdown quote and must be
+/// left alone. A body that is *only* fallback resolves to the empty string.
+fn strip_reply_fallback(body: &str) -> String {
+    if !body.starts_with('>') {
+        return body.to_string();
+    }
+    let mut rest: Vec<&str> = Vec::new();
+    let mut in_fallback = true;
+    for line in body.lines() {
+        if in_fallback {
+            if line.starts_with('>') {
+                continue;
+            }
+            // First non-quote line ends the fallback; a blank line here is the
+            // spec separator and is dropped with it.
+            in_fallback = false;
+            if line.trim().is_empty() {
+                continue;
+            }
+        }
+        rest.push(line);
+    }
+    rest.join("\n")
+}
+
+/// Remove `<mx-reply>…</mx-reply>` blocks from a formatted body. The element
+/// exists only as the rich-reply fallback (spec: "Stripping the fallback"), so
+/// this is safe to apply unconditionally — non-replies never contain it.
+fn strip_mx_reply(html: &str) -> String {
+    let pattern = regex::Regex::new(r"(?is)<mx-reply\b[^>]*>.*?</mx-reply>")
+        .expect("valid mx-reply regex");
+    pattern.replace_all(html, "").trim_start().to_string()
+}
+
 fn render_formatted_body_text(formatted_body: Option<&str>) -> (String, bool) {
     let Some(formatted_body) = formatted_body
         .map(str::trim)
@@ -122,6 +160,15 @@ fn render_formatted_body_text(formatted_body: Option<&str>) -> (String, bool) {
     else {
         return (String::new(), false);
     };
+
+    // Drop the rich-reply fallback before any tag stripping: the quoted text
+    // inside <mx-reply> would otherwise survive as plain text and duplicate the
+    // structured reply context downstream.
+    let formatted_body = strip_mx_reply(formatted_body);
+    if formatted_body.is_empty() {
+        return (String::new(), false);
+    }
+    let formatted_body = formatted_body.as_str();
 
     let custom_img_pattern = regex::Regex::new(r#"(?is)<img\b([^>]*\bdata-mx-emoticon\b[^>]*)>"#)
         .expect("valid custom emoji image regex");
@@ -295,16 +342,35 @@ fn replacement_new_content_value(content: &Value) -> Option<&Value> {
     content.get("m.new_content")
 }
 
+/// True when a raw content `Value` carries a genuine rich-reply relation —
+/// `m.in_reply_to` present and not a thread's `is_falling_back` shim (which has
+/// no body fallback to strip; its body may legitimately start with `> `).
+fn is_rich_reply_value(content: &Value) -> bool {
+    let Some(relates_to) = content.get("m.relates_to") else {
+        return false;
+    };
+    relates_to.get("m.in_reply_to").is_some()
+        && relates_to.get("is_falling_back").and_then(Value::as_bool) != Some(true)
+}
+
 fn readable_body(content: &Value) -> String {
     let msgtype = content
         .get("msgtype")
         .and_then(Value::as_str)
         .map(str::trim);
-    let body = content
+    let raw_body = content
         .get("body")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    // Strip the rich-reply fallback quote so reply summaries (messageSummary,
+    // backfill) carry only the message itself, mirroring the live path.
+    let stripped_body = if is_rich_reply_value(content) {
+        strip_reply_fallback(raw_body)
+    } else {
+        raw_body.to_string()
+    };
+    let body = stripped_body.trim();
     let formatted_body = content
         .get("formatted_body")
         .and_then(Value::as_str)
@@ -340,7 +406,8 @@ fn readable_body(content: &Value) -> String {
 mod tests {
     use super::{
         formatted_body, media_from_timeline, media_items, readable_body, relation_details,
-        replacement_new_content, summarize_message_value, summarize_timeline_event,
+        replacement_new_content, strip_reply_fallback, summarize_message_value,
+        summarize_timeline_event,
     };
     use crate::api::MatrixMediaKind;
     use matrix_sdk::deserialized_responses::{
@@ -703,6 +770,84 @@ mod tests {
     }
 
     #[test]
+    fn strip_reply_fallback_removes_quote_lines() {
+        // Multi-line fallback + blank separator: only the real message survives.
+        assert_eq!(
+            strip_reply_fallback("> <@a:example.org> first line\n> second line\n\nThanks darling"),
+            "Thanks darling",
+        );
+        // A body that is only fallback resolves to empty (nothing real was said).
+        assert_eq!(strip_reply_fallback("> <@a:example.org> quoted"), "");
+        // Multi-paragraph real messages keep their internal blank lines.
+        assert_eq!(
+            strip_reply_fallback("> <@a:example.org> q\n\npara one\n\npara two"),
+            "para one\n\npara two",
+        );
+        // A body that doesn't start with a quote is untouched.
+        assert_eq!(strip_reply_fallback("plain message"), "plain message");
+    }
+
+    #[test]
+    fn summary_reply_strips_body_fallback() {
+        // A rich reply's body carries the legacy `> <@user> …` fallback quote;
+        // the summary (messageSummary, backfill) must surface only the message.
+        let event = message_event(json!({
+            "msgtype": "m.text",
+            "body": "> <@mongo:example.org> https://example.org/ @user:example.org\n\nThanks darling",
+            "m.relates_to": { "m.in_reply_to": { "event_id": "$orig:example.org" } },
+        }));
+        let summary = summarize_message_value(&event).expect("reply summary");
+        assert_eq!(summary.body, "Thanks darling");
+    }
+
+    #[test]
+    fn summary_non_reply_keeps_markdown_quote() {
+        // Without an `m.in_reply_to` relation a leading `> ` is a legitimate
+        // markdown quote, not a reply fallback — it must survive.
+        let event = message_event(json!({
+            "msgtype": "m.text",
+            "body": "> someone said this\n\nand I disagree",
+        }));
+        let summary = summarize_message_value(&event).expect("plain summary");
+        assert_eq!(summary.body, "> someone said this\n\nand I disagree");
+    }
+
+    #[test]
+    fn summary_thread_fallback_shim_keeps_quote() {
+        // A thread message with `is_falling_back: true` carries `m.in_reply_to`
+        // only as a compatibility shim — there is no body fallback to strip, so
+        // a quote-shaped body must be left alone.
+        let event = message_event(json!({
+            "msgtype": "m.text",
+            "body": "> someone said this\n\nand I disagree",
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": "$root:example.org",
+                "m.in_reply_to": { "event_id": "$last:example.org" },
+                "is_falling_back": true,
+            },
+        }));
+        let summary = summarize_message_value(&event).expect("thread summary");
+        assert_eq!(summary.body, "> someone said this\n\nand I disagree");
+    }
+
+    #[test]
+    fn formatted_body_drops_mx_reply_block() {
+        // The custom-emoji path resolves the body from `formatted_body`; the
+        // `<mx-reply>` fallback block must be removed BEFORE tag stripping or
+        // its quoted text leaks into the rendered body as plain text.
+        let content = json!({
+            "msgtype": "m.text",
+            "body": "> <@a:example.org> quoted\n\nnice :wave:",
+            "formatted_body": "<mx-reply><blockquote><a href=\"https://matrix.to/#/$e\">In reply to</a> <a href=\"https://matrix.to/#/@a:example.org\">@a:example.org</a><br>quoted</blockquote></mx-reply>nice <img data-mx-emoticon src=\"mxc://example.org/wave\" alt=\":wave:\">",
+            "m.relates_to": { "m.in_reply_to": { "event_id": "$e:example.org" } },
+        });
+        let body = readable_body(&content);
+        assert_eq!(body, "nice :wave:");
+        assert!(!body.contains("In reply to"));
+    }
+
+    #[test]
     fn summary_edit_uses_new_content_body_not_fallback() {
         // The summarize path (used by `messageSummary` and the re-decryption
         // sweeper) must resolve `m.new_content` for an `m.replace` edit, just like
@@ -979,6 +1124,28 @@ pub async fn normalize_inbound_event(
         event_id: Some(event_id),
     });
 
+    // A rich reply's body carries the legacy fallback quote (`> <@user> …`
+    // lines) and its formatted body an `<mx-reply>` block; the spec requires
+    // clients to strip both before display. Gate the plain-body strip on a
+    // genuine reply relation — a thread `is_falling_back` shim has no fallback
+    // and its body may legitimately start with `> ` (a markdown quote).
+    let is_rich_reply = match event.content.relates_to.as_ref() {
+        Some(Relation::Reply { .. }) => true,
+        Some(Relation::Thread(thread)) => thread.in_reply_to.is_some() && !thread.is_falling_back,
+        _ => false,
+    };
+    let raw_body = content_msgtype.body().to_string();
+    let body = if is_rich_reply {
+        strip_reply_fallback(&raw_body)
+    } else {
+        raw_body
+    };
+    // `<mx-reply>` only ever appears as the reply fallback, so strip it
+    // unconditionally; drop the formatted body entirely if nothing remains.
+    let html_body = formatted_body(content_msgtype)
+        .map(|html| strip_mx_reply(&html))
+        .filter(|html| !html.is_empty());
+
     let chat_type = if thread_root_id.is_some() {
         MatrixChatType::Thread
     } else if room.is_direct().await.unwrap_or(false) {
@@ -1008,9 +1175,9 @@ pub async fn normalize_inbound_event(
         room_name,
         room_alias,
         chat_type,
-        body: content_msgtype.body().to_string(),
+        body,
         msgtype: Some(content_msgtype.msgtype().to_string()),
-        formatted_body: formatted_body(content_msgtype),
+        formatted_body: html_body,
         mentions: content_mentions.map(|mentions| MatrixInboundMentions {
             user_ids: (!mentions.user_ids.is_empty())
                 .then(|| mentions.user_ids.iter().map(ToString::to_string).collect()),

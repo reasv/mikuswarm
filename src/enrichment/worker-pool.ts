@@ -175,6 +175,7 @@ export class EnrichmentWorkerPool {
       workspaceRoot: this.options.workspaceRoot,
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
       downloadSizeLimit: this.options.downloadSizeLimit,
+      logger: this.options.logger,
     });
 
     await worker.process(event);

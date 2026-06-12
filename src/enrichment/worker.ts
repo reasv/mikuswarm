@@ -7,7 +7,14 @@ import type { FetchClient } from "./fetch-client.js";
 import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 import { extractLinkedMediaUrls } from "./linked-media.js";
 import { detectCharacterCard } from "./card-detect.js";
+import { roomIdFromTimelineKey } from "../timeline/index.js";
 import path from "node:path";
+
+export interface EnrichmentLogger {
+  info(msg: string, data?: Record<string, unknown>): void;
+  warn(msg: string, data?: Record<string, unknown>): void;
+  error(msg: string, data?: Record<string, unknown>): void;
+}
 
 export interface EnrichmentWorkerOptions {
   storage: Storage;
@@ -16,21 +23,36 @@ export interface EnrichmentWorkerOptions {
   workspaceRoot: string;
   maxPreviewsPerMessage: number;
   downloadSizeLimit?: number;
+  logger: EnrichmentLogger;
 }
 
 export class EnrichmentWorker {
   constructor(private readonly options: EnrichmentWorkerOptions) {}
 
   async process(event: CanonicalChatEvent): Promise<void> {
-    const roomId = this.extractRoomId(event);
+    // The shared parser, NOT a split(":") — Matrix room IDs contain a colon
+    // (`!local:server`), so naive splitting truncates the server part and every
+    // room-bound capability call (messageSummary, downloadMedia) then fails on
+    // an unknown room.
+    const roomId = roomIdFromTimelineKey(event.timelineKey);
+    if (!roomId) {
+      this.options.logger.warn("enrichment_room_id_unresolved", {
+        eventId: event.id,
+        timelineKey: event.timelineKey,
+      });
+    }
     const result: EnrichmentResult = {
       mediaAssets: [],
       linkPreviews: [],
       replyContext: null,
     };
 
-    const downloadPromise = this.downloadAttachments(event, roomId, result);
-    const replyPromise = this.resolveReplyContext(event, roomId, result);
+    const downloadPromise = roomId
+      ? this.downloadAttachments(event, roomId, result)
+      : Promise.resolve();
+    const replyPromise = roomId
+      ? this.resolveReplyContext(event, roomId, result)
+      : Promise.resolve();
     const messagePreviewPromise = this.fetchLinkPreviews(
       event.body, "message", event.id, result,
     );
@@ -74,14 +96,6 @@ export class EnrichmentWorker {
     }
 
     await this.options.storage.persistEnrichmentResults(event.id, result);
-  }
-
-  private extractRoomId(event: CanonicalChatEvent): string {
-    const parts = event.timelineKey.split(":");
-    if (parts[0] === "matrix" && parts.length >= 4) {
-      return parts[3];
-    }
-    return parts[2] ?? "";
   }
 
   private async downloadAttachments(
@@ -153,6 +167,13 @@ export class EnrichmentWorker {
         eventId: replyToId,
       });
       if (!summary) {
+        // Target genuinely unrepresentable (redacted, non-message, …) — stub it
+        // so the renderer can say "unavailable", and say why in the log.
+        this.options.logger.warn("enrichment_reply_target_missing", {
+          eventId: event.id,
+          replyToId,
+          roomId,
+        });
         result.replyContext = {
           event_id: event.id,
           reply_external_id: replyToId,
@@ -175,7 +196,15 @@ export class EnrichmentWorker {
       if (summary.msgtype && isMediaMsgtype(summary.msgtype)) {
         await this.downloadReplyAttachment(event.id, roomId, summary, result);
       }
-    } catch {
+    } catch (error) {
+      // Degrade to a stub (external_id only) but never silently: an unlogged
+      // failure here renders as an empty <reply_to> with no trace of why.
+      this.options.logger.error("enrichment_reply_resolution_failed", {
+        eventId: event.id,
+        replyToId,
+        roomId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       result.replyContext = {
         event_id: event.id,
         reply_external_id: replyToId,

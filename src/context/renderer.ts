@@ -117,10 +117,14 @@ function renderReply(reply: ReplyContext): string {
   if (reply.timestamp) pairs.push(["time", formatAgentTimestamp(reply.timestamp)]);
   if (reply.externalId) pairs.push(["external_id", reply.externalId]);
 
-  const innerParts: string[] = [escapeXml(reply.body ?? "")];
+  const innerParts: string[] = [];
+  if (reply.body && reply.body.trim().length > 0) innerParts.push(escapeXml(reply.body));
   for (const a of reply.attachments ?? []) innerParts.push(renderAttachment(a));
   for (const m of reply.linkedMedia ?? []) innerParts.push(renderLinkedMedia(m));
   for (const lp of reply.linkPreviews ?? []) innerParts.push(renderLinkPreview(lp));
+  // Unresolved reply context (enrichment pending or the target couldn't be
+  // fetched): say so instead of showing the model an empty quote block.
+  if (innerParts.length === 0) innerParts.push("[original message unavailable]");
 
   const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
   return `<reply_to ${attrStr}>\n${innerParts.join("\n\n")}\n</reply_to>`;
