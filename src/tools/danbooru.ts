@@ -468,8 +468,8 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
   }
 
   const previewDescription = context.modelHasVision
-    ? "Preview calls return an inline image block for a chosen post."
-    : "Preview calls return a text description of a chosen post, produced by the captioning model (this agent's model can't view images directly); ask the `media` tool about a post's asset URL for specific questions.";
+    ? "Preview calls return an inline image block for a chosen post plus its Danbooru tags (character/series tags first — the authoritative labels for who/what is in the image)."
+    : "Preview calls return a text description of a chosen post (produced by the captioning model, since this agent's model can't view images directly) plus the post's Danbooru tags — character/series tags first, the authoritative labels for who/what is in the image; ask the `media` tool about a post's asset URL for specific questions.";
 
   return {
     name: "danbooru",
@@ -719,9 +719,11 @@ async function inlinePreview(input: {
   }
 
   const pageUrl = buildPostUrl(config, post.id);
+  const tagLines = buildTagLines(post);
   const text = [
     `## Danbooru post #${post.id} (image below)`,
     "",
+    ...(tagLines.length > 0 ? [...tagLines, ""] : []),
     ...assetUrlLines(post, pageUrl),
   ].join("\n");
 
@@ -738,6 +740,7 @@ async function inlinePreview(input: {
       action: "preview",
       mode: "inline-image",
       post: summarizePost(post, config),
+      tags: collectPostTags(post),
       variant,
       assetUrl,
       sourceMimeType,
@@ -772,16 +775,18 @@ async function describePreview(input: {
 
   const captionClient = context.imageCaptionClient;
   if (!captionClient) {
+    const tagLines = buildTagLines(post);
     const text = [
       `## Danbooru post #${post.id}`,
       "",
-      "This agent's model can't view images directly and no captioning model is configured, so the image can't be described here. Use the URLs below.",
+      "This agent's model can't view images directly and no captioning model is configured, so the image can't be described here. Use the tags and URLs below.",
       "",
+      ...(tagLines.length > 0 ? [...tagLines, ""] : []),
       ...assetUrlLines(post, pageUrl),
     ].join("\n");
     return {
       content: [{ type: "text" as const, text }],
-      details: { action: "preview", mode: "urls-only", post: summarizePost(post, config), variant, assetUrl, pageUrl },
+      details: { action: "preview", mode: "urls-only", post: summarizePost(post, config), tags: collectPostTags(post), variant, assetUrl, pageUrl },
     };
   }
 
@@ -816,11 +821,13 @@ async function describePreview(input: {
     await fs.unlink(fetched.path).catch(() => {});
   }
 
+  const tagLines = buildTagLines(post);
   const text = [
     `## Danbooru post #${post.id}`,
     "",
     caption,
     "",
+    ...(tagLines.length > 0 ? [...tagLines, ""] : []),
     ...assetUrlLines(post, pageUrl),
     "",
     mediaHint,
@@ -832,12 +839,69 @@ async function describePreview(input: {
       action: "preview",
       mode: "described",
       post: summarizePost(post, config),
+      tags: collectPostTags(post),
       variant,
       assetUrl,
       pageUrl,
       captionModel,
     },
   };
+}
+
+/**
+ * Per-category tags for a post, in priority order. Character and copyright
+ * (series) tags are the ground-truth "who/what is in this image" signal — far
+ * more reliable than a caption guess — so they lead. Artist next, then a capped
+ * slice of general descriptive tags, then meta.
+ */
+const PREVIEW_GENERAL_TAG_CAP = 40;
+/** Per-post character-tag cap in the multi-post search scan view (preview is uncapped). */
+const SEARCH_CHARACTER_TAG_CAP = 12;
+
+type PostTagsByCategory = {
+  character: string[];
+  copyright: string[];
+  artist: string[];
+  general: string[];
+  meta: string[];
+};
+
+function collectPostTags(post: DanbooruPost): PostTagsByCategory {
+  const split = (value: string | undefined | null): string[] =>
+    (value ?? "").split(/\s+/).filter(Boolean);
+  return {
+    character: split(post.tag_string_character),
+    copyright: split(post.tag_string_copyright),
+    artist: split(post.tag_string_artist),
+    general: split(post.tag_string_general ?? post.tag_string),
+    meta: split(post.tag_string_meta),
+  };
+}
+
+/**
+ * Render a post's tags as a "character first" block for the preview output.
+ * Returns [] when the post carries no tags at all. `general` is capped (with an
+ * "+N more" marker); the identity categories (character/copyright/artist) are
+ * never truncated because they are the whole point.
+ */
+function buildTagLines(post: DanbooruPost, generalCap = PREVIEW_GENERAL_TAG_CAP): string[] {
+  const tags = collectPostTags(post);
+  const rows: string[] = [];
+  const push = (label: string, values: string[], cap?: number): void => {
+    if (values.length === 0) return;
+    const shown = cap != null ? values.slice(0, cap) : values;
+    const more = cap != null && values.length > cap ? ` (+${values.length - cap} more)` : "";
+    rows.push(`- ${label}: ${shown.join(" ")}${more}`);
+  };
+  push("character", tags.character);
+  push("copyright", tags.copyright);
+  push("artist", tags.artist);
+  push("general", tags.general, generalCap);
+  push("meta", tags.meta);
+  if (rows.length === 0) return [];
+  // Tags are uploader/community-controlled text — surface verbatim as data only,
+  // exactly like `source`; never feed them into any fetcher.
+  return ["Tags (character first — Danbooru's labels for who/what is in this image):", ...rows];
 }
 
 /** Shared asset-URL block appended to preview output. */
@@ -1222,10 +1286,11 @@ function buildSearchQuery(
     includeTags.length + excludeTags.length + extraTerms.length + orderTagCost;
   if (regularTagCount > config.maxRegularTags) {
     throw new Error(
-      `This workspace is configured for at most ${config.maxRegularTags} regular tags per search ` +
-        `(includeTags + excludeTags + extraTerms, plus order:* which Danbooru counts as a tag). ` +
-        `Reduce these${order ? " (an order:* term is in use — drop it or a tag)" : ""} or raise ` +
-        `max_regular_tags if your account tier allows more.`,
+      `Danbooru allows at most ${config.maxRegularTags} regular tags per search ` +
+        `(includeTags + excludeTags + extraTerms, plus order:* which Danbooru counts as a tag; ratings are free). ` +
+        `This is a hard, permanent Danbooru limit — there is no higher account tier available, so don't retry with more tags or move a tag into extraTerms (which is metatags-only and still counts). ` +
+        `${order ? "Drop the order:* or a tag. " : ""}` +
+        `Keep only your ${config.maxRegularTags} most selective tags (a character/series/artist tag narrows far more than a broad word like "fight" or "sword"), then filter the rest by viewing the results.`,
     );
   }
 
@@ -1295,14 +1360,27 @@ function buildSearchOutput(input: {
       `sample=${post.large_file_url ?? "n/a"}`,
       `original=${post.file_url ?? "n/a"}`,
     ].join(" | ");
-    const generalTags = (post.tag_string_general ?? post.tag_string ?? "")
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 12)
-      .join(" ");
+    const tags = collectPostTags(post);
+    const generalTags = tags.general.slice(0, 12).join(" ");
     lines.push(
       `- #${post.id} | rating=${post.rating} | score=${post.score} | favs=${post.fav_count} | ${post.image_width ?? "?"}x${post.image_height ?? "?"} | ext=${post.file_ext ?? "?"} | size=${formatFileSize(post.file_size)} | created=${post.created_at ?? "?"}`,
     );
+    // Character/series tags identify *who/what* is in the post — the signal for
+    // picking the right result. Surface them ahead of the descriptive general
+    // tags. Capped here (this is the multi-post scan view; a single `preview`
+    // returns the full, uncapped character list) so an ensemble post with dozens
+    // of characters can't blow up a wide search result.
+    if (tags.character.length > 0) {
+      const shown = tags.character.slice(0, SEARCH_CHARACTER_TAG_CAP).join(" ");
+      const more =
+        tags.character.length > SEARCH_CHARACTER_TAG_CAP
+          ? ` (+${tags.character.length - SEARCH_CHARACTER_TAG_CAP} more)`
+          : "";
+      lines.push(`  characters: ${shown}${more}`);
+    }
+    if (tags.copyright.length > 0) {
+      lines.push(`  series: ${tags.copyright.slice(0, 6).join(" ")}`);
+    }
     if (post.source) {
       // `source` is uploader-controlled text — surface verbatim so the agent
       // sees it as data, never feed it into any fetcher.
@@ -1703,7 +1781,9 @@ function validateExtraTerms(values: readonly string[]): void {
     const colonIndex = unsigned.indexOf(":");
     if (colonIndex <= 0) {
       throw new Error(
-        `extraTerms only supports Danbooru metatags, not plain tags. Move "${value}" into includeTags or excludeTags.`,
+        `extraTerms only supports Danbooru metatags (with a ':', like score:>100 or filetype:png), not plain tags. ` +
+          `It is NOT a way to fit extra tags past the tag budget — a plain tag belongs in includeTags/excludeTags and counts the same. ` +
+          `Move "${value}" into includeTags or excludeTags (and if that exceeds the budget, drop a less-selective tag instead).`,
       );
     }
     const key = unsigned.slice(0, colonIndex).toLowerCase();

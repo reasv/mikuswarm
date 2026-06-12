@@ -12,6 +12,89 @@ export interface FetchClientOptions {
   timeoutMs: number;
   maxResponseBytes: number;
   httpProxyUrl?: string;
+  /**
+   * Retry attempts on a *transient* network failure (connection reset/refused,
+   * connect/socket timeout, transient DNS, or a bare undici `fetch failed`).
+   * Total tries = `maxRetries + 1`. Deterministic failures — size-cap overflow,
+   * SSRF/scheme rejection, per-attempt timeout abort, non-2xx status — are NOT
+   * retried. Default 2.
+   */
+  maxRetries?: number;
+  /** Base backoff between transient retries (ms); grows linearly per attempt. Default 250. */
+  retryBaseDelayMs?: number;
+}
+
+/**
+ * undici surfaces low-level connection failures either as a Node system error
+ * with one of these codes, or as `TypeError: fetch failed` carrying the real
+ * reason on `.cause`. All are connection-phase and safe to retry for an
+ * idempotent GET. (`ENOTFOUND` is deliberately excluded — a hard DNS miss won't
+ * heal in a few hundred ms; `EAI_AGAIN`, the *transient* resolver failure, is
+ * included.)
+ */
+const TRANSIENT_FETCH_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+const delay = (ms: number): Promise<void> =>
+  ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Classify a thrown fetch error: returns a short transient-reason code when the
+ * failure is worth retrying, or `undefined` when it is deterministic (don't
+ * retry). A caller-/timeout-driven `AbortError` is treated as non-transient.
+ */
+function transientFetchErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  if ((error as { name?: string }).name === "AbortError") return undefined;
+  const direct = (error as { code?: unknown }).code;
+  if (typeof direct === "string" && TRANSIENT_FETCH_CODES.has(direct)) return direct;
+  const cause = (error as { cause?: unknown }).cause;
+  const causeCode =
+    cause && typeof cause === "object" ? (cause as { code?: unknown }).code : undefined;
+  if (typeof causeCode === "string" && TRANSIENT_FETCH_CODES.has(causeCode)) return causeCode;
+  // A bare `TypeError: fetch failed` from undici is a connection-phase failure
+  // even when the cause code isn't one we enumerate — retry it.
+  if (error instanceof TypeError && /fetch failed/i.test(error.message)) {
+    return typeof causeCode === "string" ? causeCode : "fetch_failed";
+  }
+  return undefined;
+}
+
+/**
+ * Replace undici's opaque `TypeError: fetch failed` with a message that names
+ * the underlying cause (e.g. `fetch failed (ECONNRESET)`), keeping the original
+ * as `cause`. Non-`fetch failed` errors pass through unchanged so existing
+ * messages (size cap, SSRF, HTTP status) are preserved verbatim.
+ */
+function clarifyFetchError(error: unknown): Error {
+  if (error instanceof TypeError && /fetch failed/i.test(error.message)) {
+    const cause = (error as { cause?: unknown }).cause;
+    const causeCode =
+      cause && typeof cause === "object" ? (cause as { code?: unknown }).code : undefined;
+    const causeMessage =
+      cause && typeof cause === "object" ? (cause as { message?: unknown }).message : undefined;
+    const detail =
+      typeof causeCode === "string"
+        ? causeCode
+        : typeof causeMessage === "string"
+          ? causeMessage
+          : "network error";
+    return new Error(`fetch failed (${detail})`, { cause: error });
+  }
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 /**
@@ -54,14 +137,32 @@ export interface FetchOptions {
 export class FetchClient {
   private stopped = false;
   private readonly dispatcher: Dispatcher | undefined;
+  private readonly maxRetries: number;
+  private readonly retryBaseDelayMs: number;
 
   constructor(private readonly options: FetchClientOptions) {
     this.dispatcher = buildProxyDispatcher(options.httpProxyUrl);
+    this.maxRetries = Math.max(0, options.maxRetries ?? 2);
+    this.retryBaseDelayMs = Math.max(0, options.retryBaseDelayMs ?? 250);
   }
 
   async fetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     if (this.stopped) throw new Error("FetchClient is stopped");
-    return this.doFetch(url, options);
+    // Each doFetch attempt is self-contained — it streams to a fresh temp file
+    // and unlinks any partial output on failure — so retrying the whole attempt
+    // is clean. Retries cover only transient connection-phase failures (the GET
+    // is idempotent); a deterministic error is rethrown on the first try.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.doFetch(url, options);
+      } catch (error) {
+        const transient = transientFetchErrorCode(error);
+        if (transient === undefined || this.stopped || attempt >= this.maxRetries) {
+          throw clarifyFetchError(error);
+        }
+        await delay(this.retryBaseDelayMs * (attempt + 1));
+      }
+    }
   }
 
   stop(): void {

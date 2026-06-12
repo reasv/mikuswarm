@@ -982,6 +982,113 @@ test("danbooru search surfaces createdAt, fileSize, and source on each post", as
 });
 
 // ---------------------------------------------------------------------------
+// Tag output — preview and search surface post tags, character tags first
+// ---------------------------------------------------------------------------
+
+test("preview surfaces post tags with character tags first", async () => {
+  await withWorkspace(async (workspace) => {
+    const png = await sharp({
+      create: { width: 8, height: 8, channels: 3, background: { r: 10, g: 20, b: 30 } },
+    })
+      .png()
+      .toBuffer();
+    const server = await startServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: 321,
+          rating: "s",
+          score: 5,
+          fav_count: 1,
+          file_ext: "png",
+          file_url: "http://upstream/o.png",
+          large_file_url: "http://upstream/s.png",
+          preview_file_url: "http://upstream/p.png",
+          image_width: 8,
+          image_height: 8,
+          tag_string_character: "mordred_(fate) artoria_pendragon_(fate)",
+          tag_string_copyright: "fate/grand_order fate_(series)",
+          tag_string_artist: "some_artist",
+          tag_string_general: "2girls armor sword fighting",
+        }),
+      );
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: png, contentType: "image/png" });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({
+          workspaceRoot: workspace,
+          serverUrl: server.url,
+          fetchClient: client,
+          config: { min_request_interval_ms: 0, max_in_flight: 4 },
+        }),
+      );
+      const result = await tool.execute("t-prev-tags", {
+        action: "preview",
+        postId: 321,
+        previewVariant: "original",
+      });
+      const text = (result.content.find((c: { type: string }) => c.type === "text") as { text: string }).text;
+      assert.ok(/Tags \(character first/.test(text), "preview text includes the tag block");
+      assert.ok(
+        text.includes("character: mordred_(fate) artoria_pendragon_(fate)"),
+        "character tags surfaced verbatim",
+      );
+      const ci = text.indexOf("- character:");
+      const gi = text.indexOf("- general:");
+      assert.ok(ci >= 0 && gi >= 0 && ci < gi, "character tags appear before general tags");
+      const details = result.details as { tags: { character: string[]; copyright: string[] } };
+      assert.deepEqual(details.tags.character, ["mordred_(fate)", "artoria_pendragon_(fate)"]);
+      assert.deepEqual(details.tags.copyright, ["fate/grand_order", "fate_(series)"]);
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+test("search output lists character and series tags per post", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify([
+          {
+            id: 1,
+            rating: "g",
+            score: 1,
+            fav_count: 0,
+            file_ext: "png",
+            tag_string_character: "mordred_(fate)",
+            tag_string_copyright: "fate_(series)",
+            tag_string_general: "1girl armor",
+            file_url: "http://u/o.png",
+            large_file_url: "http://u/s.png",
+            preview_file_url: "http://u/p.png",
+          },
+        ]),
+      );
+    });
+    const { client, cleanup } = makeStubFetchClient({ buffer: Buffer.alloc(0) });
+    try {
+      const tool = createDanbooruTool(
+        buildContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: client }),
+      );
+      const result = await tool.execute("t-search-tags", {
+        action: "search",
+        includeTags: ["mordred_(fate)"],
+      });
+      const text = (result.content[0] as { text: string }).text;
+      assert.ok(text.includes("characters: mordred_(fate)"), "search line lists character tags");
+      assert.ok(text.includes("series: fate_(series)"), "search line lists series/copyright tags");
+    } finally {
+      await cleanup();
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tag suggestions ("did you mean") — autocomplete-backed recovery + tags action
 // ---------------------------------------------------------------------------
 

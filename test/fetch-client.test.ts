@@ -65,6 +65,83 @@ function makeClient(): FetchClient {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Transient-error retry (a connection blip on a CDN asset must not fail the
+// tool when an immediate retry would succeed — e.g. the danbooru/media path).
+// ---------------------------------------------------------------------------
+
+/** A transient undici-style failure: `TypeError: fetch failed` with a cause code. */
+function transientFetchError(code = "ECONNRESET"): TypeError {
+  return Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("socket hang up"), { code }),
+  });
+}
+
+function makeRetryClient(overrides: Partial<ConstructorParameters<typeof FetchClient>[0]> = {}): FetchClient {
+  return new FetchClient({
+    timeoutMs: 5_000,
+    maxResponseBytes: 10 * 1024 * 1024,
+    retryBaseDelayMs: 0, // keep the test instant
+    ...overrides,
+  });
+}
+
+test("retries a transient 'fetch failed' and then succeeds", async () => {
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls < 3) throw transientFetchError();
+    return new Response(Buffer.from("ok"), { status: 200, headers: new Headers({ "content-type": "image/png" }) });
+  }) as typeof globalThis.fetch;
+  const client = makeRetryClient();
+  let result: Awaited<ReturnType<FetchClient["fetch"]>> | undefined;
+  try {
+    result = await client.fetch(`http://${PUBLIC_IP_A}/asset.png`);
+    assert.equal(result.statusCode, 200);
+    assert.equal(calls, 3, "two transient failures then a success (3 attempts total)");
+  } finally {
+    globalThis.fetch = original;
+    if (result) await rm(result.path, { force: true });
+    client.stop();
+  }
+});
+
+test("gives up after maxRetries and surfaces the underlying cause", async () => {
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    throw transientFetchError("ECONNRESET");
+  }) as typeof globalThis.fetch;
+  const client = makeRetryClient({ maxRetries: 1 });
+  try {
+    // The opaque "fetch failed" is replaced with the cause code.
+    await assert.rejects(client.fetch(`http://${PUBLIC_IP_A}/asset.png`), /fetch failed \(ECONNRESET\)/);
+    assert.equal(calls, 2, "initial try + 1 retry");
+  } finally {
+    globalThis.fetch = original;
+    client.stop();
+  }
+});
+
+test("does not retry a deterministic size-cap overflow", async () => {
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(Buffer.alloc(100), { status: 200, headers: new Headers({ "content-type": "image/png" }) });
+  }) as typeof globalThis.fetch;
+  const client = makeRetryClient({ maxResponseBytes: 10 });
+  try {
+    await assert.rejects(client.fetch(`http://${PUBLIC_IP_A}/big.png`), /exceeded/i);
+    assert.equal(calls, 1, "a deterministic failure must not be retried");
+  } finally {
+    globalThis.fetch = original;
+    client.stop();
+  }
+});
+
 test("egress guard rejects a 302 redirect to a private/metadata host", async () => {
   const stub = stubFetch((url) => {
     if (url.includes(PUBLIC_IP_A)) return { status: 302, location: `http://${METADATA_IP}/latest/meta-data/` };
