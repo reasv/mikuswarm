@@ -1162,6 +1162,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             inferenceImageOptions,
             httpProxyUrl: config.network?.http_proxy_url,
             scheduler: llmScheduler,
+            // Bound the scheduler-admission wait by the interactive budget (#14).
+            maxWaitMs: config.recovery?.llm_request_max_wait_ms,
             config: config.image_gen,
           })]
         : []),
@@ -1785,6 +1787,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await redecryptionSweeper.stop();
         await provider.stop();
         triggerCoordinator.clear();
+        // Abort each caption client's scheduler-admission seam BEFORE awaiting
+        // the pool's in-flight workers (#6). `captionPool.stop()` awaits
+        // in-flight caption work, and a caption call queued behind a half-open
+        // probe during a caption-model outage would otherwise block until the
+        // far-later `llmScheduler.stop()` rejects it (~N×llm_probe_interval_ms
+        // stall). Stopping the clients first rejects those queued waiters now.
+        for (const client of captionClients.values()) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (diaryPool) await diaryPool.stop();
@@ -1801,7 +1810,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (summarizationIndexer) await summarizationIndexer.stop();
         await mcpPool.stop();
         fetchClient.stop();
-        for (const client of captionClients.values()) client.stop();
+        // Caption clients are already stopped (above, before captionPool.stop, #6).
         await waitForRuns(activeRuns);
         // Reject any LLM requests still queued for admission AFTER in-flight runs
         // drain (a queued waiter belongs to a run; stopping earlier would surface

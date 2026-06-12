@@ -35,6 +35,13 @@ export interface SearchOptions {
   snippetMaxChars: number;
   /** Override "now" for temporal decay (testing); defaults to Date.now(). */
   now?: number;
+  /**
+   * Bounds the query-embed wait (§9d #7). Auto-retrieval inside an INTERACTIVE
+   * context build passes a deadline-derived signal so an embed-model outage
+   * degrades this query to lexical-only (the catch below) instead of blocking
+   * the build for minutes. Unset for the `recall_memory` tool and tests.
+   */
+  signal?: AbortSignal;
 }
 
 export interface SearchOutcome {
@@ -182,7 +189,7 @@ export class MemorySearch {
       : candidateLimit;
     if (this.provider && this.vectorStore) {
       try {
-        const queryVec = await this.provider.embedQuery(opts.query);
+        const queryVec = await this.provider.embedQuery(opts.query, opts.signal);
         const hits = this.vectorStore.knn(queryVec, knnK, "memory");
         if (hits.length > 0) {
           vecScoreByRow = new Map(
@@ -198,7 +205,13 @@ export class MemorySearch {
         semanticRan = true;
       } catch (error) {
         // Query-embed or KNN failed → lexical-only for this query (never cross spaces).
+        // This also covers the bounded-embed-wait abort (§9d #7): when an
+        // interactive build's deadline elapses, `embedQuery` rejects and we
+        // degrade here rather than blocking the build for minutes.
         degraded = true;
+        this.logger?.debug("memory_semantic_degraded", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 

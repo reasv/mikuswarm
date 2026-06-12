@@ -15,6 +15,8 @@ export interface DescribeMediaOptions {
   maxChars: number;
   maxTokens: number;
   timeoutMs?: number;
+  /** Shutdown abort seam (#6): aborts an in-flight caption fetch at shutdown. */
+  signal?: AbortSignal;
 }
 
 export interface DescribeMediaResult {
@@ -54,6 +56,13 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
   const timeout = options.timeoutMs
     ? setTimeout(() => controller.abort(), options.timeoutMs)
     : undefined;
+  // Compose the external shutdown signal (#6) with the per-call timeout so a
+  // SIGTERM aborts an in-flight caption fetch without waiting the full timeout.
+  const onSignal = () => controller.abort();
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort();
+    else options.signal.addEventListener("abort", onSignal, { once: true });
+  }
 
   try {
     const response = await fetch(`${options.model.endpoint}/chat/completions`, {
@@ -96,6 +105,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
     return { text: text.trim(), model: result.model ?? options.model.id };
   } finally {
     if (timeout) clearTimeout(timeout);
+    if (options.signal) options.signal.removeEventListener("abort", onSignal);
   }
 }
 

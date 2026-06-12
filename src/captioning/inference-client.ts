@@ -56,6 +56,15 @@ export interface CaptionResponse {
  */
 export class InferenceClient {
   private stopped = false;
+  /**
+   * Shutdown abort seam (#6). `stop()` aborts this; its signal is passed to the
+   * scheduler `acquire` below so a queued caption waiter is rejected promptly at
+   * shutdown instead of lingering until the next half-open probe window. Without
+   * it, `captionPool.stop()` (which awaits in-flight workers) could stall for
+   * N×`llm_probe_interval_ms` during a caption-model outage, because only the
+   * later `llmScheduler.stop()` would otherwise reject the queued waiter.
+   */
+  private readonly stopController = new AbortController();
 
   constructor(private readonly options: InferenceClientOptions) {}
 
@@ -65,6 +74,7 @@ export class InferenceClient {
 
   stop(): void {
     this.stopped = true;
+    this.stopController.abort();
   }
 
   async caption(request: CaptionRequest): Promise<CaptionResponse> {
@@ -121,6 +131,12 @@ export class InferenceClient {
           group,
           priority: "background",
           modelKey: healthKey,
+          // Shutdown abort seam (#6): a queued waiter is rejected the moment
+          // `stop()` fires (an `AbortError` from `acquire`, propagated out of
+          // `caption()` without touching `noteOutcome` — shutdown is neutral),
+          // so `captionPool.stop()` never stalls waiting for the next probe
+          // window during a caption-model outage.
+          signal: this.stopController.signal,
         })
       : undefined;
     let result;
@@ -134,16 +150,24 @@ export class InferenceClient {
         maxChars: this.options.maxChars,
         maxTokens: this.options.maxTokens,
         timeoutMs: this.options.timeoutMs,
+        // Shutdown abort seam (#6): aborts an in-flight caption fetch at stop.
+        signal: this.stopController.signal,
       });
       this.options.scheduler?.noteOutcome(group, healthKey, undefined);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.options.scheduler?.noteOutcome(
-        group,
-        healthKey,
-        classifyLlmError(message, undefined),
-        extractStatus(message.toLowerCase()),
-      );
+      // A fetch aborted by the shutdown stop signal (#6) is a NEUTRAL shutdown
+      // event, not an environmental health-streak hit — do not feed noteOutcome
+      // for it (mirrors the remote-embedding stop-abort exclusion). All other
+      // failures still feed the model-health streak.
+      if (!this.stopController.signal.aborted) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.options.scheduler?.noteOutcome(
+          group,
+          healthKey,
+          classifyLlmError(message, undefined),
+          extractStatus(message.toLowerCase()),
+        );
+      }
       throw err;
     } finally {
       release?.();

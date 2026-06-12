@@ -443,6 +443,42 @@ export class ContextBuilder {
       .map((e) => e.body)
       .filter(Boolean)
       .join("\n");
+    // Bound the inline auto-retrieval query-embed wait (spec LLM-FAILURE-HANDLING
+    // §7.1 / §9d #7): the embed is transitively an inference wait riding inside an
+    // interactive build, so it gets the SAME interactive wall-clock budget as the
+    // inference request — measured from here, composed with the build's own drain
+    // signal. On expiry the search degrades to lexical-only (never blocks the
+    // build for minutes during an embed-model outage); the `.catch(…null)` below
+    // still omits the whole block on any rejection. The embed query is kept at
+    // BACKGROUND scheduler priority (set inside the remote provider) — auto-
+    // retrieval is a best-effort enrichment, not a live reply, so it should not
+    // outrank real interactive work just because its host build is interactive;
+    // only the WAIT is bounded, not the priority.
+    const waiterClass = options.priority ?? "interactive";
+    const interactiveBuild = waiterClass === "interactive" || waiterClass === "proactive";
+    const embedMaxWaitMs = this.config.recovery?.llm_request_max_wait_ms ?? 120_000;
+    let retrievalEmbedSignal: AbortSignal | undefined;
+    let retrievalEmbedTimer: ReturnType<typeof setTimeout> | undefined;
+    let retrievalEmbedAbort: (() => void) | undefined;
+    if (!generation && this.autoRetrieval && interactiveBuild) {
+      const ctrl = new AbortController();
+      retrievalEmbedSignal = ctrl.signal;
+      retrievalEmbedTimer = setTimeout(() => ctrl.abort(), embedMaxWaitMs);
+      // Shutdown drain also aborts the embed wait (no worker will ever finish it).
+      const onDrain = () => ctrl.abort();
+      if (options.abortSignal) {
+        if (options.abortSignal.aborted) ctrl.abort();
+        else options.abortSignal.addEventListener("abort", onDrain, { once: true });
+      }
+      retrievalEmbedAbort = () => {
+        if (retrievalEmbedTimer !== undefined) clearTimeout(retrievalEmbedTimer);
+        options.abortSignal?.removeEventListener("abort", onDrain);
+      };
+    } else if (!generation && this.autoRetrieval && options.abortSignal) {
+      // Non-interactive (hypothetical background) build: no wall-clock bound, but
+      // the drain signal still aborts the embed wait at shutdown.
+      retrievalEmbedSignal = options.abortSignal;
+    }
     const retrievedMemory =
       generation || !this.autoRetrieval
         ? null
@@ -450,12 +486,15 @@ export class ContextBuilder {
             query: retrievalQuery,
             recencyContent: diaryLayer?.content ?? null,
             now,
-          }).catch((error) => {
-            this.logger?.warn("auto_retrieval_failed", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-            return null;
-          });
+            signal: retrievalEmbedSignal,
+          })
+            .catch((error) => {
+              this.logger?.warn("auto_retrieval_failed", {
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return null;
+            })
+            .finally(() => retrievalEmbedAbort?.());
 
     const systemBlock = `<system>\n${satellite}\n</system>`;
     // For a proactive build there are no trigger events; the immediate "decide now"

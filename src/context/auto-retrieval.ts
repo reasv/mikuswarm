@@ -17,6 +17,14 @@ export interface AutoRetrievalInput {
   recencyContent: string | null;
   /** Anchor for temporal decay (the trigger timestamp), not wall-clock. */
   now: number;
+  /**
+   * Bounds the query-embed wait for an INTERACTIVE build (§9d #7). When it fires
+   * (the build's interactive wall-clock deadline, or shutdown drain), the search
+   * degrades to lexical-only instead of blocking inline during an embed-model
+   * outage. The block itself never fails the build — the builder's `.catch(…null)`
+   * already omits it on rejection.
+   */
+  signal?: AbortSignal;
 }
 
 const NOTE =
@@ -62,6 +70,7 @@ export async function buildAutoRetrievalBlock(
     minScore: auto.minScore,
     snippetMaxChars: 200,
     now: input.now,
+    signal: input.signal,
   });
   if (outcome.results.length === 0) return null;
 

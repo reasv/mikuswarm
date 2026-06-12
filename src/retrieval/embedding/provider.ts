@@ -25,8 +25,13 @@ export interface EmbeddingProvider {
    * slow remote call (the per-request timeout still applies independently, §9d #11).
    */
   embedDocuments(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>;
-  /** Embed a single query (query side). */
-  embedQuery(text: string): Promise<Float32Array>;
+  /**
+   * Embed a single query (query side). An optional `signal` bounds the wait so an
+   * INTERACTIVE context build's inline auto-retrieval embed degrades to lexical-only
+   * instead of blocking for minutes during an embed-model outage (§9d #7) — the wait
+   * is transitively an inference wait and gets the same interactive wall-clock budget.
+   */
+  embedQuery(text: string, signal?: AbortSignal): Promise<Float32Array>;
   close(): Promise<void>;
 }
 
@@ -133,7 +138,12 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     return out;
   }
 
-  async embedQuery(text: string): Promise<Float32Array> {
+  async embedQuery(text: string, signal?: AbortSignal): Promise<Float32Array> {
+    // The local (ONNX) embedder is in-process and fast — there is no network
+    // wait to bound — so the `signal` (§9d #7) only short-circuits before the
+    // call when already aborted (e.g. the interactive build deadline elapsed
+    // during the lexical half). Mirrors the early-abort guard in embedDocuments.
+    if (signal?.aborted) throw new Error("embedQuery aborted before start");
     const flag = await this.embedding();
     const vec: number[] = await flag.queryEmbed(text);
     return l2normalize(vec);

@@ -15,6 +15,7 @@ import {
 } from "../src/tools/image-gen.js";
 import { FetchClient } from "../src/enrichment/fetch-client.js";
 import type { FetchOptions, FetchResult } from "../src/enrichment/fetch-client.js";
+import type { LlmScheduler } from "../src/agent/scheduler.js";
 import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 import type { ImageProcessingOptions } from "../src/media/index.js";
 
@@ -470,6 +471,89 @@ test("image_generate surfaces an HTTP 429 from the endpoint as a non-throwing te
       assert.equal(result.content[0].type, "text");
       assert.match(result.content[0].text, /HTTP 429/);
       assert.ok(result.details.error);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bounded admission wait (#14)
+// ---------------------------------------------------------------------------
+
+test("image_generate bounds the scheduler-admission wait by maxWaitMs and degrades to a text error (#14)", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startGeminiServer(() => ({ json: geminiImageResponse("AAAA") }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      let acquireSignal: AbortSignal | undefined;
+      // A scheduler stuck behind a half-open probe: acquire blocks until its
+      // signal aborts (then rejects, as the real scheduler does), simulating an
+      // image-model outage. Without the per-call timeout the tool would hang.
+      const scheduler = {
+        acquire: (opts: { signal?: AbortSignal }) =>
+          new Promise<() => void>((_resolve, reject) => {
+            acquireSignal = opts.signal;
+            opts.signal?.addEventListener(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            );
+          }),
+        noteOutcome: () => {},
+      } as unknown as LlmScheduler;
+
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client });
+      ctx.scheduler = scheduler;
+      ctx.maxWaitMs = 50; // tiny wall-clock bound so the test doesn't wait 120s
+
+      const tool = createImageGenTool(ctx);
+      const start = Date.now();
+      const result: any = await tool.execute("bounded", { prompt: "a yellow square" });
+      const elapsed = Date.now() - start;
+
+      assert.ok(acquireSignal !== undefined, "a signal was passed to acquire");
+      assert.ok(elapsed < 5000, `bounded — gave up promptly, took ${elapsed}ms`);
+      assert.equal(result.content[0].type, "text");
+      assert.match(result.content[0].text, /Image generation request failed/);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+test("image_generate composes the agent abort signal into the admission wait (#14)", async () => {
+  await withWorkspace(async (workspace) => {
+    const server = await startGeminiServer(() => ({ json: geminiImageResponse("AAAA") }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const scheduler = {
+        acquire: (opts: { signal?: AbortSignal }) =>
+          new Promise<() => void>((_resolve, reject) => {
+            opts.signal?.addEventListener(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            );
+          }),
+        noteOutcome: () => {},
+      } as unknown as LlmScheduler;
+
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client });
+      ctx.scheduler = scheduler;
+      ctx.maxWaitMs = 60_000; // long, so the AGENT signal (not the timeout) ends the wait
+
+      const tool = createImageGenTool(ctx);
+      const agent = new AbortController();
+      setTimeout(() => agent.abort(), 30);
+      const start = Date.now();
+      const result: any = await tool.execute("agent-abort", { prompt: "x" }, agent.signal);
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed < 5000, `agent abort released the wait, took ${elapsed}ms`);
+      assert.match(result.content[0].text, /Image generation request failed/);
     } finally {
       await server.close();
       await stub.cleanup();

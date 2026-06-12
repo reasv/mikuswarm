@@ -66,8 +66,13 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     return out;
   }
 
-  async embedQuery(text: string): Promise<Float32Array> {
-    const [vec] = await this.embedBatch([text]);
+  async embedQuery(text: string, signal?: AbortSignal): Promise<Float32Array> {
+    // The `signal` (interactive build deadline, §9d #7) flows into `embedBatch`
+    // as its `stopSignal`: it aborts the admission wait and the in-flight fetch
+    // alike, so an embed-model outage degrades the inline auto-retrieval query
+    // to lexical-only instead of blocking the build. A stop-signal abort is
+    // NEUTRAL — it never feeds the model-health streak (see embedBatch).
+    const [vec] = await this.embedBatch([text], signal);
     if (!vec) throw new Error("remote embeddings returned no vector for query");
     return vec;
   }
@@ -92,24 +97,54 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     // the full timeout, while a normal request still bounds itself by the
     // timeout alone (#11). Everything armed below is torn down in `finally`.
     const controller = new AbortController();
-    const onStop = () => controller.abort();
+    // Track whether the EXTERNAL stop signal (shutdown) caused the abort. A
+    // fetch that throws because of the stop signal is a NEUTRAL shutdown event,
+    // not an environmental streak hit (#5) — the per-request timeout abort, by
+    // contrast, IS environmental and must feed the model health streak.
+    let stopAborted = false;
+    const onStop = () => {
+      stopAborted = true;
+      controller.abort();
+    };
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       if (stopSignal) {
-        if (stopSignal.aborted) controller.abort();
-        else stopSignal.addEventListener("abort", onStop, { once: true });
+        if (stopSignal.aborted) {
+          stopAborted = true;
+          controller.abort();
+        } else {
+          stopSignal.addEventListener("abort", onStop, { once: true });
+        }
       }
       timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.options.apiKey}`,
-        },
-        body: JSON.stringify({ model: this.options.id, input, encoding_format: "float" }),
-        signal: controller.signal,
-        dispatcher: this.dispatcher,
-      });
+      let res: Awaited<ReturnType<typeof fetch>>;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.options.apiKey}`,
+          },
+          body: JSON.stringify({ model: this.options.id, input, encoding_format: "float" }),
+          signal: controller.signal,
+          dispatcher: this.dispatcher,
+        });
+      } catch (err) {
+        // A THROWN fetch (connection refused/reset, DNS failure, or a timeout
+        // abort) never reaches the response-path noteOutcome below, so a
+        // hard-down endpoint would otherwise never accrue a health streak or
+        // trip half-open probing (#5). Feed the model-health streak with an
+        // environmental outcome and re-throw — EXCEPT when the external stop
+        // signal caused the abort: shutdown is neutral, not a streak hit. The
+        // post-response validation throws (dim mismatch, short response) are
+        // unaffected — they happen AFTER the early-success noteOutcome below
+        // and are never counted here.
+        if (!stopAborted) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.options.scheduler?.noteOutcome(group, healthKey, classifyLlmError(message, undefined));
+        }
+        throw err;
+      }
       // Feed BOTH scheduler axes (spec LLM-FAILURE-HANDLING §5) with the
       // response status — the group's unconditional 429/503 throttle backoff
       // (with the server's Retry-After, clamped to the group's backoff_max_ms)

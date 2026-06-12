@@ -118,6 +118,15 @@ export interface ImageGenToolContext {
    * session types are user-facing). Optional so tests construct the tool bare.
    */
   scheduler?: LlmScheduler;
+  /**
+   * Wall-clock bound on the scheduler-admission wait (#14), in ms. During an
+   * image-model outage a queued admission is otherwise released only once per
+   * half-open probe window (≤ ~`llm_probe_interval_ms`), outside the session's
+   * own budget. Composed with the agent's abort signal so the tool call gives up
+   * within the interactive budget instead of stalling the chat turn. Defaults to
+   * 120_000 when unset (matches `llm_request_max_wait_ms`'s shipped default).
+   */
+  maxWaitMs?: number;
   config?: {
     base_url?: string;
     api_key?: string;
@@ -210,6 +219,10 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
   const maxOutputTokens = context.config?.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const outputSubdir = normalizeSubdir(context.config?.output_subdir);
   const dispatcher = buildProxyDispatcher(context.httpProxyUrl);
+  // Wall-clock bound on the scheduler-admission wait (#14). Default mirrors the
+  // shipped `llm_request_max_wait_ms` so an image-model outage can't park the
+  // chat turn at a queued admission for a full probe window.
+  const admissionMaxWaitMs = context.maxWaitMs ?? 120_000;
 
   return {
     name: "image_generate",
@@ -222,7 +235,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       "returned to you as an inline preview; to post it to the chat you MUST call send_message with 'media' set to " +
       "the returned path.",
     parameters: ImageGenSchema,
-    execute: async (_toolCallId, rawParams) => {
+    execute: async (_toolCallId, rawParams, agentSignal) => {
       const params = rawParams as ImageGenParams;
       const prompt = params.prompt?.trim();
       if (!prompt) {
@@ -259,15 +272,31 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       const healthKey = modelHealthKey({ baseUrl, id: modelId });
       let release: (() => void) | undefined;
       if (context.scheduler) {
+        // Bound the admission wait (#14): compose a per-call wall-clock timeout
+        // with the agent's own abort signal so an image-model outage gives up
+        // within the interactive budget instead of parking the chat turn until
+        // the next half-open probe window. A rejected acquire arms nothing, so
+        // the only teardown is the timer + the listener cleared in `finally`.
+        const admitCtrl = new AbortController();
+        const onAgentAbort = () => admitCtrl.abort();
+        const admitTimer = setTimeout(() => admitCtrl.abort(), admissionMaxWaitMs);
+        if (agentSignal) {
+          if (agentSignal.aborted) admitCtrl.abort();
+          else agentSignal.addEventListener("abort", onAgentAbort, { once: true });
+        }
         try {
           release = await context.scheduler.acquire({
             group: "default",
             priority: "interactive",
             key: "image-gen",
             modelKey: healthKey,
+            signal: admitCtrl.signal,
           });
         } catch (error) {
           return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
+        } finally {
+          clearTimeout(admitTimer);
+          if (agentSignal) agentSignal.removeEventListener("abort", onAgentAbort);
         }
       }
       let result: GeminiResponse | { httpError: ToolTextResult; status: number; retryAfterMs?: number };

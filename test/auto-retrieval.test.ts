@@ -55,6 +55,35 @@ function capturingSearch(results: RetrievalResult[]): { search: MemorySearch; qu
   return { search, queries };
 }
 
+/** A MemorySearch stub that blocks until its `signal` aborts, then degrades to
+ *  empty (lexical-only with no hits). Records whether a signal was received and
+ *  whether it actually fired — used to prove the interactive embed wait is bounded. */
+function signalAwareSearch(): { search: MemorySearch; sawSignal: () => boolean; aborted: () => boolean } {
+  let received: AbortSignal | undefined;
+  let didAbort = false;
+  const search = {
+    search: async (opts: { signal?: AbortSignal }): Promise<SearchOutcome> => {
+      received = opts.signal;
+      if (opts.signal) {
+        await new Promise<void>((resolve) => {
+          if (opts.signal!.aborted) {
+            didAbort = true;
+            resolve();
+            return;
+          }
+          opts.signal!.addEventListener("abort", () => {
+            didAbort = true;
+            resolve();
+          }, { once: true });
+        });
+      }
+      // Embed wait expired → degrade to empty results (no block).
+      return { results: [], mode: "lexical", degraded: true, ignoredDateBounds: [], contradictoryDateBounds: false };
+    },
+  } as unknown as MemorySearch;
+  return { search, sawSignal: () => received !== undefined, aborted: () => didAbort };
+}
+
 const config = resolveRetrievalConfig({ enabled: true });
 
 test("buildAutoRetrievalBlock renders a cited block", async () => {
@@ -304,6 +333,49 @@ test("ContextBuilder prefix is byte-identical with vs without auto-retrieval (ca
     assert.ok(!finalOff.content.includes("<retrieved_memory"), "no block when auto-retrieval off");
     assert.ok(finalOn.content.includes("<retrieved_memory"), "block present when auto-retrieval on");
     assert.notEqual(finalOn.content, finalOff.content, "final turn differs (the only difference)");
+  } finally {
+    storage.close();
+  }
+});
+
+test("buildAutoRetrievalBlock forwards the bound signal to search (#7)", async () => {
+  const { search, sawSignal } = signalAwareSearch();
+  const ctrl = new AbortController();
+  // Pre-abort so the stubbed search returns immediately on the aborted signal.
+  ctrl.abort();
+  const block = await buildAutoRetrievalBlock(
+    { search, config },
+    { query: "x", recencyContent: null, now: 1, signal: ctrl.signal },
+  );
+  assert.ok(sawSignal(), "the signal was threaded into search()");
+  assert.equal(block, null, "degraded (empty) search yields no block");
+});
+
+test("ContextBuilder bounds the interactive auto-retrieval embed wait and degrades to no block (#7)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const { search, aborted } = signalAwareSearch();
+  // Tiny interactive budget so the test doesn't actually wait 120s: the embed
+  // wait must be bounded by recovery.llm_request_max_wait_ms.
+  const cfg = minimalConfig();
+  cfg.recovery = { llm_request_max_wait_ms: 50 };
+  const builder = new ContextBuilder(timeline, cfg, storage, undefined, {
+    search,
+    config: resolveRetrievalConfig({ enabled: true }),
+  });
+  const TK = "matrix:miku:room:!room";
+  try {
+    const trigger = event("ev1", "what did we decide about pricing?", 1000);
+    await timeline.append(trigger);
+    const start = Date.now();
+    // An interactive build (default priority). The search stub blocks until its
+    // signal aborts; the builder must abort it at the budget and finish the build.
+    const built = await builder.build({ timelineKey: TK, trigger, activeSessions: [], workspace: emptyWorkspace });
+    const elapsed = Date.now() - start;
+    assert.ok(aborted(), "the embed wait was aborted by the interactive budget");
+    assert.ok(elapsed < 5000, `build finished promptly (bounded), took ${elapsed}ms`);
+    const finalTurn = built.messages[built.messages.length - 1]!;
+    assert.ok(!finalTurn.content.includes("<retrieved_memory"), "degraded to no retrieval block, build not failed");
   } finally {
     storage.close();
   }

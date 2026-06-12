@@ -278,6 +278,74 @@ test("RemoteEmbeddingProvider feeds status + Retry-After to the scheduler backof
   }
 });
 
+test("RemoteEmbeddingProvider feeds noteOutcome environmental on a THROWN fetch (#5)", async () => {
+  // A fetch that THROWS (here: connection refused — nothing listening on the
+  // port) never reaches the response-path noteOutcome, so before the fix a
+  // hard-down endpoint never accrued a health streak. The catch must feed the
+  // model-health streak with an environmental outcome and re-throw.
+  const noted: Array<[string, string | undefined, string | undefined]> = [];
+  const scheduler = {
+    acquire: async () => () => {},
+    noteOutcome: (group: string, modelKey: string | undefined, classification: string | undefined) => {
+      noted.push([group, modelKey, classification]);
+    },
+  } as unknown as LlmScheduler;
+  const provider = new RemoteEmbeddingProvider({
+    id: "test-embed",
+    // Reserved-discard port 9 with nothing bound → connect refused → fetch throws.
+    endpoint: "http://127.0.0.1:9",
+    apiKey: "k",
+    dim: 4,
+    batchSize: 8,
+    timeoutMs: 2000,
+    scheduler,
+  });
+  await assert.rejects(() => provider.embedQuery("x"));
+  assert.equal(noted.length, 1, "exactly one outcome fed for the thrown fetch");
+  assert.equal(noted[0]![2], "environmental", "thrown fetch counts as environmental");
+  assert.equal(noted[0]![1], "http://127.0.0.1:9::test-embed");
+  await provider.close();
+});
+
+test("RemoteEmbeddingProvider: a stop-signal abort during fetch stays NEUTRAL (#5)", async () => {
+  // A fetch aborted by the EXTERNAL stop signal (shutdown) is a neutral event,
+  // not an environmental streak hit. Server hangs without responding; the stop
+  // signal aborts the in-flight fetch — noteOutcome must NOT be called.
+  const server = http.createServer(() => {
+    /* never respond — leave the request hanging until the stop-signal abort */
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const noted: unknown[] = [];
+    const scheduler = {
+      acquire: async () => () => {},
+      noteOutcome: (...args: unknown[]) => {
+        noted.push(args);
+      },
+    } as unknown as LlmScheduler;
+    const provider = new RemoteEmbeddingProvider({
+      id: "test-embed",
+      endpoint: `http://127.0.0.1:${port}`,
+      apiKey: "k",
+      dim: 4,
+      batchSize: 8,
+      // Long timeout so the stop signal (not the per-request timeout) is what aborts.
+      timeoutMs: 30_000,
+      scheduler,
+    });
+    const stop = new AbortController();
+    const pending = provider.embedDocuments(["x"], stop.signal);
+    // Let the fetch start, then trigger shutdown.
+    setTimeout(() => stop.abort(), 50);
+    await assert.rejects(() => pending);
+    assert.equal(noted.length, 0, "a stop-signal abort must not feed the health streak");
+    await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
 test("LocalEmbeddingProvider throws when passageEmbed returns the wrong vector count (#6)", async () => {
   // The local provider binds out[i] to texts[i]'s content-hash positionally; a
   // fastembed under-count/reorder would silently misalign vectors with hashes. Inject
