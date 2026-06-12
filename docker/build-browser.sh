@@ -11,8 +11,11 @@ set -euo pipefail
 #   git submodule update --remote vendor/cloakbrowser-manager   # bump the pin
 #   docker/build-browser.sh                                     # rebuild
 #
-# This is an OPERATOR step. The harness does not build or manage this image; it
-# only connects to a running Manager over HTTP (ARCHITECTURE.md browser section).
+# The main docker-compose.yml also builds this image (the `manager` service's
+# `build:` from the same submodule context, tagged identically), so `docker compose
+# up` covers it; this script is for pre-building or bumping the pinned image out of
+# band. Either way the agent process never builds or manages the container — it only
+# connects to a running Manager over HTTP (ARCHITECTURE.md §11b).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -31,7 +34,14 @@ docker build -t "${IMAGE_NAME}" "${SUBMODULE_DIR}"
 cat <<NOTE
 Built ${IMAGE_NAME}
 
-Next steps (operator):
+Standard path (recommended): the Manager is the \`manager\` service in the main
+docker-compose.yml — \`docker compose up -d\` builds (or reuses this image) and
+starts it, creates the mikuswarm-browser bridge, and the egress sidecar firewalls it.
+No manual network/hardening step. Just set BROWSER_AUTH_TOKEN in .env; [browser]
+is already enabled in config/90-local.toml (manager_url = host.docker.internal:8080).
+This script is only needed to pre-build / bump the pinned image.
+
+Standalone path (manual / non-compose only):
   1. Create the dedicated bridge:   docker/ensure-browser-network.sh
   2. (hardening, as root) block RFC1918 egress:
        sudo MIKUSWARM_BROWSER_NETWORK=mikuswarm-browser docker/browser-egress-rules.sh

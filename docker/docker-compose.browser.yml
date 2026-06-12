@@ -1,12 +1,20 @@
 # CloakBrowser-Manager — sibling operator service (browser-use backend).
 #
+# SUPERSEDED for the standard deployment: the Manager is now the `manager` service
+# in the root docker-compose.yml and comes up with `docker compose up` (its bridge
+# firewalled automatically by the egress sidecar). This standalone file + its
+# helper scripts (ensure-browser-network.sh, browser-egress-rules.sh) are RETAINED
+# for manual / non-compose / debug bring-up only — the same status as
+# agent-egress-rules.sh. Prefer the root stack unless you specifically need to run
+# the Manager on its own.
+#
 # Unlike the dev sandbox (whose lifecycle the SandboxManager drives via the raw
 # docker CLI), this Manager is an INDEPENDENT, operator-run service. The harness
 # does not start/stop it — it only connects over HTTP at manager_url and degrades
 # gracefully if it is down (ARCHITECTURE.md browser section §3.4). This compose
-# file IS the bring-up mechanism.
+# file IS the bring-up mechanism (for the standalone path).
 #
-# Bring up:
+# Bring up (standalone path only):
 #   1. docker/build-browser.sh                       # build image from submodule
 #   2. docker/ensure-browser-network.sh              # create the mikuswarm-browser bridge
 #   3. sudo MIKUSWARM_BROWSER_NETWORK=mikuswarm-browser \      # (hardening, root) block RFC1918

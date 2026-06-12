@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# SUPERSEDED for the standard deployment: the root docker-compose.yml now owns the
+# mikuswarm-browser network (compose creates it) and the egress sidecar hardens it. This
+# script is RETAINED for the manual / non-compose bring-up path only (see
+# docker/docker-compose.browser.yml).
+#
 # Idempotently create the dedicated bridge network for the CloakBrowser-Manager.
 # A dedicated bridge keeps the browser off the harness/DB/sandbox/internal
 # networks (no access to local services) while still reaching the public internet

@@ -29,11 +29,11 @@ set -euo pipefail
 # NOT run by the harness (which has no root — the confined workload must never
 # own its own firewall). Two callers:
 #   - The `egress` compose sidecar (docker/Dockerfile.egress +
-#     egress-entrypoint.sh) reconciles the agent + sandbox bridges on a loop
-#     from the host network namespace — the normal path under Compose; reboots
+#     egress-entrypoint.sh) reconciles the agent + sandbox + browser bridges on a
+#     loop from the host network namespace — the normal path under Compose; reboots
 #     and network recreation self-heal, no operator action.
-#   - Operator-run with sudo (the wrappers above) for the browser bridge and for
-#     native/non-compose deployments. Rules are NOT persistent: reapply on
+#   - Operator-run with sudo (the wrappers above) only for native/non-compose
+#     deployments. Rules are NOT persistent: reapply on
 #     reboot, and after every network (re)creation — the bridge name derives
 #     from the network ID, so a recreated network yields a new bridge and rules
 #     keyed on the old one go stale.

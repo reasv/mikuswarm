@@ -29,12 +29,19 @@
 # stack is fail-closed: no firewall, no agent. Reboots and network recreation
 # self-heal via the reconcile loop.
 #
+# The CloakBrowser-Manager (browser-use backend) IS part of this stack — the
+# `manager` service below. The agent reaches it by service name (http://manager:8080,
+# set as [browser].manager_url in config/90-local.toml) over the internal
+# `mikuswarm-browser-ctl` network, NOT host.docker.internal (which on raw dockerd/WSL2
+# can't reach a loopback-only published port). The whole [browser] table lives in
+# 90-local.toml — the 95-docker overlay can't carry just one key without dropping
+# the rest, per its shallow-merge contract. The egress sidecar firewalls the
+# Manager's browsing bridge automatically (no manual sudo step). It browses out only
+# via its own dedicated, hardened `mikuswarm-browser` bridge and is published to loopback
+# only — humans reach the noVNC GUI via SSH tunnel.
+#
 # NOT started here (by design):
 #   - The sandbox container — created/driven by the agent via /var/run/docker.sock.
-#   - The CloakBrowser-Manager — a separately operated sibling service
-#     (docker/docker-compose.browser.yml). If you enable [browser] in
-#     90-local.toml, set manager_url = "http://host.docker.internal:8080" so the
-#     agent reaches the Manager's loopback-published port on the host.
 
 name: miku
 
@@ -44,6 +51,26 @@ networks:
     # IPv6 off so docker/agent-egress-rules.sh gives a single closed IPv4
     # boundary (its RFC1918 drops + DNS pin are IPv4); a v6-enabled bridge would
     # route around them. Mirrors the sandbox/browser bridges.
+    enable_ipv6: false
+  # Dedicated, hardened bridge for the CloakBrowser-Manager — keeps the browser
+  # off the agent/DB/sandbox networks (its own SSRF boundary). Compose-owned (this
+  # replaces the former external network + docker/ensure-browser-network.sh). The
+  # egress sidecar reconciles its firewall by bridge name; IPv6 off for the same
+  # single-closed-IPv4-boundary reason as `miku`.
+  mikuswarm-browser:
+    name: mikuswarm-browser
+    enable_ipv6: false
+  # Control-plane link between the agent and the Manager. `internal: true` ⇒ no
+  # gateway to the host/LAN and no NAT, so it is purely container-to-container:
+  # the agent reaches the Manager by service name (http://manager:8080) over
+  # docker DNS without the loopback-publish hairpin (host.docker.internal →
+  # docker0 gateway can't reach a 127.0.0.1-only published port on raw dockerd /
+  # WSL2). It widens no SSRF surface — an internal network can't route outward, so
+  # the Manager still browses out ONLY via its hardened mikuswarm-browser bridge (its
+  # default route; this network has no gateway and is never chosen for egress).
+  mikuswarm-browser-ctl:
+    name: mikuswarm-browser-ctl
+    internal: true
     enable_ipv6: false
 
 services:
@@ -66,6 +93,11 @@ services:
     environment:
       MIKUSWARM_AGENT_NETWORK: miku
       MIKUSWARM_SANDBOX_NETWORK: mikuswarm-sandbox
+      # The browser bridge is reconciled too (no --allow-intra — the Manager needs
+      # no compose peers), folding the former manual `sudo browser-egress-rules.sh`
+      # step into the loop. Applied before the health marker, so a healthy sidecar
+      # implies the browser firewall was applied that pass.
+      MIKUSWARM_BROWSER_NETWORK: mikuswarm-browser
     volumes:
       # Resolve network IDs → bridge names (read-only daemon queries).
       - /var/run/docker.sock:/var/run/docker.sock
@@ -107,8 +139,10 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     extra_hosts:
-      # Lets the agent reach the optional, host-published CloakBrowser-Manager
-      # (127.0.0.1:8080) at http://host.docker.internal:8080. Harmless if unused.
+      # Generic host-gateway escape hatch. NOT used for the CloakBrowser-Manager
+      # (reached by service name over mikuswarm-browser-ctl) — on raw dockerd/WSL2 this
+      # resolves to the docker0 gateway, which can't reach a loopback-only published
+      # port anyway. Kept as a harmless general-purpose mapping.
       - "host.docker.internal:host-gateway"
     volumes:
       # Drive the host docker daemon to create/exec the sandbox container.
@@ -127,7 +161,10 @@ services:
       # Operator identity config (gitignored): models, matrix account, captioning…
       # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).
       - ./config/90-local.toml:/app/config/90-local.toml:ro
-    networks: [miku]
+    # miku: the agent's own egress bridge. mikuswarm-browser-ctl: the internal control
+    # link to the Manager (service-name reachability; see the network def above).
+    # The agent's default route stays on miku (mikuswarm-browser-ctl has no gateway).
+    networks: [miku, mikuswarm-browser-ctl]
 
   console:
     build:
@@ -161,3 +198,58 @@ services:
       - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
     depends_on: [agent]
     networks: [miku]
+
+  # CloakBrowser-Manager — the browser-use backend (ARCHITECTURE.md §11b). A headed
+  # stealth Chromium (the `cloakbrowser` binary) inside KasmVNC/Xvfb, a FastAPI
+  # REST control plane + CDP-over-WebSocket proxy + noVNC GUI, all on :8080. The
+  # agent connects in-process over CDP (playwright connectOverCDP) and degrades
+  # gracefully if this is down — so the agent does NOT depend_on it. Built from the
+  # pinned submodule (vendor/cloakbrowser-manager). Runs as root by design: the
+  # upstream image has no USER/PUID support and pre-downloads its binary into root's
+  # cache, so it is NOT pinned to the host uid:gid like the agent/console.
+  manager:
+    build:
+      context: ./vendor/cloakbrowser-manager
+    image: mikuswarm-cloakbrowser-manager:pinned
+    container_name: mikuswarm-cloakbrowser-manager
+    restart: unless-stopped
+    # PID 1 reaping for the Xvfb/VNC/Chromium process tree.
+    init: true
+    # Fail-closed: don't start until the egress firewall sidecar is healthy. The
+    # browser bridge is reconciled in the same pass that flips the marker healthy,
+    # so the RFC1918/link-local egress drops are in force before Chromium can browse.
+    depends_on:
+      egress:
+        condition: service_healthy
+    ports:
+      # Loopback ONLY — the harness reaches REST + CDP-WS here; humans reach the
+      # noVNC GUI via SSH tunnel (ssh -L 8080:localhost:8080 your-host). The
+      # dedicated bridge below is the egress boundary, not this published port.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Gates every /api/* route (REST + the CDP-WS upgrade) behind a bearer token.
+      # The agent passes the same value as [browser].auth_token (config/90-local.toml
+      # → "${BROWSER_AUTH_TOKEN}"); keep them in sync via .env.
+      - AUTH_TOKEN=${BROWSER_AUTH_TOKEN:?set BROWSER_AUTH_TOKEN in .env (match [browser].auth_token)}
+    volumes:
+      # Persistent "miku" identity: cookies, logins, prefs, fingerprint seed. Relative
+      # bind to keep the stack self-contained (no named volumes). This single path is
+      # root-owned (the Manager runs as root, above) — the one exception to the
+      # otherwise host-uid-owned tree; it holds only the regenerable browser profile.
+      - ./var/browser-data:/data
+    # mikuswarm-browser: hardened egress bridge (default route — browsing goes here).
+    # mikuswarm-browser-ctl: internal control link so the agent reaches it by name.
+    networks: [mikuswarm-browser, mikuswarm-browser-ctl]
+    # Pin DNS to the public resolvers the browser-bridge egress rules permit (the
+    # RFC1918 drops would otherwise blackhole the host's embedded/LAN resolver).
+    # Keep in sync with PUBLIC_RESOLVERS in docker/egress-rules.sh.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # KasmVNC + headed Chromium need shared memory; the 64MB default crashes tabs.
+    shm_size: "1g"
+    # Headed Chromium + Xvfb + VNC: a single idle profile is ~512MB, but heavy/
+    # multi-tab pages spike well past that, so budget 4GiB to avoid OOM-killed tabs.
+    mem_limit: "4g"
+    cpus: 2
+    # Healthcheck (GET /api/status) is baked into the image.

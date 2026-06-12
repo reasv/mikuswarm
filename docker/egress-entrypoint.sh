@@ -18,9 +18,12 @@ set -u
 #     agent CREATES this network lazily at sandbox startup, so its absence is
 #     tolerated; once it appears the loop picks it up within one interval (this
 #     replaces the manual rerun the sandbox_network_created warning asks for).
-#
-# The browser bridge (mikuswarm-browser) belongs to the separately operated
-# CloakBrowser-Manager compose file and is NOT handled here.
+#   - the browser bridge (MIKUSWARM_BROWSER_NETWORK, default "mikuswarm-browser") — the
+#     CloakBrowser-Manager's dedicated bridge (compose-owned). Reconciled WITHOUT
+#     --allow-intra (the Manager needs no compose peers), folding the former manual
+#     `sudo browser-egress-rules.sh` step into this loop. Applied BEFORE the health
+#     marker, so a healthy sidecar implies the browser firewall was applied that
+#     pass (the `manager` service depends_on this being healthy). Absence tolerated.
 #
 # Reconcile loop, not one-shot: egress-rules.sh is idempotent and self-correcting
 # (flush-by-comment + re-derive per run), so reapplying every INTERVAL seconds
@@ -31,6 +34,7 @@ set -u
 
 AGENT_NET="${MIKUSWARM_AGENT_NETWORK:-miku}"
 SANDBOX_NET="${MIKUSWARM_SANDBOX_NETWORK:-mikuswarm-sandbox}"
+BROWSER_NET="${MIKUSWARM_BROWSER_NETWORK:-mikuswarm-browser}"
 INTERVAL="${MIKUSWARM_EGRESS_INTERVAL_S:-60}"
 MARKER="${MIKUSWARM_EGRESS_MARKER:-/tmp/egress-applied}"
 RULES=/opt/egress/egress-rules.sh
@@ -79,6 +83,14 @@ while :; do
   if docker network inspect "$SANDBOX_NET" >/dev/null 2>&1; then
     "$RULES" "$SANDBOX_NET" mikuswarm-sandbox-egress \
       || echo "egress sidecar: sandbox rules failed; will retry" >&2
+  fi
+  # Browser bridge: same best-effort posture as the sandbox. Reconciled before the
+  # marker touch so a healthy sidecar implies this pass applied the browser rules
+  # (the manager service waits on that health). No --allow-intra — the Manager has
+  # no compose peers to reach.
+  if docker network inspect "$BROWSER_NET" >/dev/null 2>&1; then
+    "$RULES" "$BROWSER_NET" mikuswarm-browser-egress \
+      || echo "egress sidecar: browser rules failed; will retry" >&2
   fi
   if [ "$agent_ok" = 1 ]; then
     touch "$MARKER"

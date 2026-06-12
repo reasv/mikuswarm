@@ -551,10 +551,11 @@ store_path = "./var/matrix/miku"
 
 # Browser-use backend (spec/BROWSER-USE.md; ARCHITECTURE.md browser section). Off
 # by default. When enabled, the `browser` tool drives one persistent stealth
-# Chromium identity inside an operator-run CloakBrowser-Manager (a sibling docker
-# service — docker/docker-compose.browser.yml), connected in-process over CDP.
-# The harness does NOT manage that container; it connects over HTTP and degrades
-# gracefully if the Manager is down. Set everything explicitly in local config.
+# Chromium identity inside the CloakBrowser-Manager (the `manager` service in the
+# main docker-compose.yml), connected in-process over CDP. The harness does NOT
+# manage that container — compose owns its lifecycle; the agent connects over HTTP
+# and degrades gracefully if the Manager is down. Set everything explicitly in
+# local config (the shipped deployment enables it; see config/90-local.toml).
 [browser]
 enabled = false
 manager_url = "http://127.0.0.1:8080"  # CloakBrowser-Manager base (loopback-published)
