@@ -102,8 +102,12 @@ COPY src ./src
 COPY config/00-defaults.toml ./config/00-defaults.toml
 COPY docker/95-docker.toml ./config/95-docker.toml
 
-# Runs as root: the bind-mounted /var/run/docker.sock is root:docker on the host,
-# and sandbox files are written as the agent's uid (process.getuid()=0 here).
-# See ARCHITECTURE.md for the non-root hardening path (match the host docker GID).
+# No USER directive: the runtime user is set by docker-compose (`user:
+# "${MIKUSWARM_UID}:${MIKUSWARM_GID}"` + `group_add: ${DOCKER_GID}` for the mounted
+# docker socket), so files written into the binds (./var, ./workspaces/miku,
+# ./debug) are host-user-owned and the sandbox container — which runs as the
+# agent's own uid:gid via process.getuid() — aligns automatically. The image
+# needs no writable paths of its own (all state lives under the binds; HOME is
+# pointed at /tmp by compose since the arbitrary uid has no passwd entry).
 ENTRYPOINT ["tini", "--"]
 CMD ["node_modules/.bin/tsx", "src/index.ts"]

@@ -1,6 +1,6 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
-import { streamSimple, completeSimple, createAssistantMessageEventStream, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
+import { streamSimple, completeSimple, createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuilder } from "../context/index.js";
 import type { ContextMessage } from "../context/builder.js";
@@ -451,6 +451,12 @@ export class AgentSessionFactory {
         systemPrompt,
         model,
         tools: filteredTools,
+        // Extended thinking (config `thinking_level`, default off): flows per
+        // request as pi-ai `options.reasoning` through the whole streamFn chain
+        // (retry → admission → streamSimple). The model descriptor's
+        // `reasoning` flag above only declares capability; this is what
+        // actually requests thinking.
+        thinkingLevel: modelConfig.thinking_level ?? "off",
       },
       transformContext: async (messages) => [
         ...frozenBase,
@@ -847,15 +853,19 @@ function isLiveRuntimeMessage(message: AgentMessage): boolean {
   return false;
 }
 
-export function createModel(config: AppConfig): Model<"anthropic-messages"> {
+export function createModel(config: AppConfig): Model<Api> {
   return createModelFromConfig(config.models.default);
 }
 
-export function createModelFromConfig(model: ModelConfig): Model<"anthropic-messages"> {
+export function createModelFromConfig(model: ModelConfig): Model<Api> {
   return {
     id: model.id,
     name: model.id,
-    api: "anthropic-messages",
+    // Wire API of the endpoint (config `api`, default anthropic-messages).
+    // pi-ai's streamSimple dispatches on this via its api registry; the
+    // provider string further selects the request dialect within the OAI
+    // implementation (compat auto-detection, e.g. provider = "together").
+    api: model.api ?? "anthropic-messages",
     provider: model.provider,
     baseUrl: model.endpoint,
     reasoning: model.reasoning ?? true,

@@ -577,37 +577,42 @@ test("#10 snapshot is enqueued before the first transcript flush", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Issue #12 — agent_end flush prefers the event's { messages } payload
+// agent_end flush ignores the event's run-scoped { messages } payload
 // ---------------------------------------------------------------------------
 
-test("#12 agent_end uses event.messages payload over state.messages", async () => {
+test("agent_end ignores the run-scoped event payload: full state.messages persisted", async () => {
   await withStorage(async (storage) => {
+    // pi-agent-core's loop emits `agent_end` with only the messages produced by
+    // THAT `prompt()` call (`newMessages`). On a multi-prompt session — e.g. a
+    // forced-completion follow-up after a scratchpad-only first turn — preferring
+    // the payload would overwrite the transcript with the last run only,
+    // dropping the trigger turn. `state.messages` (the full conversation) is
+    // canonical.
     await storage.insertAgentSession(baseInsert());
 
     const agent = new FakeAgent();
-    // state.messages is deliberately STALE / different from the event payload.
     agent.state.messages = [
-      { type: "message", role: "user", content: "stale-state" },
+      { type: "triggerGroup", role: "user", content: "trigger" },
+      { type: "message", role: "assistant", content: "scratchpad only" },
+      { type: "message", role: "user", content: "forced-completion nudge" },
+      { type: "message", role: "assistant", content: "send_message call" },
     ] as unknown as AgentMessage[];
 
-    const payloadMessages = [
-      { type: "message", role: "user", content: "payload-user" },
-      { type: "message", role: "assistant", content: "payload-assistant" },
-    ] as unknown as AgentMessage[];
+    // The second run's agent_end carries ONLY that run's messages.
+    const runScopedPayload = agent.state.messages.slice(2);
 
     attachSessionCapture(agent, { storage, sessionId: "s-abc1234567" });
-    await agent.fire("agent_end", { messages: payloadMessages });
+    await agent.fire("agent_end", { messages: runScopedPayload });
     await settle(storage);
 
-    const json = storage.getAgentSession("s-abc1234567")!.transcript_json!;
-    const parsed = JSON.parse(json);
-    assert.equal(parsed.length, 2, "persisted the payload, not the 1-msg state");
-    assert.equal(parsed[1].content, "payload-assistant");
-    assert.ok(!json.includes("stale-state"), "state.messages must not be persisted");
+    const parsed = JSON.parse(storage.getAgentSession("s-abc1234567")!.transcript_json!);
+    assert.equal(parsed.length, 4, "full conversation persisted, not the last run only");
+    assert.equal(parsed[0].content, "trigger");
+    assert.equal(parsed[3].content, "send_message call");
   });
 });
 
-test("#12 turn_end (no payload) falls back to state.messages", async () => {
+test("turn_end (no payload) flushes state.messages", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(baseInsert());
 
@@ -630,10 +635,11 @@ test("#12 turn_end (no payload) falls back to state.messages", async () => {
 test("failed run: agent_end's 1-message failure payload is ignored in favour of the full state", async () => {
   await withStorage(async (storage) => {
     // pi-agent-core's handleRunFailure emits `agent_end` with
-    // `messages: [failureMessage]` ONLY. Preferring that payload would
+    // `messages: [failureMessage]` ONLY. Flushing from the payload would
     // overwrite the transcript with a one-element array — destroying the
-    // resume material until the error-path flushNow() repair. When
-    // state.errorMessage is set (the run failed), state.messages is canonical.
+    // resume material until the error-path flushNow() repair. state.messages
+    // is canonical (the loop pushes the failure message into state via
+    // message_end before agent_end).
     await storage.insertAgentSession(baseInsert());
 
     const agent = new FakeAgent();

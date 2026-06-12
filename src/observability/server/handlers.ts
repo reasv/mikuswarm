@@ -95,7 +95,14 @@ export function sessionDetail(
   const transcript = parseJsonArray(row.transcript_json);
   sendJson(res, 200, {
     session: sessionMeta(row),
-    contextSnapshot: parseJsonArray(row.context_snapshot_json),
+    // Normalize to the same wire shape as the room-context endpoint: the
+    // persisted snapshot is raw ContextMessage JSON whose optional keys
+    // (timestamp/tier/imageBlocks) were dropped by serialization, but the
+    // console decodes both endpoints through one strict ContextMessageWire
+    // schema (present-or-null fields, refs under `imageRefs`).
+    contextSnapshot: parseJsonArray(row.context_snapshot_json).map((msg) =>
+      renderContextMessage(msg as PersistedContextMessage),
+    ),
     transcript,
     rolloutStartIndex: rolloutStartIndex(transcript),
     contextDumpPath: row.context_dump_path,
@@ -365,17 +372,33 @@ function sessionMeta(row: AgentSessionRow): Record<string, unknown> {
 }
 
 /**
+ * A persisted context-snapshot message as it comes back out of
+ * `context_snapshot_json`: structurally a {@link ContextMessage}, but optional
+ * keys (`tier`/`timestamp`/`imageBlocks`) may be absent (JSON.stringify drops
+ * `undefined`), `tokenEstimate` may be missing on legacy rows, and
+ * `imageBlocks` holds already-externalized {@link ImageRef}s rather than raw
+ * base64 blocks (session-capture externalizes at write time).
+ */
+type PersistedContextMessage = Partial<Omit<ContextMessage, "imageBlocks">> & {
+  imageBlocks?: unknown;
+};
+
+/**
  * Verbatim-renderer view of a context message (spec §10a): content is kept raw;
  * image blocks are externalized to refs so no base64 crosses the wire. Tier and
- * token metadata drive the gutter.
+ * token metadata drive the gutter. This is the ONE wire shape the console's
+ * strict `ContextMessageWire` schema decodes — both the live room-context
+ * preview and the persisted session snapshot must pass through it (optional
+ * source fields become explicit nulls). For persisted snapshots `imageBlocks`
+ * already holds refs; `externalizeImages` is a no-op deep clone there.
  */
-function renderContextMessage(msg: ContextMessage): Record<string, unknown> {
+function renderContextMessage(msg: ContextMessage | PersistedContextMessage): Record<string, unknown> {
   return {
     type: msg.type,
     role: msg.role,
     content: msg.content,
     tier: msg.tier ?? null,
-    tokenEstimate: msg.tokenEstimate,
+    tokenEstimate: msg.tokenEstimate ?? null,
     timestamp: msg.timestamp ?? null,
     imageRefs: msg.imageBlocks ? externalizeImages(msg.imageBlocks) : undefined,
   };

@@ -63,11 +63,24 @@ failure_notice = ""
 [models.default]
 id = "claude-opus-4-7"
 provider = "anthropic"
+# Wire API the endpoint speaks (pi-ai api registry): "anthropic-messages" |
+# "openai-completions" | "openai-responses" | "google-generative-ai". For
+# OAI-compatible gateways, also set `provider` to the real upstream (e.g.
+# "together") so pi-ai picks the right request dialect.
+api = "anthropic-messages"
 endpoint = "${ANTHROPIC_BASE_URL}"
 api_key = "${LLM_API_KEY}"
 multimodal = true
 max_tokens = 16384
+# Capability flag only ("this model supports extended thinking") — it does NOT
+# turn thinking on. thinking_level below does.
 reasoning = true
+# Extended-thinking level requested on every call with this model:
+# "off" | "minimal" | "low" | "medium" | "high" | "xhigh". On adaptive-thinking
+# models (Opus/Sonnet 4.6+) this is an effort hint (the model decides when and
+# how much to think); on older models it maps to a token budget. A non-off
+# level requires reasoning = true (fail-fast at startup).
+thinking_level = "off"
 context_window = 128000
 # Cap on the base64-encoded image payload shipped to the provider (not raw
 # bytes; raw inflates ~4/3 in base64). 5 MB ≈ 3.75 MB raw, under Anthropic's

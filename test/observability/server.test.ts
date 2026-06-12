@@ -219,6 +219,53 @@ test("GET /api/sessions/:id returns snapshot + transcript; 404 for unknown", asy
   });
 });
 
+test("GET /api/sessions/:id normalizes the persisted snapshot to the context wire shape", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert());
+    // As persisted by session-capture: optional ContextMessage keys
+    // (timestamp/tier/imageBlocks) are absent where undefined, and image blocks
+    // were already externalized to refs at write time. The console decodes this
+    // through the same strict ContextMessageWire schema as the room-context
+    // preview, so absent fields must come back as explicit nulls and refs must
+    // be exposed under `imageRefs`.
+    await storage.saveAgentSessionSnapshot("s-aaa1111111", {
+      snapshotJson: JSON.stringify([
+        { type: "system", role: "system", content: "sys", tokenEstimate: 10 },
+        {
+          type: "chatEvent",
+          role: "user",
+          content: "pic",
+          tier: "rich",
+          tokenEstimate: 5,
+          timestamp: 1_234,
+          imageBlocks: [
+            { __imageRef: true, eventId: "evt-1", attachmentId: "att-1", sizeBytes: 99 },
+          ],
+        },
+      ]),
+      dumpPath: null,
+      tokenEstimate: 15,
+    });
+
+    await withServer({ storage }, async (base) => {
+      const body = (await (await fetch(`${base}/api/sessions/s-aaa1111111`)).json()) as any;
+      const [sys, chat] = body.contextSnapshot;
+      // Absent optional fields become explicit nulls (present keys).
+      assert.equal(sys.tier, null);
+      assert.equal(sys.timestamp, null);
+      assert.equal(sys.tokenEstimate, 10);
+      assert.equal(sys.imageRefs, undefined);
+      // Present fields pass through; refs move from imageBlocks → imageRefs.
+      assert.equal(chat.tier, "rich");
+      assert.equal(chat.timestamp, 1_234);
+      assert.deepEqual(chat.imageRefs, [
+        { __imageRef: true, eventId: "evt-1", attachmentId: "att-1", sizeBytes: 99 },
+      ]);
+      assert.equal(chat.imageBlocks, undefined);
+    });
+  });
+});
+
 test("GET /api/sessions/:id marks rolloutStartIndex past the head final turn (issue #4)", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert());

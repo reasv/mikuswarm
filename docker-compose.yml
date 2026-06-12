@@ -16,7 +16,11 @@
 #      (the agent creates the sandbox container at runtime via the mounted
 #      socket; the image must already exist or startup fails fast).
 #   2. config/90-local.toml in place (identity/models/matrix) and
-#      cp .env.example .env, then fill in the secrets.
+#      cp .env.example .env, then fill in the secrets AND the host-identity vars
+#      (MIKUSWARM_UID/MIKUSWARM_GID/DOCKER_GID — see .env.example). The agent and console
+#      run as that host uid:gid, NOT root, so everything written into the
+#      relative binds (./var, ./workspaces/miku, ./debug) stays host-user-owned.
+#      Compose fails fast (`:?`) when any of the three is unset.
 #
 # Egress hardening is NOT a manual step: the `egress` sidecar below applies and
 # reconciles the bridge firewall (docker/egress-rules.sh — the SSRF boundary,
@@ -78,9 +82,22 @@ services:
     depends_on:
       egress:
         condition: service_healthy
+    # Non-root: run as the operator's host uid:gid so the DB (./var), workspace
+    # files, and context dumps land host-user-owned instead of root-owned. The
+    # docker socket is the only root-ish dependency, covered by group_add with
+    # the socket's gid (root:docker 660 on the host). The sandbox container
+    # inherits this same uid:gid at runtime (src/app.ts passes process.getuid()
+    # to the SandboxManager's --user), so its /workspace writes align too.
+    user: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}:${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    group_add:
+      - "${DOCKER_GID:?gid of /var/run/docker.sock — run `stat -c %g /var/run/docker.sock`}"
     env_file: .env
     environment:
       MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+      # The runtime uid has no /etc/passwd entry in the image, so HOME would be
+      # unset/"/". Nothing persistent lives in HOME (all state is under the
+      # binds), but the docker CLI and friends want a writable scratch HOME.
+      HOME: /tmp
     # Pin external DNS to public resolvers so name resolution survives the
     # agent-egress-rules.sh RFC1918 drops (the embedded resolver would otherwise
     # forward to the host's LAN/loopback nameservers, which are blocked). Compose
@@ -119,6 +136,9 @@ services:
     image: mikuswarm-console:latest
     container_name: mikuswarm-console
     restart: unless-stopped
+    # Non-root for parity with the agent. The console writes nothing (no binds),
+    # so any unprivileged uid works; reuse the host identity already in .env.
+    user: "${MIKUSWARM_UID:?host uid — run `id -u`}:${MIKUSWARM_GID:?host gid — run `id -g`}"
     environment:
       # Server→server hop over the compose network to the agent's read API.
       MIKUSWARM_CONSOLE_API_URL: "http://agent:8799"

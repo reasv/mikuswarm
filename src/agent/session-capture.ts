@@ -367,26 +367,21 @@ export function attachSessionCapture(
     return transcriptChain;
   };
 
-  // 2. Transcript — flush on turn_end / agent_end.
+  // 2. Transcript — flush on turn_end / agent_end, always from the live
+  // `state.messages`. The `agent_end` event's `{ messages }` payload is
+  // run-scoped — pi-agent-core's loop emits only the messages produced by THAT
+  // `prompt()`/`continue()` call (agent-loop `newMessages`), and
+  // `handleRunFailure` emits `[failureMessage]` alone. Preferring the payload
+  // would overwrite the transcript with the latest run only, silently dropping
+  // every earlier turn of a multi-prompt session (e.g. the trigger turn once a
+  // forced-completion follow-up fires). `state.messages` is canonical in every
+  // path: the loop pushes each message (including the synthesized failure
+  // message) into state via `message_end` before `agent_end` reaches listeners.
   const unsubscribe = agent.subscribe(async (event) => {
     if (event.type !== "turn_end" && event.type !== "agent_end") {
       return;
     }
-    // Contract (spec §3): `agent_end` carries the finalized `{ messages }`
-    // payload; prefer it so capture is decoupled from the agent's internal
-    // `state.messages` field (which a future loop could trim post-emit). Fall
-    // back to `state.messages` when the payload is absent (e.g. `turn_end`).
-    //
-    // Failure-path guard: pi-agent-core's `handleRunFailure` emits `agent_end`
-    // with `messages: [failureMessage]` ONLY — preferring that payload would
-    // overwrite the persisted transcript with a one-element array, leaving the
-    // resume material's correctness to the error-path `flushNow()` repair that
-    // follows. When the run failed (`state.errorMessage` set), the canonical
-    // source is the live state, which holds the full transcript including the
-    // failed turn.
-    const messages =
-      event.messages && !agent.state.errorMessage ? event.messages : agent.state.messages;
-    await flushTranscript(messages, event.type);
+    await flushTranscript(agent.state.messages, event.type);
   });
 
   return {

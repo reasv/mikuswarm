@@ -152,6 +152,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }
     }
   }
+  // Same fail-fast convention for the extended-thinking knob: a non-off
+  // `thinking_level` on a model declared NOT thinking-capable (`reasoning =
+  // false`) is a contradiction — the provider would reject or silently ignore
+  // the thinking request — so it's a config typo, not a runtime concern.
+  for (const [key, model] of Object.entries(config.models)) {
+    if (model.thinking_level && model.thinking_level !== "off" && model.reasoning === false) {
+      throw new Error(
+        `models.${key}: thinking_level = "${model.thinking_level}" contradicts reasoning = false; ` +
+          `set reasoning = true (thinking-capable) or thinking_level = "off"`,
+      );
+    }
+  }
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
     // Per-model health (spec LLM-FAILURE-HANDLING §5): global thresholds —

@@ -287,12 +287,42 @@ const TimelineSchema = StrictObject({
 
 const ModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
+  // pi-ai provider string. Besides naming the upstream, it drives the OAI
+  // provider's compat AUTO-DETECTION (request dialect): e.g. "together" turns
+  // on Together's thinking format (`reasoning: {enabled}`), `max_tokens`
+  // field, and no-strict-mode — needed when a gateway URL hides the real
+  // upstream from URL-based detection.
   provider: Type.String({ minLength: 1 }),
+  // Which wire API the endpoint speaks (pi-ai api registry; selects the
+  // streamSimple implementation). Default "anthropic-messages".
+  api: Type.Optional(Type.Union([
+    Type.Literal("anthropic-messages"),
+    Type.Literal("openai-completions"),
+    Type.Literal("openai-responses"),
+    Type.Literal("google-generative-ai"),
+  ])),
   endpoint: Type.String(),
   api_key: Type.String(),
   multimodal: Type.Boolean(),
   max_tokens: Type.Number({ minimum: 1 }),
   reasoning: Type.Optional(Type.Boolean()),
+  // Extended-thinking level requested on every LLM call made with this model
+  // (pi-agent-core `thinkingLevel` → pi-ai `options.reasoning`). `reasoning`
+  // above is only the CAPABILITY flag on the model descriptor — it never turns
+  // thinking on by itself; this field does. Unset or "off" = thinking disabled
+  // (requests go out with thinking explicitly off). On adaptive-thinking
+  // models (Opus/Sonnet 4.6+) the level maps to an effort hint and the model
+  // decides when/how much to think; on older models it maps to a token budget.
+  // A non-off level with `reasoning = false` is contradictory (validated
+  // fail-fast at app wiring).
+  thinking_level: Type.Optional(Type.Union([
+    Type.Literal("off"),
+    Type.Literal("minimal"),
+    Type.Literal("low"),
+    Type.Literal("medium"),
+    Type.Literal("high"),
+    Type.Literal("xhigh"),
+  ])),
   context_window: Type.Optional(Type.Number({ minimum: 1 })),
   // Cap on the base64-encoded image payload shipped to the provider, NOT raw
   // file bytes. Raw bytes inflate ~4/3 in base64 (formula

@@ -167,7 +167,7 @@ test("ensure: reuse keeps a matching running container (no recreate)", async () 
     seq.push(args[0]);
     if (args[0] === "network" && args[1] === "inspect") return ok();
     if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
-    if (args[0] === "inspect") return ok(`true\t${IMAGE_ID}\t/host/workspace`);
+    if (args[0] === "inspect") return ok(`true\t${IMAGE_ID}\t/host/workspace\t1000:1000`);
     if (args[0] === "exec") return ok(); // readiness
     return ok();
   });
@@ -176,6 +176,29 @@ test("ensure: reuse keeps a matching running container (no recreate)", async () 
   assert.ok(!seq.includes("rm"), "matching container is not removed");
   assert.ok(!seq.includes("create"), "matching container is not recreated");
   assert.ok(calls.some((c) => c.message === "sandbox_container_reused"), "logs reuse");
+});
+
+test("ensure: reuse recreates on runtime-user mismatch", async () => {
+  const { logger, calls } = recordingLogger();
+  const seq: string[] = [];
+  const { run } = fakeRunner((args) => {
+    seq.push(args[0]);
+    if (args[0] === "network" && args[1] === "inspect") return ok();
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    if (args[0] === "inspect") {
+      // same image + mount, but created under root (e.g. a pre-non-root
+      // compose deployment) while the harness now runs as 1000:1000
+      return ok(`true\t${IMAGE_ID}\t/host/workspace\t0:0`);
+    }
+    if (args[0] === "rm" || args[0] === "create" || args[0] === "start" || args[0] === "exec") return ok();
+    return ok();
+  });
+
+  await SandboxManager.ensure(baseOptions({ runDocker: run, logger, uid: 1000, gid: 1000 }));
+  assert.ok(seq.includes("rm"), "stale container is removed on user mismatch");
+  assert.ok(seq.includes("create"), "a fresh container is created");
+  const recreate = calls.find((c) => c.message === "sandbox_container_recreate");
+  assert.match(String(recreate?.fields?.reason), /runtime user changed \(running 0:0 != requested 1000:1000\)/);
 });
 
 test("createContainer: read_only_root adds --read-only plus writable tmpfs for /tmp and home", async () => {

@@ -62,6 +62,8 @@ interface ContainerState {
   requestedImageId?: string;
   /** Bind-mount source mounted at the requested `workspace_mount`, if any. */
   workspaceMountSource?: string;
+  /** The `uid:gid` the existing container was created with (`.Config.User`). */
+  user?: string;
 }
 
 /**
@@ -324,10 +326,13 @@ export class SandboxManager implements ExecBackend {
 
   /**
    * Returns a human-readable reason string when the existing container no longer
-   * matches the requested config (image ID or workspace bind-mount source), or
-   * `undefined` when it still matches. Scoped strictly to image ID + workspace
-   * mount source — broader cap/network/user comparison is intentionally out of
-   * scope (issue #6).
+   * matches the requested config (image ID, workspace bind-mount source, or
+   * runtime user), or `undefined` when it still matches. The user is part of the
+   * check because workspace file ownership must track the harness uid:gid — a
+   * container left over from a run under a different uid (e.g. a root deployment
+   * upgraded to the non-root compose user, §11c) would silently keep writing
+   * files the harness user doesn't own. Broader cap/network comparison remains
+   * intentionally out of scope (issue #6).
    */
   private static containerMismatch(
     options: SandboxManagerOptions,
@@ -346,6 +351,12 @@ export class SandboxManager implements ExecBackend {
       // The container has no bind mount at the requested container path at all —
       // it was created with a different workspace_mount. Treat as a mismatch.
       return `workspace mount missing at ${options.workspaceMount}`;
+    }
+    if (state.user !== undefined) {
+      const requestedUser = `${options.uid}:${options.gid}`;
+      if (state.user !== requestedUser) {
+        return `runtime user changed (running ${state.user} != requested ${requestedUser})`;
+      }
     }
     return undefined;
   }
@@ -397,15 +408,18 @@ export class SandboxManager implements ExecBackend {
     name: string,
   ): Promise<ContainerState> {
     const runDocker = SandboxManager.runner(options);
-    // One inspect pulls running-state, the container's image ID, and the bind
-    // source mounted at the requested workspace path (empty if none). Tab-joined
-    // so an empty mount source is still a distinct field.
+    // One inspect pulls running-state, the container's image ID, the bind
+    // source mounted at the requested workspace path (empty if none), and the
+    // created-with user. Tab-joined so an empty field is still distinct.
     const tmpl =
       "{{.State.Running}}\t{{.Image}}\t" +
-      `{{range .Mounts}}{{if eq .Destination "${options.workspaceMount}"}}{{.Source}}{{end}}{{end}}`;
+      `{{range .Mounts}}{{if eq .Destination "${options.workspaceMount}"}}{{.Source}}{{end}}{{end}}` +
+      "\t{{.Config.User}}";
     const result = await runDocker(["inspect", "-f", tmpl, name]);
     if (result.code !== 0) return { exists: false, running: false };
-    const [running = "", imageId = "", mountSource = ""] = result.stdout.replace(/\n$/, "").split("\t");
+    const [running = "", imageId = "", mountSource = "", user = ""] = result.stdout
+      .replace(/\n$/, "")
+      .split("\t");
     // Resolve the requested image tag to its current image ID so a retag that
     // points the tag at a new build is detected even though the name is unchanged.
     const imgInspect = await runDocker(["image", "inspect", "-f", "{{.Id}}", options.image]);
@@ -416,6 +430,7 @@ export class SandboxManager implements ExecBackend {
       imageId: imageId.trim() || undefined,
       requestedImageId,
       workspaceMountSource: mountSource.length > 0 ? mountSource : undefined,
+      user: user.trim() || undefined,
     };
   }
 

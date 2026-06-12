@@ -684,3 +684,43 @@ test("config: shipped docker/95-docker.toml overlay validates under strict unkno
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("config: models thinking_level accepts a valid level", async () => {
+  const toml = `${BASE_CONFIG}
+[models.thinky]
+id = "test-model-2"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "test-key"
+multimodal = false
+max_tokens = 1024
+reasoning = true
+thinking_level = "medium"
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.models.thinky.thinking_level, "medium");
+    // Unset stays unset (= off) on the base model.
+    assert.equal(config.models.default.thinking_level, undefined);
+  });
+});
+
+test("config: models thinking_level rejects an unknown level", async () => {
+  const toml = `${BASE_CONFIG}
+[models.thinky]
+id = "test-model-2"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "test-key"
+multimodal = false
+max_tokens = 1024
+thinking_level = "maximum"
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /thinking_level|Invalid config/i,
+      "an out-of-enum thinking_level must fail schema validation",
+    );
+  });
+});
