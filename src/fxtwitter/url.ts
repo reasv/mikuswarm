@@ -1,26 +1,46 @@
 /**
- * X status URL detection & canonicalization (spec/FXTWITTER-ENRICHMENT.md §2).
- * Recognizes status URLs on X/Twitter hosts plus FxTwitter's own share domains
- * (users paste those too). Canonical form for persistence/dedup:
- * `https://x.com/{screen_name|i}/status/{id}`.
+ * X status URL detection & canonicalization (spec/FXTWITTER-ENRICHMENT.md §2;
+ * spec/X-URL-NORMALIZATION-AND-COMPACT-MEDIA.md §2). Recognizes status URLs on
+ * X/Twitter hosts plus the mirror/share domains people paste for better
+ * previews (FxTwitter, vxtwitter, and friends). Canonical form for
+ * persistence/dedup: `https://x.com/{screen_name|i}/status/{id}`.
+ *
+ * Hosts are matched as BASE domains with subdomain tolerance (`isStatusHost`):
+ * `www.`, `mobile.`, `m.`, `d.`, `g.`, … of any listed base all match for free,
+ * while `notfxtwitter.com` / `evilx.com` / `x.com.evil.com` do not.
  */
 
-const STATUS_HOSTS = new Set([
+/**
+ * Recognized base domains. The deployment can extend this at runtime via
+ * `fxtwitter.extra_status_hosts` (threaded in as the `bases` argument); the
+ * defaults below ship the long-lived members of the ecosystem.
+ */
+export const STATUS_BASE_HOSTS: readonly string[] = [
   "x.com",
-  "www.x.com",
   "twitter.com",
-  "www.twitter.com",
-  "mobile.twitter.com",
-  // FxTwitter share domains.
+  // FixTweet / FxTwitter share domains.
   "fxtwitter.com",
-  "www.fxtwitter.com",
   "fixupx.com",
-  "www.fixupx.com",
   "fixvx.com",
-  "www.fixvx.com",
   "twittpr.com",
-  "www.twittpr.com",
-]);
+  "pxtwitter.com", // legacy FxTwitter domain, still in the wild
+  // FixTweet joke aliases (same path structure; used in chat).
+  "girlcockx.com",
+  "stupidpenisx.com",
+  "cunnyx.com",
+  // vxtwitter family.
+  "vxtwitter.com",
+];
+
+/**
+ * True when `hostname` is one of `bases` or a subdomain of one. The leading-dot
+ * suffix check (`.endsWith("." + base)`) accepts arbitrary subdomains without
+ * false-positiving on lookalike registrations.
+ */
+function isStatusHost(hostname: string, bases: readonly string[]): boolean {
+  const h = hostname.toLowerCase();
+  return bases.some((base) => h === base || h.endsWith("." + base));
+}
 
 // Path forms: /:screen_name/status/:id, /i/status/:id, /i/web/status/:id.
 // The id must be all-digits; trailing segments (/photo/1, /video/2) are
@@ -43,7 +63,10 @@ export interface XStatusRef {
 }
 
 /** Parse one URL (or bare numeric status id) into a status reference, or null. */
-export function parseXStatusUrl(input: string): Omit<XStatusRef, "bodyIndex"> | null {
+export function parseXStatusUrl(
+  input: string,
+  bases: readonly string[] = STATUS_BASE_HOSTS,
+): Omit<XStatusRef, "bodyIndex"> | null {
   const trimmed = input.trim();
   if (/^\d+$/.test(trimmed)) {
     return {
@@ -59,7 +82,7 @@ export function parseXStatusUrl(input: string): Omit<XStatusRef, "bodyIndex"> | 
     return null;
   }
   if (!/^https?:$/.test(url.protocol)) return null;
-  if (!STATUS_HOSTS.has(url.hostname.toLowerCase())) return null;
+  if (!isStatusHost(url.hostname, bases)) return null;
   const match = STATUS_PATH.exec(url.pathname);
   if (!match) return null;
   const screenName = match[1]?.toLowerCase();
@@ -76,11 +99,14 @@ export function parseXStatusUrl(input: string): Omit<XStatusRef, "bodyIndex"> | 
  * Extract X status URLs from a message body, deduped by status id (first
  * occurrence wins), in order of first appearance.
  */
-export function extractXStatusUrls(bodyText: string): XStatusRef[] {
+export function extractXStatusUrls(
+  bodyText: string,
+  bases: readonly string[] = STATUS_BASE_HOSTS,
+): XStatusRef[] {
   const results: XStatusRef[] = [];
   const seenIds = new Set<string>();
   for (const match of bodyText.matchAll(URL_REGEX)) {
-    const parsed = parseXStatusUrl(match[0]);
+    const parsed = parseXStatusUrl(match[0], bases);
     if (!parsed) continue;
     if (seenIds.has(parsed.statusId)) continue;
     seenIds.add(parsed.statusId);
@@ -95,6 +121,9 @@ export function extractXStatusUrls(bodyText: string): XStatusRef[] {
  * produces the bare og-card for them. Strips ALL matches of each status id,
  * not just the deduped first occurrence.
  */
-export function stripXStatusUrls(bodyText: string): string {
-  return bodyText.replace(URL_REGEX, (raw) => (parseXStatusUrl(raw) ? "" : raw));
+export function stripXStatusUrls(
+  bodyText: string,
+  bases: readonly string[] = STATUS_BASE_HOSTS,
+): string {
+  return bodyText.replace(URL_REGEX, (raw) => (parseXStatusUrl(raw, bases) ? "" : raw));
 }

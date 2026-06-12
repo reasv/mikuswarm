@@ -445,6 +445,10 @@ const FxTwitterSchema = StrictObject({
   prefer_mosaic: Type.Optional(Type.Boolean()),
   // Per node (tweet and quote each); X's own per-post max is 4.
   max_videos_per_tweet: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Extra mirror base-domains recognized as X status hosts, merged into the
+  // built-in set (subdomains of each are matched too). For new FixTweet/mirror
+  // aliases the ecosystem invents, without a code change.
+  extra_status_hosts: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   tool: Type.Optional(StrictObject({
     // Registers x_fetch — independent of the enrichment enable.
     enabled: Type.Optional(Type.Boolean()),

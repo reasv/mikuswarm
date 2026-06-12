@@ -23,6 +23,11 @@ const MAX_URL = 2048;
 // messages.
 const MAX_COMPACT_TWEET_TEXT = 280;
 const MAX_COMPACT_QUOTE_TEXT = 140;
+// Per-media caption/alt cap in the compact tweet line. A media-only tweet must
+// still carry its content at this tier (it may be the entire message, and
+// generation sessions render compact) — but bounded, since compact exists for
+// token economy. Renderer constant, not config (sibling of the caps above).
+const MAX_COMPACT_MEDIA_CAPTION = 200;
 
 /** Hint appended after truncated tweet text/notes (payload.textTruncated). */
 const X_FETCH_TRUNCATION_HINT = "[truncated — full text available via the x_fetch tool]";
@@ -93,15 +98,9 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
   }
 
   const reply = event.replyTo ? compactReply(event.replyTo) : "";
-  const attachments = (event.attachments ?? [])
-    .map((a) => ` [attachment: ${truncate(a.filename ?? a.id, MAX_FILENAME)}${a.localPath ? ` ${a.localPath}` : ""}${a.caption ? ` caption=${truncate(a.caption, 300)}` : ""}]`)
-    .join("");
-  const linked = (event.linkedMedia ?? [])
-    .map((m) => ` [linked_media: ${truncate(m.filename ?? m.id, MAX_FILENAME)}${m.localPath ? ` ${m.localPath}` : ""}${m.caption ? ` caption=${truncate(m.caption, 300)}` : ""}]`)
-    .join("");
-  const links = (event.linkPreviews ?? [])
-    .map((lp) => compactLinkPreview(lp))
-    .join("");
+  const attachments = (event.attachments ?? []).map(compactAttachmentPart).join("");
+  const linked = (event.linkedMedia ?? []).map(compactLinkedMediaPart).join("");
+  const links = (event.linkPreviews ?? []).map(compactLinkPreview).join("");
   return `[${time}] ${sender}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${linked}${links}`;
 }
 
@@ -301,43 +300,88 @@ function renderPreviewMedia(media: AttachmentMeta): string {
 }
 
 function compactLinkPreview(lp: LinkPreviewMeta): string {
-  // X.com previews truncate MUCH earlier than the generic 1000-char form:
-  // tweet text at 280 chars, quote at 140; media as counts only. Stats, polls,
-  // notes, captions and paths are all dropped at this tier (ARCHITECTURE.md §7a).
+  // X.com previews truncate MUCH earlier than the generic 1000-char form: tweet
+  // text at 280 chars, quote at 140. Media renders with its caption/alt text
+  // (bounded) — a media-only tweet must still carry content at this tier, which
+  // generation sessions (summarize/diary) routinely see (ARCHITECTURE.md §7a).
+  // Stats, polls, notes and media paths remain dropped.
   if (lp.sourceKind === FX_TWITTER_SOURCE_KIND && lp.payload) {
-    const main = compactTweetPart(lp.payload.tweet, MAX_COMPACT_TWEET_TEXT);
+    const assetById = new Map<string, AttachmentMeta>();
+    for (const m of lp.media ?? []) assetById.set(m.id, m);
+    const main = compactTweetPart(lp.payload.tweet, MAX_COMPACT_TWEET_TEXT, assetById);
     const quote = lp.payload.tweet.quote
-      ? ` | quoting ${compactTweetPart(lp.payload.tweet.quote, MAX_COMPACT_QUOTE_TEXT)}`
+      ? ` | quoting ${compactTweetPart(lp.payload.tweet.quote, MAX_COMPACT_QUOTE_TEXT, assetById)}`
       : "";
     return ` [tweet: ${main}${quote}]`;
   }
   return ` [link: ${truncate(lp.title ?? lp.url, MAX_FILENAME)} — ${truncate(lp.description ?? "", 1000)}]`;
 }
 
-function compactTweetPart(node: XTweetNode, maxText: number): string {
+function compactTweetPart(
+  node: XTweetNode,
+  maxText: number,
+  assetById: Map<string, AttachmentMeta>,
+): string {
   const handle = node.authorHandle ? ` (@${node.authorHandle})` : "";
   const who = `${node.authorName ?? "unknown"}${handle}`;
   const text = node.text ? `: "${truncate(normalizeWhitespace(node.text), maxText)}"` : "";
-  const counts = compactMediaCounts(node.media ?? []);
-  return `${who}${text}${counts.length > 0 ? ` · ${counts.join(" · ")}` : ""}`;
+  const media = compactMediaParts(node.media ?? [], assetById);
+  return `${who}${text}${media.length > 0 ? ` · ${media.join(" · ")}` : ""}`;
 }
 
-function compactMediaCounts(slots: XMediaSlot[]): string[] {
+/**
+ * Compact media rendering for a tweet node: each slot with a caption (preferred)
+ * or alt text renders as `kind: text` (bounded); caption-less slots fold into an
+ * aggregate count form appended after, so a tweet with one captioned video and
+ * three plain photos reads `video: … · 3 photos`, not four fragments. Failed
+ * downloads are shown, never silently dropped (parity with the rich `status`).
+ */
+function compactMediaParts(
+  slots: XMediaSlot[],
+  assetById: Map<string, AttachmentMeta>,
+): string[] {
+  const captioned: string[] = [];
   let photos = 0;
   let videos = 0;
   let gifs = 0;
   for (const slot of slots) {
+    const label = compactMediaKind(slot);
+    const asset = assetById.get(slot.assetId);
+    if (asset && asset.processing?.downloaded === false) {
+      captioned.push(`${label}: [media unavailable]`);
+      continue;
+    }
+    const text = asset?.caption ?? slot.altText;
+    if (text && text.trim().length > 0) {
+      captioned.push(`${label}: ${truncate(normalizeWhitespace(text), MAX_COMPACT_MEDIA_CAPTION)}`);
+      continue;
+    }
     if (slot.kind === "photo") photos += 1;
     else if (slot.kind === "mosaic") photos += slot.photoCount ?? 1;
     // A thumbnail-fallback slot still represents a video to the reader.
     else if (slot.kind === "video" || slot.kind === "video_thumbnail") videos += 1;
     else if (slot.kind === "gif") gifs += 1;
   }
-  const parts: string[] = [];
-  if (photos > 0) parts.push(`${photos} photo${photos === 1 ? "" : "s"}`);
-  if (videos > 0) parts.push(`${videos} video${videos === 1 ? "" : "s"}`);
-  if (gifs > 0) parts.push(`${gifs} gif${gifs === 1 ? "" : "s"}`);
-  return parts;
+  const counts: string[] = [];
+  if (photos > 0) counts.push(`${photos} photo${photos === 1 ? "" : "s"}`);
+  if (videos > 0) counts.push(`${videos} video${videos === 1 ? "" : "s"}`);
+  if (gifs > 0) counts.push(`${gifs} gif${gifs === 1 ? "" : "s"}`);
+  return [...captioned, ...counts];
+}
+
+/** Reader-facing kind label for a compact media slot. */
+function compactMediaKind(slot: XMediaSlot): string {
+  switch (slot.kind) {
+    case "mosaic":
+      return slot.photoCount !== undefined ? `mosaic(${slot.photoCount})` : "mosaic";
+    case "video":
+    case "video_thumbnail":
+      return "video";
+    case "gif":
+      return "gif";
+    default:
+      return "photo";
+  }
 }
 
 function compactSenderLabel(event: CanonicalChatEvent): string {
@@ -355,7 +399,23 @@ function compactReply(reply: ReplyContext): string {
     : "unknown";
   const time = reply.timestamp ? ` At: ${compactTime(reply.timestamp)}` : "";
   const body = reply.body ? `: ${truncate(normalizeWhitespace(reply.body), 4096)}` : "";
-  return `\n\n(Replying to: > [From: ${senderDisplay}${time}]${body})\n\n`;
+  // Reply-context media is carried at compact tier too (it was previously
+  // dropped): a reply to a media-only message must not render as empty.
+  const media =
+    (reply.attachments ?? []).map(compactAttachmentPart).join("") +
+    (reply.linkedMedia ?? []).map(compactLinkedMediaPart).join("") +
+    (reply.linkPreviews ?? []).map(compactLinkPreview).join("");
+  return `\n\n(Replying to: > [From: ${senderDisplay}${time}]${body}${media})\n\n`;
+}
+
+/** Compact inline form for a message/reply attachment (filename, path, caption). */
+function compactAttachmentPart(a: AttachmentMeta): string {
+  return ` [attachment: ${truncate(a.filename ?? a.id, MAX_FILENAME)}${a.localPath ? ` ${a.localPath}` : ""}${a.caption ? ` caption=${truncate(a.caption, 300)}` : ""}]`;
+}
+
+/** Compact inline form for linked media (image URLs referenced in the body). */
+function compactLinkedMediaPart(m: AttachmentMeta): string {
+  return ` [linked_media: ${truncate(m.filename ?? m.id, MAX_FILENAME)}${m.localPath ? ` ${m.localPath}` : ""}${m.caption ? ` caption=${truncate(m.caption, 300)}` : ""}]`;
 }
 
 function compactTime(timestamp: number): string {

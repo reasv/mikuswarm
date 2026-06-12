@@ -171,6 +171,64 @@ test("compact tier renders the one-line tweet form with media counts", () => {
   assert.ok(!out.includes("msg-attach"), "media paths dropped in compact");
 });
 
+test("compact tier includes media captions (with alt fallback and count fallback)", () => {
+  const payload: XTweetPayload = {
+    v: 1,
+    tweet: {
+      ...BASE_PAYLOAD.tweet,
+      media: [
+        { assetId: "v1", kind: "video", durationSeconds: 18 },
+        { assetId: "p1", kind: "photo" }, // captioned
+        { assetId: "p2", kind: "photo", altText: "alt only" }, // no caption → alt
+        { assetId: "p3", kind: "photo" }, // no caption/alt → count fallback
+      ],
+      quote: {
+        id: "999",
+        authorName: "Other Person",
+        authorHandle: "other",
+        text: "Quoted text",
+        media: [{ assetId: "m1", kind: "mosaic", photoCount: 4 }],
+      },
+    },
+  };
+  const media = [
+    asset({ id: "v1", mediaType: "video", mimeType: "video/mp4", caption: "An animated scene" }),
+    asset({ id: "p1", caption: "A close-up photo" }),
+    asset({ id: "p2" }), // no caption
+    asset({ id: "p3" }), // no caption
+    asset({ id: "m1", caption: "A four-panel collage" }),
+  ];
+  const out = renderCompactMessage(chatEvent({ linkPreviews: [xPreview(payload, media)] }));
+  assert.match(out, /video: An animated scene/);
+  assert.match(out, /photo: A close-up photo/);
+  assert.match(out, /photo: alt only/, "alt text used when no caption");
+  assert.match(out, /· 1 photo\b/, "caption-less photo folds into the count form");
+  assert.match(out, /mosaic\(4\): A four-panel collage/);
+  assert.ok(!out.includes("msg-attach"), "media paths still dropped in compact");
+});
+
+test("compact tier marks failed tweet media as unavailable", () => {
+  const payload: XTweetPayload = {
+    v: 1,
+    tweet: { ...BASE_PAYLOAD.tweet, media: [{ assetId: "x1", kind: "video" }] },
+  };
+  const media = [asset({ id: "x1", processing: { downloaded: false } })];
+  const out = renderCompactMessage(chatEvent({ linkPreviews: [xPreview(payload, media)] }));
+  assert.match(out, /video: \[media unavailable\]/);
+});
+
+test("compact tier bounds a tweet media caption at 200 chars", () => {
+  const payload: XTweetPayload = {
+    v: 1,
+    tweet: { ...BASE_PAYLOAD.tweet, media: [{ assetId: "p1", kind: "photo" }] },
+  };
+  const media = [asset({ id: "p1", caption: "z".repeat(500) })];
+  const out = renderCompactMessage(chatEvent({ linkPreviews: [xPreview(payload, media)] }));
+  const m = /photo: (z+\.\.\.)/.exec(out);
+  assert.ok(m, "caption present");
+  assert.equal(m[1].length, 200);
+});
+
 test("compact tier truncates tweet text at 280 and quote text at 140 chars", () => {
   const payload: XTweetPayload = {
     v: 1,
@@ -187,6 +245,21 @@ test("compact tier truncates tweet text at 280 and quote text at 140 chars", () 
   const quote = /quoting Other \(@other\): "(b+\.\.\.)"/.exec(out);
   assert.ok(quote, "quote text present");
   assert.equal(quote[1].length, 140);
+});
+
+test("compact reply context carries attachment captions and tweet previews", () => {
+  const out = renderCompactMessage(chatEvent({
+    replyTo: {
+      sender: { id: "@bob:example.org", displayName: "Bob" },
+      timestamp: 1_700_000_000_000,
+      body: "look",
+      attachments: [asset({ id: "r1", filename: "pic.jpg", caption: "a sunset" })],
+      linkPreviews: [xPreview(BASE_PAYLOAD)],
+    },
+  }));
+  assert.match(out, /Replying to:/);
+  assert.match(out, /\[attachment: pic\.jpg [^\]]*caption=a sunset\]/);
+  assert.match(out, /\[tweet: Frieren Daily \(@frieren\): "Tweet text here"\]/);
 });
 
 test("compact tier falls back to the generic [link:] form without a payload", () => {

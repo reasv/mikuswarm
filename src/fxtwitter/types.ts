@@ -9,6 +9,8 @@
  *    consumes.
  */
 
+import { STATUS_BASE_HOSTS } from "./url.js";
+
 /**
  * `link_previews.source_kind` value for FxTwitter-enriched X status previews.
  * Owned by the TS enrichment layer — the old Matrix-layer
@@ -168,6 +170,12 @@ export interface FxTwitterConfig {
   maxTextChars: number;
   preferMosaic: boolean;
   maxVideosPerTweet: number;
+  /**
+   * Base domains recognized as X status hosts: the built-in `STATUS_BASE_HOSTS`
+   * plus any `extra_status_hosts`. Passed to the url helpers by the enrichment
+   * worker and the `x_fetch` tool.
+   */
+  statusHosts: readonly string[];
   tool: FxTwitterToolConfig;
 }
 
@@ -178,6 +186,7 @@ export function resolveFxTwitterConfig(raw?: {
   max_text_chars?: number;
   prefer_mosaic?: boolean;
   max_videos_per_tweet?: number;
+  extra_status_hosts?: string[];
   tool?: {
     enabled?: boolean;
     default_max_chars?: number;
@@ -193,6 +202,7 @@ export function resolveFxTwitterConfig(raw?: {
     maxTextChars: raw?.max_text_chars ?? 2000,
     preferMosaic: raw?.prefer_mosaic ?? true,
     maxVideosPerTweet: raw?.max_videos_per_tweet ?? 4,
+    statusHosts: resolveStatusHosts(raw?.extra_status_hosts),
     tool: {
       enabled: raw?.tool?.enabled ?? true,
       defaultMaxChars: raw?.tool?.default_max_chars ?? 4000,
@@ -201,4 +211,21 @@ export function resolveFxTwitterConfig(raw?: {
       maxViewBlocks: raw?.tool?.max_view_blocks ?? 4,
     },
   };
+}
+
+/**
+ * Merge the deployment's `extra_status_hosts` into the built-in base set,
+ * lowercased and deduped (order: built-ins first, then extras).
+ */
+function resolveStatusHosts(extra?: string[]): readonly string[] {
+  if (!extra || extra.length === 0) return STATUS_BASE_HOSTS;
+  const seen = new Set(STATUS_BASE_HOSTS);
+  const merged = [...STATUS_BASE_HOSTS];
+  for (const raw of extra) {
+    const host = raw.trim().toLowerCase();
+    if (host.length === 0 || seen.has(host)) continue;
+    seen.add(host);
+    merged.push(host);
+  }
+  return merged;
 }

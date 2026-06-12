@@ -1206,6 +1206,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             maxImageBytes: resolveReadImageMaxBytes(config),
             inferenceImageOptions,
             config: fxTwitterConfig.tool,
+            statusHosts: fxTwitterConfig.statusHosts,
           })]
         : []),
       ...(config.image_gen

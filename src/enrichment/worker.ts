@@ -302,9 +302,9 @@ export class EnrichmentWorker {
     let xRefs: XStatusRef[] = [];
     let synapseBody = bodyText;
     if (fx) {
-      xRefs = extractXStatusUrls(bodyText);
+      xRefs = extractXStatusUrls(bodyText, fx.config.statusHosts);
       if (xRefs.length > 0) {
-        synapseBody = stripXStatusUrls(bodyText);
+        synapseBody = stripXStatusUrls(bodyText, fx.config.statusHosts);
         for (const ref of xRefs) this.xUrlExclusions.add(ref.rawUrl);
       }
       if (!fx.config.enabled) xRefs = [];

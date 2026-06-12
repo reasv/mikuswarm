@@ -194,6 +194,7 @@ fetch_timeout_ms = 15000
 max_text_chars = 2000                   # rich tier, per tweet node (text & community note each)
 prefer_mosaic = true                    # false → individual photo assets instead of the mosaic collage
 max_videos_per_tweet = 4                # per node (tweet and quote each); X's own per-post max
+extra_status_hosts = []                 # extra mirror base-domains (+ their subdomains), merged into the built-in set
 
 # The x_fetch tool: manual tweet fetching (web_fetch is blocked by X
 # server-side), paginated text plus list/download/view access to tweet media —
@@ -457,7 +458,13 @@ You are running a proactive check-in, not responding to anyone. Default to silen
 [agent.session_types.diary]
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]
-tools = ["diary_tool"]
+# diary_tool writes the entry; the rest are read/enrich escape hatches for when
+# the rendered context is insufficient — recover a tweet behind a [truncated]
+# hint or an enrichment mosaic (x_fetch), caption/load an aged-out or
+# never-captioned asset (media/read_image), or fetch a referenced URL
+# (mcp_exa_web_fetch_exa — the Exa MCP replacement for the disabled web_fetch;
+# inert where no Exa server is configured).
+tools = ["diary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
@@ -478,7 +485,12 @@ Use the diary_tool: `create` to start (the very first line MUST be the header ab
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
-tools = ["summary_tool"]
+# summary_tool writes the summary; the rest are read/enrich escape hatches for
+# content the rendered window cannot carry (truncated tweets, mosaic'd photos,
+# aged-out/never-captioned media, referenced URLs). mcp_exa_web_fetch_exa is the
+# Exa MCP fetch (web_fetch is intentionally globally disabled); inert where no
+# Exa server is configured.
+tools = ["summary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"]
 skills = "none"
 # Runaway loop-breakers (NOT a wall-clock timeout): high enough to never bite a
 # healthy run, low enough to break a degenerate loop. Hitting either aborts the
@@ -503,7 +515,9 @@ Guidelines:
 model = "default"
 workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
-tools = ["summary_tool"]
+# Condense operates over existing summary text (no raw media events in scope),
+# so it keeps only the URL-recovery hatches: x_fetch and the Exa MCP fetch.
+tools = ["summary_tool", "x_fetch", "mcp_exa_web_fetch_exa"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15

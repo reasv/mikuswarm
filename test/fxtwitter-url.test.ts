@@ -28,6 +28,62 @@ test("parseXStatusUrl recognizes FxTwitter share domains", () => {
   }
 });
 
+test("parseXStatusUrl recognizes the extended mirror domains", () => {
+  for (const host of [
+    "vxtwitter.com",
+    "pxtwitter.com",
+    "girlcockx.com",
+    "stupidpenisx.com",
+    "cunnyx.com",
+  ]) {
+    const parsed = parseXStatusUrl(`https://${host}/someone/status/123456`);
+    assert.ok(parsed, `recognizes ${host}`);
+    assert.equal(parsed.statusId, "123456");
+    assert.equal(parsed.canonicalUrl, "https://x.com/someone/status/123456");
+  }
+});
+
+test("parseXStatusUrl matches arbitrary subdomains of a recognized base", () => {
+  for (const url of [
+    "https://d.fxtwitter.com/u/status/777",
+    "https://g.fxtwitter.com/u/status/777",
+    "https://m.twitter.com/u/status/777",
+    "https://www.vxtwitter.com/u/status/777",
+  ]) {
+    assert.equal(parseXStatusUrl(url)?.statusId, "777", `recognizes ${url}`);
+  }
+});
+
+test("parseXStatusUrl does not false-positive on lookalike hosts", () => {
+  assert.equal(parseXStatusUrl("https://notfxtwitter.com/u/status/1"), null);
+  assert.equal(parseXStatusUrl("https://evilx.com/u/status/1"), null);
+  assert.equal(parseXStatusUrl("https://x.com.evil.com/u/status/1"), null);
+  assert.equal(parseXStatusUrl("https://fxtwitter.com.evil.com/u/status/1"), null);
+});
+
+test("parseXStatusUrl honors an extended bases set (extra_status_hosts)", () => {
+  const url = "https://newmirror.example/u/status/55";
+  assert.equal(parseXStatusUrl(url), null, "unknown by default");
+  const withExtra = parseXStatusUrl(url, ["x.com", "newmirror.example"]);
+  assert.equal(withExtra?.statusId, "55");
+  assert.equal(withExtra?.canonicalUrl, "https://x.com/u/status/55");
+  // Subdomain tolerance applies to extras too.
+  assert.equal(
+    parseXStatusUrl("https://a.newmirror.example/u/status/55", ["newmirror.example"])?.statusId,
+    "55",
+  );
+});
+
+test("extractXStatusUrls / stripXStatusUrls honor a custom bases set", () => {
+  const body = "x https://newmirror.example/u/status/9 y https://x.com/u/status/10";
+  const bases = ["x.com", "newmirror.example"];
+  const refs = extractXStatusUrls(body, bases);
+  assert.equal(refs.length, 2);
+  const stripped = stripXStatusUrls(body, bases);
+  assert.ok(!stripped.includes("newmirror.example"), "extra-host URL stripped");
+  assert.ok(!stripped.includes("x.com/u/status"), "x.com URL stripped");
+});
+
 test("parseXStatusUrl recognizes /i/status and /i/web/status forms", () => {
   const a = parseXStatusUrl("https://x.com/i/status/9000");
   assert.ok(a);

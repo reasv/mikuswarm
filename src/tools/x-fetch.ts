@@ -32,6 +32,8 @@ export interface XFetchToolContext {
   /** Shared inline-image conditioning options (same pipeline as danbooru preview). */
   inferenceImageOptions: ImageProcessingOptions;
   config: FxTwitterToolConfig;
+  /** Recognized X status base-domains (built-ins + extra_status_hosts). */
+  statusHosts: readonly string[];
 }
 
 function mediaSelectionSchema(description: string) {
@@ -84,7 +86,7 @@ export function createXFetchTool(context: XFetchToolContext): AgentTool {
     }),
     execute: async (_toolCallId, rawParams) => {
       const params = rawParams as XFetchParams;
-      const ref = parseXStatusUrl(params.url);
+      const ref = parseXStatusUrl(params.url, context.statusHosts);
       if (!ref) {
         throw new Error(
           "Not a recognizable X status URL. Pass an x.com/twitter.com status link, an FxTwitter share link, or a bare numeric status id.",
