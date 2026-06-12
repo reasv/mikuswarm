@@ -607,7 +607,39 @@ export function createManualResumeSession(
           timelineKey: row.timeline_key,
           fromStatus: row.status,
         });
-        const { outcome, error } = await deps.runAttempt(record, inbound);
+        // `runAttempt` (resumeSessionRun) returns a three-way outcome on the
+        // happy path, but its pre-run wiring — markRunning/attachAgent/
+        // attachSessionCapture — is NOT inside its own try/catch, so a throw
+        // there escapes here. If we let it propagate, the `finally` blocks below
+        // release the timeline slot and the in-flight guard, but the record we
+        // `adopt`ed stays in the SessionManager forever — `hasLiveSession` would
+        // then reject EVERY future resume of this session (console POST 500s)
+        // until restart. So an escaping throw must route to the SAME eviction
+        // path a `fatal` outcome takes (markDiscarded live, markFailedResumable
+        // while draining — both evict the in-memory record). Treating an escaped
+        // throw as `fatal` is correct: a thrown error here is our own code (not
+        // an LLM-layer outcome), exactly the `fatal` class.
+        let attemptResult: ResumeAttemptResult;
+        try {
+          attemptResult = await deps.runAttempt(record, inbound);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (deps.isDraining()) {
+            deps.markFailedResumable(sessionId, message);
+            return {
+              ok: false,
+              status: "failed-resumable",
+              reason: `resume threw during shutdown: ${message}`,
+            };
+          }
+          deps.markDiscarded(sessionId, message);
+          return {
+            ok: false,
+            status: "discarded",
+            reason: `resume threw before completing: ${message}`,
+          };
+        }
+        const { outcome, error } = attemptResult;
         switch (outcome) {
           case "completed":
             return { ok: true, status: "completed" };

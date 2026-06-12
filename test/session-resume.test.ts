@@ -738,6 +738,78 @@ test("manual resume: fatal on a live runtime discards; unresumable re-parks", as
   assert.deepEqual(unresumable.rec.parked, ["session row missing"]);
 });
 
+test("manual resume: runAttempt THROWING (pre-run wiring) evicts the adopted record so a retry is admitted (#11)", async () => {
+  // resumeSessionRun's markRunning/attachAgent/attachSessionCapture run OUTSIDE
+  // its own try/catch — a throw there escapes `runAttempt`. If the adopted
+  // record is not evicted, `hasLiveSession` rejects EVERY future resume of this
+  // session forever. Model live-ness off the SessionManager: adopt registers,
+  // markDiscarded/markFailedResumable evict.
+  let live = false;
+  const { deps, rec } = manualResumeHarness({
+    hasLiveSession: () => live,
+    adopt: (record) => {
+      rec.adopted.push(record);
+      live = true;
+    },
+    markDiscarded: (_id, error) => {
+      rec.discarded.push(error);
+      live = false;
+    },
+    markFailedResumable: (_id, error) => {
+      rec.parked.push(error);
+      live = false;
+    },
+    runAttempt: async (record, inbound) => {
+      rec.attempts.push({ record, inbound });
+      throw new Error("attachAgent blew up");
+    },
+  });
+  const resume = createManualResumeSession(deps);
+  const first = await resume("s-resume0001");
+  // Routed to the fatal/discard eviction path (live runtime).
+  assert.equal(first.ok, false);
+  assert.equal(first.status, "discarded");
+  assert.match(first.reason!, /resume threw before completing/);
+  assert.deepEqual(rec.discarded, ["attachAgent blew up"]);
+  assert.deepEqual(rec.parked, []);
+  // Slot + in-flight guard released regardless (finally blocks).
+  assert.deepEqual(rec.slotReleases, ["matrix:miku:room:!room"]);
+
+  // The record was evicted: a subsequent resume is NOT rejected as in-flight.
+  const second = await resume("s-resume0001");
+  assert.equal(second.status, "discarded", "admitted again — not wedged");
+  assert.equal(rec.attempts.length, 2, "second attempt actually ran");
+});
+
+test("manual resume: runAttempt throwing WHILE DRAINING re-parks (not discards) and still evicts (#11/#20)", async () => {
+  let live = false;
+  let draining = false;
+  const { deps, rec } = manualResumeHarness({
+    isDraining: () => draining,
+    hasLiveSession: () => live,
+    adopt: (record) => {
+      rec.adopted.push(record);
+      live = true;
+    },
+    markFailedResumable: (_id, error) => {
+      rec.parked.push(error);
+      live = false;
+    },
+    runAttempt: async (record, inbound) => {
+      rec.attempts.push({ record, inbound });
+      draining = true; // shutdown began mid-wiring
+      throw new Error("markRunning during shutdown");
+    },
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "failed-resumable");
+  assert.match(result.reason!, /resume threw during shutdown/);
+  assert.deepEqual(rec.parked, ["markRunning during shutdown"]);
+  assert.deepEqual(rec.discarded, [], "parked, never discarded while draining");
+  assert.equal(live, false, "record evicted");
+});
+
 test("manual resume: unparseable timeline key / unknown account rejects before the slot", async () => {
   const { deps, rec } = manualResumeHarness({
     getSessionRow: () => row({ timeline_key: "discord:guild:123" }),

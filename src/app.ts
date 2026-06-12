@@ -1490,12 +1490,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // for untagged errors (our own code throwing) below.
         if (isLlmRunFailure(error)) {
           const message = error instanceof Error ? error.message : String(error);
+          // Read the LIVE record's startedAt: `markRunning` set it on the map
+          // record, but `update()` swapped in a fresh object — the `session`
+          // const captured at launch is the original `createPlaceholder` object
+          // whose `startedAt` is forever undefined. Reading it here (before the
+          // markFailedResumable eviction below) measures elapsed run time from
+          // when the run actually began, excluding trigger-queue + context-build
+          // time. Fallback to `createdAt` only if the live record is somehow gone.
+          const startedAt = sessions.get(session.id)?.startedAt ?? session.createdAt;
           sessions.markFailedResumable(session.id, { error: message });
           logger.error("session_parked_failed_resumable", {
             sessionId: session.id,
             timelineKey: session.timelineKey,
             class: error.llmClass,
-            elapsedMs: Date.now() - (session.startedAt ?? session.createdAt),
+            elapsedMs: Date.now() - startedAt,
             error: message,
           });
           // §8.3: user-triggered sessions may announce the give-up; proactive
