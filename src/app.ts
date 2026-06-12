@@ -32,6 +32,7 @@ import {
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
+import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
 import {
   createBrowserTool,
@@ -74,7 +75,7 @@ import {
 } from "./tools/index.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { InboundChatEvent } from "./types.js";
+import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
@@ -799,11 +800,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // level-1 job the moment it crosses threshold. Fire-and-forget,
     // self-coalescing per timeline.
     summarizationIndexer?.enqueueReconcileTimeline(inbound.timelineKey);
-    if (steerReplyToActiveSession(inbound)) return;
-
+    // Nudge enrichment BEFORE the steer check: a steered reply still returns
+    // early below, but its persisted row needs resolving so a later context
+    // rebuild / summarization renders the quoted message (not the placeholder).
     if (enrichmentStatus === "pending") {
       enrichmentPool.notifyNewEvent(inbound.event.id);
     }
+
+    if (steerReplyToActiveSession(inbound)) return;
 
     if (!inbound.trigger) return;
 
@@ -1056,9 +1060,32 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     if (target?.timelineKey !== inbound.timelineKey) return false;
     if (!target?.agentSessionId || !activeIds.has(target.agentSessionId)) return false;
+
+    // The steered (injected) turn bypasses the trigger path's enrichment-readiness
+    // wait + hydrateEvents, so `inbound.event.replyTo` still carries only
+    // `externalId` and would render as "[original message unavailable]". We already
+    // resolved the replied-to message as `target`; hydrate it (captions / media
+    // paths) and fill the reply context from it so the interjection quotes the
+    // original message just like the normal trigger path would.
+    const [hydratedTarget] = hydrateEvents(storage, [target]);
+    const eventForRender: CanonicalChatEvent = {
+      ...inbound.event,
+      replyTo: {
+        ...inbound.event.replyTo,
+        externalId: replyExternalId,
+        sender: hydratedTarget.sender,
+        body: hydratedTarget.body,
+        htmlBody: hydratedTarget.htmlBody,
+        timestamp: hydratedTarget.timestamp,
+        attachments: hydratedTarget.attachments,
+        linkedMedia: hydratedTarget.linkedMedia,
+        linkPreviews: hydratedTarget.linkPreviews,
+      },
+    };
+
     const ok = sessions.steer(target.agentSessionId, {
       type: "interjection",
-      content: renderRichMessage(inbound.event),
+      content: renderRichMessage(eventForRender),
     });
     if (ok) {
       logger.info("reply_steered", {
