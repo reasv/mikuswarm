@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
-import type { LlmRequestRing } from "./request-ring.js";
+import type { LlmRequestRecord, LlmRequestRing } from "./request-ring.js";
 import type { PriorityClass } from "./scheduler.js";
 
 // =============================================================================
@@ -357,15 +357,20 @@ export function withRequestRetry(
         /* observe-only */
       }
     };
-    /** Record one settled attempt on the in-memory ring (spec §9.2). */
+    /**
+     * Record one settled attempt on the in-memory ring (spec §9.2). Returns the
+     * stored record object (or undefined when no ring is wired / it threw) so a
+     * caller can later mutate it in place — the ring keeps entries by reference,
+     * so an in-place update is reflected by `list()` without appending a row.
+     */
     const recordAttempt = (
       attempt: number,
       startedAt: number,
       outcome: "done" | "error" | "aborted",
       details?: { status?: number; cls?: LlmErrorClass; errorMessage?: string },
-    ): void => {
+    ): LlmRequestRecord | undefined => {
       try {
-        ctx.ring?.record({
+        const record: LlmRequestRecord = {
           ts: Date.now(),
           sessionId: ctx.sessionId,
           sessionType: ctx.sessionType,
@@ -379,9 +384,12 @@ export function withRequestRetry(
           status: details?.status,
           class: details?.cls,
           errorMessage: details?.errorMessage,
-        });
+        };
+        ctx.ring?.record(record);
+        return ctx.ring ? record : undefined;
       } catch {
         /* observe-only */
+        return undefined;
       }
     };
 
@@ -512,11 +520,16 @@ export function withRequestRetry(
               `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
             );
           }
-          recordAttempt(attempt + 1, attemptStart, verdict === "aborted" ? "aborted" : "error", {
-            status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
-            cls: verdict,
-            errorMessage: errorEvent.error?.errorMessage,
-          });
+          const attemptRecord = recordAttempt(
+            attempt + 1,
+            attemptStart,
+            verdict === "aborted" ? "aborted" : "error",
+            {
+              status: extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase()),
+              cls: verdict,
+              errorMessage: errorEvent.error?.errorMessage,
+            },
+          );
 
           if (verdict === "environmental") {
             // Every environmental failure is logged — including the first
@@ -582,10 +595,26 @@ export function withRequestRetry(
                   errorEvent.error?.errorMessage ?? "aborted",
                   "aborted",
                 );
-                recordAttempt(attempt + 1, attemptStart, "aborted", {
-                  cls: "aborted",
-                  errorMessage: aborted.error?.errorMessage,
-                });
+                // De-dupe (issue FU-B): this attempt's environmental wire result
+                // was ALREADY recorded on the ring before the backoff sleep. The
+                // drain landed during the inter-attempt wait — no NEW wire call
+                // happened — so the terminal disposition of the SAME attempt
+                // changed from environmental to aborted-on-drain. Update that row
+                // in place (the ring holds it by reference) rather than appending
+                // a duplicate row for the same attempt number.
+                if (attemptRecord) {
+                  attemptRecord.outcome = "aborted";
+                  attemptRecord.class = "aborted";
+                  attemptRecord.status = undefined;
+                  attemptRecord.errorMessage = aborted.error?.errorMessage;
+                  attemptRecord.ts = Date.now();
+                  attemptRecord.durationMs = Date.now() - attemptStart;
+                } else {
+                  recordAttempt(attempt + 1, attemptStart, "aborted", {
+                    cls: "aborted",
+                    errorMessage: aborted.error?.errorMessage,
+                  });
+                }
                 surface(aborted, "aborted");
                 return;
               }

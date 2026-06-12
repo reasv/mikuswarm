@@ -423,7 +423,9 @@ test("aborted admission wait synthesizes stopReason 'aborted' — no retry spin 
     admissionAttempts += 1;
     return admitted(model, context, streamOptions);
   };
-  const wrapped = withRequestRetry(counted, { retries: 4, backoffBaseMs: 1000, backoffMaxMs: 1000 });
+  // Large backoff so that IF a fatal abort were (wrongly) retried, the test
+  // would observe a slow backoff sleep — but `aborted` is fatal, so it must not.
+  const wrapped = withRequestRetry(counted, { backoffBaseMs: 1000, backoffMaxMs: 1000 });
 
   const controller = new AbortController();
   const out = wrapped(MODEL, [], { signal: controller.signal } as never);
@@ -453,7 +455,9 @@ test("scheduler-stopped admission failure is fatal — no retry spin at shutdown
     admissionAttempts += 1;
     return admitted(model, context, streamOptions);
   };
-  const wrapped = withRequestRetry(counted, { retries: 4, backoffBaseMs: 1000, backoffMaxMs: 1000 });
+  // Large backoff so a wrongful retry would manifest as a >500ms sleep; the
+  // assertion below proves the stopped gate is fatal and never re-enters backoff.
+  const wrapped = withRequestRetry(counted, { backoffBaseMs: 1000, backoffMaxMs: 1000 });
 
   const start = Date.now();
   const events = await drain(wrapped(MODEL, [], undefined as never));
@@ -479,7 +483,7 @@ test("composed with withRequestRetry, each attempt re-acquires (no slot held acr
   // Load-bearing order (§5.4): admission INSIDE retry.
   const wrapped = withRequestRetry(
     withSchedulerAdmission(base, scheduler, { group: "default", priority: "interactive" }),
-    { retries: 3, backoffBaseMs: 0, backoffMaxMs: 0 },
+    { backoffBaseMs: 0, backoffMaxMs: 0 },
   );
 
   const events = await drain(wrapped(MODEL, [], undefined as never));

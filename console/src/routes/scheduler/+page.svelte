@@ -21,12 +21,13 @@
 		refetchInterval: 5000
 	}));
 
-	const now = $derived(Date.now());
-
 	function fmtMs(ms: number): string {
 		if (ms < 1000) return `${Math.round(ms)}ms`;
 		if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-		return `${Math.round(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+		// Floor both components: rounding the minutes would render 95.3s as
+		// "2m35s" (should be "1m35s"), and rounding the seconds would render
+		// 119.6s as "1m60s".
+		return `${Math.floor(ms / 60_000)}m${Math.floor((ms % 60_000) / 1000)}s`;
 	}
 	function fmtCountdown(epochMs: number): string {
 		const delta = epochMs - Date.now();
@@ -69,7 +70,7 @@
 								{group.active.length}/{group.maxInFlight}
 							</span>
 						</div>
-						{#if group.backoffUntil > now}
+						{#if group.backoffUntil > 0}
 							<div class="mt-1 text-xs text-amber-500" title="throttle backoff (429/503)">
 								throttled — resumes in {fmtCountdown(group.backoffUntil)}
 							</div>

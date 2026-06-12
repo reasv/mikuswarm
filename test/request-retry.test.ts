@@ -18,6 +18,7 @@ import {
   withRequestRetry,
   LLM_REQUEST_FAILURE_MARKER,
 } from "../src/agent/request-retry.js";
+import { LlmRequestRing } from "../src/agent/request-ring.js";
 
 // ---------------------------------------------------------------------------
 // Layer-1 transparent request retry (spec CONCURRENCY-AND-RATE-LIMITING §6.1).
@@ -514,6 +515,33 @@ test("withRequestRetry: a ZERO-token attempt IS aborted at the deadline and park
   assert.match(err.errorMessage ?? "", /wall-clock budget/);
 });
 
+test("withRequestRetry: a CALLER abort during a HEALTHY token-producing attempt still aborts it (onCallerAbort survives detachBudget) (spec §6 / drain)", async () => {
+  // The dual of the immunity tests above. A token arrives first, so the budget
+  // listener is DETACHED and the attempt is budget-immune. The caller (a pool
+  // drain / operator Stop) then aborts mid-stream — and that MUST still reach
+  // the inner stream and abort it. The fix that makes a token-producing attempt
+  // budget-immune detaches ONLY the budget listener; the caller's abort listener
+  // must remain wired, or a drained/stopped healthy stream would run forever.
+  // A generous budget (never fires) isolates the caller-abort path.
+  const stream = lateStream({ firstEvent: textDeltaEvent("streaming"), holdMs: 10_000 });
+  const controller = new AbortController();
+  const wrapped = withRequestRetry(stream.fn, { maxWaitMs: 10_000, ...FAST });
+  const out = wrapped(MODEL, CONTEXT, { signal: controller.signal } as never);
+  // Abort well after the first token (attempt is immune) but long before holdMs.
+  setTimeout(() => controller.abort(), 30);
+  const events = await drain(out);
+  assert.equal(stream.aborted(), true, "the caller's abort reached the immune, token-producing attempt");
+  assert.equal(stream.calls(), 1, "no retry — an abort is never retried");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(err.stopReason, "aborted", "a caller abort surfaces an abort, not wait-exhaustion");
+  assert.equal(
+    extractLlmRequestClass(err.errorMessage),
+    "aborted",
+    "the class marker is `aborted` so the run is treated as a drain/Stop, not parked",
+  );
+});
+
 test("withRequestRetry: budget expiry mid-ADMISSION-wait aborts the acquire (zero-token) (spec §6 / #3)", async () => {
   // Model the admission wait: `base` blocks inside `await base(...)` (before any
   // event) until the signal fires. A budget expiry here MUST abort the acquire
@@ -646,6 +674,34 @@ test("withRequestRetry: a caller abort landing DURING the backoff sleep surfaces
       "aborted",
       "the class marker is `aborted` so wasRunAborted() reads true and drain compensation fires",
     );
+  });
+});
+
+test("withRequestRetry: a caller abort mid-backoff records ONE ring row for the attempt, not two (FU-B)", async () => {
+  // The pre-sleep environmental result of the attempt is recorded on the ring
+  // BEFORE the backoff sleep. When a caller abort then lands mid-sleep, the
+  // attempt's terminal disposition changes to aborted-on-drain — but no NEW wire
+  // call happened, so the ring must show ONE row for that attempt number, updated
+  // in place to `aborted`, NOT a second appended row.
+  await withPinnedRandom(0.999, async () => {
+    const ring = new LlmRequestRing(16);
+    const controller = new AbortController();
+    const { fn } = scriptedBase([
+      { events: [errorEvent("503 unavailable")] },
+      { events: [startEvent(), textDeltaEvent("should-not-appear"), doneEvent()] },
+    ]);
+    const wrapped = withRequestRetry(fn, { backoffBaseMs: 200, backoffMaxMs: 200 }, { ring });
+    const out = wrapped(MODEL, CONTEXT, { signal: controller.signal } as never);
+    setTimeout(() => controller.abort(), 40);
+    const events = await drain(out);
+    assert.equal((events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error.stopReason, "aborted");
+
+    const rows = ring.list();
+    assert.equal(rows.length, 1, "exactly one ring row for the single attempt — no duplicate");
+    assert.equal(rows[0]!.attempt, 1);
+    assert.equal(rows[0]!.outcome, "aborted", "the row was updated in place to the terminal aborted outcome");
+    assert.equal(rows[0]!.class, "aborted");
+    assert.equal(rows[0]!.status, undefined, "the stale environmental 503 status was cleared");
   });
 });
 
