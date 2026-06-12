@@ -6,8 +6,8 @@
 	import PreviewBanner from './PreviewBanner.svelte';
 
 	// `mode` drives default expansion (spec §10a vs §10b): `room` collapses only
-	// system/satellite; `session` also collapses earlier summary/compact/rich tiers so
-	// the captured prefix doesn't bury the rollout below it. Defaults to `room`.
+	// system/satellite/diary; `session` also collapses earlier summary/compact/rich
+	// tiers so the captured prefix doesn't bury the rollout below it. Defaults to `room`.
 	let {
 		messages,
 		mode = 'room'

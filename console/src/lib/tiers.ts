@@ -13,6 +13,7 @@ export interface TierMeta {
 
 const TIERS: Record<string, TierMeta> = {
 	system: { label: 'system', accent: 'border-l-zinc-400 text-zinc-500' },
+	diary: { label: 'diary', accent: 'border-l-teal-400 text-teal-500' },
 	summary: { label: 'summary', accent: 'border-l-violet-400 text-violet-500' },
 	compact: { label: 'compact', accent: 'border-l-sky-400 text-sky-500' },
 	rich: { label: 'rich', accent: 'border-l-emerald-400 text-emerald-500' },
@@ -29,8 +30,8 @@ export function tierMeta(tier: Tier): TierMeta {
 
 /**
  * Verbatim renderer mode (spec §10):
- * - `room`   — §10a: the live `build()` output; only the system prompt and the
- *   `<system>` satellite block collapse by default.
+ * - `room`   — §10a: the live `build()` output; only the system prompt, the
+ *   `<system>` satellite block and the diary layer collapse by default.
  * - `session`— §10b: the captured input context above a session rollout; the final
  *   user turn / trigger stays expanded, while earlier tiers (summary/compact/rich)
  *   AND system/satellite collapse by default so the long prefix doesn't bury the
@@ -44,23 +45,27 @@ export interface CollapsibleMessage {
 	tier?: Tier;
 }
 
-/** The earlier-context tiers that collapse by default in session mode (spec §10b). */
+/**
+ * The earlier-context tiers that collapse by default in session mode (spec §10b).
+ * `diary` is absent because it collapses in BOTH modes (handled in `isCollapsible`).
+ */
 const SESSION_COLLAPSED_TIERS = new Set(['summary', 'compact', 'rich', 'mixed']);
 
 /**
- * Whether a verbatim message renders with a collapse toggle. System prompt and the
- * `<system>` satellite block always get the affordance (both modes, spec §10a). In
- * session mode the earlier summary/compact/rich tiers also become collapsible so the
- * captured prefix can be folded away (spec §10b).
+ * Whether a verbatim message renders with a collapse toggle. System prompt, the
+ * `<system>` satellite block, and the diary layer always get the affordance (both
+ * modes, spec §10a) — the diary layer is a large static blob like the system prompt,
+ * not part of the conversation. In session mode the earlier summary/compact/rich
+ * tiers also become collapsible so the captured prefix can be folded away (spec §10b).
  */
 export function isCollapsible(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
-	if (msg.type === 'system' || msg.type === 'satellite') return true;
+	if (msg.type === 'system' || msg.type === 'satellite' || msg.tier === 'diary') return true;
 	if (mode === 'session') return SESSION_COLLAPSED_TIERS.has(msg.tier ?? '');
 	return false;
 }
 
 /**
- * Default `open` state for a collapsible verbatim message. System/satellite start
+ * Default `open` state for a collapsible verbatim message. System/satellite/diary start
  * collapsed in both modes; in session mode the earlier tiers also start collapsed,
  * while the final user turn / trigger stays expanded (spec §10a/§10b). Non-collapsible
  * messages are always open.

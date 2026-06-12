@@ -5,6 +5,7 @@ describe('tierMeta', () => {
 	it('returns metadata for known tiers', () => {
 		expect(tierMeta('summary').label).toBe('summary');
 		expect(tierMeta('rich').label).toBe('rich');
+		expect(tierMeta('diary').label).toBe('diary');
 	});
 
 	it('falls back for unknown / null tiers', () => {
@@ -18,9 +19,11 @@ describe('verbatim collapse defaults', () => {
 	const msg = (m: CollapsibleMessage): CollapsibleMessage => m;
 
 	describe('room mode (§10a)', () => {
-		it('collapses only system and satellite', () => {
+		it('collapses only system, satellite and the diary layer', () => {
 			expect(isCollapsible(msg({ type: 'system', tier: 'system' }), 'room')).toBe(true);
 			expect(isCollapsible(msg({ type: 'satellite', tier: 'mixed' }), 'room')).toBe(true);
+			expect(isCollapsible(msg({ type: 'diaryLayer', tier: 'diary' }), 'room')).toBe(true);
+			expect(defaultOpen(msg({ type: 'diaryLayer', tier: 'diary' }), 'room')).toBe(false);
 		});
 
 		it('keeps summary/compact/rich tiers expanded', () => {
@@ -48,6 +51,11 @@ describe('verbatim collapse defaults', () => {
 				expect(isCollapsible(msg({ type: 'chatEvent', tier }), 'session')).toBe(true);
 				expect(defaultOpen(msg({ type: 'chatEvent', tier }), 'session')).toBe(false);
 			}
+		});
+
+		it('collapses the diary layer by default', () => {
+			expect(isCollapsible(msg({ type: 'diaryLayer', tier: 'diary' }), 'session')).toBe(true);
+			expect(defaultOpen(msg({ type: 'diaryLayer', tier: 'diary' }), 'session')).toBe(false);
 		});
 
 		it('keeps the final user turn / trigger expanded', () => {
