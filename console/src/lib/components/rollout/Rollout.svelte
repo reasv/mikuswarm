@@ -5,8 +5,10 @@
 		collectToolResults,
 		contentText,
 		isInjectedUserTurn,
+		messageUsage,
 		type RolloutMsg
 	} from '$lib/rollout';
+	import { formatTokens, formatUsd } from '$lib/format';
 	import AssistantTextCard from './AssistantTextCard.svelte';
 	import ThinkingCard from './ThinkingCard.svelte';
 	import ToolCallCard from './ToolCallCard.svelte';
@@ -34,6 +36,22 @@
 					/>
 				{/if}
 			{/each}
+			<!-- Per-request usage (spec TOKEN-USAGE-TRACKING §7.3): attached once at the
+			     assistant-message group level, since the usage belongs to the request that
+			     produced the whole message. `ctx` is that request's totalTokens (the context
+			     size reached at this point). Messages without real usage render nothing. -->
+			{@const u = messageUsage(msg)}
+			{#if u}
+				<div
+					class="px-1 font-mono text-[10px] tabular-nums text-muted-foreground"
+					title={`context ${u.totalTokens} tokens · input ${u.input} · output ${u.output} · cache read ${u.cacheRead} · cache write ${u.cacheWrite} · cost ${u.cost}`}
+				>
+					ctx {formatTokens(u.totalTokens)} · in {formatTokens(u.input)} · out {formatTokens(
+						u.output
+					)} · cr {formatTokens(u.cacheRead)} · cw {formatTokens(u.cacheWrite)}{#if u.cost > 0}
+						· {formatUsd(u.cost)}{/if}
+				</div>
+			{/if}
 		{:else if isInjectedUserTurn(msg)}
 			<!-- Injected user turns: interjections carry no `role` (just
 			     `{ type:'interjection', content }`, see src/agent/messages.ts), while

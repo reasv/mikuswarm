@@ -30,6 +30,20 @@ export interface LlmRequestRecord {
   status?: number;
   class?: LlmErrorClass;
   errorMessage?: string;
+  /**
+   * Usage of the committed response (spec TOKEN-USAGE-TRACKING §3.2). Present on
+   * `done` outcomes only; ABSENT on error/aborted (their usage is stub zeros, so
+   * absence means "not a committed response" rather than a misleading 0). `cost`
+   * is `usage.cost.total` (USD).
+   */
+  usage?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    totalTokens: number;
+    cost: number;
+  };
 }
 
 export const DEFAULT_LLM_REQUEST_RING_SIZE = 500;

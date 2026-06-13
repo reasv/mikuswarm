@@ -5,6 +5,7 @@
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
+	import { formatTokens, formatUsd } from '$lib/format';
 
 	// Scheduler view (spec LLM-FAILURE-HANDLING §9.1): "who is waiting on what,
 	// and which model is down" — group budget cards beside model health badges,
@@ -210,6 +211,9 @@
 							<th class="pr-3 font-normal">att</th>
 							<th class="pr-3 font-normal">queue</th>
 							<th class="pr-3 font-normal">total</th>
+							<th class="pr-3 font-normal">ctx</th>
+							<th class="pr-3 font-normal">tok</th>
+							<th class="pr-3 font-normal">cost</th>
 							<th class="font-normal">outcome</th>
 						</tr>
 					</thead>
@@ -226,6 +230,20 @@
 								<td class="pr-3">{request.attempt}</td>
 								<td class="pr-3">{request.admissionWaitMs != null ? fmtMs(request.admissionWaitMs) : '—'}</td>
 								<td class="pr-3">{fmtMs(request.durationMs)}</td>
+								<!-- Usage columns (spec TOKEN-USAGE-TRACKING §7.4): committed (done)
+								     rows only; ctx = context size, tok = in/out summary, cost = USD. -->
+								<td class="pr-3 tabular-nums">{request.usage ? formatTokens(request.usage.totalTokens) : '—'}</td>
+								<td
+									class="pr-3 tabular-nums"
+									title={request.usage
+										? `input ${request.usage.input} · output ${request.usage.output} · cache read ${request.usage.cacheRead} · cache write ${request.usage.cacheWrite}`
+										: undefined}
+								>
+									{request.usage
+										? `${formatTokens(request.usage.input)}/${formatTokens(request.usage.output)}`
+										: '—'}
+								</td>
+								<td class="pr-3 tabular-nums">{request.usage ? formatUsd(request.usage.cost) : '—'}</td>
 								<td
 									class={cn(
 										request.outcome === 'done'

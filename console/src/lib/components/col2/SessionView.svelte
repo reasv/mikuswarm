@@ -8,6 +8,7 @@
 	import { selection } from '$lib/stores/selection.svelte';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
+	import { formatTokens, formatUsd } from '$lib/format';
 	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
 	import VerbatimContext from '$lib/components/verbatim/VerbatimContext.svelte';
@@ -154,6 +155,19 @@
 			!SYNTHETIC_SESSION_TYPES.has(session.data?.session.sessionType ?? '')
 	);
 
+	// Session-level actuals (spec TOKEN-USAGE-TRACKING §7.2). Present once the
+	// session has committed a request; `usage` is null before that / on legacy rows.
+	const actuals = $derived.by(() => {
+		const s = session.data?.session;
+		if (!s || !s.usage) return null;
+		return {
+			contextTokens: s.contextTokens ?? null,
+			maxContextTokens: s.maxContextTokens ?? null,
+			llmRequests: s.llmRequests ?? 0,
+			usage: s.usage
+		};
+	});
+
 	$effect(() => {
 		const d = session.data;
 		// The conversations top-bar summary belongs to the Conversations area only;
@@ -217,6 +231,28 @@
 				</Button>
 			{/if}
 		</div>
+		{#if actuals}
+			<!-- Session-level actuals (spec TOKEN-USAGE-TRACKING §7.2): current context
+			     size (emphasized, with the effective limit when set) + cumulative
+			     consumption + request count. Clearly distinct from the frozen-prefix
+			     estimate shown in the top bar. -->
+			<div
+				class="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b bg-background/60 px-3 py-1 font-mono text-[10px] tabular-nums text-muted-foreground"
+				title={`actual context ${actuals.contextTokens ?? 'unknown'} tokens${actuals.maxContextTokens ? ` / limit ${actuals.maxContextTokens}` : ''} · input ${actuals.usage.input} · output ${actuals.usage.output} · cache read ${actuals.usage.cacheRead} · cache write ${actuals.usage.cacheWrite} · cost ${actuals.usage.cost} · ${actuals.llmRequests} committed requests`}
+			>
+				<span class="font-semibold text-foreground">
+					ctx {formatTokens(actuals.contextTokens)}{#if actuals.maxContextTokens}
+						/ {formatTokens(actuals.maxContextTokens)}{/if}
+				</span>
+				<span>·</span>
+				<span>in {formatTokens(actuals.usage.input)}</span>
+				<span>· out {formatTokens(actuals.usage.output)}</span>
+				<span>· cr {formatTokens(actuals.usage.cacheRead)}</span>
+				<span>· cw {formatTokens(actuals.usage.cacheWrite)}</span>
+				{#if actuals.usage.cost > 0}<span>· {formatUsd(actuals.usage.cost)}</span>{/if}
+				<span>· {actuals.llmRequests} req</span>
+			</div>
+		{/if}
 		{#if isRunning && activeId}
 			{#key activeId}
 				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} onHead={(h) => (liveHead = h)} />

@@ -64,6 +64,9 @@ function sessionInsert(overrides: Partial<AgentSessionInsert> = {}): AgentSessio
 function stubFactory(preview: PreviewContext): AgentSessionFactory {
   return {
     buildPreview: async () => preview,
+    // sessionMeta resolves the effective context-token ceiling from config
+    // (spec TOKEN-USAGE-TRACKING §7.2); unenforced in these fixtures.
+    resolveEffectiveMaxContextTokens: () => null,
   } as unknown as AgentSessionFactory;
 }
 
@@ -71,6 +74,8 @@ const throwingFactory = {
   buildPreview: () => {
     throw new Error("buildPreview should not be called in this test");
   },
+  // Exercised by the session list/detail routes via sessionMeta; unenforced here.
+  resolveEffectiveMaxContextTokens: () => null,
 } as unknown as AgentSessionFactory;
 
 async function withServer(

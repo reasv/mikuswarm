@@ -1,5 +1,6 @@
 import {
   createAssistantMessageEventStream,
+  isContextOverflow,
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
@@ -104,6 +105,28 @@ export interface RequestRetryContext {
    * `withSchedulerAdmission`'s `onAdmissionWait` via a factory-owned holder.
    */
   takeAdmissionWaitMs?: () => number | undefined;
+  /**
+   * Fired once per COMMITTED request (spec TOKEN-USAGE-TRACKING §3.1), with the
+   * terminal `done` event's AssistantMessage (authoritative usage). Best-effort:
+   * exceptions are swallowed; the hook can never affect the run. NOT fired for
+   * terminal errors (their usage is stub zeros) nor for discarded attempts —
+   * this is the single authoritative usage capture point, distinct from the
+   * observe-only `onAttemptEvent` tap (which also fires for discarded attempts).
+   */
+  onRequestCommitted?: (message: AssistantMessage) => void;
+  /**
+   * Pre-flight context-budget check (spec TOKEN-USAGE-TRACKING §6.2). Evaluated
+   * ONCE per request, before the first attempt (every Layer-0 attempt replays
+   * the identical context, so per-attempt re-checking is meaningless). Returns a
+   * violation message when the session must not issue this request (its observed
+   * context already exceeds the effective limit); undefined otherwise. On a
+   * violation the wrapper synthesizes a terminal error with that message,
+   * classified `content` (deterministic on replay), and surfaces it WITHOUT
+   * consuming any retry budget — reusing the content-class park/notice/worker-
+   * retry machinery end to end. The hook owns its own logging (it has the
+   * observed/limit numbers).
+   */
+  checkContextBudget?: () => string | undefined;
 }
 
 /**
@@ -247,6 +270,28 @@ export function classifyLlmError(
   const status = extractStatus(msg);
   if (status !== undefined && CONTENT_STATUSES.has(status)) return "content";
   if (CONTENT_KEYWORDS.some((keyword) => msg.includes(keyword))) return "content";
+  // Augment the hand-rolled keyword list with pi-ai's curated cross-provider
+  // overflow-pattern set (spec TOKEN-USAGE-TRACKING §6.3): a provider-side
+  // context-overflow rejection from any supported gateway classifies `content`
+  // too (today only a few phrasings are recognized). Its NON_OVERFLOW_PATTERNS
+  // exclude rate-limit phrasings, so a 429 carrying "too many tokens"-adjacent
+  // text is not misread as overflow. We pass the ORIGINAL (non-lowercased)
+  // message — the patterns are case-insensitive but expect provider-native text.
+  if (
+    isContextOverflow({
+      role: "assistant",
+      api: "anthropic-messages",
+      provider: "unknown",
+      model: "unknown",
+      stopReason: "error",
+      errorMessage: errorMessage ?? "",
+      content: [],
+      timestamp: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    })
+  ) {
+    return "content";
+  }
   return "environmental";
 }
 
@@ -367,7 +412,12 @@ export function withRequestRetry(
       attempt: number,
       startedAt: number,
       outcome: "done" | "error" | "aborted",
-      details?: { status?: number; cls?: LlmErrorClass; errorMessage?: string },
+      details?: {
+        status?: number;
+        cls?: LlmErrorClass;
+        errorMessage?: string;
+        usage?: LlmRequestRecord["usage"];
+      },
     ): LlmRequestRecord | undefined => {
       try {
         const record: LlmRequestRecord = {
@@ -384,6 +434,7 @@ export function withRequestRetry(
           status: details?.status,
           class: details?.cls,
           errorMessage: details?.errorMessage,
+          usage: details?.usage,
         };
         ctx.ring?.record(record);
         return ctx.ring ? record : undefined;
@@ -403,6 +454,23 @@ export function withRequestRetry(
 
     void (async () => {
       try {
+        // Pre-flight context-budget check (spec TOKEN-USAGE-TRACKING §6.2):
+        // evaluated ONCE, before any attempt. A violation pre-empts the request
+        // — it synthesizes a `content`-class terminal error (the same shape a
+        // provider "prompt is too long" rejection takes, which it pre-empts) and
+        // surfaces it without consuming retry budget. The hook logs the
+        // observed/limit numbers itself; here we only record + surface.
+        const budgetViolation = ctx.checkContextBudget?.();
+        if (budgetViolation !== undefined) {
+          const violationStart = Date.now();
+          const errorEvent = synthesizeErrorEvent(model, budgetViolation, "error");
+          recordAttempt(1, violationStart, "error", {
+            cls: "content",
+            errorMessage: budgetViolation,
+          });
+          surface(errorEvent, "content");
+          return;
+        }
         for (let attempt = 0; ; attempt++) {
           const attemptStart = Date.now();
           const buffered: AssistantMessageEvent[] = [];
@@ -486,7 +554,31 @@ export function withRequestRetry(
               // Flushing forwards the terminal event last, which finalizes
               // `outer` (EventStream.push resolves on it). A success after N
               // failed attempts is byte-equivalent to a first-attempt success.
-              recordAttempt(attempt + 1, attemptStart, "done");
+              //
+              // THE commit point (spec TOKEN-USAGE-TRACKING §3.1): the terminal
+              // message carries authoritative usage. Record it on the ring and
+              // fire the per-request capture hook (best-effort) before flushing.
+              const committed = terminal.message;
+              const usage = committed?.usage;
+              recordAttempt(attempt + 1, attemptStart, "done", {
+                usage: usage
+                  ? {
+                      input: usage.input,
+                      output: usage.output,
+                      cacheRead: usage.cacheRead,
+                      cacheWrite: usage.cacheWrite,
+                      totalTokens: usage.totalTokens,
+                      cost: usage.cost?.total ?? 0,
+                    }
+                  : undefined,
+              });
+              if (committed) {
+                try {
+                  ctx.onRequestCommitted?.(committed);
+                } catch {
+                  /* best-effort: the capture hook can never affect the run */
+                }
+              }
               flush(outer, buffered);
               return;
             }

@@ -61,7 +61,7 @@ export function roomSessions(
 ): void {
   const sessions = ctx.deps.storage
     .getAgentSessionsByTimeline(ctx.params.key)
-    .map(sessionMeta);
+    .map((row) => sessionMeta(row, ctx.deps.factory));
   sendJson(res, 200, { sessions });
 }
 
@@ -94,7 +94,7 @@ export function sessionDetail(
   if (!row) return sendError(res, 404, `Unknown session: ${ctx.params.id}`);
   const transcript = parseJsonArray(row.transcript_json);
   sendJson(res, 200, {
-    session: sessionMeta(row),
+    session: sessionMeta(row, ctx.deps.factory),
     // Normalize to the same wire shape as the room-context endpoint: the
     // persisted snapshot is raw ContextMessage JSON whose optional keys
     // (timestamp/tier/imageBlocks) were dropped by serialization, but the
@@ -387,8 +387,21 @@ export function summaryDetail(
 
 // --- helpers ---------------------------------------------------------------
 
-/** Project a stored session row into the camelCase list/meta shape (spec §8). */
-function sessionMeta(row: AgentSessionRow): Record<string, unknown> {
+/**
+ * Project a stored session row into the camelCase list/meta shape (spec §8).
+ *
+ * Token usage (spec TOKEN-USAGE-TRACKING §7.1): `tokenEstimate` is the
+ * frozen-prefix ESTIMATE (unchanged, kept clearly separate); the new fields are
+ * unmistakably ACTUALS. `usage` is null when no request committed yet (legacy
+ * rows / pre-first-commit). `maxContextTokens` is the session's effective
+ * ceiling resolved from CURRENT config (Decision D7 — NOT persisted per
+ * session), or null when unenforced.
+ */
+function sessionMeta(
+  row: AgentSessionRow,
+  factory: RequestContext["deps"]["factory"],
+): Record<string, unknown> {
+  const hasUsage = row.llm_requests !== null;
   return {
     id: row.id,
     timelineKey: row.timeline_key,
@@ -399,6 +412,20 @@ function sessionMeta(row: AgentSessionRow): Record<string, unknown> {
     triggerExternalId: row.trigger_external_id,
     triggerBody: row.trigger_body,
     tokenEstimate: row.token_estimate,
+    // Actuals (§7.1). `usage` groups the four consumption values + cost; absent
+    // (null) means "no committed request yet", distinct from an all-zero usage.
+    llmRequests: row.llm_requests,
+    usage: hasUsage
+      ? {
+          input: row.usage_input_tokens ?? 0,
+          output: row.usage_output_tokens ?? 0,
+          cacheRead: row.usage_cache_read_tokens ?? 0,
+          cacheWrite: row.usage_cache_write_tokens ?? 0,
+          cost: row.usage_cost ?? 0,
+        }
+      : null,
+    contextTokens: row.context_tokens,
+    maxContextTokens: factory.resolveEffectiveMaxContextTokens(row.session_type),
     noReply: row.no_reply === 1,
     error: row.error,
     createdAt: row.created_at,

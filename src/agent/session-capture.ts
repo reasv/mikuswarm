@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { ContextMessage } from "../context/builder.js";
+import type { SessionUsageTracker } from "./usage.js";
 import { redactSecrets } from "../config/redaction.js";
 
 /**
@@ -23,6 +24,22 @@ export interface SessionCaptureContext {
   tokenEstimate?: number;
   /** context_dump_path for parity; may be undefined. */
   dumpPath?: string;
+  /**
+   * Per-session-run usage accumulator (spec TOKEN-USAGE-TRACKING §4.3). When
+   * provided, the session's actuals aggregate is persisted on every committed
+   * request via a tracker subscription (`onUpdate` → `updateAgentSessionUsage`),
+   * unsubscribed on {@link SessionCaptureHandle.detach}. Absent (tests/headless)
+   * = no usage persistence.
+   */
+  usage?: SessionUsageTracker;
+  /**
+   * Attribution for the `session_usage` settle log (spec TOKEN-USAGE-TRACKING
+   * §8): one greppable line at detach carrying the totals snapshot. Optional —
+   * absent fields are simply omitted from the log.
+   */
+  timelineKey?: string;
+  sessionType?: string;
+  model?: string;
   logger?: Logger;
 }
 
@@ -384,8 +401,34 @@ export function attachSessionCapture(
     await flushTranscript(agent.state.messages, event.type);
   });
 
+  // 3. Usage actuals (spec TOKEN-USAGE-TRACKING §4.3): persist the session-level
+  // aggregate on every committed request. The tracker fires `onUpdate` once per
+  // commit; sessions make single-digit-to-low-tens of requests, so one enqueued
+  // write per commit is negligible (no debounce). The write is fire-and-forget
+  // on the single-writer queue; an error there is logged by the storage layer.
+  const unsubscribeUsage = ctx.usage?.onUpdate((totals) => {
+    void ctx.storage.updateAgentSessionUsage(ctx.sessionId, totals);
+  });
+
   return {
-    detach: unsubscribe,
+    detach: () => {
+      unsubscribe();
+      unsubscribeUsage?.();
+      // Settle log (spec TOKEN-USAGE-TRACKING §8): one greppable line per
+      // session run at detach, carrying the final totals snapshot. Detach is
+      // called in every run path's finally (completed / parked / interrupted /
+      // worker finalize/failure), so this fires uniformly. Only emitted when a
+      // usage tracker was wired (tests/headless skip it).
+      if (ctx.usage && ctx.logger) {
+        ctx.logger.info("session_usage", {
+          sessionId: ctx.sessionId,
+          timelineKey: ctx.timelineKey,
+          sessionType: ctx.sessionType,
+          model: ctx.model,
+          ...ctx.usage.snapshot(),
+        });
+      }
+    },
     // One-shot best-effort flush of the current live messages (issue #1).
     flushNow: () => flushTranscript(agent.state.messages, "flushNow"),
   };

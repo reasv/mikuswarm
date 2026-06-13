@@ -474,6 +474,12 @@ tools = ["diary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
+# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): conservative bound on a
+# runaway diary session — enforced on ACTUALS (provider-reported context size of
+# the last committed request), composed with the model's own limit via min().
+# Well above a healthy diary run's seed (single-digit k) yet far under the model
+# context_window (128000); set explicitly per the explicit-deployment-config rule.
+max_context_tokens = 60000
 session_instruction = """
 You are writing in your own first-person diary. The conversation you are writing about is the stretch of chat from {{room}} shown above as regular messages (summaries of earlier history may precede it, for continuity). In <your_recent_memory> you can see your existing recent diary entries (read-only, for continuity).
 
@@ -503,6 +509,11 @@ skills = "none"
 # run → the pool's catch → failure → retry path.
 max_tool_calls = 30
 max_turns = 15
+# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): bounds a runaway
+# summarization session on ACTUALS; min()-composed with the model limit. A
+# breach fails the session → the pool's semantic-retry path → a fresh attempt
+# rebuilds context from scratch. See the diary block above for the rationale.
+max_context_tokens = 60000
 session_instruction = """
 You are performing a summarization task. Summarize the chat messages visible at the end of your context — everything from the latest previous summary (or the beginning, if none) to the most recent message shown.
 
@@ -527,6 +538,9 @@ tools = ["summary_tool", "x_fetch", "mcp_exa_web_fetch_exa"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
+# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): same conservative bound
+# as summarize — enforced on actuals, min()-composed with the model limit.
+max_context_tokens = 60000
 session_instruction = """
 You are condensing several lower-level summaries into a single higher-level summary. The summaries to condense are shown at the end of your context, in chronological order.
 

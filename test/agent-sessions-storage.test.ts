@@ -152,6 +152,14 @@ test("fresh DB has agent_sessions table: insert + getAgentSession round-trips", 
     assert.equal(row.context_dump_path, null);
     assert.equal(row.transcript_json, null);
     assert.equal(row.token_estimate, null);
+    // Actuals columns (v20) unset on a fresh row read as "unknown" (null).
+    assert.equal(row.llm_requests, null);
+    assert.equal(row.usage_input_tokens, null);
+    assert.equal(row.usage_output_tokens, null);
+    assert.equal(row.usage_cache_read_tokens, null);
+    assert.equal(row.usage_cache_write_tokens, null);
+    assert.equal(row.usage_cost, null);
+    assert.equal(row.context_tokens, null);
     assert.equal(row.no_reply, 0);
     assert.equal(row.error, null);
     assert.equal(row.created_at, 1_000);
@@ -164,6 +172,41 @@ test("fresh DB has agent_sessions table: insert + getAgentSession round-trips", 
 test("getAgentSession returns undefined for a missing id", async () => {
   await withStorage(async (storage) => {
     assert.equal(storage.getAgentSession("s-missing"), undefined);
+  });
+});
+
+test("updateAgentSessionUsage persists the actuals aggregate (v20)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+    await storage.updateAgentSessionUsage("s-abc1234567", {
+      llmRequests: 7,
+      inputTokens: 1234,
+      outputTokens: 5678,
+      cacheReadTokens: 132_000,
+      cacheWriteTokens: 8100,
+      cost: 0.0182,
+      contextTokens: 46_300,
+    });
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.ok(row);
+    assert.equal(row.llm_requests, 7);
+    assert.equal(row.usage_input_tokens, 1234);
+    assert.equal(row.usage_output_tokens, 5678);
+    assert.equal(row.usage_cache_read_tokens, 132_000);
+    assert.equal(row.usage_cache_write_tokens, 8100);
+    assert.ok(Math.abs((row.usage_cost ?? 0) - 0.0182) < 1e-9);
+    assert.equal(row.context_tokens, 46_300);
+    // A null contextTokens (no request committed yet) is written through as null.
+    await storage.updateAgentSessionUsage("s-abc1234567", {
+      llmRequests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cost: 0,
+      contextTokens: null,
+    });
+    assert.equal(storage.getAgentSession("s-abc1234567")!.context_tokens, null);
   });
 });
 
@@ -282,8 +325,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 19", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 19);
+test("LATEST_SCHEMA_VERSION is 20", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 20);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1165,6 +1208,23 @@ test("v16 -> v17 table rebuild preserves populated agent_sessions rows (and v18 
       // v18 columns exist and backfilled to NULL on legacy rows.
       assert.equal(a.trigger_sender_id, null);
       assert.equal(a.trigger_sender_display_name, null);
+
+      // v20 actuals columns exist and backfilled to NULL on legacy rows.
+      assert.equal(a.llm_requests, null);
+      assert.equal(a.usage_input_tokens, null);
+      assert.equal(a.usage_cost, null);
+      assert.equal(a.context_tokens, null);
+      // And the migrated DB accepts a usage update.
+      await storage.updateAgentSessionUsage("s-mig-a", {
+        llmRequests: 2,
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 30,
+        cacheWriteTokens: 0,
+        cost: 0.001,
+        contextTokens: 1000,
+      });
+      assert.equal(storage.getAgentSession("s-mig-a")?.context_tokens, 1000);
 
       // The widened CHECK accepts the resume states on a migrated row.
       await storage.updateAgentSessionStatus("s-mig-b", "resuming", { error: "529" });

@@ -20,7 +20,25 @@ import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
+import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
 import type { CanonicalChatEvent } from "../types.js";
+
+/**
+ * Resolve a session's effective context-token ceiling (spec
+ * TOKEN-USAGE-TRACKING §6.1): the MIN of the model-level and session-type-level
+ * `max_context_tokens`, considering only the values that are set. Both unset =
+ * unenforced (null). min() because both knobs are CEILINGS — a session type can
+ * only tighten a model's operator-set ceiling, never raise it (Decision D2).
+ */
+export function effectiveMaxContextTokens(
+  modelLimit?: number,
+  sessionTypeLimit?: number,
+): number | null {
+  const limits = [modelLimit, sessionTypeLimit].filter(
+    (v): v is number => typeof v === "number",
+  );
+  return limits.length > 0 ? Math.min(...limits) : null;
+}
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
@@ -170,6 +188,14 @@ export interface CreateAgentOptions {
    */
   resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
   /**
+   * Usage-tracker seed for resume-in-place (spec TOKEN-USAGE-TRACKING §4.3): the
+   * persisted session totals, so a resumed session continues accumulating from
+   * where it left off instead of resetting. Built from the durable row's usage
+   * columns by the resume caller. Absent (fresh launch / fresh-mode resume that
+   * never committed a request) = start from zero.
+   */
+  usageSeed?: SessionUsageTotals;
+  /**
    * LLM-scheduler priority override (spec §5.5/§9.3). When set, replaces the
    * session type's (configured or default) class — the summarization worker
    * passes the job row's possibly-escalated priority here so an escalated job's
@@ -221,6 +247,12 @@ export interface CreatedAgent {
   tokenEstimate?: number;
   compactTokens?: number;
   richTokens?: number;
+  /**
+   * Per-session-run actuals accumulator (spec TOKEN-USAGE-TRACKING §3.3/§4.1):
+   * fed at the Layer-0 commit point, read by `attachSessionCapture` to persist
+   * session totals. One instance per created agent, owned here.
+   */
+  usage: SessionUsageTracker;
 }
 
 export class AgentSessionFactory {
@@ -316,6 +348,17 @@ export class AgentSessionFactory {
     // budget only bounds waiting + a zero-token attempt, never a streaming one.
     const interactiveMaxWaitMs =
       modelConfig.llm_request_max_wait_ms ?? recovery?.llm_request_max_wait_ms ?? 120_000;
+    // Per-session-run usage accumulator (spec TOKEN-USAGE-TRACKING §3.3/§4.1).
+    // Seeded from persisted totals on resume so consumption continues rather
+    // than resets (§4.3). Fed at the Layer-0 commit point via onRequestCommitted.
+    const usage = new SessionUsageTracker(opts?.usageSeed);
+    // Effective context-token ceiling (spec §6.1): min of model- and
+    // session-type-level limits, considering only the set values. null =
+    // unenforced — the pre-flight hook is then omitted entirely.
+    const effectiveContextLimit = effectiveMaxContextTokens(
+      modelConfig.max_context_tokens,
+      sessionTypeConfig?.max_context_tokens,
+    );
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
@@ -351,6 +394,33 @@ export class AgentSessionFactory {
                 this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
               onAttemptDiscarded: (attempt: number, reason: string) =>
                 this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
+            }
+          : {}),
+        // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
+        // committed `done` message's authoritative usage feeds the tracker.
+        onRequestCommitted: (message: AssistantMessage) => usage.record(message.usage),
+        // Pre-flight context-budget enforcement (spec §6.2), only when a limit
+        // is set. Compares the LAST committed request's actual context size
+        // against the effective ceiling; the first request is never blocked
+        // (no actuals yet — the provider is authority on an oversized seed).
+        ...(effectiveContextLimit !== null
+          ? {
+              checkContextBudget: () => {
+                const observed = usage.snapshot().contextTokens;
+                if (observed === null || observed < effectiveContextLimit) return undefined;
+                this.options.logger?.warn("session_context_limit_exceeded", {
+                  sessionId: session.id,
+                  timelineKey: session.timelineKey,
+                  sessionType: session.sessionType,
+                  model: model.id,
+                  observed,
+                  limit: effectiveContextLimit,
+                });
+                return (
+                  `context token limit exceeded: observed context ${observed} tokens >= ` +
+                  `limit ${effectiveContextLimit} (model ${model.id}, session type ${session.sessionType})`
+                );
+              },
             }
           : {}),
       },
@@ -526,7 +596,21 @@ export class AgentSessionFactory {
       tokenEstimate: snapshotTokenEstimate,
       compactTokens: snapshotCompactTokens,
       richTokens: snapshotRichTokens,
+      usage,
     };
+  }
+
+  /**
+   * Resolve a session's effective context-token ceiling from CURRENT config
+   * (spec TOKEN-USAGE-TRACKING §7.2, Decision D7): the limit is operator config
+   * and is NOT persisted per session, so the console shows today's config for
+   * a given session type. Returns null when unenforced.
+   */
+  resolveEffectiveMaxContextTokens(sessionType: string): number | null {
+    const cfg = this.resolveSessionType(sessionType);
+    const modelKey = cfg?.model ?? "default";
+    const modelConfig = this.options.config.models[modelKey];
+    return effectiveMaxContextTokens(modelConfig?.max_context_tokens, cfg?.max_context_tokens);
   }
 
   /**

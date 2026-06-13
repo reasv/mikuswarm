@@ -738,3 +738,106 @@ test("withRequestRetry: an empty inner stream is environmental — retried like 
   assert.equal(calls(), 2, "1 empty attempt + 1 clean retry");
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
+
+// ---------------------------------------------------------------------------
+// Token-usage tracking (spec TOKEN-USAGE-TRACKING §3.1/§6.2/§6.3).
+// ---------------------------------------------------------------------------
+
+test("classifyLlmError: pi-ai overflow patterns beyond the keyword list are class content (§6.3)", () => {
+  // Provider phrasings NOT in the hand-rolled CONTENT_KEYWORDS, recognized via
+  // pi-ai's isContextOverflow pattern set.
+  assert.equal(
+    classifyLlmError("This endpoint's maximum context length is 8192 tokens", "error"),
+    "content",
+  );
+  assert.equal(
+    classifyLlmError("This model's maximum prompt length is 131072 but the request contains 200000 tokens", "error"),
+    "content",
+  );
+  // But an overflow-adjacent rate-limit phrasing stays environmental (the
+  // NON_OVERFLOW exclusion), so a 429 is never misread as content.
+  assert.equal(classifyLlmError("429 rate limit: too many tokens, slow down", "error"), "environmental");
+});
+
+test("withRequestRetry: a committed done fires onRequestCommitted with usage + records ring usage (§3.1/§3.2)", async () => {
+  const committed = message({
+    stopReason: "stop",
+    usage: {
+      input: 312,
+      output: 1800,
+      cacheRead: 43_100,
+      cacheWrite: 0,
+      totalTokens: 45_212,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.0061 },
+    },
+  });
+  const done: AssistantMessageEvent = { type: "done", reason: "stop", message: committed };
+  const { fn } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), done] }]);
+  const ring = new LlmRequestRing();
+  const captured: AssistantMessage[] = [];
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    onRequestCommitted: (msg) => captured.push(msg),
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(captured.length, 1, "onRequestCommitted fires exactly once on commit");
+  assert.equal(captured[0]!.usage.totalTokens, 45_212);
+  const rows = ring.list();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.outcome, "done");
+  assert.deepEqual(rows[0]!.usage, {
+    input: 312,
+    output: 1800,
+    cacheRead: 43_100,
+    cacheWrite: 0,
+    totalTokens: 45_212,
+    cost: 0.0061,
+  });
+});
+
+test("withRequestRetry: a terminal error never fires onRequestCommitted and records no ring usage (§3.1)", async () => {
+  const { fn } = scriptedBase([{ events: [errorEvent("400 invalid request")] }]);
+  const ring = new LlmRequestRing();
+  let committedCount = 0;
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST }, {
+    ring,
+    onRequestCommitted: () => committedCount++,
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(committedCount, 0, "no commit hook on a failed attempt");
+  assert.equal(ring.list()[0]!.usage, undefined, "error rows carry no usage (not a misleading zero)");
+});
+
+test("withRequestRetry: checkContextBudget pre-empts the request as a content failure without calling base (§6.2)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const ring = new LlmRequestRing();
+  let committedCount = 0;
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    onRequestCommitted: () => committedCount++,
+    checkContextBudget: () => "context token limit exceeded: observed context 90000 tokens >= limit 80000",
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 0, "the base stream fn is never invoked — no retry budget consumed");
+  assert.equal(committedCount, 0);
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.ok(isLlmRequestError(err.errorMessage), "carries the Layer-1 origin tag");
+  assert.equal(extractLlmRequestClass(err.errorMessage), "content", "classified content (reuses that path)");
+  assert.match(err.errorMessage ?? "", /context token limit exceeded/);
+  // The pre-empted request is recorded once on the ring as a content error.
+  const rows = ring.list();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.outcome, "error");
+  assert.equal(rows[0]!.class, "content");
+});
+
+test("withRequestRetry: checkContextBudget returning undefined lets the request proceed normally (§6.2)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    checkContextBudget: () => undefined,
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1);
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+});

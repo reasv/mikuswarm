@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
-import { Storage, MemoryFileWriter } from "./storage/index.js";
+import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
 import {
   ActivationCoordinator,
   applyEditToCanonical,
@@ -31,6 +31,7 @@ import {
   type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
+import type { SessionUsageTracker, SessionUsageTotals } from "./agent/usage.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -164,6 +165,38 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       throw new Error(
         `models.${key}: thinking_level = "${model.thinking_level}" contradicts reasoning = false; ` +
           `set reasoning = true (thinking-capable) or thinking_level = "off"`,
+      );
+    }
+  }
+  // Context-token ceiling cross-field validation (spec TOKEN-USAGE-TRACKING
+  // §6.1, same app-wiring fail-fast convention). A model-level
+  // `max_context_tokens` above its own `context_window` is an operator error
+  // (the descriptor's window is the hard wall). A session-type-level ceiling
+  // must likewise fit under the `context_window` of the model it resolves to —
+  // a ceiling larger than the model could ever reach is a no-op typo. The
+  // effective limit is min(model, type), so a type can only tighten (D2); we
+  // only fail-fast on the nonsensical "ceiling above the wall" cases.
+  const modelContextWindow = (key: string): number | undefined =>
+    config.models[key]?.context_window;
+  for (const [key, model] of Object.entries(config.models)) {
+    if (
+      model.max_context_tokens !== undefined &&
+      model.context_window !== undefined &&
+      model.max_context_tokens > model.context_window
+    ) {
+      throw new Error(
+        `models.${key}: max_context_tokens (${model.max_context_tokens}) must be <= context_window (${model.context_window})`,
+      );
+    }
+  }
+  for (const [typeName, sessionType] of Object.entries(config.agent.session_types ?? {})) {
+    if (sessionType.max_context_tokens === undefined) continue;
+    const modelKey = sessionType.model ?? "default";
+    const window = modelContextWindow(modelKey);
+    if (window !== undefined && sessionType.max_context_tokens > window) {
+      throw new Error(
+        `agent.session_types.${typeName}: max_context_tokens (${sessionType.max_context_tokens}) ` +
+          `exceeds context_window (${window}) of its model "${modelKey}"`,
       );
     }
   }
@@ -1337,6 +1370,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     const tools = buildSessionTools(inbound, record.id, target);
     let agent;
+    let usage: SessionUsageTracker | undefined;
+    // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3): continue accumulating
+    // from the persisted totals so a resumed session's consumption doesn't
+    // reset. Fresh-mode rows never committed a request, so their usage columns
+    // are null and the seed reads as zero — correct (the rebuilt run starts
+    // fresh). Continue-mode rows carry the accumulated totals.
+    const usageSeed = usageSeedFromRow(row);
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
     // snapshot — run and persisted exactly like a launch.
     let kickoff;
@@ -1351,10 +1391,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // same row. The rebuild sees the timeline as of NOW (including messages
       // that arrived after the crash), which a launch would too.
       try {
-        ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(record, tools, {
+        ({ agent, finalTurn: kickoff, snapshot, tokenEstimate, usage } = await factory.create(record, tools, {
           proactive:
             record.sessionType === (config.proactive?.session_type ?? "proactive") ? true : undefined,
           abortSignal: drainAbort.signal,
+          usageSeed,
         }));
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
@@ -1368,7 +1409,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }
     } else {
       try {
-        ({ agent } = await factory.create(record, tools, { resume: material }));
+        ({ agent, usage } = await factory.create(record, tools, { resume: material, usageSeed }));
       } catch (error) {
         return {
           outcome: "fatal",
@@ -1387,6 +1428,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       sessionId: record.id,
       snapshot,
       tokenEstimate,
+      usage,
+      timelineKey: record.timelineKey,
+      sessionType: record.sessionType,
+      model: factory.resolveModelId(record.sessionType),
       logger,
     });
     const runner = new SessionRunner({
@@ -1555,8 +1600,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
+    let usage: SessionUsageTracker | undefined;
     try {
-      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
+      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate, usage } = await factory.create(
         session,
         tools,
         {
@@ -1612,6 +1658,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       sessionId: session.id,
       snapshot,
       tokenEstimate,
+      usage,
+      timelineKey: session.timelineKey,
+      sessionType: session.sessionType,
+      model: factory.resolveModelId(session.sessionType),
       logger,
     });
     const runner = new SessionRunner({ provider, target, suppressTyping: proactive });
@@ -2073,6 +2123,25 @@ export function decideRetentionSweep(params: {
  * here — that setting is the captioning pipeline's re-encode target (~1 MB),
  * not an upper bound on images delivered to the model.
  */
+/**
+ * Build a usage-tracker seed from a persisted session row (spec
+ * TOKEN-USAGE-TRACKING §4.3). Null usage columns (legacy rows, or a fresh-mode
+ * resume that never committed a request) map to zero counts / null context, so
+ * a resumed session continues accumulating from where it left off rather than
+ * resetting.
+ */
+function usageSeedFromRow(row: AgentSessionRow): SessionUsageTotals {
+  return {
+    llmRequests: row.llm_requests ?? 0,
+    inputTokens: row.usage_input_tokens ?? 0,
+    outputTokens: row.usage_output_tokens ?? 0,
+    cacheReadTokens: row.usage_cache_read_tokens ?? 0,
+    cacheWriteTokens: row.usage_cache_write_tokens ?? 0,
+    cost: row.usage_cost ?? 0,
+    contextTokens: row.context_tokens ?? null,
+  };
+}
+
 function resolveReadImageMaxBytes(config: AppConfig): number {
   const DEFAULT_PER_MODEL = 5_242_880; // 5 MB base64 (≈ 3.75 MB raw before encoding).
   const perModel = config.models.default.image_input_bytes ?? DEFAULT_PER_MODEL;

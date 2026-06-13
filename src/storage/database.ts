@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
+import type { SessionUsageTotals } from "../agent/usage.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -650,6 +651,20 @@ export interface AgentSessionRow {
   context_dump_path: string | null;
   transcript_json: string | null;
   token_estimate: number | null;
+  /**
+   * Actuals (spec TOKEN-USAGE-TRACKING §4.2): denormalized session-level usage
+   * aggregate. Null on legacy rows and on a session that never committed a
+   * request (read as "unknown", not zero). `usage_cost` is USD (REAL);
+   * `context_tokens` is the last committed request's provider-reported context
+   * size (the session's current size).
+   */
+  llm_requests: number | null;
+  usage_input_tokens: number | null;
+  usage_output_tokens: number | null;
+  usage_cache_read_tokens: number | null;
+  usage_cache_write_tokens: number | null;
+  usage_cost: number | null;
+  context_tokens: number | null;
   no_reply: number;
   error: string | null;
   created_at: number;
@@ -4411,6 +4426,45 @@ export class Storage {
   }
 
   /**
+   * Persist the session-level usage aggregate (spec TOKEN-USAGE-TRACKING §4.2).
+   * Enqueued once per committed request via `attachSessionCapture`'s tracker
+   * subscription — sessions make single-digit-to-low-tens of requests, so one
+   * write per commit is negligible (no debounce needed). Touches ONLY the
+   * usage columns + `updated_at`; the large immutable snapshot/transcript
+   * columns are untouched. `contextTokens` may be null (no request committed
+   * yet) and is written through as such.
+   */
+  updateAgentSessionUsage(id: string, totals: SessionUsageTotals): Promise<void> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update agent_sessions set
+            llm_requests = @llmRequests,
+            usage_input_tokens = @inputTokens,
+            usage_output_tokens = @outputTokens,
+            usage_cache_read_tokens = @cacheReadTokens,
+            usage_cache_write_tokens = @cacheWriteTokens,
+            usage_cost = @cost,
+            context_tokens = @contextTokens,
+            updated_at = @updatedAt
+           where id = @id`,
+        )
+        .run({
+          id,
+          llmRequests: totals.llmRequests,
+          inputTokens: totals.inputTokens,
+          outputTokens: totals.outputTokens,
+          cacheReadTokens: totals.cacheReadTokens,
+          cacheWriteTokens: totals.cacheWriteTokens,
+          cost: totals.cost,
+          contextTokens: totals.contextTokens ?? null,
+          updatedAt: Date.now(),
+        });
+      this.warnIfNoSessionRow("updateAgentSessionUsage", id, result.changes);
+    });
+  }
+
+  /**
    * Startup healing (spec §4): flip any session left mid-flight (`running` or
    * `created`) to `interrupted`, before the provider delivers events. No
    * auto-resume — but an `interrupted` row with viable resume material stays
@@ -5560,6 +5614,17 @@ create table if not exists agent_sessions (
   context_dump_path text,
   transcript_json text,
   token_estimate integer,
+  -- Actuals (spec TOKEN-USAGE-TRACKING §4.2): denormalized session-level
+  -- aggregate of provider-reported usage. All nullable so legacy rows read as
+  -- "unknown" rather than a misleading zero. Per-request usage already lives
+  -- verbatim inside transcript_json (Decision D1); these are the cheap rollup.
+  llm_requests integer,
+  usage_input_tokens integer,
+  usage_output_tokens integer,
+  usage_cache_read_tokens integer,
+  usage_cache_write_tokens integer,
+  usage_cost real,
+  context_tokens integer,
   no_reply integer not null default 0,
   error text,
   created_at integer not null,
@@ -5582,7 +5647,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 19;
+export const LATEST_SCHEMA_VERSION = 20;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6080,6 +6145,35 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     const columns = db.pragma(`table_info(link_previews)`) as Array<{ name: string }>;
     if (columns.some((column) => column.name === "payload_json")) return;
     db.exec(`alter table link_previews add column payload_json text;`);
+  },
+  // index 19 (v19 -> v20): add the actuals usage columns to `agent_sessions`
+  // (spec TOKEN-USAGE-TRACKING §4.2): the denormalized session-level aggregate
+  // of provider-reported token usage (committed-request count, the four
+  // consumption values, a single derived cost, and the last-observed context
+  // size). All nullable ADD COLUMNs: existing rows backfill to NULL ("unknown",
+  // never a misleading 0). Per-request usage already persists inside
+  // transcript_json (Decision D1) — these are the cheap rollup so list views and
+  // future cost queries never parse transcripts. Skipped when the table is
+  // absent (minimal legacy fixtures; SCHEMA then builds it at the latest shape)
+  // or when the columns already exist (a current DB whose user_version was
+  // rewound by a test fixture — mirrors the v17→v18 presence guard). Fresh DBs
+  // get the columns directly from SCHEMA and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
+      .get();
+    if (!table) return;
+    const columns = db.pragma(`table_info(agent_sessions)`) as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "llm_requests")) return;
+    db.exec(
+      `alter table agent_sessions add column llm_requests integer;
+       alter table agent_sessions add column usage_input_tokens integer;
+       alter table agent_sessions add column usage_output_tokens integer;
+       alter table agent_sessions add column usage_cache_read_tokens integer;
+       alter table agent_sessions add column usage_cache_write_tokens integer;
+       alter table agent_sessions add column usage_cost real;
+       alter table agent_sessions add column context_tokens integer;`,
+    );
   },
 ];
 

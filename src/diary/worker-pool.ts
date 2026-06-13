@@ -365,7 +365,7 @@ export class DiaryWorkerPool {
       // turn, exactly like the summarize worker's cutoff build. The build also
       // yields a real snapshot, so diary sessions gain context_snapshot_json
       // observability parity with summarize sessions.
-      const { agent, finalTurn, snapshot, tokenEstimate } = await factory.create(syntheticSession, [diaryTool], {
+      const { agent, finalTurn, snapshot, tokenEstimate, usage } = await factory.create(syntheticSession, [diaryTool], {
         diaryRange: {
           earliestTimestamp: job.earliestTimestamp,
           latestTimestamp: job.latestTimestamp,
@@ -377,6 +377,10 @@ export class DiaryWorkerPool {
         sessionId: syntheticSession.id,
         snapshot,
         tokenEstimate,
+        usage,
+        timelineKey: syntheticSession.timelineKey,
+        sessionType: syntheticSession.sessionType,
+        model: factory.resolveModelId(syntheticSession.sessionType),
         logger,
       });
       this.activeAgents.add(agent);

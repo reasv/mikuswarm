@@ -321,7 +321,7 @@ export class SummarizationWorkerPool {
 
     let agentError: unknown;
     try {
-      const { agent, finalTurn, snapshot, tokenEstimate } = await factory.create(
+      const { agent, finalTurn, snapshot, tokenEstimate, usage } = await factory.create(
         syntheticSession,
         [summaryTool],
         {
@@ -336,12 +336,17 @@ export class SummarizationWorkerPool {
         },
       );
       // Attach snapshot + transcript capture so summarization sessions are
-      // inspectable too (spec §5). Detached after the run settles.
+      // inspectable too (spec §5), plus usage actuals (spec TOKEN-USAGE-TRACKING
+      // §4.3). Detached after the run settles.
       const capture = attachSessionCapture(agent, {
         storage,
         sessionId: syntheticSession.id,
         snapshot,
         tokenEstimate,
+        usage,
+        timelineKey: syntheticSession.timelineKey,
+        sessionType: syntheticSession.sessionType,
+        model: factory.resolveModelId(syntheticSession.sessionType),
         logger,
       });
       this.activeAgents.add(agent);

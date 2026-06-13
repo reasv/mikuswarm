@@ -76,7 +76,26 @@ export const SessionMeta = Schema.Struct({
 	triggerEventId: Schema.NullOr(Schema.String),
 	triggerExternalId: Schema.NullOr(Schema.String),
 	triggerBody: Schema.NullOr(Schema.String),
+	// Frozen-prefix ESTIMATE (unchanged, kept clearly separate from actuals below).
 	tokenEstimate: Schema.NullOr(Schema.Number),
+	// Actuals (spec TOKEN-USAGE-TRACKING §7.1). All optional/nullable: legacy rows
+	// and pre-first-commit sessions read as "unknown". `usage` is null until a
+	// request commits; `contextTokens` is the last-observed actual context size;
+	// `maxContextTokens` is the effective ceiling from current config (or null).
+	llmRequests: Schema.optional(Schema.NullOr(Schema.Number)),
+	usage: Schema.optional(
+		Schema.NullOr(
+			Schema.Struct({
+				input: Schema.Number,
+				output: Schema.Number,
+				cacheRead: Schema.Number,
+				cacheWrite: Schema.Number,
+				cost: Schema.Number
+			})
+		)
+	),
+	contextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+	maxContextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
 	noReply: Schema.Boolean,
 	error: Schema.NullOr(Schema.String),
 	createdAt: Schema.Number,
@@ -334,7 +353,19 @@ export const LlmRequestRecord = Schema.Struct({
 	outcome: Schema.String,
 	status: Schema.optional(Schema.Number),
 	class: Schema.optional(Schema.String),
-	errorMessage: Schema.optional(Schema.String)
+	errorMessage: Schema.optional(Schema.String),
+	// Usage of the committed response (spec TOKEN-USAGE-TRACKING §3.2): present on
+	// `done` rows only; absent on error/aborted.
+	usage: Schema.optional(
+		Schema.Struct({
+			input: Schema.Number,
+			output: Schema.Number,
+			cacheRead: Schema.Number,
+			cacheWrite: Schema.Number,
+			totalTokens: Schema.Number,
+			cost: Schema.Number
+		})
+	)
 });
 export type LlmRequestRecord = Schema.Schema.Type<typeof LlmRequestRecord>;
 

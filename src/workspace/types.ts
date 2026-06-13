@@ -79,4 +79,12 @@ export interface SessionTypeConfig {
    * (src/agent/scheduler.ts defaultPriorityForSessionType).
    */
   priority?: "interactive" | "proactive" | "background" | "background_low";
+  /**
+   * Per-session-type context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1).
+   * Composed with the model-level limit via min() — a session type can only
+   * tighten, never raise, a model's operator-set ceiling (Decision D2). Unset =
+   * no session-type ceiling. Worker session types set a conservative value to
+   * bound runaway diary/summary sessions; chat leaves it unset.
+   */
+  max_context_tokens?: number;
 }

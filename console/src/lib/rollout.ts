@@ -41,6 +41,48 @@ export function asMsg(m: unknown): RolloutMsg {
 	return (m ?? {}) as RolloutMsg;
 }
 
+/** Per-request usage attached to an assistant message (spec TOKEN-USAGE-TRACKING §7.3). */
+export interface RolloutUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Context size reached at this point in the rollout (the request's totalTokens). */
+	totalTokens: number;
+	cost: number;
+}
+
+/**
+ * Extract the per-request usage from an assistant message's `usage` field (the
+ * verbatim pi-ai `Usage` shape — `cost` is a nested object whose `.total` we
+ * surface). Returns null for messages without real usage (user turns, tool
+ * results, legacy transcripts, and synthesized error turns whose stub usage is
+ * all zeros → `totalTokens === 0`), which the rollout renders as nothing (§7.3).
+ */
+export function messageUsage(m: RolloutMsg): RolloutUsage | null {
+	const u = m.usage;
+	if (!u || typeof u !== 'object') return null;
+	const o = u as Record<string, unknown>;
+	const num = (k: string): number => (typeof o[k] === 'number' ? (o[k] as number) : 0);
+	const total = num('totalTokens');
+	if (total <= 0) return null;
+	const costObj = o.cost;
+	const cost =
+		costObj && typeof costObj === 'object' && typeof (costObj as { total?: unknown }).total === 'number'
+			? ((costObj as { total: number }).total)
+			: typeof costObj === 'number'
+				? costObj
+				: 0;
+	return {
+		input: num('input'),
+		output: num('output'),
+		cacheRead: num('cacheRead'),
+		cacheWrite: num('cacheWrite'),
+		totalTokens: total,
+		cost
+	};
+}
+
 /**
  * Whether a rollout message is an injected user turn (spec §10b) — rendered as a
  * distinct InterjectionCard rather than the raw-JSON fallback. Covers two shapes:
