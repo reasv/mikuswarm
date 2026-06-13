@@ -140,7 +140,16 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
     url: () => "about:blank",
     title: async () => "",
   };
-  const context = { newPage: async () => fakePage, pages: () => [fakePage] };
+  // newPage reopens the single shared page (resetting _closed): after a
+  // closeSession the next getActivePage recreates the session's first tab, and a
+  // real context would hand back a fresh, open page (issue #22 close-and-recreate).
+  const context = {
+    newPage: async () => {
+      fakePage._closed = false;
+      return fakePage;
+    },
+    pages: () => [fakePage],
+  };
   const harness: DownloadHarness = {
     cdp,
     cdpSessionsOpened: 0,
@@ -247,7 +256,10 @@ interface SessionBundle {
   manager: { restore(): void };
 }
 
-function newDownloadSession(dirs: Dirs, opts: { sizeLimit?: number; configured?: boolean } = {}): SessionBundle {
+function newDownloadSession(
+  dirs: Dirs,
+  opts: { sizeLimit?: number; configured?: boolean; actTimeoutMs?: number } = {},
+): SessionBundle {
   const manager = stubManager();
   const { browser, harness } = makeDownloadBrowser();
   const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
@@ -260,9 +272,10 @@ function newDownloadSession(dirs: Dirs, opts: { sizeLimit?: number; configured?:
   };
   const configured = opts.configured ?? true;
   const session = new BrowserSession({
-    config: baseConfig(
-      configured ? { downloads_dir: "/downloads", downloads_local_dir: dirs.staging } : {},
-    ),
+    config: baseConfig({
+      ...(configured ? { downloads_dir: "/downloads", downloads_local_dir: dirs.staging } : {}),
+      ...(opts.actTimeoutMs !== undefined ? { act_timeout_ms: opts.actTimeoutMs } : {}),
+    }),
     agentTimezone: "UTC",
     workspaceRoot: dirs.ws,
     logger: capturingLogger(logged),
@@ -441,29 +454,33 @@ test("downloads: two same-URL same-name downloads match FIFO and both land (bump
 });
 
 test("downloads: an uncorrelated entry past its deadline is dropped with a warn and its staging bytes reaped", async () => {
+  // #24: drive the deadline with a tiny real act_timeout_ms rather than reaching
+  // into private pendingDownloadEntries to backdate expiresAt. This lets the
+  // deadline expire for real (after one short wait) AND covers the
+  // act_timeout_ms → expiresAt wiring (a regression dropping that arithmetic
+  // would never expire the entry, hanging on the waitFor below). The drop still
+  // fires from a real trigger — sweepIdleNow's expirePendingDownloads pass.
   await withDirs(async (dirs) => {
-    const { session, harness, logged, manager } = newDownloadSession(dirs);
+    const { session, harness, logged, manager } = newDownloadSession(dirs, { actTimeoutMs: 1 });
     try {
       await session.getActivePage("s1");
       await writeFile(path.join(dirs.staging, GUID_A), "orphan");
 
-      // CDP stream only — the page-event counterpart never arrives.
+      // CDP stream only — the page-event counterpart never arrives. The entry is
+      // created with expiresAt = now + 1ms (act_timeout_ms), so it is past its
+      // deadline within a couple of milliseconds.
       harness.cdp.emit("Browser.downloadWillBegin", {
         guid: GUID_A, url: "https://example.com/orphan.bin", suggestedFilename: "orphan.bin",
       });
       harness.cdp.emit("Browser.downloadProgress", {
         guid: GUID_A, state: "completed", receivedBytes: 6, totalBytes: 6,
       });
+      // Let the 1ms deadline pass for real, then run a real trigger (the periodic
+      // idle sweep) — no private-field mutation. The sweep's expirePendingDownloads
+      // pass drops the now-expired entry and reaps its staging bytes.
       await new Promise((r) => setTimeout(r, 20));
-
-      // Backdate the entry past its act_timeout_ms deadline (test seam, like
-      // forceIdle in browser-session.test.ts), then run the periodic sweep.
-      const priv = session as unknown as PendingPrivate;
-      assert.equal(priv.pendingDownloadEntries.length, 1, "entry pending correlation");
-      priv.pendingDownloadEntries[0]!.expiresAt = 0;
       await session.sweepIdleNow();
 
-      assert.equal(priv.pendingDownloadEntries.length, 0, "entry dropped");
       assert.ok(
         logged.some((l) => l.event === "browser_download_uncorrelated_dropped"),
         "the drop was logged as a warn",
@@ -665,6 +682,182 @@ test("downloads: close race — the file still lands on disk but the record is d
       );
       assert.equal(session.drainDownloads("s1").length, 0, "no record surfaces from the dead session");
       assert.ok(!logged.some((l) => l.event === "browser_download_failed"), "the drop is not an error");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #22: close-and-recreate-under-the-same-id (the close-race SECOND disjunct) ─
+
+type SessionsPrivate = { sessions: Map<string, { closed: boolean; pendingDownloads: unknown[] }> };
+
+test("downloads #22: a download correlated to a session that is closed AND recreated under the same id does not land on the new session", async () => {
+  // The existing close-race test exercises the FIRST disjunct (state.closed). This
+  // covers the SECOND disjunct of finalizeDownload's re-check —
+  // `this.sessions.get(sessionId) !== state` — where, after the download
+  // correlated, the session was closed and a *fresh* session was created under the
+  // SAME id (a new chat turn reusing "s1") before the copy resolved. The record
+  // must be dropped, NOT pushed onto the new session's state.
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1");
+      await writeFile(path.join(dirs.staging, GUID_A), "old-session bytes");
+
+      // Correlate the download against the ORIGINAL "s1" state.
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/x.txt", suggestedFilename: "x.txt",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/x.txt", "x.txt"));
+
+      // Close "s1" (detaches the original state) and immediately recreate it: a new
+      // chat turn reusing the same id gets a brand-new, empty SessionState.
+      await session.closeSession("s1");
+      await session.getActivePage("s1");
+
+      // The completion now finalizes against the ORIGINAL (detached) state — its
+      // copy lands on disk, but the record must be dropped because the live "s1"
+      // state is a different object.
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 17, totalBytes: 17,
+      });
+
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "x.txt");
+      await waitFor(() => exists(finalPath), "file still lands on disk for the original session dir");
+      await waitFor(
+        () => logged.some((l) => l.event === "browser_download_after_close_dropped"),
+        "the record was deliberately dropped (not surfaced)",
+      );
+      // The crucial assertion: the RECREATED "s1" must not have inherited the
+      // record — a regression checking only `state.closed` would still drop it
+      // here too (closed is also set), so to pin the SECOND disjunct exactly we
+      // also assert below the closed=false / map-mismatch case in isolation.
+      assert.equal(session.drainDownloads("s1").length, 0, "the recreated session did not inherit the dropped record");
+
+      // Pin the SECOND disjunct in isolation: a stale state that is NOT marked
+      // closed but has been REPLACED in the session map under the same id. A
+      // regression that only checked `state.closed` (dropping the map-identity
+      // arm) would push the record onto the live session here. We swap the map
+      // entry for a fresh state object without closing the old one, then drive a
+      // fresh correlated completion whose entry references the OLD (open) state.
+      const priv = session as unknown as SessionsPrivate;
+      const staleState = priv.sessions.get("s1")!;
+      assert.equal(staleState.closed, false, "precondition: the live state is open (not closed)");
+      const replacement = { ...staleState, closed: false, pendingDownloads: [] as unknown[] };
+      priv.sessions.set("s1", replacement); // staleState is now detached but NOT closed
+
+      await writeFile(path.join(dirs.staging, GUID_B), "stale-state bytes");
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_B, url: "https://example.com/y.txt", suggestedFilename: "y.txt",
+      });
+      // Fire the page event so the entry correlates to the now-detached staleState
+      // (the page handler captured staleState when the page was tracked).
+      harness.fireDownload(metadataDownload("https://example.com/y.txt", "y.txt"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_B, state: "completed", receivedBytes: 12, totalBytes: 12,
+      });
+
+      const finalPath2 = path.join(dirs.ws, "browser-downloads", "s1", "y.txt");
+      await waitFor(() => exists(finalPath2), "second file lands on disk for the (open but detached) stale state");
+      await waitFor(
+        () => logged.filter((l) => l.event === "browser_download_after_close_dropped").length >= 2,
+        "the second record was dropped via the map-identity disjunct (state was open, not closed)",
+      );
+      assert.equal(replacement.pendingDownloads.length, 0, "the live replacement state never received the dropped record");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #22: a Browser.cancelDownload send rejection is caught; the failure still records ─
+
+test("downloads #22: when Browser.cancelDownload rejects, the rejection is swallowed and the failed record still surfaces", async () => {
+  // The over-cap path sends Browser.cancelDownload and then records a failure. If
+  // the CDP send rejects (a dead/racing session), onDownloadProgress must catch it
+  // (debug-logged) and STILL record the failure — a regression letting the rejection
+  // escape would turn an unhandled rejection loose and the model would never see the
+  // failed record.
+  await withDirs(async (dirs) => {
+    const manager = stubManager();
+    const { browser, harness } = makeDownloadBrowser();
+    const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    // A CDP session whose setDownloadBehavior succeeds (so capture is enabled and
+    // downloadsCdp is set) but whose cancelDownload send rejects.
+    const cancelRejectingCdp = {
+      sent: [] as Array<{ method: string; params: Record<string, unknown> | undefined }>,
+      handlers: new Map<string, (payload: unknown) => void>(),
+      on(event: string, cb: (payload: unknown) => void) { this.handlers.set(event, cb); },
+      async send(method: string, params?: Record<string, unknown>) {
+        this.sent.push({ method, params });
+        if (method === "Browser.cancelDownload") throw new Error("cancel send boom");
+        return {};
+      },
+      emit(event: string, payload: unknown) { this.handlers.get(event)?.(payload); },
+    };
+    harness.newCdpSession = async () => cancelRejectingCdp;
+    const session = new BrowserSession({
+      config: baseConfig({ downloads_dir: "/downloads", downloads_local_dir: dirs.staging }),
+      agentTimezone: "UTC",
+      workspaceRoot: dirs.ws,
+      logger: capturingLogger(logged),
+      downloadSizeLimit: 10,
+      connectOverCdp: async () => browser as never,
+    });
+    try {
+      await session.getActivePage("s1");
+      cancelRejectingCdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/huge.iso", suggestedFilename: "huge.iso",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/huge.iso", "huge.iso"));
+      // Breach the cap → the over-cap path sends cancelDownload (which rejects).
+      cancelRejectingCdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "inProgress", receivedBytes: 50, totalBytes: 1000,
+      });
+
+      // Despite the cancel send rejecting, the failed record must still surface.
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "the failed record after a rejecting cancel send");
+      assert.equal(drained.length, 1, "a failure record surfaces even though the cancel send rejected");
+      assert.equal(drained[0]!.failed, true);
+      assert.equal(drained[0]!.filename, "huge.iso");
+      assert.ok(
+        cancelRejectingCdp.sent.some((c) => c.method === "Browser.cancelDownload"),
+        "the over-cap path attempted Browser.cancelDownload",
+      );
+      assert.ok(logged.some((l) => l.event === "browser_download_failed"), "the failure was logged");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #22: the staging sweep skips a guid-NAMED directory (the isFile() guard) ──
+
+test("downloads #22: the staging sweep never reaps a guid-named directory (isFile guard)", async () => {
+  // STAGING_GUID_RE matches the NAME, so a directory whose name happens to look
+  // like a guid must be skipped by the `st.isFile()` guard — the sweep only reaps
+  // regular files and never recurses or rmdir's.
+  await withDirs(async (dirs) => {
+    const { session, manager } = newDownloadSession(dirs);
+    try {
+      // A directory named exactly like a completed-staging guid, backdated past TTL.
+      const guidDir = path.join(dirs.staging, GUID_A);
+      await mkdir(guidDir, { recursive: true });
+      await writeFile(path.join(guidDir, "inside.txt"), "must survive");
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(guidDir, past, past);
+
+      await session.sweepStagingNow();
+
+      assert.equal(await exists(path.join(guidDir, "inside.txt")), true, "the guid-named directory and its contents survive");
+      // And it is still a directory (never rmdir'd / never recursed into).
+      const entries = await readdir(guidDir);
+      assert.deepEqual(entries, ["inside.txt"], "the directory was left intact");
     } finally {
       manager.restore();
       await session.shutdown();

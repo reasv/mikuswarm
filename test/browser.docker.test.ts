@@ -316,7 +316,9 @@ test("browser docker: downloads cross the container boundary via the shared stag
     type ToolResult = { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> };
     const exec = (args: Record<string, unknown>) => tool.execute("c1", args) as Promise<ToolResult>;
 
-    await exec({ action: "navigate", url: "https://example.com/" });
+    // about:blank, not example.com (#25): the blob download is entirely local, so
+    // depending on an external site only adds a network flake the test doesn't need.
+    await exec({ action: "navigate", url: "about:blank" });
 
     // Trigger a real download with no network dependency: an a[download] blob link.
     const clickRes = await exec({
@@ -347,8 +349,12 @@ a.click();
     // the workspace copy is owned by this uid (not the container's root).
     const bytes = await readFile(path.join(ws, record.path));
     assert.equal(bytes.toString(), "hello download", "payload crossed the container boundary intact");
-    // Staging hygiene: the guid file was unlinked after the copy.
-    assert.deepEqual(await readdir(staging), [], "staging dir is empty after finalization");
+    // Staging hygiene: the guid staging file was unlinked after the copy. Assert
+    // no guid-named staging file remains rather than a strictly empty dir (#25) —
+    // Chromium can briefly leave a non-guid sidecar that would flake a deepEqual([]).
+    const stagingEntries = await readdir(staging);
+    const guidLike = stagingEntries.filter((name) => /^[0-9a-f-]{36}(\.crdownload)?$/i.test(name));
+    assert.deepEqual(guidLike, [], `no guid-named staging file remains after finalization (saw: ${stagingEntries.join(", ")})`);
   } finally {
     if (session) await session.shutdown();
     spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
