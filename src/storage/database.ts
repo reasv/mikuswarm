@@ -1099,6 +1099,8 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
     selectFrom: `select id, status, attempts, max_retries, timeline_key as room,
         created_at, updated_at, level, input_token_count, target_token_count,
         best_effort_draft, error, result_summary_id,
+        (select sm.token_count from summaries sm
+           where sm.id = summarization_jobs.result_summary_id) as result_token_count,
         (select s.id from agent_sessions s
            where s.trigger_event_id = 'summarize:' || summarization_jobs.id
            order by s.created_at desc limit 1) as session_id
@@ -1109,6 +1111,14 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
       const createdAt = Number(row.created_at ?? 0);
       const resultSummaryId = (row.result_summary_id as string | null) ?? null;
       const bestEffort = (row.best_effort_draft as string | null) ?? null;
+      const resultTokenCount = (row.result_token_count as number | null) ?? null;
+      // "to" side: actual produced size once available, shown as actual/target
+      // so target-vs-actual drift is visible; falls back to the target budget
+      // alone while the job is still pending/running.
+      const toLabel =
+        resultTokenCount != null
+          ? `${resultTokenCount}/${row.target_token_count}`
+          : `${row.target_token_count}`;
       return {
         pool: "summarization",
         id: String(row.id),
@@ -1119,7 +1129,7 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
         room: (row.room as string | null) ?? null,
         createdAt,
         updatedAt: Number(row.updated_at ?? createdAt),
-        inputSummary: `L${row.level} · ${row.input_token_count ?? "?"}→${row.target_token_count} tok`,
+        inputSummary: `L${row.level} · ${row.input_token_count ?? "?"}→${toLabel} tok`,
         outputSummary: resultSummaryId
           ? `→ ${resultSummaryId}`
           : bestEffort

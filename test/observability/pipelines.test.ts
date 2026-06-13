@@ -442,6 +442,32 @@ test("listPipelineItems summarization links the latest attempt's session", async
   });
 });
 
+test("listPipelineItems summarization renders actual/target tokens once a result summary exists", async () => {
+  await withStorage(async (storage) => {
+    await summarizationJob(storage, "job-1", "complete", { updatedAt: 4_000 });
+    // The produced summary, with a real token_count distinct from the 50 target.
+    await diarySummary(storage, "sum-out-1", "done", { latestTimestamp: 4_000 });
+    await storage.write((db) =>
+      db
+        .prepare(`update summaries set token_count = ? where id = ?`)
+        .run(612, "sum-out-1"),
+    );
+    // Link the job to its produced summary.
+    await storage.write((db) =>
+      db
+        .prepare(`update summarization_jobs set result_summary_id = ? where id = ?`)
+        .run("sum-out-1", "job-1"),
+    );
+
+    const { items } = storage.listPipelineItems("summarization", {}, 2);
+    assert.match(
+      items[0]!.inputSummary,
+      /L1 · 100→612\/50 tok/,
+      "the to-side shows actual/target once the produced summary's token_count is known",
+    );
+  });
+});
+
 // ── Durable captioning retry counter ─────────────────────────────────────────
 
 test("claimPendingCaptions increments the durable caption_attempts at claim", async () => {
