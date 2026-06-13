@@ -270,19 +270,22 @@ export function classifyLlmError(
   const status = extractStatus(msg);
   if (status !== undefined && CONTENT_STATUSES.has(status)) return "content";
   if (CONTENT_KEYWORDS.some((keyword) => msg.includes(keyword))) return "content";
-  // Augment the hand-rolled keyword list with pi-ai's curated cross-provider
-  // overflow-pattern set (spec TOKEN-USAGE-TRACKING §6.3): a provider-side
-  // context-overflow rejection from any supported gateway classifies `content`
-  // too (today only a few phrasings are recognized). Its NON_OVERFLOW_PATTERNS
-  // exclude rate-limit phrasings, so a 429 carrying "too many tokens"-adjacent
-  // text is not misread as overflow. We pass the ORIGINAL (non-lowercased)
-  // message — the patterns are case-insensitive but expect provider-native text.
-  if (
-    isContextOverflow({
+  // A parseable TRANSIENT status (429 or any 5xx) is authoritative: such a
+  // failure is environmental and must stay retryable regardless of its body
+  // text (#4). The pi-ai overflow augmentation below relies on body phrasing,
+  // and its NON_OVERFLOW_PATTERNS exclude only the literal "rate limit" / "too
+  // many requests" wordings — a 429 phrased "too many tokens in flight, retry
+  // later" would otherwise be misread as overflow → `content` (non-retryable),
+  // parking the session on a transient blip. So the augmentation is consulted
+  // ONLY when the status is undefined or non-transient.
+  const transient = status === 429 || (status !== undefined && status >= 500 && status < 600);
+  if (!transient && isContextOverflow({
       role: "assistant",
       api: "anthropic-messages",
       provider: "unknown",
       model: "unknown",
+      // Only reached for error/synthesized turns, so `stopReason` here is always
+      // `error`; hard-coding it (ignoring the real arg) is safe (#5).
       stopReason: "error",
       errorMessage: errorMessage ?? "",
       content: [],
@@ -460,7 +463,29 @@ export function withRequestRetry(
         // provider "prompt is too long" rejection takes, which it pre-empts) and
         // surfaces it without consuming retry budget. The hook logs the
         // observed/limit numbers itself; here we only record + surface.
-        const budgetViolation = ctx.checkContextBudget?.();
+        //
+        // Exception-isolated like every other hook: the factory-bound impl calls
+        // `logger.warn(...)`, which can throw. An unguarded throw here would
+        // escape the void-IIFE as an unhandled rejection (process-fatal) and
+        // `outer` would never terminate (hung consumer) (#12). On a throw we
+        // degrade to "no local block" — the provider remains authority on an
+        // oversized request (the D3 fallback).
+        let budgetViolation: string | undefined;
+        try {
+          budgetViolation = ctx.checkContextBudget?.();
+        } catch (err) {
+          budgetViolation = undefined;
+          try {
+            ctx.logger?.warn("llm_request_budget_check_threw", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            });
+          } catch {
+            /* the logger itself may be the thing that threw — never re-raise */
+          }
+        }
         if (budgetViolation !== undefined) {
           const violationStart = Date.now();
           const errorEvent = synthesizeErrorEvent(model, budgetViolation, "error");
@@ -572,7 +597,13 @@ export function withRequestRetry(
                     }
                   : undefined,
               });
-              if (committed) {
+              // Only fire when authoritative usage is present — symmetric with
+              // the ring branch above (#3). A `done` lacking `usage` would make
+              // the factory-bound hook call `record(undefined)`, which throws;
+              // the throw is swallowed below, silently dropping the request from
+              // the tracker. Gating here keeps the two capture branches
+              // consistent and avoids that hidden undercount.
+              if (committed && usage) {
                 try {
                   ctx.onRequestCommitted?.(committed);
                 } catch {

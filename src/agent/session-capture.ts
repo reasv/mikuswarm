@@ -419,6 +419,12 @@ export function attachSessionCapture(
       // called in every run path's finally (completed / parked / interrupted /
       // worker finalize/failure), so this fires uniformly. Only emitted when a
       // usage tracker was wired (tests/headless skip it).
+      //
+      // Best-effort: this log additionally requires a logger. The persistence
+      // subscription above gates ONLY on `ctx.usage` (logger is optional in the
+      // ctx type), so a call site wiring `usage` but omitting `logger` still
+      // persists every commit — it just drops this settle line. Persistence
+      // does not depend on the log.
       if (ctx.usage && ctx.logger) {
         ctx.logger.info("session_usage", {
           sessionId: ctx.sessionId,

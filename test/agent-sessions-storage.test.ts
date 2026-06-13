@@ -10,6 +10,8 @@ import {
   type AgentSessionInsert,
 } from "../src/storage/index.js";
 import type { Logger } from "../src/observability/index.js";
+import { resumeUsageSeed } from "../src/app.js";
+import { emptyUsageTotals } from "../src/agent/usage.js";
 
 /**
  * `media_assets` + `summarization_jobs` are base (v1) tables present in every real
@@ -1301,4 +1303,97 @@ test("v17 -> v18 ALTER adds the trigger-sender columns with populated rows intac
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #9 (pairs with #1): the per-branch resume usage-seed choice.
+//
+// `resumeUsageSeed(row, mode)` is the pure factoring of the seed decision
+// `resumeSessionRun` applies. The load-bearing invariant: a `fresh`-classified
+// row must NOT inherit the row's usage columns even when they are populated —
+// usage persists at the Layer-0 `done` commit (enqueued BEFORE the turn's
+// transcript flush), so a crash in that window leaves usage columns written
+// while `transcript_json` is null, which `loadResumeMaterial` classifies as
+// `fresh`. Seeding fresh from the row would double-count those requests and
+// could trip the first-request budget check (spec §6.2/D3). Only `continue`
+// mode inherits. The pre-#1 code seeded BOTH branches from the row; these
+// tests fail on that behavior.
+// ---------------------------------------------------------------------------
+
+test("resumeUsageSeed: a fresh-mode row with NON-NULL usage columns yields an empty seed", async () => {
+  await withStorage(async (storage) => {
+    // A row whose usage columns are populated (first request committed) but
+    // whose transcript never flushed — the real crash window that classifies
+    // `fresh`. We populate usage but leave transcript_json null.
+    await storage.insertAgentSession(baseInsert());
+    await storage.updateAgentSessionUsage("s-abc1234567", {
+      llmRequests: 3,
+      inputTokens: 4_000,
+      outputTokens: 800,
+      cacheReadTokens: 120_000,
+      cacheWriteTokens: 5_000,
+      cost: 0.07,
+      contextTokens: 190_000,
+    });
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.ok(row);
+    // Sanity: usage IS populated, transcript is NOT (the crash window).
+    assert.equal(row.llm_requests, 3);
+    assert.equal(row.context_tokens, 190_000);
+    assert.equal(row.transcript_json, null);
+
+    // Fresh path: the rebuilt tracker must start from zero totals / null
+    // contextTokens, NOT the populated row (else double-count + D3 violation).
+    const seed = resumeUsageSeed(row, "fresh");
+    assert.deepEqual(seed, emptyUsageTotals());
+    assert.equal(seed.llmRequests, 0);
+    assert.equal(seed.inputTokens, 0);
+    assert.equal(seed.outputTokens, 0);
+    assert.equal(seed.cacheReadTokens, 0);
+    assert.equal(seed.cacheWriteTokens, 0);
+    assert.equal(seed.cost, 0);
+    assert.equal(seed.contextTokens, null);
+  });
+});
+
+test("resumeUsageSeed: a continue-mode row DOES inherit its persisted usage totals", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert());
+    await storage.updateAgentSessionUsage("s-abc1234567", {
+      llmRequests: 3,
+      inputTokens: 4_000,
+      outputTokens: 800,
+      cacheReadTokens: 120_000,
+      cacheWriteTokens: 5_000,
+      cost: 0.07,
+      contextTokens: 190_000,
+    });
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.ok(row);
+
+    // Continue path: keep accumulating from the persisted totals (spec §4.3).
+    const seed = resumeUsageSeed(row, "continue");
+    assert.equal(seed.llmRequests, 3);
+    assert.equal(seed.inputTokens, 4_000);
+    assert.equal(seed.outputTokens, 800);
+    assert.equal(seed.cacheReadTokens, 120_000);
+    assert.equal(seed.cacheWriteTokens, 5_000);
+    assert.ok(Math.abs(seed.cost - 0.07) < 1e-9);
+    assert.equal(seed.contextTokens, 190_000);
+  });
+});
+
+test("resumeUsageSeed: a legacy row with NULL usage columns yields an empty seed in either mode", async () => {
+  await withStorage(async (storage) => {
+    // No updateAgentSessionUsage call: usage columns read as null (legacy row).
+    await storage.insertAgentSession(baseInsert());
+    const row = storage.getAgentSession("s-abc1234567");
+    assert.ok(row);
+    assert.equal(row.llm_requests, null);
+    assert.equal(row.context_tokens, null);
+
+    // Both branches collapse to the zero/null totals when nothing was committed.
+    assert.deepEqual(resumeUsageSeed(row, "fresh"), emptyUsageTotals());
+    assert.deepEqual(resumeUsageSeed(row, "continue"), emptyUsageTotals());
+  });
 });
