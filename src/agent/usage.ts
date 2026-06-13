@@ -56,22 +56,46 @@ export function emptyUsageTotals(): SessionUsageTotals {
 
 /**
  * In-memory usage accumulator for one session run. One instance per created
- * agent, owned by {@link AgentSessionFactory}. Seedable for resume-in-place so
- * a resumed session continues accumulating from its persisted totals rather
- * than resetting (spec §4.3).
+ * agent. Constructed in `app.ts` (which owns seed computation) and passed into
+ * {@link AgentSessionFactory}; seedable for resume-in-place so a resumed session
+ * continues accumulating from its persisted totals rather than resetting
+ * (spec TOKEN-USAGE-TRACKING §4.3 / SESSION-COST-LIMITS §4).
+ *
+ * Holds two cost lanes that are summed ONLY in-memory, never in storage (the
+ * §8c §4 invariant): the agent-loop lane (`totals.cost`, persisted to
+ * `agent_sessions.usage_*`) and a separate `toolCost` lane (this session's
+ * `tool_invocations` spend, persisted in that ledger — NOT in `usage_*`). The
+ * per-session cost ceiling (SESSION-COST-LIMITS) is enforced against their sum
+ * via {@link combinedCost}.
  */
 export class SessionUsageTracker {
   private totals: SessionUsageTotals;
+  /**
+   * Cumulative tool-use cost (USD) for this session run — the §8c lane. Kept
+   * OUT of {@link SessionUsageTotals} (whose shape maps 1:1 to the agent-loop
+   * `usage_*` columns) so persistence stays agent-loop-pure; combined only at
+   * the enforcement gate / presentation layer.
+   */
+  private toolCost: number;
+  /** Persistence + agent-loop-driven subscribers; fires on `record()` only. */
   private readonly listeners = new Set<(totals: SessionUsageTotals) => void>();
+  /**
+   * Combined-cost subscribers (spec SESSION-COST-LIMITS §4); fires on BOTH
+   * `record()` and `recordToolCost()`, so a budget crossing driven by either
+   * lane is observed. Passed the current {@link combinedCost}.
+   */
+  private readonly budgetListeners = new Set<(combinedCost: number) => void>();
 
-  constructor(seed?: SessionUsageTotals) {
+  constructor(seed?: SessionUsageTotals, toolCostSeed = 0) {
     this.totals = seed ? { ...seed } : emptyUsageTotals();
+    this.toolCost = toolCostSeed > 0 ? toolCostSeed : 0;
   }
 
   /**
    * Accumulate one committed request's usage and set `contextTokens` to its
    * `totalTokens` (the new current size — never assumed monotonic, §2.1).
-   * Notifies listeners with a fresh snapshot afterwards.
+   * Notifies `onUpdate` listeners with a fresh snapshot and `onBudgetChange`
+   * listeners with the new combined cost.
    */
   record(usage: Usage): void {
     this.totals = {
@@ -91,19 +115,59 @@ export class SessionUsageTracker {
         /* a persistence subscriber must never break the accounting path */
       }
     }
+    this.notifyBudget();
   }
 
-  /** Defensive copy of the current totals. */
+  /**
+   * Accumulate one auxiliary tool call's cost (USD) into the §8c lane (spec
+   * SESSION-COST-LIMITS §4). Fires `onBudgetChange` only — never the agent-loop
+   * `onUpdate` persistence channel, so a tool call does not redundantly re-write
+   * the `usage_*` columns. A non-positive cost is a no-op.
+   */
+  recordToolCost(cost: number): void {
+    if (!(cost > 0)) return;
+    this.toolCost += cost;
+    this.notifyBudget();
+  }
+
+  /** Combined cost (USD) across both lanes — the ceiling's enforcement basis. */
+  combinedCost(): number {
+    return this.totals.cost + this.toolCost;
+  }
+
+  /** Defensive copy of the agent-loop totals. */
   snapshot(): SessionUsageTotals {
     return { ...this.totals };
   }
 
-  /** Subscribe to post-record snapshots; returns an unsubscribe fn. */
+  /** Subscribe to post-record agent-loop snapshots; returns an unsubscribe fn. */
   onUpdate(listener: (totals: SessionUsageTotals) => void): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  /**
+   * Subscribe to combined-cost changes (either lane); returns an unsubscribe fn.
+   * Used by the soft-budget-warn watcher (spec SESSION-COST-LIMITS §2.1).
+   */
+  onBudgetChange(listener: (combinedCost: number) => void): () => void {
+    this.budgetListeners.add(listener);
+    return () => {
+      this.budgetListeners.delete(listener);
+    };
+  }
+
+  private notifyBudget(): void {
+    const combined = this.combinedCost();
+    for (const listener of this.budgetListeners) {
+      try {
+        listener(combined);
+      } catch {
+        /* a budget subscriber must never break the accounting path */
+      }
+    }
   }
 }
 

@@ -127,6 +127,15 @@ export interface RequestRetryContext {
    * observed/limit numbers).
    */
   checkContextBudget?: () => string | undefined;
+  /**
+   * Pre-flight cost-budget check (spec SESSION-COST-LIMITS §2.2). Same contract
+   * and timing as {@link checkContextBudget} — evaluated once before the first
+   * attempt, returns a violation message when the session's combined (agent-loop
+   * + tool) spend already meets the operative cost ceiling, undefined otherwise.
+   * A violation is synthesized into the same `content`-class terminal error,
+   * without consuming retry budget. The hook owns its own logging.
+   */
+  checkCostBudget?: () => string | undefined;
 }
 
 /**
@@ -472,7 +481,10 @@ export function withRequestRetry(
         // oversized request (the D3 fallback).
         let budgetViolation: string | undefined;
         try {
-          budgetViolation = ctx.checkContextBudget?.();
+          // Both pre-flight budgets share this content-class synthesis path; the
+          // first violation (context, then cost) wins. Either being undefined
+          // (unwired or within limits) defers to the next / to issuing the request.
+          budgetViolation = ctx.checkContextBudget?.() ?? ctx.checkCostBudget?.();
         } catch (err) {
           budgetViolation = undefined;
           try {

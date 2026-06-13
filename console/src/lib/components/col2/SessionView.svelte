@@ -149,6 +149,16 @@
 		const tu = session.data?.session.toolUsage;
 		return tu && tu.calls > 0 ? tu : null;
 	});
+	// Combined cost budget (spec SESSION-COST-LIMITS §6): the ONLY place the two
+	// lanes are summed — agent-loop cost (§8b) + tool cost (§8c) — against the
+	// per-session ceiling. Shown only when a ceiling resolves (else unlimited).
+	const costBudget = $derived.by(() => {
+		const s = session.data?.session;
+		const limit = s?.maxSessionCostUsd ?? null;
+		if (!s || limit == null || limit <= 0) return null;
+		const spent = (s.usage?.cost ?? 0) + (s.toolUsage?.cost ?? 0);
+		return { spent, limit, pct: Math.round((spent / limit) * 100) };
+	});
 	const toolUsageByCallId = $derived.by(() => {
 		const map = new Map<string, ToolInvocation>();
 		for (const row of session.data?.toolInvocations ?? [])
@@ -283,6 +293,25 @@
 				<span>· in {formatTokens(toolSpend.inputTokens)}</span>
 				<span>· out {formatTokens(toolSpend.outputTokens)}</span>
 				{#if toolSpend.cost > 0}<span>· {formatUsd(toolSpend.cost)}</span>{/if}
+			</div>
+		{/if}
+		{#if costBudget}
+			<!-- Combined cost budget (spec SESSION-COST-LIMITS §6): agent-loop + tool
+			     spend against the per-session ceiling. The ONLY place the two lanes
+			     are summed; the lines above keep them separate. Emphasized as the cap
+			     nears/exceeds 100%. -->
+			<div
+				class="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b bg-background/40 px-3 py-1 font-mono text-[10px] tabular-nums {costBudget.pct >=
+				100
+					? 'text-destructive'
+					: 'text-muted-foreground'}"
+				title={`combined session spend (agent-loop + tool) $${costBudget.spent} of $${costBudget.limit} ceiling (${costBudget.pct}%)`}
+			>
+				<span class="font-semibold {costBudget.pct >= 100 ? 'text-destructive' : 'text-foreground'}"
+					>budget</span
+				>
+				<span>· {formatUsd(costBudget.spent)} / {formatUsd(costBudget.limit)}</span>
+				<span>· {costBudget.pct}%</span>
 			</div>
 		{/if}
 		{#if isRunning && activeId}

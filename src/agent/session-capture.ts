@@ -432,6 +432,9 @@ export function attachSessionCapture(
           sessionType: ctx.sessionType,
           model: ctx.model,
           ...ctx.usage.snapshot(),
+          // Combined (agent-loop + tool) spend (spec SESSION-COST-LIMITS §6) — the
+          // cost-ceiling basis; `cost` above is the agent-loop lane alone.
+          combinedCost: ctx.usage.combinedCost(),
         });
       }
     },

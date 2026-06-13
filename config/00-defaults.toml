@@ -10,6 +10,14 @@ disabled_tools = ["web_fetch", "web_search"]
 # this zone (never the server's real zone), and it is exported as TZ to the
 # process and the Docker sandbox. Set explicitly in local config.
 timezone = "UTC"
+# Per-session-run cost ceiling (spec SESSION-COST-LIMITS). Counts agent-loop +
+# tool-use cost (captioning excluded). max_session_cost_usd is intentionally unset
+# here → sessions are uncapped by default; set it (globally and/or per session
+# type via [agent.session_types.*]) in local config to bound spend. When a ceiling
+# IS set, cost_warn_fraction is the point at which the agent receives a one-shot
+# "wind down" interjection before the hard block at 100%.
+# max_session_cost_usd = 1.00
+cost_warn_fraction = 0.8
 
 [observability]
 # Capacity of the in-memory Layer-0 LLM request ring backing

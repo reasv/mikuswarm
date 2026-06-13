@@ -182,3 +182,49 @@ test("resolveSessionContextCeiling: throws (defensive) when the resolved model h
     /model "default" \(session type "default"\) has no context_window/,
   );
 });
+
+// --- SESSION-COST-LIMITS §3: resolveSessionCostCeiling — global default +
+// per-session-type override; `0` (either level) means "no cap"; unset = unlimited. ---
+
+/** Build a factory exercising the cost-ceiling resolver. */
+function makeCostFactory(opts: {
+  global?: number;
+  sessionTypes?: Record<string, { max_session_cost_usd?: number }>;
+}): AgentSessionFactory {
+  const config = {
+    models: { default: { context_window: 128_000 } },
+    agent: { max_session_cost_usd: opts.global, session_types: opts.sessionTypes },
+  } as unknown as AppConfig;
+  return new AgentSessionFactory({
+    config,
+    contextBuilder: {} as any,
+    getActiveSessions: () => [],
+  });
+}
+
+test("resolveSessionCostCeiling: unset global and override → unlimited (undefined)", () => {
+  const factory = makeCostFactory({ sessionTypes: { default: {} } });
+  assert.equal(factory.resolveSessionCostCeiling("default"), undefined);
+});
+
+test("resolveSessionCostCeiling: global default applies when no override is set", () => {
+  const factory = makeCostFactory({ global: 1.5, sessionTypes: { default: {} } });
+  assert.equal(factory.resolveSessionCostCeiling("default"), 1.5);
+  // Unknown session type also inherits the global default.
+  assert.equal(factory.resolveSessionCostCeiling("nonexistent"), 1.5);
+});
+
+test("resolveSessionCostCeiling: a per-type override wins over the global default", () => {
+  const factory = makeCostFactory({ global: 1.0, sessionTypes: { diary: { max_session_cost_usd: 0.25 } } });
+  assert.equal(factory.resolveSessionCostCeiling("diary"), 0.25);
+});
+
+test("resolveSessionCostCeiling: an override of 0 opts out even when a global default exists", () => {
+  const factory = makeCostFactory({ global: 1.0, sessionTypes: { unbounded: { max_session_cost_usd: 0 } } });
+  assert.equal(factory.resolveSessionCostCeiling("unbounded"), undefined);
+});
+
+test("resolveSessionCostCeiling: a global default of 0 means unlimited", () => {
+  const factory = makeCostFactory({ global: 0, sessionTypes: { default: {} } });
+  assert.equal(factory.resolveSessionCostCeiling("default"), undefined);
+});

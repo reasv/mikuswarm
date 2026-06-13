@@ -895,6 +895,53 @@ test("withRequestRetry: a THROWING checkContextBudget does not crash/hang — de
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "run terminated cleanly");
 });
 
+test("withRequestRetry: checkCostBudget pre-empts as a content failure without calling base (SESSION-COST-LIMITS §2.2)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const ring = new LlmRequestRing();
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    checkContextBudget: () => undefined,
+    checkCostBudget: () => "session cost limit exceeded: observed combined cost $1.2000 >= limit $1.0000",
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 0, "base stream never invoked — no retry budget consumed");
+  assert.deepEqual(events.map((e) => e.type), ["error"]);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.equal(extractLlmRequestClass(err.errorMessage), "content", "reuses the content-class path");
+  assert.match(err.errorMessage ?? "", /session cost limit exceeded/);
+  const rows = ring.list();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.class, "content");
+});
+
+test("withRequestRetry: checkContextBudget is checked BEFORE checkCostBudget (first violation wins)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  let costChecked = false;
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    checkContextBudget: () => "context token limit exceeded: observed context 90000 tokens >= limit 80000",
+    checkCostBudget: () => {
+      costChecked = true;
+      return "should not be reached";
+    },
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 0);
+  const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
+  assert.match(err.errorMessage ?? "", /context token limit exceeded/, "context violation surfaced");
+  assert.equal(costChecked, false, "cost check short-circuited by the context violation");
+});
+
+test("withRequestRetry: both budget checks undefined lets the request proceed normally", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    checkContextBudget: () => undefined,
+    checkCostBudget: () => undefined,
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1);
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+});
+
 test("withRequestRetry: a committed done LACKING usage does not call the capture hook (#3)", async () => {
   // The two capture branches must be consistent: the ring branch already gates on
   // `usage`, so the onRequestCommitted branch must too. A `done` whose message

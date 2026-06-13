@@ -449,6 +449,11 @@ function sessionMeta(
       : null,
     contextTokens: row.context_tokens,
     maxContextTokens: factory.resolveSessionContextCeiling(row.session_type),
+    // Per-session cost ceiling (spec SESSION-COST-LIMITS §6), resolved from
+    // CURRENT config (not persisted). null = unlimited. The combined-spend
+    // denominator the console renders beside the agent-loop + tool lanes; the
+    // numerator is `usage.cost` (§8b) + the §8c tool spend (`toolUsage.cost`).
+    maxSessionCostUsd: factory.resolveSessionCostCeiling(row.session_type) ?? null,
     noReply: row.no_reply === 1,
     error: row.error,
     createdAt: row.created_at,
