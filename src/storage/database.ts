@@ -2887,6 +2887,37 @@ export class Storage {
     return row ? mapSummaryRow(row) : undefined;
   }
 
+  /**
+   * Level-N summary IDs already condensed into a completed (or best-effort
+   * `truncated`) level-(N+1) summary — i.e. they appear as a `parent_id` of
+   * such a higher-level summary (spec SUMMARIZATION-JOB-INPUT-INTEGRITY §3.2,
+   * Fix A). These are no longer condensation candidates: re-condensing a range
+   * already represented one level up is pure duplicate work and the trigger
+   * behind the field case (Defect A). Lineage-keyed (not timestamp-overlap),
+   * so it survives the producing job row being pruned and also suppresses
+   * re-condensation under a manually inserted / out-of-band higher-level
+   * summary. `truncated` higher summaries count toward the covered set (open
+   * question A1 resolved: the range IS represented; re-condensing it is the
+   * same waste). Pure read.
+   */
+  getCondensedSummaryIds(timelineKey: string, level: number): Set<string> {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select distinct sp.parent_id as id
+             from summary_parents sp
+             join summaries child on child.id = sp.parent_id
+             join summaries higher on higher.id = sp.summary_id
+            where child.timeline_key = ?
+              and child.level = ?
+              and higher.level = ?
+              and higher.status in ('complete', 'truncated')`,
+        )
+        .all(timelineKey, level, level + 1) as Array<{ id: string }>,
+    );
+    return new Set(rows.map((r) => r.id));
+  }
+
   /** Summaries at a given level, status in (complete, truncated), ordered by earliest_timestamp ASC. */
   getSummariesByLevel(timelineKey: string, level: number): Summary[] {
     const rows = this.read((db) =>

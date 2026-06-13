@@ -1008,6 +1008,168 @@ test("diaryRange and summarizationCutoff are mutually exclusive", async () => {
   }
 });
 
+// ── condenseInputs path in ContextBuilder.build() (spec SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1) ──
+
+/** Insert a summary row directly (test helper for the condense input-addressed path). */
+function insertLeveledSummaryRow(
+  storage: Storage,
+  s: {
+    id: string;
+    level: number;
+    earliest: number;
+    latest: number;
+    content?: string;
+    status?: string;
+    latestEventId?: string;
+  },
+): Promise<void> {
+  return storage.write((db) => {
+    db.prepare(
+      `insert into summaries (id, timeline_key, level, content, earliest_timestamp,
+        latest_timestamp, latest_event_id, event_count, token_count, model_id,
+        status, generated_at, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      s.id,
+      "matrix:miku:room:!room",
+      s.level,
+      s.content ?? `content of ${s.id}`,
+      s.earliest,
+      s.latest,
+      s.latestEventId ?? `ev_${s.id}`,
+      2,
+      50,
+      "model",
+      s.status ?? "complete",
+      0,
+      0,
+    );
+  });
+}
+
+test("condenseInputs: renders exactly the declared child summaries, no raw events, no coverage selection", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    // Five level-1 summaries — the declared condense inputs.
+    for (let i = 0; i < 5; i++) {
+      await insertLeveledSummaryRow(storage, { id: `l1_${i}`, level: 1, earliest: i * 100, latest: i * 100 + 50 });
+    }
+    // A DUPLICATE covering level-2 summary over the same span (the field-case
+    // hazard): greedy coverage selection would prefer it. condenseInputs must
+    // ignore it entirely.
+    await insertLeveledSummaryRow(storage, { id: "l2_dup", level: 2, earliest: 0, latest: 450 });
+    // Raw timeline events in the same span — condense must not read them.
+    await timeline.append(testEvent({ id: "ev_a", body: "raw a", timestamp: 100 }));
+    await timeline.append(testEvent({ id: "ev_b", body: "raw b", timestamp: 200 }));
+
+    const children = storage.getSummariesByLevel(TK, 1);
+    assert.equal(children.length, 5);
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "condense:test", body: "condense", timestamp: 450 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      condenseInputs: { summaries: children },
+    });
+
+    const summaryLayer = built.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(summaryLayer, "a summary layer is rendered");
+    for (const id of ["l1_0", "l1_1", "l1_2", "l1_3", "l1_4"]) {
+      assert.ok(summaryLayer!.content.includes(id), `summary layer includes declared child ${id}`);
+    }
+    assert.ok(!summaryLayer!.content.includes("l2_dup"), "the duplicate covering L2 is NOT selected");
+    // No raw events rendered.
+    assert.equal(built.messages.filter((m) => m.type === "chatEvent").length, 0, "condense renders no raw events");
+    assert.ok(!JSON.stringify(built.messages).includes("raw a"), "raw timeline events are not read");
+    // Final turn is the satellite, not a trigger group.
+    assert.equal(built.messages[built.messages.length - 1]!.type, "satellite");
+    storage.close();
+  } catch (e) {
+    storage.close();
+    throw e;
+  }
+});
+
+test("condenseInputs: renderedInputIds equals the declared parent IDs in order", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 0; i < 3; i++) {
+      await insertLeveledSummaryRow(storage, { id: `l1_${i}`, level: 1, earliest: i * 100, latest: i * 100 + 50 });
+    }
+    const children = storage.getSummariesByLevel(TK, 1);
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "condense:test", body: "condense", timestamp: 250 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      condenseInputs: { summaries: children },
+    });
+    assert.deepEqual(built.renderedInputIds, ["l1_0", "l1_1", "l1_2"]);
+    storage.close();
+  } catch (e) {
+    storage.close();
+    throw e;
+  }
+});
+
+test("summarizationCutoff: renderedInputIds equals the rendered raw-event IDs (level-1 integrity surface)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    await timeline.append(testEvent({ id: "ev1", body: "first", timestamp: 1000 }));
+    await timeline.append(testEvent({ id: "ev2", body: "second", timestamp: 2000 }));
+    await timeline.append(testEvent({ id: "ev3", body: "third", timestamp: 3000 }));
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger: testEvent({ id: "summarize:test", body: "summarize", timestamp: 2000 }),
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      summarizationCutoff: { endTimestamp: 2000 },
+    });
+    // Only ev1, ev2 are <= cutoff and rendered as to-summarize material.
+    assert.deepEqual(built.renderedInputIds, ["ev1", "ev2"]);
+    storage.close();
+  } catch (e) {
+    storage.close();
+    throw e;
+  }
+});
+
+test("condenseInputs and summarizationCutoff are mutually exclusive", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  try {
+    await assert.rejects(
+      builder.build({
+        timelineKey: "matrix:miku:room:!room",
+        trigger: testEvent({ id: "x", body: "x", timestamp: 1000 }),
+        activeSessions: [],
+        workspace: emptyWorkspace,
+        summarizationCutoff: { endTimestamp: 1000 },
+        condenseInputs: { summaries: [] },
+      }),
+      /mutually exclusive/,
+    );
+  } finally {
+    storage.close();
+  }
+});
+
 // The generation-threshold enqueue tests moved to test/summarization-indexer.test.ts
 // (spec C: job creation now lives in SummarizationIndexer, off the build path).
 

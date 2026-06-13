@@ -51,6 +51,16 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void
   }
 }
 
+/**
+ * Declared input IDs of every job seeded by {@link seedSummarizationJob} (level
+ * 1, range ev0..ev1). The stub factories surface these as `renderedInputIds` so
+ * the worker's declared-vs-rendered integrity assertion (spec
+ * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1) passes — these tests exercise
+ * terminality/drain, not the integrity gate, so the rendered set must match the
+ * declared set the real builder would produce.
+ */
+const SEEDED_RENDERED_INPUT_IDS = ["ev0", "ev1"];
+
 /** Fake factory whose agent run succeeds after writing a valid summary draft. */
 function makeSucceedingSummaryFactory() {
   return {
@@ -65,6 +75,7 @@ function makeSucceedingSummaryFactory() {
           subscribe: () => () => {},
           state: { messages: [] },
         },
+        renderedInputIds: SEEDED_RENDERED_INPUT_IDS,
       };
     },
   } as any;
@@ -349,7 +360,7 @@ function makeAbortableFactory(extra: Record<string, unknown> = {}) {
           abortResolve();
         },
       };
-      return { agent };
+      return { agent, renderedInputIds: SEEDED_RENDERED_INPUT_IDS };
     },
   } as any;
 }
@@ -402,7 +413,7 @@ test("cap abort (spec §7): an abort while the pool is RUNNING stays on the sema
           subscribe: () => () => {},
           abort: () => {},
         };
-        return { agent };
+        return { agent, renderedInputIds: SEEDED_RENDERED_INPUT_IDS };
       },
     } as any;
     const pool = new SummarizationWorkerPool({
@@ -465,7 +476,7 @@ test("cap abort racing pool stop (spec §7 / #13): a cap abort that settles whil
           subscribe: () => () => {},
           abort: () => {},
         };
-        return { agent };
+        return { agent, renderedInputIds: SEEDED_RENDERED_INPUT_IDS };
       },
     } as any;
     pool = new SummarizationWorkerPool({
@@ -520,6 +531,123 @@ test("drain abort (diary mirror, spec §7): stop() re-pends with diary_attempts 
     assert.equal(job?.summaryId, "sum_diary_drain");
     assert.equal(job?.attempts, 1, "fresh claim after a compensated drain is attempt 1, not 2");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Input integrity (spec SUMMARIZATION-JOB-INPUT-INTEGRITY): Fix C (the kickoff
+// delivers only the satellite final turn — no restated instruction turn) and
+// Fix B (declared-vs-rendered assertion fails the job, commits no artifact).
+// ---------------------------------------------------------------------------
+
+test("Fix C: the kickoff is the satellite final turn alone — no trailing 'Summarize the conversation' user turn", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_kickoff", 0);
+    const satellite = { role: "user", content: "<system>satellite block with instructions</system>", timestamp: 2000 };
+    let capturedKickoff: unknown;
+    const factory = {
+      resolveModelId: () => "test-model",
+      create: async (_session: unknown, tools: AgentTool[]) => {
+        const summaryTool = tools[0]!;
+        await summaryTool.execute("t", { command: "create", file_text: "A fine summary." });
+        return {
+          agent: {
+            prompt: async (k: unknown) => {
+              capturedKickoff = k;
+            },
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          finalTurn: satellite,
+          renderedInputIds: SEEDED_RENDERED_INPUT_IDS,
+        };
+      },
+    } as any;
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 },
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("job_kickoff")?.status === "complete");
+    await pool.stop();
+
+    // The kickoff is the satellite object itself, NOT an array ending in a
+    // restated "Summarize the conversation shown above." user turn (Fix C).
+    assert.deepEqual(capturedKickoff, satellite, "kickoff must be the satellite final turn alone");
+    assert.ok(!Array.isArray(capturedKickoff), "kickoff is not a multi-turn array");
+    assert.ok(
+      !JSON.stringify(capturedKickoff).includes("Summarize the conversation shown above"),
+      "the redundant instruction turn is gone",
+    );
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("Fix B: a declared-vs-rendered input mismatch fails the job and commits no summary", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await seedSummarizationJob(storage, "job_mismatch", 0);
+    // The factory renders the WRONG inputs (declared is ev0/ev1) — the integrity
+    // assertion must fail the run before the agent does anything.
+    // The agent only writes its draft during prompt() (as in production); since
+    // the assertion fires pre-prompt, no draft is ever produced — so there is
+    // nothing for the truncation fallback to salvage and the job truly fails.
+    let promptCalled = false;
+    const factory = {
+      resolveModelId: () => "test-model",
+      create: async () => {
+        return {
+          agent: {
+            prompt: async () => {
+              promptCalled = true;
+            },
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          finalTurn: { role: "user", content: "<system>satellite</system>" },
+          renderedInputIds: ["ev_WRONG"],
+        };
+      },
+    } as any;
+    const errors: string[] = [];
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 },
+      onComplete: () => {},
+      onError: (jobId) => errors.push(jobId),
+      logger: silentLogger,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("job_mismatch")?.status === "failed");
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("job_mismatch")!;
+    assert.equal(job.status, "failed", "an input-integrity violation fails the job");
+    assert.match(job.error ?? "", /input integrity violation/);
+    assert.equal(promptCalled, false, "the agent never ran (assertion is pre-prompt)");
+    assert.equal(
+      storage.getSummariesByLevel(TK, 1).length,
+      0,
+      "no mislabeled artifact is committed",
+    );
+    assert.deepEqual(errors, ["job_mismatch"]);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
 });
 
 test("returnSummarizationJobToPending / returnDiaryJobToPending never touch non-processing rows", async () => {

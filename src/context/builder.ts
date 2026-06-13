@@ -55,10 +55,27 @@ export interface BuildContextOptions {
   workspace: WorkspaceContent;
   sessionType?: SessionTypeConfig;
   fallbackPrompt?: string;
-  /** When set, build context for a summarization session. */
+  /** When set, build context for a level-1 summarization session. */
   summarizationCutoff?: {
     /** Cut context at this timestamp — no events past it are rendered. */
     endTimestamp: number;
+  };
+  /**
+   * When set, build context for a condensation (level 2+) session over an
+   * explicit, pre-resolved list of child summaries (spec
+   * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1, Fix B — input-addressed
+   * generation). The builder renders EXACTLY these summaries, in the order
+   * given, as the final-turn material (the summary-layer envelope the condense
+   * `session_instruction` already describes), with NO coverage selection, NO
+   * timeline query, and NO raw events — a condensation is a pure reduction of
+   * its declared inputs and has no business reading live timeline state (P3).
+   * The rendered summary IDs are surfaced as {@link BuiltContext.renderedInputIds}
+   * so the worker can assert declared == rendered before the agent runs (P1/P2).
+   * Mutually exclusive with `summarizationCutoff` and `diaryRange` (validated).
+   */
+  condenseInputs?: {
+    /** Child summaries (level N-1) to condense, chronological order. */
+    summaries: Summary[];
   };
   /**
    * When set, build context for a diary session over a level-1 summary range
@@ -112,6 +129,17 @@ export interface BuiltContext {
   compactTokens: number;
   richTokens: number;
   imageBlocks: ImageBlock[];
+  /**
+   * Input-addressed generation builds only (spec
+   * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1, Fix B): the IDs of the material the
+   * builder actually rendered as "the inputs to reduce", so the summarization
+   * worker can assert they equal the job's declared input set before the agent
+   * runs (P1/P2; invariant 1). For a `condenseInputs` (level 2+) build these
+   * are the rendered child-summary IDs; for a `summarizationCutoff` (level 1)
+   * build they are the rendered raw-event IDs. Undefined for every other build
+   * (live chat, proactive, diary-range) — they have no declared input set.
+   */
+  renderedInputIds?: string[];
 }
 
 /**
@@ -170,16 +198,21 @@ export class ContextBuilder {
   async build(options: BuildContextOptions): Promise<BuiltContext> {
     const cutoff = options.summarizationCutoff;
     const diaryRange = options.diaryRange;
-    if (cutoff && diaryRange) {
-      throw new Error("summarizationCutoff and diaryRange are mutually exclusive build modes");
+    const condenseInputs = options.condenseInputs;
+    if ([cutoff, diaryRange, condenseInputs].filter((m) => m != null).length > 1) {
+      throw new Error(
+        "summarizationCutoff, condenseInputs and diaryRange are mutually exclusive build modes",
+      );
     }
-    // A "generation" build (summarize/condense cutoff, or the diary-range mode)
-    // produces memory artifacts over a past range rather than answering a live
-    // trigger: no trigger group, no diary layer, no auto-retrieval, no reactions,
-    // no wait-or-omit, runtime state suppressed, satellite final turn. The two
-    // modes differ ONLY in their bounds (cut at range end vs. coverage bounded
-    // at range start) — spec DIARY-CONTEXT-PARITY §3.
-    const generation = cutoff != null || diaryRange != null;
+    // A "generation" build (level-1 summarize cutoff, level-2+ condense, or the
+    // diary-range mode) produces memory artifacts over a past range rather than
+    // answering a live trigger: no trigger group, no diary layer, no
+    // auto-retrieval, no reactions, no wait-or-omit, runtime state suppressed,
+    // satellite final turn. The cutoff and diary-range modes differ ONLY in
+    // their bounds (cut at range end vs. coverage bounded at range start — spec
+    // DIARY-CONTEXT-PARITY §3); the condense mode is input-addressed and reads
+    // no timeline state at all (spec SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1).
+    const generation = cutoff != null || diaryRange != null || condenseInputs != null;
     // Proactive check-in (§9g): live context as usual, but no trigger group and a
     // synthetic kickoff as the final user turn. Distinct from the generation
     // modes, which re-bound the whole context to a past range.
@@ -195,12 +228,25 @@ export class ContextBuilder {
     //    cursor advances across adjacent summaries (which are separated by
     //    real inter-message intervals) and stops only at a genuine gap of
     //    un-covered raw events.
-    let selection = selectSummaryCoverage(this.storage, options.timelineKey);
+    //
+    //    The condense (level 2+) input-addressed path (spec
+    //    SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1) is the exception: it renders
+    //    EXACTLY the declared child summaries with no coverage selection and no
+    //    timeline query at all (P3). The summary layer IS those summaries; there
+    //    are no raw events.
+    let selection: SummarySelection;
+    let events: CanonicalChatEvent[];
+    if (condenseInputs) {
+      selection = { summaries: condenseInputs.summaries, coverageEndEventId: null };
+      events = [];
+    } else {
+      selection = selectSummaryCoverage(this.storage, options.timelineKey);
 
-    // 2. Query events starting strictly after the coverage cursor.
-    let events = selection.coverageEndEventId
-      ? this.store.queryAfterContext(options.timelineKey, selection.coverageEndEventId)
-      : this.store.queryForContext(options.timelineKey, compactionState);
+      // 2. Query events starting strictly after the coverage cursor.
+      events = selection.coverageEndEventId
+        ? this.store.queryAfterContext(options.timelineKey, selection.coverageEndEventId)
+        : this.store.queryForContext(options.timelineKey, compactionState);
+    }
 
     if (cutoff) {
       // Cut at endTimestamp; re-select the summary layer to exclude any summary
@@ -506,6 +552,19 @@ export class ContextBuilder {
       ? systemBlock
       : [retrievedMemory, systemBlock, finalTurnTail].filter(Boolean).join("\n\n");
 
+    // Input-addressed integrity (spec SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1):
+    // surface exactly what was rendered as "material to reduce" so the worker
+    // can assert it equals the job's declared inputs before running the agent.
+    // Condense renders the declared child summaries (the summary layer); a
+    // level-1 cutoff renders the raw events that survived the cutoff/coverage
+    // re-query as the to-summarize turns (`compactionInput`). Every other build
+    // has no declared input set.
+    const renderedInputIds = condenseInputs
+      ? selection.summaries.map((s) => s.id)
+      : cutoff
+        ? compactionInput.map((e) => e.id)
+        : undefined;
+
     const messages: ContextMessage[] = [
       {
         type: "system",
@@ -532,6 +591,7 @@ export class ContextBuilder {
       compactTokens: compacted.compactTokens,
       richTokens: compacted.richTokens,
       imageBlocks,
+      renderedInputIds,
     };
   }
 
