@@ -170,37 +170,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
   // Context-token ceiling cross-field validation (spec TOKEN-USAGE-TRACKING
-  // §6.1, same app-wiring fail-fast convention). A model-level
-  // `max_context_tokens` above its own `context_window` is an operator error
-  // (the descriptor's window is the hard wall). A session-type-level ceiling
-  // must likewise fit under the `context_window` of the model it resolves to —
-  // a ceiling larger than the model could ever reach is a no-op typo. The
-  // effective limit is min(model, type), so a type can only tighten (D2); we
-  // only fail-fast on the nonsensical "ceiling above the wall" cases.
-  const modelContextWindow = (key: string): number | undefined =>
-    config.models[key]?.context_window;
-  for (const [key, model] of Object.entries(config.models)) {
-    if (
-      model.max_context_tokens !== undefined &&
-      model.context_window !== undefined &&
-      model.max_context_tokens > model.context_window
-    ) {
-      throw new Error(
-        `models.${key}: max_context_tokens (${model.max_context_tokens}) must be <= context_window (${model.context_window})`,
-      );
-    }
-  }
-  for (const [typeName, sessionType] of Object.entries(config.agent.session_types ?? {})) {
-    if (sessionType.max_context_tokens === undefined) continue;
-    const modelKey = sessionType.model ?? "default";
-    const window = modelContextWindow(modelKey);
-    if (window !== undefined && sessionType.max_context_tokens > window) {
-      throw new Error(
-        `agent.session_types.${typeName}: max_context_tokens (${sessionType.max_context_tokens}) ` +
-          `exceeds context_window (${window}) of its model "${modelKey}"`,
-      );
-    }
-  }
+  // §6.1). Extracted to a pure function so it can be unit-tested directly
+  // without booting the whole agent; the throw/message behavior is identical.
+  validateContextTokenCeilings(config);
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
   // under the assembled-document cap — anything else is a config typo that
@@ -2164,6 +2136,44 @@ export function decideRetentionSweep(params: {
   const { retentionDays, draining, now } = params;
   if (draining || retentionDays <= 0) return { skip: true };
   return { skip: false, cutoff: now - retentionDays * MILLIS_PER_DAY };
+}
+
+/**
+ * Context-token ceiling cross-field validation (spec TOKEN-USAGE-TRACKING
+ * §6.1, same app-wiring fail-fast convention). A model-level
+ * `max_context_tokens` above its own `context_window` is an operator error
+ * (the descriptor's window is the hard wall). A session-type-level ceiling
+ * must likewise fit under the `context_window` of the model it resolves to —
+ * a ceiling larger than the model could ever reach is a no-op typo. The
+ * effective limit is min(model, type), so a type can only tighten (D2); we
+ * only fail-fast on the nonsensical "ceiling above the wall" cases. Throws on
+ * the first offending entry. Called from {@link startMikuAgent}.
+ */
+export function validateContextTokenCeilings(config: AppConfig): void {
+  const modelContextWindow = (key: string): number | undefined =>
+    config.models[key]?.context_window;
+  for (const [key, model] of Object.entries(config.models)) {
+    if (
+      model.max_context_tokens !== undefined &&
+      model.context_window !== undefined &&
+      model.max_context_tokens > model.context_window
+    ) {
+      throw new Error(
+        `models.${key}: max_context_tokens (${model.max_context_tokens}) must be <= context_window (${model.context_window})`,
+      );
+    }
+  }
+  for (const [typeName, sessionType] of Object.entries(config.agent.session_types ?? {})) {
+    if (sessionType.max_context_tokens === undefined) continue;
+    const modelKey = sessionType.model ?? "default";
+    const window = modelContextWindow(modelKey);
+    if (window !== undefined && sessionType.max_context_tokens > window) {
+      throw new Error(
+        `agent.session_types.${typeName}: max_context_tokens (${sessionType.max_context_tokens}) ` +
+          `exceeds context_window (${window}) of its model "${modelKey}"`,
+      );
+    }
+  }
 }
 
 /**

@@ -196,6 +196,97 @@ test("GET /api/rooms/:key/sessions lists sessions for the timeline", async () =>
   });
 });
 
+test("sessionMeta surfaces ACTUALS usage as a grouped object + echoes context/limit (issue #7)", async () => {
+  await withStorage(async (storage) => {
+    // A row whose usage columns are POPULATED (a request committed). The
+    // null-vs-zero distinction is load-bearing (spec §4.2): a populated row has
+    // a non-null `llm_requests`, so `usage` must be the grouped object — never null.
+    await storage.insertAgentSession(sessionInsert());
+    await storage.updateAgentSessionUsage("s-aaa1111111", {
+      llmRequests: 3,
+      inputTokens: 1_000,
+      outputTokens: 250,
+      cacheReadTokens: 800,
+      cacheWriteTokens: 120,
+      cost: 0.0123,
+      contextTokens: 2_170,
+    });
+
+    // Pin the effective-ceiling wiring: the route reads it from
+    // factory.resolveEffectiveMaxContextTokens(session_type), so a non-null stub
+    // value must surface verbatim as `maxContextTokens`.
+    const factory = {
+      buildPreview: () => {
+        throw new Error("buildPreview should not be called in this test");
+      },
+      resolveEffectiveMaxContextTokens: (sessionType: string) => {
+        assert.equal(sessionType, "default"); // resolved from the row's session_type
+        return 8_000;
+      },
+    } as unknown as AgentSessionFactory;
+
+    await withServer({ storage, factory }, async (base) => {
+      // Both the list route and the detail route build the meta via sessionMeta;
+      // assert the populated shape on both (cheap, and they are structurally
+      // identical — the detail route just nests it under `session`).
+      const list = (await (
+        await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/sessions`)
+      ).json()) as any;
+      assert.equal(list.sessions.length, 1);
+      const s = list.sessions[0];
+      assert.deepEqual(s.usage, {
+        input: 1_000,
+        output: 250,
+        cacheRead: 800,
+        cacheWrite: 120,
+        cost: 0.0123,
+      });
+      assert.equal(s.llmRequests, 3);
+      assert.equal(s.contextTokens, 2_170);
+      assert.equal(s.maxContextTokens, 8_000);
+
+      const detail = (await (await fetch(`${base}/api/sessions/s-aaa1111111`)).json()) as any;
+      assert.deepEqual(detail.session.usage, {
+        input: 1_000,
+        output: 250,
+        cacheRead: 800,
+        cacheWrite: 120,
+        cost: 0.0123,
+      });
+      assert.equal(detail.session.llmRequests, 3);
+      assert.equal(detail.session.contextTokens, 2_170);
+      assert.equal(detail.session.maxContextTokens, 8_000);
+    });
+  });
+});
+
+test("sessionMeta returns null usage/contextTokens for a LEGACY row (null-vs-zero, issue #7)", async () => {
+  await withStorage(async (storage) => {
+    // A legacy/pre-first-commit row: never had usage written, so `llm_requests`
+    // is null. The branch `hasUsage = row.llm_requests !== null` must yield
+    // `usage === null` and `contextTokens === null` — NOT an all-zero usage
+    // object (the null-vs-zero distinction, spec §4.2).
+    await storage.insertAgentSession(sessionInsert());
+
+    await withServer({ storage }, async (base) => {
+      const list = (await (
+        await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/sessions`)
+      ).json()) as any;
+      const s = list.sessions[0];
+      assert.equal(s.usage, null);
+      assert.equal(s.contextTokens, null);
+      assert.equal(s.llmRequests, null);
+      // The default throwingFactory stub returns null → unenforced ceiling.
+      assert.equal(s.maxContextTokens, null);
+
+      const detail = (await (await fetch(`${base}/api/sessions/s-aaa1111111`)).json()) as any;
+      assert.equal(detail.session.usage, null);
+      assert.equal(detail.session.contextTokens, null);
+      assert.equal(detail.session.llmRequests, null);
+    });
+  });
+});
+
 test("GET /api/sessions/:id returns snapshot + transcript; 404 for unknown", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert());
