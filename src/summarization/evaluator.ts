@@ -30,7 +30,18 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
   const { storage, config, timelineKey, level, logger } = options;
   const fanout = config.condense_fanout ?? 5;
 
-  const summaries = storage.getSummariesByLevel(timelineKey, level);
+  // Fix A — condensation idempotency on input identity (spec
+  // SUMMARIZATION-JOB-INPUT-INTEGRITY §3.2 / P4): a level-N summary already
+  // condensed into a completed level-(N+1) summary is NOT a condensation
+  // candidate. Exclude the covered set (lineage-keyed, via `summary_parents`)
+  // before run-splitting so re-evaluation of unchanged timeline state enqueues
+  // nothing new. This mirrors render-time pruning and closes the duplicate-
+  // enqueue gap (Defect A) that triggered the field case — the existing
+  // active/failed `blocksChunk` checks below remain the in-flight / terminal-
+  // failure guards; this handles the COMPLETED case they never consulted.
+  const allSummaries = storage.getSummariesByLevel(timelineKey, level);
+  const covered = storage.getCondensedSummaryIds(timelineKey, level);
+  const summaries = covered.size === 0 ? allSummaries : allSummaries.filter((s) => !covered.has(s.id));
   if (summaries.length < fanout) return;
 
   // Terminally failed ranges interrupt runs at EVERY level above them: a

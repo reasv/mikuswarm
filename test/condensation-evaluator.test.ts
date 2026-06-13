@@ -58,6 +58,20 @@ function insertSummary(
   });
 }
 
+/**
+ * Link `childIds` (level N) as the ordered parents of `higherId` (level N+1) —
+ * i.e. record `higherId` as having condensed them, via `summary_parents`. Used
+ * to set up the already-condensed (covered) state for Fix A.
+ */
+function linkParents(storage: Storage, higherId: string, childIds: string[]): Promise<void> {
+  return storage.write((db) => {
+    const stmt = db.prepare(
+      `insert into summary_parents (summary_id, parent_id, ordinal) values (?, ?, ?)`,
+    );
+    childIds.forEach((childId, ordinal) => stmt.run(higherId, childId, ordinal));
+  });
+}
+
 test("enqueues a level-2 job for a contiguous run >= fanout", async () => {
   const storage = await openStorage();
   for (let i = 0; i < 5; i++) {
@@ -500,6 +514,139 @@ test("1c: a terminally failed level-2 range interrupts level-3 evaluation — ne
     ["l2_0", "l2_4"],
     ["l2_6", "l2_10"],
   ]);
+  storage.close();
+});
+
+// ── Fix A: condensation idempotency on input identity (spec §3.2) ────────────
+
+test("Fix A: a run already condensed into a completed level-2 summary is not re-enqueued (the field case)", async () => {
+  const storage = await openStorage();
+  // Five L1 summaries already condensed into sum_l2 ~the field case shape.
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  await insertSummary(storage, {
+    id: "sum_l2",
+    level: 2,
+    earliestTimestamp: 0,
+    latestTimestamp: 450,
+    status: "complete",
+  });
+  await linkParents(storage, "sum_l2", ["s0", "s1", "s2", "s3", "s4"]);
+
+  // No active/failed level-2 job exists (the original condense job row was
+  // pruned) — only the COMPLETED covering summary's lineage suppresses re-work.
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "a run already represented by a completed L2 must not re-condense",
+  );
+  storage.close();
+});
+
+test("Fix A: a truncated higher-level summary also suppresses re-condensation (A1)", async () => {
+  const storage = await openStorage();
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  await insertSummary(storage, {
+    id: "sum_l2_trunc",
+    level: 2,
+    earliestTimestamp: 0,
+    latestTimestamp: 450,
+    status: "truncated",
+  });
+  await linkParents(storage, "sum_l2_trunc", ["s0", "s1", "s2", "s3", "s4"]);
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "a truncated (best-effort) L2 still represents the range — no re-condensation",
+  );
+  storage.close();
+});
+
+test("Fix A: running evaluateCondensation twice over identical state is a no-op (idempotent)", async () => {
+  const storage = await openStorage();
+  for (let i = 0; i < 5; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+
+  // First pass enqueues the L2 job.
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+  const after1 = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(after1.length, 1, "first pass enqueues the condense job");
+
+  // Simulate the job completing: insert the covering L2 with lineage and mark
+  // the job complete (what insertSummaryWithLineage would do), then re-evaluate.
+  await insertSummary(storage, {
+    id: "sum_l2_done",
+    level: 2,
+    earliestTimestamp: 0,
+    latestTimestamp: 450,
+    status: "complete",
+  });
+  await linkParents(storage, "sum_l2_done", ["s0", "s1", "s2", "s3", "s4"]);
+  await storage.write((db) =>
+    db.prepare(`update summarization_jobs set status = 'complete' where id = ?`).run(after1[0]!.id),
+  );
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+  assert.equal(
+    storage.getActiveSummarizationJobs(TK, 2).length,
+    0,
+    "re-evaluation of the now-condensed state enqueues nothing new",
+  );
+  storage.close();
+});
+
+test("Fix A: only the not-yet-condensed tail re-condenses", async () => {
+  const storage = await openStorage();
+  // Ten L1 summaries; the first five are already condensed into sum_l2a.
+  for (let i = 0; i < 10; i++) {
+    await insertSummary(storage, {
+      id: `s${i}`,
+      level: 1,
+      earliestTimestamp: i * 100,
+      latestTimestamp: i * 100 + 50,
+    });
+  }
+  await insertSummary(storage, {
+    id: "sum_l2a",
+    level: 2,
+    earliestTimestamp: 0,
+    latestTimestamp: 450,
+    status: "complete",
+  });
+  await linkParents(storage, "sum_l2a", ["s0", "s1", "s2", "s3", "s4"]);
+
+  await evaluateCondensation({ storage, config, timelineKey: TK, level: 1, logger: silentLogger });
+
+  // The covered prefix [s0..s4] is excluded; only [s5..s9] forms a fanout-sized
+  // run and condenses.
+  const jobs = storage.getActiveSummarizationJobs(TK, 2);
+  assert.equal(jobs.length, 1, "exactly the uncondensed tail condenses");
+  assert.equal(jobs[0]!.inputStartId, "s5");
+  assert.equal(jobs[0]!.inputEndId, "s9");
   storage.close();
 });
 

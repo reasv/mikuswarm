@@ -16,7 +16,7 @@ import {
 } from "./scheduler.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
-import type { Storage } from "../storage/index.js";
+import type { Storage, Summary } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
@@ -151,8 +151,19 @@ export interface PreviewContext {
 type ModelConfig = AppConfig["models"]["default"];
 
 export interface CreateAgentOptions {
-  /** When set, build context for a summarization session cut at this timestamp. */
+  /** When set, build context for a level-1 summarization session cut at this timestamp. */
   summarizationCutoff?: { endTimestamp: number };
+  /**
+   * When set, build context for a condensation (level 2+) session over an
+   * explicit, pre-resolved child-summary list (spec
+   * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1, Fix B — input-addressed
+   * generation): the builder renders exactly these summaries, no coverage
+   * selection / timeline query / raw events, and surfaces the rendered IDs as
+   * {@link CreatedAgent.renderedInputIds} for the worker's declared-vs-rendered
+   * assertion. Mutually exclusive with `summarizationCutoff` and `diaryRange`;
+   * threaded straight into {@link ContextBuilder.build}.
+   */
+  condenseInputs?: { summaries: Summary[] };
   /**
    * When set, build context for a diary session over a level-1 summary range
    * (spec DIARY-CONTEXT-PARITY §3; ARCHITECTURE.md §9c): the summarize-style
@@ -254,6 +265,15 @@ export interface CreatedAgent {
    * session totals. One instance per created agent, owned here.
    */
   usage: SessionUsageTracker;
+  /**
+   * Input-addressed generation builds only (spec
+   * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1): the IDs the builder actually
+   * rendered as the inputs to reduce — child-summary IDs for a `condenseInputs`
+   * build, raw-event IDs for a `summarizationCutoff` build. The summarization
+   * worker asserts these equal the job's declared input set before kicking the
+   * agent. Undefined for resume / live / proactive / diary builds.
+   */
+  renderedInputIds?: string[];
 }
 
 export class AgentSessionFactory {
@@ -455,6 +475,10 @@ export class AgentSessionFactory {
     let snapshotTokenEstimate: number | undefined;
     let snapshotCompactTokens: number | undefined;
     let snapshotRichTokens: number | undefined;
+    // Input-addressed integrity surface (spec SUMMARIZATION-JOB-INPUT-INTEGRITY
+    // §3.1): the builder's rendered input IDs, passed back to the worker for the
+    // declared-vs-rendered assertion. Undefined in resume mode (no fresh build).
+    let renderedInputIds: string[] | undefined;
     if (opts?.resume) {
       // Defensive copy: the resume snapshot is a persisted array owned by the caller
       // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
@@ -468,6 +492,7 @@ export class AgentSessionFactory {
         sessionType: sessionTypeConfig,
         fallbackPrompt,
         summarizationCutoff: opts?.summarizationCutoff,
+        condenseInputs: opts?.condenseInputs,
         diaryRange: opts?.diaryRange,
         proactive: opts?.proactive,
         // The session's resolved class doubles as the wait-or-omit escalation
@@ -494,6 +519,7 @@ export class AgentSessionFactory {
       snapshotTokenEstimate = built.tokenEstimate;
       snapshotCompactTokens = built.compactTokens;
       snapshotRichTokens = built.richTokens;
+      renderedInputIds = built.renderedInputIds;
     }
 
     // Freeze the prefix so accidental reassignment of an element or the array throws
@@ -598,6 +624,7 @@ export class AgentSessionFactory {
       compactTokens: snapshotCompactTokens,
       richTokens: snapshotRichTokens,
       usage,
+      renderedInputIds,
     };
   }
 
@@ -642,6 +669,7 @@ export class AgentSessionFactory {
     sessionType: SessionTypeConfig | undefined;
     fallbackPrompt: string | undefined;
     summarizationCutoff?: { endTimestamp: number };
+    condenseInputs?: { summaries: Summary[] };
     diaryRange?: { earliestTimestamp: number; latestTimestamp: number; summaryId: string };
     proactive?: boolean;
     priority?: PriorityClass;
@@ -650,13 +678,14 @@ export class AgentSessionFactory {
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
       trigger: args.trigger,
-      activeSessions: args.summarizationCutoff || args.diaryRange
+      activeSessions: args.summarizationCutoff || args.condenseInputs || args.diaryRange
         ? []
         : this.options.getActiveSessions(args.timelineKey),
       workspace: args.workspace,
       sessionType: args.sessionType,
       fallbackPrompt: args.fallbackPrompt,
       summarizationCutoff: args.summarizationCutoff,
+      condenseInputs: args.condenseInputs,
       diaryRange: args.diaryRange,
       proactive: args.proactive,
       priority: args.priority,

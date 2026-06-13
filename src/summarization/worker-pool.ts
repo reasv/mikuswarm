@@ -1,5 +1,5 @@
 import { nanoid } from "nanoid";
-import type { Storage, SummarizationJob } from "../storage/index.js";
+import type { Storage, SummarizationJob, Summary } from "../storage/index.js";
 import {
   assertRunSettledCleanly,
   wasRunAborted,
@@ -40,6 +40,14 @@ interface ResolvedInput {
   eventIds?: string[];
   /** Ordered parent summary IDs (level 2+). */
   parentIds?: string[];
+  /**
+   * Resolved child summaries to render for a condense (level 2+) job, in
+   * chronological order — the input-addressed render material (spec
+   * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1). Parallel to `parentIds` (same set,
+   * same order); the full rows are needed so the builder can render them
+   * directly without re-reading the timeline.
+   */
+  summaries?: Summary[];
 }
 
 export class SummarizationWorkerPool {
@@ -321,11 +329,22 @@ export class SummarizationWorkerPool {
 
     let agentError: unknown;
     try {
-      const { agent, finalTurn, snapshot, tokenEstimate, usage } = await factory.create(
+      // Input-addressed generation (spec SUMMARIZATION-JOB-INPUT-INTEGRITY
+      // §3.1): a condense job renders its DECLARED child summaries directly —
+      // never a cutoff re-derived against live state, which is what let a
+      // duplicate sibling L2 be summarized in the field case (Defect B). A
+      // level-1 job keeps the cutoff path (raw events get covered and pruned;
+      // an existing L1 cannot masquerade as raw events), guarded by the
+      // declared-vs-rendered assertion below.
+      const inputMode =
+        job.level === 1
+          ? { summarizationCutoff: { endTimestamp: input.cutoffTimestamp } }
+          : { condenseInputs: { summaries: input.summaries ?? [] } };
+      const { agent, finalTurn, snapshot, tokenEstimate, usage, renderedInputIds } = await factory.create(
         syntheticSession,
         [summaryTool],
         {
-          summarizationCutoff: { endTimestamp: input.cutoffTimestamp },
+          ...inputMode,
           // Priority inheritance, scheduler half (spec §5.5): the job row's
           // (possibly escalated) class admits this session's LLM request, and
           // the stable job-keyed escalation key lets a waiter raise a request
@@ -335,6 +354,17 @@ export class SummarizationWorkerPool {
           escalationKey: `sumjob:${job.id}`,
         },
       );
+
+      // Declared-vs-rendered integrity assertion (spec
+      // SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1 / invariant 1): the inputs the
+      // builder actually rendered as "material to reduce" must equal the job's
+      // declared input set. A mismatch is a programming / data-consistency
+      // error — fail the run (it routes through the catch → retry → fail path,
+      // committing NO artifact) rather than persist a mislabeled summary. This
+      // converts the entire Defect-B class from silent corruption into a loud,
+      // attributable failure.
+      const declaredInputIds = job.level === 1 ? input.eventIds ?? [] : input.parentIds ?? [];
+      assertDeclaredInputsRendered(job, declaredInputIds, renderedInputIds ?? []);
       // Attach snapshot + transcript capture so summarization sessions are
       // inspectable too (spec §5), plus usage actuals (spec TOKEN-USAGE-TRACKING
       // §4.3). Detached after the run settles.
@@ -357,12 +387,19 @@ export class SummarizationWorkerPool {
         if (!this.running) throw new WorkerDrainAbortError("pool draining before run start");
         // Drive the agent directly — SessionRunner is hardwired to chat semantics
         // (send_message / NO_REPLY) and would fight a summary_tool-only session.
-        // Frozen sessions (§2b) pop the final turn off the prefix; for a cutoff build
-        // that is the runtime-suppressed `satellite` block. Deliver it followed by the
-        // summarize instruction as the kickoff turns, preserving the prior ordering.
-        const kickoff = finalTurn
-          ? [finalTurn, { role: "user", content: syntheticTrigger.body, timestamp: syntheticTrigger.timestamp }]
-          : syntheticTrigger.body;
+        // Frozen sessions (§2b) pop the final turn off the prefix; for a generation
+        // build that is the runtime-suppressed `satellite` block, which already
+        // carries the session type's `session_instruction` + tail — the full task
+        // framing. Deliver it as the SOLE kickoff (spec
+        // SUMMARIZATION-JOB-INPUT-INTEGRITY §3.3 / P5, Fix C): the old appended
+        // "Summarize the conversation shown above." user turn was redundant for
+        // summarize and actively wrong for condense ("conversation" contradicts the
+        // condense instruction's "lower-level summaries"). The synthetic trigger
+        // event still backs the `agent_sessions` trigger columns and the cutoff
+        // anchor — only the extra conversational turn is removed. The neutral,
+        // level-appropriate fallback is a pure safety net for the (never-hit on a
+        // generation build) case where the satellite is somehow absent.
+        const kickoff = finalTurn ?? neutralKickoffFor(job.level);
         await agent.prompt(kickoff as any);
         await agent.waitForIdle();
         // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7). A DRAIN abort
@@ -665,8 +702,54 @@ export class SummarizationWorkerPool {
       eventCount: summaries.reduce((sum, s) => sum + s.eventCount, 0),
       modelId,
       parentIds: summaries.map((s) => s.id),
+      summaries,
     };
   }
+}
+
+/**
+ * Neutral, level-appropriate kickoff used ONLY as a defensive fallback when a
+ * generation build somehow emits no satellite final turn (spec
+ * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.3). Unlike the removed "Summarize the
+ * conversation shown above." turn, it does not call condense inputs "the
+ * conversation". Never the common path — the satellite + `session_instruction`
+ * fully specify the task.
+ */
+function neutralKickoffFor(level: number): string {
+  return level === 1
+    ? "Summarize the messages shown above using the summary_tool."
+    : "Condense the lower-level summaries shown above into a single higher-level summary using the summary_tool.";
+}
+
+/**
+ * Declared-vs-rendered integrity assertion (spec
+ * SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1 / invariant 1). Throws when the set of
+ * inputs the builder rendered as "material to reduce" differs from the job's
+ * declared input set — order-independent set equality. The throw routes through
+ * the worker's normal failure path (retry → fail), so a divergence becomes a
+ * loud, attributable failure that commits no mislabeled artifact, never silent
+ * corruption (P1/P2). For a condense build the two are equal by construction
+ * (input-addressed render); for a level-1 build this is the guarantee that the
+ * cutoff/coverage re-query rendered exactly the declared event range.
+ */
+function assertDeclaredInputsRendered(
+  job: SummarizationJob,
+  declared: string[],
+  rendered: string[],
+): void {
+  const declaredSet = new Set(declared);
+  const renderedSet = new Set(rendered);
+  const sameSize = declaredSet.size === renderedSet.size;
+  const sameMembers = sameSize && [...declaredSet].every((id) => renderedSet.has(id));
+  if (sameMembers) return;
+  const missing = [...declaredSet].filter((id) => !renderedSet.has(id));
+  const extra = [...renderedSet].filter((id) => !declaredSet.has(id));
+  throw new Error(
+    `summarization input integrity violation (job ${job.id}, level ${job.level}): ` +
+      `rendered inputs do not match declared inputs — ` +
+      `${missing.length} declared-but-not-rendered [${missing.slice(0, 8).join(", ")}], ` +
+      `${extra.length} rendered-but-not-declared [${extra.slice(0, 8).join(", ")}]`,
+  );
 }
 
 const TRUNCATION_TRAILER =
