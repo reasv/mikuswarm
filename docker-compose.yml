@@ -164,6 +164,12 @@ services:
       # Deliberately OUTSIDE the workspace bind so in-flight, root-owned,
       # guid-named files are invisible to the file tools and the sandbox; the
       # agent copies finalized files into workspaces/miku/browser-downloads/.
+      # REDUNDANT-BUT-INTENTIONAL on the agent side: ./var:/app/var above
+      # already mounts this exact host path (same host source, nested target),
+      # so this bind adds no isolation here. It is kept only to mirror the
+      # manager-side bind below — where it is load-bearing (the SAME host dir is
+      # mounted at the browser's /downloads target) — and to make the shared
+      # staging topology explicit in one place. Edit both binds together.
       - ./var/browser-downloads:/app/var/browser-downloads
       # Operator identity config (gitignored): models, matrix account, captioning…
       # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).

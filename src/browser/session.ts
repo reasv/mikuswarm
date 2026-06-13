@@ -959,6 +959,22 @@ export class BrowserSession {
    * ordering matches emission order; ambiguity requires two simultaneous
    * in-flight downloads with identical URL AND filename, in which case the
    * records are interchangeable anyway.
+   *
+   * Cross-session attribution limitation (issue #11, documented, not fixed):
+   * the match key is (url, suggestedFilename) only — it carries no chat
+   * session. So the *one* case this FIFO cannot disambiguate is two DIFFERENT
+   * chat sessions downloading an identical URL AND identical filename at the
+   * same time: the bytes are byte-for-byte interchangeable, but the download
+   * could land in the wrong session's browser-downloads/<session>/ dir and thus
+   * surface to the wrong user (only the destination room differs, not the
+   * content). The FIFO is nonetheless correct in normal operation: both the CDP
+   * stream (downloadWillBegin) and the Playwright stream (page.on("download"))
+   * emit in browser-event order, so oldest-pairs-with-oldest holds — a
+   * mis-attribution would require the two delivery paths to reorder relative to
+   * each other. A genuine session-aware tie-break would mean plumbing the CDP
+   * downloadWillBegin.frameId → page → session, which the public Playwright API
+   * does not expose (the raw frameId is not mappable to a Page), so it is not
+   * currently done.
    */
   private onDownloadWillBegin(event: { guid: string; url: string; suggestedFilename: string }): void {
     // Minimal anti-traversal guard on the guid before it ever reaches a path
