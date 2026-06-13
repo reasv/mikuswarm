@@ -31,6 +31,7 @@ import {
   type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
+import { emptyUsageTotals } from "./agent/usage.js";
 import type { SessionUsageTracker, SessionUsageTotals } from "./agent/usage.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import { hydrateEvents } from "./context/hydrate.js";
@@ -1411,12 +1412,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const tools = buildSessionTools(inbound, record.id, target);
     let agent;
     let usage: SessionUsageTracker | undefined;
-    // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3): continue accumulating
-    // from the persisted totals so a resumed session's consumption doesn't
-    // reset. Fresh-mode rows never committed a request, so their usage columns
-    // are null and the seed reads as zero — correct (the rebuilt run starts
-    // fresh). Continue-mode rows carry the accumulated totals.
-    const usageSeed = usageSeedFromRow(row);
+    // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3, §6.2/D3). The seed is
+    // chosen per-branch below, NOT once for both: only a continue-mode resume
+    // inherits the row's persisted totals (so its consumption keeps
+    // accumulating). A fresh-mode resume must start from an EMPTY seed (zeros
+    // with `contextTokens: null`), because the row's usage columns can be
+    // populated even though it classifies fresh: usage persists at the Layer-0
+    // `done` commit, enqueued BEFORE the turn's transcript flush, so a crash in
+    // that window leaves usage written but `transcript_json` null (→ fresh).
+    // Seeding fresh from the row would (1) double-count those requests on
+    // re-run and (2) seed a non-null `contextTokens` that could trip the
+    // first-request `checkContextBudget` and permanently park the session,
+    // violating D3 ("the first request is never locally blocked").
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
     // snapshot — run and persisted exactly like a launch.
     let kickoff;
@@ -1435,7 +1442,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           proactive:
             record.sessionType === (config.proactive?.session_type ?? "proactive") ? true : undefined,
           abortSignal: drainAbort.signal,
-          usageSeed,
+          // Empty seed (see `resumeUsageSeed`): never inherit row totals on the
+          // fresh path — the row may carry usage from a request whose transcript
+          // never flushed, which the rebuilt run will re-commit.
+          usageSeed: resumeUsageSeed(row, material.mode),
         }));
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
@@ -1449,7 +1459,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       }
     } else {
       try {
-        ({ agent, usage } = await factory.create(record, tools, { resume: material, usageSeed }));
+        // Continue mode inherits the row's persisted totals so the resumed
+        // session keeps accumulating from where it left off (spec §4.3).
+        ({ agent, usage } = await factory.create(record, tools, {
+          resume: material,
+          usageSeed: resumeUsageSeed(row, material.mode),
+        }));
       } catch (error) {
         return {
           outcome: "fatal",
@@ -2165,10 +2180,10 @@ export function decideRetentionSweep(params: {
  */
 /**
  * Build a usage-tracker seed from a persisted session row (spec
- * TOKEN-USAGE-TRACKING §4.3). Null usage columns (legacy rows, or a fresh-mode
- * resume that never committed a request) map to zero counts / null context, so
- * a resumed session continues accumulating from where it left off rather than
- * resetting.
+ * TOKEN-USAGE-TRACKING §4.3). Maps the row's usage columns to cumulative
+ * totals so a continue-mode resume keeps accumulating from where it left off
+ * rather than resetting. Used ONLY for continue mode — see
+ * {@link resumeUsageSeed} for why fresh mode must not read the row.
  */
 function usageSeedFromRow(row: AgentSessionRow): SessionUsageTotals {
   return {
@@ -2180,6 +2195,29 @@ function usageSeedFromRow(row: AgentSessionRow): SessionUsageTotals {
     cost: row.usage_cost ?? 0,
     contextTokens: row.context_tokens ?? null,
   };
+}
+
+/**
+ * Choose the usage seed for a resumed session run by resume mode (spec
+ * TOKEN-USAGE-TRACKING §4.3, §6.2/D3). Pure — the per-branch seed decision
+ * that {@link MikuAgentRuntime}'s `resumeSessionRun` applies, factored out so
+ * it can be unit-tested at the boundary (review issue #9).
+ *
+ * - `continue`: inherit the row's persisted totals (keep accumulating).
+ * - `fresh`: an EMPTY seed (zeros, `contextTokens: null`). A fresh-classified
+ *   row can still carry usage columns: usage persists at the Layer-0 `done`
+ *   commit, enqueued BEFORE the turn's transcript flush, so a crash in that
+ *   window leaves usage written but `transcript_json` null (→ `fresh`).
+ *   Seeding from the row would (1) double-count those requests when the
+ *   rebuilt run re-commits them and (2) seed a non-null `contextTokens` that
+ *   could trip the first-request `checkContextBudget` and permanently park the
+ *   session, violating D3 ("the first request is never locally blocked").
+ */
+export function resumeUsageSeed(
+  row: AgentSessionRow,
+  mode: "fresh" | "continue",
+): SessionUsageTotals {
+  return mode === "fresh" ? emptyUsageTotals() : usageSeedFromRow(row);
 }
 
 function resolveReadImageMaxBytes(config: AppConfig): number {
