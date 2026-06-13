@@ -150,10 +150,31 @@ interface PendingDownloadEntry {
 const STAGING_GUID_RE = /^[0-9a-f-]{36}$/i;
 
 /**
+ * In-flight downloads are staged as `<guid>.crdownload` and renamed to the bare
+ * `<guid>` only on completion (verified against the pinned manager image). The
+ * bare-guid sweep regex can never match a `.crdownload` left behind by a
+ * mid-download crash, so those orphans would leak forever (issue #3). The sweep
+ * reaps stale files matching EITHER form; this matches the in-flight name.
+ */
+const STAGING_CRDOWNLOAD_RE = /^[0-9a-f-]{36}\.crdownload$/i;
+
+/**
  * Connect-time staging-hygiene TTL: guid files older than this are orphans from
  * crashes/disconnects mid-download (in-flight downloads are recent by definition).
  */
 export const STAGING_SWEEP_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Coarse cap on concurrently in-flight pending downloads (issue #4). The
+ * per-download size cap (media.download_size_limit) bounds one transfer but
+ * nothing bounds the COUNT, so a hostile page can script unlimited under-cap
+ * downloads — filling the shared staging volume and the workspace and growing
+ * pendingDownloadEntries without bound. A new download beyond this many pending
+ * entries is rejected with a failed record and stages nothing (the CDP side
+ * cancels it). Generous enough that no legitimate burst hits it; this is a
+ * disk-exhaustion backstop, not a throughput knob, so no config key is warranted.
+ */
+export const MAX_PENDING_DOWNLOADS = 64;
 
 /** Connect to a CDP endpoint. Injectable so tests can supply a fake browser. */
 export type ConnectOverCdp = (
@@ -962,6 +983,21 @@ export class BrowserSession {
       match.expiresAt = Infinity; // correlated — lives until completed/canceled
       return;
     }
+    // Concurrency cap (issue #4): merging into an existing entry above is always
+    // allowed (it is the same download correlating, not a new one) — only the
+    // creation of a BRAND-NEW pending entry is bounded. Over the cap, cancel the
+    // transfer so it stages nothing and drop it; with no session attached yet
+    // there is nowhere to surface a failed record, so this is log-only (a late
+    // page event finds no entry and warn-drops, same as any uncorrelated one).
+    if (this.pendingDownloadEntries.length >= MAX_PENDING_DOWNLOADS) {
+      this.logger.warn("browser_download_too_many", {
+        url: event.url,
+        filename: event.suggestedFilename,
+        pending: this.pendingDownloadEntries.length,
+      });
+      void this.downloadsCdp?.send("Browser.cancelDownload", { guid: event.guid })?.catch(() => {});
+      return;
+    }
     this.pendingDownloadEntries.push({
       url: event.url,
       suggestedFilename: event.suggestedFilename,
@@ -999,7 +1035,11 @@ export class BrowserSession {
           error: error instanceof Error ? error.message : String(error),
         });
       }
-      await this.unlinkStaging(event.guid);
+      // No unlinkStaging here (issue #3): mid-flight the partial is named
+      // `<guid>.crdownload`, not the bare `<guid>` unlinkStaging targets, so the
+      // unlink was a misleading no-op — and Chromium deletes its own partial on
+      // Browser.cancelDownload anyway. Any partial that does survive a crash is
+      // reaped as a `.crdownload` orphan by the TTL sweep.
       this.failDownload(entry, `exceeds the download size limit (${this.downloadSizeLimit} bytes)`);
       return;
     }
@@ -1017,7 +1057,9 @@ export class BrowserSession {
       return;
     }
     if (event.state === "canceled") {
-      await this.unlinkStaging(event.guid);
+      // No unlinkStaging (issue #3): Chromium owns partial cleanup on cancel and
+      // the mid-flight file is `<guid>.crdownload`, not the bare `<guid>`. Any
+      // surviving partial is reaped as a `.crdownload` orphan by the TTL sweep.
       this.failDownload(entry, "canceled by the browser");
     }
   }
@@ -1066,6 +1108,24 @@ export class BrowserSession {
       (e) => e.sessionId === undefined && e.url === url && e.suggestedFilename === suggestedFilename,
     );
     if (!match) {
+      // Concurrency cap (issue #4): bound only the creation of a brand-new entry,
+      // never a merge into an existing one. Unlike the CDP side, here the owning
+      // session is known, so surface a failed record immediately so the model
+      // learns the click produced no file. Stage nothing — the CDP side already
+      // canceled its half (or never created an entry), so no bytes are retained.
+      if (this.pendingDownloadEntries.length >= MAX_PENDING_DOWNLOADS) {
+        this.logger.warn("browser_download_too_many", {
+          sessionId,
+          url,
+          filename: suggestedFilename,
+          pending: this.pendingDownloadEntries.length,
+        });
+        this.recordDownloadFailure(
+          { url, suggestedFilename, sessionId, state, completed: false, failed: true, expiresAt: 0 },
+          "too many concurrent downloads",
+        );
+        return;
+      }
       this.pendingDownloadEntries.push({
         url,
         suggestedFilename,
@@ -1221,12 +1281,15 @@ export class BrowserSession {
   }
 
   /**
-   * Staging hygiene, run fire-and-forget on every successful connect (public as
-   * a test seam, like sweepIdleNow): reap guid-named files older than
-   * STAGING_SWEEP_TTL_MS — orphans from crashes/disconnects mid-download.
-   * Guid-pattern files only; never recurses, never touches non-guid names. The
-   * dir holds at most in-flight downloads transiently and is empty at steady
-   * state.
+   * Staging hygiene, run fire-and-forget on every successful connect AND
+   * periodically from the idle sweep (issue #7; public as a test seam, like
+   * sweepIdleNow): reap files older than STAGING_SWEEP_TTL_MS — orphans from
+   * crashes/disconnects mid-download. Matches both staging forms (issue #3): the
+   * bare `<guid>` (completed-but-never-finalized) and `<guid>.crdownload` (an
+   * abandoned in-flight partial). Guid-pattern files only; never recurses, never
+   * touches non-guid names. The dir holds at most in-flight downloads
+   * transiently and is empty at steady state — the 1h TTL keeps a genuinely
+   * in-flight transfer safe from the periodic sweep.
    */
   async sweepStagingNow(now = Date.now()): Promise<void> {
     const dir = this.downloadsLocalDir;
@@ -1243,7 +1306,11 @@ export class BrowserSession {
     let unreaped = 0;
     let lastError: unknown;
     for (const name of names) {
-      if (!STAGING_GUID_RE.test(name)) continue;
+      // Reap stale orphans of BOTH staging forms (issue #3): the bare `<guid>`
+      // (a completed download whose finalization never ran — crash/disconnect)
+      // and the in-flight `<guid>.crdownload` (a transfer abandoned mid-stream).
+      // Never recurse, never touch a non-guid name.
+      if (!STAGING_GUID_RE.test(name) && !STAGING_CRDOWNLOAD_RE.test(name)) continue;
       const filePath = path.join(dir, name);
       let expired: boolean;
       try {
@@ -1306,6 +1373,11 @@ export class BrowserSession {
     // Piggyback the pending-download expiry on the periodic sweep so an
     // uncorrelated entry is dropped even when no further download events arrive.
     this.expirePendingDownloads(now);
+    // Piggyback the staging-orphan sweep too (issue #7): connect-only reaping
+    // never runs for a connection that lasts days/weeks, so orphans (popup
+    // leftovers, #3's `.crdownload` partials) would persist for the whole
+    // connection. The 1h TTL keeps a genuinely in-flight transfer safe.
+    void this.sweepStagingNow(now);
     const idleMs = this.config.session_page_idle_ms;
     for (const [sessionId, state] of this.sessions) {
       // Never reap a session with an operation in flight (issue #1): closing its
@@ -1380,10 +1452,15 @@ function sanitizeSessionId(sessionId: string): string {
  * Filesystem-safe download filename from the browser-suggested one (hostile
  * input): strip to `[A-Za-z0-9._-]`, bound the length, and fall back to
  * "download" for an empty/missing suggestion. The charset forbids separators,
- * so the result can never introduce a path segment.
+ * so the result can never introduce a path segment. Mirrors sanitizeSessionId
+ * (issue #10): the surviving charset still permits `.`, so collapse a result
+ * that is empty OR only dots (`.`, `..`, `...`) to "download" — otherwise a
+ * dot-only suggestion would dead-end as `EISDIR`/`..` rather than a real file.
  */
 function sanitizeDownloadFilename(suggested: string): string {
-  return (suggested || "download").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 200) || "download";
+  const cleaned = (suggested || "download").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 200);
+  if (cleaned === "" || /^\.+$/.test(cleaned)) return "download";
+  return cleaned;
 }
 
 /**
@@ -1397,11 +1474,18 @@ async function copyBumpUntilFree(src: string, destDir: string, safeName: string)
   const stem = safeName.slice(0, safeName.length - ext.length);
   for (let n = 1; ; n++) {
     const candidate = n === 1 ? safeName : `${stem} (${n})${ext}`;
+    const destPath = path.join(destDir, candidate);
     try {
-      await copyFile(src, path.join(destDir, candidate), fsConstants.COPYFILE_EXCL);
+      await copyFile(src, destPath, fsConstants.COPYFILE_EXCL);
       return candidate;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      // A non-EEXIST failure (ENOSPC/EIO) can occur AFTER COPYFILE_EXCL created
+      // the destination, leaving a truncated, plausibly-named file under the
+      // session dir that the next finalization of the same name would bump past
+      // (issue #9). Best-effort remove that partial before surfacing the failure;
+      // the staging source is deliberately retained for the TTL sweep.
+      await unlink(destPath).catch(() => {});
       throw error;
     }
   }

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { BrowserSession, STAGING_SWEEP_TTL_MS, type ConnectOverCdp } from "../src/browser/session.js";
+import { BrowserSession, MAX_PENDING_DOWNLOADS, STAGING_SWEEP_TTL_MS, type ConnectOverCdp } from "../src/browser/session.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
 
@@ -449,12 +449,18 @@ test("downloads: an uncorrelated entry past its deadline is dropped with a warn 
   });
 });
 
-test("downloads: a transfer over the size cap is canceled, its partial unlinked, and a failed record surfaces", async () => {
+test("downloads: a transfer over the size cap is canceled, Chromium owns the partial, and a failed record surfaces", async () => {
   await withDirs(async (dirs) => {
     const { session, harness, logged, manager } = newDownloadSession(dirs, { sizeLimit: 10 });
     try {
       await session.getActivePage("s1");
-      await writeFile(path.join(dirs.staging, GUID_A), "partial-bytes-on-disk");
+      // Mid-flight the partial is named `<guid>.crdownload` (NOT the bare guid),
+      // and Browser.cancelDownload makes Chromium delete its own partial (issue
+      // #3). The over-cap path therefore must NOT itself unlink the bare guid —
+      // that was a misleading no-op. Plant the realistic in-flight name; it is
+      // the TTL sweep, not the cancel path, that reaps any surviving partial.
+      const crPartial = path.join(dirs.staging, `${GUID_A}.crdownload`);
+      await writeFile(crPartial, "partial-bytes-on-disk");
 
       harness.cdp.emit("Browser.downloadWillBegin", {
         guid: GUID_A, url: "https://example.com/huge.iso", suggestedFilename: "huge.iso",
@@ -470,7 +476,6 @@ test("downloads: a transfer over the size cap is canceled, its partial unlinked,
       );
       const cancel = harness.cdp.sent.find((c) => c.method === "Browser.cancelDownload")!;
       assert.deepEqual(cancel.params, { guid: GUID_A }, "cancel targets the offending guid");
-      await waitFor(async () => !(await exists(path.join(dirs.staging, GUID_A))), "partial staging file unlinked");
 
       const drained = session.drainDownloads("s1");
       assert.equal(drained.length, 1, "a failure record surfaces");
@@ -478,6 +483,13 @@ test("downloads: a transfer over the size cap is canceled, its partial unlinked,
       assert.equal(drained[0]!.filename, "huge.iso");
       assert.equal(drained[0]!.path, "", "a failed record carries no workspace path");
       assert.ok(logged.some((l) => l.event === "browser_download_failed"), "failure logged");
+
+      // A surviving `.crdownload` partial (Chromium didn't get to delete it) is
+      // reaped by the TTL sweep — never by the over-cap path itself.
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(crPartial, past, past);
+      await session.sweepStagingNow();
+      assert.equal(await exists(crPartial), false, "a surviving aged .crdownload partial is reaped by the TTL sweep");
     } finally {
       manager.restore();
       await session.shutdown();
@@ -825,6 +837,186 @@ test("downloads: the staging sweep reaps only old guid-named files (never non-gu
       assert.equal(await exists(oldGuid), false, "old guid orphan reaped");
       assert.equal(await exists(freshGuid), true, "fresh guid (in-flight) kept");
       assert.equal(await exists(nonGuid), true, "non-guid name untouched even when old");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #3: the sweep reaps stale <guid>.crdownload in-flight partials ───────────
+
+test("downloads #3: an aged <guid>.crdownload orphan is reaped while a fresh one is kept", async () => {
+  await withDirs(async (dirs) => {
+    const { session, manager } = newDownloadSession(dirs);
+    try {
+      // In-flight downloads are staged as `<guid>.crdownload` and renamed to the
+      // bare `<guid>` only on completion. A mid-download crash leaves the
+      // `.crdownload` behind — which the OLD bare-guid-only sweep regex could
+      // never match, so it leaked forever.
+      const oldCr = path.join(dirs.staging, `${GUID_A}.crdownload`);
+      const freshCr = path.join(dirs.staging, `${GUID_B}.crdownload`);
+      await writeFile(oldCr, "abandoned partial");
+      await writeFile(freshCr, "still downloading");
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(oldCr, past, past);
+
+      await session.sweepStagingNow();
+
+      assert.equal(await exists(oldCr), false, "aged .crdownload orphan reaped (old code leaked it)");
+      assert.equal(await exists(freshCr), true, "a fresh .crdownload (genuinely in-flight) is kept");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #7: the periodic idle sweep also runs the staging sweep ──────────────────
+
+test("downloads #7: the periodic idle sweep reaps an aged staging orphan (no direct sweepStagingNow call)", async () => {
+  await withDirs(async (dirs) => {
+    const { session, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1"); // connect; its connect-time sweep sees an empty dir
+      // Plant an aged orphan of BOTH staging forms AFTER connect, so only the
+      // PERIODIC sweep (piggybacked on sweepIdleNow) can reap them. The test
+      // never calls sweepStagingNow directly — deleting the periodic wiring fails it.
+      const oldGuid = path.join(dirs.staging, GUID_A);
+      const oldCr = path.join(dirs.staging, `${GUID_B}.crdownload`);
+      await writeFile(oldGuid, "aged orphan");
+      await writeFile(oldCr, "aged partial");
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(oldGuid, past, past);
+      await utimes(oldCr, past, past);
+
+      await session.sweepIdleNow();
+
+      await waitFor(async () => !(await exists(oldGuid)) && !(await exists(oldCr)), "aged orphans reaped by the periodic sweep");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #4: a concurrent-download budget bounds the pending map ──────────────────
+
+test("downloads #4: the (N+1)th concurrent download is rejected with a failed record and stages nothing", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1");
+      // Saturate the pending map with MAX_PENDING_DOWNLOADS distinct in-flight
+      // downloads (CDP willBegin only — each is a distinct (url) so none merge).
+      for (let i = 0; i < MAX_PENDING_DOWNLOADS; i++) {
+        harness.cdp.emit("Browser.downloadWillBegin", {
+          guid: `00000000-0000-4000-8000-${i.toString().padStart(12, "0")}`,
+          url: `https://example.com/f${i}.bin`,
+          suggestedFilename: `f${i}.bin`,
+        });
+      }
+      const priv = session as unknown as PendingPrivate;
+      assert.equal(priv.pendingDownloadEntries.length, MAX_PENDING_DOWNLOADS, "pending map saturated at the cap");
+
+      // The (N+1)th download arrives page-side first (the opener's session is
+      // known): it must be rejected with a failed record and stage nothing.
+      harness.fireDownload(metadataDownload("https://example.com/overflow.bin", "overflow.bin"));
+      await new Promise((r) => setTimeout(r, 20));
+
+      assert.equal(
+        priv.pendingDownloadEntries.length,
+        MAX_PENDING_DOWNLOADS,
+        "the overflow download created no new pending entry (it was rejected, not queued)",
+      );
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1, "exactly one failed record surfaces for the rejected download");
+      assert.equal(drained[0]!.failed, true);
+      assert.equal(drained[0]!.filename, "overflow.bin");
+      assert.equal(drained[0]!.path, "", "a rejected download carries no workspace path");
+      assert.ok(logged.some((l) => l.event === "browser_download_too_many"), "the rejection was logged");
+
+      // The cap must NOT break correlation of entries already in flight: complete
+      // one of the saturating downloads and assert it still finalizes normally.
+      await writeFile(path.join(dirs.staging, "00000000-0000-4000-8000-000000000000"), "ok bytes");
+      harness.fireDownload(metadataDownload("https://example.com/f0.bin", "f0.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: "00000000-0000-4000-8000-000000000000", state: "completed", receivedBytes: 8, totalBytes: 8,
+      });
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "f0.bin");
+      await waitFor(() => exists(finalPath), "an in-flight download under the cap still correlates and finalizes");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #9: a copy failure leaves no partial workspace file and yields a failure ──
+
+test("downloads #9: a copy failure removes the partial workspace file and surfaces a failed record", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1");
+      // Drive a normal correlate→complete sequence but NEVER write the staging
+      // source, so the finalize copy fails (ENOENT — a non-EEXIST copy error).
+      // Pre-plant a truncated file at the exact destination candidate to stand in
+      // for a partial left by an earlier mid-copy failure: the OLD code would
+      // leave it (and the next finalize would bump past it); the fix unlinks it.
+      const destDir = path.join(dirs.ws, "browser-downloads", "s1");
+      await mkdir(destDir, { recursive: true });
+      const partial = path.join(destDir, "doc.bin");
+      await writeFile(partial, "TRUNCATED PARTIAL");
+
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/doc.bin", suggestedFilename: "doc.bin",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/doc.bin", "doc.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 4, totalBytes: 4,
+      });
+
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "the failed record after the copy error");
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0]!.failed, true, "copy failure yields a failed record");
+      assert.equal(drained[0]!.filename, "doc.bin");
+      assert.equal(await exists(partial), false, "the partial workspace file was removed (old code left it)");
+      assert.ok(logged.some((l) => l.event === "browser_download_failed"), "the copy failure was logged");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #10: a dot-only suggested filename collapses to "download" ───────────────
+
+test("downloads #10: a dot-only suggested filename collapses to \"download\"", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1");
+      await writeFile(path.join(dirs.staging, GUID_A), "dot bytes");
+
+      // A suggested filename of ".." would, under the OLD sanitizer, survive as
+      // ".." (the charset permits dots) and dead-end as EISDIR/a traversal step.
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/x", suggestedFilename: "..",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/x", ".."));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 9, totalBytes: 9,
+      });
+
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "download");
+      await waitFor(() => exists(finalPath), "the dot-only name collapsed to 'download'");
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0]!.filename, "download", "dot-only name collapses to the safe fallback");
+      assert.equal(drained[0]!.path, path.join("browser-downloads", "s1", "download"));
+      assert.equal((await readFile(finalPath)).toString(), "dot bytes", "bytes landed under the safe name");
     } finally {
       manager.restore();
       await session.shutdown();
