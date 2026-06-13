@@ -244,12 +244,18 @@ services:
       # root-owned (the Manager runs as root, above) — the one exception to the
       # otherwise host-uid-owned tree; it holds only the regenerable browser profile.
       - ./var/browser-data:/data
-      # Browser-download staging (ARCHITECTURE.md §11b): Chromium writes
+      # Browser-download staging (ARCHITECTURE.md §11b/§11c): Chromium writes
       # guid-named downloads here ([browser] downloads_dir = "/downloads"); the
       # agent sees the same storage at /app/var/browser-downloads, copies
-      # completed files into the workspace, and unlinks the staging guid. The
-      # host dir is host-uid-owned (compose/agent creates it); root can always
-      # write into it. Steady-state empty.
+      # completed files into the workspace, and unlinks the staging guid. PRE-CREATE
+      # this host dir owned by the agent's uid BEFORE `docker compose up` — `var/`
+      # is gitignored, so on a fresh deploy Docker auto-creates the missing bind
+      # source ROOT-OWNED, and the agent's in-container `mkdir -p` cannot fix that.
+      # A root-owned dir lets the agent copy out but not unlink the root-written
+      # guid files, silently leaking every download into ./var; app.ts probes this
+      # at startup and fails fast. (e.g. `mkdir -p var/browser-downloads &&
+      # chown $(id -u):$(id -g) var/browser-downloads`.) Root can always write into
+      # an agent-uid-owned dir. Steady-state empty.
       - ./var/browser-downloads:/downloads
     # mikuswarm-browser: hardened egress bridge (default route — browsing goes here).
     # mikuswarm-browser-ctl: internal control link so the agent reaches it by name.

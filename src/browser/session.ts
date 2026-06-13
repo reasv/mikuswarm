@@ -1045,7 +1045,12 @@ export class BrowserSession {
     // permission, not file ownership. Best-effort — the connect-time TTL sweep
     // reaps any leftover.
     await unlink(stagingPath).catch((error: unknown) => {
-      this.logger.debug("browser_download_staging_unlink_failed", {
+      // WARN, not debug (issue #1): a persistent unlink failure (typically EACCES
+      // when the staging directory is root-owned — the fresh-compose-deploy leak)
+      // means every finalized download leaks a copy into the shared staging
+      // volume. The startup probe in app.ts is meant to catch this loudly, but
+      // surface it here too in case the directory's permissions change at runtime.
+      this.logger.warn("browser_download_staging_unlink_failed", {
         guid: entry.guid,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -1132,18 +1137,38 @@ export class BrowserSession {
     } catch {
       return;
     }
+    // Track unreaped expired orphans so we warn (at least once per sweep) instead
+    // of silently swallowing — an expired guid file we CANNOT unlink is the
+    // root-owned-staging-dir leak (issue #1), not a benign vanished file.
+    let unreaped = 0;
+    let lastError: unknown;
     for (const name of names) {
       if (!STAGING_GUID_RE.test(name)) continue;
       const filePath = path.join(dir, name);
+      let expired: boolean;
       try {
         const st = await stat(filePath);
         if (!st.isFile()) continue;
-        if (now - st.mtimeMs < STAGING_SWEEP_TTL_MS) continue;
+        expired = now - st.mtimeMs >= STAGING_SWEEP_TTL_MS;
+      } catch {
+        // A vanished or unstattable entry is someone else's problem (likely
+        // unlinked between readdir and stat) — never the permission leak.
+        continue;
+      }
+      if (!expired) continue;
+      try {
         await unlink(filePath);
         this.logger.info("browser_download_staging_orphan_reaped", { file: name });
-      } catch {
-        // Best-effort: a vanished or unstattable entry is someone else's problem.
+      } catch (error) {
+        unreaped++;
+        lastError = error;
       }
+    }
+    if (unreaped > 0) {
+      this.logger.warn("browser_download_staging_orphan_unreaped", {
+        count: unreaped,
+        error: lastError instanceof Error ? lastError.message : String(lastError),
+      });
     }
   }
 

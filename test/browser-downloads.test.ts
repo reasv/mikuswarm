@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -626,6 +626,90 @@ test("downloads: the staging sweep reaps only old guid-named files (never non-gu
       assert.equal(await exists(freshGuid), true, "fresh guid (in-flight) kept");
       assert.equal(await exists(nonGuid), true, "non-guid name untouched even when old");
     } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// Issue #1: a per-download staging unlink that fails (the root-owned-dir leak)
+// must surface at WARN, not debug — every leaked file is a copy stranded in the
+// shared ./var volume. chmod can't block root, so meaningful only as non-root.
+test("downloads: a failed per-download staging unlink is logged at warn (issue #1)", { skip: process.getuid?.() === 0 }, async () => {
+  await withDirs(async (dirs) => {
+    const levels: Array<{ level: string; event: string }> = [];
+    const manager = stubManager();
+    const { browser, harness } = makeDownloadBrowser();
+    const levelLogger: import("../src/observability/logger.js").Logger = {
+      debug(event) { levels.push({ level: "debug", event }); },
+      info(event) { levels.push({ level: "info", event }); },
+      warn(event) { levels.push({ level: "warn", event }); },
+      error(event) { levels.push({ level: "error", event }); },
+      child() { return levelLogger; },
+    };
+    const session = new BrowserSession({
+      config: baseConfig({ downloads_dir: "/downloads", downloads_local_dir: dirs.staging }),
+      agentTimezone: "UTC",
+      workspaceRoot: dirs.ws,
+      logger: levelLogger,
+      connectOverCdp: async () => browser as never,
+    });
+    try {
+      await session.getActivePage("s1");
+      await writeFile(path.join(dirs.staging, GUID_A), "hello bytes");
+      // Make the staging dir non-writable: the copy OUT still reads the 0644 file,
+      // but the post-copy unlink of the staging guid fails with EACCES.
+      await chmod(dirs.staging, 0o555);
+
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/report.pdf", suggestedFilename: "report.pdf",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/report.pdf", "report.pdf"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 11, totalBytes: 11,
+      });
+
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "report.pdf");
+      await waitFor(() => exists(finalPath), "the finalized workspace file");
+      await waitFor(
+        () => levels.some((l) => l.event === "browser_download_staging_unlink_failed"),
+        "the staging-unlink-failed log",
+      );
+      const entry = levels.find((l) => l.event === "browser_download_staging_unlink_failed");
+      assert.equal(entry!.level, "warn", "staging-unlink failure logs at warn, not debug");
+    } finally {
+      await chmod(dirs.staging, 0o755).catch(() => {});
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// Issue #1: an expired guid orphan the agent cannot unlink (the root-owned
+// staging-dir leak) must WARN once per sweep rather than be silently swallowed.
+// chmod can't block root, so the test is meaningful only as a non-root user.
+test("downloads: the staging sweep warns when it cannot reap an expired orphan (issue #1)", { skip: process.getuid?.() === 0 }, async () => {
+  await withDirs(async (dirs) => {
+    const { session, logged, manager } = newDownloadSession(dirs);
+    try {
+      const oldGuid = path.join(dirs.staging, GUID_A);
+      await writeFile(oldGuid, "old orphan");
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(oldGuid, past, past);
+      // Make the staging directory non-writable so unlink fails with EACCES,
+      // standing in for the root-owned-dir leak the probe is meant to catch.
+      await chmod(dirs.staging, 0o555);
+
+      await session.sweepStagingNow();
+
+      assert.equal(
+        logged.filter((l) => l.event === "browser_download_staging_orphan_unreaped").length,
+        1,
+        "an unreapable expired orphan warns exactly once per sweep",
+      );
+      assert.equal(await exists(oldGuid), true, "the orphan was NOT reaped (unlink failed)");
+    } finally {
+      await chmod(dirs.staging, 0o755).catch(() => {});
       manager.restore();
       await session.shutdown();
     }
