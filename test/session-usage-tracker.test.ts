@@ -104,3 +104,64 @@ test("a throwing listener never breaks the accounting path", () => {
   assert.ok(ok);
   assert.equal(tracker.snapshot().llmRequests, 1);
 });
+
+// --- per-session cost ceiling: tool-cost lane + combined view (SESSION-COST-LIMITS) ---
+
+test("combinedCost sums the agent-loop and tool lanes; toolCost stays out of the snapshot", () => {
+  const tracker = new SessionUsageTracker();
+  tracker.record(usage({ input: 10, output: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.10 } }));
+  tracker.recordToolCost(0.25);
+  // The agent-loop snapshot (→ persisted usage_*) never sees tool cost.
+  assert.ok(Math.abs(tracker.snapshot().cost - 0.10) < 1e-9);
+  // The combined view (→ ceiling enforcement) sums both lanes.
+  assert.ok(Math.abs(tracker.combinedCost() - 0.35) < 1e-9);
+});
+
+test("recordToolCost ignores non-positive costs", () => {
+  const tracker = new SessionUsageTracker();
+  tracker.recordToolCost(0);
+  tracker.recordToolCost(-1);
+  tracker.recordToolCost(Number.NaN);
+  assert.equal(tracker.combinedCost(), 0);
+});
+
+test("toolCostSeed continues the tool lane on resume", () => {
+  const tracker = new SessionUsageTracker(undefined, 0.40);
+  assert.ok(Math.abs(tracker.combinedCost() - 0.40) < 1e-9);
+  tracker.recordToolCost(0.10);
+  assert.ok(Math.abs(tracker.combinedCost() - 0.50) < 1e-9);
+  // A non-positive seed is normalized to 0.
+  assert.equal(new SessionUsageTracker(undefined, -5).combinedCost(), 0);
+});
+
+test("onBudgetChange fires on BOTH record and recordToolCost with the combined cost", () => {
+  const tracker = new SessionUsageTracker();
+  const seen: number[] = [];
+  const off = tracker.onBudgetChange((c) => seen.push(c));
+  tracker.record(usage({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.10 } }));
+  tracker.recordToolCost(0.30);
+  off();
+  tracker.recordToolCost(1.0); // post-unsubscribe → not observed
+  assert.equal(seen.length, 2);
+  assert.ok(Math.abs(seen[0]! - 0.10) < 1e-9);
+  assert.ok(Math.abs(seen[1]! - 0.40) < 1e-9);
+});
+
+test("onUpdate does NOT fire on recordToolCost (persistence stays agent-loop-only)", () => {
+  const tracker = new SessionUsageTracker();
+  let updates = 0;
+  tracker.onUpdate(() => updates++);
+  tracker.recordToolCost(0.50);
+  assert.equal(updates, 0);
+  tracker.record(usage({ input: 1, totalTokens: 1 }));
+  assert.equal(updates, 1);
+});
+
+test("a throwing budget listener never breaks the accounting path", () => {
+  const tracker = new SessionUsageTracker();
+  tracker.onBudgetChange(() => {
+    throw new Error("boom");
+  });
+  assert.doesNotThrow(() => tracker.recordToolCost(0.1));
+  assert.ok(Math.abs(tracker.combinedCost() - 0.1) < 1e-9);
+});

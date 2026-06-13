@@ -208,6 +208,14 @@ export interface CreateAgentOptions {
    */
   usageSeed?: SessionUsageTotals;
   /**
+   * Pre-constructed usage tracker (spec SESSION-COST-LIMITS §5). When provided,
+   * the factory uses it verbatim and ignores {@link usageSeed} — the caller
+   * (app.ts) builds the tracker up front (seeded) so the same instance also
+   * receives the tool-cost feed wired into `recordToolUsage`. Absent (worker
+   * pools / tests, no tool-cost lane) = the factory constructs one from the seed.
+   */
+  usage?: SessionUsageTracker;
+  /**
    * LLM-scheduler priority override (spec §5.5/§9.3). When set, replaces the
    * session type's (configured or default) class — the summarization worker
    * passes the job row's possibly-escalated priority here so an escalated job's
@@ -323,6 +331,9 @@ export class AgentSessionFactory {
     // text-editor read budget (app.ts buildSessionTools, via the same resolver).
     // No consumer reads `context_window` directly (U3). Always a number.
     const contextCeiling = this.resolveSessionContextCeiling(session.sessionType);
+    // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
+    // once and fed to the hard-cap pre-flight below. `undefined` = unlimited.
+    const costCeiling = this.resolveSessionCostCeiling(session.sessionType);
     const model = createModelFromConfig(modelConfig, contextCeiling);
     // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
     // chosen stream fn so an environmental failure re-issues the exact same
@@ -379,7 +390,11 @@ export class AgentSessionFactory {
     // Per-session-run usage accumulator (spec TOKEN-USAGE-TRACKING §3.3/§4.1).
     // Seeded from persisted totals on resume so consumption continues rather
     // than resets (§4.3). Fed at the Layer-0 commit point via onRequestCommitted.
-    const usage = new SessionUsageTracker(opts?.usageSeed);
+    // A caller that must share the tracker with the tool-cost feed (app.ts, spec
+    // SESSION-COST-LIMITS §5) constructs it up front and passes it via `opts.usage`;
+    // otherwise the factory constructs one from the seed (worker pools / tests,
+    // which have no tool-cost lane).
+    const usage = opts?.usage ?? new SessionUsageTracker(opts?.usageSeed);
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
@@ -442,6 +457,29 @@ export class AgentSessionFactory {
           return (
             `context token limit exceeded: observed context ${observed} tokens >= ` +
             `limit ${contextCeiling} (model ${model.id}, session type ${session.sessionType})`
+          );
+        },
+        // Per-request hard-cap pre-flight for the per-session cost ceiling (spec
+        // SESSION-COST-LIMITS §2.2). Same shape as checkContextBudget: compares the
+        // combined (agent-loop + tool) actual spend against the operative ceiling;
+        // a violation synthesizes a `content`-class terminal error WITHOUT
+        // consuming retry budget. Inert when no ceiling resolves (unlimited). The
+        // first request is never blocked (combined cost is 0 before any commit).
+        checkCostBudget: () => {
+          if (costCeiling === undefined) return undefined;
+          const observed = usage.combinedCost();
+          if (observed < costCeiling) return undefined;
+          this.options.logger?.warn("session_cost_limit_exceeded", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            sessionType: session.sessionType,
+            model: model.id,
+            observedCostUsd: observed,
+            limitUsd: costCeiling,
+          });
+          return (
+            `session cost limit exceeded: observed combined cost $${observed.toFixed(4)} >= ` +
+            `limit $${costCeiling.toFixed(4)} (session type ${session.sessionType})`
           );
         },
       },
@@ -651,6 +689,25 @@ export class AgentSessionFactory {
       );
     }
     return composeSessionContextCeiling(contextWindow, cfg?.max_context_tokens);
+  }
+
+  /**
+   * Resolve a session's operative USD cost ceiling from CURRENT config (spec
+   * SESSION-COST-LIMITS §3): the session type's `max_session_cost_usd` override
+   * when set, else the global `agent.max_session_cost_usd` default. A resolved
+   * value of `0` (at either level) means "no cap" — so a session type can set
+   * `0` to opt out even when a global default exists. Returns `undefined` when
+   * unlimited. Like the context ceiling, this is operator config, NOT persisted
+   * per session, so the console reflects today's config. Fed to the hard-cap
+   * pre-flight and surfaced as the console's spend denominator.
+   */
+  resolveSessionCostCeiling(sessionType: string): number | undefined {
+    const cfg = this.resolveSessionType(sessionType);
+    const resolved =
+      cfg?.max_session_cost_usd !== undefined
+        ? cfg.max_session_cost_usd
+        : this.options.config.agent.max_session_cost_usd;
+    return resolved !== undefined && resolved > 0 ? resolved : undefined;
   }
 
   /**

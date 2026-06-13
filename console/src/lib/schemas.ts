@@ -98,6 +98,10 @@ export const SessionMeta = Schema.Struct({
 	),
 	contextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
 	maxContextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+	// Per-session cost ceiling (spec SESSION-COST-LIMITS §6), resolved from current
+	// config; null = unlimited. Denominator for the combined (agent-loop + tool)
+	// spend indicator below.
+	maxSessionCostUsd: Schema.optional(Schema.NullOr(Schema.Number)),
 	// Auxiliary tool-spend rollup (spec AUXILIARY-USAGE-TRACKING §10.3): a SEPARATE
 	// lane shown beside the §8b actuals, never blended in (§9). Present on the
 	// session-detail meta only (absent on the list shape), hence optional. Always a

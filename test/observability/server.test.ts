@@ -67,6 +67,9 @@ function stubFactory(preview: PreviewContext): AgentSessionFactory {
     // sessionMeta resolves the operative context-token ceiling from config
     // (spec CONTEXT-LIMIT-UNIFICATION §2.4); a fixed value in these fixtures.
     resolveSessionContextCeiling: () => 128_000,
+    // sessionMeta also resolves the per-session cost ceiling (spec
+    // SESSION-COST-LIMITS §6); unlimited in these fixtures.
+    resolveSessionCostCeiling: () => undefined,
   } as unknown as AgentSessionFactory;
 }
 
@@ -76,6 +79,7 @@ const throwingFactory = {
   },
   // Exercised by the session list/detail routes via sessionMeta; fixed here.
   resolveSessionContextCeiling: () => 128_000,
+  resolveSessionCostCeiling: () => undefined,
 } as unknown as AgentSessionFactory;
 
 async function withServer(
@@ -223,6 +227,7 @@ test("sessionMeta surfaces ACTUALS usage as a grouped object + echoes context/li
         assert.equal(sessionType, "default"); // resolved from the row's session_type
         return 8_000;
       },
+      resolveSessionCostCeiling: () => undefined,
     } as unknown as AgentSessionFactory;
 
     await withServer({ storage, factory }, async (base) => {

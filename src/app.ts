@@ -32,7 +32,7 @@ import {
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { emptyUsageTotals } from "./agent/usage.js";
-import type { CostRates, SessionUsageTracker, SessionUsageTotals } from "./agent/usage.js";
+import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -1234,6 +1234,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     sessionId: string,
     target: NonNullable<InboundChatEvent["outboundTarget"]>,
     sessionType: string,
+    usage: SessionUsageTracker,
   ) {
     const roomId = target.roomId;
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
@@ -1400,6 +1401,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // Separate lane — never touches agent_sessions.usage_* (§4).
             agentSessionId: sessionId,
             recordToolUsage: (record) => {
+              // Feed the per-session cost ceiling's combined-spend lane in-memory
+              // (spec SESSION-COST-LIMITS §4) — separate from the durable ledger
+              // write below, and never folded into agent_sessions.usage_* (§8c §4).
+              usage.recordToolCost(record.cost ?? 0);
               void storage
                 .insertToolInvocation({
                   agentSessionId: record.agentSessionId,
@@ -1451,6 +1456,46 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
+   * Wire the soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1). When
+   * the session's combined (agent-loop + tool) spend first crosses
+   * `cost_warn_fraction × ceiling`, steer ONE agent-visible `<interjection>` so the
+   * autonomous session can wind down before the hard cap (§2.2) blocks its next
+   * request. One-shot per run (`warned` latch). No-op (returns a noop unsubscribe)
+   * when the session has no resolved ceiling. Returns the `onBudgetChange`
+   * unsubscribe; the caller tears it down alongside the capture handle.
+   */
+  function wireCostBudgetWarner(
+    sessionId: string,
+    sessionType: string,
+    usage: SessionUsageTracker,
+  ): () => void {
+    const ceiling = factory.resolveSessionCostCeiling(sessionType);
+    if (ceiling === undefined) return () => {};
+    const fraction = config.agent.cost_warn_fraction ?? 0.8;
+    const threshold = ceiling * fraction;
+    let warned = false;
+    return usage.onBudgetChange((combinedCost) => {
+      if (warned || combinedCost < threshold) return;
+      warned = true;
+      const pct = Math.round((combinedCost / ceiling) * 100);
+      const content =
+        `You have spent $${combinedCost.toFixed(2)} of your $${ceiling.toFixed(2)} cost ` +
+        `budget for this session (${pct}%). Wind down now: send your final message and ` +
+        `avoid further tool calls or expensive actions. If you exceed the budget, your ` +
+        `next request will be blocked.`;
+      const steered = sessions.steer(sessionId, { type: "interjection", content });
+      logger.info("session_cost_warn", {
+        sessionId,
+        sessionType,
+        combinedCostUsd: combinedCost,
+        ceilingUsd: ceiling,
+        fraction,
+        steered,
+      });
+    });
+  }
+
+  /**
    * Run one resume-in-place attempt for a session (spec
    * CONCURRENCY-AND-RATE-LIMITING §6.2): rebuild the tool set, re-create the
    * agent from the persisted snapshot + transcript (skipping the context build
@@ -1476,21 +1521,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
 
-    const tools = buildSessionTools(inbound, record.id, target, record.sessionType);
     let agent;
-    let usage: SessionUsageTracker | undefined;
-    // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3, §6.2/D3). The seed is
-    // chosen per-branch below, NOT once for both: only a continue-mode resume
-    // inherits the row's persisted totals (so its consumption keeps
-    // accumulating). A fresh-mode resume must start from an EMPTY seed (zeros
-    // with `contextTokens: null`), because the row's usage columns can be
-    // populated even though it classifies fresh: usage persists at the Layer-0
-    // `done` commit, enqueued BEFORE the turn's transcript flush, so a crash in
-    // that window leaves usage written but `transcript_json` null (→ fresh).
-    // Seeding fresh from the row would (1) double-count those requests on
-    // re-run and (2) seed a non-null `contextTokens` that could trip the
-    // first-request `checkContextBudget` and permanently park the session,
-    // violating D3 ("the first request is never locally blocked").
+    // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3, §6.2/D3 + SESSION-COST-LIMITS
+    // §4). Chosen by mode, NOT once for both: only a continue-mode resume inherits
+    // the row's persisted totals (so its consumption keeps accumulating). A
+    // fresh-mode resume must start from an EMPTY seed (zeros with
+    // `contextTokens: null`), because the row's usage columns can be populated even
+    // though it classifies fresh: usage persists at the Layer-0 `done` commit,
+    // enqueued BEFORE the turn's transcript flush, so a crash in that window leaves
+    // usage written but `transcript_json` null (→ fresh). Seeding fresh from the row
+    // would (1) double-count those requests on re-run and (2) seed a non-null
+    // `contextTokens` that could trip the first-request `checkContextBudget` and
+    // permanently park the session, violating D3 ("the first request is never
+    // locally blocked"). The tool-cost lane seed follows the same rule: continue
+    // inherits the persisted ledger sum (getSessionToolUsage), fresh starts at 0.
+    // The tracker is built here so the SAME instance receives the tool-cost feed
+    // (buildSessionTools) and the factory's agent-loop commits.
+    const usage = new SessionUsageTracker(
+      resumeUsageSeed(row, material.mode),
+      material.mode === "fresh" ? 0 : storage.getSessionToolUsage(record.id).cost,
+    );
+    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage);
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
     // snapshot — run and persisted exactly like a launch.
     let kickoff;
@@ -1505,14 +1556,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // same row. The rebuild sees the timeline as of NOW (including messages
       // that arrived after the crash), which a launch would too.
       try {
-        ({ agent, finalTurn: kickoff, snapshot, tokenEstimate, usage } = await factory.create(record, tools, {
+        ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(record, tools, {
           proactive:
             record.sessionType === (config.proactive?.session_type ?? "proactive") ? true : undefined,
           abortSignal: drainAbort.signal,
-          // Empty seed (see `resumeUsageSeed`): never inherit row totals on the
-          // fresh path — the row may carry usage from a request whose transcript
-          // never flushed, which the rebuilt run will re-commit.
-          usageSeed: resumeUsageSeed(row, material.mode),
+          usage,
         }));
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
@@ -1528,9 +1576,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       try {
         // Continue mode inherits the row's persisted totals so the resumed
         // session keeps accumulating from where it left off (spec §4.3).
-        ({ agent, usage } = await factory.create(record, tools, {
+        ({ agent } = await factory.create(record, tools, {
           resume: material,
-          usageSeed: resumeUsageSeed(row, material.mode),
+          usage,
         }));
       } catch (error) {
         return {
@@ -1556,6 +1604,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       model: factory.resolveModelId(record.sessionType),
       logger,
     });
+    // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); the combined
+    // spend is seeded from the row above, so a resumed session warns/blocks from
+    // where it left off. Torn down with the capture handle in the finally.
+    const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage);
     const runner = new SessionRunner({
       provider,
       target,
@@ -1598,6 +1650,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return { outcome, error: message };
     } finally {
       captureHandle.detach();
+      costWarnUnsub();
     }
   }
 
@@ -1717,18 +1770,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
       return;
     }
-    const tools = buildSessionTools(inbound, session.id, target, session.sessionType);
+    // Per-session-run usage tracker (spec SESSION-COST-LIMITS §5): constructed
+    // here (fresh launch → empty seed) so the SAME instance receives both the
+    // tool-cost feed (wired into buildSessionTools' recordToolUsage) and the
+    // factory's Layer-0 agent-loop commits — the combined basis for the ceiling.
+    const usage = new SessionUsageTracker();
+    const tools = buildSessionTools(inbound, session.id, target, session.sessionType, usage);
     let agent;
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
-    let usage: SessionUsageTracker | undefined;
     try {
-      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate, usage } = await factory.create(
+      ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
         session,
         tools,
         {
           proactive: proactive ? true : undefined,
+          usage,
           // Drain cancellation (spec §7.2): a build waiting on a summary job
           // aborts cleanly at shutdown instead of out-living the worker pool.
           abortSignal: drainAbort.signal,
@@ -1786,6 +1844,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       model: factory.resolveModelId(session.sessionType),
       logger,
     });
+    // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
+    // the run's .finally alongside the capture handle.
+    const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage);
     const runner = new SessionRunner({ provider, target, suppressTyping: proactive });
 
     const run = runner
@@ -1856,6 +1917,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       })
       .finally(() => {
         captureHandle.detach();
+        costWarnUnsub();
         activeRuns.delete(run);
         // Close this session's browser tab(s) when the run settles (the idle
         // sweeper is only a backstop). Fire-and-forget; never block completion.

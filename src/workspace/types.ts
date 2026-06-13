@@ -89,4 +89,11 @@ export interface SessionTypeConfig {
    * diary/summary sessions; interactive types leave it unset.
    */
   max_context_tokens?: number;
+  /**
+   * Per-session-type USD cost ceiling (spec SESSION-COST-LIMITS §3) — an OVERRIDE
+   * of the global `agent.max_session_cost_usd`. Counts agent-loop + tool-use cost
+   * (captioning excluded). Unset = inherits the global default; `0` = no cap even
+   * when a global default is set.
+   */
+  max_session_cost_usd?: number;
 }

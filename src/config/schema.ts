@@ -69,6 +69,14 @@ const SessionTypeSchema = StrictObject({
   // `context_window`). The name (vs `context_window`) deliberately signals
   // "artificial tightening," not a model property.
   max_context_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Per-session-type USD cost ceiling (spec SESSION-COST-LIMITS §3) — an OVERRIDE
+  // of the global `agent.max_session_cost_usd`. Set = wins; unset = inherits the
+  // global default (or unlimited when that is also unset). Counts BOTH lanes:
+  // agent-loop cost + this session's tool-use cost (`tool_invocations`); captioning
+  // is excluded (pool-scoped). Enforced per-session-run on actuals; the first
+  // request is never blocked locally. `0` disables the cap for this type even when
+  // a global default is set.
+  max_session_cost_usd: Type.Optional(Type.Number({ minimum: 0 })),
 });
 
 const DiarySchema = StrictObject({
@@ -788,6 +796,15 @@ export const AppConfigSchema = StrictObject({
       fallback_prompt: Type.Optional(Type.String()),
     }),
     session_types: Type.Optional(Type.Record(Type.String(), SessionTypeSchema)),
+    // Global per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3),
+    // applied to every session unless a session type overrides it via
+    // `session_types.*.max_session_cost_usd`. Counts agent-loop cost +
+    // tool-use cost (captioning excluded). Unset = unlimited.
+    max_session_cost_usd: Type.Optional(Type.Number({ minimum: 0 })),
+    // Fraction of the resolved cost ceiling at which a one-shot, agent-visible
+    // budget interjection fires (spec SESSION-COST-LIMITS §2.1). Strictly in
+    // (0,1); defaults to 0.8 (00-defaults.toml). Ignored when no ceiling resolves.
+    cost_warn_fraction: Type.Optional(Type.Number({ exclusiveMinimum: 0, exclusiveMaximum: 1 })),
     disabled_tools: Type.Optional(Type.Array(Type.String())),
     // Named IANA time zone (e.g. "UTC", "America/New_York", "Asia/Tokyo"). All
     // timestamps the agent can see are rendered in this zone; the server's real
