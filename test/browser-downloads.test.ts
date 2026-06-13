@@ -101,6 +101,13 @@ interface DownloadHarness {
   cdpSessionsOpened: number;
   /** Override what newBrowserCDPSession does (e.g. to make the override send reject). */
   newCdpSession?: () => Promise<unknown>;
+  /**
+   * Fire the browser's captured `disconnected` handler (issue #17): drives the
+   * reconnect path (BrowserSession clears `browser`/`context`/`downloadsCdp`/
+   * `pendingDownloadEntries`, the next getActivePage reconnects). Faithful to the
+   * disconnect-capturing fake in test/browser-session.test.ts.
+   */
+  fireDisconnect(): void;
   /** The page-level `download` handler trackPage registered. */
   fireDownload(download: DownloadFake): void;
   /**
@@ -121,6 +128,7 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
   const cdp = makeFakeCdp();
   let downloadHandler: ((arg: unknown) => void) | undefined;
   let popupHandler: ((arg: unknown) => void) | undefined;
+  let disconnectHandler: (() => void) | undefined;
   const fakePage = {
     _closed: false,
     isClosed() { return this._closed; },
@@ -136,6 +144,8 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
   const harness: DownloadHarness = {
     cdp,
     cdpSessionsOpened: 0,
+    // Reassigned below once `browser` exists (it needs to flip browser._connected).
+    fireDisconnect() { throw new Error("fireDisconnect wired after browser creation"); },
     fireDownload(download) {
       assert.ok(downloadHandler, "download handler was registered");
       downloadHandler!(download);
@@ -158,14 +168,26 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
   const browser = {
     _connected: true,
     contexts: () => [context],
-    isConnected: () => true,
-    on: () => {},
-    close: async () => {},
+    isConnected: () => browser._connected,
+    // Capture the `disconnected` handler so the reconnect path is drivable
+    // (issue #17) — the old `on: () => {}` discarded it. Mirrors the
+    // disconnect-capturing fake in test/browser-session.test.ts.
+    on: (event: string, cb: () => void) => {
+      if (event === "disconnected") disconnectHandler = cb;
+    },
+    close: async () => { browser._connected = false; },
     newBrowserCDPSession: async () => {
       harness.cdpSessionsOpened++;
       if (harness.newCdpSession) return harness.newCdpSession();
       return cdp;
     },
+  };
+  // A fired disconnect flips isConnected to false (so ensureContext reconnects)
+  // before invoking the captured handler, matching real Playwright ordering.
+  harness.fireDisconnect = () => {
+    assert.ok(disconnectHandler, "the browser's disconnected handler was captured");
+    browser._connected = false;
+    disconnectHandler!();
   };
   return { browser, harness };
 }
@@ -229,7 +251,13 @@ function newDownloadSession(dirs: Dirs, opts: { sizeLimit?: number; configured?:
   const manager = stubManager();
   const { browser, harness } = makeDownloadBrowser();
   const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
-  const connect: ConnectOverCdp = async () => browser as never;
+  // Each connect (initial AND reconnect after a fired disconnect) yields a live
+  // socket — flip _connected back true so a post-disconnect getActivePage finds
+  // a connected browser (issue #17). Real connectOverCDP always returns a live one.
+  const connect: ConnectOverCdp = async () => {
+    (browser as { _connected: boolean })._connected = true;
+    return browser as never;
+  };
   const configured = opts.configured ?? true;
   const session = new BrowserSession({
     config: baseConfig(
@@ -497,6 +525,93 @@ test("downloads: a transfer over the size cap is canceled, Chromium owns the par
   });
 });
 
+// ── #18: an over-cap value arriving on the `completed` state must NOT finalize ─
+
+test("downloads #18: an over-cap transfer reported on the `completed` state is canceled, lands no workspace file, and surfaces a failed record", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs, { sizeLimit: 10 });
+    try {
+      await session.getActivePage("s1");
+      // A small-but-over-cap transfer can report `completed` WITHOUT a prior
+      // over-cap `inProgress` event (the size cap is checked on every state, not
+      // just inProgress — §2.5). Plant the bare completed guid file (the
+      // realistic on-disk state at `completed`): the cap check must fire BEFORE
+      // the completed-finalize branch, so the bytes must NOT be copied into the
+      // workspace. A regression hoisting the cap check below the `completed`
+      // branch would land an over-cap file in the workspace — this catches it.
+      await writeFile(path.join(dirs.staging, GUID_A), "0123456789ABCDEF"); // 16 bytes > 10
+
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/big.bin", suggestedFilename: "big.bin",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/big.bin", "big.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 50, totalBytes: 50,
+      });
+
+      await waitFor(
+        () => harness.cdp.sent.some((c) => c.method === "Browser.cancelDownload"),
+        "Browser.cancelDownload sent for the over-cap completed transfer",
+      );
+      const cancel = harness.cdp.sent.find((c) => c.method === "Browser.cancelDownload")!;
+      assert.deepEqual(cancel.params, { guid: GUID_A }, "cancel targets the offending guid");
+
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1, "a failure record surfaces");
+      assert.equal(drained[0]!.failed, true);
+      assert.equal(drained[0]!.filename, "big.bin");
+      assert.equal(drained[0]!.path, "", "a failed record carries no workspace path");
+      assert.ok(logged.some((l) => l.event === "browser_download_failed"), "failure logged");
+      assert.equal(
+        await exists(path.join(dirs.ws, "browser-downloads", "s1", "big.bin")),
+        false,
+        "the over-cap bytes were NOT finalized into the workspace",
+      );
+      const priv = session as unknown as PendingPrivate;
+      assert.equal(priv.pendingDownloadEntries.length, 0, "the over-cap entry is dropped (session was attributed)");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+test("downloads #18: a chunked over-cap transfer with no declared total (totalBytes 0) is canceled with a failed record", async () => {
+  // Variant (a): a chunked transfer reports its size only via receivedBytes
+  // (totalBytes stays 0). The cap is enforced on max(received, total), so this
+  // must still cancel + fail. (The pre-correlation ordering of this exact shape
+  // is exercised by "downloads #6"; this asserts it for the common
+  // page-event-first ordering too, keeping the chunked leg explicit alongside
+  // the declared-total and completed-state legs.)
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs, { sizeLimit: 10 });
+    try {
+      await session.getActivePage("s1");
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/stream.bin", suggestedFilename: "stream.bin",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/stream.bin", "stream.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "inProgress", receivedBytes: 50, totalBytes: 0,
+      });
+
+      await waitFor(
+        () => harness.cdp.sent.some((c) => c.method === "Browser.cancelDownload"),
+        "Browser.cancelDownload sent for the chunked over-cap transfer",
+      );
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1, "a failure record surfaces for the no-declared-total chunked transfer");
+      assert.equal(drained[0]!.failed, true);
+      assert.equal(drained[0]!.filename, "stream.bin");
+      assert.equal(drained[0]!.path, "");
+      assert.ok(logged.some((l) => l.event === "browser_download_failed"), "failure logged");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
 test("downloads: a browser-side cancel surfaces a failed record", async () => {
   await withDirs(async (dirs) => {
     const { session, harness, logged, manager } = newDownloadSession(dirs);
@@ -728,6 +843,129 @@ test("downloads #8: when the override send rejects, the opened CDP session is de
   });
 });
 
+// ── #16: newBrowserCDPSession itself rejecting also degrades to downloads-off ──
+
+test("downloads #16: when newBrowserCDPSession rejects, connect still succeeds, the failure is warned, and a later download records nothing", async () => {
+  await withDirs(async (dirs) => {
+    const manager = stubManager();
+    const { browser, harness } = makeDownloadBrowser();
+    const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    // Distinct from #8 (where the SESSION opens but the override SEND rejects):
+    // here opening the browser-level CDP session ITSELF rejects, so there is no
+    // session to leak — but the connect must STILL succeed (navigation/snapshot
+    // keep working) and downloads must degrade to disabled, not propagate the
+    // error out of setupDownloadCapture (which connect() awaits — a regression
+    // there would break EVERY browser tool call, §2.3).
+    harness.newCdpSession = async () => {
+      throw new Error("newBrowserCDPSession boom");
+    };
+    const session = new BrowserSession({
+      config: baseConfig({ downloads_dir: "/downloads", downloads_local_dir: dirs.staging }),
+      agentTimezone: "UTC",
+      workspaceRoot: dirs.ws,
+      logger: capturingLogger(logged),
+      connectOverCdp: async () => browser as never,
+    });
+    try {
+      const page = await session.getActivePage("s1");
+      assert.ok(page, "connect still yields an active page despite the CDP-session open failure");
+      assert.equal(harness.cdpSessionsOpened, 1, "newBrowserCDPSession was attempted exactly once");
+      assert.ok(
+        logged.some((l) => l.event === "browser_download_override_failed"),
+        "the override failure was warned",
+      );
+      assert.equal(
+        harness.cdp.sent.filter((c) => c.method === "Browser.setDownloadBehavior").length,
+        0,
+        "no override was sent (the session never opened)",
+      );
+      // Downloads are disabled (downloadsCdp stayed undefined): a page download
+      // records nothing — and this is the disabled state, NOT a failed transfer,
+      // so no failed record surfaces either.
+      await writeFile(path.join(dirs.staging, GUID_A), "would-be bytes");
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/f.bin", suggestedFilename: "f.bin",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/f.bin", "f.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 13, totalBytes: 13,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(session.drainDownloads("s1").length, 0, "downloads disabled ⇒ nothing recorded (not a failed record)");
+      assert.equal(
+        await exists(path.join(dirs.ws, "browser-downloads", "s1", "f.bin")),
+        false,
+        "no file finalized into the workspace when downloads are disabled",
+      );
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #17: reconnect re-issues the override and resets pending download state ───
+
+test("downloads #17: reconnect re-issues the setDownloadBehavior override and clears stale pending entries", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, manager } = newDownloadSession(dirs);
+    const priv = session as unknown as PendingPrivate;
+    try {
+      // First connect: the override is sent once.
+      await session.getActivePage("s1");
+      assert.equal(harness.cdpSessionsOpened, 1, "one CDP session on the initial connect");
+      assert.equal(
+        harness.cdp.sent.filter((c) => c.method === "Browser.setDownloadBehavior").length,
+        1,
+        "override sent once on the initial connect",
+      );
+
+      // Seed a stale pending entry (a CDP willBegin whose page event never landed
+      // before the socket dropped) — it references a now-dead transfer/session.
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/stale.bin", suggestedFilename: "stale.bin",
+      });
+      assert.equal(priv.pendingDownloadEntries.length, 1, "a pending entry is seeded before the disconnect");
+
+      // The socket drops: BrowserSession's disconnected handler must clear
+      // downloadsCdp + pendingDownloadEntries (the held CDP session died with the
+      // connection; pending entries point at dead transfers).
+      harness.fireDisconnect();
+      assert.equal(priv.pendingDownloadEntries.length, 0, "the stale pending entry was cleared on disconnect");
+
+      // Reconnect on the next use: the override MUST be re-issued (every connect),
+      // and a fresh CDP session opened.
+      await session.getActivePage("s1");
+      assert.equal(harness.cdpSessionsOpened, 2, "a second CDP session opened on reconnect");
+      assert.equal(
+        harness.cdp.sent.filter((c) => c.method === "Browser.setDownloadBehavior").length,
+        2,
+        "the override was re-issued after reconnect (sent a SECOND time)",
+      );
+
+      // A fresh download now correlates cleanly against a clean FIFO — it does NOT
+      // attach to the stale pre-disconnect entry (which is gone) and finalizes.
+      await writeFile(path.join(dirs.staging, GUID_B), "fresh bytes");
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_B, url: "https://example.com/fresh.bin", suggestedFilename: "fresh.bin",
+      });
+      harness.fireDownload(metadataDownload("https://example.com/fresh.bin", "fresh.bin"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_B, state: "completed", receivedBytes: 11, totalBytes: 11,
+      });
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "fresh.bin");
+      await waitFor(() => exists(finalPath), "the post-reconnect download finalized cleanly");
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1, "exactly the fresh download surfaces (no stale residue)");
+      assert.equal(drained[0]!.filename, "fresh.bin");
+      assert.ok(!drained[0]!.failed);
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
 // ── #20/#12 (ported from the old saveAs path): hostile names stay confined ───
 
 const HOSTILE_FILENAMES: Array<{ name: string; suggested: string }> = [
@@ -873,6 +1111,42 @@ test("downloads #3: an aged <guid>.crdownload orphan is reaped while a fresh one
 });
 
 // ── #7: the periodic idle sweep also runs the staging sweep ──────────────────
+
+// ── #20: connect() itself fires the staging sweep (the wiring, not the policy) ─
+
+test("downloads #20: connect() reaps a backdated staging orphan present before connect (no direct sweepStagingNow call)", async () => {
+  await withDirs(async (dirs) => {
+    const { session, logged, manager } = newDownloadSession(dirs);
+    try {
+      // Plant an aged guid orphan of BOTH staging forms BEFORE the first connect.
+      // connect() must trigger the staging sweep itself (`void this.sweepStagingNow()`),
+      // so these get reaped by getActivePage's connect — the test never calls
+      // sweepStagingNow OR sweepIdleNow directly, so deleting the connect-time
+      // wiring (separate from #7's periodic wiring) fails this.
+      const oldGuid = path.join(dirs.staging, GUID_A);
+      const oldCr = path.join(dirs.staging, `${GUID_B}.crdownload`);
+      await writeFile(oldGuid, "pre-connect orphan");
+      await writeFile(oldCr, "pre-connect partial");
+      const past = new Date(Date.now() - STAGING_SWEEP_TTL_MS - 60_000);
+      await utimes(oldGuid, past, past);
+      await utimes(oldCr, past, past);
+
+      await session.getActivePage("s1"); // connect — its connect-time sweep must reap both
+
+      await waitFor(
+        async () => !(await exists(oldGuid)) && !(await exists(oldCr)),
+        "the pre-connect aged orphans were reaped by connect()'s own sweep",
+      );
+      assert.ok(
+        logged.some((l) => l.event === "browser_download_staging_orphan_reaped"),
+        "the connect-time sweep logged the reap",
+      );
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
 
 test("downloads #7: the periodic idle sweep reaps an aged staging orphan (no direct sweepStagingNow call)", async () => {
   await withDirs(async (dirs) => {

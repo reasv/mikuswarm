@@ -12,9 +12,8 @@ import { startMikuAgent } from "../src/app.js";
 // pools are disabled, so the [browser] block is the validation under test. The
 // download keys are appended per-test.
 //
-// NOTE: a full sweep of the "exactly one key" cross-field cases is tracked as
-// review issue #21; here we cover #1's writability/deletability probe and #13's
-// absolute-path requirement directly.
+// Covers the cross-field "must be set together" check (issue #21), #1's
+// writability/deletability probe, and #13's absolute-path requirement.
 const BASE_CONFIG = (workspaceRoot: string, browserBlock: string) => `
 [app]
 name = "mikuswarm"
@@ -109,6 +108,52 @@ downloads_local_dir = "${path.join(os.tmpdir(), "miku-dl-staging-rel")}"
       /downloads_dir.*must be an absolute path/,
       "a relative downloads_dir must fail-fast at startup",
     );
+  });
+});
+
+test("startup rejects downloads_dir set WITHOUT downloads_local_dir (issue #21 cross-field)", async () => {
+  // Exactly one of the two keys is a broken topology, not a partial opt-in: the
+  // pair describes ONE shared staging volume from two containers' viewpoints.
+  await withConfig(`downloads_dir = "/downloads"\n`, async (config) => {
+    await assert.rejects(
+      () => startMikuAgent(config),
+      /must be set together/,
+      "downloads_dir alone must fail-fast at startup",
+    );
+  });
+});
+
+test("startup rejects downloads_local_dir set WITHOUT downloads_dir (issue #21 cross-field)", async () => {
+  await withConfig(
+    `downloads_local_dir = "${path.join(os.tmpdir(), "miku-dl-staging-lonely")}"\n`,
+    async (config) => {
+      await assert.rejects(
+        () => startMikuAgent(config),
+        /must be set together/,
+        "downloads_local_dir alone must fail-fast at startup",
+      );
+    },
+  );
+});
+
+test("startup accepts NEITHER key set — browser downloads disabled, no cross-field/probe error (issue #21)", async () => {
+  // Both unset ⇒ downloads disabled (explicit opt-in). Startup must clear the
+  // cross-field check, the absolute-path check, and the probe (the probe only
+  // runs when downloads_local_dir is set), then fail later for the unrelated
+  // disabled-matrix reason in this stub config — so we assert NONE of the three
+  // browser-download errors is raised.
+  await withConfig("", async (config) => {
+    let runtime: Awaited<ReturnType<typeof startMikuAgent>> | undefined;
+    try {
+      runtime = await startMikuAgent(config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.doesNotMatch(message, /must be set together/, "neither key set must pass the cross-field check");
+      assert.doesNotMatch(message, /must be an absolute path/, "neither key set must pass the absolute-path check");
+      assert.doesNotMatch(message, /not writable\+deletable/, "no probe runs when downloads_local_dir is unset");
+    } finally {
+      if (runtime) await runtime.stop();
+    }
   });
 });
 
