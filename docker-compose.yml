@@ -22,6 +22,12 @@
 #      relative binds (./var, ./workspaces/miku, ./debug) stays host-user-owned.
 #      Compose fails fast (`:?`) when any of the three is unset.
 #
+# Bind-dir ownership is NOT a manual step: the one-shot `init` service below
+# pre-creates the agent-owned bind dirs (incl. ./var/browser-downloads) and chowns
+# them to MIKUSWARM_UID:MIKUSWARM_GID before the agent/manager start, so a fresh `up` never
+# leaves them root-owned. (./var/browser-data is the one intentional exception —
+# the root Manager owns it.)
+#
 # Egress hardening is NOT a manual step: the `egress` sidecar below applies and
 # reconciles the bridge firewall (docker/egress-rules.sh — the SSRF boundary,
 # since the app-layer guard is off in docker, docker/95-docker.toml) from inside
@@ -102,6 +108,55 @@ services:
       # Resolve network IDs → bridge names (read-only daemon queries).
       - /var/run/docker.sock:/var/run/docker.sock
 
+  # One-shot provisioner: ensure the host bind directories the NON-ROOT agent
+  # writes into exist AND are owned by the agent's host uid:gid BEFORE the agent
+  # (or manager) starts. `var/`, `workspaces/`, `debug/` are gitignored, so on a
+  # fresh deploy Docker auto-creates any missing bind source ROOT-OWNED — which the
+  # non-root agent then cannot write to (the browser-download staging probe in
+  # src/app.ts fails fast on exactly that). This is the privileged piece that owns
+  # the fix: it runs as root (the only thing in the stack that can chown a
+  # root-owned dir), corrects ownership, and exits. agent + manager gate on its
+  # successful completion, so a started agent implies a writable tree — folding the
+  # former manual `mkdir -p && chown` pre-up step into the stack. Idempotent: on an
+  # already-correct tree every chown is a no-op.
+  init:
+    image: busybox:latest
+    container_name: mikuswarm-init
+    # Root so it can chown root-owned auto-created dirs; the ONLY non-host-uid
+    # service besides the manager. Does no networking.
+    user: "0:0"
+    network_mode: none
+    environment:
+      # Same host identity the agent runs as (.env); guarded so a missing value
+      # fails the stack here rather than silently chowning to a wrong owner.
+      MIKUSWARM_UID: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}"
+      MIKUSWARM_GID: "${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    volumes:
+      # The parents of every agent-owned bind. Mounting the parents (not each leaf)
+      # lets `mkdir -p` below create a missing leaf on the host THROUGH the bind.
+      - ./var:/provision/var
+      - ./workspaces:/provision/workspaces
+      - ./debug:/provision/debug
+    # Create the agent-owned dirs, then chown them NON-RECURSIVELY: only the
+    # directory entries the agent must create/unlink within need its ownership;
+    # existing children (e.g. the SQLite DB under ./var) are already correctly owned
+    # and left untouched. ./var/browser-data is deliberately ABSENT from this list —
+    # it stays root-owned (the Manager runs as root and owns its browser profile;
+    # see the `manager` service). $$VAR escapes compose interpolation so the value
+    # is expanded by the runtime shell, not by compose.
+    command:
+      - sh
+      - -ceu
+      - |
+        mkdir -p /provision/var/browser-downloads /provision/workspaces/miku /provision/debug
+        chown "$$MIKUSWARM_UID:$$MIKUSWARM_GID" \
+          /provision/var \
+          /provision/var/browser-downloads \
+          /provision/workspaces \
+          /provision/workspaces/miku \
+          /provision/debug
+    restart: "no"
+
   agent:
     build:
       context: .
@@ -110,10 +165,13 @@ services:
     container_name: mikuswarm
     restart: unless-stopped
     # Fail-closed: do not start the agent until the egress firewall is verified
-    # in place (the app-layer SSRF guard is off under compose).
+    # in place (the app-layer SSRF guard is off under compose) AND the init
+    # provisioner has made the bind dirs writable by the non-root agent.
     depends_on:
       egress:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
     # Non-root: run as the operator's host uid:gid so the DB (./var), workspace
     # files, and context dumps land host-user-owned instead of root-owned. The
     # docker socket is the only root-ish dependency, covered by group_add with
@@ -231,9 +289,13 @@ services:
     # Fail-closed: don't start until the egress firewall sidecar is healthy. The
     # browser bridge is reconciled in the same pass that flips the marker healthy,
     # so the RFC1918/link-local egress drops are in force before Chromium can browse.
+    # Also wait on init so the shared ./var/browser-downloads staging dir exists and
+    # is agent-owned before Chromium writes guid files the agent must later unlink.
     depends_on:
       egress:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
     ports:
       # Loopback ONLY — the harness reaches REST + CDP-WS here; humans reach the
       # noVNC GUI via SSH tunnel (ssh -L 8080:localhost:8080 your-host). The
@@ -253,15 +315,15 @@ services:
       # Browser-download staging (ARCHITECTURE.md §11b/§11c): Chromium writes
       # guid-named downloads here ([browser] downloads_dir = "/downloads"); the
       # agent sees the same storage at /app/var/browser-downloads, copies
-      # completed files into the workspace, and unlinks the staging guid. PRE-CREATE
-      # this host dir owned by the agent's uid BEFORE `docker compose up` — `var/`
-      # is gitignored, so on a fresh deploy Docker auto-creates the missing bind
-      # source ROOT-OWNED, and the agent's in-container `mkdir -p` cannot fix that.
-      # A root-owned dir lets the agent copy out but not unlink the root-written
-      # guid files, silently leaking every download into ./var; app.ts probes this
-      # at startup and fails fast. (e.g. `mkdir -p var/browser-downloads &&
-      # chown $(id -u):$(id -g) var/browser-downloads`.) Root can always write into
-      # an agent-uid-owned dir. Steady-state empty.
+      # completed files into the workspace, and unlinks the staging guid. This host
+      # dir MUST be owned by the agent's uid — `var/` is gitignored, so on a fresh
+      # deploy Docker would auto-create the missing bind source ROOT-OWNED, and the
+      # agent's in-container `mkdir -p` cannot fix that; a root-owned dir lets the
+      # agent copy out but not unlink the root-written guid files, silently leaking
+      # every download into ./var (app.ts probes this at startup and fails fast).
+      # The `init` service above now guarantees the correct ownership before this
+      # service starts (manager depends_on init), so no manual pre-up step is
+      # needed. Root can always write into an agent-uid-owned dir. Steady-state empty.
       - ./var/browser-downloads:/downloads
     # mikuswarm-browser: hardened egress bridge (default route — browsing goes here).
     # mikuswarm-browser-ctl: internal control link so the agent reaches it by name.
