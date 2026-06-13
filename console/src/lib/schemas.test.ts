@@ -8,7 +8,13 @@ import {
 	AbortSessionResponse,
 	AgentEventWire,
 	ImageRef,
-	ContextMessageWire
+	ContextMessageWire,
+	SessionMeta,
+	ToolInvocation,
+	CaptioningUsageAggregate,
+	PipelineHealth,
+	PipelineMediaAsset,
+	CostOverview
 } from './schemas';
 
 const decode = <A, I>(s: Schema.Schema<A, I>, v: unknown) => Schema.decodeUnknownSync(s)(v);
@@ -218,5 +224,193 @@ describe('wire schemas (fidelity guard)', () => {
 
 	it('rejects a malformed envelope (missing fields)', () => {
 		expect(() => decode(RoomsResponse, { rooms: [{ timelineKey: '!a' }] })).toThrow();
+	});
+});
+
+/**
+ * Auxiliary (out-of-loop) usage & cost wire fields (spec AUXILIARY-USAGE-TRACKING
+ * §10). Pins the decode contract for the new captioning/image-gen/cost-overview
+ * shapes, including the null-not-zero ("—") and optional-for-legacy conventions.
+ */
+describe('auxiliary usage schemas', () => {
+	// A minimal valid SessionMeta to hang the optional toolUsage field off of.
+	const baseSession = {
+		id: 's-1',
+		timelineKey: '!abc:m',
+		sessionType: 'default',
+		status: 'running',
+		modelId: null,
+		triggerEventId: null,
+		triggerExternalId: null,
+		triggerBody: null,
+		tokenEstimate: null,
+		noReply: false,
+		error: null,
+		createdAt: 1,
+		startedAt: null,
+		updatedAt: 2,
+		completedAt: null
+	};
+
+	it('decodes the captioning pool usage aggregate (§10.2)', () => {
+		const out = decode(CaptioningUsageAggregate, {
+			captionedCount: 12,
+			totalInputTokens: 3400,
+			totalOutputTokens: 900,
+			totalCost: 0.0123
+		});
+		expect(out.captionedCount).toBe(12);
+		expect(out.totalCost).toBeCloseTo(0.0123);
+	});
+
+	it('decodes the global cost overview as three side-by-side lanes (§10.4)', () => {
+		const out = decode(CostOverview, { agentLoopCost: 1.5, toolCost: 0.25, captioningCost: 0.03 });
+		expect(out.agentLoopCost).toBe(1.5);
+		expect(out.toolCost).toBe(0.25);
+		expect(out.captioningCost).toBe(0.03);
+	});
+
+	it('decodes a fully-populated tool invocation ledger row (§10.3)', () => {
+		const out = decode(ToolInvocation, {
+			id: 'toolinv_abc',
+			toolCallId: 'call_1',
+			toolName: 'image_generate',
+			modelId: 'gemini-3-pro-image',
+			provider: 'gemini',
+			input: 100,
+			output: 1290,
+			cacheRead: 0,
+			cacheWrite: 0,
+			images: 1,
+			cost: 0.0795,
+			ref: 'workspace/out.png',
+			createdAt: 5
+		});
+		expect(out.toolName).toBe('image_generate');
+		expect(out.cost).toBeCloseTo(0.0795);
+	});
+
+	it('decodes a tool invocation with null usage ("unknown" → "—")', () => {
+		// Gateway omitted usageMetadata: every token/cost field is null, not 0.
+		const out = decode(ToolInvocation, {
+			id: 'toolinv_def',
+			toolCallId: null,
+			toolName: 'image_generate',
+			modelId: null,
+			provider: null,
+			input: null,
+			output: null,
+			cacheRead: null,
+			cacheWrite: null,
+			images: null,
+			cost: null,
+			ref: null,
+			createdAt: 6
+		});
+		expect(out.cost).toBeNull();
+		expect(out.input).toBeNull();
+	});
+
+	it('rejects a tool invocation where a null-or-number field is a string', () => {
+		expect(() =>
+			decode(ToolInvocation, {
+				id: 'x',
+				toolCallId: null,
+				toolName: 'image_generate',
+				modelId: null,
+				provider: null,
+				input: '100',
+				output: null,
+				cacheRead: null,
+				cacheWrite: null,
+				images: null,
+				cost: null,
+				ref: null,
+				createdAt: 6
+			})
+		).toThrow();
+	});
+
+	it('decodes a captioning pool health row carrying a usage aggregate', () => {
+		const out = decode(PipelineHealth, {
+			pool: 'captioning',
+			enabled: true,
+			workerCount: 2,
+			maxRetries: 3,
+			inFlight: 0,
+			counts: { pending: 0, processing: 0, retrying: 0, done: 5, failed: 0, skipped: 0 },
+			usage: { captionedCount: 5, totalInputTokens: 1000, totalOutputTokens: 200, totalCost: 0.004 }
+		});
+		expect(out.usage?.captionedCount).toBe(5);
+	});
+
+	it('decodes a non-captioning pool health row with null usage', () => {
+		const out = decode(PipelineHealth, {
+			pool: 'summarization',
+			enabled: true,
+			workerCount: 1,
+			maxRetries: 3,
+			inFlight: 0,
+			counts: { pending: 0, processing: 0, retrying: 0, done: 0, failed: 0, skipped: 0 },
+			usage: null
+		});
+		expect(out.usage).toBeNull();
+	});
+
+	it('decodes a pool health row from a pre-feature backend (usage absent)', () => {
+		const out = decode(PipelineHealth, {
+			pool: 'enrichment',
+			enabled: true,
+			workerCount: 1,
+			maxRetries: 3,
+			inFlight: 0,
+			counts: { pending: 0, processing: 0, retrying: 0, done: 0, failed: 0, skipped: 0 }
+		});
+		expect(out.usage).toBeUndefined();
+	});
+
+	it('decodes a media asset with caption usage, and with legacy null usage', () => {
+		const withUsage = decode(PipelineMediaAsset, {
+			ref: 'r',
+			role: 'user',
+			mediaType: 'image',
+			mimeType: 'image/png',
+			filename: null,
+			downloadStatus: 'done',
+			captionStatus: 'done',
+			caption: 'a cat',
+			captionModel: 'google/gemini-3.5-flash',
+			hasBytes: true,
+			usage: { input: 700, output: 200, cacheRead: 300, total: 1200, cost: 0.0009 }
+		});
+		expect(withUsage.usage?.total).toBe(1200);
+
+		const legacy = decode(PipelineMediaAsset, {
+			ref: 'r',
+			role: 'user',
+			mediaType: 'image',
+			mimeType: null,
+			filename: null,
+			downloadStatus: 'done',
+			captionStatus: 'done',
+			caption: null,
+			captionModel: null,
+			hasBytes: false,
+			usage: null
+		});
+		expect(legacy.usage).toBeNull();
+	});
+
+	it('decodes a session meta with the separate tool-spend lane, and without it', () => {
+		const withTools = decode(SessionMeta, {
+			...baseSession,
+			toolUsage: { calls: 3, inputTokens: 300, outputTokens: 3870, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0.238 }
+		});
+		expect(withTools.toolUsage?.calls).toBe(3);
+		expect(withTools.toolUsage?.cost).toBeCloseTo(0.238);
+
+		// Absent on the list shape / pre-feature backend.
+		const noTools = decode(SessionMeta, baseSession);
+		expect(noTools.toolUsage).toBeUndefined();
 	});
 });
