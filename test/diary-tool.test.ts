@@ -71,6 +71,23 @@ test("finalize on a valid created draft terminates", async () => {
   assert.match(text(result), /create applied/);
 });
 
+test("finalize command on a created draft terminates without mutating it", async () => {
+  const { draft, tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: `${HEADER}\nthe entry` });
+  const result = await tool.execute("2", { command: "finalize" });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /finalized/);
+  assert.equal(draft.getContent(), `${HEADER}\nthe entry`, "committed as-is, no spurious edit");
+});
+
+test("finalize command on an empty draft terminates as the legitimate skip", async () => {
+  const { draft, tool } = toolFor();
+  const result = await tool.execute("1", { command: "finalize" });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /no entry/i);
+  assert.equal(draft.isCreated(), false, "empty-draft finalize leaves nothing to append");
+});
+
 test("str_replace that keeps the header still applies", async () => {
   const { draft, tool } = toolFor();
   await tool.execute("1", { command: "create", file_text: `${HEADER}\nplaceholder` });

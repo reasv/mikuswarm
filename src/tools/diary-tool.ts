@@ -31,6 +31,7 @@ const DiaryToolSchema = Type.Object({
     Type.Literal("view"),
     Type.Literal("str_replace"),
     Type.Literal("insert"),
+    Type.Literal("finalize"),
   ]),
   file_text: Type.Optional(Type.String()),
   view_range: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2 })),
@@ -41,7 +42,7 @@ const DiaryToolSchema = Type.Object({
 });
 
 type DiaryToolArgs = {
-  command: "create" | "view" | "str_replace" | "insert";
+  command: "create" | "view" | "str_replace" | "insert" | "finalize";
   file_text?: string;
   view_range?: [number, number];
   old_str?: string;
@@ -61,7 +62,7 @@ export function createDiaryTool(options: {
     name: "diary_tool",
     label: "Diary editor",
     description:
-      "Write your new diary entry. Use `create` to start it (the very first line MUST be the exact dictated header), then `str_replace` or `insert` to revise, and `view` to inspect. Set `finalize: true` on your final tool call (on ALL tools if your final batch has several) to commit the entry. If there is genuinely nothing worth recording, call `view` with `finalize: true` on the empty draft to finish without writing anything.",
+      "Write your new diary entry. Use `create` to start it (the very first line MUST be the exact dictated header), then `str_replace` or `insert` to revise, and `view` to inspect. To finish: either set `finalize: true` on your `create` (or final edit) call, or call `command: \"finalize\"` on its own once the entry is written — do NOT make a no-op edit just to finalize. If there is genuinely nothing worth recording, call `command: \"finalize\"` on the empty draft to finish without writing anything.",
     executionMode: "sequential",
     parameters: DiaryToolSchema,
     execute: async (_toolCallId, params) => {
@@ -80,6 +81,20 @@ export function createDiaryTool(options: {
         } catch (err) {
           return errorResult(err);
         }
+      }
+
+      // `finalize` is a standalone terminal command (mirrors the `finalize: true`
+      // parameter): commit whatever is in the draft and end, without faking a
+      // no-op edit. An empty/uncreated draft is the legitimate "nothing worth
+      // recording" skip → terminate, and the worker appends nothing. A created
+      // draft has already passed both per-edit checks (budget + header-first), so
+      // it is safe to commit as-is — same as the `finalize: true` path below.
+      if (args.command === "finalize") {
+        const tokens = draft.isCreated() ? draft.getTokenCount() : 0;
+        const text = draft.isCreated()
+          ? `Diary entry finalized (${tokens} tokens).`
+          : "Diary finalized with no entry (nothing recorded).";
+        return { content: [{ type: "text", text }], details: { command: "finalize", tokens }, terminate: true };
       }
 
       const snapshot = draft.snapshot();

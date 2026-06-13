@@ -98,6 +98,7 @@ const SummaryToolSchema = Type.Object({
     Type.Literal("view"),
     Type.Literal("str_replace"),
     Type.Literal("insert"),
+    Type.Literal("finalize"),
   ]),
   file_text: Type.Optional(Type.String()),
   view_range: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2 })),
@@ -108,7 +109,7 @@ const SummaryToolSchema = Type.Object({
 });
 
 type SummaryToolArgs = {
-  command: "create" | "view" | "str_replace" | "insert";
+  command: "create" | "view" | "str_replace" | "insert" | "finalize";
   file_text?: string;
   view_range?: [number, number];
   old_str?: string;
@@ -129,7 +130,7 @@ export function createSummaryTool(options: {
     name: "summary_tool",
     label: "Summary editor",
     description:
-      "Write and revise the summary document. Use `create` to start the summary, then `str_replace` or `insert` to revise it, and `view` to inspect it. Set `finalize: true` on your final tool call (on ALL tools if your final batch has several) to complete the summarization.",
+      "Write and revise the summary document. Use `create` to start the summary, then `str_replace` or `insert` to revise it, and `view` to inspect it. To finish: either set `finalize: true` on your `create` (or final edit) call to commit it in the same step, or — if the draft is already written — call `command: \"finalize\"` on its own. `finalize` is a parameter or a standalone command; do NOT make a no-op edit (e.g. replacing text with itself) or re-view the draft just to finalize.",
     executionMode: "sequential",
     parameters: SummaryToolSchema,
     execute: async (_toolCallId, params) => {
@@ -145,6 +146,30 @@ export function createSummaryTool(options: {
         } catch (err) {
           return errorResult(err);
         }
+      }
+
+      // `finalize` is a standalone terminal command: commit the current draft and
+      // end the session in a single call, without faking a no-op edit. The model
+      // consistently reaches for `command: "finalize"` on its own (it reads the
+      // instruction's "finalize" as a verb), so accepting it — alongside the
+      // `finalize: true` parameter — removes a wasted validation-error round trip
+      // and the identity `str_replace` it used to invent. A summary must have
+      // content, so finalizing an empty/uncreated draft is an error, not a skip.
+      if (args.command === "finalize") {
+        if (!draft.isCreated() || draft.getContent().trim().length === 0) {
+          return {
+            content: [
+              { type: "text", text: "Error: nothing to finalize — use `create` to write the summary first." },
+            ],
+            details: { command: "finalize" },
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text", text: `Summary finalized (${draft.getTokenCount()} tokens).` }],
+          details: { command: "finalize", tokens: draft.getTokenCount() },
+          terminate: true,
+        };
       }
 
       const snapshot = draft.snapshot();

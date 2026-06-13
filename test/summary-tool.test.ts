@@ -169,3 +169,23 @@ test("insert with finalize: true sets terminate: true", async () => {
   assert.equal(result.terminate, true);
   assert.match(text(result), /insert applied/);
 });
+
+// --- standalone `finalize` command ---
+
+test("finalize command terminates without mutating the draft", async () => {
+  const { draft, tool } = toolFor();
+  await tool.execute("1", { command: "create", file_text: "the summary" });
+  const result = await tool.execute("2", { command: "finalize" });
+  assert.equal(result.terminate, true);
+  assert.match(text(result), /finalized/);
+  // The draft is committed exactly as written — no spurious edit.
+  assert.equal(draft.getContent(), "the summary");
+});
+
+test("finalize command on an uncreated draft is an error and does not terminate", async () => {
+  const { tool } = toolFor();
+  const result = await tool.execute("1", { command: "finalize" });
+  assert.equal(result.isError, true);
+  assert.notEqual(result.terminate, true);
+  assert.match(text(result), /nothing to finalize/i);
+});
