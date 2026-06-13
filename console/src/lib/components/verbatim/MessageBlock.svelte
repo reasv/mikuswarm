@@ -15,6 +15,16 @@
 	const imageRefs = $derived(
 		(msg.imageRefs ?? []) as { attachmentId?: string; sizeBytes?: number; mimeType?: string }[]
 	);
+
+	// Per-file/skill system-prompt breakdown (live preview only). Sorted by
+	// contribution, largest first, so the heaviest segment reads at a glance. The
+	// `\n\n` joiners and BPE boundary effects are not attributed to any segment, so
+	// the subtotal sits a few tokens under the block's whole-string estimate above —
+	// surfaced explicitly rather than silently fudged.
+	const segments = $derived(
+		msg.segments ? [...msg.segments].sort((a, b) => b.tokenEstimate - a.tokenEstimate) : []
+	);
+	const segmentsTotal = $derived(segments.reduce((sum, s) => sum + s.tokenEstimate, 0));
 </script>
 
 <div class={cn('border-l-2 pl-2', meta.accent)}>
@@ -43,6 +53,24 @@
 	</div>
 
 	{#if open}
+		{#if segments.length > 0}
+			<table class="mb-2 w-full text-[10px] tabular-nums">
+				<tbody>
+					{#each segments as seg (seg.tag + ':' + (seg.source ?? seg.label))}
+						<tr class="border-b border-border/40">
+							<td class="py-0.5 pr-2 font-medium">{seg.label}</td>
+							<td class="py-0.5 pr-2 text-muted-foreground/60">{seg.source ?? ''}</td>
+							<td class="py-0.5 text-right text-muted-foreground">{seg.tokenEstimate}</td>
+						</tr>
+					{/each}
+					<tr>
+						<td class="py-0.5 pr-2 text-muted-foreground uppercase">segments Σ</td>
+						<td></td>
+						<td class="py-0.5 text-right text-muted-foreground tabular-nums">{segmentsTotal}</td>
+					</tr>
+				</tbody>
+			</table>
+		{/if}
 		<div class="overflow-x-auto pb-2">
 			<XmlHighlight code={msg.content} />
 			{#if imageRefs.length > 0}

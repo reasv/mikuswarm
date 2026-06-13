@@ -24,6 +24,15 @@ export const ImageRef = Schema.Struct({
 });
 export type ImageRef = Schema.Schema.Type<typeof ImageRef>;
 
+/** One named piece of the system prompt and its token contribution (prompt.ts `SystemPromptSegment`). */
+export const SystemPromptSegmentWire = Schema.Struct({
+	tag: Schema.String,
+	label: Schema.String,
+	source: Schema.NullOr(Schema.String),
+	tokenEstimate: Schema.Number
+});
+export type SystemPromptSegmentWire = Schema.Schema.Type<typeof SystemPromptSegmentWire>;
+
 /** A rendered context message (handlers.ts `renderContextMessage`). */
 export const ContextMessageWire = Schema.Struct({
 	type: Schema.String,
@@ -37,7 +46,14 @@ export const ContextMessageWire = Schema.Struct({
 	timestamp: Schema.NullOr(Schema.Number),
 	imageRefs: Schema.optional(Schema.Array(ImageRef)),
 	/** present only on room-context preview messages (spec §9) */
-	preview: Schema.optional(Schema.Boolean)
+	preview: Schema.optional(Schema.Boolean),
+	/**
+	 * Per-segment token breakdown of the system prompt — present ONLY on the
+	 * `system` message of a live room-context preview (spec §10a). Absent on every
+	 * other message and on persisted session snapshots, which carry the system
+	 * prompt as one opaque blob.
+	 */
+	segments: Schema.optional(Schema.Array(SystemPromptSegmentWire))
 });
 export type ContextMessageWire = Schema.Schema.Type<typeof ContextMessageWire>;
 

@@ -4,7 +4,11 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { loadWorkspace } from "../src/workspace/loader.js";
-import { renderSystemPrompt, renderSatelliteBlock } from "../src/workspace/prompt.js";
+import {
+  renderSystemPrompt,
+  renderSystemPromptWithSegments,
+  renderSatelliteBlock,
+} from "../src/workspace/prompt.js";
 import { scanSkills } from "../src/workspace/skills.js";
 import { filterTools, AgentSessionFactory } from "../src/agent/factory.js";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -296,6 +300,92 @@ describe("system prompt rendering", () => {
 
     const prompt = renderSystemPrompt(workspace);
     assert.equal(prompt, "");
+  });
+});
+
+describe("system prompt segments", () => {
+  it("text is byte-identical to renderSystemPrompt", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ["AGENTS.md", "Main instructions here."],
+        ["SOUL.md", "I am Miku."],
+        ["TOOLS.md", "Tool notes."],
+      ]),
+      tailContent: "tail",
+      skills: {
+        listed: [
+          { name: "danbooru", description: "Search images", path: "skills/danbooru/SKILL.md", alwaysLoaded: false },
+        ],
+        inlined: [
+          { name: "core", description: "Always present", path: "skills/core/SKILL.md", alwaysLoaded: true, content: "Inlined body." },
+        ],
+      },
+    };
+
+    const { text } = renderSystemPromptWithSegments(workspace);
+    assert.equal(text, renderSystemPrompt(workspace),
+      "segment variant text must match the string-only renderer exactly");
+  });
+
+  it("emits one segment per rendered block with labels, sources, and positive estimates", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([
+        ["AGENTS.md", "Main instructions here."],
+        ["SOUL.md", "I am Miku."],
+        ["TOOLS.md", "Tool notes."],
+      ]),
+      tailContent: null,
+      skills: {
+        listed: [
+          { name: "danbooru", description: "Search images", path: "skills/danbooru/SKILL.md", alwaysLoaded: false },
+        ],
+        inlined: [
+          { name: "core", description: "Always present", path: "skills/core/SKILL.md", alwaysLoaded: true, content: "Inlined body." },
+        ],
+      },
+    };
+
+    const { segments } = renderSystemPromptWithSegments(workspace);
+
+    // Order mirrors the rendered prompt: files (canonical) → inlined skill → index.
+    assert.deepEqual(
+      segments.map((s) => ({ tag: s.tag, label: s.label, source: s.source })),
+      [
+        { tag: "agent_instructions", label: "AGENTS.md", source: "AGENTS.md" },
+        { tag: "soul", label: "SOUL.md", source: "SOUL.md" },
+        { tag: "tools_guide", label: "TOOLS.md", source: "TOOLS.md" },
+        { tag: "skill_instructions", label: "core", source: "skills/core/SKILL.md" },
+        { tag: "available_skills", label: "available_skills", source: null },
+      ],
+    );
+    for (const s of segments) {
+      assert.ok(s.tokenEstimate > 0, `segment ${s.label} should have a positive token estimate`);
+    }
+  });
+
+  it("attributes the fallback prompt to the AGENTS.md segment", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map([["SOUL.md", "personality"]]),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const { segments } = renderSystemPromptWithSegments(workspace, "Fallback instructions");
+    const agents = segments.find((s) => s.source === "AGENTS.md");
+    assert.ok(agents, "fallback should still produce an AGENTS.md segment");
+    assert.ok(agents!.tokenEstimate > 0);
+  });
+
+  it("returns empty text and no segments for an empty workspace", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const { text, segments } = renderSystemPromptWithSegments(workspace);
+    assert.equal(text, "");
+    assert.deepEqual(segments, []);
   });
 });
 
