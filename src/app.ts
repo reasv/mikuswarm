@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer } from "./observability/index.js";
@@ -353,11 +353,51 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           "set both, or neither to disable browser downloads",
       );
     }
-    // Create the agent-side staging dir up front so it is owned by the agent's
-    // uid (root — the Manager — can write into it regardless), and so the first
-    // download doesn't race a missing directory.
+    // downloads_dir is the staging path AS SEEN BY THE BROWSER CONTAINER and is
+    // sent verbatim over CDP in Browser.setDownloadBehavior (issue #13). A
+    // relative value is resolved by Chromium against ITS OWN cwd in the manager
+    // container, so the bytes land somewhere the agent never sees — surfacing as
+    // confusing per-download copy failures for a statically detectable typo. The
+    // browser container is always Linux in both topologies, so require an
+    // absolute POSIX path (fail-fast here for a friendlier message than a schema
+    // pattern, consistent with the cross-field check above).
+    if (config.browser.downloads_dir !== undefined && !config.browser.downloads_dir.startsWith("/")) {
+      throw new Error(
+        `browser.downloads_dir = "${config.browser.downloads_dir}" must be an absolute path (begin with "/"): ` +
+          "it is sent verbatim to the browser container over CDP, where Chromium resolves a relative path " +
+          "against its own cwd and the downloaded bytes never reach the agent",
+      );
+    }
+    // Create the agent-side staging dir up front and probe it for writability AND
+    // deletability (issue #1). The download pipeline needs not just to copy OUT of
+    // the staging dir but to UNLINK the root-owned 0644 guid files the Manager's
+    // Chromium writes — which is governed by write permission on the DIRECTORY,
+    // not the files. Under compose, `var/` is gitignored, so a fresh deploy has no
+    // `./var/browser-downloads`; Docker then creates the bind source ROOT-OWNED
+    // before the agent runs, and this in-container `mkdir -p` is a no-op against
+    // the existing mount point that never fixes ownership. The copy still works
+    // (read-only on a 0644 file), but every unlink fails with EACCES — silently
+    // leaking every download permanently into the shared `./var` volume. The probe
+    // converts that invisible leak into a loud startup error: create then unlink a
+    // probe file; if either fails we cannot reap staging files, so fail fast.
     if (config.browser.downloads_local_dir !== undefined) {
-      await mkdir(path.resolve(config.browser.downloads_local_dir), { recursive: true });
+      const stagingDir = path.resolve(config.browser.downloads_local_dir);
+      await mkdir(stagingDir, { recursive: true });
+      const probePath = path.join(stagingDir, `.write-probe-${process.pid}-${Date.now()}`);
+      try {
+        await writeFile(probePath, "");
+        await unlink(probePath);
+      } catch (error) {
+        throw new Error(
+          `browser.downloads_local_dir "${stagingDir}" is not writable+deletable by this process ` +
+            `(${error instanceof Error ? error.message : String(error)}). The browser-download pipeline ` +
+            "must create files in and unlink root-owned staging files from this directory; both are governed " +
+            "by directory write permission. The likely cause under docker compose is that the host bind " +
+            "source did not exist on a fresh deploy, so Docker created it ROOT-OWNED before the agent " +
+            "started — pre-create it owned by the agent's uid (e.g. `mkdir -p var/browser-downloads && " +
+            "chown $(id -u):$(id -g) var/browser-downloads`) and recreate the containers",
+        );
+      }
     }
     browserSession = new BrowserSession({
       config: config.browser,

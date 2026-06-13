@@ -618,10 +618,13 @@ const BrowserSchema = StrictObject({
   session_page_idle_ms: Type.Integer({ minimum: 30000 }),
   // Browser downloads (ARCHITECTURE.md §11b "Downloads"): the shared staging dir
   // AS SEEN BY THE BROWSER container — sent verbatim over CDP in
-  // Browser.setDownloadBehavior. Set BOTH downloads keys or NEITHER (cross-field
-  // validated in app.ts, not the loader, per the proactive-posting precedent);
-  // both unset ⇒ downloads disabled, an explicit opt-in that must match the
-  // deployment's mount topology (the bytes land in the browser container's fs).
+  // Browser.setDownloadBehavior. When the browser is enabled, set BOTH downloads
+  // keys or NEITHER (cross-field validated in app.ts inside the `enabled` guard,
+  // not the loader, per the proactive-posting precedent — so setting exactly one
+  // is a startup error only when the browser is enabled, consistent with
+  // manager_url/auth_token); both unset ⇒ downloads disabled, an explicit opt-in
+  // that must match the deployment's mount topology (the bytes land in the
+  // browser container's fs).
   downloads_dir: Type.Optional(Type.String({ minLength: 1 })),
   // The SAME storage as seen by the agent process; relative paths resolve against
   // cwd like the other dir keys. Two keys rather than one because only the compose

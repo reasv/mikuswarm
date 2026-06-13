@@ -840,3 +840,79 @@ test("renderConsole: small message set is rendered verbatim with no marker", () 
   ]);
   assert.equal(text, "[log] hello\n[error] boom");
 });
+
+// ── #23: renderDownloads formatting at the tool layer ────────────────────────
+
+// renderDownloads is private to src/tools/browser.ts, so it is exercised through
+// the real tool path: an `act:wait` result appends renderDownloads(drainDownloads).
+// We seed the session's pendingDownloads buffer (the exact array drainDownloads
+// reads) with one successful and one failed DownloadRecord — the shapes the
+// capture pipeline produces — then assert the rendered text the model actually
+// sees. (Driving the full CDP pipeline here would re-test capture, not formatting.)
+type SessionsPrivate = {
+  sessions: Map<string, { pendingDownloads: Array<{ path: string; filename: string; url: string; failed?: boolean }> }>;
+};
+
+test("tool: a failed download renders as [download failed: name (url)] and a successful one as its path (#23)", async () => {
+  const ws = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-browser-tool-dl-"));
+  const restore = stubManager();
+  const cfg = baseConfig();
+  const connect: ConnectOverCdp = async () => makeBrowser({}) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+  const session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+  try {
+    await session.getActivePage("s1"); // creates the session state whose pendingDownloads we seed
+    const state = (session as unknown as SessionsPrivate).sessions.get("s1")!;
+    state.pendingDownloads.push(
+      { path: "browser-downloads/s1/report.pdf", filename: "report.pdf", url: "https://example.com/report.pdf" },
+      { path: "", filename: "huge.iso", url: "https://example.com/huge.iso", failed: true },
+    );
+
+    // act:wait drains + renders the downloads onto its result text.
+    const result = await tool.execute("c1", { action: "act", kind: "wait", ms: 1 });
+    const text = textOf(result as { content: Array<{ type: string; text?: string }> });
+
+    // The failed record renders in the [download failed: <name> (<url>)] form.
+    assert.match(text, /\[download failed: huge\.iso \(https:\/\/example\.com\/huge\.iso\)\]/);
+    // The successful record renders as its workspace path + source url.
+    assert.match(text, /browser-downloads\/s1\/report\.pdf \(from https:\/\/example\.com\/report\.pdf\)/);
+    // With at least one saved file the header is the "downloaded N file(s)" variant.
+    assert.match(text, /\[downloaded 1 file\(s\) to the workspace\]/);
+    assert.doesNotMatch(text, /no file produced/, "the saved header is used when something saved");
+    // Drained: a second render carries no download lines.
+    const again = textOf(await tool.execute("c1", { action: "act", kind: "wait", ms: 1 }) as { content: Array<{ type: string; text?: string }> });
+    assert.doesNotMatch(again, /download failed|downloaded 1 file/, "downloads were drained after the first render");
+  } finally {
+    restore();
+    await session.shutdown();
+    await rm(ws, { recursive: true, force: true });
+  }
+});
+
+test("tool: when every drained download failed, the header switches to the 'no file produced' variant (#23)", async () => {
+  const ws = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-browser-tool-dl-"));
+  const restore = stubManager();
+  const cfg = baseConfig();
+  const connect: ConnectOverCdp = async () => makeBrowser({}) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
+  const session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+  try {
+    await session.getActivePage("s1");
+    const state = (session as unknown as SessionsPrivate).sessions.get("s1")!;
+    // Only failed records → nothing saved.
+    state.pendingDownloads.push(
+      { path: "", filename: "a.zip", url: "https://example.com/a.zip", failed: true },
+      { path: "", filename: "b.zip", url: "https://example.com/b.zip", failed: true },
+    );
+
+    const text = textOf(await tool.execute("c1", { action: "act", kind: "wait", ms: 1 }) as { content: Array<{ type: string; text?: string }> });
+    assert.match(text, /\[download\(s\) failed — no file produced\]/, "the no-file-produced header is used when nothing saved");
+    assert.doesNotMatch(text, /downloaded \d+ file/, "the saved-files header is NOT used");
+    assert.match(text, /\[download failed: a\.zip \(https:\/\/example\.com\/a\.zip\)\]/);
+    assert.match(text, /\[download failed: b\.zip \(https:\/\/example\.com\/b\.zip\)\]/);
+  } finally {
+    restore();
+    await session.shutdown();
+    await rm(ws, { recursive: true, force: true });
+  }
+});
