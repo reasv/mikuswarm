@@ -80,7 +80,7 @@ import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
-import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
+import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
@@ -442,19 +442,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   // Auxiliary caption cost rates (spec AUXILIARY-USAGE-TRACKING §5/§7.1): the
   // config cost block is snake_case USD/1M tokens; map to the CostRates shape.
-  // Resolution: modality model's cost → top-level [captioning.model].cost → unset
-  // (= usage captured, cost 0 = untracked). Does NOT fall back to models.default.
-  function resolveModalityCost(modalityConfig?: {
-    model?: { cost?: { input: number; output: number; cache_read: number; cache_write: number } };
+  // Cost is a property of a SPECIFIC model and is never inherited across models —
+  // resolveCaptionCost applies the top-level [captioning.model].cost only when the
+  // modality actually runs the shared model. A modality that overrides the model to
+  // a different id without its own cost block has UNKNOWN cost (untracked, not the
+  // shared model's rates); we warn so that silent gap is visible. Never falls back
+  // to models.default.
+  function resolveModalityCost(modality: MediaModality, modalityConfig?: {
+    model?: { id?: string; cost?: { input: number; output: number; cache_read: number; cache_write: number } };
   }): CostRates | undefined {
-    const block = modalityConfig?.model?.cost ?? captioningConfig.model?.cost;
-    if (!block) return undefined;
-    return {
-      input: block.input,
-      output: block.output,
-      cacheRead: block.cache_read,
-      cacheWrite: block.cache_write,
-    };
+    const { rates, unpricedOverride } = resolveCaptionCost({
+      modalityModelId: modalityConfig?.model?.id,
+      modalityCost: modalityConfig?.model?.cost,
+      sharedModelId: sharedModel.id,
+      topLevelCost: captioningConfig.model?.cost,
+    });
+    if (unpricedOverride) {
+      logger.warn("caption_cost_untracked_model_override", {
+        modality,
+        modality_model: modalityConfig?.model?.id,
+        shared_model: sharedModel.id,
+        detail:
+          "captioning modality overrides the model but sets no [captioning." +
+          modality +
+          ".model.cost]; its usage will be tracked with unknown cost ([captioning.model].cost is not inherited across different models)",
+      });
+    }
+    return rates;
   }
 
   // Image-gen per-tier cost block (spec §7.2): snake_case config → CostRates,
@@ -498,7 +512,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: imageConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
-      costRates: resolveModalityCost(imageConfig),
+      costRates: resolveModalityCost("image", imageConfig),
       imageProcessing: inferenceImageOptions,
     })],
     ["video", new InferenceClient({
@@ -509,7 +523,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: videoConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
-      costRates: resolveModalityCost(videoConfig),
+      costRates: resolveModalityCost("video", videoConfig),
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
         maxResolution: mediaVideoConfig.max_resolution ?? 480,
@@ -530,7 +544,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
-      costRates: resolveModalityCost(audioConfig),
+      costRates: resolveModalityCost("audio", audioConfig),
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {
         maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
