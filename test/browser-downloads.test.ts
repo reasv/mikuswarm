@@ -94,26 +94,40 @@ function makeFakeCdp(): FakeCdp {
   };
 }
 
+type DownloadFake = { url(): string; suggestedFilename(): string; saveAs?(p: string): Promise<void> };
+
 interface DownloadHarness {
   cdp: FakeCdp;
   cdpSessionsOpened: number;
+  /** Override what newBrowserCDPSession does (e.g. to make the override send reject). */
+  newCdpSession?: () => Promise<unknown>;
   /** The page-level `download` handler trackPage registered. */
-  fireDownload(download: { url(): string; suggestedFilename(): string; saveAs?(p: string): Promise<void> }): void;
+  fireDownload(download: DownloadFake): void;
+  /**
+   * Simulate a `target="_blank"`/`window.open` popup that fires a `download`
+   * event on the POPUP page (issue #2): emits the opener page's `popup` event
+   * with a fresh page, then fires `download` on that popup. The popup is never
+   * added to any session's tab list — it only ever carries this one download.
+   */
+  firePopupDownload(download: DownloadFake): void;
 }
 
 /**
- * A fake browser whose single page captures the `download` handler and whose
- * newBrowserCDPSession returns a controllable fake CDP session.
+ * A fake browser whose single page captures the `download` (and `popup`)
+ * handlers and whose newBrowserCDPSession returns a controllable fake CDP
+ * session.
  */
 function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
   const cdp = makeFakeCdp();
   let downloadHandler: ((arg: unknown) => void) | undefined;
+  let popupHandler: ((arg: unknown) => void) | undefined;
   const fakePage = {
     _closed: false,
     isClosed() { return this._closed; },
     async close() { this._closed = true; },
     on(event: string, cb: (arg: unknown) => void) {
       if (event === "download") downloadHandler = cb;
+      else if (event === "popup") popupHandler = cb;
     },
     url: () => "about:blank",
     title: async () => "",
@@ -126,6 +140,20 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
       assert.ok(downloadHandler, "download handler was registered");
       downloadHandler!(download);
     },
+    firePopupDownload(download) {
+      assert.ok(popupHandler, "popup handler was registered on the opener page");
+      // A minimal popup page that only exposes the `download` event, matching a
+      // real Playwright popup the agent never drives.
+      let popupDownloadHandler: ((arg: unknown) => void) | undefined;
+      const popup = {
+        on(event: string, cb: (arg: unknown) => void) {
+          if (event === "download") popupDownloadHandler = cb;
+        },
+      };
+      popupHandler!(popup);
+      assert.ok(popupDownloadHandler, "the popup's download handler was attached");
+      popupDownloadHandler!(download);
+    },
   };
   const browser = {
     _connected: true,
@@ -135,6 +163,7 @@ function makeDownloadBrowser(): { browser: unknown; harness: DownloadHarness } {
     close: async () => {},
     newBrowserCDPSession: async () => {
       harness.cdpSessionsOpened++;
+      if (harness.newCdpSession) return harness.newCdpSession();
       return cdp;
     },
   };
@@ -509,6 +538,177 @@ test("downloads: close race — the file still lands on disk but the record is d
       );
       assert.equal(session.drainDownloads("s1").length, 0, "no record surfaces from the dead session");
       assert.ok(!logged.some((l) => l.event === "browser_download_failed"), "the drop is not an error");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #2: popup/new-tab downloads correlate to the opener's session ───────────
+
+test("downloads #2: a popup/target=_blank download lands in the OPENER's session dir", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, manager } = newDownloadSession(dirs);
+    try {
+      // s1 opens a tab; a target=_blank export link spawns a popup that downloads.
+      await session.getActivePage("s1");
+      await writeFile(path.join(dirs.staging, GUID_A), "popup bytes");
+
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/export.csv", suggestedFilename: "export.csv",
+      });
+      // The page event fires on the POPUP, not the opener page — the OLD code
+      // (handler only on tracked pages) would never see this, the entry would
+      // never correlate, and the bytes would be reaped after act_timeout_ms.
+      harness.firePopupDownload(metadataDownload("https://example.com/export.csv", "export.csv"));
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "completed", receivedBytes: 11, totalBytes: 11,
+      });
+
+      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "export.csv");
+      await waitFor(() => exists(finalPath), "the popup download finalized under the opener's session dir");
+      assert.equal((await readFile(finalPath)).toString(), "popup bytes", "bytes copied intact");
+      await waitFor(async () => !(await exists(path.join(dirs.staging, GUID_A))), "staging guid unlinked");
+
+      const drained = session.drainDownloads("s1");
+      assert.equal(drained.length, 1, "the popup download surfaces on the opener's session");
+      assert.equal(drained[0]!.path, path.join("browser-downloads", "s1", "export.csv"));
+      assert.ok(!drained[0]!.failed);
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #5: an unsafe CDP guid is rejected before it reaches a path join ─────────
+
+test("downloads #5: a guid containing ../ is rejected and touches no path outside staging", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs);
+    try {
+      await session.getActivePage("s1");
+      // A traversal target the OLD code would have copied from / unlinked at:
+      // <workspace>/escaped.txt sits one level above the staging dir's sibling.
+      const escapeTarget = path.join(dirs.staging, "..", "escaped.txt");
+      await writeFile(escapeTarget, "must survive");
+      const hostileGuid = "../escaped.txt";
+
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: hostileGuid, url: "https://example.com/x", suggestedFilename: "x.txt",
+      });
+      // Even a completion for the hostile guid must not act on it (the entry was
+      // never stored, so there is nothing to find).
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: hostileGuid, state: "completed", receivedBytes: 4, totalBytes: 4,
+      });
+      // And a canceled state must not unlink the escape target via unlinkStaging.
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: hostileGuid, state: "canceled", receivedBytes: 0, totalBytes: 0,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      assert.ok(
+        logged.some((l) => l.event === "browser_download_guid_rejected"),
+        "the hostile guid was rejected with a warn",
+      );
+      assert.equal(await exists(escapeTarget), true, "the out-of-staging file was never touched");
+      const priv = session as unknown as PendingPrivate;
+      assert.equal(priv.pendingDownloadEntries.length, 0, "no pending entry was created for the hostile guid");
+      assert.equal(session.drainDownloads("s1").length, 0, "nothing recorded");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #6: a size-cap/cancel failure BEFORE correlation still surfaces ──────────
+
+test("downloads #6: an over-cap failure fired before the page event still surfaces a failed record", async () => {
+  await withDirs(async (dirs) => {
+    const { session, harness, logged, manager } = newDownloadSession(dirs, { sizeLimit: 10 });
+    try {
+      await session.getActivePage("s1");
+      await writeFile(path.join(dirs.staging, GUID_A), "partial");
+
+      // CDP side begins AND breaches the cap BEFORE Playwright's page event —
+      // the entry has no session yet. The OLD code removed it from the FIFO, so
+      // the late page event created an orphan that warn-dropped and the model
+      // never saw [download failed: …].
+      harness.cdp.emit("Browser.downloadWillBegin", {
+        guid: GUID_A, url: "https://example.com/huge.iso", suggestedFilename: "huge.iso",
+      });
+      harness.cdp.emit("Browser.downloadProgress", {
+        guid: GUID_A, state: "inProgress", receivedBytes: 50, totalBytes: 0,
+      });
+      await waitFor(
+        () => harness.cdp.sent.some((c) => c.method === "Browser.cancelDownload"),
+        "the over-cap transfer was canceled",
+      );
+      // Nothing surfaces yet — no session attributed.
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(session.drainDownloads("s1").length, 0, "no record before the page event attributes a session");
+
+      // The late page event attaches the opener's session and surfaces the failure.
+      harness.fireDownload(metadataDownload("https://example.com/huge.iso", "huge.iso"));
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "the failed record after late correlation");
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0]!.failed, true);
+      assert.equal(drained[0]!.filename, "huge.iso");
+      assert.equal(drained[0]!.path, "", "a failed record carries no workspace path");
+      assert.ok(logged.some((l) => l.event === "browser_download_failed"), "failure logged");
+      const priv = session as unknown as PendingPrivate;
+      assert.equal(priv.pendingDownloadEntries.length, 0, "the entry is dropped once surfaced (no double-record)");
+    } finally {
+      manager.restore();
+      await session.shutdown();
+    }
+  });
+});
+
+// ── #8: a failed setDownloadBehavior detaches the freshly opened CDP session ──
+
+test("downloads #8: when the override send rejects, the opened CDP session is detached (no leak) and connect still works", async () => {
+  await withDirs(async (dirs) => {
+    const manager = stubManager();
+    const { browser, harness } = makeDownloadBrowser();
+    const logged: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    let detached = 0;
+    // A CDP session whose setDownloadBehavior send rejects, exposing detach().
+    const failingCdp = {
+      sent: [] as Array<{ method: string }>,
+      on() {},
+      async send(method: string) {
+        if (method === "Browser.setDownloadBehavior") throw new Error("send boom");
+        return {};
+      },
+      async detach() { detached++; },
+    };
+    harness.newCdpSession = async () => failingCdp;
+    const session = new BrowserSession({
+      config: baseConfig({ downloads_dir: "/downloads", downloads_local_dir: dirs.staging }),
+      agentTimezone: "UTC",
+      workspaceRoot: dirs.ws,
+      logger: capturingLogger(logged),
+      connectOverCdp: async () => browser as never,
+    });
+    try {
+      // The override fails, but connect must still succeed (navigation/snapshot
+      // keep working) — getActivePage resolves a page.
+      const page = await session.getActivePage("s1");
+      assert.ok(page, "connect still yields an active page despite the override failure");
+      assert.equal(detached, 1, "the half-set-up CDP session was detached exactly once (no leak)");
+      assert.ok(
+        logged.some((l) => l.event === "browser_download_override_failed"),
+        "the override failure was warned",
+      );
+      // Downloads are disabled: a page download records nothing.
+      harness.fireDownload(metadataDownload("https://example.com/f.bin", "f.bin"));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(session.drainDownloads("s1").length, 0, "no capture when the override failed");
     } finally {
       manager.restore();
       await session.shutdown();

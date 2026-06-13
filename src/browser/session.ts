@@ -126,10 +126,22 @@ interface PendingDownloadEntry {
   /** Set when Browser.downloadProgress completed before correlation finished. */
   completed: boolean;
   /**
+   * Set when the transfer failed (canceled / over the size cap) while still
+   * CDP-side only — no session was attached yet, so the failure could not be
+   * surfaced (issue #6). The entry is KEPT in the FIFO (rather than removed) so
+   * a late page event can attach a session and surface the failed record; if no
+   * page event arrives the entry is dropped on its normal deadline. `completed`
+   * and `failed` are mutually exclusive terminal states.
+   */
+  failed: boolean;
+  /** Human-readable reason for `failed`, surfaced when a late page event attaches. */
+  failureReason?: string;
+  /**
    * Deadline for the missing counterpart (act_timeout_ms from creation), set to
    * Infinity once correlated. An entry that never sees its counterpart is
    * dropped with a warn log; correlated entries live until completed/canceled
-   * (or the connection drops).
+   * (or the connection drops). A pre-correlation failure keeps the original
+   * deadline so a late page event still has its act_timeout_ms window.
    */
   expiresAt: number;
 }
@@ -736,6 +748,21 @@ export class BrowserSession {
     page.on("download", (download: Download) => {
       this.handleDownload(sessionId, state, download);
     });
+    // Popup/new-tab downloads (issue #2): a `target="_blank"` export link or
+    // `window.open(url)` that triggers a download fires Playwright's `download`
+    // event on the POPUP page, which is otherwise untracked — so without this
+    // its bytes stage, never correlate, and get reaped after act_timeout_ms
+    // (silent loss, exactly what §2.4 set out to fix). Attribute the popup's
+    // download to the OPENER's chat session so it flows through the same
+    // handleDownload path and lands in browser-downloads/<session>/. Scoped to
+    // download capture only — the popup is not added to the session's tab list;
+    // we just attach the one handler. (Dialog/console instrumentation is not
+    // wired here because the agent never drives this untracked popup.)
+    page.on("popup", (popup: Page) => {
+      popup.on("download", (download: Download) => {
+        this.handleDownload(sessionId, state, download);
+      });
+    });
     // Console + uncaught page errors → a bounded per-page buffer the agent can
     // drain via the `console` action to self-diagnose a silently-failing page.
     this.consoleBuffers.set(page, []);
@@ -875,8 +902,9 @@ export class BrowserSession {
       this.logger.info("browser_download_unconfigured");
       return;
     }
+    let cdp: CDPSession | undefined;
     try {
-      const cdp = await browser.newBrowserCDPSession();
+      cdp = await browser.newBrowserCDPSession();
       // Listeners before the override so no event can slip between the two.
       cdp.on("Browser.downloadWillBegin", (event) => {
         this.onDownloadWillBegin(event);
@@ -889,8 +917,14 @@ export class BrowserSession {
         downloadPath: this.downloadsDir,
         eventsEnabled: true,
       });
+      // Assign only on full success — so a half-set-up session (created but the
+      // override send rejected) is never treated as live download capture.
       this.downloadsCdp = cdp;
     } catch (error) {
+      // The session may have been created before send() threw (issue #8): detach
+      // it so its two listeners don't leak one CDP session per failed-override
+      // connect. Best-effort — detach failing is itself non-fatal.
+      if (cdp) await cdp.detach().catch(() => {});
       this.logger.warn("browser_download_override_failed", {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -906,6 +940,19 @@ export class BrowserSession {
    * records are interchangeable anyway.
    */
   private onDownloadWillBegin(event: { guid: string; url: string; suggestedFilename: string }): void {
+    // Minimal anti-traversal guard on the guid before it ever reaches a path
+    // join (issue #5, defense-in-depth): the guid comes from the browser, which
+    // the pipeline treats as hostile. Reject only the values that could escape
+    // the staging dir or denote it — a separator, a NUL, or a bare dot/dot-dot —
+    // deliberately NOT a format match on Chromium's guid shape (that would
+    // silently break every download if the guid format ever changes).
+    if (!isSafeStagingGuid(event.guid)) {
+      this.logger.warn("browser_download_guid_rejected", {
+        url: event.url,
+        filename: event.suggestedFilename,
+      });
+      return;
+    }
     this.expirePendingDownloads();
     const match = this.pendingDownloadEntries.find(
       (e) => e.guid === undefined && e.url === event.url && e.suggestedFilename === event.suggestedFilename,
@@ -920,6 +967,7 @@ export class BrowserSession {
       suggestedFilename: event.suggestedFilename,
       guid: event.guid,
       completed: false,
+      failed: false,
       expiresAt: Date.now() + this.config.act_timeout_ms,
     });
   }
@@ -943,7 +991,6 @@ export class BrowserSession {
     // caught. Checked on every state (a tiny-but-over-cap download can report
     // `completed` without an over-cap `inProgress` event first).
     if (Math.max(event.receivedBytes, event.totalBytes) > this.downloadSizeLimit) {
-      this.removePendingEntry(entry);
       try {
         await this.downloadsCdp?.send("Browser.cancelDownload", { guid: event.guid });
       } catch (error) {
@@ -953,10 +1000,13 @@ export class BrowserSession {
         });
       }
       await this.unlinkStaging(event.guid);
-      this.recordDownloadFailure(entry, `exceeds the download size limit (${this.downloadSizeLimit} bytes)`);
+      this.failDownload(entry, `exceeds the download size limit (${this.downloadSizeLimit} bytes)`);
       return;
     }
     if (event.state === "completed") {
+      // A failure already recorded for this entry wins — never finalize an entry
+      // that was canceled/over-cap (its staging bytes are gone).
+      if (entry.failed) return;
       if (entry.sessionId !== undefined) {
         this.removePendingEntry(entry);
         await this.finalizeDownload(entry);
@@ -967,10 +1017,34 @@ export class BrowserSession {
       return;
     }
     if (event.state === "canceled") {
-      this.removePendingEntry(entry);
       await this.unlinkStaging(event.guid);
-      this.recordDownloadFailure(entry, "canceled by the browser");
+      this.failDownload(entry, "canceled by the browser");
     }
+  }
+
+  /**
+   * Terminal failure for an in-flight download (canceled / over the size cap).
+   * If the owning session is already known, surface the failed record and drop
+   * the entry. If the failure fires while the entry is still CDP-side only
+   * (`sessionId === undefined`), KEEP the entry — marked failed — so a late
+   * `page.on("download")` event can attach a session and surface the record
+   * (issue #6); otherwise the model would never learn the click produced no
+   * file. The kept entry expires on its normal act_timeout_ms deadline if no
+   * page event arrives. Idempotent: a second failure on an already-failed entry
+   * is ignored so it can't double-record.
+   */
+  private failDownload(entry: PendingDownloadEntry, reason: string): void {
+    if (entry.failed) return;
+    entry.failed = true;
+    entry.failureReason = reason;
+    if (entry.sessionId !== undefined) {
+      this.removePendingEntry(entry);
+      this.recordDownloadFailure(entry, reason);
+      return;
+    }
+    // Pre-correlation: log now (no attribution to surface yet) and keep the
+    // entry so handleDownload can surface it when the page event arrives.
+    this.recordDownloadFailure(entry, reason);
   }
 
   /**
@@ -998,12 +1072,22 @@ export class BrowserSession {
         sessionId,
         state,
         completed: false,
+        failed: false,
         expiresAt: Date.now() + this.config.act_timeout_ms,
       });
       return;
     }
     match.sessionId = sessionId;
     match.state = state;
+    // A pre-correlation failure (canceled / over-cap before any session was
+    // attached, issue #6) recorded only a log; now that we know the session,
+    // surface the failed record and drop the entry. Take precedence over a
+    // (mutually exclusive) completion.
+    if (match.failed) {
+      this.removePendingEntry(match);
+      this.recordDownloadFailure(match, match.failureReason ?? "download failed");
+      return;
+    }
     match.expiresAt = Infinity; // correlated
     // The CDP completion may have raced ahead of the page event — finalize now.
     if (match.completed) {
@@ -1100,6 +1184,17 @@ export class BrowserSession {
       const entry = this.pendingDownloadEntries[i]!;
       if (entry.expiresAt > now) continue;
       this.pendingDownloadEntries.splice(i, 1);
+      if (entry.failed) {
+        // A pre-correlation failure whose page event never arrived (issue #6):
+        // already logged + staging already reaped by failDownload; just drop it
+        // (a less alarming log than the uncorrelated-success case).
+        this.logger.debug("browser_download_failed_uncorrelated_dropped", {
+          url: entry.url,
+          filename: entry.suggestedFilename,
+          guid: entry.guid,
+        });
+        continue;
+      }
       this.logger.warn("browser_download_uncorrelated_dropped", {
         url: entry.url,
         filename: entry.suggestedFilename,
@@ -1117,6 +1212,11 @@ export class BrowserSession {
   /** Best-effort removal of a (possibly partial) staging guid file. */
   private async unlinkStaging(guid: string): Promise<void> {
     if (this.downloadsLocalDir === undefined) return;
+    // Belt-and-suspenders (issue #5): onDownloadWillBegin already rejects unsafe
+    // guids before they are stored, but never unlink a path-bearing guid even if
+    // one slipped in by some other route — an unlink outside the staging dir is
+    // the worst case this guard exists to prevent.
+    if (!isSafeStagingGuid(guid)) return;
     await unlink(path.join(this.downloadsLocalDir, guid)).catch(() => {});
   }
 
@@ -1245,6 +1345,20 @@ export class BrowserSession {
 /** Promise-based sleep, used by the cold-start readiness poll. */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Minimal anti-traversal guard for a CDP-supplied download guid before it is
+ * concatenated into a staging filesystem path (issue #5). Rejects only the
+ * values that could escape or denote the staging directory — a path separator
+ * (`/` or `\`), a NUL byte, or a bare `.`/`..` — and deliberately nothing
+ * format-specific, so a future change to Chromium's guid shape can never
+ * silently break every download. An empty guid is also rejected (it would
+ * resolve to the staging dir itself).
+ */
+function isSafeStagingGuid(guid: string): boolean {
+  if (guid === "" || guid === "." || guid === "..") return false;
+  return !/[/\\\0]/.test(guid);
 }
 
 /**
