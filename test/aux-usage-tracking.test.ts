@@ -37,10 +37,23 @@ test("computeUsageCost: flat per_image charge added per generated image", () => 
   assert.equal(c.total, 0.078);
 });
 
-test("computeUsageCost: zero/absent rates yield total 0 (untracked)", () => {
+test("computeUsageCost: zero rates yield total 0 (untracked)", () => {
   const zero: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const c = computeUsageCost(zero, { input: 5000, output: 5000, cacheRead: 0, cacheWrite: 0 });
   assert.equal(c.total, 0);
+});
+
+test("computeUsageCost: absent rate fields coalesce to 0, never NaN", () => {
+  // Defensive: a partially-populated rates object must not let NaN reach the DB.
+  const partial = { input: 3 } as unknown as CostRates;
+  const c = computeUsageCost(partial, { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, images: 1 });
+  assert.equal(c.input, 3);
+  assert.equal(c.output, 0);
+  assert.equal(c.cacheRead, 0);
+  assert.equal(c.cacheWrite, 0);
+  assert.equal(c.image, 0);
+  assert.equal(c.total, 3);
+  assert.ok(!Number.isNaN(c.total));
 });
 
 // ── §6.1 OpenAI/OpenRouter usage parser ─────────────────────────────────────

@@ -5477,6 +5477,32 @@ create index if not exists idx_reactions_by_target
   on reactions(target_event_id, reacted_at) where redacted_at is null;
 `;
 
+// Auxiliary tool-use usage ledger DDL (spec AUXILIARY-USAGE-TRACKING §8.2),
+// shared verbatim between the canonical SCHEMA (fresh DBs) and the v20→v21
+// migration step (existing DBs) so the two can never drift. Both uses are
+// `create … if not exists`, so applying it twice is harmless.
+const TOOL_INVOCATIONS_SCHEMA = `
+create table if not exists tool_invocations (
+  id text primary key,
+  agent_session_id text,
+  tool_name text not null,
+  tool_call_id text,
+  model_id text,
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost real,
+  ref text,
+  created_at integer not null
+);
+
+create index if not exists idx_tool_invocations_session
+  on tool_invocations(agent_session_id, created_at);
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -5889,26 +5915,8 @@ create index if not exists idx_agent_sessions_status
 -- per billable raw-fetch tool call (today image_generate). Attributed to the
 -- ambient session but a SEPARATE accounting lane — never folded into
 -- agent_sessions.usage_* (§4). All usage/cost fields nullable ("unknown", not 0).
--- Created via the v20→v21 migration for existing DBs.
-create table if not exists tool_invocations (
-  id text primary key,
-  agent_session_id text,
-  tool_name text not null,
-  tool_call_id text,
-  model_id text,
-  provider text,
-  input_tokens integer,
-  output_tokens integer,
-  cache_read_tokens integer,
-  cache_write_tokens integer,
-  images integer,
-  cost real,
-  ref text,
-  created_at integer not null
-);
-
-create index if not exists idx_tool_invocations_session
-  on tool_invocations(agent_session_id, created_at);
+-- DDL shared with the v20→v21 migration via TOOL_INVOCATIONS_SCHEMA.
+${TOOL_INVOCATIONS_SCHEMA}
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
@@ -6472,26 +6480,8 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       }
     }
     // `create table/index if not exists` is itself idempotent — no extra guard.
-    db.exec(
-      `create table if not exists tool_invocations (
-         id text primary key,
-         agent_session_id text,
-         tool_name text not null,
-         tool_call_id text,
-         model_id text,
-         provider text,
-         input_tokens integer,
-         output_tokens integer,
-         cache_read_tokens integer,
-         cache_write_tokens integer,
-         images integer,
-         cost real,
-         ref text,
-         created_at integer not null
-       );
-       create index if not exists idx_tool_invocations_session
-         on tool_invocations(agent_session_id, created_at);`,
-    );
+    // Same DDL the canonical SCHEMA uses, so fresh and migrated DBs can't drift.
+    db.exec(TOOL_INVOCATIONS_SCHEMA);
   },
 ];
 

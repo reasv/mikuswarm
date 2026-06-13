@@ -158,12 +158,14 @@ export interface ComputedCost {
  * component and adds a flat `perImage * images` charge. Unset rates are 0, so an
  * unconfigured cost block yields `total: 0` (rendered as "untracked"/"—" by the
  * cost-hidden-when-zero convention) rather than a misleading non-zero figure.
+ * Every rate and token field is coalesced to 0, so a partially-populated rates
+ * object can never let `NaN` reach the cost columns.
  */
 export function computeUsageCost(rates: CostRates, u: RawTokenUsage): ComputedCost {
-  const input = (rates.input / 1e6) * (u.input ?? 0);
-  const output = (rates.output / 1e6) * (u.output ?? 0);
-  const cacheRead = (rates.cacheRead / 1e6) * (u.cacheRead ?? 0);
-  const cacheWrite = (rates.cacheWrite / 1e6) * (u.cacheWrite ?? 0);
+  const input = ((rates.input ?? 0) / 1e6) * (u.input ?? 0);
+  const output = ((rates.output ?? 0) / 1e6) * (u.output ?? 0);
+  const cacheRead = ((rates.cacheRead ?? 0) / 1e6) * (u.cacheRead ?? 0);
+  const cacheWrite = ((rates.cacheWrite ?? 0) / 1e6) * (u.cacheWrite ?? 0);
   const image = (rates.perImage ?? 0) * (u.images ?? 0);
   return {
     input,
