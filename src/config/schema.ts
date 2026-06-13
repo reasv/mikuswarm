@@ -55,15 +55,19 @@ const SessionTypeSchema = StrictObject({
   // back to the global cap).
   max_tool_calls: Type.Optional(Type.Integer({ minimum: 1 })),
   max_turns: Type.Optional(Type.Integer({ minimum: 1 })),
-  // Per-session-type context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1).
-  // Composed with the model-level `max_context_tokens` via min() — both are
-  // ceilings, so a session type can only TIGHTEN a model's operator-set limit,
-  // never raise it (Decision D2). Enforced on ACTUALS (last committed request's
+  // Per-session-type context-token ceiling — an ARTIFICIAL, tighter OVERRIDE
+  // layered on the model's `context_window` (spec CONTEXT-LIMIT-UNIFICATION
+  // §2.2/U2). Effective ceiling = `min(context_window, max_context_tokens)`,
+  // considering the override only when set — a session type can only TIGHTEN the
+  // model ceiling, never raise it. Enforced on ACTUALS (last committed request's
   // provider-reported context size), never estimates; the first request of a
-  // session is never blocked locally. Unset = no session-type ceiling. Worker
-  // session types (summarize/condense/diary) set a conservative value to bound a
-  // runaway session; chat leaves it unset. Cross-field validated at app wiring
-  // (must not exceed the resolved model's `context_window`).
+  // session is never blocked locally. Unset = the model's `context_window` is the
+  // ceiling (always enforced — never unbounded). Worker session types
+  // (summarize/condense/diary) set a conservative value to bound a runaway
+  // session; interactive types leave it unset and inherit `context_window`.
+  // Cross-field validated at app wiring (must not exceed the resolved model's
+  // `context_window`). The name (vs `context_window`) deliberately signals
+  // "artificial tightening," not a model property.
   max_context_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
@@ -333,17 +337,17 @@ const ModelSchema = StrictObject({
     Type.Literal("high"),
     Type.Literal("xhigh"),
   ])),
+  // The model-level context ceiling AND the always-on enforcement base (spec
+  // CONTEXT-LIMIT-UNIFICATION §2.1/U1). Operators set it deliberately BELOW the
+  // physical provider window to stay clear of edge-case degradation/cost. It is
+  // the SOLE model-level limit: the operative per-session ceiling is
+  // `min(context_window, session_type.max_context_tokens)`, resolved once and
+  // fed to every consumer (enforcement, the pi-ai model descriptor, the
+  // text-editor read budget — `resolveSessionContextCeiling`). Required for any
+  // model a session type resolves to (fail-fast at app wiring, §2.5) so
+  // enforcement is always wired. There is no model-level `max_context_tokens` —
+  // it was removed (U2); a tighter ceiling is expressed per session type.
   context_window: Type.Optional(Type.Number({ minimum: 1 })),
-  // Operator-enforced context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1).
-  // DISTINCT from `context_window` (Decision D5): `context_window` feeds pi-ai's
-  // model descriptor + overflow heuristics (wire behavior); `max_context_tokens`
-  // is pure-local policy — the size a session is allowed to reach before it is
-  // failed/interrupted. Enforced on ACTUALS (last committed request's
-  // provider-reported context size) at the request boundary, never on estimates,
-  // and never mid-stream; the first request is never blocked locally. Composed
-  // with a session type's own ceiling via min(). Unset = unenforced at the model
-  // level. Cross-field validated at app wiring (must be <= `context_window`).
-  max_context_tokens: Type.Optional(Type.Number({ minimum: 1 })),
   // Cap on the base64-encoded image payload shipped to the provider, NOT raw
   // file bytes. Raw bytes inflate ~4/3 in base64 (formula
   // `4 * ceil(rawBytes / 3)`). Used by `read_image` and by the danbooru

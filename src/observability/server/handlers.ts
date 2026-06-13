@@ -395,7 +395,9 @@ export function summaryDetail(
  * unmistakably ACTUALS. `usage` is null when no request committed yet (legacy
  * rows / pre-first-commit). `maxContextTokens` is the session's effective
  * ceiling resolved from CURRENT config (Decision D7 — NOT persisted per
- * session), or null when unenforced.
+ * session). Always a non-null number now that `context_window` is the always-on
+ * ceiling (spec CONTEXT-LIMIT-UNIFICATION §4); the field stays nullable in the
+ * console schema for legacy/headless rows.
  */
 function sessionMeta(
   row: AgentSessionRow,
@@ -425,7 +427,7 @@ function sessionMeta(
         }
       : null,
     contextTokens: row.context_tokens,
-    maxContextTokens: factory.resolveEffectiveMaxContextTokens(row.session_type),
+    maxContextTokens: factory.resolveSessionContextCeiling(row.session_type),
     noReply: row.no_reply === 1,
     error: row.error,
     createdAt: row.created_at,

@@ -81,7 +81,9 @@ export const SessionMeta = Schema.Struct({
 	// Actuals (spec TOKEN-USAGE-TRACKING §7.1). All optional/nullable: legacy rows
 	// and pre-first-commit sessions read as "unknown". `usage` is null until a
 	// request commits; `contextTokens` is the last-observed actual context size;
-	// `maxContextTokens` is the effective ceiling from current config (or null).
+	// `maxContextTokens` is the operative ceiling from current config — now always
+	// a non-null number for live sessions (spec CONTEXT-LIMIT-UNIFICATION §4), so
+	// the `/ limit` denominator always renders; kept nullable for legacy/headless rows.
 	llmRequests: Schema.optional(Schema.NullOr(Schema.Number)),
 	usage: Schema.optional(
 		Schema.NullOr(

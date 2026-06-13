@@ -456,6 +456,10 @@ function minimalConfig(overrides?: Partial<AppConfig>): AppConfig {
         api_key: "key",
         multimodal: false,
         max_tokens: 4096,
+        // context_window is the always-on enforcement base and is required for
+        // any model a session type resolves to (spec CONTEXT-LIMIT-UNIFICATION
+        // §2.5); factory.create() resolves the session ceiling from it.
+        context_window: 128_000,
       },
     },
     context: {

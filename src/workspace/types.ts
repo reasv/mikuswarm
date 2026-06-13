@@ -80,11 +80,13 @@ export interface SessionTypeConfig {
    */
   priority?: "interactive" | "proactive" | "background" | "background_low";
   /**
-   * Per-session-type context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1).
-   * Composed with the model-level limit via min() — a session type can only
-   * tighten, never raise, a model's operator-set ceiling (Decision D2). Unset =
-   * no session-type ceiling. Worker session types set a conservative value to
-   * bound runaway diary/summary sessions; chat leaves it unset.
+   * Per-session-type context-token ceiling — an artificial OVERRIDE that tightens
+   * the model's `context_window` (spec CONTEXT-LIMIT-UNIFICATION §2.2). Effective
+   * ceiling = `min(context_window, max_context_tokens)`, considering the override
+   * only when set; a session type can only tighten, never raise, the model
+   * ceiling. Unset = the model's `context_window` is the (always-enforced)
+   * ceiling. Worker session types set a conservative value to bound runaway
+   * diary/summary sessions; interactive types leave it unset.
    */
   max_context_tokens?: number;
 }

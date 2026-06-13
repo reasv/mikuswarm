@@ -1180,8 +1180,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     inbound: InboundChatEvent,
     sessionId: string,
     target: NonNullable<InboundChatEvent["outboundTarget"]>,
+    sessionType: string,
   ) {
     const roomId = target.roomId;
+    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
+    // consumer 3 / §2.5 ordering shape (a)): the text-editor read budget derives
+    // from the SAME resolver call that feeds enforcement and the model descriptor,
+    // never an independent `config.models.*.context_window` read — so a session
+    // type's override (or a non-default model) shapes the tool budget too.
+    const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
     return [
       createSendMessageTool({
         provider,
@@ -1266,9 +1273,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             workspaceRoot,
           })]
         : []),
-      // Adaptive paging uses the default model's context window — non-default models (e.g. captioning) reuse the same budget.
-      // Clamps in resolveMaxCharacters (50KB–512KB) bound the impact, so a mismatch only shifts the cap within those limits.
-      createTextEditorTool({ workspaceRoot, contextWindowTokens: config.models.default.context_window }),
+      // Adaptive paging uses the session's operative context ceiling
+      // (`min(context_window, session_type.max_context_tokens)`), resolved once
+      // above — so a single read is sized against the budget it will actually
+      // consume, not the raw physical window. Clamps in resolveMaxCharacters
+      // (50KB–512KB) bound the impact, so a mismatch only shifts the cap within
+      // those limits.
+      createTextEditorTool({ workspaceRoot, contextWindowTokens: contextCeiling }),
       createSearchFilesTool({ workspaceRoot, sandbox }),
       ...(sandbox ? [createBashTool({ sandbox, defaultTimeoutMs: config.sandbox?.exec_timeout_ms })] : []),
       createMediaTool({
@@ -1381,7 +1392,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
 
-    const tools = buildSessionTools(inbound, record.id, target);
+    const tools = buildSessionTools(inbound, record.id, target, record.sessionType);
     let agent;
     let usage: SessionUsageTracker | undefined;
     // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3, §6.2/D3). The seed is
@@ -1622,7 +1633,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
       return;
     }
-    const tools = buildSessionTools(inbound, session.id, target);
+    const tools = buildSessionTools(inbound, session.id, target, session.sessionType);
     let agent;
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
@@ -2139,35 +2150,44 @@ export function decideRetentionSweep(params: {
 }
 
 /**
- * Context-token ceiling cross-field validation (spec TOKEN-USAGE-TRACKING
- * §6.1, same app-wiring fail-fast convention). A model-level
- * `max_context_tokens` above its own `context_window` is an operator error
- * (the descriptor's window is the hard wall). A session-type-level ceiling
- * must likewise fit under the `context_window` of the model it resolves to —
- * a ceiling larger than the model could ever reach is a no-op typo. The
- * effective limit is min(model, type), so a type can only tighten (D2); we
- * only fail-fast on the nonsensical "ceiling above the wall" cases. Throws on
- * the first offending entry. Called from {@link startMikuAgent}.
+ * Context-token ceiling cross-field validation (spec CONTEXT-LIMIT-UNIFICATION
+ * §2.5, same app-wiring fail-fast convention). `context_window` is the model
+ * ceiling AND the always-on enforcement base, so every model a configured
+ * session type resolves to MUST declare it — unset is fail-fast, which is what
+ * guarantees enforcement is always wired and lets the descriptor's `?? 128_000`
+ * fallback be deleted. A session-type-level `max_context_tokens` is an
+ * artificial tightening that must fit under the `context_window` of the model it
+ * resolves to — an override larger than the model could ever reach is a no-op
+ * typo. There is no model-level `max_context_tokens` any more (U2), so that
+ * check is gone. Throws on the first offending entry. Called from
+ * {@link startMikuAgent}.
  */
 export function validateContextTokenCeilings(config: AppConfig): void {
-  const modelContextWindow = (key: string): number | undefined =>
-    config.models[key]?.context_window;
-  for (const [key, model] of Object.entries(config.models)) {
-    if (
-      model.max_context_tokens !== undefined &&
-      model.context_window !== undefined &&
-      model.max_context_tokens > model.context_window
-    ) {
+  // Require `context_window` on a model and return it. `who` names the call site
+  // (a session type, or the always-resolvable default model) for the error.
+  const requireWindow = (modelKey: string, who: string): number => {
+    const model = config.models[modelKey];
+    if (!model) {
+      throw new Error(`${who}: model "${modelKey}" not found in [models]`);
+    }
+    if (model.context_window === undefined) {
       throw new Error(
-        `models.${key}: max_context_tokens (${model.max_context_tokens}) must be <= context_window (${model.context_window})`,
+        `models.${modelKey}: context_window is required (resolved by ${who}); ` +
+          `it is the model ceiling and the always-on enforcement base`,
       );
     }
-  }
+    return model.context_window;
+  };
+
+  // The `default` model is always resolvable — it backs the implicit fallback
+  // for any unconfigured session type and the default session type itself — so
+  // its window is required regardless of what session types are declared.
+  requireWindow("default", "default model");
+
   for (const [typeName, sessionType] of Object.entries(config.agent.session_types ?? {})) {
-    if (sessionType.max_context_tokens === undefined) continue;
     const modelKey = sessionType.model ?? "default";
-    const window = modelContextWindow(modelKey);
-    if (window !== undefined && sessionType.max_context_tokens > window) {
+    const window = requireWindow(modelKey, `agent.session_types.${typeName}`);
+    if (sessionType.max_context_tokens !== undefined && sessionType.max_context_tokens > window) {
       throw new Error(
         `agent.session_types.${typeName}: max_context_tokens (${sessionType.max_context_tokens}) ` +
           `exceeds context_window (${window}) of its model "${modelKey}"`,

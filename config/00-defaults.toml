@@ -81,6 +81,14 @@ reasoning = true
 # how much to think); on older models it maps to a token budget. A non-off
 # level requires reasoning = true (fail-fast at startup).
 thinking_level = "off"
+# The model-level context ceiling AND the always-on enforcement base. Set it
+# deliberately BELOW the physical provider window (128000 vs this model's ~200k
+# real window) to stay clear of edge-case degradation/cost. It is the SOLE
+# model-level limit: the operative per-session ceiling is
+# min(context_window, session_type.max_context_tokens), resolved once and fed to
+# enforcement, the pi-ai model descriptor, and the text-editor read budget.
+# Required on any model a session type resolves to (fail-fast at startup) — so
+# interactive sessions are always bounded, never grow until the provider rejects.
 context_window = 128000
 # Cap on the base64-encoded image payload shipped to the provider (not raw
 # bytes; raw inflates ~4/3 in base64). 5 MB ≈ 3.75 MB raw, under Anthropic's
@@ -474,10 +482,11 @@ tools = ["diary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
-# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): conservative bound on a
-# runaway diary session — enforced on ACTUALS (provider-reported context size of
-# the last committed request), composed with the model's own limit via min().
-# Well above a healthy diary run's seed (single-digit k) yet far under the model
+# Context-token ceiling — an artificial tightening layered on the model's
+# context_window (spec CONTEXT-LIMIT-UNIFICATION §2.2): conservative bound on a
+# runaway diary session. Effective ceiling = min(context_window, this); enforced
+# on ACTUALS (provider-reported context size of the last committed request). Well
+# above a healthy diary run's seed (single-digit k) yet far under the model
 # context_window (128000); set explicitly per the explicit-deployment-config rule.
 max_context_tokens = 60000
 session_instruction = """
@@ -509,10 +518,11 @@ skills = "none"
 # run → the pool's catch → failure → retry path.
 max_tool_calls = 30
 max_turns = 15
-# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): bounds a runaway
-# summarization session on ACTUALS; min()-composed with the model limit. A
-# breach fails the session → the pool's semantic-retry path → a fresh attempt
-# rebuilds context from scratch. See the diary block above for the rationale.
+# Context-token ceiling — artificial tightening on the model's context_window
+# (spec CONTEXT-LIMIT-UNIFICATION §2.2): bounds a runaway summarization session on
+# ACTUALS; effective ceiling = min(context_window, this). A breach fails the
+# session → the pool's semantic-retry path → a fresh attempt rebuilds context
+# from scratch. See the diary block above for the rationale.
 max_context_tokens = 60000
 session_instruction = """
 You are performing a summarization task. Summarize the chat messages visible at the end of your context — everything from the latest previous summary (or the beginning, if none) to the most recent message shown.
@@ -538,8 +548,8 @@ tools = ["summary_tool", "x_fetch", "mcp_exa_web_fetch_exa"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
-# Context-token ceiling (spec TOKEN-USAGE-TRACKING §6.1): same conservative bound
-# as summarize — enforced on actuals, min()-composed with the model limit.
+# Context-token ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.2): same conservative
+# bound as summarize — enforced on actuals; effective = min(context_window, this).
 max_context_tokens = 60000
 session_instruction = """
 You are condensing several lower-level summaries into a single higher-level summary. The summaries to condense are shown at the end of your context, in chronological order.

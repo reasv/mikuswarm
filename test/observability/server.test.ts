@@ -64,9 +64,9 @@ function sessionInsert(overrides: Partial<AgentSessionInsert> = {}): AgentSessio
 function stubFactory(preview: PreviewContext): AgentSessionFactory {
   return {
     buildPreview: async () => preview,
-    // sessionMeta resolves the effective context-token ceiling from config
-    // (spec TOKEN-USAGE-TRACKING §7.2); unenforced in these fixtures.
-    resolveEffectiveMaxContextTokens: () => null,
+    // sessionMeta resolves the operative context-token ceiling from config
+    // (spec CONTEXT-LIMIT-UNIFICATION §2.4); a fixed value in these fixtures.
+    resolveSessionContextCeiling: () => 128_000,
   } as unknown as AgentSessionFactory;
 }
 
@@ -74,8 +74,8 @@ const throwingFactory = {
   buildPreview: () => {
     throw new Error("buildPreview should not be called in this test");
   },
-  // Exercised by the session list/detail routes via sessionMeta; unenforced here.
-  resolveEffectiveMaxContextTokens: () => null,
+  // Exercised by the session list/detail routes via sessionMeta; fixed here.
+  resolveSessionContextCeiling: () => 128_000,
 } as unknown as AgentSessionFactory;
 
 async function withServer(
@@ -212,14 +212,14 @@ test("sessionMeta surfaces ACTUALS usage as a grouped object + echoes context/li
       contextTokens: 2_170,
     });
 
-    // Pin the effective-ceiling wiring: the route reads it from
-    // factory.resolveEffectiveMaxContextTokens(session_type), so a non-null stub
-    // value must surface verbatim as `maxContextTokens`.
+    // Pin the operative-ceiling wiring: the route reads it from
+    // factory.resolveSessionContextCeiling(session_type), so the stub value must
+    // surface verbatim as `maxContextTokens`.
     const factory = {
       buildPreview: () => {
         throw new Error("buildPreview should not be called in this test");
       },
-      resolveEffectiveMaxContextTokens: (sessionType: string) => {
+      resolveSessionContextCeiling: (sessionType: string) => {
         assert.equal(sessionType, "default"); // resolved from the row's session_type
         return 8_000;
       },
@@ -276,8 +276,10 @@ test("sessionMeta returns null usage/contextTokens for a LEGACY row (null-vs-zer
       assert.equal(s.usage, null);
       assert.equal(s.contextTokens, null);
       assert.equal(s.llmRequests, null);
-      // The default throwingFactory stub returns null → unenforced ceiling.
-      assert.equal(s.maxContextTokens, null);
+      // maxContextTokens is the operative ceiling resolved from CURRENT config —
+      // independent of the row's (absent) usage. The default throwingFactory stub
+      // returns a fixed 128000 (always-on now, never null; spec §4).
+      assert.equal(s.maxContextTokens, 128_000);
 
       const detail = (await (await fetch(`${base}/api/sessions/s-aaa1111111`)).json()) as any;
       assert.equal(detail.session.usage, null);

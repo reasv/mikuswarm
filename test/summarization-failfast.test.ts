@@ -32,6 +32,9 @@ endpoint = "http://localhost"
 api_key = "test-key"
 multimodal = false
 max_tokens = 1024
+# Required for any session-resolved model (spec CONTEXT-LIMIT-UNIFICATION §2.5);
+# validateContextTokenCeilings fail-fasts at startup without it.
+context_window = 128000
 
 [context.tiers]
 rich_target_tokens = 1000

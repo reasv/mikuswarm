@@ -24,20 +24,21 @@ import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
 import type { CanonicalChatEvent } from "../types.js";
 
 /**
- * Resolve a session's effective context-token ceiling (spec
- * TOKEN-USAGE-TRACKING §6.1): the MIN of the model-level and session-type-level
- * `max_context_tokens`, considering only the values that are set. Both unset =
- * unenforced (null). min() because both knobs are CEILINGS — a session type can
- * only tighten a model's operator-set ceiling, never raise it (Decision D2).
+ * Compose a session's operative context-token ceiling (spec
+ * CONTEXT-LIMIT-UNIFICATION §2.2): `min(context_window, override)`, considering
+ * the per-session-type override only when set. `context_window` is the model
+ * ceiling and is always present (§2.5 makes it mandatory for any model a session
+ * type resolves to), so this ALWAYS returns a number — enforcement is never
+ * unwired. min() because the override can only TIGHTEN the model ceiling, never
+ * raise it; cross-validation enforces `override <= context_window`, so min() and
+ * "the override substitutes the window" are equivalent — min() is the defensive
+ * form.
  */
-export function effectiveMaxContextTokens(
-  modelLimit?: number,
-  sessionTypeLimit?: number,
-): number | null {
-  const limits = [modelLimit, sessionTypeLimit].filter(
-    (v): v is number => typeof v === "number",
-  );
-  return limits.length > 0 ? Math.min(...limits) : null;
+export function composeSessionContextCeiling(
+  contextWindow: number,
+  override?: number,
+): number {
+  return typeof override === "number" ? Math.min(contextWindow, override) : contextWindow;
 }
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
@@ -295,7 +296,14 @@ export class AgentSessionFactory {
     const modelKey = sessionTypeConfig?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
-    const model = createModelFromConfig(modelConfig);
+    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4):
+    // resolved ONCE here and fed to every consumer — enforcement (below), the
+    // pi-ai Model descriptor (so any future window-keyed mechanism triggers
+    // against the ceiling the session is actually judged against), and the
+    // text-editor read budget (app.ts buildSessionTools, via the same resolver).
+    // No consumer reads `context_window` directly (U3). Always a number.
+    const contextCeiling = this.resolveSessionContextCeiling(session.sessionType);
+    const model = createModelFromConfig(modelConfig, contextCeiling);
     // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
     // chosen stream fn so an environmental failure re-issues the exact same
     // request — buffered to the terminal event, partials discarded — before the
@@ -352,13 +360,6 @@ export class AgentSessionFactory {
     // Seeded from persisted totals on resume so consumption continues rather
     // than resets (§4.3). Fed at the Layer-0 commit point via onRequestCommitted.
     const usage = new SessionUsageTracker(opts?.usageSeed);
-    // Effective context-token ceiling (spec §6.1): min of model- and
-    // session-type-level limits, considering only the set values. null =
-    // unenforced — the pre-flight hook is then omitted entirely.
-    const effectiveContextLimit = effectiveMaxContextTokens(
-      modelConfig.max_context_tokens,
-      sessionTypeConfig?.max_context_tokens,
-    );
     const streamFn = withRequestRetry(
       admittedStreamFn,
       {
@@ -399,30 +400,30 @@ export class AgentSessionFactory {
         // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
         // committed `done` message's authoritative usage feeds the tracker.
         onRequestCommitted: (message: AssistantMessage) => usage.record(message.usage),
-        // Pre-flight context-budget enforcement (spec §6.2), only when a limit
-        // is set. Compares the LAST committed request's actual context size
-        // against the effective ceiling; the first request is never blocked
-        // (no actuals yet — the provider is authority on an oversized seed).
-        ...(effectiveContextLimit !== null
-          ? {
-              checkContextBudget: () => {
-                const observed = usage.snapshot().contextTokens;
-                if (observed === null || observed < effectiveContextLimit) return undefined;
-                this.options.logger?.warn("session_context_limit_exceeded", {
-                  sessionId: session.id,
-                  timelineKey: session.timelineKey,
-                  sessionType: session.sessionType,
-                  model: model.id,
-                  observed,
-                  limit: effectiveContextLimit,
-                });
-                return (
-                  `context token limit exceeded: observed context ${observed} tokens >= ` +
-                  `limit ${effectiveContextLimit} (model ${model.id}, session type ${session.sessionType})`
-                );
-              },
-            }
-          : {}),
+        // Pre-flight context-budget enforcement (spec CONTEXT-LIMIT-UNIFICATION
+        // §2.3). The operative ceiling is never null (context_window is always
+        // present), so enforcement is ALWAYS wired — interactive sessions now
+        // gain the model's `context_window` ceiling where they previously had
+        // none. Compares the LAST committed request's actual context size against
+        // the ceiling; the first request is never blocked (no actuals yet — the
+        // provider is authority on an oversized seed). D3 from TOKEN-USAGE-TRACKING
+        // is preserved verbatim.
+        checkContextBudget: () => {
+          const observed = usage.snapshot().contextTokens;
+          if (observed === null || observed < contextCeiling) return undefined;
+          this.options.logger?.warn("session_context_limit_exceeded", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            sessionType: session.sessionType,
+            model: model.id,
+            observed,
+            limit: contextCeiling,
+          });
+          return (
+            `context token limit exceeded: observed context ${observed} tokens >= ` +
+            `limit ${contextCeiling} (model ${model.id}, session type ${session.sessionType})`
+          );
+        },
       },
     );
 
@@ -601,16 +602,28 @@ export class AgentSessionFactory {
   }
 
   /**
-   * Resolve a session's effective context-token ceiling from CURRENT config
-   * (spec TOKEN-USAGE-TRACKING §7.2, Decision D7): the limit is operator config
-   * and is NOT persisted per session, so the console shows today's config for
-   * a given session type. Returns null when unenforced.
+   * Resolve a session's operative context-token ceiling from CURRENT config
+   * (spec CONTEXT-LIMIT-UNIFICATION §2.4; D7 from TOKEN-USAGE-TRACKING preserved):
+   * `min(context_window, session_type.max_context_tokens)`. The limit is operator
+   * config and is NOT persisted per session, so the console shows today's config
+   * for a given session type. The single resolver feeding enforcement, the model
+   * descriptor, and the text-editor read budget (U3) — always returns a number
+   * (context_window is mandatory for session-resolved models, §2.5). Throws (a
+   * defensive backstop, never reached in normal operation since app-wiring
+   * validation requires the window) if the resolved model has no `context_window`.
    */
-  resolveEffectiveMaxContextTokens(sessionType: string): number | null {
+  resolveSessionContextCeiling(sessionType: string): number {
     const cfg = this.resolveSessionType(sessionType);
     const modelKey = cfg?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
-    return effectiveMaxContextTokens(modelConfig?.max_context_tokens, cfg?.max_context_tokens);
+    const contextWindow = modelConfig?.context_window;
+    if (contextWindow === undefined) {
+      throw new Error(
+        `model "${modelKey}" (session type "${sessionType}") has no context_window; ` +
+          `it is required to resolve the session context ceiling`,
+      );
+    }
+    return composeSessionContextCeiling(contextWindow, cfg?.max_context_tokens);
   }
 
   /**
@@ -941,7 +954,21 @@ export function createModel(config: AppConfig): Model<Api> {
   return createModelFromConfig(config.models.default);
 }
 
-export function createModelFromConfig(model: ModelConfig): Model<Api> {
+/**
+ * Build the pi-ai `Model` descriptor from a model config entry. `contextWindow`
+ * is fed the resolved OPERATIVE per-session ceiling when supplied (spec
+ * CONTEXT-LIMIT-UNIFICATION §2.4 consumer 2 / U3) — so any future window-keyed
+ * mechanism (compaction, SDK overflow math) triggers against the ceiling the
+ * session is actually judged against, not the raw model window. When omitted
+ * (the `createModel` convenience path, no session context), it falls back to the
+ * model's own `context_window`, which is mandatory for any model a session type
+ * resolves to (§2.5) — hence the throw rather than a silent literal default.
+ */
+export function createModelFromConfig(model: ModelConfig, contextWindow?: number): Model<Api> {
+  const resolvedContextWindow = contextWindow ?? model.context_window;
+  if (resolvedContextWindow === undefined) {
+    throw new Error(`model "${model.id}" has no context_window`);
+  }
   return {
     id: model.id,
     name: model.id,
@@ -960,7 +987,7 @@ export function createModelFromConfig(model: ModelConfig): Model<Api> {
       cacheRead: model.cost?.cache_read ?? 0,
       cacheWrite: model.cost?.cache_write ?? 0,
     },
-    contextWindow: model.context_window ?? 128_000,
+    contextWindow: resolvedContextWindow,
     maxTokens: model.max_tokens,
     compat: {
       supportsCacheControlOnTools: model.compat?.supports_cache_control_on_tools ?? false,

@@ -1,52 +1,46 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { effectiveMaxContextTokens } from "../src/agent/factory.js";
+import { AgentSessionFactory, composeSessionContextCeiling } from "../src/agent/factory.js";
 import { validateContextTokenCeilings } from "../src/app.js";
 import type { AppConfig } from "../src/config/index.js";
 
-// --- #8 (a): effective-limit composition (Decision D2 — a session type can
-// only TIGHTEN a model's ceiling, never raise it; the effective limit is the
-// min of the set values). ---
+// === spec CONTEXT-LIMIT-UNIFICATION ===========================================
+// `context_window` is the sole model-level ceiling and the always-on enforcement
+// base; `max_context_tokens` survives only as a per-session-type override that
+// can TIGHTEN that ceiling. One resolver composes the two and feeds every
+// consumer. These tests pin the composition, the cross-field validation, and the
+// per-session resolver method.
 
-test("effectiveMaxContextTokens: returns the min of two set values", () => {
-  assert.equal(effectiveMaxContextTokens(8_000, 4_000), 4_000);
-  assert.equal(effectiveMaxContextTokens(4_000, 8_000), 4_000);
+// --- §2.2: composition — min(context_window, override) ------------------------
+
+test("composeSessionContextCeiling: override below the window tightens to the override", () => {
+  assert.equal(composeSessionContextCeiling(128_000, 60_000), 60_000);
 });
 
-test("effectiveMaxContextTokens: a session type can only tighten, never raise", () => {
-  // Model ceiling 4_000, session type asks for 9_000 → still clamped to 4_000.
-  // The type cannot widen the model's operator-set ceiling (D2).
-  assert.equal(effectiveMaxContextTokens(4_000, 9_000), 4_000);
+test("composeSessionContextCeiling: override equal to the window collapses to that value", () => {
+  assert.equal(composeSessionContextCeiling(60_000, 60_000), 60_000);
 });
 
-test("effectiveMaxContextTokens: returns the single set value when only one side is set", () => {
-  assert.equal(effectiveMaxContextTokens(5_000, undefined), 5_000);
-  assert.equal(effectiveMaxContextTokens(undefined, 5_000), 5_000);
+test("composeSessionContextCeiling: override above the window cannot raise the ceiling", () => {
+  // Defensive min(): even though cross-validation rejects override > window, the
+  // composer never widens the model ceiling.
+  assert.equal(composeSessionContextCeiling(60_000, 128_000), 60_000);
 });
 
-test("effectiveMaxContextTokens: returns null when both are unset (unenforced)", () => {
-  assert.equal(effectiveMaxContextTokens(undefined, undefined), null);
+test("composeSessionContextCeiling: unset override falls back to the window (always a number)", () => {
+  assert.equal(composeSessionContextCeiling(128_000, undefined), 128_000);
+  assert.equal(composeSessionContextCeiling(128_000), 128_000);
 });
 
-test("effectiveMaxContextTokens: equal values collapse to that value", () => {
-  assert.equal(effectiveMaxContextTokens(6_000, 6_000), 6_000);
-});
-
-// --- #8 (b/c): cross-field startup validation. `validateContextTokenCeilings`
-// is the pure function extracted from `startMikuAgent` (it reads only
-// config.models + config.agent.session_types). We cast minimal fixtures, the
-// same convention the other tests use for partial config/dep shapes. ---
+// --- §2.5: cross-field startup validation. `validateContextTokenCeilings` is the
+// pure function extracted from `startMikuAgent` (it reads only config.models +
+// config.agent.session_types). We cast minimal fixtures, the same convention the
+// other tests use for partial config/dep shapes. ---
 
 /** Minimal AppConfig shape touched by validateContextTokenCeilings. */
 function configWith(opts: {
-  models: Record<
-    string,
-    { context_window?: number; max_context_tokens?: number }
-  >;
-  sessionTypes?: Record<
-    string,
-    { model?: string; max_context_tokens?: number }
-  >;
+  models: Record<string, { context_window?: number; max_context_tokens?: number }>;
+  sessionTypes?: Record<string, { model?: string; max_context_tokens?: number }>;
 }): AppConfig {
   return {
     models: opts.models,
@@ -54,17 +48,36 @@ function configWith(opts: {
   } as unknown as AppConfig;
 }
 
-test("validateContextTokenCeilings: throws when a model's max_context_tokens > context_window", () => {
-  const config = configWith({
-    models: { default: { context_window: 4_000, max_context_tokens: 8_000 } },
-  });
+test("validateContextTokenCeilings: throws when the default model has no context_window", () => {
   assert.throws(
-    () => validateContextTokenCeilings(config),
-    /models\.default: max_context_tokens \(8000\) must be <= context_window \(4000\)/,
+    () => validateContextTokenCeilings(configWith({ models: { default: {} } })),
+    /models\.default: context_window is required \(resolved by default model\)/,
   );
 });
 
-test("validateContextTokenCeilings: throws when a session-type ceiling exceeds the resolved model's context_window", () => {
+test("validateContextTokenCeilings: throws when a session-resolved model has no context_window", () => {
+  const config = configWith({
+    models: { default: { context_window: 128_000 }, tiny: {} },
+    sessionTypes: { worker: { model: "tiny" } },
+  });
+  assert.throws(
+    () => validateContextTokenCeilings(config),
+    /models\.tiny: context_window is required \(resolved by agent\.session_types\.worker\)/,
+  );
+});
+
+test("validateContextTokenCeilings: throws when a session type names a missing model", () => {
+  const config = configWith({
+    models: { default: { context_window: 128_000 } },
+    sessionTypes: { worker: { model: "ghost" } },
+  });
+  assert.throws(
+    () => validateContextTokenCeilings(config),
+    /agent\.session_types\.worker: model "ghost" not found in \[models\]/,
+  );
+});
+
+test("validateContextTokenCeilings: throws when a session-type override exceeds the resolved model's context_window", () => {
   const config = configWith({
     models: { default: { context_window: 4_000 } },
     sessionTypes: { summarize: { max_context_tokens: 9_000 } },
@@ -90,37 +103,82 @@ test("validateContextTokenCeilings: a session type resolves through its own `mod
   );
 });
 
-test("validateContextTokenCeilings: passes when only one side is set", () => {
-  // Model has a ceiling but no window → nothing to compare against; passes.
-  assert.doesNotThrow(() =>
-    validateContextTokenCeilings(
-      configWith({ models: { default: { max_context_tokens: 8_000 } } }),
-    ),
-  );
-  // Model has a window but no ceiling; a session-type ceiling within window passes.
+test("validateContextTokenCeilings: passes when values fit (override <= window, equal allowed)", () => {
   assert.doesNotThrow(() =>
     validateContextTokenCeilings(
       configWith({
-        models: { default: { context_window: 10_000 } },
-        sessionTypes: { summarize: { max_context_tokens: 6_000 } },
+        models: { default: { context_window: 8_000 } },
+        sessionTypes: { summarize: { max_context_tokens: 8_000 }, chat: {} },
       }),
     ),
   );
 });
 
-test("validateContextTokenCeilings: passes when values fit (ceiling <= window, equal allowed)", () => {
+test("validateContextTokenCeilings: passes when only the default model with a window is configured", () => {
   assert.doesNotThrow(() =>
-    validateContextTokenCeilings(
-      configWith({
-        models: { default: { context_window: 8_000, max_context_tokens: 8_000 } },
-        sessionTypes: { summarize: { max_context_tokens: 8_000 } },
-      }),
-    ),
+    validateContextTokenCeilings(configWith({ models: { default: { context_window: 128_000 } } })),
   );
 });
 
-test("validateContextTokenCeilings: passes when nothing is set (empty config)", () => {
-  assert.doesNotThrow(() =>
-    validateContextTokenCeilings(configWith({ models: { default: {} } })),
+// --- §2.4: the single per-session resolver. `resolveSessionContextCeiling`
+// composes the resolved model's window with the session type's override and
+// ALWAYS returns a number — never null, so enforcement is always wired. ---
+
+/** Build a factory over a minimal config exercising only the resolver. */
+function makeFactory(opts: {
+  models: Record<string, { context_window?: number }>;
+  sessionTypes?: Record<string, { model?: string; max_context_tokens?: number }>;
+}): AgentSessionFactory {
+  const config = {
+    models: opts.models,
+    agent: { session_types: opts.sessionTypes },
+  } as unknown as AppConfig;
+  return new AgentSessionFactory({
+    config,
+    contextBuilder: {} as any,
+    getActiveSessions: () => [],
+  });
+}
+
+test("resolveSessionContextCeiling: an interactive type with no override resolves to the model window (always-on enforcement)", () => {
+  // The behavioral delta: `default`/`proactive` gain the model's context_window
+  // as an enforced ceiling where they previously resolved to null (unbounded).
+  const factory = makeFactory({
+    models: { default: { context_window: 128_000 } },
+    sessionTypes: { default: {} },
+  });
+  assert.equal(factory.resolveSessionContextCeiling("default"), 128_000);
+});
+
+test("resolveSessionContextCeiling: a worker override tightens below the window", () => {
+  const factory = makeFactory({
+    models: { default: { context_window: 128_000 } },
+    sessionTypes: { summarize: { max_context_tokens: 60_000 } },
+  });
+  assert.equal(factory.resolveSessionContextCeiling("summarize"), 60_000);
+});
+
+test("resolveSessionContextCeiling: resolves through a session type's own model key", () => {
+  const factory = makeFactory({
+    models: { default: { context_window: 128_000 }, tiny: { context_window: 32_000 } },
+    sessionTypes: { worker: { model: "tiny", max_context_tokens: 20_000 } },
+  });
+  assert.equal(factory.resolveSessionContextCeiling("worker"), 20_000);
+});
+
+test("resolveSessionContextCeiling: an unknown session type falls back to the default model window", () => {
+  const factory = makeFactory({
+    models: { default: { context_window: 128_000 } },
+    sessionTypes: {},
+  });
+  // No matching or `default` session type → resolves the `default` model window.
+  assert.equal(factory.resolveSessionContextCeiling("nonexistent"), 128_000);
+});
+
+test("resolveSessionContextCeiling: throws (defensive) when the resolved model has no context_window", () => {
+  const factory = makeFactory({ models: { default: {} } });
+  assert.throws(
+    () => factory.resolveSessionContextCeiling("default"),
+    /model "default" \(session type "default"\) has no context_window/,
   );
 });
