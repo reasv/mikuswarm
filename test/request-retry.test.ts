@@ -759,6 +759,42 @@ test("classifyLlmError: pi-ai overflow patterns beyond the keyword list are clas
   assert.equal(classifyLlmError("429 rate limit: too many tokens, slow down", "error"), "environmental");
 });
 
+test("classifyLlmError: a 429 carrying 'too many tokens' WITHOUT a rate-limit phrasing stays environmental (#4)", () => {
+  // pi-ai's NON_OVERFLOW exclusion only covers the literal "rate limit" / "too
+  // many requests" wordings, so a 429 phrased "too many tokens in flight, retry
+  // later" matches the generic overflow pattern. The parseable transient status
+  // (429) must veto the overflow augmentation so this stays retryable — a
+  // transient blip must never park the session as a content failure.
+  assert.equal(
+    classifyLlmError("429 too many tokens in flight, retry later", "error"),
+    "environmental",
+  );
+  // A 5xx with overflow-adjacent body text — recognized ONLY by pi-ai's pattern
+  // set, NOT by the hand-rolled CONTENT_KEYWORDS — is protected by its transient
+  // status and stays environmental. (A 5xx carrying a literal CONTENT_KEYWORD
+  // like "prompt is too long" still classifies content by design; that gate is
+  // unchanged. This case isolates the newly-gated isContextOverflow path.)
+  assert.equal(
+    classifyLlmError(
+      "503 this model's maximum prompt length is 131072 but the request contains 200000 tokens",
+      "error",
+    ),
+    "environmental",
+  );
+});
+
+test("classifyLlmError: a genuine overflow with NO parseable status still classifies content (#4)", () => {
+  // The status gate only protects parseable transients; a no-status overflow body
+  // recognized only by the pi-ai pattern set must still classify content.
+  assert.equal(
+    classifyLlmError(
+      "This model's maximum prompt length is 131072 but the request contains 200000 tokens",
+      "error",
+    ),
+    "content",
+  );
+});
+
 test("withRequestRetry: a committed done fires onRequestCommitted with usage + records ring usage (§3.1/§3.2)", async () => {
   const committed = message({
     stopReason: "stop",
@@ -840,4 +876,45 @@ test("withRequestRetry: checkContextBudget returning undefined lets the request 
   const events = await drain(wrapped(MODEL, CONTEXT, undefined));
   assert.equal(calls(), 1);
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
+});
+
+test("withRequestRetry: a THROWING checkContextBudget does not crash/hang — degrades to no local block (#2)", async () => {
+  // The factory-bound impl calls logger.warn(...), which can throw. An unguarded
+  // throw would escape the void-IIFE as a process-fatal unhandled rejection and
+  // leave `outer` without a terminal event (hung consumer). The pre-flight must
+  // be exception-isolated: on a throw it degrades to "no local block" and the
+  // request proceeds to the provider (the D3 fallback) and terminates cleanly.
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    checkContextBudget: () => {
+      throw new Error("logger exploded inside the budget check");
+    },
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1, "the request proceeded — no violation applied");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "run terminated cleanly");
+});
+
+test("withRequestRetry: a committed done LACKING usage does not call the capture hook (#3)", async () => {
+  // The two capture branches must be consistent: the ring branch already gates on
+  // `usage`, so the onRequestCommitted branch must too. A `done` whose message
+  // carries no usage object must NOT invoke the hook (the factory-bound impl
+  // dereferences usage.input and would throw, silently dropping the request from
+  // the tracker — an undercount). The ring row is still recorded, with no usage.
+  const noUsageMessage = { ...message({ stopReason: "stop" }), usage: undefined } as unknown as AssistantMessage;
+  const done: AssistantMessageEvent = { type: "done", reason: "stop", message: noUsageMessage };
+  const { fn } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), done] }]);
+  const ring = new LlmRequestRing();
+  let committedCount = 0;
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    onRequestCommitted: () => committedCount++,
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "the run still completes");
+  assert.equal(committedCount, 0, "the capture hook is NOT called when usage is absent");
+  const rows = ring.list();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.outcome, "done");
+  assert.equal(rows[0]!.usage, undefined, "no usage recorded on the ring either");
 });
