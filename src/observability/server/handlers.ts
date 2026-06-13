@@ -40,6 +40,10 @@ export async function roomContext(
   const messages = built.messages.map((msg, i) => ({
     ...renderContextMessage(msg),
     preview: finalTurnIndex >= 0 && i >= finalTurnIndex,
+    // Per-segment system-prompt breakdown rides on the leading `system` message
+    // for the live inspector (spec §10a). Live-preview-only: the persisted
+    // snapshot path (sessionDetail) never sets it, so the field is absent there.
+    ...(msg.type === "system" ? { segments: built.systemPromptSegments } : {}),
   }));
   sendJson(res, 200, {
     timelineKey: ctx.params.key,

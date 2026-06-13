@@ -158,6 +158,7 @@ export async function loadResumeMaterial(
     compactTokens: 0,
     richTokens: 0,
     imageBlocks: [],
+    systemPromptSegments: [],
   });
 
   const transcript = stripFailedTail(transcriptRaw);

@@ -1,6 +1,30 @@
 import type { WorkspaceContent, SessionTypeConfig, SatelliteRuntimeInput } from "./types.js";
 import { escapeXml, escapeAttr } from "../context/xml.js";
+import { estimateTokens } from "../context/tokens.js";
 import { formatAgentTimestamp } from "../time/index.js";
+
+/**
+ * One named piece of the system prompt and its token contribution.
+ *
+ * A "segment" is one rendered top-level XML block in {@link renderSystemPrompt} —
+ * a workspace file (`<agent_instructions>`, `<soul>`, …), one inlined skill
+ * (`<skill_instructions>`), or the available-skills index (`<available_skills>`).
+ * `tokenEstimate` is the gpt-4o BPE length of that block's rendered string,
+ * INCLUDING its wrapping tags. Segment estimates do not sum exactly to the whole
+ * system-prompt estimate: the `\n\n` joiners between blocks and BPE boundary
+ * effects cost a handful of tokens that are deliberately left unattributed — the
+ * authoritative whole-prompt figure stays on the system message itself.
+ */
+export interface SystemPromptSegment {
+  /** XML tag that wraps this block (e.g. "soul", "skill_instructions"). */
+  tag: string;
+  /** Human label for display: filename, skill name, or "available_skills". */
+  label: string;
+  /** Source path (workspace filename or skill path); null for the skills index. */
+  source: string | null;
+  /** gpt-4o token estimate of the rendered block, wrapping tags included. */
+  tokenEstimate: number;
+}
 
 /**
  * Tag name mapping for workspace files.
@@ -33,7 +57,24 @@ export function renderSystemPrompt(
   workspace: WorkspaceContent,
   fallbackPrompt?: string,
 ): string {
-  const sections: string[] = [];
+  return renderSystemPromptWithSegments(workspace, fallbackPrompt).text;
+}
+
+/**
+ * Render the system prompt and, alongside it, the per-segment token breakdown.
+ *
+ * `text` is byte-identical to {@link renderSystemPrompt} (which delegates here),
+ * so every caller that needs only the string is unaffected. `segments` carries
+ * each rendered block's token contribution for the console's live system-prompt
+ * inspector (ARCHITECTURE.md §10a) — see {@link SystemPromptSegment}.
+ */
+export function renderSystemPromptWithSegments(
+  workspace: WorkspaceContent,
+  fallbackPrompt?: string,
+): { text: string; segments: SystemPromptSegment[] } {
+  // Each block is rendered once; its string drives BOTH the joined prompt and
+  // its own token estimate, so the breakdown can never drift from the text.
+  const blocks: { tag: string; label: string; source: string | null; text: string }[] = [];
 
   // Inject AGENTS.md fallback when the file is missing or empty.
   // An empty AGENTS.md on disk is treated the same as a missing one — the
@@ -55,14 +96,22 @@ export function renderSystemPrompt(
     if (!content) continue;
 
     const tagName = FILE_TAG_MAP[filename] ?? filenameToTag(filename);
-    sections.push(`<${tagName} source="${escapeAttr(filename)}">\n${content}\n</${tagName}>`);
+    blocks.push({
+      tag: tagName,
+      label: filename,
+      source: filename,
+      text: `<${tagName} source="${escapeAttr(filename)}">\n${content}\n</${tagName}>`,
+    });
   }
 
   // Inlined skills (always_loaded: true)
   for (const skill of workspace.skills.inlined) {
-    sections.push(
-      `<skill_instructions source="${escapeAttr(skill.path)}" name="${escapeAttr(skill.name)}">\n${skill.content}\n</skill_instructions>`,
-    );
+    blocks.push({
+      tag: "skill_instructions",
+      label: skill.name,
+      source: skill.path,
+      text: `<skill_instructions source="${escapeAttr(skill.path)}" name="${escapeAttr(skill.name)}">\n${skill.content}\n</skill_instructions>`,
+    });
   }
 
   // Available skills index (always_loaded: false)
@@ -73,10 +122,23 @@ export function renderSystemPrompt(
           `<skill name="${escapeAttr(skill.name)}" path="${escapeAttr(skill.path)}">${escapeXml(skill.description)}</skill>`,
       )
       .join("\n");
-    sections.push(`<available_skills>\n${skillEntries}\n</available_skills>`);
+    blocks.push({
+      tag: "available_skills",
+      label: "available_skills",
+      source: null,
+      text: `<available_skills>\n${skillEntries}\n</available_skills>`,
+    });
   }
 
-  return sections.join("\n\n");
+  return {
+    text: blocks.map((b) => b.text).join("\n\n"),
+    segments: blocks.map((b) => ({
+      tag: b.tag,
+      label: b.label,
+      source: b.source,
+      tokenEstimate: estimateTokens(b.text),
+    })),
+  };
 }
 
 /**

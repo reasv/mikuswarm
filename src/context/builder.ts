@@ -25,7 +25,11 @@ import {
   type SummarySelection,
 } from "./summary-layer.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
-import { renderSystemPrompt, renderSatelliteBlock } from "../workspace/prompt.js";
+import {
+  renderSystemPromptWithSegments,
+  renderSatelliteBlock,
+  type SystemPromptSegment,
+} from "../workspace/prompt.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
@@ -140,6 +144,16 @@ export interface BuiltContext {
    * (live chat, proactive, diary-range) — they have no declared input set.
    */
   renderedInputIds?: string[];
+  /**
+   * Per-segment token breakdown of the leading `system` message (the workspace
+   * files, inlined skills, and the available-skills index). Computed on every
+   * build but surfaced ONLY by the live room-context preview endpoint
+   * (`roomContext`); the persisted frozen snapshot stays a flat string blob and
+   * does not carry it (the breakdown is a live affordance — ARCHITECTURE.md §10a).
+   * The estimates do not sum exactly to the system message's `tokenEstimate`; see
+   * {@link SystemPromptSegment}.
+   */
+  systemPromptSegments: SystemPromptSegment[];
 }
 
 /**
@@ -424,7 +438,8 @@ export class ContextBuilder {
     // Both are required: the factory's version sets initialState.systemPrompt (used by
     // pi-agent-core on every API call), and this one populates the system message in
     // transformContext output. They must produce identical results.
-    const systemPrompt = renderSystemPrompt(options.workspace, options.fallbackPrompt);
+    const { text: systemPrompt, segments: systemPromptSegments } =
+      renderSystemPromptWithSegments(options.workspace, options.fallbackPrompt);
     // The diary session type's session_instruction is a per-job TEMPLATE
     // ({{room}}/{{date}}/{{header}} are substituted by the diary worker) and is
     // delivered, substituted, inside the worker's kickoff turn right after this
@@ -592,6 +607,7 @@ export class ContextBuilder {
       richTokens: compacted.richTokens,
       imageBlocks,
       renderedInputIds,
+      systemPromptSegments,
     };
   }
 
