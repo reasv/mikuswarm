@@ -13,8 +13,15 @@
 	import ThinkingCard from './ThinkingCard.svelte';
 	import ToolCallCard from './ToolCallCard.svelte';
 	import InterjectionCard from './InterjectionCard.svelte';
+	import type { ToolInvocation } from '$lib/schemas';
 
-	let { messages }: { messages: readonly unknown[] } = $props();
+	// `toolUsage` maps a tool-call id → its auxiliary usage ledger row (spec
+	// AUXILIARY-USAGE-TRACKING §10.3) so a tool-call block can be annotated with its
+	// own spend (today image_generate). Empty for live rollouts (ledger is durable).
+	let {
+		messages,
+		toolUsage
+	}: { messages: readonly unknown[]; toolUsage?: Map<string, ToolInvocation> } = $props();
 
 	const toolResults = $derived(collectToolResults(messages));
 	const rows = $derived(messages.map(asMsg));
@@ -33,6 +40,7 @@
 						name={block.name}
 						args={block.arguments}
 						result={toolResults.get(block.id)}
+						usage={toolUsage?.get(block.id)}
 					/>
 				{/if}
 			{/each}

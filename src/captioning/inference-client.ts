@@ -2,6 +2,7 @@ import { readFile, unlink } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
 import { modelHealthKey, type LlmScheduler } from "../agent/scheduler.js";
 import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
+import { computeUsageCost, type CostRates, type RawTokenUsage } from "../agent/usage.js";
 import {
   processImageForInference,
   processVideoForInference,
@@ -12,6 +13,9 @@ import {
   type AudioProcessingOptions,
   type ProcessedMedia,
 } from "../media/index.js";
+
+/** All-zero cost rates: usage captured, cost "untracked" (spec §7.1 unset case). */
+const ZERO_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 export interface InferenceClientOptions {
   modality: MediaModality;
@@ -28,6 +32,14 @@ export interface InferenceClientOptions {
   scheduler?: LlmScheduler;
   /** Rate-limit group for caption inference. Unset = `default`. */
   rateLimitGroup?: string;
+  /**
+   * USD/1M-token cost rates for this modality's caption model (spec
+   * AUXILIARY-USAGE-TRACKING §5/§7.1), resolved modality → top-level → unset.
+   * When unset (or all-zero), token usage is still captured but cost is 0
+   * ("untracked"). Auxiliary spend is a separate lane — never folded into the
+   * §8b session counters (spec §4).
+   */
+  costRates?: CostRates;
   imageProcessing?: ImageProcessingOptions;
   videoProcessing?: VideoProcessingOptions;
   audioProcessing?: AudioProcessingOptions;
@@ -46,6 +58,13 @@ export interface CaptionRequest {
 export interface CaptionResponse {
   caption: string;
   model: string;
+  /** Provider-reported token usage (spec §6.1), or null when the gateway omits it. */
+  usage: RawTokenUsage | null;
+  /**
+   * USD cost for this call (`computeUsageCost(...).total`), or null when usage is
+   * unknown. May be 0 when usage is known but no cost rates are configured.
+   */
+  cost: number | null;
 }
 
 /**
@@ -178,7 +197,13 @@ export class InferenceClient {
       caption = formatTruncationWarning(caption, processed, request.context ?? "pipeline");
     }
 
-    return { caption, model: result.model };
+    // Auxiliary cost (spec §5/§11): compute from config rates when the provider
+    // reported usage. Cost is 0 (not null) when usage is known but no rates are
+    // configured — tokens are still recorded; only the price is "untracked".
+    const usage = result.usage;
+    const cost = usage ? computeUsageCost(this.options.costRates ?? ZERO_RATES, usage).total : null;
+
+    return { caption, model: result.model, usage, cost };
   }
 }
 

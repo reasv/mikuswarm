@@ -7,6 +7,7 @@
 	import SessionView from '$lib/components/col2/SessionView.svelte';
 	import RetryButton from '$lib/components/RetryButton.svelte';
 	import { relativeTime } from '$lib/utils';
+	import { formatTokens, formatUsd } from '$lib/format';
 
 	const queryClient = useQueryClient();
 	const detail = pipelineItemQuery(
@@ -165,6 +166,19 @@
 							<div class="rounded bg-muted/50 px-2 py-1">{m.caption}</div>
 						{:else}
 							<div class="text-muted-foreground">No caption/transcript yet.</div>
+						{/if}
+						{#if m.usage}
+							<!-- Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §10.1):
+							     in · out · cr · $cost. Hidden when usage is null (legacy/unknown);
+							     cost hidden when 0 (no rates configured). -->
+							<div
+								class="font-mono text-[10px] tabular-nums text-muted-foreground"
+								title={`caption usage · input ${m.usage.input} · output ${m.usage.output} · cache read ${m.usage.cacheRead} · total ${m.usage.total} · cost ${m.usage.cost}`}
+							>
+								in {formatTokens(m.usage.input)} · out {formatTokens(m.usage.output)} · cr {formatTokens(
+									m.usage.cacheRead
+								)}{#if m.usage.cost > 0} · {formatUsd(m.usage.cost)}{/if}
+							</div>
 						{/if}
 					{:else}
 						<div class="text-muted-foreground">Media asset not found.</div>

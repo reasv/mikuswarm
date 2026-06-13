@@ -1,11 +1,15 @@
 <script lang="ts">
-	import { pipelinesQuery } from '$lib/query/pipelines';
+	import { pipelinesQuery, costOverviewQuery } from '$lib/query/pipelines';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { pipelineSummary } from '$lib/stores/pipeline-summary.svelte';
 	import type { PipelineHealth } from '$lib/schemas';
 	import { cn } from '$lib/utils';
+	import { formatTokens, formatUsd } from '$lib/format';
 
 	const pipelines = pipelinesQuery();
+	// Global spend across the three lanes (spec AUXILIARY-USAGE-TRACKING §10.4),
+	// shown side-by-side in the footer — never summed into one headline (§9).
+	const cost = costOverviewQuery();
 
 	const POOL_LABELS: Record<string, string> = {
 		enrichment: 'Enrichment',
@@ -138,10 +142,33 @@
 									'bg-emerald-500/10 text-emerald-600/80 dark:text-emerald-400/80'
 								)}
 							</div>
+							{#if p.usage && p.usage.captionedCount > 0}
+								<!-- Captioning usage aggregate (spec AUXILIARY-USAGE-TRACKING §10.2):
+								     tokens captioned + total spend. Cost hidden when 0 (no rates). -->
+								<div class="font-mono text-[10px] tabular-nums text-muted-foreground">
+									{p.usage.captionedCount} captioned · in {formatTokens(p.usage.totalInputTokens)} · out
+									{formatTokens(p.usage.totalOutputTokens)}{#if p.usage.totalCost > 0}
+										· {formatUsd(p.usage.totalCost)} spent{/if}
+								</div>
+							{/if}
 						</button>
 					</li>
 				{/each}
 			</ul>
 		{/if}
 	</div>
+	{#if cost.data && (cost.data.agentLoopCost > 0 || cost.data.toolCost > 0 || cost.data.captioningCost > 0)}
+		<!-- Cost overview (spec AUXILIARY-USAGE-TRACKING §10.4): the three spend lanes
+		     side-by-side. Lanes are kept distinct (different pricing scales; tool/image
+		     tokens are not context-bearing — §9), so this is NOT a single total. -->
+		<div
+			class="flex flex-wrap items-center gap-x-3 gap-y-0.5 border-t px-3 py-1.5 font-mono text-[10px] tabular-nums text-muted-foreground"
+			title="Spend by lane — agent loop, tool calls, captioning (not summed; different pricing scales)"
+		>
+			<span class="font-semibold tracking-wide uppercase">Cost</span>
+			<span>loop {formatUsd(cost.data.agentLoopCost)}</span>
+			<span>· tools {formatUsd(cost.data.toolCost)}</span>
+			<span>· caption {formatUsd(cost.data.captioningCost)}</span>
+		</div>
+	{/if}
 </div>

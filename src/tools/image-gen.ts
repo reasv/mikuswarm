@@ -16,6 +16,7 @@ import {
 } from "../media/index.js";
 import { modelHealthKey, parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
 import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
+import { computeUsageCost, type CostRates, type RawTokenUsage } from "../agent/usage.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,6 +50,8 @@ const RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
  */
 const REFERENCE_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const USER_AGENT = "MikuAgent/0.1 (mikuswarm image_generate)";
+/** All-zero rates: usage captured, cost "untracked" (spec §7.2 unset case). */
+const ZERO_COST_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 const ASPECT_RATIOS = [
   "1:1",
@@ -84,12 +87,43 @@ type ImageGenParams = {
 // Minimal shape of the Gemini `:generateContent` response we read from.
 type GeminiInlineData = { mimeType?: string; mime_type?: string; data?: string };
 type GeminiPart = { text?: string; inlineData?: GeminiInlineData; inline_data?: GeminiInlineData };
+// Provider-reported usage (spec AUXILIARY-USAGE-TRACKING §6.2). `candidatesTokenCount`
+// is the generated image billed AS output tokens (different $/tok scale than the
+// agent loop — hence the separate lane, §4).
+type GeminiUsageMetadata = {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+  totalTokenCount?: number;
+};
 type GeminiResponse = {
   candidates?: Array<{
     finishReason?: string;
     content?: { parts?: GeminiPart[] };
   }>;
+  usageMetadata?: GeminiUsageMetadata;
 };
+
+/**
+ * One auxiliary tool-call usage record (spec AUXILIARY-USAGE-TRACKING §8.2),
+ * handed to {@link ImageGenToolContext.recordToolUsage} for durable ledger
+ * insertion. Attributed to the ambient session; NEVER folded into the §8b
+ * session counters (§4 invariant). `usage.images` carries the generated-image
+ * count so the flat `per_image` charge can be re-derived if needed.
+ */
+export interface ToolUsageRecord {
+  agentSessionId: string | null;
+  toolName: string;
+  /** pi-agent-core tool-call id, for matching this row to a rollout block (§10.3). */
+  toolCallId: string | null;
+  modelId: string;
+  provider: string;
+  usage: RawTokenUsage;
+  /** USD total from `computeUsageCost(...).total`. */
+  cost: number;
+  /** Output image workspace path (nullable). */
+  ref?: string | null;
+}
 
 export interface ImageGenToolContext {
   workspaceRoot: string;
@@ -127,6 +161,23 @@ export interface ImageGenToolContext {
    * 120_000 when unset (matches `llm_request_max_wait_ms`'s shipped default).
    */
   maxWaitMs?: number;
+  /**
+   * Ambient agent session this tool was built for (spec §8.2). Tools are built
+   * per-session (`buildSessionTools`), so the factory closes over the id; it is
+   * recorded on each `tool_invocations` ledger row for per-session rollups.
+   */
+  agentSessionId?: string | null;
+  /**
+   * Durable usage-ledger sink (spec §8.2). When set, every billable
+   * `image_generate` call records one row (auxiliary lane — never the §8b
+   * counters). Optional so tests/callers without storage construct the tool bare.
+   */
+  recordToolUsage?: (record: ToolUsageRecord) => void;
+  /**
+   * Per-tier USD/1M-token cost rates (+ optional flat `per_image`) — spec §5/§7.2.
+   * Keyed by model alias; unset/all-zero ⇒ usage captured, cost 0 ("untracked").
+   */
+  costRates?: Partial<Record<ModelAlias, CostRates>>;
   config?: {
     base_url?: string;
     api_key?: string;
@@ -235,7 +286,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       "returned to you as an inline preview; to post it to the chat you MUST call send_message with 'media' set to " +
       "the returned path.",
     parameters: ImageGenSchema,
-    execute: async (_toolCallId, rawParams, agentSignal) => {
+    execute: async (toolCallId, rawParams, agentSignal) => {
       const params = rawParams as ImageGenParams;
       const prompt = params.prompt?.trim();
       if (!prompt) {
@@ -350,6 +401,31 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         relPath = toWorkspaceRelative(context.workspaceRoot, savedPath);
       } catch (error) {
         return textError(`Generated the image but failed to save it: ${errMessage(error)}`);
+      }
+
+      // Auxiliary usage ledger (spec §8.2): one row per billable call, attributed
+      // to the ambient session. Captured AFTER the save so `ref` points at the
+      // durable artifact and `images: 1` reflects what was actually produced.
+      // Usage may be null (gateway omitted usageMetadata) — then nothing is
+      // recorded (the call left no measurable spend). Never touches the §8b
+      // session counters (§4 invariant).
+      const usage = parseGeminiUsage(result.usageMetadata, 1);
+      if (usage && context.recordToolUsage) {
+        const cost = computeUsageCost(context.costRates?.[alias] ?? ZERO_COST_RATES, usage).total;
+        try {
+          context.recordToolUsage({
+            agentSessionId: context.agentSessionId ?? null,
+            toolName: "image_generate",
+            toolCallId: toolCallId ?? null,
+            modelId,
+            provider: "gemini",
+            usage,
+            cost,
+            ref: relPath,
+          });
+        } catch {
+          /* the ledger is observability — a sink failure must never fail the tool */
+        }
       }
 
       // Inline preview so the model sees what it made. Conditioning failure is
@@ -649,6 +725,30 @@ export function extractImage(payload: GeminiResponse): {
     }
   }
   return { image, text, finishReason };
+}
+
+/**
+ * Map a Gemini `usageMetadata` block → {@link RawTokenUsage} (spec §6.2). `input`
+ * is uncached prompt tokens (prompt minus cached, incl. reference-image tokens);
+ * `output` is `candidatesTokenCount` (the generated image billed as tokens);
+ * cached tokens land in `cacheRead`. `images` is the count of images actually
+ * saved (drives the flat per-image charge). Returns null when usageMetadata is
+ * absent ("unknown", not zero).
+ */
+export function parseGeminiUsage(
+  meta: GeminiUsageMetadata | undefined | null,
+  images: number,
+): RawTokenUsage | null {
+  if (!meta) return null;
+  const prompt = meta.promptTokenCount ?? 0;
+  const cached = meta.cachedContentTokenCount ?? 0;
+  return {
+    input: Math.max(0, prompt - cached),
+    output: meta.candidatesTokenCount ?? 0,
+    cacheRead: cached,
+    cacheWrite: 0,
+    images,
+  };
 }
 
 // ---------------------------------------------------------------------------

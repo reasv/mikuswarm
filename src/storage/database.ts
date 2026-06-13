@@ -3,7 +3,8 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
-import type { SessionUsageTotals } from "../agent/usage.js";
+import { nanoid } from "nanoid";
+import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -118,6 +119,18 @@ export interface MediaAssetRow {
   caption_error?: string | null;
   /** Durable claim-time caption retry counter (mirrors enrichment_retries). */
   caption_attempts?: number;
+  /**
+   * Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §8.1), written
+   * atomically with the caption result. Null on legacy rows and when the gateway
+   * omitted usage ("unknown", never zero). `caption_cost` is USD;
+   * `caption_total_tokens` is input+output+cacheRead. This is a separate lane —
+   * never folded into `agent_sessions.usage_*` (§4).
+   */
+  caption_input_tokens?: number | null;
+  caption_output_tokens?: number | null;
+  caption_cache_read_tokens?: number | null;
+  caption_total_tokens?: number | null;
+  caption_cost?: number | null;
   download_status: string;
   download_error?: string | null;
   created_at: number;
@@ -671,6 +684,90 @@ export interface AgentSessionRow {
   started_at: number | null;
   updated_at: number;
   completed_at: number | null;
+}
+
+/**
+ * One row of the auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING
+ * §8.2): a generic per-invocation record for provider calls made by a tool via
+ * raw fetch (today `image_generate`). Attributed to the ambient
+ * `agent_session_id` but accounted in a SEPARATE lane — never folded into
+ * `agent_sessions.usage_*`/`context_tokens` (§4). All usage/cost fields are
+ * nullable ("unknown", never a misleading 0).
+ */
+export interface ToolInvocationRow {
+  id: string;
+  agent_session_id: string | null;
+  tool_name: string;
+  /** The pi-agent-core tool-call id, for matching a ledger row to a rollout block. */
+  tool_call_id: string | null;
+  model_id: string | null;
+  provider: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  /** Generated-image count (nullable; image-gen only). */
+  images: number | null;
+  /** USD total (`computeUsageCost(...).total`). */
+  cost: number | null;
+  /** Output artifact reference, e.g. the workspace image path (nullable). */
+  ref: string | null;
+  created_at: number;
+}
+
+/**
+ * Insert payload for {@link Storage.insertToolInvocation}. The store generates
+ * `id` (nanoid) and `created_at`; the caller supplies attribution + usage/cost.
+ */
+export interface ToolInvocationInput {
+  agentSessionId: string | null;
+  toolName: string;
+  toolCallId?: string | null;
+  modelId?: string | null;
+  provider?: string | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  images?: number | null;
+  cost?: number | null;
+  ref?: string | null;
+}
+
+/**
+ * Per-session auxiliary tool-spend rollup (spec §8.3, §10.3), derived on read by
+ * SUM/COUNT over `tool_invocations`. A separate lane from the §8b session
+ * actuals — shown beside, never blended into, the LLM-loop figures (§9).
+ */
+export interface SessionToolUsage {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cost: number;
+}
+
+/**
+ * Captioning-pool usage aggregate (spec §10.2), derived by SUM/COUNT over
+ * `media_assets`. `captionedCount` counts complete captions with recorded usage.
+ */
+export interface CaptioningUsageAggregate {
+  captionedCount: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCost: number;
+}
+
+/**
+ * Global cost overview across the three lanes (spec §10.4): the §8b agent-loop
+ * cost, the auxiliary tool-call cost, and the captioning cost. Summed
+ * independently; presented side-by-side, never as one blended headline (§9).
+ */
+export interface CostOverview {
+  agentLoopCost: number;
+  toolCost: number;
+  captioningCost: number;
 }
 
 /**
@@ -2374,13 +2471,152 @@ export class Storage {
     });
   }
 
-  updateCaptionResult(assetId: string, caption: string, model: string): Promise<void> {
+  updateCaptionResult(
+    assetId: string,
+    caption: string,
+    model: string,
+    usage?: RawTokenUsage | null,
+    cost?: number | null,
+  ): Promise<void> {
+    // Auxiliary usage/cost (spec AUXILIARY-USAGE-TRACKING §8.1) written atomically
+    // with the caption result. Null when usage is unknown (gateway omitted it) —
+    // left NULL, never 0. `caption_total_tokens` = input + output + cacheRead
+    // (= prompt + completion on the OpenAI transport). Cost may be 0 (usage known,
+    // no rates configured). This lane never touches `agent_sessions.usage_*` (§4).
+    const inputTokens = usage ? usage.input : null;
+    const outputTokens = usage ? usage.output : null;
+    const cacheReadTokens = usage ? usage.cacheRead : null;
+    const totalTokens = usage ? usage.input + usage.output + usage.cacheRead : null;
+    const captionCost = usage ? cost ?? 0 : null;
     return this.write((db) => {
       db.prepare(
         `update media_assets
-         set caption = ?, caption_model = ?, caption_status = 'complete', caption_error = null, updated_at = ?
+         set caption = ?, caption_model = ?, caption_status = 'complete', caption_error = null,
+             caption_input_tokens = ?, caption_output_tokens = ?, caption_cache_read_tokens = ?,
+             caption_total_tokens = ?, caption_cost = ?, updated_at = ?
          where id = ?`,
-      ).run(caption, model, Date.now(), assetId);
+      ).run(caption, model, inputTokens, outputTokens, cacheReadTokens, totalTokens, captionCost, Date.now(), assetId);
+    });
+  }
+
+  /**
+   * Append one row to the auxiliary tool-use usage ledger (spec §8.2). Generates
+   * `id` (nanoid) and `created_at`; runs on the single-writer queue. Used by the
+   * `image_generate` tool's `recordToolUsage` callback. Never updates
+   * `agent_sessions` — the per-session rollup is derived on read (§8.3).
+   */
+  insertToolInvocation(input: ToolInvocationInput): Promise<void> {
+    const row: ToolInvocationRow = {
+      id: `toolinv_${nanoid(12)}`,
+      agent_session_id: input.agentSessionId,
+      tool_name: input.toolName,
+      tool_call_id: input.toolCallId ?? null,
+      model_id: input.modelId ?? null,
+      provider: input.provider ?? null,
+      input_tokens: input.inputTokens ?? null,
+      output_tokens: input.outputTokens ?? null,
+      cache_read_tokens: input.cacheReadTokens ?? null,
+      cache_write_tokens: input.cacheWriteTokens ?? null,
+      images: input.images ?? null,
+      cost: input.cost ?? null,
+      ref: input.ref ?? null,
+      created_at: Date.now(),
+    };
+    return this.write((db) => {
+      db.prepare(
+        `insert into tool_invocations (
+           id, agent_session_id, tool_name, tool_call_id, model_id, provider,
+           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+           images, cost, ref, created_at
+         ) values (
+           @id, @agent_session_id, @tool_name, @tool_call_id, @model_id, @provider,
+           @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens,
+           @images, @cost, @ref, @created_at
+         )`,
+      ).run(row);
+    });
+  }
+
+  /**
+   * Per-session auxiliary tool-spend rollup (spec §8.3/§10.3): SUM/COUNT over the
+   * ledger for one session. Always returns a zeroed shape (never null) so callers
+   * render "0 calls" rather than "unknown" for a session with no tool spend.
+   */
+  getSessionToolUsage(agentSessionId: string): SessionToolUsage {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select
+             count(*) as calls,
+             coalesce(sum(input_tokens), 0) as inputTokens,
+             coalesce(sum(output_tokens), 0) as outputTokens,
+             coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+             coalesce(sum(cache_write_tokens), 0) as cacheWriteTokens,
+             coalesce(sum(cost), 0) as cost
+           from tool_invocations where agent_session_id = ?`,
+        )
+        .get(agentSessionId) as SessionToolUsage;
+      return row;
+    });
+  }
+
+  /**
+   * All ledger rows for a session, newest-first (spec §10.3) — matched into the
+   * transcript by `tool_call_id` so the rollout can annotate the right block.
+   */
+  getToolInvocationsBySession(agentSessionId: string): ToolInvocationRow[] {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select * from tool_invocations where agent_session_id = ? order by created_at desc`,
+        )
+        .all(agentSessionId) as ToolInvocationRow[];
+    });
+  }
+
+  /**
+   * Captioning-pool usage aggregate (spec §10.2): SUM/COUNT over `media_assets`
+   * rows that recorded usage. `captionedCount` counts complete captions whose
+   * token usage is present (legacy/unknown rows excluded from the count and sums).
+   */
+  getCaptioningUsageAggregate(): CaptioningUsageAggregate {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select
+             sum(case when caption_total_tokens is not null then 1 else 0 end) as captionedCount,
+             coalesce(sum(caption_input_tokens), 0) as totalInputTokens,
+             coalesce(sum(caption_output_tokens), 0) as totalOutputTokens,
+             coalesce(sum(caption_cost), 0) as totalCost
+           from media_assets`,
+        )
+        .get() as { captionedCount: number | null; totalInputTokens: number; totalOutputTokens: number; totalCost: number };
+      return {
+        captionedCount: row.captionedCount ?? 0,
+        totalInputTokens: row.totalInputTokens,
+        totalOutputTokens: row.totalOutputTokens,
+        totalCost: row.totalCost,
+      };
+    });
+  }
+
+  /**
+   * Global cost overview across the three lanes (spec §10.4): agent-loop cost
+   * (Σ `agent_sessions.usage_cost`), tool cost (Σ `tool_invocations.cost`), and
+   * captioning cost (Σ `media_assets.caption_cost`). Three independent SUMs.
+   */
+  getCostOverview(): CostOverview {
+    return this.read((db) => {
+      const agentLoop = db
+        .prepare(`select coalesce(sum(usage_cost), 0) as c from agent_sessions`)
+        .get() as { c: number };
+      const tool = db
+        .prepare(`select coalesce(sum(cost), 0) as c from tool_invocations`)
+        .get() as { c: number };
+      const captioning = db
+        .prepare(`select coalesce(sum(caption_cost), 0) as c from media_assets`)
+        .get() as { c: number };
+      return { agentLoopCost: agentLoop.c, toolCost: tool.c, captioningCost: captioning.c };
     });
   }
 
@@ -5415,6 +5651,16 @@ create table if not exists media_assets (
   -- retrying" survives a restart and is visible to the DB-derived pipeline counts
   -- (the captioning pool previously tracked this in-memory only).
   caption_attempts integer not null default 0,
+  -- Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §8.1), written
+  -- atomically with the caption result. Nullable: legacy rows and gateways that
+  -- omit usage read as "unknown" (never 0). caption_total_tokens =
+  -- input+output+cacheRead; caption_cost is USD. A separate lane from
+  -- agent_sessions.usage_* (§4). Added via the v20->v21 migration for existing DBs.
+  caption_input_tokens integer,
+  caption_output_tokens integer,
+  caption_cache_read_tokens integer,
+  caption_total_tokens integer,
+  caption_cost real,
   download_status text not null default 'complete'
     check(download_status in ('complete', 'failed')),
   download_error text,
@@ -5638,6 +5884,31 @@ create index if not exists idx_agent_sessions_timeline
 
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
+
+-- Auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one row
+-- per billable raw-fetch tool call (today image_generate). Attributed to the
+-- ambient session but a SEPARATE accounting lane — never folded into
+-- agent_sessions.usage_* (§4). All usage/cost fields nullable ("unknown", not 0).
+-- Created via the v20→v21 migration for existing DBs.
+create table if not exists tool_invocations (
+  id text primary key,
+  agent_session_id text,
+  tool_name text not null,
+  tool_call_id text,
+  model_id text,
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost real,
+  ref text,
+  created_at integer not null
+);
+
+create index if not exists idx_tool_invocations_session
+  on tool_invocations(agent_session_id, created_at);
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
@@ -5647,7 +5918,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 20;
+export const LATEST_SCHEMA_VERSION = 21;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6173,6 +6444,53 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
        alter table agent_sessions add column usage_cache_write_tokens integer;
        alter table agent_sessions add column usage_cost real;
        alter table agent_sessions add column context_tokens integer;`,
+    );
+  },
+  // index 20 (v20 -> v21): auxiliary usage tracking (spec AUXILIARY-USAGE-TRACKING
+  // §8/§12). Two additive, idempotent changes, same discipline as v19→v20:
+  //   1. media_assets gains 5 nullable caption usage/cost columns (§8.1) —
+  //      existing rows backfill to NULL ("unknown", never 0).
+  //   2. tool_invocations ledger table + its session index (§8.2) created if
+  //      absent (the generic per-tool-call lane; image_generate is the first user).
+  // Both guarded by existence checks so a test fixture that rewound user_version
+  // on a current DB re-runs harmlessly (mirrors the v19→v20 presence guard).
+  // Fresh DBs get all of this directly from SCHEMA and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'media_assets'`)
+      .get();
+    if (table) {
+      const columns = db.pragma(`table_info(media_assets)`) as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "caption_cost")) {
+        db.exec(
+          `alter table media_assets add column caption_input_tokens integer;
+           alter table media_assets add column caption_output_tokens integer;
+           alter table media_assets add column caption_cache_read_tokens integer;
+           alter table media_assets add column caption_total_tokens integer;
+           alter table media_assets add column caption_cost real;`,
+        );
+      }
+    }
+    // `create table/index if not exists` is itself idempotent — no extra guard.
+    db.exec(
+      `create table if not exists tool_invocations (
+         id text primary key,
+         agent_session_id text,
+         tool_name text not null,
+         tool_call_id text,
+         model_id text,
+         provider text,
+         input_tokens integer,
+         output_tokens integer,
+         cache_read_tokens integer,
+         cache_write_tokens integer,
+         images integer,
+         cost real,
+         ref text,
+         created_at integer not null
+       );
+       create index if not exists idx_tool_invocations_session
+         on tool_invocations(agent_session_id, created_at);`,
     );
   },
 ];

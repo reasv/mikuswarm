@@ -6,7 +6,7 @@ import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { ContextMessage } from "../../context/builder.js";
 import { externalizeImages } from "../../agent/session-capture.js";
 import { isFinalTurnMessage } from "../../agent/factory.js";
-import type { AgentSessionRow } from "../../storage/index.js";
+import type { AgentSessionRow, ToolInvocationRow } from "../../storage/index.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
 import type { RequestContext } from "./types.js";
@@ -93,8 +93,15 @@ export function sessionDetail(
   const row = ctx.deps.storage.getAgentSession(ctx.params.id);
   if (!row) return sendError(res, 404, `Unknown session: ${ctx.params.id}`);
   const transcript = parseJsonArray(row.transcript_json);
+  // Auxiliary tool-spend lane (spec AUXILIARY-USAGE-TRACKING §10.3): the
+  // per-session rollup (a SECOND line in SessionView, never blended into the §8b
+  // actuals — §9) plus the per-call ledger rows the rollout matches by
+  // `toolCallId` to annotate the image_generate block.
+  const toolUsage = ctx.deps.storage.getSessionToolUsage(row.id);
+  const toolInvocations = ctx.deps.storage.getToolInvocationsBySession(row.id);
   sendJson(res, 200, {
-    session: sessionMeta(row, ctx.deps.factory),
+    session: { ...sessionMeta(row, ctx.deps.factory), toolUsage },
+    toolInvocations: toolInvocations.map(toolInvocationWire),
     // Normalize to the same wire shape as the room-context endpoint: the
     // persisted snapshot is raw ContextMessage JSON whose optional keys
     // (timestamp/tier/imageBlocks) were dropped by serialization, but the
@@ -107,6 +114,20 @@ export function sessionDetail(
     rolloutStartIndex: rolloutStartIndex(transcript),
     contextDumpPath: row.context_dump_path,
   });
+}
+
+/**
+ * GET /api/cost-overview — global spend across the three lanes (spec
+ * AUXILIARY-USAGE-TRACKING §10.4): agent-loop cost, auxiliary tool-call cost, and
+ * captioning cost. Each is an independent SUM; presented side-by-side, never
+ * blended into one headline (§9).
+ */
+export function costOverview(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  sendJson(res, 200, ctx.deps.storage.getCostOverview());
 }
 
 /**
@@ -434,6 +455,30 @@ function sessionMeta(
     startedAt: row.started_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
+  };
+}
+
+/**
+ * Wire projection of one auxiliary tool-use ledger row (spec
+ * AUXILIARY-USAGE-TRACKING §10.3). `toolCallId` lets the rollout match a row to
+ * its `image_generate` block; token/cost fields are null when usage is unknown
+ * (rendered "—", never 0).
+ */
+function toolInvocationWire(row: ToolInvocationRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    toolCallId: row.tool_call_id,
+    toolName: row.tool_name,
+    modelId: row.model_id,
+    provider: row.provider,
+    input: row.input_tokens,
+    output: row.output_tokens,
+    cacheRead: row.cache_read_tokens,
+    cacheWrite: row.cache_write_tokens,
+    images: row.images,
+    cost: row.cost,
+    ref: row.ref,
+    createdAt: row.created_at,
   };
 }
 

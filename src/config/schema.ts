@@ -490,6 +490,18 @@ const CaptioningModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
+  // USD/1M-token cost rates for auxiliary (out-of-loop) usage accounting (spec
+  // AUXILIARY-USAGE-TRACKING §7.1) — identical shape to `[models.*].cost`. Token
+  // usage is captured regardless; this only prices it. Resolution (app wiring):
+  // modality model's cost → top-level `[captioning.model].cost` → unset (= 0 =
+  // untracked). 00-defaults leaves it unset per the explicit-deployment-config
+  // convention; real rates live in local config.
+  cost: Type.Optional(StrictObject({
+    input: Type.Number({ minimum: 0 }),
+    output: Type.Number({ minimum: 0 }),
+    cache_read: Type.Number({ minimum: 0 }),
+    cache_write: Type.Number({ minimum: 0 }),
+  })),
   // LLM rate-limit group (spec §9.2/§9.4). Captioning typically sits on a
   // separate, generous budget (OpenRouter) — declare that group under
   // `[rate_limits.llm.*]` and name it here. Unset = `default` (shares the
@@ -644,6 +656,16 @@ export type BrowserConfig = Static<typeof BrowserSchema>;
 // tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
 // `Authorization: Bearer`. The `api_key` field name matches the secret regex so
 // it auto-registers for log redaction.
+// One per-tier image cost block (spec AUXILIARY-USAGE-TRACKING §7.2): the four
+// USD/1M-token rates plus an optional flat per-image charge. All >= 0.
+const ImageCostBlock = StrictObject({
+  input: Type.Number({ minimum: 0 }),
+  output: Type.Number({ minimum: 0 }),
+  cache_read: Type.Number({ minimum: 0 }),
+  cache_write: Type.Number({ minimum: 0 }),
+  per_image: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
 const ImageGenSchema = StrictObject({
   base_url: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
@@ -656,6 +678,17 @@ const ImageGenSchema = StrictObject({
   // truncated before any image is produced (see src/tools/image-gen.ts).
   max_output_tokens: Type.Optional(Type.Number({ minimum: 256 })),
   output_subdir: Type.Optional(Type.String()),
+  // Per-tier USD cost rates for auxiliary usage accounting (spec
+  // AUXILIARY-USAGE-TRACKING §7.2). Image models price differently per tier
+  // (pro vs flash) and Gemini bills the generated image as `candidatesTokenCount`
+  // (output tokens) — so token rates are USD/1M tokens like everywhere else.
+  // `per_image` is an OPTIONAL flat USD charge added once per generated image,
+  // for endpoints that quote per-image pricing. Set token rates, the flat charge,
+  // both, or neither (unset = 0 = untracked). 00-defaults leaves it unset.
+  costs: Type.Optional(StrictObject({
+    pro: Type.Optional(ImageCostBlock),
+    flash: Type.Optional(ImageCostBlock),
+  })),
 });
 
 // One LLM rate-limit group = one shared upstream budget (spec §9.2). There is one

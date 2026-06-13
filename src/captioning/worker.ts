@@ -41,7 +41,7 @@ export class CaptionWorker {
       context: "pipeline",
     });
 
-    await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
+    await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
     return asset.event_id;
   }
 
@@ -57,7 +57,7 @@ export class CaptionWorker {
             filename: asset.original_filename ?? path.basename(asset.local_path!),
             context: "pipeline",
           });
-          await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
+          await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
           return asset.event_id;
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
@@ -87,7 +87,7 @@ export class CaptionWorker {
         filename: asset.original_filename ?? path.basename(asset.local_path!),
         context: "pipeline",
       });
-      await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model);
+      await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
       return asset.event_id;
     } finally {
       await unlink(tmpPath).catch(() => {});

@@ -237,6 +237,74 @@ test("image_generate writes the image to the workspace and returns an inline pre
   });
 });
 
+test("image_generate records a tool_invocations ledger row with parsed usage + computed cost", async () => {
+  await withWorkspace(async (workspace) => {
+    const b64 = await smallPngBase64();
+    // Gemini reply carries usageMetadata (spec §6.2): image billed as candidates tokens.
+    const server = await startGeminiServer(() => ({
+      json: {
+        ...geminiImageResponse(b64),
+        usageMetadata: {
+          promptTokenCount: 500,
+          candidatesTokenCount: 1290,
+          cachedContentTokenCount: 100,
+          totalTokenCount: 1790,
+        },
+      },
+    }));
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    const records: import("../src/tools/image-gen.js").ToolUsageRecord[] = [];
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client });
+      const tool = createImageGenTool({
+        ...ctx,
+        agentSessionId: "s-img",
+        recordToolUsage: (r) => records.push(r),
+        // pro: $2/1M input, $30/1M output, plus a flat $0.04 per image.
+        costRates: { pro: { input: 2, output: 30, cacheRead: 0, cacheWrite: 0, perImage: 0.04 } },
+      });
+      await tool.execute("call-img-1", { prompt: "a yellow square" });
+
+      assert.equal(records.length, 1, "one ledger row recorded");
+      const rec = records[0];
+      assert.equal(rec.agentSessionId, "s-img");
+      assert.equal(rec.toolName, "image_generate");
+      assert.equal(rec.toolCallId, "call-img-1");
+      assert.equal(rec.provider, "gemini");
+      assert.equal(rec.modelId, "gemini-3-pro-image");
+      // input = prompt - cached = 400; output = candidates = 1290; cacheRead = 100.
+      assert.deepEqual(rec.usage, { input: 400, output: 1290, cacheRead: 100, cacheWrite: 0, images: 1 });
+      // cost = 400/1e6*2 + 1290/1e6*30 + 0.04 = 0.0008 + 0.0387 + 0.04 = 0.0795
+      assert.ok(Math.abs(rec.cost - 0.0795) < 1e-9, `cost ${rec.cost}`);
+      assert.equal(rec.ref, records[0].ref); // points at the saved path
+      assert.match(rec.ref ?? "", /generated-images/);
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+test("image_generate omits the ledger row when the provider returns no usageMetadata", async () => {
+  await withWorkspace(async (workspace) => {
+    const b64 = await smallPngBase64();
+    const server = await startGeminiServer(() => ({ json: geminiImageResponse(b64) })); // no usageMetadata
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    const records: import("../src/tools/image-gen.js").ToolUsageRecord[] = [];
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client });
+      const tool = createImageGenTool({ ...ctx, agentSessionId: "s", recordToolUsage: (r) => records.push(r) });
+      const result: any = await tool.execute("call-x", { prompt: "a square" });
+      // The image still saves; only the (unmeasurable) ledger row is skipped.
+      assert.match(result.details.path, /generated-images/);
+      assert.equal(records.length, 0, "no ledger row when usage is unknown");
+    } finally {
+      await server.close();
+      await stub.cleanup();
+    }
+  });
+});
+
 test("image_generate edit mode loads a workspace reference image as an inlineData part", async () => {
   await withWorkspace(async (workspace) => {
     // Drop a reference image into the workspace.

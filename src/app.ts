@@ -32,7 +32,7 @@ import {
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { emptyUsageTotals } from "./agent/usage.js";
-import type { SessionUsageTracker, SessionUsageTotals } from "./agent/usage.js";
+import type { CostRates, SessionUsageTracker, SessionUsageTotals } from "./agent/usage.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -440,6 +440,42 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return config.models.default.rate_limit_group;
   }
 
+  // Auxiliary caption cost rates (spec AUXILIARY-USAGE-TRACKING §5/§7.1): the
+  // config cost block is snake_case USD/1M tokens; map to the CostRates shape.
+  // Resolution: modality model's cost → top-level [captioning.model].cost → unset
+  // (= usage captured, cost 0 = untracked). Does NOT fall back to models.default.
+  function resolveModalityCost(modalityConfig?: {
+    model?: { cost?: { input: number; output: number; cache_read: number; cache_write: number } };
+  }): CostRates | undefined {
+    const block = modalityConfig?.model?.cost ?? captioningConfig.model?.cost;
+    if (!block) return undefined;
+    return {
+      input: block.input,
+      output: block.output,
+      cacheRead: block.cache_read,
+      cacheWrite: block.cache_write,
+    };
+  }
+
+  // Image-gen per-tier cost block (spec §7.2): snake_case config → CostRates,
+  // carrying the optional flat per_image charge. Unset ⇒ undefined (untracked).
+  function toImageCostRates(block?: {
+    input: number;
+    output: number;
+    cache_read: number;
+    cache_write: number;
+    per_image?: number;
+  }): CostRates | undefined {
+    if (!block) return undefined;
+    return {
+      input: block.input,
+      output: block.output,
+      cacheRead: block.cache_read,
+      cacheWrite: block.cache_write,
+      ...(block.per_image != null ? { perImage: block.per_image } : {}),
+    };
+  }
+
   const imageConfig = captioningConfig.image ?? {};
   const videoConfig = captioningConfig.video ?? {};
   const audioConfig = captioningConfig.audio ?? {};
@@ -462,6 +498,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: imageConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
+      costRates: resolveModalityCost(imageConfig),
       imageProcessing: inferenceImageOptions,
     })],
     ["video", new InferenceClient({
@@ -472,6 +509,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: videoConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
+      costRates: resolveModalityCost(videoConfig),
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
         maxResolution: mediaVideoConfig.max_resolution ?? 480,
@@ -492,6 +530,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
       rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
+      costRates: resolveModalityCost(audioConfig),
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {
         maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
@@ -1342,6 +1381,37 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             scheduler: llmScheduler,
             // Bound the scheduler-admission wait by the interactive budget (#14).
             maxWaitMs: config.recovery?.llm_request_max_wait_ms,
+            // Auxiliary usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): attribute
+            // each billable generation to this session and append one durable row.
+            // Separate lane — never touches agent_sessions.usage_* (§4).
+            agentSessionId: sessionId,
+            recordToolUsage: (record) => {
+              void storage
+                .insertToolInvocation({
+                  agentSessionId: record.agentSessionId,
+                  toolName: record.toolName,
+                  toolCallId: record.toolCallId,
+                  modelId: record.modelId,
+                  provider: record.provider,
+                  inputTokens: record.usage.input,
+                  outputTokens: record.usage.output,
+                  cacheReadTokens: record.usage.cacheRead,
+                  cacheWriteTokens: record.usage.cacheWrite,
+                  images: record.usage.images ?? null,
+                  cost: record.cost,
+                  ref: record.ref,
+                })
+                .catch((error) => {
+                  logger.warn("image_gen_usage_ledger_insert_failed", {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                });
+            },
+            // Per-tier cost rates (spec §7.2): snake_case config block → CostRates.
+            costRates: {
+              pro: toImageCostRates(config.image_gen.costs?.pro),
+              flash: toImageCostRates(config.image_gen.costs?.flash),
+            },
             config: config.image_gen,
           })]
         : []),

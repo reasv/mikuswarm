@@ -1,5 +1,10 @@
 import { createQuery, createInfiniteQuery } from '@tanstack/svelte-query';
-import { getPipelines, getPipelineItems, getPipelineItem } from '$lib/api/pipelines.remote';
+import {
+	getPipelines,
+	getPipelineItems,
+	getPipelineItem,
+	getCostOverview
+} from '$lib/api/pipelines.remote';
 import type { PipelineId, PipelineItemsResponse } from '$lib/schemas';
 import { fresh } from './client';
 import { keys } from './keys';
@@ -54,6 +59,18 @@ export function pipelineItemsQuery(
 			refetchInterval: 5_000
 		};
 	});
+}
+
+/**
+ * Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING
+ * §10.4). Polled on the same 5s cadence as the dashboard feed.
+ */
+export function costOverviewQuery() {
+	return createQuery(() => ({
+		queryKey: keys.costOverview(),
+		queryFn: () => fresh(getCostOverview()),
+		refetchInterval: 5_000
+	}));
 }
 
 export function pipelineItemQuery(pool: () => PipelineId | null, id: () => string | null) {

@@ -9,6 +9,7 @@
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
 	import { formatTokens, formatUsd } from '$lib/format';
+	import type { ToolInvocation } from '$lib/schemas';
 	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
 	import VerbatimContext from '$lib/components/verbatim/VerbatimContext.svelte';
@@ -139,6 +140,21 @@
 		const d = session.data;
 		return d ? d.transcript.slice(d.rolloutStartIndex) : [];
 	});
+
+	// Auxiliary tool-spend lane (spec AUXILIARY-USAGE-TRACKING §10.3): the
+	// per-session rollup (shown as a SECOND line below the §8b actuals, never
+	// blended — §9) and the per-call ledger rows keyed by toolCallId for the
+	// rollout annotation. `toolUsage` is null/zero when the session spent nothing.
+	const toolSpend = $derived.by(() => {
+		const tu = session.data?.session.toolUsage;
+		return tu && tu.calls > 0 ? tu : null;
+	});
+	const toolUsageByCallId = $derived.by(() => {
+		const map = new Map<string, ToolInvocation>();
+		for (const row of session.data?.toolInvocations ?? [])
+			if (row.toolCallId) map.set(row.toolCallId, row);
+		return map;
+	});
 	const isRunning = $derived(session.data?.session.status === 'running');
 	// Resumable statuses (spec CONCURRENCY-AND-RATE-LIMITING §6.2 / Decision D):
 	// `failed-resumable` (parked by Layer-2 exhaustion) and `interrupted` (healed
@@ -253,12 +269,28 @@
 				<span>· {actuals.llmRequests} req</span>
 			</div>
 		{/if}
+		{#if toolSpend}
+			<!-- Auxiliary tool spend (spec AUXILIARY-USAGE-TRACKING §9/§10.3): a SECOND,
+			     visually distinct line — these are image-gen/tool tokens on a different
+			     pricing scale that do NOT count toward the context window, so they are
+			     never merged into the LLM-loop figures above. -->
+			<div
+				class="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b bg-background/40 px-3 py-1 font-mono text-[10px] tabular-nums text-muted-foreground"
+				title={`tool spend (separate lane; not context-bearing) · ${toolSpend.calls} calls · input ${toolSpend.inputTokens} · output ${toolSpend.outputTokens} · cost ${toolSpend.cost}`}
+			>
+				<span class="font-semibold text-foreground">tools</span>
+				<span>· {toolSpend.calls} {toolSpend.calls === 1 ? 'call' : 'calls'}</span>
+				<span>· in {formatTokens(toolSpend.inputTokens)}</span>
+				<span>· out {formatTokens(toolSpend.outputTokens)}</span>
+				{#if toolSpend.cost > 0}<span>· {formatUsd(toolSpend.cost)}</span>{/if}
+			</div>
+		{/if}
 		{#if isRunning && activeId}
 			{#key activeId}
 				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} onHead={(h) => (liveHead = h)} />
 			{/key}
 		{:else}
-			<Rollout messages={rolloutMessages} />
+			<Rollout messages={rolloutMessages} toolUsage={toolUsageByCallId} />
 		{/if}
 	{/if}
 </div>

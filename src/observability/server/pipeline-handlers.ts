@@ -41,6 +41,9 @@ export function listPipelines(
   ctx: RequestContext,
 ): void {
   const registry = ctx.deps.pipelines;
+  // Captioning usage aggregate (spec AUXILIARY-USAGE-TRACKING §10.2): one SUM/COUNT
+  // over media_assets, attached only to the captioning pool's row.
+  const captioningUsage = ctx.deps.storage.getCaptioningUsageAggregate();
   const pipelines = PIPELINE_IDS.map((pool) => {
     const stats = registry ? registry[pool] : null;
     return {
@@ -50,6 +53,7 @@ export function listPipelines(
       maxRetries: stats?.maxRetries ?? FALLBACK_MAX_RETRIES[pool],
       inFlight: stats ? stats.inFlight() : 0,
       counts: ctx.deps.storage.getPipelineCounts(pool),
+      usage: pool === "captioning" ? captioningUsage : null,
     };
   });
   sendJson(res, 200, { pipelines });
@@ -98,6 +102,19 @@ function mediaAssetWire(asset: MediaAssetRow): Record<string, unknown> {
     captionModel: asset.caption_model ?? null,
     /** Whether bytes are fetchable at GET /api/media/:ref. */
     hasBytes: asset.local_path != null,
+    // Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §10.1). Null on
+    // legacy rows / gateways that omit usage (rendered "—", never 0). `cost` may
+    // be 0 when usage is known but no rates are configured (hidden by formatUsd).
+    usage:
+      asset.caption_total_tokens != null
+        ? {
+            input: asset.caption_input_tokens ?? 0,
+            output: asset.caption_output_tokens ?? 0,
+            cacheRead: asset.caption_cache_read_tokens ?? 0,
+            total: asset.caption_total_tokens,
+            cost: asset.caption_cost ?? 0,
+          }
+        : null,
   };
 }
 

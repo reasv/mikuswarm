@@ -19,5 +19,7 @@ export const keys = {
 	pipelineItem: (pool: string, id: string) => ['pipelines', pool, 'items', id] as const,
 	// Scheduler view (spec LLM-FAILURE-HANDLING §9.1/§9.2) — polled snapshots.
 	scheduler: () => ['scheduler'] as const,
-	llmRequests: () => ['llm-requests'] as const
+	llmRequests: () => ['llm-requests'] as const,
+	// Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING §10.4).
+	costOverview: () => ['cost-overview'] as const
 };

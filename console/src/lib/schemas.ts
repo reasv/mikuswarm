@@ -98,6 +98,20 @@ export const SessionMeta = Schema.Struct({
 	),
 	contextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
 	maxContextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+	// Auxiliary tool-spend rollup (spec AUXILIARY-USAGE-TRACKING §10.3): a SEPARATE
+	// lane shown beside the §8b actuals, never blended in (§9). Present on the
+	// session-detail meta only (absent on the list shape), hence optional. Always a
+	// zeroed shape (never null) when present — `calls === 0` means no tool spend.
+	toolUsage: Schema.optional(
+		Schema.Struct({
+			calls: Schema.Number,
+			inputTokens: Schema.Number,
+			outputTokens: Schema.Number,
+			cacheReadTokens: Schema.Number,
+			cacheWriteTokens: Schema.Number,
+			cost: Schema.Number
+		})
+	),
 	noReply: Schema.Boolean,
 	error: Schema.NullOr(Schema.String),
 	createdAt: Schema.Number,
@@ -108,13 +122,38 @@ export const SessionMeta = Schema.Struct({
 export type SessionMeta = Schema.Schema.Type<typeof SessionMeta>;
 export const SessionsResponse = Schema.Struct({ sessions: Schema.Array(SessionMeta) });
 
+/**
+ * One auxiliary tool-use ledger row (spec AUXILIARY-USAGE-TRACKING §10.3),
+ * matched into the rollout by `toolCallId` to annotate the `image_generate`
+ * block. Token/cost fields are nullable ("unknown", rendered "—").
+ */
+export const ToolInvocation = Schema.Struct({
+	id: Schema.String,
+	toolCallId: Schema.NullOr(Schema.String),
+	toolName: Schema.String,
+	modelId: Schema.NullOr(Schema.String),
+	provider: Schema.NullOr(Schema.String),
+	input: Schema.NullOr(Schema.Number),
+	output: Schema.NullOr(Schema.Number),
+	cacheRead: Schema.NullOr(Schema.Number),
+	cacheWrite: Schema.NullOr(Schema.Number),
+	images: Schema.NullOr(Schema.Number),
+	cost: Schema.NullOr(Schema.Number),
+	ref: Schema.NullOr(Schema.String),
+	createdAt: Schema.Number
+});
+export type ToolInvocation = Schema.Schema.Type<typeof ToolInvocation>;
+
 /** GET /api/sessions/:id — transcript/snapshot elements kept permissive. */
 export const SessionDetailResponse = Schema.Struct({
 	session: SessionMeta,
 	contextSnapshot: Schema.Array(ContextMessageWire),
 	transcript: Schema.Array(PassthroughObject),
 	rolloutStartIndex: Schema.Number,
-	contextDumpPath: Schema.NullOr(Schema.String)
+	contextDumpPath: Schema.NullOr(Schema.String),
+	// Auxiliary tool-use ledger rows for this session (spec §10.3); optional so a
+	// pre-feature backend still decodes.
+	toolInvocations: Schema.optional(Schema.Array(ToolInvocation))
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 
@@ -175,6 +214,18 @@ export const PipelineCounts = Schema.Struct({
 });
 export type PipelineCounts = Schema.Schema.Type<typeof PipelineCounts>;
 
+/**
+ * Captioning-pool usage aggregate (spec AUXILIARY-USAGE-TRACKING §10.2), present
+ * only on the captioning pool's row (null elsewhere). SUM/COUNT over media_assets.
+ */
+export const CaptioningUsageAggregate = Schema.Struct({
+	captionedCount: Schema.Number,
+	totalInputTokens: Schema.Number,
+	totalOutputTokens: Schema.Number,
+	totalCost: Schema.Number
+});
+export type CaptioningUsageAggregate = Schema.Schema.Type<typeof CaptioningUsageAggregate>;
+
 /** One pool's dashboard row (GET /api/pipelines). */
 export const PipelineHealth = Schema.Struct({
 	pool: PipelineId,
@@ -182,7 +233,10 @@ export const PipelineHealth = Schema.Struct({
 	workerCount: Schema.Number,
 	maxRetries: Schema.Number,
 	inFlight: Schema.Number,
-	counts: PipelineCounts
+	counts: PipelineCounts,
+	// Captioning usage aggregate (§10.2); null on non-captioning pools. Optional so
+	// a pre-feature backend still decodes.
+	usage: Schema.optional(Schema.NullOr(CaptioningUsageAggregate))
 });
 export type PipelineHealth = Schema.Schema.Type<typeof PipelineHealth>;
 export const PipelinesResponse = Schema.Struct({ pipelines: Schema.Array(PipelineHealth) });
@@ -222,7 +276,20 @@ export const PipelineMediaAsset = Schema.Struct({
 	captionStatus: Schema.String,
 	caption: Schema.NullOr(Schema.String),
 	captionModel: Schema.NullOr(Schema.String),
-	hasBytes: Schema.Boolean
+	hasBytes: Schema.Boolean,
+	// Auxiliary caption usage/cost (spec §10.1); null on legacy rows / gateways
+	// that omit usage. `cost` may be 0 (usage known, no rates) → hidden by formatUsd.
+	usage: Schema.optional(
+		Schema.NullOr(
+			Schema.Struct({
+				input: Schema.Number,
+				output: Schema.Number,
+				cacheRead: Schema.Number,
+				total: Schema.Number,
+				cost: Schema.Number
+			})
+		)
+	)
 });
 export type PipelineMediaAsset = Schema.Schema.Type<typeof PipelineMediaAsset>;
 
@@ -375,3 +442,15 @@ export const LlmRequestsResponse = Schema.Struct({
 	requests: Schema.Array(LlmRequestRecord)
 });
 export type LlmRequestsResponse = Schema.Schema.Type<typeof LlmRequestsResponse>;
+
+/**
+ * GET /api/cost-overview — global spend across the three lanes (spec
+ * AUXILIARY-USAGE-TRACKING §10.4): kept side-by-side, never summed into one
+ * headline (§9). All USD.
+ */
+export const CostOverview = Schema.Struct({
+	agentLoopCost: Schema.Number,
+	toolCost: Schema.Number,
+	captioningCost: Schema.Number
+});
+export type CostOverview = Schema.Schema.Type<typeof CostOverview>;

@@ -106,3 +106,71 @@ export class SessionUsageTracker {
     };
   }
 }
+
+// =============================================================================
+// Auxiliary (out-of-loop) usage cost helper (spec AUXILIARY-USAGE-TRACKING §5).
+//
+// A pure, I/O-free cost calculator for provider calls made OUTSIDE the agent
+// runner (raw `fetch`, no pi-ai `withRequestRetry` / model descriptor) — today
+// captioning (src/captioning) and the image_generate tool (src/tools/image-gen).
+// pi-ai computes cost from a model descriptor during `streamSimple`; these paths
+// never construct one, so we compute locally from config rates. Keeping the
+// formula here — `rate / 1e6 * tokens`, identical to pi-ai's `calculateCost` —
+// guarantees parity with the §8b agent-loop accounting. Auxiliary spend is
+// accounted in a SEPARATE lane and is NEVER folded into SessionUsageTracker /
+// `agent_sessions.usage_*` (spec §4 invariant).
+// =============================================================================
+
+/** Cost rates in USD per 1,000,000 tokens (same scale as §8b / `[models.*].cost`). */
+export interface CostRates {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** Flat USD added per generated image (image-gen only); ignored elsewhere. */
+  perImage?: number;
+}
+
+/** Provider-reported token counts for one auxiliary call. */
+export interface RawTokenUsage {
+  /** Uncached prompt tokens (provider total minus cached). */
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** Count of generated images (image-gen only); drives `perImage`. */
+  images?: number;
+}
+
+/** Per-component + total cost (USD) for one auxiliary call. */
+export interface ComputedCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  image: number;
+  total: number;
+}
+
+/**
+ * Compute USD cost for one auxiliary call from config rates and provider-reported
+ * token counts. Mirrors pi-ai's `calculateCost` (`rate / 1e6 * tokens`) per
+ * component and adds a flat `perImage * images` charge. Unset rates are 0, so an
+ * unconfigured cost block yields `total: 0` (rendered as "untracked"/"—" by the
+ * cost-hidden-when-zero convention) rather than a misleading non-zero figure.
+ */
+export function computeUsageCost(rates: CostRates, u: RawTokenUsage): ComputedCost {
+  const input = (rates.input / 1e6) * (u.input ?? 0);
+  const output = (rates.output / 1e6) * (u.output ?? 0);
+  const cacheRead = (rates.cacheRead / 1e6) * (u.cacheRead ?? 0);
+  const cacheWrite = (rates.cacheWrite / 1e6) * (u.cacheWrite ?? 0);
+  const image = (rates.perImage ?? 0) * (u.images ?? 0);
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    image,
+    total: input + output + cacheRead + cacheWrite + image,
+  };
+}

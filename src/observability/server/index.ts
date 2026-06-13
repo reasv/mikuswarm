@@ -15,6 +15,7 @@ import {
   summaryDetail,
   schedulerSnapshot,
   llmRequests,
+  costOverview,
 } from "./handlers.js";
 import {
   listPipelines,
@@ -77,6 +78,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/summaries/:id", summaryDetail)
     .add("GET", "/api/scheduler", schedulerSnapshot)
     .add("GET", "/api/llm-requests", llmRequests)
+    .add("GET", "/api/cost-overview", costOverview)
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)
     .add("GET", "/api/pipelines/:pool/items", pipelineItems)

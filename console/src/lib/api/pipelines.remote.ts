@@ -5,7 +5,8 @@ import {
 	PipelineId,
 	PipelinesResponse,
 	PipelineItemsResponse,
-	PipelineItemDetail
+	PipelineItemDetail,
+	CostOverview
 } from '$lib/schemas';
 
 /**
@@ -56,4 +57,11 @@ export const getPipelineItem = query(PipelineItemArg, (arg) =>
 		PipelineItemDetail
 	)
 );
+
+/**
+ * GET /api/cost-overview — global spend across the three lanes (spec
+ * AUXILIARY-USAGE-TRACKING §10.4): agent-loop, tool, and captioning cost,
+ * side-by-side (never one blended headline — §9).
+ */
+export const getCostOverview = query(() => apiGet('/api/cost-overview', CostOverview));
 

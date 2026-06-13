@@ -1,3 +1,5 @@
+import type { RawTokenUsage } from "../agent/usage.js";
+
 export type MediaModality = "image" | "video" | "audio";
 
 export interface CaptionModelConfig {
@@ -22,6 +24,38 @@ export interface DescribeMediaOptions {
 export interface DescribeMediaResult {
   text: string;
   model: string;
+  /**
+   * Provider-reported token usage (spec AUXILIARY-USAGE-TRACKING §6.1), or null
+   * when the gateway omits the `usage` block ("unknown", never zero). The caller
+   * computes cost from config rates and persists it (§8.1).
+   */
+  usage: RawTokenUsage | null;
+}
+
+/** Shape of the OpenAI/OpenRouter `usage` block we read (all fields optional). */
+interface OpenAiUsageBlock {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+}
+
+/**
+ * Map an OpenAI/OpenRouter `/chat/completions` `usage` block → {@link RawTokenUsage}
+ * (spec §6.1). `input` is uncached prompt tokens (prompt minus cached); cached
+ * tokens land in `cacheRead`; there is no cache-write notion on this transport.
+ * Returns null when no usage block is present.
+ */
+export function parseOpenAiUsage(usage: OpenAiUsageBlock | undefined | null): RawTokenUsage | null {
+  if (!usage) return null;
+  const prompt = usage.prompt_tokens ?? 0;
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+  return {
+    input: Math.max(0, prompt - cached),
+    output: usage.completion_tokens ?? 0,
+    cacheRead: cached,
+    cacheWrite: 0,
+  };
 }
 
 export async function describeMedia(options: DescribeMediaOptions): Promise<DescribeMediaResult> {
@@ -85,6 +119,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
     const result = (await response.json()) as {
       choices?: Array<{ message?: { content?: string | Array<{ type: string; text?: string }> } }>;
       model?: string;
+      usage?: OpenAiUsageBlock;
     };
 
     const choice = result.choices?.[0]?.message?.content;
@@ -102,7 +137,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
 
     if (!text.trim()) throw new Error("Caption inference returned empty response");
 
-    return { text: text.trim(), model: result.model ?? options.model.id };
+    return { text: text.trim(), model: result.model ?? options.model.id, usage: parseOpenAiUsage(result.usage) };
   } finally {
     if (timeout) clearTimeout(timeout);
     if (options.signal) options.signal.removeEventListener("abort", onSignal);

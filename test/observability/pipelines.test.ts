@@ -922,7 +922,7 @@ test("CaptionWorkerPool emits claimed→completed through the real activity bus"
     const pool = makeCaptionPool(
       storage,
       bus,
-      async () => ({ caption: "a stubbed caption", model: "stub-model" }),
+      async () => ({ caption: "a stubbed caption", model: "stub-model", usage: null, cost: null }),
       2,
     );
 
