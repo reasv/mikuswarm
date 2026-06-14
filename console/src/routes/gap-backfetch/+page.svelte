@@ -87,6 +87,14 @@
 							<td class="py-1 text-[11px] text-red-400">
 								{#if room.cappedHole}
 									{fmtTime(room.cappedHole.fromTimestamp)} → {fmtTime(room.cappedHole.toTimestamp)}
+									{#if room.cappedHole.reason}
+										<span
+											class="ml-1 rounded bg-red-500/15 px-1 py-0.5 font-mono text-[10px] text-red-300"
+											title="why the descent stopped, leaving this hole"
+										>
+											{room.cappedHole.reason}
+										</span>
+									{/if}
 								{:else}
 									—
 								{/if}
