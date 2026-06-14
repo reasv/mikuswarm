@@ -10,6 +10,7 @@ import { roomIdFromTimelineKey } from "../src/timeline/index.js";
 import { configureAgentTimezone } from "../src/time/index.js";
 import type { Logger } from "../src/observability/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
+import { SessionUsageTracker } from "../src/agent/usage.js";
 
 configureAgentTimezone("UTC");
 
@@ -78,6 +79,9 @@ function makeFakeFactory(
 ) {
   return {
     resolveModelId: () => "test-model",
+    // SESSION-COST-LIMITS §6: the worker threads this resolved ceiling into the
+    // capture ctx so its session_usage settle log carries the real cap, not null.
+    resolveSessionCostCeiling: () => 0.5,
     resolveSessionType: () => ({
       session_instruction: "Write your entry. Begin with EXACTLY this header:\n{{header}}\n(room {{room}}, date {{date}})",
     }),
@@ -460,5 +464,78 @@ test("a rejected over-budget edit that recovers to a valid draft appends the rev
     const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
     assert.match(content, /valid recovered entry/);
     assert.doesNotMatch(content, /x x x/, "the rejected over-budget content must not be appended");
+  });
+});
+
+test("the session_usage settle log carries the worker's resolved cost ceiling, not null (SESSION-COST-LIMITS §6, #1b)", async () => {
+  // A diary worker has the §2.2 hard cap but no soft-warn watcher; even so, the
+  // ceiling resolved once via factory.resolveSessionCostCeiling("diary") must be
+  // threaded into the capture ctx so the greppable session_usage settle line is
+  // self-contained (spend vs. the ceiling) rather than logging a misleading null.
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
+
+    // Capturing logger: collect the session_usage settle line emitted at detach.
+    const infoLines: { message: string; fields?: Record<string, unknown> }[] = [];
+    const capturingLogger: Logger = {
+      debug() {}, warn() {}, error() {},
+      info(message: string, fields?: Record<string, unknown>) {
+        infoLines.push({ message, fields });
+      },
+      child() { return capturingLogger; },
+    } as unknown as Logger;
+
+    // Factory that resolves a concrete diary ceiling AND returns a usage tracker
+    // (the settle log only emits when a tracker is wired). The tool finalizes a
+    // valid draft so the run settles and detach fires.
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: (sessionType: string) =>
+        sessionType === "diary" ? 0.5 : undefined,
+      resolveSessionType: () => ({
+        session_instruction: "Begin with EXACTLY this header:\n{{header}}",
+      }),
+      create: async (_session: unknown, tools: AgentTool[]) => {
+        const tool = tools[0]!;
+        const state: { messages: unknown[] } = { messages: [] };
+        return {
+          agent: {
+            prompt: async () => {
+              await tool.execute("t", { command: "create", file_text: `${header}\nentry`, finalize: true });
+            },
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state,
+            abort: () => {},
+          },
+          finalTurn: { type: "satellite", content: "<system>diary satellite</system>" },
+          snapshot: undefined,
+          tokenEstimate: undefined,
+          usage: new SessionUsageTracker(),
+        };
+      },
+    } as any;
+
+    const pool = new DiaryWorkerPool({
+      storage, factory, memoryWriter,
+      config: { worker_count: 1, max_retries: 0, per_session_budget_tokens: 1000 },
+      workspaceRoot,
+      resolveChannelLabel: async () => "Test Room (Earendil)",
+      logger: capturingLogger,
+    });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => diaryStatus(storage, "sum1") === "done");
+    await pool.stop();
+
+    const settle = infoLines.find((l) => l.message === "session_usage");
+    assert.ok(settle, "session_usage settle line emitted at detach");
+    assert.equal(settle!.fields?.sessionType, "diary");
+    assert.equal(
+      settle!.fields?.maxSessionCostUsd,
+      0.5,
+      "the resolved diary ceiling is logged, not null",
+    );
   });
 });

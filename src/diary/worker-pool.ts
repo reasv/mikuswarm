@@ -372,6 +372,11 @@ export class DiaryWorkerPool {
           summaryId: job.summaryId,
         },
       });
+      // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) so
+      // the settle log's spend-vs-ceiling line is self-contained. Diary sessions
+      // get the §2.2 hard cap (no soft-warn watcher), but the ceiling they were
+      // measured against must still be logged rather than a misleading null.
+      const costCeiling = factory.resolveSessionCostCeiling(syntheticSession.sessionType);
       const capture = attachSessionCapture(agent, {
         storage,
         sessionId: syntheticSession.id,
@@ -381,6 +386,7 @@ export class DiaryWorkerPool {
         timelineKey: syntheticSession.timelineKey,
         sessionType: syntheticSession.sessionType,
         model: factory.resolveModelId(syntheticSession.sessionType),
+        maxSessionCostUsd: costCeiling,
         logger,
       });
       this.activeAgents.add(agent);

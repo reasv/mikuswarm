@@ -65,6 +65,7 @@ const SEEDED_RENDERED_INPUT_IDS = ["ev0", "ev1"];
 function makeSucceedingSummaryFactory() {
   return {
     resolveModelId: () => "test-model",
+    resolveSessionCostCeiling: () => 0.5,
     create: async (_session: unknown, tools: AgentTool[]) => {
       const summaryTool = tools[0]!;
       await summaryTool.execute("t", { command: "create", file_text: "A perfectly fine summary." });
@@ -258,6 +259,7 @@ async function seedDiaryJob(storage: Storage, summaryId: string): Promise<void> 
 function makeIdleDiaryFactory() {
   return {
     resolveModelId: () => "test-model",
+    resolveSessionCostCeiling: () => 0.5,
     resolveSessionType: () => undefined,
     create: async () => ({
       agent: {
@@ -340,6 +342,7 @@ test("issue #4 (diary mirror): a storage rejection with retry budget left re-pen
 function makeAbortableFactory(extra: Record<string, unknown> = {}) {
   return {
     resolveModelId: () => "test-model",
+    resolveSessionCostCeiling: () => 0.5,
     resolveSessionType: () => undefined,
     ...extra,
     create: async () => {
@@ -402,6 +405,7 @@ test("cap abort (spec §7): an abort while the pool is RUNNING stays on the sema
     // still running, so this is a degenerate-output problem, not a drain.
     const factory = {
       resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
       create: async () => {
         const agent: any = {
           state: { messages: [] as unknown[], errorMessage: undefined as string | undefined },
@@ -460,6 +464,7 @@ test("cap abort racing pool stop (spec §7 / #13): a cap abort that settles whil
     let pool!: SummarizationWorkerPool;
     const factory = {
       resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
       create: async () => {
         const agent: any = {
           state: { messages: [] as unknown[], errorMessage: undefined as string | undefined },
@@ -547,6 +552,7 @@ test("Fix C: the kickoff is the satellite final turn alone — no trailing 'Summ
     let capturedKickoff: unknown;
     const factory = {
       resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
       create: async (_session: unknown, tools: AgentTool[]) => {
         const summaryTool = tools[0]!;
         await summaryTool.execute("t", { command: "create", file_text: "A fine summary." });
@@ -604,6 +610,7 @@ test("Fix B: a declared-vs-rendered input mismatch fails the job and commits no 
     let promptCalled = false;
     const factory = {
       resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
       create: async () => {
         return {
           agent: {

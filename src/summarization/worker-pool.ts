@@ -368,6 +368,11 @@ export class SummarizationWorkerPool {
       // Attach snapshot + transcript capture so summarization sessions are
       // inspectable too (spec §5), plus usage actuals (spec TOKEN-USAGE-TRACKING
       // §4.3). Detached after the run settles.
+      // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) so
+      // the settle log's spend-vs-ceiling line is self-contained. Summary/condense
+      // sessions get the §2.2 hard cap (no soft-warn watcher), but the ceiling they
+      // were measured against must still be logged rather than a misleading null.
+      const costCeiling = factory.resolveSessionCostCeiling(syntheticSession.sessionType);
       const capture = attachSessionCapture(agent, {
         storage,
         sessionId: syntheticSession.id,
@@ -377,6 +382,7 @@ export class SummarizationWorkerPool {
         timelineKey: syntheticSession.timelineKey,
         sessionType: syntheticSession.sessionType,
         model: factory.resolveModelId(syntheticSession.sessionType),
+        maxSessionCostUsd: costCeiling,
         logger,
       });
       this.activeAgents.add(agent);
