@@ -24,6 +24,15 @@
  * by skipping un-attributed claims.
  */
 
+/**
+ * What a read consumer (marker / guard) needs about another session's claim on a
+ * message: the owning session id when known, or `undefined` for an un-attributed
+ * (queued / pre-launch) claim that is rendered/named as "pending" (review #4).
+ */
+export interface ClaimMarker {
+  sessionId?: string;
+}
+
 export interface SessionClaim {
   /**
    * Owning session id. Backfilled by {@link SessionClaims.attachSession} when the
@@ -98,28 +107,33 @@ export class SessionClaims {
   }
 
   /**
-   * The claim on `externalId` by **another attributable session** (§3.4): a claim
-   * whose owning session id is known and differs from `selfSessionId`. Used by the
-   * marker (§4) and the live `send_message` guard (§6). Un-attributed claims
-   * (sessionId not yet backfilled — a brief accept→launch window) are skipped:
-   * there is nothing to render or name.
+   * The claim on `externalId` by **another session** (§3.4) — used by the marker
+   * (§4) and the live `send_message` guard (§6). Excludes the caller's own claim.
+   * An **un-attributed** claim (sessionId not yet backfilled — the accept→launch
+   * window, or a still-queued trigger) IS returned (review #4): such a claim still
+   * means the message is already being handled, so it must still deter; the
+   * consumer renders/names it as "pending" (no session id yet). An un-attributed
+   * claim can never be self, so the self-exclusion only applies once attributed.
    */
   claimantOf(timelineKey: string, externalId: string, selfSessionId?: string): SessionClaim | undefined {
     const claim = this.byTimeline.get(timelineKey)?.get(externalId);
-    if (!claim || !claim.sessionId) return undefined;
-    if (claim.sessionId === selfSessionId) return undefined;
+    if (!claim) return undefined;
+    if (claim.sessionId && claim.sessionId === selfSessionId) return undefined;
     return claim;
   }
 
   /**
-   * A running session whose **trigger's own reply-target** equals
-   * `replyToExternalId` (§3.4 / §5.1 — co-target coalescing). Returns the first
-   * such attributable claim (sessionId known, not self). The caller still verifies
-   * the steer succeeds (the session may be settling) and applies the coalesce
-   * window. Only attributable claims qualify — coalescing must steer into a live
-   * session, which a not-yet-launched (queued) claim cannot offer.
+   * The claim whose **trigger's own reply-target** equals `replyToExternalId`
+   * (§3.4 / §5.1 — co-target coalescing, spec DEFERRED-COALESCING). Returns the
+   * first match regardless of attribution: an un-attributed (queued / pre-launch)
+   * claim is returned too, so the caller can DEFER the co-reply until the owning
+   * session goes live rather than spawning a twin during the accept→launch window.
+   * The caller inspects `sessionId` (and the owner's liveness) to decide steer vs
+   * defer vs spawn, and applies the coalesce window. Self is excluded; an
+   * un-attributed claim can never be self (the caller is not yet claimed at the
+   * coalesce decision point).
    */
-  coTargetSession(
+  coTargetClaim(
     timelineKey: string,
     replyToExternalId: string,
     selfSessionId?: string,
@@ -127,7 +141,7 @@ export class SessionClaims {
     const perTimeline = this.byTimeline.get(timelineKey);
     if (!perTimeline) return undefined;
     for (const claim of perTimeline.values()) {
-      if (!claim.sessionId || claim.sessionId === selfSessionId) continue;
+      if (claim.sessionId && claim.sessionId === selfSessionId) continue;
       if (claim.replyToExternalId === replyToExternalId) return claim;
     }
     return undefined;
@@ -135,18 +149,21 @@ export class SessionClaims {
 
   /**
    * Snapshot the claimed external ids for a build (§4.1): a stable
-   * `externalId → owning sessionId` map of every OTHER attributable session's
-   * claims on the timeline, taken once at build time so the frozen context's
-   * markers are deterministic for the build's duration. Excludes the building
-   * session's own claims and any un-attributed (queued) claim.
+   * `externalId → marker` map of every OTHER session's claims on the timeline,
+   * taken once at build time so the frozen context's markers are deterministic for
+   * the build's duration. Excludes the building session's own claims. Un-attributed
+   * (queued / pre-launch) claims ARE included (review #4) with `sessionId`
+   * undefined — the renderer emits a `pending` marker so they still deter, even
+   * before their owning session id exists (notably DMs, where a saturated
+   * single-slot timeline means queueing is the norm).
    */
-  snapshotForBuild(timelineKey: string, selfSessionId?: string): Map<string, string> {
-    const out = new Map<string, string>();
+  snapshotForBuild(timelineKey: string, selfSessionId?: string): Map<string, ClaimMarker> {
+    const out = new Map<string, ClaimMarker>();
     const perTimeline = this.byTimeline.get(timelineKey);
     if (!perTimeline) return out;
     for (const claim of perTimeline.values()) {
-      if (!claim.sessionId || claim.sessionId === selfSessionId) continue;
-      out.set(claim.externalId, claim.sessionId);
+      if (claim.sessionId && claim.sessionId === selfSessionId) continue;
+      out.set(claim.externalId, { sessionId: claim.sessionId });
     }
     return out;
   }
@@ -155,4 +172,26 @@ export class SessionClaims {
   clear(): void {
     this.byTimeline.clear();
   }
+}
+
+/**
+ * Whether a co-target match's owning session will (eventually) become steerable, so
+ * a co-reply that cannot be steered RIGHT NOW should DEFER rather than spawn a twin
+ * (spec DEFERRED-COALESCING). Two pre-live cases qualify:
+ *
+ *  - the claim is un-attributed (`attributed === false`): no session exists yet — it
+ *    is queued or in its accept→launch window and WILL launch;
+ *  - the claim is attributed but its session record is still `created`/`running`:
+ *    attributed at `attachSession` but not yet agent-live (the `attachSession →
+ *    attachAgent` context-build window), so a steer attempt fails transiently.
+ *
+ * A terminal/evicted owner (`ownerStatus` absent or any other value) will never be
+ * steerable again → the caller falls through to a normal spawn (§5.2).
+ */
+export function coTargetOwnerSteerableSoon(
+  attributed: boolean,
+  ownerStatus: string | undefined,
+): boolean {
+  if (!attributed) return true;
+  return ownerStatus === "created" || ownerStatus === "running";
 }

@@ -53,16 +53,17 @@ export interface RenderRichOptions {
   bodyMax?: number;
   /**
    * Claim-marker predicate (spec DUPLICATE-REPLY-MITIGATION §4): given a message's
-   * Matrix external id, return the id of *another* running session that has
-   * claimed it (its trigger), or undefined. When it returns a session id, a
-   * `<handled_by_session id="…"/>` child is emitted as the first part of the
-   * message so the model knows another session is already answering it. The
-   * builder binds this to the current session (self-claims excluded) and a
-   * build-time snapshot of the claim registry. RICH TIER ONLY — the compact
-   * renderer never receives it, keeping the cache-stable compact prefix
-   * byte-identical (§4.3). Undefined for every non-live-build caller.
+   * Matrix external id, return a marker for *another* session that has claimed it
+   * (its trigger), or undefined. When it returns a marker, a `<handled_by_session>`
+   * child is emitted as the first part of the message so the model knows another
+   * session is already answering it — `id="…"` when the owning session is known, or
+   * `pending="true"` for an un-attributed (queued / pre-launch) claim whose session
+   * id does not exist yet (review #4). The builder binds this to the current session
+   * (self-claims excluded) and a build-time snapshot of the claim registry. RICH
+   * TIER ONLY — the compact renderer never receives it, keeping the cache-stable
+   * compact prefix byte-identical (§4.3). Undefined for every non-live-build caller.
    */
-  claimedBy?: (externalId: string) => string | undefined;
+  claimedBy?: (externalId: string) => { sessionId?: string } | undefined;
 }
 
 export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOptions): string {
@@ -77,12 +78,19 @@ export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOp
   const parts: string[] = [];
   const body = opts?.bodyMax !== undefined ? truncate(event.body, opts.bodyMax) : event.body;
 
-  // Claim marker (§4): a message another live session has claimed is flagged
-  // "hands off" before its body, so the model uses it as context but does not
-  // re-answer it. Self-claims are already excluded by the predicate.
-  const claimSessionId =
+  // Claim marker (§4): a message another session has claimed is flagged "hands off"
+  // before its body, so the model uses it as context but does not re-answer it.
+  // Self-claims are already excluded by the predicate. An un-attributed (queued /
+  // pre-launch) claim has no session id yet → render `pending="true"` (review #4).
+  const claim =
     event.externalId && opts?.claimedBy ? opts.claimedBy(event.externalId) : undefined;
-  if (claimSessionId) parts.push(`<handled_by_session id="${escapeAttr(claimSessionId)}"/>`);
+  if (claim) {
+    parts.push(
+      claim.sessionId
+        ? `<handled_by_session id="${escapeAttr(claim.sessionId)}"/>`
+        : `<handled_by_session pending="true"/>`,
+    );
+  }
 
   if (event.replyTo) parts.push(renderReply(event.replyTo));
   parts.push(escapeXml(body));
