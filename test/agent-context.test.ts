@@ -590,6 +590,60 @@ test("summarizationCutoff: summary layer excludes summaries overlapping the even
   }
 });
 
+test("live builds wrap the summary layer in the expand_summary envelope; generation builds stay bare", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, config, storage);
+  const TK = "matrix:miku:room:!room";
+  try {
+    for (let i = 1; i <= 4; i++) {
+      await timeline.append(testEvent({ id: `ev${i}`, body: `event ${i}`, timestamp: i * 1000 }));
+    }
+    // A summary covering the oldest history (up to ev1 / ts 1500).
+    await storage.write((db) => {
+      db.prepare(
+        `insert into summaries (id, timeline_key, level, content, earliest_timestamp,
+         latest_timestamp, latest_event_id, event_count, token_count, model_id,
+         status, generated_at, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run("sum_old", TK, 1, "old history", 500, 1500, "ev1", 2, 50, "model", "complete", 0, 0);
+    });
+
+    // Live build (no cutoff / diaryRange / condenseInputs): envelope present.
+    const trigger = testEvent({ id: "ev5", body: "live trigger", timestamp: 5000 });
+    await timeline.append(trigger);
+    const live = await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+    });
+    const liveLayer = live.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(liveLayer, "live build renders a summary layer");
+    assert.ok(liveLayer!.content.includes("<conversation_summary"), "live summary layer is wrapped in the envelope");
+    assert.ok(liveLayer!.content.includes("expand_summary"), "envelope note names expand_summary");
+    assert.ok(liveLayer!.content.includes("<summary"), "inner summary blocks are still present");
+    assert.ok(liveLayer!.content.includes("old history"), "summary content is rendered");
+
+    // Generation build (cutoff): bare — the worker consumes summaries as input.
+    const sTrigger = testEvent({ id: "summarize:env", body: "Summarize", timestamp: 4000 });
+    const gen = await builder.build({
+      timelineKey: TK,
+      trigger: sTrigger,
+      activeSessions: [],
+      workspace: emptyWorkspace,
+      summarizationCutoff: { endTimestamp: 4000 },
+    });
+    const genLayer = gen.messages.find((m) => m.type === "summaryLayer");
+    assert.ok(genLayer, "generation build renders a summary layer");
+    assert.ok(!genLayer!.content.includes("<conversation_summary"), "generation build leaves the summary layer bare");
+    assert.ok(genLayer!.content.includes("<summary"), "bare summary blocks still present");
+  } finally {
+    storage.close();
+  }
+});
+
 test("summarizationCutoff: runtime state is suppressed", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   const config = minimalConfig();

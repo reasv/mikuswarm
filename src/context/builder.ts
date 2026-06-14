@@ -36,6 +36,17 @@ import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieva
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
 import type { Logger } from "../observability/index.js";
 
+/**
+ * Self-describing note on the live summary-layer envelope (§9b). Plain text only —
+ * no quotes or angle brackets — so it is safe to inline in the double-quoted XML
+ * attribute without escaping. Added only to interactive/proactive builds; never to
+ * generation builds (see {@link ContextBuilder.buildSummaryLayerMessage}).
+ */
+const SUMMARY_LAYER_NOTE =
+  "Condensed, lossy recaps of older history (oldest first, newest last). " +
+  "Each carries an id — call expand_summary with that id to recover the finer " +
+  "detail and the raw messages beneath it.";
+
 export interface ContextMessage {
   type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "diaryLayer" | "satellite";
   role: "user" | "assistant" | "system";
@@ -730,7 +741,18 @@ export class ContextBuilder {
       labels = resolved.labels;
     }
 
-    const content = renderSummaryLayer(summaries, labels);
+    // Live builds wrap the summary blocks in a self-describing envelope so the
+    // agent learns, at the point of use, that these are lossy condensations whose
+    // `id` it can hand to `expand_summary` (mirrors the §9d `<retrieved_memory>` /
+    // §9c `<recent_memory>` note style — the summary layer was the lone unlabeled
+    // one). Generation builds (cutoff / condense / diary-range) are deliberately
+    // left bare: the note is an instruction to a tool-less worker that operates ON
+    // these summaries as input, and `condenseInputs` asserts declared == rendered
+    // input ids — an envelope here would be noise at best, a hazard at worst.
+    const rendered = renderSummaryLayer(summaries, labels);
+    const content = isGenerationBuild
+      ? rendered
+      : `<conversation_summary note="${SUMMARY_LAYER_NOTE}">\n${rendered}\n</conversation_summary>`;
     const latestTs = summaries.reduce((max, s) => Math.max(max, s.latestTimestamp), 0);
     return {
       type: "summaryLayer",
