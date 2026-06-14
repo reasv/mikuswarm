@@ -787,6 +787,13 @@ export const AppConfigSchema = StrictObject({
       max_concurrent_dm: Type.Number({ minimum: 1 }),
       max_queued_per_timeline: Type.Optional(Type.Number({ minimum: 1 })),
       forced_completion_retries: Type.Number({ minimum: 0 }),
+      // Co-target coalescing window (spec DUPLICATE-REPLY-MITIGATION §8): the max
+      // age difference between a new reply and a running session's trigger for the
+      // two to coalesce (both replied to the SAME message → the second is steered
+      // into the first as a co-reply interjection instead of spawning a twin).
+      // Short by chat standards (a minute) so only near-simultaneous reactions to
+      // the same beat merge. Unset → no coalescing.
+      coalesce_window_ms: Type.Optional(Type.Number({ minimum: 0 })),
       // Optional hard cap on tool-call iterations within a single session run.
       // Left unset by default → agent work is unbounded (the loop runs as long as
       // the model emits tool calls). Set a number only if you want a guardrail.

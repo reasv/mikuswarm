@@ -22,6 +22,7 @@ import {
   LlmRequestRing,
   DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
+  SessionClaims,
   SessionRunner,
   isLlmRunFailure,
   createManualResumeSession,
@@ -35,6 +36,7 @@ import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
+import { escapeAttr, escapeXml } from "./context/xml.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
 import {
@@ -44,6 +46,8 @@ import {
   createDanbooruTool,
   createDeleteMessageTool,
   createDelegateToSessionTool,
+  createSpawnSessionTool,
+  type SpawnCoReplyResult,
   createEditMessageTool,
   createEmojiListTool,
   createImageGenTool,
@@ -209,6 +213,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);
   const sessions = new SessionManager({ storage, logger });
+  // Per-timeline session-claim registry (spec DUPLICATE-REPLY-MITIGATION §3): the
+  // single source of truth for "is this message being handled by another running/
+  // queued session", backing the render marker, the send_message guard, and
+  // co-target coalescing. Written synchronously at trigger-accept time (§3.2).
+  const sessionClaims = new SessionClaims();
+  // Coalesced co-replies retained for `spawn_session` (spec §5.4): a co-reply that
+  // was folded into a running session as an interjection is kept here, keyed by its
+  // Matrix external id, so the session can later push it back out into its own
+  // session. Scoped to the session it was coalesced into; cleaned up on that
+  // session's settle (and on use).
+  const coReplyInbounds = new Map<string, { inbound: InboundChatEvent; intoSessionId: string }>();
   // Canonicalize once at the source. `config.workspace.root_dir` is commonly
   // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
   // means every tool downstream receives an absolute, normalized root. That
@@ -394,6 +409,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     retrieval && retrievalConfig.autoRetrieval
       ? { search: retrieval.search, config: retrievalConfig }
       : undefined,
+    // Claim registry for `<handled_by_session>` markers (DUPLICATE-REPLY-MITIGATION §4).
+    sessionClaims,
   );
 
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
@@ -938,10 +955,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     if (!inbound.trigger) return;
 
+    // Co-target coalescing (spec DUPLICATE-REPLY-MITIGATION §5): a reply that
+    // targets the SAME message a running session's trigger replied to is steered
+    // into that session as a self-explaining co-reply interjection instead of
+    // spawning a twin (Case B). Ordered after the existing reply-steer (which
+    // handles a reply to a running session's OWN authored message) and before the
+    // spawn decision (§5.1).
+    if (coalesceCoTargetReply(inbound)) return;
+
     await resolveTriggerGroup(inbound);
     captionPool.notifyNewWork();
 
     const decision = triggerCoordinator.accept(inbound);
+    // Claim the trigger SYNCHRONOUSLY here — immediately after accept, before any
+    // `await` — so a concurrent inbound handler observes the claim even during the
+    // accept→placeholder gap (spec §3.2/§3.3). Both spawn and queued claim; only
+    // `ignored` (queue full) does not. The owning session id is backfilled in
+    // launchSession, and the claim is released on settle.
+    if (decision.action === "spawn" || decision.action === "queued") {
+      addClaim(inbound);
+    }
     if (decision.action !== "spawn") {
       logger.info("trigger_not_spawned", {
         timelineKey: inbound.timelineKey,
@@ -954,6 +987,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     await awaitTriggerReadiness(inbound);
     await launchSession(inbound, routed.duplicate);
+  }
+
+  /**
+   * Insert a session claim for an accepted trigger (spec DUPLICATE-REPLY-MITIGATION
+   * §3.3). Synchronous and side-effect-free beyond the in-memory registry write, so
+   * it can sit on the no-`await` path right after `triggerCoordinator.accept`. A
+   * trigger with no external id (rare — synthetic/proactive) cannot be marked or
+   * guarded, so it is not claimed. Carries the trigger's own external id (marker /
+   * guard key) and its reply-target (co-target coalescing key).
+   */
+  function addClaim(inbound: InboundChatEvent): void {
+    const externalId = inbound.event.externalId;
+    if (!externalId) return;
+    sessionClaims.claim(inbound.timelineKey, {
+      triggerId: inbound.event.id,
+      externalId,
+      replyToExternalId: inbound.event.replyTo?.externalId,
+      triggerTimestamp: inbound.event.timestamp,
+      createdAt: Date.now(),
+    });
   }
 
   /**
@@ -1213,26 +1266,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (steeredEventIds.has(inbound.event.id)) return true;
 
     // The steered (injected) turn bypasses the trigger path's enrichment-readiness
-    // wait + hydrateEvents, so `inbound.event.replyTo` still carries only
-    // `externalId` and would render as "[original message unavailable]". We already
-    // resolved the replied-to message as `target`; hydrate it (captions / media
-    // paths) and fill the reply context from it so the interjection quotes the
-    // original message just like the normal trigger path would.
-    const [hydratedTarget] = hydrateEvents(storage, [target]);
-    const eventForRender: CanonicalChatEvent = {
-      ...inbound.event,
-      replyTo: {
-        ...inbound.event.replyTo,
-        externalId: replyExternalId,
-        sender: hydratedTarget.sender,
-        body: hydratedTarget.body,
-        htmlBody: hydratedTarget.htmlBody,
-        timestamp: hydratedTarget.timestamp,
-        attachments: hydratedTarget.attachments,
-        linkedMedia: hydratedTarget.linkedMedia,
-        linkPreviews: hydratedTarget.linkPreviews,
-      },
-    };
+    // wait + hydrateEvents, so `inbound.event.replyTo` carries only `externalId`.
+    // Hydrate the resolved target and fill the reply context so the interjection
+    // quotes the original message just like the normal trigger path would.
+    const eventForRender = buildReplyHydratedEvent(inbound, target);
 
     const ok = sessions.steer(target.agentSessionId, {
       type: "interjection",
@@ -1247,6 +1284,153 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
     }
     return ok;
+  }
+
+  /**
+   * Fill an inbound reply event's `replyTo` from its resolved (hydrated) target so
+   * a steered interjection quotes the original message (captions/media included),
+   * instead of rendering "[original message unavailable]". Shared by the existing
+   * reply-steer and the new co-target coalescing path (spec
+   * DUPLICATE-REPLY-MITIGATION §5.3). The steer paths bypass the trigger path's
+   * enrichment-readiness wait + `hydrateEvents`, so the raw `replyTo` carries only
+   * an `externalId`.
+   */
+  function buildReplyHydratedEvent(
+    inbound: InboundChatEvent,
+    target: CanonicalChatEvent,
+  ): CanonicalChatEvent {
+    const [hydratedTarget] = hydrateEvents(storage, [target]);
+    return {
+      ...inbound.event,
+      replyTo: {
+        ...inbound.event.replyTo,
+        externalId: inbound.event.replyTo?.externalId,
+        sender: hydratedTarget.sender,
+        body: hydratedTarget.body,
+        htmlBody: hydratedTarget.htmlBody,
+        timestamp: hydratedTarget.timestamp,
+        attachments: hydratedTarget.attachments,
+        linkedMedia: hydratedTarget.linkedMedia,
+        linkPreviews: hydratedTarget.linkPreviews,
+      },
+    };
+  }
+
+  /**
+   * Co-target coalescing (spec DUPLICATE-REPLY-MITIGATION §5). A new trigger that
+   * is a reply, whose reply-target equals the reply-target of a currently-running
+   * session's OWN trigger (a `coTargetSession` hit) and falls within the coalesce
+   * window, is steered into that session as a self-explaining `co-reply`
+   * interjection instead of spawning a twin (Case B). Returns true when it
+   * coalesced (caller returns, no spawn); false to fall through to the normal spawn
+   * path — including when the steer fails because the target session is already
+   * settling (§5.2: a fresh session built after the sibling settles sees its
+   * replies, so redundancy is still deterred at the content level).
+   */
+  function coalesceCoTargetReply(inbound: InboundChatEvent): boolean {
+    const replyTarget = inbound.event.replyTo?.externalId;
+    if (!replyTarget) return false;
+    const windowMs = config.agent.sessions.coalesce_window_ms;
+    if (windowMs === undefined) return false;
+
+    const match = sessionClaims.coTargetSession(inbound.timelineKey, replyTarget);
+    if (!match?.sessionId) return false;
+    // Only near-simultaneous reactions to the SAME beat merge — bare proximity
+    // would wrongly fold the independent questions of Case A.
+    if (Math.abs(inbound.event.timestamp - match.triggerTimestamp) > windowMs) return false;
+
+    // Trigger-hold re-delivery dedup (shared with reply-steer): inject at most once.
+    if (steeredEventIds.has(inbound.event.id)) return true;
+
+    const coReplySessionId = match.sessionId;
+    const target = timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey);
+    // The shared reply-target should exist (the running session replied to it), but
+    // guard defensively: without it we cannot hydrate the quote, so fall through to
+    // a normal spawn rather than inject a broken interjection.
+    if (!target || target.timelineKey !== inbound.timelineKey) return false;
+
+    const eventForRender = buildReplyHydratedEvent(inbound, target);
+    const senderName = inbound.event.sender.displayName ?? inbound.event.sender.id;
+    const externalId = inbound.event.externalId;
+    const content =
+      `<interjection reason="co-reply">\n` +
+      `${escapeXml(senderName)} replied to the same message you're answering:\n\n` +
+      `${renderRichMessage(eventForRender)}\n\n` +
+      `Handle it as part of this session if it fits here (sending a second message is fine) — ` +
+      (externalId
+        ? `or, if it warrants being worked independently, call spawn_session with message_id="${escapeAttr(externalId)}" to give it its own session.`
+        : `or, if it warrants being worked independently, handle it separately.`) +
+      `\n</interjection>`;
+
+    const ok = sessions.steer(coReplySessionId, { type: "interjection", content });
+    if (!ok) return false; // target session settling → fall back to spawn (§5.2)
+
+    markSteered(inbound.event.id);
+    // Retain the inbound so the session can spin it off via spawn_session (§5.4),
+    // and clean it up when that session settles.
+    if (externalId) {
+      coReplyInbounds.set(externalId, { inbound, intoSessionId: coReplySessionId });
+      sessions.onSettle(coReplySessionId, () => coReplyInbounds.delete(externalId));
+    }
+    logger.info("co_reply_coalesced", {
+      sessionId: coReplySessionId,
+      timelineKey: inbound.timelineKey,
+      eventId: inbound.event.id,
+      replyTarget,
+    });
+    return true;
+  }
+
+  /**
+   * Re-dispatch a coalesced co-reply into its own session (spec
+   * DUPLICATE-REPLY-MITIGATION §5.4 — the `spawn_session` tool). Bound per session:
+   * only a co-reply that was coalesced INTO `requestingSessionId` can be spun off.
+   * Runs the spawn tail (trigger-group resolution, accept + claim, readiness wait,
+   * launch); a concurrency miss queues like any trigger (open question §9.1(a)),
+   * and a full queue returns an error so the session handles it inline.
+   */
+  async function spawnCoReplySession(
+    messageId: string,
+    requestingSessionId: string,
+  ): Promise<SpawnCoReplyResult> {
+    const entry = coReplyInbounds.get(messageId);
+    if (!entry || entry.intoSessionId !== requestingSessionId) return { status: "not_found" };
+    coReplyInbounds.delete(messageId);
+    const inbound = entry.inbound;
+    try {
+      await resolveTriggerGroup(inbound);
+      captionPool.notifyNewWork();
+      const decision = triggerCoordinator.accept(inbound);
+      if (decision.action === "spawn" || decision.action === "queued") {
+        addClaim(inbound);
+      }
+      if (decision.action === "queued") return { status: "queued" };
+      if (decision.action !== "spawn") {
+        return { status: "error", detail: decision.reason ?? "trigger not accepted" };
+      }
+      await awaitTriggerReadiness(inbound);
+      // Fire-and-forget the run (the calling session continues its own work). On a
+      // synchronous launch failure, release the slot + drain the next queued trigger
+      // just like every other launch site.
+      void launchSession(inbound, false).catch((error) => {
+        logger.error("co_reply_spawn_launch_failed", {
+          timelineKey: inbound.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (draining) return;
+        const next = triggerCoordinator.complete(inbound.timelineKey);
+        if (next) void launchSession(next, true).catch((err) => {
+          logger.error("queued_session_launch_failed", {
+            timelineKey: next.timelineKey,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          triggerCoordinator.complete(next.timelineKey);
+        });
+      });
+      return { status: "spawned" };
+    } catch (error) {
+      return { status: "error", detail: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /**
@@ -1277,6 +1461,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         agentSessionId: sessionId,
         workspaceRoot,
         mediaMaxBytes: downloadSizeLimit,
+        // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): a LIVE registry
+        // lookup at send time (excluding self), so it catches a sibling that
+        // claimed the reply-target after this session's context was built — the
+        // later-claim race the frozen marker structurally cannot cover.
+        isClaimedByOther: (externalId) => {
+          const claim = sessionClaims.claimantOf(inbound.timelineKey, externalId, sessionId);
+          return claim?.sessionId ? { sessionId: claim.sessionId } : undefined;
+        },
       }),
       createDelegateToSessionTool({
         currentEvent: inbound.event,
@@ -1285,6 +1477,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             type: "interjection",
             content,
           }),
+      }),
+      // spawn_session (spec DUPLICATE-REPLY-MITIGATION §5.4): push a coalesced
+      // co-reply back out into its own session when this session judges it warrants
+      // independent handling. Bound to this session so only co-replies coalesced
+      // into it can be spun off.
+      createSpawnSessionTool({
+        spawnCoReply: (messageId) => spawnCoReplySession(messageId, sessionId),
       }),
       ...(roomId ? [
         createEmojiListTool({ client: provider.getClient(target), roomId }),
@@ -1789,6 +1988,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
       : sessions.createPlaceholder(inbound);
     sessions.markRunning(session.id);
+    // Attribute the claim added at accept time to this session and release it when
+    // the run settles (spec DUPLICATE-REPLY-MITIGATION §3.3). Registered before the
+    // outbound-target check below so even the immediate-discard paths fire the
+    // release on evict. Proactive/synthetic triggers have no external id → no claim,
+    // and `releaseSession` is a no-op for a session that never claimed.
+    if (inbound.event.externalId) {
+      sessionClaims.attachSession(session.timelineKey, inbound.event.externalId, session.id);
+    }
+    sessions.onSettle(session.id, () => sessionClaims.releaseSession(session.timelineKey, session.id));
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
     const target = inbound.outboundTarget;
     if (!target) {
@@ -2235,6 +2443,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await redecryptionSweeper.stop();
         await provider.stop();
         triggerCoordinator.clear();
+        // Drop any claims whose queued triggers were just discarded by the
+        // coordinator clear (spec DUPLICATE-REPLY-MITIGATION §3.3 — queued claims
+        // released on teardown); in-flight runs release their own on settle.
+        sessionClaims.clear();
+        coReplyInbounds.clear();
         // Abort each caption client's scheduler-admission seam BEFORE awaiting
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open

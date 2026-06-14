@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
+import type { SessionClaims } from "../agent/session-claims.js";
 import type { PriorityClass } from "../agent/scheduler.js";
 import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
@@ -109,6 +110,14 @@ export interface BuildContextOptions {
    */
   proactive?: boolean;
   /**
+   * The building session's own id (spec DUPLICATE-REPLY-MITIGATION §4). When set
+   * (live chat / proactive builds), claimed-message markers and the
+   * `<coordination>` gate are computed against the claim registry, excluding this
+   * session's own claims (a session may always answer its own trigger). Absent for
+   * generation builds (summarize/condense/diary) and the room-context preview.
+   */
+  selfSessionId?: string;
+  /**
    * Resolved scheduler priority class of the building session (spec §5.5: the
    * waiting class is the building session's OWN class). A summary job this
    * build must wait on is escalated to exactly this class — so a proactive
@@ -199,14 +208,24 @@ export class ContextBuilder {
    */
   private readonly autoRetrieval?: AutoRetrievalDeps;
 
+  /**
+   * Session-claim registry (spec DUPLICATE-REPLY-MITIGATION §3/§4). Injected by
+   * app wiring so the builder can mark, at build time, any in-context message that
+   * another running session has claimed (`<handled_by_session>`). Undefined in
+   * tests / non-claim contexts → no markers (the predicate is simply never bound).
+   */
+  private readonly claims?: SessionClaims;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
     private readonly storage: Storage,
     private readonly logger?: Logger,
     autoRetrieval?: AutoRetrievalDeps,
+    claims?: SessionClaims,
   ) {
     this.autoRetrieval = autoRetrieval;
+    this.claims = claims;
   }
 
   async build(options: BuildContextOptions): Promise<BuiltContext> {
@@ -396,9 +415,25 @@ export class ContextBuilder {
       }
     }
 
+    // Claim markers (spec DUPLICATE-REPLY-MITIGATION §4): snapshot the OTHER
+    // active sessions' claims ONCE here so the frozen context's markers are
+    // deterministic for this build's duration (§4.1). Live builds only — never
+    // generation builds (no live answering). The marker is rich-tier only: the
+    // compact renderer is passed unchanged, keeping the cache-stable compact
+    // prefix byte-identical (§4.3).
+    const claimSnapshot =
+      !generation && this.claims && options.selfSessionId
+        ? this.claims.snapshotForBuild(options.timelineKey, options.selfSessionId)
+        : undefined;
+    const richRenderer =
+      claimSnapshot && claimSnapshot.size > 0
+        ? (event: CanonicalChatEvent) =>
+            renderRichMessage(event, { claimedBy: (externalId) => claimSnapshot.get(externalId) })
+        : renderRichMessage;
+
     const compacted = compactTimelineEvents(
       compactionInput,
-      renderRichMessage,
+      richRenderer,
       renderCompactMessage,
       this.config.context.tiers,
       {

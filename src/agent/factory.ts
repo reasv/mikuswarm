@@ -529,6 +529,10 @@ export class AgentSessionFactory {
         workspace,
         sessionType: sessionTypeConfig,
         fallbackPrompt,
+        // The building session's id, for claim markers + the coordination gate
+        // (spec DUPLICATE-REPLY-MITIGATION §4). `buildContext` drops it for the
+        // generation modes (cutoff/condense/diary), which have no live answering.
+        selfSessionId: session.id,
         summarizationCutoff: opts?.summarizationCutoff,
         condenseInputs: opts?.condenseInputs,
         diaryRange: opts?.diaryRange,
@@ -725,6 +729,7 @@ export class AgentSessionFactory {
     workspace: WorkspaceContent;
     sessionType: SessionTypeConfig | undefined;
     fallbackPrompt: string | undefined;
+    selfSessionId?: string;
     summarizationCutoff?: { endTimestamp: number };
     condenseInputs?: { summaries: Summary[] };
     diaryRange?: { earliestTimestamp: number; latestTimestamp: number; summaryId: string };
@@ -732,15 +737,16 @@ export class AgentSessionFactory {
     priority?: PriorityClass;
     abortSignal?: AbortSignal;
   }): Promise<BuiltContext> {
+    const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({
       timelineKey: args.timelineKey,
       trigger: args.trigger,
-      activeSessions: args.summarizationCutoff || args.condenseInputs || args.diaryRange
-        ? []
-        : this.options.getActiveSessions(args.timelineKey),
+      activeSessions: generation ? [] : this.options.getActiveSessions(args.timelineKey),
       workspace: args.workspace,
       sessionType: args.sessionType,
       fallbackPrompt: args.fallbackPrompt,
+      // Generation builds have no live answering → no claim markers / coordination.
+      selfSessionId: generation ? undefined : args.selfSessionId,
       summarizationCutoff: args.summarizationCutoff,
       condenseInputs: args.condenseInputs,
       diaryRange: args.diaryRange,

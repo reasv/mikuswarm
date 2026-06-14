@@ -11,6 +11,14 @@ export interface SatelliteRuntimeInput {
   timelineKey: string;
   trigger: CanonicalChatEvent;
   activeSessions: Array<Pick<AgentSessionRecord, "id" | "createdAt" | "trigger">>;
+  /**
+   * The building session's own id (spec DUPLICATE-REPLY-MITIGATION §4.2). Used to
+   * count *other* active sessions when deciding whether to emit the code-owned
+   * `<coordination>` explanation line for `<handled_by_session>` markers. Undefined
+   * for builds with no owning session (e.g. the room-context preview), where every
+   * listed session counts as "other".
+   */
+  selfSessionId?: string;
   now?: Date;
   /** When true, the <runtime_state> section is omitted (summarization builds). */
   suppressRuntimeState?: boolean;

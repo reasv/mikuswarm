@@ -6,6 +6,7 @@ import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext, with
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import type { BuiltContext } from "../src/context/index.js";
 import { ContextBuilder, type BuildContextOptions } from "../src/context/builder.js";
+import { SessionClaims } from "../src/agent/session-claims.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
 import type { AppConfig } from "../src/config/index.js";
@@ -1177,6 +1178,58 @@ test("condenseInputs and summarizationCutoff are mutually exclusive", async () =
 // `maxRetries: 0` onto every base stream call so the provider SDK's silent default
 // of 2 internal retries (backoff inside the held scheduler slot, 429s invisible to
 // the group backoff) is disabled.
+test("live build marks a claimed in-context message and emits the coordination line (DUPLICATE-REPLY-MITIGATION §4)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const config = minimalConfig();
+  const timeline = new TimelineStore(storage);
+  const claims = new SessionClaims();
+  const TK = "matrix:miku:room:!room";
+  try {
+    // A recent in-context message ($claimed) and the building session's own trigger.
+    await timeline.append({
+      ...testEvent({ id: "ev-claimed", body: "> plagueis", timestamp: 1000 }),
+      externalId: "$claimed",
+    });
+    const trigger = { ...testEvent({ id: "ev-trigger", body: "hey miku", timestamp: 2000 }), externalId: "$trigger" };
+    await timeline.append(trigger);
+
+    // Another running session ($claimed's owner) and self both active.
+    claims.claim(TK, { triggerId: "ev-claimed", externalId: "$claimed", triggerTimestamp: 1000, createdAt: 1000 });
+    claims.attachSession(TK, "$claimed", "s-other");
+
+    const builder = new ContextBuilder(timeline, config, storage, undefined, undefined, claims);
+    const activeSessions = [
+      { id: "s-self", createdAt: 2000, timelineKey: TK, sessionType: "default", status: "running", trigger: { timelineKey: TK, provider: "matrix", event: trigger } },
+      { id: "s-other", createdAt: 1000, timelineKey: TK, sessionType: "default", status: "running", trigger: { timelineKey: TK, provider: "matrix", event: { ...testEvent({ id: "ev-claimed", body: "> plagueis", timestamp: 1000 }), externalId: "$claimed" } } },
+    ] as unknown as BuildContextOptions["activeSessions"];
+
+    const built = await builder.build({
+      timelineKey: TK,
+      trigger,
+      activeSessions,
+      selfSessionId: "s-self",
+      workspace: emptyWorkspace,
+    });
+
+    // The claimed (non-trigger) message renders rich with the marker.
+    const chatEvents = built.messages.filter((m) => m.type === "chatEvent");
+    const marked = chatEvents.some((m) => m.content.includes('<handled_by_session id="s-other"/>'));
+    assert.ok(marked, "claimed in-context message should carry the <handled_by_session> marker");
+
+    // The final user turn carries the code-owned coordination line (≥1 other session).
+    const finalTurn = built.messages[built.messages.length - 1];
+    assert.ok(finalTurn.content.includes("<coordination>"), "coordination line should be emitted");
+
+    // The session never marks its OWN trigger as handled-by-another.
+    assert.ok(
+      !built.messages.some((m) => m.content.includes('<handled_by_session id="s-self"')),
+      "self-claims must never be marked",
+    );
+  } finally {
+    storage.close();
+  }
+});
+
 test("withSdkRetriesDisabled pins maxRetries: 0 while preserving other stream options (#8)", () => {
   const seen: Array<Record<string, unknown> | undefined> = [];
   const base = ((_model: unknown, _context: unknown, options?: Record<string, unknown>) => {

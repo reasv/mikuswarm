@@ -3,6 +3,7 @@ export {
   type AgentSessionRecord,
   type AgentSessionStatus,
 } from "./session-manager.js";
+export { SessionClaims, type SessionClaim } from "./session-claims.js";
 export type {
   ChatEventMessage,
   InterjectionMessage,

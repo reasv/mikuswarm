@@ -23,6 +23,16 @@ export interface SendMessageToolContext {
   agentSessionId: string;
   workspaceRoot?: string;
   mediaMaxBytes?: number;
+  /**
+   * Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6). Given a `reply_to_id`
+   * (`$…` event id), returns the *other* session currently handling that message,
+   * or undefined. Queried at SEND time (not build time), so it catches the case
+   * the frozen `<handled_by_session>` marker structurally cannot: a sibling that
+   * started after this session's context was built. When it returns a session, the
+   * tool refuses the reply with a non-terminating redirect (another turn), not a
+   * wall. Self is already excluded by the closure. Absent = no guard (tests).
+   */
+  isClaimedByOther?: (externalId: string) => { sessionId: string } | undefined;
 }
 
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
@@ -56,6 +66,25 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
           content: [{ type: "text", text: "error: reply_to_id is required when is_reply is true. Provide the event ID of the message you want to reply to." }],
           details: null,
         };
+      }
+
+      // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): refuse to REPLY to a
+      // message another session is currently handling. Scoped to exactly this one
+      // mechanical signal (`reply_to_id`) so false positives are near-zero — inline
+      // addressing without a reply marker stays the marker/coordination line's job
+      // (§4). The error is a redirect (names the alternatives), not a refusal, and
+      // does NOT terminate — the agent gets another turn.
+      if (args.is_reply && args.reply_to_id?.trim() && context.isClaimedByOther) {
+        const claim = context.isClaimedByOther(args.reply_to_id.trim());
+        if (claim) {
+          return {
+            content: [{
+              type: "text",
+              text: `error: ${args.reply_to_id.trim()} is currently being handled by another session (${claim.sessionId}). Don't reply to it — that session has it. If you only meant to surface or quote it, send without is_reply. If it needs independent handling, that's already covered.`,
+            }],
+            details: null,
+          };
+        }
       }
 
       // A send with no text, no HTML, and no media has nothing to deliver — it would

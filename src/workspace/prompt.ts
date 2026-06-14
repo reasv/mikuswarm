@@ -185,6 +185,20 @@ export function renderSatelliteBlock(
 /**
  * Render runtime state content (the volatile per-session data).
  */
+/**
+ * Code-owned coordination instruction for `<handled_by_session>` markers (spec
+ * DUPLICATE-REPLY-MITIGATION §4.2). Rendered ONLY here (a conditional child of
+ * `<active_sessions>`), never in TAIL.md: the dedup rule is a system invariant, it
+ * must not be silently editable per-agent, and it must stay out of the cached
+ * stable prefix — `<runtime_state>` is already volatile-per-build. The final
+ * clause preserves the wanted behaviour (referencing other in-context messages)
+ * and forbids only re-answering a claimed one.
+ */
+const COORDINATION_LINE =
+  "<coordination>Messages tagged &lt;handled_by_session&gt; are already being answered by " +
+  "another running session. Don't reply to or address them — you may still use them as " +
+  "context.</coordination>";
+
 function renderRuntimeState(options: SatelliteRuntimeInput): string {
   const sessions = options.activeSessions
     .map(
@@ -193,8 +207,18 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
     )
     .join("\n");
 
+  // Emit the coordination line only when ≥1 OTHER active session exists — the
+  // sole condition under which a `<handled_by_session>` marker could appear (spec
+  // §4.2, the "ship first" gate). `activeSessions` includes the building session
+  // itself, so filter it out by id; with no self id (preview build) every entry
+  // counts as other.
+  const otherSessionCount = options.activeSessions.filter(
+    (session) => session.id !== options.selfSessionId,
+  ).length;
+  const coordination = otherSessionCount > 0 ? `\n${COORDINATION_LINE}` : "";
+
   const sessionsBlock = sessions
-    ? `\n\n<active_sessions>\n${sessions}\n</active_sessions>`
+    ? `\n\n<active_sessions>\n${sessions}${coordination}\n</active_sessions>`
     : "";
 
   return `Current time: ${formatAgentTimestamp(options.now ?? options.trigger.timestamp)}
