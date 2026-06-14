@@ -198,6 +198,152 @@ test("coordination line absent when there are no active sessions at all", () => 
   assert.doesNotMatch(out, /coordination/);
 });
 
+// ── co-target admission ordering: coalesce→claim must have no yield (review #5) ─
+//
+// This models the trigger-admission span of `handleInbound` (src/app.ts, the region
+// `coalesceCoTargetReply` → `triggerCoordinator.accept` → `addClaim`, then the
+// deferred `await resolveTriggerGroup`). The bug (#5): a real event-loop yield
+// (`await resolveTriggerGroup`) sat BETWEEN the co-target coalesce check (which reads
+// the registry keyed on `replyToExternalId`) and the claim registration (`addClaim`).
+// Two DISTINCT replies to the SAME target could both pass coalesce — neither had
+// claimed yet — before either reached `addClaim`, so both spawned and the bot replied
+// twice. The fix moves `await resolveTriggerGroup` to AFTER accept+addClaim, making the
+// coalesce→claim span synchronous.
+//
+// We reproduce the exact ordering with the real `SessionClaims`, parameterized by a
+// `yieldBeforeClaim` flag. `yieldBeforeClaim:true` is the PRE-FIX ordering and must
+// double-spawn; `false` is the POST-FIX ordering and must coalesce the sibling.
+
+interface AdmitResult {
+  action: "spawn" | "coalesce";
+}
+
+/**
+ * Faithful model of the handleInbound co-target admission span. With
+ * `yieldBeforeClaim:true` the (former) `await resolveTriggerGroup` runs between the
+ * coalesce check and `addClaim` — the pre-fix ordering. With `false` the claim is
+ * registered first and the resolve runs after — the post-fix ordering.
+ *
+ * `resolveTriggerGroup` is modeled as a microtask boundary (`await Promise.resolve()`),
+ * exactly the kind of real event-loop yield the live code performs (it awaits a
+ * single-writer SQLite enqueue). The coalesce decision mirrors the real one: a
+ * co-target claim within the window (a non-reply or out-of-window sibling never
+ * coalesces — same as `coalesceCoTargetReply`).
+ */
+async function admit(
+  claims: SessionClaims,
+  inbound: { externalId: string; replyToExternalId?: string; timestamp: number; sessionId: string },
+  windowMs: number,
+  yieldBeforeClaim: boolean,
+): Promise<AdmitResult> {
+  // 1. coalesceCoTargetReply: a reply whose target already has a co-target owner
+  //    within the window is folded in (no spawn).
+  if (inbound.replyToExternalId !== undefined) {
+    const match = claims.coTargetClaim(TK, inbound.replyToExternalId, inbound.sessionId);
+    if (match && Math.abs(inbound.timestamp - match.triggerTimestamp) <= windowMs) {
+      return { action: "coalesce" };
+    }
+  }
+
+  // 2. PRE-FIX: the resolveTriggerGroup yield happens here, before the claim.
+  if (yieldBeforeClaim) await Promise.resolve();
+
+  // 3. accept + addClaim (synchronous in the real code right after accept).
+  claims.claim(TK, {
+    triggerId: `t-${inbound.externalId}`,
+    externalId: inbound.externalId,
+    replyToExternalId: inbound.replyToExternalId,
+    triggerTimestamp: inbound.timestamp,
+    createdAt: inbound.timestamp,
+  });
+  claims.attachSession(TK, inbound.externalId, inbound.sessionId);
+
+  // 4. POST-FIX: the resolveTriggerGroup yield happens here, after the claim.
+  if (!yieldBeforeClaim) await Promise.resolve();
+
+  return { action: "spawn" };
+}
+
+test("co-target burst (PRE-FIX ordering) double-spawns — the #5 race, guarded against regression", async () => {
+  // Two DISTINCT replies to the SAME beat, admitted concurrently. With the yield
+  // BETWEEN coalesce and claim (pre-fix), both pass coalesce before either claims.
+  const claims = new SessionClaims();
+  const a = { externalId: "$replyA", replyToExternalId: "$beat", timestamp: 1000, sessionId: "s-A" };
+  const b = { externalId: "$replyB", replyToExternalId: "$beat", timestamp: 1001, sessionId: "s-B" };
+
+  // Interleave across the await window: both coalesce checks run before either claim.
+  const [ra, rb] = await Promise.all([
+    admit(claims, a, 5000, /* yieldBeforeClaim */ true),
+    admit(claims, b, 5000, /* yieldBeforeClaim */ true),
+  ]);
+
+  // Pre-fix: BOTH spawn → two replies (this is the bug the fix removes).
+  assert.equal(ra.action, "spawn");
+  assert.equal(rb.action, "spawn");
+});
+
+test("co-target burst (POST-FIX ordering) yields exactly ONE spawn, the sibling coalesces", async () => {
+  // Same burst, but with the claim registered BEFORE the yield (post-fix ordering).
+  // Whichever sibling wins the coalesce→claim race first claims $beat; the other now
+  // observes that claim and coalesces instead of spawning a twin.
+  const claims = new SessionClaims();
+  const a = { externalId: "$replyA", replyToExternalId: "$beat", timestamp: 1000, sessionId: "s-A" };
+  const b = { externalId: "$replyB", replyToExternalId: "$beat", timestamp: 1001, sessionId: "s-B" };
+
+  const [ra, rb] = await Promise.all([
+    admit(claims, a, 5000, /* yieldBeforeClaim */ false),
+    admit(claims, b, 5000, /* yieldBeforeClaim */ false),
+  ]);
+
+  const actions = [ra.action, rb.action].sort();
+  assert.deepEqual(actions, ["coalesce", "spawn"], "exactly one spawn, the sibling coalesces");
+  // And the registry holds exactly one claim on the shared beat's owner side.
+  assert.ok(claims.coTargetClaim(TK, "$beat"), "the winning sibling is the registered co-target owner");
+});
+
+test("post-fix ordering preserves the normal single-trigger path (distinct targets both spawn)", async () => {
+  // Two replies to DIFFERENT beats are independent — both spawn under either ordering.
+  // Confirms the fix does not over-coalesce non-co-target inbounds.
+  const claims = new SessionClaims();
+  const a = { externalId: "$replyA", replyToExternalId: "$beat1", timestamp: 1000, sessionId: "s-A" };
+  const b = { externalId: "$replyB", replyToExternalId: "$beat2", timestamp: 1001, sessionId: "s-B" };
+
+  const [ra, rb] = await Promise.all([
+    admit(claims, a, 5000, false),
+    admit(claims, b, 5000, false),
+  ]);
+
+  assert.equal(ra.action, "spawn");
+  assert.equal(rb.action, "spawn");
+});
+
+test("post-fix ordering: an out-of-window sibling still spawns (coalesce window preserved)", async () => {
+  // First reply claims $beat; a second reply to $beat arrives far outside the window →
+  // it does NOT coalesce (mirrors coalesceCoTargetReply's window check), it spawns.
+  const claims = new SessionClaims();
+  await admit(claims, { externalId: "$replyA", replyToExternalId: "$beat", timestamp: 1000, sessionId: "s-A" }, 5000, false);
+  const rb = await admit(
+    claims,
+    { externalId: "$replyB", replyToExternalId: "$beat", timestamp: 1_000_000, sessionId: "s-B" },
+    5000,
+    false,
+  );
+  assert.equal(rb.action, "spawn");
+});
+
+test("post-fix ordering: a non-reply trigger never coalesces (Case A unaffected)", async () => {
+  // A plain (non-reply) trigger has no reply-target → it is never a co-target sibling.
+  const claims = new SessionClaims();
+  await admit(claims, { externalId: "$replyA", replyToExternalId: "$beat", timestamp: 1000, sessionId: "s-A" }, 5000, false);
+  const plain = await admit(
+    claims,
+    { externalId: "$plainB", replyToExternalId: undefined, timestamp: 1001, sessionId: "s-B" },
+    5000,
+    false,
+  );
+  assert.equal(plain.action, "spawn");
+});
+
 // ── send_message reply guard (§6) ───────────────────────────────────────────
 
 function sendCtx(overrides: Partial<SendMessageToolContext> = {}): SendMessageToolContext {

@@ -1023,9 +1023,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // spawn decision (§5.1).
     if (coalesceCoTargetReply(inbound)) return;
 
-    await resolveTriggerGroup(inbound);
-    captionPool.notifyNewWork();
-
+    // Accept + claim run SYNCHRONOUSLY immediately after the coalesce check, with NO
+    // `await` between them (review #5). The co-target coalesce decision above read
+    // the registry keyed on `replyToExternalId` and found no owner; this is the point
+    // that records THIS inbound as the co-target owner. Any event-loop yield in that
+    // span would let a second, DISTINCT reply to the SAME target also pass coalesce
+    // before either claims — both spawn, the bot replies twice (the send-time guard
+    // keys on each trigger's OWN externalId, so it can't catch co-target siblings).
+    // `resolveTriggerGroup` (the former yield) is therefore deferred to AFTER the
+    // claim below; it mutates only `inbound.trigger.groupedEventIds` / persists the
+    // group, which neither `accept` (truthiness of `inbound.trigger`, already held)
+    // nor `addClaim`/`coalesceCoTargetReply` consume — only the later readiness wait
+    // and launch do, all of which run after the claim.
     const decision = triggerCoordinator.accept(inbound);
     // Claim the trigger SYNCHRONOUSLY here — immediately after accept, before any
     // `await` — so a concurrent inbound handler observes the claim even during the
@@ -1035,6 +1044,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (decision.action === "spawn" || decision.action === "queued") {
       addClaim(inbound);
     }
+
+    // Resolve the trigger group and nudge captions AFTER the claim (was before
+    // `accept` — moved per review #5 to close the coalesce→claim yield window). Still
+    // runs for every accepted action (spawn / queued / ignored) before the early
+    // return below, so a queued or ignored trigger gets its group persisted and its
+    // grouped attachments captioned exactly as before; only the relative order of
+    // these two `await`-free-span operations changed.
+    await resolveTriggerGroup(inbound);
+    captionPool.notifyNewWork();
+
     if (decision.action !== "spawn") {
       logger.info("trigger_not_spawned", {
         timelineKey: inbound.timelineKey,
