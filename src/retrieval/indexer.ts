@@ -8,6 +8,16 @@ import type { ResolvedRetrievalConfig } from "./config.js";
 
 const MEMORY_DIR = "memory";
 const MD_FILE_RE = /\.md$/;
+/**
+ * Files in `memory/` that are NOT memory *content* and must never be indexed as
+ * retrieval candidates. `README.md` is the agent's own scratchpad/instructions
+ * *about* the memory directory (how to log, what to keep) — meta, not a diary
+ * entry — yet it used to top almost every auto-retrieval result because its prose
+ * ("notable room events", "user-profile updates", …) lexically resembles a query.
+ * Matched case-insensitively on basename. Any chunks already indexed for an excluded
+ * file are pruned on the next `reconcileAll` (the on-disk set no longer lists it).
+ */
+const NON_CONTENT_FILES = new Set(["readme.md"]);
 const CORPUS_SIGNATURE_KEY = "corpus_signature";
 
 export interface MemoryIndexerOptions {
@@ -173,7 +183,9 @@ export class MemoryIndexer {
   private async listMemoryFiles(): Promise<string[]> {
     try {
       const entries = await readdir(this.memoryDir);
-      return entries.filter((n) => MD_FILE_RE.test(n)).sort();
+      return entries
+        .filter((n) => MD_FILE_RE.test(n) && !NON_CONTENT_FILES.has(n.toLowerCase()))
+        .sort();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;

@@ -426,6 +426,18 @@ max_results = 3                   # §8c — small on purpose
 min_score = 0.45
 max_tokens = 600                  # whole injected block budget
 dedup_against_recency = true      # §8c — skip blocks already in the §10a recency layer
+# User lane (§9d): a lexical-only sub-search keyed on the trigger user's display
+# name(s), reserving slots for "my recent history with this person" alongside the
+# topical results. Additive to max_results; the combined block still obeys max_tokens.
+user_lane_enabled = true
+user_lane_max_results = 2          # reserved slots, surfaced ahead of topical hits
+# Lower than min_score above: the lane is already name-scoped, so the floor only
+# drops near-noise. A single exact name-token hit lands ~0.45, so 0.3 keeps them.
+user_lane_min_score = 0.3
+user_lane_prefix_enabled = true    # also match shortened forms ("Plaguis"→"Plag")
+# Prefix stem length + min token length to attempt prefix. Larger = fewer false
+# positives, less tolerance for short nicknames. Exact always beats prefix.
+user_lane_prefix_min_chars = 4
 
 [retrieval.embedding]
 # Active model resolution (§5a): an explicit `provider` wins; an unset `provider`

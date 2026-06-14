@@ -549,6 +549,18 @@ export class ContextBuilder {
       .map((e) => e.body)
       .filter(Boolean)
       .join("\n");
+    // The user lane (§9d) keys on WHO is talking: the distinct display name(s) of the
+    // trigger senders, excluding the bot itself. This is the strongest relevance
+    // signal we have — diaries name people by display name constantly — so it drives a
+    // separate lexical "history with this person" sub-search inside auto-retrieval.
+    const triggerUsers = Array.from(
+      new Set(
+        triggerEvents
+          .filter((e) => !e.sender.isSelf)
+          .map((e) => e.sender.displayName?.trim())
+          .filter((n): n is string => n !== undefined && n.length > 0),
+      ),
+    );
     // Bound the inline auto-retrieval query-embed wait (spec LLM-FAILURE-HANDLING
     // §7.1 / §9d #7): the embed is transitively an inference wait riding inside an
     // interactive build, so it gets the SAME interactive wall-clock budget as the
@@ -590,6 +602,7 @@ export class ContextBuilder {
         ? null
         : await buildAutoRetrievalBlock(this.autoRetrieval, {
             query: retrievalQuery,
+            triggerUsers,
             recencyContent: diaryLayer?.content ?? null,
             now,
             signal: retrievalEmbedSignal,

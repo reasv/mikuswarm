@@ -265,6 +265,21 @@ const RetrievalSchema = StrictObject({
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       max_tokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
       dedup_against_recency: Type.Optional(Type.Boolean()),
+      // User lane (§9d): a lexical-only sub-search keyed on the trigger user's
+      // display name(s), reserving a few result slots for "my recent history with
+      // this person" alongside the topical lane. Additive to max_results; the whole
+      // block stays bounded by max_tokens.
+      user_lane_enabled: Type.Optional(Type.Boolean()),
+      user_lane_max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      // Lower than the topical floor on purpose — the lane is already name-scoped, so
+      // the floor only drops near-noise rather than gating relevance.
+      user_lane_min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      // Match shortened display-name forms by prefix (e.g. "Plaguis"→"Plag") in
+      // addition to exact. Exact is always preferred; prefix only fills leftover slots.
+      user_lane_prefix_enabled: Type.Optional(Type.Boolean()),
+      // Prefix stem length AND the min token length to attempt a prefix at all. Larger
+      // = fewer false positives, less tolerance for short nicknames (the FP/recall knob).
+      user_lane_prefix_min_chars: Type.Optional(Type.Integer({ minimum: 2, maximum: 64 })),
     }),
   ),
   embedding: Type.Optional(RetrievalEmbeddingSchema),

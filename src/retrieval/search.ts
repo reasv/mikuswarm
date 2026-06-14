@@ -44,6 +44,26 @@ export interface SearchOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Inputs for the lexical "who am I talking to" lane (ARCHITECTURE.md §9d). Driven by
+ * the trigger user's display name(s), not free text — see `MemorySearch.searchUserLane`.
+ */
+export interface UserLaneOptions {
+  /** Trigger-user display name(s); tokenized + deduped into name terms. */
+  names: string[];
+  maxResults: number;
+  /** Pre-decay relevance floor (lower than the topical lane — the lane is already
+   *  name-scoped, so the floor only drops near-noise; see config defaults). */
+  minScore: number;
+  /** Allow shortened-name prefix matching (§3) in addition to exact. */
+  prefixEnabled: boolean;
+  /** Stem length for prefix matching; also the min token length to attempt it. */
+  prefixMinChars: number;
+  snippetMaxChars: number;
+  /** Decay anchor (trigger timestamp) for cache determinism; defaults to Date.now(). */
+  now?: number;
+}
+
 export interface SearchOutcome {
   results: RetrievalResult[];
   /** 'hybrid' when the semantic half ran; 'lexical' otherwise / on degrade. */
@@ -326,6 +346,85 @@ export class MemorySearch {
       snippet: makeSnippet(hit.text, snippetMaxChars),
     };
   }
+
+  /**
+   * Lexical-only "who am I talking to" lane (ARCHITECTURE.md §9d / design §8c). Diary
+   * entries carry no structural author tag, but people are named by display name
+   * constantly in the prose, so an exact BM25 match on the trigger user's display
+   * name reliably surfaces "my recent history with this person"; temporal decay then
+   * orders it toward the most recent interactions. Deliberately NOT hybrid — a bare
+   * name embeds poorly (pure noise to the vector half), and the exact-token lexical
+   * hit IS the whole signal — so this also dodges the embed-wait/degrade machinery.
+   *
+   * Exact is always preferred (the operator's explicit requirement): every qualifying
+   * exact hit is returned before any prefix-only hit, so prefix matches (shortened
+   * display-name forms, §3) only fill slots exact leaves empty. The two false-positive
+   * controls are `minScore` and the prefix stem length (`prefixMinChars`).
+   */
+  async searchUserLane(opts: UserLaneOptions): Promise<RetrievalResult[]> {
+    if (opts.maxResults <= 0) return [];
+    await this.indexer.ensureFreshForQuery();
+    const now = opts.now ?? Date.now();
+    const q = this.config.query;
+    const tokens = userLaneTokens(opts.names);
+    if (tokens.length === 0) return [];
+    const candidateLimit = Math.max(opts.maxResults, opts.maxResults * q.candidateMultiplier);
+
+    const exactHits = this.userLaneLexical(
+      `{text} : (${tokens.map((t) => `"${t}"`).join(" OR ")})`,
+      candidateLimit,
+    );
+    const stems = opts.prefixEnabled
+      ? Array.from(
+          new Set(
+            tokens
+              .map((t) => userLanePrefixStem(t, opts.prefixMinChars))
+              .filter((s): s is string => s !== null),
+          ),
+        )
+      : [];
+    const prefixHits = stems.length
+      ? this.userLaneLexical(`{text} : (${stems.map((s) => `"${s}"*`).join(" OR ")})`, candidateLimit)
+      : [];
+
+    // Score a hit set with the same saturating-BM25 → temporal-decay transform the
+    // hybrid path uses, but lexical-only (relevance == normalized bm25; vec half off).
+    const score = (hits: LexicalHit[]): Scored[] => {
+      const rel = normalizeBm25(hits);
+      return hits.map((h) => {
+        const relevance = rel.get(h.rowid) ?? 0;
+        const decayed = q.temporalDecayEnabled
+          ? relevance * decayFactor(h.entryTs, now, q.temporalDecayHalfLifeDays)
+          : relevance;
+        return { ...h, vecScore: 0, bm25Score: relevance, relevance, score: decayed };
+      });
+    };
+
+    const exactScored = score(exactHits)
+      .filter((s) => s.relevance >= opts.minScore)
+      .sort((a, b) => b.score - a.score);
+    const exactIds = new Set(exactScored.map((s) => s.rowid));
+    const prefixScored = score(prefixHits)
+      .filter((s) => s.relevance >= opts.minScore && !exactIds.has(s.rowid))
+      .sort((a, b) => b.score - a.score);
+
+    // Exact always before prefix (favor exact); prefix only fills remaining slots.
+    return [...exactScored, ...prefixScored]
+      .slice(0, opts.maxResults)
+      .map((s) => this.toResult(s, opts.snippetMaxChars));
+  }
+
+  /** FTS lookup for the user lane, degrading to empty (mirrors the topical guard, #9). */
+  private userLaneLexical(match: string, limit: number): LexicalHit[] {
+    try {
+      return this.storage.searchMemoryLexical({ match, limit });
+    } catch (error) {
+      this.logger?.warn("memory_user_lane_search_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
 }
 
 /**
@@ -365,6 +464,37 @@ export function buildFtsMatch(query: string): string | null {
   if (tokens.length === 0) return null;
   const orGroup = tokens.map((t) => `"${t}"`).join(" OR ");
   return `{text} : (${orGroup})`;
+}
+
+/**
+ * Distinct, usable name terms from one or more trigger-user display names for the
+ * user lane (`searchUserLane`). Lowercased and split on non-alphanumerics so a
+ * multi-word display name ("Atomic Tiger") yields both tokens; 1-char fragments and
+ * bare stopwords are dropped (a display name that is only "the"/"an" carries no
+ * recall signal and would match everything). Deduped, capped at 32.
+ */
+export function userLaneTokens(names: string[]): string[] {
+  const out = new Set<string>();
+  for (const name of names) {
+    for (const tok of name.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+      if (tok.length >= 2 && !STOPWORDS.has(tok)) out.add(tok);
+    }
+  }
+  return Array.from(out).slice(0, 32);
+}
+
+/**
+ * Prefix stem for a name token, or null when prefix matching shouldn't apply. Returns
+ * null when the token length is <= `minChars`: the stem would be the whole token
+ * (catching only rare *lengthenings*) and a short stem invites false positives. Above
+ * that, the first `minChars` characters, so a longer display name still matches a
+ * common shortened form ("plaguis" → stem "plag" → matches a diary mention of
+ * "plagu"). Exact matching always runs and is always preferred; this only ever fills
+ * slots exact leaves empty.
+ */
+export function userLanePrefixStem(token: string, minChars: number): string | null {
+  if (token.length <= minChars) return null;
+  return token.slice(0, minChars);
 }
 
 /**

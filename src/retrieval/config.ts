@@ -35,6 +35,14 @@ export interface ResolvedRetrievalConfig {
     minScore: number;
     maxTokens: number;
     dedupAgainstRecency: boolean;
+    /** User lane (§9d): lexical "history with this person" sub-search, by display name. */
+    userLane: {
+      enabled: boolean;
+      maxResults: number;
+      minScore: number;
+      prefixEnabled: boolean;
+      prefixMinChars: number;
+    };
   };
   embedding: {
     /** Resolved active provider: remote iff a remote block is configured (§5a). */
@@ -84,6 +92,15 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       minScore: auto.min_score ?? 0.45,
       maxTokens: auto.max_tokens ?? 600,
       dedupAgainstRecency: auto.dedup_against_recency ?? true,
+      userLane: {
+        enabled: auto.user_lane_enabled ?? true,
+        maxResults: auto.user_lane_max_results ?? 2,
+        // Lower than auto.minScore (0.45): a single exact name-token hit lands ~0.45,
+        // so a tighter floor would drop the very entries the lane exists to surface.
+        minScore: auto.user_lane_min_score ?? 0.3,
+        prefixEnabled: auto.user_lane_prefix_enabled ?? true,
+        prefixMinChars: auto.user_lane_prefix_min_chars ?? 4,
+      },
     },
     embedding: {
       provider,

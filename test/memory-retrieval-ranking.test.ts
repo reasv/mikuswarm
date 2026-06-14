@@ -8,6 +8,8 @@ import {
   MemoryIndexer,
   MemorySearch,
   buildFtsMatch,
+  userLaneTokens,
+  userLanePrefixStem,
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
@@ -457,4 +459,136 @@ test("config resolution rejects fallback_chunk_tokens > max_chunk_tokens (review
   );
   // The shipped defaults (fallback 400 <= max 512) resolve cleanly.
   assert.doesNotThrow(() => resolveRetrievalConfig({ enabled: true }));
+});
+
+// --- §9d user lane: name tokenization + prefix stem (pure, no DB) ---
+
+test("userLaneTokens splits multi-word names, dedups, drops short/stopword fragments", () => {
+  assert.deepEqual(userLaneTokens(["Atomic Tiger"]), ["atomic", "tiger"]);
+  assert.deepEqual(userLaneTokens(["Plaguis", "Plaguis"]), ["plaguis"], "deduped across names");
+  assert.deepEqual(userLaneTokens(["The Architect"]), ["architect"], "bare stopword dropped");
+  assert.deepEqual(userLaneTokens(["A J"]), [], "1-char fragments dropped");
+  assert.deepEqual(userLaneTokens(["Jo"]), ["jo"], "2-char content token kept");
+});
+
+test("userLanePrefixStem returns a stem only when it can catch a shortened form", () => {
+  assert.equal(userLanePrefixStem("plaguis", 4), "plag");
+  assert.equal(userLanePrefixStem("atomictiger", 4), "atom");
+  assert.equal(userLanePrefixStem("alex", 4), null, "token at the floor → no prefix (would be whole token)");
+  assert.equal(userLanePrefixStem("rey", 4), null, "short token → no prefix (false-positive risk)");
+});
+
+// --- §9d user lane: exact match by display name, ordered by recency ---
+
+test("searchUserLane surfaces entries naming the person, most-recent first (decay)", async () => {
+  await withHarness(async ({ workspaceRoot, indexer, search }) => {
+    const body = "Had a long chat with Plaguis about the build.";
+    await writeMemory(workspaceRoot, "2026-04-10.md",
+      `# 2026-04-10 Daily Memory\n\n` + block("2026-04-10 14:00", "2026-04-10 15:00", "#general", body));
+    await writeMemory(workspaceRoot, "2026-05-20.md",
+      `# 2026-05-20 Daily Memory\n\n` + block("2026-05-20 14:00", "2026-05-20 15:00", "#general", body));
+    await indexer.reconcileAll();
+
+    const now = parseZonedWallClock("2026-05-21 12:00", TZ)!;
+    const hits = await search.searchUserLane({
+      names: ["Plaguis"], maxResults: 5, minScore: 0,
+      prefixEnabled: false, prefixMinChars: 4, snippetMaxChars: 200, now,
+    });
+    assert.equal(hits.length, 2, "both entries naming Plaguis surface");
+    // Identical bodies → equal relevance → temporal decay orders the recent one first.
+    assert.equal(hits[0]!.date, "2026-05-20", "most recent interaction ranks first");
+    assert.equal(hits[1]!.date, "2026-04-10");
+
+    // A different person finds nothing.
+    const none = await search.searchUserLane({
+      names: ["Bulchi"], maxResults: 5, minScore: 0,
+      prefixEnabled: false, prefixMinChars: 4, snippetMaxChars: 200, now,
+    });
+    assert.equal(none.length, 0);
+  });
+});
+
+// --- §9d user lane: prefix catches shortened names, but exact is always preferred ---
+
+test("searchUserLane: exact beats prefix; a shortened form only fills leftover slots", async () => {
+  await withHarness(async ({ workspaceRoot, indexer, search }) => {
+    // An OLD entry naming the person in full, a NEWER entry using a shortened prefix form.
+    await writeMemory(workspaceRoot, "2026-03-01.md",
+      `# 2026-03-01 Daily Memory\n\n` +
+        block("2026-03-01 14:00", "2026-03-01 15:00", "#general", "Reviewed the PR with Plaguis today."));
+    await writeMemory(workspaceRoot, "2026-05-25.md",
+      `# 2026-05-25 Daily Memory\n\n` +
+        block("2026-05-25 14:00", "2026-05-25 15:00", "#general", "Quick sync with Plagu about deploys."));
+    await indexer.reconcileAll();
+
+    const now = parseZonedWallClock("2026-05-26 12:00", TZ)!;
+    const hits = await search.searchUserLane({
+      names: ["Plaguis"], maxResults: 5, minScore: 0,
+      prefixEnabled: true, prefixMinChars: 4, snippetMaxChars: 200, now,
+    });
+    assert.equal(hits.length, 2, "exact (Plaguis) + prefix (Plagu) both surface");
+    // Despite being OLDER, the exact match ranks first — exact is favored over prefix,
+    // so the newer prefix-only hit cannot leapfrog it on recency.
+    assert.equal(hits[0]!.date, "2026-03-01", "exact hit first even though older");
+    assert.match(hits[0]!.snippet, /Reviewed the PR with Plaguis/);
+    assert.equal(hits[1]!.date, "2026-05-25", "prefix-only hit second");
+    assert.match(hits[1]!.snippet, /Quick sync with Plagu/);
+
+    // With prefix disabled, the shortened "Plagu" mention is not found at all.
+    const exactOnly = await search.searchUserLane({
+      names: ["Plaguis"], maxResults: 5, minScore: 0,
+      prefixEnabled: false, prefixMinChars: 4, snippetMaxChars: 200, now,
+    });
+    assert.equal(exactOnly.length, 1, "only the exact Plaguis entry without prefix");
+    assert.equal(exactOnly[0]!.date, "2026-03-01");
+  });
+});
+
+// --- §9d user lane: short display names get no prefix lane (false-positive guard) ---
+
+test("searchUserLane does not prefix-match a short display name", async () => {
+  await withHarness(async ({ workspaceRoot, indexer, search }) => {
+    // "Rey" (3 chars) is below prefixMinChars, so "rey*" must NOT run and pull in
+    // unrelated words like "really". Only an exact "Rey" mention should match.
+    await writeMemory(workspaceRoot, "2026-04-12.md",
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "We really reworked the renderer."));
+    await indexer.reconcileAll();
+
+    const now = parseZonedWallClock("2026-04-13 12:00", TZ)!;
+    const hits = await search.searchUserLane({
+      names: ["Rey"], maxResults: 5, minScore: 0,
+      prefixEnabled: true, prefixMinChars: 4, snippetMaxChars: 200, now,
+    });
+    assert.equal(hits.length, 0, "short name must not prefix-match 'really'/'reworked'/'renderer'");
+  });
+});
+
+// --- §9d README.md (and other non-content files) are never indexed ---
+
+test("reconcileAll excludes README.md from the memory index", async () => {
+  await withHarness(async ({ workspaceRoot, storage, indexer, search }) => {
+    // README.md is the agent's scratchpad ABOUT the memory dir, not a diary entry; it
+    // used to top auto-retrieval because its prose resembles a query. It must be skipped.
+    await writeMemory(workspaceRoot, "README.md",
+      "# memory/README.md\n\nUse memory/YYYY-MM-DD.md as your daily scratchpad. zorbflux marker.\n");
+    await writeMemory(workspaceRoot, "2026-04-12.md",
+      `# 2026-04-12 Daily Memory\n\n` +
+        block("2026-04-12 14:00", "2026-04-12 15:00", "#general", "We shipped the zorbflux feature."));
+    await indexer.reconcileAll();
+    await storage.waitForIdle();
+
+    const paths = storage.listMemoryChunkPaths();
+    assert.ok(!paths.includes("memory/README.md"), "README.md is not indexed");
+    assert.ok(paths.includes("memory/2026-04-12.md"), "real diary entries are still indexed");
+
+    // The unique token lives in both files; only the diary hit should come back.
+    const now = parseZonedWallClock("2026-04-13 12:00", TZ)!;
+    const outcome = await search.search({ query: "zorbflux", maxResults: 6, minScore: 0, snippetMaxChars: 200, now });
+    assert.ok(outcome.results.length >= 1, "the diary entry is found");
+    assert.ok(
+      outcome.results.every((r) => r.path !== "memory/README.md"),
+      "no result comes from README.md",
+    );
+  });
 });

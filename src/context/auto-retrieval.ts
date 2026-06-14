@@ -1,4 +1,8 @@
-import type { MemorySearch, ResolvedRetrievalConfig } from "../retrieval/index.js";
+import type {
+  MemorySearch,
+  ResolvedRetrievalConfig,
+  RetrievalResult,
+} from "../retrieval/index.js";
 import { estimateTokens } from "./tokens.js";
 
 export interface AutoRetrievalDeps {
@@ -13,6 +17,13 @@ export interface AutoRetrievalInput {
    * Reply/caption/attachment context is deliberately excluded (see builder.ts).
    */
   query: string;
+  /**
+   * Distinct trigger-user display name(s) for the user lane (§9d) — the single
+   * strongest relevance signal we have. Drives a separate lexical "history with this
+   * person" sub-search whose hits are reserved ahead of the topical results. Empty for
+   * proactive builds (no trigger sender) or when the sender has no display name.
+   */
+  triggerUsers: string[];
   /** The recency-layer (§10a) content for dedup, or null when absent. */
   recencyContent: string | null;
   /** Anchor for temporal decay (the trigger timestamp), not wall-clock. */
@@ -62,24 +73,54 @@ export async function buildAutoRetrievalBlock(
 ): Promise<string | null> {
   const auto = deps.config.auto;
   const query = input.query.trim();
-  if (query.length === 0) return null;
 
-  const outcome = await deps.search.search({
-    query,
-    maxResults: auto.maxResults,
-    minScore: auto.minScore,
-    snippetMaxChars: 200,
-    now: input.now,
-    signal: input.signal,
-  });
-  if (outcome.results.length === 0) return null;
+  // Topical lane: the existing free-text hybrid search over the trigger body.
+  const topical: RetrievalResult[] =
+    query.length === 0
+      ? []
+      : (
+          await deps.search.search({
+            query,
+            maxResults: auto.maxResults,
+            minScore: auto.minScore,
+            snippetMaxChars: 200,
+            now: input.now,
+            signal: input.signal,
+          })
+        ).results;
+
+  // User lane: lexical "history with this person" by trigger display name (§9d).
+  // Lexical-only, so no embed wait — runs unconditionally of the embed deadline.
+  const userLane: RetrievalResult[] =
+    auto.userLane.enabled && input.triggerUsers.length > 0
+      ? await deps.search.searchUserLane({
+          names: input.triggerUsers,
+          maxResults: auto.userLane.maxResults,
+          minScore: auto.userLane.minScore,
+          prefixEnabled: auto.userLane.prefixEnabled,
+          prefixMinChars: auto.userLane.prefixMinChars,
+          snippetMaxChars: 200,
+          now: input.now,
+        })
+      : [];
+
+  // Combine, user-lane first (reserved, priority placement) then topical, deduped by
+  // chunk id so a chunk surfaced by both lanes appears once (in its user-lane slot).
+  const seen = new Set<string>();
+  const results: RetrievalResult[] = [];
+  for (const r of [...userLane, ...topical]) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    results.push(r);
+  }
+  if (results.length === 0) return null;
 
   const recencyNorm =
     deps.config.auto.dedupAgainstRecency && input.recencyContent ? norm(input.recencyContent) : null;
 
   const lines: string[] = [];
   let tokenBudget = auto.maxTokens - estimateTokens(`<retrieved_memory note="${NOTE}">\n</retrieved_memory>`);
-  for (const r of outcome.results) {
+  for (const r of results) {
     // Dedup against the recency layer: skip a chunk whose body already appears there.
     //
     // This is a deliberate best-effort substring heuristic, NOT chunk-`id` identity
