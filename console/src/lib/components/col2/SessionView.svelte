@@ -9,6 +9,7 @@
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
 	import { formatTokens, formatUsd } from '$lib/format';
+	import { computeCostBudget } from '$lib/cost-budget';
 	import type { ToolInvocation } from '$lib/schemas';
 	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
@@ -152,13 +153,9 @@
 	// Combined cost budget (spec SESSION-COST-LIMITS §6): the ONLY place the two
 	// lanes are summed — agent-loop cost (§8b) + tool cost (§8c) — against the
 	// per-session ceiling. Shown only when a ceiling resolves (else unlimited).
-	const costBudget = $derived.by(() => {
-		const s = session.data?.session;
-		const limit = s?.maxSessionCostUsd ?? null;
-		if (!s || limit == null || limit <= 0) return null;
-		const spent = (s.usage?.cost ?? 0) + (s.toolUsage?.cost ?? 0);
-		return { spent, limit, pct: Math.round((spent / limit) * 100) };
-	});
+	// The lane-sum / rounding / null-gating live in the pure `computeCostBudget`
+	// helper so they are unit-testable; this $derived just feeds it the session.
+	const costBudget = $derived(computeCostBudget(session.data?.session));
 	const toolUsageByCallId = $derived.by(() => {
 		const map = new Map<string, ToolInvocation>();
 		for (const row of session.data?.toolInvocations ?? [])

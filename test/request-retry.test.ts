@@ -895,6 +895,25 @@ test("withRequestRetry: a THROWING checkContextBudget does not crash/hang — de
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "run terminated cleanly");
 });
 
+test("withRequestRetry: a THROWING checkCostBudget does not crash/hang — degrades to no local block (SESSION-COST-LIMITS §2.2)", async () => {
+  // Parallel to the checkContextBudget throw test above: the factory-bound cost
+  // pre-flight flows through the same try/catch and must be equally
+  // exception-isolated. A throw out of checkCostBudget must NOT escape the
+  // void-IIFE as a process-fatal unhandled rejection or leave `outer` without a
+  // terminal event; it degrades to "no local block" so the request proceeds to
+  // the provider and terminates cleanly. checkContextBudget is left undefined so
+  // the `??` reaches the cost check and the throw originates there.
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    checkCostBudget: () => {
+      throw new Error("logger exploded inside the cost budget check");
+    },
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1, "the request proceeded — no violation applied");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "run terminated cleanly");
+});
+
 test("withRequestRetry: checkCostBudget pre-empts as a content failure without calling base (SESSION-COST-LIMITS §2.2)", async () => {
   const { fn, calls } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
   const ring = new LlmRequestRing();
