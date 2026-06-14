@@ -2,6 +2,7 @@
 	import { pipelinesQuery, costOverviewQuery } from '$lib/query/pipelines';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { pipelineSummary } from '$lib/stores/pipeline-summary.svelte';
+	import { pipelinesHref } from '$lib/nav';
 	import type { PipelineHealth } from '$lib/schemas';
 	import { cn } from '$lib/utils';
 	import { formatTokens, formatUsd } from '$lib/format';
@@ -95,12 +96,14 @@
 				</div>
 			</div>
 
-			<ul>
+			<!-- URL-driven selection (ARCHITECTURE.md §11): a pool link omits item/status/room
+			     (a fresh drill-down), and is deep-linkable / new-tab-able. -->
+			<ul data-sveltekit-noscroll data-sveltekit-keepfocus>
 				{#each pipelines.data.pipelines as p (p.pool)}
 					<li>
-						<button
-							type="button"
-							onclick={() => pipelineSelection.selectPool(p.pool)}
+						<a
+							href={pipelinesHref({ pool: p.pool })}
+							aria-current={pipelineSelection.pool === p.pool ? 'true' : undefined}
 							class={cn(
 								'flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-accent',
 								pipelineSelection.pool === p.pool && 'bg-accent'
@@ -151,7 +154,7 @@
 										· {formatUsd(p.usage.totalCost)} spent{/if}
 								</div>
 							{/if}
-						</button>
+						</a>
 					</li>
 				{/each}
 			</ul>

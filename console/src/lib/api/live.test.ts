@@ -36,16 +36,21 @@ describe('streamSessionEvents', () => {
 		).toEqual(['turn_start', 'turn_end']);
 	});
 
-	it('terminates the generator on agent_end', async () => {
+	it('yields agent_end like any other event and runs until the stream ends', async () => {
+		// A single run drives several agent-loop invocations (kickoff + forced-completion
+		// prompts), each emitting its own agent_end; the server's stream spans the whole
+		// run, so agent_end is NOT a terminator (ARCHITECTURE.md §11 / live.ts). The events
+		// after it are still yielded; termination is the byte stream closing on run
+		// settlement — here, after the final chunk.
 		vi.stubGlobal('fetch', async () =>
 			streamResponse([
 				'event: agent_end\ndata: {"type":"agent_end","messages":[]}\n\n',
-				'event: turn_start\ndata: {"type":"turn_start"}\n\n' // must NOT be yielded
+				'event: turn_start\ndata: {"type":"turn_start"}\n\n' // a later invocation — still yielded
 			])
 		);
 		expect(
 			await collectTypes(streamSessionEvents('s', new AbortController().signal))
-		).toEqual(['agent_end']);
+		).toEqual(['agent_end', 'turn_start']);
 	});
 
 	it('terminates immediately on not_live with no events', async () => {

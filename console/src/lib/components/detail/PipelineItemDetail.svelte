@@ -3,6 +3,7 @@
 	import { pipelineItemQuery } from '$lib/query/pipelines';
 	import { keys } from '$lib/query/keys';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
+	import { pipelinesHref } from '$lib/nav';
 	import PipelineStatusBadge from '$lib/components/col1/PipelineStatusBadge.svelte';
 	import SessionView from '$lib/components/col2/SessionView.svelte';
 	import RetryButton from '$lib/components/RetryButton.svelte';
@@ -107,19 +108,16 @@
 											<span class="truncate">{m.filename ?? m.ref}</span>
 											<div class="flex items-center gap-2">
 												<span class="font-mono text-[10px] text-muted-foreground">{m.mediaType}</span>
-												<!-- Cross-pipeline drill: jump to this asset's captioning item. -->
+												<!-- Cross-pipeline drill: a link to this asset's captioning item (a fresh
+												     drill-down into the captioning pool — see ARCHITECTURE.md §11). -->
 												{#if ['image', 'video', 'audio'].includes(m.mediaType)}
-													<button
-														type="button"
+													<a
 														class="rounded border px-1 text-[10px] text-muted-foreground hover:bg-accent"
 														title="View in the captioning pipeline"
-														onclick={() => {
-															pipelineSelection.selectPool('captioning');
-															pipelineSelection.selectItem(m.ref);
-														}}
+														href={pipelinesHref({ pool: 'captioning', item: m.ref })}
 													>
 														caption →
-													</button>
+													</a>
 												{/if}
 											</div>
 										</div>

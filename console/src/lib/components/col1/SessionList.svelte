@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { roomSessionsQuery } from '$lib/query/rooms';
 	import { selection } from '$lib/stores/selection.svelte';
+	import { conversationsHref } from '$lib/nav';
 	import StatusBadge from './StatusBadge.svelte';
 	import { cn } from '$lib/utils';
 
@@ -25,12 +26,14 @@
 		{:else if sessions.data.sessions.length === 0}
 			<div class="p-3 text-sm text-muted-foreground">No sessions.</div>
 		{:else}
-			<ul>
+			<!-- URL-driven selection (ARCHITECTURE.md §11): a session link carries the current
+			     room so the drill-down is fully deep-linkable / new-tab-able. -->
+			<ul data-sveltekit-noscroll data-sveltekit-keepfocus>
 				{#each sessions.data.sessions as session (session.id)}
 					<li>
-						<button
-							type="button"
-							onclick={() => selection.selectSession(session.id)}
+						<a
+							href={conversationsHref({ room: selection.roomKey, session: session.id })}
+							aria-current={selection.sessionId === session.id ? 'true' : undefined}
 							class={cn(
 								'flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-accent',
 								selection.sessionId === session.id && 'bg-accent'
@@ -43,7 +46,7 @@
 							<span class="line-clamp-2 text-xs text-muted-foreground">
 								{session.triggerBody ?? session.id}
 							</span>
-						</button>
+						</a>
 					</li>
 				{/each}
 			</ul>

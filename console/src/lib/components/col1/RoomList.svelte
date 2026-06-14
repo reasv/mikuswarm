@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { roomsQuery } from '$lib/query/rooms';
 	import { selection } from '$lib/stores/selection.svelte';
+	import { conversationsHref } from '$lib/nav';
 	import { Badge } from '$lib/components/ui/badge';
 	import { cn } from '$lib/utils';
 
@@ -23,12 +24,16 @@
 		{:else if rooms.data.rooms.length === 0}
 			<div class="p-3 text-sm text-muted-foreground">No rooms.</div>
 		{:else}
-			<ul>
+			<!-- Selection is URL-driven (ARCHITECTURE.md §11): each row is a real link, so
+			     deep-link/refresh/new-tab all work. A room link omits `session`, so clicking a
+			     room returns to room view even while a session is open. noscroll/keepfocus keep
+			     the list steady across the client-side nav. -->
+			<ul data-sveltekit-noscroll data-sveltekit-keepfocus>
 				{#each rooms.data.rooms as room (room.timelineKey)}
 					<li>
-						<button
-							type="button"
-							onclick={() => selection.selectRoom(room.timelineKey)}
+						<a
+							href={conversationsHref({ room: room.timelineKey })}
+							aria-current={selection.roomKey === room.timelineKey ? 'true' : undefined}
 							class={cn(
 								'flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm hover:bg-accent',
 								selection.roomKey === room.timelineKey && 'bg-accent'
@@ -45,7 +50,7 @@
 							<span class="shrink-0 text-xs text-muted-foreground tabular-nums">
 								{room.sessionCount}
 							</span>
-						</button>
+						</a>
 					</li>
 				{/each}
 			</ul>

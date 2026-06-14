@@ -1,44 +1,37 @@
+import { page } from '$app/state';
 import type { PipelineId } from '$lib/schemas';
+
+const POOLS = new Set<PipelineId>(['enrichment', 'captioning', 'summarization', 'diary']);
 
 /**
  * Pipelines-area selection state (ARCHITECTURE.md §11), the sibling of the
- * conversations `selection` store. A selected pool, optionally an item within it,
- * plus the Col2 status/room filter chips. Selecting a different pool clears the
- * item and filters (a fresh drill-down); changing a filter clears the item (it may
- * no longer be in the filtered list).
+ * conversations `selection` store. Like it, the URL is the source of truth: these are
+ * reactive getters over the `/pipelines` route's query params
+ * (`?pool=…&status=…&room=…&item=…`), so pools, filters, and items are all
+ * deep-linkable and the selection controls are real `<a>` links (see `$lib/nav`).
+ *
+ * A pool link omits item/status/room (a fresh drill-down); changing a filter omits
+ * `item` (it may no longer be in the filtered list). `pool` is validated against the
+ * known set so a malformed deep-link can't index the per-pool chip table; `itemId`
+ * is gated on a valid pool so an item never resolves without its pool (the detail
+ * query needs both).
  */
 class PipelineSelection {
-	pool = $state<PipelineId | null>(null);
-	itemId = $state<string | null>(null);
-	status = $state<string | null>(null);
-	room = $state<string | null>(null);
-
-	selectPool(pool: PipelineId) {
-		if (this.pool !== pool) {
-			this.itemId = null;
-			this.status = null;
-			this.room = null;
-		}
-		this.pool = pool;
+	get pool(): PipelineId | null {
+		const p = page.url.searchParams.get('pool');
+		return p && POOLS.has(p as PipelineId) ? (p as PipelineId) : null;
 	}
 
-	selectItem(id: string) {
-		this.itemId = id;
+	get itemId(): string | null {
+		return this.pool ? page.url.searchParams.get('item') : null;
 	}
 
-	clearItem() {
-		this.itemId = null;
+	get status(): string | null {
+		return page.url.searchParams.get('status');
 	}
 
-	/** Toggle the status filter chip; null clears it. Drops the item selection. */
-	setStatus(status: string | null) {
-		this.status = this.status === status ? null : status;
-		this.itemId = null;
-	}
-
-	setRoom(room: string | null) {
-		this.room = room;
-		this.itemId = null;
+	get room(): string | null {
+		return page.url.searchParams.get('room');
 	}
 
 	get mode(): 'empty' | 'pool' | 'item' {

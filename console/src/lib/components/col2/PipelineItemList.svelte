@@ -3,6 +3,7 @@
 	import { toast } from 'svelte-sonner';
 	import { pipelineItemsQuery, pipelinesQuery } from '$lib/query/pipelines';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
+	import { pipelinesHref } from '$lib/nav';
 	import { retryFailedPipelineItems } from '$lib/api/admin.remote';
 	import { keys } from '$lib/query/keys';
 	import type { PipelineId } from '$lib/schemas';
@@ -83,13 +84,20 @@
 		{/if}
 	</div>
 
-	<!-- Status filter chips -->
+	<!-- Status filter chips. URL-driven (ARCHITECTURE.md §11): each chip is a link that
+	     toggles `status` (re-clicking the active chip clears it) and drops `item` (it may no
+	     longer be in the filtered list), preserving the pool + room filter. -->
 	{#if pipelineSelection.pool}
-		<div class="flex flex-wrap gap-1 border-b px-3 pb-2">
+		<div class="flex flex-wrap gap-1 border-b px-3 pb-2" data-sveltekit-noscroll data-sveltekit-keepfocus>
 			{#each STATUS_CHIPS[pipelineSelection.pool] as chip (chip)}
-				<button
-					type="button"
-					onclick={() => pipelineSelection.setStatus(chip)}
+				<a
+					href={pipelinesHref({
+						pool: pipelineSelection.pool,
+						status: pipelineSelection.status === chip ? null : chip,
+						room: pipelineSelection.room,
+						item: null
+					})}
+					aria-current={pipelineSelection.status === chip ? 'true' : undefined}
 					class={cn(
 						'rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase transition-colors',
 						pipelineSelection.status === chip
@@ -98,7 +106,7 @@
 					)}
 				>
 					{chip}
-				</button>
+				</a>
 			{/each}
 		</div>
 	{/if}
@@ -117,12 +125,20 @@
 		{:else if allItems.length === 0}
 			<div class="p-3 text-sm text-muted-foreground">No items.</div>
 		{:else}
-			<ul>
+			<!-- URL-driven selection (ARCHITECTURE.md §11): an item link carries the current
+			     pool + status/room filter so it is deep-linkable / new-tab-able. The inline
+			     RetryButton is a sibling (not nested in the link). -->
+			<ul data-sveltekit-noscroll data-sveltekit-keepfocus>
 				{#each allItems as item (item.id)}
 					<li class="relative">
-						<button
-							type="button"
-							onclick={() => pipelineSelection.selectItem(item.id)}
+						<a
+							href={pipelinesHref({
+								pool: pipelineSelection.pool,
+								status: pipelineSelection.status,
+								room: pipelineSelection.room,
+								item: item.id
+							})}
+							aria-current={pipelineSelection.itemId === item.id ? 'true' : undefined}
 							class={cn(
 								'flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-accent',
 								pipelineSelection.itemId === item.id && 'bg-accent'
@@ -150,7 +166,7 @@
 									⚠ {item.error}
 								</span>
 							{/if}
-						</button>
+						</a>
 						<!-- Inline retry on failed rows (a sibling, not nested in the row button). -->
 						{#if item.status === 'failed'}
 							<div class="absolute right-2 bottom-2">

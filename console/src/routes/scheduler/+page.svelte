@@ -2,6 +2,7 @@
 	import { createQuery } from '@tanstack/svelte-query';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
 	import { getSchedulerSnapshot, getLlmRequests } from '$lib/api/scheduler.remote';
+	import { conversationsHref } from '$lib/nav';
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
@@ -169,7 +170,10 @@
 								<tr class="border-t border-border/50">
 									<td class="py-0.5 pr-3">
 										{#if waiter.sessionId}
-											<a class="underline-offset-2 hover:underline" href={`/?session=${waiter.sessionId}`}>
+											<a
+												class="underline-offset-2 hover:underline"
+												href={conversationsHref({ session: waiter.sessionId })}
+											>
 												{waiter.sessionId}
 											</a>
 										{:else}—{/if}
@@ -221,7 +225,16 @@
 						{#each requests.data!.requests as request, i (i)}
 							<tr class="border-t border-border/50">
 								<td class="py-0.5 pr-3 whitespace-nowrap">{fmtTime(request.ts)}</td>
-								<td class="pr-3">{request.sessionId ?? '—'}</td>
+								<td class="pr-3">
+									{#if request.sessionId}
+										<a
+											class="underline-offset-2 hover:underline"
+											href={conversationsHref({ session: request.sessionId })}
+										>
+											{request.sessionId}
+										</a>
+									{:else}—{/if}
+								</td>
 								<td class="pr-3">{request.sessionType ?? '—'}</td>
 								<td class="max-w-40 truncate pr-3" title={request.model}>{request.model}</td>
 								<td class={cn('pr-3', PRIORITY_CLASSES[request.priority ?? ''] ?? '')}>
