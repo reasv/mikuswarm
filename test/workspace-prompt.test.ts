@@ -403,8 +403,43 @@ describe("satellite block rendering", () => {
     // no milliseconds — see src/time).
     assert.ok(satellite.includes("Current time: 2026-05-26T14:00:00Z"));
     assert.ok(satellite.includes("Current timeline: matrix:miku:room:!test:server.org"));
-    assert.ok(satellite.includes("Trigger event: evt-1"));
     assert.ok(satellite.includes("</runtime_state>"));
+    // The opaque trigger event id is no longer surfaced (no agent use).
+    assert.ok(!satellite.includes("Trigger event:"));
+  });
+
+  it("renders channel label and DM/group type when resolved", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const group = renderSatelliteBlock(
+      makeRuntimeInput({ channelLabel: "general (ExampleChat)", isDirect: false }),
+      workspace,
+    );
+    assert.ok(group.includes("Channel: general (ExampleChat)"));
+    assert.ok(group.includes("Type: group room"));
+
+    const dm = renderSatelliteBlock(
+      makeRuntimeInput({ channelLabel: "Alice", isDirect: true }),
+      workspace,
+    );
+    assert.ok(dm.includes("Channel: Alice"));
+    assert.ok(dm.includes("Type: direct message"));
+  });
+
+  it("omits channel and type lines when unresolved", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const satellite = renderSatelliteBlock(makeRuntimeInput(), workspace);
+    assert.ok(!satellite.includes("Channel:"));
+    assert.ok(!satellite.includes("Type:"));
   });
 
   it("renders active sessions in runtime state", () => {

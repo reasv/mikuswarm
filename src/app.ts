@@ -870,6 +870,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return client.channelLabel({ roomId });
   };
 
+  // Feed the context builder's <runtime_state> channel descriptor (label + DM
+  // flag). Mirrors resolveChannelLabel but returns both fields from one
+  // channelInfo call, and — per the hook contract — never rejects: a malformed
+  // key or lookup failure resolves to null and the Channel/Type lines are simply
+  // omitted (the raw timeline key still identifies the room).
+  contextBuilder.resolveChannelContext = async (timelineKey) => {
+    try {
+      const accountId = timelineKey.split(":")[1];
+      const roomId = roomIdFromTimelineKey(timelineKey);
+      if (!roomId) return null;
+      const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+      return await client.channelContext({ roomId });
+    } catch (error) {
+      logger.debug("resolve_channel_context_failed", {
+        timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  };
+
   const diaryPool = diaryEnabled
     ? new DiaryWorkerPool({
         storage,

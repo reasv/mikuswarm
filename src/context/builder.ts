@@ -202,6 +202,19 @@ export class ContextBuilder {
   reconcileSummaries?: (timelineKey: string) => Promise<void>;
 
   /**
+   * Channel-descriptor hook for `<runtime_state>`: injected by app wiring so the
+   * builder can label the current room (`Name (Space)` + DM flag) without taking
+   * a Matrix dependency itself. Called once per live/proactive/preview build
+   * (generation builds suppress runtime state and skip it). Resolves to null —
+   * and the Channel/Type lines are omitted — when the timeline isn't a resolvable
+   * Matrix room or the lookup fails. Must never reject (app wiring catches and
+   * returns null); the builder also guards defensively.
+   */
+  resolveChannelContext?: (
+    timelineKey: string,
+  ) => Promise<{ label: string; isDirect: boolean } | null>;
+
+  /**
    * Auto-retrieval dependencies (ARCHITECTURE.md §9d / design §8c). Set when the
    * retrieval subsystem is enabled AND `retrieval.auto_retrieval` is on; otherwise
    * undefined and no auto-retrieval block is built.
@@ -496,8 +509,27 @@ export class ContextBuilder {
       diaryRange && options.sessionType
         ? { ...options.sessionType, session_instruction: undefined }
         : options.sessionType;
+    // Resolve the human-readable channel descriptor for runtime state. Only for
+    // builds that actually render it (generation builds suppress runtime state);
+    // null/throw degrades gracefully to the timeline-key-only form.
+    let channelContext: { label: string; isDirect: boolean } | null = null;
+    if (!generation && this.resolveChannelContext) {
+      try {
+        channelContext = await this.resolveChannelContext(options.timelineKey);
+      } catch (error) {
+        this.logger?.debug("resolve_channel_context_failed", {
+          timelineKey: options.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     const satellite = renderSatelliteBlock(
-      { ...options, suppressRuntimeState: generation },
+      {
+        ...options,
+        suppressRuntimeState: generation,
+        channelLabel: channelContext?.label,
+        isDirect: channelContext?.isDirect,
+      },
       options.workspace,
       satelliteSessionType,
     );

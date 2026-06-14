@@ -12,6 +12,19 @@ export interface SatelliteRuntimeInput {
   trigger: CanonicalChatEvent;
   activeSessions: Array<Pick<AgentSessionRecord, "id" | "createdAt" | "trigger">>;
   /**
+   * Human-readable channel label for `<runtime_state>` — `Name (Space)` (the
+   * same descriptor the diary header uses), resolved from the current room by
+   * the builder's injected `resolveChannelContext` hook. Undefined when the
+   * timeline isn't a resolvable Matrix room or resolution failed; the Channel
+   * line is then omitted (the raw timeline key still identifies the room).
+   */
+  channelLabel?: string;
+  /**
+   * Whether the current timeline is a direct message, resolved alongside
+   * {@link channelLabel}. Undefined when unresolved → the Type line is omitted.
+   */
+  isDirect?: boolean;
+  /**
    * The building session's own id (spec DUPLICATE-REPLY-MITIGATION §4.2). Used to
    * count *other* active sessions when deciding whether to emit the code-owned
    * `<coordination>` explanation line for `<handled_by_session>` markers. Undefined

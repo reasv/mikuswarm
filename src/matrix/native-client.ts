@@ -161,16 +161,26 @@ export class MatrixNativeClient {
   }
 
   /**
-   * Human channel label for the diary header's `<ROOM>` token (ARCHITECTURE.md §9c):
-   * `displayName ?? canonicalAlias ?? roomId`, suffixed ` (parentSpaceName)` when the
-   * room has a legitimate, name-resolvable parent space. A thin wrapper over
-   * `channelInfo` — no new NAPI binding (the parent-space name rides on the existing
-   * channel-info payload).
+   * Human channel descriptor for prompt surfaces: the same `Name (Space)` label
+   * the diary header uses plus the room's DM flag, both derived from a single
+   * `channelInfo` call. `label` is `displayName ?? canonicalAlias ?? roomId`,
+   * suffixed ` (parentSpaceName)` when the room has a legitimate, name-resolvable
+   * parent space; `isDirect` is the room's direct-message flag. A thin wrapper over
+   * `channelInfo` — no new NAPI binding (both fields ride the existing payload).
    */
-  async channelLabel(request: MatrixChannelInfoRequest): Promise<string> {
+  async channelContext(request: MatrixChannelInfoRequest): Promise<{ label: string; isDirect: boolean }> {
     const info = await this.channelInfo(request);
     const base = info.displayName ?? info.canonicalAlias ?? info.roomId;
-    return info.parentSpaceName ? `${base} (${info.parentSpaceName})` : base;
+    const label = info.parentSpaceName ? `${base} (${info.parentSpaceName})` : base;
+    return { label, isDirect: info.isDirect };
+  }
+
+  /**
+   * Human channel label for the diary header's `<ROOM>` token (ARCHITECTURE.md §9c).
+   * Delegates to {@link channelContext} and keeps only the label.
+   */
+  async channelLabel(request: MatrixChannelInfoRequest): Promise<string> {
+    return (await this.channelContext(request)).label;
   }
 
   async uploadMedia(request: MatrixUploadMediaRequest): Promise<MatrixUploadMediaResult> {

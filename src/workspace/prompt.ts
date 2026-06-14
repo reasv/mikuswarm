@@ -221,9 +221,22 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
     ? `\n\n<active_sessions>\n${sessions}${coordination}\n</active_sessions>`
     : "";
 
-  return `Current time: ${formatAgentTimestamp(options.now ?? options.trigger.timestamp)}
-Current timeline: ${escapeXml(options.timelineKey)}
-Trigger event: ${escapeXml(options.trigger.id)}${sessionsBlock}`;
+  // Human-readable location, when the builder's resolveChannelContext hook
+  // supplied it (live/proactive/preview builds over a resolvable Matrix room).
+  // `Channel` is the `Name (Space)` label; `Type` distinguishes a DM from a
+  // group room — both omitted when unresolved, leaving the raw timeline key as
+  // the sole (machine-readable) room identifier. The trigger event id is no
+  // longer surfaced here: it is an opaque coordination id with no agent use.
+  const channelLine = options.channelLabel
+    ? `\nChannel: ${escapeXml(options.channelLabel)}`
+    : "";
+  const typeLine =
+    options.isDirect === undefined
+      ? ""
+      : `\nType: ${options.isDirect ? "direct message" : "group room"}`;
+
+  return `Current time: ${formatAgentTimestamp(options.now ?? options.trigger.timestamp)}${channelLine}${typeLine}
+Current timeline: ${escapeXml(options.timelineKey)}${sessionsBlock}`;
 }
 
 /**
