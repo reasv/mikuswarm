@@ -5,7 +5,12 @@ import { applyEditToCanonical, editStatus, needsEnrichment, type EditReplacement
 import type { CanonicalChatEvent, InboundChatEvent, TimelineState } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { classifyForRoom } from "./classify.js";
-import { paginateBackward, type BackfillReadClient, type MessageDisposition } from "./paginate.js";
+import {
+  paginateBackward,
+  type BackfillReadClient,
+  type BackwardPaginateStopReason,
+  type MessageDisposition,
+} from "./paginate.js";
 
 /**
  * Startup gap backfetch coordinator (ARCHITECTURE.md §7c).
@@ -68,8 +73,13 @@ interface RoomState {
   phase: RoomPhase;
   backfillBuf: BufferItem[];
   liveBuf: InboundChatEvent[];
-  /** A permanent hole was left below the oldest committed gap message (capped). */
-  cappedHole?: { fromTimestamp: number; toTimestamp: number };
+  /**
+   * A permanent hole was left below the oldest committed gap message (capped).
+   * `reason` (issue #6) is the descent's stop reason so an operator can tell an
+   * operator cap (`count`/`window`/`timeout`) from a floor-undefined `utd_halt`;
+   * post-#1 a read `error` never commits, so it is never a capped-hole reason.
+   */
+  cappedHole?: { fromTimestamp: number; toTimestamp: number; reason: BackwardPaginateStopReason };
   committed: number;
   startedAt: number;
 }
@@ -92,7 +102,13 @@ export interface GapBackfetchSnapshotRoom {
   backfillBuffered: number;
   liveBuffered: number;
   committed: number;
-  cappedHole?: { fromTimestamp: number; toTimestamp: number };
+  /**
+   * The permanent hole left below the oldest committed gap message under an
+   * operator cap/window/timeout (or a floor-undefined UTD halt). `reason` (issue
+   * #6) is the stop reason that produced the hole, so the console can show *why*
+   * it was capped. Optional/back-compatible: absent on every cleanly-filled room.
+   */
+  cappedHole?: { fromTimestamp: number; toTimestamp: number; reason: BackwardPaginateStopReason };
 }
 
 export interface GapBackfetchCoordinatorOptions {
@@ -273,6 +289,9 @@ export class GapBackfetchCoordinator {
         roomId: room.roomId,
         fetched: result.fetched,
         buffered: room.backfillBuf.length,
+        // Canonical single stop reason (issue #6) beside the raw flags it derives
+        // from, so the fill log and the capped log agree on one discriminator.
+        stopReason: result.stopReason,
         reachedFloor: result.reachedFloor,
         exhausted: result.exhausted,
         reachedCount: result.reachedCount,
@@ -302,9 +321,10 @@ export class GapBackfetchCoordinator {
       room.phase = "committing";
       // A stop that is neither "gap fully closed" (floor) nor "no more history"
       // (exhausted) leaves a permanent hole below the oldest committed gap message
-      // (§10). Note this BEFORE commit so the log carries the span.
-      const incomplete = !result.reachedFloor && !result.exhausted;
-      await this.commit(room, incomplete);
+      // (§10). Carry the single canonical stop reason (issue #6) into commit so the
+      // `gap_backfetch_capped` log + the `cappedHole` record name *which* opt-in
+      // (count/window/timeout, or a floor-undefined utd_halt) produced the hole.
+      await this.commit(room, result.stopReason);
       this.opts.logger.info("gap_backfetch_done", {
         roomId: room.roomId,
         committed: room.committed,
@@ -410,7 +430,14 @@ export class GapBackfetchCoordinator {
    * Commit the buffered gap (§5.3), oldest-first for crash-safety (§5.4), then
    * unfreeze and replay the live buffer.
    */
-  private async commit(room: RoomState, incomplete: boolean): Promise<void> {
+  private async commit(room: RoomState, stopReason: BackwardPaginateStopReason): Promise<void> {
+    // A stop that is neither "gap fully closed" (floor) nor "no more history"
+    // (exhausted) leaves a permanent hole below the oldest committed gap message
+    // (§10). `error` never reaches here (routed to the failed path in `runRoom`,
+    // post-#1), so the incomplete reasons are the operator opt-ins
+    // (count/window/timeout) or a floor-undefined utd_halt.
+    const incomplete = stopReason !== "floor" && stopReason !== "exhausted";
+
     // 1. Dedup buffered events by canonical id, sort ascending (oldest-first).
     const byId = new Map<string, CanonicalChatEvent>();
     for (const item of room.backfillBuf) {
@@ -420,14 +447,21 @@ export class GapBackfetchCoordinator {
 
     // Capped-hole bookkeeping (§10): the hole spans from the floor up to the
     // oldest committed gap message. Only meaningful when the descent stopped
-    // incomplete AND something was buffered.
+    // incomplete AND something was buffered. `reason` (issue #6) lets an operator
+    // distinguish a cap from a window/timeout/UTD-halt hole in both the log and
+    // the console panel.
     if (incomplete && room.floor && events.length > 0) {
       const oldest = events[0]!;
       if (oldest.timestamp > room.floor.timestamp) {
-        room.cappedHole = { fromTimestamp: room.floor.timestamp, toTimestamp: oldest.timestamp };
+        room.cappedHole = {
+          fromTimestamp: room.floor.timestamp,
+          toTimestamp: oldest.timestamp,
+          reason: stopReason,
+        };
         this.opts.logger.warn("gap_backfetch_capped", {
           accountId: room.accountId,
           roomId: room.roomId,
+          reason: stopReason,
           unfetchedFromTimestamp: room.floor.timestamp,
           unfetchedToTimestamp: oldest.timestamp,
         });

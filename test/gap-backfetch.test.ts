@@ -71,6 +71,28 @@ class FailingAtClient implements BackfillReadClient {
   }
 }
 
+/**
+ * Like ScriptedClient but each `readMessages` resolves after a per-call delay
+ * (`delaysMs[n]` for the Nth 0-based call, default 0), to exercise the descent's
+ * wall-clock timeout: a delay larger than `timeoutMs` makes `withDeadline` reject
+ * the in-flight read with `BackfillTimeoutError`, which paginateBackward records as
+ * `timedOut` (reason `timeout`), distinct from a read `error`.
+ */
+class DelayingClient implements BackfillReadClient {
+  readonly calls: Array<string | undefined> = [];
+  constructor(
+    private readonly pages: MatrixReadMessagesResult[],
+    private readonly delaysMs: number[],
+  ) {}
+  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+    this.calls.push(request.before);
+    const i = this.calls.length - 1;
+    const delay = this.delaysMs[i] ?? 0;
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    return this.pages[i] ?? { messages: [], nextBatch: null, prevBatch: null };
+  }
+}
+
 /** A summary marked undecryptable (UTD), as the native client reports key-less events. */
 function utdSummary(over: { eventId: string; timestamp: number; sessionId?: string }): MatrixMessageSummary {
   return summary({
@@ -321,7 +343,6 @@ test("live events arriving during the freeze are buffered and replayed after com
 });
 
 test("cap leaves a hole below the oldest committed gap message and logs capped", async () => {
-  let cappedSpan: { fromTimestamp: number; toTimestamp: number } | undefined;
   const h = await makeHarness(
     [
       page(
@@ -343,8 +364,75 @@ test("cap leaves a hole below the oldest committed gap message and logs capped",
   // Only the newest 2 of the gap committed; $b never fetched → hole [1000, 3000).
   assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a", "$c", "$d"]);
   const snap = h.coordinator.snapshot();
-  cappedSpan = snap[0]?.cappedHole;
-  assert.deepEqual(cappedSpan, { fromTimestamp: 1000, toTimestamp: 3000 });
+  // The capped hole carries the cap stop reason (#6: `count`) so an operator can
+  // tell this opt-in cap apart from a window/timeout/UTD-halt hole.
+  assert.deepEqual(snap[0]?.cappedHole, { fromTimestamp: 1000, toTimestamp: 3000, reason: "count" });
+  h.storage.close();
+});
+
+test("window stop leaves a capped hole tagged reason 'window' (#6)", async () => {
+  // windowMs bounds the descent to events newer than now − windowMs. $c/$d are
+  // inside the window and committed; $b is older than the window floor → the
+  // descent stops with reason `window`, leaving a hole below $c. Use a wide window
+  // and small fixed timestamps so the window floor sits between $b and $c
+  // deterministically (relative to wall-clock now).
+  const now = Date.now();
+  const h = await makeHarness(
+    [
+      page(
+        [
+          summary({ eventId: "$d", timestamp: now - 1000 }),
+          summary({ eventId: "$c", timestamp: now - 2000 }),
+          summary({ eventId: "$b", timestamp: now - 100_000 }), // older than the window floor → stop
+        ],
+        null,
+      ),
+    ],
+    { windowMs: 50_000 },
+  );
+  await seedFloor(h.timeline, h.storage, "$a", now - 200_000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  // Only the two in-window events committed; $b (below the window floor) is the
+  // boundary and is not stored.
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), [`$a`, `$c`, `$d`]);
+  const hole = h.coordinator.snapshot()[0]?.cappedHole;
+  assert.equal(hole?.reason, "window", "window stop tagged reason 'window'");
+  assert.equal(hole?.fromTimestamp, now - 200_000, "hole spans up from the floor");
+  assert.equal(hole?.toTimestamp, now - 2000, "hole spans up to the oldest committed gap message ($c)");
+  h.storage.close();
+});
+
+test("timeout stop leaves a capped hole tagged reason 'timeout' (#6)", async () => {
+  // A per-page delay larger than the descent's timeout: page 1 commits, then the
+  // deadline trips before page 2 lands → the descent stops with reason `timeout`,
+  // burying $b under a capped hole. `withDeadline` rejects the in-flight read with
+  // BackfillTimeoutError, which paginateBackward records as `timedOut` (not errored).
+  const client = new DelayingClient(
+    [
+      page([summary({ eventId: "$d", timestamp: 4000 }), summary({ eventId: "$c", timestamp: 3000 })], "tok1"),
+      page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+    ],
+    // Page 1 is instant; page 2 stalls well past the timeout so the deadline trips.
+    [0, 1000],
+  );
+  const h = await makeHarness([], { timeoutMs: 50 }, undefined, client);
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  // Page 1 ($c,$d) committed; the timeout fired before page 2, so $b stays buried.
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a", "$c", "$d"]);
+  const hole = h.coordinator.snapshot()[0]?.cappedHole;
+  assert.equal(hole?.reason, "timeout", "timeout stop tagged reason 'timeout'");
+  assert.deepEqual(
+    { from: hole?.fromTimestamp, to: hole?.toTimestamp },
+    { from: 1000, to: 3000 },
+    "hole spans from the floor up to the oldest committed gap message ($c)",
+  );
   h.storage.close();
 });
 
