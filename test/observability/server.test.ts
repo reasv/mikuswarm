@@ -231,6 +231,8 @@ test("GET /api/rooms/:key/sessions filters by status, type, and trigger search (
 
       // Free-text trigger search.
       assert.deepEqual(await list("?q=rocket"), ["s-rocket-111"]);
+      // Partial term is an implicit prefix (search-as-you-type): "roc" finds "rocket".
+      assert.deepEqual(await list("?q=roc"), ["s-rocket-111"]);
       // Status filter (repeatable param).
       assert.deepEqual(await list("?status=running"), ["s-cat-2222"]);
       // Type filter.

@@ -33,11 +33,24 @@ export function sanitizeSummaryFtsMatch(query: string): string | undefined {
 /**
  * Column-scoped MATCH expression over `agent_sessions_fts`'s single `trigger_body`
  * column, for the console sessions filter's keyword search (ARCHITECTURE.md §11).
- * Same tokenization/quoting as `sanitizeFtsMatch` — only the column differs. Returns
- * undefined for a no-token query (→ the caller runs a metadata-only filter).
+ * Unlike `sanitizeFtsMatch`/`sanitizeSummaryFtsMatch` (agent-facing, where a bare term
+ * is an exact-token match), this powers a **search-as-you-type** box, so EVERY term is
+ * an implicit **prefix** query — typing "roc" finds "rocket". Terms are still quoted to
+ * neutralize FTS5 operators (user input can't inject syntax); a trailing `*` the user
+ * types is collapsed into the same prefix. Implicit AND across terms. Returns undefined
+ * for a no-token query (→ the caller runs a metadata-only filter). Note: FTS5 prefixes
+ * match from the START of a token only — "ocket" still won't find "rocket".
  */
 export function sanitizeTriggerFtsMatch(query: string): string | undefined {
-  const terms = ftsQuotedTerms(query);
+  const tokens = query.match(/\S+/g);
+  if (!tokens || tokens.length === 0) return undefined;
+  const terms: string[] = [];
+  for (const raw of tokens) {
+    const core = raw.endsWith("*") ? raw.slice(0, -1) : raw;
+    const escaped = core.replace(/"/g, '""');
+    if (escaped.replace(/[^\p{L}\p{N}]/gu, "") === "") continue; // pure punctuation
+    terms.push(`"${escaped}"*`);
+  }
   if (terms.length === 0) return undefined;
   return `{trigger_body} : (${terms.join(" ")})`;
 }

@@ -1466,14 +1466,33 @@ test("searchAgentSessionsByTimeline: FTS over trigger_body is room-scoped and re
   });
 });
 
-test("searchAgentSessionsByTimeline: trailing-* is a prefix query", async () => {
+test("searchAgentSessionsByTimeline: a bare partial term is an implicit prefix (search-as-you-type)", async () => {
   await withStorage(async (storage) => {
     await seedFilterRows(storage);
-    const match = sanitizeTriggerFtsMatch("rock*");
-    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: match });
+    // No trailing `*` — typing "roc" must still find "rocket" (the box is incremental).
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: sanitizeTriggerFtsMatch("roc"),
+    });
     assert.deepEqual(
-      hits.map((h) => h.id).sort(),
+      hits.map((h) => h.id),
+      ["s-rocket-3", "s-rocket-1"],
+    );
+    // An explicit trailing `*` collapses to the same prefix (no double star).
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: sanitizeTriggerFtsMatch("rock*") })
+        .map((h) => h.id)
+        .sort(),
       ["s-rocket-1", "s-rocket-3"],
+    );
+    // Multi-term: each fragment is its own prefix, AND-combined.
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, {
+          triggerMatch: sanitizeTriggerFtsMatch("dep roc"),
+        })
+        .map((h) => h.id),
+      ["s-rocket-1"],
     );
   });
 });
