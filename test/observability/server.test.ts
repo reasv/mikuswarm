@@ -200,6 +200,69 @@ test("GET /api/rooms/:key/sessions lists sessions for the timeline", async () =>
   });
 });
 
+test("GET /api/rooms/:key/sessions filters by status, type, and trigger search (ARCHITECTURE.md §11)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      sessionInsert({
+        id: "s-rocket-111",
+        status: "completed",
+        sessionType: "default",
+        triggerBody: "deploy the rocket",
+        createdAt: 1_000,
+      }),
+    );
+    await storage.insertAgentSession(
+      sessionInsert({
+        id: "s-cat-2222",
+        status: "running",
+        sessionType: "proactive",
+        triggerBody: "feed the cat",
+        createdAt: 2_000,
+      }),
+    );
+
+    await withServer({ storage }, async (base) => {
+      const list = async (qs: string): Promise<string[]> => {
+        const res = await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/sessions${qs}`);
+        assert.equal(res.status, 200);
+        const body = (await res.json()) as { sessions: Array<{ id: string }> };
+        return body.sessions.map((s) => s.id);
+      };
+
+      // Free-text trigger search.
+      assert.deepEqual(await list("?q=rocket"), ["s-rocket-111"]);
+      // Status filter (repeatable param).
+      assert.deepEqual(await list("?status=running"), ["s-cat-2222"]);
+      // Type filter.
+      assert.deepEqual(await list("?type=proactive"), ["s-cat-2222"]);
+      // AND across categories: rocket is completed, so a running filter excludes it.
+      assert.deepEqual(await list("?q=rocket&status=running"), []);
+      // Unknown status value is ignored (not an error) → no status filter applied.
+      assert.deepEqual((await list("?status=bogus")).sort(), ["s-cat-2222", "s-rocket-111"]);
+      // A query that sanitizes to no token yields no hits (not "all").
+      assert.deepEqual(await list("?q=%23%23%23"), []);
+      // No params → unfiltered, reverse-chron.
+      assert.deepEqual(await list(""), ["s-cat-2222", "s-rocket-111"]);
+    });
+  });
+});
+
+test("GET /api/rooms/:key/session-facets returns the distinct types present", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-aaa1111111", sessionType: "default" }));
+    await storage.insertAgentSession(
+      sessionInsert({ id: "s-bbb2222222", sessionType: "diary", createdAt: 2_000, updatedAt: 2_000 }),
+    );
+
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/session-facets`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { types: string[] };
+      assert.deepEqual(body.types, ["default", "diary"]);
+    });
+  });
+});
+
 test("sessionMeta surfaces ACTUALS usage as a grouped object + echoes context/limit (issue #7)", async () => {
   await withStorage(async (storage) => {
     // A row whose usage columns are POPULATED (a request committed). The

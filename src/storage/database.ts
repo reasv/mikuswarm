@@ -4875,6 +4875,80 @@ export class Storage {
   }
 
   /**
+   * Filtered/searched sessions for a timeline, reverse-chron by creation (console
+   * sessions filter, ARCHITECTURE.md §11). All filters are AND-combined; within a
+   * category (`statuses`, `sessionTypes`) the values are OR'd via `in (...)`.
+   * `triggerMatch` is an already-sanitized FTS5 MATCH expression (built by
+   * `sanitizeTriggerFtsMatch` in the handler, mirroring `searchChatIndex`'s
+   * match-agnostic contract) — when present, the query joins `agent_sessions_fts` to
+   * keyword-search the trigger message. With no filters this degenerates to the same
+   * result as `getAgentSessionsByTimeline`. Read-only.
+   */
+  searchAgentSessionsByTimeline(
+    timelineKey: string,
+    opts: {
+      triggerMatch?: string;
+      statuses?: AgentSessionStatus[];
+      sessionTypes?: string[];
+      limit?: number;
+    } = {},
+  ): AgentSessionRow[] {
+    const limit = opts.limit ?? 100;
+    return this.read((db) => {
+      const where: string[] = ["s.timeline_key = @timelineKey"];
+      const params: Record<string, unknown> = { timelineKey, limit };
+      const ftsJoin = opts.triggerMatch
+        ? "join agent_sessions_fts f on f.rowid = s.rowid"
+        : "";
+      if (opts.triggerMatch) {
+        where.push("agent_sessions_fts match @triggerMatch");
+        params.triggerMatch = opts.triggerMatch;
+      }
+      const inClause = (col: string, values: string[], prefix: string): void => {
+        const keys = values.map((v, i) => {
+          params[`${prefix}${i}`] = v;
+          return `@${prefix}${i}`;
+        });
+        where.push(`${col} in (${keys.join(", ")})`);
+      };
+      if (opts.statuses && opts.statuses.length > 0) {
+        inClause("s.status", opts.statuses, "st");
+      }
+      if (opts.sessionTypes && opts.sessionTypes.length > 0) {
+        inClause("s.session_type", opts.sessionTypes, "ty");
+      }
+      return db
+        .prepare(
+          `select s.* from agent_sessions s
+           ${ftsJoin}
+           where ${where.join(" and ")}
+           order by s.created_at desc
+           limit @limit`,
+        )
+        .all(params) as AgentSessionRow[];
+    });
+  }
+
+  /**
+   * Distinct `session_type` values present for a timeline (console sessions filter,
+   * ARCHITECTURE.md §11). Backs the type-filter options — statuses are a fixed enum
+   * the UI knows, but session types are open-ended, so the filter offers exactly the
+   * types that actually occur in this room. Ordered for a stable menu. Read-only.
+   */
+  getAgentSessionTimelineFacets(timelineKey: string): { types: string[] } {
+    return this.read((db) => {
+      const rows = db
+        .prepare(
+          `select distinct session_type from agent_sessions
+           where timeline_key = ?
+           order by session_type`,
+        )
+        .all(timelineKey) as Array<{ session_type: string }>;
+      return { types: rows.map((r) => r.session_type) };
+    });
+  }
+
+  /**
    * Count `agent_sessions` rows for a timeline of a given session type created
    * at/after `since` (ARCHITECTURE.md §9g). Backs the proactive scheduler's
    * derived daily budget: because the placeholder row is inserted at session
@@ -5574,6 +5648,36 @@ create trigger if not exists summaries_ad after delete on summaries begin
 end;
 `;
 
+// Session trigger-message search index (console sessions filter, ARCHITECTURE.md §11).
+// External-content FTS5 over `agent_sessions.trigger_body` so the console can keyword-
+// search the message that launched a session. Mirrors `summaries_fts` / `chat_index_fts`,
+// but the source column is set ONCE at session creation and effectively immutable (later
+// updates only flip status / write usage rollups — never `trigger_body`). So no separate
+// reconciliation indexer is needed: the triggers keep the index exact. The `au` trigger is
+// gated on `trigger_body` actually changing (IS NOT compares NULLs safely) so the steady
+// stream of status/usage updates on a row never churns the FTS index. `agent_sessions.id`
+// is a TEXT PK but the table is not WITHOUT ROWID, so it has the implicit integer `rowid`
+// the external-content FTS docid maps onto (same as `summaries`).
+const AGENT_SESSIONS_FTS_SCHEMA = `
+create virtual table if not exists agent_sessions_fts using fts5(
+  trigger_body, content='agent_sessions', content_rowid='rowid'
+);
+create trigger if not exists agent_sessions_ai after insert on agent_sessions begin
+  insert into agent_sessions_fts(rowid, trigger_body) values (new.rowid, new.trigger_body);
+end;
+create trigger if not exists agent_sessions_ad after delete on agent_sessions begin
+  insert into agent_sessions_fts(agent_sessions_fts, rowid, trigger_body)
+    values ('delete', old.rowid, old.trigger_body);
+end;
+create trigger if not exists agent_sessions_au after update on agent_sessions
+  when new.trigger_body is not old.trigger_body
+begin
+  insert into agent_sessions_fts(agent_sessions_fts, rowid, trigger_body)
+    values ('delete', old.rowid, old.trigger_body);
+  insert into agent_sessions_fts(rowid, trigger_body) values (new.rowid, new.trigger_body);
+end;
+`;
+
 // Passive reaction store (ARCHITECTURE.md §6/§9f): the
 // source of truth for emoji reactions the agent passively perceives. Deliberately
 // NOT part of the timeline — a reaction is a mutable many-to-one relation (N
@@ -6074,6 +6178,8 @@ create index if not exists idx_agent_sessions_timeline
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
 
+${AGENT_SESSIONS_FTS_SCHEMA}
+
 -- Auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one row
 -- per billable raw-fetch tool call (today image_generate). Attributed to the
 -- ambient session but a SEPARATE accounting lane — never folded into
@@ -6089,7 +6195,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 22;
+export const LATEST_SCHEMA_VERSION = 23;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6657,6 +6763,27 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       `create index if not exists idx_timeline_events_active_updated
          on timeline_events(updated_at, id)
          where enrichment_status not in ('inactive', 'skipped');`,
+    );
+  },
+  // index 22 (v22 -> v23): add `agent_sessions_fts`, the external-content FTS5 index
+  // over `agent_sessions.trigger_body` that backs the console sessions filter's
+  // keyword search (ARCHITECTURE.md §11). The `create virtual table / trigger if not
+  // exists` DDL is idempotent and identical to the canonical SCHEMA, so fresh and
+  // migrated DBs can't drift. After creating the (empty) index, backfill it from the
+  // existing rows: a plain `insert ... select` into an external-content FTS table
+  // builds the index over the rows already present (the triggers only cover rows
+  // written from here on). Skipped when the table is absent (minimal legacy fixtures;
+  // SCHEMA then builds it at the latest shape). Fresh DBs get it directly from SCHEMA
+  // and never run this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
+      .get();
+    if (!table) return;
+    db.exec(AGENT_SESSIONS_FTS_SCHEMA);
+    db.exec(
+      `insert into agent_sessions_fts(rowid, trigger_body)
+         select rowid, trigger_body from agent_sessions;`,
     );
   },
 ];

@@ -6,7 +6,8 @@ import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { ContextMessage } from "../../context/builder.js";
 import { externalizeImages } from "../../agent/session-capture.js";
 import { isFinalTurnMessage } from "../../agent/factory.js";
-import type { AgentSessionRow, ToolInvocationRow } from "../../storage/index.js";
+import type { AgentSessionRow, AgentSessionStatus, ToolInvocationRow } from "../../storage/index.js";
+import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
 import type { RequestContext } from "./types.js";
@@ -57,16 +58,84 @@ export async function roomContext(
   });
 }
 
-/** GET /api/rooms/:key/sessions — sessions for a timeline, reverse-chron (spec §8). */
+/** The fixed set of session statuses (mirrors the `agent_sessions.status` CHECK). */
+const SESSION_STATUSES: readonly AgentSessionStatus[] = [
+  "created",
+  "running",
+  "completed",
+  "discarded",
+  "interrupted",
+  "suspended",
+  "resuming",
+  "failed-resumable",
+];
+const SESSION_STATUS_SET = new Set<string>(SESSION_STATUSES);
+
+/**
+ * Read a repeatable/CSV query param into a deduped list of non-empty tokens.
+ * Accepts both `?status=a&status=b` and `?status=a,b`. Returns undefined when no
+ * usable token is present (→ the filter is simply not applied).
+ */
+function listParam(url: URL, name: string): string[] | undefined {
+  const tokens = url.searchParams
+    .getAll(name)
+    .flatMap((v) => v.split(","))
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  if (tokens.length === 0) return undefined;
+  return [...new Set(tokens)];
+}
+
+/**
+ * GET /api/rooms/:key/sessions — sessions for a timeline, reverse-chron (spec §8).
+ * Optional filters (console sessions filter, ARCHITECTURE.md §11), AND-combined:
+ *   - `q`      free-text FTS5 search over the trigger message (`trigger_body`)
+ *   - `status` one or more session statuses (repeatable or CSV; unknown values ignored)
+ *   - `type`   one or more session types (repeatable or CSV)
+ * With no params this is identical to the original unfiltered list.
+ */
 export function roomSessions(
   _req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
 ): void {
-  const sessions = ctx.deps.storage
-    .getAgentSessionsByTimeline(ctx.params.key)
-    .map((row) => sessionMeta(row, ctx.deps.factory));
+  const q = ctx.url.searchParams.get("q")?.trim();
+  const triggerMatch = q ? sanitizeTriggerFtsMatch(q) : undefined;
+  // A non-empty query that sanitizes to nothing usable (pure punctuation) must not
+  // silently fall back to "all sessions" — it means "no token to match" → no hits.
+  if (q && q.length > 0 && triggerMatch === undefined) {
+    sendJson(res, 200, { sessions: [] });
+    return;
+  }
+  const statuses = listParam(ctx.url, "status")?.filter((s) =>
+    SESSION_STATUS_SET.has(s),
+  ) as AgentSessionStatus[] | undefined;
+  const sessionTypes = listParam(ctx.url, "type");
+  const rows =
+    triggerMatch === undefined && statuses === undefined && sessionTypes === undefined
+      ? ctx.deps.storage.getAgentSessionsByTimeline(ctx.params.key)
+      : ctx.deps.storage.searchAgentSessionsByTimeline(ctx.params.key, {
+          triggerMatch,
+          statuses,
+          sessionTypes,
+        });
+  const sessions = rows.map((row) => sessionMeta(row, ctx.deps.factory));
   sendJson(res, 200, { sessions });
+}
+
+/**
+ * GET /api/rooms/:key/session-facets — the distinct session types present in a
+ * timeline, to populate the sessions filter's type menu (ARCHITECTURE.md §11).
+ * Statuses are a fixed enum the client knows, so only the open-ended types are
+ * served here.
+ */
+export function roomSessionFacets(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const facets = ctx.deps.storage.getAgentSessionTimelineFacets(ctx.params.key);
+  sendJson(res, 200, { types: facets.types });
 }
 
 /**

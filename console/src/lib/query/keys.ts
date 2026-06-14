@@ -6,7 +6,12 @@
 export const keys = {
 	rooms: () => ['rooms'] as const,
 	roomContext: (key: string) => ['rooms', key, 'context'] as const,
-	roomSessions: (key: string) => ['rooms', key, 'sessions'] as const,
+	// `filters` is folded into the key so changing the search/status/type filter is a
+	// distinct cache entry that refetches; invalidating `['rooms', key, 'sessions']`
+	// still cascades across every filter variant.
+	roomSessions: (key: string, filters: Record<string, unknown> = {}) =>
+		['rooms', key, 'sessions', filters] as const,
+	roomSessionFacets: (key: string) => ['rooms', key, 'session-facets'] as const,
 	session: (id: string) => ['sessions', id] as const,
 	summary: (id: string) => ['summaries', id] as const,
 	// Pipeline monitor (ARCHITECTURE.md §11). `pipelines()` is the dashboard feed;

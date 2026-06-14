@@ -12,6 +12,7 @@ import {
 import type { Logger } from "../src/observability/index.js";
 import { resumeUsageSeed } from "../src/app.js";
 import { emptyUsageTotals } from "../src/agent/usage.js";
+import { sanitizeTriggerFtsMatch } from "../src/search/query.js";
 
 /**
  * `media_assets` + `summarization_jobs` are base (v1) tables present in every real
@@ -327,8 +328,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 22", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 22);
+test("LATEST_SCHEMA_VERSION is 23", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 23);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1396,4 +1397,275 @@ test("resumeUsageSeed: a legacy row with NULL usage columns yields an empty seed
     assert.deepEqual(resumeUsageSeed(row, "fresh"), emptyUsageTotals());
     assert.deepEqual(resumeUsageSeed(row, "continue"), emptyUsageTotals());
   });
+});
+
+// ---------------------------------------------------------------------------
+// Console sessions filter (ARCHITECTURE.md §11): `searchAgentSessionsByTimeline`
+// (status / type / trigger-message FTS) + `getAgentSessionTimelineFacets`, backed
+// by the `agent_sessions_fts` external-content FTS5 index (v23). All filters are
+// AND-combined; values within a category are OR'd.
+// ---------------------------------------------------------------------------
+
+const FILTER_ROOM = "matrix:miku:room:!filter";
+
+async function seedFilterRows(storage: Storage): Promise<void> {
+  await storage.insertAgentSession(
+    baseInsert({
+      id: "s-rocket-1",
+      timelineKey: FILTER_ROOM,
+      status: "completed",
+      sessionType: "default",
+      triggerBody: "deploy the rocket to mars",
+      createdAt: 100,
+    }),
+  );
+  await storage.insertAgentSession(
+    baseInsert({
+      id: "s-cat-2",
+      timelineKey: FILTER_ROOM,
+      status: "running",
+      sessionType: "proactive",
+      triggerBody: "feed the cat please",
+      createdAt: 200,
+    }),
+  );
+  await storage.insertAgentSession(
+    baseInsert({
+      id: "s-rocket-3",
+      timelineKey: FILTER_ROOM,
+      status: "failed-resumable",
+      sessionType: "diary",
+      triggerBody: "rocket launch checklist",
+      createdAt: 300,
+    }),
+  );
+  // A different room with a body that WOULD match — proves room scoping.
+  await storage.insertAgentSession(
+    baseInsert({
+      id: "s-other-4",
+      timelineKey: "matrix:miku:room:!other",
+      status: "completed",
+      sessionType: "default",
+      triggerBody: "rocket elsewhere",
+      createdAt: 400,
+    }),
+  );
+}
+
+test("searchAgentSessionsByTimeline: FTS over trigger_body is room-scoped and reverse-chron", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const match = sanitizeTriggerFtsMatch("rocket");
+    assert.ok(match, "non-empty query sanitizes to a MATCH expr");
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: match });
+    // s-rocket-3 (300) before s-rocket-1 (100); the other-room row never leaks.
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-rocket-3", "s-rocket-1"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: trailing-* is a prefix query", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const match = sanitizeTriggerFtsMatch("rock*");
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: match });
+    assert.deepEqual(
+      hits.map((h) => h.id).sort(),
+      ["s-rocket-1", "s-rocket-3"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: status filter (OR within category)", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      statuses: ["running", "failed-resumable"],
+    });
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-rocket-3", "s-cat-2"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: session-type filter", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      sessionTypes: ["diary", "proactive"],
+    });
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-rocket-3", "s-cat-2"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: filters are AND-combined across categories", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const match = sanitizeTriggerFtsMatch("rocket");
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: match,
+      statuses: ["failed-resumable"],
+    });
+    // Only s-rocket-3 matches BOTH the text and the status.
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-rocket-3"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: no filters == getAgentSessionsByTimeline", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const filtered = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {});
+    const plain = storage.getAgentSessionsByTimeline(FILTER_ROOM);
+    assert.deepEqual(
+      filtered.map((h) => h.id),
+      plain.map((h) => h.id),
+    );
+    // Three rows in this room, reverse-chron.
+    assert.deepEqual(
+      filtered.map((h) => h.id),
+      ["s-rocket-3", "s-cat-2", "s-rocket-1"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: FTS operators in user text can't inject syntax", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    // Quotes/operators are neutralized by sanitizeTriggerFtsMatch — the query must
+    // not throw, and the bare term still matches.
+    const match = sanitizeTriggerFtsMatch('rocket OR "); drop');
+    assert.ok(match);
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: match });
+    // "rocket" AND "drop" — no row has both, so zero hits, but crucially no error.
+    assert.deepEqual(hits, []);
+    // The bare token alone still works.
+    const ok = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: sanitizeTriggerFtsMatch("checklist"),
+    });
+    assert.deepEqual(
+      ok.map((h) => h.id),
+      ["s-rocket-3"],
+    );
+  });
+});
+
+test("agent_sessions_fts stays correct across a status update (au trigger gated on trigger_body)", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    // A status churn (the common case) must not corrupt or drop the FTS row.
+    await storage.updateAgentSessionStatus("s-rocket-1", "running");
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: sanitizeTriggerFtsMatch("mars"),
+    });
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-rocket-1"],
+    );
+  });
+});
+
+test("getAgentSessionTimelineFacets: distinct types present in the room, sorted", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    const facets = storage.getAgentSessionTimelineFacets(FILTER_ROOM);
+    assert.deepEqual(facets.types, ["default", "diary", "proactive"]);
+    // Empty room → no types.
+    assert.deepEqual(storage.getAgentSessionTimelineFacets("matrix:miku:room:!empty").types, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v22 -> v23 migration: create `agent_sessions_fts` and BACKFILL it from rows that
+// already exist (the triggers only cover rows written from here on).
+// ---------------------------------------------------------------------------
+
+/** The v22 `agent_sessions` shape: full current columns, but NO FTS index yet. */
+const V22_AGENT_SESSIONS = `create table agent_sessions (
+   id text primary key,
+   timeline_key text not null,
+   session_type text not null default 'default',
+   status text not null
+     check(status in ('created', 'running', 'completed', 'discarded', 'interrupted', 'suspended',
+                      'resuming', 'failed-resumable')),
+   model_id text,
+   trigger_event_id text,
+   trigger_external_id text,
+   trigger_body text,
+   trigger_sender_id text,
+   trigger_sender_display_name text,
+   context_snapshot_json text,
+   context_dump_path text,
+   transcript_json text,
+   token_estimate integer,
+   llm_requests integer,
+   usage_input_tokens integer,
+   usage_output_tokens integer,
+   usage_cache_read_tokens integer,
+   usage_cache_write_tokens integer,
+   usage_cost real,
+   context_tokens integer,
+   no_reply integer not null default 0,
+   error text,
+   created_at integer not null,
+   started_at integer,
+   updated_at integer not null,
+   completed_at integer
+ );
+ create index idx_agent_sessions_timeline on agent_sessions(timeline_key, created_at desc);
+ create index idx_agent_sessions_status on agent_sessions(status, updated_at desc);`;
+
+test("v22 -> v23 builds agent_sessions_fts and backfills existing rows", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v22-fts-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS); // fresh-vs-existing probe keys on this table
+    legacy.exec(V22_AGENT_SESSIONS);
+    const insert = legacy.prepare(FULL_ROW_INSERT);
+    insert.run(legacyRow("s-pre-rocket", "completed", { triggerBody: "rocket to the moon" }));
+    insert.run(legacyRow("s-pre-cat", "running", { triggerBody: "where is the cat" }));
+    legacy.pragma("user_version = 22");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+      // The pre-existing rows are now searchable (backfill worked).
+      const room = "matrix:miku:room:!room";
+      const hits = storage.searchAgentSessionsByTimeline(room, {
+        triggerMatch: sanitizeTriggerFtsMatch("rocket"),
+      });
+      assert.deepEqual(
+        hits.map((h) => h.id),
+        ["s-pre-rocket"],
+      );
+      // And a row inserted post-migration is indexed by the live triggers.
+      await storage.insertAgentSession(
+        baseInsert({ id: "s-post-fts", timelineKey: room, triggerBody: "another rocket flight" }),
+      );
+      assert.equal(
+        storage
+          .searchAgentSessionsByTimeline(room, { triggerMatch: sanitizeTriggerFtsMatch("rocket") })
+          .length,
+        2,
+      );
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

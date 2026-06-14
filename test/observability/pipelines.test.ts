@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Storage } from "../../src/storage/index.js";
+import { Storage, LATEST_SCHEMA_VERSION } from "../../src/storage/index.js";
 import type { PipelineId } from "../../src/storage/index.js";
 import { SessionManager } from "../../src/agent/index.js";
 import type { AgentSessionFactory } from "../../src/agent/factory.js";
@@ -701,7 +701,7 @@ test("v22 migration creates the partial active enrichment index on an existing D
     const second = await Storage.open({ databasePath: dbPath });
     try {
       const version = second.read((db) => db.pragma("user_version", { simple: true }) as number);
-      assert.equal(version, 22, "the v21→v22 step ran");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "the v21→v22 step (and later steps) ran");
       const idx = second.read((db) =>
         (db.pragma("index_list(timeline_events)") as Array<{ name: string }>).map((i) => i.name),
       );

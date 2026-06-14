@@ -31,6 +31,18 @@ export function sanitizeSummaryFtsMatch(query: string): string | undefined {
 }
 
 /**
+ * Column-scoped MATCH expression over `agent_sessions_fts`'s single `trigger_body`
+ * column, for the console sessions filter's keyword search (ARCHITECTURE.md §11).
+ * Same tokenization/quoting as `sanitizeFtsMatch` — only the column differs. Returns
+ * undefined for a no-token query (→ the caller runs a metadata-only filter).
+ */
+export function sanitizeTriggerFtsMatch(query: string): string | undefined {
+  const terms = ftsQuotedTerms(query);
+  if (terms.length === 0) return undefined;
+  return `{trigger_body} : (${terms.join(" ")})`;
+}
+
+/**
  * Tokenize free text into quoted FTS5 terms (implicit AND; trailing `*` = prefix
  * query). Quoting neutralizes FTS5 operators so user text can't inject syntax; pure
  * punctuation tokens are dropped. Shared by the message and summary match builders.

@@ -142,6 +142,10 @@ export const SessionMeta = Schema.Struct({
 export type SessionMeta = Schema.Schema.Type<typeof SessionMeta>;
 export const SessionsResponse = Schema.Struct({ sessions: Schema.Array(SessionMeta) });
 
+/** session filter facets (handlers.ts `roomSessionFacets`) — distinct types present. */
+export const SessionFacetsResponse = Schema.Struct({ types: Schema.Array(Schema.String) });
+export type SessionFacetsResponse = Schema.Schema.Type<typeof SessionFacetsResponse>;
+
 /**
  * One auxiliary tool-use ledger row (spec AUXILIARY-USAGE-TRACKING §10.3),
  * matched into the rollout by `toolCallId` to annotate the `image_generate`
