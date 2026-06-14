@@ -9,6 +9,25 @@ import {
   type CapturableAgent,
 } from "../src/agent/session-capture.js";
 import type { ContextMessage } from "../src/context/builder.js";
+import { SessionUsageTracker } from "../src/agent/usage.js";
+import type { Logger } from "../src/observability/logger.js";
+
+/**
+ * Capture-only logger stub: records every `info` call so a test can assert the
+ * `session_usage` settle line's payload. Other levels and `child` are no-ops
+ * sufficient for the capture path (which only ever calls `info`/`error`).
+ */
+function recordingLogger(): { logger: Logger; info: Array<{ message: string; fields?: Record<string, unknown> }> } {
+  const info: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (message, fields) => info.push({ message, fields }),
+    warn: () => {},
+    error: () => {},
+    child: () => logger,
+  };
+  return { logger, info };
+}
 
 async function withStorage(fn: (storage: Storage) => Promise<void>): Promise<void> {
   const storage = await Storage.open({ databasePath: ":memory:" });
@@ -826,5 +845,56 @@ test("#15 summarization capture: discarded run still flushes via error path", as
     assert.equal(row?.error, "agent prompt failed");
     assert.ok(row?.transcript_json, "kickoff turn flushed on error path");
     assert.equal(JSON.parse(row!.transcript_json!)[0].content, "Summarize the conversation shown above.");
+  });
+});
+
+test("settle log includes combinedCost and the resolved maxSessionCostUsd (spec SESSION-COST-LIMITS §6)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-cost000001" }));
+
+    const agent = new FakeAgent();
+    const usage = new SessionUsageTracker();
+    // Tool-lane spend so combinedCost is non-trivially the sum of both lanes.
+    usage.recordToolCost(0.25);
+    const { logger, info } = recordingLogger();
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId: "s-cost000001",
+      usage,
+      maxSessionCostUsd: 1.0,
+      logger,
+    });
+    capture.detach();
+    await settle(storage);
+
+    const settle_ = info.find((l) => l.message === "session_usage");
+    assert.ok(settle_, "session_usage settle line emitted at detach");
+    assert.equal(settle_!.fields?.maxSessionCostUsd, 1.0);
+    assert.ok(Math.abs((settle_!.fields?.combinedCost as number) - 0.25) < 1e-9);
+  });
+});
+
+test("settle log emits maxSessionCostUsd: null when no ceiling is threaded (unlimited)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-cost000002" }));
+
+    const agent = new FakeAgent();
+    const usage = new SessionUsageTracker();
+    const { logger, info } = recordingLogger();
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId: "s-cost000002",
+      usage,
+      // maxSessionCostUsd intentionally omitted (unlimited / worker path).
+      logger,
+    });
+    capture.detach();
+    await settle(storage);
+
+    const settle_ = info.find((l) => l.message === "session_usage");
+    assert.ok(settle_, "session_usage settle line emitted at detach");
+    assert.equal(settle_!.fields?.maxSessionCostUsd, null);
   });
 });

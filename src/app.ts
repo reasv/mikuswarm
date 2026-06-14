@@ -33,6 +33,7 @@ import {
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
+import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -1463,20 +1464,28 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * request. One-shot per run (`warned` latch). No-op (returns a noop unsubscribe)
    * when the session has no resolved ceiling. Returns the `onBudgetChange`
    * unsubscribe; the caller tears it down alongside the capture handle.
+   *
+   * Thin wiring only: the one-shot latch/threshold decision lives in the pure
+   * {@link makeCostWarnDecider} (testable without steer/log side effects); this
+   * function performs the steer + log when it reports a crossing. The `ceiling`
+   * is resolved ONCE by the caller (shared with the capture ctx's
+   * `maxSessionCostUsd`); `undefined` = unlimited → no warner.
    */
   function wireCostBudgetWarner(
     sessionId: string,
     sessionType: string,
     usage: SessionUsageTracker,
+    ceiling: number | undefined,
   ): () => void {
-    const ceiling = factory.resolveSessionCostCeiling(sessionType);
     if (ceiling === undefined) return () => {};
+    // Must match the cost_warn_fraction default shipped in config/00-defaults.toml.
+    // There is no config hot-reload, so this cannot drift at runtime; per the
+    // explicit-deployment-config convention local config normally always provides
+    // it, so this `?? 0.8` is a defensive backstop, not the live value.
     const fraction = config.agent.cost_warn_fraction ?? 0.8;
-    const threshold = ceiling * fraction;
-    let warned = false;
+    const decider = makeCostWarnDecider(ceiling, fraction);
     return usage.onBudgetChange((combinedCost) => {
-      if (warned || combinedCost < threshold) return;
-      warned = true;
+      if (!decider.shouldWarn(combinedCost)) return;
       const pct = Math.round((combinedCost / ceiling) * 100);
       const content =
         `You have spent $${combinedCost.toFixed(2)} of your $${ceiling.toFixed(2)} cost ` +
@@ -1539,7 +1548,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // (buildSessionTools) and the factory's agent-loop commits.
     const usage = new SessionUsageTracker(
       resumeUsageSeed(row, material.mode),
-      material.mode === "fresh" ? 0 : storage.getSessionToolUsage(record.id).cost,
+      selectToolCostSeed(material.mode, () => storage.getSessionToolUsage(record.id).cost),
     );
     const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage);
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
@@ -1593,6 +1602,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // (written once at original creation); only the transcript keeps flushing.
     // Fresh mode: pass the REBUILT snapshot so the row reflects the context
     // this run actually used (overwriting the stale original).
+    // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) and
+    // share it between the settle log (self-contained spend-vs-ceiling line) and
+    // the soft-warn watcher, rather than resolving it twice.
+    const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: record.id,
@@ -1602,12 +1615,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       timelineKey: record.timelineKey,
       sessionType: record.sessionType,
       model: factory.resolveModelId(record.sessionType),
+      maxSessionCostUsd: costCeiling,
       logger,
     });
     // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); the combined
     // spend is seeded from the row above, so a resumed session warns/blocks from
     // where it left off. Torn down with the capture handle in the finally.
-    const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage);
+    const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
     const runner = new SessionRunner({
       provider,
       target,
@@ -1833,6 +1847,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // during the run; detach only unsubscribes). Only reached on the success
     // path — the kickoff-missing / factory-failed early returns above never get
     // here.
+    // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) and
+    // share it between the settle log (self-contained spend-vs-ceiling line) and
+    // the soft-warn watcher, rather than resolving it twice.
+    const costCeiling = factory.resolveSessionCostCeiling(session.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: session.id,
@@ -1842,11 +1860,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       timelineKey: session.timelineKey,
       sessionType: session.sessionType,
       model: factory.resolveModelId(session.sessionType),
+      maxSessionCostUsd: costCeiling,
       logger,
     });
     // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
     // the run's .finally alongside the capture handle.
-    const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage);
+    const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
     const runner = new SessionRunner({ provider, target, suppressTyping: proactive });
 
     const run = runner

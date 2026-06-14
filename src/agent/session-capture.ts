@@ -40,6 +40,16 @@ export interface SessionCaptureContext {
   timelineKey?: string;
   sessionType?: string;
   model?: string;
+  /**
+   * Resolved per-session cost ceiling (USD) for this run (spec
+   * SESSION-COST-LIMITS §6) — `factory.resolveSessionCostCeiling(sessionType)`,
+   * resolved ONCE per session at the wiring site (shared with the soft-warn
+   * watcher) and threaded through, not re-resolved here. Emitted in the
+   * `session_usage` settle log alongside `combinedCost` so that greppable line
+   * is self-contained (spend vs. the ceiling it was measured against). Absent =
+   * unlimited (or a call site with no ceiling) → logged as `null`.
+   */
+  maxSessionCostUsd?: number;
   logger?: Logger;
 }
 
@@ -435,6 +445,10 @@ export function attachSessionCapture(
           // Combined (agent-loop + tool) spend (spec SESSION-COST-LIMITS §6) — the
           // cost-ceiling basis; `cost` above is the agent-loop lane alone.
           combinedCost: ctx.usage.combinedCost(),
+          // The resolved ceiling combinedCost was measured against (§6), so this
+          // line is self-contained even if config changes between run and later
+          // analysis. null = unlimited.
+          maxSessionCostUsd: ctx.maxSessionCostUsd ?? null,
         });
       }
     },
