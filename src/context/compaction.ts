@@ -41,6 +41,14 @@ export interface CompactTimelineOptions {
    * reaction exists only as a View A count.
    */
   discreteHorizonMessages?: number;
+  /**
+   * View B horizon for NON-self (inter-user) reaction lines, applied independently
+   * of {@link discreteHorizonMessages} so cross-user reactions can be clamped to a
+   * tighter recent-message window than the bot-directed lines (§9f asymmetric
+   * horizon). Same units (0 = whole rich tier; >0 = last N rich messages). When
+   * undefined, non-self lines fall back to {@link discreteHorizonMessages}.
+   */
+  discreteOtherHorizonMessages?: number;
 }
 
 /** A renderable unit fed to {@link buildTieredTurns}: a real event or a synthetic line. */
@@ -142,10 +150,16 @@ export function compactTimelineEvents(
     messageId: item.event.id,
   }));
   // Inject only reaction lines within the rich tier's time span (§8 horizon).
-  // discreteHorizonMessages tightens it to the last N rich messages (0 = whole tier).
-  const richHorizon = computeReactionHorizon(rich, options.discreteHorizonMessages ?? 0);
+  // discreteHorizonMessages tightens it to the last N rich messages (0 = whole
+  // tier). Non-self (inter-user) lines use their own, typically tighter, horizon
+  // (§9f asymmetric horizon); when unset they inherit the self horizon.
+  const selfHorizon = computeReactionHorizon(rich, options.discreteHorizonMessages ?? 0);
+  const otherHorizon = computeReactionHorizon(
+    rich,
+    options.discreteOtherHorizonMessages ?? options.discreteHorizonMessages ?? 0,
+  );
   const reactionUnits: TurnUnit[] = (options.reactionLines ?? [])
-    .filter((line) => line.timestamp >= richHorizon)
+    .filter((line) => line.timestamp >= (line.self ? selfHorizon : otherHorizon))
     .map((line) => ({
       role: "user" as ChatRole,
       tier: "rich" as const,

@@ -447,6 +447,15 @@ show_aggregates = true            # View A: key×count on every rich-tier messag
 show_discrete = true              # View B: "X reacted Y to your message" lines, interleaved
 discrete_assistant_only = true    # View B targets: true = only the agent's own messages
 discrete_horizon_messages = 0     # View B horizon: 0 = whole rich tier; >0 = last N rich messages
+# Applies ONLY when discrete_assistant_only = false, i.e. to inter-user reaction
+# lines — keeps cross-user reaction chatter tighter than the bot-directed lines (the
+# reactions that become conversation topics are on recent messages).
+discrete_other_horizon_messages = 10  # inter-user horizon: last N rich messages (0 = whole tier)
+# Episode splitting (applies to all View B lines): a coalesced reaction is split into
+# separate lines when the conversation moved on between two reactions, so each burst
+# lands at its own timeline position instead of all at the latest reaction.
+discrete_split_messages = 5       # ≥N messages between two reactions to one msg → split (hard seam)
+discrete_split_minutes = 30       # with 1..N-1 messages between, also split if >M min elapsed
 discrete_name_cap = 8             # >N senders on one reaction → first 4 + "(and N others)"
 
 # Proactive posting (ARCHITECTURE.md §9g): let the bot post on its own initiative
