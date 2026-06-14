@@ -131,6 +131,23 @@ interface Harness {
   enriched: string[];
   summarized: string[];
   chatIndexed: string[];
+  /** Every `logger.warn(event, fields)` call, captured in order. */
+  warnings: Array<{ event: string; fields?: Record<string, unknown> }>;
+}
+
+/** A logger stub that records `warn` calls into `sink`; other levels are silent. */
+function capturingLogger(sink: Array<{ event: string; fields?: Record<string, unknown> }>) {
+  return {
+    info() {},
+    warn(event: string, fields?: Record<string, unknown>) {
+      sink.push({ event, fields });
+    },
+    error() {},
+    debug() {},
+    child() {
+      return this;
+    },
+  } as never;
 }
 
 const DEFAULT_CONFIG: GapBackfetchConfig = {
@@ -148,6 +165,7 @@ async function makeHarness(
   configOverride: Partial<GapBackfetchConfig> = {},
   storeOverride?: Pick<GapBackfetchCoordinatorOptions, "timeline">,
   clientOverride?: BackfillReadClient & { calls: Array<string | undefined> },
+  isDraining: () => boolean = () => false,
 ): Promise<Harness> {
   const storage = await Storage.open({ databasePath: ":memory:" });
   const timeline = new TimelineStore(storage);
@@ -157,6 +175,7 @@ async function makeHarness(
   const enriched: string[] = [];
   const summarized: string[] = [];
   const chatIndexed: string[] = [];
+  const warnings: Array<{ event: string; fields?: Record<string, unknown> }> = [];
 
   const coordinator = new GapBackfetchCoordinator({
     storage,
@@ -169,19 +188,11 @@ async function makeHarness(
     enqueueChatSearch: (id) => chatIndexed.push(id),
     enqueueSummarization: (tk) => summarized.push(tk),
     replayLiveInbound: (inbound) => replayed.push(inbound),
-    isDraining: () => false,
-    logger: {
-      info() {},
-      warn() {},
-      error() {},
-      debug() {},
-      child() {
-        return this;
-      },
-    } as never,
+    isDraining,
+    logger: capturingLogger(warnings),
   });
 
-  return { storage, timeline, recording, client, coordinator, replayed, enriched, summarized, chatIndexed };
+  return { storage, timeline, recording, client, coordinator, replayed, enriched, summarized, chatIndexed, warnings };
 }
 
 /** Seed a committed event (the floor) and mark its timeline active. */
@@ -763,6 +774,189 @@ test("equal-timestamp floor: same-ms lower-id gap event recovered; exact floor e
     storedIds(h.storage, ROOM_TK).includes("$pre"),
     false,
     "the strictly-older event below the floor is not committed",
+  );
+  h.storage.close();
+});
+
+// --- #3: commit() bails when draining begins, leaving the room frozen ---
+test("draining before commit: room does NOT commit, stays frozen, gap re-derivable next run", async () => {
+  // The fill completes (descent reaches the floor), but shutdown has begun before
+  // the room issues its first write. commit() must bail at the top: nothing is
+  // committed, the live buffer is NOT drained, and the room is left frozen so the
+  // §4 invariant re-derives the same single gap on the next (non-draining) startup.
+  let draining = false;
+  const h = await makeHarness(
+    [
+      page(
+        [
+          summary({ eventId: "$d", timestamp: 4000 }),
+          summary({ eventId: "$c", timestamp: 3000 }),
+          summary({ eventId: "$b", timestamp: 2000 }),
+          summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        ],
+        null,
+      ),
+    ],
+    {},
+    undefined,
+    undefined,
+    () => draining,
+  );
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+
+  h.coordinator.prepare();
+  // A live @ arrives during the freeze — it must NOT be replayed on the bailed path.
+  h.coordinator.bufferLive(makeInbound("$live1", 9000));
+  // Shutdown begins after prepare/buffer but before run launches the room's commit.
+  draining = true;
+  await h.coordinator.run();
+
+  // Nothing committed; the high-water never advanced (only the seeded floor row).
+  assert.deepEqual(h.recording.inserted, [], "no rows committed while draining");
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a"], "only the pre-existing floor row remains");
+  // The room is left frozen (still in an active phase) with its live buffer intact,
+  // not unfrozen-and-done — so it re-derives the gap next startup.
+  assert.equal(h.coordinator.isFrozen(ROOM_TK), true, "room left frozen after a draining bail");
+  const snap = h.coordinator.snapshot();
+  assert.equal(snap[0]?.committed, 0, "committed count is zero");
+  assert.equal(snap[0]?.liveBuffered, 1, "live buffer NOT drained on the draining bail");
+  assert.deepEqual(h.replayed, [], "live buffer NOT replayed while draining");
+
+  // A clean re-run (fresh coordinator, not draining) closes the gap with no hole.
+  const coord2 = new GapBackfetchCoordinator({
+    storage: h.storage,
+    timeline: h.timeline,
+    config: DEFAULT_CONFIG,
+    getClient: () =>
+      new ScriptedClient([
+        page(
+          [
+            summary({ eventId: "$d", timestamp: 4000 }),
+            summary({ eventId: "$c", timestamp: 3000 }),
+            summary({ eventId: "$b", timestamp: 2000 }),
+            summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+          ],
+          null,
+        ),
+      ]),
+    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    notifyEnrichment() {},
+    notifyCaptions() {},
+    enqueueChatSearch() {},
+    enqueueSummarization() {},
+    replayLiveInbound() {},
+    isDraining: () => false,
+    logger: silentLogger(),
+  });
+  coord2.prepare();
+  await coord2.run();
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a", "$b", "$c", "$d"], "re-run closes the gap, no buried hole");
+  h.storage.close();
+});
+
+test("draining that flips true mid-run bails the commit (no partial writes)", async () => {
+  // isDraining flips true only when first observed inside commit(): the fill loop
+  // sees draining=false (so the room is launched and filled), then commit's top
+  // check sees true and bails. Proves the bail is evaluated at commit start, not
+  // only at room-launch time.
+  let observed = 0;
+  const h = await makeHarness(
+    [page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null)],
+    {},
+    undefined,
+    undefined,
+    // false for the run-loop's pre-launch check, true once commit() asks.
+    () => observed++ >= 1,
+  );
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  assert.deepEqual(h.recording.inserted, [], "commit bailed — no rows written");
+  assert.equal(h.coordinator.isFrozen(ROOM_TK), true, "room remains frozen");
+  h.storage.close();
+});
+
+// --- #7: mixed room:/dm: keys — base kind chosen by most-recent high-water ---
+test("mixed room/dm keys: base kind is the newest-high-water side (room wins), events route to room", async () => {
+  const DM_TK = `matrix:${ACCOUNT}:dm:${ROOM}`;
+  // Same roomId held BOTH a room: and a dm: committed event (m.direct flipped over
+  // time). The room: side has the NEWER high-water (3000 > 2000), so the room
+  // currently behaves as a regular room and recovered events must base on `room:`,
+  // NOT the dm base (the old unconditional dm-preference would mis-home them).
+  const h = await makeHarness([
+    page(
+      [
+        summary({ eventId: "$g2", timestamp: 5000 }),
+        summary({ eventId: "$g1", timestamp: 4000 }),
+        summary({ eventId: "$room", timestamp: 3000 }), // === room: floor (the MAX over all keys) → stop
+      ],
+      null,
+    ),
+  ]);
+  // Seed a dm: floor (older) and a room: floor (newer). getHighWaterMark over all
+  // keys returns the room: event ($room@3000) as the floor; the room: side also
+  // wins the base-kind comparison.
+  await seedFloor(h.timeline, h.storage, "$dm", 2000, DM_TK);
+  await seedFloor(h.timeline, h.storage, "$room", 3000, ROOM_TK);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  // Recovered gap events ($g1,$g2) route to the room: base, not the dm: base.
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$room", "$g1", "$g2"], "recovered events based on room:");
+  assert.deepEqual(storedIds(h.storage, DM_TK), ["$dm"], "dm: side untouched (no recovered events re-homed)");
+  // A mixed-kind warning was emitted naming the chosen kind.
+  const mixed = h.warnings.find((w) => w.event === "gap_backfetch_mixed_room_kind");
+  assert.ok(mixed, "gap_backfetch_mixed_room_kind warning emitted");
+  assert.equal(mixed?.fields?.chosen, "room", "warning names the chosen base kind (room)");
+  assert.equal(mixed?.fields?.roomId, ROOM, "warning carries the roomId");
+  h.storage.close();
+});
+
+test("mixed room/dm keys: dm side newer ⇒ dm base chosen; single-kind groups emit no mixed warning", async () => {
+  const DM_TK = `matrix:${ACCOUNT}:dm:${ROOM}`;
+  // Symmetric case: the dm: side has the newer high-water (4000 > 2000), so the dm:
+  // base is chosen. Floor = MAX over all keys = $dm@4000; the descent stops there.
+  const h = await makeHarness([
+    page(
+      [
+        summary({ eventId: "$g2", timestamp: 6000 }),
+        summary({ eventId: "$g1", timestamp: 5000 }),
+        summary({ eventId: "$dm", timestamp: 4000 }), // === dm: floor (MAX over all keys) → stop
+      ],
+      null,
+    ),
+  ]);
+  await seedFloor(h.timeline, h.storage, "$room", 2000, ROOM_TK);
+  await seedFloor(h.timeline, h.storage, "$dm", 4000, DM_TK);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  assert.deepEqual(storedIds(h.storage, DM_TK), ["$dm", "$g1", "$g2"], "recovered events based on dm:");
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$room"], "room: side untouched");
+  const mixed = h.warnings.find((w) => w.event === "gap_backfetch_mixed_room_kind");
+  assert.equal(mixed?.fields?.chosen, "dm", "warning names dm as the chosen base kind");
+  h.storage.close();
+});
+
+test("single-kind group: no mixed-kind warning, unchanged behavior", async () => {
+  // The normal case (room: only) must be completely unchanged: no mixed warning.
+  const h = await makeHarness([
+    page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+  ]);
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a", "$b"]);
+  assert.equal(
+    h.warnings.some((w) => w.event === "gap_backfetch_mixed_room_kind"),
+    false,
+    "single-kind groups emit no mixed-kind warning",
   );
   h.storage.close();
 });

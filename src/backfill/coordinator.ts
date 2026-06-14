@@ -178,40 +178,57 @@ export class GapBackfetchCoordinator {
   prepare(): void {
     if (!this.opts.config.enabled) return;
     const keys = this.opts.storage.listKnownTimelineKeys();
-    // Group known timeline keys by (account, room).
-    const groups = new Map<string, { parsed: ParsedKey; keys: string[] }>();
+    // Group known timeline keys by (account, room), tracking every key's kind. A
+    // room's `m.direct` flag is mutable, so a single roomId can hold BOTH `room:`
+    // and `dm:` keys; the base kind is resolved per group below (#7).
+    const groups = new Map<
+      string,
+      { accountId: string; roomId: string; keysByKind: Map<"room" | "dm", string[]>; keys: string[] }
+    >();
     for (const key of keys) {
       const parsed = parseKey(key);
       if (!parsed) continue;
       const rk = roomKeyOf(parsed.accountId, parsed.roomId);
-      const existing = groups.get(rk);
-      if (existing) {
-        existing.keys.push(key);
-        // Prefer a DM base if any key for this room is a dm key (defensive).
-        if (parsed.kind === "dm") existing.parsed = parsed;
-      } else {
-        groups.set(rk, { parsed, keys: [key] });
+      let existing = groups.get(rk);
+      if (!existing) {
+        existing = { accountId: parsed.accountId, roomId: parsed.roomId, keysByKind: new Map(), keys: [] };
+        groups.set(rk, existing);
       }
+      existing.keys.push(key);
+      const forKind = existing.keysByKind.get(parsed.kind);
+      if (forKind) forKind.push(key);
+      else existing.keysByKind.set(parsed.kind, [key]);
     }
 
-    for (const [rk, { parsed, keys: roomKeys }] of groups) {
-      const selfUserId = this.opts.selfUserIds.get(parsed.accountId);
+    for (const [rk, { accountId, roomId, keysByKind, keys: roomKeys }] of groups) {
+      const selfUserId = this.opts.selfUserIds.get(accountId);
       if (!selfUserId) {
         this.opts.logger.warn("gap_backfetch_skip_room", {
-          accountId: parsed.accountId,
-          roomId: parsed.roomId,
+          accountId,
+          roomId,
           reason: "unknown_self_user",
         });
         continue;
       }
-      const isDm = parsed.kind === "dm";
+      // Resolve the group's base kind (#7). Single-kind groups (the normal case)
+      // take that one kind unchanged. A mixed `room:`/`dm:` group picks the side
+      // whose timeline keys have the newest committed high-water — i.e. where the
+      // room currently behaves, where new live events land — rather than the old
+      // unconditional dm-preference (which mis-homed recovered events to the dm
+      // base even after the room flipped back to a regular room). The descent floor
+      // is still MAX across ALL keys (computed below), so this choice changes only
+      // where recovered events are *based*, never how far the descent goes.
+      const baseKind = this.selectBaseKind(accountId, roomId, keysByKind);
+      const isDm = baseKind === "dm";
       const baseTimelineKey = isDm
-        ? `matrix:${parsed.accountId}:dm:${parsed.roomId}`
-        : `matrix:${parsed.accountId}:room:${parsed.roomId}`;
+        ? `matrix:${accountId}:dm:${roomId}`
+        : `matrix:${accountId}:room:${roomId}`;
+      // Floor = MAX across ALL the room's keys (room/DM + threads), independent of
+      // the base-kind choice; this bounds the descent regardless (#7).
       const floor = this.opts.storage.getHighWaterMark(roomKeys);
       this.rooms.set(rk, {
-        accountId: parsed.accountId,
-        roomId: parsed.roomId,
+        accountId,
+        roomId,
         roomKey: rk,
         baseTimelineKey,
         isDm,
@@ -226,6 +243,51 @@ export class GapBackfetchCoordinator {
       });
     }
     this.opts.logger.info("gap_backfetch_prepared", { rooms: this.rooms.size });
+  }
+
+  /**
+   * Pick the group's base kind (#7). Single-kind groups return that kind directly
+   * (the normal case — no log, no comparison). For a mixed `room:`/`dm:` group,
+   * choose the kind whose subset of timeline keys has the newest committed
+   * high-water by the canonical `(timestamp, id)` order — the side where current
+   * live events land — and emit a one-line `gap_backfetch_mixed_room_kind` warning
+   * for operator visibility. If exactly one kind has any committed events, that
+   * kind wins; if neither does (only `timeline_compaction_state` rows), default to
+   * `room`.
+   */
+  private selectBaseKind(
+    accountId: string,
+    roomId: string,
+    keysByKind: Map<"room" | "dm", string[]>,
+  ): "room" | "dm" {
+    const roomKeys = keysByKind.get("room");
+    const dmKeys = keysByKind.get("dm");
+    if (!roomKeys) return "dm"; // dm-only (dmKeys is guaranteed present)
+    if (!dmKeys) return "room"; // room-only (the common case)
+
+    // Mixed: compare each side's high-water (MAX over that side's keys, threads
+    // included) by canonical order and pick the newer.
+    const roomHw = this.opts.storage.getHighWaterMark(roomKeys);
+    const dmHw = this.opts.storage.getHighWaterMark(dmKeys);
+    let chosen: "room" | "dm";
+    if (roomHw && dmHw) {
+      chosen = compareFloor(roomHw, dmHw) >= 0 ? "room" : "dm";
+    } else if (roomHw) {
+      chosen = "room";
+    } else if (dmHw) {
+      chosen = "dm";
+    } else {
+      chosen = "room";
+    }
+    this.opts.logger.warn("gap_backfetch_mixed_room_kind", {
+      accountId,
+      roomId,
+      kinds: ["room", "dm"],
+      chosen,
+      roomHighWater: roomHw?.timestamp ?? null,
+      dmHighWater: dmHw?.timestamp ?? null,
+    });
+    return chosen;
   }
 
   /** True while the room owning `timelineKey` has not yet finished its gap fill. */
@@ -431,6 +493,22 @@ export class GapBackfetchCoordinator {
    * unfreeze and replay the live buffer.
    */
   private async commit(room: RoomState, stopReason: BackwardPaginateStopReason): Promise<void> {
+    // Drain bail (#3): if shutdown has begun before this room issues its first
+    // write, do NOT start committing. Leaving the room frozen (live buffer intact,
+    // backfill buffer discarded with the coordinator) keeps the §4 invariant —
+    // the same single gap re-derives on the next startup — and avoids racing a
+    // write into a closing DB (`storage.waitForIdle()`/`close()` in `stop()`).
+    // A room already mid-commit when `draining` flips still finishes its
+    // oldest-first batch (crash-safe); this only prevents *starting* one. No-op
+    // during normal operation (isDraining is false).
+    if (this.opts.isDraining()) {
+      this.opts.logger.info("gap_backfetch_commit_skipped_draining", {
+        accountId: room.accountId,
+        roomId: room.roomId,
+        buffered: room.backfillBuf.length,
+      });
+      return;
+    }
     // A stop that is neither "gap fully closed" (floor) nor "no more history"
     // (exhausted) leaves a permanent hole below the oldest committed gap message
     // (§10). `error` never reaches here (routed to the failed path in `runRoom`,
@@ -570,5 +648,16 @@ export class GapBackfetchCoordinator {
 function compareAscending(a: CanonicalChatEvent, b: CanonicalChatEvent): number {
   if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
   if (a.receivedAt !== b.receivedAt) return a.receivedAt - b.receivedAt;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * Compare two committed high-water marks by the canonical `(timestamp, id)` order
+ * (the `received_at` tie-breaker is unavailable here — `getHighWaterMark` returns
+ * only `{timestamp, id}`). Returns >0 when `a` is newer, <0 when `b` is newer,
+ * 0 when equal. Used to pick a mixed room/dm group's base kind (#7).
+ */
+function compareFloor(a: { timestamp: number; id: string }, b: { timestamp: number; id: string }): number {
+  if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
