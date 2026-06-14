@@ -82,8 +82,10 @@ import {
   createXFetchTool,
   createXSearchTool,
   GrokResultCache,
+  createFindSourceTool,
   type ToolUsageRecord,
 } from "./tools/index.js";
+import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
@@ -196,6 +198,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (fxTwitterConfig.tool.maxCharsLimit > fxTwitterConfig.tool.maxTotalChars) {
     throw new Error(
       `fxtwitter.tool: max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit}) must be <= max_total_chars (${fxTwitterConfig.tool.maxTotalChars})`,
+    );
+  }
+  // [saucenao] cross-field sanity (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5; app-wiring
+  // per the proactive-posting precedent): the schema keeps `api_key` optional so a
+  // disabled block needn't carry a `${SAUCENAO_API_KEY}` template that would fail
+  // startup when the env var is unset — but an *enabled* block with no key is a
+  // misconfiguration the `find_source` tool would only catch at construction time.
+  if (config.saucenao?.enabled === true && !(config.saucenao.api_key ?? "").trim()) {
+    throw new Error(
+      "saucenao.enabled is true but saucenao.api_key is missing/empty — set a SauceNAO API key (e.g. api_key = \"${SAUCENAO_API_KEY}\") or set enabled = false.",
     );
   }
   const llmScheduler = new LlmScheduler({
@@ -450,6 +462,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // busy channel dampen to a single Grok call. Only the expensive synthesis is
   // cached (pre-hydration); 0 minutes disables it.
   const xSearchCache = new GrokResultCache((config.x_search?.cache_ttl_minutes ?? 10) * 60_000);
+
+  // Shared SauceNAO short-window quota guard (spec SAUCENAO-SOURCE-LOOKUP §4): the
+  // SauceNAO free-tier limit is per-ACCOUNT (global), so a single limiter is
+  // constructed here and injected into every session's `find_source` tool — a
+  // per-session limiter would not bound the shared budget. Built only when the
+  // tool is enabled.
+  const sauceNaoRateLimiter =
+    config.saucenao?.enabled === true
+      ? new SauceNaoRateLimiter({
+          shortWindowMax: config.saucenao.rate_limit?.short_window_max ?? 6,
+          shortWindowMs: config.saucenao.rate_limit?.short_window_ms ?? 30_000,
+        })
+      : undefined;
 
   const captioningConfig = config.captioning ?? {};
   const sharedModel = {
@@ -1955,6 +1980,24 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
               flash: toImageCostRates(config.image_gen.costs?.flash),
             },
             config: config.image_gen,
+          })]
+        : []),
+      // find_source (spec SAUCENAO-SOURCE-LOOKUP): reverse-image search via
+      // SauceNAO — image → source URL + artist (inverse of `danbooru`). Gated on
+      // saucenao.enabled; shares the process-wide per-account quota limiter.
+      ...(config.saucenao?.enabled === true && sauceNaoRateLimiter
+        ? [createFindSourceTool({
+            workspaceRoot,
+            fetchClient,
+            // Same shared per-model base64 cap + conditioning pipeline as
+            // read_image / danbooru preview, for the view-thumbnail path.
+            inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+            inferenceImageOptions,
+            modelHasVision: config.models.default.multimodal,
+            rateLimiter: sauceNaoRateLimiter,
+            maxWaitMs: config.saucenao.rate_limit?.max_wait_ms,
+            httpProxyUrl: config.network?.http_proxy_url,
+            config: config.saucenao,
           })]
         : []),
       // x_search (spec/X-SEARCH.md): Grok-as-subagent X.com search, grounded by

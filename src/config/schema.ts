@@ -797,6 +797,35 @@ const XSearchSchema = StrictObject({
   })),
 });
 
+// Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP; backs
+// the `find_source` tool). Opt-in (`enabled`, default false). `api_key` is a
+// per-account SauceNAO key; the field name matches the secret regex so it
+// auto-registers for log redaction. It is OPTIONAL in the schema (so a disabled
+// block needn't ship a `${SAUCENAO_API_KEY}` template that would fail startup
+// when the env var is unset); the `enabled => api_key` invariant is enforced as
+// a cross-field check in app.ts (per the proactive-posting precedent).
+const SauceNaoSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  api_key: Type.Optional(Type.String({ minLength: 1 })),
+  base_url: Type.Optional(Type.String({ minLength: 1 })), // default https://saucenao.com
+  numres: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+  max_results_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+  min_similarity: Type.Optional(Type.Number({ minimum: 0, maximum: 100 })),
+  db: Type.Optional(Type.Integer({ minimum: 0 })), // default 999 (all indexes)
+  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  max_image_bytes: Type.Optional(Type.Integer({ minimum: 1 })), // upload conditioning cap
+  view_max_blocks: Type.Optional(Type.Integer({ minimum: 1 })),
+  // In-memory short-window guard for SauceNAO's per-account quota (§4). The long/
+  // daily window is surfaced from SauceNAO's own counters, not enforced here.
+  rate_limit: Type.Optional(
+    StrictObject({
+      short_window_max: Type.Optional(Type.Integer({ minimum: 1 })),
+      short_window_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+      max_wait_ms: Type.Optional(Type.Number({ minimum: 0 })),
+    }),
+  ),
+});
+
 // One LLM rate-limit group = one shared upstream budget (spec §9.2). There is one
 // `default` group and everything lands in it unless a model opts into another via
 // `rate_limit_group`; extra groups exist only for genuinely separate budgets.
@@ -1041,6 +1070,7 @@ export const AppConfigSchema = StrictObject({
   })),
   image_gen: Type.Optional(ImageGenSchema),
   x_search: Type.Optional(XSearchSchema),
+  saucenao: Type.Optional(SauceNaoSchema),
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),
@@ -1055,6 +1085,7 @@ export type SearchConfig = Static<typeof SearchSchema>;
 export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
 export type XSearchConfig = Static<typeof XSearchSchema>;
+export type SauceNaoConfig = Static<typeof SauceNaoSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
