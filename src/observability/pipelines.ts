@@ -1,4 +1,4 @@
-import type { PipelineId } from "../storage/index.js";
+import type { CaptionEligibility, PipelineId } from "../storage/index.js";
 
 /**
  * The tiny read-only stats seam each background worker pool exposes for the
@@ -18,6 +18,13 @@ export interface PipelineStats {
    * the dashboard read path need not provide it.
    */
   notify?(): void;
+  /**
+   * Captioning only: the config-derived eligibility the monitor needs to compute
+   * the derived `deferred` status (a pending asset the pool would never claim). The
+   * captioning pool sets it from its `caption_all`/`caption_assistant_messages`
+   * config; other pools omit it.
+   */
+  captionEligibility?: CaptionEligibility;
 }
 
 /**

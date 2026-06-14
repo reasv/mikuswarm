@@ -14,10 +14,13 @@
 	import { cn } from '$lib/utils';
 
 	// Status filter chips per pool. `pending`/`retrying` are backed by the same
-	// pseudo-filter the dashboard buckets use; the rest are raw statuses.
+	// pseudo-filter the dashboard buckets use; `deferred` (captioning) is a derived
+	// pseudo-status (pending the pool would never claim under the current config);
+	// the rest are raw statuses. The default (no chip) view hides `skipped` for every
+	// pool and `deferred` for captioning — selecting the chip reveals them.
 	const STATUS_CHIPS: Record<PipelineId, string[]> = {
 		enrichment: ['processing', 'pending', 'retrying', 'complete', 'failed', 'skipped'],
-		captioning: ['processing', 'pending', 'retrying', 'complete', 'failed', 'skipped'],
+		captioning: ['processing', 'pending', 'retrying', 'complete', 'deferred', 'failed', 'skipped'],
 		summarization: ['processing', 'pending', 'retrying', 'complete', 'failed'],
 		diary: ['processing', 'pending', 'retrying', 'done', 'skipped', 'failed']
 	};

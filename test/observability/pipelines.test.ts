@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Storage } from "../../src/storage/index.js";
 import type { PipelineId } from "../../src/storage/index.js";
 import { SessionManager } from "../../src/agent/index.js";
@@ -153,6 +156,38 @@ async function mediaAsset(
   });
 }
 
+/**
+ * Append a parent event (optionally trigger-bearing and/or assistant-role) then a
+ * media asset under it — the fixture for captioning eligibility / `deferred` tests.
+ * Eligibility mirrors `claimPendingCaptions`: trigger-group OR (caption_all) OR
+ * (assistant-role AND caption_assistant_messages).
+ */
+async function captionAsset(
+  storage: Storage,
+  eventId: string,
+  assetId: string,
+  opts: {
+    triggerGroup?: boolean;
+    role?: "user" | "assistant";
+    status?: string;
+    updatedAt?: number;
+    mediaType?: string;
+  } = {},
+): Promise<void> {
+  await storage.appendTimelineEvent(userEvent(eventId));
+  if (opts.triggerGroup || opts.role) {
+    await storage.write((db) =>
+      db
+        .prepare(`update timeline_events set trigger_group_id = ?, role = ? where id = ?`)
+        .run(opts.triggerGroup ? "g1" : null, opts.role ?? "user", eventId),
+    );
+  }
+  await mediaAsset(storage, assetId, eventId, opts.status ?? "pending", {
+    updatedAt: opts.updatedAt,
+    mediaType: opts.mediaType,
+  });
+}
+
 async function summarizationJob(
   storage: Storage,
   id: string,
@@ -237,6 +272,7 @@ test("getPipelineCounts buckets enrichment statuses; excludes inactive", async (
       done: 1,
       failed: 1,
       skipped: 1,
+      deferred: 0,
     });
   });
 });
@@ -253,6 +289,39 @@ test("getPipelineCounts for captioning scopes to image/video/audio", async () =>
     assert.equal(counts.pending, 1, "the 'file' asset is not in the captioning track");
     assert.equal(counts.retrying, 1);
     assert.equal(counts.done, 1);
+    assert.equal(counts.deferred, 0, "no eligibility supplied → no deferred partition");
+  });
+});
+
+test("getPipelineCounts captioning partitions deferred pending from real backlog", async () => {
+  await withStorage(async (storage) => {
+    await captionAsset(storage, "evt-trig", "m-trig", { triggerGroup: true }); // eligible pending
+    await captionAsset(storage, "evt-user", "m-user", {}); // deferred (non-trigger user)
+    await captionAsset(storage, "evt-asst", "m-asst", { role: "assistant" }); // deferred unless assistant on
+    await captionAsset(storage, "evt-done", "m-done", { status: "complete" });
+    await captionAsset(storage, "evt-skip", "m-skip", { status: "skipped" });
+
+    // No eligibility → legacy behaviour: every fresh pending counts as pending.
+    const legacy = storage.getPipelineCounts("captioning");
+    assert.equal(legacy.pending, 3);
+    assert.equal(legacy.deferred, 0);
+
+    // Neither flag set: only the trigger-group asset is real backlog.
+    const off = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false });
+    assert.equal(off.pending, 1, "only the trigger-group asset is real pending backlog");
+    assert.equal(off.deferred, 2, "non-trigger user + assistant pending are deferred");
+    assert.equal(off.done, 1);
+    assert.equal(off.skipped, 1);
+
+    // caption_assistant_messages on: the assistant asset becomes real backlog.
+    const asst = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: true });
+    assert.equal(asst.pending, 2);
+    assert.equal(asst.deferred, 1, "only the plain-user asset stays deferred");
+
+    // caption_all: nothing is ever deferred.
+    const all = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(all.pending, 3);
+    assert.equal(all.deferred, 0);
   });
 });
 
@@ -263,7 +332,7 @@ test("getPipelineCounts for summarization + diary", async () => {
     await summarizationJob(storage, "j-done", "complete");
     await summarizationJob(storage, "j-fail", "failed");
     const sc = storage.getPipelineCounts("summarization");
-    assert.deepEqual(sc, { pending: 1, retrying: 1, processing: 0, done: 1, failed: 1, skipped: 0 });
+    assert.deepEqual(sc, { pending: 1, retrying: 1, processing: 0, done: 1, failed: 1, skipped: 0, deferred: 0 });
 
     await diarySummary(storage, "d-pending", "pending");
     await diarySummary(storage, "d-done", "done");
@@ -271,7 +340,7 @@ test("getPipelineCounts for summarization + diary", async () => {
     await diarySummary(storage, "d-fail", "failed");
     await diarySummary(storage, "d-l2", null, { level: 2 }); // level-2: not a diary item
     const dc = storage.getPipelineCounts("diary");
-    assert.deepEqual(dc, { pending: 1, retrying: 0, processing: 0, done: 1, failed: 1, skipped: 1 });
+    assert.deepEqual(dc, { pending: 1, retrying: 0, processing: 0, done: 1, failed: 1, skipped: 1, deferred: 0 });
   });
 });
 
@@ -359,6 +428,74 @@ test("listPipelineItems pending/retrying filters match the count buckets", async
       ["again"],
       "the 'retrying' chip is pending rows with prior attempts",
     );
+  });
+});
+
+test("listPipelineItems enrichment hides skipped by default; the chip reveals it", async () => {
+  await withStorage(async (storage) => {
+    await enrichEvent(storage, "e-done", "complete", { updatedAt: 3_000 });
+    await enrichEvent(storage, "e-pend", "pending", { updatedAt: 2_000 });
+    await enrichEvent(storage, "e-skip", "skipped", { updatedAt: 1_000 });
+
+    const def = storage.listPipelineItems("enrichment", {}, 3);
+    assert.deepEqual(
+      def.items.map((i) => i.id),
+      ["e-done", "e-pend"],
+      "default view excludes skipped (the bulk of plain messages)",
+    );
+
+    const skipped = storage.listPipelineItems("enrichment", { status: "skipped" }, 3);
+    assert.deepEqual(
+      skipped.items.map((i) => i.id),
+      ["e-skip"],
+      "the skipped chip still reveals them for debugging",
+    );
+  });
+});
+
+test("listPipelineItems captioning hides skipped + deferred by default; chips reveal", async () => {
+  await withStorage(async (storage) => {
+    await captionAsset(storage, "evt-trig", "m-trig", { triggerGroup: true, updatedAt: 4_000 }); // eligible
+    await captionAsset(storage, "evt-user", "m-user", { updatedAt: 3_000 }); // deferred
+    await captionAsset(storage, "evt-done", "m-done", { status: "complete", updatedAt: 2_000 });
+    await captionAsset(storage, "evt-skip", "m-skip", { status: "skipped", updatedAt: 1_000 });
+
+    const elig = { captionAll: false, captionAssistant: false };
+
+    const def = storage.listPipelineItems("captioning", {}, 2, elig);
+    assert.deepEqual(
+      def.items.map((i) => i.id),
+      ["m-trig", "m-done"],
+      "default view hides both skipped and config-deferred pending",
+    );
+
+    const deferred = storage.listPipelineItems("captioning", { status: "deferred" }, 2, elig);
+    assert.deepEqual(deferred.items.map((i) => i.id), ["m-user"]);
+    assert.equal(
+      deferred.items[0]!.status,
+      "deferred",
+      "the row is badged with the derived deferred status",
+    );
+
+    const pending = storage.listPipelineItems("captioning", { status: "pending" }, 2, elig);
+    assert.deepEqual(
+      pending.items.map((i) => i.id),
+      ["m-trig"],
+      "the pending chip is the honest eligible backlog (excludes deferred)",
+    );
+
+    const skipped = storage.listPipelineItems("captioning", { status: "skipped" }, 2, elig);
+    assert.deepEqual(skipped.items.map((i) => i.id), ["m-skip"]);
+  });
+});
+
+test("getPipelineItem relabels an ineligible pending caption as deferred", async () => {
+  await withStorage(async (storage) => {
+    await captionAsset(storage, "evt-user", "m-user", {});
+    const elig = { captionAll: false, captionAssistant: false };
+    assert.equal(storage.getPipelineItem("captioning", "m-user", 2, elig)!.status, "deferred");
+    // Without eligibility (e.g. the retry path) it reads as the raw pending status.
+    assert.equal(storage.getPipelineItem("captioning", "m-user", 2)!.status, "pending");
   });
 });
 
@@ -511,6 +648,76 @@ test("media_assets carry caption_attempts + updated_at columns and keyset index"
   });
 });
 
+test("the default enrichment list is served by the partial active index (no skipped scan)", async () => {
+  await withStorage(async (storage) => {
+    const idx = storage.read((db) =>
+      (db.prepare(`pragma index_list(timeline_events)`).all() as Array<{ name: string }>).map(
+        (i) => i.name,
+      ),
+    );
+    assert.ok(idx.includes("idx_timeline_events_active_updated"), "the partial active index exists");
+
+    // Mirrors listPipelineItems' default (no-chip) enrichment branch: the merged
+    // `defaultScope` predicate + the reverse-chron keyset order/cursor. The planner
+    // must serve it from the partial index, not by scanning past the skipped bulk.
+    const plan = storage
+      .read(
+        (db) =>
+          db
+            .prepare(
+              `explain query plan
+               select id from timeline_events
+               where enrichment_status not in ('inactive', 'skipped')
+                 and (updated_at < @s or (updated_at = @s and id < @id))
+               order by updated_at desc, id desc limit 51`,
+            )
+            .all({ s: 5, id: "x" }) as Array<{ detail: string }>,
+      )
+      .map((r) => r.detail)
+      .join(" | ");
+    assert.match(
+      plan,
+      /idx_timeline_events_active_updated/,
+      `default view must use the partial active index; got: ${plan}`,
+    );
+  });
+});
+
+test("v22 migration creates the partial active enrichment index on an existing DB", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-pipe-migrate-"));
+  const dbPath = path.join(dir, "db.sqlite");
+  try {
+    const first = await Storage.open({ databasePath: dbPath });
+    await first.waitForIdle();
+    // Simulate a pre-v22 DB: drop the index and rewind user_version so the next
+    // open runs the v21→v22 step.
+    first.write((db) => {
+      db.exec("drop index if exists idx_timeline_events_active_updated");
+      db.pragma("user_version = 21");
+    });
+    await first.waitForIdle();
+    first.close();
+
+    const second = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = second.read((db) => db.pragma("user_version", { simple: true }) as number);
+      assert.equal(version, 22, "the v21→v22 step ran");
+      const idx = second.read((db) =>
+        (db.pragma("index_list(timeline_events)") as Array<{ name: string }>).map((i) => i.name),
+      );
+      assert.ok(
+        idx.includes("idx_timeline_events_active_updated"),
+        "the v22 step (re)created the partial active index",
+      );
+    } finally {
+      await second.waitForIdle();
+      second.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // ── HTTP endpoints ───────────────────────────────────────────────────────────
 
 test("GET /api/pipelines returns one row per pool with counts + live inFlight", async () => {
@@ -575,6 +782,37 @@ test("GET /api/pipelines/:pool/items paginates and filters; unknown pool 404", a
 
       const unknown = await fetch(`${base}/api/pipelines/nope/items`);
       assert.equal(unknown.status, 404);
+    });
+  });
+});
+
+test("GET captioning items applies the pool's eligibility (deferred hidden by default)", async () => {
+  await withStorage(async (storage) => {
+    await captionAsset(storage, "evt-trig", "m-trig", { triggerGroup: true, updatedAt: 2_000 });
+    await captionAsset(storage, "evt-user", "m-user", { updatedAt: 1_000 }); // deferred
+    const pipelines = fullRegistry({
+      captioning: stubStats("captioning", {
+        captionEligibility: { captionAll: false, captionAssistant: false },
+      }),
+    });
+
+    await withServer({ storage, pipelines }, async (base) => {
+      const def = (await (await fetch(`${base}/api/pipelines/captioning/items`)).json()) as {
+        items: any[];
+      };
+      assert.deepEqual(def.items.map((i) => i.id), ["m-trig"], "deferred m-user hidden by default");
+
+      const deferred = (await (
+        await fetch(`${base}/api/pipelines/captioning/items?status=deferred`)
+      ).json()) as { items: any[] };
+      assert.deepEqual(deferred.items.map((i) => i.id), ["m-user"]);
+      assert.equal(deferred.items[0].status, "deferred");
+
+      // The dashboard counts also reflect the partition for this pool.
+      const dash = (await (await fetch(`${base}/api/pipelines`)).json()) as { pipelines: any[] };
+      const cap = dash.pipelines.find((p) => p.pool === "captioning");
+      assert.equal(cap.counts.pending, 1);
+      assert.equal(cap.counts.deferred, 1);
     });
   });
 });

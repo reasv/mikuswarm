@@ -327,8 +327,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 21", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 21);
+test("LATEST_SCHEMA_VERSION is 22", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 22);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {

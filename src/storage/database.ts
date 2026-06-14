@@ -826,6 +826,51 @@ export interface PipelineCounts {
   done: number;
   failed: number;
   skipped: number;
+  /**
+   * Captioning-only: `pending` assets the pool would never claim under the current
+   * config (the derived `deferred` status — see {@link CaptionEligibility}). Carved
+   * out of `pending` so that count reflects real backlog. Always 0 for the other
+   * pools (and for captioning when no eligibility is supplied to
+   * {@link Storage.getPipelineCounts}).
+   */
+  deferred: number;
+}
+
+/**
+ * Whether the captioning pool would *ever* claim a pending media asset under the
+ * current config — mirrors the `claimPendingCaptions` join predicate. A pending
+ * asset that is NOT eligible is surfaced by the monitor as the derived `deferred`
+ * status: with neither `caption_all` nor `caption_assistant_messages` set, media on
+ * non-trigger (and non-assistant) messages parks `pending` indefinitely, so the
+ * monitor hides it by default rather than counting it as backlog. Supplied to the
+ * pipeline read methods for the captioning pool only; absent ⇒ no `deferred`
+ * partition (legacy behaviour: every `pending` asset counts as pending work).
+ */
+export interface CaptionEligibility {
+  /** `caption_all`: caption media in every message ⇒ nothing is ever deferred. */
+  captionAll: boolean;
+  /** `caption_all || caption_assistant_messages`: also caption assistant-message media. */
+  captionAssistant: boolean;
+}
+
+/**
+ * SQL boolean (over the `te` alias) for "the captioning pool would claim this
+ * asset's event". Inlines the two config booleans as literals — they are trusted
+ * config, never user input, so the fragment carries no bind params and composes
+ * into any WHERE/CASE. Mirrors the {@link Storage.claimPendingCaptions} predicate.
+ */
+function captionEligibleSql(e: CaptionEligibility): string {
+  if (e.captionAll) return "1"; // every event eligible — nothing deferred
+  const clauses = ["te.trigger_group_id is not null"];
+  if (e.captionAssistant) clauses.push("te.role = 'assistant'");
+  return `(${clauses.join(" or ")})`;
+}
+
+/** JS mirror of {@link captionEligibleSql} for the row projection. */
+function captionEligibleRow(row: Record<string, unknown>, e: CaptionEligibility): boolean {
+  if (e.captionAll) return true;
+  if (row.trigger_group_id != null) return true;
+  return e.captionAssistant && row.role === "assistant";
 }
 
 /**
@@ -948,9 +993,26 @@ interface PipelineListSpec {
   idCol: string;
   scope: string | null;
   done: string[];
+  /**
+   * Optional predicate for the DEFAULT (no status filter) view that supersedes
+   * `scope` + the generic `status != 'skipped'` — written to match a pool's partial
+   * "active" index verbatim so that primary view is an index walk, not a scan past
+   * the skipped bulk. Set for enrichment (the large, skipped-dominated table); other
+   * pools fall back to `scope` + `!= 'skipped'`.
+   */
+  defaultScope?: string;
   /** Full SELECT list + FROM (incl. any join + correlated session subquery). */
   selectFrom: string;
-  project: (row: Record<string, unknown>, defaultMaxRetries: number) => PipelineItem;
+  /**
+   * Maps a raw row to a {@link PipelineItem}. `eligibility` is supplied for the
+   * captioning pool only, where it relabels an ineligible pending asset's status
+   * to the derived `deferred` (consistent with the list/count filtering).
+   */
+  project: (
+    row: Record<string, unknown>,
+    defaultMaxRetries: number,
+    eligibility?: CaptionEligibility,
+  ) => PipelineItem;
 }
 
 /**
@@ -975,10 +1037,13 @@ const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
     done: ["complete"],
   },
   captioning: {
-    table: "media_assets",
-    statusCol: "caption_status",
-    attemptsCol: "caption_attempts",
-    scope: "media_type in ('image', 'video', 'audio')",
+    // Joins timeline_events so the count can evaluate caption eligibility (the
+    // `deferred` partition); the join is on the indexed FK and inner (every asset
+    // has a parent event), so it does not change the scoped row set.
+    table: "media_assets ma join timeline_events te on te.id = ma.event_id",
+    statusCol: "ma.caption_status",
+    attemptsCol: "ma.caption_attempts",
+    scope: "ma.media_type in ('image', 'video', 'audio')",
     done: ["complete"],
   },
   summarization: {
@@ -1019,6 +1084,9 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
     // Exclude never-queued events (assistant turns / nothing enrichable): the
     // monitor only shows events that are/were actually in the enrichment queue.
     scope: "enrichment_status != 'inactive'",
+    // Default view also hides `skipped` (every plain message); the merged predicate
+    // matches idx_timeline_events_active_updated so it stays an index walk.
+    defaultScope: "enrichment_status not in ('inactive', 'skipped')",
     done: ["complete"],
     selectFrom: `select id, enrichment_status as status, enrichment_retries as attempts,
         timeline_key as room, created_at, updated_at,
@@ -1062,12 +1130,19 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
     selectFrom: `select ma.id as id, ma.caption_status as status, ma.caption_attempts as attempts,
         te.timeline_key as room, ma.created_at as created_at, ma.updated_at as updated_at,
         ma.original_filename as original_filename, ma.media_type as media_type,
-        ma.caption as caption, ma.caption_error as caption_error
+        ma.caption as caption, ma.caption_error as caption_error,
+        te.trigger_group_id as trigger_group_id, te.role as role
       from media_assets ma
       join timeline_events te on te.id = ma.event_id`,
-    project: (row, maxRetries) => {
-      const status = String(row.status);
+    project: (row, maxRetries, eligibility) => {
       const attempts = Number(row.attempts ?? 0);
+      // Derived `deferred`: a fresh pending asset the pool would never claim under
+      // the current config (mirrors the list/count filter), surfaced as its own
+      // status so the monitor can hide it by default yet badge it distinctly.
+      const status =
+        eligibility && row.status === "pending" && attempts === 0 && !captionEligibleRow(row, eligibility)
+          ? "deferred"
+          : String(row.status);
       const createdAt = Number(row.created_at ?? 0);
       const caption = (row.caption as string | null) ?? null;
       return {
@@ -4925,17 +5000,25 @@ export class Storage {
    * a `pending` row with `attempts > 0` is `retrying` (no explicit state exists).
    * Pure read.
    */
-  getPipelineCounts(pool: PipelineId): PipelineCounts {
+  getPipelineCounts(pool: PipelineId, eligibility?: CaptionEligibility): PipelineCounts {
     const spec = PIPELINE_COUNT_SPECS[pool];
     const where = spec.scope ? `where ${spec.scope}` : "";
     const donePlaceholders = spec.done.map(() => "?").join(", ");
+    // Captioning: split the raw `pending` bucket into eligible (real backlog) and
+    // `deferred` (never-claimed under the current config). Other pools — and
+    // captioning when no eligibility is supplied — have no `deferred` partition.
+    const eligibleSql = pool === "captioning" && eligibility ? captionEligibleSql(eligibility) : null;
+    const freshPending = `${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0`;
+    const pendingCase = eligibleSql ? `${freshPending} and ${eligibleSql}` : freshPending;
+    const deferredCase = eligibleSql ? `${freshPending} and not ${eligibleSql}` : null;
     const sql = `select
-        sum(case when ${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0 then 1 else 0 end) as pending,
+        sum(case when ${pendingCase} then 1 else 0 end) as pending,
         sum(case when ${spec.statusCol} = 'pending' and ${spec.attemptsCol} > 0 then 1 else 0 end) as retrying,
         sum(case when ${spec.statusCol} = 'processing' then 1 else 0 end) as processing,
         sum(case when ${spec.statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
         sum(case when ${spec.statusCol} = 'failed' then 1 else 0 end) as failed,
-        sum(case when ${spec.statusCol} = 'skipped' then 1 else 0 end) as skipped
+        sum(case when ${spec.statusCol} = 'skipped' then 1 else 0 end) as skipped,
+        ${deferredCase ? `sum(case when ${deferredCase} then 1 else 0 end)` : "0"} as deferred
       from ${spec.table} ${where}`;
     return this.read((db) => {
       const row = db.prepare(sql).get(...spec.done) as Record<string, number | null>;
@@ -4946,6 +5029,7 @@ export class Storage {
         done: row.done ?? 0,
         failed: row.failed ?? 0,
         skipped: row.skipped ?? 0,
+        deferred: row.deferred ?? 0,
       };
     });
   }
@@ -4962,6 +5046,7 @@ export class Storage {
     pool: PipelineId,
     query: PipelineItemQuery,
     defaultMaxRetries: number,
+    eligibility?: CaptionEligibility,
   ): PipelineItemPage {
     const spec = PIPELINE_LIST_SPECS[pool];
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 200);
@@ -4969,7 +5054,18 @@ export class Storage {
 
     const where: string[] = [];
     const params: Record<string, unknown> = {};
-    if (spec.scope) where.push(spec.scope);
+    // The default (no-chip) view of a pool with a `defaultScope` uses that single
+    // predicate instead of `scope` (which it already implies) so the planner stays
+    // on the pool's partial "active" index; every other branch uses `scope`.
+    const usesDefaultScope = !query.status && spec.defaultScope != null;
+    if (spec.scope && !usesDefaultScope) where.push(spec.scope);
+    // Captioning `deferred` (never-claimed pending under the current config). The
+    // fragment inlines its config booleans, so it needs no bind params. Only the
+    // captioning pool supplies `eligibility`; absent ⇒ no deferred partition.
+    const eligibleSql = pool === "captioning" && eligibility ? captionEligibleSql(eligibility) : null;
+    const deferredSql = eligibleSql
+      ? `${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0 and not ${eligibleSql}`
+      : null;
     // `pending`/`retrying` are the two count buckets that share the raw `pending`
     // status (retrying = pending with prior attempts); filter on the same predicate
     // the counts use so a chip's rows match its badge. Any other value is a raw
@@ -4977,10 +5073,24 @@ export class Storage {
     if (query.status === "retrying") {
       where.push(`${spec.statusCol} = 'pending' and ${spec.attemptsCol} > 0`);
     } else if (query.status === "pending") {
+      // The `pending` chip mirrors the honest count: deferred (never-claimed)
+      // captioning rows are excluded — they live under the `deferred` chip.
       where.push(`${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0`);
+      if (eligibleSql) where.push(eligibleSql);
+    } else if (query.status === "deferred" && deferredSql) {
+      where.push(deferredSql);
     } else if (query.status) {
       where.push(`${spec.statusCol} = @status`);
       params.status = query.status;
+    } else {
+      // Default (unfiltered) view: hide the terminal-noise that otherwise drowns
+      // the list into an all-message timeline — `skipped` (nothing to do) for every
+      // pool, plus captioning's config-`deferred` pending. Both stay reachable via
+      // their explicit chip. `defaultScope` (enrichment) folds the `skipped` + scope
+      // exclusion into the one index-matching predicate; pools without it fall back
+      // to `scope` (pushed above) + a plain `!= 'skipped'`.
+      where.push(spec.defaultScope ?? `${spec.statusCol} != 'skipped'`);
+      if (deferredSql) where.push(`not (${deferredSql})`);
     }
     if (query.room) {
       where.push(`${spec.roomCol} = @room`);
@@ -5006,7 +5116,7 @@ export class Storage {
     );
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const items = pageRows.map((row) => spec.project(row, defaultMaxRetries));
+    const items = pageRows.map((row) => spec.project(row, defaultMaxRetries, eligibility));
     const last = items[items.length - 1];
     const nextCursor =
       hasMore && last ? encodePipelineCursor({ s: last.updatedAt, id: last.id }) : null;
@@ -5024,6 +5134,7 @@ export class Storage {
     pool: PipelineId,
     id: string,
     defaultMaxRetries: number,
+    eligibility?: CaptionEligibility,
   ): PipelineItem | undefined {
     const spec = PIPELINE_LIST_SPECS[pool];
     const where = [spec.scope, `${spec.idCol} = @id`].filter(Boolean).join(" and ");
@@ -5031,7 +5142,7 @@ export class Storage {
     const row = this.read(
       (db) => db.prepare(sql).get({ id }) as Record<string, unknown> | undefined,
     );
-    return row ? spec.project(row, defaultMaxRetries) : undefined;
+    return row ? spec.project(row, defaultMaxRetries, eligibility) : undefined;
   }
 
   /**
@@ -5632,6 +5743,17 @@ create index if not exists idx_timeline_events_updated
 create index if not exists idx_timeline_events_status_updated
   on timeline_events(enrichment_status, updated_at, id);
 
+-- Pipeline monitor: the DEFAULT (no status chip) enrichment list — now the primary
+-- browsing view — hides the noise (inactive never-queued rows + the skipped bulk of
+-- every plain message), reverse-chron on (updated_at, id). A partial index over only
+-- the non-noise minority lets that view be a clean keyset walk instead of scanning
+-- past the skipped majority on idx_timeline_events_updated. The predicate matches the
+-- emitted default-view WHERE term verbatim (PipelineListSpec defaultScope) so the
+-- planner can use it (ARCHITECTURE.md §11).
+create index if not exists idx_timeline_events_active_updated
+  on timeline_events(updated_at, id)
+  where enrichment_status not in ('inactive', 'skipped');
+
 create index if not exists idx_timeline_events_trigger_group
   on timeline_events(trigger_group_id)
   where trigger_group_id is not null;
@@ -5967,7 +6089,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 21;
+export const LATEST_SCHEMA_VERSION = 22;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6523,6 +6645,19 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     // `create table/index if not exists` is itself idempotent — no extra guard.
     // Same DDL the canonical SCHEMA uses, so fresh and migrated DBs can't drift.
     db.exec(TOOL_INVOCATIONS_SCHEMA);
+  },
+  // index 21 (v21 -> v22): add the partial "active enrichment" keyset index backing
+  // the pipeline monitor's DEFAULT (no-chip) enrichment list, which now hides the
+  // `inactive`/`skipped` noise (ARCHITECTURE.md §11). Partial over the non-noise
+  // minority, so it is small to build (only non-skipped rows) and cheap to maintain.
+  // `create index if not exists` is idempotent; same DDL as the canonical SCHEMA so
+  // fresh and migrated DBs can't drift. Fresh DBs get it directly from SCHEMA.
+  (db) => {
+    db.exec(
+      `create index if not exists idx_timeline_events_active_updated
+         on timeline_events(updated_at, id)
+         where enrichment_status not in ('inactive', 'skipped');`,
+    );
   },
 ];
 
