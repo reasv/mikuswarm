@@ -393,6 +393,32 @@ enable_video_understanding = false  # off by default (slower/costlier)
 # input = 0.0
 # output = 0.0
 
+# Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP), backing
+# the `find_source` tool: image → source URL + artist (the inverse of `danbooru`).
+# Opt-in and disabled by default. `api_key` is deliberately NOT templated here:
+# a `${SAUCENAO_API_KEY}` default would fail startup whenever the env var is unset
+# (env substitution errors on missing vars before validation). Set it explicitly
+# in local config, e.g.  api_key = "${SAUCENAO_API_KEY}"  alongside enabled = true.
+[saucenao]
+enabled = false
+base_url = "https://saucenao.com"
+numres = 8                   # results requested per search
+max_results_limit = 16       # hard cap on the per-call `limit` parameter
+min_similarity = 55          # % floor; below this is usually noise (agent can lower per-call)
+db = 999                     # search all SauceNAO indexes
+timeout_ms = 15000
+max_image_bytes = 4000000    # condition uploads down to ~4MB before sending
+view_max_blocks = 3          # max matched thumbnails inlined when view=true (vision models)
+
+# In-memory short-window quota guard (~6 searches / 30s on the free tier). The
+# long/daily window (~200/day) is surfaced from SauceNAO's own counters, not
+# enforced locally. max_wait_ms bounds how long a call waits for a free slot
+# before returning a soft "try again shortly" result.
+[saucenao.rate_limit]
+short_window_max = 6
+short_window_ms = 30000
+max_wait_ms = 8000
+
 [summarization]
 enabled = true
 worker_count = 1

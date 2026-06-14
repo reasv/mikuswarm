@@ -21,6 +21,7 @@ export { createWebFetchTool, createWebSearchTool } from "./web.js";
 export { createDanbooruTool, type DanbooruToolContext } from "./danbooru.js";
 export { createXFetchTool, type XFetchToolContext } from "./x-fetch.js";
 export { createImageGenTool, type ImageGenToolContext, type ToolUsageRecord } from "./image-gen.js";
+export { createFindSourceTool, type FindSourceToolContext } from "./find-source.js";
 export {
   createXSearchTool,
   resolveXSearchConfig,
