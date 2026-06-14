@@ -6,6 +6,7 @@ import test from "node:test";
 import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import { MatrixProvider } from "../src/matrix/provider.js";
 import type { MatrixInboundEvent } from "../src/matrix/native-types.js";
+import type { InboundChatEvent } from "../src/types.js";
 
 test("Matrix direct events keep dm timeline identity and exact outbound room target", () => {
   const nativeEvent: MatrixInboundEvent = {
@@ -246,4 +247,51 @@ test("Matrix room triggers require structured Matrix mention metadata", () => {
   assert.equal(textOnly.trigger, undefined);
   assert.equal(structured.event.mentions?.mentionedSelf, true);
   assert.equal(structured.trigger?.type, "mention");
+});
+
+test("Matrix provider delivers a trigger event TWICE — same event.id, trigger stripped then populated", async () => {
+  // Premise underlying the interjection dedup in app.ts (steerReplyToActiveSession):
+  // the trigger hold emits every trigger-bearing event immediately with
+  // `trigger: undefined` (for ingestion) and AGAIN after `trigger_hold_ms` with
+  // the trigger populated (for the spawn decision). Both deliveries carry the same
+  // `event.id`. `handleInbound` runs on both, so anything non-idempotent on that
+  // path (steering a reply into a live session) must dedup by event id, or the
+  // interjection lands twice. See ARCHITECTURE.md §"Trigger hold".
+  const provider = new MatrixProvider();
+  // emitWithTriggerHold only reads `config` truthiness + `trigger_hold_ms`.
+  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: 5 };
+
+  const deliveries: InboundChatEvent[] = [];
+  provider.subscribe((event) => deliveries.push(event));
+
+  // A DM reply is always a trigger (type "dm") — the common interjection path.
+  const dmReply: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$reply",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "direct",
+    body: "actually, wait —",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+    replyToId: "$bot-msg",
+  };
+  const inbound = normalizeMatrixInboundEvent(dmReply, {
+    accountId: "miku",
+    selfUserId: "@miku:example.org",
+  });
+  assert.equal(inbound.trigger?.type, "dm", "DM reply is a trigger");
+
+  (provider as unknown as { emitWithTriggerHold(e: InboundChatEvent): void }).emitWithTriggerHold(inbound);
+
+  // Immediate emit: trigger stripped, for ingestion.
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].trigger, undefined);
+  const eventId = deliveries[0].event.id;
+
+  // Post-hold re-emit: SAME event id, trigger now populated.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(deliveries.length, 2, "trigger event is delivered twice");
+  assert.ok(deliveries[1].trigger, "second delivery carries the trigger");
+  assert.equal(deliveries[1].event.id, eventId, "both deliveries share one event.id");
 });

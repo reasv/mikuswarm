@@ -1179,6 +1179,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
   }
 
+  // A trigger-bearing reply reaches handleInbound TWICE: the provider's trigger
+  // hold emits the event immediately with `trigger: undefined` (for ingestion)
+  // and again after the hold window with the trigger populated (for the spawn
+  // decision) — see `emitWithTriggerHold` / ARCHITECTURE.md §"Trigger hold". Both
+  // deliveries carry the same `event.id` and both reach the steer check below, so
+  // without dedup the interjection is injected into the live session twice (~2s
+  // apart). A DM reply is *always* a trigger, so this fires on the common path.
+  // Track recently-steered event ids (bounded FIFO) and steer at most once per
+  // event; the second delivery still returns `true` to suppress the spawn path.
+  const steeredEventIds = new Set<string>();
+  const STEERED_EVENT_ID_CAP = 1024;
+  function markSteered(eventId: string): void {
+    steeredEventIds.add(eventId);
+    if (steeredEventIds.size > STEERED_EVENT_ID_CAP) {
+      // `Set` preserves insertion order — evict the oldest id.
+      const oldest = steeredEventIds.values().next().value;
+      if (oldest !== undefined) steeredEventIds.delete(oldest);
+    }
+  }
+
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
     const replyExternalId = inbound.event.replyTo?.externalId;
     if (!replyExternalId) return false;
@@ -1187,6 +1207,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     if (target?.timelineKey !== inbound.timelineKey) return false;
     if (!target?.agentSessionId || !activeIds.has(target.agentSessionId)) return false;
+
+    // The trigger-hold re-delivery already steered this event on its immediate
+    // emission. Suppress the spawn (return true) but do not re-inject.
+    if (steeredEventIds.has(inbound.event.id)) return true;
 
     // The steered (injected) turn bypasses the trigger path's enrichment-readiness
     // wait + hydrateEvents, so `inbound.event.replyTo` still carries only
@@ -1215,6 +1239,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       content: renderRichMessage(eventForRender),
     });
     if (ok) {
+      markSteered(inbound.event.id);
       logger.info("reply_steered", {
         sessionId: target.agentSessionId,
         timelineKey: inbound.timelineKey,
