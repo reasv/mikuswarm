@@ -29,15 +29,17 @@ function chatEvent(overrides: Partial<CanonicalChatEvent> = {}): CanonicalChatEv
 
 // ── SessionClaims registry (§3) ─────────────────────────────────────────────
 
-test("SessionClaims: claimantOf returns another session's attributed claim, excludes self and queued", () => {
+test("SessionClaims: claimantOf surfaces another session's claim (incl. un-attributed), excludes self", () => {
   const claims = new SessionClaims();
-  // Inserted at accept time, no session id yet (the accept→launch gap).
+  // Inserted at accept time, no session id yet (the accept→launch gap / queued).
   claims.claim(TK, { triggerId: "t1", externalId: "$n3m7", triggerTimestamp: 1000, createdAt: 1000 });
-  // Un-attributed → not surfaced (nothing to name/render).
-  assert.equal(claims.claimantOf(TK, "$n3m7", "s-self"), undefined);
+  // Un-attributed IS surfaced now (review #4) — still "being handled" — but un-named.
+  const pending = claims.claimantOf(TK, "$n3m7", "s-self");
+  assert.ok(pending);
+  assert.equal(pending?.sessionId, undefined);
 
   claims.attachSession(TK, "$n3m7", "s-owner");
-  // Surfaced to another session.
+  // Surfaced to another session, now named.
   assert.equal(claims.claimantOf(TK, "$n3m7", "s-self")?.sessionId, "s-owner");
   // Never surfaced to the owner itself (a session may always answer its own trigger).
   assert.equal(claims.claimantOf(TK, "$n3m7", "s-owner"), undefined);
@@ -102,7 +104,7 @@ test("coTargetOwnerSteerableSoon: defer while pre-live, spawn once terminal", ()
   assert.equal(coTargetOwnerSteerableSoon(true, undefined), false);
 });
 
-test("SessionClaims: snapshotForBuild excludes self and un-attributed claims", () => {
+test("SessionClaims: snapshotForBuild excludes self, includes others (attributed + pending)", () => {
   const claims = new SessionClaims();
   claims.claim(TK, { triggerId: "t1", externalId: "$a", triggerTimestamp: 1, createdAt: 1 });
   claims.claim(TK, { triggerId: "t2", externalId: "$b", triggerTimestamp: 2, createdAt: 2 });
@@ -111,19 +113,30 @@ test("SessionClaims: snapshotForBuild excludes self and un-attributed claims", (
   claims.attachSession(TK, "$b", "s-other");
 
   const snap = claims.snapshotForBuild(TK, "s-self");
-  assert.equal(snap.get("$a"), undefined); // self excluded
-  assert.equal(snap.get("$b"), "s-other");
-  assert.equal(snap.get("$c"), undefined); // un-attributed excluded
-  assert.equal(snap.size, 1);
+  assert.equal(snap.has("$a"), false); // self excluded
+  assert.equal(snap.get("$b")?.sessionId, "s-other"); // other, attributed
+  // Un-attributed (queued) IS included now (review #4), as a pending marker.
+  assert.equal(snap.has("$c"), true);
+  assert.equal(snap.get("$c")?.sessionId, undefined);
+  assert.equal(snap.size, 2);
 });
 
 // ── Render marker (§4) ──────────────────────────────────────────────────────
 
 test("renderRichMessage emits <handled_by_session> when claimedBy hits, before the body", () => {
   const ev = chatEvent({ externalId: "$n3m7", body: "> plagueis" });
-  const out = renderRichMessage(ev, { claimedBy: (id) => (id === "$n3m7" ? "s-TQBfXQVCYQ" : undefined) });
+  const out = renderRichMessage(ev, { claimedBy: (id) => (id === "$n3m7" ? { sessionId: "s-TQBfXQVCYQ" } : undefined) });
   assert.match(out, /<handled_by_session id="s-TQBfXQVCYQ"\/>/);
   // Marker precedes the body text.
+  assert.ok(out.indexOf("handled_by_session") < out.indexOf("plagueis"));
+});
+
+test("renderRichMessage emits a pending marker for an un-attributed (queued) claim", () => {
+  const ev = chatEvent({ externalId: "$n3m7", body: "> plagueis" });
+  // claimedBy returns a marker with no sessionId (a pending owner — review #4).
+  const out = renderRichMessage(ev, { claimedBy: (id) => (id === "$n3m7" ? {} : undefined) });
+  assert.match(out, /<handled_by_session pending="true"\/>/);
+  assert.doesNotMatch(out, /handled_by_session id="/); // no session id to name yet
   assert.ok(out.indexOf("handled_by_session") < out.indexOf("plagueis"));
 });
 
@@ -224,6 +237,26 @@ test("send_message guard refuses a reply to a message another session claimed, w
   assert.equal(sent, false);
   assert.match((result.content[0] as { text: string }).text, /being handled by another session \(s-TQBfXQVCYQ\)/);
   // Non-terminating: the agent gets another turn.
+  assert.notEqual(result.terminate, true);
+});
+
+test("send_message guard refuses a reply to a message claimed by a not-yet-named (pending) session", async () => {
+  let sent = false;
+  // The owner is un-attributed → marker carries no sessionId (review #4).
+  const ctx = sendCtx({ isClaimedByOther: (id) => (id === "$n3m7" ? {} : undefined) });
+  (ctx.provider as { send: ChatProvider["send"] }).send = async (target) => {
+    sent = true;
+    return { provider: "matrix", target, externalId: "$x", deliveredAt: Date.now() };
+  };
+  const tool = createSendMessageTool(ctx);
+  const result = await tool.execute("call-1", {
+    message: "yeah that's real",
+    is_reply: true,
+    reply_to_id: "$n3m7",
+    final: true,
+  });
+  assert.equal(sent, false);
+  assert.match((result.content[0] as { text: string }).text, /a session that's starting up/);
   assert.notEqual(result.terminate, true);
 });
 

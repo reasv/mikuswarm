@@ -1625,7 +1625,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // later-claim race the frozen marker structurally cannot cover.
         isClaimedByOther: (externalId) => {
           const claim = sessionClaims.claimantOf(inbound.timelineKey, externalId, sessionId);
-          return claim?.sessionId ? { sessionId: claim.sessionId } : undefined;
+          // Surfaces un-attributed (queued / pre-launch) claims too (review #4): the
+          // marker is undefined for a pending owner, named once attributed.
+          return claim ? { sessionId: claim.sessionId } : undefined;
         },
       }),
       createDelegateToSessionTool({
