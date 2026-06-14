@@ -15,6 +15,7 @@ import {
   media,
   summaryDetail,
   schedulerSnapshot,
+  gapBackfetchSnapshot,
   llmRequests,
   costOverview,
 } from "./handlers.js";
@@ -79,6 +80,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/media/:ref", media)
     .add("GET", "/api/summaries/:id", summaryDetail)
     .add("GET", "/api/scheduler", schedulerSnapshot)
+    .add("GET", "/api/gap-backfetch", gapBackfetchSnapshot)
     .add("GET", "/api/llm-requests", llmRequests)
     .add("GET", "/api/cost-overview", costOverview)
     .add("GET", "/api/pipelines", listPipelines)

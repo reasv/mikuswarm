@@ -56,6 +56,13 @@ export interface ConsoleServerDeps {
    * provide it (the route then 503s).
    */
   resumeSession?: (sessionId: string) => Promise<{ ok: boolean; status: string; reason?: string }>;
+  /**
+   * Startup gap-backfetch status snapshot (ARCHITECTURE.md §7c §11): per-room
+   * phase (frozen/filling/committing/done), buffered counts, and any capped holes,
+   * so an operator can watch the bot catch up after a restart. Optional: absent =
+   * the route returns an empty list (feature disabled or not wired).
+   */
+  gapBackfetch?: () => unknown[];
   logger: Logger;
 }
 

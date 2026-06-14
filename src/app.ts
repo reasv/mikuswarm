@@ -98,6 +98,7 @@ import {
   ABSENCE_LOOKBACK_DEFAULT_MS,
 } from "./search/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
+import { GapBackfetchCoordinator, type GapBackfetchConfig } from "./backfill/coordinator.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
 import { BrowserSession } from "./browser/index.js";
@@ -897,6 +898,44 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger: logger.child("room-labels"),
   });
 
+  // Startup gap backfetch (ARCHITECTURE.md §7c): recover room history missed while
+  // offline. Constructed unconditionally — when disabled, `prepare()`/`run()` are
+  // no-ops and `isFrozen()` is always false, so the wiring below adds no cost. The
+  // `replayLiveInbound` closure re-enters the (hoisted) `handleInbound`, draining a
+  // room's buffered live events through the normal pipeline once its gap is filled.
+  const gapBackfetchConfig: GapBackfetchConfig = {
+    enabled: config.timeline?.gap_backfetch_enabled ?? false,
+    maxMessages: config.timeline?.gap_backfetch_max_messages ?? 0,
+    windowMs: config.timeline?.gap_backfetch_window_ms ?? 0,
+    timeoutMs: config.timeline?.gap_backfetch_timeout_ms ?? 0,
+    pageSize: config.timeline?.gap_backfetch_page_size ?? 100,
+    utdHaltThreshold: config.timeline?.gap_backfetch_utd_halt_threshold ?? 50,
+    concurrency: config.timeline?.gap_backfetch_concurrency ?? 3,
+  };
+  const gapBackfetchSelfIds = new Map<string, string>();
+  for (const [accountId, account] of Object.entries(config.matrix.accounts)) {
+    if (account.user_id) gapBackfetchSelfIds.set(accountId, account.user_id);
+  }
+  const gapBackfetch = new GapBackfetchCoordinator({
+    storage,
+    timeline,
+    config: gapBackfetchConfig,
+    getClient: (accountId) =>
+      provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+    selfUserIds: gapBackfetchSelfIds,
+    notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
+    notifyCaptions: () => captionPool.notifyNewWork(),
+    enqueueChatSearch: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
+    enqueueSummarization: (timelineKey) => summarizationIndexer?.enqueueReconcileTimeline(timelineKey),
+    replayLiveInbound: (inbound) => {
+      void handleInbound(inbound).catch((error) => {
+        logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
+      });
+    },
+    isDraining: () => draining,
+    logger: logger.child("gap-backfetch"),
+  });
+
   provider.subscribe((inbound) => {
     void handleInbound(inbound).catch((error) => {
       logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
@@ -928,6 +967,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         await timeline.setEnrichmentStatus(resolvedEvent.id, "pending");
         enrichmentPool.notifyNewEvent(resolvedEvent.id);
       }
+      return;
+    }
+
+    // Startup gap backfetch freeze (ARCHITECTURE.md §7c §6.3): while a room's gap
+    // is being filled, a normal live event is buffered (NOT persisted, enriched,
+    // summarized, or evaluated for a trigger) and replayed through this same path
+    // once the gap commits — upholding the §4 invariant that the committed
+    // high-water never advances mid-fill. Placed after the edit/echo preamble:
+    // edits apply in place / park in `pending_edits` (no high-water advance), and
+    // self-echoes can't occur for a frozen room (its sessions are frozen too).
+    if (gapBackfetch.isFrozen(inbound.timelineKey)) {
+      gapBackfetch.bufferLive(inbound);
       return;
     }
 
@@ -2274,6 +2325,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
     },
     isDraining: () => draining,
+    // Skip channels whose startup gap is still filling (ARCHITECTURE.md §7c §6.4).
+    isFrozen: (timelineKey) => gapBackfetch.isFrozen(timelineKey),
     logger: logger.child("proactive"),
   });
 
@@ -2375,6 +2428,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }),
   );
 
+  // Gap-backfetch freeze (ARCHITECTURE.md §7c §8 step 2): enumerate in-scope
+  // rooms, record each `floor`, and mark them frozen — strictly BEFORE
+  // `provider.start` so no live event is missed and no commit races the floor
+  // capture. The stale-activation/session resets and the chat-search/summarization
+  // startup sweeps above all operate on committed state ≤ each room's floor (the
+  // gap is above it, uncommitted), so they are unaffected. No-op when disabled.
+  gapBackfetch.prepare();
+
   await provider.start(config.matrix);
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
@@ -2400,6 +2461,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
   proactiveScheduler.start();
+
+  // Gap-backfetch fill (ARCHITECTURE.md §7c §8 step 5): launch the per-room
+  // fill→commit→unfreeze workers AFTER the scan-driven pools are up (so committed
+  // gap rows are picked up) and after the proactive scheduler (which already skips
+  // frozen rooms — §6.4). Fire-and-forget: the bot must stay responsive for
+  // non-frozen rooms while gaps fill, and each room self-unfreezes as it completes.
+  void gapBackfetch.run().catch((error) => {
+    logger.error("gap_backfetch_run_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
 
   if (retentionDays > 0) {
     void runInactiveRetention();
@@ -2438,6 +2510,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
       // console's second mutating action, next to abort.
       resumeSession: manualResumeSession,
+      // Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11).
+      gapBackfetch: () => gapBackfetch.snapshot(),
       logger: logger.child("console"),
     });
     await consoleServer.start();

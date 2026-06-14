@@ -237,6 +237,21 @@ export function schedulerSnapshot(
 }
 
 /**
+ * GET /api/gap-backfetch — the startup gap-backfetch status snapshot
+ * (ARCHITECTURE.md §7c §11): every in-scope room's phase and buffered/committed
+ * counts. Returns an empty list when the feature is disabled or not wired, so the
+ * console panel renders cleanly in both cases.
+ */
+export function gapBackfetchSnapshot(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  const snapshot = ctx.deps.gapBackfetch;
+  sendJson(res, 200, snapshot ? snapshot() : []);
+}
+
+/**
  * GET /api/llm-requests — the in-memory Layer-0 attempt ring (spec §9.2),
  * newest-first. Deliberately not durable: llm-gateway holds the authoritative
  * wire log; this adds session/priority attribution, admission wait, attempt

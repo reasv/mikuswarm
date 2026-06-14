@@ -16,7 +16,9 @@
 			? 'pipelines'
 			: page.url.pathname.startsWith('/scheduler')
 				? 'scheduler'
-				: 'conversations'
+				: page.url.pathname.startsWith('/gap-backfetch')
+					? 'gap-backfetch'
+					: 'conversations'
 	);
 </script>
 
@@ -58,6 +60,17 @@
 		>
 			Scheduler
 		</a>
+		<a
+			href="/gap-backfetch"
+			class={cn(
+				'rounded px-2 py-0.5 transition-colors',
+				area === 'gap-backfetch'
+					? 'bg-background font-medium text-foreground shadow-sm'
+					: 'text-muted-foreground hover:text-foreground'
+			)}
+		>
+			Backfetch
+		</a>
 	</nav>
 
 	<span class="text-muted-foreground">/</span>
@@ -65,6 +78,10 @@
 	{#if area === 'scheduler'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			<span>llm scheduler</span>
+		</nav>
+	{:else if area === 'gap-backfetch'}
+		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
+			<span>startup gap backfetch</span>
 		</nav>
 	{:else if area === 'conversations'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">

@@ -194,6 +194,21 @@ initial_backfill_utd_halt_threshold = 50  # stop paging after N consecutive UTD 
 redecryption_sweep_interval_ms = 60000    # retry stored UTD events every 60s (0 = sweeper off)
 redecryption_sweep_batch = 50             # max UTD events probed per sweep tick
 
+# Startup gap backfetch (ARCHITECTURE.md §7c): on startup, per room, paginate
+# backward from the live head down to the last message already stored (the floor),
+# recovering everything said while the bot was offline and processing it exactly
+# like a live message — EXCEPT that backfetched messages never start a session
+# (reactive/proactive starts for a room are frozen until its gap is filled). The
+# committed high-water never advances until a room's gap is fully closed, so a
+# crash at any point is recoverable as a single re-derived gap on the next boot.
+gap_backfetch_enabled = false             # master switch (off until rollout)
+gap_backfetch_max_messages = 0            # per-room cap; 0 = UNBOUNDED (recover the whole gap)
+gap_backfetch_window_ms = 0               # don't fetch older than now-this; 0 = no window bound
+gap_backfetch_timeout_ms = 0              # per-room wall-clock budget; 0 = no timeout
+gap_backfetch_page_size = 100             # messages per backward page request (clamped 1–1000)
+gap_backfetch_utd_halt_threshold = 50     # stop paging after N consecutive UTD events (0 = off)
+gap_backfetch_concurrency = 3             # rooms fetched in parallel on startup
+
 [matrix]
 enabled = false
 trigger_hold_ms = 2000

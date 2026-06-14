@@ -259,6 +259,14 @@ export interface ProactiveSchedulerOptions {
    */
   launchSession: (inbound: InboundChatEvent, duplicate: boolean, opts: { proactive: true }) => void;
   isDraining: () => boolean;
+  /**
+   * True while a channel's startup gap backfetch is still filling (ARCHITECTURE.md
+   * §7c §6.4). A frozen channel is skipped this tick (it would post on incomplete
+   * context) and re-armed by `rescheduleChannel`; proactive is memoryless and
+   * budget-derived, so a deferred tick during the bounded freeze is simply
+   * postponed, not lost. Defaults to never-frozen when omitted.
+   */
+  isFrozen?: (timelineKey: string) => boolean;
   logger: Logger;
   /** Injectable clock/RNG for deterministic tests. */
   now?: () => number;
@@ -393,6 +401,10 @@ export class ProactiveScheduler {
     const remaining = eff.dailyPosts - consumed;
     const base = { consumed, remaining };
 
+    // Skip while the channel's startup gap is still filling (§6.4): posting now
+    // would build on incomplete context. The tick is re-armed by the caller; no
+    // queueing needed (proactive is memoryless and budget-derived).
+    if (this.options.isFrozen?.(eff.timelineKey)) return { decision: "skip_backfetch", ...base };
     if (remaining <= 0) return { decision: "skip_budget", ...base };
     if (this.options.sessions.activeForTimeline(eff.timelineKey).length > 0) {
       return { decision: "skip_active", ...base };

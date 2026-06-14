@@ -452,6 +452,39 @@ test("ProactiveScheduler: skip_active when a session is already active for the t
   assert.equal(acquires, 0, "tryAcquire not reached — no slot acquired, no budget spent");
 });
 
+test("ProactiveScheduler: skip_backfetch while a channel's startup gap is still filling (§7c §6.4)", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  configureAgentTimezone("UTC");
+  t.after(() => resetAgentTimezone());
+
+  const now = Date.UTC(2026, 5, 2, 12, 0, 0);
+  const ticks: Array<Record<string, unknown>> = [];
+  let launched = 0;
+  const scheduler = new ProactiveScheduler({
+    config: schedulerConfig(),
+    // The freeze check runs FIRST — before the active-session / gate / slot checks —
+    // so none of those collaborators are touched while frozen.
+    sessions: { activeForTimeline: () => { throw new Error("must not check active sessions while frozen"); } } as any,
+    triggerCoordinator: { tryAcquire: () => { throw new Error("must not acquire a slot while frozen"); }, complete: () => undefined } as any,
+    storage: { countSessionsByType: () => 0 } as any,
+    timeline: { query: () => { throw new Error("gate must not be scanned while frozen"); } } as any,
+    launchSession: () => { launched++; },
+    isDraining: () => false,
+    isFrozen: () => true,
+    logger: tickRecordingLogger(ticks),
+    now: () => now,
+    random: () => 0,
+  });
+
+  scheduler.start();
+  t.mock.timers.tick(60_000);
+  scheduler.stop();
+
+  assert.ok(ticks.length >= 1, "at least one tick fired");
+  assert.equal(ticks[0]!.decision, "skip_backfetch");
+  assert.equal(launched, 0, "no proactive post while the gap is filling");
+});
+
 test("ProactiveScheduler: skip_busy_slot when tryAcquire is refused (and complete() is NOT called)", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   configureAgentTimezone("UTC");

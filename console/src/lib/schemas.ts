@@ -436,6 +436,30 @@ export const SchedulerSnapshot = Schema.Struct({
 });
 export type SchedulerSnapshot = Schema.Schema.Type<typeof SchedulerSnapshot>;
 
+/**
+ * One room's startup gap-backfetch status (GET /api/gap-backfetch; ARCHITECTURE.md
+ * §7c §11). `phase` walks frozen → filling → committing → done (or failed); the
+ * buffered counts show how much history is staged before the oldest-first commit,
+ * and `cappedHole` (when present) marks a permanent hole left below the oldest
+ * committed gap message under an operator-set cap/window/timeout.
+ */
+export const GapBackfetchRoom = Schema.Struct({
+	accountId: Schema.String,
+	roomId: Schema.String,
+	baseTimelineKey: Schema.String,
+	phase: Schema.String,
+	backfillBuffered: Schema.Number,
+	liveBuffered: Schema.Number,
+	committed: Schema.Number,
+	cappedHole: Schema.optional(
+		Schema.Struct({ fromTimestamp: Schema.Number, toTimestamp: Schema.Number })
+	)
+});
+export type GapBackfetchRoom = Schema.Schema.Type<typeof GapBackfetchRoom>;
+
+export const GapBackfetchSnapshot = Schema.Array(GapBackfetchRoom);
+export type GapBackfetchSnapshot = Schema.Schema.Type<typeof GapBackfetchSnapshot>;
+
 /** One settled Layer-0 attempt (GET /api/llm-requests, newest-first). */
 export const LlmRequestRecord = Schema.Struct({
 	ts: Schema.Number,

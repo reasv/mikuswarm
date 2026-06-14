@@ -324,6 +324,30 @@ const TimelineSchema = StrictObject({
   // Prune events from inactive timelines older than this (days). 0 = no pruning.
   // Drives the Phase 8 retention cleanup job (runs on startup + daily).
   inactive_event_retention_days: Type.Optional(Type.Number({ minimum: 0 })),
+
+  // --- Startup gap backfetch (ARCHITECTURE.md §7c) ---
+  // Master on/off switch. When enabled, on startup the bot paginates backward
+  // per room from the live head until it reaches the last message it already has
+  // (the floor), filling any history missed while it was offline. Off → behaviour
+  // is exactly as before (no freeze, no backfetch).
+  gap_backfetch_enabled: Type.Optional(Type.Boolean()),
+  // Per-room message cap. UNSET or 0 ⇒ UNBOUNDED (the default): page until the gap
+  // is fully closed (floor reached) or history is exhausted. A positive value is a
+  // purely opt-in safety valve for memory/startup-latency control; under it a
+  // permanent hole may remain below the oldest committed gap message (§10).
+  gap_backfetch_max_messages: Type.Optional(Type.Number({ minimum: 0 })),
+  // Don't fetch messages older than `now - this` (ms). 0 ⇒ no window bound (default).
+  gap_backfetch_window_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Per-room wall-clock budget (ms) for the descent. 0 ⇒ no timeout (default).
+  gap_backfetch_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Messages per backward-pagination page request (clamped 1–1000). Default 100.
+  gap_backfetch_page_size: Type.Optional(Type.Number({ minimum: 1, maximum: 1000 })),
+  // Stop paging after this many consecutive undecryptable (UTD) events (no useful
+  // forward progress into key-less history). 0 disables the guard. Default 50.
+  gap_backfetch_utd_halt_threshold: Type.Optional(Type.Number({ minimum: 0 })),
+  // How many rooms are backfetched in parallel on startup (bounded so the descent
+  // doesn't hammer the homeserver / shared HTTP limiter). Default 3.
+  gap_backfetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
 const ModelSchema = StrictObject({

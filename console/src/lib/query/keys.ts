@@ -25,6 +25,8 @@ export const keys = {
 	// Scheduler view (spec LLM-FAILURE-HANDLING §9.1/§9.2) — polled snapshots.
 	scheduler: () => ['scheduler'] as const,
 	llmRequests: () => ['llm-requests'] as const,
+	// Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11) — polled.
+	gapBackfetch: () => ['gap-backfetch'] as const,
 	// Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING §10.4).
 	costOverview: () => ['cost-overview'] as const
 };

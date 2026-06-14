@@ -1574,6 +1574,30 @@ export class Storage {
   }
 
   /**
+   * The committed high-water mark across a set of timeline keys — the single
+   * newest event by the canonical `(timestamp, received_at, id)` ordering used
+   * everywhere reads sort. Returns the event's `timestamp` and full canonical
+   * `id` (the gap-backfetch floor; ARCHITECTURE.md §7c §5.1), or `undefined` when
+   * none of the keys hold any event. Pass the explicit list of a room's keys
+   * (room/DM + thread) so the floor is the max across all its timelines.
+   */
+  getHighWaterMark(timelineKeys: string[]): { timestamp: number; id: string } | undefined {
+    if (timelineKeys.length === 0) return undefined;
+    const placeholders = timelineKeys.map(() => "?").join(",");
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select id, timestamp from timeline_events
+           where timeline_key in (${placeholders})
+           order by timestamp desc, received_at desc, id desc
+           limit 1`,
+        )
+        .get(...timelineKeys) as { id: string; timestamp: number } | undefined,
+    );
+    return row ? { timestamp: row.timestamp, id: row.id } : undefined;
+  }
+
+  /**
    * Set a timeline's lifecycle state, upserting the compaction-state row. The
    * insert seeds a minimal valid `state_json`; the on-conflict path touches only
    * `timeline_state`/`updated_at`, preserving the compaction cursors and any
@@ -1646,9 +1670,14 @@ export class Storage {
   }
 
   /**
-   * Every distinct timeline key known to the store (events or sessions),
-   * regardless of lifecycle state. Used by the startup room-label backfill to
-   * resolve names for rooms that may currently be idle.
+   * Every distinct timeline key known to the store (events, sessions, or a
+   * lifecycle row), regardless of state. Used by the startup room-label backfill
+   * to resolve names for currently-idle rooms, and by the startup gap-backfetch
+   * room enumeration (ARCHITECTURE.md §7c §6.1) — "all known rooms" (G5), active
+   * *and* currently-inactive/pruned, without a native room-list API. The
+   * `timeline_compaction_state` arm covers activated rooms whose events were all
+   * pruned by retention (the lifecycle row outlives them); thread keys are
+   * included and grouped under their room by the coordinator.
    */
   listKnownTimelineKeys(): string[] {
     return this.read((db) =>
@@ -1657,7 +1686,9 @@ export class Storage {
           .prepare(
             `select timeline_key from timeline_events
              union
-             select timeline_key from agent_sessions`,
+             select timeline_key from agent_sessions
+             union
+             select timeline_key from timeline_compaction_state`,
           )
           .all() as Array<{ timeline_key: string }>
       ).map((row) => row.timeline_key),
