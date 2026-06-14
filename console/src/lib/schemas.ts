@@ -441,7 +441,11 @@ export type SchedulerSnapshot = Schema.Schema.Type<typeof SchedulerSnapshot>;
  * §7c §11). `phase` walks frozen → filling → committing → done (or failed); the
  * buffered counts show how much history is staged before the oldest-first commit,
  * and `cappedHole` (when present) marks a permanent hole left below the oldest
- * committed gap message under an operator-set cap/window/timeout.
+ * committed gap message under an operator-set cap/window/timeout. `cappedHole.reason`
+ * is the descent's stop reason (issue #6) — `count`/`window`/`timeout` for an
+ * operator opt-in, or `utd_halt` for a floor-undefined UTD wall — so the operator
+ * can tell *why* the hole was left. Optional/back-compatible: absent on a backend
+ * that predates the field.
  */
 export const GapBackfetchRoom = Schema.Struct({
 	accountId: Schema.String,
@@ -452,7 +456,11 @@ export const GapBackfetchRoom = Schema.Struct({
 	liveBuffered: Schema.Number,
 	committed: Schema.Number,
 	cappedHole: Schema.optional(
-		Schema.Struct({ fromTimestamp: Schema.Number, toTimestamp: Schema.Number })
+		Schema.Struct({
+			fromTimestamp: Schema.Number,
+			toTimestamp: Schema.Number,
+			reason: Schema.optional(Schema.String)
+		})
 	)
 });
 export type GapBackfetchRoom = Schema.Schema.Type<typeof GapBackfetchRoom>;

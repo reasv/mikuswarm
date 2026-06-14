@@ -78,6 +78,24 @@ export interface BackwardPaginateOptions {
   ) => Promise<MessageDisposition> | MessageDisposition;
 }
 
+/**
+ * The single reason the backward descent stopped, derived from the boolean
+ * flags below (one canonical discriminator for telemetry — issue #6). `"running"`
+ * is the unreachable initial value; the loop always sets a terminal reason before
+ * returning. Distinguishes a clean fill (`floor`/`exhausted`) from each operator
+ * opt-in (`count`/`window`/`timeout`) and the two non-committing stops
+ * (`utd_halt`/`error`) so an operator can tell a cap hole from a timeout/UTD hole.
+ */
+export type BackwardPaginateStopReason =
+  | "floor"
+  | "exhausted"
+  | "count"
+  | "window"
+  | "timeout"
+  | "utd_halt"
+  | "error"
+  | "running";
+
 export interface BackwardPaginateResult {
   /** Summaries seen across all pages. */
   fetched: number;
@@ -95,6 +113,30 @@ export interface BackwardPaginateResult {
   error?: string;
   /** Paging stopped after a long run of consecutive undecryptable (UTD) events. */
   haltedOnUtd: boolean;
+  /**
+   * Canonical single stop reason derived from the flags above (issue #6). The
+   * one discriminator callers should thread into telemetry / capped-hole records
+   * rather than re-deriving the precedence from the booleans.
+   */
+  stopReason: BackwardPaginateStopReason;
+}
+
+/**
+ * Collapse the (possibly several) terminal flags into the single canonical
+ * {@link BackwardPaginateStopReason}. Floor/exhausted (clean completions) take
+ * precedence, then the operator opt-ins, then the non-committing stops; the
+ * order matches the loop's break precedence so the derived reason names the stop
+ * that actually fired.
+ */
+function deriveStopReason(r: BackwardPaginateResult): BackwardPaginateStopReason {
+  if (r.reachedFloor) return "floor";
+  if (r.exhausted) return "exhausted";
+  if (r.reachedCount) return "count";
+  if (r.reachedWindow) return "window";
+  if (r.timedOut) return "timeout";
+  if (r.haltedOnUtd) return "utd_halt";
+  if (r.errored) return "error";
+  return "running";
 }
 
 export class BackfillTimeoutError extends Error {}
@@ -129,6 +171,7 @@ export async function paginateBackward(
     timedOut: false,
     errored: false,
     haltedOnUtd: false,
+    stopReason: "running",
   };
 
   // Consecutive-UTD counter: advanced per recorded UTD message, reset on any
@@ -217,6 +260,7 @@ export async function paginateBackward(
     before = nextBefore;
   }
 
+  result.stopReason = deriveStopReason(result);
   return result;
 }
 

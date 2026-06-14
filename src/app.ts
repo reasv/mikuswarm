@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer } from "./observability/index.js";
+import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
 import {
@@ -1044,9 +1044,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // spawn decision (§5.1).
     if (coalesceCoTargetReply(inbound)) return;
 
-    await resolveTriggerGroup(inbound);
-    captionPool.notifyNewWork();
-
+    // Accept + claim run SYNCHRONOUSLY immediately after the coalesce check, with NO
+    // `await` between them (review #5). The co-target coalesce decision above read
+    // the registry keyed on `replyToExternalId` and found no owner; this is the point
+    // that records THIS inbound as the co-target owner. Any event-loop yield in that
+    // span would let a second, DISTINCT reply to the SAME target also pass coalesce
+    // before either claims — both spawn, the bot replies twice (the send-time guard
+    // keys on each trigger's OWN externalId, so it can't catch co-target siblings).
+    // `resolveTriggerGroup` (the former yield) is therefore deferred to AFTER the
+    // claim below; it mutates only `inbound.trigger.groupedEventIds` / persists the
+    // group, which neither `accept` (truthiness of `inbound.trigger`, already held)
+    // nor `addClaim`/`coalesceCoTargetReply` consume — only the later readiness wait
+    // and launch do, all of which run after the claim.
     const decision = triggerCoordinator.accept(inbound);
     // Claim the trigger SYNCHRONOUSLY here — immediately after accept, before any
     // `await` — so a concurrent inbound handler observes the claim even during the
@@ -1056,6 +1065,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (decision.action === "spawn" || decision.action === "queued") {
       addClaim(inbound);
     }
+
+    // Resolve the trigger group and nudge captions AFTER the claim (was before
+    // `accept` — moved per review #5 to close the coalesce→claim yield window). Still
+    // runs for every accepted action (spawn / queued / ignored) before the early
+    // return below, so a queued or ignored trigger gets its group persisted and its
+    // grouped attachments captioned exactly as before; only the relative order of
+    // these two `await`-free-span operations changed.
+    await resolveTriggerGroup(inbound);
+    captionPool.notifyNewWork();
+
     if (decision.action !== "spawn") {
       logger.info("trigger_not_spawned", {
         timelineKey: inbound.timelineKey,
@@ -2676,9 +2695,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // Gap-backfetch fill (ARCHITECTURE.md §7c §8 step 5): launch the per-room
   // fill→commit→unfreeze workers AFTER the scan-driven pools are up (so committed
   // gap rows are picked up) and after the proactive scheduler (which already skips
-  // frozen rooms — §6.4). Fire-and-forget: the bot must stay responsive for
-  // non-frozen rooms while gaps fill, and each room self-unfreezes as it completes.
-  void gapBackfetch.run().catch((error) => {
+  // frozen rooms — §6.4). The bot stays responsive for non-frozen rooms while gaps
+  // fill, and each room self-unfreezes as it completes. We HOLD the promise rather
+  // than discard it (#3) so `stop()` can await an in-flight fill/commit to quiesce
+  // before storage teardown — otherwise a commit could outrace `storage.close()`
+  // (rejected-after-close → logged failure). The coordinator's `isDraining()` gate
+  // (set at the top of `stop()`) stops launching new rooms and bails an un-started
+  // commit, so this await is bounded by the single in-flight room's remaining work.
+  const gapBackfetchRun = gapBackfetch.run().catch((error) => {
     logger.error("gap_backfetch_run_failed", {
       error: error instanceof Error ? error.message : String(error),
     });
@@ -2733,6 +2757,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Quiesce the gap-backfetch run BEFORE any pool/storage teardown (#3).
+        // `draining` is now true, so the coordinator stops launching new rooms and
+        // `commit()` bails before its first write; awaiting `gapBackfetchRun` lets
+        // an already-in-flight fill/commit finish its oldest-first (crash-safe)
+        // batch so it does not race `storage.waitForIdle()`/`close()`. Bound it so
+        // a hung homeserver read cannot block shutdown forever — mirror the
+        // `waitForRuns` 10s race; on timeout we proceed (an outstanding commit is
+        // idempotent + oldest-first, so the gap simply re-derives next startup).
+        await waitForGapBackfetch(gapBackfetchRun, logger);
         // Cancel context builds waiting on summarization jobs BEFORE any pool
         // teardown: once the summarization pool stops, nothing can drive a
         // waited job to terminal, so a waiting build would otherwise poll until
@@ -2806,6 +2839,30 @@ async function waitForRuns(runs: Set<Promise<void>>): Promise<void> {
   if (runs.size === 0) return;
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, 10_000));
   await Promise.race([Promise.allSettled([...runs]), timeout]);
+}
+
+const GAP_BACKFETCH_DRAIN_TIMEOUT_MS = 10_000;
+
+/**
+ * Await the held gap-backfetch `run()` promise during shutdown so an in-flight
+ * fill/commit quiesces before storage teardown (#3), bounded so a hung homeserver
+ * read cannot block shutdown forever. By the time this is called `draining` is
+ * already true, so the coordinator launches no new rooms and `commit()` bails
+ * before its first write; this just lets the single in-flight room finish (or, on
+ * timeout, proceeds anyway — an outstanding oldest-first commit is idempotent and
+ * the gap re-derives on the next startup). `run()` already early-returns when the
+ * feature is disabled, so the held promise resolves immediately in that case.
+ */
+async function waitForGapBackfetch(run: Promise<void>, logger: Logger): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), GAP_BACKFETCH_DRAIN_TIMEOUT_MS);
+  });
+  const outcome = await Promise.race([run.then(() => "settled" as const), timeout]);
+  if (timer) clearTimeout(timer);
+  if (outcome === "timeout") {
+    logger.warn("gap_backfetch_drain_timeout", { timeoutMs: GAP_BACKFETCH_DRAIN_TIMEOUT_MS });
+  }
 }
 
 const MILLIS_PER_DAY = 86_400_000;
