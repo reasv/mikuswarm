@@ -32,7 +32,7 @@ const X_SEARCH_USER_AGENT = "MikuAgent/0.1 (mikuswarm x_search)";
 /** Hard cap on the OpenRouter JSON response body. A cited synthesis is small. */
 const RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 
-const DEFAULT_MODEL = "x-ai/grok-4.1-fast";
+const DEFAULT_MODEL = "x-ai/grok-4.3";
 const DEFAULT_SYSTEM_PROMPT = [
   "You are an X.com (Twitter) search subagent. You have live X search and an auxiliary general web search.",
   "X is the priority corpus; lean on web results only when they add value the X posts cannot.",
