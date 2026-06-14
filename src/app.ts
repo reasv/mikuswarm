@@ -1463,9 +1463,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       coReplyInbounds.set(externalId, { inbound, intoSessionId: coReplySessionId });
       sessions.onSettle(coReplySessionId, () => coReplyInbounds.delete(externalId));
       // Race guard (review #3): `onSettle` fires nothing if the session ALREADY
-      // settled between the steer above and this registration — re-check liveness so
-      // the just-stored entry can't linger until shutdown.
-      if (!sessions.isAgentLive(coReplySessionId)) coReplyInbounds.delete(externalId);
+      // settled (evicted) between the steer above and this registration — clean up
+      // the just-stored entry so it can't linger until shutdown. The check is
+      // "record gone" (`!sessions.get`), NOT `isAgentLive`: the success drain
+      // (DEFERRED-COALESCING) calls this right after `attachAgent` but BEFORE
+      // `runner.run()`, where the steer succeeds yet `agent.signal` is still
+      // undefined — `isAgentLive` would be false there and wrongly drop the entry,
+      // silently breaking the `spawn_session` affordance the interjection advertises.
+      // A still-present record (running, or interrupted-pending-evict) will fire
+      // `onSettle` later, so the entry is correctly retained.
+      if (!sessions.get(coReplySessionId)) coReplyInbounds.delete(externalId);
     }
     logger.info("co_reply_coalesced", {
       sessionId: coReplySessionId,
