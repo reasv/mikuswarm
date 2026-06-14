@@ -6,6 +6,7 @@ export {
   containsEmbeddedRasterDataUri,
   buildInferenceImageOptions,
   SVG_MAX_INPUT_PIXELS,
+  RASTER_MAX_INPUT_PIXELS,
 } from "./image.js";
 export { processVideoForInference } from "./video.js";
 export { processAudioForInference } from "./audio.js";

@@ -10,7 +10,7 @@ import pngTextChunk from "png-chunk-text";
 import sharp from "sharp";
 import type { FetchClient } from "../enrichment/fetch-client.js";
 import { buildAssetFetchError } from "./danbooru.js";
-import { SVG_MAX_INPUT_PIXELS } from "../media/index.js";
+import { SVG_MAX_INPUT_PIXELS, RASTER_MAX_INPUT_PIXELS } from "../media/index.js";
 import { escapeAttr, escapeXml } from "../context/xml.js";
 
 // Reject PNGs whose chunk table is structurally hostile before handing the
@@ -1761,13 +1761,18 @@ async function loadImageSource(input: {
 
   // limitInputPixels caps librsvg/libvips rasterization. Without it, a
   // crafted SVG can demand multi-gigabyte rasters even though the source
-  // buffer is tiny. Reuse the same constant the read_image and captioning
-  // pipelines already enforce.
-  const pipeline = sharp(buffer, { animated: false, limitInputPixels: SVG_MAX_INPUT_PIXELS });
-  const metadata = await pipeline.metadata();
-  if (!metadata.format) {
+  // buffer is tiny. But the limit gates the *input decode*, so applying the
+  // tight SVG budget to a raster would reject a legitimate large avatar
+  // (e.g. a 30 MP photo) outright. Probe the format first (metadata reads
+  // headers only), then decode under the format-appropriate ceiling — the
+  // same split the read_image and captioning pipelines enforce.
+  const format = (await sharp(buffer, { animated: false, limitInputPixels: RASTER_MAX_INPUT_PIXELS }).metadata()).format;
+  if (!format) {
     throw new Error("The provided image could not be decoded.");
   }
+  const limitInputPixels = format === "svg" ? SVG_MAX_INPUT_PIXELS : RASTER_MAX_INPUT_PIXELS;
+  const pipeline = sharp(buffer, { animated: false, limitInputPixels });
+  const metadata = await pipeline.metadata();
   const pngBuffer = await pipeline.png().toBuffer();
   return {
     pngBuffer,

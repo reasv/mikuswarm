@@ -6,19 +6,30 @@ import { readFile, writeFile, unlink } from "node:fs/promises";
 import type { ImageProcessingOptions, ProcessedMedia } from "./types.js";
 
 /**
- * Cap on pixels sharp will materialize for any single decode. 25 MP is large
- * enough for any reasonable photo/screenshot/diagram but small enough to keep
- * worst-case allocation bounded across the iterative compression loop.
+ * Decode ceiling for **SVG** input only. librsvg honors `limitInputPixels`, so
+ * a crafted `<viewBox="0 0 16000 16000">` cannot balloon into a ~1 GP raster
+ * during rasterization. 25 MP is generous for any legitimate vector render but
+ * small enough to keep worst-case allocation bounded.
  *
- * Specifically relevant for SVG input: librsvg honors `limitInputPixels`, so a
- * crafted `<viewBox="0 0 16000 16000">` does not balloon into a ~1 GP raster.
- * Sharp's own default (`Math.pow(0x3FFF, 2)` ≈ 268 MP) only catches truly
- * extreme inputs.
+ * Do NOT apply this to raster inputs — `limitInputPixels` gates the *input
+ * decode*, not the output, so a legitimate large photo/screenshot (e.g. a
+ * 6000×5000 = 30 MP JPEG) would be rejected outright before the resize step
+ * ever runs. Rasters get {@link RASTER_MAX_INPUT_PIXELS} instead; the resize in
+ * `compressToFit` is what brings their dimensions down to the pixel budget.
  *
  * Shared with `src/tools/read-image.ts` so the SVG rasterization budget is
  * uniform across captioning and the `read_image` tool.
  */
 export const SVG_MAX_INPUT_PIXELS = 25_000_000;
+
+/**
+ * Decompression-bomb ceiling for **raster** input. Matches libvips/sharp's own
+ * default (`Math.pow(0x3FFF, 2)` ≈ 268 MP) — high enough that every legitimate
+ * photo, screenshot, or scan decodes successfully, low enough to still refuse a
+ * pathological gigapixel decode. Dimension reduction is the job of the resize
+ * step (`computeTargetDimensions` + `compressToFit`), NOT of this guard.
+ */
+export const RASTER_MAX_INPUT_PIXELS = 268_402_689;
 
 /**
  * Build the canonical `ImageProcessingOptions` from the `media.image` config
@@ -138,12 +149,22 @@ export async function conditionImageBufferForInference(
   input: Buffer,
   options: ImageProcessingOptions,
 ): Promise<{ buffer: Buffer; mimeType: string; sizeBytes: number; truncated: boolean }> {
-  const metadata = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS }).metadata();
+  // Probe format/dimensions with the generous raster ceiling. metadata() reads
+  // headers only (no full decode), so this never balloons memory even for an
+  // SVG declaring huge dimensions — the actual render below re-gates SVGs at the
+  // tight SVG budget. The probe must use the high limit so a legitimate large
+  // raster (>25 MP) survives long enough to be measured and resized.
+  const metadata = await sharp(input, { limitInputPixels: RASTER_MAX_INPUT_PIXELS }).metadata();
+  const isSvg = metadata.format === "svg";
+  // Per-format decode ceiling for the real decode/resize calls below: SVG keeps
+  // the tight bomb budget (librsvg can balloon a tiny viewBox into a gigapixel
+  // raster); rasters get the generous ceiling and rely on resize for sizing.
+  const limitInputPixels = isSvg ? SVG_MAX_INPUT_PIXELS : RASTER_MAX_INPUT_PIXELS;
   // SVG-specific gate: librsvg/Cairo decode `<image href="data:image/...">`
   // payloads against the inner raster's own dimensions, not the SVG canvas,
   // so SVG_MAX_INPUT_PIXELS does not bound them. Conservative refusal — see
   // `containsEmbeddedRasterDataUri` for rationale.
-  if (metadata.format === "svg" && svgBufferContainsEmbeddedRasterDataUri(input)) {
+  if (isSvg && svgBufferContainsEmbeddedRasterDataUri(input)) {
     throw new Error(
       "Refusing to rasterize SVG containing embedded data: URI raster — strip the inline image and retry.",
     );
@@ -154,7 +175,7 @@ export async function conditionImageBufferForInference(
   const { width, height } = computeTargetDimensions(origWidth, origHeight, options);
 
   const useMozjpeg = options.mozjpeg;
-  const result = await compressToFit(input, width, height, options.maxBytes, useMozjpeg);
+  const result = await compressToFit(input, width, height, options.maxBytes, useMozjpeg, limitInputPixels);
   if (result) {
     return {
       buffer: result,
@@ -164,7 +185,7 @@ export async function conditionImageBufferForInference(
     };
   }
 
-  const fallback = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS })
+  const fallback = await sharp(input, { limitInputPixels })
     .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 60, mozjpeg: useMozjpeg })
     .toBuffer();
@@ -213,13 +234,14 @@ async function compressToFit(
   targetHeight: number,
   maxBytes: number,
   mozjpeg: boolean,
+  limitInputPixels: number,
 ): Promise<Buffer | undefined> {
   let width = targetWidth;
   let height = targetHeight;
 
   for (;;) {
     for (const quality of [82, 72, 62, 52, 42, 35]) {
-      const output = await sharp(input, { limitInputPixels: SVG_MAX_INPUT_PIXELS })
+      const output = await sharp(input, { limitInputPixels })
         .resize({
           width: Math.round(width),
           height: Math.round(height),

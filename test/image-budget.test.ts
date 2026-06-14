@@ -4,7 +4,11 @@ import { mkdtemp, writeFile, unlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
-import { processImageForInference, buildInferenceImageOptions } from "../src/media/index.js";
+import {
+  processImageForInference,
+  conditionImageBufferForInference,
+  buildInferenceImageOptions,
+} from "../src/media/index.js";
 
 test("buildInferenceImageOptions returns documented defaults when the config slice is empty/undefined", () => {
   const undef = buildInferenceImageOptions(undefined);
@@ -61,6 +65,37 @@ test("image processing honors configured pixel budget and byte limit", async () 
   } finally {
     await unlink(tmpPath).catch(() => {});
   }
+});
+
+test("conditions a raster larger than the SVG decode budget instead of rejecting it", async () => {
+  // A legitimate 6000×5000 = 30 MP photo exceeds the 25 MP SVG_MAX_INPUT_PIXELS
+  // guard. limitInputPixels gates the *input decode*, so before the per-format
+  // split this threw "Input image exceeds pixel limit" at the very first sharp
+  // call — breaking find_source, captioning, danbooru preview, and context
+  // attachments alike. Rasters must decode under the generous bomb ceiling and
+  // be brought down to budget by the resize step.
+  const width = 6000;
+  const height = 5000; // 30 MP > 25 MP SVG ceiling
+  const big = await sharp({
+    create: { width, height, channels: 3, background: { r: 40, g: 90, b: 160 } },
+  })
+    .png()
+    .toBuffer();
+
+  const result = await conditionImageBufferForInference(big, {
+    maxTotalPixels: 921_600,
+    maxTotalPixelsHard: 1_843_200,
+    minShortestSide: 480,
+    maxBytes: 200_000,
+    mozjpeg: true,
+  });
+
+  assert.equal(result.mimeType, "image/jpeg");
+  assert.equal(result.sizeBytes <= 200_000, true, `sizeBytes ${result.sizeBytes} should be <= 200000`);
+  const meta = await sharp(result.buffer).metadata();
+  assert.equal(meta.format, "jpeg");
+  // Resized down to the configured pixel budget, not left at 30 MP.
+  assert.equal((meta.width ?? 0) * (meta.height ?? 0) <= 1_843_200, true);
 });
 
 test("captioning image pipeline refuses SVGs with embedded data: URI rasters", async () => {
