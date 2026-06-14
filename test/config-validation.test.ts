@@ -492,6 +492,36 @@ discrete_split_messages = 0
   });
 });
 
+test("config: [reactions] discrete_split_minutes below 1 is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_split_minutes = 0
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|minimum/i);
+  });
+});
+
+test("config: [reactions] discrete_split_messages above the maximum is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_split_messages = 100001
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|maximum/i);
+  });
+});
+
+test("config: [reactions] negative discrete_other_horizon_messages is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_other_horizon_messages = -1
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|minimum/i);
+  });
+});
+
 test("config: [reactions] discrete_name_cap below 4 is rejected", async () => {
   const toml = `${BASE_CONFIG}
 [reactions]

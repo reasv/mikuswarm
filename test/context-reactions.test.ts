@@ -339,6 +339,23 @@ test("1..N-1 messages between → split only when the time gap exceeds the thres
   assert.equal(merged.length, 1);
 });
 
+test("a time gap exactly equal to the threshold coalesces (the seam is strictly >)", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 2000 }),
+  ];
+  // 1 message between (below the seam of 5); gap is exactly 1000ms === the threshold.
+  // The rule is "split only when the gap *exceeds* the threshold", so == coalesces.
+  const lines = synthesizeReactionLines(rows, selfTarget("$a1", "msg"), {
+    nameCap: 8,
+    messageTimestamps: [1500],
+    splitMessages: 5,
+    splitGapMs: 1000,
+  });
+  assert.equal(lines.length, 1, "gap == splitGapMs is not a seam (strict greater-than)");
+  assert.match(lines[0].content, /Aa and Bb reacted/);
+});
+
 test("without messageTimestamps, splitting is off (legacy single-line behavior)", () => {
   const rows = [
     discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
@@ -450,6 +467,33 @@ test("discreteOtherHorizonMessages clamps non-self lines tighter than self lines
   const all = result.turns.map((t) => t.content).join("\n");
   assert.match(all, /SELFLINE reacted/, "the self line is within the whole-tier self horizon");
   assert.doesNotMatch(all, /OTHERLINE reacted/, "the non-self line is before the tighter inter-user horizon");
+});
+
+test("an unset discreteOtherHorizonMessages makes non-self lines inherit discreteHorizonMessages (§9f)", () => {
+  // Production passes the knob through unresolved (builder.ts), so "unset" must fall
+  // back to the self horizon — NOT a hardcoded literal. Here the self horizon is the
+  // last-1-message span (>= t=4000); with the field omitted the non-self line shares
+  // it and a t=2500 non-self line is dropped exactly like the self one would be.
+  const events = [
+    chatEvent("a1", "assistant", "m1", 1000),
+    chatEvent("a2", "assistant", "m2", 2000),
+    chatEvent("a3", "assistant", "m3", 3000),
+    chatEvent("a4", "assistant", "m4", 4000),
+  ];
+  const opts = { rich_max_tokens: 10_000, rich_target_tokens: 9_000, compact_max_tokens: 10_000, compact_target_tokens: 9_000 };
+  const result = compactTimelineEvents(events, renderRichMessage, renderCompactMessage, opts, {
+    timelineKey: TK,
+    now: 1,
+    discreteHorizonMessages: 1,
+    // discreteOtherHorizonMessages intentionally omitted → inherits the above.
+    reactionLines: [
+      { timestamp: 2500, self: false, content: "<reaction>OTHEROLD reacted 👍 to Bob's message [$a2]</reaction>" },
+      { timestamp: 4500, self: false, content: "<reaction>OTHERNEW reacted 👍 to Bob's message [$a4]</reaction>" },
+    ],
+  });
+  const all = result.turns.map((t) => t.content).join("\n");
+  assert.doesNotMatch(all, /OTHEROLD reacted/, "before the inherited last-1-message horizon → dropped");
+  assert.match(all, /OTHERNEW reacted/, "within the inherited horizon → renders");
 });
 
 test("with no reaction lines, compaction output is unchanged", () => {

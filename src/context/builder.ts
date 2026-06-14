@@ -447,9 +447,12 @@ export class ContextBuilder {
         state: generation ? undefined : compactionState,
         reactionLines,
         discreteHorizonMessages: rx.discrete_horizon_messages ?? 0,
-        // Tighter default for inter-user lines (last 10 rich messages) so cross-user
-        // reaction chatter stays at the live edge; inert when assistantOnly (§9f).
-        discreteOtherHorizonMessages: rx.discrete_other_horizon_messages ?? 10,
+        // Inter-user lines use a tighter horizon (the shipped default in
+        // 00-defaults.toml is 10 — the live edge — so cross-user reaction chatter
+        // stays recent); inert when assistantOnly (§9f). Passed through unresolved so
+        // that when the knob is genuinely unset it inherits discrete_horizon_messages
+        // (compaction's fallback), per §9f — do NOT default it to a literal here.
+        discreteOtherHorizonMessages: rx.discrete_other_horizon_messages,
       },
     );
     if (!generation && compacted.stateChanged && compacted.state) {
