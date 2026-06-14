@@ -1,5 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { PIPELINE_IDS, type MediaAssetRow, type PipelineId } from "../../storage/index.js";
+import {
+  PIPELINE_IDS,
+  type CaptionEligibility,
+  type MediaAssetRow,
+  type PipelineId,
+} from "../../storage/index.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
 import type { RequestContext } from "./types.js";
@@ -18,6 +23,16 @@ const FALLBACK_MAX_RETRIES: Record<PipelineId, number> = {
 
 function isPipelineId(value: string): value is PipelineId {
   return (PIPELINE_IDS as readonly string[]).includes(value);
+}
+
+/**
+ * The captioning pool's config-derived eligibility, for the derived `deferred`
+ * status (a pending asset the pool would never claim). Returned only for the
+ * captioning pool; `undefined` for the others or when no registry is wired (the
+ * storage read then falls back to no `deferred` partition).
+ */
+function captionEligibility(ctx: RequestContext, pool: PipelineId): CaptionEligibility | undefined {
+  return pool === "captioning" ? ctx.deps.pipelines?.captioning.captionEligibility : undefined;
 }
 
 /** Parse a finite positive `?limit=`; undefined (→ storage default) otherwise. */
@@ -52,7 +67,7 @@ export function listPipelines(
       workerCount: stats?.workerCount ?? 0,
       maxRetries: stats?.maxRetries ?? FALLBACK_MAX_RETRIES[pool],
       inFlight: stats ? stats.inFlight() : 0,
-      counts: ctx.deps.storage.getPipelineCounts(pool),
+      counts: ctx.deps.storage.getPipelineCounts(pool, captionEligibility(ctx, pool)),
       usage: pool === "captioning" ? captioningUsage : null,
     };
   });
@@ -84,6 +99,7 @@ export function pipelineItems(
       limit: parseLimit(q.get("limit")),
     },
     maxRetries,
+    captionEligibility(ctx, pool),
   );
   sendJson(res, 200, page);
 }
@@ -142,7 +158,7 @@ export function pipelineItemDetail(
   const stats = ctx.deps.pipelines ? ctx.deps.pipelines[pool] : null;
   const maxRetries = stats?.maxRetries ?? FALLBACK_MAX_RETRIES[pool];
   const { storage } = ctx.deps;
-  const item = storage.getPipelineItem(pool, ctx.params.id, maxRetries);
+  const item = storage.getPipelineItem(pool, ctx.params.id, maxRetries, captionEligibility(ctx, pool));
   if (!item) return sendError(res, 404, `Unknown ${pool} item: ${ctx.params.id}`);
 
   switch (pool) {

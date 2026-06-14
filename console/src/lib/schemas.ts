@@ -230,7 +230,11 @@ export const PipelineCounts = Schema.Struct({
 	retrying: Schema.Number,
 	done: Schema.Number,
 	failed: Schema.Number,
-	skipped: Schema.Number
+	skipped: Schema.Number,
+	// Captioning-only: pending assets the pool would never claim under the current
+	// config (the derived `deferred` status), carved out of `pending`. 0 elsewhere.
+	// Optional so a pre-feature backend still decodes (defaults to 0).
+	deferred: Schema.optionalWith(Schema.Number, { default: () => 0 })
 });
 export type PipelineCounts = Schema.Schema.Type<typeof PipelineCounts>;
 

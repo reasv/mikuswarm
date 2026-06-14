@@ -129,6 +129,13 @@
 									p.counts.pending,
 									'bg-zinc-500/15 text-zinc-600 dark:text-zinc-400'
 								)}
+								<!-- Captioning `deferred` (pending the pool would never claim under
+								     the current config); 0 elsewhere, so the chip self-hides. -->
+								{@render countChip(
+									'def',
+									p.counts.deferred,
+									'bg-violet-500/10 text-violet-600 dark:text-violet-400'
+								)}
 								{@render countChip(
 									'↻',
 									p.counts.retrying,

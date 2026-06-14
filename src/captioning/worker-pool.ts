@@ -64,6 +64,14 @@ export class CaptionWorkerPool {
       maxRetries: this.options.config.max_retries ?? 2,
       inFlight: () => this.activeWorkers.size,
       notify: () => this.notifyNewWork(),
+      // Mirrors the claim gate in poll(): the monitor uses this to mark the pending
+      // assets the pool would never claim under the current config as `deferred`.
+      captionEligibility: {
+        captionAll: this.options.config.caption_all ?? false,
+        captionAssistant:
+          (this.options.config.caption_all ?? false) ||
+          (this.options.config.caption_assistant_messages ?? false),
+      },
     };
   }
 

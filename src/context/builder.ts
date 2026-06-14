@@ -410,6 +410,10 @@ export class ContextBuilder {
         reactionLines = this.buildDiscreteReactionLines(compactionInput, {
           assistantOnly: rx.discrete_assistant_only !== false,
           nameCap: rx.discrete_name_cap ?? 8,
+          // Episode splitting (§9f): a coalesced reaction is split across a seam so
+          // temporally-distinct bursts land at their own timeline position.
+          splitMessages: rx.discrete_split_messages ?? 5,
+          splitGapMs: (rx.discrete_split_minutes ?? 30) * 60_000,
           selfUserId: this.resolveSelfUserId(options.timelineKey),
         });
       }
@@ -443,6 +447,9 @@ export class ContextBuilder {
         state: generation ? undefined : compactionState,
         reactionLines,
         discreteHorizonMessages: rx.discrete_horizon_messages ?? 0,
+        // Tighter default for inter-user lines (last 10 rich messages) so cross-user
+        // reaction chatter stays at the live edge; inert when assistantOnly (§9f).
+        discreteOtherHorizonMessages: rx.discrete_other_horizon_messages ?? 10,
       },
     );
     if (!generation && compacted.stateChanged && compacted.state) {
@@ -1056,8 +1063,9 @@ export class ContextBuilder {
    * View B (ARCHITECTURE.md §9f): synthesize discrete reaction lines for messages
    * among `events`. By default only the assistant's own messages are targeted
    * (`assistantOnly`); when false, any sender's recent messages qualify and the
-   * line reads "<author>'s message" instead of "your message". The store is
-   * queried for all such targets; compaction injects only the lines whose
+   * line reads "<author>'s message" instead of "your message". Non-self lines are
+   * additionally clamped, in compaction, by a tighter horizon. The
+   * store is queried for all such targets; compaction injects only the lines whose
    * timestamp falls within the rich tier's time span. Returns [] when there are no
    * targets or no live reactions on them.
    */
@@ -1076,7 +1084,13 @@ export class ContextBuilder {
 
   private buildDiscreteReactionLines(
     events: CanonicalChatEvent[],
-    opts: { assistantOnly: boolean; nameCap: number; selfUserId?: string },
+    opts: {
+      assistantOnly: boolean;
+      nameCap: number;
+      splitMessages?: number;
+      splitGapMs?: number;
+      selfUserId?: string;
+    },
   ): ReactionLine[] {
     const targets = events.filter(
       (e) => e.externalId !== undefined && (!opts.assistantOnly || e.role === "assistant"),
@@ -1096,9 +1110,15 @@ export class ContextBuilder {
         authorDisplay: target.sender.displayName ?? undefined,
       });
     }
+    // Ascending message times across the whole rendered set — the seam signal for
+    // episode splitting (count of messages between two reactions). §9f.
+    const messageTimestamps = events.map((e) => e.timestamp).sort((a, b) => a - b);
     return synthesizeReactionLines(rows, targetInfo, {
       nameCap: opts.nameCap,
       selfUserId: opts.selfUserId,
+      messageTimestamps,
+      splitMessages: opts.splitMessages,
+      splitGapMs: opts.splitGapMs,
     });
   }
 

@@ -173,6 +173,34 @@ test("a non-self target with no known author reads \"a message\"", () => {
   assert.match(lines[0].content, /to a message \[\$u9\]:/);
 });
 
+test("synthesized lines carry the target's self flag", () => {
+  const targets = new Map<string, ReactionTarget>([
+    ["$a1", { body: "mine", self: true }],
+    ["$u9", { body: "theirs", self: false, authorDisplay: "Bob" }],
+  ]);
+  const rows = [
+    discrete({ reactionEventId: "$r1", targetEventId: "$a1", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", targetEventId: "$u9", reactedAt: 2000 }),
+  ];
+  const lines = synthesizeReactionLines(rows, targets, { nameCap: 8 });
+  assert.deepEqual(
+    lines.map((l) => l.self),
+    [true, false],
+  );
+});
+
+test("a high-participation NON-self reaction stays a single coalesced line", () => {
+  // Coalescing + name cap already bound a pile-on to one line (first 4 + others),
+  // so no participation ceiling is needed — there is exactly one discrete line.
+  const target = new Map<string, ReactionTarget>([["$u9", { body: "hot take", self: false, authorDisplay: "Bob" }]]);
+  const rows = Array.from({ length: 10 }, (_, i) =>
+    discrete({ reactionEventId: `$r${i}`, targetEventId: "$u9", senderId: `@u${i}:test`, senderDisplay: `U${i}`, reactedAt: 1000 + i }),
+  );
+  const lines = synthesizeReactionLines(rows, target, { nameCap: 8 });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0].content, /^<reaction>U0, U1, U2, U3 \(and 6 others\) reacted 👍 to Bob's message/);
+});
+
 test("falls back to sender id when no display name is known", () => {
   const lines = synthesizeReactionLines(
     [discrete({ reactionEventId: "$r1", senderId: "@nodisplay:test", senderDisplay: null })],
@@ -242,6 +270,84 @@ test("multiple groups render in deterministic timestamp order across repeated ca
   );
 });
 
+// --- View B: episode splitting ---
+
+const SPLIT = { splitMessages: 5, splitGapMs: 30 * 60_000 };
+
+test("a (target,key) splits across a message seam into one line per episode", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 5000 }),
+  ];
+  // 5 messages strictly between the two reactions → hard seam → two lines.
+  const lines = synthesizeReactionLines(rows, selfTarget("$a1", "msg"), {
+    nameCap: 8,
+    messageTimestamps: [1500, 2000, 2500, 3000, 3500],
+    ...SPLIT,
+  });
+  assert.equal(lines.length, 2);
+  // Each episode is placed at its own latest reaction (not both at the later one).
+  assert.deepEqual(
+    lines.map((l) => l.timestamp),
+    [1000, 5000],
+  );
+  assert.match(lines[0].content, /^<reaction>Aa reacted/);
+  assert.match(lines[1].content, /^<reaction>Bb reacted/);
+});
+
+test("no messages between two reactions → always coalesced, however large the time gap", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 9_000_000 }),
+  ];
+  // Splitting enabled (non-empty timestamps), but the only message predates both
+  // reactions → 0 strictly between → never split despite the huge gap.
+  const lines = synthesizeReactionLines(rows, selfTarget("$a1", "msg"), {
+    nameCap: 8,
+    messageTimestamps: [500],
+    splitMessages: 5,
+    splitGapMs: 1,
+  });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0].content, /Aa and Bb reacted/);
+});
+
+test("1..N-1 messages between → split only when the time gap exceeds the threshold", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 5000 }),
+  ];
+  // 1 message between (below the seam of 5); gap 4000ms > 1000ms threshold → split.
+  const split = synthesizeReactionLines(rows, selfTarget("$a1", "msg"), {
+    nameCap: 8,
+    messageTimestamps: [2000],
+    splitMessages: 5,
+    splitGapMs: 1000,
+  });
+  assert.equal(split.length, 2);
+  // Same shape but the reactions are close in time (gap 500ms ≤ 1000ms) → coalesced.
+  const closeRows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 1500 }),
+  ];
+  const merged = synthesizeReactionLines(closeRows, selfTarget("$a1", "msg"), {
+    nameCap: 8,
+    messageTimestamps: [1200],
+    splitMessages: 5,
+    splitGapMs: 1000,
+  });
+  assert.equal(merged.length, 1);
+});
+
+test("without messageTimestamps, splitting is off (legacy single-line behavior)", () => {
+  const rows = [
+    discrete({ reactionEventId: "$r1", senderId: "@a:test", senderDisplay: "Aa", reactedAt: 1000 }),
+    discrete({ reactionEventId: "$r2", senderId: "@b:test", senderDisplay: "Bb", reactedAt: 9_000_000 }),
+  ];
+  const lines = synthesizeReactionLines(rows, selfTarget("$a1", "msg"), { nameCap: 8 });
+  assert.equal(lines.length, 1);
+});
+
 // --- View B integration: compaction interleaving ---
 
 test("reaction lines interleave chronologically into the rich tier", () => {
@@ -258,7 +364,7 @@ test("reaction lines interleave chronologically into the rich tier", () => {
       timelineKey: TK,
       now: 1,
       // A reaction at t=2000 lands between the two messages.
-      reactionLines: [{ timestamp: 2000, content: "<reaction>Bo reacted 👍 to your message [$a1]</reaction>" }],
+      reactionLines: [{ timestamp: 2000, self: true, content: "<reaction>Bo reacted 👍 to your message [$a1]</reaction>" }],
     },
   );
   // The reaction (user role) merges with the later user turn; the assistant turn
@@ -286,8 +392,8 @@ test("reaction lines before the rich horizon are dropped (View A still has the c
       timelineKey: TK,
       now: 1,
       reactionLines: [
-        { timestamp: 2000, content: "<reaction>OLD reacted 👍 to your message [$a0]</reaction>" },
-        { timestamp: 6000, content: "<reaction>NEW reacted 👍 to your message [$u1]</reaction>" },
+        { timestamp: 2000, self: true, content: "<reaction>OLD reacted 👍 to your message [$a0]</reaction>" },
+        { timestamp: 6000, self: true, content: "<reaction>NEW reacted 👍 to your message [$u1]</reaction>" },
       ],
     },
   );
@@ -311,13 +417,39 @@ test("discreteHorizonMessages restricts lines to the last N rich messages", () =
     now: 1,
     discreteHorizonMessages: 2,
     reactionLines: [
-      { timestamp: 2500, content: "<reaction>OLD reacted 👍 to your message [$a2]</reaction>" },
-      { timestamp: 3500, content: "<reaction>NEW reacted 👍 to your message [$a3]</reaction>" },
+      { timestamp: 2500, self: true, content: "<reaction>OLD reacted 👍 to your message [$a2]</reaction>" },
+      { timestamp: 3500, self: true, content: "<reaction>NEW reacted 👍 to your message [$a3]</reaction>" },
     ],
   });
   const all = result.turns.map((t) => t.content).join("\n");
   assert.doesNotMatch(all, /OLD reacted/, "a reaction before the last-2-message span is excluded");
   assert.match(all, /NEW reacted/, "a reaction within the last-2-message span renders");
+});
+
+test("discreteOtherHorizonMessages clamps non-self lines tighter than self lines", () => {
+  // Four rich messages at t=1000..4000. Self horizon = whole tier (0); non-self
+  // horizon = last 1 message (>= t=4000). A self and a non-self line both at
+  // t=2500: the self one survives, the non-self one is dropped.
+  const events = [
+    chatEvent("a1", "assistant", "m1", 1000),
+    chatEvent("a2", "assistant", "m2", 2000),
+    chatEvent("a3", "assistant", "m3", 3000),
+    chatEvent("a4", "assistant", "m4", 4000),
+  ];
+  const opts = { rich_max_tokens: 10_000, rich_target_tokens: 9_000, compact_max_tokens: 10_000, compact_target_tokens: 9_000 };
+  const result = compactTimelineEvents(events, renderRichMessage, renderCompactMessage, opts, {
+    timelineKey: TK,
+    now: 1,
+    discreteHorizonMessages: 0,
+    discreteOtherHorizonMessages: 1,
+    reactionLines: [
+      { timestamp: 2500, self: true, content: "<reaction>SELFLINE reacted 👍 to your message [$a2]</reaction>" },
+      { timestamp: 2500, self: false, content: "<reaction>OTHERLINE reacted 👍 to Bob's message [$a2]</reaction>" },
+    ],
+  });
+  const all = result.turns.map((t) => t.content).join("\n");
+  assert.match(all, /SELFLINE reacted/, "the self line is within the whole-tier self horizon");
+  assert.doesNotMatch(all, /OTHERLINE reacted/, "the non-self line is before the tighter inter-user horizon");
 });
 
 test("with no reaction lines, compaction output is unchanged", () => {

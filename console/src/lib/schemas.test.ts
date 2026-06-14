@@ -367,6 +367,8 @@ describe('auxiliary usage schemas', () => {
 			counts: { pending: 0, processing: 0, retrying: 0, done: 0, failed: 0, skipped: 0 }
 		});
 		expect(out.usage).toBeUndefined();
+		// `deferred` is absent on a pre-feature backend → defaults to 0.
+		expect(out.counts.deferred).toBe(0);
 	});
 
 	it('decodes a media asset with caption usage, and with legacy null usage', () => {

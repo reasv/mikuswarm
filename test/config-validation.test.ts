@@ -464,6 +464,9 @@ show_aggregates = false
 show_discrete = true
 discrete_assistant_only = false
 discrete_horizon_messages = 5
+discrete_other_horizon_messages = 8
+discrete_split_messages = 4
+discrete_split_minutes = 20
 discrete_name_cap = 12
 `;
   await withConfigDir(toml, async (dir) => {
@@ -472,7 +475,20 @@ discrete_name_cap = 12
     assert.equal(config.reactions?.show_aggregates, false);
     assert.equal(config.reactions?.discrete_assistant_only, false);
     assert.equal(config.reactions?.discrete_horizon_messages, 5);
+    assert.equal(config.reactions?.discrete_other_horizon_messages, 8);
+    assert.equal(config.reactions?.discrete_split_messages, 4);
+    assert.equal(config.reactions?.discrete_split_minutes, 20);
     assert.equal(config.reactions?.discrete_name_cap, 12);
+  });
+});
+
+test("config: [reactions] discrete_split_messages below 1 is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[reactions]
+discrete_split_messages = 0
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /Invalid config|minimum/i);
   });
 });
 

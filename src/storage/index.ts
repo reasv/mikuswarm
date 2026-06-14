@@ -33,6 +33,7 @@ export {
   PIPELINE_SAFE_RETRY,
   type PipelineId,
   type PipelineCounts,
+  type CaptionEligibility,
   type PipelineItem,
   type PipelineItemPage,
   type PipelineItemQuery,

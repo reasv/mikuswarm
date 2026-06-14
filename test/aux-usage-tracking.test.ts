@@ -7,7 +7,7 @@ import path from "node:path";
 import { computeUsageCost, type CostRates } from "../src/agent/usage.js";
 import { parseOpenAiUsage } from "../src/captioning/describe.js";
 import { parseGeminiUsage } from "../src/tools/image-gen.js";
-import { Storage, type MediaAssetRow } from "../src/storage/index.js";
+import { LATEST_SCHEMA_VERSION, Storage, type MediaAssetRow } from "../src/storage/index.js";
 
 // =============================================================================
 // Auxiliary (out-of-loop) usage & cost tracking (spec AUXILIARY-USAGE-TRACKING).
@@ -347,12 +347,13 @@ test("v21 migration: re-running the step on a current DB (rewound user_version) 
     await first.waitForIdle();
     first.close();
 
-    // Re-opening runs the v20→v21 step again; its existence guards must make it a
-    // no-op (no "duplicate column" / "table already exists") and preserve data.
+    // Re-opening runs the v20→v21 step again (then any later steps); its existence
+    // guards must make it a no-op (no "duplicate column" / "table already exists")
+    // and preserve data, landing at the current latest version.
     const second = await Storage.open({ databasePath: dbPath });
     try {
       const version = second.read((db) => db.pragma("user_version", { simple: true }) as number);
-      assert.equal(version, 21);
+      assert.equal(version, LATEST_SCHEMA_VERSION);
       const cols = second.read(
         (db) => (db.pragma("table_info(media_assets)") as Array<{ name: string }>).map((c) => c.name),
       );

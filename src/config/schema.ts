@@ -162,12 +162,31 @@ const ReactionsSchema = StrictObject({
   // View B: chronological discrete reaction lines.
   show_discrete: Type.Optional(Type.Boolean()),
   // View B target filter: true = only reactions to the assistant's own messages;
-  // false also surfaces reactions to anyone's recent messages.
+  // false also surfaces reactions to anyone's recent messages. The
+  // discrete_other_horizon_messages knob below applies ONLY to those non-self
+  // (inter-user) lines — it keeps cross-user reaction chatter tighter than the
+  // bot-directed lines.
   discrete_assistant_only: Type.Optional(Type.Boolean()),
   // View B horizon: 0 = the whole rich tier; >0 = only the last N rich messages
   // produce discrete lines. Bounded (mirrors the [search] min/max convention) so a
   // fat-fingered value can't silently degrade.
   discrete_horizon_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 100_000 })),
+  // View B horizon for NON-self (inter-user) targets, applied independently of
+  // discrete_horizon_messages so cross-user reactions can be clamped to just the
+  // conversationally-live edge (the reactions that become topics are on recent
+  // messages). 0 = whole rich tier; >0 = last N rich messages. Inert while
+  // discrete_assistant_only is true (no non-self targets exist).
+  discrete_other_horizon_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 100_000 })),
+  // View B episode splitting: a coalesced (target, emoji) reaction is split into
+  // separate lines across a "seam" so temporally-distinct reaction bursts land at
+  // their own point in the timeline instead of all at the latest reaction. Between
+  // two consecutive reactions to the same message: 0 messages in between → never
+  // split; ≥ discrete_split_messages messages in between → split (the conversation
+  // moved on); 1..N-1 in between → split only if more than discrete_split_minutes
+  // elapsed (so the later reaction reads as happening *after* the intervening msgs).
+  // Applies to all View B lines (self and inter-user). Both bounded.
+  discrete_split_messages: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  discrete_split_minutes: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
   // More than this many senders on one reaction → first 4 + "(and N others)".
   // Minimum 4 (the shown-name count) so "(and N others)" can never go negative.
   discrete_name_cap: Type.Optional(Type.Integer({ minimum: 4, maximum: 1_000 })),
