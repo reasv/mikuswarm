@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { SessionClaims } from "../src/agent/session-claims.js";
+import { SessionClaims, coTargetOwnerSteerableSoon } from "../src/agent/session-claims.js";
 import { renderRichMessage, renderCompactMessage } from "../src/context/renderer.js";
 import { renderSatelliteBlock } from "../src/workspace/prompt.js";
 import { createSendMessageTool, type SendMessageToolContext } from "../src/tools/send-message.js";
@@ -58,7 +58,7 @@ test("SessionClaims: releaseSession drops a settled session's claims so it stops
   assert.equal(claims.claimantOf(TK, "$b", "s-x")?.sessionId, "s-2");
 });
 
-test("SessionClaims: coTargetSession matches on the trigger's OWN reply-target (Case B)", () => {
+test("SessionClaims: coTargetClaim matches on the trigger's OWN reply-target (Case B)", () => {
   const claims = new SessionClaims();
   // Session s-1 was triggered by a reply to the shared beat $beat.
   claims.claim(TK, {
@@ -71,15 +71,35 @@ test("SessionClaims: coTargetSession matches on the trigger's OWN reply-target (
   claims.attachSession(TK, "$reply1", "s-1");
 
   // A second reply to the SAME beat finds s-1 (co-target).
-  assert.equal(claims.coTargetSession(TK, "$beat")?.sessionId, "s-1");
+  assert.equal(claims.coTargetClaim(TK, "$beat")?.sessionId, "s-1");
   // A reply to the trigger message itself ($reply1) is NOT a co-target match
   // (that is Case A — handled by the marker/guard, not coalescing).
-  assert.equal(claims.coTargetSession(TK, "$reply1"), undefined);
+  assert.equal(claims.coTargetClaim(TK, "$reply1"), undefined);
   // Self is excluded.
-  assert.equal(claims.coTargetSession(TK, "$beat", "s-1"), undefined);
-  // Queued (un-attributed) co-target claim is not steerable → not returned.
+  assert.equal(claims.coTargetClaim(TK, "$beat", "s-1"), undefined);
+  // A queued (un-attributed) co-target claim IS returned now (spec
+  // DEFERRED-COALESCING) — the caller defers the co-reply until the owner goes live
+  // rather than skipping it. Its sessionId is still undefined.
   claims.claim(TK, { triggerId: "t9", externalId: "$reply9", replyToExternalId: "$beat2", triggerTimestamp: 1, createdAt: 1 });
-  assert.equal(claims.coTargetSession(TK, "$beat2"), undefined);
+  const queuedMatch = claims.coTargetClaim(TK, "$beat2");
+  assert.equal(queuedMatch?.externalId, "$reply9");
+  assert.equal(queuedMatch?.sessionId, undefined);
+});
+
+test("coTargetOwnerSteerableSoon: defer while pre-live, spawn once terminal", () => {
+  // Un-attributed owner (queued / accept→launch window) → will launch → defer.
+  assert.equal(coTargetOwnerSteerableSoon(false, undefined), true);
+  // Attributed but still building (attachSession→attachAgent window) → defer.
+  assert.equal(coTargetOwnerSteerableSoon(true, "created"), true);
+  assert.equal(coTargetOwnerSteerableSoon(true, "running"), true);
+  // Attributed owner that has reached a terminal/evicted state → never steerable
+  // again → fall through to a normal spawn (§5.2).
+  assert.equal(coTargetOwnerSteerableSoon(true, "completed"), false);
+  assert.equal(coTargetOwnerSteerableSoon(true, "discarded"), false);
+  assert.equal(coTargetOwnerSteerableSoon(true, "failed-resumable"), false);
+  assert.equal(coTargetOwnerSteerableSoon(true, "interrupted"), false);
+  // Attributed owner whose record is already gone (evicted) → spawn.
+  assert.equal(coTargetOwnerSteerableSoon(true, undefined), false);
 });
 
 test("SessionClaims: snapshotForBuild excludes self and un-attributed claims", () => {

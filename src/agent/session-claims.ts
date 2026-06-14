@@ -112,14 +112,17 @@ export class SessionClaims {
   }
 
   /**
-   * A running session whose **trigger's own reply-target** equals
-   * `replyToExternalId` (§3.4 / §5.1 — co-target coalescing). Returns the first
-   * such attributable claim (sessionId known, not self). The caller still verifies
-   * the steer succeeds (the session may be settling) and applies the coalesce
-   * window. Only attributable claims qualify — coalescing must steer into a live
-   * session, which a not-yet-launched (queued) claim cannot offer.
+   * The claim whose **trigger's own reply-target** equals `replyToExternalId`
+   * (§3.4 / §5.1 — co-target coalescing, spec DEFERRED-COALESCING). Returns the
+   * first match regardless of attribution: an un-attributed (queued / pre-launch)
+   * claim is returned too, so the caller can DEFER the co-reply until the owning
+   * session goes live rather than spawning a twin during the accept→launch window.
+   * The caller inspects `sessionId` (and the owner's liveness) to decide steer vs
+   * defer vs spawn, and applies the coalesce window. Self is excluded; an
+   * un-attributed claim can never be self (the caller is not yet claimed at the
+   * coalesce decision point).
    */
-  coTargetSession(
+  coTargetClaim(
     timelineKey: string,
     replyToExternalId: string,
     selfSessionId?: string,
@@ -127,7 +130,7 @@ export class SessionClaims {
     const perTimeline = this.byTimeline.get(timelineKey);
     if (!perTimeline) return undefined;
     for (const claim of perTimeline.values()) {
-      if (!claim.sessionId || claim.sessionId === selfSessionId) continue;
+      if (claim.sessionId && claim.sessionId === selfSessionId) continue;
       if (claim.replyToExternalId === replyToExternalId) return claim;
     }
     return undefined;
@@ -155,4 +158,26 @@ export class SessionClaims {
   clear(): void {
     this.byTimeline.clear();
   }
+}
+
+/**
+ * Whether a co-target match's owning session will (eventually) become steerable, so
+ * a co-reply that cannot be steered RIGHT NOW should DEFER rather than spawn a twin
+ * (spec DEFERRED-COALESCING). Two pre-live cases qualify:
+ *
+ *  - the claim is un-attributed (`attributed === false`): no session exists yet — it
+ *    is queued or in its accept→launch window and WILL launch;
+ *  - the claim is attributed but its session record is still `created`/`running`:
+ *    attributed at `attachSession` but not yet agent-live (the `attachSession →
+ *    attachAgent` context-build window), so a steer attempt fails transiently.
+ *
+ * A terminal/evicted owner (`ownerStatus` absent or any other value) will never be
+ * steerable again → the caller falls through to a normal spawn (§5.2).
+ */
+export function coTargetOwnerSteerableSoon(
+  attributed: boolean,
+  ownerStatus: string | undefined,
+): boolean {
+  if (!attributed) return true;
+  return ownerStatus === "created" || ownerStatus === "running";
 }

@@ -23,6 +23,7 @@ import {
   DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
   SessionClaims,
+  coTargetOwnerSteerableSoon,
   SessionRunner,
   isLlmRunFailure,
   createManualResumeSession,
@@ -224,6 +225,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // session. Scoped to the session it was coalesced into; cleaned up on that
   // session's settle (and on use).
   const coReplyInbounds = new Map<string, { inbound: InboundChatEvent; intoSessionId: string }>();
+  // Deferred co-replies (spec DEFERRED-COALESCING): a co-target reply that arrives
+  // while its owning session is not yet steerable (un-attributed accept→launch window,
+  // queued, or the attachSession→attachAgent build window) is parked here keyed by the
+  // OWNER trigger's external id, then steered in the moment that owner goes live
+  // (`launchSession` post-attachAgent drain). If the owner is abandoned before going
+  // live, the parked replies are re-dispatched as normal triggers (the owner's settle
+  // listener / the pre-attribution catch) so they are never silently dropped.
+  const pendingCoReplies = new Map<string, InboundChatEvent[]>();
   // Canonicalize once at the source. `config.workspace.root_dir` is commonly
   // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
   // means every tool downstream receives an absolute, normalized root. That
@@ -993,6 +1002,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // not leak un-attributed. A throw past attachSession already released via
       // settle, making this a no-op there.
       releaseClaimFor(inbound);
+      // A throw BEFORE attachSession also means the settle-fallback was never
+      // registered, so any co-replies parked on this trigger would be orphaned
+      // (spec DEFERRED-COALESCING) — re-dispatch them here.
+      if (inbound.event.externalId) redispatchPendingCoReplies(inbound.event.externalId);
       throw error;
     }
   }
@@ -1355,8 +1368,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const windowMs = config.agent.sessions.coalesce_window_ms;
     if (windowMs === undefined) return false;
 
-    const match = sessionClaims.coTargetSession(inbound.timelineKey, replyTarget);
-    if (!match?.sessionId) return false;
+    // The match is the FIRST claim (any attribution) whose own trigger replied to the
+    // same beat — including an un-attributed (queued / pre-launch) one (spec
+    // DEFERRED-COALESCING).
+    const match = sessionClaims.coTargetClaim(inbound.timelineKey, replyTarget);
+    if (!match) return false;
     // Only near-simultaneous reactions to the SAME beat merge — bare proximity
     // would wrongly fold the independent questions of Case A.
     if (Math.abs(inbound.event.timestamp - match.triggerTimestamp) > windowMs) return false;
@@ -1364,17 +1380,51 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Trigger-hold re-delivery dedup (shared with reply-steer): inject at most once.
     if (steeredEventIds.has(inbound.event.id)) return true;
 
-    const coReplySessionId = match.sessionId;
-    const target = timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey);
-    // The shared reply-target should exist (the running session replied to it), but
-    // guard defensively: without it we cannot hydrate the quote, so fall through to
-    // a normal spawn rather than inject a broken interjection.
-    if (!target || target.timelineKey !== inbound.timelineKey) return false;
+    // Owner already live → steer the co-reply in now (Case B, immediate).
+    if (match.sessionId) {
+      const outcome = trySteerCoReply(match.sessionId, inbound);
+      if (outcome === "steered") return true;
+      // Cannot hydrate the quote → spawn rather than inject a broken interjection.
+      if (outcome === "no-target") return false;
+      // outcome === "not-live": owner attributed but not steerable. Defer only if it
+      // is still in its build window (will go live); a terminal/settling owner →
+      // spawn (§5.2 — a fresh session built after it settles sees its replies).
+      if (!coTargetOwnerSteerableSoon(true, sessions.get(match.sessionId)?.status)) return false;
+    } else {
+      // Un-attributed owner (queued / accept→launch window): it WILL launch. Only
+      // defer if the shared target exists so the interjection can hydrate at drain.
+      const target = timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey);
+      if (!target || target.timelineKey !== inbound.timelineKey) return false;
+    }
 
+    // Defer: suppress the spawn now, park keyed by the OWNER trigger's external id,
+    // and steer in when that owner goes live (or re-dispatch if it is abandoned).
+    markSteered(inbound.event.id);
+    const parked = pendingCoReplies.get(match.externalId) ?? [];
+    parked.push(inbound);
+    pendingCoReplies.set(match.externalId, parked);
+    logger.info("co_reply_deferred", {
+      ownerTriggerExternalId: match.externalId,
+      ownerSessionId: match.sessionId,
+      timelineKey: inbound.timelineKey,
+      eventId: inbound.event.id,
+      replyTarget,
+    });
+    return true;
+  }
+
+  /**
+   * Build the self-explaining `co-reply` interjection body for a co-target reply
+   * folded into a sibling session (spec §5.4 / DEFERRED-COALESCING).
+   */
+  function buildCoReplyInterjection(
+    inbound: InboundChatEvent,
+    target: NonNullable<ReturnType<TimelineStore["getByExternalId"]>>,
+  ): string {
     const eventForRender = buildReplyHydratedEvent(inbound, target);
     const senderName = inbound.event.sender.displayName ?? inbound.event.sender.id;
     const externalId = inbound.event.externalId;
-    const content =
+    return (
       `<interjection reason="co-reply">\n` +
       `${escapeXml(senderName)} replied to the same message you're answering:\n\n` +
       `${renderRichMessage(eventForRender)}\n\n` +
@@ -1382,14 +1432,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       (externalId
         ? `or, if it warrants being worked independently, call spawn_session with message_id="${escapeAttr(externalId)}" to give it its own session.`
         : `or, if it warrants being worked independently, handle it separately.`) +
-      `\n</interjection>`;
+      `\n</interjection>`
+    );
+  }
 
-    const ok = sessions.steer(coReplySessionId, { type: "interjection", content });
-    if (!ok) return false; // target session settling → fall back to spawn (§5.2)
+  /**
+   * Attempt to steer a co-reply into a live sibling session as an interjection.
+   * Returns `"steered"` on success (and retains the inbound for `spawn_session`),
+   * `"no-target"` when the shared reply-target is missing (cannot hydrate the quote),
+   * or `"not-live"` when the session is not steerable (settling, or still pre-live).
+   */
+  function trySteerCoReply(
+    coReplySessionId: string,
+    inbound: InboundChatEvent,
+  ): "steered" | "no-target" | "not-live" {
+    const replyTarget = inbound.event.replyTo?.externalId;
+    const target = replyTarget
+      ? timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey)
+      : undefined;
+    if (!target || target.timelineKey !== inbound.timelineKey) return "no-target";
+
+    const content = buildCoReplyInterjection(inbound, target);
+    if (!sessions.steer(coReplySessionId, { type: "interjection", content })) return "not-live";
 
     markSteered(inbound.event.id);
     // Retain the inbound so the session can spin it off via spawn_session (§5.4),
     // and clean it up when that session settles.
+    const externalId = inbound.event.externalId;
     if (externalId) {
       coReplyInbounds.set(externalId, { inbound, intoSessionId: coReplySessionId });
       sessions.onSettle(coReplySessionId, () => coReplyInbounds.delete(externalId));
@@ -1404,7 +1473,50 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       eventId: inbound.event.id,
       replyTarget,
     });
-    return true;
+    return "steered";
+  }
+
+  /**
+   * Steer every co-reply parked on an owner trigger into that owner's now-live
+   * session (spec DEFERRED-COALESCING — the success drain, called from
+   * `launchSession` after `attachAgent`). A co-reply that can no longer be steered
+   * (e.g. its hydration target vanished) is re-dispatched as its own trigger rather
+   * than dropped. Consumes the parked entries.
+   */
+  function drainPendingCoRepliesIntoSession(ownerTriggerExternalId: string, sessionId: string): void {
+    const parked = pendingCoReplies.get(ownerTriggerExternalId);
+    if (!parked) return;
+    pendingCoReplies.delete(ownerTriggerExternalId);
+    for (const inbound of parked) {
+      if (trySteerCoReply(sessionId, inbound) !== "steered") {
+        void redispatchCoReply(inbound).catch((error) => {
+          logger.error("co_reply_redispatch_failed", {
+            timelineKey: inbound.timelineKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    }
+  }
+
+  /**
+   * Re-dispatch every co-reply parked on an owner trigger as its own trigger (spec
+   * DEFERRED-COALESCING — the fallback when the owner is abandoned before going live:
+   * fired from the owner's settle listener and the pre-attribution catch). Never
+   * drops a parked reply. Consumes the parked entries.
+   */
+  function redispatchPendingCoReplies(ownerTriggerExternalId: string): void {
+    const parked = pendingCoReplies.get(ownerTriggerExternalId);
+    if (!parked) return;
+    pendingCoReplies.delete(ownerTriggerExternalId);
+    for (const inbound of parked) {
+      void redispatchCoReply(inbound).catch((error) => {
+        logger.error("co_reply_redispatch_failed", {
+          timelineKey: inbound.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
   }
 
   /**
@@ -1422,7 +1534,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const entry = coReplyInbounds.get(messageId);
     if (!entry || entry.intoSessionId !== requestingSessionId) return { status: "not_found" };
     coReplyInbounds.delete(messageId);
-    const inbound = entry.inbound;
+    return redispatchCoReply(entry.inbound);
+  }
+
+  /**
+   * Run the spawn tail for a co-reply inbound: trigger-group resolution, accept +
+   * claim, readiness wait, fire-and-forget launch (spec §5.4 / DEFERRED-COALESCING).
+   * Shared by `spawn_session` (a session spinning a coalesced reply off explicitly)
+   * and the deferral fallback (an owner abandoned before it could absorb the parked
+   * reply). A concurrency miss queues like any trigger; a full queue returns an error.
+   */
+  async function redispatchCoReply(inbound: InboundChatEvent): Promise<SpawnCoReplyResult> {
     try {
       await resolveTriggerGroup(inbound);
       captionPool.notifyNewWork();
@@ -1462,6 +1584,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Pre-attribution failure (review #2): release the claim added after accept so
       // it does not leak un-attributed.
       releaseClaimFor(inbound);
+      // A throw before attachSession orphans any co-replies parked on this trigger
+      // (spec DEFERRED-COALESCING) — re-dispatch them.
+      if (inbound.event.externalId) redispatchPendingCoReplies(inbound.event.externalId);
       return { status: "error", detail: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -2030,6 +2155,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       sessionClaims.attachSession(session.timelineKey, inbound.event.externalId, session.id);
     }
     sessions.onSettle(session.id, () => sessionClaims.releaseSession(session.timelineKey, session.id));
+    // Deferred-coalescing fallback (spec DEFERRED-COALESCING): if this session is
+    // abandoned before it goes live (the missing-target / factory-failed early
+    // returns below both route through evict→fireSettle), re-dispatch any co-replies
+    // still parked on its trigger so they are never dropped. On the success path the
+    // post-attachAgent drain has already consumed them, so this fires on nothing.
+    const ownerExternalId = inbound.event.externalId;
+    if (ownerExternalId) {
+      sessions.onSettle(session.id, () => redispatchPendingCoReplies(ownerExternalId));
+    }
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
     const target = inbound.outboundTarget;
     if (!target) {
@@ -2113,6 +2247,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       return;
     }
     sessions.attachAgent(session.id, agent);
+    // Success drain (spec DEFERRED-COALESCING): the session is now steerable, so fold
+    // every co-reply parked on its trigger in as an interjection. Consumes the parked
+    // entries, so the settle-fallback registered above then fires on nothing.
+    if (ownerExternalId) drainPendingCoRepliesIntoSession(ownerExternalId, session.id);
 
     // Attach snapshot + transcript capture (spec §5). Detached in the run
     // promise's .finally() below (the agent_end transcript flush already happens
@@ -2488,6 +2626,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // released on teardown); in-flight runs release their own on settle.
         sessionClaims.clear();
         coReplyInbounds.clear();
+        // Drop any co-replies still parked on an un-launched owner (spec
+        // DEFERRED-COALESCING): the runtime is draining, so they will not be steered
+        // in or re-dispatched.
+        pendingCoReplies.clear();
         // Abort each caption client's scheduler-admission seam BEFORE awaiting
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
