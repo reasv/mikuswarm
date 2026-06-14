@@ -201,7 +201,7 @@ redecryption_sweep_batch = 50             # max UTD events probed per sweep tick
 # (reactive/proactive starts for a room are frozen until its gap is filled). The
 # committed high-water never advances until a room's gap is fully closed, so a
 # crash at any point is recoverable as a single re-derived gap on the next boot.
-gap_backfetch_enabled = false             # master switch (off until rollout)
+gap_backfetch_enabled = true              # master switch (on by default)
 gap_backfetch_max_messages = 0            # per-room cap; 0 = UNBOUNDED (recover the whole gap)
 gap_backfetch_window_ms = 0               # don't fetch older than now-this; 0 = no window bound
 gap_backfetch_timeout_ms = 0              # per-room wall-clock budget; 0 = no timeout
