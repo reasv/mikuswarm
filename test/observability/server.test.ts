@@ -249,6 +249,31 @@ test("GET /api/rooms/:key/sessions filters by status, type, and trigger search (
   });
 });
 
+test("GET /api/rooms/:key/sessions search surfaces a session by interjection text (timeline→session)", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      sessionInsert({ id: "s-aaa1111111", triggerBody: "original trigger" }),
+    );
+    await storage.insertSessionInterjection({
+      sessionId: "s-aaa1111111",
+      eventId: "evt-int",
+      kind: "reply",
+      body: "follow-up about the quasar deploy",
+      createdAt: 1_500,
+    });
+
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/sessions?q=quasar`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { sessions: Array<{ id: string }> };
+      assert.deepEqual(
+        body.sessions.map((s) => s.id),
+        ["s-aaa1111111"],
+      );
+    });
+  });
+});
+
 test("GET /api/rooms/:key/session-facets returns the distinct types present", async () => {
   await withStorage(async (storage) => {
     await storage.insertAgentSession(sessionInsert({ id: "s-aaa1111111", sessionType: "default" }));

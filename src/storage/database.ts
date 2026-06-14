@@ -645,6 +645,23 @@ export interface AgentSessionInsert {
 }
 
 /**
+ * Insert shape for a `session_interjections` row (ARCHITECTURE.md §8/§11). One row per
+ * user message injected into a running session (reply-steer / co-reply). `eventId`/
+ * `externalId` are the inbound timeline message's ids (the durable timeline→session
+ * link); `body` is the raw inbound text (the search corpus, truncated by the caller).
+ */
+export interface SessionInterjectionInsert {
+  sessionId: string;
+  eventId?: string | null;
+  externalId?: string | null;
+  senderId?: string | null;
+  senderDisplayName?: string | null;
+  kind: string;
+  body: string;
+  createdAt: number;
+}
+
+/**
  * A persisted `agent_sessions` row as stored (snake_case columns). Read-side
  * shape returned by {@link Storage.getAgentSession}; mirrors the table in
  * spec §4 verbatim so the console can render snapshot + transcript directly.
@@ -4647,6 +4664,36 @@ export class Storage {
   }
 
   /**
+   * Record a user interjection injected into a running session (ARCHITECTURE.md
+   * §8/§11). Fire-and-forget on the single-writer queue, written at the steer site
+   * after a successful inject; the `_ai` trigger maintains `session_interjections_fts`
+   * so the session becomes reachable by the interjection's text. Cascades with the
+   * parent session row.
+   */
+  insertSessionInterjection(row: SessionInterjectionInsert): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into session_interjections (
+          session_id, event_id, external_id, sender_id, sender_display_name,
+          kind, body, created_at
+        ) values (
+          @sessionId, @eventId, @externalId, @senderId, @senderDisplayName,
+          @kind, @body, @createdAt
+        )`,
+      ).run({
+        sessionId: row.sessionId,
+        eventId: row.eventId ?? null,
+        externalId: row.externalId ?? null,
+        senderId: row.senderId ?? null,
+        senderDisplayName: row.senderDisplayName ?? null,
+        kind: row.kind,
+        body: row.body,
+        createdAt: row.createdAt,
+      });
+    });
+  }
+
+  /**
    * Surface a no-op `agent_sessions` write. The session save/update methods all
    * target `where id = @id`; if that id does not exist the UPDATE silently
    * affects zero rows and the caller is none the wiser. A zero-change write here
@@ -4878,11 +4925,15 @@ export class Storage {
    * Filtered/searched sessions for a timeline, reverse-chron by creation (console
    * sessions filter, ARCHITECTURE.md §11). All filters are AND-combined; within a
    * category (`statuses`, `sessionTypes`) the values are OR'd via `in (...)`.
-   * `triggerMatch` is an already-sanitized FTS5 MATCH expression (built by
-   * `sanitizeTriggerFtsMatch` in the handler, mirroring `searchChatIndex`'s
-   * match-agnostic contract) — when present, the query joins `agent_sessions_fts` to
-   * keyword-search the trigger message. With no filters this degenerates to the same
-   * result as `getAgentSessionsByTimeline`. Read-only.
+   * `triggerMatch` is an already-sanitized, column-agnostic FTS5 MATCH expression
+   * (built by `sanitizeTriggerFtsMatch` in the handler, mirroring `searchChatIndex`'s
+   * match-agnostic contract). When present, a session matches if the text hits its
+   * **trigger** body (`agent_sessions_fts`) **OR** any of its **interjection** bodies
+   * (`session_interjections_fts`) — both are user messages the session acted on, so the
+   * "timeline message → session" debug path finds the session by either (§8/§11). The
+   * two are OR'd via subqueries (not a JOIN) so a session is returned once regardless of
+   * how many interjections match. With no filters this degenerates to the same result
+   * as `getAgentSessionsByTimeline`. Read-only.
    */
   searchAgentSessionsByTimeline(
     timelineKey: string,
@@ -4897,12 +4948,19 @@ export class Storage {
     return this.read((db) => {
       const where: string[] = ["s.timeline_key = @timelineKey"];
       const params: Record<string, unknown> = { timelineKey, limit };
-      const ftsJoin = opts.triggerMatch
-        ? "join agent_sessions_fts f on f.rowid = s.rowid"
-        : "";
       if (opts.triggerMatch) {
-        where.push("agent_sessions_fts match @triggerMatch");
-        params.triggerMatch = opts.triggerMatch;
+        params.ftsMatch = opts.triggerMatch;
+        where.push(
+          `(s.rowid in (select rowid from agent_sessions_fts where agent_sessions_fts match @ftsMatch)
+            or exists (
+              select 1 from session_interjections si
+              where si.session_id = s.id
+                and si.rowid in (
+                  select rowid from session_interjections_fts
+                  where session_interjections_fts match @ftsMatch
+                )
+            ))`,
+        );
       }
       const inClause = (col: string, values: string[], prefix: string): void => {
         const keys = values.map((v, i) => {
@@ -4920,7 +4978,6 @@ export class Storage {
       return db
         .prepare(
           `select s.* from agent_sessions s
-           ${ftsJoin}
            where ${where.join(" and ")}
            order by s.created_at desc
            limit @limit`,
@@ -5678,6 +5735,50 @@ begin
 end;
 `;
 
+// Per-session **interjection** store (console sessions filter, ARCHITECTURE.md §8/§11).
+// An interjection is a user message injected into an already-running session (a reply
+// steered into the live run, or a co-target co-reply — see §8 "Steering"); it plays the
+// same role as the session's trigger but arrives mid-run, and there can be many. So
+// unlike the single `agent_sessions.trigger_body` column, interjections need a child
+// table. Each row denormalizes the inbound message that drove the interjection — its
+// timeline `event_id`/`external_id` (the durable "timeline message → session" link the
+// debug path follows), sender, kind, and the raw `body` (truncated like `trigger_body`)
+// — so a session is reachable by an interjection's text exactly as it is by its trigger.
+// `body` is written once at injection and never updated, so (like `summaries_fts`) the
+// external-content FTS5 index needs only insert/delete sync triggers, no update guard.
+// `on delete cascade` from `agent_sessions` (FKs ON) keeps the children + their FTS rows
+// consistent if a session row is ever removed; the `_ad` trigger cleans the FTS on the
+// cascade (recursive triggers are on by default).
+const SESSION_INTERJECTIONS_SCHEMA = `
+create table if not exists session_interjections (
+  -- AUTOINCREMENT: the external-content FTS docid keys on this rowid; never reusing a
+  -- deleted row's id keeps the FTS mapping unambiguous (same idiom as chat_index).
+  rowid               integer primary key autoincrement,
+  session_id          text not null references agent_sessions(id) on delete cascade,
+  event_id            text,   -- internal timeline event id (null for non-timeline injects)
+  external_id         text,   -- Matrix $… id of the inbound message
+  sender_id           text,
+  sender_display_name text,
+  kind                text not null,            -- 'reply' | 'co-reply'
+  body                text not null default '', -- raw inbound body (search corpus)
+  created_at          integer not null
+);
+create index if not exists idx_session_interjections_session
+  on session_interjections(session_id, created_at);
+create index if not exists idx_session_interjections_event
+  on session_interjections(event_id) where event_id is not null;
+create virtual table if not exists session_interjections_fts using fts5(
+  body, content='session_interjections', content_rowid='rowid'
+);
+create trigger if not exists session_interjections_ai after insert on session_interjections begin
+  insert into session_interjections_fts(rowid, body) values (new.rowid, new.body);
+end;
+create trigger if not exists session_interjections_ad after delete on session_interjections begin
+  insert into session_interjections_fts(session_interjections_fts, rowid, body)
+    values ('delete', old.rowid, old.body);
+end;
+`;
+
 // Passive reaction store (ARCHITECTURE.md §6/§9f): the
 // source of truth for emoji reactions the agent passively perceives. Deliberately
 // NOT part of the timeline — a reaction is a mutable many-to-one relation (N
@@ -6179,6 +6280,7 @@ create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
 
 ${AGENT_SESSIONS_FTS_SCHEMA}
+${SESSION_INTERJECTIONS_SCHEMA}
 
 -- Auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one row
 -- per billable raw-fetch tool call (today image_generate). Attributed to the
@@ -6195,7 +6297,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 23;
+export const LATEST_SCHEMA_VERSION = 24;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6785,6 +6887,23 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       `insert into agent_sessions_fts(rowid, trigger_body)
          select rowid, trigger_body from agent_sessions;`,
     );
+  },
+  // index 23 (v23 -> v24): add the `session_interjections` child table + its
+  // external-content FTS5 index (ARCHITECTURE.md §8/§11 "Sessions filter"). The
+  // `create table/index/virtual table/trigger if not exists` DDL is idempotent and
+  // identical to the canonical SCHEMA, so fresh and migrated DBs can't drift. There
+  // is NO backfill: a historical interjection lives only inside `transcript_json` (the
+  // rendered injected turn, without its inbound event id), so it cannot be reliably
+  // reconstructed into this row shape — the index is forward-only (every interjection
+  // injected from here on is captured at the steer site). Guarded on `agent_sessions`
+  // absence (the FK target): minimal legacy fixtures lack it, and SCHEMA then builds
+  // both at the latest shape. Fresh DBs get it directly from SCHEMA and skip this step.
+  (db) => {
+    const table = db
+      .prepare(`select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'`)
+      .get();
+    if (!table) return;
+    db.exec(SESSION_INTERJECTIONS_SCHEMA);
   },
 ];
 

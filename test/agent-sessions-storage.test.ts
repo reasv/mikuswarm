@@ -328,8 +328,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 23", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 23);
+test("LATEST_SCHEMA_VERSION is 24", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 24);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1600,6 +1600,186 @@ test("getAgentSessionTimelineFacets: distinct types present in the room, sorted"
     // Empty room → no types.
     assert.deepEqual(storage.getAgentSessionTimelineFacets("matrix:miku:room:!empty").types, []);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Interjection search (ARCHITECTURE.md §8/§11): a session is reachable by an
+// interjection's text, not only its trigger — the "timeline message → session"
+// debug path. `searchAgentSessionsByTimeline` ORs trigger_body and interjection
+// bodies; both are room-scoped through the parent session.
+// ---------------------------------------------------------------------------
+
+test("searchAgentSessionsByTimeline: a session is found by an interjection body, not just its trigger", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-int-1", timelineKey: FILTER_ROOM, triggerBody: "alpha trigger" }),
+    );
+    await storage.insertSessionInterjection({
+      sessionId: "s-int-1",
+      eventId: "evt-int-1",
+      externalId: "$int-1",
+      kind: "reply",
+      body: "zulu interjection text",
+      createdAt: 1_500,
+    });
+
+    // The interjection word finds the session even though it's not in the trigger.
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: sanitizeTriggerFtsMatch("zulu") })
+        .map((h) => h.id),
+      ["s-int-1"],
+    );
+    // The trigger word still finds it too (OR over both corpora).
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: sanitizeTriggerFtsMatch("alpha") })
+        .map((h) => h.id),
+      ["s-int-1"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: interjection match is room-scoped through the session", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-here", timelineKey: FILTER_ROOM, triggerBody: "here trigger" }),
+    );
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-there", timelineKey: "matrix:miku:room:!other", triggerBody: "there trigger" }),
+    );
+    await storage.insertSessionInterjection({
+      sessionId: "s-here",
+      kind: "reply",
+      body: "shared keyword",
+      createdAt: 1_500,
+    });
+    await storage.insertSessionInterjection({
+      sessionId: "s-there",
+      kind: "reply",
+      body: "shared keyword",
+      createdAt: 1_500,
+    });
+
+    // Same interjection text in two rooms — only the queried room's session returns.
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, { triggerMatch: sanitizeTriggerFtsMatch("keyword") })
+        .map((h) => h.id),
+      ["s-here"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: multiple matching interjections return the session once", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-multi", timelineKey: FILTER_ROOM, triggerBody: "t" }),
+    );
+    for (let i = 0; i < 3; i++) {
+      await storage.insertSessionInterjection({
+        sessionId: "s-multi",
+        kind: "co-reply",
+        body: `recurring token ${i}`,
+        createdAt: 1_000 + i,
+      });
+    }
+    const hits = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: sanitizeTriggerFtsMatch("recurring"),
+    });
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      ["s-multi"],
+    );
+  });
+});
+
+test("searchAgentSessionsByTimeline: status/type filters still AND with an interjection match", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(
+      baseInsert({
+        id: "s-run",
+        timelineKey: FILTER_ROOM,
+        status: "running",
+        sessionType: "default",
+        triggerBody: "t1",
+      }),
+    );
+    await storage.insertAgentSession(
+      baseInsert({
+        id: "s-done",
+        timelineKey: FILTER_ROOM,
+        status: "completed",
+        sessionType: "default",
+        triggerBody: "t2",
+      }),
+    );
+    for (const id of ["s-run", "s-done"]) {
+      await storage.insertSessionInterjection({
+        sessionId: id,
+        kind: "reply",
+        body: "needle",
+        createdAt: 1_500,
+      });
+    }
+    // Both sessions have the interjection; the status filter narrows to one.
+    assert.deepEqual(
+      storage
+        .searchAgentSessionsByTimeline(FILTER_ROOM, {
+          triggerMatch: sanitizeTriggerFtsMatch("needle"),
+          statuses: ["running"],
+        })
+        .map((h) => h.id),
+      ["s-run"],
+    );
+  });
+});
+
+test("v23 -> v24 builds session_interjections + its FTS and supports interjection search", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v23-int-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS);
+    legacy.exec(V22_AGENT_SESSIONS);
+    // A v23 DB additionally has agent_sessions_fts (v22→v23); build it so the
+    // fixture is a faithful v23 and the v23→v24 step is the only one that runs.
+    legacy.exec(`create virtual table agent_sessions_fts using fts5(
+      trigger_body, content='agent_sessions', content_rowid='rowid');`);
+    const insert = legacy.prepare(FULL_ROW_INSERT);
+    insert.run(legacyRow("s-v23", "completed", { triggerBody: "legacy trigger" }));
+    legacy.pragma("user_version = 23");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+      const room = "matrix:miku:room:!room";
+      await storage.insertSessionInterjection({
+        sessionId: "s-v23",
+        eventId: "evt-x",
+        kind: "reply",
+        body: "postmigration interjection",
+        createdAt: 5_000,
+      });
+      assert.deepEqual(
+        storage
+          .searchAgentSessionsByTimeline(room, {
+            triggerMatch: sanitizeTriggerFtsMatch("postmigration"),
+          })
+          .map((h) => h.id),
+        ["s-v23"],
+      );
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

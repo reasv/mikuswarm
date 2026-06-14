@@ -16,6 +16,23 @@ export type AgentSessionStatus =
 
 /** Trigger body is truncated before persisting to keep the row small. */
 const MAX_TRIGGER_BODY = 500;
+/** Interjection body is truncated the same way as the trigger body. */
+const MAX_INTERJECTION_BODY = 500;
+
+/**
+ * The inbound timeline message behind a user interjection (ARCHITECTURE.md §8/§11),
+ * passed to {@link SessionManager.steer} so the inject is recorded as a searchable,
+ * event-linked `session_interjections` row. `body` is the raw inbound text (the search
+ * corpus); `kind` distinguishes a direct reply-steer from a co-target co-reply.
+ */
+export interface InterjectionSource {
+  eventId?: string | null;
+  externalId?: string | null;
+  senderId?: string | null;
+  senderDisplayName?: string | null;
+  kind: "reply" | "co-reply";
+  body: string;
+}
 
 export interface AgentSessionRecord {
   id: string;
@@ -329,11 +346,35 @@ export class SessionManager {
     }
   }
 
-  steer(sessionId: string, message: AgentMessage): boolean {
+  /**
+   * Inject a message into a running session. Returns false if the session isn't live
+   * (unknown / not running) — the caller falls back (e.g. spawn a fresh session).
+   *
+   * `source` is the inbound timeline message behind a user **interjection** (reply-steer
+   * / co-reply); when present AND the inject succeeds, a durable `session_interjections`
+   * row is recorded so the session is reachable by the interjection's text and ids (the
+   * "timeline message → session" debug path, §8/§11). Omitted for non-timeline injects
+   * (cost-budget warning, delegate tool), which carry no event to link.
+   */
+  steer(sessionId: string, message: AgentMessage, source?: InterjectionSource): boolean {
     const session = this.sessions.get(sessionId);
     const agent = this.agents.get(sessionId);
     if (!session || !agent || session.status !== "running") return false;
     agent.steer(message);
+    if (source) {
+      this.persist("session interjection insert", sessionId, (storage) =>
+        storage.insertSessionInterjection({
+          sessionId,
+          eventId: source.eventId ?? null,
+          externalId: source.externalId ?? null,
+          senderId: source.senderId ?? null,
+          senderDisplayName: source.senderDisplayName ?? null,
+          kind: source.kind,
+          body: (source.body ?? "").slice(0, MAX_INTERJECTION_BODY),
+          createdAt: Date.now(),
+        }),
+      );
+    }
     return true;
   }
 

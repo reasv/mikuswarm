@@ -1271,10 +1271,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // quotes the original message just like the normal trigger path would.
     const eventForRender = buildReplyHydratedEvent(inbound, target);
 
-    const ok = sessions.steer(target.agentSessionId, {
-      type: "interjection",
-      content: renderRichMessage(eventForRender),
-    });
+    const ok = sessions.steer(
+      target.agentSessionId,
+      {
+        type: "interjection",
+        content: renderRichMessage(eventForRender),
+      },
+      {
+        eventId: inbound.event.id,
+        externalId: inbound.event.externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "reply",
+        body: inbound.event.body ?? "",
+      },
+    );
     if (ok) {
       markSteered(inbound.event.id);
       logger.info("reply_steered", {
@@ -1362,7 +1373,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         : `or, if it warrants being worked independently, handle it separately.`) +
       `\n</interjection>`;
 
-    const ok = sessions.steer(coReplySessionId, { type: "interjection", content });
+    const ok = sessions.steer(
+      coReplySessionId,
+      { type: "interjection", content },
+      {
+        eventId: inbound.event.id,
+        externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "co-reply",
+        body: inbound.event.body ?? "",
+      },
+    );
     if (!ok) return false; // target session settling → fall back to spawn (§5.2)
 
     markSteered(inbound.event.id);

@@ -83,7 +83,7 @@
 						type="search"
 						bind:value={draft}
 						oninput={onInput}
-						placeholder="Search trigger messages…"
+						placeholder="Search trigger &amp; interjection text…"
 						class="h-8 w-full rounded-md border border-input bg-background pr-7 pl-7 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
 					/>
 					{#if draft.length > 0}

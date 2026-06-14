@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Storage } from "../src/storage/index.js";
 import { SessionManager } from "../src/agent/session-manager.js";
+import { sanitizeTriggerFtsMatch } from "../src/search/query.js";
 import type { InboundChatEvent } from "../src/types.js";
 
 async function openStorage(): Promise<{ storage: Storage; dir: string }> {
@@ -345,4 +346,111 @@ test("SessionManager without storage is a no-op and never throws", () => {
   sessions.markCompleted(record.id, { noReply: true });
   // Completed sessions are evicted from the in-memory map.
   assert.equal(sessions.get(record.id), undefined);
+});
+
+/** Minimal live agent stub that records the steered message. */
+function fakeSteerableAgent(): { agent: any; steered: () => unknown } {
+  let last: unknown;
+  return {
+    agent: {
+      steer(message: unknown) {
+        last = message;
+      },
+    },
+    steered: () => last,
+  };
+}
+
+test("SessionManager.steer with a source records a searchable interjection row", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    const { agent, steered } = fakeSteerableAgent();
+    sessions.markRunning(record.id);
+    sessions.attachAgent(record.id, agent);
+
+    const ok = sessions.steer(
+      record.id,
+      { type: "interjection", content: "rendered quote + guidance" },
+      {
+        eventId: "evt-9",
+        externalId: "ext-9",
+        senderId: "u2",
+        senderDisplayName: "Bob",
+        kind: "reply",
+        body: "please also check the zephyr config",
+      },
+    );
+    assert.equal(ok, true);
+    assert.ok(steered(), "message was forwarded to the agent");
+
+    await storage.waitForIdle();
+    // The session is now reachable by the interjection's text (timeline → session).
+    const hits = storage.searchAgentSessionsByTimeline("tl:room1", {
+      triggerMatch: sanitizeTriggerFtsMatch("zephyr"),
+    });
+    assert.deepEqual(
+      hits.map((h) => h.id),
+      [record.id],
+    );
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager.steer without a source records no interjection (cost-budget/delegate path)", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    const { agent } = fakeSteerableAgent();
+    sessions.markRunning(record.id);
+    sessions.attachAgent(record.id, agent);
+
+    sessions.steer(record.id, { type: "interjection", content: "budget warning: spend is high" });
+    await storage.waitForIdle();
+
+    // No interjection row → the warning text does not surface the session.
+    assert.deepEqual(
+      storage.searchAgentSessionsByTimeline("tl:room1", {
+        triggerMatch: sanitizeTriggerFtsMatch("budget"),
+      }),
+      [],
+    );
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager.steer truncates an overlong interjection body to 500 chars", async () => {
+  const { storage, dir } = await openStorage();
+  try {
+    const sessions = new SessionManager({ storage });
+    const record = sessions.createPlaceholder(makeTrigger(), "default");
+    const { agent } = fakeSteerableAgent();
+    sessions.markRunning(record.id);
+    sessions.attachAgent(record.id, agent);
+
+    sessions.steer(
+      record.id,
+      { type: "interjection", content: "x" },
+      { kind: "reply", body: "y".repeat(1000) },
+    );
+    await storage.waitForIdle();
+    const len = storage.read(
+      (db) =>
+        (
+          db
+            .prepare(`select length(body) as n from session_interjections where session_id = ?`)
+            .get(record.id) as { n: number }
+        ).n,
+    );
+    assert.equal(len, 500);
+  } finally {
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

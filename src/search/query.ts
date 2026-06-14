@@ -31,11 +31,13 @@ export function sanitizeSummaryFtsMatch(query: string): string | undefined {
 }
 
 /**
- * Column-scoped MATCH expression over `agent_sessions_fts`'s single `trigger_body`
- * column, for the console sessions filter's keyword search (ARCHITECTURE.md §11).
- * Unlike `sanitizeFtsMatch`/`sanitizeSummaryFtsMatch` (agent-facing, where a bare term
- * is an exact-token match), this powers a **search-as-you-type** box, so EVERY term is
- * an implicit **prefix** query — typing "roc" finds "rocket". Terms are still quoted to
+ * Free-text MATCH expression for the console sessions filter's keyword search
+ * (ARCHITECTURE.md §8/§11). Deliberately **column-agnostic** — no `{col} :` scope — so
+ * the SAME expression matches both single-column FTS tables the sessions search spans:
+ * `agent_sessions_fts(trigger_body)` and `session_interjections_fts(body)`. Unlike
+ * `sanitizeFtsMatch`/`sanitizeSummaryFtsMatch` (agent-facing, where a bare term is an
+ * exact-token match), this powers a **search-as-you-type** box, so EVERY term is an
+ * implicit **prefix** query — typing "roc" finds "rocket". Terms are still quoted to
  * neutralize FTS5 operators (user input can't inject syntax); a trailing `*` the user
  * types is collapsed into the same prefix. Implicit AND across terms. Returns undefined
  * for a no-token query (→ the caller runs a metadata-only filter). Note: FTS5 prefixes
@@ -52,7 +54,7 @@ export function sanitizeTriggerFtsMatch(query: string): string | undefined {
     terms.push(`"${escaped}"*`);
   }
   if (terms.length === 0) return undefined;
-  return `{trigger_body} : (${terms.join(" ")})`;
+  return `(${terms.join(" ")})`;
 }
 
 /**
