@@ -80,6 +80,9 @@ import {
   createWebSearchTool,
   createWriteMemoryTool,
   createXFetchTool,
+  createXSearchTool,
+  GrokResultCache,
+  type ToolUsageRecord,
 } from "./tools/index.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
@@ -441,6 +444,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     timeoutMs: fxTwitterConfig.fetchTimeoutMs,
     httpProxyUrl: config.network?.http_proxy_url,
   });
+
+  // Shared, cross-session Grok-result cache for x_search (spec X-SEARCH §9): one
+  // instance so a reactive and a proactive session hitting the same topic in a
+  // busy channel dampen to a single Grok call. Only the expensive synthesis is
+  // cached (pre-hydration); 0 minutes disables it.
+  const xSearchCache = new GrokResultCache((config.x_search?.cache_ttl_minutes ?? 10) * 60_000);
 
   const captioningConfig = config.captioning ?? {};
   const sharedModel = {
@@ -1715,6 +1724,37 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // never an independent `config.models.*.context_window` read — so a session
     // type's override (or a non-default model) shapes the tool budget too.
     const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
+
+    // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
+    // x_search). Feeds the per-session cost ceiling's combined-spend lane in-memory
+    // (spec SESSION-COST-LIMITS §4) and appends one durable `tool_invocations` row
+    // (spec AUXILIARY-USAGE-TRACKING §8.2 / X-SEARCH §7). Both lanes are separate
+    // from agent_sessions.usage_* (§8c §4); a sink failure never fails the tool.
+    const recordToolUsage = (record: ToolUsageRecord) => {
+      usage.recordToolCost(record.cost ?? 0);
+      void storage
+        .insertToolInvocation({
+          agentSessionId: record.agentSessionId,
+          toolName: record.toolName,
+          toolCallId: record.toolCallId,
+          modelId: record.modelId,
+          provider: record.provider,
+          inputTokens: record.usage.input,
+          outputTokens: record.usage.output,
+          cacheReadTokens: record.usage.cacheRead,
+          cacheWriteTokens: record.usage.cacheWrite,
+          images: record.usage.images ?? null,
+          cost: record.cost,
+          ref: record.ref,
+        })
+        .catch((error) => {
+          logger.warn("tool_usage_ledger_insert_failed", {
+            tool: record.toolName,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    };
+
     return [
       createSendMessageTool({
         provider,
@@ -1889,38 +1929,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // each billable generation to this session and append one durable row.
             // Separate lane — never touches agent_sessions.usage_* (§4).
             agentSessionId: sessionId,
-            recordToolUsage: (record) => {
-              // Feed the per-session cost ceiling's combined-spend lane in-memory
-              // (spec SESSION-COST-LIMITS §4) — separate from the durable ledger
-              // write below, and never folded into agent_sessions.usage_* (§8c §4).
-              usage.recordToolCost(record.cost ?? 0);
-              void storage
-                .insertToolInvocation({
-                  agentSessionId: record.agentSessionId,
-                  toolName: record.toolName,
-                  toolCallId: record.toolCallId,
-                  modelId: record.modelId,
-                  provider: record.provider,
-                  inputTokens: record.usage.input,
-                  outputTokens: record.usage.output,
-                  cacheReadTokens: record.usage.cacheRead,
-                  cacheWriteTokens: record.usage.cacheWrite,
-                  images: record.usage.images ?? null,
-                  cost: record.cost,
-                  ref: record.ref,
-                })
-                .catch((error) => {
-                  logger.warn("image_gen_usage_ledger_insert_failed", {
-                    error: error instanceof Error ? error.message : String(error),
-                  });
-                });
-            },
+            recordToolUsage,
             // Per-tier cost rates (spec §7.2): snake_case config block → CostRates.
             costRates: {
               pro: toImageCostRates(config.image_gen.costs?.pro),
               flash: toImageCostRates(config.image_gen.costs?.flash),
             },
             config: config.image_gen,
+          })]
+        : []),
+      // x_search (spec/X-SEARCH.md): Grok-as-subagent X.com search, grounded by
+      // miku's own FxTwitter hydration + inline captioning. The Grok call goes to
+      // OpenRouter — a different provider lane than the agent loop — so it is NOT
+      // admitted through llmScheduler (§8); only the inline captions ride the
+      // caption client's own scheduler. Gated on x_search.enabled (default true).
+      ...(config.x_search && (config.x_search.enabled ?? true)
+        ? [createXSearchTool({
+            config: config.x_search,
+            fxTwitterClient,
+            statusHosts: fxTwitterConfig.statusHosts,
+            // Reuse the image caption model — the exact `media`-tool path (§5).
+            imageCaptionClient: captionClients.get("image"),
+            fetchClient,
+            downloadSizeLimit,
+            httpProxyUrl: config.network?.http_proxy_url,
+            cache: xSearchCache,
+            agentSessionId: sessionId,
+            recordToolUsage,
           })]
         : []),
       createUserProfileReadTool({

@@ -363,6 +363,36 @@ output_subdir = "generated-images"
 pro = "gemini-3-pro-image"
 flash = "gemini-3.1-flash-image"
 
+# X.com (Twitter) search via Grok-as-subagent (spec/X-SEARCH.md). Routes through
+# OpenRouter/LlmGateway: `base_url` is the OpenRouter API ROOT (the tool appends
+# /chat/completions), reusing the existing OPENROUTER_BASE_URL + LLM_API_KEY — no
+# new credential, no new egress host. Grok returns a cited synthesis; miku then
+# re-fetches the cited tweets through its own FxTwitter pipeline (verbatim text +
+# media) and captions the top images inline, so fabricated citations are dropped
+# and counted and the persona actually "sees" tweet images. Ephemeral, like
+# x_fetch — nothing is persisted to channel history / the retrieval corpus.
+[x_search]
+enabled = true
+base_url = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+model = "x-ai/grok-4.1-fast"        # effort=fast tier (default; quick non-reasoning)
+deep_model = "x-ai/grok-4.1-fast"   # effort=deep tier (set to a reasoning model)
+timeout_ms = 60000                  # reasoning search is slow; graceful timeout
+cache_ttl_minutes = 10              # cache the (expensive) Grok synthesis; 0 = off
+hydrate_default = 5                 # cited tweets re-fetched verbatim via FxTwitter
+hydrate_max = 10                    # hard cap the `hydrate` parameter is clamped to
+caption_top = 4                     # images auto-captioned inline; rest → media tool
+source_text_chars = 600             # per-source verbatim text window in the Sources block
+enable_image_understanding = true   # Grok's own inline vision (cheap, improves reasoning)
+enable_video_understanding = false  # off by default (slower/costlier)
+
+# Per-MTok USD rates for the Grok call's tool_invocations ledger row (X-SEARCH §7).
+# Left unset here per the explicit-deployment-config convention — set real rates in
+# local config; unset = usage captured, cost untracked (0).
+# [x_search.cost]
+# input = 0.0
+# output = 0.0
+
 [summarization]
 enabled = true
 worker_count = 1

@@ -20,7 +20,19 @@ export { createReadImageTool, type ReadImageToolContext } from "./read-image.js"
 export { createWebFetchTool, createWebSearchTool } from "./web.js";
 export { createDanbooruTool, type DanbooruToolContext } from "./danbooru.js";
 export { createXFetchTool, type XFetchToolContext } from "./x-fetch.js";
-export { createImageGenTool, type ImageGenToolContext } from "./image-gen.js";
+export { createImageGenTool, type ImageGenToolContext, type ToolUsageRecord } from "./image-gen.js";
+export {
+  createXSearchTool,
+  resolveXSearchConfig,
+  GrokResultCache,
+  buildCacheKey,
+  buildGrokRequestBody,
+  extractSynthesis,
+  extractCitations,
+  type XSearchToolContext,
+  type XSearchRawConfig,
+  type GrokResult,
+} from "./x-search.js";
 export {
   createUserProfileReadTool,
   createUserProfileEditTool,

@@ -757,6 +757,46 @@ const ImageGenSchema = StrictObject({
   })),
 });
 
+// X.com search via Grok-as-subagent (spec/X-SEARCH.md; ARCHITECTURE.md §10).
+// Routes through OpenRouter/LlmGateway — `base_url` is the OpenRouter API root
+// (the tool appends `/chat/completions`), `api_key` is sent as
+// `Authorization: Bearer` (the field name matches the secret regex, so it
+// auto-registers for log redaction). Reuses the existing `${OPENROUTER_BASE_URL}`
+// + `${LLM_API_KEY}` — no new credential, no new egress host. Hydration +
+// captioning reuse the shared FxTwitter client + the image caption model.
+const XSearchSchema = StrictObject({
+  // false → x_search is not registered. Defaults to true when the block exists.
+  enabled: Type.Optional(Type.Boolean()),
+  base_url: Type.String({ minLength: 1 }),
+  api_key: Type.String({ minLength: 1 }),
+  // effort=fast tier (default); should be a quick non-reasoning Grok model.
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  // effort=deep tier; set to a reasoning model for harder research tasks.
+  deep_model: Type.Optional(Type.String({ minLength: 1 })),
+  // Wall-clock bound on the Grok reasoning search (slow); graceful timeout.
+  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+  // Short-TTL cache of the (expensive) Grok synthesis; 0 disables caching.
+  cache_ttl_minutes: Type.Optional(Type.Number({ minimum: 0 })),
+  // How many cited tweets to re-fetch verbatim via FxTwitter by default, and the
+  // hard cap the `hydrate` parameter is clamped to.
+  hydrate_default: Type.Optional(Type.Integer({ minimum: 0 })),
+  hydrate_max: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Images auto-captioned inline across the hydrated tweets; rest → media tool.
+  caption_top: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Per-source verbatim text window (chars) in the Sources block.
+  source_text_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Grok's own inline vision over cited media (cheap; on by default).
+  enable_image_understanding: Type.Optional(Type.Boolean()),
+  enable_video_understanding: Type.Optional(Type.Boolean()),
+  // Overridable subagent scaffold (forces a live cited search; §4.2).
+  system_prompt: Type.Optional(Type.String({ minLength: 1 })),
+  // Per-MTok USD rates for the Grok call's tool_invocations ledger row (§7).
+  cost: Type.Optional(StrictObject({
+    input: Type.Number({ minimum: 0 }),
+    output: Type.Number({ minimum: 0 }),
+  })),
+});
+
 // One LLM rate-limit group = one shared upstream budget (spec §9.2). There is one
 // `default` group and everything lands in it unless a model opts into another via
 // `rate_limit_group`; extra groups exist only for genuinely separate budgets.
@@ -1000,6 +1040,7 @@ export const AppConfigSchema = StrictObject({
     ssrf_guard: Type.Optional(Type.Boolean()),
   })),
   image_gen: Type.Optional(ImageGenSchema),
+  x_search: Type.Optional(XSearchSchema),
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),
@@ -1013,6 +1054,7 @@ export type RetrievalConfig = Static<typeof RetrievalSchema>;
 export type SearchConfig = Static<typeof SearchSchema>;
 export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
+export type XSearchConfig = Static<typeof XSearchSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
