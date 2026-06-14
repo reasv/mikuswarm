@@ -2008,6 +2008,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(config.x_search && (config.x_search.enabled ?? true)
         ? [createXSearchTool({
             config: config.x_search,
+            workspaceRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
             // Reuse the image caption model — the exact `media`-tool path (§5).

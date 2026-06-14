@@ -383,8 +383,8 @@ hydrate_default = 5                 # cited tweets re-fetched verbatim via FxTwi
 hydrate_max = 10                    # hard cap the `hydrate` parameter is clamped to
 caption_top = 4                     # images auto-captioned inline; rest → media tool
 source_text_chars = 600             # per-source verbatim text window in the Sources block
-enable_image_understanding = true   # Grok's own inline vision (cheap, improves reasoning)
-enable_video_understanding = false  # off by default (slower/costlier)
+enable_image_understanding = true   # Grok's vision over images it finds while searching
+enable_video_understanding = true   # Grok's vision over videos it finds while searching
 
 # Per-MTok USD rates for the Grok call's tool_invocations ledger row (X-SEARCH §7).
 # Left unset here per the explicit-deployment-config convention — set real rates in

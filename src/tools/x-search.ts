@@ -1,8 +1,9 @@
-import { unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { Dispatcher } from "undici";
 import { guardedFetch } from "./ssrf.js";
+import { resolveWorkspacePath } from "./workspace.js";
 import { buildProxyDispatcher, type FetchClient } from "../enrichment/fetch-client.js";
 import type { FxTwitterClient } from "../fxtwitter/client.js";
 import { parseXStatusUrl } from "../fxtwitter/url.js";
@@ -31,6 +32,8 @@ import type { ToolUsageRecord } from "./image-gen.js";
 const X_SEARCH_USER_AGENT = "MikuAgent/0.1 (mikuswarm x_search)";
 /** Hard cap on the OpenRouter JSON response body. A cited synthesis is small. */
 const RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+/** Max images the model may attach to one Grok query (vision context, not corpus). */
+const MAX_INPUT_IMAGES = 4;
 
 const DEFAULT_MODEL = "x-ai/grok-4.3";
 const DEFAULT_SYSTEM_PROMPT = [
@@ -108,7 +111,7 @@ export function resolveXSearchConfig(raw?: XSearchRawConfig): ResolvedXSearchCon
     captionTop: raw?.caption_top ?? 4,
     sourceTextChars: raw?.source_text_chars ?? 600,
     enableImageUnderstanding: raw?.enable_image_understanding ?? true,
-    enableVideoUnderstanding: raw?.enable_video_understanding ?? false,
+    enableVideoUnderstanding: raw?.enable_video_understanding ?? true,
     systemPrompt: (raw?.system_prompt ?? "").trim() || DEFAULT_SYSTEM_PROMPT,
     costRates: raw?.cost
       ? { input: raw.cost.input, output: raw.cost.output, cacheRead: 0, cacheWrite: 0 }
@@ -178,6 +181,7 @@ export function buildCacheKey(input: {
   fromDate?: string;
   toDate?: string;
   model: string;
+  images?: string[];
 }): string {
   return JSON.stringify({
     q: input.query.trim().replace(/\s+/g, " ").toLowerCase(),
@@ -186,6 +190,9 @@ export function buildCacheKey(input: {
     f: input.fromDate ?? null,
     t: input.toDate ?? null,
     m: input.model,
+    // Image identity is keyed on the *source string* (path/URL), order-preserving:
+    // same query + same image refs within the short TTL dampens to one Grok call.
+    i: input.images && input.images.length > 0 ? input.images : null,
   });
 }
 
@@ -196,6 +203,8 @@ export function buildCacheKey(input: {
 export interface XSearchToolContext {
   /** Raw `[x_search]` config block. */
   config: XSearchRawConfig;
+  /** Agent workspace root — resolves local image paths passed via `images`. */
+  workspaceRoot: string;
   /** Shared FxTwitter client (hydration), same instance x_fetch uses. */
   fxTwitterClient: FxTwitterClient;
   /** Recognized X status base-domains (built-ins + extra_status_hosts). */
@@ -226,7 +235,7 @@ interface XSearchParams {
   to_date?: string;
   effort?: "fast" | "deep";
   hydrate?: number;
-  enable_video_understanding?: boolean;
+  images?: string[];
 }
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -248,7 +257,9 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
       "Returns a cited synthesis plus the actual cited tweets (verbatim text + media), with the top images already " +
       "captioned. Grok can also pull in general web results when useful. Use this for DISCOVERY across X " +
       "(\"what are people saying about…\", \"find posts from @x about…\"); use `x_fetch` when you already have a " +
-      "specific tweet URL.",
+      "specific tweet URL. " +
+      "You can also attach `images` so Grok visually recognizes what's in them and searches X/web for it — " +
+      "a fallback for sourcing media when `find_source` (SauceNAO) comes up empty.",
     parameters: Type.Object({
       query: Type.String({
         minLength: 1,
@@ -274,8 +285,13 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
         maximum: config.hydrateMax,
         description: `How many cited tweets to re-fetch verbatim via FxTwitter (default ${config.hydrateDefault}, cap ${config.hydrateMax}). 0 = synthesis + raw URLs only.`,
       })),
-      enable_video_understanding: Type.Optional(Type.Boolean({
-        description: "Let Grok analyze cited video frames (default from config; off by default — slower/costlier).",
+      images: Type.Optional(Type.Array(Type.String(), {
+        maxItems: MAX_INPUT_IMAGES,
+        description:
+          `Attach up to ${MAX_INPUT_IMAGES} images (workspace paths or http(s) URLs) for Grok to SEE while searching. ` +
+          "Grok recognizes what's in the image (character, artist, series, meme, scene) and searches X/web for it — " +
+          "use this as a fallback for finding a media's source when `find_source` (SauceNAO) fails or returns nothing. " +
+          "Note: this is visual recognition + text search, not a true reverse-image match.",
       })),
     }),
     execute: async (toolCallId, rawParams, agentSignal) => {
@@ -295,11 +311,15 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
           return textError(`Dates must be YYYY-MM-DD, got "${d}".`);
         }
       }
+      const imageSources = sanitizeImageSources(params.images);
+      if (imageSources.length > MAX_INPUT_IMAGES) {
+        return textError(`images allows at most ${MAX_INPUT_IMAGES} items.`);
+      }
 
       const effort: "fast" | "deep" = params.effort ?? "fast";
       const model = effort === "deep" ? config.deepModel : config.model;
       const hydrate = Math.min(params.hydrate ?? config.hydrateDefault, config.hydrateMax);
-      const enableVideo = params.enable_video_understanding ?? config.enableVideoUnderstanding;
+      const enableVideo = config.enableVideoUnderstanding;
 
       const startMs = now();
       const cacheKey = buildCacheKey({
@@ -309,6 +329,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
         fromDate: params.from_date,
         toDate: params.to_date,
         model,
+        images: imageSources,
       });
 
       // 1) Grok call (cache → live). A cache hit makes no billable call, so it
@@ -316,6 +337,15 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
       let grok = context.cache.get(cacheKey, startMs);
       let cached = grok !== undefined;
       if (!grok) {
+        // Attached images become base64 data-URL blocks on the user turn (vision
+        // context for source-finding — §10). A load failure is a clear error, not
+        // a silent degrade: the model needs to know its image never reached Grok.
+        let imageDataUrls: string[];
+        try {
+          imageDataUrls = await loadInputImages(context, imageSources);
+        } catch (error) {
+          return textError(`x_search could not load an attached image: ${errMessage(error)}`);
+        }
         const body = buildGrokRequestBody({
           model,
           query,
@@ -326,6 +356,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
           toDate: params.to_date,
           enableImageUnderstanding: config.enableImageUnderstanding,
           enableVideoUnderstanding: enableVideo,
+          imageDataUrls,
         });
         let live: GrokResult | { error: string };
         try {
@@ -404,6 +435,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
           effort,
           cached,
           tookMs,
+          imageCount: imageSources.length,
           droppedCitations: dropped,
           captionedCount,
           citations: grok.citations.map((url) => {
@@ -443,6 +475,8 @@ export function buildGrokRequestBody(input: {
   toDate?: string;
   enableImageUnderstanding: boolean;
   enableVideoUnderstanding: boolean;
+  /** Base64 `data:` URLs for images the agent attached (vision context). */
+  imageDataUrls?: string[];
 }): Record<string, unknown> {
   const filter: Record<string, unknown> = {
     enable_image_understanding: input.enableImageUnderstanding,
@@ -453,11 +487,22 @@ export function buildGrokRequestBody(input: {
   if (input.fromDate) filter.from_date = input.fromDate;
   if (input.toDate) filter.to_date = input.toDate;
 
+  // Text-only → scalar string content (unchanged). With images, the user turn
+  // becomes a multimodal content-block array (text first, then image_url blocks)
+  // — the standard OpenRouter/Grok vision shape (§10).
+  const userContent =
+    input.imageDataUrls && input.imageDataUrls.length > 0
+      ? [
+          { type: "text", text: input.query },
+          ...input.imageDataUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+        ]
+      : input.query;
+
   return {
     model: input.model,
     messages: [
       { role: "system", content: input.systemPrompt },
-      { role: "user", content: input.query },
+      { role: "user", content: userContent },
     ],
     plugins: [{ id: "web" }],
     x_search_filter: filter,
@@ -874,6 +919,76 @@ function sanitizeHandles(handles: string[] | undefined): string[] {
   return handles
     .map((h) => h.trim().replace(/^@+/, ""))
     .filter((h) => h.length > 0);
+}
+
+function sanitizeImageSources(images: string[] | undefined): string[] {
+  if (!images) return [];
+  return images.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+function isHttpUrl(value: string): boolean {
+  return value.startsWith("http://") || value.startsWith("https://");
+}
+
+/**
+ * Load attached images (workspace paths or http(s) URLs) into base64 `data:`
+ * URLs, in order. URLs go through the shared `fetchClient` (per-host limiter +
+ * `downloadSizeLimit`); local paths are confined to the workspace by
+ * `resolveWorkspacePath` and size-capped via `stat`. Sniffs the MIME from the
+ * URL content-type or the magic bytes, falling back to the extension. Throws on
+ * the first failure so the caller can surface a clear error (the image never
+ * reached Grok).
+ */
+async function loadInputImages(context: XSearchToolContext, sources: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const source of sources) {
+    out.push(await loadInputImage(context, source));
+  }
+  return out;
+}
+
+async function loadInputImage(context: XSearchToolContext, source: string): Promise<string> {
+  if (isHttpUrl(source)) {
+    const fetched = await context.fetchClient.fetch(source, { maxBytes: context.downloadSizeLimit });
+    try {
+      if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+        throw new Error(`${source} → HTTP ${fetched.statusCode}`);
+      }
+      const bytes = await readFile(fetched.path);
+      const ct = fetched.contentType?.split(";")[0]?.trim().toLowerCase();
+      const mime = ct && ct.startsWith("image/") ? ct : detectImageMime(bytes, source);
+      return `data:${mime};base64,${bytes.toString("base64")}`;
+    } finally {
+      await unlink(fetched.path).catch(() => {});
+    }
+  }
+  const absolute = resolveWorkspacePath(context.workspaceRoot, source);
+  const info = await stat(absolute);
+  if (info.size > context.downloadSizeLimit) {
+    throw new Error(`${source} too large: ${info.size} > ${context.downloadSizeLimit} bytes`);
+  }
+  const bytes = await readFile(absolute);
+  return `data:${detectImageMime(bytes, source)};base64,${bytes.toString("base64")}`;
+}
+
+/** Detect an image MIME from magic bytes, falling back to the extension (then JPEG). */
+function detectImageMime(bytes: Buffer, source: string): string {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes.subarray(1, 4).toString() === "PNG") return "image/png";
+  if (bytes.length >= 4 && bytes.subarray(0, 4).toString() === "GIF8") return "image/gif";
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP") {
+    return "image/webp";
+  }
+  if (bytes.length >= 12 && bytes.subarray(4, 8).toString() === "ftyp") {
+    const brand = bytes.subarray(8, 12).toString();
+    if (brand === "avif" || brand === "avis") return "image/avif";
+  }
+  const ext = source.split(/[?#]/)[0].split(".").pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+    webp: "image/webp", bmp: "image/bmp", avif: "image/avif", tiff: "image/tiff",
+  };
+  return map[ext ?? ""] ?? "image/jpeg";
 }
 
 async function readJsonCapped(response: Response, controller: AbortController): Promise<unknown> {

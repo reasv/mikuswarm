@@ -109,6 +109,52 @@ test("buildCacheKey: whitespace/case-insensitive query, sorted handles", () => {
   assert.notEqual(a, c);
 });
 
+test("buildCacheKey: attached images partition the key (order-significant)", () => {
+  const base = { query: "q", allowedHandles: [], excludedHandles: [], model: "m" };
+  const none = buildCacheKey(base);
+  const img = buildCacheKey({ ...base, images: ["a.png"] });
+  assert.notEqual(none, img, "an image must not collide with the no-image key");
+  assert.equal(buildCacheKey({ ...base, images: [] }), none, "empty images === no images");
+  assert.equal(img, buildCacheKey({ ...base, images: ["a.png"] }), "same image ref → same key");
+  assert.notEqual(img, buildCacheKey({ ...base, images: ["b.png"] }), "different ref → different key");
+  assert.notEqual(
+    buildCacheKey({ ...base, images: ["a.png", "b.png"] }),
+    buildCacheKey({ ...base, images: ["b.png", "a.png"] }),
+    "image order is significant",
+  );
+});
+
+test("buildGrokRequestBody: images become a multimodal user content array", () => {
+  const body = buildGrokRequestBody({
+    model: "x-ai/grok-4.3",
+    query: "whose art is this",
+    systemPrompt: "scaffold",
+    allowedHandles: [],
+    excludedHandles: [],
+    enableImageUnderstanding: true,
+    enableVideoUnderstanding: true,
+    imageDataUrls: ["data:image/png;base64,AAAA", "data:image/jpeg;base64,BBBB"],
+  }) as any;
+  const content = body.messages[1].content;
+  assert.ok(Array.isArray(content), "user content must be an array when images attached");
+  assert.deepEqual(content[0], { type: "text", text: "whose art is this" });
+  assert.deepEqual(content[1], { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } });
+  assert.deepEqual(content[2], { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } });
+});
+
+test("buildGrokRequestBody: no images → scalar string content (unchanged)", () => {
+  const body = buildGrokRequestBody({
+    model: "x-ai/grok-4.3",
+    query: "plain query",
+    systemPrompt: "scaffold",
+    allowedHandles: [],
+    excludedHandles: [],
+    enableImageUnderstanding: true,
+    enableVideoUnderstanding: true,
+  }) as any;
+  assert.equal(body.messages[1].content, "plain query");
+});
+
 test("GrokResultCache: stores within TTL, expires after, 0 ttl disables", () => {
   const cache = new GrokResultCache(60_000);
   const result = { synthesis: "s", citations: [], usage: null, model: "m" };
@@ -127,10 +173,12 @@ test("resolveXSearchConfig: requires base_url + api_key, applies defaults", () =
   assert.throws(() => resolveXSearchConfig({ base_url: "https://x.test" }), /api_key/);
   const cfg = resolveXSearchConfig({ base_url: "https://x.test/", api_key: "k" });
   assert.equal(cfg.baseUrl, "https://x.test"); // trailing slash stripped
-  assert.equal(cfg.model, "x-ai/grok-4.1-fast");
-  assert.equal(cfg.deepModel, "x-ai/grok-4.1-fast"); // defaults to model
+  assert.equal(cfg.model, "x-ai/grok-4.3");
+  assert.equal(cfg.deepModel, "x-ai/grok-4.3"); // defaults to model
   assert.equal(cfg.hydrateDefault, 5);
   assert.equal(cfg.captionTop, 4);
+  assert.equal(cfg.enableImageUnderstanding, true); // forced on by default
+  assert.equal(cfg.enableVideoUnderstanding, true); // forced on by default (not a model knob)
   assert.ok(cfg.systemPrompt.length > 0);
 });
 
@@ -180,6 +228,7 @@ async function startOpenRouter(
 
 interface Harness {
   context: XSearchToolContext;
+  workspaceRoot: string;
   records: ToolUsageRecord[];
   fetchedUrls: string[];
   captionCalls: string[];
@@ -230,6 +279,7 @@ async function makeHarness(opts: {
 
   const context: XSearchToolContext = {
     config: { base_url: opts.serverUrl, api_key: "test-key", ...opts.rawConfig },
+    workspaceRoot,
     fxTwitterClient,
     statusHosts: STATUS_HOSTS,
     imageCaptionClient,
@@ -242,6 +292,7 @@ async function makeHarness(opts: {
 
   return {
     context,
+    workspaceRoot,
     records,
     fetchedUrls,
     captionCalls,
@@ -328,6 +379,51 @@ test("x_search: hydrates citations, captions top images, records ledger rows, co
     assert.equal(result.details.droppedCitations, 0);
     assert.equal(result.details.citations.length, 2);
     assert.equal(result.details.citations[0].hydrated, true);
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: attached images become base64 image_url blocks (local path + URL)", async () => {
+  const server = await startOpenRouter(() => ({ json: grokResponse("It's by @artist.", []) }));
+  const h = await makeHarness({ serverUrl: server.url });
+  try {
+    // A real PNG (magic bytes) in the workspace, referenced by relative path.
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    await writeFile(path.join(h.workspaceRoot, "pic.png"), png);
+
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("call-img", {
+      query: "whose art is this",
+      images: ["pic.png", "https://imghost.test/remote.jpg"],
+    });
+
+    const content = server.lastBody().messages[1].content;
+    assert.ok(Array.isArray(content), "user content is a multimodal array");
+    assert.deepEqual(content[0], { type: "text", text: "whose art is this" });
+    assert.match(content[1].image_url.url, /^data:image\/png;base64,/, "local PNG sniffed from magic bytes");
+    assert.match(content[2].image_url.url, /^data:image\/jpeg;base64,/, "URL image mimed from content-type");
+    assert.ok(h.fetchedUrls.includes("https://imghost.test/remote.jpg"), "URL image fetched via fetchClient");
+    assert.equal(result.details.imageCount, 2);
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: over-cap images and unloadable images error before any Grok call", async () => {
+  const server = await startOpenRouter(() => ({ json: grokResponse("x", []) }));
+  const h = await makeHarness({ serverUrl: server.url });
+  try {
+    const tool = createXSearchTool(h.context);
+    const over: any = await tool.execute("c1", { query: "q", images: ["a", "b", "c", "d", "e"] });
+    assert.match(over.content[0].text, /at most 4/);
+
+    const missing: any = await tool.execute("c2", { query: "q", images: ["nope.png"] });
+    assert.match(missing.content[0].text, /could not load an attached image/);
+
+    assert.equal(server.count(), 0, "no Grok call when image validation/loading fails");
   } finally {
     await server.close();
     await h.cleanup();
