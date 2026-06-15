@@ -35,9 +35,11 @@ export interface NormalizeResult {
 
 /**
  * Normalize + validate `[[limits]]`. `defaultTz` (from `agent.timezone`, else
- * "UTC") backfills a calendar rule's omitted tz. `knownTools`/`knownSessionTypes`
- * drive soft "unknown reference" warnings (config survives renames). A rule whose
- * duration or tz is invalid is dropped and reported as fatal.
+ * "UTC") backfills a calendar rule's omitted tz. `knownTools`/`knownSessionTypes`/
+ * `knownModelIds` drive soft "unknown reference" warnings (config survives renames).
+ * `knownModelIds` is optional (review #11): the full set of configured model ids is
+ * only assembled in app.ts, so a caller without it (tests) simply skips the model
+ * warning. A rule whose duration or tz is invalid is dropped and reported as fatal.
  */
 export function normalizeLimits(
   raw: RawLimitRule[] | undefined,
@@ -45,6 +47,9 @@ export function normalizeLimits(
     defaultTz: string;
     knownTools: Set<string>;
     knownSessionTypes: Set<string>;
+    /** Every configured model id (zero-cost ∪ paid); when present, a `models`
+     *  selector naming an id outside it earns a soft warning (review #11). */
+    knownModelIds?: Set<string>;
   },
 ): NormalizeResult {
   const rules: LimitRule[] = [];
@@ -98,6 +103,16 @@ export function normalizeLimits(
     for (const st of selector.sessionTypes ?? []) {
       if (!opts.knownSessionTypes.has(st))
         warnings.push(`[[limits]] "${entry.name}": unknown session type "${st}"`);
+    }
+    // Symmetric model-id check (review #11): a `models` selector naming an id that
+    // exists in no config lane produces a dead, never-matching rule. Warn (never
+    // fatal — `models` stays free-form, §5.2). Skipped when the caller didn't supply
+    // the known-id set (tests that don't assemble it).
+    if (opts.knownModelIds) {
+      for (const m of selector.models ?? []) {
+        if (!opts.knownModelIds.has(m))
+          warnings.push(`[[limits]] "${entry.name}": unknown model "${m}"`);
+      }
     }
 
     // A trigger_rejection_message is only meaningful on a rule that can cover a

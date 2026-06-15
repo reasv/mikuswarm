@@ -9,7 +9,7 @@ import { EmbedWorkerPool } from "./embed-worker.js";
 import { VectorStore } from "./vector-store.js";
 import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding/index.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
-import type { BudgetHooks } from "../budget/index.js";
+import { makeRateLimitedClaimGate, type BudgetHooks } from "../budget/index.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
@@ -106,16 +106,21 @@ export async function createRetrievalSubsystem(
       scheduler: opts.scheduler,
       // Remote-embedding usage row (spec §9): emitted with the active model id; no
       // session attribution (background enrichment). Local provider never calls this.
-      onEmbeddingUsage:
-        opts.budget?.record && remoteId
-          ? (promptTokens, costUsd) =>
-              opts.budget!.record!({
-                class: "embedding",
-                modelId: remoteId,
-                inputTokens: promptTokens,
-                costUsd,
-              })
-          : undefined,
+      // `budget.record` is read at CALL time, not construction time: the holder is
+      // filled by app.ts AFTER this subsystem is built (finding #21), so capturing
+      // `opts.budget.record` here would freeze it to `undefined` and silently drop
+      // every embedding row. The optional-chain no-ops until the holder is filled —
+      // safe, since no embedding work runs before startup completes.
+      onEmbeddingUsage: remoteId
+        ? (promptTokens, costUsd) => {
+            opts.budget?.record?.({
+              class: "embedding",
+              modelId: remoteId,
+              inputTokens: promptTokens,
+              costUsd,
+            });
+          }
+        : undefined,
       logger,
     });
 
@@ -154,13 +159,23 @@ export async function createRetrievalSubsystem(
       config,
       // Budget claim gate (§6.3): only the remote provider can cost money, so the
       // pause descriptor uses the remote model id; a local provider yields no
-      // descriptor and is never paused (zero cost).
+      // descriptor and is never paused (zero cost). On pause, emit one rate-limited
+      // (≤1/min) `usage_limit_blocked` log naming the hit rules (§6.4, review #2),
+      // mirroring the caption/summary/diary gates (shared `makeRateLimitedClaimGate`).
+      //
+      // The engine is LATE-BOUND (`() => opts.budget?.engine`), not read at
+      // construction time (finding #21): app.ts builds this subsystem before the
+      // BudgetEngine exists and fills the holder afterwards, so capturing
+      // `opts.budget.engine` here would freeze the gate to `undefined` and leave the
+      // embed lane permanently unbounded. `makeRateLimitedClaimGate` resolves the
+      // source per call and never parks while it is still undefined — safe, since no
+      // embedding work runs before startup completes.
       shouldPause:
-        opts.budget?.engine && remoteActive && config.embedding.remote
-          ? () => !opts.budget!.engine!.check({
-              class: "embedding",
-              modelId: config.embedding.remote!.id,
-            }).allowed
+        remoteActive && config.embedding.remote
+          ? makeRateLimitedClaimGate({
+              engine: () => opts.budget?.engine,
+              descriptors: () => [{ class: "embedding", modelId: config.embedding.remote!.id }],
+            })
           : undefined,
       logger,
     });

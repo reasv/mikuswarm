@@ -11,17 +11,23 @@
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
+	import { buildSpendChart, isSpendChartEmpty } from '$lib/spend-chart';
+	import { presentRule } from '$lib/rule-status';
 
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7): cards + a stacked spend chart,
 	// the always-shown Limits section (every configured rule + headroom), and the
 	// recent-sessions / recent-paid-calls tables. All over the unified usage_events
 	// ledger + the live BudgetEngine. Polled — the aggregates are cheap.
+	// `today`/`month` align to the UTC calendar boundary (server-side, handlers.ts);
+	// this can disagree with a tz'd calendar [[limits]] rule shown in Limits, so the
+	// UTC basis is surfaced in the UI (issue #9). `utc:true` marks those controls.
+	const UTC_HINT = 'Window is UTC-aligned — may differ from a rule’s configured timezone';
 	const WINDOWS = [
-		{ id: 'today', label: 'Today' },
-		{ id: '24h', label: '24h' },
-		{ id: '7d', label: '7d' },
-		{ id: '30d', label: '30d' },
-		{ id: 'month', label: 'This month' }
+		{ id: 'today', label: 'Today', utc: true },
+		{ id: '24h', label: '24h', utc: false },
+		{ id: '7d', label: '7d', utc: false },
+		{ id: '30d', label: '30d', utc: false },
+		{ id: 'month', label: 'This month', utc: true }
 	] as const;
 
 	let window = $state<string>('24h');
@@ -132,40 +138,19 @@
 
 	// Build a stacked-bar chart model from the (bucket, group, cost) series. Inline
 	// SVG (no charting dependency): one column per time bucket, segments stacked per
-	// group, height scaled to the busiest bucket.
-	const chart = $derived.by(() => {
-		const series = timeseries.data?.series ?? [];
-		const bucketMs = timeseries.data?.bucketMs ?? 3_600_000;
-		const buckets = new Map<number, Map<string, number>>();
-		const groups = new Set<string>();
-		for (const row of series) {
-			groups.add(row.grp);
-			let b = buckets.get(row.bucket);
-			if (!b) {
-				b = new Map();
-				buckets.set(row.bucket, b);
-			}
-			b.set(row.grp, (b.get(row.grp) ?? 0) + row.cost);
-		}
-		const orderedGroups = [...groups];
-		const groupColor = new Map(orderedGroups.map((g, i) => [g, colorFor(g, i)]));
-		const orderedBuckets = [...buckets.keys()].sort((a, b) => a - b);
-		let max = 0;
-		for (const b of buckets.values()) {
-			let sum = 0;
-			for (const v of b.values()) sum += v;
-			if (sum > max) max = sum;
-		}
-		const columns = orderedBuckets.map((bucket) => {
-			const b = buckets.get(bucket)!;
-			const segments = orderedGroups
-				.filter((g) => (b.get(g) ?? 0) > 0)
-				.map((g) => ({ group: g, cost: b.get(g) ?? 0, color: groupColor.get(g)! }));
-			const sum = segments.reduce((s, seg) => s + seg.cost, 0);
-			return { bucket, segments, sum };
-		});
-		return { columns, groups: orderedGroups, groupColor, max, bucketMs };
-	});
+	// group, height scaled to the busiest bucket. Logic lives in `$lib/spend-chart`
+	// (pure + unit-tested).
+	const chart = $derived(
+		buildSpendChart(
+			timeseries.data?.series ?? [],
+			timeseries.data?.bucketMs ?? 3_600_000,
+			colorFor
+		)
+	);
+	// Empty = no buckets, or buckets exist but no positive spend (zero-cost-only
+	// window → `max === 0`): show the "No spend" panel rather than an empty frame
+	// with dangling legend swatches (issue #8).
+	const chartEmpty = $derived(isSpendChartEmpty(chart));
 
 	const CHART_W = 720;
 	const CHART_H = 180;
@@ -204,9 +189,10 @@
 								? 'bg-background font-medium text-foreground shadow-sm'
 								: 'text-muted-foreground hover:text-foreground'
 						)}
+						title={w.utc ? UTC_HINT : undefined}
 						onclick={() => (window = w.id)}
 					>
-						{w.label}
+						{w.label}{#if w.utc}<span class="ml-0.5 text-[8px] uppercase opacity-60">utc</span>{/if}
 					</button>
 				{/each}
 			</div>
@@ -228,6 +214,9 @@
 			{#if summary.isFetching || budgets.isFetching}
 				<span class="text-[10px] text-blue-500">updating…</span>
 			{/if}
+			<span class="text-[10px] text-muted-foreground" title={UTC_HINT}>
+				Today / This month windows are UTC-aligned
+			</span>
 		</div>
 
 		<!-- 2. Cards -->
@@ -283,6 +272,7 @@
 			{:else}
 				<div class="grid grid-cols-1 gap-2 md:grid-cols-2">
 					{#each rules as rule (rule.name)}
+						{@const pres = presentRule(rule)}
 						<div class="rounded-lg border p-3">
 							<div class="flex items-center justify-between gap-2">
 								<span class="font-mono text-sm font-semibold">{rule.name}</span>
@@ -295,18 +285,26 @@
 									{rule.state}
 								</span>
 							</div>
-							<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-								<div
-									class={cn('h-full rounded-full', barColor(rule.state))}
-									style={`width:${Math.min(100, rule.fraction * 100).toFixed(1)}%`}
-								></div>
-							</div>
-							<div class="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
-								<span class="font-mono text-foreground">
-									{fmtUsd(rule.spentUsd)} / {fmtUsd(rule.capUsd)}
-								</span>
-								<span>{(rule.fraction * 100).toFixed(0)}%</span>
-							</div>
+							{#if pres.kind === 'disabled'}
+								<!-- Cap-0 rule: paid spend disabled for the scope. Render distinctly,
+								     not as a maxed-out bar — no money was spent (issue #10b). -->
+								<div class="mt-2 rounded bg-muted px-2 py-1 text-[11px] font-medium text-muted-foreground">
+									{pres.label}
+								</div>
+							{:else}
+								<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+									<div
+										class={cn('h-full rounded-full', barColor(rule.state))}
+										style={`width:${pres.fillPct.toFixed(1)}%`}
+									></div>
+								</div>
+								<div class="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+									<span class="font-mono text-foreground">
+										{fmtUsd(rule.spentUsd)} / {fmtUsd(rule.capUsd)}
+									</span>
+									<span>{pres.percentLabel}</span>
+								</div>
+							{/if}
 							<div class="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
 								<span title={scopeLabel(rule.scope)} class="max-w-[60%] truncate">
 									{scopeLabel(rule.scope)}
@@ -326,7 +324,7 @@
 			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
 				Spend over time
 			</h2>
-			{#if chart.columns.length === 0}
+			{#if chartEmpty}
 				<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
 					No spend in this window.
 				</div>

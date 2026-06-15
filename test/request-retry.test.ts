@@ -961,6 +961,125 @@ test("withRequestRetry: both budget checks undefined lets the request proceed no
   assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"]);
 });
 
+// ---------------------------------------------------------------------------
+// Capture-once across retry/resume (spec USAGE-COST-LIMITS §3.1; review #20).
+//
+// The single authoritative agent_loop capture point is `withRequestRetry`'s
+// terminal `done` branch, which fires `onRequestCommitted` exactly once per
+// committed request, gated on `committed && usage`. In production (factory.ts
+// `onRequestCommitted`) that hook does TWO things per commit: `budget.record(
+// {class:"agent_loop"})` (in-memory engine increment) and the durable
+// `insertUsageEvent`. These tests drive the SAME seam with a factory-shaped
+// hook and assert exactly ONE record + ONE ledger insert across a fail→fail→
+// done sequence, and ZERO on a never-committed (parked/resumable) request.
+// ---------------------------------------------------------------------------
+
+interface RecordedUsage {
+  class: string;
+  costUsd: number;
+}
+
+/**
+ * A factory-shaped `onRequestCommitted`: mirrors src/agent/factory.ts — on each
+ * commit it increments the (fake) BudgetEngine and appends one (fake) durable
+ * `usage_events` row, both class `agent_loop`. Records each call for assertions.
+ */
+function makeAgentLoopCaptureHook() {
+  const recorded: RecordedUsage[] = [];
+  const inserted: RecordedUsage[] = [];
+  const hook = (msg: AssistantMessage): void => {
+    const u = msg.usage;
+    const event: RecordedUsage = { class: "agent_loop", costUsd: u.cost?.total ?? 0 };
+    // budget.record(...) — synchronous in-memory increment (app.ts recordUsageEvent).
+    recorded.push(event);
+    // insertUsageEvent(...) — the durable ledger append fired from the same call.
+    inserted.push(event);
+  };
+  return { hook, recorded, inserted };
+}
+
+const committedDone = (cost: number): AssistantMessageEvent => ({
+  type: "done",
+  reason: "stop",
+  message: message({
+    stopReason: "stop",
+    usage: {
+      input: 100,
+      output: 200,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 300,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+    },
+  }),
+});
+
+test("withRequestRetry: fail→fail→done captures the agent_loop row EXACTLY ONCE (#20)", async () => {
+  // Two retryable pre-commit failures then a clean commit. The capture point is
+  // the single terminal `done`, so `budget.record({class:"agent_loop"})` and the
+  // durable insert each fire exactly once — never per attempt. If `record` were
+  // moved outside the `committed && usage` block (e.g. onto every attempt) this
+  // would see three records.
+  const { fn, calls } = scriptedBase([
+    { events: [errorEvent("503 unavailable")] },
+    { events: [errorEvent("500 internal")] },
+    { events: [startEvent(), textDeltaEvent("ok"), committedDone(0.0061)] },
+  ]);
+  const { hook, recorded, inserted } = makeAgentLoopCaptureHook();
+  const wrapped = withRequestRetry(fn, { ...FAST }, { onRequestCommitted: hook });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 3, "two failures then the committed attempt");
+  assert.deepEqual(events.map((e) => e.type), ["start", "text_delta", "done"], "only the clean attempt is forwarded");
+  assert.equal(recorded.length, 1, "exactly one budget.record({class:'agent_loop'}) across the whole retried request");
+  assert.equal(recorded[0]!.class, "agent_loop");
+  assert.equal(recorded[0]!.costUsd, 0.0061);
+  assert.equal(inserted.length, 1, "exactly one insertUsageEvent — the ledger is not double-written by the failed attempts");
+});
+
+test("withRequestRetry: a never-committed (parked/resumable) request emits ZERO agent_loop rows (#20)", async () => {
+  // The resume precondition: a request that exhausts its budget WITHOUT a terminal
+  // `done` (environmental → parks failed-resumable) must not have recorded any
+  // agent_loop usage. So when the parked session is later resumed, the resumed
+  // request is the FIRST and ONLY one to commit — no double count. Here the first
+  // life of the request fails terminally and captures nothing.
+  const { fn } = scriptedBase([{ events: [errorEvent("503 unavailable")] }]);
+  const { hook, recorded, inserted } = makeAgentLoopCaptureHook();
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 0, ...FAST }, { onRequestCommitted: hook });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.deepEqual(events.map((e) => e.type), ["error"], "the request parked without committing");
+  assert.equal(recorded.length, 0, "no agent_loop record for a request that never reached a committed done");
+  assert.equal(inserted.length, 0, "no ledger insert either — nothing to resume-double-count");
+});
+
+test("withRequestRetry: resume — the already-committed request is never replayed, so the resumed life captures once (#20)", async () => {
+  // Model the resume timeline at the capture seam: the SAME logical request first
+  // commits once (life 1), then a fresh wrapped call (life 2, the resume) commits
+  // its own single row. The wrapper never re-drives an already-committed request
+  // within a life (the terminal `done` finalizes and the generator returns), so
+  // across both lives there is one record per committed `done` — two total, never
+  // a re-emit of life 1's already-captured request.
+  const { hook, recorded } = makeAgentLoopCaptureHook();
+
+  // Life 1: a clean single-attempt commit.
+  const life1 = scriptedBase([{ events: [startEvent(), committedDone(0.01)] }]);
+  const w1 = withRequestRetry(life1.fn, { ...FAST }, { onRequestCommitted: hook });
+  const e1 = await drain(w1(MODEL, CONTEXT, undefined));
+  assert.equal(e1.filter((e) => e.type === "done").length, 1, "life 1 forwards exactly one terminal done");
+  assert.equal(recorded.length, 1, "life 1 captured once");
+
+  // Life 2 (the resume of the parked/continued run): a brand-new wrapped call.
+  // Draining it does NOT replay life 1 — it captures only its own commit.
+  const life2 = scriptedBase([{ events: [startEvent(), committedDone(0.02)] }]);
+  const w2 = withRequestRetry(life2.fn, { ...FAST }, { onRequestCommitted: hook });
+  await drain(w2(MODEL, CONTEXT, undefined));
+  assert.equal(recorded.length, 2, "the resume captured its OWN single row — life 1's commit was not re-emitted");
+  assert.deepEqual(
+    recorded.map((r) => r.costUsd),
+    [0.01, 0.02],
+    "one row per committed life, in order — no duplicate of the already-committed request",
+  );
+});
+
 test("withRequestRetry: a committed done LACKING usage does not call the capture hook (#3)", async () => {
   // The two capture branches must be consistent: the ring branch already gates on
   // `usage`, so the onRequestCommitted branch must too. A `done` whose message

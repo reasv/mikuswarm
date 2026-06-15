@@ -2868,8 +2868,40 @@ export class Storage {
    * Append one billable event to the unified ledger (spec §3.1). Best-effort at
    * the call site (a ledger failure must never fail the underlying work); the
    * store generates `id`/`created_at` and defaults `ts` to now.
+   *
+   * Ledger correctness invariants (the engine's accuracy rests on both):
+   *   1. APPEND-ONLY with a RANDOM PK and NO DEDUP. There is no idempotency key —
+   *      nothing here collapses a duplicate logical event. Correctness therefore
+   *      requires every capture point (the §3.1 write sites — `recordUsageEvent`,
+   *      caption/embedding workers) to fire AT MOST ONCE per logical event; a
+   *      double-fire would be counted twice by every covering rule.
+   *   2. MICROTASK-DRAINED BEFORE THE ENGINE TICK. The BudgetEngine is seeded once
+   *      from a SUM over this table, then kept current by in-memory increments on
+   *      each insert; its periodic reconcile runs on a `setInterval` (macrotask).
+   *      For seed-then-increment consistency this durable write (queued on the
+   *      single-writer microtask queue) and the matching `engine.record()` must
+   *      both settle within one synchronous turn + microtask drain, BEFORE any
+   *      `tick()` macrotask re-sums the ledger — otherwise a tick could double-count
+   *      an increment also reflected in its SUM, or miss one not yet written. The
+   *      app-side ordering of `engine.record()` vs this write lives at
+   *      `recordUsageEvent` in `src/app.ts`.
    */
   insertUsageEvent(input: UsageEventInput): Promise<void> {
+    // The ledger is the durable budget truth and the seed source for the
+    // BudgetEngine's per-window SUMs; a non-finite or negative `cost_usd` would
+    // poison those sums (and a NaN can never be cleared). Reject such a row at the
+    // door — code-level guard, no DDL CHECK (the v25 table may already exist on a
+    // live deployment, and a CHECK needs a table rebuild). The dropped row is rare
+    // (no caller emits these today) and non-fatal: token counts for that one event
+    // are lost, never the underlying work.
+    if (!Number.isFinite(input.costUsd) || input.costUsd < 0) {
+      this.logger?.warn("usage_event_rejected_bad_cost", {
+        class: input.class,
+        model: input.modelId,
+        costUsd: input.costUsd,
+      });
+      return Promise.resolve();
+    }
     const now = Date.now();
     const row: UsageEventRow = {
       id: `usage_${nanoid(12)}`,
@@ -2932,7 +2964,44 @@ export class Storage {
       const row = db
         .prepare(`select coalesce(sum(cost_usd), 0) as c from usage_events where ${clauses.join(" and ")}`)
         .get(...params) as { c: number };
-      return row.c;
+      // Defense-in-depth: a single non-finite `cost_usd` row (e.g. left behind by a
+      // pre-guard write or a degraded backfill) makes SQLite's SUM non-finite and
+      // would poison the whole window total. `insertUsageEvent` now rejects such
+      // rows at the door (the primary guard); this clamp keeps the read robust if
+      // one ever slips in. A finite sum passes through unchanged.
+      return Number.isFinite(row.c) ? row.c : 0;
+    });
+  }
+
+  /**
+   * Earliest `ts` of a ledger row matching one rule's own-scope selector within
+   * `[since, until)`, or `null` when none match (spec USAGE-COST-LIMITS §6.1).
+   * Mirrors {@link sumUsageCost}'s selector/window filtering. Used OFF the hot path
+   * (console + the human-facing refusal message) to compute an accurate rolling
+   * ETA — the oldest contributing spend ages out at `minTs + durationMs`, far
+   * sooner than the `now + durationMs` upper bound the gate cheaply uses (§5 #5).
+   */
+  minUsageTs(filter: UsageCostFilter): number | null {
+    const clauses: string[] = ["ts >= ?"];
+    const params: unknown[] = [filter.since];
+    if (filter.until !== undefined) {
+      clauses.push("ts < ?");
+      params.push(filter.until);
+    }
+    const inClause = (column: string, values: string[] | undefined): void => {
+      if (!values || values.length === 0) return;
+      clauses.push(`${column} in (${values.map(() => "?").join(", ")})`);
+      params.push(...values);
+    };
+    inClause("class", filter.classes);
+    inClause("session_type", filter.sessionTypes);
+    inClause("tool_name", filter.tools);
+    inClause("model_id", filter.models);
+    return this.read((db) => {
+      const row = db
+        .prepare(`select min(ts) as t from usage_events where ${clauses.join(" and ")}`)
+        .get(...params) as { t: number | null };
+      return row.t ?? null;
     });
   }
 
@@ -2966,9 +3035,13 @@ export class Storage {
   getUsageTimeseries(since: number, bucketMs: number, groupBy: "class" | "model"): UsageTimeseriesRow[] {
     const groupCol = groupBy === "model" ? "model_id" : "class";
     return this.read((db) => {
+      // `cast(... as integer)` forces an integer FLOOR: a bound numeric parameter
+      // makes `ts / ?` floating-point in SQLite, so without the cast the bucket
+      // expression returns `ts` itself and `group by bucket` would collapse only
+      // identical timestamps (one column per event instead of per hour/day).
       return db
         .prepare(
-          `select (ts / ?) * ? as bucket, ${groupCol} as grp, coalesce(sum(cost_usd), 0) as cost
+          `select cast(ts / ? as integer) * ? as bucket, ${groupCol} as grp, coalesce(sum(cost_usd), 0) as cost
              from usage_events where ts >= ?
              group by bucket, grp order by bucket asc`,
         )
@@ -2999,11 +3072,24 @@ export class Storage {
              coalesce(s.usage_cache_read_tokens, 0) as cacheReadTokens,
              coalesce(s.usage_cache_write_tokens, 0) as cacheWriteTokens,
              coalesce(s.usage_cost, 0) as agentCost,
-             coalesce((select sum(u.cost_usd) from usage_events u
-                        where u.agent_session_id = s.id and u.class = 'tool'), 0) as toolCost,
-             coalesce((select count(*) from usage_events u
-                        where u.agent_session_id = s.id and u.class = 'tool'), 0) as toolCalls
+             coalesce(t.toolCost, 0) as toolCost,
+             coalesce(t.toolCalls, 0) as toolCalls
            from agent_sessions s
+           -- Per-session tool rollup as ONE grouped pass, joined by id, instead of two
+           -- correlated subqueries per row. The correlated form forced each session to
+           -- probe usage_events via idx_usage_events_class_ts with agent_session_id as a
+           -- residual filter -- ~O(N x #tool_events) per console page over a growing
+           -- append-only table. Result parity is exact: the subselect groups by
+           -- agent_session_id (one row per id; the null-session group never equals a
+           -- concrete s.id, so it drops just as the correlated per-row equality did),
+           -- and a session with no tool rows gets a null t coalesced to 0 -- matching the
+           -- old per-column coalesce. No new index (keeps the append-only table lean).
+           left join (
+             select agent_session_id, sum(cost_usd) as toolCost, count(*) as toolCalls
+             from usage_events
+             where class = 'tool'
+             group by agent_session_id
+           ) t on t.agent_session_id = s.id
            order by coalesce(s.completed_at, s.updated_at) desc
            limit ?`,
         )
@@ -6178,6 +6264,13 @@ create index if not exists idx_tool_invocations_session
 // invisible to the BudgetEngine (§2.2). Shared verbatim between the canonical
 // SCHEMA (fresh DBs) and the v24→v25 migration step (existing DBs) so the two
 // can never drift; both uses are `create … if not exists`, idempotent.
+//
+// APPEND-ONLY, RANDOM PK, NO DEDUP: the `id` is a random `usage_<nanoid>` (or a
+// `usage_bf_*` backfill key), never a natural/idempotency key — nothing collapses
+// a duplicate logical event, so each capture point must fire at most once. The
+// engine's seed-then-increment consistency additionally requires each insert to be
+// microtask-drained before its `setInterval` tick. See `insertUsageEvent` for the
+// full statement of both invariants.
 const USAGE_EVENTS_SCHEMA = `
 create table if not exists usage_events (
   id text primary key,
@@ -6200,6 +6293,12 @@ create table if not exists usage_events (
   created_at integer not null
 );
 
+-- NB: there is intentionally NO session_type index. Session-scoped budget rules
+-- (the spec's flagship) sumUsageCost over "ts >= window.start" plus a residual
+-- "session_type in (...)" filter -- served by idx_usage_events_ts (the range bounds
+-- the scan; the type filter is cheap on the windowed slice). Add a dedicated
+-- idx_usage_events_sessiontype_ts only for a high-volume deployment running long
+-- rolling session rules where the windowed scan grows costly.
 create index if not exists idx_usage_events_ts        on usage_events(ts);
 create index if not exists idx_usage_events_session   on usage_events(agent_session_id, ts);
 create index if not exists idx_usage_events_class_ts   on usage_events(class, ts);
@@ -7289,15 +7388,32 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     // a partial fixture simply gets an empty ledger (new rows accrue from the
     // upgrade point) rather than failing the whole migration. The outer migration
     // transaction is unaffected — a caught statement error leaves it intact.
-    const backfill = (sql: string): void => {
+    //
+    // The `hasTable`/pragma guards above this `try` already cover the *expected*
+    // partial-schema case (a missing source table is skipped before we ever call
+    // `backfill`), so reaching this catch is more likely a real defect on a complete
+    // DB (a typo'd column, a future source-table rename) than a benign legacy shape —
+    // and its only other symptom is a silently empty console chart, indistinguishable
+    // from the spec-sanctioned "no history". So LOG the caught error (stable tag +
+    // lane + message) to leave a trace; behavior is unchanged (still swallowed, never
+    // re-thrown, migration proceeds). The migration layer is a free function with no
+    // `Storage.logger`, so this uses `console.warn` directly with structured fields.
+    const backfill = (lane: string, sql: string): void => {
       try {
         db.exec(sql);
-      } catch {
-        /* best-effort history copy (§3.2 step 3): skip on a partial legacy shape */
+      } catch (error) {
+        console.warn(
+          JSON.stringify({
+            event: "usage_backfill_skipped",
+            lane,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
       }
     };
     if (hasTable("tool_invocations")) {
       backfill(
+        "tool",
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
            tool_name, model_id, provider, input_tokens, output_tokens,
@@ -7314,6 +7430,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     }
     if (hasTable("agent_sessions")) {
       backfill(
+        "agent_loop",
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
            tool_name, model_id, provider, input_tokens, output_tokens,
@@ -7333,6 +7450,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       const columns = db.pragma(`table_info(media_assets)`) as Array<{ name: string }>;
       if (columns.some((column) => column.name === "caption_cost")) {
         backfill(
+          "caption",
           `insert into usage_events (
              id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
              tool_name, model_id, provider, input_tokens, output_tokens,

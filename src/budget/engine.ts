@@ -112,6 +112,21 @@ export interface BudgetEngineOptions {
     tools?: string[];
     models?: string[];
   }) => number;
+  /**
+   * Earliest `ts` of the ledger rows matching a selector within a window, or null
+   * when none match. Used OFF the hot path (`ruleStatuses` + the refusal-message
+   * path via `rollingResetsAt`) to compute an accurate rolling reset ETA (§5 #5);
+   * NEVER consulted inside `check()`'s gate loop. Optional so tests/engines without
+   * a ledger fall back to the cheap `now + duration` upper bound.
+   */
+  minUsageTs?: (filter: {
+    since: number;
+    until?: number;
+    classes?: string[];
+    sessionTypes?: string[];
+    tools?: string[];
+    models?: string[];
+  }) => number | null;
   /** Model ids whose configured cost rate is zero (§2.2). */
   zeroCostModelIds: Set<string>;
   /**
@@ -147,7 +162,10 @@ export class BudgetEngine {
 
   constructor(private readonly options: BudgetEngineOptions) {
     this.now = options.now ?? Date.now;
-    this.nearThreshold = options.nearThreshold ?? 0.8;
+    // Clamp to the open interval (0,1): a 0 threshold would mark every rule with
+    // any spend "near", and a ≥1 threshold would disable the "near" badge entirely
+    // (both are nonsense for the console's headroom signal). Fall back to 0.8.
+    this.nearThreshold = Math.min(0.999, Math.max(0.001, options.nearThreshold ?? 0.8));
     this.tickMs = options.tickMs ?? 60_000;
     const now = this.now();
     this.states = options.rules.map((rule) => {
@@ -181,9 +199,33 @@ export class BudgetEngine {
   }
 
   /**
-   * Reconcile every rule's window + total. Calendar rules reseed only when their
-   * boundary has passed; rolling rules recompute every tick from the ledger
-   * (cheap via `idx_usage_events_ts`) to shed aged-out spend (§6.1).
+   * Roll a CALENDAR rule's window forward, in place and WITHOUT a SQL SUM, if its
+   * boundary has passed at `now`. A fresh calendar window is empty at its start —
+   * per-rule increments only ever happen via `record()`, which rolls-then-adds —
+   * so resetting `spent` to 0 is exact, not a guess (§6.5: no SUM on the hot path).
+   *
+   * Called at the top of every read/decision path (`check`, `isClassAvailable`,
+   * `ruleStatuses`) and inside `record()`'s loop, so a passed boundary is reflected
+   * immediately rather than waiting up to one `tick()` (which would otherwise let a
+   * rule that hit cap yesterday keep reporting blocked against a fresh-empty
+   * window). Rolling windows are untouched here — they recompute exactly in
+   * `tick()` (their total has no cheap closed-form roll).
+   */
+  private rollIfNeeded(state: RuleState, now: number): void {
+    if (state.rule.window.type !== "calendar") return;
+    if (now < state.resetsAt) return;
+    const w = resolveWindow(state.rule.window, now);
+    state.windowStart = w.start;
+    state.resetsAt = w.resetsAt;
+    state.spent = 0;
+  }
+
+  /**
+   * Reconcile every rule's window + total from the ledger — the authoritative
+   * periodic reconciler. Calendar rules re-SUM when their boundary has passed
+   * (correcting any drift from the cheap `rollIfNeeded` zero-reset); rolling rules
+   * recompute every tick (cheap via `idx_usage_events_ts`) to shed aged-out spend
+   * (§6.1). This is the only place a calendar roll consults the ledger.
    */
   private tick(): void {
     const now = this.now();
@@ -204,6 +246,43 @@ export class BudgetEngine {
 
   private isZeroCost(modelId: string): boolean {
     return this.options.zeroCostModelIds.has(modelId);
+  }
+
+  /**
+   * The accurate "resets at" instant for a rule's CURRENT window (§5 #5).
+   *
+   * - Calendar: the fixed boundary already in `state.resetsAt`.
+   * - Rolling: a trailing window has no fixed boundary; it is fully clear once its
+   *   OLDEST contributing spend ages out, i.e. `min(ts in window) + durationMs`.
+   *   `state.resetsAt` (`now + durationMs`) is only an UPPER bound — it pins at the
+   *   full duration even when the oldest spend ages out in minutes, making the
+   *   console countdown and the "back in 24h" refusal misleading. We query the
+   *   earliest contributing `ts` off the hot path; with no contributing spend (or
+   *   no ledger wired) we fall back to that upper bound.
+   *
+   * OFF the hot path only (`ruleStatuses` + `accurateResetsAt`); `check()` keeps
+   * the cheap `state.resetsAt`.
+   */
+  private computeResetsAt(state: RuleState, now: number): number {
+    if (state.rule.window.type !== "rolling") return state.resetsAt;
+    const durationMs = state.rule.window.durationMs;
+    const minTs = this.options.minUsageTs?.({ since: state.windowStart, ...state.rule.selector });
+    if (minTs === undefined || minTs === null) return now + durationMs;
+    return minTs + durationMs;
+  }
+
+  /**
+   * The accurate reset instant for a named rule's current window (§5 #5), for the
+   * human-facing refusal/defer message path in `app.ts`. Rolls a passed calendar
+   * boundary first; for a rolling rule returns the `min(contributing ts) + duration`
+   * ETA. Returns `undefined` for an unknown rule name so the caller can fall back.
+   */
+  accurateResetsAt(ruleName: string): number | undefined {
+    const state = this.states.find((s) => s.rule.name === ruleName);
+    if (!state) return undefined;
+    const now = this.now();
+    this.rollIfNeeded(state, now);
+    return this.computeResetsAt(state, now);
   }
 
   private selectorMatches(rule: LimitRule, d: SpendDescriptor): boolean {
@@ -236,8 +315,10 @@ export class BudgetEngine {
     if (this.isZeroCost(descriptor.modelId)) {
       return { allowed: true, blockingRules: [] };
     }
+    const now = this.now();
     const blocking: BlockingRule[] = [];
     for (const state of this.states) {
+      this.rollIfNeeded(state, now);
       if (!this.selectorMatches(state.rule, descriptor)) continue;
       if (state.spent >= state.rule.maxUsd) blocking.push(this.toBlocking(state));
     }
@@ -264,9 +345,15 @@ export class BudgetEngine {
   /** Is the named model currently within budget (hook for deferred fallback, §6.2)? */
   isModelAvailable(modelId: string): boolean {
     if (this.isZeroCost(modelId)) return true;
+    const now = this.now();
     for (const state of this.states) {
+      this.rollIfNeeded(state, now);
+      // A rule covers this model iff it either targets it explicitly OR has no
+      // `models` selector (wildcard) — symmetric with `selectorMatches`. Without
+      // the wildcard arm a global over-cap rule wrongly reports every model free,
+      // contradicting `check()`.
       const s = state.rule.selector;
-      if (s.models && s.models.includes(modelId) && state.spent >= state.rule.maxUsd) return false;
+      if ((!s.models || s.models.includes(modelId)) && state.spent >= state.rule.maxUsd) return false;
     }
     return true;
   }
@@ -305,7 +392,12 @@ export class BudgetEngine {
    * never under-enforces).
    */
   record(event: UsageEventInput): void {
-    if (event.costUsd <= 0) return;
+    // Reject NaN, 0, and negatives in one expression (same idiom as
+    // normalize.ts:73). `NaN <= 0` is false, so the old `<= 0` form admitted a NaN
+    // cost and poisoned `state.spent` (the rule then stops enforcing until the next
+    // recompute); a negative would be dropped here but summed on the recompute path
+    // → divergence. `!(x > 0)` rejects all three uniformly.
+    if (!(event.costUsd > 0)) return;
     const descriptor: SpendDescriptor = {
       class: event.class,
       sessionType: event.sessionType ?? undefined,
@@ -315,21 +407,19 @@ export class BudgetEngine {
     };
     const now = this.now();
     for (const state of this.states) {
-      // Lazily roll a calendar window whose boundary passed since the last tick,
-      // so a spend that lands just after midnight doesn't accrue to yesterday.
-      if (state.rule.window.type === "calendar" && now >= state.resetsAt) {
-        const w = resolveWindow(state.rule.window, now);
-        state.windowStart = w.start;
-        state.resetsAt = w.resetsAt;
-        state.spent = this.sumRule(state.rule, w.start);
-      }
+      // Roll a passed calendar boundary in place (no SUM, §6.5) before adding, so a
+      // spend that lands just after midnight accrues to the new window, not
+      // yesterday's. Rolling windows are reconciled by `tick()`.
+      this.rollIfNeeded(state, now);
       if (this.selectorMatches(state.rule, descriptor)) state.spent += event.costUsd;
     }
   }
 
   /** One status entry per configured rule (never filtered) for the console (§6.2). */
   ruleStatuses(): RuleStatus[] {
+    const now = this.now();
     return this.states.map((state) => {
+      this.rollIfNeeded(state, now);
       const cap = state.rule.maxUsd;
       const fraction = cap > 0 ? state.spent / cap : state.spent > 0 ? Infinity : 1;
       const blocked = state.spent >= cap;
@@ -346,7 +436,10 @@ export class BudgetEngine {
         fraction: Number.isFinite(fraction) ? fraction : 1,
         state: blocked ? "blocked" : near ? "near" : "ok",
         window,
-        resetsAt: state.resetsAt,
+        // Accurate reset for the console countdown: a rolling rule resets when its
+        // oldest contributing spend ages out, not at the full-duration upper bound
+        // (§5 #5). Off the hot path, so the `minUsageTs` query is fine here.
+        resetsAt: this.computeResetsAt(state, now),
         scope: state.rule.selector,
       } satisfies RuleStatus;
     });
@@ -385,4 +478,55 @@ export class BudgetEngine {
       ...extra,
     });
   }
+}
+
+/**
+ * Build a worker-pool claim gate (spec USAGE-COST-LIMITS §6.3/§6.4, review #2): a
+ * `() => boolean` that returns true (PARK the pool) while ANY of `descriptors` is
+ * over budget, and — mirroring the caption pool — emits ONE rate-limited (≤1/min)
+ * `usage_limit_blocked` log (gate `"worker_claim"`) naming the hit rules on pause.
+ *
+ * The summary/diary/embed pools all park silently before this (only caption logged),
+ * masking the §6.4 invariant that every blocking gate names the rules it hit — worst
+ * for summarization, whose pause transitively halts triggered/proactive sessions via
+ * the dependency cascade (§2.1). The first over-budget descriptor wins the log
+ * (conservative pause: any one over-budget descriptor parks the whole pool).
+ *
+ * `descriptors` is resolved lazily each call so a caller can recompute model ids the
+ * way the engine does; an empty result (e.g. every session type unresolvable) never
+ * parks. Each gate owns its own rate-limit clock — independent across pools.
+ *
+ * `engine` may be a concrete `BudgetEngine` (summary/diary call sites, constructed
+ * after the engine) OR a late-bound source `() => BudgetEngine | undefined` for a
+ * consumer wired BEFORE the engine exists (the embed worker, whose subsystem is
+ * built ahead of the engine and reads it from the shared holder at call time —
+ * finding #21). The source is resolved per call; while it is still undefined the
+ * gate returns `false` (never park) and logs nothing — no embedding work runs
+ * before startup completes anyway.
+ */
+export function makeRateLimitedClaimGate(opts: {
+  engine: BudgetEngine | (() => BudgetEngine | undefined);
+  /** The prospective spends to gate on (first blocked one wins the log). */
+  descriptors: () => SpendDescriptor[];
+  now?: () => number;
+}): () => boolean {
+  const now = opts.now ?? Date.now;
+  const resolveEngine =
+    typeof opts.engine === "function" ? opts.engine : () => opts.engine as BudgetEngine;
+  let lastPauseLog = 0;
+  return () => {
+    const engine = resolveEngine();
+    if (!engine) return false; // engine not yet wired → never park, never log
+    for (const descriptor of opts.descriptors()) {
+      const result = engine.check(descriptor);
+      if (result.allowed) continue;
+      const t = now();
+      if (t - lastPauseLog > 60_000) {
+        lastPauseLog = t;
+        engine.logBlocked("worker_claim", result.blockingRules, descriptor);
+      }
+      return true;
+    }
+    return false;
+  };
 }

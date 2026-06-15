@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BudgetEngine, type LimitRule } from "../src/budget/engine.js";
+import { BudgetEngine, makeRateLimitedClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
+import type { UsageEventInput } from "../src/storage/database.js";
 import { normalizeLimits, type RawLimitRule } from "../src/budget/normalize.js";
 import { parseDuration, resolveWindow, isValidTimeZone } from "../src/budget/window.js";
-import { collectZeroCostModelIds } from "../src/budget/zero-cost.js";
+import { collectZeroCostModelIds, collectKnownModelIds } from "../src/budget/zero-cost.js";
 
 const noopLogger = {
   debug() {},
@@ -173,6 +174,456 @@ test("ruleStatuses: one entry per rule with state + fraction", () => {
 });
 
 // ---------------------------------------------------------------------------
+// makeRateLimitedClaimGate — worker-pool claim gate logging (§6.4 / review #2)
+// ---------------------------------------------------------------------------
+
+/** A logger that records every `warn` call (message + fields) for assertions. */
+function capturingLogger() {
+  const warns: { message: string; fields?: Record<string, unknown> }[] = [];
+  const logger = {
+    debug() {}, info() {}, error() {},
+    warn(message: string, fields?: Record<string, unknown>) {
+      warns.push({ message, fields });
+    },
+    child() {
+      return logger;
+    },
+  } as never;
+  return { logger, warns };
+}
+
+function overBudgetEngine(rules: LimitRule[], spend: { descriptor: SpendDescriptor; cost: number }[], now = () => 1_000_000) {
+  const { logger, warns } = capturingLogger();
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger,
+    now,
+  });
+  for (const s of spend) engine.record({ ...s.descriptor, costUsd: s.cost });
+  return { engine, warns };
+}
+
+test("#2 claim gate: over-budget pool logs ONE usage_limit_blocked('worker_claim') with the hit rules", () => {
+  // A pool whose gated class is over budget must park AND emit one rule-naming log
+  // (§6.4 explicitly names worker pools). Pre-fix summary/diary/embed parked silently.
+  const rules: LimitRule[] = [
+    { name: "diary-cap", maxUsd: 1, window: dayWindow, selector: { sessionTypes: ["diary"] } },
+  ];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", sessionType: "diary", modelId: "m1" }, cost: 5 },
+  ]);
+  const gate = makeRateLimitedClaimGate({
+    engine,
+    descriptors: () => [{ class: "agent_loop", sessionType: "diary", modelId: "m1" }],
+  });
+  assert.equal(gate(), true, "the over-budget gate parks the pool");
+  const blocked = warns.filter((w) => w.message === "usage_limit_blocked");
+  assert.equal(blocked.length, 1, "exactly one block log on pause");
+  assert.equal(blocked[0].fields?.gate, "worker_claim", "gate tag names the worker-claim gate");
+  assert.deepEqual(
+    (blocked[0].fields?.limits as { name: string }[]).map((l) => l.name),
+    ["diary-cap"],
+    "the log names the hit rule(s)",
+  );
+});
+
+test("#2 claim gate: repeated polls within a minute do NOT re-log (rate limit holds)", () => {
+  let clock = 1_000_000;
+  const rules: LimitRule[] = [{ name: "g", maxUsd: 1, window: dayWindow, selector: {} }];
+  const { engine, warns } = overBudgetEngine(
+    rules,
+    [{ descriptor: { class: "agent_loop", modelId: "m1" }, cost: 5 }],
+    () => clock,
+  );
+  const gate = makeRateLimitedClaimGate({
+    engine,
+    descriptors: () => [{ class: "agent_loop", modelId: "m1" }],
+    now: () => clock,
+  });
+  // Three polls 20s apart — all park, but only the first logs (≤1/min).
+  assert.equal(gate(), true);
+  clock += 20_000;
+  assert.equal(gate(), true);
+  clock += 20_000;
+  assert.equal(gate(), true);
+  assert.equal(
+    warns.filter((w) => w.message === "usage_limit_blocked").length,
+    1,
+    "still parking, but no re-log inside the 60s window",
+  );
+  // Past the minute, it logs again (periodic re-log, §6.4).
+  clock += 30_000; // now 70s since the first log
+  assert.equal(gate(), true);
+  assert.equal(
+    warns.filter((w) => w.message === "usage_limit_blocked").length,
+    2,
+    "re-logs once the rate-limit window elapses",
+  );
+});
+
+test("#2 claim gate: within-budget pool does not park and never logs", () => {
+  const rules: LimitRule[] = [{ name: "g", maxUsd: 100, window: dayWindow, selector: {} }];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", modelId: "m1" }, cost: 5 }, // well under cap
+  ]);
+  const gate = makeRateLimitedClaimGate({
+    engine,
+    descriptors: () => [{ class: "agent_loop", modelId: "m1" }],
+  });
+  assert.equal(gate(), false, "headroom → no pause");
+  assert.equal(warns.filter((w) => w.message === "usage_limit_blocked").length, 0, "no log when not blocked");
+});
+
+test("#2 claim gate: multi-descriptor (summarize+condense) — first over-budget descriptor wins the log", () => {
+  // The summary pool gates on BOTH session types; an over-budget condense parks the
+  // whole pool and the log names condense's rule.
+  const rules: LimitRule[] = [
+    { name: "condense-cap", maxUsd: 1, window: dayWindow, selector: { sessionTypes: ["condense"] } },
+  ];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", sessionType: "condense", modelId: "m1" }, cost: 5 },
+  ]);
+  const gate = makeRateLimitedClaimGate({
+    engine,
+    // summarize first (within budget), condense second (over budget).
+    descriptors: () => [
+      { class: "agent_loop", sessionType: "summarize", modelId: "m1" },
+      { class: "agent_loop", sessionType: "condense", modelId: "m1" },
+    ],
+  });
+  assert.equal(gate(), true);
+  const blocked = warns.filter((w) => w.message === "usage_limit_blocked");
+  assert.equal(blocked.length, 1);
+  assert.equal((blocked[0].fields?.descriptor as { sessionType?: string }).sessionType, "condense");
+  assert.deepEqual(
+    (blocked[0].fields?.limits as { name: string }[]).map((l) => l.name),
+    ["condense-cap"],
+  );
+});
+
+test("#2 claim gate: empty descriptor list never parks (all session types unresolvable)", () => {
+  const rules: LimitRule[] = [{ name: "g", maxUsd: 1, window: dayWindow, selector: {} }];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", modelId: "m1" }, cost: 5 },
+  ]);
+  const gate = makeRateLimitedClaimGate({ engine, descriptors: () => [] });
+  assert.equal(gate(), false, "no descriptors → never blocks (unresolvable model ids)");
+  assert.equal(warns.filter((w) => w.message === "usage_limit_blocked").length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// regression: finding #21 — embedding lane late-binding
+//
+// The embed worker's claim gate AND its ledger emitter are built (in
+// subsystem.ts) BEFORE the BudgetEngine / ledger recorder exist, then read the
+// shared holder at call time. These two tests fail on the pre-fix
+// construction-time-ternary behavior, which froze both to `undefined`.
+// ---------------------------------------------------------------------------
+
+test("#21 claim gate: late-bound engine — never parks/logs while unresolved, parks once present + over budget", () => {
+  // Mirror the embed-worker wiring: the gate is built against `() => holder.engine`
+  // while the holder is empty, exactly as subsystem.ts builds it before app.ts
+  // fills the holder. A construction-time read would have captured `undefined`.
+  const { logger, warns } = capturingLogger();
+  const holder: { engine?: BudgetEngine } = {};
+  const descriptor: SpendDescriptor = { class: "embedding", modelId: "embed-model" };
+  const gate = makeRateLimitedClaimGate({
+    engine: () => holder.engine,
+    descriptors: () => [descriptor],
+  });
+
+  // (a) Unresolved engine: never park, never log (no embedding work runs pre-startup).
+  assert.equal(gate(), false, "unresolved engine → never parks");
+  assert.equal(
+    warns.filter((w) => w.message === "usage_limit_blocked").length,
+    0,
+    "unresolved engine → never logs",
+  );
+
+  // Fill the holder with an over-budget engine, as app.ts does after the factory.
+  const rules: LimitRule[] = [
+    { name: "embed-cap", maxUsd: 1, window: dayWindow, selector: { classes: ["embedding"] } },
+  ];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "embed-model",
+    logger,
+    now: () => 1_000_000,
+  });
+  engine.record({ ...descriptor, costUsd: 5 }); // push over the $1 cap
+  holder.engine = engine;
+
+  // (b) Resolved + over budget: the SAME gate now parks and logs once, naming the rule.
+  assert.equal(gate(), true, "resolved over-budget engine → parks");
+  const blocked = warns.filter((w) => w.message === "usage_limit_blocked");
+  assert.equal(blocked.length, 1, "exactly one block log once the engine is wired");
+  assert.equal(blocked[0].fields?.gate, "worker_claim");
+  assert.deepEqual(
+    (blocked[0].fields?.limits as { name: string }[]).map((l) => l.name),
+    ["embed-cap"],
+  );
+});
+
+test("#21 onEmbeddingUsage: late-filled holder.record IS invoked with a class='embedding' row", () => {
+  // The exact closure subsystem.ts installs on the embedding provider, built while
+  // the holder is empty (as in app.ts). Pre-fix it was `record && remoteId ? … :
+  // undefined`, so an empty-at-construction holder produced NO callback and every
+  // embedding row was dropped. Late-binding `opts.budget?.record?.(…)` records once
+  // the holder is filled.
+  const remoteId = "embed-model";
+  const recorded: UsageEventInput[] = [];
+  const holder: BudgetHooks = {}; // empty at construction, like app.ts
+  const onEmbeddingUsage: ((promptTokens: number, costUsd: number) => void) | undefined = remoteId
+    ? (promptTokens, costUsd) => {
+        holder.record?.({ class: "embedding", modelId: remoteId, inputTokens: promptTokens, costUsd });
+      }
+    : undefined;
+  assert.ok(onEmbeddingUsage, "callback installed whenever remoteId is set (not gated on record)");
+
+  // Before the holder is filled the optional-chain no-ops — no throw, nothing recorded.
+  onEmbeddingUsage!(100, 0.002);
+  assert.equal(recorded.length, 0, "no record sink yet → silently no-ops (no embedding work pre-startup)");
+
+  // app.ts fills the holder; the SAME closure now records.
+  holder.record = (event) => recorded.push(event);
+  onEmbeddingUsage!(250, 0.005);
+  assert.equal(recorded.length, 1, "row emitted once the holder is filled");
+  assert.deepEqual(recorded[0], {
+    class: "embedding",
+    modelId: remoteId,
+    inputTokens: 250,
+    costUsd: 0.005,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// regression: review group 1 (#1, #4, #5, #6, #10a)
+// ---------------------------------------------------------------------------
+
+test("#1 isModelAvailable: global (no-models) rule over cap blocks every model", () => {
+  // A global rule has no `models` selector → it covers every model (wildcard),
+  // exactly as check() treats it. Pre-fix isModelAvailable ignored such rules and
+  // wrongly reported every model available even when global was over cap.
+  const rules: LimitRule[] = [{ name: "global", maxUsd: 1, window: dayWindow, selector: {} }];
+  const engine = engineWith(rules, {}, { zero: new Set(["free-model"]) });
+  engine.record({ class: "agent_loop", modelId: "paid", costUsd: 5 }); // global over cap
+  assert.equal(engine.isModelAvailable("paid"), false);
+  assert.equal(engine.isModelAvailable("some-other-model"), false); // wildcard covers it too
+  // Zero-cost short-circuit preserved: a free model is never blocked.
+  assert.equal(engine.isModelAvailable("free-model"), true);
+});
+
+test("#1 isModelAvailable: models-scoped rule blocks only its listed models", () => {
+  const rules: LimitRule[] = [
+    { name: "opus", maxUsd: 1, window: dayWindow, selector: { models: ["opus"] } },
+  ];
+  const engine = engineWith(rules);
+  engine.record({ class: "agent_loop", modelId: "opus", costUsd: 5 });
+  assert.equal(engine.isModelAvailable("opus"), false);
+  assert.equal(engine.isModelAvailable("sonnet"), true); // not in the rule's models
+});
+
+test("#4 calendar roll: check()/ruleStatuses() report rolled-empty window WITHOUT tick(), no SUM on hot path", () => {
+  // UTC day window. Seed blocked, then advance the clock past midnight without
+  // calling tick(): the read/decision paths must roll in place (spent→0) and see
+  // the fresh window. Pre-fix, only record() rolled, so check()/ruleStatuses()
+  // read stale spend for up to one tick after the boundary.
+  let clock = Date.UTC(2026, 5, 15, 12, 0, 0); // noon, June 15 UTC
+  let sumCalls = 0;
+  const rules: LimitRule[] = [{ name: "daily", maxUsd: 10, window: dayWindow, selector: {} }];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: (f) => {
+      sumCalls++; // seeds once; must NOT be called again by record/check/ruleStatuses
+      return f.since <= Date.UTC(2026, 5, 15, 0, 0, 0) ? 12 : 0; // June-15 window seeded over cap
+    },
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => clock,
+  });
+  assert.equal(sumCalls, 1, "seed runs exactly one SUM per rule");
+  assert.equal(engine.check({ class: "agent_loop", modelId: "m1" }).allowed, false); // blocked on June 15
+
+  // Cross the UTC midnight boundary into June 16.
+  clock = Date.UTC(2026, 5, 16, 1, 0, 0);
+  const after = engine.check({ class: "agent_loop", modelId: "m1" });
+  assert.equal(after.allowed, true, "fresh window after the boundary has zero spend");
+  const status = engine.ruleStatuses().find((s) => s.name === "daily")!;
+  assert.equal(status.spentUsd, 0);
+  assert.equal(status.state, "ok");
+  assert.equal(status.resetsAt, Date.UTC(2026, 5, 17, 0, 0, 0)); // next midnight after June 16
+  // No SUM ran on any of the post-seed read/decision paths (§6.5: rollIfNeeded is SUM-free).
+  assert.equal(sumCalls, 1, "rollIfNeeded resets to 0 without a SQL SUM");
+});
+
+test("#4 record() rolls a passed calendar boundary in place without a SUM", () => {
+  // A spend that lands just after midnight must accrue to the NEW window, not the
+  // old one — and must do so WITHOUT the hot-path SUM the pre-fix lazy-roll ran.
+  let clock = Date.UTC(2026, 5, 15, 23, 30, 0); // late June 15
+  let sumCalls = 0;
+  const rules: LimitRule[] = [{ name: "daily", maxUsd: 10, window: dayWindow, selector: {} }];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => {
+      sumCalls++;
+      return 8; // June-15 window seeded near cap
+    },
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => clock,
+  });
+  assert.equal(sumCalls, 1);
+  // Cross into June 16, then record: the boundary roll zeroes spent, so $5 leaves
+  // the rule at 5/10 (NOT 8+5=13 against the stale window).
+  clock = Date.UTC(2026, 5, 16, 0, 30, 0);
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5 });
+  assert.equal(engine.check({ class: "agent_loop", modelId: "m1" }).allowed, true);
+  const status = engine.ruleStatuses().find((s) => s.name === "daily")!;
+  assert.equal(status.spentUsd, 5);
+  assert.equal(sumCalls, 1, "record()'s calendar roll uses no SQL SUM (§6.5)");
+});
+
+test("#4 tick(): rolling recompute + calendar roll re-sum from the ledger", () => {
+  // tick() is the authoritative periodic reconciler (the only place a calendar
+  // roll re-SUMs). Previously uncovered.
+  let clock = Date.UTC(2026, 5, 15, 12, 0, 0);
+  // Ledger state the SUM reflects, keyed by window kind, mutated between ticks.
+  let rollingSpend = 5;
+  let calendarSpend = 9;
+  const rolling = { type: "rolling", durationMs: 3_600_000, duration: "1h" } as const;
+  const rules: LimitRule[] = [
+    { name: "roll", maxUsd: 10, window: rolling, selector: { classes: ["tool"] } },
+    { name: "cal", maxUsd: 10, window: dayWindow, selector: { classes: ["agent_loop"] } },
+  ];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: (f) => (f.classes?.includes("tool") ? rollingSpend : calendarSpend),
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => clock,
+    tickMs: 1000,
+  });
+  engine.start();
+  // Rolling rule recomputes every tick: shed aged-out spend so it drops below cap.
+  rollingSpend = 2;
+  // Calendar rule: cross midnight so the boundary rolls and re-SUMs the new window.
+  calendarSpend = 1;
+  clock = Date.UTC(2026, 5, 16, 1, 0, 0);
+  // Drive one tick synchronously via the private method (the timer is unref'd).
+  (engine as unknown as { tick(): void }).tick();
+  engine.stop();
+  const roll = engine.ruleStatuses().find((s) => s.name === "roll")!;
+  const cal = engine.ruleStatuses().find((s) => s.name === "cal")!;
+  assert.equal(roll.spentUsd, 2, "rolling rule recomputed from the ledger");
+  assert.equal(cal.spentUsd, 1, "calendar rule re-summed the new day window");
+  assert.equal(cal.resetsAt, Date.UTC(2026, 5, 17, 0, 0, 0));
+});
+
+test("#5 rolling resetsAt: counts down from oldest contributing spend, not now + duration", () => {
+  // A rolling window frees up when its OLDEST spend ages out: minTs + duration,
+  // far sooner than the now + duration upper bound. ruleStatuses() (console) and
+  // accurateResetsAt() (refusal message) must surface the accurate ETA.
+  const now = 10_000_000;
+  const durationMs = 86_400_000; // 24h
+  const oldestTs = now - 80_000_000; // contributing spend ~66m from aging out
+  const rolling = { type: "rolling", durationMs, duration: "24h" } as const;
+  const rules: LimitRule[] = [{ name: "burst", maxUsd: 1, window: rolling, selector: {} }];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 5, // over cap
+    minUsageTs: () => oldestTs,
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => now,
+  });
+  const status = engine.ruleStatuses().find((s) => s.name === "burst")!;
+  assert.equal(status.resetsAt, oldestTs + durationMs, "console countdown uses oldest-spend ETA");
+  assert.notEqual(status.resetsAt, now + durationMs, "not the full-duration upper bound");
+  assert.equal(engine.accurateResetsAt("burst"), oldestTs + durationMs);
+  // check() keeps the cheap upper bound (never consults minUsageTs on the hot path).
+  const blocked = engine.check({ class: "agent_loop", modelId: "m1" });
+  assert.equal(blocked.primary?.resetsAt, now + durationMs);
+});
+
+test("#5 rolling resetsAt: falls back to now + duration with no contributing spend", () => {
+  const now = 10_000_000;
+  const durationMs = 3_600_000;
+  const rolling = { type: "rolling", durationMs, duration: "1h" } as const;
+  const rules: LimitRule[] = [{ name: "burst", maxUsd: 5, window: rolling, selector: {} }];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    minUsageTs: () => null, // no contributing spend in the window
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => now,
+  });
+  assert.equal(engine.accurateResetsAt("burst"), now + durationMs);
+  assert.equal(engine.accurateResetsAt("no-such-rule"), undefined);
+});
+
+test("#6 record() rejects NaN and negative cost; the rule keeps enforcing", () => {
+  // NaN <= 0 is false, so the old guard admitted a NaN cost → spent became NaN and
+  // the rule silently stopped enforcing (fail-open). The `!(x > 0)` guard rejects
+  // NaN, 0, and negatives uniformly.
+  const rules: LimitRule[] = [{ name: "daily", maxUsd: 10, window: dayWindow, selector: {} }];
+  const engine = engineWith(rules);
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: 10 }); // exactly at cap
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: Number.NaN }); // ignored
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: -100 }); // ignored
+  const status = engine.ruleStatuses().find((s) => s.name === "daily")!;
+  assert.ok(Number.isFinite(status.spentUsd), "spent stays finite after a NaN cost");
+  assert.equal(status.spentUsd, 10, "NaN/negative costs do not move the total");
+  assert.equal(
+    engine.check({ class: "agent_loop", modelId: "m1" }).allowed,
+    false,
+    "rule still blocks at cap (no fail-open)",
+  );
+});
+
+test("#10a nearThreshold clamped to (0,1)", () => {
+  const rules: LimitRule[] = [{ name: "a", maxUsd: 10, window: dayWindow, selector: {} }];
+  const mk = (nearThreshold: number) =>
+    new BudgetEngine({
+      rules: rules.map((r) => ({ ...r })),
+      sumUsageCost: () => 0,
+      zeroCostModelIds: new Set(),
+      dependencies: {},
+      resolveModelId: () => "m1",
+      logger: noopLogger,
+      now: () => 1_000_000,
+      nearThreshold,
+    });
+  // A 0 threshold must NOT mark a rule with a tiny spend "near" (clamped up to >0).
+  const zero = mk(0);
+  zero.record({ class: "agent_loop", modelId: "m1", costUsd: 0.001 }); // 0.0001 fraction
+  assert.equal(zero.ruleStatuses()[0].state, "ok");
+  // A >1 threshold must NOT disable "near" entirely (clamped down to 0.999). A
+  // not-quite-full rule (0.9999 fraction, below cap so not "blocked") still flags
+  // "near"; pre-clamp a raw 5.0 threshold could never be reached → "near" dead.
+  const big = mk(5);
+  big.record({ class: "agent_loop", modelId: "m1", costUsd: 9.999 }); // 0.9999 fraction
+  assert.equal(big.ruleStatuses()[0].state, "near");
+});
+
+// ---------------------------------------------------------------------------
 // seeding (§6.1)
 // ---------------------------------------------------------------------------
 
@@ -250,6 +701,39 @@ test("normalizeLimits: warns on unknown tool/session-type + misplaced rejection 
   assert.ok(res.warnings.some((w) => /trigger_rejection_message/.test(w)));
 });
 
+test("#11 normalizeLimits: warns on an unknown model id, not a known one (never fatal)", () => {
+  const opts = { ...normOpts, knownModelIds: new Set(["opus", "sonnet"]) };
+  const res = normalizeLimits(
+    [
+      // A `models` selector naming an id present in no config lane → dead rule → warn.
+      { name: "bogus", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["typo-model"] },
+      // A selector listing only known ids → no model warning.
+      { name: "good", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["opus", "sonnet"] },
+    ],
+    opts,
+  );
+  assert.equal(res.fatal.length, 0, "an unknown model id is never fatal (models stays free-form)");
+  assert.ok(
+    res.warnings.some((w) => /unknown model "typo-model"/.test(w)),
+    "the bogus model id earns a soft warning",
+  );
+  assert.ok(
+    !res.warnings.some((w) => /unknown model "(opus|sonnet)"/.test(w)),
+    "a known model id earns no warning",
+  );
+});
+
+test("#11 normalizeLimits: omitting knownModelIds skips the model check entirely", () => {
+  // A caller that doesn't assemble the known-id set (the default) must not warn on
+  // any model id — the check is opt-in via `knownModelIds`.
+  const res = normalizeLimits(
+    [{ name: "r", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["anything"] }],
+    normOpts,
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.ok(!res.warnings.some((w) => /unknown model/.test(w)));
+});
+
 // ---------------------------------------------------------------------------
 // collectZeroCostModelIds (§2.2)
 // ---------------------------------------------------------------------------
@@ -279,4 +763,23 @@ test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", (
   } as never;
   const zero = collectZeroCostModelIds(config);
   assert.equal(zero.has("shared"), false);
+});
+
+test("#11 collectKnownModelIds: union of every configured model id (zero ∪ paid), across all lanes", () => {
+  const config = {
+    models: {
+      default: { id: "free", cost: { input: 0, output: 0 } },
+      big: { id: "paid", cost: { input: 3, output: 15 } },
+    },
+    captioning: { model: { id: "cap-model" }, image: { model: { id: "img-cap" } } },
+    image_gen: { models: { pro: "ig-pro", flash: "ig-flash" } },
+    x_search: { model: "xs", deep_model: "xs-deep" },
+    retrieval: { embedding: { remote: { id: "emb" } } },
+  } as never;
+  const ids = collectKnownModelIds(config);
+  // Zero-cost AND paid models alike are "known" (the union is for the dead-rule check).
+  for (const id of ["free", "paid", "cap-model", "img-cap", "ig-pro", "ig-flash", "xs", "xs-deep", "emb"]) {
+    assert.equal(ids.has(id), true, `${id} is a known configured model id`);
+  }
+  assert.equal(ids.has("nonexistent"), false);
 });

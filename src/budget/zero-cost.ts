@@ -72,3 +72,40 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
   for (const id of paid) zero.delete(id);
   return zero;
 }
+
+/**
+ * The union of EVERY configured model id (zero-cost ∪ paid), scanned across the
+ * same config sites as {@link collectZeroCostModelIds}. Used by the `[[limits]]`
+ * cross-field validation (spec §5.2 / review #11) to soft-warn on a `models`
+ * selector naming an id that exists nowhere in config — a dead, never-matching
+ * rule. `models` stays free-form (the warning never fails startup).
+ */
+export function collectKnownModelIds(config: AppConfig): Set<string> {
+  const ids = new Set<string>();
+  const add = (id: string | undefined): void => {
+    if (id) ids.add(id);
+  };
+
+  for (const model of Object.values(config.models ?? {})) add(model.id);
+
+  const cap = config.captioning;
+  if (cap) {
+    add(cap.model?.id);
+    for (const modality of [cap.image, cap.video, cap.audio]) add(modality?.model?.id);
+  }
+
+  const ig = config.image_gen;
+  if (ig) {
+    add(ig.models.pro);
+    add(ig.models.flash);
+  }
+
+  const xs = config.x_search;
+  if (xs) {
+    add(xs.model);
+    add(xs.deep_model);
+  }
+
+  add(config.retrieval?.embedding?.remote?.id);
+  return ids;
+}

@@ -97,7 +97,7 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
-import { BudgetEngine, collectZeroCostModelIds, normalizeLimits, type BudgetHooks } from "./budget/index.js";
+import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeRateLimitedClaimGate, type BudgetHooks, type SpendDescriptor, type AdmissionResult } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
@@ -274,9 +274,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // Period cost limits (spec USAGE-COST-LIMITS §6). A late-bound holder: the
   // BudgetEngine + the unified-ledger recorder are constructed below (after the
   // factory, which the engine resolves model ids through), but several consumers
-  // wired before then (the remote embedding provider, the caption pool) close
-  // over this holder and read `engine`/`record` only at runtime. Filled exactly
-  // once, before any work runs.
+  // wired before then close over this holder and read `engine`/`record` only at
+  // call time — never capturing the fields at construction. The remote embedding
+  // provider reads `record` inside its `onEmbeddingUsage` closure (§9 ledger row)
+  // and resolves `engine` per call through its late-bound claim gate (§6 embed
+  // pause); the caption pool likewise reads both at call time in its worker loop.
+  // Filled exactly once, before any work runs.
   const budgetHooks: BudgetHooks = {};
 
   const retrievalConfig = resolveRetrievalConfig(config.retrieval);
@@ -782,10 +785,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       "image_generate",
       "x_search",
     ]);
+    // Every configured model id (zero-cost ∪ paid), assembled before normalize so a
+    // `models` selector naming an unknown id earns a soft validation warning,
+    // symmetric with the unknown-tool / unknown-session-type warnings (review #11).
+    const knownModelIds = collectKnownModelIds(config);
     const normalized = normalizeLimits(config.limits as never, {
       defaultTz: config.agent.timezone ?? "UTC",
       knownTools,
       knownSessionTypes,
+      knownModelIds,
     });
     if (normalized.fatal.length > 0) {
       throw new Error(`invalid [[limits]] config:\n  ${normalized.fatal.join("\n  ")}`);
@@ -811,6 +819,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const engine = new BudgetEngine({
       rules: normalized.rules,
       sumUsageCost: (filter) => storage.sumUsageCost(filter),
+      // Off-hot-path earliest-contributing-ts lookup for the accurate rolling reset
+      // ETA (console countdown + the refusal/defer message); never hit in check().
+      minUsageTs: (filter) => storage.minUsageTs(filter),
       zeroCostModelIds,
       dependencies,
       resolveModelId: (sessionType) => {
@@ -828,6 +839,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // durable append (queued, best-effort — a ledger failure must never fail
       // the underlying work or desync the engine, which re-seeds from the ledger
       // on the next rolling tick / restart).
+      //
+      // Ledger correctness invariants — the app-side mirror of `insertUsageEvent`'s
+      // (see `src/storage/database.ts`):
+      //   1. The synchronous `engine.record()` and the queued `insertUsageEvent`
+      //      durable write below MUST both settle within ONE synchronous turn +
+      //      microtask drain, BEFORE any engine `tick()` macrotask re-sums the
+      //      ledger. Otherwise a tick could double-count an increment already in
+      //      its SUM, or miss one not yet written (seed-then-increment consistency).
+      //      Recording in-memory first, then enqueuing the write, preserves this:
+      //      both are issued in this one synchronous call before control returns.
+      //   2. Capture points are FIRE-ONCE. The ledger has no idempotency key (random
+      //      PK, no dedup), so every caller of `recordUsageEvent` must invoke it at
+      //      most once per logical event — a double-fire is counted twice by every
+      //      covering rule.
       engine.record(event);
       void storage.insertUsageEvent(event).catch((error) => {
         logger.warn("usage_event_insert_failed", {
@@ -873,7 +898,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const result = engine.check(descriptor);
     if (result.allowed) return undefined;
     engine.logBlocked("tool_call", result.blockingRules, descriptor, { toolName });
-    const when = result.primary ? formatResetsAt(result.primary.resetsAt) : "later";
+    // Surface the ACCURATE reset (rolling rules age out at oldest-spend + duration,
+    // not the cheap now + duration the gate carries — §5 #5); fall back to the
+    // gate's value if the rule can't be resolved.
+    const resetsAt = result.primary
+      ? (engine.accurateResetsAt(result.primary.name) ?? result.primary.resetsAt)
+      : undefined;
+    const when = resetsAt !== undefined ? formatResetsAt(resetsAt) : "later";
     return (
       `Over budget for ${toolName} (limit ${result.primary?.name ?? "unknown"}); ` +
       `resets ${when}. Try again after that.`
@@ -909,6 +940,38 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  // Shared agent-loop claim-gate builder for the summary/diary worker pools (spec
+  // USAGE-COST-LIMITS §6.3/§6.4, review #2). Returns a `shouldPause` closure that
+  // parks the pool while ANY of its `agent_loop` session types is over budget AND
+  // — mirroring the caption pool — emits one rate-limited (≤1/min) `usage_limit_blocked`
+  // log naming the hit rules. Model-id resolution matches the engine's
+  // `isClassAvailable` (resolve via `factory.resolveModelId`; an unresolvable type
+  // contributes no descriptor and never blocks). The rate-limited log + first-blocked
+  // selection live in the shared `makeRateLimitedClaimGate`; each pool gets its own
+  // gate (independent rate-limit clocks). `budgetHooks.engine` is set before pool
+  // construction, so it is always present here; absent = no gate (no budgeting).
+  const makeAgentLoopClaimGate = (sessionTypes: readonly string[]): (() => boolean) => {
+    const engine = budgetHooks.engine;
+    if (!engine) return () => false;
+    return makeRateLimitedClaimGate({
+      engine,
+      descriptors: () => {
+        const out: SpendDescriptor[] = [];
+        for (const sessionType of sessionTypes) {
+          let modelId: string | undefined;
+          try {
+            modelId = factory.resolveModelId(sessionType);
+          } catch {
+            modelId = undefined;
+          }
+          if (modelId === undefined) continue; // unresolvable → don't block on it
+          out.push({ class: "agent_loop", sessionType, modelId });
+        }
+        return out;
+      },
+    });
+  };
+
   const summarizationPool = summarizationEnabled
     ? new SummarizationWorkerPool({
         storage,
@@ -918,10 +981,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // summarization session type is over budget. Conservative — over-pausing
         // summarization only delays it (nothing dropped) and is the safe side of
         // the structural dependency that gates triggered/proactive sessions (§2.1).
-        shouldPause: () =>
-          !!budgetHooks.engine &&
-          (!budgetHooks.engine.isClassAvailable("summarize") ||
-            !budgetHooks.engine.isClassAvailable("condense")),
+        // The gate emits a rate-limited `usage_limit_blocked` log on pause (§6.4,
+        // review #2) — summarization is the worst silent omission since its pause
+        // transitively halts triggered/proactive sessions via the dependency cascade.
+        shouldPause: makeAgentLoopClaimGate(["summarize", "condense"]),
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -1080,7 +1143,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         activityBus: pipelineActivityBus,
         // Budget claim gate (spec USAGE-COST-LIMITS §6.3): park while the diary
         // class is over budget. Diary depends on nothing, so this gates only diary.
-        shouldPause: () => !!budgetHooks.engine && !budgetHooks.engine.isClassAvailable("diary"),
+        // Emits a rate-limited `usage_limit_blocked` log on pause (§6.4, review #2).
+        shouldPause: makeAgentLoopClaimGate(["diary"]),
         logger: logger.child("diary"),
       })
     : null;
@@ -2573,34 +2637,59 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       } catch {
         admissionModelId = undefined;
       }
+      // Exception-isolated, fail-open admission decision (review #7): a throw inside
+      // the engine call would unwind to the dispatch `catch` (releaseClaimFor +
+      // rethrow, but NOT `triggerCoordinator.complete`), leaking the per-timeline
+      // slot. `safeCheckAdmission` returns undefined on a throw → we fall through to
+      // a normal launch (admit), so a budget-engine bug never stops the bot replying.
       const admission = admissionModelId
-        ? budgetHooks.engine.checkAdmission(session.sessionType, admissionModelId)
+        ? safeCheckAdmission(budgetHooks.engine, session.sessionType, admissionModelId, logger, {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+          })
         : undefined;
       if (admission && !admission.allowed) {
         const gate = admission.dependency ? "dependency" : "trigger_admission";
-        budgetHooks.engine.logBlocked(
-          gate,
-          admission.dependency ? admission.dependency.blocking : admission.ownBlocking,
-          { class: "agent_loop", sessionType: session.sessionType, modelId: admissionModelId! },
-          {
+        // The refusal-emission engine calls (`logBlocked`, `accurateResetsAt`) are
+        // also isolated (review #7): the deny DECISION is already valid, so a throw
+        // here must NOT escape and leak the slot — we still complete the discard +
+        // drain below; we just skip the (failed) log / templated reply.
+        try {
+          budgetHooks.engine.logBlocked(
+            gate,
+            admission.dependency ? admission.dependency.blocking : admission.ownBlocking,
+            { class: "agent_loop", sessionType: session.sessionType, modelId: admissionModelId! },
+            {
+              sessionId: session.id,
+              timelineKey: session.timelineKey,
+              ...(admission.dependency ? { dependsOn: admission.dependency.sessionType } : {}),
+            },
+          );
+          // Human trigger: post the templated refusal if a covering global-capable
+          // rule supplies one (silent otherwise, and always silent for proactive).
+          if (!proactive) {
+            const message = admission.primary?.triggerRejectionMessage;
+            if (message && admission.primary) {
+              // Accurate reset for the templated reply: a rolling rule frees up when
+              // its oldest spend ages out, not at the full-duration upper bound the
+              // gate carries (§5 #5). Fall back to the gate's value if unresolved.
+              const resetsAt =
+                budgetHooks.engine.accurateResetsAt(admission.primary.name) ?? admission.primary.resetsAt;
+              const body = message.replace(/\{resets_at\}/g, formatResetsAt(resetsAt));
+              void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
+                logger.warn("usage_limit_rejection_send_failed", {
+                  sessionId: session.id,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              });
+            }
+          }
+        } catch (error) {
+          logger.warn("usage_admission_refusal_threw", {
             sessionId: session.id,
             timelineKey: session.timelineKey,
-            ...(admission.dependency ? { dependsOn: admission.dependency.sessionType } : {}),
-          },
-        );
-        // Human trigger: post the templated refusal if a covering global-capable
-        // rule supplies one (silent otherwise, and always silent for proactive).
-        if (!proactive) {
-          const message = admission.primary?.triggerRejectionMessage;
-          if (message && admission.primary) {
-            const body = message.replace(/\{resets_at\}/g, formatResetsAt(admission.primary.resetsAt));
-            void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
-              logger.warn("usage_limit_rejection_send_failed", {
-                sessionId: session.id,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            });
-          }
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
         sessions.markDiscarded(session.id);
         const next = triggerCoordinator.complete(session.timelineKey);
@@ -2860,19 +2949,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     isDraining: () => draining,
     // Skip channels whose startup gap is still filling (ARCHITECTURE.md §7c §6.4).
     isFrozen: (timelineKey) => gapBackfetch.isFrozen(timelineKey),
-    // Defer proactive cadence past the budget-window reset when proactive (or its
-    // summarization dependency) is over budget (spec USAGE-COST-LIMITS §6.3).
+    // Defer proactive cadence past the ACCURATE budget-window reset (oldest-spend +
+    // duration, §5 #5) when proactive (or its summarization dependency) is over
+    // budget (spec USAGE-COST-LIMITS §6.3). Exception-isolated + fail-open
+    // (review #7): an engine throw → no defer.
     budgetDeferUntil: () => {
-      if (!budgetHooks.engine) return undefined;
-      const proactiveType = config.proactive?.session_type ?? "proactive";
-      let modelId: string | undefined;
-      try {
-        modelId = factory.resolveModelId(proactiveType);
-      } catch {
-        return undefined;
-      }
-      const admission = budgetHooks.engine.checkAdmission(proactiveType, modelId);
-      return admission.allowed ? undefined : admission.primary?.resetsAt;
+      const engine = budgetHooks.engine;
+      if (!engine) return undefined;
+      return safeProactiveDeferUntil(
+        engine,
+        config.proactive?.session_type ?? "proactive",
+        (sessionType) => factory.resolveModelId(sessionType),
+        logger,
+      );
     },
     logger: logger.child("proactive"),
   });
@@ -3237,6 +3326,75 @@ export function decideRetentionSweep(params: {
   const { retentionDays, draining, now } = params;
   if (draining || retentionDays <= 0) return { skip: true };
   return { skip: false, cutoff: now - retentionDays * MILLIS_PER_DAY };
+}
+
+/** The slice of {@link BudgetEngine} the budget admission/defer gates consume. */
+type AdmissionEngine = Pick<BudgetEngine, "checkAdmission" | "accurateResetsAt">;
+
+/**
+ * Exception-isolated session-admission check (spec USAGE-COST-LIMITS, review #7).
+ * The budget gate runs INSIDE `launchSession`, before its discard/slot-release
+ * plumbing; an unguarded `checkAdmission` throw would unwind to the dispatch
+ * `catch`, which does `releaseClaimFor` + rethrow but NOT
+ * `triggerCoordinator.complete`, leaking the per-timeline slot. So this FAILS OPEN:
+ * on a throw it returns `undefined` (= admit; the caller falls through to a normal
+ * launch) and logs `usage_admission_check_threw`. Fail-open is correct — a
+ * budget-engine bug must never silently stop the bot from responding (mirrors the
+ * isolated pre-flight at `src/agent/request-retry.ts`).
+ */
+export function safeCheckAdmission(
+  engine: AdmissionEngine,
+  sessionType: string,
+  modelId: string,
+  logger: Logger,
+  context: Record<string, unknown> = {},
+): AdmissionResult | undefined {
+  try {
+    return engine.checkAdmission(sessionType, modelId);
+  } catch (error) {
+    logger.warn("usage_admission_check_threw", {
+      ...context,
+      sessionType,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * Exception-isolated proactive budget-defer instant (spec USAGE-COST-LIMITS,
+ * review #5 + #7). Returns the instant proactive posting should be deferred to when
+ * the proactive class (or its summarization dependency) is over budget, else
+ * `undefined` (no defer). Uses the ACCURATE rolling reset (oldest-spend + duration,
+ * §5 #5) rather than the full-duration upper bound so it doesn't over-defer. FAILS
+ * OPEN (review #7): if the model can't be resolved or any engine call throws, it
+ * returns `undefined` (no defer) and logs — a budget-engine bug must not silently
+ * stall proactive posting.
+ */
+export function safeProactiveDeferUntil(
+  engine: AdmissionEngine,
+  proactiveType: string,
+  resolveModelId: (sessionType: string) => string | undefined,
+  logger: Logger,
+): number | undefined {
+  let modelId: string | undefined;
+  try {
+    modelId = resolveModelId(proactiveType);
+  } catch {
+    return undefined;
+  }
+  if (modelId === undefined) return undefined;
+  try {
+    const admission = engine.checkAdmission(proactiveType, modelId);
+    if (admission.allowed || !admission.primary) return undefined;
+    return engine.accurateResetsAt(admission.primary.name) ?? admission.primary.resetsAt;
+  } catch (error) {
+    logger.warn("usage_proactive_defer_check_threw", {
+      proactiveType,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
 }
 
 /**
