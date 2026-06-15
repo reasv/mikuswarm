@@ -9,6 +9,12 @@ export interface EmbedWorkerOptions {
   vectorStore: VectorStore;
   provider: EmbeddingProvider;
   config: ResolvedRetrievalConfig;
+  /**
+   * Budget claim gate (spec USAGE-COST-LIMITS §6.3): when it returns true the
+   * embedding class is over budget, so a loop idles instead of claiming a batch
+   * and resumes after the window rolls. Absent / local provider = never paused.
+   */
+  shouldPause?: () => boolean;
   logger?: Logger;
 }
 
@@ -119,6 +125,9 @@ export class EmbedWorkerPool {
   /** Claim and embed one batch. Returns the number of chunks processed. */
   private async processBatch(): Promise<number> {
     const { storage, provider, vectorStore, config } = this.options;
+    // Budget claim gate (§6.3): park (return 0 → loop idles) while the embedding
+    // class is over budget; resumes on the next poll after the window rolls.
+    if (this.options.shouldPause?.()) return 0;
     const claimed = await storage.claimPendingEmbedChunks(config.index.embedBatchSize);
     if (claimed.length === 0) return 0;
 

@@ -174,6 +174,13 @@ export interface ImageGenToolContext {
    */
   recordToolUsage?: (record: ToolUsageRecord) => void;
   /**
+   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called before the paid
+   * generation with the resolved model id; returns an agent-facing error message
+   * when a covering period rule is over budget (the call is then refused as a
+   * tool error, never thrown), else undefined. Absent = no period budgeting.
+   */
+  checkBudget?: (modelId: string) => string | undefined;
+  /**
    * Per-tier USD/1M-token cost rates (+ optional flat `per_image`) — spec §5/§7.2.
    * Keyed by model alias; unset/all-zero ⇒ usage captured, cost 0 ("untracked").
    */
@@ -299,6 +306,12 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
           "image_size '512' is only supported by the flash model. Use model:'flash', or choose 1K/2K/4K.",
         );
       }
+
+      // Period-budget gate (spec USAGE-COST-LIMITS §6.3): refuse the paid call as
+      // a tool error (the agent sees it and adapts) when this tool/model is over
+      // budget — before loading references or issuing the POST.
+      const budgetError = context.checkBudget?.(modelId);
+      if (budgetError) return textError(budgetError);
 
       // Edit mode: load reference images as inlineData parts.
       let refs: ReferenceImage[] = [];

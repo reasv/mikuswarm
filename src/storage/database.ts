@@ -751,10 +751,80 @@ export interface ToolInvocationInput {
   ref?: string | null;
 }
 
+/** Consumer class of a {@link UsageEventRow} (spec USAGE-COST-LIMITS §3). */
+export type UsageEventClass = "agent_loop" | "tool" | "caption" | "embedding";
+
+/**
+ * One billable event in the unified usage ledger (spec USAGE-COST-LIMITS §3).
+ * `model_id` is always present; attribution columns are null for background
+ * (caption/embedding) events. `cost_usd` is the USD priced at commit time (0 for
+ * a zero-rate free model — still recorded for its token counts, §2.2).
+ */
+export interface UsageEventRow {
+  id: string;
+  ts: number;
+  class: UsageEventClass;
+  agent_session_id: string | null;
+  session_type: string | null;
+  timeline_key: string | null;
+  trigger_sender_id: string | null;
+  tool_name: string | null;
+  model_id: string;
+  provider: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  images: number | null;
+  cost_usd: number;
+  ref: string | null;
+  created_at: number;
+}
+
+/**
+ * Insert payload for {@link Storage.insertUsageEvent}. The store generates `id`
+ * and `created_at`; `ts` defaults to now when omitted. Every other column maps
+ * directly to {@link UsageEventRow}.
+ */
+export interface UsageEventInput {
+  ts?: number;
+  class: UsageEventClass;
+  agentSessionId?: string | null;
+  sessionType?: string | null;
+  timelineKey?: string | null;
+  triggerSenderId?: string | null;
+  toolName?: string | null;
+  modelId: string;
+  provider?: string | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  images?: number | null;
+  costUsd: number;
+  ref?: string | null;
+}
+
+/**
+ * Selector for {@link Storage.sumUsageCost} — the own-scope filter of a single
+ * budget rule (spec USAGE-COST-LIMITS §2/§6.1). `since`/`until` bound the window
+ * (ms epoch, half-open `[since, until)`); the dimension arrays AND together, with
+ * OR within each list; an omitted dimension is a wildcard.
+ */
+export interface UsageCostFilter {
+  since: number;
+  until?: number;
+  classes?: string[];
+  sessionTypes?: string[];
+  tools?: string[];
+  models?: string[];
+}
+
 /**
  * Per-session auxiliary tool-spend rollup (spec §8.3, §10.3), derived on read by
- * SUM/COUNT over `tool_invocations`. A separate lane from the §8b session
- * actuals — shown beside, never blended into, the LLM-loop figures (§9).
+ * SUM/COUNT over `usage_events` (class='tool'; was `tool_invocations` before the
+ * v25 ledger). A separate lane from the §8b session actuals — shown beside,
+ * never blended into, the LLM-loop figures (§9).
  */
 export interface SessionToolUsage {
   calls: number;
@@ -785,6 +855,40 @@ export interface CostOverview {
   agentLoopCost: number;
   toolCost: number;
   captioningCost: number;
+}
+
+/** Spend + counts by class and by model over a window (spec USAGE-COST-LIMITS §7.1 cards). */
+export interface UsageSummary {
+  since: number;
+  total: number;
+  byClass: Array<{ class: string; cost: number; events: number }>;
+  byModel: Array<{ model: string; cost: number; events: number }>;
+}
+
+/** One (bucket, group) point of the stacked spend-over-time chart (§7.1). */
+export interface UsageTimeseriesRow {
+  bucket: number;
+  grp: string;
+  cost: number;
+}
+
+/** One row of the console's recent-sessions table (§7.1 table 5). */
+export interface UsageSessionRow {
+  sessionId: string;
+  modelId: string | null;
+  sessionType: string;
+  timelineKey: string;
+  triggerSender: string | null;
+  status: string;
+  completedAt: number | null;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  agentCost: number;
+  toolCost: number;
+  toolCalls: number;
 }
 
 /**
@@ -2750,6 +2854,176 @@ export class Storage {
         .prepare(`select coalesce(sum(caption_cost), 0) as c from media_assets`)
         .get() as { c: number };
       return { agentLoopCost: agentLoop.c, toolCost: tool.c, captioningCost: captioning.c };
+    });
+  }
+
+  // ===========================================================================
+  // Unified usage ledger (spec USAGE-COST-LIMITS §3/§4). One append-only row per
+  // billable event; the source of truth for the BudgetEngine seed/recompute (§6)
+  // and the console "Usage & Cost" page (§7). Additive to the per-lane stores —
+  // never replaces them.
+  // ===========================================================================
+
+  /**
+   * Append one billable event to the unified ledger (spec §3.1). Best-effort at
+   * the call site (a ledger failure must never fail the underlying work); the
+   * store generates `id`/`created_at` and defaults `ts` to now.
+   */
+  insertUsageEvent(input: UsageEventInput): Promise<void> {
+    const now = Date.now();
+    const row: UsageEventRow = {
+      id: `usage_${nanoid(12)}`,
+      ts: input.ts ?? now,
+      class: input.class,
+      agent_session_id: input.agentSessionId ?? null,
+      session_type: input.sessionType ?? null,
+      timeline_key: input.timelineKey ?? null,
+      trigger_sender_id: input.triggerSenderId ?? null,
+      tool_name: input.toolName ?? null,
+      model_id: input.modelId,
+      provider: input.provider ?? null,
+      input_tokens: input.inputTokens ?? null,
+      output_tokens: input.outputTokens ?? null,
+      cache_read_tokens: input.cacheReadTokens ?? null,
+      cache_write_tokens: input.cacheWriteTokens ?? null,
+      images: input.images ?? null,
+      cost_usd: input.costUsd,
+      ref: input.ref ?? null,
+      created_at: now,
+    };
+    return this.write((db) => {
+      db.prepare(
+        `insert into usage_events (
+           id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
+           tool_name, model_id, provider, input_tokens, output_tokens, cache_read_tokens,
+           cache_write_tokens, images, cost_usd, ref, created_at
+         ) values (
+           @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
+           @tool_name, @model_id, @provider, @input_tokens, @output_tokens, @cache_read_tokens,
+           @cache_write_tokens, @images, @cost_usd, @ref, @created_at
+         )`,
+      ).run(row);
+    });
+  }
+
+  /**
+   * Σ `cost_usd` over the ledger rows matching one rule's own-scope selector
+   * within `[since, until)` (spec §6.1). Used to SEED each BudgetEngine rule at
+   * startup and to RECOMPUTE rolling windows on the periodic tick. Dimension
+   * arrays AND together (OR within each list); an omitted dimension is wildcard.
+   */
+  sumUsageCost(filter: UsageCostFilter): number {
+    const clauses: string[] = ["ts >= ?"];
+    const params: unknown[] = [filter.since];
+    if (filter.until !== undefined) {
+      clauses.push("ts < ?");
+      params.push(filter.until);
+    }
+    const inClause = (column: string, values: string[] | undefined): void => {
+      if (!values || values.length === 0) return;
+      clauses.push(`${column} in (${values.map(() => "?").join(", ")})`);
+      params.push(...values);
+    };
+    inClause("class", filter.classes);
+    inClause("session_type", filter.sessionTypes);
+    inClause("tool_name", filter.tools);
+    inClause("model_id", filter.models);
+    return this.read((db) => {
+      const row = db
+        .prepare(`select coalesce(sum(cost_usd), 0) as c from usage_events where ${clauses.join(" and ")}`)
+        .get(...params) as { c: number };
+      return row.c;
+    });
+  }
+
+  /**
+   * Spend + counts grouped by class and by model over `[since, now)` (spec §4 /
+   * §7.1 cards). One read, two aggregations.
+   */
+  getUsageSummary(since: number): UsageSummary {
+    return this.read((db) => {
+      const byClass = db
+        .prepare(
+          `select class, coalesce(sum(cost_usd), 0) as cost, count(*) as events
+             from usage_events where ts >= ? group by class order by cost desc`,
+        )
+        .all(since) as Array<{ class: string; cost: number; events: number }>;
+      const byModel = db
+        .prepare(
+          `select model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
+             from usage_events where ts >= ? group by model_id order by cost desc`,
+        )
+        .all(since) as Array<{ model: string; cost: number; events: number }>;
+      const total = byClass.reduce((sum, r) => sum + r.cost, 0);
+      return { since, total, byClass, byModel };
+    });
+  }
+
+  /**
+   * Stacked spend-over-time, bucketed by `bucketMs`, grouped by class or model
+   * (spec §7.1 chart). Returns one row per (bucket, group) with summed cost.
+   */
+  getUsageTimeseries(since: number, bucketMs: number, groupBy: "class" | "model"): UsageTimeseriesRow[] {
+    const groupCol = groupBy === "model" ? "model_id" : "class";
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select (ts / ?) * ? as bucket, ${groupCol} as grp, coalesce(sum(cost_usd), 0) as cost
+             from usage_events where ts >= ?
+             group by bucket, grp order by bucket asc`,
+        )
+        .all(bucketMs, bucketMs, since) as UsageTimeseriesRow[];
+    });
+  }
+
+  /**
+   * Recent sessions joined with their per-class `usage_events` rollup (spec §7.1
+   * table 5): agent-LLM cost vs tool cost per session, plus token totals and
+   * channel/type/trigger attribution from `agent_sessions`.
+   */
+  getUsageRecentSessions(limit: number): UsageSessionRow[] {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select
+             s.id as sessionId,
+             s.model_id as modelId,
+             s.session_type as sessionType,
+             s.timeline_key as timelineKey,
+             s.trigger_sender_display_name as triggerSender,
+             s.status as status,
+             s.completed_at as completedAt,
+             coalesce(s.llm_requests, 0) as requests,
+             coalesce(s.usage_input_tokens, 0) as inputTokens,
+             coalesce(s.usage_output_tokens, 0) as outputTokens,
+             coalesce(s.usage_cache_read_tokens, 0) as cacheReadTokens,
+             coalesce(s.usage_cache_write_tokens, 0) as cacheWriteTokens,
+             coalesce(s.usage_cost, 0) as agentCost,
+             coalesce((select sum(u.cost_usd) from usage_events u
+                        where u.agent_session_id = s.id and u.class = 'tool'), 0) as toolCost,
+             coalesce((select count(*) from usage_events u
+                        where u.agent_session_id = s.id and u.class = 'tool'), 0) as toolCalls
+           from agent_sessions s
+           order by coalesce(s.completed_at, s.updated_at) desc
+           limit ?`,
+        )
+        .all(limit) as UsageSessionRow[];
+    });
+  }
+
+  /**
+   * Recent paid non-agent-loop events — tool / caption / embedding (spec §7.1
+   * table 6), newest first.
+   */
+  getUsageRecentToolCalls(limit: number): UsageEventRow[] {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select * from usage_events
+             where class in ('tool', 'caption', 'embedding')
+             order by ts desc limit ?`,
+        )
+        .all(limit) as UsageEventRow[];
     });
   }
 
@@ -5891,6 +6165,48 @@ create index if not exists idx_tool_invocations_session
   on tool_invocations(agent_session_id, created_at);
 `;
 
+// Unified usage ledger DDL (spec USAGE-COST-LIMITS §3). One row per BILLABLE
+// event across every consumer class (agent_loop / tool / caption / embedding) —
+// the single source of truth for all cross-cutting usage queries (period
+// budgets, console charts, both console tables). The per-lane stores
+// (agent_sessions.usage_*, media_assets.caption_*) are retained as denormalized
+// caches; this is an ADDITIONAL unified write, never folded back into them
+// (§3.1). `model_id` is NOT NULL (every billable event names the model it
+// priced against); attribution columns are nullable (caption/embedding are
+// background, not session-scoped). `cost_usd` defaults 0 so a zero-rate
+// (free-model) event still records its token/request counts while staying
+// invisible to the BudgetEngine (§2.2). Shared verbatim between the canonical
+// SCHEMA (fresh DBs) and the v24→v25 migration step (existing DBs) so the two
+// can never drift; both uses are `create … if not exists`, idempotent.
+const USAGE_EVENTS_SCHEMA = `
+create table if not exists usage_events (
+  id text primary key,
+  ts integer not null,
+  class text not null,
+  agent_session_id text,
+  session_type text,
+  timeline_key text,
+  trigger_sender_id text,
+  tool_name text,
+  model_id text not null,
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost_usd real not null default 0,
+  ref text,
+  created_at integer not null
+);
+
+create index if not exists idx_usage_events_ts        on usage_events(ts);
+create index if not exists idx_usage_events_session   on usage_events(agent_session_id, ts);
+create index if not exists idx_usage_events_class_ts   on usage_events(class, ts);
+create index if not exists idx_usage_events_model_ts   on usage_events(model_id, ts);
+create index if not exists idx_usage_events_tool_ts    on usage_events(tool_name, ts);
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -6319,6 +6635,11 @@ ${SESSION_INTERJECTIONS_SCHEMA}
 -- agent_sessions.usage_* (§4). All usage/cost fields nullable ("unknown", not 0).
 -- DDL shared with the v20→v21 migration via TOOL_INVOCATIONS_SCHEMA.
 ${TOOL_INVOCATIONS_SCHEMA}
+-- Unified usage ledger (spec USAGE-COST-LIMITS §3): one row per billable event
+-- across all consumer classes, the source of truth for cross-cutting usage
+-- queries. Mirrors tool_invocations (one-to-one) and adds per-request agent-loop
+-- rows + caption + embedding. DDL shared with the v24-to-v25 migration step.
+${USAGE_EVENTS_SCHEMA}
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
@@ -6328,7 +6649,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 24;
+export const LATEST_SCHEMA_VERSION = 25;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -6935,6 +7256,98 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       .get();
     if (!table) return;
     db.exec(SESSION_INTERJECTIONS_SCHEMA);
+  },
+  // index 24 (v24 -> v25): unified usage ledger (spec USAGE-COST-LIMITS §3). Two
+  // parts, both idempotent:
+  //   1. Create `usage_events` + its indexes via the shared DDL (same as the
+  //      canonical SCHEMA, so fresh and migrated DBs can't drift).
+  //   2. Backfill history from the three existing per-lane stores so the console
+  //      charts are not empty at the upgrade point (§3.2). All three are
+  //      best-effort `insert … select` guarded on the source table's presence:
+  //        - tool rows: every `tool_invocations` row 1:1 (class='tool'), session
+  //          attribution joined from `agent_sessions` where present (§3.2 step 2).
+  //        - agent_loop rows: one COARSE synthetic row per session that has usage
+  //          actuals (ts = completed_at/updated_at, totals from
+  //          `agent_sessions.usage_*`) — session-granular, clearly the pre-upgrade
+  //          baseline; new sessions get true per-request rows (§3.2 step 3).
+  //        - caption rows: every captioned `media_assets` row with a known cost.
+  //      `model_id` is NOT NULL on the table, so every backfilled row coalesces a
+  //      null source model to 'unknown'. The migration only re-runs on a rewound
+  //      fixture if `usage_events` is empty, so the guard below skips the backfill
+  //      when rows already exist (prevents double-copy). Fresh DBs build the table
+  //      from SCHEMA and never run this step.
+  (db) => {
+    db.exec(USAGE_EVENTS_SCHEMA);
+    const existing = db.prepare(`select 1 from usage_events limit 1`).get();
+    if (existing) return; // already backfilled (or live rows present) — don't double-copy
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type = 'table' and name = ?`).get(name);
+    // The three history backfills (§3.2) are BEST-EFFORT (the spec allows skipping
+    // them entirely): a real v24 DB carries the full canonical schema and copies
+    // cleanly, but a minimal/partial legacy test fixture may define one of these
+    // tables without all the columns the SELECT reads. Each backfill is wrapped so
+    // a partial fixture simply gets an empty ledger (new rows accrue from the
+    // upgrade point) rather than failing the whole migration. The outer migration
+    // transaction is unaffected — a caught statement error leaves it intact.
+    const backfill = (sql: string): void => {
+      try {
+        db.exec(sql);
+      } catch {
+        /* best-effort history copy (§3.2 step 3): skip on a partial legacy shape */
+      }
+    };
+    if (hasTable("tool_invocations")) {
+      backfill(
+        `insert into usage_events (
+           id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
+           tool_name, model_id, provider, input_tokens, output_tokens,
+           cache_read_tokens, cache_write_tokens, images, cost_usd, ref, created_at
+         )
+         select
+           ti.id, ti.created_at, 'tool', ti.agent_session_id, s.session_type, s.timeline_key,
+           s.trigger_sender_id, ti.tool_name, coalesce(ti.model_id, 'unknown'), ti.provider,
+           ti.input_tokens, ti.output_tokens, ti.cache_read_tokens, ti.cache_write_tokens,
+           ti.images, coalesce(ti.cost, 0), ti.ref, ti.created_at
+         from tool_invocations ti
+         left join agent_sessions s on s.id = ti.agent_session_id;`,
+      );
+    }
+    if (hasTable("agent_sessions")) {
+      backfill(
+        `insert into usage_events (
+           id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
+           tool_name, model_id, provider, input_tokens, output_tokens,
+           cache_read_tokens, cache_write_tokens, images, cost_usd, ref, created_at
+         )
+         select
+           'usage_bf_' || s.id, coalesce(s.completed_at, s.updated_at), 'agent_loop', s.id,
+           s.session_type, s.timeline_key, s.trigger_sender_id, null,
+           coalesce(s.model_id, 'unknown'), null, s.usage_input_tokens, s.usage_output_tokens,
+           s.usage_cache_read_tokens, s.usage_cache_write_tokens, null, coalesce(s.usage_cost, 0),
+           null, coalesce(s.completed_at, s.updated_at)
+         from agent_sessions s
+         where s.usage_cost is not null or s.usage_input_tokens is not null;`,
+      );
+    }
+    if (hasTable("media_assets")) {
+      const columns = db.pragma(`table_info(media_assets)`) as Array<{ name: string }>;
+      if (columns.some((column) => column.name === "caption_cost")) {
+        backfill(
+          `insert into usage_events (
+             id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
+             tool_name, model_id, provider, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, images, cost_usd, ref, created_at
+           )
+           select
+             'usage_capbf_' || m.id, coalesce(m.updated_at, m.created_at), 'caption', null,
+             null, null, null, null, coalesce(m.caption_model, 'unknown'), null,
+             m.caption_input_tokens, m.caption_output_tokens, m.caption_cache_read_tokens, null,
+             null, coalesce(m.caption_cost, 0), null, coalesce(m.updated_at, m.created_at)
+           from media_assets m
+           where m.caption_status = 'complete' and m.caption_cost is not null;`,
+        );
+      }
+    }
   },
 ];
 

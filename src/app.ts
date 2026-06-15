@@ -97,6 +97,8 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
+import { BudgetEngine, collectZeroCostModelIds, normalizeLimits, type BudgetHooks } from "./budget/index.js";
+import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
   ChatSearchIndexer,
@@ -269,6 +271,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // after each memory write (hooked below), the embedding worker populates the vector
   // index in the background, and the search engine backs the `recall_memory` tool and
   // auto-retrieval. Degrades to lexical-only (FTS5/BM25) if embeddings are unavailable.
+  // Period cost limits (spec USAGE-COST-LIMITS §6). A late-bound holder: the
+  // BudgetEngine + the unified-ledger recorder are constructed below (after the
+  // factory, which the engine resolves model ids through), but several consumers
+  // wired before then (the remote embedding provider, the caption pool) close
+  // over this holder and read `engine`/`record` only at runtime. Filled exactly
+  // once, before any work runs.
+  const budgetHooks: BudgetHooks = {};
+
   const retrievalConfig = resolveRetrievalConfig(config.retrieval);
   let retrieval: RetrievalSubsystem | undefined;
   if (retrievalConfig.enabled) {
@@ -279,6 +289,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       config: retrievalConfig,
       httpProxyUrl: config.network?.http_proxy_url,
       scheduler: llmScheduler,
+      budget: budgetHooks,
       logger: logger.child("retrieval"),
     });
     // Reconcile the touched file after every memory mutation (diary append /
@@ -664,6 +675,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     onError: (assetId, error) =>
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
+    budget: budgetHooks,
+    captionModelId:
+      config.captioning?.model?.id ??
+      config.captioning?.image?.model?.id ??
+      config.captioning?.video?.model?.id ??
+      config.captioning?.audio?.model?.id,
     logger,
   });
 
@@ -746,7 +763,122 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     scheduler: llmScheduler,
     liveEvents,
     requestRing: llmRequestRing,
+    budget: budgetHooks,
   });
+
+  // ---------------------------------------------------------------------------
+  // Period cost limits (spec USAGE-COST-LIMITS §5/§6): normalize + validate the
+  // `[[limits]]` rules, build the BudgetEngine (seeded from `usage_events`), and
+  // fill the late-bound holder with the engine + the unified-ledger recorder.
+  // The recorder is the single fan-in for every billable event: it appends one
+  // `usage_events` row (best-effort) and increments the engine in memory.
+  // ---------------------------------------------------------------------------
+  {
+    const knownSessionTypes = new Set<string>([
+      "default",
+      ...Object.keys(config.agent.session_types ?? {}),
+    ]);
+    const knownTools = new Set<string>([
+      "image_generate",
+      "x_search",
+    ]);
+    const normalized = normalizeLimits(config.limits as never, {
+      defaultTz: config.agent.timezone ?? "UTC",
+      knownTools,
+      knownSessionTypes,
+    });
+    if (normalized.fatal.length > 0) {
+      throw new Error(`invalid [[limits]] config:\n  ${normalized.fatal.join("\n  ")}`);
+    }
+    for (const warning of normalized.warnings) logger.warn("usage_limit_config_warning", { warning });
+
+    // Model ids whose configured cost rate is zero (spec §2.2): these bypass the
+    // budget gates entirely (cost = rate × tokens; rate 0 ⇒ cost 0 ⇒ never moves
+    // or is blocked by a rule). Collected across every config site that prices a
+    // model — agent models, captioning, image-gen tiers, x_search, remote
+    // embeddings — so a free model in any lane is recognized.
+    const zeroCostModelIds = collectZeroCostModelIds(config);
+
+    // Structural dependency cascade (§2.1): triggered (default) + proactive
+    // sessions cannot run if summarization cannot (they need fresh summaries for
+    // context assembly). Diary depends on nothing. Encoded in code, not config.
+    const proactiveType = config.proactive?.session_type ?? "proactive";
+    const dependencies: Record<string, string[]> = {
+      default: ["summarize", "condense"],
+      [proactiveType]: ["summarize", "condense"],
+    };
+
+    const engine = new BudgetEngine({
+      rules: normalized.rules,
+      sumUsageCost: (filter) => storage.sumUsageCost(filter),
+      zeroCostModelIds,
+      dependencies,
+      resolveModelId: (sessionType) => {
+        try {
+          return factory.resolveModelId(sessionType);
+        } catch {
+          return undefined;
+        }
+      },
+      logger: logger.child("budget"),
+    });
+
+    const recordUsageEvent = (event: UsageEventInput): void => {
+      // In-memory increment first (synchronous, hot-path authoritative), then the
+      // durable append (queued, best-effort — a ledger failure must never fail
+      // the underlying work or desync the engine, which re-seeds from the ledger
+      // on the next rolling tick / restart).
+      engine.record(event);
+      void storage.insertUsageEvent(event).catch((error) => {
+        logger.warn("usage_event_insert_failed", {
+          class: event.class,
+          model: event.modelId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+
+    budgetHooks.engine = engine;
+    budgetHooks.record = recordUsageEvent;
+    if (normalized.rules.length > 0) {
+      engine.start();
+      logger.info("usage_limits_active", {
+        rules: normalized.rules.map((r) => r.name),
+      });
+    }
+  }
+
+  // Human-readable reset instant for the trigger-rejection reply (§5/§6.3),
+  // rendered in the agent's configured time zone. Falls back to ISO on a bad tz.
+  const formatResetsAt = (ms: number): string => {
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: config.agent.timezone ?? "UTC",
+        weekday: "short",
+        hour: "numeric",
+        minute: "2-digit",
+      }).format(new Date(ms));
+    } catch {
+      return new Date(ms).toISOString();
+    }
+  };
+
+  // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3): returns an
+  // agent-facing refusal message when the tool/model is over budget, else
+  // undefined. Wired into the paid LLM-calling tools (image_generate, x_search).
+  const makeToolBudgetCheck = (toolName: string) => (modelId: string): string | undefined => {
+    const engine = budgetHooks.engine;
+    if (!engine) return undefined;
+    const descriptor = { class: "tool" as const, tool: toolName, modelId };
+    const result = engine.check(descriptor);
+    if (result.allowed) return undefined;
+    engine.logBlocked("tool_call", result.blockingRules, descriptor, { toolName });
+    const when = result.primary ? formatResetsAt(result.primary.resetsAt) : "later";
+    return (
+      `Over budget for ${toolName} (limit ${result.primary?.name ?? "unknown"}); ` +
+      `resets ${when}. Try again after that.`
+    );
+  };
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
   // default chat agent or model. Both this check and pool instantiation use
@@ -782,6 +914,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         storage,
         factory,
         config: config.summarization ?? {},
+        // Budget claim gate (spec USAGE-COST-LIMITS §6.3): park while EITHER
+        // summarization session type is over budget. Conservative — over-pausing
+        // summarization only delays it (nothing dropped) and is the safe side of
+        // the structural dependency that gates triggered/proactive sessions (§2.1).
+        shouldPause: () =>
+          !!budgetHooks.engine &&
+          (!budgetHooks.engine.isClassAvailable("summarize") ||
+            !budgetHooks.engine.isClassAvailable("condense")),
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -938,6 +1078,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         onComplete: (summaryId) => logger.info("diary_job_complete", { summaryId }),
         onError: (summaryId, error) => logger.error("diary_failed", { summaryId, error: error.message }),
         activityBus: pipelineActivityBus,
+        // Budget claim gate (spec USAGE-COST-LIMITS §6.3): park while the diary
+        // class is over budget. Diary depends on nothing, so this gates only diary.
+        shouldPause: () => !!budgetHooks.engine && !budgetHooks.engine.isClassAvailable("diary"),
         logger: logger.child("diary"),
       })
     : null;
@@ -1797,6 +1940,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             error: error instanceof Error ? error.message : String(error),
           });
         });
+      // Unified ledger (spec USAGE-COST-LIMITS §3.1): the same tool spend, as a
+      // class='tool' row, + the BudgetEngine increment. Additive to the
+      // tool_invocations write above (which retains tool_call_id for transcript
+      // annotation); never folded into agent_sessions.usage_* (§4 invariant).
+      budgetHooks.record?.({
+        class: "tool",
+        agentSessionId: record.agentSessionId,
+        sessionType,
+        timelineKey: inbound.timelineKey,
+        triggerSenderId: inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id ?? null,
+        toolName: record.toolName,
+        modelId: record.modelId,
+        provider: record.provider,
+        inputTokens: record.usage.input,
+        outputTokens: record.usage.output,
+        cacheReadTokens: record.usage.cacheRead,
+        cacheWriteTokens: record.usage.cacheWrite,
+        images: record.usage.images ?? null,
+        costUsd: record.cost ?? 0,
+        ref: record.ref,
+      });
     };
 
     return [
@@ -1974,6 +2138,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // Separate lane — never touches agent_sessions.usage_* (§4).
             agentSessionId: sessionId,
             recordToolUsage,
+            // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
+            checkBudget: makeToolBudgetCheck("image_generate"),
             // Per-tier cost rates (spec §7.2): snake_case config block → CostRates.
             costRates: {
               pro: toImageCostRates(config.image_gen.costs?.pro),
@@ -2019,6 +2185,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             cache: xSearchCache,
             agentSessionId: sessionId,
             recordToolUsage,
+            // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
+            checkBudget: makeToolBudgetCheck("x_search"),
           })]
         : []),
       createUserProfileReadTool({
@@ -2391,6 +2559,62 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
       return;
     }
+    // Period cost limits — triggered/proactive admission gate (spec
+    // USAGE-COST-LIMITS §6.3 / §2.1). Refuse to spawn when the session's own
+    // covering rules are over budget OR a class it structurally depends on
+    // (summarization) is blocked. A human trigger gets an immediate, informative
+    // refusal (the optional templated reply); proactive is silent (the scheduler
+    // already clamps its cadence). Not queued — an hours-late autonomous reply is
+    // worse than a clear "back at X". Reuses the discard/drain plumbing above.
+    if (budgetHooks.engine) {
+      let admissionModelId: string | undefined;
+      try {
+        admissionModelId = factory.resolveModelId(session.sessionType);
+      } catch {
+        admissionModelId = undefined;
+      }
+      const admission = admissionModelId
+        ? budgetHooks.engine.checkAdmission(session.sessionType, admissionModelId)
+        : undefined;
+      if (admission && !admission.allowed) {
+        const gate = admission.dependency ? "dependency" : "trigger_admission";
+        budgetHooks.engine.logBlocked(
+          gate,
+          admission.dependency ? admission.dependency.blocking : admission.ownBlocking,
+          { class: "agent_loop", sessionType: session.sessionType, modelId: admissionModelId! },
+          {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            ...(admission.dependency ? { dependsOn: admission.dependency.sessionType } : {}),
+          },
+        );
+        // Human trigger: post the templated refusal if a covering global-capable
+        // rule supplies one (silent otherwise, and always silent for proactive).
+        if (!proactive) {
+          const message = admission.primary?.triggerRejectionMessage;
+          if (message && admission.primary) {
+            const body = message.replace(/\{resets_at\}/g, formatResetsAt(admission.primary.resetsAt));
+            void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
+              logger.warn("usage_limit_rejection_send_failed", {
+                sessionId: session.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+        }
+        sessions.markDiscarded(session.id);
+        const next = triggerCoordinator.complete(session.timelineKey);
+        if (next && !draining) void launchSession(next, true).catch((error) => {
+          releaseClaimFor(next);
+          logger.error("queued_session_launch_failed", {
+            timelineKey: next.timelineKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          triggerCoordinator.complete(next.timelineKey);
+        });
+        return;
+      }
+    }
     // Per-session-run usage tracker (spec SESSION-COST-LIMITS §5): constructed
     // here (fresh launch → empty seed) so the SAME instance receives both the
     // tool-cost feed (wired into buildSessionTools' recordToolUsage) and the
@@ -2636,6 +2860,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     isDraining: () => draining,
     // Skip channels whose startup gap is still filling (ARCHITECTURE.md §7c §6.4).
     isFrozen: (timelineKey) => gapBackfetch.isFrozen(timelineKey),
+    // Defer proactive cadence past the budget-window reset when proactive (or its
+    // summarization dependency) is over budget (spec USAGE-COST-LIMITS §6.3).
+    budgetDeferUntil: () => {
+      if (!budgetHooks.engine) return undefined;
+      const proactiveType = config.proactive?.session_type ?? "proactive";
+      let modelId: string | undefined;
+      try {
+        modelId = factory.resolveModelId(proactiveType);
+      } catch {
+        return undefined;
+      }
+      const admission = budgetHooks.engine.checkAdmission(proactiveType, modelId);
+      return admission.allowed ? undefined : admission.primary?.resetsAt;
+    },
     logger: logger.child("proactive"),
   });
 
@@ -2826,6 +3064,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       resumeSession: manualResumeSession,
       // Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11).
       gapBackfetch: () => gapBackfetch.snapshot(),
+      // Period-budget rule statuses for the Usage & Cost page (spec USAGE-COST-LIMITS §7).
+      budgetEngine: budgetHooks.engine,
       logger: logger.child("console"),
     });
     await consoleServer.start();

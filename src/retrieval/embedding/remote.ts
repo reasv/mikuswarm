@@ -22,10 +22,22 @@ export interface RemoteProviderOptions {
   scheduler?: LlmScheduler;
   /** Rate-limit group for embedding requests. Unset = `default`. */
   rateLimitGroup?: string;
+  /** USD per 1M input tokens (spec USAGE-COST-LIMITS §9). Unset/0 = untracked. */
+  costPerMtok?: number;
+  /** Chars-per-token estimate when the response omits a token count (§9, default 4). */
+  charsPerToken?: number;
+  /**
+   * Unified-ledger sink (spec USAGE-COST-LIMITS §9): called once per embedded
+   * batch with the prompt-token count (provider-reported, else estimated) and the
+   * computed USD cost, so a class='embedding' `usage_events` row can be emitted.
+   */
+  onUsage?: (promptTokens: number, costUsd: number) => void;
 }
 
 interface EmbeddingsResponse {
   data: Array<{ embedding: number[]; index: number }>;
+  /** OpenAI-compatible usage block (OpenRouter returns it); absent → estimate (§9). */
+  usage?: { prompt_tokens?: number; total_tokens?: number };
 }
 
 /**
@@ -170,6 +182,20 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
         );
       }
       const json = (await res.json()) as EmbeddingsResponse;
+      // Usage accounting (spec USAGE-COST-LIMITS §9): prefer the provider-reported
+      // prompt-token count; else estimate from input character length ÷ a configured
+      // chars-per-token factor. Cost = tokens / 1e6 × the configured rate (0 when
+      // unset → a zero-cost row, counted in the console but invisible to budgets).
+      if (this.options.onUsage) {
+        const reported = json.usage?.prompt_tokens ?? json.usage?.total_tokens;
+        const promptTokens =
+          reported ??
+          Math.ceil(
+            input.reduce((sum, s) => sum + s.length, 0) / (this.options.charsPerToken ?? 4),
+          );
+        const cost = (promptTokens / 1e6) * (this.options.costPerMtok ?? 0);
+        this.options.onUsage(promptTokens, cost);
+      }
       const data = json.data ?? [];
       // The response must be a complete 0..n-1 permutation of the input: one vector
       // per input, every index in range, no gaps or dupes. A short/partial/duplicated

@@ -28,5 +28,13 @@ export const keys = {
 	// Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11) — polled.
 	gapBackfetch: () => ['gap-backfetch'] as const,
 	// Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING §10.4).
-	costOverview: () => ['cost-overview'] as const
+	costOverview: () => ['cost-overview'] as const,
+	// Usage & Cost page (spec USAGE-COST-LIMITS §7) — polled ledger views + budgets.
+	// `window` folds into the summary/timeseries keys so changing it refetches.
+	usageSummary: (window: string) => ['usage', 'summary', window] as const,
+	usageTimeseries: (window: string, groupBy: string) =>
+		['usage', 'timeseries', window, groupBy] as const,
+	usageSessions: () => ['usage', 'sessions'] as const,
+	usageToolCalls: () => ['usage', 'tool-calls'] as const,
+	usageBudgets: () => ['usage', 'budgets'] as const
 };

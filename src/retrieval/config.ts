@@ -55,6 +55,10 @@ export interface ResolvedRetrievalConfig {
       dim: number;
       /** LLM rate-limit group (spec §9.4); unset = `default`. */
       rateLimitGroup?: string;
+      /** USD per 1M input tokens for usage accounting (spec USAGE-COST-LIMITS §9). */
+      costPerMtok?: number;
+      /** Chars-per-token estimate when the response omits a token count (§9). */
+      charsPerToken?: number;
     } | null;
   };
 }
@@ -115,6 +119,8 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
             apiKey: remoteBlock.api_key,
             dim: remoteBlock.dim,
             rateLimitGroup: remoteBlock.rate_limit_group,
+            costPerMtok: remoteBlock.cost_per_mtok,
+            charsPerToken: remoteBlock.chars_per_token,
           }
         : null,
     },

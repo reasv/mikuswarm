@@ -514,3 +514,100 @@ export const CostOverview = Schema.Struct({
 	captioningCost: Schema.Number
 });
 export type CostOverview = Schema.Schema.Type<typeof CostOverview>;
+
+// ===========================================================================
+// Usage & Cost page (spec USAGE-COST-LIMITS §7). Wire shapes for the unified
+// `usage_events` ledger views + the BudgetEngine rule statuses. All USD.
+// ===========================================================================
+
+/** GET /api/usage/summary — totals by class + by model over a window (§7.1 cards). */
+export const UsageSummary = Schema.Struct({
+	since: Schema.Number,
+	total: Schema.Number,
+	byClass: Schema.Array(
+		Schema.Struct({ class: Schema.String, cost: Schema.Number, events: Schema.Number })
+	),
+	byModel: Schema.Array(
+		Schema.Struct({ model: Schema.String, cost: Schema.Number, events: Schema.Number })
+	)
+});
+export type UsageSummary = Schema.Schema.Type<typeof UsageSummary>;
+
+/** GET /api/usage/timeseries — stacked spend-over-time (§7.1 chart). */
+export const UsageTimeseries = Schema.Struct({
+	series: Schema.Array(
+		Schema.Struct({ bucket: Schema.Number, grp: Schema.String, cost: Schema.Number })
+	),
+	bucketMs: Schema.Number,
+	groupBy: Schema.String
+});
+export type UsageTimeseries = Schema.Schema.Type<typeof UsageTimeseries>;
+
+/** One recent-sessions row (§7.1 table 5). */
+export const UsageSessionRow = Schema.Struct({
+	sessionId: Schema.String,
+	modelId: Schema.NullOr(Schema.String),
+	sessionType: Schema.String,
+	timelineKey: Schema.String,
+	triggerSender: Schema.NullOr(Schema.String),
+	status: Schema.String,
+	completedAt: Schema.NullOr(Schema.Number),
+	requests: Schema.Number,
+	inputTokens: Schema.Number,
+	outputTokens: Schema.Number,
+	cacheReadTokens: Schema.Number,
+	cacheWriteTokens: Schema.Number,
+	agentCost: Schema.Number,
+	toolCost: Schema.Number,
+	toolCalls: Schema.Number
+});
+export const UsageSessions = Schema.Struct({ sessions: Schema.Array(UsageSessionRow) });
+export type UsageSessions = Schema.Schema.Type<typeof UsageSessions>;
+
+/** One recent paid-event row — tool/caption/embedding (§7.1 table 6). */
+export const UsageEventRow = Schema.Struct({
+	id: Schema.String,
+	ts: Schema.Number,
+	class: Schema.String,
+	agent_session_id: Schema.NullOr(Schema.String),
+	session_type: Schema.NullOr(Schema.String),
+	timeline_key: Schema.NullOr(Schema.String),
+	trigger_sender_id: Schema.NullOr(Schema.String),
+	tool_name: Schema.NullOr(Schema.String),
+	model_id: Schema.String,
+	provider: Schema.NullOr(Schema.String),
+	input_tokens: Schema.NullOr(Schema.Number),
+	output_tokens: Schema.NullOr(Schema.Number),
+	cache_read_tokens: Schema.NullOr(Schema.Number),
+	cache_write_tokens: Schema.NullOr(Schema.Number),
+	images: Schema.NullOr(Schema.Number),
+	cost_usd: Schema.Number,
+	ref: Schema.NullOr(Schema.String)
+});
+export const UsageToolCalls = Schema.Struct({ toolCalls: Schema.Array(UsageEventRow) });
+export type UsageToolCalls = Schema.Schema.Type<typeof UsageToolCalls>;
+
+/** One configured-rule status (§6.2 / §7.1 #3). Window/scope kept loose to decode both kinds. */
+export const RuleStatus = Schema.Struct({
+	name: Schema.String,
+	spentUsd: Schema.Number,
+	capUsd: Schema.Number,
+	fraction: Schema.Number,
+	state: Schema.String,
+	window: Schema.Struct({
+		type: Schema.String,
+		period: Schema.optional(Schema.String),
+		duration: Schema.optional(Schema.String),
+		tz: Schema.optional(Schema.String)
+	}),
+	resetsAt: Schema.Number,
+	scope: Schema.Struct({
+		classes: Schema.optional(Schema.Array(Schema.String)),
+		sessionTypes: Schema.optional(Schema.Array(Schema.String)),
+		tools: Schema.optional(Schema.Array(Schema.String)),
+		models: Schema.optional(Schema.Array(Schema.String))
+	})
+});
+export type RuleStatus = Schema.Schema.Type<typeof RuleStatus>;
+export const UsageBudgets = Schema.Struct({ rules: Schema.Array(RuleStatus) });
+export type UsageBudgets = Schema.Schema.Type<typeof UsageBudgets>;

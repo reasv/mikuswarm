@@ -267,6 +267,14 @@ export interface ProactiveSchedulerOptions {
    * postponed, not lost. Defaults to never-frozen when omitted.
    */
   isFrozen?: (timelineKey: string) => boolean;
+  /**
+   * Period cost limits — proactive defer (spec USAGE-COST-LIMITS §6.3). Returns
+   * the window-reset instant (ms) when proactive posting is currently over budget
+   * (or blocked by its summarization dependency), else undefined. The next
+   * scheduled attempt is clamped to `max(normal_schedule, resets_at)`, so a
+   * channel simply waits out the budget rather than posting and being refused.
+   */
+  budgetDeferUntil?: () => number | undefined;
   logger: Logger;
   /** Injectable clock/RNG for deterministic tests. */
   now?: () => number;
@@ -356,6 +364,17 @@ export class ProactiveScheduler {
         minGapMs: Math.max(eff.minGapMs, PROACTIVE_ABSOLUTE_MIN_GAP_MS),
         random: this.randomFn,
       });
+    }
+    // Budget defer (spec USAGE-COST-LIMITS §6.3): when proactive is over budget,
+    // clamp the next attempt to the window reset so the channel waits instead of
+    // posting into a refusal. Self-reschedule already re-arms after this instant.
+    const deferUntil = this.options.budgetDeferUntil?.();
+    if (deferUntil !== undefined && deferUntil > next) {
+      this.options.logger.info("proactive_deferred_budget", {
+        timelineKey: eff.timelineKey,
+        deferUntil,
+      });
+      next = deferUntil;
     }
     return this.armChannel(eff, next);
   }

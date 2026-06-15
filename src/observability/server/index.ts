@@ -18,6 +18,11 @@ import {
   gapBackfetchSnapshot,
   llmRequests,
   costOverview,
+  usageSummary,
+  usageTimeseries,
+  usageSessions,
+  usageToolCalls,
+  usageBudgets,
 } from "./handlers.js";
 import {
   listPipelines,
@@ -83,6 +88,11 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/gap-backfetch", gapBackfetchSnapshot)
     .add("GET", "/api/llm-requests", llmRequests)
     .add("GET", "/api/cost-overview", costOverview)
+    .add("GET", "/api/usage/summary", usageSummary)
+    .add("GET", "/api/usage/timeseries", usageTimeseries)
+    .add("GET", "/api/usage/sessions", usageSessions)
+    .add("GET", "/api/usage/tool-calls", usageToolCalls)
+    .add("GET", "/api/usage/budgets", usageBudgets)
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)
     .add("GET", "/api/pipelines/:pool/items", pipelineItems)

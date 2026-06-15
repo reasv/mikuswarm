@@ -203,6 +203,72 @@ export function costOverview(
   sendJson(res, 200, ctx.deps.storage.getCostOverview());
 }
 
+// ===========================================================================
+// Usage & Cost page (spec USAGE-COST-LIMITS §7.2). All read via `Storage.read()`
+// over the unified `usage_events` ledger; the budgets route reads the live
+// BudgetEngine.
+// ===========================================================================
+
+/**
+ * Translate a window keyword into an inclusive `since` (ms epoch). Rolling
+ * keywords trail `now`; `today`/`month` align to the UTC calendar boundary (a
+ * display convenience — budget RULES use their own configured tz, §6.1).
+ */
+function windowSince(window: string | null, now: number): number {
+  switch (window) {
+    case "24h":
+      return now - 24 * 3_600_000;
+    case "7d":
+      return now - 7 * 86_400_000;
+    case "30d":
+      return now - 30 * 86_400_000;
+    case "today": {
+      const d = new Date(now);
+      return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    }
+    case "month": {
+      const d = new Date(now);
+      return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+    }
+    default:
+      return now - 24 * 3_600_000;
+  }
+}
+
+/** GET /api/usage/summary?window=… — totals by class + by model (§7.1 cards). */
+export function usageSummary(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const since = windowSince(ctx.url.searchParams.get("window"), Date.now());
+  sendJson(res, 200, ctx.deps.storage.getUsageSummary(since));
+}
+
+/** GET /api/usage/timeseries?window=&bucket=&groupBy=class|model — chart series (§7.1). */
+export function usageTimeseries(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const window = ctx.url.searchParams.get("window");
+  const since = windowSince(window, Date.now());
+  const groupBy = ctx.url.searchParams.get("groupBy") === "model" ? "model" : "class";
+  // Hourly buckets for ≤24h windows, daily otherwise (§7.1 chart).
+  const bucketMs = window === "24h" || window === "today" || window === null ? 3_600_000 : 86_400_000;
+  sendJson(res, 200, { series: ctx.deps.storage.getUsageTimeseries(since, bucketMs, groupBy), bucketMs, groupBy });
+}
+
+/** GET /api/usage/sessions?limit=… — recent sessions with per-class rollup (§7.1 table 5). */
+export function usageSessions(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 50, 1), 500);
+  sendJson(res, 200, { sessions: ctx.deps.storage.getUsageRecentSessions(limit) });
+}
+
+/** GET /api/usage/tool-calls?limit=… — recent paid tool/caption/embedding events (§7.1 table 6). */
+export function usageToolCalls(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 50, 1), 500);
+  sendJson(res, 200, { toolCalls: ctx.deps.storage.getUsageRecentToolCalls(limit) });
+}
+
+/** GET /api/usage/budgets — every configured rule's live status (§6.2 / §7.1 #3). */
+export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];
+  sendJson(res, 200, { rules });
+}
+
 /**
  * Index of the first rollout message in a persisted transcript: skip the leading
  * run of head final-user-turn messages (`triggerGroup`/`satellite`), reusing the

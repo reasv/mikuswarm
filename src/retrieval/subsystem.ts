@@ -9,6 +9,7 @@ import { EmbedWorkerPool } from "./embed-worker.js";
 import { VectorStore } from "./vector-store.js";
 import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding/index.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
+import type { BudgetHooks } from "../budget/index.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
@@ -34,6 +35,12 @@ export interface CreateSubsystemOptions {
   httpProxyUrl?: string;
   /** LLM scheduler — joined only by the remote provider (spec §5.4). */
   scheduler?: LlmScheduler;
+  /**
+   * Period cost limits (spec USAGE-COST-LIMITS §6/§9). `budget.record` emits the
+   * class='embedding' ledger row for remote embeds; `budget.engine` drives the
+   * embed-worker claim gate. Absent / local provider = no budgeting (zero cost).
+   */
+  budget?: BudgetHooks;
   logger?: Logger;
 }
 
@@ -92,10 +99,23 @@ export async function createRetrievalSubsystem(
   try {
     const cacheDir = path.join(opts.dataDir, "models", "fastembed");
     await mkdir(cacheDir, { recursive: true });
+    const remoteId = config.embedding.remote?.id;
     const p = createEmbeddingProvider(config, {
       cacheDir,
       httpProxyUrl: opts.httpProxyUrl,
       scheduler: opts.scheduler,
+      // Remote-embedding usage row (spec §9): emitted with the active model id; no
+      // session attribution (background enrichment). Local provider never calls this.
+      onEmbeddingUsage:
+        opts.budget?.record && remoteId
+          ? (promptTokens, costUsd) =>
+              opts.budget!.record!({
+                class: "embedding",
+                modelId: remoteId,
+                inputTokens: promptTokens,
+                costUsd,
+              })
+          : undefined,
       logger,
     });
 
@@ -127,7 +147,23 @@ export async function createRetrievalSubsystem(
     }
     provider = p;
     vectorStore = vs;
-    embedWorker = new EmbedWorkerPool({ storage, vectorStore, provider, config, logger });
+    embedWorker = new EmbedWorkerPool({
+      storage,
+      vectorStore,
+      provider,
+      config,
+      // Budget claim gate (§6.3): only the remote provider can cost money, so the
+      // pause descriptor uses the remote model id; a local provider yields no
+      // descriptor and is never paused (zero cost).
+      shouldPause:
+        opts.budget?.engine && remoteActive && config.embedding.remote
+          ? () => !opts.budget!.engine!.check({
+              class: "embedding",
+              modelId: config.embedding.remote!.id,
+            }).allowed
+          : undefined,
+      logger,
+    });
     logger?.info("retrieval_semantic_ready", { model: p.modelId, dim: p.dim });
   } catch (error) {
     // A configured remote provider failing here is fatal (#19) — rethrow rather than

@@ -223,6 +223,13 @@ export interface XSearchToolContext {
   agentSessionId?: string | null;
   /** Durable usage-ledger sink (§7); also feeds the in-memory cost lane. */
   recordToolUsage?: (record: ToolUsageRecord) => void;
+  /**
+   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called before the paid Grok
+   * call with the resolved model id; returns an agent-facing error message when a
+   * covering period rule is over budget (the call is refused, not thrown), else
+   * undefined. Absent = no period budgeting.
+   */
+  checkBudget?: (modelId: string) => string | undefined;
   /** Clock injection for cache TTL + tookMs (defaults to Date.now). */
   now?: () => number;
 }
@@ -337,6 +344,11 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
       let grok = context.cache.get(cacheKey, startMs);
       let cached = grok !== undefined;
       if (!grok) {
+        // Period-budget gate (spec USAGE-COST-LIMITS §6.3): a cache HIT above is
+        // free and always allowed; only the live (billable) Grok call is gated.
+        // Over budget → refuse as a tool error before issuing the call.
+        const budgetError = context.checkBudget?.(model);
+        if (budgetError) return textError(budgetError);
         // Attached images become base64 data-URL blocks on the user turn (vision
         // context for source-finding — §10). A load failure is a clear error, not
         // a silent degrade: the model needs to know its image never reached Grok.

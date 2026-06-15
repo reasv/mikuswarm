@@ -22,6 +22,7 @@ import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
 import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
 import type { CanonicalChatEvent } from "../types.js";
+import type { BudgetHooks } from "../budget/index.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -124,6 +125,12 @@ export interface AgentFactoryOptions {
    * admission wait. Optional: absent = no recording (tests, headless).
    */
   requestRing?: LlmRequestRing;
+  /**
+   * Period cost limits (spec USAGE-COST-LIMITS §6). A holder filled during app
+   * wiring: `engine` powers the per-request pre-flight, `record` emits the
+   * per-request agent-loop ledger row. Absent = no period budgeting (tests).
+   */
+  budget?: BudgetHooks;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -334,6 +341,11 @@ export class AgentSessionFactory {
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
     // once and fed to the hard-cap pre-flight below. `undefined` = unlimited.
     const costCeiling = this.resolveSessionCostCeiling(session.sessionType);
+    // Triggering user for the unified usage ledger (spec USAGE-COST-LIMITS §3):
+    // the explicit trigger origin, else the inbound event's sender, else null
+    // (background/proactive). Resolved once for every per-request ledger row.
+    const triggerSenderId =
+      session.trigger.trigger?.triggeredBy?.id ?? session.trigger.event.sender?.id ?? null;
     const model = createModelFromConfig(modelConfig, contextCeiling);
     // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
     // chosen stream fn so an environmental failure re-issues the exact same
@@ -433,8 +445,32 @@ export class AgentSessionFactory {
             }
           : {}),
         // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
-        // committed `done` message's authoritative usage feeds the tracker.
-        onRequestCommitted: (message: AssistantMessage) => usage.record(message.usage),
+        // committed `done` message's authoritative usage feeds the tracker AND
+        // (spec USAGE-COST-LIMITS §3.1) emits one per-request agent-loop row to
+        // the unified `usage_events` ledger + increments the BudgetEngine. The
+        // ledger write is additive — the §8b `agent_sessions.usage_*` aggregate
+        // is still maintained by the tracker's persistence subscriber.
+        onRequestCommitted: (message: AssistantMessage) => {
+          usage.record(message.usage);
+          const budget = this.options.budget;
+          if (budget?.record) {
+            const u = message.usage;
+            budget.record({
+              class: "agent_loop",
+              agentSessionId: session.id,
+              sessionType: session.sessionType,
+              timelineKey: session.timelineKey,
+              triggerSenderId,
+              modelId: model.id,
+              provider: model.provider ?? null,
+              inputTokens: u.input ?? null,
+              outputTokens: u.output ?? null,
+              cacheReadTokens: u.cacheRead ?? null,
+              cacheWriteTokens: u.cacheWrite ?? null,
+              costUsd: u.cost?.total ?? 0,
+            });
+          }
+        },
         // Pre-flight context-budget enforcement (spec CONTEXT-LIMIT-UNIFICATION
         // §2.3). The operative ceiling is never null (context_window is always
         // present), so enforcement is ALWAYS wired — interactive sessions now
@@ -466,21 +502,52 @@ export class AgentSessionFactory {
         // consuming retry budget. Inert when no ceiling resolves (unlimited). The
         // first request is never blocked (combined cost is 0 before any commit).
         checkCostBudget: () => {
-          if (costCeiling === undefined) return undefined;
-          const observed = usage.combinedCost();
-          if (observed < costCeiling) return undefined;
-          this.options.logger?.warn("session_cost_limit_exceeded", {
-            sessionId: session.id,
-            timelineKey: session.timelineKey,
-            sessionType: session.sessionType,
-            model: model.id,
-            observedCostUsd: observed,
-            limitUsd: costCeiling,
-          });
-          return (
-            `session cost limit exceeded: observed combined cost $${observed.toFixed(4)} >= ` +
-            `limit $${costCeiling.toFixed(4)} (session type ${session.sessionType})`
-          );
+          // §8d per-run ceiling (unchanged). Evaluated first; either it or the §6
+          // period rules below can synthesize the same `content`-class terminal.
+          if (costCeiling !== undefined) {
+            const observed = usage.combinedCost();
+            if (observed >= costCeiling) {
+              this.options.logger?.warn("session_cost_limit_exceeded", {
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                sessionType: session.sessionType,
+                model: model.id,
+                observedCostUsd: observed,
+                limitUsd: costCeiling,
+              });
+              return (
+                `session cost limit exceeded: observed combined cost $${observed.toFixed(4)} >= ` +
+                `limit $${costCeiling.toFixed(4)} (session type ${session.sessionType})`
+              );
+            }
+          }
+          // §6 period limits (spec USAGE-COST-LIMITS §6.3 per-request pre-flight):
+          // a covering period rule over budget blocks the next request the same
+          // way — a `content`-class terminal that burns no retry budget. The
+          // zero-cost short-circuit (§2.2) is inside `check`.
+          const engine = this.options.budget?.engine;
+          if (engine) {
+            const descriptor = {
+              class: "agent_loop" as const,
+              sessionType: session.sessionType,
+              modelId: model.id,
+              provider: model.provider ?? undefined,
+            };
+            const result = engine.check(descriptor);
+            if (!result.allowed) {
+              engine.logBlocked("request_preflight", result.blockingRules, descriptor, {
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+              });
+              const resetsAt = result.primary?.resetsAt;
+              const when = resetsAt ? new Date(resetsAt).toISOString() : "unknown";
+              return (
+                `period cost limit exceeded (${result.primary?.name ?? "unknown"}); ` +
+                `resets at ${when} (session type ${session.sessionType})`
+              );
+            }
+          }
+          return undefined;
         },
       },
     );

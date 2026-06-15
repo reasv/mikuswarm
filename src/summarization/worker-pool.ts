@@ -25,6 +25,13 @@ export interface SummarizationWorkerPoolOptions {
   onError: (jobId: string, error: Error) => void;
   /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
   activityBus?: PipelineActivityBus;
+  /**
+   * Budget claim gate (spec USAGE-COST-LIMITS §6.3): when it returns true the
+   * summarization class is over budget, so the pool parks (stops claiming) and
+   * resumes after the window rolls. Because triggered/proactive sessions depend
+   * structurally on summarization (§2.1), a paused summarizer also gates them.
+   */
+  shouldPause?: () => boolean;
   logger: Logger;
 }
 
@@ -158,6 +165,13 @@ export class SummarizationWorkerPool {
     const available = workerCount - this.activeWorkers.size;
     if (available <= 0) {
       this.schedulePoll(100);
+      return;
+    }
+
+    // Budget claim gate (§6.3): park without claiming while summarization is over
+    // budget; the periodic re-poll resumes once the window rolls.
+    if (this.options.shouldPause?.()) {
+      this.schedulePoll(30_000);
       return;
     }
 

@@ -3,11 +3,19 @@ import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import { isAnimatedImage, convertAnimatedToVideo, extractFirstFrame } from "./animated.js";
+import type { RawTokenUsage } from "../agent/usage.js";
 
 export interface CaptionWorkerOptions {
   storage: Storage;
   clients: Map<MediaModality, InferenceClient>;
   workspaceRoot: string;
+  /**
+   * Unified-ledger sink (spec USAGE-COST-LIMITS §3.1): emits one class='caption'
+   * `usage_events` row per completed caption, alongside the atomic
+   * `media_assets.caption_*` write. Detached enrichment — no session attribution.
+   * Optional so tests construct a bare worker.
+   */
+  recordUsage?: (result: { model: string; usage: RawTokenUsage | null; cost: number | null }) => void;
 }
 
 function mimeTypeDefault(modality: MediaModality): string {
@@ -20,6 +28,19 @@ function mimeTypeDefault(modality: MediaModality): string {
 
 export class CaptionWorker {
   constructor(private readonly options: CaptionWorkerOptions) {}
+
+  /**
+   * Persist the caption result atomically to `media_assets.caption_*` and emit
+   * the unified-ledger row (spec USAGE-COST-LIMITS §3.1). Single funnel for all
+   * three caption paths so the ledger write can never be forgotten on one.
+   */
+  private async persist(
+    asset: MediaAssetRow,
+    result: { caption: string; model: string; usage: RawTokenUsage | null; cost: number | null },
+  ): Promise<void> {
+    await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
+    this.options.recordUsage?.(result);
+  }
 
   async process(asset: MediaAssetRow): Promise<string> {
     const absolutePath = path.join(this.options.workspaceRoot, asset.local_path!);
@@ -41,7 +62,7 @@ export class CaptionWorker {
       context: "pipeline",
     });
 
-    await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
+    await this.persist(asset, result);
     return asset.event_id;
   }
 
@@ -57,7 +78,7 @@ export class CaptionWorker {
             filename: asset.original_filename ?? path.basename(asset.local_path!),
             context: "pipeline",
           });
-          await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
+          await this.persist(asset, result);
           return asset.event_id;
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
@@ -87,7 +108,7 @@ export class CaptionWorker {
         filename: asset.original_filename ?? path.basename(asset.local_path!),
         context: "pipeline",
       });
-      await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
+      await this.persist(asset, result);
       return asset.event_id;
     } finally {
       await unlink(tmpPath).catch(() => {});

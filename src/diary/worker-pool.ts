@@ -35,6 +35,12 @@ export interface DiaryWorkerPoolOptions {
   onError?: (summaryId: string, error: Error) => void;
   /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
   activityBus?: PipelineActivityBus;
+  /**
+   * Budget claim gate (spec USAGE-COST-LIMITS §6.3): when it returns true the
+   * diary class is over budget, so the pool parks and resumes after the window
+   * rolls. Diary depends on nothing, so a paused diary blocks only diary (§2.1).
+   */
+  shouldPause?: () => boolean;
   logger: Logger;
 }
 
@@ -161,6 +167,13 @@ export class DiaryWorkerPool {
     const available = workerCount - this.activeWorkers.size;
     if (available <= 0) {
       this.schedulePoll(100);
+      return;
+    }
+
+    // Budget claim gate (§6.3): park without claiming while the diary class is
+    // over budget; the periodic re-poll resumes once the window rolls.
+    if (this.options.shouldPause?.()) {
+      this.schedulePoll(30_000);
       return;
     }
 

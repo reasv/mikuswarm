@@ -8,6 +8,7 @@ import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
 import type { SessionLiveEventBus } from "../live-events.js";
 import type { LlmScheduler } from "../../agent/scheduler.js";
 import type { LlmRequestRing } from "../../agent/request-ring.js";
+import type { BudgetEngine } from "../../budget/index.js";
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -63,6 +64,12 @@ export interface ConsoleServerDeps {
    * the route returns an empty list (feature disabled or not wired).
    */
   gapBackfetch?: () => unknown[];
+  /**
+   * The period-cost BudgetEngine (spec USAGE-COST-LIMITS §6/§7), for the
+   * `GET /api/usage/budgets` rule-status list. Optional: absent = the route
+   * returns an empty list (no `[[limits]]` configured / not wired).
+   */
+  budgetEngine?: BudgetEngine;
   logger: Logger;
 }
 

@@ -3,6 +3,7 @@ import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { CaptionWorker } from "./worker.js";
+import type { BudgetHooks } from "../budget/index.js";
 
 export interface CaptionConfig {
   worker_count?: number;
@@ -21,6 +22,15 @@ export interface CaptionWorkerPoolOptions {
   onError?: (assetId: string, error: unknown) => void;
   /** Pipeline monitor activity bus (ARCHITECTURE.md §11); additive to the callbacks. */
   activityBus?: PipelineActivityBus;
+  /**
+   * Period cost limits (spec USAGE-COST-LIMITS §6). `budget.record` emits the
+   * class='caption' ledger row; `budget.engine` + `captionModelId` drive the
+   * claim gate (§6.3): the pool stops claiming while the caption class is over
+   * budget and resumes after the window rolls. Absent = no budgeting.
+   */
+  budget?: BudgetHooks;
+  /** Representative caption model id for the claim-gate descriptor (§6.3). */
+  captionModelId?: string;
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -29,8 +39,31 @@ export class CaptionWorkerPool {
   private readonly activeWorkers = new Set<Promise<void>>();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private wakeResolve?: () => void;
+  /** Last `caption_pool_budget_paused` log (ms) — rate-limited to one/minute (§6.4). */
+  private lastPauseLog = 0;
 
   constructor(private readonly options: CaptionWorkerPoolOptions) {}
+
+  /**
+   * Budget claim gate (spec USAGE-COST-LIMITS §6.3): true while the caption class
+   * is over budget, so the pool parks (stops claiming) and resumes after the
+   * window rolls. Free-model captioning short-circuits inside `engine.check`.
+   */
+  private shouldPauseForBudget(): boolean {
+    const engine = this.options.budget?.engine;
+    const modelId = this.options.captionModelId;
+    if (!engine || !modelId) return false;
+    const result = engine.check({ class: "caption", modelId });
+    if (!result.allowed) {
+      const now = Date.now();
+      if (now - this.lastPauseLog > 60_000) {
+        this.lastPauseLog = now;
+        engine.logBlocked("worker_claim", result.blockingRules, { class: "caption", modelId });
+      }
+      return true;
+    }
+    return false;
+  }
 
   async start(): Promise<void> {
     this.running = true;
@@ -98,6 +131,13 @@ export class CaptionWorkerPool {
       return;
     }
 
+    // Budget claim gate (§6.3): park without claiming while the caption class is
+    // over budget; the periodic re-poll resumes work once the window rolls.
+    if (this.shouldPauseForBudget()) {
+      this.schedulePoll(30_000);
+      return;
+    }
+
     const captionAll = this.options.config.caption_all ?? false;
     const captionAssistant = captionAll || (this.options.config.caption_assistant_messages ?? false);
     const claimed = await this.options.storage.claimPendingCaptions(available, captionAll, captionAssistant);
@@ -114,10 +154,23 @@ export class CaptionWorkerPool {
       return;
     }
 
+    const record = this.options.budget?.record;
     const worker = new CaptionWorker({
       storage: this.options.storage,
       clients: this.options.clients,
       workspaceRoot: this.options.workspaceRoot,
+      recordUsage: record
+        ? (result) =>
+            record({
+              class: "caption",
+              modelId: result.model,
+              inputTokens: result.usage?.input ?? null,
+              outputTokens: result.usage?.output ?? null,
+              cacheReadTokens: result.usage?.cacheRead ?? null,
+              images: result.usage?.images ?? null,
+              costUsd: result.cost ?? 0,
+            })
+        : undefined,
     });
 
     for (const asset of claimed) {

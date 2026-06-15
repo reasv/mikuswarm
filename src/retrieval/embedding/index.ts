@@ -14,6 +14,11 @@ export interface CreateProviderOptions {
   httpProxyUrl?: string;
   /** LLM scheduler — only the remote provider participates (spec §5.4). */
   scheduler?: LlmScheduler;
+  /**
+   * Usage sink for the remote provider (spec USAGE-COST-LIMITS §9): one call per
+   * embedded batch with prompt tokens + computed USD cost. Local emits nothing.
+   */
+  onEmbeddingUsage?: (promptTokens: number, costUsd: number) => void;
   logger?: Logger;
 }
 
@@ -38,6 +43,9 @@ export function createEmbeddingProvider(
       httpProxyUrl: opts.httpProxyUrl,
       scheduler: opts.scheduler,
       rateLimitGroup: config.embedding.remote.rateLimitGroup,
+      costPerMtok: config.embedding.remote.costPerMtok,
+      charsPerToken: config.embedding.remote.charsPerToken,
+      onUsage: opts.onEmbeddingUsage,
       logger: opts.logger,
     });
   }

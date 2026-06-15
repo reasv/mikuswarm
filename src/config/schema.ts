@@ -205,6 +205,13 @@ const RetrievalEmbeddingRemoteSchema = StrictObject({
   // LLM rate-limit group (spec §9.4): only meaningful when remote embedding is
   // the active provider (local ONNX never touches the scheduler). Unset = `default`.
   rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
+  // USD per 1,000,000 input tokens for usage accounting (spec USAGE-COST-LIMITS
+  // §9). Unset/0 = untracked (the remote model emits a zero-cost `usage_events`
+  // row, invisible to the BudgetEngine but counted in the console).
+  cost_per_mtok: Type.Optional(Type.Number({ minimum: 0 })),
+  // Chars-per-token estimate used to price a response that omits a token count
+  // (§9). Defaults to 4 when unset.
+  chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
 });
 
 const RetrievalEmbeddingSchema = StrictObject({
@@ -896,6 +903,50 @@ const RecoverySchema = StrictObject({
   failure_notice: Type.Optional(Type.String()),
 });
 
+// Period cost-limit rule (spec USAGE-COST-LIMITS §5.1). A centralized array of
+// own-scope rules; each declares a USD cap over a window and an optional selector
+// (which spend it covers). Selector dimensions AND together, OR within a list; an
+// omitted dimension is a wildcard; no dimensions = global. TypeBox covers
+// shape/bounds — cross-field semantics (name uniqueness, valid IANA tz, parseable
+// duration, message applicability) are validated fail-fast in app.ts (§5.2).
+const LimitWindowSchema = Type.Union([
+  StrictObject({
+    type: Type.Literal("rolling"),
+    // Trailing-window length, e.g. "24h", "7d", "30d" (parsed in app.ts).
+    duration: Type.String({ minLength: 1 }),
+  }),
+  StrictObject({
+    type: Type.Literal("calendar"),
+    period: Type.Union([Type.Literal("day"), Type.Literal("week"), Type.Literal("month")]),
+    // IANA zone the boundary is computed in. Optional — defaults to
+    // `agent.timezone` (then "UTC") at normalization.
+    tz: Type.Optional(Type.String({ minLength: 1 })),
+  }),
+]);
+
+const LimitRuleSchema = StrictObject({
+  name: Type.String({ minLength: 1 }),
+  max_usd: Type.Number({ minimum: 0 }),
+  window: LimitWindowSchema,
+  // Selector dimensions — all optional. Omitted = wildcard.
+  classes: Type.Optional(
+    Type.Array(
+      Type.Union([
+        Type.Literal("agent_loop"),
+        Type.Literal("tool"),
+        Type.Literal("caption"),
+        Type.Literal("embedding"),
+      ]),
+    ),
+  ),
+  session_types: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  models: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Posted as a timeline reply when a human trigger is refused by this rule
+  // (global-rule-typical). `{resets_at}` is templated. Omit to refuse silently.
+  trigger_rejection_message: Type.Optional(Type.String()),
+});
+
 export const AppConfigSchema = StrictObject({
   app: StrictObject({
     name: Type.String(),
@@ -1075,6 +1126,10 @@ export const AppConfigSchema = StrictObject({
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),
   rate_limits: Type.Optional(RateLimitsSchema),
+  // Period cost limits (spec USAGE-COST-LIMITS §5): a centralized array of
+  // own-scope budget rules enforced across the app by the BudgetEngine. Unset/
+  // empty = no period limits (the §8d per-run ceiling is orthogonal, unchanged).
+  limits: Type.Optional(Type.Array(LimitRuleSchema)),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
