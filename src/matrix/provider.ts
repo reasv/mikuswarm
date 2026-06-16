@@ -9,6 +9,8 @@ import type {
   InboundChatEvent,
   OutboundMessage,
   OutboundTarget,
+  SenderInfo,
+  TriggerInfo,
   Unsubscribe,
 } from "../types.js";
 import { MatrixNativeClient } from "./native-client.js";
@@ -50,6 +52,23 @@ export interface MatrixProviderOptions {
    */
   onReaction?: (event: MatrixReactionStreamEvent, context: { accountId: string }) => void;
   onDiagnostics?: (diagnostics: ReturnType<MatrixNativeClient["start"]>, context: { accountId: string }) => void;
+  /**
+   * Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). Called inside the
+   * trigger hold ({@link emitWithTriggerHold}) for an UNTRIGGERED reply to some
+   * other sender's message, BEFORE the strip/hold logic. The provider stays
+   * resume-UNAWARE: it only asks the app "is this a reply to one of my own
+   * messages, and are reply triggers enabled for this context?". The app owns the
+   * timeline lookup and the resume config; when it returns a {@link TriggerInfo}
+   * the reply enters the normal hold/debounce/same-sender grouping (so a bare
+   * group reply earns one held, grouped trigger-bearing delivery). Returning
+   * `undefined` leaves the reply untriggered (it stays a plain stored message).
+   */
+  resolveReplyTrigger?: (args: {
+    provider: string;
+    externalId: string;
+    timelineKey: string;
+    sender: SenderInfo;
+  }) => TriggerInfo | undefined;
 }
 
 export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
@@ -243,6 +262,32 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
   }
 
   private emitWithTriggerHold(inbound: InboundChatEvent): void {
+    // Reply-as-trigger (spec RESUMABLE-SESSIONS §5): an UNTRIGGERED reply to
+    // someone else's message may still be a reply to one of the bot's own
+    // messages. Ask the app (resume-unaware here) BEFORE the strip/hold below, so
+    // a resolved trigger flows through the exact same hold/debounce/same-sender
+    // grouping as a native dm/mention — one held, grouped trigger-bearing
+    // delivery (no late synthesis past the hold). Self-replies are excluded (a
+    // bot reply to its own message is never a trigger). The downstream
+    // resume-vs-fresh fork still happens in the app; the provider only classifies.
+    if (
+      !inbound.trigger &&
+      inbound.event.replyTo?.externalId &&
+      !inbound.event.sender.isSelf &&
+      this.options.resolveReplyTrigger
+    ) {
+      const replyTrigger = this.options.resolveReplyTrigger({
+        provider: inbound.provider,
+        externalId: inbound.event.replyTo.externalId,
+        timelineKey: inbound.timelineKey,
+        sender: inbound.event.sender,
+      });
+      if (replyTrigger) {
+        inbound.trigger = replyTrigger;
+        inbound.event.trigger = replyTrigger;
+      }
+    }
+
     this.emit({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
     if (!this.config) return;
 

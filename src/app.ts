@@ -93,7 +93,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
+import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
@@ -740,6 +740,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         lastSuccessfulSyncAt: diagnostics.lastSuccessfulSyncAt,
         lastSuccessfulDecryptionAt: diagnostics.lastSuccessfulDecryptionAt,
       }),
+    // Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). The provider asks,
+    // inside its trigger hold, whether an untriggered reply targets one of the
+    // bot's own messages with resume enabled for the context; if so it becomes a
+    // `reply` trigger and rides the normal hold/debounce/grouping. The provider
+    // stays resume-unaware — the timeline lookup and resume config live here. DMs
+    // already trigger as `dm`, so in practice this only ever fires for groups
+    // (the provider's `!inbound.trigger` guard). The resume-vs-fresh decision
+    // stays downstream in `tryReplyResume`; this only classifies the trigger.
+    resolveReplyTrigger: ({ provider, externalId, timelineKey, sender }) => {
+      const ctx = resumeContextFor(timelineKey);
+      if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;
+      const targetEvent = timeline.getByExternalId(provider, externalId, timelineKey);
+      if (!targetEvent || targetEvent.timelineKey !== timelineKey || !targetEvent.agentSessionId) {
+        return undefined;
+      }
+      return {
+        type: "reply",
+        reason: "reply to bot message",
+        triggeredBy: { id: sender.id, displayName: sender.displayName },
+      };
+    },
   });
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
@@ -1311,13 +1332,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     if (steerReplyToActiveSession(inbound)) return;
 
-    // Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5): a bare reply to one of
-    // the bot's own (now-completed) messages enters the pipeline when resume is
-    // enabled for this context, so the §7 fork in launchSession can continue it (or
-    // give a fresh response). Synthesizes `inbound.trigger` in place; no-op when the
-    // message already triggered (dm/mention) or isn't a reply to a bot message.
-    if (!inbound.trigger) maybeSynthesizeReplyTrigger(inbound);
-
+    // Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5) is resolved upstream in
+    // the provider's trigger hold (`resolveReplyTrigger`), so a bare reply to one of
+    // the bot's own completed messages already carries `inbound.trigger` here (with
+    // the hold's debounce + same-sender grouping applied). The §7 fork in
+    // launchSession then continues that session or gives a fresh response. Nothing
+    // to synthesize at this point.
     if (!inbound.trigger) return;
 
     // Co-target coalescing (spec DUPLICATE-REPLY-MITIGATION §5): a reply that
@@ -2637,35 +2657,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     "Your browser tab from the previous turn was closed when that run settled, but its " +
     "login/cookies persist on the shared identity — reopen the browser tool if you need it.";
 
-  /** DM vs group from the timeline key (`matrix:<acct>:dm:<room>` → dm). */
+  /**
+   * DM vs group from the timeline key (`matrix:<acct>:dm:<room>` → dm). Reused by
+   * the provider's `resolveReplyTrigger` callback (reply-as-trigger, §5) and the
+   * resume fork; reply triggers themselves are now classified upstream in the
+   * provider's trigger hold, not synthesized here.
+   */
   function resumeContextFor(timelineKey: string): "dm" | "group" {
     return timelineKey.split(":")[2] === "dm" ? "dm" : "group";
-  }
-
-  /**
-   * Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5). When resume is enabled
-   * for this context, a bare reply to one of the bot's OWN messages enters the
-   * pipeline (a group reply that today would not trigger), so the §7 fork can
-   * continue that session — or, if it turns out non-resumable, give a fresh
-   * response (addressing the bot always gets an answer; resumability only decides
-   * continue-vs-fresh, downstream). DMs already trigger as `dm`, so in practice
-   * this only ever fires for groups. Mutates `inbound.trigger` in place and leaves
-   * the rest of the pipeline unchanged. Called only when `inbound.trigger` is unset.
-   */
-  function maybeSynthesizeReplyTrigger(inbound: InboundChatEvent): void {
-    const replyExternalId = inbound.event.replyTo?.externalId;
-    if (!replyExternalId) return;
-    const ctx = resumeContextFor(inbound.timelineKey);
-    if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return;
-    const targetEvent = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
-    if (!targetEvent || targetEvent.timelineKey !== inbound.timelineKey || !targetEvent.agentSessionId) return;
-    const trigger: TriggerInfo = {
-      type: "reply",
-      reason: "reply to bot message",
-      triggeredBy: { id: inbound.event.sender.id, displayName: inbound.event.sender.displayName },
-    };
-    inbound.trigger = trigger;
-    inbound.event.trigger = trigger;
   }
 
   /** Built-in exempt tool names (from the per-tool flags) + per-context extras. */

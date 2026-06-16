@@ -5,9 +5,12 @@ import { TimelineStore } from "../src/timeline/index.js";
 import { ContextBuilder } from "../src/context/index.js";
 import { loadCompletedSessionMaterial } from "../src/agent/index.js";
 import { configureAgentTimezone, resetAgentTimezone } from "../src/time/index.js";
+import { MatrixProvider, type MatrixProviderOptions } from "../src/matrix/provider.js";
+import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
+import type { MatrixInboundEvent } from "../src/matrix/native-types.js";
 import type { AppConfig } from "../src/config/index.js";
 import type { AgentSessionRow } from "../src/storage/index.js";
-import type { CanonicalChatEvent } from "../src/types.js";
+import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "../src/types.js";
 import type { WorkspaceContent } from "../src/workspace/types.js";
 
 const TK = "matrix:miku:room:!room";
@@ -308,4 +311,177 @@ test("buildResumeTurn: gap omitted entirely when budget is off (default)", async
     storage.close();
     resetAgentTimezone();
   }
+});
+
+// ── §5 reply-as-trigger flows through the provider's trigger hold (issues #1, #7) ─
+//
+// Reply triggers are classified UPSTREAM in `emitWithTriggerHold` via the
+// resume-unaware `resolveReplyTrigger` callback — not synthesized late in the app
+// (the deleted `maybeSynthesizeReplyTrigger`). Consequence: the provider's strip +
+// hold guarantees exactly ONE trigger-bearing delivery per reply (so `handleInbound`
+// runs its trigger path once → handled exactly once, #1), and the reply rides the
+// same debounce + same-sender grouping as a native dm/mention (#7).
+
+const SELF = "@miku:example.org";
+const HOLD_MS = 5;
+const SETTLE_MS = 30;
+
+/** Build a provider whose `config`/hold is set, capturing every delivery. */
+function holdHarness(opts: Pick<MatrixProviderOptions, "resolveReplyTrigger">) {
+  const provider = new MatrixProvider(opts);
+  // emitWithTriggerHold only reads `config` truthiness + `trigger_hold_ms`.
+  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: HOLD_MS };
+  const deliveries: InboundChatEvent[] = [];
+  provider.subscribe((event) => deliveries.push(event));
+  const drive = (inbound: InboundChatEvent) =>
+    (provider as unknown as { emitWithTriggerHold(e: InboundChatEvent): void }).emitWithTriggerHold(inbound);
+  return { provider, deliveries, drive };
+}
+
+function nativeReply(args: {
+  eventId: string;
+  body: string;
+  replyToId?: string;
+  chatType?: MatrixInboundEvent["chatType"];
+  senderId?: string;
+  mentions?: string[];
+  ts?: number;
+}): InboundChatEvent {
+  const native: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: args.eventId,
+    senderId: args.senderId ?? "@alice:example.org",
+    senderName: "Alice",
+    chatType: args.chatType ?? "channel",
+    body: args.body,
+    timestamp: new Date(args.ts ?? 1000).toISOString(),
+    media: [],
+    replyToId: args.replyToId,
+    mentions: args.mentions ? { userIds: args.mentions } : undefined,
+  };
+  return normalizeMatrixInboundEvent(native, { accountId: "miku", selfUserId: SELF });
+}
+
+/** A resolver that recognises one bot message id as resumable (the app's job). */
+function replyResolverFor(botMsgId: string): NonNullable<MatrixProviderOptions["resolveReplyTrigger"]> {
+  return ({ externalId, sender }) =>
+    externalId === botMsgId
+      ? { type: "reply", reason: "reply to bot message", triggeredBy: { id: sender.id, displayName: sender.displayName } }
+      : undefined;
+}
+
+const triggerBearing = (ds: InboundChatEvent[]) => ds.filter((d) => d.trigger);
+
+test("group bare reply to a bot message: one held trigger-bearing delivery (handled once) — #1", async () => {
+  const { deliveries, drive } = holdHarness({ resolveReplyTrigger: replyResolverFor("$bot-msg") });
+  const reply = nativeReply({ eventId: "$reply", body: "where's that image?", replyToId: "$bot-msg" });
+  assert.equal(reply.trigger, undefined, "a bare group reply does not natively trigger");
+
+  drive(reply);
+  // Delivery 1: the always-stripped raw emit (handleInbound ingests, no trigger path).
+  assert.equal(deliveries.length, 1, "immediate raw emit");
+  assert.equal(deliveries[0].trigger, undefined, "raw emit is trigger-stripped");
+
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  // Delivery 2: the held trigger-bearing emit — and ONLY one such delivery.
+  const triggered = triggerBearing(deliveries);
+  assert.equal(triggered.length, 1, "exactly one trigger-bearing delivery → handled exactly once (#1)");
+  assert.equal(triggered[0].trigger?.type, "reply", "resolved as a reply trigger");
+  assert.equal(triggered[0].event.trigger?.type, "reply", "trigger mirrored onto event for the downstream fork");
+  assert.deepEqual(
+    triggered[0].trigger?.groupedEventIds,
+    [reply.event.id],
+    "the held trigger group carries the reply (by canonical event id)",
+  );
+});
+
+test("group reply to a NON-bot message: resolver declines → no trigger (still FRESH/ignored)", async () => {
+  const { deliveries, drive } = holdHarness({ resolveReplyTrigger: replyResolverFor("$bot-msg") });
+  // Reply targets some other user's message the resolver doesn't recognise.
+  drive(nativeReply({ eventId: "$reply", body: "nice", replyToId: "$someone-else" }));
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  assert.equal(triggerBearing(deliveries).length, 0, "an unresolved reply target never becomes a trigger");
+});
+
+test("group reply when resume is disabled (resolver returns undefined): no trigger", async () => {
+  // Mirrors `enabled.group !== true`: the app-side resolver short-circuits to undefined.
+  const { deliveries, drive } = holdHarness({ resolveReplyTrigger: () => undefined });
+  drive(nativeReply({ eventId: "$reply", body: "hello again", replyToId: "$bot-msg" }));
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  assert.equal(triggerBearing(deliveries).length, 0, "reply triggers are gated off when the resolver declines");
+});
+
+test("self-reply to the bot's own message is excluded from the resolver — no trigger", async () => {
+  let resolverCalls = 0;
+  const { deliveries, drive } = holdHarness({
+    resolveReplyTrigger: (args) => {
+      resolverCalls += 1;
+      return replyResolverFor("$bot-msg")(args);
+    },
+  });
+  // The bot replies to its own message (sender is self).
+  const selfReply = nativeReply({ eventId: "$self-reply", body: "addendum", replyToId: "$bot-msg", senderId: SELF });
+  assert.equal(selfReply.event.sender.isSelf, true, "sender is self");
+
+  drive(selfReply);
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  assert.equal(resolverCalls, 0, "resolver is NEVER invoked for a self-reply (self-reply guard)");
+  assert.equal(triggerBearing(deliveries).length, 0, "a self-reply never becomes a trigger");
+});
+
+test("DM reply natively triggers as dm — resolver is bypassed, single held delivery (no double) — #1", async () => {
+  let resolverCalls = 0;
+  const { deliveries, drive } = holdHarness({
+    resolveReplyTrigger: (args) => {
+      resolverCalls += 1;
+      return replyResolverFor("$bot-msg")(args);
+    },
+  });
+  const dmReply = nativeReply({ eventId: "$dm-reply", body: "and one more thing", replyToId: "$bot-msg", chatType: "direct" });
+  assert.equal(dmReply.trigger?.type, "dm", "a DM reply already triggers natively as dm");
+
+  drive(dmReply);
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  assert.equal(resolverCalls, 0, "resolver bypassed when a native trigger is already present (the !inbound.trigger guard)");
+  const triggered = triggerBearing(deliveries);
+  assert.equal(triggered.length, 1, "exactly one trigger-bearing delivery for a DM reply (no double-handle)");
+  assert.equal(triggered[0].trigger?.type, "dm", "the single delivery keeps the native dm trigger");
+});
+
+test("group reply + @mention natively triggers as mention — resolver bypassed, single delivery — #1", async () => {
+  let resolverCalls = 0;
+  const { deliveries, drive } = holdHarness({
+    resolveReplyTrigger: (args) => {
+      resolverCalls += 1;
+      return replyResolverFor("$bot-msg")(args);
+    },
+  });
+  const reply = nativeReply({ eventId: "$mention-reply", body: "@miku follow up", replyToId: "$bot-msg", mentions: [SELF] });
+  assert.equal(reply.trigger?.type, "mention", "a group reply that also @-mentions triggers natively as mention");
+
+  drive(reply);
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  assert.equal(resolverCalls, 0, "resolver bypassed when the mention already triggered");
+  const triggered = triggerBearing(deliveries);
+  assert.equal(triggered.length, 1, "exactly one trigger-bearing delivery for a group reply+mention (no double-handle)");
+  assert.equal(triggered[0].trigger?.type, "mention", "native mention trigger preserved");
+});
+
+test("resolved group reply rides same-sender grouping in the hold — one grouped trigger group (#7)", async () => {
+  const { deliveries, drive } = holdHarness({ resolveReplyTrigger: replyResolverFor("$bot-msg") });
+  // 1) A bare group reply to the bot → resolved into a `reply` trigger, held.
+  const reply = nativeReply({ eventId: "$reply", body: "where's that image", replyToId: "$bot-msg", ts: 1000 });
+  drive(reply);
+  // 2) A same-sender follow-up (no reply, no trigger) arrives within the hold window.
+  const followup = nativeReply({ eventId: "$followup", body: "the one you made earlier", ts: 1001 });
+  drive(followup);
+
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  const triggered = triggerBearing(deliveries);
+  assert.equal(triggered.length, 1, "still exactly one trigger-bearing delivery (#1 holds with grouping)");
+  assert.deepEqual(
+    triggered[0].trigger?.groupedEventIds,
+    [reply.event.id, followup.event.id],
+    "the follow-up is folded into the reply's trigger group by the hold (#7)",
+  );
 });
