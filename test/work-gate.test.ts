@@ -20,6 +20,9 @@ import { createReactTool as _unused } from "../src/tools/react.ts"; // keep impo
 import { createWebSearchTool } from "../src/tools/web.ts";
 import { createSearchMessagesTool } from "../src/tools/search-messages.ts";
 import { createWriteMemoryTool } from "../src/tools/memory.ts";
+// The WHOLE first-party tool factory set, for the exhaustive both-directions
+// drift test (issue #15) — every work tool too, not just the 11 exempt ones.
+import * as allTools from "../src/tools/index.ts";
 
 void _unused;
 
@@ -154,4 +157,133 @@ test("drift: representative work tools are NOT flagged exempt", () => {
   for (const tool of [createWebSearchTool(stub), createSearchMessagesTool(stub), createWriteMemoryTool(stub)]) {
     assert.notEqual(tool.resumeWorkExempt, true, `${tool.name} must count as work`);
   }
+});
+
+// ── Issue #15: EXHAUSTIVE both-directions drift over the FULL tool set ────────
+//
+// The drift tests above pin the 11 exempt names positively and three work tools
+// negatively, but neither can catch a stray `resumeWorkExempt: true` accidentally
+// added to some OTHER work tool (e.g. `bash`, `browser`, `recap`). This test
+// constructs EVERY first-party tool factory exported from `src/tools/index.ts`,
+// reads each one's static flag, and asserts the flagged set equals EXACTLY the
+// spec §7a eleven — so a stray flag on any of the ~28 work tools fails here, and
+// dropping a flag off an exempt tool fails too. It is the symmetric closure of the
+// two one-directional tests (which are kept as readable, low-dependency guards).
+
+/** The spec §7a built-in exempt set, verbatim — the EXACT expected flagged set. */
+const SPEC_EXEMPT_NAMES = [
+  "create_poll",
+  "delegate_to_session",
+  "delete_message",
+  "edit_message",
+  "media",
+  "pins",
+  "poll_vote",
+  "react",
+  "send_message",
+  "set_profile",
+  "spawn_session",
+] as const;
+
+/**
+ * A self-returning, callable Proxy used as a stub context. Every property read
+ * returns the same proxy and every call/construct returns it too, so a factory can
+ * dereference and chain whatever it likes at CONSTRUCTION time without us modeling
+ * real context — the factories build a plain object and only touch context inside
+ * `execute` (the same property `resume-exempt.ts` and the drift tests above rely
+ * on). `Symbol.toPrimitive` → "" and a missing `then` keep it from masquerading as
+ * a number or a thenable.
+ */
+function tolerantContextStub(): never {
+  const fn = function () {
+    return stub;
+  };
+  const stub: unknown = new Proxy(fn, {
+    get(_t, prop) {
+      if (prop === Symbol.toPrimitive) return () => "";
+      if (prop === "then") return undefined;
+      return stub;
+    },
+    apply: () => stub,
+    construct: () => stub as object,
+  });
+  return stub as never;
+}
+
+/**
+ * Four work-tool factories validate a real `config` block at construction (URL /
+ * model-name shape), so the blanket stub can't build them. They get a minimal
+ * VALID config; everything else still rides the tolerant stub. All four are work
+ * tools — the point is to include them so a stray exempt flag on one is caught.
+ */
+const STRICT_FACTORY_CONTEXTS: Record<string, () => unknown> = {
+  createDanbooruTool: () => ({
+    fetchClient: tolerantContextStub(),
+    config: { base_url: "https://danbooru.donmai.us", default_order: "id_desc" },
+  }),
+  createFindSourceTool: () => ({
+    workspaceRoot: "/tmp",
+    fetchClient: tolerantContextStub(),
+    inlineImageMaxBytes: 1000,
+    inferenceImageOptions: {},
+    modelHasVision: false,
+    rateLimiter: tolerantContextStub(),
+    config: { base_url: "https://saucenao.com/search.php", api_key: "k" },
+  }),
+  createImageGenTool: () => ({
+    fetchClient: tolerantContextStub(),
+    config: {
+      base_url: "https://example.org/google",
+      models: { flash: "gemini-2.5-flash", pro: "gemini-2.5-pro" },
+      api_key: "k",
+    },
+  }),
+  createXSearchTool: () => ({
+    workspaceRoot: "/tmp",
+    fxTwitterClient: tolerantContextStub(),
+    statusHosts: [],
+    fetchClient: tolerantContextStub(),
+    downloadSizeLimit: 1000,
+    cache: tolerantContextStub(),
+    config: { base_url: "https://example.org/grok", api_key: "k", model: "grok-2" },
+  }),
+};
+
+test("issue #15: across the ENTIRE first-party tool set, exactly the 11 spec tools are resumeWorkExempt", () => {
+  const factoryNames = Object.keys(allTools).filter(
+    (k) => k.startsWith("create") && typeof (allTools as Record<string, unknown>)[k] === "function",
+  );
+  // Sanity: the index really exports the full tool surface, not a stub subset — so
+  // a future work tool added there without a context override is exercised here.
+  assert.ok(factoryNames.length >= 38, `expected the full factory set; saw ${factoryNames.length}`);
+
+  const flaggedExempt: string[] = [];
+  const builtNames: string[] = [];
+  for (const fname of factoryNames) {
+    const factory = (allTools as Record<string, (ctx: never) => AgentTool>)[fname]!;
+    const ctx = (STRICT_FACTORY_CONTEXTS[fname]?.() ?? tolerantContextStub()) as never;
+    const tool = factory(ctx);
+    builtNames.push(tool.name);
+    if (tool.resumeWorkExempt === true) flaggedExempt.push(tool.name);
+  }
+
+  // Every factory built (none silently skipped) and the flagged set is EXACTLY the
+  // spec eleven — a stray flag on any work tool, or a dropped flag on an exempt
+  // tool, breaks this equality.
+  assert.equal(builtNames.length, factoryNames.length, "every tool factory must construct");
+  assert.deepEqual(
+    [...new Set(flaggedExempt)].sort(),
+    [...SPEC_EXEMPT_NAMES].sort(),
+    `resumeWorkExempt set drifted from the spec §7a eleven; flagged: ${flaggedExempt.sort().join(", ")}`,
+  );
+  // And it agrees with the shipped context-free derivation.
+  assert.deepEqual(
+    [...collectExemptToolNames(
+      factoryNames.map((fname) => {
+        const ctx = (STRICT_FACTORY_CONTEXTS[fname]?.() ?? tolerantContextStub()) as never;
+        return (allTools as Record<string, (c: never) => AgentTool>)[fname]!(ctx);
+      }),
+    )].sort(),
+    [...SPEC_EXEMPT_NAMES].sort(),
+  );
 });

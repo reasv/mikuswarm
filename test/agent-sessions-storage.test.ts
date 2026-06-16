@@ -1327,6 +1327,164 @@ test("v17 -> v18 ALTER adds the trigger-sender columns with populated rows intac
 });
 
 // ---------------------------------------------------------------------------
+// Issue #10: populated-fixture v25 -> v26 migration (the resumable-sessions step).
+// The v4-chain test above asserts the columns EXIST after the full chain, but
+// only on an empty agent_sessions and from a v4 fixture where the columns arrive
+// via the ALTER path incidentally. This pins the v25 -> v26 SEMANTICS directly,
+// with rows present (mirroring the v16/v17 populated-row tests): a completed
+// session backfills `resume_generation = 0` (so it stays reply-resumable exactly
+// once, §6), an already-sent assistant timeline row reads `agent_session_generation`
+// NULL (≡ generation 0 at the §6 gate), and a re-open is a clean no-op.
+// ---------------------------------------------------------------------------
+
+/** The v25 `agent_sessions` shape: v17 widened CHECK + v18 sender columns + v20
+ *  actuals/usage columns — everything BEFORE the v26 `resume_generation` and the
+ *  v27 `chat_upper_bound_ts`. Built by appending the ALTER-added columns (which
+ *  land at the table's end) onto the v17 body. */
+const V25_AGENT_SESSIONS = V17_AGENT_SESSIONS.replace(
+  `   completed_at integer
+ );`,
+  `   completed_at integer,
+   trigger_sender_id text,
+   trigger_sender_display_name text,
+   llm_requests integer,
+   usage_input_tokens integer,
+   usage_output_tokens integer,
+   usage_cache_read_tokens integer,
+   usage_cache_write_tokens integer,
+   usage_cost real,
+   context_tokens integer
+ );`,
+);
+
+/** A v25 `timeline_events` shape: like V6 but WITHOUT `agent_session_generation`
+ *  (the column the v25 -> v26 step adds). Carries `agent_session_id` so an
+ *  assistant send can be attributed to the legacy session. */
+const V25_TIMELINE_EVENTS = V6_TIMELINE_EVENTS;
+
+test("v25 -> v26 backfills resume_generation=0 on populated rows and NULL generation on legacy sends (issue #10)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v25-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V25_TIMELINE_EVENTS);
+    legacy.exec(V25_AGENT_SESSIONS);
+
+    // A completed session row (the only reply-resumable status, §7.2) with a
+    // populated transcript — exactly what a reply-resume reads post-migration.
+    const insertSession = legacy.prepare(
+      `insert into agent_sessions (
+         id, timeline_key, session_type, status, model_id,
+         trigger_event_id, trigger_external_id, trigger_body,
+         context_snapshot_json, context_dump_path, transcript_json,
+         token_estimate, no_reply, error, created_at, started_at, updated_at, completed_at,
+         trigger_sender_id, trigger_sender_display_name
+       ) values (
+         @id, @timelineKey, @sessionType, @status, @modelId,
+         @triggerEventId, @triggerExternalId, @triggerBody,
+         @snapshot, @dumpPath, @transcript,
+         @tokenEstimate, @noReply, @error, @createdAt, @startedAt, @updatedAt, @completedAt,
+         @senderId, @senderName
+       )`,
+    );
+    insertSession.run({
+      id: "s-v25-done", timelineKey: "matrix:miku:room:!room", sessionType: "default", status: "completed",
+      modelId: "anthropic/claude", triggerEventId: "evt-1", triggerExternalId: "$server-1", triggerBody: "make an image",
+      snapshot: '[{"type":"system"}]', dumpPath: null, transcript: '[{"role":"user"},{"role":"assistant"}]',
+      tokenEstimate: 42, noReply: 0, error: null, createdAt: 1_000, startedAt: 1_100, updatedAt: 2_000, completedAt: 2_000,
+      senderId: "@alice:example.org", senderName: "Alice",
+    });
+
+    // An assistant timeline_events row attributed to that session — a legacy "send"
+    // that predates generation tagging (no agent_session_generation column yet).
+    legacy
+      .prepare(
+        `insert into timeline_events (
+           id, external_id, timeline_key, provider, role, sender_id, sender_display_name,
+           body, timestamp, received_at, agent_session_id, event_json,
+           enrichment_status, created_at, updated_at
+         ) values (
+           @id, @externalId, @timelineKey, 'matrix', 'assistant', '@miku:server', 'Miku',
+           @body, @ts, @ts, @sessionId, @eventJson, 'complete', @ts, @ts
+         )`,
+      )
+      .run({
+        id: "assistant:s-v25-done:$sent:0", externalId: "$sent", timelineKey: "matrix:miku:room:!room",
+        body: "here is your image", ts: 1_900, sessionId: "s-v25-done",
+        eventJson: JSON.stringify({ id: "assistant:s-v25-done:$sent:0", externalId: "$sent", role: "assistant" }),
+      });
+
+    legacy.pragma("user_version = 25");
+
+    // Sanity: the resume columns are ABSENT before migration (the v25 shape).
+    const colsBefore = (legacy.pragma(`table_info(agent_sessions)`) as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(!colsBefore.includes("resume_generation"), "v25 fixture must NOT have resume_generation yet");
+    assert.ok(
+      !(legacy.pragma(`table_info(timeline_events)`) as Array<{ name: string }>)
+        .some((c) => c.name === "agent_session_generation"),
+      "v25 fixture must NOT have agent_session_generation yet",
+    );
+    legacy.close();
+
+    // Open through Storage: runs the v25 -> v26 (and v26 -> v27) steps.
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+
+      // (1) The legacy completed row backfilled resume_generation = 0 — so it remains
+      //     reply-resumable EXACTLY once (a reply to its gen-0 send is the live handle).
+      const row = storage.getAgentSession("s-v25-done");
+      assert.ok(row, "the completed session survived the migration");
+      assert.equal(row.status, "completed");
+      assert.equal(row.resume_generation, 0, "legacy completed row backfills resume_generation = 0");
+      assert.equal(row.transcript_json, '[{"role":"user"},{"role":"assistant"}]', "transcript intact");
+      assert.equal(row.trigger_sender_id, "@alice:example.org", "v18 sender column intact across the migration");
+
+      // (2) The legacy assistant send reads agent_session_generation NULL (≡ 0 at the
+      //     §6 gate): the column exists and is NULL for a pre-migration send.
+      const sendGen = storage.read((db) =>
+        (
+          db
+            .prepare(`select agent_session_generation as g from timeline_events where external_id = '$sent'`)
+            .get() as { g: number | null } | undefined
+        )?.g,
+      );
+      assert.equal(sendGen, null, "a pre-migration send reads NULL generation (treated as 0 by the gate)");
+
+      // The accept-CAS then works on the migrated row: gen 0 -> 1, status resuming.
+      const bumped = await storage.acceptResumeGeneration("s-v25-done");
+      assert.equal(bumped, 1, "the migrated row consumes its one resume, bumping gen 0 -> 1");
+      assert.equal(storage.getAgentSession("s-v25-done")?.resume_generation, 1);
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+
+    // (3) Re-open is a clean no-op: the version is already LATEST, no migration runs,
+    //     and the row state is unchanged.
+    const reopened = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        reopened.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+        "re-open leaves the version at LATEST (no re-migration)",
+      );
+      const row = reopened.getAgentSession("s-v25-done");
+      assert.equal(row?.resume_generation, 1, "re-open does not touch the row's generation");
+      assert.equal(row?.status, "resuming", "re-open is a clean no-op on the row");
+    } finally {
+      await reopened.waitForIdle();
+      reopened.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Issue #9 (pairs with #1): the per-branch resume usage-seed choice.
 //
 // `resumeUsageSeed(row, mode)` is the pure factoring of the seed decision

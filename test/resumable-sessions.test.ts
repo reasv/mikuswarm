@@ -3,7 +3,12 @@ import test from "node:test";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
 import { ContextBuilder } from "../src/context/index.js";
-import { loadCompletedSessionMaterial } from "../src/agent/index.js";
+import { renderRichMessage } from "../src/context/renderer.js";
+import { estimateTokens } from "../src/context/tokens.js";
+import { loadCompletedSessionMaterial, SessionClaims } from "../src/agent/index.js";
+// `rehydrateImages` is @internal-exported from recovery (not re-exported via the
+// agent index) — used by the issue #13 catch-mechanism test below.
+import { rehydrateImages } from "../src/agent/recovery.js";
 import { configureAgentTimezone, resetAgentTimezone } from "../src/time/index.js";
 import { MatrixProvider, type MatrixProviderOptions } from "../src/matrix/provider.js";
 import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
@@ -88,6 +93,44 @@ test("acceptResumeGeneration on an unknown row returns undefined", async () => {
   }
 });
 
+// Issue #11(a): a TRUE concurrent CAS — two replies to the same completed handle
+// race to consume the single resume (spec §6 single-consumption). The CAS is
+// `update … where status='completed'` on the single-writer queue, so the two
+// promises are *issued* concurrently (Promise.all, no await between) but serialize
+// at the writer: exactly one observes `completed` and bumps to gen 1, the other
+// sees `resuming` and changes nothing. The second reply is what the running-session
+// interjection / coalescing path (§10) then handles — never a second resume.
+test("acceptResumeGeneration: concurrent accepts consume exactly once (issue #11)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const now = 1000;
+    await storage.insertAgentSession({
+      id: "s1", timelineKey: TK, sessionType: "default", status: "created", createdAt: now, updatedAt: now,
+    });
+    await storage.updateAgentSessionStatus("s1", "completed", { completedAt: now });
+
+    // Both issued before either resolves — a genuine race, not a sequence.
+    const [a, b] = await Promise.all([
+      storage.acceptResumeGeneration("s1"),
+      storage.acceptResumeGeneration("s1"),
+    ]);
+
+    // Exactly one winner (returns the bumped generation 1); the loser returns undefined.
+    const results = [a, b];
+    const winners = results.filter((r) => typeof r === "number");
+    const losers = results.filter((r) => r === undefined);
+    assert.equal(winners.length, 1, "exactly one concurrent accept consumes the resume");
+    assert.equal(losers.length, 1, "the other concurrent accept consumes nothing");
+    assert.equal(winners[0], 1, "the single winner bumps the generation to 1");
+
+    // The row settled at generation 1 (a single consumption), status resuming.
+    assert.equal(storage.getAgentSession("s1")?.resume_generation, 1, "generation ends at 1, never 2");
+    assert.equal(storage.getAgentSession("s1")?.status, "resuming");
+  } finally {
+    storage.close();
+  }
+});
+
 // ── §6 generation tagging round-trips and survives the echo-enrich UPDATE ─────
 
 test("agent_session_generation tags an outbound event and survives echo reconciliation", async () => {
@@ -117,6 +160,57 @@ test("agent_session_generation tags an outbound event and survives echo reconcil
     const afterEcho = timeline.getByExternalId("matrix", "$matrixId", TK);
     assert.equal(afterEcho?.agentSessionGeneration, 2, "generation survives the echo-enrich UPDATE");
     assert.equal(afterEcho?.agentSessionId, "s1", "session attribution also survives");
+  } finally {
+    storage.close();
+  }
+});
+
+// Issue #11(b): the generation must populate the RAW `agent_session_generation`
+// COLUMN — not merely live inside the serialized `event_json` blob. The §6 stale-
+// handle gate reads the column (the timeline query selects it), so a generation
+// that only round-tripped through event_json would read NULL→0 at the gate and let
+// a superseded reply resume. This pins the column for BOTH write paths: the
+// `append` insert (the send-tool path) and the `ingestAssistantEcho` UPDATE/insert
+// (the Matrix echo reconciliation).
+test("agent_session_generation populates the raw column on append and ingestAssistantEcho (issue #11)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  try {
+    const rawGenFor = (eventExternalId: string) =>
+      storage.read((db) =>
+        (
+          db
+            .prepare(
+              `select agent_session_generation as g
+                 from timeline_events
+                where external_id = ? and timeline_key = ?`,
+            )
+            .get(eventExternalId, TK) as { g: number | null } | undefined
+        )?.g,
+      );
+
+    // 1) The send-tool append path: a tagged assistant event.
+    const sent: CanonicalChatEvent = {
+      ...ev("$appended", "tagged via append", 5000, "assistant"),
+      id: "assistant:s1:$appended:0",
+      externalId: "$appended",
+      agentSessionId: "s1",
+      agentSessionGeneration: 3,
+    };
+    await timeline.append(sent);
+    assert.equal(rawGenFor("$appended"), 3, "append writes the generation to the raw column, not just event_json");
+
+    // 2) The echo path, NEW row (no pre-existing candidate to enrich): the insert
+    //    branch of ingestAssistantEcho must carry the column too.
+    const echoNew: CanonicalChatEvent = {
+      ...ev("$echoed", "tagged via echo insert", 6000, "assistant"),
+      id: "assistant:s1:$echoed:0",
+      externalId: "$echoed",
+      agentSessionId: "s1",
+      agentSessionGeneration: 4,
+    };
+    await timeline.ingestAssistantEcho(echoNew);
+    assert.equal(rawGenFor("$echoed"), 4, "ingestAssistantEcho insert writes the generation to the raw column");
   } finally {
     storage.close();
   }
@@ -203,6 +297,57 @@ test("loadCompletedSessionMaterial returns null when snapshot or transcript is m
   } finally {
     storage.close();
   }
+});
+
+// Issue #13: every CORRUPT-material branch of loadCompletedSessionMaterial must
+// return null so the fork degrades to FRESH (spec §7 / §2 — a wrong guess degrades
+// to a fresh session, never corruption). Table-driven over the parse/shape guards.
+// (The missing-column branch is covered by the test above; here we exercise the
+// JSON.parse failure, the non-array shapes, and the empty transcript.)
+const NULL_MATERIAL_DEPS = { media: { getMediaAssetById: () => undefined }, workspaceRoot: "/tmp" };
+
+const corruptMaterialCases: Array<{ name: string; row: Partial<AgentSessionRow> }> = [
+  // JSON.parse throws on the snapshot → caught → null.
+  { name: "malformed snapshot JSON", row: { context_snapshot_json: "{not json", transcript_json: "[{}]" } },
+  // JSON.parse throws on the transcript → caught → null.
+  { name: "malformed transcript JSON", row: { context_snapshot_json: "[]", transcript_json: "{nope" } },
+  // Parsed-but-non-array snapshot (an object) → the Array.isArray guard → null.
+  { name: "non-array snapshot (object)", row: { context_snapshot_json: '{"a":1}', transcript_json: "[{}]" } },
+  // Parsed-but-non-array transcript (an object) → the Array.isArray guard → null.
+  { name: "non-array transcript (object)", row: { context_snapshot_json: "[]", transcript_json: '{"a":1}' } },
+  // A bare JSON scalar is also non-array → null (both positions).
+  { name: "scalar transcript (number)", row: { context_snapshot_json: "[]", transcript_json: "42" } },
+  // Empty-array transcript: a completed session always flushed ≥1 turn, so an empty
+  // transcript means a pruned/corrupt row → null (the length-0 guard).
+  { name: "empty-array transcript", row: { context_snapshot_json: '[{"type":"system"}]', transcript_json: "[]" } },
+];
+
+for (const { name, row } of corruptMaterialCases) {
+  test(`loadCompletedSessionMaterial → null (FRESH) on ${name} (issue #13)`, async () => {
+    const result = await loadCompletedSessionMaterial({ id: "s", ...row } as AgentSessionRow, NULL_MATERIAL_DEPS);
+    assert.equal(result, null, `${name} must degrade to FRESH`);
+  });
+}
+
+// Issue #13 image-rehydration-throw branch. loadCompletedSessionMaterial wraps the
+// rehydration in try/catch (recovery.ts ~206) so an unexpected throw there degrades
+// to FRESH rather than escaping the fork. Through the PUBLIC API that branch is
+// effectively unreachable: the real per-load resolver (createImageRefResolver)
+// swallows every error internally (a throwing getMediaAssetById, a bad workspace
+// root, an unresolvable ref) and returns null → a text placeholder, never a throw —
+// verified empirically. So we pin the catch's MECHANISM at the unit it guards:
+// rehydrateImages itself propagates a resolver throw (which the production resolver
+// is specifically written never to do), confirming the guard is load-bearing if a
+// future resolver regression ever did throw.
+test("rehydrateImages propagates a resolver throw (the branch loadCompletedSessionMaterial guards) (issue #13)", async () => {
+  const throwingResolver = (async () => {
+    throw new Error("resolver blew up");
+  }) as Parameters<typeof rehydrateImages>[1];
+  await assert.rejects(
+    () => rehydrateImages([{ type: "image", source: { __imageRef: true, attachmentId: "x" } }], throwingResolver),
+    /resolver blew up/,
+    "a throwing resolver propagates — which is exactly why loadCompletedSessionMaterial wraps it in try/catch",
+  );
 });
 
 // ── §9/§11 buildResumeTurn: satellite re-render + gap backfill ────────────────
@@ -461,6 +606,133 @@ test("buildResumeTurn: max_messages = -1 is unlimited, not bounded at 500 (issue
     );
     assert.ok(turn.content.includes("umsg 0"), "the oldest message (beyond the old 500 cap) is kept");
     assert.ok(turn.content.includes(`umsg ${total - 1}`), "the newest message is kept");
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+// Issue #12(a) gap OWNERSHIP (spec §9.2). A gap message that is itself a trigger
+// claimed by ANOTHER running session is surfaced with a `<handled_by_session>`
+// marker so the resumed session uses it as context but does NOT duplicate-handle it
+// (the exact failure SessionClaims prevents). The marker is driven by a
+// build-time `SessionClaims` snapshot keyed on each message's Matrix external id;
+// the builder excludes the resumed session's OWN claims (a session may answer its
+// own trigger), and a completed claimant has already released its claim → no marker.
+test("buildResumeTurn: a gap message claimed by another session is marked handled_by_session (issue #12)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const claims = new SessionClaims();
+  // 6th ctor arg is the claim registry (app wiring injects it; tests usually omit it).
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage, undefined, undefined, claims);
+  try {
+    await timeline.append(ev("gap-other", "can someone look at X?", 2000)); // claimed by another session
+    await timeline.append(ev("gap-self", "and Y too?", 3000)); // claimed by the RESUMED session itself
+    await timeline.append(ev("gap-free", "just chatter", 3500)); // unclaimed
+    const trigger = ev("reply1", "back, continuing", 4000);
+
+    // Another running session has claimed `gap-other` (its trigger); the resumed
+    // session `s1` has claimed `gap-self`. Claim key = the event's external id
+    // (== its id, via `ev`).
+    claims.claim(TK, {
+      sessionId: "other-session", triggerId: "gap-other", externalId: "gap-other",
+      triggerTimestamp: 2000, createdAt: 2000,
+    });
+    claims.claim(TK, {
+      sessionId: "s1", triggerId: "gap-self", externalId: "gap-self",
+      triggerTimestamp: 3000, createdAt: 3000,
+    });
+
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+      gap: { maxMessages: 100, maxTokens: 1000000, lowerBoundTimestamp: 1000 },
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("messages_while_you_were_away"), "gap block present");
+    // The other session's claimed message is flagged hands-off, naming the owner.
+    assert.ok(
+      turn.content.includes('<handled_by_session id="other-session"/>'),
+      "a gap message another session claimed is marked handled_by_session with the owner id",
+    );
+    assert.ok(turn.content.includes("can someone look at X?"), "the claimed message is still rendered as context");
+    // The resumed session's OWN claim is NOT marked (it may answer its own trigger),
+    // and the unclaimed message carries no marker either.
+    assert.ok(!/and Y too\?[\s\S]*?<handled_by_session/.test(turn.content), "the self-claimed gap message is not marked");
+    assert.ok(
+      !turn.content.includes('<handled_by_session id="s1"'),
+      "the resumed session is never named as the handler of its own gap message",
+    );
+    // Exactly ONE handled_by_session marker in the whole gap (only gap-other).
+    assert.equal(
+      (turn.content.match(/<handled_by_session/g) ?? []).length,
+      1,
+      "only the other-session-claimed message is marked",
+    );
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+// Issue #12(b) the TOKEN-budget truncation branch (spec §9.3 `max_tokens`). Every
+// other gap test uses maxTokens 0 (off) or huge (never hit); this exercises the
+// `tokenCapHit` path: the newest-fit contiguous run is kept, the older overflow is
+// truncated oldest-first, and the marker reports the true omitted count. The token
+// budget excludes the trigger group (the request is never budgeted away, §9.3) and
+// `max_messages` is left unlimited so TOKENS alone decide the cut.
+test("buildResumeTurn: gap truncates on the token budget and marks the omission (issue #12)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    // Five gap messages, each a distinct findable token. Bodies are sized so the
+    // per-message token estimate is well above 1 — a small maxTokens admits only the
+    // newest few before the next would overflow.
+    const big = "lorem ipsum dolor sit amet consectetur ".repeat(8); // ~> dozens of tokens
+    await timeline.append(ev("g1", `ONE ${big}`, 2000));
+    await timeline.append(ev("g2", `TWO ${big}`, 2500));
+    await timeline.append(ev("g3", `THREE ${big}`, 3000));
+    await timeline.append(ev("g4", `FOUR ${big}`, 3500));
+    await timeline.append(ev("g5", `FIVE ${big}`, 3800));
+    const trigger = ev("reply1", "back now", 4000);
+
+    // Measure one rendered message's token cost EXACTLY as renderResumeGap does
+    // (renderRichMessage → estimateTokens), so the cap admits ~2 messages and the
+    // TOKEN axis (not the message-count axis, left unlimited) is what truncates.
+    const oneCost = estimateTokens(renderRichMessage(ev("g5", `FIVE ${big}`, 3800)));
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+      // maxMessages unlimited; maxTokens admits ~2 messages, so tokens drive the cut.
+      gap: { maxMessages: -1, maxTokens: Math.floor(oneCost * 2.5), lowerBoundTimestamp: 1000 },
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("messages_while_you_were_away"), "gap block present");
+    // Newest messages kept (newest-fit), oldest truncated by the TOKEN budget.
+    assert.ok(turn.content.includes("FIVE"), "newest message kept under the token budget");
+    assert.ok(!turn.content.includes("ONE"), "oldest message truncated by the token budget");
+    // A truncation marker is emitted (the token cut, not a message-count cut), and
+    // its count is in range (≥1, < total).
+    const m = turn.content.match(/earlier_messages_omitted count="(\d+)"/);
+    assert.ok(m, "token-budget truncation emits the omitted marker");
+    const omitted = Number(m![1]);
+    assert.ok(omitted >= 1 && omitted < 5, `omitted count in range, got ${omitted}`);
+    // The kept run is contiguous (no holes): the kept set is a suffix of the window.
+    // Whatever the newest kept count, every message OLDER than the oldest-kept is gone.
+    const keptTokens = ["FIVE", "FOUR", "THREE", "TWO", "ONE"].filter((t) => turn.content.includes(t));
+    const keptCount = keptTokens.length;
+    assert.equal(keptCount, 5 - omitted, "kept + omitted accounts for the whole window (contiguous cut)");
   } finally {
     storage.close();
     resetAgentTimezone();

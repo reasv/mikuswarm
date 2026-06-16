@@ -80,8 +80,20 @@ export function hasResumableWork(
   if (opts.scope === "since_last_turn") {
     // The latest real user turn delimits the latest generation's rollout. Only
     // true triggers / resume-triggers (typed triggerGroup/satellite) delimit
-    // segments — NOT interjections. Falls through to index 0 (scan all) when none
-    // is found, which is the conservative direction (more likely to find work).
+    // segments — NOT interjections.
+    //
+    // The "no boundary found → scan all (startIndex stays 0)" case is purely
+    // DEFENSIVE: it cannot occur for a reply-resumable session, because every such
+    // transcript carries ≥1 triggerGroup/satellite boundary (each resume generation
+    // begins with exactly one real user turn, §6). So in practice the loop below
+    // always finds a boundary. Note that for THIS gate "scan the whole transcript"
+    // is the LESS safe direction, not the more conservative one: a wider scan is
+    // *more* likely to find a non-exempt call → more likely to RESUME, and the spec's
+    // safe failure direction is the opposite ("didn't resume" → degrade to a fresh
+    // session, §7a). The no-boundary fallback is therefore tolerated only because it
+    // is unreachable for real input; if a malformed transcript ever lacked a boundary
+    // it would scan-all and lean toward resuming — acceptable solely because it can't
+    // happen, NOT because scanning all is itself the conservative choice.
     for (let i = transcript.length - 1; i >= 0; i--) {
       const type = (transcript[i] as { type?: string }).type;
       if (type === "triggerGroup" || type === "satellite") {

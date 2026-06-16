@@ -213,3 +213,117 @@ test("issue #2: the resume gate never rejects, whatever the callbacks do", async
     ),
   );
 });
+
+// =============================================================================
+// Issue #14-remainder: the remaining fork-gate → FRESH cases at the
+// `evaluateResumeGate` boundary. The happy path, missing/non-completed row, stale
+// generation, work-gate, over-ceiling, and throw-safety are pinned above; these add
+// the INTENT-heuristic gates (§7.6 same_user_only / window) and the §7.3 synthetic-
+// type structural gate, plus the both-directions controls that prove each gate is
+// the decisive factor (toggle off / within window → still RESUME).
+// =============================================================================
+
+test("issue #14: same_user_only + a different sender → FRESH (the scarce resume is reserved for the asker)", async () => {
+  // Row's trigger_sender_id is "alice"; a different user ("bob") replies. §6/§7.6:
+  // the single-consumption resume is reserved for the original trigger sender.
+  const v = await evaluateResumeGate(
+    gateArgs({
+      inbound: {
+        timelineKey: "matrix:miku:room:!room",
+        event: { sender: { id: "bob" }, timestamp: NOW },
+      },
+    }),
+  );
+  assert.deepEqual(v, { resume: false });
+});
+
+test("issue #14: same_user_only=false lets a different sender RESUME (gate is the decisive factor)", async () => {
+  // The control: with the toggle OFF, the SAME different-sender reply resumes — so
+  // the FRESH above is attributable to same_user_only, not some other gate.
+  const v = await evaluateResumeGate(
+    gateArgs({
+      resumeCfg: { same_user_only: false },
+      inbound: {
+        timelineKey: "matrix:miku:room:!room",
+        event: { sender: { id: "bob" }, timestamp: NOW },
+      },
+    }),
+  );
+  assert.equal(v.resume, true, "with same_user_only off, a third party may consume the resume");
+});
+
+test("issue #14: a reply OUTSIDE the resume window → FRESH (stale)", async () => {
+  // window.group = 1000ms; the row completed at NOW-1000 and the reply lands at
+  // NOW + 5000, i.e. 6000ms after completion → outside the window → FRESH (§7.6).
+  const v = await evaluateResumeGate(
+    gateArgs({
+      resumeCfg: { same_user_only: true, window: { group: 1_000 } },
+      inbound: {
+        timelineKey: "matrix:miku:room:!room",
+        event: { sender: { id: "alice" }, timestamp: NOW + 5_000 },
+      },
+    }),
+  );
+  assert.deepEqual(v, { resume: false });
+});
+
+test("issue #14: a reply INSIDE the resume window still RESUMES (window gate is decisive)", async () => {
+  // The control: same window, but the reply lands 500ms after completion (< 1000ms)
+  // → within window → RESUME. Pins that the FRESH above is the window, not staleness
+  // elsewhere.
+  const v = await evaluateResumeGate(
+    gateArgs({
+      resumeCfg: { same_user_only: true, window: { group: 1_000 } },
+      // completed_at defaults to NOW-1000; place the reply at NOW-500 (500ms after).
+      getSession: () => completedRow({ completed_at: NOW - 500 }),
+      inbound: {
+        timelineKey: "matrix:miku:room:!room",
+        event: { sender: { id: "alice" }, timestamp: NOW },
+      },
+    }),
+  );
+  assert.equal(v.resume, true, "a reply within the window resumes");
+});
+
+test("issue #14: the window gate is per-context — a group window does not gate a DM reply", async () => {
+  // window is keyed by ctx; a stale-looking gap under `group` must not leak into a
+  // `dm` evaluation that has no DM window configured. ctx=dm, only group set → the
+  // window gate is inert, so an otherwise-eligible DM reply resumes.
+  const v = await evaluateResumeGate(
+    gateArgs({
+      ctx: "dm",
+      resumeCfg: { same_user_only: true, window: { group: 1_000 } },
+      inbound: {
+        timelineKey: "matrix:miku:room:!room",
+        event: { sender: { id: "alice" }, timestamp: NOW + 1_000_000 }, // way past any group window
+      },
+    }),
+  );
+  assert.equal(v.resume, true, "a group window does not gate a DM-context resume");
+});
+
+test("issue #14: a synthetic worker session type → FRESH (§7.3, structural)", async () => {
+  // Summarize/condense/diary sessions aren't repliable; the structural gate rejects
+  // them even though every other gate would pass.
+  for (const sessionType of ["summarize", "condense", "diary"]) {
+    const v = await evaluateResumeGate(gateArgs({ getSession: () => completedRow({ session_type: sessionType }) }));
+    assert.deepEqual(v, { resume: false }, `${sessionType} must be FRESH`);
+  }
+});
+
+// NOTE (issue #14, app-orchestration path): the full `handleInbound` fork —
+// concurrent replies to the same dead handle where ONE resumes and the OTHER
+// coalesces into the resumed session (spec §10), and the launch/`tryReplyResume`
+// wiring around `evaluateResumeGate` + the `acceptResumeGeneration` CAS — is NOT
+// cleanly unit-reachable: that logic lives inside the `startMikuAgent` closure in
+// app.ts (the resolver, claims registry, session manager, and provider are all
+// captured locals), with no exported seam to drive an inbound message through it in
+// isolation. The decomposable, behaviour-bearing pieces are each covered at their
+// own boundary instead: the single-consumption CAS race (exactly one of two
+// concurrent accepts wins) in test/resumable-sessions.test.ts; the pre-CAS gate
+// (every FRESH branch, throw-safety) here; the co-target coalescing that lands the
+// second reply as an interjection in the SessionClaims / coalescing tests. Driving
+// the closure would require a near-whole-app harness (real provider + manager +
+// storage + config), which the project's unit suite deliberately avoids — an honest
+// gap noted rather than a contrived harness. The Group 1 provider-boundary tests
+// already pin "a natively-triggered reply is handled exactly once".
