@@ -2835,11 +2835,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ? {
           maxMessages: gapCfg!.max_messages ?? 0,
           maxTokens: gapCfg!.max_tokens ?? 0,
-          // Newest message the session already has → the gap surfaces only newer.
-          lowerBoundTimestamp:
-            storage.getLatestEventTimestampForSession(record.id) ?? targetEvent.timestamp,
+          // Lower bound = the trigger group's latest member the session ALREADY
+          // covers (spec §9.2): its persisted `chat_upper_bound_ts` — its original
+          // trigger on creation, advanced to each accepted resume's trigger below.
+          // NULL only on a legacy (pre-v27) row's first resume → a one-time bounded
+          // fallback to the replied-to message's timestamp (the old behaviour for
+          // that single edge). Read from the in-memory `row` (read-old), before the
+          // write-new below — no race despite the queued write.
+          lowerBoundTimestamp: row.chat_upper_bound_ts ?? targetEvent.timestamp,
         }
       : undefined;
+
+    // Advance the gap lower bound to THIS resume's trigger group latest member
+    // (== `inbound.event.timestamp`, the upper bound `renderResumeGap` walks back
+    // from) so the NEXT resume's gap starts where this one ends (spec §9.2). Always
+    // advanced on an accepted resume — independent of whether the gap is currently
+    // enabled — so toggling the gap on mid-chain still computes from the right
+    // bound. Fire-and-forget on the single-writer queue (the read above already
+    // captured the old value into `gap`).
+    void storage.setSessionChatUpperBound(record.id, inbound.event.timestamp);
 
     let agent;
     let kickoff;

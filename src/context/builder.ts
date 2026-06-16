@@ -48,6 +48,16 @@ const SUMMARY_LAYER_NOTE =
   "Each carries an id — call expand_summary with that id to recover the finer " +
   "detail and the raw messages beneath it.";
 
+// Resume-gap (§9.2) safety fetch ceiling. The gap query is NOT pre-budget-capped
+// — the full away-window is fetched so the truncation marker can report the TRUE
+// omitted count and `max_messages = -1` (unlimited) is honoured. This is the one
+// hard backstop against a pathological away-window (a very busy room, away for a
+// very long time) materializing unbounded rows; it sits far above any sane gap
+// (the §7 time-window heuristic keeps real gaps tiny). Hitting it switches the
+// marker to an open-ended `at_least` form so the count is never silently
+// undercounted.
+const RESUME_GAP_FETCH_CEILING = 5000;
+
 export interface ContextMessage {
   type: "system" | "chatEvent" | "triggerGroup" | "summaryLayer" | "diaryLayer" | "satellite";
   role: "user" | "assistant" | "system";
@@ -816,11 +826,14 @@ export class ContextBuilder {
    * Render the gap backfill (spec RESUMABLE-SESSIONS §9.2): a CONTIGUOUS,
    * newest-first run of room messages in `(lowerBound, trigger]` — excluding the
    * trigger-group members (rendered separately) — truncated oldest-first to the
-   * budget, with a marker when cut. Messages another running session has claimed
-   * are flagged `<handled_by_session>` so the resumed session does not
-   * duplicate-handle them (§9.2 ownership). Never punches holes to fit a budget;
-   * truncation is always a contiguous oldest-first cut. Returns null when nothing
-   * falls in the window.
+   * budget, with a marker reporting the TRUE count of messages the budget cut.
+   * Messages another running session has claimed are flagged
+   * `<handled_by_session>` so the resumed session does not duplicate-handle them
+   * (§9.2 ownership). Never punches holes to fit a budget; truncation is always a
+   * contiguous oldest-first cut. The whole window is fetched (no pre-budget cap),
+   * so `max_messages = -1` is genuinely unlimited; only a far-above-normal safety
+   * ceiling bounds a pathological away-window (and then the marker turns
+   * open-ended). Returns null when nothing falls in the window.
    */
   private renderResumeGap(
     timelineKey: string,
@@ -830,16 +843,22 @@ export class ContextBuilder {
     selfSessionId: string,
   ): string | null {
     // Walk back from the trigger group's latest member (the trigger itself, the
-    // chronologically-last event). Query the whole window newest-first (capped),
-    // then apply the budget. `+1` makes the lower bound exclusive (the session
-    // already has everything at/below it).
-    const queryLimit = gap.maxMessages > 0 ? Math.max(gap.maxMessages + 1, 50) : 500;
+    // chronologically-last event). The query is NOT pre-budget-capped: it fetches
+    // the WHOLE window newest-first (up to a high safety ceiling) so the budget
+    // alone decides what is dropped, the truncation marker can report the TRUE
+    // omitted count, and `max_messages = -1` (unlimited) is honoured rather than
+    // silently bounded. `+1` makes the lower bound exclusive (the session already
+    // has everything at/below it); the extra `+1` on the fetch limit lets us
+    // detect that the safety ceiling itself truncated the window (overflow).
     const windowAsc = this.store.query({
       timelineKey,
       fromTimestamp: gap.lowerBoundTimestamp + 1,
       toTimestamp: trigger.timestamp,
-      limit: queryLimit,
+      limit: RESUME_GAP_FETCH_CEILING + 1,
     });
+    // `query` returns the NEWEST `limit` rows (then ascending), so an overflow drop
+    // is always of the OLDEST window messages — older than anything we will keep.
+    const ceilingOverflow = windowAsc.length > RESUME_GAP_FETCH_CEILING;
     const gapEvents = windowAsc.filter((e) => !triggerGroupIds.has(e.id));
     if (gapEvents.length === 0) return null;
 
@@ -849,7 +868,9 @@ export class ContextBuilder {
       : undefined;
 
     // Accumulate newest-first until a budget is hit; the remaining older events are
-    // truncated (oldest-first). -1 on an axis = unlimited (never the cap).
+    // truncated (oldest-first). -1 on an axis = unlimited (never the cap). `gapEvents`
+    // is the true window (modulo a ceiling overflow tracked above), so `omitted` is
+    // the exact count of older messages the budget dropped.
     const kept: string[] = [];
     let totalTokens = 0;
     let omitted = 0;
@@ -867,7 +888,13 @@ export class ContextBuilder {
     }
     if (kept.length === 0) return null;
     kept.reverse(); // chronological (oldest kept → newest)
-    const marker = omitted > 0 ? `<earlier_messages_omitted count="${omitted}"/>\n` : "";
+    // An exact count when the whole window was fetched; an open-ended `at_least`
+    // form when the safety ceiling itself truncated older messages we never saw
+    // (so the count can never silently undercount the real gap).
+    const marker =
+      omitted > 0 || ceilingOverflow
+        ? `<earlier_messages_omitted count="${omitted}"${ceilingOverflow ? ' at_least="true"' : ""}/>\n`
+        : "";
     return (
       `<messages_while_you_were_away note="These arrived in the room since your last reply; ` +
       `some may already be handled by other sessions (tagged &lt;handled_by_session&gt;).">\n` +

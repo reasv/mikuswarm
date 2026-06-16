@@ -328,8 +328,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 26", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 26);
+test("LATEST_SCHEMA_VERSION is 27", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 27);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -411,6 +411,26 @@ test("opening a v4 DB without agent_sessions migrates it and creates the table",
       const row = storage.getAgentSession("s-abc1234567");
       assert.ok(row, "agent_sessions row should round-trip after migration");
       assert.equal(row.status, "created");
+
+      // v25->v26 + v26->v27 (RESUMABLE-SESSIONS): the resume columns landed via the
+      // ALTER path here (the table was created at v4->v5 without them). A
+      // baseInsert() omits the v27 gap lower bound, so the column must exist and
+      // read NULL (its nullable default) on the migrated table.
+      const sessionCols = storage.read((db) =>
+        (db.prepare(`pragma table_info(agent_sessions)`).all() as Array<{ name: string }>).map(
+          (c) => c.name,
+        ),
+      );
+      assert.ok(
+        sessionCols.includes("resume_generation"),
+        `migration must add resume_generation; have: ${sessionCols.join(", ")}`,
+      );
+      assert.ok(
+        sessionCols.includes("chat_upper_bound_ts"),
+        `migration must add chat_upper_bound_ts; have: ${sessionCols.join(", ")}`,
+      );
+      assert.equal(row.resume_generation, 0, "resume_generation defaults to 0 after migration");
+      assert.equal(row.chat_upper_bound_ts, null, "chat_upper_bound_ts is NULL when omitted on insert");
 
       // Version stamped to LATEST.
       const version = storage.read(

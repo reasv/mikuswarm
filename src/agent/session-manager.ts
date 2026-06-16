@@ -126,6 +126,12 @@ export class SessionManager {
         triggerBody: trigger.event.body?.slice(0, MAX_TRIGGER_BODY),
         triggerSenderId: triggerSender.id,
         triggerSenderDisplayName: triggerSender.displayName,
+        // Gap-backfill lower bound (spec RESUMABLE-SESSIONS §9.2): the trigger
+        // group's latest member, which is always the trigger event itself (the
+        // group only folds in EARLIER same-sender messages). On a reply-resume the
+        // gap surfaces only what arrived after this. Worker/proactive sessions are
+        // not reply-resumable, so the value is inert for them.
+        chatUpperBoundTs: trigger.event.timestamp,
         createdAt: record.createdAt,
         updatedAt: record.createdAt,
       }),

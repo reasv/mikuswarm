@@ -639,6 +639,15 @@ export interface AgentSessionInsert {
    */
   triggerSenderId?: string | null;
   triggerSenderDisplayName?: string | null;
+  /**
+   * Gap-backfill lower bound (spec RESUMABLE-SESSIONS §9.2): the timestamp of the
+   * ORIGINAL trigger group's latest member (== the trigger event's timestamp; the
+   * group only folds in EARLIER same-sender messages). The newest message the
+   * session's context already covers, so the gap surfaces only what arrived AFTER
+   * it. Nullable on legacy (pre-v27) rows; advanced on each accepted resume to the
+   * new trigger's timestamp via {@link Storage.setSessionChatUpperBound}.
+   */
+  chatUpperBoundTs?: number | null;
   createdAt: number;
   startedAt?: number | null;
   updatedAt: number;
@@ -702,6 +711,15 @@ export interface AgentSessionRow {
    * this value.
    */
   resume_generation: number;
+  /**
+   * Gap-backfill lower bound (spec RESUMABLE-SESSIONS §9.2): the timestamp of the
+   * trigger group's latest member that this session's context already covers — its
+   * original trigger on creation, advanced to each accepted resume's trigger
+   * thereafter. The reply-resume gap window is `(chat_upper_bound_ts, new
+   * trigger]`. NULL on legacy (pre-v27) rows; on such a row's first resume the gap
+   * falls back to the new trigger's timestamp (a one-time bounded fallback).
+   */
+  chat_upper_bound_ts: number | null;
   no_reply: number;
   error: string | null;
   created_at: number;
@@ -5038,11 +5056,13 @@ export class Storage {
           id, timeline_key, session_type, status, model_id,
           trigger_event_id, trigger_external_id, trigger_body,
           trigger_sender_id, trigger_sender_display_name,
+          chat_upper_bound_ts,
           no_reply, created_at, started_at, updated_at
         ) values (
           @id, @timelineKey, @sessionType, @status, @modelId,
           @triggerEventId, @triggerExternalId, @triggerBody,
           @triggerSenderId, @triggerSenderDisplayName,
+          @chatUpperBoundTs,
           0, @createdAt, @startedAt, @updatedAt
         )`,
       ).run({
@@ -5056,6 +5076,7 @@ export class Storage {
         triggerBody: row.triggerBody ?? null,
         triggerSenderId: row.triggerSenderId ?? null,
         triggerSenderDisplayName: row.triggerSenderDisplayName ?? null,
+        chatUpperBoundTs: row.chatUpperBoundTs ?? null,
         createdAt: row.createdAt,
         startedAt: row.startedAt ?? null,
         updatedAt: row.updatedAt,
@@ -5339,18 +5360,21 @@ export class Storage {
   }
 
   /**
-   * The latest `timestamp` among the timeline events a session authored (its own
-   * sends), or undefined if it sent nothing. The gap-backfill lower bound (spec
-   * RESUMABLE-SESSIONS §9.2): the newest message a resumed session already has in
-   * its context, so the gap surfaces only what arrived AFTER it. Read-only.
+   * Advance a session's gap-backfill lower bound (spec RESUMABLE-SESSIONS §9.2) to
+   * `ts` — the latest member of the trigger group that just resumed it (== that
+   * trigger's timestamp). Called on each accepted reply-resume AFTER the gap is
+   * built from the prior bound, so the NEXT resume's gap starts where this one
+   * ends. Single-writer write; mirrors `updateAgentSessionStatus`/`markRunning`.
    */
-  getLatestEventTimestampForSession(sessionId: string): number | undefined {
-    const row = this.read((db) =>
-      db
-        .prepare(`select max(timestamp) as ts from timeline_events where agent_session_id = ?`)
-        .get(sessionId) as { ts: number | null } | undefined,
-    );
-    return row?.ts ?? undefined;
+  setSessionChatUpperBound(id: string, ts: number): Promise<void> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update agent_sessions set chat_upper_bound_ts = @ts, updated_at = @updatedAt where id = @id`,
+        )
+        .run({ id, ts, updatedAt: Date.now() });
+      this.warnIfNoSessionRow("setSessionChatUpperBound", id, result.changes);
+    });
   }
 
   /**
@@ -6784,6 +6808,13 @@ create table if not exists agent_sessions (
   -- continued at most once. A linear chain works (each resume's new sends carry
   -- the bumped value); branching from a superseded output degrades to FRESH.
   resume_generation integer not null default 0,
+  -- Resumable sessions (spec RESUMABLE-SESSIONS §9.2): the gap-backfill lower
+  -- bound — the timestamp of the trigger group's latest member the session's
+  -- context already covers (its original trigger on creation, advanced to each
+  -- accepted resume's trigger). The reply-resume gap window is
+  -- (chat_upper_bound_ts, new trigger]. Nullable: legacy (pre-v27) rows are NULL
+  -- and fall back to the new trigger's timestamp on their first resume.
+  chat_upper_bound_ts integer,
   no_reply integer not null default 0,
   error text,
   created_at integer not null,
@@ -6821,7 +6852,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 26;
+export const LATEST_SCHEMA_VERSION = 27;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -7560,6 +7591,27 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     }
     if (!hasColumn("timeline_events", "agent_session_generation")) {
       db.exec(`alter table timeline_events add column agent_session_generation integer;`);
+    }
+  },
+  // index 26 (v26 -> v27): resumable-sessions gap lower bound (spec
+  // RESUMABLE-SESSIONS §9.2). One additive nullable column, guarded for rewound
+  // test fixtures (no-op when the table is absent or the column already exists,
+  // mirroring the v25->v26 ALTER above). Existing rows backfill to NULL; a legacy
+  // completed session's first reply-resume falls back to the new trigger's
+  // timestamp for the gap window (a one-time bounded fallback — the old behaviour
+  // for that single edge), and every session created from v27 on carries the
+  // correct bound (its trigger group's latest member).
+  (db) => {
+    const hasColumn = (table: string, column: string): boolean => {
+      const exists = db
+        .prepare(`select 1 from sqlite_master where type = 'table' and name = ?`)
+        .get(table);
+      if (!exists) return true; // no table → nothing to ALTER (fresh-fixture guard)
+      const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      return columns.some((c) => c.name === column);
+    };
+    if (!hasColumn("agent_sessions", "chat_upper_bound_ts")) {
+      db.exec(`alter table agent_sessions add column chat_upper_bound_ts integer;`);
     }
   },
 ];

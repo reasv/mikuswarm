@@ -122,16 +122,33 @@ test("agent_session_generation tags an outbound event and survives echo reconcil
   }
 });
 
-test("getLatestEventTimestampForSession returns the newest send (gap lower bound)", async () => {
+// ── §9.2 gap lower bound: chat_upper_bound_ts round-trips and advances ────────
+
+test("chat_upper_bound_ts round-trips through insert and advances on resume (gap lower bound)", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
-  const timeline = new TimelineStore(storage);
   try {
-    await timeline.append({ ...ev("a", "first", 1000, "assistant"), id: "a", agentSessionId: "s1" });
-    await timeline.append({ ...ev("b", "second", 3000, "assistant"), id: "b", agentSessionId: "s1" });
-    await timeline.append({ ...ev("c", "other", 9000, "assistant"), id: "c", agentSessionId: "s2" });
-    assert.equal(storage.getLatestEventTimestampForSession("s1"), 3000);
-    assert.equal(storage.getLatestEventTimestampForSession("s2"), 9000);
-    assert.equal(storage.getLatestEventTimestampForSession("none"), undefined);
+    const now = 1000;
+    // Set at creation = the original trigger group's latest member (its trigger ts).
+    await storage.insertAgentSession({
+      id: "s1", timelineKey: TK, sessionType: "default", status: "created",
+      chatUpperBoundTs: 4000, createdAt: now, updatedAt: now,
+    });
+    assert.equal(
+      storage.getAgentSession("s1")?.chat_upper_bound_ts, 4000,
+      "creation persists the trigger group's latest-member timestamp as the bound",
+    );
+
+    // Each accepted resume advances the bound to its own trigger's timestamp, so the
+    // NEXT resume's gap window starts where this one ended.
+    await storage.setSessionChatUpperBound("s1", 9000);
+    assert.equal(storage.getAgentSession("s1")?.chat_upper_bound_ts, 9000, "resume advances the bound");
+
+    // A row created without the field (e.g. a path that omits it) reads NULL — the
+    // legacy pre-v27 shape the read site falls back from.
+    await storage.insertAgentSession({
+      id: "s2", timelineKey: TK, sessionType: "default", status: "created", createdAt: now, updatedAt: now,
+    });
+    assert.equal(storage.getAgentSession("s2")?.chat_upper_bound_ts, null, "omitted bound stores NULL");
   } finally {
     storage.close();
   }
@@ -307,6 +324,143 @@ test("buildResumeTurn: gap omitted entirely when budget is off (default)", async
     })) as unknown as ResumeTurnShape;
     assert.ok(!turn.content.includes("messages_while_you_were_away"), "no gap block when the budget is 0/0");
     assert.ok(!turn.content.includes("while away"), "missed message not surfaced when the gap is off");
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+// Issue #3 lower-bound correctness lock. The gap lower bound is the previous
+// trigger group's latest member (its trigger timestamp), NOT the bot's last send.
+// Timeline: original trigger at t=1000; a human message at t=1500; the bot's reply
+// send at t=2000 (LATER than its trigger — a slow rollout). The OLD bound (= the
+// bot's max send timestamp = 2000) made the gap window (2000, new-trigger] and
+// silently DROPPED the t=1500 message; the corrected bound (= 1000) surfaces it,
+// and §9.2 also wants the bot's own send (t=2000) rendered as an in-room message.
+test("buildResumeTurn: gap lower bound is the prior trigger ts, not the bot's send (issue #3)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    await timeline.append(ev("orig-trigger", "make me an image", 1000)); // prior trigger (the bound)
+    await timeline.append(ev("mid", "any update?", 1500)); // arrived BETWEEN trigger and the bot's send
+    await timeline.append({
+      ...ev("bot-send", "here is your image", 2000, "assistant"),
+      id: "bot-send",
+      agentSessionId: "s1",
+      agentSessionGeneration: 0,
+    }); // the bot's reply — LATER than its trigger
+    const trigger = ev("reply1", "where did it go?", 3000);
+
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+      // The corrected bound = the prior trigger group's latest member (t=1000).
+      gap: { maxMessages: 100, maxTokens: 1000000, lowerBoundTimestamp: 1000 },
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("messages_while_you_were_away"), "gap block present");
+    assert.ok(
+      turn.content.includes("any update?"),
+      "the mid-rollout message (between trigger and bot-send) is surfaced — the OLD bot's-last-send bound dropped it",
+    );
+    assert.ok(
+      turn.content.includes("here is your image"),
+      "the bot's own send in the window is rendered as an in-room message (§9.2)",
+    );
+    assert.ok(
+      !turn.content.includes("make me an image"),
+      "the prior trigger itself (== the lower bound) is excluded — never re-rendered",
+    );
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+// Issue #4 query-cap / truncation-marker correctness. The gap query is no longer
+// pre-budget-capped, so the truncation marker reports the TRUE count of messages
+// the budget cut (not a query-cap-relative undercount), and `max_messages = -1`
+// (unlimited) is honoured rather than silently bounded.
+test("buildResumeTurn: truncation marker reports the true omitted count past the old query cap (issue #4)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    // 600 messages in the window — past the OLD hardcoded 500 query cap. The OLD
+    // code fetched only the newest 500, so a 2-message budget reported omitted=498
+    // (cap-relative). The window is the true 600, so the marker must report 598.
+    const total = 600;
+    for (let i = 0; i < total; i++) {
+      await timeline.append(ev(`g${i}`, `msg ${i}`, 1000 + (i + 1)));
+    }
+    const trigger = ev("reply1", "back now", 1000 + total + 1);
+
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+      gap: { maxMessages: 2, maxTokens: 1000000, lowerBoundTimestamp: 1000 },
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("messages_while_you_were_away"), "gap block present");
+    const m = turn.content.match(/earlier_messages_omitted count="(\d+)"/);
+    assert.ok(m, "truncation marker present");
+    assert.equal(
+      Number(m![1]),
+      total - 2,
+      "marker reports the TRUE omitted count (598), not the old 500-query-cap-relative 498",
+    );
+    // Newest two kept (the contiguous newest-fit run), oldest truncated.
+    assert.ok(turn.content.includes(`msg ${total - 1}`) && turn.content.includes(`msg ${total - 2}`), "newest two kept");
+    assert.ok(!turn.content.includes(`msg ${total - 3}`), "older messages truncated by the budget");
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+test("buildResumeTurn: max_messages = -1 is unlimited, not bounded at 500 (issue #4)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    // 520 messages — past the OLD 500 cap. With max_messages = -1 (unlimited) and a
+    // generous token budget, the OLD code still capped the query at 500 and dropped
+    // the oldest 20; the corrected code keeps all 520 (no message truncation).
+    const total = 520;
+    for (let i = 0; i < total; i++) {
+      await timeline.append(ev(`g${i}`, `umsg ${i}`, 1000 + (i + 1)));
+    }
+    const trigger = ev("reply1", "back now", 1000 + total + 1);
+
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+      gap: { maxMessages: -1, maxTokens: 1000000, lowerBoundTimestamp: 1000 },
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("messages_while_you_were_away"), "gap block present");
+    assert.ok(
+      !/earlier_messages_omitted/.test(turn.content),
+      "no truncation marker — max_messages = -1 keeps the whole window (not bounded at 500)",
+    );
+    assert.ok(turn.content.includes("umsg 0"), "the oldest message (beyond the old 500 cap) is kept");
+    assert.ok(turn.content.includes(`umsg ${total - 1}`), "the newest message is kept");
   } finally {
     storage.close();
     resetAgentTimezone();
