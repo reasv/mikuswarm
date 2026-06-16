@@ -31,8 +31,8 @@ import {
   loadResumeMaterial,
   loadCompletedSessionMaterial,
   SYNTHETIC_SESSION_TYPES,
-  collectExemptToolNames,
   hasResumableWork,
+  type ResumeMaterial,
   type ResumeWorkScope,
   type AgentSessionRecord,
   type ManualResumeResult,
@@ -46,6 +46,7 @@ import { escapeAttr, escapeXml } from "./context/xml.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
 import {
+  BUILTIN_RESUME_EXEMPT_TOOL_NAMES,
   createBrowserTool,
   createChannelInfoTool,
   createCreatePollTool,
@@ -2650,8 +2651,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   /** Synchronous single-flight guard for the resume fork (§15 concurrent replies). */
   const resumeClaims = new Set<string>();
-  /** Memoized exempt tool-NAME set (the per-tool flags are static; build once). */
-  let cachedResumeExemptToolNames: Set<string> | undefined;
   /** One-line browser note for the resumed satellite's runtime_state (§11). */
   const RESUME_BROWSER_NOTE =
     "Your browser tab from the previous turn was closed when that run settled, but its " +
@@ -2667,21 +2666,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     return timelineKey.split(":")[2] === "dm" ? "dm" : "group";
   }
 
-  /** Built-in exempt tool names (from the per-tool flags) + per-context extras. */
-  function resumeExemptToolNames(
-    inbound: InboundChatEvent,
-    target: NonNullable<InboundChatEvent["outboundTarget"]>,
-    extra: readonly string[],
-  ): Set<string> {
-    if (!cachedResumeExemptToolNames) {
-      // Build the canonical tool set ONCE to read the static `resumeWorkExempt`
-      // flags (the work gate sees only names in a persisted transcript).
-      // Construction is side-effect-free — nothing executes; the throwaway usage
-      // tracker and probe id are never used for a real run.
-      const probe = buildSessionTools(inbound, "resume-exempt-probe", target, "default", new SessionUsageTracker(), 0);
-      cachedResumeExemptToolNames = collectExemptToolNames(probe);
-    }
-    return new Set<string>([...cachedResumeExemptToolNames, ...extra]);
+  /**
+   * The work gate's exempt tool-NAME set: the context-free built-in set (derived
+   * once from the tool factories' static `resumeWorkExempt` flags, independent of
+   * `roomId`/target — see {@link BUILTIN_RESUME_EXEMPT_TOOL_NAMES}) unioned with this
+   * context's `extra_exempt_tools` (which may include `mcp__…` names, §7a knob 2).
+   * Deriving the built-ins context-free avoids the old per-inbound `buildSessionTools`
+   * probe, whose room-scoped exempt tools dropped out for a falsy `roomId`.
+   */
+  function resumeExemptToolNames(extra: readonly string[]): Set<string> {
+    return new Set<string>([...BUILTIN_RESUME_EXEMPT_TOOL_NAMES, ...extra]);
   }
 
   /** Release this timeline's slot and launch the next queued trigger (mirrors the
@@ -2728,49 +2722,31 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (resumeClaims.has(sessionId)) return false;
     resumeClaims.add(sessionId);
     try {
-      const row = storage.getAgentSession(sessionId);
-      // §7.2: only `completed` is reply-resumable (failed-resumable/interrupted keep
-      // the console path; discarded is dead; a pruned/missing row → FRESH).
-      if (!row || row.status !== "completed") return false;
-      // §7.3: synthetic worker sessions (summarize/condense/diary) aren't repliable.
-      if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return false;
-      // §7.4 generation gate: the target message must carry the session's CURRENT
-      // generation (a reply to a superseded output → stale → FRESH).
-      if ((targetEvent.agentSessionGeneration ?? 0) !== row.resume_generation) return false;
-      // §7.6 intent heuristics (human reply). Explicit agent delegation would bypass
-      // these — but delegation today only targets running sessions, never reaches here.
-      if (
-        (resumeCfg.same_user_only ?? true) &&
-        row.trigger_sender_id &&
-        inbound.event.sender.id !== row.trigger_sender_id
-      ) {
-        return false;
-      }
-      const windowMs = resumeCfg.window?.[ctx];
-      if (
-        windowMs !== undefined &&
-        windowMs > 0 &&
-        row.completed_at != null &&
-        inbound.event.timestamp - row.completed_at > windowMs
-      ) {
-        return false;
-      }
-      // §7.7 capability gate: if the persisted context is already at/over the
-      // ceiling, a resume would immediately re-park (no compaction) — FRESH instead.
-      let ceiling: number | undefined;
-      try {
-        ceiling = factory.resolveSessionContextCeiling(row.session_type);
-      } catch {
-        ceiling = undefined;
-      }
-      if (ceiling !== undefined && row.context_tokens != null && row.context_tokens >= ceiling) return false;
-      // §7.5/§7.8 work gate + material viability (one load of the completed material).
-      const material = await loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger });
-      if (!material) return false;
-      const scope = (resumeCfg.work_gate?.[ctx]?.scope ??
-        (ctx === "dm" ? "any_in_history" : "since_last_turn")) as ResumeWorkScope;
-      const exempt = resumeExemptToolNames(inbound, target, resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []);
-      if (!hasResumableWork(material.transcript, { scope, exemptToolNames: exempt })) return false;
+      // ── Pre-CAS gate (§7 steps 2–8) ────────────────────────────────────────
+      // Delegated to the throw-safe `evaluateResumeGate` (review issue #2): every
+      // ineligible reply — and any UNEXPECTED throw inside the gate (DB read,
+      // ceiling resolution, material load, work scan) — yields `{resume:false}`,
+      // which we degrade to FRESH below. A throw must never escape here: it would
+      // unwind through `launchSession` (no try/catch at the call site) → the
+      // dispatch rethrow, dropping the user's message with no reply, violating the
+      // never-drop invariant (§2/§7). Must precede the CAS — once
+      // `acceptResumeGeneration` bumps the generation we own the slot and the
+      // post-accept path (below) handles its own failures. The `row`/`material`
+      // captured here are the ORIGINAL snapshot the spec reuses for the resumed run.
+      const verdict = await evaluateResumeGate({
+        sessionId,
+        getSession: () => storage.getAgentSession(sessionId),
+        targetEvent,
+        inbound,
+        ctx,
+        resumeCfg,
+        exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
+        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        loadMaterial: (row) => loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger }),
+        logger,
+      });
+      if (!verdict.resume) return false;
+      const { row, material } = verdict;
 
       // All gates pass → ACCEPT. Single-consumption CAS (§6): completed → resuming,
       // bump generation. A racing reply that already consumed this state gets
@@ -3907,6 +3883,118 @@ export function resumeUsageSeed(
   mode: "fresh" | "continue",
 ): SessionUsageTotals {
   return mode === "fresh" ? emptyUsageTotals() : usageSeedFromRow(row);
+}
+
+/** The verdict of {@link evaluateResumeGate}: continue this session, or go FRESH. */
+export type ResumeGateVerdict =
+  | { resume: true; row: AgentSessionRow; material: ResumeMaterial }
+  | { resume: false };
+
+/** The only resume-config fields the pre-CAS gate reads (structural subset of the
+ *  `[agent.sessions.resume]` schema), so the gate is decoupled from config shape. */
+export interface ResumeGateConfig {
+  same_user_only?: boolean;
+  window?: { dm?: number; group?: number };
+  work_gate?: {
+    dm?: { scope?: ResumeWorkScope; extra_exempt_tools?: readonly string[] };
+    group?: { scope?: ResumeWorkScope; extra_exempt_tools?: readonly string[] };
+  };
+}
+
+/**
+ * The pre-CAS resume-eligibility gate (spec RESUMABLE-SESSIONS §7 steps 2–8),
+ * factored out of `tryReplyResume`'s closure so it is unit-testable at the boundary
+ * (review issue #2 — mirrors {@link resumeUsageSeed}). Pure over its inputs except
+ * for three injected effectful callbacks; performs no DB writes and no claim
+ * bookkeeping (the caller owns the `resumeClaims` slot and the `acceptResumeGeneration`
+ * CAS that follows a `{resume:true}` verdict).
+ *
+ * CRITICAL (the issue #2 invariant): this is wrapped in a single try/catch that
+ * degrades ANY unexpected throw — from `getSession`, `resolveCeiling`, `loadMaterial`,
+ * or the work scan — to `{resume:false}` (FRESH), never re-throwing. A throw escaping
+ * here would unwind through `tryReplyResume` → `launchSession` (no try/catch at the
+ * `if (await tryReplyResume(...)) return;` site) → the dispatch rethrow, dropping the
+ * user's message with no reply at all — the one outcome the spec forbids ("degrade to
+ * FRESH, never to corruption/loss", §2/§7). Returning FRESH lets the caller fall
+ * through to a normal new session, which still answers.
+ *
+ * `resolveCeiling` is additionally guarded individually (mirrors the original inline
+ * gate, where only that call had a catch) so a ceiling-resolution failure leaves the
+ * capability gate inert (treated as "no ceiling") rather than failing the whole gate —
+ * but the outer catch is the backstop that makes the never-drop guarantee total.
+ */
+export async function evaluateResumeGate(args: {
+  sessionId: string;
+  /** Reads the durable row INSIDE the gate's try/catch, so a DB-read throw also
+   *  degrades to FRESH (issue #2) rather than escaping the caller. */
+  getSession: () => AgentSessionRow | undefined;
+  targetEvent: Pick<CanonicalChatEvent, "agentSessionGeneration">;
+  inbound: Pick<InboundChatEvent, "timelineKey"> & {
+    event: { sender: { id: string }; timestamp: number };
+  };
+  ctx: "dm" | "group";
+  resumeCfg: ResumeGateConfig;
+  exemptToolNames: ReadonlySet<string>;
+  resolveCeiling: (sessionType: string) => number | undefined;
+  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
+  logger: Pick<Logger, "warn">;
+}): Promise<ResumeGateVerdict> {
+  const { sessionId, targetEvent, inbound, ctx, resumeCfg, exemptToolNames, logger } = args;
+  try {
+    const row = args.getSession();
+    // §7.2: only `completed` is reply-resumable (failed-resumable/interrupted keep
+    // the console path; discarded is dead; a pruned/missing row → FRESH).
+    if (!row || row.status !== "completed") return { resume: false };
+    // §7.3: synthetic worker sessions (summarize/condense/diary) aren't repliable.
+    if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return { resume: false };
+    // §7.4 generation gate: the target message must carry the session's CURRENT
+    // generation (a reply to a superseded output → stale → FRESH).
+    if ((targetEvent.agentSessionGeneration ?? 0) !== row.resume_generation) return { resume: false };
+    // §7.6 intent heuristics (human reply). Explicit agent delegation would bypass
+    // these — but delegation today only targets running sessions, never reaches here.
+    if (
+      (resumeCfg.same_user_only ?? true) &&
+      row.trigger_sender_id &&
+      inbound.event.sender.id !== row.trigger_sender_id
+    ) {
+      return { resume: false };
+    }
+    const windowMs = resumeCfg.window?.[ctx];
+    if (
+      windowMs !== undefined &&
+      windowMs > 0 &&
+      row.completed_at != null &&
+      inbound.event.timestamp - row.completed_at > windowMs
+    ) {
+      return { resume: false };
+    }
+    // §7.7 capability gate: if the persisted context is already at/over the
+    // ceiling, a resume would immediately re-park (no compaction) — FRESH instead.
+    let ceiling: number | undefined;
+    try {
+      ceiling = args.resolveCeiling(row.session_type);
+    } catch {
+      ceiling = undefined;
+    }
+    if (ceiling !== undefined && row.context_tokens != null && row.context_tokens >= ceiling) {
+      return { resume: false };
+    }
+    // §7.5/§7.8 work gate + material viability (one load of the completed material).
+    const material = await args.loadMaterial(row);
+    if (!material) return { resume: false };
+    const scope = (resumeCfg.work_gate?.[ctx]?.scope ??
+      (ctx === "dm" ? "any_in_history" : "since_last_turn")) as ResumeWorkScope;
+    if (!hasResumableWork(material.transcript, { scope, exemptToolNames })) return { resume: false };
+    return { resume: true, row, material };
+  } catch (error) {
+    // A gate threw unexpectedly → treat as ineligible (FRESH), never propagate.
+    logger.warn("resume_gate_threw", {
+      sessionId,
+      timelineKey: inbound.timelineKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { resume: false };
+  }
 }
 
 function resolveReadImageMaxBytes(config: AppConfig): number {
