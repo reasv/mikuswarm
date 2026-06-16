@@ -29,6 +29,11 @@ import {
   createManualResumeSession,
   isResumableRunError,
   loadResumeMaterial,
+  loadCompletedSessionMaterial,
+  SYNTHETIC_SESSION_TYPES,
+  collectExemptToolNames,
+  hasResumableWork,
+  type ResumeWorkScope,
   type AgentSessionRecord,
   type ManualResumeResult,
 } from "./agent/index.js";
@@ -88,7 +93,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
+import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
@@ -1094,6 +1099,37 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  // Resumable sessions (spec RESUMABLE-SESSIONS §14): cross-field checks the
+  // TypeBox schema can't express (the scope enum is already schema-enforced).
+  // Mirrors the proactive pattern — fail-fast on impossibilities, warn on
+  // dead/inert config.
+  {
+    const resume = config.agent.sessions.resume;
+    if (resume) {
+      for (const ctx of ["dm", "group"] as const) {
+        const gap = resume.gap?.[ctx];
+        // Hard rule (§9.3): a context's gap budget is never BOTH unlimited — that
+        // would let a single resume drag the entire room history into the rollout.
+        if (gap && gap.max_messages === -1 && gap.max_tokens === -1) {
+          throw new Error(
+            `agent.sessions.resume.gap.${ctx}: max_messages and max_tokens cannot both be -1 (unlimited) — bound at least one`,
+          );
+        }
+        // Inert-config warning: a gap configured to surface something for a context
+        // where resume never runs is dead config (the default gap is 0/0, so this
+        // only fires on a deliberate-but-stranded setting).
+        const enabled = resume.enabled?.[ctx] === true;
+        const gapActive = gap !== undefined && (gap.max_messages !== 0 || gap.max_tokens !== 0);
+        if (!enabled && gapActive) {
+          logger.warn("resume_config_inert_gap", {
+            context: ctx,
+            reason: `agent.sessions.resume.gap.${ctx} is configured but agent.sessions.resume.enabled.${ctx} is false — the gap will never be surfaced`,
+          });
+        }
+      }
+    }
+  }
+
   // Map a (per-room) timeline key to its account + room id and ask that account's
   // Matrix client for a human room label. Shared by the diary header and the
   // RoomLabelCache (which feeds the observability console room list). Rejects on a
@@ -1274,6 +1310,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
 
     if (steerReplyToActiveSession(inbound)) return;
+
+    // Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5): a bare reply to one of
+    // the bot's own (now-completed) messages enters the pipeline when resume is
+    // enabled for this context, so the §7 fork in launchSession can continue it (or
+    // give a fresh response). Synthesizes `inbound.trigger` in place; no-op when the
+    // message already triggered (dm/mention) or isn't a reply to a bot message.
+    if (!inbound.trigger) maybeSynthesizeReplyTrigger(inbound);
 
     if (!inbound.trigger) return;
 
@@ -1967,6 +2010,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     target: NonNullable<InboundChatEvent["outboundTarget"]>,
     sessionType: string,
     usage: SessionUsageTracker,
+    // The session's `resume_generation` at run start (spec RESUMABLE-SESSIONS §6).
+    // Threaded into send_message so every outbound event is tagged with it. 0 for
+    // a fresh launch; the bumped value for a reply-resumed run.
+    resumeGeneration: number = 0,
   ) {
     const roomId = target.roomId;
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
@@ -2033,6 +2080,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         target,
         timeline,
         agentSessionId: sessionId,
+        agentSessionGeneration: resumeGeneration,
         workspaceRoot,
         mediaMaxBytes: downloadSizeLimit,
         // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): a LIVE registry
@@ -2368,7 +2416,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       resumeUsageSeed(row, material.mode),
       selectToolCostSeed(material.mode, () => storage.getSessionToolUsage(record.id).cost),
     );
-    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage);
+    // Tag this resumed run's sends with the row's CURRENT resume_generation
+    // (spec RESUMABLE-SESSIONS §6), so a session that was reply-resumed (generation
+    // bumped) then parked stays reply-resumable from its newest output after a
+    // manual console resume — its sends carry the live generation, not 0.
+    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, row.resume_generation);
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
     // snapshot — run and persisted exactly like a launch.
     let kickoff;
@@ -2568,6 +2620,361 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
   }
 
+  // ── Resumable sessions (spec RESUMABLE-SESSIONS) ────────────────────────────
+  //
+  // The trigger pipeline stays entirely resume-unaware (§4); the resume-vs-fresh
+  // decision is a single fork made DOWNSTREAM, at session creation (the top of
+  // launchSession). Everything the resume branch needs — snapshot, transcript,
+  // adopt, the appended turn — is the existing failure-recovery machinery plus the
+  // render pieces in builder/factory.
+
+  /** Synchronous single-flight guard for the resume fork (§15 concurrent replies). */
+  const resumeClaims = new Set<string>();
+  /** Memoized exempt tool-NAME set (the per-tool flags are static; build once). */
+  let cachedResumeExemptToolNames: Set<string> | undefined;
+  /** One-line browser note for the resumed satellite's runtime_state (§11). */
+  const RESUME_BROWSER_NOTE =
+    "Your browser tab from the previous turn was closed when that run settled, but its " +
+    "login/cookies persist on the shared identity — reopen the browser tool if you need it.";
+
+  /** DM vs group from the timeline key (`matrix:<acct>:dm:<room>` → dm). */
+  function resumeContextFor(timelineKey: string): "dm" | "group" {
+    return timelineKey.split(":")[2] === "dm" ? "dm" : "group";
+  }
+
+  /**
+   * Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5). When resume is enabled
+   * for this context, a bare reply to one of the bot's OWN messages enters the
+   * pipeline (a group reply that today would not trigger), so the §7 fork can
+   * continue that session — or, if it turns out non-resumable, give a fresh
+   * response (addressing the bot always gets an answer; resumability only decides
+   * continue-vs-fresh, downstream). DMs already trigger as `dm`, so in practice
+   * this only ever fires for groups. Mutates `inbound.trigger` in place and leaves
+   * the rest of the pipeline unchanged. Called only when `inbound.trigger` is unset.
+   */
+  function maybeSynthesizeReplyTrigger(inbound: InboundChatEvent): void {
+    const replyExternalId = inbound.event.replyTo?.externalId;
+    if (!replyExternalId) return;
+    const ctx = resumeContextFor(inbound.timelineKey);
+    if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return;
+    const targetEvent = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
+    if (!targetEvent || targetEvent.timelineKey !== inbound.timelineKey || !targetEvent.agentSessionId) return;
+    const trigger: TriggerInfo = {
+      type: "reply",
+      reason: "reply to bot message",
+      triggeredBy: { id: inbound.event.sender.id, displayName: inbound.event.sender.displayName },
+    };
+    inbound.trigger = trigger;
+    inbound.event.trigger = trigger;
+  }
+
+  /** Built-in exempt tool names (from the per-tool flags) + per-context extras. */
+  function resumeExemptToolNames(
+    inbound: InboundChatEvent,
+    target: NonNullable<InboundChatEvent["outboundTarget"]>,
+    extra: readonly string[],
+  ): Set<string> {
+    if (!cachedResumeExemptToolNames) {
+      // Build the canonical tool set ONCE to read the static `resumeWorkExempt`
+      // flags (the work gate sees only names in a persisted transcript).
+      // Construction is side-effect-free — nothing executes; the throwaway usage
+      // tracker and probe id are never used for a real run.
+      const probe = buildSessionTools(inbound, "resume-exempt-probe", target, "default", new SessionUsageTracker(), 0);
+      cachedResumeExemptToolNames = collectExemptToolNames(probe);
+    }
+    return new Set<string>([...cachedResumeExemptToolNames, ...extra]);
+  }
+
+  /** Release this timeline's slot and launch the next queued trigger (mirrors the
+   *  fresh run's `.finally`; no-op while draining). */
+  function drainNextQueuedTrigger(timelineKey: string): void {
+    if (draining) return;
+    const next = triggerCoordinator.complete(timelineKey);
+    if (!next) return;
+    void launchSession(next, true).catch((error) => {
+      logger.error("queued_session_launch_failed", {
+        timelineKey: next.timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      triggerCoordinator.complete(next.timelineKey);
+    });
+  }
+
+  /**
+   * The resume fork (spec RESUMABLE-SESSIONS §7). Returns true when a reply
+   * continues a COMPLETED, resume-eligible session — the resumed run then owns this
+   * trigger's timeline slot + claim lifecycle (released on settle). Returns false
+   * (any gate fails / not a reply-to-bot) → the caller proceeds with a normal FRESH
+   * launch, which owns the slot instead. Pure degrade: a wrong guess is FRESH,
+   * never corruption or message loss.
+   */
+  async function tryReplyResume(inbound: InboundChatEvent, duplicate: boolean): Promise<boolean> {
+    const target = inbound.outboundTarget;
+    const replyExternalId = inbound.event.replyTo?.externalId;
+    if (!target || !replyExternalId) return false;
+    const ctx = resumeContextFor(inbound.timelineKey);
+    const resumeCfg = config.agent.sessions.resume;
+    if (resumeCfg?.enabled?.[ctx] !== true) return false; // §7 step 0: enabled? else FRESH
+
+    const targetEvent = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
+    const sessionId = targetEvent?.agentSessionId;
+    if (!targetEvent || targetEvent.timelineKey !== inbound.timelineKey || !sessionId) return false;
+    // A live in-memory record (running/resuming) is the steer path's business (§7.1)
+    // — steerReplyToActiveSession already ran for running sessions; either way this
+    // is not a completed-session fork.
+    if (sessions.get(sessionId)) return false;
+    // Synchronous single-flight (§15): only the first reply resumes a given state.
+    // A concurrent second reply degrades to FRESH; once the first markRunning's,
+    // later replies steer via the running-session path instead.
+    if (resumeClaims.has(sessionId)) return false;
+    resumeClaims.add(sessionId);
+    try {
+      const row = storage.getAgentSession(sessionId);
+      // §7.2: only `completed` is reply-resumable (failed-resumable/interrupted keep
+      // the console path; discarded is dead; a pruned/missing row → FRESH).
+      if (!row || row.status !== "completed") return false;
+      // §7.3: synthetic worker sessions (summarize/condense/diary) aren't repliable.
+      if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return false;
+      // §7.4 generation gate: the target message must carry the session's CURRENT
+      // generation (a reply to a superseded output → stale → FRESH).
+      if ((targetEvent.agentSessionGeneration ?? 0) !== row.resume_generation) return false;
+      // §7.6 intent heuristics (human reply). Explicit agent delegation would bypass
+      // these — but delegation today only targets running sessions, never reaches here.
+      if (
+        (resumeCfg.same_user_only ?? true) &&
+        row.trigger_sender_id &&
+        inbound.event.sender.id !== row.trigger_sender_id
+      ) {
+        return false;
+      }
+      const windowMs = resumeCfg.window?.[ctx];
+      if (
+        windowMs !== undefined &&
+        windowMs > 0 &&
+        row.completed_at != null &&
+        inbound.event.timestamp - row.completed_at > windowMs
+      ) {
+        return false;
+      }
+      // §7.7 capability gate: if the persisted context is already at/over the
+      // ceiling, a resume would immediately re-park (no compaction) — FRESH instead.
+      let ceiling: number | undefined;
+      try {
+        ceiling = factory.resolveSessionContextCeiling(row.session_type);
+      } catch {
+        ceiling = undefined;
+      }
+      if (ceiling !== undefined && row.context_tokens != null && row.context_tokens >= ceiling) return false;
+      // §7.5/§7.8 work gate + material viability (one load of the completed material).
+      const material = await loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger });
+      if (!material) return false;
+      const scope = (resumeCfg.work_gate?.[ctx]?.scope ??
+        (ctx === "dm" ? "any_in_history" : "since_last_turn")) as ResumeWorkScope;
+      const exempt = resumeExemptToolNames(inbound, target, resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []);
+      if (!hasResumableWork(material.transcript, { scope, exemptToolNames: exempt })) return false;
+
+      // All gates pass → ACCEPT. Single-consumption CAS (§6): completed → resuming,
+      // bump generation. A racing reply that already consumed this state gets
+      // `undefined` here → FRESH.
+      const generation = await storage.acceptResumeGeneration(sessionId);
+      if (generation === undefined) return false;
+      // Past the CAS we own the trigger's timeline slot (return true → no FRESH
+      // launch). `runReplyResumeSession` wires the run's `.finally` slot-drain, but
+      // a throw in its pre-run setup (adopt/markRunning/tool build) would settle
+      // before that — so guard it: evict any adopted record and drain the slot so
+      // the timeline can't deadlock. The orphaned generation bump is harmless
+      // (the row is no longer `completed` → future replies fork FRESH, §6).
+      try {
+        await runReplyResumeSession({ inbound, duplicate, target, targetEvent, row, material, generation, ctx, resumeCfg });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
+        logger.error("session_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
+        drainNextQueuedTrigger(inbound.timelineKey);
+      }
+      return true;
+    } finally {
+      resumeClaims.delete(sessionId);
+    }
+  }
+
+  /**
+   * Adopt the accepted session and run the resumed rollout (spec §7/§9/§11). Mirrors
+   * the fresh run's lifecycle tail (claim attribution, capture, run/settle, slot
+   * drain, browser close) — the only differences are: the row is ADOPTED (not
+   * created), the usage seed and generation come from the bumped row, the snapshot
+   * is reused (capture re-persists only the growing transcript), and the kickoff is
+   * the freshly-built appended turn (gap + fresh satellite + trigger group).
+   */
+  async function runReplyResumeSession(args: {
+    inbound: InboundChatEvent;
+    duplicate: boolean;
+    target: NonNullable<InboundChatEvent["outboundTarget"]>;
+    targetEvent: CanonicalChatEvent;
+    row: ReturnType<typeof storage.getAgentSession> & object;
+    material: NonNullable<Awaited<ReturnType<typeof loadCompletedSessionMaterial>>>;
+    generation: number;
+    ctx: "dm" | "group";
+    resumeCfg: NonNullable<NonNullable<typeof config.agent.sessions.resume>>;
+  }): Promise<void> {
+    const { inbound, duplicate, target, targetEvent, row, material, generation, ctx, resumeCfg } = args;
+    const record: AgentSessionRecord = {
+      id: row.id,
+      timelineKey: row.timeline_key,
+      sessionType: row.session_type,
+      status: "resuming",
+      trigger: inbound,
+      createdAt: row.created_at,
+      startedAt: row.started_at ?? undefined,
+    };
+    sessions.adopt(record);
+    sessions.markRunning(record.id);
+    // Claim attribution + release-on-settle, identical to a fresh launch.
+    if (inbound.event.externalId) {
+      sessionClaims.attachSession(record.timelineKey, inbound.event.externalId, record.id);
+    }
+    sessions.onSettle(record.id, () => sessionClaims.releaseSession(record.timelineKey, record.id));
+    const ownerExternalId = inbound.event.externalId;
+    if (ownerExternalId) {
+      sessions.onSettle(record.id, () => redispatchPendingCoReplies(ownerExternalId));
+    }
+    logger.info("session_resume_started", {
+      sessionId: record.id,
+      timelineKey: record.timelineKey,
+      generation,
+      context: ctx,
+    });
+
+    // Usage continues accumulating from the row (continue-mode seed).
+    const usage = new SessionUsageTracker(
+      resumeUsageSeed(row, "continue"),
+      selectToolCostSeed("continue", () => storage.getSessionToolUsage(record.id).cost),
+    );
+    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, generation);
+
+    // Gap backfill (§9): active only when BOTH limits are non-zero (0 = include none).
+    const gapCfg = resumeCfg.gap?.[ctx];
+    const gapActive =
+      !!gapCfg && (gapCfg.max_messages ?? 0) !== 0 && (gapCfg.max_tokens ?? 0) !== 0;
+    const gap = gapActive
+      ? {
+          maxMessages: gapCfg!.max_messages ?? 0,
+          maxTokens: gapCfg!.max_tokens ?? 0,
+          // Newest message the session already has → the gap surfaces only newer.
+          lowerBoundTimestamp:
+            storage.getLatestEventTimestampForSession(record.id) ?? targetEvent.timestamp,
+        }
+      : undefined;
+
+    let agent;
+    let kickoff;
+    try {
+      ({ agent, finalTurn: kickoff } = await factory.create(record, tools, {
+        resume: material,
+        resumeContinuation: {
+          tail: resumeCfg.satellite?.tail ?? true,
+          browserNote: browserSession ? RESUME_BROWSER_NOTE : undefined,
+          gap,
+        },
+        usage,
+        abortSignal: drainAbort.signal,
+      }));
+      if (!kickoff) throw new Error("resume continuation produced no appended turn");
+    } catch (error) {
+      const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      sessions.markDiscarded(record.id, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      logger.error(buildTimeout ? "session_resume_build_wait_timeout" : "session_resume_factory_failed", {
+        sessionId: record.id,
+        timelineKey: record.timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (buildTimeout) sendFailureNotice(target, record.id);
+      drainNextQueuedTrigger(record.timelineKey);
+      return;
+    }
+    sessions.attachAgent(record.id, agent);
+    if (ownerExternalId) drainPendingCoRepliesIntoSession(ownerExternalId, record.id);
+
+    const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
+    const captureHandle = attachSessionCapture(agent, {
+      storage,
+      sessionId: record.id,
+      // The frozen prefix is unchanged on resume (the original snapshot stays
+      // persisted); capture re-persists only the GROWING transcript.
+      snapshot: undefined,
+      tokenEstimate: undefined,
+      usage,
+      timelineKey: record.timelineKey,
+      sessionType: record.sessionType,
+      model: factory.resolveModelId(record.sessionType),
+      maxSessionCostUsd: costCeiling,
+      logger,
+    });
+    const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
+    const runner = new SessionRunner({ provider, target, suppressTyping: false });
+    const run = runner
+      .run(agent, record, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(record.id))
+      .then((result) => {
+        sessions.markCompleted(record.id, { noReply: result.noReply });
+        logger.info("session_resumed_completed", {
+          sessionId: record.id,
+          generation,
+          noReply: result.noReply,
+          duplicate,
+        });
+      })
+      .catch(async (error) => {
+        try {
+          await captureHandle.flushNow();
+        } catch (flushErr) {
+          logger.error("session capture: resume error-path flush failed", {
+            sessionId: record.id,
+            error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+          });
+        }
+        // Same park-never-discard policy as a fresh run: an LLM-layer failure parks
+        // `failed-resumable` (the console can redo it). The bumped generation is
+        // harmless — the session is no longer `completed`, so a reply to its prior
+        // output now forks FRESH (spec §6 "failed resumes are safe").
+        if (isLlmRunFailure(error)) {
+          sessions.markFailedResumable(record.id, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          logger.error("session_resume_parked_failed_resumable", {
+            sessionId: record.id,
+            timelineKey: record.timelineKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          sendFailureNotice(target, record.id);
+          return;
+        }
+        sessions.markDiscarded(record.id, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        logger.error("session_resume_failed", {
+          sessionId: record.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        captureHandle.detach();
+        costWarnUnsub();
+        activeRuns.delete(run);
+        if (browserSession) {
+          void browserSession.closeSession(record.id).catch((error) => {
+            logger.warn("browser_session_close_failed", {
+              sessionId: record.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
+        drainNextQueuedTrigger(record.timelineKey);
+      });
+    activeRuns.add(run);
+  }
+
   async function launchSession(
     inbound: InboundChatEvent,
     duplicate: boolean,
@@ -2578,6 +2985,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // context-build mode, and typing suppression. Everything else — tool assembly,
     // capture, slot release, queued-trigger drainage — is shared.
     const proactive = opts?.proactive === true;
+    // Resume fork (spec RESUMABLE-SESSIONS §7): a reply that continues a completed,
+    // eligible session takes over this trigger's slot and returns true. Any gate
+    // failing (or a non-reply/proactive trigger) falls through to the FRESH launch
+    // below. This is the ONLY new branch — the trigger pipeline above is unchanged.
+    if (!proactive && (await tryReplyResume(inbound, duplicate))) return;
     const session = proactive
       ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
       : sessions.createPlaceholder(inbound);

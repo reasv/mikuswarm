@@ -13,6 +13,8 @@ export function createDelegateToSessionTool(context: DelegateToolContext): Agent
   return {
     name: "delegate_to_session",
     label: "Delegate to session",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): control flow, not state — not work.
+    resumeWorkExempt: true,
     description: "Route the current user request into another running agent session.",
     parameters: Type.Object({
       session_id: Type.String(),

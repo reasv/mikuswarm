@@ -21,6 +21,14 @@ export interface SendMessageToolContext {
   target: OutboundTarget;
   timeline: TimelineStore;
   agentSessionId: string;
+  /**
+   * The owning session's `resume_generation` at run start (spec
+   * RESUMABLE-SESSIONS §6). Tagged onto every outbound event so a later reply to
+   * this message can tell whether it targets the session's live generation
+   * (continue) or a superseded one (fresh). 0 for a fresh session; the bumped
+   * value for a resumed run. Absent in tests = untagged (read as generation 0).
+   */
+  agentSessionGeneration?: number;
   workspaceRoot?: string;
   mediaMaxBytes?: number;
   /**
@@ -42,6 +50,9 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
   return {
     name: "send_message",
     label: "Send message",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — the effect IS
+    // the chat message, so it leaves no rollout state worth continuing.
+    resumeWorkExempt: true,
     description: "Send a message to the current Matrix room. You must explicitly decide whether the message is a reply.",
     parameters: Type.Object({
       message: Type.String({ description: "Message text. Can be empty string if sending media only." }),
@@ -159,6 +170,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             timelineKey: context.target.timelineKey,
             provider: context.provider.id,
             agentSessionId: context.agentSessionId,
+            agentSessionGeneration: context.agentSessionGeneration,
             role: "assistant",
             sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
             body,
@@ -203,6 +215,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             timelineKey: context.target.timelineKey,
             provider: context.provider.id,
             agentSessionId: context.agentSessionId,
+            agentSessionGeneration: context.agentSessionGeneration,
             role: "assistant",
             sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
             body: chunks[i],

@@ -41,9 +41,11 @@ export {
 } from "./runner.js";
 export {
   loadResumeMaterial,
+  loadCompletedSessionMaterial,
   stripFailedTail,
   createManualResumeSession,
   MANUAL_RESUME_STATUSES,
+  SYNTHETIC_SESSION_TYPES,
   RESUME_IMAGE_PLACEHOLDER,
   type ResumeMaterial,
   type ResumeMaterialDeps,
@@ -51,3 +53,8 @@ export {
   type ManualResumeDeps,
   type ManualResumeResult,
 } from "./recovery.js";
+export {
+  collectExemptToolNames,
+  hasResumableWork,
+  type ResumeWorkScope,
+} from "./work-gate.js";

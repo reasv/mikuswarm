@@ -324,6 +324,78 @@ const ProactiveSchema = StrictObject({
   channels: Type.Optional(Type.Array(ProactiveChannelSchema)),
 });
 
+// Resumable sessions (spec RESUMABLE-SESSIONS §14). Replying to a COMPLETED
+// agent message continues its session as a genuine multi-turn rollout instead of
+// spawning a fresh one. Off by default per context (`enabled.dm`/`enabled.group`
+// both false); every knob is per-context (DM vs group) except `same_user_only`,
+// which is global (inert in DMs). Each field is optional so a partial/omitted
+// block degrades to the safe code-level default (resume off); 00-defaults.toml
+// ships the full explicit block. Cross-field checks live in app.ts.
+const ResumeEnabledSchema = StrictObject({
+  dm: Type.Optional(Type.Boolean()),
+  group: Type.Optional(Type.Boolean()),
+});
+
+// Resume time window per context (§7): a reply more than this many ms after the
+// session completed → FRESH. 0 or -1 = unlimited.
+const ResumeWindowSchema = StrictObject({
+  dm: Type.Optional(Type.Integer({ minimum: -1 })),
+  group: Type.Optional(Type.Integer({ minimum: -1 })),
+});
+
+// Gap-backfill budget for one context (§9.3). Two independent limits; the
+// backfill stops at whichever is hit first. 0 = include none (gap off; the
+// default), >0 = cap, -1 = unlimited. `max_tokens` excludes the trigger group.
+// Cross-field rule (app.ts): the two are never BOTH -1.
+const ResumeGapBudgetSchema = StrictObject({
+  max_messages: Type.Optional(Type.Integer({ minimum: -1 })),
+  max_tokens: Type.Optional(Type.Integer({ minimum: -1 })),
+});
+
+const ResumeGapSchema = StrictObject({
+  dm: Type.Optional(ResumeGapBudgetSchema),
+  group: Type.Optional(ResumeGapBudgetSchema),
+});
+
+const ResumeSatelliteSchema = StrictObject({
+  // The single satellite knob (§11): repeat the tail instructions in the fresh
+  // satellite on resume (default on). `runtime_state` is always re-rendered and
+  // `retrieved_memory` is always omitted on resume — neither is configurable.
+  tail: Type.Optional(Type.Boolean()),
+});
+
+// Work-gate tuning for one context (§7a). The base gate (≥1 non-exempt tool call
+// somewhere in scope) is ALWAYS on; only these two knobs are configurable.
+const ResumeWorkGateContextSchema = StrictObject({
+  // Where the work must appear: `since_last_turn` (strict — in the latest
+  // resume-generation's rollout) or `any_in_history` (loose — anywhere so far).
+  scope: Type.Optional(
+    Type.Union([Type.Literal("since_last_turn"), Type.Literal("any_in_history")]),
+  ),
+  // Extra tool names (first-party OR `mcp__…`) to treat as non-work, on top of
+  // the built-in chat-surface/control exempt set. Lean exempt for anything
+  // ambiguous — the safe failure direction is "didn't resume".
+  extra_exempt_tools: Type.Optional(Type.Array(Type.String())),
+});
+
+const ResumeWorkGateSchema = StrictObject({
+  dm: Type.Optional(ResumeWorkGateContextSchema),
+  group: Type.Optional(ResumeWorkGateContextSchema),
+});
+
+const ResumeSchema = StrictObject({
+  // Reserve the scarce single resume for the ORIGINAL trigger sender (§6/§7):
+  // a reply from a different user → FRESH. Global; inert in DMs (the asker is the
+  // only human). Applies to human replies only — explicit agent delegations
+  // bypass it (the decision IS the signal).
+  same_user_only: Type.Optional(Type.Boolean()),
+  enabled: Type.Optional(ResumeEnabledSchema),
+  window: Type.Optional(ResumeWindowSchema),
+  gap: Type.Optional(ResumeGapSchema),
+  satellite: Type.Optional(ResumeSatelliteSchema),
+  work_gate: Type.Optional(ResumeWorkGateSchema),
+});
+
 const TimelineSchema = StrictObject({
   // How many messages to fetch on first trigger (initial backfill). 0 = none.
   initial_backfill_messages: Type.Optional(Type.Number({ minimum: 0 })),
@@ -976,6 +1048,10 @@ export const AppConfigSchema = StrictObject({
       // Left unset by default → agent work is unbounded (the loop runs as long as
       // the model emits tool calls). Set a number only if you want a guardrail.
       max_tool_calls: Type.Optional(Type.Number({ minimum: 1 })),
+      // Resumable sessions (spec RESUMABLE-SESSIONS §14): reply-to-continue. Off
+      // by default per context; the whole block is optional so omitting it leaves
+      // resume off. Cross-field validation in app.ts.
+      resume: Type.Optional(ResumeSchema),
     }),
     system: StrictObject({
       fallback_prompt: Type.Optional(Type.String()),

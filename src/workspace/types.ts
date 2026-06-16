@@ -35,6 +35,18 @@ export interface SatelliteRuntimeInput {
   now?: Date;
   /** When true, the <runtime_state> section is omitted (summarization builds). */
   suppressRuntimeState?: boolean;
+  /**
+   * When true, the <tail_instructions> section is omitted (spec
+   * RESUMABLE-SESSIONS §11: the resume satellite's `tail` toggle is off). The
+   * normal final-turn build never sets this — only the resume re-render does.
+   */
+  suppressTail?: boolean;
+  /**
+   * An extra line appended to <runtime_state> on resume (spec RESUMABLE-SESSIONS
+   * §11 browser note): e.g. that the previous browser tab was closed but its
+   * login/cookies survive and it can be reopened. Omitted when unset.
+   */
+  resumeNote?: string;
 }
 
 /**

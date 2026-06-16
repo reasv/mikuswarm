@@ -11,6 +11,8 @@ export function createDeleteMessageTool(context: DeleteMessageToolContext): Agen
   return {
     name: "delete_message",
     label: "Delete message",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Redact (delete) a message. This is irreversible. You can freely delete your own messages; deleting others' messages requires moderator permissions.",
     parameters: Type.Object({
       message_id: Type.String({ description: "Matrix event ID of the message to delete." }),

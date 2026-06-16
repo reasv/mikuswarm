@@ -695,6 +695,13 @@ export interface AgentSessionRow {
   usage_cache_write_tokens: number | null;
   usage_cost: number | null;
   context_tokens: number | null;
+  /**
+   * Single-consumption counter for reply-resume (spec RESUMABLE-SESSIONS §6).
+   * `NOT NULL DEFAULT 0`; bumped when a resume is accepted. A completed session
+   * is reply-resumable only via a target message whose tagged generation equals
+   * this value.
+   */
+  resume_generation: number;
   no_reply: number;
   error: string | null;
   created_at: number;
@@ -1471,11 +1478,11 @@ export class Storage {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          event_json, enrichment_status, created_at, updated_at
+          agent_session_generation, event_json, enrichment_status, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+          @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
         )
         on conflict(id) do update set
           external_id = excluded.external_id,
@@ -1488,6 +1495,7 @@ export class Storage {
           timestamp = excluded.timestamp,
           received_at = excluded.received_at,
           agent_session_id = excluded.agent_session_id,
+          agent_session_generation = excluded.agent_session_generation,
           event_json = excluded.event_json,
           enrichment_status = excluded.enrichment_status,
           created_at = timeline_events.created_at,
@@ -1504,6 +1512,7 @@ export class Storage {
         timestamp: event.timestamp,
         receivedAt: event.receivedAt,
         agentSessionId: event.agentSessionId ?? null,
+        agentSessionGeneration: event.agentSessionGeneration ?? null,
         eventJson: JSON.stringify(event),
         enrichmentStatus: enrichmentStatus ?? "pending",
         createdAt: now,
@@ -5055,6 +5064,41 @@ export class Storage {
   }
 
   /**
+   * Accept a reply-resume of a COMPLETED session (spec RESUMABLE-SESSIONS §6):
+   * atomically flip `completed → resuming` AND increment `resume_generation` in a
+   * single CAS, returning the new generation, or `undefined` when the row is no
+   * longer `completed` (already resumed by a racing reply, or never completed).
+   *
+   * The `where status = 'completed'` guard is the durable single-consumption
+   * point: only the first accepted resume of a given state mutates the row, so the
+   * prior run's outputs (tagged with the pre-bump generation on their
+   * `timeline_events` rows) become stale forever and the same state can never be
+   * continued twice. The in-memory fork guard (app.ts) is the synchronous
+   * first-line defense; this CAS is the authoritative, cross-restart backstop.
+   * Status moves through `resuming` exactly as the manual/failure resume path,
+   * so `markRunning`/`markCompleted` drive the rest of the lifecycle unchanged.
+   */
+  acceptResumeGeneration(sessionId: string): Promise<number | undefined> {
+    return this.readAndWrite((db) => {
+      const now = Date.now();
+      const result = db
+        .prepare(
+          `update agent_sessions
+             set status = 'resuming',
+                 resume_generation = resume_generation + 1,
+                 updated_at = @now
+           where id = @id and status = 'completed'`,
+        )
+        .run({ id: sessionId, now });
+      if (result.changes === 0) return undefined;
+      const row = db
+        .prepare(`select resume_generation from agent_sessions where id = ?`)
+        .get(sessionId) as { resume_generation: number } | undefined;
+      return row?.resume_generation;
+    });
+  }
+
+  /**
    * Record a user interjection injected into a running session (ARCHITECTURE.md
    * §8/§11). Fire-and-forget on the single-writer queue, written at the steer site
    * after a successful inject; the `_ai` trigger maintains `session_interjections_fts`
@@ -5292,6 +5336,21 @@ export class Storage {
         | AgentSessionRow
         | undefined,
     );
+  }
+
+  /**
+   * The latest `timestamp` among the timeline events a session authored (its own
+   * sends), or undefined if it sent nothing. The gap-backfill lower bound (spec
+   * RESUMABLE-SESSIONS §9.2): the newest message a resumed session already has in
+   * its context, so the gap surfaces only what arrived AFTER it. Read-only.
+   */
+  getLatestEventTimestampForSession(sessionId: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select max(timestamp) as ts from timeline_events where agent_session_id = ?`)
+        .get(sessionId) as { ts: number | null } | undefined,
+    );
+    return row?.ts ?? undefined;
   }
 
   /**
@@ -6325,6 +6384,13 @@ create table if not exists timeline_events (
   timestamp integer not null,
   received_at integer not null,
   agent_session_id text,
+  -- Resumable sessions (spec RESUMABLE-SESSIONS §6): the resume_generation the
+  -- owning session held when this (bot-sent) message was tagged. NULL on inbound
+  -- rows and on pre-migration sends, treated as generation 0. A reply-resume
+  -- accepts a completed session only via a target message whose generation equals
+  -- the session's CURRENT agent_sessions.resume_generation (older becomes FRESH),
+  -- so a superseded output can never re-consume an already-continued state.
+  agent_session_generation integer,
   event_json text not null,
   enrichment_status text not null default 'pending'
     check(enrichment_status in ('inactive', 'pending', 'processing', 'complete', 'failed', 'skipped')),
@@ -6711,6 +6777,13 @@ create table if not exists agent_sessions (
   usage_cache_write_tokens integer,
   usage_cost real,
   context_tokens integer,
+  -- Resumable sessions (spec RESUMABLE-SESSIONS §6): the single-consumption
+  -- counter. Bumped atomically when a reply-resume is ACCEPTED (status →
+  -- resuming), so the prior run's outputs (tagged with the pre-bump value on
+  -- their timeline_events rows) become stale forever and a state can be
+  -- continued at most once. A linear chain works (each resume's new sends carry
+  -- the bumped value); branching from a superseded output degrades to FRESH.
+  resume_generation integer not null default 0,
   no_reply integer not null default 0,
   error text,
   created_at integer not null,
@@ -6748,7 +6821,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 25;
+export const LATEST_SCHEMA_VERSION = 26;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -7465,6 +7538,28 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
            where m.caption_status = 'complete' and m.caption_cost is not null;`,
         );
       }
+    }
+  },
+  // index 25 (v25 -> v26): resumable sessions (spec RESUMABLE-SESSIONS §6/§13).
+  // Two additive columns, both guarded for rewound test fixtures (skip if the
+  // table is absent or the column already exists, mirroring the v15->v16 ALTER
+  // pattern). Existing completed sessions get `resume_generation = 0` and their
+  // already-sent messages read as generation 0 (NULL), so each remains
+  // reply-resumable exactly once — the intended one-continuation-per-state rule.
+  (db) => {
+    const hasColumn = (table: string, column: string): boolean => {
+      const exists = db
+        .prepare(`select 1 from sqlite_master where type = 'table' and name = ?`)
+        .get(table);
+      if (!exists) return true; // no table → nothing to ALTER (fresh-fixture guard)
+      const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      return columns.some((c) => c.name === column);
+    };
+    if (!hasColumn("agent_sessions", "resume_generation")) {
+      db.exec(`alter table agent_sessions add column resume_generation integer not null default 0;`);
+    }
+    if (!hasColumn("timeline_events", "agent_session_generation")) {
+      db.exec(`alter table timeline_events add column agent_session_generation integer;`);
     }
   },
 ];

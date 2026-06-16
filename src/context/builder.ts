@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AppConfig } from "../config/index.js";
 import type { AgentSessionRecord } from "../agent/index.js";
 import type { SessionClaims } from "../agent/session-claims.js";
@@ -710,6 +711,168 @@ export class ContextBuilder {
       renderedInputIds,
       systemPromptSegments,
     };
+  }
+
+  /**
+   * Build the appended user turn for a reply-RESUME (spec RESUMABLE-SESSIONS
+   * §9/§11). Returns a single `triggerGroup` AgentMessage that the factory hands
+   * to the runner as the kickoff — `agent.prompt(...)` appends it after the
+   * resumed transcript and continues the rollout. It is NOT a frozen-prefix build:
+   * the frozen prefix is the ORIGINAL snapshot, reused verbatim (§2).
+   *
+   * Layout (chronological, mirroring the live final turn's
+   * `[retrieved_memory, satellite, trigger]` order): the **gap** (older missed
+   * context, §9) takes the structural place of retrieved memory, then a **fresh
+   * satellite** (`runtime_state` always, tail per the toggle, NO retrieved memory,
+   * + the browser note), then the **trigger group** (the actual request). Marking
+   * it `triggerGroup` also makes it a real-user-turn boundary for a later
+   * `since_last_turn` work-gate scan (§7a).
+   */
+  async buildResumeTurn(options: {
+    timelineKey: string;
+    trigger: CanonicalChatEvent;
+    activeSessions: AgentSessionRecord[];
+    workspace: WorkspaceContent;
+    sessionType?: SessionTypeConfig;
+    selfSessionId: string;
+    /** Satellite tail toggle (spec §11; config `resume.satellite.tail`). */
+    tail: boolean;
+    /** One-line resume note for runtime_state (the browser tab note, §11). */
+    browserNote?: string;
+    /**
+     * Gap backfill budget (§9). Omitted/inactive → no gap. Both limits must be
+     * non-zero to surface anything (0 = include none); -1 = unlimited.
+     * `lowerBoundTimestamp` is the newest message the session already has.
+     */
+    gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+  }): Promise<AgentMessage> {
+    const now = options.trigger.timestamp;
+
+    // Trigger group: the reply plus any coalesced members (resolved exactly as a
+    // live build), rich-rendered and joined. Looked up individually rather than
+    // via a window query — the members are an explicit id set.
+    const triggerGroupIds = this.resolveTriggerGroupIds(options.trigger);
+    const triggerEvents: CanonicalChatEvent[] = [];
+    for (const id of triggerGroupIds) {
+      const event = id === options.trigger.id ? options.trigger : this.store.getById(id);
+      if (event) triggerEvents.push(event);
+    }
+    triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+    const imageBlocks = await this.selectImageBlocks(options.trigger);
+    this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
+    const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+
+    // Fresh satellite at the new (volatile) position. runtime_state always; tail
+    // per toggle; retrieved_memory never (§11); the browser note rides in
+    // runtime_state.
+    let channelContext: { label: string; isDirect: boolean } | null = null;
+    if (this.resolveChannelContext) {
+      try {
+        channelContext = await this.resolveChannelContext(options.timelineKey);
+      } catch (error) {
+        this.logger?.debug("resolve_channel_context_failed", {
+          timelineKey: options.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const satellite = renderSatelliteBlock(
+      {
+        timelineKey: options.timelineKey,
+        trigger: options.trigger,
+        activeSessions: options.activeSessions,
+        selfSessionId: options.selfSessionId,
+        channelLabel: channelContext?.label,
+        isDirect: channelContext?.isDirect,
+        suppressRuntimeState: false,
+        suppressTail: !options.tail,
+        resumeNote: options.browserNote,
+      },
+      options.workspace,
+      options.sessionType,
+    );
+    const systemBlock = `<system>\n${satellite}\n</system>`;
+
+    // Gap backfill (§9): contiguous newest-first run of room messages the session
+    // missed, excluding trigger members, claim-marked and budget-truncated.
+    const gapActive =
+      options.gap !== undefined && options.gap.maxMessages !== 0 && options.gap.maxTokens !== 0;
+    const gapRendered = gapActive
+      ? this.renderResumeGap(options.timelineKey, options.trigger, triggerGroupIds, options.gap!, options.selfSessionId)
+      : null;
+
+    const finalUserContent = [gapRendered, systemBlock, triggerContent].filter(Boolean).join("\n\n");
+    return {
+      type: "triggerGroup",
+      content: finalUserContent,
+      imageBlocks,
+      timestamp: now,
+      tier: "trigger",
+      tokenEstimate: estimateTokens(finalUserContent),
+    } as AgentMessage;
+  }
+
+  /**
+   * Render the gap backfill (spec RESUMABLE-SESSIONS §9.2): a CONTIGUOUS,
+   * newest-first run of room messages in `(lowerBound, trigger]` — excluding the
+   * trigger-group members (rendered separately) — truncated oldest-first to the
+   * budget, with a marker when cut. Messages another running session has claimed
+   * are flagged `<handled_by_session>` so the resumed session does not
+   * duplicate-handle them (§9.2 ownership). Never punches holes to fit a budget;
+   * truncation is always a contiguous oldest-first cut. Returns null when nothing
+   * falls in the window.
+   */
+  private renderResumeGap(
+    timelineKey: string,
+    trigger: CanonicalChatEvent,
+    triggerGroupIds: Set<string>,
+    gap: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number },
+    selfSessionId: string,
+  ): string | null {
+    // Walk back from the trigger group's latest member (the trigger itself, the
+    // chronologically-last event). Query the whole window newest-first (capped),
+    // then apply the budget. `+1` makes the lower bound exclusive (the session
+    // already has everything at/below it).
+    const queryLimit = gap.maxMessages > 0 ? Math.max(gap.maxMessages + 1, 50) : 500;
+    const windowAsc = this.store.query({
+      timelineKey,
+      fromTimestamp: gap.lowerBoundTimestamp + 1,
+      toTimestamp: trigger.timestamp,
+      limit: queryLimit,
+    });
+    const gapEvents = windowAsc.filter((e) => !triggerGroupIds.has(e.id));
+    if (gapEvents.length === 0) return null;
+
+    const claimSnapshot = this.claims?.snapshotForBuild(timelineKey, selfSessionId);
+    const claimedBy = claimSnapshot
+      ? (externalId: string) => claimSnapshot.get(externalId)
+      : undefined;
+
+    // Accumulate newest-first until a budget is hit; the remaining older events are
+    // truncated (oldest-first). -1 on an axis = unlimited (never the cap).
+    const kept: string[] = [];
+    let totalTokens = 0;
+    let omitted = 0;
+    for (let i = gapEvents.length - 1; i >= 0; i--) {
+      const text = renderRichMessage(gapEvents[i]!, claimedBy ? { claimedBy } : undefined);
+      const tokens = estimateTokens(text);
+      const messageCapHit = gap.maxMessages > 0 && kept.length >= gap.maxMessages;
+      const tokenCapHit = gap.maxTokens > 0 && kept.length > 0 && totalTokens + tokens > gap.maxTokens;
+      if (messageCapHit || tokenCapHit) {
+        omitted = i + 1;
+        break;
+      }
+      kept.push(text);
+      totalTokens += tokens;
+    }
+    if (kept.length === 0) return null;
+    kept.reverse(); // chronological (oldest kept → newest)
+    const marker = omitted > 0 ? `<earlier_messages_omitted count="${omitted}"/>\n` : "";
+    return (
+      `<messages_while_you_were_away note="These arrived in the room since your last reply; ` +
+      `some may already be handled by other sessions (tagged &lt;handled_by_session&gt;).">\n` +
+      `${marker}${kept.join("\n\n")}\n</messages_while_you_were_away>`
+    );
   }
 
   /**

@@ -207,6 +207,25 @@ export interface CreateAgentOptions {
    */
   resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
   /**
+   * Reply-resume continuation (spec RESUMABLE-SESSIONS §9/§11). Set ALONGSIDE
+   * `resume` when continuing a COMPLETED session because a user replied to it:
+   * instead of `continue()`-ing the seeded transcript (the failure-recovery
+   * shape, which re-issues the last un-answered request), the factory builds a
+   * FRESH appended user turn — gap backfill + a fresh satellite + the trigger
+   * group — via {@link ContextBuilder.buildResumeTurn} and returns it as
+   * `finalTurn`, so the runner `prompt()`s it onto the end of the rollout. Absent
+   * (failure-recovery resume) → no `finalTurn`, runner continue-mode. The frozen
+   * prefix is still the original `resume.snapshot`, reused verbatim (never rebuilt).
+   */
+  resumeContinuation?: {
+    /** Satellite tail toggle (config `agent.sessions.resume.satellite.tail`). */
+    tail: boolean;
+    /** One-line browser note for runtime_state (§11). */
+    browserNote?: string;
+    /** Gap backfill budget (§9); omitted/inactive → no gap. */
+    gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+  };
+  /**
    * Usage-tracker seed for resume-in-place (spec TOKEN-USAGE-TRACKING §4.3): the
    * persisted session totals, so a resumed session continues accumulating from
    * where it left off instead of resetting. Built from the durable row's usage
@@ -589,6 +608,24 @@ export class AgentSessionFactory {
       // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
       // from aliasing — and freezing — the caller's array (§6).
       frozenBaseSeed = [...opts.resume.snapshot];
+      // Reply-resume of a COMPLETED session (spec RESUMABLE-SESSIONS §9/§11): build
+      // the fresh appended turn (gap + fresh satellite + trigger group) and return
+      // it as the kickoff. The frozen prefix above is the ORIGINAL snapshot, reused
+      // verbatim — never rebuilt (the freeze invariant, §2). Absent → failure-
+      // recovery continue-mode (no kickoff; runner re-issues the seeded tail).
+      if (opts.resumeContinuation) {
+        finalTurn = await this.options.contextBuilder.buildResumeTurn({
+          timelineKey: session.timelineKey,
+          trigger: session.trigger.event,
+          activeSessions: this.options.getActiveSessions(session.timelineKey),
+          workspace,
+          sessionType: sessionTypeConfig,
+          selfSessionId: session.id,
+          tail: opts.resumeContinuation.tail,
+          browserNote: opts.resumeContinuation.browserNote,
+          gap: opts.resumeContinuation.gap,
+        });
+      }
     } else {
       const built = await this.buildContext({
         timelineKey: session.timelineKey,

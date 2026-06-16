@@ -11,6 +11,8 @@ export function createReactTool(context: ReactToolContext): AgentTool {
   return {
     name: "react",
     label: "React to message",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Add or remove an emoji reaction on a message. Use unicode emoji directly or :shortcode: for custom emoji.",
     parameters: Type.Object({
       message_id: Type.String({ description: "Matrix event ID of the message to react to." }),

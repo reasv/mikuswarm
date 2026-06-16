@@ -161,8 +161,9 @@ export function renderSatelliteBlock(
     parts.push(`<runtime_state>\n${renderRuntimeState(options)}\n</runtime_state>`);
   }
 
-  // Part 2: Tail instructions
-  if (workspace.tailContent) {
+  // Part 2: Tail instructions (omitted when the resume satellite toggles them off,
+  // spec RESUMABLE-SESSIONS §11).
+  if (workspace.tailContent && !options.suppressTail) {
     const sourceFile = sessionType?.tail_file ?? "TAIL.md";
     // Only add source attr if it's a real file (not suppressed)
     if (typeof sourceFile === "string") {
@@ -235,8 +236,12 @@ function renderRuntimeState(options: SatelliteRuntimeInput): string {
       ? ""
       : `\nType: ${options.isDirect ? "direct message" : "group room"}`;
 
+  // Resume note (spec RESUMABLE-SESSIONS §11): a one-line situational marker (e.g.
+  // the browser tab was closed but login survives) injected at the volatile end.
+  const resumeLine = options.resumeNote ? `\n${escapeXml(options.resumeNote)}` : "";
+
   return `Current time: ${formatAgentTimestamp(options.now ?? options.trigger.timestamp)}${channelLine}${typeLine}
-Current timeline: ${escapeXml(options.timelineKey)}${sessionsBlock}`;
+Current timeline: ${escapeXml(options.timelineKey)}${resumeLine}${sessionsBlock}`;
 }
 
 /**

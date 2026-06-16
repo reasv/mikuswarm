@@ -11,6 +11,8 @@ export function createEditMessageTool(context: EditMessageToolContext): AgentToo
   return {
     name: "edit_message",
     label: "Edit message",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Edit one of your own previously sent messages. Only messages sent by you can be edited.",
     parameters: Type.Object({
       message_id: Type.String({ description: "Matrix event ID of the message to edit." }),

@@ -170,6 +170,63 @@ export async function loadResumeMaterial(
 }
 
 /**
+ * Load a COMPLETED session's persisted snapshot + FULL transcript for reply-resume
+ * (spec RESUMABLE-SESSIONS §7). Unlike {@link loadResumeMaterial} (failure
+ * recovery), this does NOT strip a tail or require the transcript to end at an
+ * un-answered request: a completed session's rollout ends at a clean assistant
+ * turn (its last send), and that whole rollout is what we continue. The caller
+ * appends a NEW user turn (the reply + gap + fresh satellite, §9/§11) and
+ * `prompt()`s it — it never `continue()`s.
+ *
+ * Returns null (→ the fork degrades to FRESH) when the material is missing or
+ * corrupt: a completed session must carry both a snapshot (written once at
+ * creation) and a non-empty transcript (flushed at each turn), so absence means a
+ * pruned, legacy, or corrupt row. Image refs are rehydrated exactly as the
+ * failure-recovery path (a `{type:"image"}` block whose data is still a ref object
+ * would 400 the resumed request).
+ */
+export async function loadCompletedSessionMaterial(
+  row: AgentSessionRow,
+  deps: ResumeMaterialDeps,
+): Promise<ResumeMaterial | null> {
+  if (!row.context_snapshot_json || !row.transcript_json) return null;
+
+  let snapshotRaw: ContextMessage[];
+  let transcriptRaw: AgentMessage[];
+  try {
+    snapshotRaw = JSON.parse(row.context_snapshot_json) as ContextMessage[];
+    transcriptRaw = JSON.parse(row.transcript_json) as AgentMessage[];
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(snapshotRaw) || !Array.isArray(transcriptRaw)) return null;
+  if (transcriptRaw.length === 0) return null;
+
+  const resolve = createImageRefResolver(deps);
+  try {
+    snapshotRaw = (await rehydrateImages(snapshotRaw, resolve)) as ContextMessage[];
+    transcriptRaw = (await rehydrateImages(transcriptRaw, resolve)) as AgentMessage[];
+  } catch (err) {
+    deps.logger?.error("resume material (completed): image rehydration failed", {
+      sessionId: row.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+
+  const snapshot = mapBuiltMessages({
+    messages: snapshotRaw,
+    tokenEstimate: 0,
+    compactTokens: 0,
+    richTokens: 0,
+    imageBlocks: [],
+    systemPromptSegments: [],
+  });
+
+  return { snapshot, transcript: transcriptRaw };
+}
+
+/**
  * Drop the failed tail: trailing assistant messages that are the synthetic
  * error/aborted turn (or a partial that died mid-stream and carries an error
  * stopReason). A CLEAN trailing assistant message is left alone — that run

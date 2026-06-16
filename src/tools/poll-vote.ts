@@ -11,6 +11,8 @@ export function createPollVoteTool(context: PollVoteToolContext): AgentTool {
   return {
     name: "poll_vote",
     label: "Vote in poll",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Vote in an existing poll by selecting one or more answer IDs.",
     parameters: Type.Object({
       poll_event_id: Type.String({ description: "Matrix event ID of the poll to vote in." }),

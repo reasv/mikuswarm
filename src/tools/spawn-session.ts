@@ -37,6 +37,8 @@ export function createSpawnSessionTool(context: SpawnSessionToolContext): AgentT
   return {
     name: "spawn_session",
     label: "Spawn session",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): control flow, not state — not work.
+    resumeWorkExempt: true,
     description:
       "Spin a co-reply (surfaced to you in an `<interjection reason=\"co-reply\">`) off into its own " +
       "independent agent session, identified by its message_id. Use this only when the co-reply " +

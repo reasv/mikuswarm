@@ -11,6 +11,8 @@ export function createCreatePollTool(context: CreatePollToolContext): AgentTool 
   return {
     name: "create_poll",
     label: "Create poll",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Create a poll in the current room. Provide a question and 2-20 answer options.",
     parameters: Type.Object({
       question: Type.String({ description: "The poll question." }),

@@ -48,6 +48,62 @@ coalesce_window_ms = 60000
 # max_tool_calls is intentionally unset → agent work is unbounded (the loop runs
 # as long as the model emits tool calls). Set a number here only to impose a cap.
 
+# Resumable sessions (spec RESUMABLE-SESSIONS). Replying to a message the bot sent
+# continues THAT session as a multi-turn rollout (it remembers what it did) instead
+# of spawning a fresh, amnesiac session. Off by default in both contexts; opt in
+# per context below. A wrong guess degrades to a fresh session, never to corruption
+# or message loss.
+[agent.sessions.resume]
+# Reserve the scarce single resume for the original asker (§6/§7): a reply from a
+# different user starts a fresh session. Global; inert in DMs. Explicit agent
+# delegations bypass this — it gates human replies only.
+same_user_only = true
+
+# Resume is off unless the message's context is enabled here (§14).
+[agent.sessions.resume.enabled]
+dm = false
+group = false
+
+# Resume time window (§7), per context. A reply more than this many ms after the
+# session completed starts a fresh session. 0 or -1 = unlimited.
+[agent.sessions.resume.window]
+dm = 21600000     # 6h — focused 1:1; a reply carries explicit continuation intent
+group = 3600000   # 1h — noisy; bound staleness / blast-radius of a wrong guess
+
+# Gap backfill (§9): surface room messages the session missed while away, prepended
+# to the resumed turn. Off by default. 0 = none, >0 = cap, -1 = unlimited; the two
+# limits are never both -1 (app.ts validates). max_tokens excludes the request.
+# DMs stay off for a stronger reason than size (§9.2): a DM's gap is entirely other
+# sessions' triggers. Groups are where enabling it is meaningful.
+[agent.sessions.resume.gap.dm]
+max_messages = 0
+max_tokens = 0
+
+[agent.sessions.resume.gap.group]
+max_messages = 0
+max_tokens = 0
+
+# Satellite re-rendering on resume (§11). runtime_state is always re-rendered
+# (forced on) and retrieved_memory is always omitted (forced off); the tail
+# instructions are the only knob — repeating them keeps high-adherence guidance
+# near the context end, where a long resumed rollout drifts worst.
+[agent.sessions.resume.satellite]
+tail = true
+
+# Work gate (§7a): resume only continues STATEFUL work — a session whose rollout is
+# pure conversation has nothing a fresh session lacks. The base rule (≥1 non-exempt
+# tool call in scope) is always on; these knobs tune HOW work is measured, per
+# context. scope = "since_last_turn" (strict: work in the latest turn's rollout) or
+# "any_in_history" (loose: work anywhere so far). extra_exempt_tools lists extra
+# tool names (incl. mcp__*) to NOT count as work, atop the built-in exempt set.
+[agent.sessions.resume.work_gate.dm]
+scope = "any_in_history"    # follow-up chains keep prior work's context
+extra_exempt_tools = []
+
+[agent.sessions.resume.work_gate.group]
+scope = "since_last_turn"   # a single lookup can't swallow the room's back-and-forth
+extra_exempt_tools = []
+
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 

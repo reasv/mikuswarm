@@ -23,6 +23,9 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
   return {
     name: "media",
     label: "Media",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): source is already in chat and
+    // the caption is regenerable by re-calling media — exempt (see §18).
+    resumeWorkExempt: true,
     description,
     parameters: Type.Object({
       prompt: Type.Optional(Type.String({ description: "Custom prompt describing what to analyze." })),

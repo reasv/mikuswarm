@@ -12,6 +12,8 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
   return {
     name: "pins",
     label: "Pin management",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Pin, unpin, or list pinned messages in the current room. Pinning/unpinning requires sufficient room permissions.",
     parameters: Type.Object({
       action: Type.Union([

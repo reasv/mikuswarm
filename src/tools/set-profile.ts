@@ -16,6 +16,8 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
   return {
     name: "set_profile",
     label: "Set profile",
+    // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
+    resumeWorkExempt: true,
     description: "Change the bot's display name and/or avatar. Avatar can be an mxc:// URI, an HTTP URL, or a local file path.",
     parameters: Type.Object({
       display_name: Type.Optional(Type.String({ description: "New display name. Empty string clears it." })),

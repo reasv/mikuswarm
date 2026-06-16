@@ -117,6 +117,16 @@ export interface CanonicalChatEvent {
   timelineKey: string;
   provider: string;
   agentSessionId?: string;
+  /**
+   * Resume generation the owning session held when this (bot-sent) message was
+   * tagged (spec RESUMABLE-SESSIONS §6). Set only on assistant sends; absent on
+   * inbound messages and pre-feature sends (read as generation 0). Persisted both
+   * in `event_json` (so it survives the echo-enrich UPDATE, which rebuilds the row
+   * from the canonical event) and in the `timeline_events.agent_session_generation`
+   * column. A reply-resume continues a completed session only when this equals the
+   * session's current `resume_generation`.
+   */
+  agentSessionGeneration?: number;
   role: ChatRole;
   sender: SenderInfo;
   body: string;

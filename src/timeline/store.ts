@@ -41,11 +41,11 @@ export class TimelineStore {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          event_json, enrichment_status, created_at, updated_at
+          agent_session_generation, event_json, enrichment_status, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+          @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
         )`,
       ).run({ ...timelineEventParams(event, now), enrichmentStatus: enrichmentStatus ?? "pending" });
 
@@ -128,11 +128,11 @@ export class TimelineStore {
           `insert into timeline_events (
             id, external_id, timeline_key, provider, role, sender_id,
             sender_display_name, body, timestamp, received_at, agent_session_id,
-            event_json, enrichment_status, created_at, updated_at
+            agent_session_generation, event_json, enrichment_status, created_at, updated_at
           ) values (
             @id, @externalId, @timelineKey, @provider, @role, @senderId,
             @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-            @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+            @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
           )`,
         ).run({ ...timelineEventParams(event, now), enrichmentStatus: "skipped" });
         return "appended";
@@ -156,6 +156,7 @@ export class TimelineStore {
              timestamp = @timestamp,
              received_at = @receivedAt,
              agent_session_id = @agentSessionId,
+             agent_session_generation = @agentSessionGeneration,
              event_json = @eventJson,
              updated_at = @updatedAt
          where id = @id`,
@@ -392,6 +393,7 @@ function timelineEventParams(event: CanonicalChatEvent, now: number) {
     timestamp: event.timestamp,
     receivedAt: event.receivedAt,
     agentSessionId: event.agentSessionId ?? null,
+    agentSessionGeneration: event.agentSessionGeneration ?? null,
     eventJson: JSON.stringify(event),
     createdAt: now,
     updatedAt: now,
