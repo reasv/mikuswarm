@@ -33,6 +33,16 @@ export interface ClaimMarker {
   sessionId?: string;
 }
 
+/**
+ * Minimal logger surface the registry needs for the advisory ordering guard
+ * (spec CLAIM-VISIBILITY-SERIALIZATION §4.4). Structural so the registry stays a
+ * dependency-light, unit-testable in-memory map (a test can pass a capturing stub;
+ * app wiring passes a real `logger.child(...)`).
+ */
+export interface SessionClaimsLogger {
+  warn(event: string, fields?: Record<string, unknown>): void;
+}
+
 export interface SessionClaim {
   /**
    * Owning session id. Backfilled by {@link SessionClaims.attachSession} when the
@@ -61,16 +71,48 @@ export class SessionClaims {
   private readonly byTimeline = new Map<string, Map<string, SessionClaim>>();
 
   /**
+   * Optional logger for the advisory ordering guard (spec
+   * CLAIM-VISIBILITY-SERIALIZATION §4.4). Absent in tests that don't assert on it.
+   */
+  constructor(private readonly logger?: SessionClaimsLogger) {}
+
+  /**
    * Insert a claim synchronously (§3.2/§3.3). Keyed by the trigger's external id;
    * a trigger event is unique, so there is at most one claim per external id. A
    * re-insert (e.g. queued→spawned re-dispatch) overwrites, preserving any
    * already-attached session id only if the caller carries it.
+   *
+   * Advisory serialization guard (spec CLAIM-VISIBILITY-SERIALIZATION §4.4,
+   * invariant 3): claims for a timeline must land in trigger arrival order. This is
+   * upheld structurally by the await-free pre-claim critical section in
+   * `handleInbound` (see app.ts), not by this method — so the guard only *surfaces*
+   * a regression: if a claim for a NEWER trigger has already landed when an OLDER
+   * trigger's claim is inserted, an order-breaking `await` crept onto the pre-claim
+   * path. We log `claim_out_of_order` and otherwise do nothing — never reorder or
+   * drop on it: `origin_server_ts` can legitimately tie or skew under the trigger
+   * hold, and a re-dispatch (queued→spawn / `spawn_session`) can replay an older
+   * trigger after a newer one. Compared against OTHER triggers (same-externalId
+   * re-inserts are excluded) and strict (`<`), so ties never warn.
    */
   claim(timelineKey: string, claim: SessionClaim): void {
     let perTimeline = this.byTimeline.get(timelineKey);
     if (!perTimeline) {
       perTimeline = new Map<string, SessionClaim>();
       this.byTimeline.set(timelineKey, perTimeline);
+    } else if (this.logger && perTimeline.size > 0) {
+      let newestExisting = Number.NEGATIVE_INFINITY;
+      for (const [externalId, existing] of perTimeline) {
+        if (externalId === claim.externalId) continue; // re-insert of the same trigger
+        if (existing.triggerTimestamp > newestExisting) newestExisting = existing.triggerTimestamp;
+      }
+      if (newestExisting !== Number.NEGATIVE_INFINITY && claim.triggerTimestamp < newestExisting) {
+        this.logger.warn("claim_out_of_order", {
+          timelineKey,
+          externalId: claim.externalId,
+          triggerTimestamp: claim.triggerTimestamp,
+          newestExistingTimestamp: newestExisting,
+        });
+      }
     }
     perTimeline.set(claim.externalId, claim);
   }

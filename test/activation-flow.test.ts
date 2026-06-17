@@ -78,6 +78,8 @@ interface Harness {
   coordinator: ActivationCoordinator;
   launched: InboundChatEvent[];
   dispatched: InboundChatEvent[];
+  claimed: InboundChatEvent[];
+  released: InboundChatEvent[];
   enriched: string[];
   warnings: Array<{ event: string; fields?: Record<string, unknown> }>;
   setDraining: (value: boolean) => void;
@@ -111,6 +113,8 @@ function makeHarness(overrides?: {
 
     const launched: InboundChatEvent[] = [];
     const dispatched: InboundChatEvent[] = [];
+    const claimed: InboundChatEvent[] = [];
+    const released: InboundChatEvent[] = [];
     const enriched: string[] = [];
     const warnings: Array<{ event: string; fields?: Record<string, unknown> }> = [];
     let draining = false;
@@ -129,6 +133,12 @@ function makeHarness(overrides?: {
       runInitialBackfill: overrides?.runInitialBackfill ?? (async () => {}),
       resolveTriggerGroup: overrides?.resolveTriggerGroup ?? (async () => {}),
       awaitTriggerReadiness: overrides?.awaitTriggerReadiness ?? (async () => {}),
+      addClaim: (inbound) => {
+        claimed.push(inbound);
+      },
+      releaseClaim: (inbound) => {
+        released.push(inbound);
+      },
       launchSession: async (inbound, duplicate) => {
         launched.push(inbound);
         if (overrides?.launchSession) overrides.launchSession(inbound, duplicate, harness);
@@ -164,6 +174,8 @@ function makeHarness(overrides?: {
       coordinator,
       launched,
       dispatched,
+      claimed,
+      released,
       enriched,
       warnings,
       setDraining: (value: boolean) => {
@@ -201,6 +213,45 @@ test("first trigger activates the timeline and launches a session", async () => 
     assert.equal(h.launched.length, 1, "the initiating trigger should launch a session");
     assert.equal(h.launched[0].event.id, "t1");
     assert.equal(h.triggerCoordinator.activeCount(TK), 1, "the slot is claimed by the active session");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("activation claims the activating trigger (spec CLAIM-VISIBILITY-SERIALIZATION §4.3) so its message renders a marker", async () => {
+  const h = await makeHarness();
+  try {
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" })));
+    await new Promise((r) => setImmediate(r));
+    // The activating trigger is claimed exactly once, on the spawn decision — like
+    // every other accepted trigger. (The real registry is what makes the message
+    // render a `<handled_by_session>` marker; here we assert the claim is inserted.)
+    assert.equal(h.claimed.length, 1, "the activating trigger is claimed");
+    assert.equal(h.claimed[0].event.id, "t1");
+    // A successful launch never releases the claim here (it is released on settle).
+    assert.equal(h.released.length, 0, "a successful launch does not release the activation claim early");
+  } finally {
+    h.storage.close();
+  }
+});
+
+test("activation releases the claim when the session launch fails before attribution (no leaked deterrent)", async () => {
+  const h = await makeHarness({
+    // Force the fire-and-forget launchSession to reject so the activation catch runs.
+    launchSession: () => {
+      throw new Error("launch boom");
+    },
+  });
+  try {
+    await h.coordinator.gateInbound(triggerInbound(userEvent({ id: "t1" })));
+    // Let the void launchSession(...).catch chain settle.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.claimed.length, 1, "the trigger was claimed before launch");
+    assert.equal(h.released.length, 1, "a pre-attribution launch failure releases the claim");
+    assert.equal(h.released[0].event.id, "t1");
+    // The per-timeline slot is freed so future triggers aren't blocked.
+    assert.equal(h.triggerCoordinator.activeCount(TK), 0, "the slot is released after the failed launch");
   } finally {
     h.storage.close();
   }

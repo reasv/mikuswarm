@@ -241,8 +241,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // Per-timeline session-claim registry (spec DUPLICATE-REPLY-MITIGATION §3): the
   // single source of truth for "is this message being handled by another running/
   // queued session", backing the render marker, the send_message guard, and
-  // co-target coalescing. Written synchronously at trigger-accept time (§3.2).
-  const sessionClaims = new SessionClaims();
+  // co-target coalescing. Written synchronously at trigger-accept time (§3.2). The
+  // logger backs the advisory `claim_out_of_order` serialization guard (spec
+  // CLAIM-VISIBILITY-SERIALIZATION §4.4).
+  const sessionClaims = new SessionClaims(logger.child("session-claims"));
   // Coalesced co-replies retained for `spawn_session` (spec §5.4): a co-reply that
   // was folded into a running session as an interjection is kept here, keyed by its
   // Matrix external id, so the session can later push it back out into its own
@@ -1361,6 +1363,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // group, which neither `accept` (truthiness of `inbound.trigger`, already held)
     // nor `addClaim`/`coalesceCoTargetReply` consume — only the later readiness wait
     // and launch do, all of which run after the claim.
+    //
+    // SERIALIZATION INVARIANT (spec CLAIM-VISIBILITY-SERIALIZATION §4.4, invariant
+    // 3): for two trigger messages M₁ (earlier) then M₂ (later) on the SAME timeline,
+    // M₁'s claim must land — and M₁'s session must become visible in
+    // `activeForTimeline` — before M₂ reads either signal, so a later message never
+    // sees an earlier one as unclaimed or not-running. This holds *only* because no
+    // variable-latency / order-breaking `await` precedes the `accept → addClaim`
+    // critical section on the active path: `gateInbound` returns "active" without
+    // yielding, `router.route` resolves strictly FIFO on the single-writer queue, and
+    // `steerReplyToActiveSession`/`coalesceCoTargetReply` are synchronous (reply-as-
+    // trigger is resolved upstream in the provider's trigger hold, before handleInbound).
+    // DO NOT introduce such an `await` between `handleInbound` entry and here — it
+    // would let M₂ claim before M₁. `SessionClaims.claim` logs `claim_out_of_order`
+    // as a cheap regression tripwire (advisory only). The *visible-before-wait* half
+    // of the invariant is upheld downstream: `launchSession` reaches
+    // `createPlaceholder`/`markRunning` (→ visible) BEFORE its own
+    // `awaitTriggerReadiness` (§4.1), so a captioning-blocked session is still seen.
     const decision = triggerCoordinator.accept(inbound);
     // Claim the trigger SYNCHRONOUSLY here — immediately after accept, before any
     // `await` — so a concurrent inbound handler observes the claim even during the
@@ -1391,7 +1410,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
 
     try {
-      await awaitTriggerReadiness(inbound);
+      // The readiness wait is NOT here any more — it was relocated INTO `launchSession`
+      // (post-`createPlaceholder`/`markRunning`/claim-attach, post-budget, pre-build),
+      // so the session is visible-as-running in `activeForTimeline` BEFORE it blocks on
+      // enrichment/captions (spec CLAIM-VISIBILITY-SERIALIZATION §4.1). A sibling
+      // session built during that wait now sees this one in `<active_sessions>` + the
+      // `<coordination>` line, instead of a bare un-explained marker (the incident).
       await launchSession(inbound, routed.duplicate);
     } catch (error) {
       // Pre-attribution failure (review #2): release the just-added claim so it does
@@ -1984,7 +2008,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       if (decision.action !== "spawn") {
         return { status: "error", detail: decision.reason ?? "trigger not accepted" };
       }
-      await awaitTriggerReadiness(inbound);
+      // No readiness wait here — it now lives inside `launchSession`, after the
+      // session is registered (visible) + admitted and before its build (spec
+      // CLAIM-VISIBILITY-SERIALIZATION §4.1). The calling session no longer blocks on
+      // the spun-off co-reply's captioning; the co-reply's own run waits for it.
       // Fire-and-forget the run (the calling session continues its own work). On a
       // synchronous launch failure, release the slot + drain the next queued trigger
       // just like every other launch site.
@@ -2858,6 +2885,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let agent;
     let kickoff;
     try {
+      // Readiness wait (spec CLAIM-VISIBILITY-SERIALIZATION §4.1/§4.2): the resumed
+      // session is already visible-as-running (`adopt`/`markRunning` above) and its
+      // claim attributed, so wait for the reply trigger's enrichment + caption
+      // readiness HERE — a reply that itself carries fresh media gets its appended
+      // turn built with the caption ready, instead of skipping the wait as before.
+      await awaitTriggerReadiness(inbound);
       ({ agent, finalTurn: kickoff } = await factory.create(record, tools, {
         resume: material,
         resumeContinuation: {
@@ -3116,6 +3149,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
     try {
+      // Readiness wait (spec CLAIM-VISIBILITY-SERIALIZATION §4.1): wait for the
+      // trigger group's enrichment + caption readiness HERE — the session is already
+      // visible-as-running (`createPlaceholder`/`markRunning` above) and its claim
+      // attributed, AND it has cleared the missing-target + budget-admission gates, so
+      // a refused/aborted session never blocks on captioning. The build below still
+      // renders an enriched, captioned trigger group because the wait completes first.
+      // A throw here (rare — `awaitTriggerReadiness` resolves on its own timeouts) is
+      // caught by this same block → `markDiscarded` → settle releases the claim +
+      // drains the next trigger, exactly like a factory failure. For a proactive /
+      // synthetic trigger (no persisted event, no media) this is a fast no-op.
+      await awaitTriggerReadiness(inbound);
       ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(
         session,
         tools,
@@ -3304,6 +3348,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     runInitialBackfill,
     resolveTriggerGroup,
     awaitTriggerReadiness,
+    // Claim the activating trigger so its message renders a `<handled_by_session>`
+    // marker like every other accepted trigger (spec CLAIM-VISIBILITY-SERIALIZATION
+    // §4.3); released on a pre-attribution launch failure, same as the active path.
+    addClaim,
+    releaseClaim: releaseClaimFor,
     launchSession,
     dispatch: (inbound) => {
       void handleInbound(inbound).catch((error) => {
