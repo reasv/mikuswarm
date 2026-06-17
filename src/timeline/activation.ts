@@ -41,6 +41,22 @@ export interface ActivationCoordinatorOptions {
   resolveTriggerGroup: (inbound: InboundChatEvent) => Promise<void>;
   /** Wait for the trigger group's enrichment/captions to be ready. */
   awaitTriggerReadiness: (inbound: InboundChatEvent) => Promise<void>;
+  /**
+   * Insert the per-timeline session claim for an accepted activating trigger (spec
+   * CLAIM-VISIBILITY-SERIALIZATION §4.3) — synchronous, side-effect-free beyond the
+   * in-memory registry write — so the first session's trigger message renders a
+   * `<handled_by_session>` marker like every other accepted trigger. Mirrors
+   * `handleInbound`'s `addClaim`.
+   */
+  addClaim: (inbound: InboundChatEvent) => void;
+  /**
+   * Release a claim added by {@link addClaim} for an activating trigger whose launch
+   * failed before attribution (spec CLAIM-VISIBILITY-SERIALIZATION §4.3) — otherwise
+   * the un-attributed claim would deter forever. Idempotent: a launch failure past
+   * `attachSession` already released the claim via the session's settle listener.
+   * Mirrors `handleInbound`'s `releaseClaimFor`.
+   */
+  releaseClaim: (inbound: InboundChatEvent) => void;
   /** Spawn and run a session for a trigger that won the coordinator slot. */
   launchSession: (inbound: InboundChatEvent, duplicate: boolean) => Promise<void>;
   /** Re-dispatch an inbound event through the top-level handler (held replay). */
@@ -316,8 +332,22 @@ export class ActivationCoordinator {
     const held = this.finishActivation(inbound.timelineKey);
 
     const decision = this.opts.triggerCoordinator.accept(inbound);
+    // Claim the activating trigger (spec CLAIM-VISIBILITY-SERIALIZATION §4.3),
+    // synchronously right after accept and BEFORE `replay(held)` below, so the
+    // first session's trigger message renders a `<handled_by_session>` marker like
+    // every other accepted trigger — and any replayed held trigger sees the claim.
+    // Both spawn and queued claim; `ignored` does not. There is no concurrent-session
+    // hazard during activation (later triggers were held and are replayed only here),
+    // so claiming at the end of the prelude rather than at recognition is sufficient.
+    if (decision.action === "spawn" || decision.action === "queued") {
+      this.opts.addClaim(inbound);
+    }
     if (decision.action === "spawn") {
       void this.opts.launchSession(inbound, duplicate).catch((error) => {
+        // Pre-attribution launch failure: release the just-added claim so it cannot
+        // leak un-attributed (idempotent — a failure past `attachSession` already
+        // released via the session's settle listener).
+        this.opts.releaseClaim(inbound);
         this.opts.logger.error("activation_session_launch_failed", {
           timelineKey: inbound.timelineKey,
           error: error instanceof Error ? error.message : String(error),
