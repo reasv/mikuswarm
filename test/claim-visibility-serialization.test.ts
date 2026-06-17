@@ -267,6 +267,49 @@ test("a settled session releases its claim (the later build no longer sees it)",
   assert.equal(claims.claimantOf(TK, "$m1", "s-other"), undefined, "settled session's claim is released");
 });
 
+// ── drained-trigger claim release on pre-attribution failure (review #1) ──────
+
+/**
+ * Faithful model of `drainNextQueuedTrigger`'s `.catch` (app.ts): on a launch that
+ * throws BEFORE `attachSession` (so no settle was ever registered), the drained
+ * trigger's accept-time claim must be released here — otherwise it leaks
+ * un-attributed forever and keeps deterring as a `pending` marker / guard entry.
+ * `releaseClaimFor(next)` is `claims.releaseExternalId(next.timelineKey, externalId)`.
+ */
+test("a drained trigger whose launch fails pre-attribution has its claim released (review #1)", async () => {
+  const claims = new SessionClaims();
+
+  // The drained ("next") trigger was claimed at accept time, un-attributed (no
+  // session id yet) — exactly the registry state when `triggerCoordinator.complete`
+  // hands it to `drainNextQueuedTrigger`.
+  const next = inboundFor("$next", "evt-next", 1000);
+  claims.claim(TK, { triggerId: "evt-next", externalId: "$next", triggerTimestamp: 1000, createdAt: 1000 });
+  assert.ok(claims.claimantOf(TK, "$next", "s-other"), "the queued trigger is claimed (un-attributed) before drain");
+
+  // Model the helper: launch the drained trigger; it throws before attachSession
+  // (e.g. tryReplyResume's acceptResumeGeneration CAS throwing), so the .catch runs.
+  await launchModel({
+    sessions: new SessionManager(),
+    claims,
+    inbound: next,
+    // Fail BEFORE createPlaceholder/attachSession (no settle is ever registered).
+    readiness: async () => {
+      throw new Error("acceptResumeGeneration storage CAS threw");
+    },
+    waitBeforeVisible: true,
+  }).catch(() => {
+    // The drain helper's catch: release the un-attributed claim (review #1) so it
+    // does not leak. Idempotent past attachSession — but here attachSession never ran.
+    claims.releaseExternalId(next.timelineKey, next.event.externalId!);
+  });
+
+  assert.equal(
+    claims.claimantOf(TK, "$next", "s-other"),
+    undefined,
+    "the drained trigger's claim is released after a pre-attribution launch failure",
+  );
+});
+
 // ── claim_out_of_order advisory guard (§4.4) ─────────────────────────────────
 
 test("SessionClaims.claim warns claim_out_of_order only when a strictly-older trigger follows a newer one", () => {
@@ -310,4 +353,31 @@ test("SessionClaims without a logger never throws on out-of-order inserts (guard
     claims.claim(TK, { triggerId: "t2", externalId: "$b", triggerTimestamp: 1000, createdAt: 2 }),
   );
   assert.equal(claims.claimantOf(TK, "$b", "s-x")?.triggerId, "t2");
+});
+
+test("the redispatch flag suppresses claim_out_of_order on the designed re-claim path (review #4)", () => {
+  const warnings: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+  const claims = new SessionClaims({ warn: (event, fields) => warnings.push({ event, fields }) });
+
+  // A newer trigger has already claimed the timeline (the normal arrival-order case).
+  claims.claim(TK, { triggerId: "t1", externalId: "$a", triggerTimestamp: 2000, createdAt: 1000 });
+  assert.equal(warnings.length, 0);
+
+  // redispatchCoReply re-claims an OLDER trigger after the newer one — but flags it,
+  // so the advisory guard stays silent (this is a designed insert, not a regression).
+  claims.claim(
+    TK,
+    { triggerId: "t2", externalId: "$b", triggerTimestamp: 1000, createdAt: 2000 },
+    { redispatch: true },
+  );
+  assert.equal(warnings.length, 0, "the flagged re-dispatch path does not warn");
+  assert.equal(claims.claimantOf(TK, "$b", "s-x")?.triggerId, "t2", "the claim is still inserted");
+
+  // The UNflagged path with the same older-after-newer shape still warns — the flag
+  // is the only thing that suppresses it (activation/active paths stay genuine
+  // ordering points).
+  claims.claim(TK, { triggerId: "t3", externalId: "$c", triggerTimestamp: 1500, createdAt: 3000 });
+  assert.equal(warnings.length, 1, "the unflagged path still warns");
+  assert.equal(warnings[0].event, "claim_out_of_order");
+  assert.equal(warnings[0].fields?.externalId, "$c");
 });

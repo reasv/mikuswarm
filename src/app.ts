@@ -1437,17 +1437,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * trigger with no external id (rare — synthetic/proactive) cannot be marked or
    * guarded, so it is not claimed. Carries the trigger's own external id (marker /
    * guard key) and its reply-target (co-target coalescing key).
+   *
+   * `opts.redispatch` is forwarded to {@link SessionClaims.claim} to suppress the
+   * advisory `claim_out_of_order` warn on the designed re-dispatch path
+   * (`redispatchCoReply` re-claims an older trigger after newer ones — review #4);
+   * the active and activation `addClaim` callers must NOT pass it (they stay genuine
+   * ordering points).
    */
-  function addClaim(inbound: InboundChatEvent): void {
+  function addClaim(inbound: InboundChatEvent, opts?: { redispatch?: boolean }): void {
     const externalId = inbound.event.externalId;
     if (!externalId) return;
-    sessionClaims.claim(inbound.timelineKey, {
-      triggerId: inbound.event.id,
-      externalId,
-      replyToExternalId: inbound.event.replyTo?.externalId,
-      triggerTimestamp: inbound.event.timestamp,
-      createdAt: Date.now(),
-    });
+    sessionClaims.claim(
+      inbound.timelineKey,
+      {
+        triggerId: inbound.event.id,
+        externalId,
+        replyToExternalId: inbound.event.replyTo?.externalId,
+        triggerTimestamp: inbound.event.timestamp,
+        createdAt: Date.now(),
+      },
+      opts,
+    );
   }
 
   /**
@@ -1456,8 +1466,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * inside `launchSession` (after `attachSession`); if anything throws in the
    * accept→attachSession span the claim would otherwise leak un-attributed until
    * shutdown — harmless before, but a permanent false-positive once un-attributed
-   * claims deter (review #4). Idempotent: a throw AFTER attachSession already
-   * released via settle, so this is a no-op there.
+   * claims deter (review #4). Idempotent — if the run already settled, its settle
+   * listener released the claim; otherwise (a synchronous throw before the run
+   * promise was constructed) this performs the release.
    */
   function releaseClaimFor(inbound: InboundChatEvent): void {
     const externalId = inbound.event.externalId;
@@ -2002,7 +2013,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       captionPool.notifyNewWork();
       const decision = triggerCoordinator.accept(inbound);
       if (decision.action === "spawn" || decision.action === "queued") {
-        addClaim(inbound);
+        // Re-dispatch re-claims this co-reply's ORIGINAL (older) trigger after newer
+        // triggers have already claimed the timeline, so flag it to skip the advisory
+        // `claim_out_of_order` warn — this is a designed out-of-order insert, not a
+        // serialization regression (spec CLAIM-VISIBILITY-SERIALIZATION §4.4, review #4).
+        addClaim(inbound, { redispatch: true });
       }
       if (decision.action === "queued") return { status: "queued" };
       if (decision.action !== "spawn") {
@@ -2023,16 +2038,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           timelineKey: inbound.timelineKey,
           error: error instanceof Error ? error.message : String(error),
         });
-        if (draining) return;
-        const next = triggerCoordinator.complete(inbound.timelineKey);
-        if (next) void launchSession(next, true).catch((err) => {
-          releaseClaimFor(next);
-          logger.error("queued_session_launch_failed", {
-            timelineKey: next.timelineKey,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          triggerCoordinator.complete(next.timelineKey);
-        });
+        drainNextQueuedTrigger(inbound.timelineKey);
       });
       return { status: "spawned" };
     } catch (error) {
@@ -2603,20 +2609,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     adopt: (record) => sessions.adopt(record),
     tryAcquireTimelineSlot: (timelineKey) => triggerCoordinator.tryAcquire(timelineKey),
     // Mirror launchSession's `.finally`: release the slot AND drain the next
-    // queued trigger (issue #17). During drain the coordinator is cleared by
-    // stop(), so skip — same as launchSession does.
-    releaseTimelineSlot: (timelineKey) => {
-      if (draining) return;
-      const next = triggerCoordinator.complete(timelineKey);
-      if (next) void launchSession(next, true).catch((error) => {
-        logger.error("queued_session_launch_failed", {
-          timelineKey: next.timelineKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Release the per-timeline slot so future triggers aren't permanently blocked
-        triggerCoordinator.complete(next.timelineKey);
-      });
-    },
+    // queued trigger (issue #17), via the shared helper so the drained trigger's
+    // claim is released on a pre-attribution launch failure too (review #1). During
+    // drain the coordinator is cleared by stop(), so the helper skips — same as
+    // launchSession does.
+    releaseTimelineSlot: (timelineKey) => drainNextQueuedTrigger(timelineKey),
     selfUserIdForAccount: (accountId) => config.matrix.accounts[accountId]?.user_id,
     runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
     markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
@@ -2706,16 +2703,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /** Release this timeline's slot and launch the next queued trigger (mirrors the
-   *  fresh run's `.finally`; no-op while draining). */
+   *  fresh run's `.finally`; no-op while draining). The single funnel for every
+   *  queued-drain tail (active spawn, resume, co-reply, manual resume, proactive,
+   *  and the immediate-discard gates) so the claim-release semantics below stay in
+   *  one place (review #1). */
   function drainNextQueuedTrigger(timelineKey: string): void {
     if (draining) return;
     const next = triggerCoordinator.complete(timelineKey);
     if (!next) return;
     void launchSession(next, true).catch((error) => {
+      // Pre-attribution launch failure (review #1): release the drained trigger's
+      // accept-time claim so it cannot leak un-attributed (no settle was registered
+      // — the throw is before `attachSession`; idempotent past it). Without this a
+      // failed drain leaves a permanent false-positive `<handled_by_session>` marker
+      // / guard entry for that message id until shutdown `clear()`.
+      releaseClaimFor(next);
       logger.error("queued_session_launch_failed", {
         timelineKey: next.timelineKey,
         error: error instanceof Error ? error.message : String(error),
       });
+      // Release the per-timeline slot so future triggers aren't permanently blocked.
       triggerCoordinator.complete(next.timelineKey);
     });
   }
@@ -3043,18 +3050,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         timelineKey: session.timelineKey,
         provider: inbound.provider,
       });
-      const next = triggerCoordinator.complete(session.timelineKey);
-      if (next && !draining) void launchSession(next, true).catch((error) => {
-        // Pre-attribution launch failure (review #2): release the queued trigger's
-        // claim so it cannot leak un-attributed (idempotent past attachSession).
-        releaseClaimFor(next);
-        logger.error("queued_session_launch_failed", {
-          timelineKey: next.timelineKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Release the per-timeline slot so future triggers aren't permanently blocked
-        triggerCoordinator.complete(next.timelineKey);
-      });
+      drainNextQueuedTrigger(session.timelineKey);
       return;
     }
     // Period cost limits — triggered/proactive admission gate (spec
@@ -3126,15 +3122,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           });
         }
         sessions.markDiscarded(session.id);
-        const next = triggerCoordinator.complete(session.timelineKey);
-        if (next && !draining) void launchSession(next, true).catch((error) => {
-          releaseClaimFor(next);
-          logger.error("queued_session_launch_failed", {
-            timelineKey: next.timelineKey,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          triggerCoordinator.complete(next.timelineKey);
-        });
+        drainNextQueuedTrigger(session.timelineKey);
         return;
       }
     }
@@ -3194,18 +3182,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // arbitrary factory bugs; never for proactive launches (the proactive
       // scheduler simply fires again next cadence).
       if (buildTimeout && !proactive) sendFailureNotice(target, session.id);
-      const next = triggerCoordinator.complete(session.timelineKey);
-      if (next && !draining) void launchSession(next, true).catch((error) => {
-        // Pre-attribution launch failure (review #2): release the queued trigger's
-        // claim so it cannot leak un-attributed (idempotent past attachSession).
-        releaseClaimFor(next);
-        logger.error("queued_session_launch_failed", {
-          timelineKey: next.timelineKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Release the per-timeline slot so future triggers aren't permanently blocked
-        triggerCoordinator.complete(next.timelineKey);
-      });
+      drainNextQueuedTrigger(session.timelineKey);
       return;
     }
     sessions.attachAgent(session.id, agent);
@@ -3320,16 +3297,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             });
           });
         }
-        if (draining) return;
-        const next = triggerCoordinator.complete(session.timelineKey);
-        if (next) void launchSession(next, true).catch((error) => {
-          logger.error("queued_session_launch_failed", {
-            timelineKey: next.timelineKey,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          // Release the per-timeline slot so future triggers aren't permanently blocked
-          triggerCoordinator.complete(next.timelineKey);
-        });
+        drainNextQueuedTrigger(session.timelineKey);
       });
     activeRuns.add(run);
   }
@@ -3384,16 +3352,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // aren't permanently blocked (launchSession threw before its own .finally
         // could run). Forward any trigger queued during the proactive run into the
         // launcher, mirroring every other release site so a real reply still drains.
-        if (draining) return;
-        const next = triggerCoordinator.complete(inbound.timelineKey);
-        if (next) void launchSession(next, true).catch((err) => {
-          releaseClaimFor(next);
-          logger.error("queued_session_launch_failed", {
-            timelineKey: next.timelineKey,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          triggerCoordinator.complete(next.timelineKey);
-        });
+        drainNextQueuedTrigger(inbound.timelineKey);
       });
     },
     isDraining: () => draining,

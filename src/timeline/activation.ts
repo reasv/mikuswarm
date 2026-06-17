@@ -345,8 +345,9 @@ export class ActivationCoordinator {
     if (decision.action === "spawn") {
       void this.opts.launchSession(inbound, duplicate).catch((error) => {
         // Pre-attribution launch failure: release the just-added claim so it cannot
-        // leak un-attributed (idempotent — a failure past `attachSession` already
-        // released via the session's settle listener).
+        // leak un-attributed (idempotent — if the run already settled, its settle
+        // listener released the claim; otherwise, a synchronous throw before the run
+        // promise was constructed, this performs the release).
         this.opts.releaseClaim(inbound);
         this.opts.logger.error("activation_session_launch_failed", {
           timelineKey: inbound.timelineKey,

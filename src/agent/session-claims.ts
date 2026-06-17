@@ -90,16 +90,23 @@ export class SessionClaims {
    * trigger's claim is inserted, an order-breaking `await` crept onto the pre-claim
    * path. We log `claim_out_of_order` and otherwise do nothing — never reorder or
    * drop on it: `origin_server_ts` can legitimately tie or skew under the trigger
-   * hold, and a re-dispatch (queued→spawn / `spawn_session`) can replay an older
-   * trigger after a newer one. Compared against OTHER triggers (same-externalId
-   * re-inserts are excluded) and strict (`<`), so ties never warn.
+   * hold. Compared against OTHER triggers (same-externalId re-inserts are excluded)
+   * and strict (`<`), so ties never warn.
+   *
+   * The one DESIGNED out-of-order inserter — `redispatchCoReply` (deferred co-reply
+   * / `spawn_session` replay, which re-claims an older trigger after newer ones have
+   * landed) — passes `opts.redispatch` to skip the warn, so it is now structurally
+   * excluded rather than left to operators to filter out (review #4). The normal
+   * queued→drain path never reaches here (it re-uses the existing claim via
+   * `attachSession`), so the active and activation paths remain genuine ordering
+   * points and still warn.
    */
-  claim(timelineKey: string, claim: SessionClaim): void {
+  claim(timelineKey: string, claim: SessionClaim, opts?: { redispatch?: boolean }): void {
     let perTimeline = this.byTimeline.get(timelineKey);
     if (!perTimeline) {
       perTimeline = new Map<string, SessionClaim>();
       this.byTimeline.set(timelineKey, perTimeline);
-    } else if (this.logger && perTimeline.size > 0) {
+    } else if (this.logger && !opts?.redispatch && perTimeline.size > 0) {
       let newestExisting = Number.NEGATIVE_INFINITY;
       for (const [externalId, existing] of perTimeline) {
         if (externalId === claim.externalId) continue; // re-insert of the same trigger
