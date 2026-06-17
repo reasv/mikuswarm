@@ -7,6 +7,10 @@ node_modules
 # regenerate them; only the platform .node binary is rebuilt in the image.
 npm/*.node
 native/target
+# The 20 MB GLM tokenizer is fetched + checksum-verified inside the builder
+# (scripts/fetch-glm-tokenizer.mjs), never copied from the host — keeps the
+# context lean and the asset reproducible. Its LICENSE/README stay in context.
+native/assets/glm-5.1/tokenizer.json
 var
 workspaces
 debug

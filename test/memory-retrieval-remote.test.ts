@@ -16,6 +16,7 @@ import {
   createRetrievalSubsystem,
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
+import { GptTokenizer } from "../src/context/tokenizer/index.js";
 
 async function withStorage(run: (s: Storage) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-remote-"));
@@ -560,6 +561,7 @@ test("indexer stamps new chunks 'skip' when embeddings are inactive (#2)", async
         storage,
         workspaceRoot: ws,
         config: resolveRetrievalConfig({ enabled: true }),
+        tokenizer: new GptTokenizer(),
         embeddingsActive: () => false,
       });
       await skipIndexer.reconcileAll();
@@ -584,6 +586,7 @@ test("indexer stamps new chunks 'skip' when embeddings are inactive (#2)", async
         storage,
         workspaceRoot: ws,
         config: resolveRetrievalConfig({ enabled: true }),
+        tokenizer: new GptTokenizer(),
         embeddingsActive: () => true,
       });
       await activeIndexer.reconcileAll();

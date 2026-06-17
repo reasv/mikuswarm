@@ -52,6 +52,13 @@ COPY rust-toolchain.toml ./
 COPY native ./native
 RUN pnpm build:native
 
+# Fetch the GLM-5.1 tokenizer (20 MB, not committed — see scripts + .gitignore).
+# Checksum-verified; idempotent. Lands at native/assets/glm-5.1/tokenizer.json,
+# which `[tokenizer].glm_tokenizer_path` defaults to. The builder has curl + CA
+# certs + network; the file is copied into the runtime stage below.
+COPY scripts ./scripts
+RUN pnpm fetch:tokenizer
+
 # -----------------------------------------------------------------------------
 # Runtime — slim base + only what the agent needs at run time.
 # -----------------------------------------------------------------------------
@@ -94,6 +101,11 @@ COPY npm/index.js npm/package.json ./npm/
 # App sources + manifests (tsx reads tsconfig.json; lockfile kept for parity).
 COPY package.json pnpm-lock.yaml tsconfig.json ./
 COPY src ./src
+
+# Fetched GLM-5.1 tokenizer + its MIT LICENSE/README, from the builder. Path-stable
+# at /app/native/assets/glm-5.1/ so `[tokenizer].glm_tokenizer_path` resolves under
+# the runtime CWD when a `glm` selection is active (inert under the gpt default).
+COPY --from=builder /app/native/assets ./native/assets
 
 # Baked config: shipped defaults + the container-infrastructure overlay. The
 # operator's identity config (config/90-local.toml — models/matrix/captioning)

@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
@@ -42,6 +43,7 @@ import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
 import { ContextBuilder, renderRichMessage } from "./context/index.js";
+import { initTokenizers } from "./context/tokenizer/index.js";
 import { escapeAttr, escapeXml } from "./context/xml.js";
 import { hydrateEvents } from "./context/hydrate.js";
 import type { ContextMessage } from "./context/builder.js";
@@ -218,6 +220,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       "saucenao.enabled is true but saucenao.api_key is missing/empty — set a SauceNAO API key (e.g. api_key = \"${SAUCENAO_API_KEY}\") or set enabled = false.",
     );
   }
+  // [tokenizer] cross-field validation + init (spec TOKENIZER-SWAP §5.4). Selecting
+  // `glm` for either consumer requires a readable `glm_tokenizer_path` — TypeBox
+  // can't express the dependency, so it's checked here (same fail-fast convention
+  // as saucenao above). Tokenizers are bound NOW, before any subsystem reads the
+  // registry (the retrieval subsystem below selects the retrieval tokenizer) and
+  // long before the first context build.
+  validateTokenizerConfig(config);
+  await initTokenizers({
+    primary: config.tokenizer?.primary,
+    retrieval: config.tokenizer?.retrieval,
+    glmTokenizerPath: config.tokenizer?.glm_tokenizer_path,
+  });
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
     // Per-model health (spec LLM-FAILURE-HANDLING §5): global thresholds —
@@ -3891,6 +3905,39 @@ export function validateContextTokenCeilings(config: AppConfig): void {
           `exceeds context_window (${window}) of its model "${modelKey}"`,
       );
     }
+  }
+}
+
+/**
+ * Cross-field validation for `[tokenizer]` (spec TOKENIZER-SWAP §5.4). TypeBox
+ * keeps `glm_tokenizer_path` optional so a `gpt-tokenizer`-only config (the
+ * default) needn't carry it; but selecting `glm` for either consumer makes the
+ * path required AND readable — a missing/unreadable GLM asset must fail startup
+ * loudly rather than silently degrade. Extracted (like
+ * {@link validateContextTokenCeilings}) so it can be unit-tested without booting
+ * the agent. Throws on the first problem.
+ */
+export function validateTokenizerConfig(config: AppConfig): void {
+  const tok = config.tokenizer;
+  if (!tok) return;
+  const usesGlm = tok.primary === "glm" || tok.retrieval === "glm";
+  if (!usesGlm) return;
+  const glmPath = (tok.glm_tokenizer_path ?? "").trim();
+  if (!glmPath) {
+    throw new Error(
+      "tokenizer: primary and/or retrieval is \"glm\" but glm_tokenizer_path is missing/empty — " +
+        "set glm_tokenizer_path to the GLM tokenizer.json (e.g. \"native/assets/glm-5.1/tokenizer.json\") " +
+        "or use \"gpt-tokenizer\".",
+    );
+  }
+  try {
+    accessSync(glmPath, fsConstants.R_OK);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `tokenizer.glm_tokenizer_path "${glmPath}" is not readable: ${detail} — ` +
+        "point it at the GLM tokenizer.json file.",
+    );
   }
 }
 

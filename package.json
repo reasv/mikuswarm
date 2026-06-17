@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "pnpm build:native && tsc --noEmit",
+    "build": "pnpm fetch:tokenizer && pnpm build:native && tsc --noEmit",
     "build:native": "napi build --platform --manifest-path native/crates/matrix-core/Cargo.toml --js-package-name mikuswarm --output-dir npm",
+    "fetch:tokenizer": "node scripts/fetch-glm-tokenizer.mjs",
     "test": "node --import tsx --test --test-timeout=60000 \"test/**/!(*.docker).test.ts\"",
     "test:docker": "node --import tsx --test \"test/**/*.docker.test.ts\"",
     "start": "tsx src/index.ts",

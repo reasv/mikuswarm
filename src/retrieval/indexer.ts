@@ -3,6 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
+import type { Tokenizer } from "../context/tokenizer/types.js";
 import { chunkMemoryFile, dayFromFilename } from "./chunk.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
 
@@ -24,6 +25,13 @@ export interface MemoryIndexerOptions {
   storage: Storage;
   workspaceRoot: string;
   config: ResolvedRetrievalConfig;
+  /**
+   * Embedder-matched tokenizer for chunking (spec/TOKENIZER-SWAP.md §5.3). Injected
+   * (not read from the module-level chat tokenizer) so the memory corpus's chunk
+   * boundaries/hashes track the embedding model and are unaffected by switching the
+   * chat tokenizer. Defaults to `gpt-tokenizer` (`[tokenizer].retrieval`).
+   */
+  tokenizer: Tokenizer;
   logger?: Logger;
   /** Prune vectors for chunks removed this reconcile (set by the subsystem, §9d). */
   pruneVectors?: (rowids: number[]) => void;
@@ -52,6 +60,7 @@ export class MemoryIndexer {
   private readonly storage: Storage;
   private readonly workspaceRoot: string;
   private readonly config: ResolvedRetrievalConfig;
+  private readonly tokenizer: Tokenizer;
   private readonly logger?: Logger;
   private readonly pruneVectors?: (rowids: number[]) => void;
   private readonly onChunksInserted?: () => void;
@@ -63,6 +72,7 @@ export class MemoryIndexer {
     this.storage = opts.storage;
     this.workspaceRoot = opts.workspaceRoot;
     this.config = opts.config;
+    this.tokenizer = opts.tokenizer;
     this.logger = opts.logger;
     this.pruneVectors = opts.pruneVectors;
     this.onChunksInserted = opts.onChunksInserted;
@@ -153,7 +163,7 @@ export class MemoryIndexer {
       }
       throw error;
     }
-    const chunks = chunkMemoryFile({
+    const chunks = await chunkMemoryFile({
       relativePath: rel,
       text,
       fileDate: dayFromFilename(path.basename(rel)),
@@ -161,6 +171,7 @@ export class MemoryIndexer {
       maxChunkTokens: this.config.index.maxChunkTokens,
       fallbackChunkTokens: this.config.index.fallbackChunkTokens,
       fallbackChunkOverlap: this.config.index.fallbackChunkOverlap,
+      tokenizer: this.tokenizer,
     });
     // In lexical-only mode (no active provider) stamp new chunks 'skip' so the embed
     // queue doesn't grow unbounded (#2); 'pending' otherwise. `resetAllEmbeddings()`

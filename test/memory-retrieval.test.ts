@@ -6,6 +6,7 @@ import test from "node:test";
 import { Storage } from "../src/storage/index.js";
 import { MemoryIndexer, MemorySearch, resolveRetrievalConfig } from "../src/retrieval/index.js";
 import { chunkMemoryFile } from "../src/retrieval/chunk.js";
+import { GptTokenizer } from "../src/context/tokenizer/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
 import {
   configureAgentTimezone,
@@ -29,7 +30,7 @@ async function withHarness(run: (h: Harness) => Promise<void>): Promise<void> {
   await mkdir(path.join(workspaceRoot, "memory"), { recursive: true });
   const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
   const config = resolveRetrievalConfig({ enabled: true });
-  const indexer = new MemoryIndexer({ storage, workspaceRoot, config });
+  const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
   const search = new MemorySearch(storage, indexer, config);
   try {
     await run({ workspaceRoot, storage, indexer, search });
@@ -78,10 +79,10 @@ test("parseZonedWallClock round-trips through the configured zone", () => {
   }
 });
 
-test("chunkMemoryFile: one chunk per diary block with header metadata", () => {
+test("chunkMemoryFile: one chunk per diary block with header metadata", async () => {
   configureAgentTimezone(TZ);
   try {
-    const chunks = chunkMemoryFile({
+    const chunks = await chunkMemoryFile({
       relativePath: "memory/2026-04-12.md",
       text: diaryFile(),
       fileDate: "2026-04-12",
@@ -89,6 +90,7 @@ test("chunkMemoryFile: one chunk per diary block with header metadata", () => {
       maxChunkTokens: 512,
       fallbackChunkTokens: 400,
       fallbackChunkOverlap: 80,
+      tokenizer: new GptTokenizer(),
     });
     // The `# ... Daily Memory` title block is dropped; two diary blocks remain.
     assert.equal(chunks.length, 2);
@@ -108,7 +110,7 @@ test("chunkMemoryFile: one chunk per diary block with header metadata", () => {
   }
 });
 
-test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", () => {
+test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", async () => {
   configureAgentTimezone(TZ);
   try {
     const header = buildDiaryHeader({
@@ -117,7 +119,7 @@ test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", 
       room: "#general",
     });
     const body = Array.from({ length: 200 }, (_, i) => `sentence number ${i} about widgets`).join(" ");
-    const chunks = chunkMemoryFile({
+    const chunks = await chunkMemoryFile({
       relativePath: "memory/2026-04-12.md",
       text: `${header}\n${body}\n`,
       fileDate: "2026-04-12",
@@ -125,6 +127,7 @@ test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", 
       maxChunkTokens: 50,
       fallbackChunkTokens: 40,
       fallbackChunkOverlap: 8,
+      tokenizer: new GptTokenizer(),
     });
     assert.ok(chunks.length > 1, "oversized block should sub-split");
     for (const c of chunks) {
@@ -136,7 +139,7 @@ test("chunkMemoryFile: oversized header block sub-splits, inheriting metadata", 
   }
 });
 
-test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that contain its text (issue #18)", () => {
+test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that contain its text (issue #18)", async () => {
   configureAgentTimezone(TZ);
   try {
     const header = buildDiaryHeader({
@@ -154,7 +157,7 @@ test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that 
     const text = `${header}\n${body}\n`;
     // Force the oversized path: maxChunkTokens below the block's size so it sub-splits,
     // and a fallback window small enough to yield several sub-chunks (≥2).
-    const chunks = chunkMemoryFile({
+    const chunks = await chunkMemoryFile({
       relativePath: "memory/2026-04-12.md",
       text,
       fileDate: "2026-04-12",
@@ -162,6 +165,7 @@ test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that 
       maxChunkTokens: 40,
       fallbackChunkTokens: 30,
       fallbackChunkOverlap: 6,
+      tokenizer: new GptTokenizer(),
     });
     assert.ok(chunks.length >= 2, `oversized multi-byte block should sub-split, got ${chunks.length}`);
 
@@ -191,8 +195,8 @@ test("chunkMemoryFile: oversized multi-byte block maps each chunk to lines that 
   }
 });
 
-test("chunkMemoryFile: header-less legacy file falls back to token windows", () => {
-  const chunks = chunkMemoryFile({
+test("chunkMemoryFile: header-less legacy file falls back to token windows", async () => {
+  const chunks = await chunkMemoryFile({
     relativePath: "memory/legacy.md",
     text: "Some imported OpenClaw note about the Helsinki trip and the sauna incident.",
     fileDate: null,
@@ -200,6 +204,7 @@ test("chunkMemoryFile: header-less legacy file falls back to token windows", () 
     maxChunkTokens: 512,
     fallbackChunkTokens: 400,
     fallbackChunkOverlap: 80,
+    tokenizer: new GptTokenizer(),
   });
   assert.equal(chunks.length, 1);
   assert.equal(chunks[0]!.room, null);
