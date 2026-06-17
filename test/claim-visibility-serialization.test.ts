@@ -381,3 +381,221 @@ test("the redispatch flag suppresses claim_out_of_order on the designed re-claim
   assert.equal(warnings[0].event, "claim_out_of_order");
   assert.equal(warnings[0].fields?.externalId, "$c");
 });
+
+// ── queued drain awaits readiness (spec §7 / §2b / §6) ───────────────────────
+
+/**
+ * spec §7 "Queued drain awaits readiness". The queued-trigger drain runs
+ * `triggerCoordinator.complete → launchSession(next, true)` (app.ts
+ * `drainNextQueuedTrigger`), so the drained trigger funnels through the SAME
+ * `launchSession` post-fix tail as a fresh spawn: createPlaceholder → markRunning
+ * → attach → …gates… → awaitTriggerReadiness → build (app.ts:3150). Before §4.1
+ * the drain skipped the wait entirely (spec §2b: "Drained triggers build with no
+ * guaranteed readiness"); this asserts a DRAINED trigger now blocks on
+ * caption/enrichment readiness BEFORE its build runs.
+ *
+ * The drain is modeled exactly as production does it: the occupying session's
+ * settle fires `drainNextQueuedTrigger`, which here launches the queued trigger
+ * via a second `launchModel` (the same lifecycle model the post-fix cases use).
+ * The queued trigger's readiness is stubbed to block, so its `onBuild` must NOT
+ * fire until that readiness resolves.
+ */
+test("spec §7: a DRAINED queued trigger awaits caption readiness before its build runs", async () => {
+  const sessions = new SessionManager();
+  const claims = new SessionClaims();
+
+  // The occupier holds the timeline's single slot; a second trigger arrived while
+  // it was running and was QUEUED (claimed at accept time, un-attributed — exactly
+  // the registry state `triggerCoordinator.complete` later hands to the drain).
+  const occupierInbound = inboundFor("$occ", "evt-occ", 1000);
+  claims.claim(TK, { triggerId: "evt-occ", externalId: "$occ", triggerTimestamp: 1000, createdAt: 1000 });
+  const queuedInbound = inboundFor("$queued", "evt-queued", 2000);
+  claims.claim(TK, { triggerId: "evt-queued", externalId: "$queued", triggerTimestamp: 2000, createdAt: 2000 });
+
+  // The queued trigger's readiness blocks on a (stubbed) pending caption — it stays
+  // unresolved until we release it, modeling a reply that carried fresh media.
+  const queuedGate = deferred();
+  let queuedVisible = false;
+  let queuedBuilt = false;
+  let queuedSawReadinessDone = false;
+  let readinessResolved = false;
+
+  // Drain trigger (mirrors `drainNextQueuedTrigger`): launch the QUEUED trigger via
+  // launchSession(next, true) — modeled by a second launchModel with the post-fix
+  // ordering. Fired from the occupier's settle, exactly like the real `.finally`
+  // drain. Captured so the test can await its completion after releasing the gate.
+  let drainRun: Promise<string> | undefined;
+  const drain = () => {
+    drainRun = launchModel({
+      sessions,
+      claims,
+      inbound: queuedInbound,
+      readiness: () => queuedGate.promise,
+      onVisible: () => {
+        queuedVisible = true;
+      },
+      onBuild: () => {
+        queuedBuilt = true;
+        queuedSawReadinessDone = readinessResolved;
+      },
+    });
+  };
+
+  // Run the occupier; on settle it drains the queued trigger (the production seam).
+  const occupier = launchModel({
+    sessions,
+    claims,
+    inbound: occupierInbound,
+    readiness: async () => {},
+  });
+  const occupierId = await occupier;
+  sessions.onSettle(occupierId, drain);
+
+  // Complete the occupier → its settle drains the queued trigger into launchSession.
+  sessions.markCompleted(occupierId);
+  await tick();
+
+  // The drained trigger has reached its placeholder (visible-as-running) but is now
+  // PARKED on the blocked readiness wait — its build has NOT run. (Pre-§4.1 the
+  // drain skipped the wait, so the build would already have fired here.)
+  assert.equal(queuedVisible, true, "the drained trigger is visible-as-running before its readiness wait");
+  assert.equal(queuedBuilt, false, "the drained trigger's build does NOT run while readiness is blocked");
+  assert.ok(
+    sessions.activeForTimeline(TK).some((s) => s.trigger.event.externalId === "$queued"),
+    "the drained trigger is in activeForTimeline while it waits (visible-before-wait)",
+  );
+
+  // Release the caption → the drained build now runs, having observed a COMPLETED wait.
+  readinessResolved = true;
+  queuedGate.resolve();
+  await drainRun;
+  assert.equal(queuedBuilt, true, "the drained trigger builds once readiness resolves");
+  assert.equal(queuedSawReadinessDone, true, "the drained build ran only AFTER its readiness wait completed");
+});
+
+// ── resume awaits readiness (spec §7 / §4.2) ─────────────────────────────────
+
+/**
+ * Faithful model of `runReplyResumeSession`'s lifecycle tail (app.ts:2830-2901,
+ * spec §4.2): a reply-resume ADOPTS the existing completed-session record (status
+ * "resuming"), `markRunning`s it (→ visible in activeForTimeline), attaches the
+ * claim + release-on-settle, then — the freshly-added gate — `await`s the reply
+ * trigger's readiness BEFORE `factory.create`/`buildResumeTurn`. The pre-§4.2
+ * resume path skipped the wait entirely, so a media-bearing reply built its
+ * appended turn uncaptioned. `waitBeforeBuild=false` flips to that pre-fix
+ * ordering for the contrast assertion.
+ *
+ * The adopted record carries a pre-existing id (the completed session being
+ * resumed), distinguishing this from a fresh `createPlaceholder` launch.
+ */
+async function resumeModel(args: {
+  sessions: SessionManager;
+  claims: SessionClaims;
+  inbound: InboundChatEvent;
+  resumedId: string;
+  readiness: () => Promise<void>;
+  waitBeforeBuild?: boolean;
+  onVisible?: (sessionId: string) => void;
+  onBuild?: (sessionId: string) => void;
+}): Promise<void> {
+  const { sessions, claims, inbound, resumedId } = args;
+  const ext = inbound.event.externalId;
+  // adopt the completed session's record as `resuming` (app.ts:2830-2839).
+  const record: AgentSessionRecord = {
+    id: resumedId,
+    timelineKey: inbound.timelineKey,
+    sessionType: "default",
+    status: "resuming",
+    trigger: inbound,
+    createdAt: Date.now(),
+  };
+  sessions.adopt(record);
+  sessions.markRunning(record.id); // → running → visible in activeForTimeline
+  if (ext) claims.attachSession(inbound.timelineKey, ext, record.id); // claim attributed
+  sessions.onSettle(record.id, () => claims.releaseSession(inbound.timelineKey, record.id));
+  args.onVisible?.(record.id);
+  if (args.waitBeforeBuild === false) {
+    // PRE-FIX: build the resume turn with no readiness wait (the dropped gate).
+    args.onBuild?.(record.id);
+    return;
+  }
+  await args.readiness(); // POST-FIX: gate the resume build on caption readiness (app.ts:2900)
+  args.onBuild?.(record.id); // == factory.create / buildResumeTurn
+}
+
+test("spec §7: a reply-resume awaits caption readiness before building the resume turn", async () => {
+  const sessions = new SessionManager();
+  const claims = new SessionClaims();
+
+  // The reply that triggers the resume carries fresh media → its readiness blocks on
+  // a pending caption. The trigger was claimed (un-attributed) at the accept seam.
+  const replyInbound = inboundFor("$reply", "evt-reply", 3000);
+  claims.claim(TK, { triggerId: "evt-reply", externalId: "$reply", triggerTimestamp: 3000, createdAt: 3000 });
+  const resumedId = "s-resumed-completed"; // the COMPLETED session being continued
+
+  let readinessDone = false;
+  let visibleBeforeReadiness: boolean | undefined;
+  let buildSawReadinessDone: boolean | undefined;
+  let activeWhileBlocked = false;
+  await resumeModel({
+    sessions,
+    claims,
+    inbound: replyInbound,
+    resumedId,
+    readiness: async () => {
+      // The resumed session is visible-as-running while the caption is still pending.
+      activeWhileBlocked = sessions.activeForTimeline(TK).some((s) => s.id === resumedId);
+      await tick(); // caption completes during the wait
+      readinessDone = true;
+    },
+    onVisible: () => {
+      visibleBeforeReadiness = readinessDone === false;
+    },
+    onBuild: () => {
+      buildSawReadinessDone = readinessDone;
+    },
+  });
+
+  assert.equal(visibleBeforeReadiness, true, "the resumed session is visible before the readiness wait completes");
+  assert.equal(activeWhileBlocked, true, "the resumed session is in activeForTimeline while it waits on the caption");
+  assert.equal(
+    buildSawReadinessDone,
+    true,
+    "buildResumeTurn runs only AFTER caption readiness — a media-bearing reply is captioned before its appended turn",
+  );
+});
+
+test("PRE-FIX contrast: a reply-resume that skips the wait builds before its caption is ready (the gap §4.2 closed)", async () => {
+  // The same media-bearing reply, but with the resume path's readiness wait absent
+  // (the behaviour before §4.2). The resume turn builds while the caption is still
+  // pending — exactly the regression a future drop of app.ts:2900 would reintroduce.
+  const sessions = new SessionManager();
+  const claims = new SessionClaims();
+  const replyInbound = inboundFor("$reply", "evt-reply", 3000);
+  claims.claim(TK, { triggerId: "evt-reply", externalId: "$reply", triggerTimestamp: 3000, createdAt: 3000 });
+
+  const gate = deferred();
+  let readinessRan = false;
+  let buildSawReadinessRun: boolean | undefined;
+  await resumeModel({
+    sessions,
+    claims,
+    inbound: replyInbound,
+    resumedId: "s-resumed-completed",
+    waitBeforeBuild: false, // PRE-FIX: no readiness gate before the build
+    readiness: async () => {
+      await gate.promise;
+      readinessRan = true;
+    },
+    onBuild: () => {
+      buildSawReadinessRun = readinessRan;
+    },
+  });
+
+  assert.equal(
+    buildSawReadinessRun,
+    false,
+    "PRE-FIX: the resume turn built without the caption being ready (the bug §4.2 fixed)",
+  );
+  gate.resolve();
+});
