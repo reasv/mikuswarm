@@ -96,6 +96,30 @@ export function isInjectedUserTurn(m: RolloutMsg): boolean {
 	return m.type === 'interjection' || m.role === 'user';
 }
 
+/** Content signature of an injected user turn for dedup (role/type + flattened text). */
+function injectedTurnSignature(m: RolloutMsg): string {
+	return `${m.role ?? ''}|${m.type ?? ''}|${contentText(m.content)}`;
+}
+
+/**
+ * Whether `m` (an injected user turn) duplicates one already present in
+ * `messages`. The live rollout uses this to drop a `message_start` that
+ * re-delivers a turn the seed already carried: `Agent.subscribe` is future-only
+ * but a turn committed to `agent.state.messages` *just* before the console
+ * attaches can land in the seed AND fire a subsequent `message_start`, rendering
+ * twice (the "printed twice, fixed on refresh" symptom). Compares role/type +
+ * the flattened text rather than object identity, because the seed copy and the
+ * message_start copy are distinct objects. The caller gates this to the brief
+ * post-seed window so legitimate repeat interjections are never suppressed.
+ */
+export function isDuplicateInjectedTurn(messages: readonly RolloutMsg[], m: RolloutMsg): boolean {
+	const sig = injectedTurnSignature(m);
+	for (const existing of messages) {
+		if (isInjectedUserTurn(existing) && injectedTurnSignature(existing) === sig) return true;
+	}
+	return false;
+}
+
 /** Assistant content blocks (text / thinking / toolCall), normalized to an array. */
 export function assistantBlocks(content: unknown): AssistantBlock[] {
 	if (!Array.isArray(content)) return [];

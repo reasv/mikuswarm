@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { streamSessionEvents, streamPipelineActivity } from './live';
+import {
+	streamSessionEvents,
+	streamPipelineActivity,
+	consumeSessionStream,
+	type SessionStreamEnd
+} from './live';
+import type { AgentEventWire } from '$lib/schemas';
 
 /** Build a Response whose body streams the given string chunks as bytes. */
 function streamResponse(chunks: string[]): Response {
@@ -106,6 +112,136 @@ describe('streamSessionEvents', () => {
 		const controller = new AbortController();
 		await collectTypes(streamSessionEvents('s', controller.signal));
 		expect(captured).toBe(controller.signal);
+	});
+
+	it('returns the terminal reason as the generator return value', async () => {
+		// `not_live` record → 'not_live'; a clean byte-stream end → 'closed'. The
+		// reason is the RETURN value (a `for await` ignores it; consumeSessionStream
+		// reads it to decide reconnect-vs-stop).
+		async function drainEnd(
+			gen: AsyncGenerator<AgentEventWire, SessionStreamEnd, void>
+		): Promise<{ types: string[]; end: SessionStreamEnd }> {
+			const types: string[] = [];
+			for (;;) {
+				const n = await gen.next();
+				if (n.done) return { types, end: n.value };
+				types.push(n.value.type);
+			}
+		}
+
+		vi.stubGlobal('fetch', async () =>
+			streamResponse(['event: not_live\ndata: {"sessionId":"s","status":"completed"}\n\n'])
+		);
+		expect(await drainEnd(streamSessionEvents('s', new AbortController().signal))).toEqual({
+			types: [],
+			end: 'not_live'
+		});
+
+		vi.stubGlobal('fetch', async () =>
+			streamResponse(['event: turn_end\ndata: {"type":"turn_end"}\n\n'])
+		);
+		expect(await drainEnd(streamSessionEvents('s', new AbortController().signal))).toEqual({
+			types: ['turn_end'],
+			end: 'closed'
+		});
+	});
+});
+
+describe('consumeSessionStream', () => {
+	// Build a mock opener from a list of per-attempt "scripts": each attempt yields
+	// its events then ends with `end` ('closed'/'not_live'), or `throws` to simulate
+	// a dropped connection. The last script repeats for any further reconnects.
+	type Script = { events?: string[]; end?: SessionStreamEnd; throws?: boolean };
+	function mockOpen(scripts: Script[]) {
+		const calls: string[] = [];
+		const open = (sessionId: string): AsyncGenerator<AgentEventWire, SessionStreamEnd, void> => {
+			const script = scripts[Math.min(calls.length, scripts.length - 1)];
+			calls.push(sessionId);
+			return (async function* () {
+				if (script.throws) throw new Error('dropped connection');
+				for (const t of script.events ?? []) yield { type: t } as AgentEventWire;
+				return script.end ?? 'closed';
+			})();
+		};
+		return { open, calls };
+	}
+	const immediateSleep = () => Promise.resolve();
+
+	it('stops on not_live without reconnecting', async () => {
+		const { open, calls } = mockOpen([{ events: ['turn_end'], end: 'not_live' }]);
+		const seen: string[] = [];
+		await consumeSessionStream('s', {
+			signal: new AbortController().signal,
+			onEvent: (e) => seen.push(e.type),
+			open,
+			sleep: immediateSleep
+		});
+		expect(seen).toEqual(['turn_end']);
+		expect(calls.length).toBe(1);
+	});
+
+	it('reconnects after a dropped connection, then settles on not_live', async () => {
+		const { open, calls } = mockOpen([{ throws: true }, { events: ['turn_start'], end: 'not_live' }]);
+		const seen: string[] = [];
+		await consumeSessionStream('s', {
+			signal: new AbortController().signal,
+			onEvent: (e) => seen.push(e.type),
+			open,
+			sleep: immediateSleep
+		});
+		expect(seen).toEqual(['turn_start']); // the dropped attempt produced nothing
+		expect(calls.length).toBe(2); // dropped → reconnected
+	});
+
+	it('re-attaches across a clean settlement to stream the resumed run', async () => {
+		// First run settles (`closed`); the resumed run streams on the reconnect and
+		// then ends terminal — events from BOTH runs are delivered, none duplicated by
+		// the consumer (re-seed dedup is the fold's job, tested elsewhere).
+		const { open, calls } = mockOpen([
+			{ events: ['turn_end'], end: 'closed' },
+			{ events: ['turn_start'], end: 'not_live' }
+		]);
+		const seen: string[] = [];
+		await consumeSessionStream('s', {
+			signal: new AbortController().signal,
+			onEvent: (e) => seen.push(e.type),
+			open,
+			sleep: immediateSleep
+		});
+		expect(seen).toEqual(['turn_end', 'turn_start']);
+		expect(calls.length).toBe(2);
+	});
+
+	it('stops delivering events once aborted mid-stream', async () => {
+		const controller = new AbortController();
+		const { open, calls } = mockOpen([{ events: ['a', 'b', 'c'], end: 'closed' }]);
+		const seen: string[] = [];
+		await consumeSessionStream('s', {
+			signal: controller.signal,
+			onEvent: (e) => {
+				seen.push(e.type);
+				if (e.type === 'a') controller.abort(); // teardown after the first event
+			},
+			open,
+			sleep: immediateSleep
+		});
+		expect(seen).toEqual(['a']); // 'b'/'c' suppressed after abort
+		expect(calls.length).toBe(1); // no reconnect after teardown
+	});
+
+	it('does nothing when the signal is already aborted', async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const { open, calls } = mockOpen([{ events: ['x'], end: 'not_live' }]);
+		const seen: string[] = [];
+		await consumeSessionStream('s', {
+			signal: controller.signal,
+			onEvent: (e) => seen.push(e.type),
+			open,
+			sleep: immediateSleep
+		});
+		expect(seen).toEqual([]);
+		expect(calls.length).toBe(0);
 	});
 });
 
