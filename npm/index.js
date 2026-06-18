@@ -310,6 +310,11 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { MatrixCoreClient } = nativeBinding
+const { MatrixCoreClient, NativeTokenizer } = nativeBinding
 
 module.exports.MatrixCoreClient = MatrixCoreClient
+// GLM-native tokenizer (spec/TOKENIZER-SWAP.md §5.2). This re-export list is
+// hand-maintained alongside the TS declarations in src/.../native-binding.ts — the
+// crate does not enable napi's `typedef` feature, so `napi build` does not
+// regenerate this loader. Add new `#[napi]` exports here when the Rust surface grows.
+module.exports.NativeTokenizer = NativeTokenizer

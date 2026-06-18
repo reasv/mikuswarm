@@ -1019,6 +1019,23 @@ const LimitRuleSchema = StrictObject({
   trigger_rejection_message: Type.Optional(Type.String()),
 });
 
+// Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). Per-consumer selection: the
+// `primary` tokenizer measures everything that bounds what we send the chat model
+// (context tiers, summarization, diary, auto-retrieval, search coverage); the
+// `retrieval` tokenizer is the memory chunker's, which must match the EMBEDDER, not
+// the chat model (switching `primary` must not perturb chunk boundaries/hashes/
+// embeddings). Both default to `gpt-tokenizer` (the shipped default + always-on
+// fallback). When either is `glm`, `glm_tokenizer_path` is required and readable —
+// a cross-field check in app.ts (TypeBox can't express it) fail-fasts otherwise.
+const TokenizerKindSchema = Type.Union([Type.Literal("gpt-tokenizer"), Type.Literal("glm")]);
+const TokenizerSchema = StrictObject({
+  primary: Type.Optional(TokenizerKindSchema),
+  retrieval: Type.Optional(TokenizerKindSchema),
+  // Path to the GLM `tokenizer.json` (Hugging Face format). Required when either
+  // selection is `glm`; loaded once at startup by the native tokenizer.
+  glm_tokenizer_path: Type.Optional(Type.String({ minLength: 1 })),
+});
+
 export const AppConfigSchema = StrictObject({
   app: StrictObject({
     name: Type.String(),
@@ -1091,6 +1108,9 @@ export const AppConfigSchema = StrictObject({
       compact_max_tokens: Type.Number({ minimum: 1 }),
     }),
   }),
+  // Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). Optional so existing configs
+  // stay valid; unset = `gpt-tokenizer` everywhere (behaviour-identical default).
+  tokenizer: Type.Optional(TokenizerSchema),
   media: Type.Optional(MediaSchema),
   storage: StrictObject({
     database_path: Type.String(),
@@ -1217,6 +1237,7 @@ export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
 export type XSearchConfig = Static<typeof XSearchSchema>;
 export type SauceNaoConfig = Static<typeof SauceNaoSchema>;
+export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;

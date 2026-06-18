@@ -4,6 +4,12 @@ dist/
 native/target/
 native/*.node
 npm/*.node
+# Fetched on build (checksum-verified) by scripts/fetch-glm-tokenizer.mjs — 20 MB,
+# kept out of git history. The dir's LICENSE/README stay tracked. See
+# spec/TOKENIZER-CALIBRATION.md §6.
+native/assets/glm-5.1/tokenizer.json
+# …and any orphaned staging temp from an interrupted fetch (rename never reached).
+native/assets/glm-5.1/tokenizer.json.tmp-*
 config/90-local.toml
 *.db
 *.db-shm

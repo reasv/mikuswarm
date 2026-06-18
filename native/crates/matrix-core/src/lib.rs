@@ -9,6 +9,7 @@ mod previews;
 mod reactions;
 mod state;
 mod sync;
+mod tokenizer;
 
 use std::sync::Mutex;
 

@@ -13,6 +13,7 @@ import {
   l2normalize,
   type EmbeddingProvider,
 } from "../src/retrieval/index.js";
+import { GptTokenizer } from "../src/context/tokenizer/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
 import { configureAgentTimezone, resetAgentTimezone, parseZonedWallClock } from "../src/time/index.js";
 
@@ -64,6 +65,7 @@ async function withStack(run: (s: Stack) => Promise<void>): Promise<void> {
     storage,
     workspaceRoot,
     config,
+    tokenizer: new GptTokenizer(),
     pruneVectors: (rowids) => rowids.forEach((r) => void vectorStore.remove(r)),
   });
   const worker = new EmbedWorkerPool({ storage, vectorStore, provider, config });

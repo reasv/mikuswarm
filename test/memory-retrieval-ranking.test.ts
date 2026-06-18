@@ -12,6 +12,7 @@ import {
   userLanePrefixStem,
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
+import { GptTokenizer } from "../src/context/tokenizer/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
 import {
   configureAgentTimezone,
@@ -36,7 +37,7 @@ async function withHarness(run: (h: Harness) => Promise<void>): Promise<void> {
   await mkdir(path.join(workspaceRoot, "memory"), { recursive: true });
   const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
   const config = resolveRetrievalConfig({ enabled: true });
-  const indexer = new MemoryIndexer({ storage, workspaceRoot, config });
+  const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
   const search = new MemorySearch(storage, indexer, config);
   try {
     await run({ workspaceRoot, storage, indexer, search });
@@ -83,7 +84,7 @@ async function dstBeforeInclusiveCase(opts: {
   await mkdir(path.join(workspaceRoot, "memory"), { recursive: true });
   const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
   const config = resolveRetrievalConfig({ enabled: true });
-  const indexer = new MemoryIndexer({ storage, workspaceRoot, config });
+  const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
   const search = new MemorySearch(storage, indexer, config);
   try {
     // Index a real file so the corpus signature is recorded and the lazy on-search

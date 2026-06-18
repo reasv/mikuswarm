@@ -188,6 +188,22 @@ rich_max_tokens = 8000
 compact_target_tokens = 16000
 compact_max_tokens = 24000
 
+# Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). `primary` is the chat/context/
+# summarization estimator (everything that bounds what we send the chat model);
+# `retrieval` is the memory chunker's, which must match the EMBEDDER, not the chat
+# model — so switching `primary` to "glm" must NOT change `retrieval`, or the memory
+# corpus would re-chunk. Both default to "gpt-tokenizer" (the shipped default +
+# always-available fallback). `glm_tokenizer_path` points at the GLM-5.1 tokenizer.json
+# (MIT) fetched on build into native/assets/glm-5.1/ (checksum-verified by
+# scripts/fetch-glm-tokenizer.mjs; run `pnpm fetch:tokenizer` if absent). It is loaded
+# only when a selection is "glm", so it is inert under the default. Flip `primary = "glm"` to count the
+# model-facing budgets in real GLM tokens — calibration (spec/TOKENIZER-CALIBRATION.md)
+# measured GLM-5.1 ≈ gpt-4o (~1.02×) on live data, so the token knobs need no rescaling.
+[tokenizer]
+primary = "gpt-tokenizer"        # "gpt-tokenizer" | "glm"
+retrieval = "gpt-tokenizer"      # match the embedder, not the chat model
+glm_tokenizer_path = "native/assets/glm-5.1/tokenizer.json"
+
 [media]
 download_size_limit = 1073741824
 

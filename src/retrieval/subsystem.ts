@@ -3,6 +3,8 @@ import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { LlmScheduler } from "../agent/scheduler.js";
+import type { Tokenizer } from "../context/tokenizer/types.js";
+import { getRetrievalTokenizer } from "../context/tokenizer/registry.js";
 import { MemoryIndexer } from "./indexer.js";
 import { MemorySearch } from "./search.js";
 import { EmbedWorkerPool } from "./embed-worker.js";
@@ -41,6 +43,12 @@ export interface CreateSubsystemOptions {
    * embed-worker claim gate. Absent / local provider = no budgeting (zero cost).
    */
   budget?: BudgetHooks;
+  /**
+   * Embedder-matched tokenizer for chunking (spec/TOKENIZER-SWAP.md §5.3). Defaults
+   * to the registry's retrieval tokenizer (`[tokenizer].retrieval`, default
+   * `gpt-tokenizer`); injectable for tests.
+   */
+  tokenizer?: Tokenizer;
   logger?: Logger;
 }
 
@@ -77,6 +85,7 @@ export async function createRetrievalSubsystem(
     storage,
     workspaceRoot,
     config,
+    tokenizer: opts.tokenizer ?? getRetrievalTokenizer(),
     logger,
     pruneVectors: (rowids) => {
       for (const r of rowids) void vectorStore?.remove(r);

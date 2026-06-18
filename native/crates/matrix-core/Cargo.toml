@@ -21,6 +21,12 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
+# GLM-native tokenizer (spec/TOKENIZER-SWAP.md §5.2). Inference only — `onig` is
+# HF's reference pretokenizer-regex backend (parity with the model's published
+# tokenizer.json); `progressbar`/`esaxx_fast`/`http` are training/download extras we
+# don't need. Built under the debug/napi profile, so an `opt-level` override in
+# native/Cargo.toml keeps this BPE loop fast (§5.2 build caveat).
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 

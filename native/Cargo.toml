@@ -1,3 +1,14 @@
 [workspace]
 members = ["crates/matrix-core"]
 resolver = "2"
+
+# `build:native` runs `napi build` with NO `--release`, so the shipped
+# `npm/index.*.node` is a debug artifact. matrix-sdk tolerates debug (async I/O
+# glue), but the GLM tokenizer is a tight CPU BPE loop — the one place debug Rust
+# runs 10–30× slower and could end up slower than the `gpt-tokenizer` JS it
+# replaces, invalidating the spec's "keep it synchronous" decision. Optimize all
+# DEPENDENCIES (incl. `tokenizers`/`onig`) under the debug build while leaving our
+# own crate at default opt-level for fast iteration. See spec/TOKENIZER-SWAP.md
+# §5.2 (build caveat). The §6.3 perf gate must confirm this took effect.
+[profile.dev.package."*"]
+opt-level = 3

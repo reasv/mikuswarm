@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { estimateTokens, splitByTokens } from "../context/tokens.js";
+import type { Tokenizer } from "../context/tokenizer/types.js";
 import { getConfiguredTimezone, parseZonedWallClock } from "../time/index.js";
 import { diaryHeaderRegex } from "../diary/header.js";
 
@@ -46,6 +46,13 @@ export interface ChunkOptions {
   fallbackChunkTokens: number;
   /** Token-window overlap for fallback chunking (§3). */
   fallbackChunkOverlap: number;
+  /**
+   * The **embedder-matched** tokenizer (spec/TOKENIZER-SWAP.md §5.3), injected
+   * rather than reached from the module-level chat tokenizer: chunk boundaries,
+   * `tokenCount`s and content hashes must track the embedding model, so switching
+   * `[tokenizer].primary` (the chat tokenizer) leaves the memory corpus untouched.
+   */
+  tokenizer: Tokenizer;
 }
 
 function sha256Hex(input: string): string {
@@ -126,14 +133,25 @@ function headerSegments(text: string): Array<{ start: number; end: number; isHea
  * chunk per diary block (oversized blocks are token-window sub-split, inheriting the
  * block's metadata); header-less legacy files are token-window chunked. Pure-title /
  * whitespace leading segments (a file's `# <date> Daily Memory` line) are dropped.
+ *
+ * Async (spec/TOKENIZER-SWAP.md §4/§5.3): the per-block oversize check — the one
+ * large encode in this background path — goes through the injected tokenizer's
+ * optional `countAsync` escape hatch, which the native `glm` tokenizer runs on a
+ * libuv worker thread. Everything else (the rare sub-split, per-sub-chunk counts)
+ * stays synchronous. With the default `gpt-tokenizer` retrieval tokenizer
+ * `countAsync` is absent, so this resolves synchronously with no thread hop.
  */
-export function chunkMemoryFile(opts: ChunkOptions): MemoryChunk[] {
-  const { relativePath, text } = opts;
+export async function chunkMemoryFile(opts: ChunkOptions): Promise<MemoryChunk[]> {
+  const { relativePath, text, tokenizer } = opts;
   const lineStarts = lineStartOffsets(text);
   const fileNoonTs = opts.fileDate
     ? parseZonedWallClock(`${opts.fileDate} 12:00`, getConfiguredTimezone())
     : null;
   const baseTs = fileNoonTs ?? opts.fallbackTimestamp;
+
+  /** Count a potentially-large block off-thread when the tokenizer supports it. */
+  const countLarge = (s: string): Promise<number> =>
+    tokenizer.countAsync ? tokenizer.countAsync(s) : Promise.resolve(tokenizer.count(s));
 
   const out: MemoryChunk[] = [];
   let ordinal = 0;
@@ -144,6 +162,7 @@ export function chunkMemoryFile(opts: ChunkOptions): MemoryChunk[] {
     charEnd: number,
     room: string | null,
     entryTs: number,
+    knownTokenCount?: number,
   ): void => {
     if (chunkText.trim().length === 0) return; // skip whitespace-only fragments
     out.push({
@@ -156,7 +175,9 @@ export function chunkMemoryFile(opts: ChunkOptions): MemoryChunk[] {
       room,
       entryTs,
       text: chunkText,
-      tokenCount: estimateTokens(chunkText),
+      // Sub-chunks are bounded (≤ maxChunkTokens), so a sync count is cheap; the one
+      // large encode (the whole block) is reused from the oversize check below.
+      tokenCount: knownTokenCount ?? tokenizer.count(chunkText),
       contentHash: sha256Hex(chunkText),
     });
   };
@@ -168,19 +189,20 @@ export function chunkMemoryFile(opts: ChunkOptions): MemoryChunk[] {
       const parsed = parseHeaderLine(firstLine);
       const room = parsed?.room ?? null;
       const entryTs = parsed?.endTs ?? baseTs;
-      if (estimateTokens(segText) > opts.maxChunkTokens) {
+      const segTokens = await countLarge(segText);
+      if (segTokens > opts.maxChunkTokens) {
         // Oversized block: sub-split, sub-chunks inherit the block's metadata (§3).
-        for (const w of splitByTokens(segText, opts.fallbackChunkTokens, opts.fallbackChunkOverlap)) {
+        for (const w of tokenizer.split(segText, opts.fallbackChunkTokens, opts.fallbackChunkOverlap)) {
           emit(w.text, seg.start + w.charStart, seg.start + w.charEnd, room, entryTs);
         }
       } else {
-        emit(segText, seg.start, seg.end, room, entryTs);
+        emit(segText, seg.start, seg.end, room, entryTs, segTokens);
       }
     } else {
       // Leading / legacy segment. Drop if it is only a `# ` title line + whitespace.
       const stripped = segText.replace(/^\s*#[^\n]*\n?/, "").trim();
       if (stripped.length === 0) continue;
-      for (const w of splitByTokens(segText, opts.fallbackChunkTokens, opts.fallbackChunkOverlap)) {
+      for (const w of tokenizer.split(segText, opts.fallbackChunkTokens, opts.fallbackChunkOverlap)) {
         emit(w.text, seg.start + w.charStart, seg.start + w.charEnd, null, baseTs);
       }
     }
