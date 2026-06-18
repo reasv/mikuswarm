@@ -28,7 +28,7 @@
  */
 import Database from "better-sqlite3";
 import { loadConfig } from "../src/config/index.js";
-import { Storage } from "../src/storage/index.js";
+import { Storage, LATEST_SCHEMA_VERSION } from "../src/storage/index.js";
 import { computeUsageCost, type CostRates } from "../src/agent/usage.js";
 
 const args = process.argv.slice(2);
@@ -37,11 +37,21 @@ const dbPath = args.find((a) => !a.startsWith("--")) ?? "./var/mikuswarm.db";
 
 const config = await loadConfig("./config");
 
-// Apply pending migrations (incl. v28's caption-row rebuild) first, so repricing
-// operates on the final row set and can't be clobbered by a later migration.
-const migrated = await Storage.open({ databasePath: dbPath });
-await migrated.waitForIdle();
-migrated.close();
+// Apply pending migrations (incl. v28's caption-row rebuild) BEFORE repricing, so
+// repricing operates on the final row set and can't be clobbered by a later
+// migration — but ONLY when the DB is behind. When it is already current (the
+// app has migrated it), skip opening a competing Storage writer; the direct
+// UPDATE below uses a busy-timeout, so it is safe against a live DB.
+{
+  const probe = new Database(dbPath, { readonly: true });
+  const version = probe.pragma("user_version", { simple: true }) as number;
+  probe.close();
+  if (version < LATEST_SCHEMA_VERSION) {
+    const migrated = await Storage.open({ databasePath: dbPath });
+    await migrated.waitForIdle();
+    migrated.close();
+  }
+}
 
 const cap = config.captioning?.model?.cost;
 const captionRates: CostRates | null = cap
