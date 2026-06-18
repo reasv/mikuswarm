@@ -3192,6 +3192,24 @@ export class Storage {
     });
   }
 
+  /**
+   * The durable trigger-group membership: the ids of every timeline event whose
+   * `trigger_group_id` column names this trigger (written by {@link setTriggerGroup}).
+   * Mirrors {@link getMediaAssetsForTriggerGroup}'s key. Synchronous (`read`). Used by
+   * the context builder to reconstruct a trigger group whose in-memory
+   * `groupedEventIds` was lost — e.g. a resume that re-read the trigger from
+   * `event_json` (provider-hold group only), dropping backward-lookback members
+   * (FOLLOWUP-FOLDING review #2).
+   */
+  getTriggerGroupMemberIds(triggerEventId: string): string[] {
+    return this.read((db) => {
+      const rows = db.prepare(
+        `select id from timeline_events where trigger_group_id = ?`,
+      ).all(triggerEventId) as Array<{ id: string }>;
+      return rows.map((r) => r.id);
+    });
+  }
+
   // ── Metadata key-value accessors ──────────────────────────────────
 
   getMetadata(key: string): string | null {

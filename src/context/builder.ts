@@ -1263,6 +1263,18 @@ export class ContextBuilder {
     for (const id of trigger.trigger?.groupedEventIds ?? []) {
       ids.add(id);
     }
+    // Also union the DURABLE group from the `trigger_group_id` column (FOLLOWUP-FOLDING
+    // review #2). The in-memory `groupedEventIds` is authoritative on the live `build`
+    // path, but a resume re-reads the trigger from `event_json` (provider-hold group
+    // only), dropping backward-lookback members; those survive only in the column.
+    // Unioning makes the rendered-TEXT path consistent with the image path
+    // (`getMediaAssetsForTriggerGroup`, same key) and immune to the in-memory loss.
+    // A no-op for `build`, where the column holds exactly the same member ids
+    // `setTriggerGroup` wrote from that group (and is empty until persisted, so it can
+    // only ever add ids already present). Synchronous (`read`).
+    for (const id of this.storage.getTriggerGroupMemberIds(trigger.id)) {
+      ids.add(id);
+    }
     return ids;
   }
 
@@ -1407,6 +1419,20 @@ export class ContextBuilder {
    */
   async conditionEventImages(event: CanonicalChatEvent): Promise<ImageBlock[]> {
     return this.selectImageBlocks(event);
+  }
+
+  /**
+   * Mark an event's attachments that were conditioned into {@link ImageBlock}s, so the
+   * renderer emits `image_block="true"` on them (renderer.ts) — telling the model the
+   * loose vision block and the `<attachment>` are the same image. Public wrapper over
+   * the trigger-group-scoped {@link markImageBlocks}, used by the steer path for a
+   * folded media follow-up / image co-reply (spec FOLLOWUP-FOLDING §5.1): there the
+   * blocks come from {@link conditionEventImages}, not a trigger-group build, so the
+   * `build` (live) / `buildResumeTurn` (resume) marking does not run. The passed
+   * `events` must be the SAME objects subsequently rendered (the mark mutates them).
+   */
+  markEventImageBlocks(events: CanonicalChatEvent[], blocks: ImageBlock[]): void {
+    this.markImageBlocks(events, new Set(blocks.map((b) => b.attachmentId)));
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

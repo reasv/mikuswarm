@@ -1837,14 +1837,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * DUPLICATE-REPLY-MITIGATION §5.3). The steer paths bypass the trigger path's
    * enrichment-readiness wait + `hydrateEvents`, so the raw `replyTo` carries only
    * an `externalId`.
+   *
+   * `baseEvent` defaults to the raw `inbound.event`. The image co-reply steer passes
+   * the HYDRATED stored event (`followUpHydratedEvent`) so the co-reply's OWN image
+   * attachments carry `localPath` — needed to condition them into pixels AND to mark
+   * them `image_block` on the very object that is rendered (review #1).
    */
   function buildReplyHydratedEvent(
     inbound: InboundChatEvent,
     target: CanonicalChatEvent,
+    baseEvent: CanonicalChatEvent = inbound.event,
   ): CanonicalChatEvent {
     const [hydratedTarget] = hydrateEvents(storage, [target]);
     return {
-      ...inbound.event,
+      ...baseEvent,
       replyTo: {
         ...inbound.event.replyTo,
         externalId: inbound.event.replyTo?.externalId,
@@ -1950,8 +1956,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   function buildCoReplyInterjection(
     inbound: InboundChatEvent,
     target: NonNullable<ReturnType<TimelineStore["getByExternalId"]>>,
+    // Optional prebuilt hydrated event to render. The image steer
+    // (`steerCoReplyWithPixels`) builds it ONCE so the same object is conditioned,
+    // marked (`markEventImageBlocks`), and rendered here — otherwise marking a
+    // separately-built object would be a no-op (review #1). The synchronous text path
+    // omits it and rebuilds internally (no pixels to mark).
+    prebuiltEventForRender?: CanonicalChatEvent,
   ): string {
-    const eventForRender = buildReplyHydratedEvent(inbound, target);
+    const eventForRender = prebuiltEventForRender ?? buildReplyHydratedEvent(inbound, target);
     const senderName = inbound.event.sender.displayName ?? inbound.event.sender.id;
     const externalId = inbound.event.externalId;
     return (
@@ -2051,10 +2063,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     target: CanonicalChatEvent,
   ): Promise<void> {
     await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    // Build the rendered event ONCE (off the hydrated stored event so the co-reply's
+    // own image attachments carry `localPath`), then condition + mark + render the SAME
+    // object — marking a separately-built copy would be a no-op (review #1). The
+    // synchronous text path (`buildCoReplyInterjection` with no prebuilt event) rebuilds
+    // its own; here pixels exist so the marked object must be the rendered one.
+    const eventForRender = buildReplyHydratedEvent(inbound, target, followUpHydratedEvent(inbound));
     let imageBlocks: ImageBlock[] | undefined;
     try {
-      const blocks = await contextBuilder.conditionEventImages(followUpHydratedEvent(inbound));
-      if (blocks.length > 0) imageBlocks = blocks;
+      const blocks = await contextBuilder.conditionEventImages(eventForRender);
+      if (blocks.length > 0) {
+        imageBlocks = blocks;
+        contextBuilder.markEventImageBlocks([eventForRender], blocks);
+      }
     } catch (error) {
       // No-pixels branch (mirrors steerFollowUp): caption-only steer rather than block.
       logger.warn("co_reply_image_condition_failed", {
@@ -2063,7 +2084,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    const content = buildCoReplyInterjection(inbound, target);
+    const content = buildCoReplyInterjection(inbound, target, eventForRender);
     const steered = sessions.steer(
       coReplySessionId,
       { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) },
@@ -2410,7 +2431,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (form === "media") {
       try {
         const blocks = await contextBuilder.conditionEventImages(hydrated);
-        if (blocks.length > 0) imageBlocks = blocks;
+        if (blocks.length > 0) {
+          imageBlocks = blocks;
+          // Mark the same `hydrated` object the interjection renders so its
+          // `<attachment>` gains `image_block="true"` — telling the model the loose
+          // vision block and the rendered attachment are one image, matching the
+          // live/resume builds (review #1). Without this the image rides only as a
+          // loose block while the quote renders caption-only.
+          contextBuilder.markEventImageBlocks([hydrated], blocks);
+        }
       } catch (error) {
         // No-pixels branch (§5.1): caption-only steer rather than block.
         logger.warn("follow_up_image_condition_failed", {
