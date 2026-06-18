@@ -23,18 +23,38 @@ export declare class NativeTokenizer {
 }
 
 const require = createRequire(import.meta.url);
-const binding = require("../../../npm/index.js") as {
-  NativeTokenizer?: typeof NativeTokenizer;
-};
 
-if (!binding.NativeTokenizer) {
-  // The prebuilt artifact predates the tokenizer export. Surfaced only when the
-  // `glm` tokenizer is actually selected; the default `gpt-tokenizer` never loads
-  // this module.
-  throw new Error(
-    "native module does not export NativeTokenizer — rebuild it with `pnpm build:native` " +
-      "(spec/TOKENIZER-SWAP.md §5.2)",
-  );
+let cachedBinding: typeof NativeTokenizer | null = null;
+
+/**
+ * Lazily load and memoize the native `NativeTokenizer` class from the NAPI module.
+ *
+ * This is deliberately NOT done at module top level: `tokens.ts → registry.ts →
+ * glm.ts → native-binding.ts` is a chain of *static* imports, so a top-level
+ * `require` + presence-`throw` here would fire on every path that touches the token
+ * seam — including the default `gpt-tokenizer` one, which has no business loading
+ * the addon (spec/TOKENIZER-SWAP.md §5.1). Calling this only from
+ * `GlmTokenizer.fromFile` keeps the default path native-free; the addon is loaded
+ * exactly when (and only when) the `glm` tokenizer is actually constructed.
+ *
+ * Throws a clear, actionable error when the loaded module predates the tokenizer
+ * export (e.g. a stale prebuilt artifact), since that only surfaces for a genuine
+ * `glm` selection.
+ */
+export function loadNativeTokenizerBinding(): typeof NativeTokenizer {
+  if (cachedBinding) return cachedBinding;
+  const binding = require("../../../npm/index.js") as {
+    NativeTokenizer?: typeof NativeTokenizer;
+  };
+  if (!binding.NativeTokenizer) {
+    // The prebuilt artifact predates the tokenizer export. Reached only when the
+    // `glm` tokenizer is actually selected; the default `gpt-tokenizer` never calls
+    // this loader.
+    throw new Error(
+      "native module does not export NativeTokenizer — rebuild it with `pnpm build:native` " +
+        "(spec/TOKENIZER-SWAP.md §5.2)",
+    );
+  }
+  cachedBinding = binding.NativeTokenizer;
+  return cachedBinding;
 }
-
-export const NativeTokenizerBinding = binding.NativeTokenizer;

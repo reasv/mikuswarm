@@ -1,5 +1,5 @@
 import { splitWith, truncateWith } from "./algorithms.js";
-import { NativeTokenizerBinding, type NativeTokenizer } from "./native-binding.js";
+import { loadNativeTokenizerBinding, type NativeTokenizer } from "./native-binding.js";
 import type { Tokenizer, TokenWindow } from "./types.js";
 
 /**
@@ -18,7 +18,9 @@ export class GlmTokenizer implements Tokenizer {
   /** Load from a Hugging Face `tokenizer.json`. Throws (path included) on a
    *  missing/invalid file — fail-fast for a misconfigured `glm` asset. */
   static fromFile(path: string): GlmTokenizer {
-    return new GlmTokenizer(NativeTokenizerBinding.fromFile(path));
+    // Load the addon lazily here — this is the ONLY place that touches it, so the
+    // default `gpt-tokenizer` path never loads native (spec/TOKENIZER-SWAP.md §5.1).
+    return new GlmTokenizer(loadNativeTokenizerBinding().fromFile(path));
   }
 
   count(text: string): number {

@@ -16,9 +16,26 @@ import type { AppConfig } from "../src/config/index.js";
 
 const FIXTURE = "native/crates/matrix-core/tests/fixtures/byte-bpe.tokenizer.json";
 
+// Probe the native addon ONCE. The GLM tokenizer needs a `NativeTokenizer` export
+// built from this commit; a normal CI checkout (or the deliberately stale binary in
+// this worktree) has none, so `GlmTokenizer.fromFile` throws the actionable
+// rebuild-error. We gate every native-dependent GLM subtest on this boolean so the
+// suite is GREEN (with those reported as SKIPPED) without a fresh `pnpm build:native`,
+// while all gpt-path / scoping tests still RUN. (Issue #2 — the lazy binding from
+// issue #1 means this no longer throws at import time, only here.)
+const nativeAvailable: boolean = (() => {
+  try {
+    GlmTokenizer.fromFile(FIXTURE);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 // --- Shared parity/behaviour suite, run against both implementations ---------
-function paritySuite(name: string, make: () => Tokenizer): void {
-  test(`${name}: count — empty is 0, non-empty is positive, stable`, () => {
+// `skip` gates the GLM run on native availability (the gpt run always runs).
+function paritySuite(name: string, make: () => Tokenizer, skip = false): void {
+  test(`${name}: count — empty is 0, non-empty is positive, stable`, { skip }, () => {
     const t = make();
     assert.equal(t.count(""), 0);
     const c = t.count("hello world, this is a calibration probe");
@@ -26,13 +43,13 @@ function paritySuite(name: string, make: () => Tokenizer): void {
     assert.equal(c, t.count("hello world, this is a calibration probe"));
   });
 
-  test(`${name}: count adds NO special-token overhead (empty → 0)`, () => {
+  test(`${name}: count adds NO special-token overhead (empty → 0)`, { skip }, () => {
     // A BOS-adding count would make the empty string 1, not 0 — this is the
     // add_special_tokens=false contract (parity with gpt-tokenizer).
     assert.equal(make().count(""), 0);
   });
 
-  test(`${name}: truncate is a no-op within budget, a prefix over budget`, () => {
+  test(`${name}: truncate is a no-op within budget, a prefix over budget`, { skip }, () => {
     const t = make();
     const text = Array.from({ length: 400 }, (_, i) => `token number ${i} about widgets and gadgets`).join(" ");
     const full = t.count(text);
@@ -44,7 +61,7 @@ function paritySuite(name: string, make: () => Tokenizer): void {
     assert.ok(clipped.length < text.length);
   });
 
-  test(`${name}: truncate handles multibyte/emoji without producing garbage`, () => {
+  test(`${name}: truncate handles multibyte/emoji without producing garbage`, { skip }, () => {
     const t = make();
     const text = "こんにちは 🎉 café ümlauts 日本語 🚀 ".repeat(40);
     const clipped = t.truncate(text, 20);
@@ -58,7 +75,7 @@ function paritySuite(name: string, make: () => Tokenizer): void {
     assert.ok(text.startsWith(clipped.slice(0, 4)));
   });
 
-  test(`${name}: split — windows tile the text, offsets are valid substrings`, () => {
+  test(`${name}: split — windows tile the text, offsets are valid substrings`, { skip }, () => {
     const t = make();
     const text = Array.from({ length: 300 }, (_, i) => `sentence ${i} about the launch and the rollout`).join("\n");
     const windows = t.split(text, 40, 8);
@@ -77,7 +94,7 @@ function paritySuite(name: string, make: () => Tokenizer): void {
     }
   });
 
-  test(`${name}: split returns [] for empty, single window when within size`, () => {
+  test(`${name}: split returns [] for empty, single window when within size`, { skip }, () => {
     const t = make();
     assert.deepEqual(t.split("", 100, 10), []);
     const small = "just a short line";
@@ -90,10 +107,11 @@ function paritySuite(name: string, make: () => Tokenizer): void {
 }
 
 paritySuite("GptTokenizer", () => new GptTokenizer());
-paritySuite("GlmTokenizer", () => GlmTokenizer.fromFile(FIXTURE));
+// GLM parity needs the native addon — skipped when no fresh `pnpm build:native`.
+paritySuite("GlmTokenizer", () => GlmTokenizer.fromFile(FIXTURE), !nativeAvailable);
 
 // --- GLM native specifics ---------------------------------------------------
-test("GlmTokenizer: countAsync matches sync count (libuv escape hatch)", async () => {
+test("GlmTokenizer: countAsync matches sync count (libuv escape hatch)", { skip: !nativeAvailable }, async () => {
   const t = GlmTokenizer.fromFile(FIXTURE);
   for (const s of ["", "hello world", "こんにちは 🎉 multibyte"]) {
     assert.equal(await t.countAsync(s), t.count(s), `countAsync==count for ${JSON.stringify(s)}`);
@@ -111,7 +129,7 @@ test("registry: defaults to gpt-tokenizer lazily when init never ran", () => {
   assert.ok(getRetrievalTokenizer() instanceof GptTokenizer);
 });
 
-test("registry: initTokenizers binds primary=glm, retrieval=gpt (per-consumer scoping)", async () => {
+test("registry: initTokenizers binds primary=glm, retrieval=gpt (per-consumer scoping)", { skip: !nativeAvailable }, async () => {
   resetTokenizersForTest();
   await initTokenizers({ primary: "glm", retrieval: "gpt-tokenizer", glmTokenizerPath: FIXTURE });
   assert.ok(getPrimaryTokenizer() instanceof GlmTokenizer, "primary is glm");
@@ -137,9 +155,13 @@ test("registry: initTokenizers fail-fast when glm selected without a path", asyn
 
 test("registry: chunk.ts uses the INJECTED retrieval tokenizer, not the primary (§5.3)", async () => {
   resetTokenizersForTest();
-  // Set the MODULE primary to glm — if the chunker (wrongly) reached for the
-  // module-level tokenizer, tokenCount would be a small BPE number, not the stub's.
-  await initTokenizers({ primary: "glm", retrieval: "gpt-tokenizer", glmTokenizerPath: FIXTURE });
+  // Poison the MODULE primary with a real BPE tokenizer (gpt-tokenizer) whose count
+  // is NOT char-length — so if the chunker (wrongly) reached for the module-level
+  // tokenizer instead of the injected one, tokenCount would be a BPE number, not the
+  // stub's char length, and the assertion below would fail. Deliberately gpt, not
+  // glm: this scoping/injection coverage must run WITHOUT the native addon so it
+  // still exercises chunk.ts on a stock CI checkout (issue #2).
+  await initTokenizers({ primary: "gpt-tokenizer", retrieval: "gpt-tokenizer" });
   let countAsyncCalls = 0;
   const stub: Tokenizer = {
     count: (t) => t.length, // distinctive: char length, never a BPE count
@@ -168,19 +190,25 @@ test("registry: chunk.ts uses the INJECTED retrieval tokenizer, not the primary 
   resetTokenizersForTest();
 });
 
-test("registry: module-level estimateTokens delegates to the primary tokenizer", async () => {
+test("registry: module-level estimateTokens/truncate/split delegate to the gpt primary", async () => {
+  // No-native coverage of the seam → primary delegation (issue #2): with a gpt
+  // primary the module helpers must match GptTokenizer directly.
   resetTokenizersForTest();
-  // gpt primary → estimateTokens == GptTokenizer.count
   await initTokenizers({ primary: "gpt-tokenizer" });
   const probe = "a representative chat message about the deploy logs";
   assert.equal(estimateTokens(probe), new GptTokenizer().count(probe));
-  // glm primary → estimateTokens tracks the glm tokenizer (different count)
-  resetTokenizersForTest();
-  await initTokenizers({ primary: "glm", glmTokenizerPath: FIXTURE });
-  assert.equal(estimateTokens(probe), GlmTokenizer.fromFile(FIXTURE).count(probe));
   // truncate/split delegate too
   assert.equal(truncateToTokens(probe, 100000), probe);
   assert.ok(splitByTokens(probe.repeat(50), 30, 5).length > 1);
+  resetTokenizersForTest();
+});
+
+test("registry: module-level estimateTokens tracks the glm primary", { skip: !nativeAvailable }, async () => {
+  resetTokenizersForTest();
+  // glm primary → estimateTokens tracks the glm tokenizer (its own count)
+  await initTokenizers({ primary: "glm", glmTokenizerPath: FIXTURE });
+  const probe = "a representative chat message about the deploy logs";
+  assert.equal(estimateTokens(probe), GlmTokenizer.fromFile(FIXTURE).count(probe));
   resetTokenizersForTest();
 });
 

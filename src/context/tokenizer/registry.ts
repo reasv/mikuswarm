@@ -77,8 +77,9 @@ export async function initTokenizers(selection: TokenizerSelection): Promise<voi
 /**
  * The chat/context/summarization tokenizer. Backs the module-level `estimateTokens`
  * family in `src/context/tokens.ts`. Lazily defaults to `gpt-tokenizer` when
- * `initTokenizers` was never called (tests/tools); the native path can never be
- * reached this way because only `initTokenizers` loads it, and `app.ts` awaits init
+ * `initTokenizers` was never called (tests/tools); the native addon is never loaded
+ * on this fallback path — only constructing a `glm` tokenizer touches it (and the
+ * lazy default here only ever builds `GptTokenizer`), and `app.ts` awaits init
  * before any context build.
  */
 export function getPrimaryTokenizer(): Tokenizer {
