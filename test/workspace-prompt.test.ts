@@ -462,6 +462,38 @@ describe("satellite block rendering", () => {
     assert.ok(satellite.includes('triggered_by="test message"'));
   });
 
+  it("labels the agent's own session in the active session list", () => {
+    const workspace: WorkspaceContent = {
+      files: new Map(),
+      tailContent: null,
+      skills: { listed: [], inlined: [] },
+    };
+
+    const input = makeRuntimeInput({
+      selfSessionId: "s-self",
+      activeSessions: [
+        {
+          id: "s-self",
+          createdAt: Date.parse("2026-05-26T13:59:00.000Z"),
+          trigger: { event: { body: "current trigger" } },
+        },
+        {
+          id: "s-other",
+          createdAt: Date.parse("2026-05-26T14:01:00.000Z"),
+          trigger: { event: { body: "other trigger" } },
+        },
+      ],
+    });
+
+    const satellite = renderSatelliteBlock(input, workspace);
+    assert.match(
+      satellite,
+      /<session id="s-self" current="true" note="this is your own session; continue handling this task here"/,
+    );
+    assert.match(satellite, /<session id="s-other" started=/);
+    assert.doesNotMatch(satellite, /<session id="s-other" current="true"/);
+  });
+
   it("includes tail instructions when TAIL.md content exists", () => {
     const workspace: WorkspaceContent = {
       files: new Map(),

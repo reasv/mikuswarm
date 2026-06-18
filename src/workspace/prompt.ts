@@ -202,10 +202,13 @@ const COORDINATION_LINE =
 
 function renderRuntimeState(options: SatelliteRuntimeInput): string {
   const sessions = options.activeSessions
-    .map(
-      (session) =>
-        `<session id="${escapeAttr(session.id)}" started="${formatAgentTimestamp(session.createdAt)}" triggered_by="${escapeAttr((session.trigger.event.body ?? "").slice(0, 160))}"/>`,
-    )
+    .map((session) => {
+      const isSelf = session.id === options.selfSessionId;
+      const selfAttrs = isSelf
+        ? ' current="true" note="this is your own session; continue handling this task here"'
+        : "";
+      return `<session id="${escapeAttr(session.id)}"${selfAttrs} started="${formatAgentTimestamp(session.createdAt)}" triggered_by="${escapeAttr((session.trigger.event.body ?? "").slice(0, 160))}"/>`;
+    })
     .join("\n");
 
   // Emit the coordination line only when ≥1 OTHER active session exists — the
@@ -282,4 +285,3 @@ function filenameToTag(filename: string): string {
   if (!tag || /^[0-9]/.test(tag)) tag = `ws_${tag || "unknown"}`;
   return tag;
 }
-
