@@ -14,7 +14,9 @@ export declare class NativeTokenizer {
   /** Encode to token ids; `addSpecialTokens` defaults to false. */
   encode(text: string, addSpecialTokens?: boolean): Uint32Array;
   /** Decode ids back to text (special tokens not skipped → lossless round-trip
-   *  for byte-level BPE). */
+   *  for byte-level BPE). Out-of-vocab ids (`>= vocab size`) are silently dropped
+   *  (lossy), not an error — safe because callers only round-trip ids this
+   *  tokenizer produced. */
   decode(ids: Uint32Array): string;
   /** Token count with `addSpecialTokens = false`. */
   countTokens(text: string): number;

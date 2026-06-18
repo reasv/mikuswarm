@@ -10,7 +10,7 @@
 // changed upstream never silently swaps the tokenizer the budgets are calibrated
 // against.
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -65,8 +65,19 @@ async function main() {
 
   await mkdir(path.dirname(DEST), { recursive: true });
   const tmp = `${DEST}.tmp-${process.pid}`;
-  await writeFile(tmp, buf);
-  await rename(tmp, DEST); // atomic
+  // Stage to a sibling temp file then atomically rename onto DEST, so DEST is
+  // never observed half-written. If anything between the write and the rename
+  // fails, unlink the temp so a kill/throw can't orphan a `tokenizer.json.tmp-<pid>`
+  // (the next run keys idempotency on DEST, not on stray temps).
+  try {
+    await writeFile(tmp, buf);
+    await rename(tmp, DEST); // atomic
+  } catch (err) {
+    await unlink(tmp).catch((cleanupErr) => {
+      if (cleanupErr?.code !== "ENOENT") throw cleanupErr;
+    });
+    throw err;
+  }
   console.log(`wrote ${DEST} (${(buf.length / 1e6).toFixed(1)} MB, sha256 ok)`);
 }
 

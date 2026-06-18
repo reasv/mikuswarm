@@ -52,11 +52,17 @@ function createTokenizer(kind: TokenizerKind, glmTokenizerPath?: string): Tokeni
 }
 
 /**
- * Construct and bind the primary + retrieval tokenizers from config. Idempotent
- * per process: call once at startup. Async to match the spec's startup contract
- * (and to leave room for a future non-blocking asset load); the native load is
- * currently synchronous. A single backend instance is shared when both selections
- * name it (the default → one shared `gpt-tokenizer`; or both `glm` from one path).
+ * Construct and bind the primary + retrieval tokenizers from config. One-shot at
+ * startup: call exactly once (`app.ts`, before the first context build). This is
+ * NOT re-entry-guarded — a second call rebinds the singletons, but subsystems that
+ * already captured a reference (e.g. the retrieval chunker, which takes its
+ * tokenizer injected) keep the old instance, so a late re-init won't propagate.
+ *
+ * The `async` signature is forward-compat for a future off-thread asset load; the
+ * load performed today is fully **synchronous** — constructing the `glm` tokenizer
+ * parses the ~20 MB `tokenizer.json` on the calling (event-loop) thread. A single
+ * backend instance is shared when both selections name it (the default → one shared
+ * `gpt-tokenizer`; or both `glm` from one path).
  */
 export async function initTokenizers(selection: TokenizerSelection): Promise<void> {
   const primaryKind = selection.primary ?? "gpt-tokenizer";

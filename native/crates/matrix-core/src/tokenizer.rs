@@ -57,6 +57,12 @@ impl NativeTokenizer {
     /// Decode token ids back to text. Special tokens are NOT skipped, so for a
     /// byte-level BPE tokenizer `decode(encode(x))` is an exact round-trip — the
     /// property the TS `truncate`/`split` helpers rely on.
+    ///
+    /// Out-of-vocab ids (`id >= vocab_size`) map to nothing and are **silently
+    /// dropped** (lossy) rather than erroring — `tokenizers` decode has no range
+    /// check. Safe here because the only callers round-trip ids this very tokenizer
+    /// produced (always in-range); we deliberately keep the hot path free of per-id
+    /// validation.
     #[napi]
     pub fn decode(&self, ids: Uint32Array) -> Result<String> {
         self.inner
