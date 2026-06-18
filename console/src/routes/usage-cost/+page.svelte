@@ -1,18 +1,22 @@
 <script lang="ts">
 	import { createQuery, keepPreviousData } from '@tanstack/svelte-query';
+	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
+	import SpendSummaryCard from '$lib/components/SpendSummaryCard.svelte';
 	import {
 		getUsageSummary,
 		getUsageTimeseries,
 		getUsageSessions,
 		getUsageToolCalls,
+		getUsageLeaderboard,
 		getUsageBudgets
 	} from '$lib/api/usage.remote';
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
+	import { fmtUsd, fmtInt, fmtPct } from '$lib/usage-format';
 	import { buildSpendChart, isSpendChartEmpty, niceTicks } from '$lib/spend-chart';
-	import { buildSpendAverages } from '$lib/spend-averages';
 	import { presentRule } from '$lib/rule-status';
 
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7): cards + a stacked spend chart,
@@ -31,8 +35,34 @@
 		{ id: 'month', label: 'This month', utc: true }
 	] as const;
 
-	let window = $state<string>('24h');
-	let groupBy = $state<'class' | 'model'>('class');
+	// URL is the source of truth (ARCHITECTURE.md §11): the window, the class/model breakdown,
+	// and the active detail tab all live in query params, so the view is deep-linkable,
+	// refreshable, and shareable. Reads are reactive getters over `page.url`; writes go through
+	// `setParam` (replaceState — a filter/tab toggle shouldn't pile up browser history). Unknown
+	// or hand-edited values coerce to a safe default so a bad URL never breaks a query or the
+	// selector highlight.
+	const WINDOW_IDS = WINDOWS.map((w) => w.id) as readonly string[];
+	const TABS = [
+		{ id: 'sessions', label: 'Recent sessions' },
+		{ id: 'paid', label: 'Recent paid calls' },
+		{ id: 'leaderboard', label: 'User leaderboard' }
+	] as const;
+	const TAB_IDS = TABS.map((t) => t.id) as readonly string[];
+
+	function coerce(value: string | null, allowed: readonly string[], fallback: string): string {
+		return value != null && allowed.includes(value) ? value : fallback;
+	}
+	const window = $derived(coerce(page.url.searchParams.get('window'), WINDOW_IDS, '24h'));
+	const groupBy = $derived(
+		coerce(page.url.searchParams.get('group'), ['class', 'model'], 'class') as 'class' | 'model'
+	);
+	const tab = $derived(coerce(page.url.searchParams.get('tab'), TAB_IDS, 'sessions'));
+
+	function setParam(key: string, value: string): void {
+		const url = new URL(page.url);
+		url.searchParams.set(key, value);
+		void goto(url, { replaceState: true, keepFocus: true, noScroll: true });
+	}
 
 	// `window`/`groupBy` fold into these query keys, so switching them is a new cache
 	// entry. `keepPreviousData` keeps the prior window's cards/chart on screen while
@@ -51,14 +81,28 @@
 		placeholderData: keepPreviousData,
 		refetchInterval: 5000
 	}));
+	// The three tab-bound feeds only poll while their tab is visible (`enabled`), so the page
+	// isn't fetching all three at once; switching to a tab fetches the newly-shown one.
 	const sessions = createQuery(() => ({
 		queryKey: keys.usageSessions(),
 		queryFn: () => fresh(getUsageSessions()),
+		enabled: tab === 'sessions',
 		refetchInterval: 8000
 	}));
 	const toolCalls = createQuery(() => ({
 		queryKey: keys.usageToolCalls(),
 		queryFn: () => fresh(getUsageToolCalls()),
+		enabled: tab === 'paid',
+		refetchInterval: 8000
+	}));
+	// Per-user leaderboard — `window` folds into the key (cards + table both scope to the
+	// selected period); `keepPreviousData` keeps the prior window on screen while a new one
+	// loads, like the cards/chart above.
+	const leaderboard = createQuery(() => ({
+		queryKey: keys.usageLeaderboard(window),
+		queryFn: () => fresh(getUsageLeaderboard({ window })),
+		enabled: tab === 'leaderboard',
+		placeholderData: keepPreviousData,
 		refetchInterval: 8000
 	}));
 	const budgets = createQuery(() => ({
@@ -71,26 +115,6 @@
 	const byClass = $derived(summary.data?.byClass ?? []);
 	const byModel = $derived(summary.data?.byModel ?? []);
 
-	// Per-sub-period spend averages for the Total card. Denominator is the *actual*
-	// elapsed data range (`now - firstTs`), never the nominal window — see
-	// `$lib/spend-averages`. Fed by the same timeseries the chart uses (per-bucket
-	// totals are group-independent, so the class⇄model toggle doesn't move them).
-	const averages = $derived(
-		buildSpendAverages({
-			total,
-			firstTs: summary.data?.firstTs ?? null,
-			now: summary.data?.now ?? Date.now(),
-			series: timeseries.data?.series ?? [],
-			bucketMs: timeseries.data?.bucketMs ?? 3_600_000,
-			window
-		})
-	);
-	// Sub-label under the total spelling out the averaging basis.
-	const rangeNote = $derived(
-		summary.data?.firstTs == null
-			? 'no spend in window'
-			: `over ${fmtElapsed((summary.data?.now ?? Date.now()) - summary.data.firstTs)} of data`
-	);
 	const rules = $derived(
 		// Blocked first, then near, then ok; ties by fill fraction (spec §7.1 #3).
 		[...(budgets.data?.rules ?? [])].sort((a, b) => {
@@ -122,14 +146,6 @@
 		return CLASS_COLORS[group] ?? PALETTE[index % PALETTE.length];
 	}
 
-	function fmtUsd(n: number): string {
-		if (n === 0) return '$0';
-		if (n < 0.01) return '<$0.01';
-		return `$${n.toFixed(n < 1 ? 4 : 2)}`;
-	}
-	function fmtInt(n: number | null): string {
-		return n == null ? '—' : n.toLocaleString();
-	}
 	function fmtTime(ts: number | null): string {
 		return ts == null ? '—' : new Date(ts).toLocaleString();
 	}
@@ -239,17 +255,6 @@
 		}
 		return start.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 	}
-	// Elapsed actual-data range under the total — the basis for the per-period averages.
-	function fmtElapsed(ms: number): string {
-		if (ms <= 0) return '0m';
-		const mins = Math.round(ms / 60000);
-		if (mins < 60) return `${mins}m`;
-		const hrs = Math.floor(mins / 60);
-		if (hrs < 48) return `${hrs}h ${mins % 60}m`;
-		const days = ms / 86_400_000;
-		return `${days.toFixed(days < 10 ? 1 : 0)}d`;
-	}
-
 	const STATE_BADGE: Record<string, string> = {
 		ok: 'bg-emerald-500/15 text-emerald-500',
 		near: 'bg-amber-500/15 text-amber-500',
@@ -275,7 +280,7 @@
 								: 'text-muted-foreground hover:text-foreground'
 						)}
 						title={w.utc ? UTC_HINT : undefined}
-						onclick={() => (window = w.id)}
+						onclick={() => setParam('window', w.id)}
 					>
 						{w.label}{#if w.utc}<span class="ml-0.5 text-[8px] uppercase opacity-60">utc</span>{/if}
 					</button>
@@ -290,7 +295,7 @@
 								? 'bg-background font-medium text-foreground shadow-sm'
 								: 'text-muted-foreground hover:text-foreground'
 						)}
-						onclick={() => (groupBy = g as 'class' | 'model')}
+						onclick={() => setParam('group', g)}
 					>
 						by {g}
 					</button>
@@ -305,46 +310,15 @@
 		<!-- items-start so the taller Total card (it carries the averages breakdown) doesn't
 		     stretch the by-class / top-models cards into a column of empty space. -->
 		<div class="grid grid-cols-1 items-start gap-3 md:grid-cols-3">
-			<div class="rounded-lg border p-3">
-				<div class="text-xs text-muted-foreground">Total spend</div>
-				<div class="mt-1 font-mono text-2xl font-semibold">{fmtUsd(total)}</div>
-				<div class="mt-0.5 text-[10px] text-muted-foreground" title="averages divide by this elapsed range, not the nominal window">
-					{rangeNote}
-				</div>
-				<!-- Sub-period averages (spec §7.1 cards): how much per hour/day/week, with the
-				     min/max/σ spread across full periods. Denominator = actual elapsed data range. -->
-				{#if averages.stats.length}
-					<div class="mt-2 border-t pt-2">
-						<table class="w-full text-[11px]">
-							<thead>
-								<tr class="text-[9px] uppercase tracking-wide text-muted-foreground">
-									<th class="text-left font-medium"></th>
-									<th class="pl-2 text-right font-medium">avg</th>
-									<th class="pl-2 text-right font-medium">min</th>
-									<th class="pl-2 text-right font-medium">max</th>
-									<th class="pl-2 text-right font-medium">σ</th>
-									<th class="pl-2 text-right font-medium" title="full periods the spread is over">n</th>
-								</tr>
-							</thead>
-							<tbody class="font-mono tabular-nums">
-								{#each averages.stats as s (s.label)}
-									<tr>
-										<td class="py-0.5 pr-2 text-left text-muted-foreground">{s.label}</td>
-										<td class="py-0.5 pl-2 text-right font-semibold text-foreground">{fmtUsd(s.avg)}</td>
-										<td class="py-0.5 pl-2 text-right">{s.min == null ? '—' : fmtUsd(s.min)}</td>
-										<td class="py-0.5 pl-2 text-right">{s.max == null ? '—' : fmtUsd(s.max)}</td>
-										<td class="py-0.5 pl-2 text-right">{s.stdev == null ? '—' : fmtUsd(s.stdev)}</td>
-										<td class="py-0.5 pl-2 text-right text-muted-foreground">{s.n}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-						<div class="mt-1 text-[9px] leading-tight text-muted-foreground">
-							avg = spend ÷ elapsed periods over the actual data range; min/max/σ across full periods
-						</div>
-					</div>
-				{/if}
-			</div>
+			<SpendSummaryCard
+				label="Total spend"
+				total={total}
+				firstTs={summary.data?.firstTs ?? null}
+				now={summary.data?.now ?? Date.now()}
+				series={timeseries.data?.series ?? []}
+				bucketMs={timeseries.data?.bucketMs ?? 3_600_000}
+				windowId={window}
+			/>
 			<div class="rounded-lg border p-3">
 				<div class="text-xs text-muted-foreground">By class</div>
 				<div class="mt-1 space-y-1">
@@ -577,11 +551,29 @@
 			{/if}
 		</section>
 
-		<!-- 5. Recent sessions -->
+		<!-- 5. Detail tabs — Recent sessions / Recent paid calls / User leaderboard. Limits stays
+		     above as its own always-visible section; these three switch via ?tab=. -->
 		<section>
-			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-				Recent sessions
-			</h2>
+			<div class="mb-3 border-b">
+				<nav class="-mb-px flex flex-wrap gap-4 text-sm" aria-label="Usage detail">
+					{#each TABS as t (t.id)}
+						<button
+							class={cn(
+								'border-b-2 px-0.5 py-2 transition-colors',
+								tab === t.id
+									? 'border-foreground font-medium text-foreground'
+									: 'border-transparent text-muted-foreground hover:text-foreground'
+							)}
+							aria-current={tab === t.id ? 'page' : undefined}
+							onclick={() => setParam('tab', t.id)}
+						>
+							{t.label}
+						</button>
+					{/each}
+				</nav>
+			</div>
+
+			{#if tab === 'sessions'}
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
@@ -636,13 +628,8 @@
 					</tbody>
 				</table>
 			</div>
-		</section>
-
-		<!-- 6. Recent paid tool/caption/embedding calls -->
-		<section>
-			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-				Recent paid calls
-			</h2>
+			{:else if tab === 'paid'}
+			<!-- Recent paid tool/caption/embedding calls -->
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
@@ -683,6 +670,90 @@
 					</tbody>
 				</table>
 			</div>
+			{:else if tab === 'leaderboard'}
+				{@const lb = leaderboard.data}
+				{#if !lb}
+					<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+						Loading…
+					</div>
+				{:else if lb.users.length === 0}
+					<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+						No user-attributable spend in this window. Background (caption / embedding) and
+						self-initiated spend isn’t tied to a user.
+					</div>
+				{:else}
+					<!-- Top-10 user cards: the per-user equivalent of the Total-spend card. auto-fill
+					     grid so they wrap to fit the viewport rather than each hogging a full row. -->
+					<div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(17rem,1fr))]">
+						{#each lb.users as u, i (u.senderId)}
+							<SpendSummaryCard
+								label={u.displayName ?? u.senderId}
+								titleAttr={u.senderId}
+								total={u.total}
+								firstTs={u.firstTs}
+								now={lb.now}
+								series={u.series}
+								bucketMs={lb.bucketMs}
+								windowId={window}
+								rank={i + 1}
+								shareOfTotal={lb.grandTotal > 0 ? u.total / lb.grandTotal : null}
+								events={u.events}
+								sessions={u.sessions}
+							/>
+						{/each}
+					</div>
+
+					<!-- Leaderboard table: the same users with precise figures + active range. -->
+					<div class="mt-4 overflow-x-auto">
+						<table class="w-full text-sm">
+							<thead class="text-left text-xs text-muted-foreground">
+								<tr class="border-b">
+									<th class="py-1 pr-3 text-right font-medium">#</th>
+									<th class="py-1 pr-3 font-medium">user</th>
+									<th class="py-1 pr-3 text-right font-medium">spend</th>
+									<th
+										class="py-1 pr-3 text-right font-medium"
+										title="share of total spend in this window"
+									>
+										share
+									</th>
+									<th class="py-1 pr-3 text-right font-medium">events</th>
+									<th class="py-1 pr-3 text-right font-medium">sessions</th>
+									<th class="py-1 pr-3 font-medium">first seen</th>
+									<th class="py-1 font-medium">last seen</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each lb.users as u, i (u.senderId)}
+									<tr class="border-b border-border/50">
+										<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
+											{i + 1}
+										</td>
+										<td class="max-w-[20rem] truncate py-1 pr-3" title={u.senderId}>
+											{u.displayName ?? u.senderId}
+										</td>
+										<td class="py-1 pr-3 text-right font-mono text-[11px] font-semibold">
+											{fmtUsd(u.total)}
+										</td>
+										<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
+											{lb.grandTotal > 0 ? fmtPct(u.total / lb.grandTotal) : '—'}
+										</td>
+										<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.events)}</td>
+										<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.sessions)}</td>
+										<td class="py-1 pr-3 text-[10px] text-muted-foreground">{fmtTime(u.firstTs)}</td>
+										<td class="py-1 text-[10px] text-muted-foreground">{fmtTime(u.lastTs)}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						<div class="mt-1.5 text-[10px] text-muted-foreground">
+							Top users by spend over the selected window, attributed by trigger sender.
+							Background (caption / embedding) and self-initiated spend has no user and is
+							excluded, so per-user shares sum to ≤ 100% of total.
+						</div>
+					</div>
+				{/if}
+			{/if}
 		</section>
 	</div>
 </div>

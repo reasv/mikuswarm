@@ -6,6 +6,7 @@ import {
 	UsageTimeseries,
 	UsageSessions,
 	UsageToolCalls,
+	UsageLeaderboard,
 	UsageBudgets
 } from '$lib/schemas';
 
@@ -42,6 +43,11 @@ export const getUsageSessions = query(() => apiGet('/api/usage/sessions?limit=50
 /** GET /api/usage/tool-calls — recent paid tool/caption/embedding events. */
 export const getUsageToolCalls = query(() =>
 	apiGet('/api/usage/tool-calls?limit=50', UsageToolCalls)
+);
+
+/** GET /api/usage/leaderboard?window= — top users by spend (per-user equivalent of the Total card). */
+export const getUsageLeaderboard = query(WindowArg, (arg) =>
+	apiGet(`/api/usage/leaderboard?window=${encodeURIComponent(arg.window)}`, UsageLeaderboard)
 );
 
 /** GET /api/usage/budgets — every configured rule's live status. */

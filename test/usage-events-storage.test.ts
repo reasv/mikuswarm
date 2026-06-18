@@ -727,3 +727,101 @@ test("getUsageRecentSessions: tool rollup join — toolCost/toolCalls, no-tool s
     storage.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// getUsageLeaderboard: per-user spend ranking — the per-user equivalent of the
+// Total-spend card (§7.1 leaderboard tab). Attribution is by trigger_sender_id;
+// null-sender (background / self-initiated) spend is EXCLUDED from the users but
+// still counted in grandTotal (so per-user shares sum to <= 100%). Display name
+// resolves to the most-recent NON-null agent_sessions name for the sender; each
+// user carries its per-bucket series for the card's sub-period averaging.
+// ---------------------------------------------------------------------------
+
+test("getUsageLeaderboard: ranks by spend, resolves latest name, excludes null-sender, buckets series", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Sessions exist ONLY to resolve display names. Alice has three: the most-recent
+    // carries a NULL name (must be skipped by the `is not null` filter), so the latest
+    // NON-null name ("Alice Cooper", updated 9000) wins over the older "Alice" (5000).
+    // Bob has one. Carol has NONE → her display name resolves to null.
+    await storage.insertAgentSession(
+      session({ id: "s-alice-old", triggerExternalId: "$a-old", triggerSenderId: "@alice:x", triggerSenderDisplayName: "Alice", updatedAt: 5_000 }),
+    );
+    await storage.insertAgentSession(
+      session({ id: "s-alice-new", triggerExternalId: "$a-new", triggerSenderId: "@alice:x", triggerSenderDisplayName: "Alice Cooper", updatedAt: 9_000 }),
+    );
+    await storage.insertAgentSession(
+      session({ id: "s-alice-null", triggerExternalId: "$a-null", triggerSenderId: "@alice:x", triggerSenderDisplayName: null, updatedAt: 9_999 }),
+    );
+    await storage.insertAgentSession(
+      session({ id: "s-bob", triggerExternalId: "$b", triggerSenderId: "@bob:x", triggerSenderDisplayName: "Bob", updatedAt: 6_000 }),
+    );
+
+    // Ledger. bucketMs = 1000 below, so `ts/1000` floors to the bucket start.
+    // Alice: 3 events across TWO sessions (distinct-session count = 2), total 6;
+    //   bucket 1000 → 3, bucket 2000 → 2 + 1 = 3.
+    await storage.insertUsageEvent({ ts: 1_000, class: "agent_loop", agentSessionId: "s-alice-new", triggerSenderId: "@alice:x", modelId: "opus", costUsd: 3 });
+    await storage.insertUsageEvent({ ts: 2_000, class: "tool", toolName: "x_search", agentSessionId: "s-alice-old", triggerSenderId: "@alice:x", modelId: "xs", costUsd: 2 });
+    await storage.insertUsageEvent({ ts: 2_000, class: "agent_loop", agentSessionId: "s-alice-new", triggerSenderId: "@alice:x", modelId: "opus", costUsd: 1 });
+    // Bob: 1 event, total 4; bucket 3000 → 4.
+    await storage.insertUsageEvent({ ts: 3_000, class: "agent_loop", agentSessionId: "s-bob", triggerSenderId: "@bob:x", modelId: "opus", costUsd: 4 });
+    // Carol: 1 event, total 0.1, but NO agent_sessions row → displayName null.
+    await storage.insertUsageEvent({ ts: 500, class: "agent_loop", agentSessionId: "s-carol", triggerSenderId: "@carol:x", modelId: "opus", costUsd: 0.1 });
+    // Null-sender background spend: excluded from users, counted in grandTotal.
+    await storage.insertUsageEvent({ ts: 1_500, class: "caption", modelId: "flash", costUsd: 0.5 });
+    await storage.insertUsageEvent({ ts: 1_600, class: "embedding", modelId: "emb", costUsd: 0.25 });
+    await storage.waitForIdle();
+
+    const lb = storage.getUsageLeaderboard(0, 10_000, 1_000, 10);
+
+    // Envelope: echoes now/bucketMs; grandTotal counts EVERY event (incl. null-sender).
+    assert.equal(lb.now, 10_000);
+    assert.equal(lb.bucketMs, 1_000);
+    assert.ok(Math.abs(lb.grandTotal - 10.85) < 1e-9, "grandTotal = 6 + 4 + 0.1 + 0.5 + 0.25");
+
+    // Three attributable users, ranked by spend desc; null-sender rows are NOT users.
+    assert.deepEqual(
+      lb.users.map((u) => u.senderId),
+      ["@alice:x", "@bob:x", "@carol:x"],
+    );
+
+    const [alice, bob, carol] = lb.users;
+    // Alice: latest NON-null name wins; totals/counts; distinct-session count = 2.
+    assert.equal(alice!.displayName, "Alice Cooper");
+    assert.ok(Math.abs(alice!.total - 6) < 1e-9);
+    assert.equal(alice!.events, 3);
+    assert.equal(alice!.sessions, 2, "distinct agent_session_id across her ledger rows");
+    assert.equal(alice!.firstTs, 1_000);
+    assert.equal(alice!.lastTs, 2_000);
+    // Per-bucket series (ascending); the two ts=2000 rows fold: 1000→3, 2000→(2+1)=3.
+    assert.deepEqual(alice!.series, [
+      { bucket: 1_000, cost: 3 },
+      { bucket: 2_000, cost: 3 },
+    ]);
+
+    // Bob: single session/event.
+    assert.equal(bob!.displayName, "Bob");
+    assert.equal(bob!.total, 4);
+    assert.equal(bob!.events, 1);
+    assert.equal(bob!.sessions, 1);
+    assert.deepEqual(bob!.series, [{ bucket: 3_000, cost: 4 }]);
+
+    // Carol: a spender with no session row resolves to a null display name.
+    assert.equal(carol!.displayName, null);
+    assert.ok(Math.abs(carol!.total - 0.1) < 1e-9);
+
+    // limit is honored: top-1 is the highest spender only, grandTotal unaffected.
+    const top1 = storage.getUsageLeaderboard(0, 10_000, 1_000, 1);
+    assert.equal(top1.users.length, 1);
+    assert.equal(top1.users[0]?.senderId, "@alice:x");
+    assert.ok(Math.abs(top1.grandTotal - 10.85) < 1e-9, "grandTotal is independent of the limit");
+
+    // A window starting after every event → no users, grandTotal 0.
+    const empty = storage.getUsageLeaderboard(50_000, 60_000, 1_000, 10);
+    assert.equal(empty.users.length, 0);
+    assert.equal(empty.grandTotal, 0);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});

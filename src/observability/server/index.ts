@@ -22,6 +22,7 @@ import {
   usageTimeseries,
   usageSessions,
   usageToolCalls,
+  usageLeaderboard,
   usageBudgets,
 } from "./handlers.js";
 import {
@@ -92,6 +93,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/usage/timeseries", usageTimeseries)
     .add("GET", "/api/usage/sessions", usageSessions)
     .add("GET", "/api/usage/tool-calls", usageToolCalls)
+    .add("GET", "/api/usage/leaderboard", usageLeaderboard)
     .add("GET", "/api/usage/budgets", usageBudgets)
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)

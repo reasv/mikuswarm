@@ -266,6 +266,18 @@ export function usageToolCalls(_req: IncomingMessage, res: ServerResponse, ctx: 
   sendJson(res, 200, { toolCalls: ctx.deps.storage.getUsageRecentToolCalls(limit) });
 }
 
+/** GET /api/usage/leaderboard?window=&limit= — top users by spend with per-user averages (§7.1 leaderboard). */
+export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const window = ctx.url.searchParams.get("window");
+  const now = Date.now();
+  const since = windowSince(window, now);
+  // Same bucket granularity as the timeseries so each user's sub-period averages re-bin
+  // identically to the Total card's.
+  const bucketMs = window === "24h" || window === "today" || window === null ? 3_600_000 : 86_400_000;
+  const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 10, 1), 50);
+  sendJson(res, 200, ctx.deps.storage.getUsageLeaderboard(since, now, bucketMs, limit));
+}
+
 /** GET /api/usage/budgets — every configured rule's live status (§6.2 / §7.1 #3). */
 export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];

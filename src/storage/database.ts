@@ -931,6 +931,43 @@ export interface UsageSessionRow {
   toolCalls: number;
 }
 
+/** One per-bucket spend point for a single leaderboard user (§7.1 leaderboard cards). */
+export interface UsageLeaderboardSeriesPoint {
+  bucket: number;
+  cost: number;
+}
+
+/**
+ * One leaderboard user — the per-user equivalent of the console's Total-spend card
+ * (§7.1 leaderboard tab). `series` carries this user's per-bucket totals (same
+ * `bucketMs` as the page chart) so the card can reuse the sub-period averaging.
+ */
+export interface UsageLeaderboardUser {
+  senderId: string;
+  displayName: string | null;
+  total: number;
+  events: number;
+  sessions: number;
+  firstTs: number;
+  lastTs: number;
+  series: UsageLeaderboardSeriesPoint[];
+}
+
+/** Per-user spend leaderboard over a window (§7.1 leaderboard tab). */
+export interface UsageLeaderboard {
+  /** Server `now` (ms) the window was computed against — each card's average denominator upper bound. */
+  now: number;
+  /** Bucket width (ms) of every user's `series` — hourly for ≤24h windows, daily otherwise. */
+  bucketMs: number;
+  /**
+   * Grand total over EVERY event in the window, including non-attributable
+   * (null-sender) spend. The denominator for each user's share-of-total, matching the
+   * Total-spend card; per-user shares therefore sum to ≤ 100%.
+   */
+  grandTotal: number;
+  users: UsageLeaderboardUser[];
+}
+
 /**
  * One row per timeline for the observability console's room list (spec §8,
  * `GET /api/rooms`). Aggregated from `timeline_events` with correlated counts;
@@ -3159,6 +3196,91 @@ export class Storage {
              order by ts desc limit ?`,
         )
         .all(limit) as UsageEventRow[];
+    });
+  }
+
+  /**
+   * Top-`limit` users by spend over `[since, now)` (spec §7.1 leaderboard tab) — the
+   * per-user equivalent of the Total-spend card. Attribution is by `trigger_sender_id`;
+   * background (caption/embedding) and self-initiated (proactive) events carry a null
+   * sender and are **excluded** here (so the per-user totals sum to ≤ `grandTotal`,
+   * which still counts them). Each user carries its per-bucket `series` so the console
+   * can reuse the sub-period averaging it runs for the Total card.
+   */
+  getUsageLeaderboard(since: number, now: number, bucketMs: number, limit: number): UsageLeaderboard {
+    return this.read((db) => {
+      // Top-N senders by spend, with counts and the active range. The display name lives
+      // on `agent_sessions` (the ledger only stores the id), so resolve it with a
+      // correlated subquery that runs ONLY over the already-limited N rows (the CTE
+      // bounds the scan before the per-row lookup) and picks each sender's most-recent
+      // non-null name.
+      const users = db
+        .prepare(
+          `with top as (
+             select trigger_sender_id as senderId,
+                    coalesce(sum(cost_usd), 0) as total,
+                    count(*) as events,
+                    count(distinct agent_session_id) as sessions,
+                    min(ts) as firstTs,
+                    max(ts) as lastTs
+               from usage_events
+              where ts >= ? and trigger_sender_id is not null
+              group by trigger_sender_id
+              order by total desc
+              limit ?
+           )
+           select top.senderId, top.total, top.events, top.sessions, top.firstTs, top.lastTs,
+                  (select s.trigger_sender_display_name
+                     from agent_sessions s
+                    where s.trigger_sender_id = top.senderId
+                      and s.trigger_sender_display_name is not null
+                    order by coalesce(s.completed_at, s.updated_at) desc
+                    limit 1) as displayName
+             from top
+            order by top.total desc`,
+        )
+        .all(since, limit) as Array<Omit<UsageLeaderboardUser, "series">>;
+
+      // Grand total over EVERY event in the window (incl. non-attributable) — the share
+      // denominator, matching the Total-spend card.
+      const grandTotal = (
+        db.prepare(`select coalesce(sum(cost_usd), 0) as t from usage_events where ts >= ?`).get(since) as {
+          t: number;
+        }
+      ).t;
+
+      // Per-(sender, bucket) spend for just the top-N, feeding each card's sub-period
+      // averages (`buildSpendAverages` re-bins these). One grouped pass over the window,
+      // restricted to the surfaced senders. `cast(... as integer)` forces an integer
+      // FLOOR (a bound numeric `?` makes `ts / ?` float in SQLite), matching getUsageTimeseries.
+      const seriesBySender = new Map<string, UsageLeaderboardSeriesPoint[]>();
+      if (users.length > 0) {
+        const ids = users.map((u) => u.senderId);
+        const placeholders = ids.map(() => "?").join(", ");
+        const rows = db
+          .prepare(
+            `select trigger_sender_id as senderId,
+                    cast(ts / ? as integer) * ? as bucket,
+                    coalesce(sum(cost_usd), 0) as cost
+               from usage_events
+              where ts >= ? and trigger_sender_id in (${placeholders})
+              group by senderId, bucket
+              order by bucket asc`,
+          )
+          .all(bucketMs, bucketMs, since, ...ids) as Array<{ senderId: string; bucket: number; cost: number }>;
+        for (const r of rows) {
+          const list = seriesBySender.get(r.senderId) ?? [];
+          list.push({ bucket: r.bucket, cost: r.cost });
+          seriesBySender.set(r.senderId, list);
+        }
+      }
+
+      return {
+        now,
+        bucketMs,
+        grandTotal,
+        users: users.map((u) => ({ ...u, series: seriesBySender.get(u.senderId) ?? [] })),
+      };
     });
   }
 

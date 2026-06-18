@@ -36,5 +36,7 @@ export const keys = {
 		['usage', 'timeseries', window, groupBy] as const,
 	usageSessions: () => ['usage', 'sessions'] as const,
 	usageToolCalls: () => ['usage', 'tool-calls'] as const,
+	// `window` folds into the key so changing it refetches the leaderboard (cards + table).
+	usageLeaderboard: (window: string) => ['usage', 'leaderboard', window] as const,
 	usageBudgets: () => ['usage', 'budgets'] as const
 };

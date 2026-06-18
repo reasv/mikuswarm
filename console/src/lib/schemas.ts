@@ -615,3 +615,32 @@ export const RuleStatus = Schema.Struct({
 export type RuleStatus = Schema.Schema.Type<typeof RuleStatus>;
 export const UsageBudgets = Schema.Struct({ rules: Schema.Array(RuleStatus) });
 export type UsageBudgets = Schema.Schema.Type<typeof UsageBudgets>;
+
+/** One per-bucket point feeding a leaderboard user's sub-period averages (§7.1 leaderboard). */
+export const UsageLeaderboardSeriesPoint = Schema.Struct({
+	bucket: Schema.Number,
+	cost: Schema.Number
+});
+
+/** One leaderboard user — the per-user equivalent of the Total-spend card (§7.1 leaderboard). */
+export const UsageLeaderboardUser = Schema.Struct({
+	senderId: Schema.String,
+	displayName: Schema.NullOr(Schema.String),
+	total: Schema.Number,
+	events: Schema.Number,
+	sessions: Schema.Number,
+	firstTs: Schema.Number,
+	lastTs: Schema.Number,
+	series: Schema.Array(UsageLeaderboardSeriesPoint)
+});
+
+/** GET /api/usage/leaderboard — top users by spend over a window, each with its averaging series. */
+export const UsageLeaderboard = Schema.Struct({
+	now: Schema.Number,
+	bucketMs: Schema.Number,
+	// Grand total over EVERY event in the window (incl. non-attributable) — the share
+	// denominator, so per-user shares sum to ≤ 100%.
+	grandTotal: Schema.Number,
+	users: Schema.Array(UsageLeaderboardUser)
+});
+export type UsageLeaderboard = Schema.Schema.Type<typeof UsageLeaderboard>;
