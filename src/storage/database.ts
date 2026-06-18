@@ -132,6 +132,13 @@ export interface MediaAssetRow {
   caption_total_tokens?: number | null;
   caption_cost?: number | null;
   download_status: string;
+  /**
+   * Channel (timeline_key) the captioned asset belongs to. NOT a `media_assets`
+   * column — join-populated by {@link Storage.claimPendingCaptions} (via
+   * `event_id → timeline_events`) so the caption worker can attribute its ledger
+   * row to a room. Undefined on rows read by paths that don't perform that join.
+   */
+  timeline_key?: string | null;
   download_error?: string | null;
   created_at: number;
   /** Last-mutated wall clock (bumped on every caption write); seeded to created_at. */
@@ -2694,7 +2701,7 @@ export class Storage {
   claimPendingCaptions(limit: number, captionAll: boolean, captionAssistantMessages = false): Promise<MediaAssetRow[]> {
     return this.write((db) => {
       const rows = db.prepare(
-        `select ma.* from media_assets ma
+        `select ma.*, te.timeline_key as timeline_key from media_assets ma
          join timeline_events te on ma.event_id = te.id
          where ma.caption_status = 'pending'
            and ma.download_status = 'complete'
@@ -5284,16 +5291,22 @@ export class Storage {
    * Persist the session-level usage aggregate (spec TOKEN-USAGE-TRACKING §4.2).
    * Enqueued once per committed request via `attachSessionCapture`'s tracker
    * subscription — sessions make single-digit-to-low-tens of requests, so one
-   * write per commit is negligible (no debounce needed). Touches ONLY the
-   * usage columns + `updated_at`; the large immutable snapshot/transcript
-   * columns are untouched. `contextTokens` may be null (no request committed
-   * yet) and is written through as such.
+   * write per commit is negligible (no debounce needed). Touches the usage
+   * columns, `model_id` (the actually-billed model, via `coalesce` so a null
+   * arg never clobbers a recorded model), + `updated_at`; the large immutable
+   * snapshot/transcript columns are untouched. `contextTokens` may be null (no
+   * request committed yet) and is written through as such.
    */
-  updateAgentSessionUsage(id: string, totals: SessionUsageTotals): Promise<void> {
+  updateAgentSessionUsage(
+    id: string,
+    totals: SessionUsageTotals,
+    modelId?: string | null,
+  ): Promise<void> {
     return this.write((db) => {
       const result = db
         .prepare(
           `update agent_sessions set
+            model_id = coalesce(@modelId, model_id),
             llm_requests = @llmRequests,
             usage_input_tokens = @inputTokens,
             usage_output_tokens = @outputTokens,
@@ -5306,6 +5319,7 @@ export class Storage {
         )
         .run({
           id,
+          modelId: modelId ?? null,
           llmRequests: totals.llmRequests,
           inputTokens: totals.inputTokens,
           outputTokens: totals.outputTokens,
@@ -6852,7 +6866,7 @@ ${REACTIONS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 27;
+export const LATEST_SCHEMA_VERSION = 28;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -7612,6 +7626,130 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     };
     if (!hasColumn("agent_sessions", "chat_upper_bound_ts")) {
       db.exec(`alter table agent_sessions add column chat_upper_bound_ts integer;`);
+    }
+  },
+  // index 27 (v27 -> v28): repair usage attribution that earlier code left blank
+  // (spec USAGE-COST-LIMITS §3 — a data-integrity backfill, no schema change).
+  // Three latent gaps are healed, all best-effort & idempotent (a fresh DB has
+  // nothing to match, so every step is a no-op there):
+  //
+  //   1. `agent_sessions.model_id` was only ever written at placeholder insert,
+  //      and the default/proactive launch path passed none — so those rows carried
+  //      a NULL model despite real cost. The model is recovered in priority order:
+  //        a. the session's own non-'unknown' agent_loop `usage_events` row (the
+  //           authoritative billed model — present for recent / post-fix sessions);
+  //        b. failing that, the GLM-cutover heuristic the maintainer confirmed —
+  //           any agent (non-caption/image) session BEFORE the first GLM-5.2 use
+  //           ran GLM-5.1, at/after ran GLM-5.2. Worker sessions (diary/summarize/
+  //           condense) already store their model and are untouched by (b).
+  //   2. The v25 backfill stamped those NULL session models into the synthetic
+  //      `usage_bf_*` agent_loop ledger rows as the literal 'unknown' with a NULL
+  //      provider. Now that the sessions are repaired, propagate the real model +
+  //      provider ('together' for the together-dialect GLM ids) into those rows.
+  //   3. The v25 caption backfill (`usage_capbf_*`) left provider + timeline_key
+  //      NULL. Recover both from the source asset (the row id embeds the asset id;
+  //      channel via event_id → timeline_events; provider = 'openrouter', the
+  //      captioning upstream). Rebuilt by delete + reinsert from media_assets.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
+    if (!hasTable("agent_sessions") || !hasTable("usage_events")) return;
+
+    // Cutover = the earliest reliable GLM-5.2 signal in THIS db (self-calibrating,
+    // never a hardcoded date). Absent ⇒ GLM-5.2 was never used ⇒ every null-model
+    // session predates it and falls to GLM-5.1.
+    const t2 = db
+      .prepare(
+        `select min(t) as t from (
+           select min(started_at) as t from agent_sessions where model_id like '%GLM-5.2%'
+           union all
+           select min(ts) as t from usage_events where model_id like '%GLM-5.2%')`,
+      )
+      .get() as { t: number | null } | undefined;
+    const cutover = t2 && t2.t != null ? Number(t2.t) : Number.MAX_SAFE_INTEGER;
+
+    // GLM-5.1 / GLM-5.2 literal ids, derived from the data (not hardcoded): the
+    // dominant pre-cutover real agent model is GLM-5.1; the 5.2 id is whatever the
+    // cutover probe matched. Either may be absent on a minimal fixture.
+    const glm51row = db
+      .prepare(
+        `select model_id as m from usage_events
+          where class='agent_loop' and model_id<>'unknown' and ts < ?
+          group by model_id order by count(*) desc limit 1`,
+      )
+      .get(cutover) as { m: string } | undefined;
+    const glm52row = db
+      .prepare(`select model_id as m from usage_events where model_id like '%GLM-5.2%' limit 1`)
+      .get() as { m: string } | undefined;
+    const glm51 = glm51row?.m ?? null;
+    const glm52 = glm52row?.m ?? null;
+
+    // 1a. Recover model from the session's own authoritative ledger row.
+    db.prepare(
+      `update agent_sessions
+          set model_id = (
+            select u.model_id from usage_events u
+             where u.agent_session_id = agent_sessions.id
+               and u.class='agent_loop' and u.model_id<>'unknown'
+             order by u.ts desc limit 1)
+        where (model_id is null or model_id='unknown')
+          and exists (select 1 from usage_events u
+                       where u.agent_session_id = agent_sessions.id
+                         and u.class='agent_loop' and u.model_id<>'unknown')`,
+    ).run();
+
+    // 1b. GLM-cutover fallback for sessions still null with no ledger row to learn
+    //     from — restricted to sessions that ACTUALLY ran a model (have usage). A
+    //     usage-less session (died before its first request) never billed a model,
+    //     so it legitimately stays null rather than being attributed a guess.
+    if (glm51 || glm52) {
+      db.prepare(
+        `update agent_sessions
+            set model_id = case when coalesce(started_at, created_at) < @cutover
+                                then @glm51 else @glm52 end
+          where (model_id is null or model_id='unknown')
+            and (usage_cost is not null or usage_input_tokens is not null
+                 or coalesce(llm_requests, 0) > 0)`,
+      ).run({ cutover, glm51: glm51 ?? glm52, glm52: glm52 ?? glm51 });
+    }
+
+    // 2. Propagate the repaired model + provider into the synthetic agent_loop
+    //    ledger rows (the v25 'usage_bf_*' backfill). Provider is 'together' for
+    //    the together-dialect GLM ids; any other id keeps its existing value.
+    db.prepare(
+      `update usage_events
+          set model_id = coalesce(
+                (select s.model_id from agent_sessions s where s.id = usage_events.agent_session_id),
+                model_id),
+              provider = case
+                when (select s.model_id from agent_sessions s
+                       where s.id = usage_events.agent_session_id) like 'together.%'
+                then 'together' else provider end
+        where id like 'usage_bf_%' and class='agent_loop'`,
+    ).run();
+
+    // 3. Rebuild caption ledger rows with provider + channel. Delete the v25
+    //    'usage_capbf_*' rows and re-derive from the source assets (the row id
+    //    embeds the asset id; only backfill rows are touched — live nanoid rows
+    //    written by the post-fix caption worker already carry both fields).
+    if (hasTable("media_assets") && hasTable("timeline_events")) {
+      const cols = db.pragma(`table_info(media_assets)`) as Array<{ name: string }>;
+      if (cols.some((c) => c.name === "caption_cost")) {
+        db.prepare(`delete from usage_events where class='caption' and id like 'usage_capbf_%'`).run();
+        db.prepare(
+          `insert into usage_events (
+             id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
+             tool_name, model_id, provider, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, images, cost_usd, ref, created_at)
+           select
+             'usage_capbf_' || m.id, coalesce(m.updated_at, m.created_at), 'caption', null, null,
+             te.timeline_key, null, null, coalesce(m.caption_model, 'unknown'), 'openrouter',
+             m.caption_input_tokens, m.caption_output_tokens, m.caption_cache_read_tokens, null,
+             null, coalesce(m.caption_cost, 0), null, coalesce(m.updated_at, m.created_at)
+           from media_assets m left join timeline_events te on te.id = m.event_id
+           where m.caption_status='complete' and m.caption_cost is not null`,
+        ).run();
+      }
     }
   },
 ];

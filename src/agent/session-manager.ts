@@ -91,7 +91,11 @@ export class SessionManager {
    */
   constructor(private readonly deps: { storage?: Storage; logger?: Logger } = {}) {}
 
-  createPlaceholder(trigger: InboundChatEvent, sessionType: string = "default"): AgentSessionRecord {
+  createPlaceholder(
+    trigger: InboundChatEvent,
+    sessionType: string = "default",
+    modelId?: string | null,
+  ): AgentSessionRecord {
     const record: AgentSessionRecord = {
       id: `s-${nanoid(10)}`,
       timelineKey: trigger.timelineKey,
@@ -121,6 +125,10 @@ export class SessionManager {
         timelineKey: record.timelineKey,
         sessionType: record.sessionType,
         status: "created",
+        // Seed the model at creation (the workers do the same) so even a session
+        // that dies before its first commit carries one; the per-request
+        // write-back (updateAgentSessionUsage) keeps it authoritative thereafter.
+        modelId: modelId ?? null,
         triggerEventId: trigger.event.id,
         triggerExternalId: trigger.event.externalId,
         triggerBody: trigger.event.body?.slice(0, MAX_TRIGGER_BODY),

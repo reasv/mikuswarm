@@ -6,6 +6,8 @@ export interface CaptionModelConfig {
   id: string;
   endpoint: string;
   api_key: string;
+  /** pi-ai provider label, recorded on caption usage_events rows (accounting only). */
+  provider?: string | null;
 }
 
 export interface DescribeMediaOptions {

@@ -417,7 +417,12 @@ export function attachSessionCapture(
   // write per commit is negligible (no debounce). The write is fire-and-forget
   // on the single-writer queue; an error there is logged by the storage layer.
   const unsubscribeUsage = ctx.usage?.onUpdate((totals) => {
-    void ctx.storage.updateAgentSessionUsage(ctx.sessionId, totals);
+    // Persist the model alongside usage on every committed request (spec
+    // TOKEN-USAGE-TRACKING §4.3): `ctx.model` is the model actually billed, so
+    // the durable `agent_sessions.model_id` matches the ledger's agent_loop rows
+    // even under fallback. `coalesce` in the writer means a null here never
+    // clobbers a previously-recorded model.
+    void ctx.storage.updateAgentSessionUsage(ctx.sessionId, totals, ctx.model ?? null);
   });
 
   return {

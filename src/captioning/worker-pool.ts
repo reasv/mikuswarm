@@ -160,10 +160,15 @@ export class CaptionWorkerPool {
       clients: this.options.clients,
       workspaceRoot: this.options.workspaceRoot,
       recordUsage: record
-        ? (result) =>
+        ? (result, asset) =>
             record({
               class: "caption",
               modelId: result.model,
+              // Provider + channel attribution (parity with tool/agent_loop rows):
+              // provider from the caption client's model config; timeline_key
+              // recovered by claimPendingCaptions' event_id → timeline_events join.
+              provider: result.provider ?? null,
+              timelineKey: asset.timeline_key ?? null,
               inputTokens: result.usage?.input ?? null,
               outputTokens: result.usage?.output ?? null,
               cacheReadTokens: result.usage?.cacheRead ?? null,

@@ -458,7 +458,7 @@
 							<th class="py-1 pr-3 text-right font-medium">in</th>
 							<th class="py-1 pr-3 text-right font-medium">out</th>
 							<th class="py-1 pr-3 text-right font-medium" title="cache read">cr</th>
-							<th class="py-1 pr-3 text-right font-medium">img</th>
+							<th class="py-1 pr-3 text-right font-medium" title="generated images — image-gen tool calls only; blank for token-priced calls">img</th>
 							<th class="py-1 pr-3 text-right font-medium">cost</th>
 							<th class="py-1 font-medium">channel</th>
 						</tr>
@@ -474,7 +474,7 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.input_tokens)}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.output_tokens)}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.cache_read_tokens)}</td>
-								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.images)}</td>
+								<td class="py-1 pr-3 text-right font-mono text-[11px]">{t.images ? fmtInt(t.images) : '—'}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtUsd(t.cost_usd)}</td>
 								<td class="py-1 max-w-[12rem] truncate text-[10px]" title={t.timeline_key ?? ''}>
 									{t.timeline_key ?? '—'}

@@ -517,13 +517,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     id: captioningConfig.model?.id ?? "google/gemini-3.5-flash",
     endpoint: captioningConfig.model?.endpoint ?? config.models.default.endpoint,
     api_key: captioningConfig.model?.api_key ?? config.models.default.api_key,
+    // Accounting provenance recorded on caption usage_events rows; never inherited
+    // across a different modality model (parity with cost), only carried verbatim.
+    provider: captioningConfig.model?.provider ?? null,
   };
 
-  function resolveModalityModel(modalityConfig?: { model?: { id?: string; endpoint?: string; api_key?: string } }) {
+  function resolveModalityModel(modalityConfig?: {
+    model?: { id?: string; endpoint?: string; api_key?: string; provider?: string };
+  }) {
     return {
       id: modalityConfig?.model?.id ?? sharedModel.id,
       endpoint: modalityConfig?.model?.endpoint ?? sharedModel.endpoint,
       api_key: modalityConfig?.model?.api_key ?? sharedModel.api_key,
+      provider: modalityConfig?.model?.provider ?? sharedModel.provider,
     };
   }
 
@@ -3033,9 +3039,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // failing (or a non-reply/proactive trigger) falls through to the FRESH launch
     // below. This is the ONLY new branch — the trigger pipeline above is unchanged.
     if (!proactive && (await tryReplyResume(inbound, duplicate))) return;
-    const session = proactive
-      ? sessions.createPlaceholder(inbound, config.proactive?.session_type ?? "proactive")
-      : sessions.createPlaceholder(inbound);
+    const sessionType = proactive ? config.proactive?.session_type ?? "proactive" : "default";
+    // Seed the durable row's model at creation (resolveModelId mirrors the diary/
+    // summarize workers) so the model is present from the outset; the per-request
+    // write-back rewrites it with the actually-billed model.
+    const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType));
     sessions.markRunning(session.id);
     // Attribute the claim added at accept time to this session and release it when
     // the run settles (spec DUPLICATE-REPLY-MITIGATION §3.3). Registered before the

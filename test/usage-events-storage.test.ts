@@ -281,7 +281,7 @@ test("v24 -> v25 migration stamps LATEST and backfills the expected per-class co
 // (c) attribution-join values + (d) usage-less / uncosted exclusion
 // ---------------------------------------------------------------------------
 
-test("backfill joins session attribution onto tool rows; caption rows carry null attribution (#18)", async () => {
+test("backfill joins session attribution onto tool rows; caption rows recover channel + provider via v28 (#18)", async () => {
   const { storage, dir } = await buildAndMigrate(seedRepresentative);
   try {
     const get = (id: string): UsageEventRow =>
@@ -320,13 +320,16 @@ test("backfill joins session attribution onto tool rows; caption rows carry null
     assert.equal(loop.tool_name, null);
     assert.equal(loop.ts, 5_000); // completed_at
 
-    // (c) caption row carries NULL attribution (background work — no session).
+    // (c) caption row: session/sender attribution stays null (background work, no
+    // session), but the v28 repair recovers the channel (event_id → timeline_events)
+    // and the provider so caption spend is room-attributable.
     const caption = get("usage_capbf_ma-costed");
     assert.equal(caption.class, "caption");
     assert.equal(caption.agent_session_id, null);
     assert.equal(caption.session_type, null);
-    assert.equal(caption.timeline_key, null);
+    assert.equal(caption.timeline_key, TK);
     assert.equal(caption.trigger_sender_id, null);
+    assert.equal(caption.provider, "openrouter");
     assert.equal(caption.model_id, "google/gemini-3.5-flash");
     assert.equal(caption.input_tokens, 700);
     assert.equal(caption.cost_usd, 0.0009);

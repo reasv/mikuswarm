@@ -58,6 +58,8 @@ export interface CaptionRequest {
 export interface CaptionResponse {
   caption: string;
   model: string;
+  /** pi-ai provider label for this caption call (from config), or null when unset. */
+  provider: string | null;
   /** Provider-reported token usage (spec §6.1), or null when the gateway omits it. */
   usage: RawTokenUsage | null;
   /**
@@ -203,7 +205,7 @@ export class InferenceClient {
     const usage = result.usage;
     const cost = usage ? computeUsageCost(this.options.costRates ?? ZERO_RATES, usage).total : null;
 
-    return { caption, model: result.model, usage, cost };
+    return { caption, model: result.model, provider: this.options.model.provider ?? null, usage, cost };
   }
 }
 

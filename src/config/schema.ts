@@ -662,6 +662,12 @@ const CaptioningModelSchema = StrictObject({
   id: Type.String({ minLength: 1 }),
   endpoint: Type.String({ minLength: 1 }),
   api_key: Type.String({ minLength: 1 }),
+  // pi-ai provider label recorded on the unified ledger's caption rows so a
+  // caption's upstream is attributable like an agent-loop or tool row (spec
+  // USAGE-COST-LIMITS §3.1). Accounting provenance only — captioning drives the
+  // OAI client directly, so this does NOT affect request dialect. Unset = the
+  // ledger row's `provider` stays null.
+  provider: Type.Optional(Type.String({ minLength: 1 })),
   // USD/1M-token cost rates for auxiliary (out-of-loop) usage accounting (spec
   // AUXILIARY-USAGE-TRACKING §7.1) — identical shape to `[models.*].cost`. Token
   // usage is captured regardless; this only prices it. Resolution (app wiring):

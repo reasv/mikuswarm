@@ -15,7 +15,10 @@ export interface CaptionWorkerOptions {
    * `media_assets.caption_*` write. Detached enrichment — no session attribution.
    * Optional so tests construct a bare worker.
    */
-  recordUsage?: (result: { model: string; usage: RawTokenUsage | null; cost: number | null }) => void;
+  recordUsage?: (
+    result: { model: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
+    asset: MediaAssetRow,
+  ) => void;
 }
 
 function mimeTypeDefault(modality: MediaModality): string {
@@ -36,10 +39,10 @@ export class CaptionWorker {
    */
   private async persist(
     asset: MediaAssetRow,
-    result: { caption: string; model: string; usage: RawTokenUsage | null; cost: number | null },
+    result: { caption: string; model: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
   ): Promise<void> {
     await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
-    this.options.recordUsage?.(result);
+    this.options.recordUsage?.(result, asset);
   }
 
   async process(asset: MediaAssetRow): Promise<string> {
