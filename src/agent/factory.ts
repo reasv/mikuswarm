@@ -224,6 +224,12 @@ export interface CreateAgentOptions {
     browserNote?: string;
     /** Gap backfill budget (§9); omitted/inactive → no gap. */
     gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+    /**
+     * One-line preamble prepended to the rendered trigger (spec FOLLOWUP-FOLDING
+     * §10) — set only for a settled→resume follow-up fold, so the resumed rollout
+     * knows the appended turn arrived as a quick same-sender follow-up.
+     */
+    triggerPreamble?: string;
   };
   /**
    * Usage-tracker seed for resume-in-place (spec TOKEN-USAGE-TRACKING §4.3): the
@@ -624,6 +630,7 @@ export class AgentSessionFactory {
           tail: opts.resumeContinuation.tail,
           browserNote: opts.resumeContinuation.browserNote,
           gap: opts.resumeContinuation.gap,
+          triggerPreamble: opts.resumeContinuation.triggerPreamble,
         });
       }
     } else {

@@ -755,6 +755,14 @@ export class ContextBuilder {
      * `lowerBoundTimestamp` is the newest message the session already has.
      */
     gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+    /**
+     * One-line preamble prepended to the rendered trigger group (spec
+     * FOLLOWUP-FOLDING §10). Set only for a settled→resume follow-up fold, so the
+     * resumed rollout knows the appended turn arrived as a quick same-sender
+     * follow-up (and, for a re-`@`, that it was explicitly re-addressed). Absent for
+     * an ordinary reply-resume — the reply itself is the address.
+     */
+    triggerPreamble?: string;
   }): Promise<AgentMessage> {
     const now = options.trigger.timestamp;
 
@@ -770,7 +778,12 @@ export class ContextBuilder {
     triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
     const imageBlocks = await this.selectImageBlocks(options.trigger);
     this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
-    const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+    const renderedTrigger = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+    // A follow-up fold prepends a one-line preamble so the resumed rollout sees the
+    // appended turn as a quick same-sender follow-up (§10); a plain reply-resume has none.
+    const triggerContent = options.triggerPreamble
+      ? `${options.triggerPreamble}\n\n${renderedTrigger}`
+      : renderedTrigger;
 
     // Fresh satellite at the new (volatile) position. runtime_state always; tail
     // per toggle; retrieved_memory never (§11); the browser note rides in
@@ -1380,6 +1393,20 @@ export class ContextBuilder {
       splitMessages: opts.splitMessages,
       splitGapMs: opts.splitGapMs,
     });
+  }
+
+  /**
+   * Condition a SINGLE event's own image attachments into inference-ready
+   * {@link ImageBlock}s (spec FOLLOWUP-FOLDING §5.1). Used by the steer path for a
+   * folded **media** follow-up, which has no trigger group of its own (the fold
+   * suppresses its accept): `selectImageBlocks` falls through its trigger-group
+   * cascade to the event's own `imageAttachments`, so passing the bare event yields
+   * exactly its pixels. Empty when the model is non-multimodal, the image isn't
+   * downloaded yet, or `processImageForInference` throws — the caller then steers a
+   * caption-only interjection rather than blocking (§5.1 no-pixels branch).
+   */
+  async conditionEventImages(event: CanonicalChatEvent): Promise<ImageBlock[]> {
+    return this.selectImageBlocks(event);
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

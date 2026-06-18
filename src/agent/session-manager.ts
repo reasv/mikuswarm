@@ -23,14 +23,15 @@ const MAX_INTERJECTION_BODY = 500;
  * The inbound timeline message behind a user interjection (ARCHITECTURE.md §8/§11),
  * passed to {@link SessionManager.steer} so the inject is recorded as a searchable,
  * event-linked `session_interjections` row. `body` is the raw inbound text (the search
- * corpus); `kind` distinguishes a direct reply-steer from a co-target co-reply.
+ * corpus); `kind` distinguishes a direct reply-steer, a co-target co-reply, and a
+ * same-sender quick follow-up folded into the session (spec FOLLOWUP-FOLDING §5.1).
  */
 export interface InterjectionSource {
   eventId?: string | null;
   externalId?: string | null;
   senderId?: string | null;
   senderDisplayName?: string | null;
-  kind: "reply" | "co-reply";
+  kind: "reply" | "co-reply" | "follow-up";
   body: string;
 }
 

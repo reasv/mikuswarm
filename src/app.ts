@@ -25,6 +25,14 @@ import {
   SessionManager,
   SessionClaims,
   coTargetOwnerSteerableSoon,
+  FollowUpWatch,
+  classifyFollowUpForm,
+  followUpGateDecision,
+  followUpConfigActive,
+  maxWallClockMs,
+  type FollowUpForm,
+  type FollowUpConfig,
+  type FollowUpLeverConfig,
   SessionRunner,
   isLlmRunFailure,
   createManualResumeSession,
@@ -42,7 +50,7 @@ import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
-import { ContextBuilder, renderRichMessage } from "./context/index.js";
+import { ContextBuilder, renderRichMessage, type ImageBlock } from "./context/index.js";
 import { initTokenizers } from "./context/tokenizer/index.js";
 import { escapeAttr, escapeXml } from "./context/xml.js";
 import { hydrateEvents } from "./context/hydrate.js";
@@ -96,7 +104,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, InboundChatEvent } from "./types.js";
+import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
@@ -273,6 +281,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // live, the parked replies are re-dispatched as normal triggers (the owner's settle
   // listener / the pre-attribution catch) so they are never silently dropped.
   const pendingCoReplies = new Map<string, InboundChatEvent[]>();
+
+  // Follow-up folding (spec FOLLOWUP-FOLDING). Resolve the three levers once; the
+  // whole feature is inert unless at least one is enabled (the watch's GC lifetime
+  // is 0 → `arm` no-ops, `get` returns nothing, so `foldFollowUp` always degrades to
+  // the native path). 00-defaults.toml ships the full explicit block.
+  const resolveFollowUpLever = (
+    lever: { enabled?: boolean; user_gap_ms?: number; wall_clock_ms?: number } | undefined,
+  ): FollowUpLeverConfig => ({
+    enabled: lever?.enabled ?? false,
+    userGapMs: lever?.user_gap_ms ?? 0,
+    wallClockMs: lever?.wall_clock_ms ?? 0,
+  });
+  const followUpConfig: FollowUpConfig = {
+    media: resolveFollowUpLever(config.agent.sessions.followup?.media),
+    text: resolveFollowUpLever(config.agent.sessions.followup?.text),
+    mention: resolveFollowUpLever(config.agent.sessions.followup?.mention),
+  };
+  const followUpActive = followUpConfigActive(followUpConfig);
+  // Per-(timeline, sender) watch naming the most-recent session that sender
+  // triggered (armed at the claim-attribution seam, §4.1/§7). GC'd at the widest
+  // lever's wall_clock; inert (lifetime 0) when no lever is enabled.
+  const followUpWatch = new FollowUpWatch(followUpActive ? maxWallClockMs(followUpConfig) : 0);
+  // Follow-ups parked while their owner session is still pre-live (created / queued /
+  // attachSession→attachAgent build window, §5.2), keyed by the OWNER session id.
+  // Drained into the session the moment it goes live (`launchSession`/resume
+  // post-attachAgent), or reverted to native fate if the owner is abandoned.
+  const pendingFollowUps = new Map<string, FollowUpDelivery[]>();
   // Canonicalize once at the source. `config.workspace.root_dir` is commonly
   // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
   // means every tool downstream receives an absolute, normalized root. That
@@ -1168,6 +1203,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
   }
 
+  // Follow-up folding (spec FOLLOWUP-FOLDING §9): cross-field checks the TypeBox
+  // schema can't express. Same fail-fast convention as the resume block above.
+  {
+    const followup = config.agent.sessions.followup;
+    if (followup) {
+      for (const form of ["media", "text", "mention"] as const) {
+        const lever = followup[form];
+        if (!lever) continue;
+        const userGap = lever.user_gap_ms;
+        const wallClock = lever.wall_clock_ms;
+        // Hard rule: the wall-clock lifetime must be able to CONTAIN the user-gap it
+        // guards — the follow-up's wall-clock age at fold time is ≈ its user-perceived
+        // gap plus processing lag, so a wall_clock_ms below user_gap_ms makes the
+        // user-gap moot (the looser clock would always cut first). Refuse it.
+        if (userGap !== undefined && wallClock !== undefined && wallClock < userGap) {
+          throw new Error(
+            `agent.sessions.followup.${form}: wall_clock_ms (${wallClock}) must be >= user_gap_ms (${userGap}) — ` +
+              `the watch lifetime has to outlast the user-perceived gap it guards`,
+          );
+        }
+      }
+    }
+  }
+
   // Map a (per-room) timeline key to its account + room id and ask that account's
   // Matrix client for a human room label. Shared by the diary header and the
   // RoomLabelCache (which feeds the observability console room list). Rejects on a
@@ -1348,6 +1407,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
 
     if (steerReplyToActiveSession(inbound)) return;
+
+    // Follow-up folding (spec FOLLOWUP-FOLDING §6): a quick same-sender follow-up —
+    // forced-split media, a trailing bare-text thought, or an amending re-`@` — is
+    // folded into the session its immediately-prior triggering message produced
+    // (steer / park / resume) instead of being lost, answered half-blind, or spawned
+    // as a twin. Placed AFTER reply-steer (a reply to a running session still
+    // interjects first; the fold skips replies entirely) and BEFORE the `!trigger`
+    // return + accept, so it catches BOTH a group's non-triggering bare follow-up and
+    // a trigger-bearing one (re-`@` / DM message) whose parallel spawn it suppresses.
+    // Fully synchronous, so the accept→claim serialization invariant below is intact.
+    if (foldFollowUp(inbound)) return;
 
     // Reply-to-bot as a trigger (spec RESUMABLE-SESSIONS §5) is resolved upstream in
     // the provider's trigger hold (`resolveReplyTrigger`), so a bare reply to one of
@@ -2064,6 +2134,468 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       if (inbound.event.externalId) redispatchPendingCoReplies(inbound.event.externalId);
       return { status: "error", detail: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  // ─── Follow-up folding (spec FOLLOWUP-FOLDING) ─────────────────────────────
+  // A quick same-sender follow-up — a forced-split image, a trailing bare-text
+  // thought, or an amending re-`@` — is folded into the session its immediately-prior
+  // triggering message produced: STEERED in if it is running, PARKED if it is still
+  // building, or RESUMED if it just completed. The synchronous `foldFollowUp` fork
+  // (in `handleInbound`, after reply-steer and before the `!trigger` return / accept)
+  // makes the decision; the deliveries run async, never blocking the dispatch path.
+
+  /** One folded follow-up's unit of work: the event, its lever, and the
+   *  user-perceived gap (origin-ts diff) captured at fold time for the §10 text. */
+  interface FollowUpDelivery {
+    inbound: InboundChatEvent;
+    form: FollowUpForm;
+    gapMs: number;
+  }
+
+  /**
+   * Arm (or replace) the follow-up watch so a sender's next quick follow-up folds
+   * into `sessionId` (spec §4.1/§7). Called at the claim-attribution seam in BOTH
+   * the fresh launch and the resume runner — after the resume-vs-fresh fork resolves
+   * — so it always names the session that actually handled the trigger. Skips
+   * proactive launches (caller-guarded) and any trigger without a human external id
+   * (synthetic) — neither has a human follow-up to fold.
+   */
+  function armFollowUpWatch(inbound: InboundChatEvent, sessionId: string): void {
+    if (!followUpActive) return;
+    const senderId = inbound.event.sender.id;
+    if (!senderId || inbound.event.sender.isSelf || !inbound.event.externalId) return;
+    followUpWatch.arm(inbound.timelineKey, senderId, {
+      sessionId,
+      triggerOriginTs: inbound.event.timestamp,
+      armedAtWallClock: Date.now(),
+    });
+  }
+
+  /**
+   * The synchronous fold fork (spec §6). Returns true when the follow-up was consumed
+   * (steered / parked / resume-dispatched, or its trigger-hold twin suppressed) — the
+   * caller returns without spawning. Returns false to fall through to the normal path
+   * (native fate): a reply, a non-matching event, the RAW delivery of a trigger-bearing
+   * follow-up (folded later on its post-hold delivery), or a settled-but-unresumable
+   * owner. Fully synchronous so it preserves the accept→claim serialization invariant;
+   * the actual steer/resume work is fired as detached promises.
+   */
+  function foldFollowUp(inbound: InboundChatEvent): boolean {
+    if (!followUpActive) return false;
+    // The fold is the SAME-SENDER axis: replies keep their existing routing
+    // (reply-steer above, co-target coalescing / reply-resume downstream).
+    if (inbound.event.replyTo?.externalId) return false;
+    if (inbound.event.sender.isSelf) return false;
+    const senderId = inbound.event.sender.id;
+    if (!senderId) return false;
+    const watch = followUpWatch.get(inbound.timelineKey, senderId);
+    if (!watch) return false;
+
+    // Trigger-hold double-delivery dedup (shared with reply-steer / co-reply): a
+    // trigger-bearing follow-up reaches handleInbound twice. We fold it on its
+    // POST-HOLD delivery (which carries `inbound.trigger`, so native-fate reversion
+    // has a real trigger to re-dispatch); the earlier RAW delivery (trigger stripped)
+    // is skipped here and falls through to `!inbound.trigger → inert`. A bare GROUP
+    // follow-up has only one (raw) delivery and is never trigger-bearing.
+    const wouldTrigger =
+      resumeContextFor(inbound.timelineKey) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
+    if (wouldTrigger && !inbound.trigger) return false;
+    if (steeredEventIds.has(inbound.event.id)) return true;
+
+    const form = classifyFollowUpForm(inbound.event);
+    const passes = followUpGateDecision({
+      form,
+      config: followUpConfig,
+      triggerOriginTs: watch.triggerOriginTs,
+      followUpOriginTs: inbound.event.timestamp,
+      armedAtWallClock: watch.armedAtWallClock,
+      now: Date.now(),
+    });
+    if (!passes) return false;
+
+    const gapMs = Math.abs(inbound.event.timestamp - watch.triggerOriginTs);
+    const delivery: FollowUpDelivery = { inbound, form, gapMs };
+    const record = sessions.get(watch.sessionId);
+
+    // Belt-and-suspenders (§6 #1): if the live owner already grouped this event into
+    // its trigger turn (the 2s hold), it is turn-1 content, not a follow-up — leave it.
+    // Structurally impossible given arm-after-launch, but cheap to assert.
+    if (record?.trigger.event.trigger?.groupedEventIds?.includes(inbound.event.id)) return false;
+
+    if (record && (record.status === "created" || record.status === "running")) {
+      markSteered(inbound.event.id);
+      // Steerable iff running AND the agent is ATTACHED — the same gate
+      // `SessionManager.steer` applies (an attached agent queues a steered message
+      // even in the attachAgent→first-prompt gap, where `isAgentLive` is still false).
+      // Using attachment (not liveness) closes that gap: a follow-up landing there
+      // steers rather than parking onto an already-drained list.
+      if (record.status === "running" && sessions.getAgent(watch.sessionId)) {
+        void steerFollowUp(watch.sessionId, delivery).catch((error) => {
+          logger.error("follow_up_steer_threw", {
+            sessionId: watch.sessionId,
+            eventId: inbound.event.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      } else {
+        // created / running-but-pre-attachAgent → park; drained when it goes live.
+        parkFollowUp(watch.sessionId, delivery);
+      }
+      return true;
+    }
+
+    // Owner gone from memory → settled. Only a `completed` row is fold-resumable (§5.3
+    // / §7.2); a discarded/interrupted/failed-resumable/pruned row → native fate (this
+    // returns false, so a trigger-bearing follow-up spawns its own session and a bare
+    // group one goes inert via the `!inbound.trigger` return — no explicit revert).
+    const row = storage.getAgentSession(watch.sessionId);
+    if (row && row.status === "completed") {
+      markSteered(inbound.event.id);
+      void resumeFollowUp(delivery, watch.sessionId).catch((error) => {
+        logger.error("follow_up_resume_threw", {
+          sessionId: watch.sessionId,
+          eventId: inbound.event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Read + hydrate the follow-up's stored event so its image attachments carry
+   * `localPath`/captions (the in-memory inbound from the provider does not). Used to
+   * both condition pixels and render the interjection quote. Falls back to the raw
+   * inbound event if the row isn't stored yet (→ no pixels; caption-only steer).
+   */
+  function followUpHydratedEvent(inbound: InboundChatEvent): CanonicalChatEvent {
+    const stored = storage.getTimelineEventById(inbound.event.id);
+    const [hydrated] = hydrateEvents(storage, [stored ?? inbound.event]);
+    return hydrated;
+  }
+
+  /**
+   * Steer a folded follow-up into a live session as an `<interjection>` (spec §5.1).
+   * A **media** follow-up first waits on its enrichment DOWNLOAD (NOT captioning — the
+   * slow pool, irrelevant to pixels; the event is still captioned normally for
+   * history) and conditions its image to real blocks; on any miss it steers
+   * caption-only rather than block. If the owner settled before the inject lands, the
+   * follow-up reverts to native fate.
+   */
+  async function steerFollowUp(sessionId: string, delivery: FollowUpDelivery): Promise<void> {
+    const { inbound, form, gapMs } = delivery;
+    // For a media follow-up, wait on the DOWNLOAD (enrichment) before hydrating, so the
+    // hydrated event carries `localPath` for conditioning. `awaitEnrichmentComplete`
+    // resolves on its own timeout (never rejects). NOT captioning — the slow pool,
+    // irrelevant to pixels; the event is still captioned normally for history.
+    if (form === "media") {
+      await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    }
+    const hydrated = followUpHydratedEvent(inbound);
+    let imageBlocks: ImageBlock[] | undefined;
+    if (form === "media") {
+      try {
+        const blocks = await contextBuilder.conditionEventImages(hydrated);
+        if (blocks.length > 0) imageBlocks = blocks;
+      } catch (error) {
+        // No-pixels branch (§5.1): caption-only steer rather than block.
+        logger.warn("follow_up_image_condition_failed", {
+          sessionId,
+          eventId: inbound.event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const content = buildFollowUpInterjection(inbound, form, gapMs, hydrated);
+    const steered = sessions.steer(
+      sessionId,
+      { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) },
+      {
+        eventId: inbound.event.id,
+        externalId: inbound.event.externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "follow-up",
+        body: inbound.event.body ?? "",
+      },
+    );
+    if (!steered) {
+      // The owner settled between the fold decision and here → native fate.
+      revertFollowUpToNativeFate(inbound, "steer-not-live");
+      return;
+    }
+    retainFollowUpForSpawn(inbound, sessionId);
+    logger.info("follow_up_steered", {
+      sessionId,
+      form,
+      eventId: inbound.event.id,
+      timelineKey: inbound.timelineKey,
+      pixels: imageBlocks !== undefined,
+    });
+  }
+
+  /**
+   * Retain a steered follow-up so the session can spin it off via `spawn_session`
+   * (named in the interjection, §10) — reusing the co-reply registry so the existing
+   * tool works uniformly. Cleaned up on the session's settle (and on use), with the
+   * same already-settled race guard as `trySteerCoReply`.
+   */
+  function retainFollowUpForSpawn(inbound: InboundChatEvent, sessionId: string): void {
+    const externalId = inbound.event.externalId;
+    if (!externalId) return;
+    // A bare-GROUP follow-up has no trigger; synthesize one so `redispatchCoReply` can
+    // spin it into a real session if the agent calls spawn_session (the trigger-bearing
+    // forms already carry their post-hold trigger). Treated as a `mention` — the agent
+    // explicitly judged it a separate ask the bot should now handle on its own.
+    const spawnInbound: InboundChatEvent = inbound.trigger
+      ? inbound
+      : (() => {
+          const trigger: TriggerInfo = {
+            type: "mention",
+            reason: "follow-up spun off via spawn_session",
+            triggeredBy: inbound.event.sender,
+            groupedEventIds: [inbound.event.id],
+          };
+          return { ...inbound, trigger, event: { ...inbound.event, trigger } };
+        })();
+    coReplyInbounds.set(externalId, { inbound: spawnInbound, intoSessionId: sessionId });
+    sessions.onSettle(sessionId, () => coReplyInbounds.delete(externalId));
+    if (!sessions.get(sessionId)) coReplyInbounds.delete(externalId);
+  }
+
+  /** Park a follow-up whose owner is still pre-live (spec §5.2), keyed by owner id. */
+  function parkFollowUp(sessionId: string, delivery: FollowUpDelivery): void {
+    const parked = pendingFollowUps.get(sessionId) ?? [];
+    parked.push(delivery);
+    pendingFollowUps.set(sessionId, parked);
+    logger.info("follow_up_parked", {
+      sessionId,
+      form: delivery.form,
+      eventId: delivery.inbound.event.id,
+      timelineKey: delivery.inbound.timelineKey,
+    });
+  }
+
+  /**
+   * Steer every follow-up parked on a now-live session in (spec §5.2 — the success
+   * drain, from `launchSession`/`runResumeSession` after `attachAgent`). Consumes the
+   * parked entries; a steer that fails (owner already settling) reverts to native fate.
+   */
+  function drainPendingFollowUpsIntoSession(sessionId: string): void {
+    const parked = pendingFollowUps.get(sessionId);
+    if (!parked) return;
+    pendingFollowUps.delete(sessionId);
+    for (const delivery of parked) {
+      void steerFollowUp(sessionId, delivery).catch((error) => {
+        logger.error("follow_up_drain_steer_threw", {
+          sessionId,
+          eventId: delivery.inbound.event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
+  /**
+   * Revert every follow-up parked on an abandoned owner to native fate (spec §5.2 —
+   * the owner settled before going live: missing-target / budget / factory failure).
+   * On the success path the post-attachAgent drain consumed them, so this fires on
+   * nothing. Fired from the owner's settle listener.
+   */
+  function revertAbandonedFollowUps(sessionId: string): void {
+    const parked = pendingFollowUps.get(sessionId);
+    if (!parked) return;
+    pendingFollowUps.delete(sessionId);
+    for (const delivery of parked) revertFollowUpToNativeFate(delivery.inbound, "owner-abandoned");
+  }
+
+  /**
+   * Release a consumed follow-up to native fate (spec §5.2/§6 #3, principle: a
+   * non-trigger never starts its own session; a real trigger must never be lost). A
+   * **trigger-bearing** follow-up (re-`@`, or any DM message — `inbound.trigger`
+   * present, since we fold those on their post-hold delivery) is re-dispatched as its
+   * own trigger (reusing `redispatchCoReply`'s spawn tail, which is marker-agnostic).
+   * A **bare group** follow-up (no trigger) reverts to inert: it is already persisted
+   * as a normal timeline event, so there is nothing to do (= today, no loss).
+   */
+  function revertFollowUpToNativeFate(inbound: InboundChatEvent, reason: string): void {
+    if (inbound.trigger) {
+      logger.info("follow_up_native_redispatch", {
+        reason,
+        eventId: inbound.event.id,
+        timelineKey: inbound.timelineKey,
+      });
+      void redispatchCoReply(inbound).catch((error) => {
+        logger.error("follow_up_native_redispatch_failed", {
+          timelineKey: inbound.timelineKey,
+          eventId: inbound.event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    } else {
+      logger.info("follow_up_native_inert", {
+        reason,
+        eventId: inbound.event.id,
+        timelineKey: inbound.timelineKey,
+      });
+    }
+  }
+
+  /**
+   * Resume a just-completed session because a quick same-sender follow-up arrived
+   * (spec §5.3). Acquires a per-timeline slot without queuing (mirrors proactive — a
+   * follow-up resume must not queue behind or race a concurrent session), runs the
+   * follow-up resume gate (a SUBSET of reply-resume's: completed + non-synthetic +
+   * capability ceiling + material viable; NO work gate, NO window, same-sender is
+   * structural via the watch), performs the single-consumption CAS, and continues the
+   * rollout via the shared `runResumeSession` with the §10 follow-up preamble. Any
+   * gate/CAS/slot miss reverts to native fate. The settled→resume re-arms the watch to
+   * the resumed session inside `runResumeSession` (§7), so chains stay linear.
+   */
+  async function resumeFollowUp(delivery: FollowUpDelivery, sessionId: string): Promise<void> {
+    const { inbound, form, gapMs } = delivery;
+    const target = inbound.outboundTarget;
+    if (!target) {
+      revertFollowUpToNativeFate(inbound, "resume-no-target");
+      return;
+    }
+    // Single-flight with reply-resume: a concurrent reply to the same state sees this
+    // and degrades to FRESH (and vice-versa), so only the CAS winner runs.
+    if (resumeClaims.has(sessionId)) {
+      revertFollowUpToNativeFate(inbound, "resume-inflight");
+      return;
+    }
+    if (!triggerCoordinator.tryAcquire(inbound.timelineKey)) {
+      // No free slot (a concurrent session holds the timeline) → native fate.
+      revertFollowUpToNativeFate(inbound, "resume-no-slot");
+      return;
+    }
+    resumeClaims.add(sessionId);
+    try {
+      const verdict = await evaluateFollowUpResumeGate({
+        sessionId,
+        getSession: () => storage.getAgentSession(sessionId),
+        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        loadMaterial: (row) => loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger }),
+        timelineKey: inbound.timelineKey,
+        logger,
+      });
+      if (!verdict.resume) {
+        drainNextQueuedTrigger(inbound.timelineKey); // release the slot we acquired
+        revertFollowUpToNativeFate(inbound, "resume-gate-failed");
+        return;
+      }
+      const { row, material } = verdict;
+      // Single-consumption CAS (§5.3): completed → resuming. A racing fold/reply that
+      // already consumed this state gets `undefined` → native fate.
+      const generation = await storage.acceptResumeGeneration(sessionId);
+      if (generation === undefined) {
+        drainNextQueuedTrigger(inbound.timelineKey);
+        revertFollowUpToNativeFate(inbound, "resume-cas-lost");
+        return;
+      }
+      // Past the CAS we own the slot; `runResumeSession` releases it (its terminal
+      // drain) on every path. A throw in its pre-run setup settles before that — evict
+      // + drain so the timeline can't deadlock (mirrors `tryReplyResume`). The orphaned
+      // generation bump is harmless (the row is no longer `completed` → FRESH after).
+      try {
+        await runResumeSession({
+          inbound,
+          duplicate: false,
+          target,
+          row,
+          material,
+          generation,
+          continuation: {
+            tail: config.agent.sessions.resume?.satellite?.tail ?? true,
+            // A follow-up resume continues seconds later — there is no meaningful gap.
+            gap: undefined,
+            triggerPreamble: buildFollowUpResumePreamble(inbound, form, gapMs),
+          },
+          resumeLabel: "follow-up",
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
+        logger.error("follow_up_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
+        drainNextQueuedTrigger(inbound.timelineKey);
+      }
+    } finally {
+      resumeClaims.delete(sessionId);
+    }
+  }
+
+  /**
+   * Build the steered follow-up interjection text (spec §10), per form. The content is
+   * wrapped again by `convert.ts` in a generic `<interjection>` (same as co-reply); the
+   * image, for a media follow-up, rides as a real content block (via `imageBlocks`),
+   * not in this text. Names `spawn_session` so the agent can break it out if it judges
+   * the follow-up doesn't belong.
+   */
+  function buildFollowUpInterjection(
+    inbound: InboundChatEvent,
+    form: FollowUpForm,
+    gapMs: number,
+    hydrated: CanonicalChatEvent,
+  ): string {
+    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.id);
+    const n = Math.max(0, Math.round(gapMs / 1000));
+    const externalId = inbound.event.externalId;
+    const spawnHint = externalId
+      ? `call spawn_session(message_id="${escapeAttr(externalId)}")`
+      : `handle it separately`;
+    const rendered = renderRichMessage(hydrated);
+    if (form === "media") {
+      return (
+        `<interjection reason="follow-up-media">\n` +
+        `${senderName} sent this ${n}s after the message you're handling, without addressing you again. ` +
+        `Matrix sends images separately, so this is probably the image they meant — but it wasn't explicitly triggered. ` +
+        `Use judgment: fold it into your reply if it fits, ignore it if it doesn't, or ${spawnHint} to handle it on its own.\n\n` +
+        `${rendered}\n</interjection>`
+      );
+    }
+    if (form === "mention") {
+      return (
+        `<interjection reason="follow-up-mention">\n` +
+        `${senderName} @'d you again ${n}s after the message you're handling — probably amending or adding to it. ` +
+        `Fold it into this reply if it continues the same request; if it's a genuinely separate ask, ${spawnHint} to give it its own session.\n\n` +
+        `${rendered}\n</interjection>`
+      );
+    }
+    return (
+      `<interjection reason="follow-up-text">\n` +
+      `${senderName} sent this ${n}s after the message you're handling, without addressing you again — likely a continuation of the same thought. ` +
+      `Use judgment: treat it as part of the request if it fits, ignore it if unrelated, or ${spawnHint}.\n\n` +
+      `${rendered}\n</interjection>`
+    );
+  }
+
+  /**
+   * The one-line preamble prepended to a settled→resume follow-up's appended turn
+   * (spec §10). The follow-up IS the new turn (not an interjection to break out), so
+   * there is no `spawn_session` affordance — just the framing that a quick follow-up
+   * arrived (and, for a re-`@`, that it was an explicit re-address).
+   */
+  function buildFollowUpResumePreamble(inbound: InboundChatEvent, form: FollowUpForm, gapMs: number): string {
+    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.id);
+    const n = Math.max(0, Math.round(gapMs / 1000));
+    if (form === "media") {
+      return (
+        `<follow_up reason="media">${senderName} sent this ${n}s after your last reply, without addressing you again — ` +
+        `Matrix splits images out, so it's probably the image they meant. Continue as part of the same exchange.</follow_up>`
+      );
+    }
+    if (form === "mention") {
+      return (
+        `<follow_up reason="mention">${senderName} @'d you again ${n}s after your last reply — ` +
+        `probably amending or adding to it. Continue the same exchange.</follow_up>`
+      );
+    }
+    return (
+      `<follow_up reason="text">${senderName} sent this ${n}s after your last reply, without addressing you again — ` +
+      `likely a continuation of the same thought. Continue the same exchange.</follow_up>`
+    );
   }
 
   /**
@@ -2801,14 +3333,40 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // `undefined` here → FRESH.
       const generation = await storage.acceptResumeGeneration(sessionId);
       if (generation === undefined) return false;
+      // Gap backfill (spec RESUMABLE-SESSIONS §9): active only when BOTH limits are
+      // non-zero (0 = include none). Lower bound = the trigger group's latest member
+      // the session ALREADY covers (§9.2): its persisted `chat_upper_bound_ts` —
+      // its original trigger on creation, advanced to each accepted resume's trigger.
+      // NULL only on a legacy (pre-v27) row's first resume → a one-time bounded
+      // fallback to the replied-to message's timestamp. Read from the in-memory `row`
+      // (read-old), before the write-new inside `runResumeSession` — no race.
+      const gapCfg = resumeCfg.gap?.[ctx];
+      const gapActive =
+        !!gapCfg && (gapCfg.max_messages ?? 0) !== 0 && (gapCfg.max_tokens ?? 0) !== 0;
+      const gap = gapActive
+        ? {
+            maxMessages: gapCfg!.max_messages ?? 0,
+            maxTokens: gapCfg!.max_tokens ?? 0,
+            lowerBoundTimestamp: row.chat_upper_bound_ts ?? targetEvent.timestamp,
+          }
+        : undefined;
       // Past the CAS we own the trigger's timeline slot (return true → no FRESH
-      // launch). `runReplyResumeSession` wires the run's `.finally` slot-drain, but
-      // a throw in its pre-run setup (adopt/markRunning/tool build) would settle
-      // before that — so guard it: evict any adopted record and drain the slot so
-      // the timeline can't deadlock. The orphaned generation bump is harmless
-      // (the row is no longer `completed` → future replies fork FRESH, §6).
+      // launch). `runResumeSession` wires the run's `.finally` slot-drain, but a
+      // throw in its pre-run setup (adopt/markRunning/tool build) would settle before
+      // that — so guard it: evict any adopted record and drain the slot so the
+      // timeline can't deadlock. The orphaned generation bump is harmless (the row is
+      // no longer `completed` → future replies fork FRESH, §6).
       try {
-        await runReplyResumeSession({ inbound, duplicate, target, targetEvent, row, material, generation, ctx, resumeCfg });
+        await runResumeSession({
+          inbound,
+          duplicate,
+          target,
+          row,
+          material,
+          generation,
+          continuation: { tail: resumeCfg.satellite?.tail ?? true, gap },
+          resumeLabel: "reply",
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
@@ -2822,25 +3380,34 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
-   * Adopt the accepted session and run the resumed rollout (spec §7/§9/§11). Mirrors
-   * the fresh run's lifecycle tail (claim attribution, capture, run/settle, slot
-   * drain, browser close) — the only differences are: the row is ADOPTED (not
-   * created), the usage seed and generation come from the bumped row, the snapshot
-   * is reused (capture re-persists only the growing transcript), and the kickoff is
-   * the freshly-built appended turn (gap + fresh satellite + trigger group).
+   * Adopt the accepted session and run the resumed rollout (spec RESUMABLE-SESSIONS
+   * §7/§9/§11; spec FOLLOWUP-FOLDING §5.3). Shared by reply-to-continue (a reply to
+   * a completed bot message) and follow-up folding's settled→resume branch — the
+   * caller resolves eligibility through its own gate, performs the single-consumption
+   * CAS, and hands in the pre-computed `continuation` (satellite tail, gap budget,
+   * and the optional follow-up trigger preamble). Mirrors the fresh run's lifecycle
+   * tail (claim attribution, follow-up watch re-arm, capture, run/settle, slot drain,
+   * browser close); the differences are: the row is ADOPTED (not created), usage seed
+   * + generation come from the bumped row, the snapshot is reused (capture re-persists
+   * only the growing transcript), and the kickoff is the freshly-built appended turn.
    */
-  async function runReplyResumeSession(args: {
+  async function runResumeSession(args: {
     inbound: InboundChatEvent;
     duplicate: boolean;
     target: NonNullable<InboundChatEvent["outboundTarget"]>;
-    targetEvent: CanonicalChatEvent;
     row: ReturnType<typeof storage.getAgentSession> & object;
     material: NonNullable<Awaited<ReturnType<typeof loadCompletedSessionMaterial>>>;
     generation: number;
-    ctx: "dm" | "group";
-    resumeCfg: NonNullable<NonNullable<typeof config.agent.sessions.resume>>;
+    /** Pre-computed appended-turn options (gap/tail resolved by the caller, §9/§5.3). */
+    continuation: {
+      tail: boolean;
+      gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+      triggerPreamble?: string;
+    };
+    /** Which resume path drove this — used only for log attribution. */
+    resumeLabel: "reply" | "follow-up";
   }): Promise<void> {
-    const { inbound, duplicate, target, targetEvent, row, material, generation, ctx, resumeCfg } = args;
+    const { inbound, duplicate, target, row, material, generation, continuation, resumeLabel } = args;
     const record: AgentSessionRecord = {
       id: row.id,
       timelineKey: row.timeline_key,
@@ -2856,16 +3423,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (inbound.event.externalId) {
       sessionClaims.attachSession(record.timelineKey, inbound.event.externalId, record.id);
     }
+    // Re-arm the follow-up watch to this resumed session (spec FOLLOWUP-FOLDING §7
+    // resume-chain invariance): a subsequent bare follow-up folds into the resumed
+    // session, so chains stay linear across mixed reply-resume / follow-up-resume
+    // steps. Same seam as the claim attribution (post-fork), so it names the live
+    // session; `inbound.event.timestamp` re-anchors the user-gap clock to this turn.
+    armFollowUpWatch(inbound, record.id);
     sessions.onSettle(record.id, () => sessionClaims.releaseSession(record.timelineKey, record.id));
     const ownerExternalId = inbound.event.externalId;
     if (ownerExternalId) {
       sessions.onSettle(record.id, () => redispatchPendingCoReplies(ownerExternalId));
     }
+    // Abandonment fallback for any follow-ups parked on this resumed session before it
+    // went live (spec FOLLOWUP-FOLDING §5.2): on the success path the post-attachAgent
+    // drain consumes them, so this fires on nothing.
+    sessions.onSettle(record.id, () => revertAbandonedFollowUps(record.id));
     logger.info("session_resume_started", {
       sessionId: record.id,
       timelineKey: record.timelineKey,
       generation,
-      context: ctx,
+      context: resumeContextFor(record.timelineKey),
+      resumeLabel,
     });
 
     // Usage continues accumulating from the row (continue-mode seed).
@@ -2875,24 +3453,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     );
     const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, generation);
 
-    // Gap backfill (§9): active only when BOTH limits are non-zero (0 = include none).
-    const gapCfg = resumeCfg.gap?.[ctx];
-    const gapActive =
-      !!gapCfg && (gapCfg.max_messages ?? 0) !== 0 && (gapCfg.max_tokens ?? 0) !== 0;
-    const gap = gapActive
-      ? {
-          maxMessages: gapCfg!.max_messages ?? 0,
-          maxTokens: gapCfg!.max_tokens ?? 0,
-          // Lower bound = the trigger group's latest member the session ALREADY
-          // covers (spec §9.2): its persisted `chat_upper_bound_ts` — its original
-          // trigger on creation, advanced to each accepted resume's trigger below.
-          // NULL only on a legacy (pre-v27) row's first resume → a one-time bounded
-          // fallback to the replied-to message's timestamp (the old behaviour for
-          // that single edge). Read from the in-memory `row` (read-old), before the
-          // write-new below — no race despite the queued write.
-          lowerBoundTimestamp: row.chat_upper_bound_ts ?? targetEvent.timestamp,
-        }
-      : undefined;
+    // Gap backfill (§9): the caller resolved the budget + lower bound (reply-resume
+    // reads it from `[agent.sessions.resume.gap]`; a follow-up resume omits it — the
+    // continuation arrives seconds later, so there is nothing meaningful to surface).
+    const gap = continuation.gap;
 
     // Advance the gap lower bound to THIS resume's trigger group latest member
     // (== `inbound.event.timestamp`, the upper bound `renderResumeGap` walks back
@@ -2915,9 +3479,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ({ agent, finalTurn: kickoff } = await factory.create(record, tools, {
         resume: material,
         resumeContinuation: {
-          tail: resumeCfg.satellite?.tail ?? true,
+          tail: continuation.tail,
           browserNote: browserSession ? RESUME_BROWSER_NOTE : undefined,
           gap,
+          triggerPreamble: continuation.triggerPreamble,
         },
         usage,
         abortSignal: drainAbort.signal,
@@ -2939,6 +3504,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
     sessions.attachAgent(record.id, agent);
     if (ownerExternalId) drainPendingCoRepliesIntoSession(ownerExternalId, record.id);
+    // Follow-ups parked while this resumed session was building (§5.2) — steer them in
+    // now that it is live (a follow-up resume can itself accrue a parked follow-up).
+    drainPendingFollowUpsIntoSession(record.id);
 
     const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
@@ -3045,6 +3613,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (inbound.event.externalId) {
       sessionClaims.attachSession(session.timelineKey, inbound.event.externalId, session.id);
     }
+    // Arm the follow-up watch for this sender (spec FOLLOWUP-FOLDING §4.1/§7): a quick
+    // same-sender follow-up now folds into THIS session. Same seam as the claim
+    // attribution (post resume-vs-fresh fork), so the watch names the session that
+    // actually handled the trigger. Skipped for proactive launches (no human follow-up
+    // to fold) and for synthetic triggers (no external id); guarded inside the helper.
+    if (!proactive) armFollowUpWatch(inbound, session.id);
     sessions.onSettle(session.id, () => sessionClaims.releaseSession(session.timelineKey, session.id));
     // Deferred-coalescing fallback (spec DEFERRED-COALESCING): if this session is
     // abandoned before it goes live (the missing-target / factory-failed early
@@ -3055,6 +3629,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (ownerExternalId) {
       sessions.onSettle(session.id, () => redispatchPendingCoReplies(ownerExternalId));
     }
+    // Follow-up abandonment fallback (spec FOLLOWUP-FOLDING §5.2): the same evict→
+    // fireSettle paths revert any follow-ups parked on this session to native fate
+    // (trigger-bearing → own trigger; bare group → inert). Consumed by the
+    // post-attachAgent drain on the success path, so this then fires on nothing.
+    sessions.onSettle(session.id, () => revertAbandonedFollowUps(session.id));
     logger.info("session_started", { sessionId: session.id, timelineKey: session.timelineKey, proactive });
     const target = inbound.outboundTarget;
     if (!target) {
@@ -3204,6 +3783,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // every co-reply parked on its trigger in as an interjection. Consumes the parked
     // entries, so the settle-fallback registered above then fires on nothing.
     if (ownerExternalId) drainPendingCoRepliesIntoSession(ownerExternalId, session.id);
+    // Same for follow-ups parked while this session was building (spec FOLLOWUP-FOLDING
+    // §5.2): steer them in now that it is agent-live. Consumes the parked entries, so
+    // the abandonment settle-fallback above then fires on nothing.
+    drainPendingFollowUpsIntoSession(session.id);
 
     // Attach snapshot + transcript capture (spec §5). Detached in the run
     // promise's .finally() below (the agent_end transcript flush already happens
@@ -3623,6 +4206,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // DEFERRED-COALESCING): the runtime is draining, so they will not be steered
         // in or re-dispatched.
         pendingCoReplies.clear();
+        // Drop every follow-up watch + its GC timer, and any parked follow-ups (spec
+        // FOLLOWUP-FOLDING): the runtime is draining, so nothing more folds.
+        followUpWatch.clear();
+        pendingFollowUps.clear();
         // Abort each caption client's scheduler-admission seam BEFORE awaiting
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
@@ -4060,6 +4647,63 @@ export async function evaluateResumeGate(args: {
     logger.warn("resume_gate_threw", {
       sessionId,
       timelineKey: inbound.timelineKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { resume: false };
+  }
+}
+
+/** The verdict of {@link evaluateFollowUpResumeGate}. */
+export type FollowUpResumeGateVerdict =
+  | { resume: true; row: AgentSessionRow; material: ResumeMaterial }
+  | { resume: false };
+
+/**
+ * The follow-up settled→resume gate (spec FOLLOWUP-FOLDING §5.3), factored out for
+ * unit-testing like {@link evaluateResumeGate}. A deliberate SUBSET of reply-resume's
+ * gate: it KEEPS the completed-status check, the synthetic-type exclusion, the
+ * capability/context-ceiling gate (an image is token-heavy — a resume that would
+ * instantly re-park is pointless), and material viability; it DROPS the work gate
+ * (the rationale is inverted — a toolless "look at this" session is exactly what we
+ * resume), the time window, the same-user check (structural via the per-sender watch),
+ * and the generation-match (the watch names the session directly; single-consumption
+ * is the caller's CAS). Throw-safe: ANY unexpected throw degrades to `{resume:false}`
+ * (→ native fate), never propagating — a fold-resume must never drop the follow-up.
+ */
+export async function evaluateFollowUpResumeGate(args: {
+  sessionId: string;
+  getSession: () => AgentSessionRow | undefined;
+  resolveCeiling: (sessionType: string) => number | undefined;
+  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
+  timelineKey: string;
+  logger: Pick<Logger, "warn">;
+}): Promise<FollowUpResumeGateVerdict> {
+  try {
+    const row = args.getSession();
+    // §7.2: only a `completed` row is resumable (failed-resumable/interrupted keep the
+    // console path; discarded is dead; a pruned/missing row → native fate).
+    if (!row || row.status !== "completed") return { resume: false };
+    // §7.3: synthetic worker sessions never arm a watch, but exclude defensively.
+    if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return { resume: false };
+    // Capability/context-ceiling gate (§5.3 KEEP): a resume that would instantly
+    // re-park is pointless → native fate instead.
+    let ceiling: number | undefined;
+    try {
+      ceiling = args.resolveCeiling(row.session_type);
+    } catch {
+      ceiling = undefined;
+    }
+    if (ceiling !== undefined && row.context_tokens != null && row.context_tokens >= ceiling) {
+      return { resume: false };
+    }
+    // Material viability (one load of the completed material).
+    const material = await args.loadMaterial(row);
+    if (!material) return { resume: false };
+    return { resume: true, row, material };
+  } catch (error) {
+    args.logger.warn("follow_up_resume_gate_threw", {
+      sessionId: args.sessionId,
+      timelineKey: args.timelineKey,
       error: error instanceof Error ? error.message : String(error),
     });
     return { resume: false };

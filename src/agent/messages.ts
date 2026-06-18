@@ -41,6 +41,15 @@ export interface SatelliteMessage {
 export interface InterjectionMessage {
   type: "interjection";
   content: string;
+  /**
+   * Real image pixels carried alongside the interjection text (spec
+   * FOLLOWUP-FOLDING §3). The sole producer is a steered follow-up of the **media**
+   * form: a forced-split image that arrived a beat after its triggering message and
+   * is folded into the live session. Without this an image interjection degrades to
+   * its caption; `convert.ts` turns these into `{type:"image"}` content blocks via
+   * `contentWithImages`. A co-reply that itself carries an image rides the same field.
+   */
+  imageBlocks?: ImageBlock[];
 }
 
 declare module "@earendil-works/pi-agent-core" {
