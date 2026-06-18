@@ -73,9 +73,10 @@ async function main() {
     await writeFile(tmp, buf);
     await rename(tmp, DEST); // atomic
   } catch (err) {
-    await unlink(tmp).catch((cleanupErr) => {
-      if (cleanupErr?.code !== "ENOENT") throw cleanupErr;
-    });
+    // Best-effort cleanup: swallow any unlink failure (missing temp, or a temp we
+    // can't remove) so it never masks the original error that actually failed the
+    // fetch — that root cause is what the caller needs to see.
+    await unlink(tmp).catch(() => {});
     throw err;
   }
   console.log(`wrote ${DEST} (${(buf.length / 1e6).toFixed(1)} MB, sha256 ok)`);
