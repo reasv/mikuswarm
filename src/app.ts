@@ -30,6 +30,8 @@ import {
   followUpGateDecision,
   followUpConfigActive,
   maxWallClockMs,
+  decideFollowUpRoute,
+  hasImageAttachment,
   type FollowUpForm,
   type FollowUpConfig,
   type FollowUpLeverConfig,
@@ -1205,27 +1207,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
   // Follow-up folding (spec FOLLOWUP-FOLDING §9): cross-field checks the TypeBox
   // schema can't express. Same fail-fast convention as the resume block above.
-  {
-    const followup = config.agent.sessions.followup;
-    if (followup) {
-      for (const form of ["media", "text", "mention"] as const) {
-        const lever = followup[form];
-        if (!lever) continue;
-        const userGap = lever.user_gap_ms;
-        const wallClock = lever.wall_clock_ms;
-        // Hard rule: the wall-clock lifetime must be able to CONTAIN the user-gap it
-        // guards — the follow-up's wall-clock age at fold time is ≈ its user-perceived
-        // gap plus processing lag, so a wall_clock_ms below user_gap_ms makes the
-        // user-gap moot (the looser clock would always cut first). Refuse it.
-        if (userGap !== undefined && wallClock !== undefined && wallClock < userGap) {
-          throw new Error(
-            `agent.sessions.followup.${form}: wall_clock_ms (${wallClock}) must be >= user_gap_ms (${userGap}) — ` +
-              `the watch lifetime has to outlast the user-perceived gap it guards`,
-          );
-        }
-      }
-    }
-  }
+  assertFollowupConfigValid(config.agent.sessions.followup);
 
   // Map a (per-room) timeline key to its account + room id and ask that account's
   // Matrix client for a human room label. Shared by the diary header and the
@@ -1908,14 +1890,36 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     // Owner already live → steer the co-reply in now (Case B, immediate).
     if (match.sessionId) {
-      const outcome = trySteerCoReply(match.sessionId, inbound);
+      const ownerSessionId = match.sessionId;
+      // An image-bearing co-reply into a LIVE owner carries real pixels (§3), which
+      // needs async conditioning — commit synchronously (markSteered, suppress the
+      // twin) and finish off the serialization path via `steerCoReplyWithPixels`,
+      // mirroring the media follow-up steer. The text fast-path (the common case) stays
+      // fully synchronous below. A pre-live owner with an image co-reply falls through
+      // to `trySteerCoReply` → "not-live" → the defer/park path, and the parked image
+      // is conditioned at drain time (`drainPendingCoRepliesIntoSession`).
+      if (hasImageAttachment(inbound.event) && sessions.getAgent(ownerSessionId)) {
+        const target = timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey);
+        // Cannot hydrate the quote → spawn rather than inject a broken interjection.
+        if (!target || target.timelineKey !== inbound.timelineKey) return false;
+        markSteered(inbound.event.id);
+        void steerCoReplyWithPixels(ownerSessionId, inbound, target).catch((error) => {
+          logger.error("co_reply_image_steer_threw", {
+            sessionId: ownerSessionId,
+            eventId: inbound.event.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        return true;
+      }
+      const outcome = trySteerCoReply(ownerSessionId, inbound);
       if (outcome === "steered") return true;
       // Cannot hydrate the quote → spawn rather than inject a broken interjection.
       if (outcome === "no-target") return false;
       // outcome === "not-live": owner attributed but not steerable. Defer only if it
       // is still in its build window (will go live); a terminal/settling owner →
       // spawn (§5.2 — a fresh session built after it settles sees its replies).
-      if (!coTargetOwnerSteerableSoon(true, sessions.get(match.sessionId)?.status)) return false;
+      if (!coTargetOwnerSteerableSoon(true, sessions.get(ownerSessionId)?.status)) return false;
     } else {
       // Un-attributed owner (queued / accept→launch window): it WILL launch. Only
       // defer if the shared target exists so the interjection can hydrate at drain.
@@ -1996,24 +2000,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!steered) return "not-live";
 
     markSteered(inbound.event.id);
-    // Retain the inbound so the session can spin it off via spawn_session (§5.4),
-    // and clean it up when that session settles.
-    const externalId = inbound.event.externalId;
-    if (externalId) {
-      coReplyInbounds.set(externalId, { inbound, intoSessionId: coReplySessionId });
-      sessions.onSettle(coReplySessionId, () => coReplyInbounds.delete(externalId));
-      // Race guard (review #3): `onSettle` fires nothing if the session ALREADY
-      // settled (evicted) between the steer above and this registration — clean up
-      // the just-stored entry so it can't linger until shutdown. The check is
-      // "record gone" (`!sessions.get`), NOT `isAgentLive`: the success drain
-      // (DEFERRED-COALESCING) calls this right after `attachAgent` but BEFORE
-      // `runner.run()`, where the steer succeeds yet `agent.signal` is still
-      // undefined — `isAgentLive` would be false there and wrongly drop the entry,
-      // silently breaking the `spawn_session` affordance the interjection advertises.
-      // A still-present record (running, or interrupted-pending-evict) will fire
-      // `onSettle` later, so the entry is correctly retained.
-      if (!sessions.get(coReplySessionId)) coReplyInbounds.delete(externalId);
-    }
+    retainCoReplyForSpawn(inbound, coReplySessionId);
     logger.info("co_reply_coalesced", {
       sessionId: coReplySessionId,
       timelineKey: inbound.timelineKey,
@@ -2021,6 +2008,92 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       replyTarget,
     });
     return "steered";
+  }
+
+  /**
+   * Retain a co-reply inbound so its sibling session can spin it off via
+   * `spawn_session` (spec §5.4), cleaning up when that session settles. Shared by the
+   * synchronous text steer (`trySteerCoReply`) and the async image steer
+   * (`steerCoReplyWithPixels`).
+   */
+  function retainCoReplyForSpawn(inbound: InboundChatEvent, coReplySessionId: string): void {
+    const externalId = inbound.event.externalId;
+    if (!externalId) return;
+    coReplyInbounds.set(externalId, { inbound, intoSessionId: coReplySessionId });
+    sessions.onSettle(coReplySessionId, () => coReplyInbounds.delete(externalId));
+    // Race guard: `onSettle` fires nothing if the session ALREADY settled (evicted)
+    // between the steer and this registration — clean up the just-stored entry so it
+    // can't linger until shutdown. The check is "record gone" (`!sessions.get`), NOT
+    // `isAgentLive`: the success drain (DEFERRED-COALESCING) calls this right after
+    // `attachAgent` but BEFORE `runner.run()`, where the steer succeeds yet
+    // `agent.signal` is still undefined — `isAgentLive` would be false there and
+    // wrongly drop the entry, silently breaking the `spawn_session` affordance the
+    // interjection advertises. A still-present record (running, or interrupted-
+    // pending-evict) fires `onSettle` later, so the entry is correctly retained.
+    if (!sessions.get(coReplySessionId)) coReplyInbounds.delete(externalId);
+  }
+
+  /**
+   * Steer an IMAGE-bearing co-reply into a live sibling session carrying real pixels
+   * (spec FOLLOWUP-FOLDING §3). The synchronous `trySteerCoReply` cannot — it runs on
+   * the accept→claim serialization path and pixel conditioning is async — so the image
+   * case is committed synchronously (`markSteered`) by the caller and finished here off
+   * the hot path, mirroring `steerFollowUp`: wait the co-reply's own image DOWNLOAD
+   * (NOT captioning — the slow pool, irrelevant to pixels; the event is still captioned
+   * normally for history), condition the pixels, then steer; on a conditioning miss
+   * steer caption-only rather than block. If the owner settled before the inject lands,
+   * re-dispatch the co-reply as its own session (the async analogue of the synchronous
+   * "not-live → spawn" fallback).
+   */
+  async function steerCoReplyWithPixels(
+    coReplySessionId: string,
+    inbound: InboundChatEvent,
+    target: CanonicalChatEvent,
+  ): Promise<void> {
+    await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    let imageBlocks: ImageBlock[] | undefined;
+    try {
+      const blocks = await contextBuilder.conditionEventImages(followUpHydratedEvent(inbound));
+      if (blocks.length > 0) imageBlocks = blocks;
+    } catch (error) {
+      // No-pixels branch (mirrors steerFollowUp): caption-only steer rather than block.
+      logger.warn("co_reply_image_condition_failed", {
+        coReplySessionId,
+        eventId: inbound.event.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const content = buildCoReplyInterjection(inbound, target);
+    const steered = sessions.steer(
+      coReplySessionId,
+      { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) },
+      {
+        eventId: inbound.event.id,
+        externalId: inbound.event.externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "co-reply",
+        body: inbound.event.body ?? "",
+      },
+    );
+    if (!steered) {
+      // Owner settled during the download wait → re-dispatch as its own session.
+      void redispatchCoReply(inbound).catch((error) => {
+        logger.error("co_reply_redispatch_failed", {
+          timelineKey: inbound.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+    retainCoReplyForSpawn(inbound, coReplySessionId);
+    logger.info("co_reply_coalesced", {
+      sessionId: coReplySessionId,
+      timelineKey: inbound.timelineKey,
+      eventId: inbound.event.id,
+      replyTarget: inbound.event.replyTo?.externalId,
+      pixels: imageBlocks !== undefined,
+    });
   }
 
   /**
@@ -2035,6 +2108,34 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!parked) return;
     pendingCoReplies.delete(ownerTriggerExternalId);
     for (const inbound of parked) {
+      // A parked IMAGE co-reply carries real pixels too (§3): condition + steer off the
+      // hot path (the synchronous `trySteerCoReply` cannot await conditioning).
+      // `steerCoReplyWithPixels` re-dispatches itself on a steer failure, so only its
+      // own missing-hydration-target case needs the inline redispatch here.
+      if (hasImageAttachment(inbound.event)) {
+        const replyTarget = inbound.event.replyTo?.externalId;
+        const target = replyTarget
+          ? timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey)
+          : undefined;
+        if (target && target.timelineKey === inbound.timelineKey) {
+          void steerCoReplyWithPixels(sessionId, inbound, target).catch((error) => {
+            logger.error("co_reply_image_steer_threw", {
+              sessionId,
+              eventId: inbound.event.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+          continue;
+        }
+        // No hydration target → re-dispatch as its own session (cannot render the quote).
+        void redispatchCoReply(inbound).catch((error) => {
+          logger.error("co_reply_redispatch_failed", {
+            timelineKey: inbound.timelineKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        continue;
+      }
       if (trySteerCoReply(sessionId, inbound) !== "steered") {
         void redispatchCoReply(inbound).catch((error) => {
           logger.error("co_reply_redispatch_failed", {
@@ -2222,35 +2323,40 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Structurally impossible given arm-after-launch, but cheap to assert.
     if (record?.trigger.event.trigger?.groupedEventIds?.includes(inbound.event.id)) return false;
 
-    if (record && (record.status === "created" || record.status === "running")) {
-      markSteered(inbound.event.id);
-      // Steerable iff running AND the agent is ATTACHED — the same gate
-      // `SessionManager.steer` applies (an attached agent queues a steered message
-      // even in the attachAgent→first-prompt gap, where `isAgentLive` is still false).
-      // Using attachment (not liveness) closes that gap: a follow-up landing there
-      // steers rather than parking onto an already-drained list.
-      if (record.status === "running" && sessions.getAgent(watch.sessionId)) {
-        void steerFollowUp(watch.sessionId, delivery).catch((error) => {
-          logger.error("follow_up_steer_threw", {
-            sessionId: watch.sessionId,
-            eventId: inbound.event.id,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      } else {
-        // created / running-but-pre-attachAgent → park; drained when it goes live.
-        parkFollowUp(watch.sessionId, delivery);
-      }
-      return true;
+    // The owner's liveness at fold time picks the delivery route (spec §5 / §2 table),
+    // extracted as a pure decision so the precedence is unit-testable. A live
+    // `created`/`running` record steers (if its agent is attached) or parks; an owner
+    // gone from memory resumes iff its durable row is `completed` (the only
+    // fold-resumable state, §5.3/§7.2) — a discarded/interrupted/failed/pruned row, or
+    // a never-launched one, yields `none`.
+    const route = decideFollowUpRoute({
+      recordPresent: !!record,
+      recordStatus: record?.status,
+      agentAttached: !!sessions.getAgent(watch.sessionId),
+      rowCompleted: storage.getAgentSession(watch.sessionId)?.status === "completed",
+    });
+    if (route === "none") {
+      // Not foldable → native fate downstream: a trigger-bearing follow-up spawns its
+      // own session, a bare group one goes inert via the `!inbound.trigger` return — no
+      // explicit revert here.
+      return false;
     }
-
-    // Owner gone from memory → settled. Only a `completed` row is fold-resumable (§5.3
-    // / §7.2); a discarded/interrupted/failed-resumable/pruned row → native fate (this
-    // returns false, so a trigger-bearing follow-up spawns its own session and a bare
-    // group one goes inert via the `!inbound.trigger` return — no explicit revert).
-    const row = storage.getAgentSession(watch.sessionId);
-    if (row && row.status === "completed") {
-      markSteered(inbound.event.id);
+    // Past the route decision the event is consumed exactly once (§6): mark it so the
+    // trigger-hold twin (DM / re-`@`) is suppressed, then dispatch the chosen delivery.
+    markSteered(inbound.event.id);
+    if (route === "steer") {
+      void steerFollowUp(watch.sessionId, delivery).catch((error) => {
+        logger.error("follow_up_steer_threw", {
+          sessionId: watch.sessionId,
+          eventId: inbound.event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    } else if (route === "park") {
+      // created / running-but-pre-attachAgent → park; drained when it goes live.
+      parkFollowUp(watch.sessionId, delivery);
+    } else {
+      // settled `completed` → resume (append the follow-up as a new turn, §5.3).
       void resumeFollowUp(delivery, watch.sessionId).catch((error) => {
         logger.error("follow_up_resume_threw", {
           sessionId: watch.sessionId,
@@ -2258,9 +2364,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           error: error instanceof Error ? error.message : String(error),
         });
       });
-      return true;
     }
-    return false;
+    return true;
   }
 
   /**
@@ -2321,8 +2426,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       },
     );
     if (!steered) {
-      // The owner settled between the fold decision and here → native fate.
-      revertFollowUpToNativeFate(inbound, "steer-not-live");
+      // The owner settled between the fold decision and here — it completed during the
+      // download wait above (uncommon: needs a slow download racing a fast owner, since
+      // the wait is on the DOWNLOAD, not the slow caption pool). Prefer resuming the
+      // just-settled owner — carrying the now-ready pixels (§5.3) — over dropping the
+      // fold to native fate. `resumeFollowUp` self-guards (its gate resumes only a
+      // `completed` row and otherwise reverts to native fate itself), so this is safe
+      // even if the owner settled into a non-resumable state.
+      await resumeFollowUp(delivery, sessionId);
       return;
     }
     retainFollowUpForSpawn(inbound, sessionId);
@@ -3428,6 +3539,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // session, so chains stay linear across mixed reply-resume / follow-up-resume
     // steps. Same seam as the claim attribution (post-fork), so it names the live
     // session; `inbound.event.timestamp` re-anchors the user-gap clock to this turn.
+    // Unlike the fresh-launch arm, this call is not `!proactive`-guarded: a resumed
+    // session is never proactive (proactive sessions never resume), and
+    // `armFollowUpWatch` re-checks self/synthetic regardless.
     armFollowUpWatch(inbound, record.id);
     sessions.onSettle(record.id, () => sessionClaims.releaseSession(record.timelineKey, record.id));
     const ownerExternalId = inbound.event.externalId;
@@ -3476,6 +3590,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // readiness HERE — a reply that itself carries fresh media gets its appended
       // turn built with the caption ready, instead of skipping the wait as before.
       await awaitTriggerReadiness(inbound);
+      // The trigger's enrichment download is now complete (readiness wait above), so
+      // hydrate its event before the appended turn is built. `buildResumeTurn →
+      // selectImageBlocks` needs the attachment's `localPath` to deliver a media
+      // follow-up's image as REAL PIXELS (spec FOLLOWUP-FOLDING §5.3/§10), and the raw
+      // provider event never carries it — only `hydrateEvents` (reading the media_assets
+      // row) does. Without this the folded image silently degrades to its caption — the
+      // exact loss the fold exists to prevent — because the folded event has no trigger
+      // group either (it was consumed before `accept`/`setTriggerGroup`). This also
+      // hydrates a reply-resume whose reply itself carried fresh media. Mirrors the
+      // steer path's `followUpHydratedEvent`; falls back to the raw event (caption-only)
+      // if the row is somehow not stored yet.
+      record.trigger = { ...record.trigger, event: followUpHydratedEvent(record.trigger) };
       ({ agent, finalTurn: kickoff } = await factory.create(record, tools, {
         resume: material,
         resumeContinuation: {
@@ -4657,6 +4783,45 @@ export async function evaluateResumeGate(args: {
 export type FollowUpResumeGateVerdict =
   | { resume: true; row: AgentSessionRow; material: ResumeMaterial }
   | { resume: false };
+
+/**
+ * Cross-field validation for `[agent.sessions.followup]` (spec FOLLOWUP-FOLDING §9) —
+ * the rules TypeBox can't express. Factored out for unit-testing; called once at app
+ * wiring (fail-fast). Throws on the first offending lever; an absent block (folding
+ * unconfigured) is valid.
+ */
+export function assertFollowupConfigValid(
+  followup: AppConfig["agent"]["sessions"]["followup"],
+): void {
+  if (!followup) return;
+  for (const form of ["media", "text", "mention"] as const) {
+    const lever = followup[form];
+    if (!lever) continue;
+    const userGap = lever.user_gap_ms;
+    const wallClock = lever.wall_clock_ms;
+    // The wall-clock lifetime must CONTAIN the user-gap it guards — the follow-up's
+    // wall-clock age at fold time is ≈ its user-perceived gap plus processing lag, so a
+    // wall_clock_ms below user_gap_ms makes the user-gap moot (the looser clock would
+    // always cut first). Refuse it.
+    if (userGap !== undefined && wallClock !== undefined && wallClock < userGap) {
+      throw new Error(
+        `agent.sessions.followup.${form}: wall_clock_ms (${wallClock}) must be >= user_gap_ms (${userGap}) — ` +
+          `the watch lifetime has to outlast the user-perceived gap it guards`,
+      );
+    }
+    // A lever block that sets a user gap but omits its wall-clock lifetime would resolve
+    // `wall_clock_ms` to 0 (`resolveFollowUpLever`'s `?? 0`), silently disabling that
+    // lever (every follow-up's wall-clock age exceeds 0). Refuse the partial block
+    // rather than ship a dead lever — defends against a future 00-defaults edit that
+    // drops the field (shipped defaults set all three).
+    if (userGap !== undefined && wallClock === undefined) {
+      throw new Error(
+        `agent.sessions.followup.${form}: user_gap_ms is set but wall_clock_ms is missing — ` +
+          `a lever with no wall-clock lifetime is silently inert; set wall_clock_ms`,
+      );
+    }
+  }
+}
 
 /**
  * The follow-up settled→resume gate (spec FOLLOWUP-FOLDING §5.3), factored out for

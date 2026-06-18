@@ -8,10 +8,11 @@ import {
   followUpConfigActive,
   hasImageAttachment,
   maxWallClockMs,
+  decideFollowUpRoute,
   type FollowUpConfig,
 } from "../src/agent/follow-up-watch.js";
 import { convertToLlm } from "../src/agent/convert.js";
-import { evaluateFollowUpResumeGate } from "../src/app.ts";
+import { evaluateFollowUpResumeGate, assertFollowupConfigValid } from "../src/app.ts";
 import type { ResumeMaterial } from "../src/agent/index.ts";
 import type { AgentSessionRow } from "../src/storage/index.ts";
 import type { CanonicalChatEvent } from "../src/types.js";
@@ -171,6 +172,109 @@ test("followUpConfigActive: true iff some lever is enabled", () => {
 
 test("maxWallClockMs: the widest lever's wall_clock (GC lifetime)", () => {
   assert.equal(maxWallClockMs(defaultConfig()), 30_000);
+});
+
+test("maxWallClockMs: a disabled wide lever does NOT inflate the GC lifetime", () => {
+  // media (widest, 30s) disabled but its window left at the default → the lifetime is
+  // the widest ENABLED lever (text, 15s), not 30s. A disabled lever never admits a fold,
+  // so its window must not extend retention.
+  assert.equal(maxWallClockMs(defaultConfig({ media: { enabled: false, userGapMs: 10_000, wallClockMs: 30_000 } })), 15_000);
+});
+
+// ── decideFollowUpRoute (§5 / §2 delivery table) ─────────────────────────────
+
+test("decideFollowUpRoute: running + agent attached → steer", () => {
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "running", agentAttached: true, rowCompleted: false }),
+    "steer",
+  );
+});
+
+test("decideFollowUpRoute: running but agent NOT attached → park (drained at go-live)", () => {
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "running", agentAttached: false, rowCompleted: false }),
+    "park",
+  );
+});
+
+test("decideFollowUpRoute: created (pre-live) → park, regardless of agent flag", () => {
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "created", agentAttached: false, rowCompleted: false }),
+    "park",
+  );
+  // A created record never has an attached agent, but assert the route is park even if
+  // the flag were somehow set — `steer` requires status === "running".
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "created", agentAttached: true, rowCompleted: false }),
+    "park",
+  );
+});
+
+test("decideFollowUpRoute: owner gone + durable row completed → resume", () => {
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: false, recordStatus: undefined, agentAttached: false, rowCompleted: true }),
+    "resume",
+  );
+});
+
+test("decideFollowUpRoute: owner gone + row NOT completed → none (native fate)", () => {
+  // discarded / interrupted / failed / pruned / absent → not fold-resumable.
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: false, recordStatus: undefined, agentAttached: false, rowCompleted: false }),
+    "none",
+  );
+});
+
+test("decideFollowUpRoute: a live record outranks the durable row (steer/park win over resume)", () => {
+  // Settle race: the in-memory record is still running while the row already flipped to
+  // completed — the live record wins (steer), never resume.
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "running", agentAttached: true, rowCompleted: true }),
+    "steer",
+  );
+});
+
+test("decideFollowUpRoute: a present record in a terminal status falls through to the row", () => {
+  // record present but neither created nor running (e.g. interrupted, pending evict):
+  // the route is decided by the durable row, exactly as if the record were gone.
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "interrupted", agentAttached: false, rowCompleted: true }),
+    "resume",
+  );
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "interrupted", agentAttached: false, rowCompleted: false }),
+    "none",
+  );
+});
+
+// ── assertFollowupConfigValid (§9 cross-field) ───────────────────────────────
+
+test("assertFollowupConfigValid: an absent block is valid (folding unconfigured)", () => {
+  assert.doesNotThrow(() => assertFollowupConfigValid(undefined));
+});
+
+test("assertFollowupConfigValid: the shipped-shape defaults pass", () => {
+  assert.doesNotThrow(() =>
+    assertFollowupConfigValid({
+      media: { enabled: true, user_gap_ms: 10_000, wall_clock_ms: 30_000 },
+      text: { enabled: true, user_gap_ms: 7_000, wall_clock_ms: 15_000 },
+      mention: { enabled: true, user_gap_ms: 5_000, wall_clock_ms: 12_000 },
+    }),
+  );
+});
+
+test("assertFollowupConfigValid: wall_clock_ms < user_gap_ms is rejected (#5)", () => {
+  assert.throws(
+    () => assertFollowupConfigValid({ text: { enabled: true, user_gap_ms: 7_000, wall_clock_ms: 5_000 } }),
+    /wall_clock_ms \(5000\) must be >= user_gap_ms \(7000\)/,
+  );
+});
+
+test("assertFollowupConfigValid: a user_gap_ms with no wall_clock_ms is rejected (#8 dead-lever guard)", () => {
+  assert.throws(
+    () => assertFollowupConfigValid({ media: { enabled: true, user_gap_ms: 10_000 } }),
+    /user_gap_ms is set but wall_clock_ms is missing/,
+  );
 });
 
 // ── FollowUpWatch registry (§4.1) ────────────────────────────────────────────
@@ -427,4 +531,173 @@ test("evaluateFollowUpResumeGate: ANY throw degrades to no-resume, never propaga
     },
   });
   assert.equal(ceilingThrew.resume, true, "a ceiling throw is treated as 'no ceiling', not a gate failure");
+});
+
+// ── foldFollowUp precedence (faithful model, §6 single-consumption + §5 routing) ──
+//
+// Models the synchronous `foldFollowUp` fork in handleInbound (src/app.ts): the guard
+// chain (reply-skip → self-skip → watch lookup → trigger-hold raw-skip → dedup → gate)
+// then the route dispatch. The pieces it composes are the REAL ones — a real
+// `FollowUpWatch`, a real `steeredEventIds` Set, `classifyFollowUpForm`,
+// `followUpGateDecision`, `decideFollowUpRoute`; only the control-flow ordering is
+// reproduced here (the live function fires detached deliveries this model does not).
+// Mirrors the duplicate-reply-mitigation `admit` model.
+
+type FoldOutcome = "skip" | "deduped" | "steer" | "park" | "resume" | "none";
+
+function fold(args: {
+  watch: FollowUpWatch;
+  steered: Set<string>;
+  config: FollowUpConfig;
+  inbound: CanonicalChatEvent;
+  /** `inbound.trigger` present — the POST-HOLD delivery of a trigger-bearing follow-up. */
+  trigger: boolean;
+  /** DM || mentionedSelf — the set of follow-ups that double-deliver (raw + post-hold). */
+  wouldTrigger: boolean;
+  owner: { recordPresent: boolean; recordStatus?: string; agentAttached?: boolean; rowCompleted?: boolean };
+  now: number;
+}): FoldOutcome {
+  const ev = args.inbound;
+  if (ev.replyTo?.externalId) return "skip"; // replies keep their own (reply/co-target/resume) path
+  if (ev.sender.isSelf) return "skip";
+  if (!ev.sender.id) return "skip";
+  const w = args.watch.get(ev.timelineKey, ev.sender.id);
+  if (!w) return "skip"; // no armed watch → inert (bare group follow-up with no prior session)
+  if (args.wouldTrigger && !args.trigger) return "skip"; // raw delivery of a trigger-bearing follow-up
+  if (args.steered.has(ev.id)) return "deduped"; // trigger-hold twin already consumed
+  const passes = followUpGateDecision({
+    form: classifyFollowUpForm(ev),
+    config: args.config,
+    triggerOriginTs: w.triggerOriginTs,
+    followUpOriginTs: ev.timestamp,
+    armedAtWallClock: w.armedAtWallClock,
+    now: args.now,
+  });
+  if (!passes) return "skip";
+  const route = decideFollowUpRoute({
+    recordPresent: args.owner.recordPresent,
+    recordStatus: args.owner.recordStatus,
+    agentAttached: !!args.owner.agentAttached,
+    rowCompleted: !!args.owner.rowCompleted,
+  });
+  if (route !== "none") args.steered.add(ev.id); // consumed exactly once (markSteered)
+  return route;
+}
+
+function armedWatch(): FollowUpWatch {
+  // A real registry, armed for @alice with a trigger at t=1_000_000; deterministic fake
+  // timer (now()===0) so nothing GC-evicts mid-test.
+  const w = new FollowUpWatch(30_000, () => 0, () => 1 as unknown as ReturnType<typeof setTimeout>, () => {});
+  w.arm(TK, "@alice:server.org", { sessionId: "s1", triggerOriginTs: 1_000_000, armedAtWallClock: 0 });
+  return w;
+}
+const RUNNING_ATTACHED = { recordPresent: true, recordStatus: "running", agentAttached: true } as const;
+
+test("fold: a reply is never folded — it keeps its own path (bare-only scoping, §6)", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ replyTo: { externalId: "$target" }, timestamp: 1_002_000 }),
+      trigger: false, wouldTrigger: false, owner: RUNNING_ATTACHED, now: 1_000,
+    }),
+    "skip",
+  );
+});
+
+test("fold: the bot's own message is never folded", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ sender: { id: "@miku:server.org", displayName: "Miku", isSelf: true }, timestamp: 1_002_000 }),
+      trigger: false, wouldTrigger: false, owner: RUNNING_ATTACHED, now: 1_000,
+    }),
+    "skip",
+  );
+});
+
+test("fold: no armed watch → inert (a bare group follow-up with no prior session)", () => {
+  const unarmed = new FollowUpWatch(30_000, () => 0, () => 1 as unknown as ReturnType<typeof setTimeout>, () => {});
+  assert.equal(
+    fold({
+      watch: unarmed, steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_002_000 }),
+      trigger: false, wouldTrigger: false, owner: RUNNING_ATTACHED, now: 1_000,
+    }),
+    "skip",
+  );
+});
+
+test("fold: an armed watch + a quick bare-text group follow-up → steer (group non-trigger capture)", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), // 3s after trigger (text gap 7s)
+      trigger: false, wouldTrigger: false, owner: RUNNING_ATTACHED, now: 2_000,
+    }),
+    "steer",
+  );
+});
+
+test("fold: DM raw-vs-post-hold dedup — the raw delivery skips, the post-hold one folds (§6)", () => {
+  const steered = new Set<string>();
+  const watch = armedWatch();
+  const common = { watch, steered, config: defaultConfig(), wouldTrigger: true, owner: RUNNING_ATTACHED, now: 2_000 } as const;
+  // Raw delivery (trigger stripped) of a DM follow-up → skipped; it does NOT mark the
+  // event, so the post-hold delivery can still fold it.
+  assert.equal(fold({ ...common, inbound: event({ timestamp: 1_003_000 }), trigger: false }), "skip");
+  assert.equal(steered.has("evt-1"), false, "the raw skip leaves the event unconsumed");
+  // Post-hold delivery (trigger present) → folds (steer) and consumes the event id.
+  assert.equal(fold({ ...common, inbound: event({ timestamp: 1_003_000 }), trigger: true }), "steer");
+  assert.ok(steered.has("evt-1"), "the folded event is marked consumed exactly once");
+});
+
+test("fold: a re-delivered (already-consumed) event is deduped, not re-folded", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(["evt-1"]), config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: true, wouldTrigger: true, owner: RUNNING_ATTACHED, now: 2_000,
+    }),
+    "deduped",
+  );
+});
+
+test("fold: a follow-up outside the user-gap window → skip (gate rejects)", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_009_000 }), // 9s after trigger — outside the 7s text gap
+      trigger: false, wouldTrigger: false, owner: RUNNING_ATTACHED, now: 2_000,
+    }),
+    "skip",
+  );
+});
+
+test("fold: a settled (completed) owner → resume; a non-resumable settled owner → none", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: false, wouldTrigger: false,
+      owner: { recordPresent: false, rowCompleted: true }, now: 2_000,
+    }),
+    "resume",
+  );
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: false, wouldTrigger: false,
+      owner: { recordPresent: false, rowCompleted: false }, now: 2_000,
+    }),
+    "none",
+  );
+});
+
+test("fold: a pre-attach (building) owner → park, drained when it goes live", () => {
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: new Set(), config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: false, wouldTrigger: false,
+      owner: { recordPresent: true, recordStatus: "running", agentAttached: false }, now: 2_000,
+    }),
+    "park",
+  );
 });
