@@ -1176,6 +1176,10 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
     provider: model.provider,
     baseUrl: model.endpoint,
     reasoning: model.reasoning ?? true,
+    // Per-level remap of the requested thinking level → the provider's wire
+    // effort value (e.g. GLM-5.2 on Together: xhigh → "max"). Undefined for
+    // models that use pi-ai's native effort vocabulary. See ModelSchema.
+    thinkingLevelMap: model.thinking_level_map,
     input: model.multimodal ? ["text", "image"] : ["text"],
     cost: {
       input: model.cost?.input ?? 0,
@@ -1190,6 +1194,10 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       supportsLongCacheRetention: model.compat?.supports_long_cache_retention ?? false,
       supportsEagerToolInputStreaming: model.compat?.supports_eager_tool_input_streaming,
       sendSessionAffinityHeaders: model.compat?.send_session_affinity_headers,
+      // Override pi-ai's auto-detection (false for provider="together") so the
+      // reasoning-effort level is forwarded as `reasoning_effort`. Undefined =
+      // leave auto-detection in place.
+      supportsReasoningEffort: model.compat?.supports_reasoning_effort,
     },
   };
 }

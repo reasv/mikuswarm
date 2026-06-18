@@ -482,6 +482,25 @@ const ModelSchema = StrictObject({
     Type.Literal("high"),
     Type.Literal("xhigh"),
   ])),
+  // Per-level remap of `thinking_level` → the provider's wire value for the
+  // reasoning-effort knob (pi-ai `Model.thinkingLevelMap`). Needed when the
+  // upstream's effort vocabulary differs from pi-ai's `ThinkingLevel` enum
+  // ("minimal"|"low"|"medium"|"high"|"xhigh"). Example: GLM-5.2 on Together
+  // exposes two efforts, "high" and "max" — map `xhigh = "max"` (and the lower
+  // levels to "high") so `thinking_level = "xhigh"` is forwarded on the wire as
+  // `reasoning_effort = "max"`. A level mapped to `null` is treated as
+  // unsupported (pi-ai clamps away from it). Only consulted on the
+  // openai-completions path when `compat.supports_reasoning_effort` is set.
+  // Mapping `xhigh` is ALSO what makes `xhigh` selectable at all — pi-ai treats
+  // xhigh as a supported level only when it is explicitly mapped here.
+  thinking_level_map: Type.Optional(StrictObject({
+    off: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    minimal: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    low: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    medium: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    high: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    xhigh: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  })),
   // The model-level context ceiling AND the always-on enforcement base (spec
   // CONTEXT-LIMIT-UNIFICATION §2.1/U1). Operators set it deliberately BELOW the
   // physical provider window to stay clear of edge-case degradation/cost. It is
@@ -528,6 +547,14 @@ const ModelSchema = StrictObject({
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
     supports_eager_tool_input_streaming: Type.Optional(Type.Boolean()),
     send_session_affinity_headers: Type.Optional(Type.Boolean()),
+    // Force-enable the openai-completions `reasoning_effort` parameter. pi-ai
+    // auto-detects effort support from the endpoint/provider and DISABLES it for
+    // `provider = "together"` (that gateway dialect normally only toggles
+    // thinking on/off via `reasoning: { enabled }`). Set true when the Together
+    // upstream actually honors an effort level (e.g. GLM-5.2's high/max) so
+    // `thinking_level` (via `thinking_level_map`) is forwarded as
+    // `reasoning_effort`. Unset = keep pi-ai's auto-detection.
+    supports_reasoning_effort: Type.Optional(Type.Boolean()),
   })),
 });
 
