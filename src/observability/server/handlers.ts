@@ -237,8 +237,11 @@ function windowSince(window: string | null, now: number): number {
 
 /** GET /api/usage/summary?window=… — totals by class + by model (§7.1 cards). */
 export function usageSummary(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
-  const since = windowSince(ctx.url.searchParams.get("window"), Date.now());
-  sendJson(res, 200, ctx.deps.storage.getUsageSummary(since));
+  // One `now` for both the window boundary and the average-denominator upper bound, so the
+  // console's per-period math is internally consistent (no within-request clock drift).
+  const now = Date.now();
+  const since = windowSince(ctx.url.searchParams.get("window"), now);
+  sendJson(res, 200, ctx.deps.storage.getUsageSummary(since, now));
 }
 
 /** GET /api/usage/timeseries?window=&bucket=&groupBy=class|model — chart series (§7.1). */

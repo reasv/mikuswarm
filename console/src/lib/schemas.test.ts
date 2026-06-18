@@ -435,6 +435,8 @@ describe('usage & cost schemas', () => {
 	it('decodes GET /api/usage/summary (totals by class + by model)', () => {
 		const out = decode(UsageSummary, {
 			since: 1_700_000_000_000,
+			now: 1_700_000_086_400_000,
+			firstTs: 1_700_000_001_000,
 			total: 7.5,
 			byClass: [
 				{ class: 'tool', cost: 4, events: 3 },
@@ -451,6 +453,11 @@ describe('usage & cost schemas', () => {
 		// A zero-cost class is still a valid summary row (counted in `events`).
 		expect(out.byClass[2].cost).toBe(0);
 		expect(out.byClass[2].events).toBe(5);
+		// Average-denominator fields: `now` upper bound + actual data start in the window.
+		expect(out.now).toBe(1_700_000_086_400_000);
+		expect(out.firstTs).toBe(1_700_000_001_000);
+		// An empty window carries a null data start.
+		expect(decode(UsageSummary, { since: 0, now: 1, firstTs: null, total: 0, byClass: [], byModel: [] }).firstTs).toBeNull();
 	});
 
 	it('decodes GET /api/usage/timeseries (stacked series + bucket meta)', () => {

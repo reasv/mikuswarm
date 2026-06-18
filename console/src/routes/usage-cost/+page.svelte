@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { createQuery } from '@tanstack/svelte-query';
+	import { createQuery, keepPreviousData } from '@tanstack/svelte-query';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
 	import {
 		getUsageSummary,
@@ -11,7 +11,8 @@
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
-	import { buildSpendChart, isSpendChartEmpty } from '$lib/spend-chart';
+	import { buildSpendChart, isSpendChartEmpty, niceTicks } from '$lib/spend-chart';
+	import { buildSpendAverages } from '$lib/spend-averages';
 	import { presentRule } from '$lib/rule-status';
 
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7): cards + a stacked spend chart,
@@ -33,14 +34,21 @@
 	let window = $state<string>('24h');
 	let groupBy = $state<'class' | 'model'>('class');
 
+	// `window`/`groupBy` fold into these query keys, so switching them is a new cache
+	// entry. `keepPreviousData` keeps the prior window's cards/chart on screen while
+	// the new window loads — without it the entry has no data and the UI blank-flashes
+	// to "$0 / no spend" for one frame before refilling. Background polls (same key)
+	// already retain data in place, so they update silently with no indicator.
 	const summary = createQuery(() => ({
 		queryKey: keys.usageSummary(window),
 		queryFn: () => fresh(getUsageSummary({ window })),
+		placeholderData: keepPreviousData,
 		refetchInterval: 5000
 	}));
 	const timeseries = createQuery(() => ({
 		queryKey: keys.usageTimeseries(window, groupBy),
 		queryFn: () => fresh(getUsageTimeseries({ window, groupBy })),
+		placeholderData: keepPreviousData,
 		refetchInterval: 5000
 	}));
 	const sessions = createQuery(() => ({
@@ -62,6 +70,27 @@
 	const total = $derived(summary.data?.total ?? 0);
 	const byClass = $derived(summary.data?.byClass ?? []);
 	const byModel = $derived(summary.data?.byModel ?? []);
+
+	// Per-sub-period spend averages for the Total card. Denominator is the *actual*
+	// elapsed data range (`now - firstTs`), never the nominal window — see
+	// `$lib/spend-averages`. Fed by the same timeseries the chart uses (per-bucket
+	// totals are group-independent, so the class⇄model toggle doesn't move them).
+	const averages = $derived(
+		buildSpendAverages({
+			total,
+			firstTs: summary.data?.firstTs ?? null,
+			now: summary.data?.now ?? Date.now(),
+			series: timeseries.data?.series ?? [],
+			bucketMs: timeseries.data?.bucketMs ?? 3_600_000,
+			window
+		})
+	);
+	// Sub-label under the total spelling out the averaging basis.
+	const rangeNote = $derived(
+		summary.data?.firstTs == null
+			? 'no spend in window'
+			: `over ${fmtElapsed((summary.data?.now ?? Date.now()) - summary.data.firstTs)} of data`
+	);
 	const rules = $derived(
 		// Blocked first, then near, then ok; ties by fill fraction (spec §7.1 #3).
 		[...(budgets.data?.rules ?? [])].sort((a, b) => {
@@ -152,17 +181,73 @@
 	// with dangling legend swatches (issue #8).
 	const chartEmpty = $derived(isSpendChartEmpty(chart));
 
-	const CHART_W = 720;
-	const CHART_H = 180;
-	function barWidth(count: number): number {
-		if (count === 0) return 0;
-		return Math.max(2, Math.min(40, Math.floor((CHART_W - 8) / count) - 2));
+	// --- Stacked spend chart geometry. Inline SVG with a real y-axis (rounded USD
+	// ticks + gridlines) and per-column hover; the model build stays pure in
+	// `$lib/spend-chart`. A left gutter holds the y labels, a bottom gutter the x labels.
+	const VIEW_W = 760;
+	const VIEW_H = 220;
+	const PAD = { top: 8, right: 12, bottom: 22, left: 52 };
+	const plotW = VIEW_W - PAD.left - PAD.right;
+	const plotH = VIEW_H - PAD.top - PAD.bottom;
+	// Bars scale to a rounded ceiling so the tallest sits just under a labelled gridline.
+	const axis = $derived(niceTicks(chart.max, 4));
+	function yFor(v: number): number {
+		return PAD.top + plotH - (axis.niceMax > 0 ? (v / axis.niceMax) * plotH : 0);
+	}
+	function bandX(i: number, count: number): number {
+		return PAD.left + (count > 0 ? (i / count) * plotW : 0);
+	}
+	function bandW(count: number): number {
+		return count > 0 ? plotW / count : plotW;
+	}
+	function barW(count: number): number {
+		return Math.max(2, Math.min(40, bandW(count) - 2));
+	}
+	function xLabelEvery(count: number): number {
+		return Math.max(1, Math.ceil(count / 8));
+	}
+
+	// Hovered column → a floating breakdown tooltip (per-group values + total + the
+	// bucket's time span), so the chart reads in absolute terms, not by colour alone.
+	let hovered = $state<number | null>(null);
+	const hoverCol = $derived(hovered != null ? chart.columns[hovered] : undefined);
+	function tipLeftPct(i: number): number {
+		const n = chart.columns.length;
+		const cx = bandX(i, n) + bandW(n) / 2;
+		return Math.min(82, Math.max(18, (cx / VIEW_W) * 100)); // clamp so the tooltip stays in frame
+	}
+
+	function axisDecimals(step: number): number {
+		return step >= 1 ? 0 : step >= 0.01 ? 2 : step >= 0.001 ? 3 : 4;
+	}
+	function fmtAxisUsd(v: number, step: number): string {
+		return v === 0 ? '$0' : `$${v.toFixed(axisDecimals(step))}`;
 	}
 	function fmtBucket(bucket: number, bucketMs: number): string {
 		const d = new Date(bucket);
 		return bucketMs < 86_400_000
 			? d.toLocaleTimeString([], { hour: '2-digit' })
 			: d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+	}
+	// Full bucket span for the hover tooltip header (the column's x-axis position).
+	function fmtBucketRange(bucket: number, bucketMs: number): string {
+		const start = new Date(bucket);
+		if (bucketMs < 86_400_000) {
+			const end = new Date(bucket + bucketMs);
+			const hm = { hour: '2-digit', minute: '2-digit' } as const;
+			return `${start.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${start.toLocaleTimeString([], hm)}–${end.toLocaleTimeString([], hm)}`;
+		}
+		return start.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+	}
+	// Elapsed actual-data range under the total — the basis for the per-period averages.
+	function fmtElapsed(ms: number): string {
+		if (ms <= 0) return '0m';
+		const mins = Math.round(ms / 60000);
+		if (mins < 60) return `${mins}m`;
+		const hrs = Math.floor(mins / 60);
+		if (hrs < 48) return `${hrs}h ${mins % 60}m`;
+		const days = ms / 86_400_000;
+		return `${days.toFixed(days < 10 ? 1 : 0)}d`;
 	}
 
 	const STATE_BADGE: Record<string, string> = {
@@ -211,20 +296,54 @@
 					</button>
 				{/each}
 			</div>
-			{#if summary.isFetching || budgets.isFetching}
-				<span class="text-[10px] text-blue-500">updating…</span>
-			{/if}
 			<span class="text-[10px] text-muted-foreground" title={UTC_HINT}>
 				Today / This month windows are UTC-aligned
 			</span>
 		</div>
 
 		<!-- 2. Cards -->
-		<div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+		<!-- items-start so the taller Total card (it carries the averages breakdown) doesn't
+		     stretch the by-class / top-models cards into a column of empty space. -->
+		<div class="grid grid-cols-1 items-start gap-3 md:grid-cols-3">
 			<div class="rounded-lg border p-3">
 				<div class="text-xs text-muted-foreground">Total spend</div>
 				<div class="mt-1 font-mono text-2xl font-semibold">{fmtUsd(total)}</div>
-				<div class="mt-0.5 text-[10px] text-muted-foreground">in window</div>
+				<div class="mt-0.5 text-[10px] text-muted-foreground" title="averages divide by this elapsed range, not the nominal window">
+					{rangeNote}
+				</div>
+				<!-- Sub-period averages (spec §7.1 cards): how much per hour/day/week, with the
+				     min/max/σ spread across full periods. Denominator = actual elapsed data range. -->
+				{#if averages.stats.length}
+					<div class="mt-2 border-t pt-2">
+						<table class="w-full text-[11px]">
+							<thead>
+								<tr class="text-[9px] uppercase tracking-wide text-muted-foreground">
+									<th class="text-left font-medium"></th>
+									<th class="pl-2 text-right font-medium">avg</th>
+									<th class="pl-2 text-right font-medium">min</th>
+									<th class="pl-2 text-right font-medium">max</th>
+									<th class="pl-2 text-right font-medium">σ</th>
+									<th class="pl-2 text-right font-medium" title="full periods the spread is over">n</th>
+								</tr>
+							</thead>
+							<tbody class="font-mono tabular-nums">
+								{#each averages.stats as s (s.label)}
+									<tr>
+										<td class="py-0.5 pr-2 text-left text-muted-foreground">{s.label}</td>
+										<td class="py-0.5 pl-2 text-right font-semibold text-foreground">{fmtUsd(s.avg)}</td>
+										<td class="py-0.5 pl-2 text-right">{s.min == null ? '—' : fmtUsd(s.min)}</td>
+										<td class="py-0.5 pl-2 text-right">{s.max == null ? '—' : fmtUsd(s.max)}</td>
+										<td class="py-0.5 pl-2 text-right">{s.stdev == null ? '—' : fmtUsd(s.stdev)}</td>
+										<td class="py-0.5 pl-2 text-right text-muted-foreground">{s.n}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						<div class="mt-1 text-[9px] leading-tight text-muted-foreground">
+							avg = spend ÷ elapsed periods over the actual data range; min/max/σ across full periods
+						</div>
+					</div>
+				{/if}
 			</div>
 			<div class="rounded-lg border p-3">
 				<div class="text-xs text-muted-foreground">By class</div>
@@ -260,7 +379,146 @@
 			</div>
 		</div>
 
-		<!-- 3. Limits — always show every configured rule (spec §7.1 #3) -->
+		<!-- 3. Stacked spend-over-time chart — real y-axis + per-column hover breakdown.
+		     Sits ABOVE Limits: the time series is the primary read, Limits the reference. -->
+		<section>
+			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+				Spend over time
+			</h2>
+			{#if chartEmpty}
+				<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+					No spend in this window.
+				</div>
+			{:else}
+				<div class="rounded-lg border p-3">
+					<div class="mb-2 flex flex-wrap gap-3 text-[10px]">
+						{#each chart.groups as g (g)}
+							<span class="flex items-center gap-1.5">
+								<span
+									class="inline-block size-2 rounded-sm"
+									style={`background:${chart.groupColor.get(g)}`}
+								></span>
+								<span class="max-w-[10rem] truncate font-mono" title={g}>{g}</span>
+							</span>
+						{/each}
+					</div>
+					<!-- relative wrapper anchors the absolutely-positioned hover tooltip -->
+					<div class="relative">
+						<svg
+							viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+							class="w-full"
+							role="img"
+							aria-label="Stacked spend over time"
+							onpointerleave={() => (hovered = null)}
+						>
+							<!-- y-axis: gridlines + USD tick labels (so bars have an absolute scale) -->
+							{#each axis.ticks as t (t)}
+								<line
+									x1={PAD.left}
+									x2={VIEW_W - PAD.right}
+									y1={yFor(t)}
+									y2={yFor(t)}
+									class="stroke-border"
+									stroke-width="1"
+								/>
+								<text
+									x={PAD.left - 6}
+									y={yFor(t) + 3}
+									text-anchor="end"
+									class="fill-muted-foreground"
+									font-size="9"
+								>
+									{fmtAxisUsd(t, axis.step)}
+								</text>
+							{/each}
+							<!-- highlight the hovered column band -->
+							{#if hovered != null}
+								<rect
+									x={bandX(hovered, chart.columns.length)}
+									y={PAD.top}
+									width={bandW(chart.columns.length)}
+									height={plotH}
+									class="fill-muted"
+									opacity="0.5"
+								/>
+							{/if}
+							<!-- stacked bars -->
+							{#each chart.columns as col, i (col.bucket)}
+								{@const n = chart.columns.length}
+								{@const bw = barW(n)}
+								{@const x = bandX(i, n) + (bandW(n) - bw) / 2}
+								{#each col.segments as seg, si (seg.group)}
+									{@const prior = col.segments.slice(0, si).reduce((s, p) => s + p.cost, 0)}
+									{@const yTop = yFor(prior + seg.cost)}
+									<rect {x} y={yTop} width={bw} height={Math.max(0, yFor(prior) - yTop)} fill={seg.color} />
+								{/each}
+								{#if i % xLabelEvery(n) === 0}
+									<text
+										x={bandX(i, n) + bandW(n) / 2}
+										y={VIEW_H - 6}
+										text-anchor="middle"
+										class="fill-muted-foreground"
+										font-size="9"
+									>
+										{fmtBucket(col.bucket, chart.bucketMs)}
+									</text>
+								{/if}
+							{/each}
+							<!-- x baseline -->
+							<line
+								x1={PAD.left}
+								x2={VIEW_W - PAD.right}
+								y1={PAD.top + plotH}
+								y2={PAD.top + plotH}
+								class="stroke-border"
+								stroke-width="1"
+							/>
+							<!-- transparent full-height hit targets so hovering anywhere in a column counts -->
+							{#each chart.columns as col, i (col.bucket)}
+								<rect
+									x={bandX(i, chart.columns.length)}
+									y={PAD.top}
+									width={bandW(chart.columns.length)}
+									height={plotH}
+									fill="transparent"
+									role="presentation"
+									onpointerenter={() => (hovered = i)}
+								/>
+							{/each}
+						</svg>
+						{#if hoverCol}
+							<div
+								class="pointer-events-none absolute top-1 z-10 w-max max-w-[15rem] -translate-x-1/2 rounded-md border bg-background/95 p-2 text-[11px] shadow-md backdrop-blur"
+								style={`left:${tipLeftPct(hovered ?? 0)}%`}
+							>
+								<div class="mb-1 font-medium text-muted-foreground">
+									{fmtBucketRange(hoverCol.bucket, chart.bucketMs)}
+								</div>
+								{#each [...hoverCol.segments].sort((a, b) => b.cost - a.cost) as seg (seg.group)}
+									<div class="flex items-center justify-between gap-3">
+										<span class="flex items-center gap-1.5">
+											<span class="inline-block size-2 rounded-sm" style={`background:${seg.color}`}></span>
+											<span class="max-w-[8rem] truncate font-mono" title={seg.group}>{seg.group}</span>
+										</span>
+										<span class="font-mono tabular-nums">
+											{fmtUsd(seg.cost)}<span class="ml-1 text-muted-foreground"
+												>{hoverCol.sum > 0 ? `${Math.round((seg.cost / hoverCol.sum) * 100)}%` : ''}</span
+											>
+										</span>
+									</div>
+								{/each}
+								<div class="mt-1 flex items-center justify-between gap-3 border-t pt-1 font-mono font-semibold">
+									<span>total</span>
+									<span class="tabular-nums">{fmtUsd(hoverCol.sum)}</span>
+								</div>
+							</div>
+						{/if}
+					</div>
+				</div>
+			{/if}
+		</section>
+
+		<!-- 4. Limits — always show every configured rule (spec §7.1 #3) -->
 		<section>
 			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
 				Limits
@@ -315,67 +573,6 @@
 							</div>
 						</div>
 					{/each}
-				</div>
-			{/if}
-		</section>
-
-		<!-- 4. Stacked spend-over-time chart -->
-		<section>
-			<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-				Spend over time
-			</h2>
-			{#if chartEmpty}
-				<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
-					No spend in this window.
-				</div>
-			{:else}
-				<div class="rounded-lg border p-3">
-					<div class="mb-2 flex flex-wrap gap-3 text-[10px]">
-						{#each chart.groups as g (g)}
-							<span class="flex items-center gap-1.5">
-								<span
-									class="inline-block size-2 rounded-sm"
-									style={`background:${chart.groupColor.get(g)}`}
-								></span>
-								<span class="max-w-[10rem] truncate font-mono" title={g}>{g}</span>
-							</span>
-						{/each}
-					</div>
-					<svg viewBox={`0 0 ${CHART_W} ${CHART_H + 20}`} class="w-full" role="img">
-						{#each chart.columns as col, i (col.bucket)}
-							{@const bw = barWidth(chart.columns.length)}
-							{@const gap = (CHART_W - 8) / chart.columns.length}
-							{@const x = 4 + i * gap + (gap - bw) / 2}
-							{@const colH = chart.max > 0 ? (col.sum / chart.max) * CHART_H : 0}
-							{#each col.segments as seg, si (seg.group)}
-								{@const prior = col.segments
-									.slice(0, si)
-									.reduce((s, p) => s + p.cost, 0)}
-								{@const segH = chart.max > 0 ? (seg.cost / chart.max) * CHART_H : 0}
-								{@const yTop = CHART_H - (chart.max > 0 ? (prior / chart.max) * CHART_H : 0) - segH}
-								<rect
-									{x}
-									y={yTop}
-									width={bw}
-									height={Math.max(0, segH)}
-									fill={seg.color}
-								>
-									<title>{seg.group}: {fmtUsd(seg.cost)}</title>
-								</rect>
-							{/each}
-							{#if i % Math.ceil(chart.columns.length / 8) === 0}
-								<text
-									x={x + bw / 2}
-									y={CHART_H + 14}
-									text-anchor="middle"
-									class="fill-muted-foreground"
-									font-size="9"
-								>
-									{fmtBucket(col.bucket, chart.bucketMs)}
-								</text>
-							{/if}
-						{/each}
-					</svg>
 				</div>
 			{/if}
 		</section>

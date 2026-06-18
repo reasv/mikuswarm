@@ -568,8 +568,10 @@ test("getUsageSummary: groups by class and by model with totals (#18)", async ()
       { ts: 4_000, class: "caption", modelId: "flash", costUsd: 0 }, // zero-cost row still counted in `events`
     ],
     async (storage) => {
-      const summary = storage.getUsageSummary(0);
+      const summary = storage.getUsageSummary(0, 10_000);
       assert.equal(summary.since, 0);
+      assert.equal(summary.now, 10_000, "echoes the `now` it was computed against");
+      assert.equal(summary.firstTs, 1_000, "firstTs is the earliest event ts within the window");
       assert.ok(Math.abs(summary.total - 7) < 1e-9);
       const byClass = new Map(summary.byClass.map((r) => [r.class, r]));
       assert.equal(byClass.get("agent_loop")?.cost, 3);
@@ -582,6 +584,8 @@ test("getUsageSummary: groups by class and by model with totals (#18)", async ()
       assert.equal(byModel.get("gemini")?.cost, 4);
       // Ordered cost-desc: the priciest class leads.
       assert.equal(summary.byClass[0]?.class, "tool");
+      // A window that starts after every event has no data start to anchor averages to.
+      assert.equal(storage.getUsageSummary(5_000, 10_000).firstTs, null);
     },
   );
 });

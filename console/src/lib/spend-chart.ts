@@ -101,3 +101,55 @@ export function buildSpendChart(
 export function isSpendChartEmpty(chart: Pick<SpendChart, 'columns' | 'max'>): boolean {
 	return chart.columns.length === 0 || chart.max === 0;
 }
+
+/** A "nice" linear y-axis: a rounded ceiling ≥ data max, and the tick values up to it. */
+export interface AxisTicks {
+	/** Axis ceiling (≥ max), a round multiple of `step`. Bars scale to this, not raw max. */
+	niceMax: number;
+	/** Spacing between adjacent ticks (round 1/2/5 × 10ⁿ). 0 when there's nothing to scale. */
+	step: number;
+	/** Tick values `[0, step, 2·step, …, niceMax]` — gridlines + labels. */
+	ticks: number[];
+}
+
+/** Nearest "nice" number (1/2/5 × 10ⁿ) to `x`: round to nearest, or `ceil` toward nicer. */
+function niceNum(x: number, round: boolean): number {
+	const exp = Math.floor(Math.log10(x));
+	const mag = Math.pow(10, exp);
+	const f = x / mag; // 1 ≤ f < 10
+	const nf = round
+		? f < 1.5
+			? 1
+			: f < 3
+				? 2
+				: f < 7
+					? 5
+					: 10
+		: f <= 1
+			? 1
+			: f <= 2
+				? 2
+				: f <= 5
+					? 5
+					: 10;
+	return nf * mag;
+}
+
+/**
+ * Build a small set of human-round y-axis ticks spanning `[0, max]` (Heckbert's
+ * "nice numbers" algorithm): a nice range, then a nice step near
+ * `range / targetCount`, then a ceiling that is a whole number of steps ≥ `max`.
+ * Gives the chart an actual, readable y-scale instead of bars at heights
+ * meaningful only relative to one another. Pure so the tick math is
+ * unit-testable; `max ≤ 0` ⇒ a single 0 tick.
+ */
+export function niceTicks(max: number, targetCount = 4): AxisTicks {
+	if (!(max > 0) || !Number.isFinite(max)) return { niceMax: 0, step: 0, ticks: [0] };
+	const range = niceNum(max, false);
+	const step = niceNum(range / Math.max(1, targetCount), true);
+	const count = Math.ceil(max / step); // whole steps needed to cover max
+	const niceMax = count * step;
+	// Build by integer index so floating drift never yields a stray near-duplicate tick.
+	const ticks = Array.from({ length: count + 1 }, (_, i) => i * step);
+	return { niceMax, step, ticks };
+}

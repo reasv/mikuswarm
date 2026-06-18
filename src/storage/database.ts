@@ -892,6 +892,14 @@ export interface CostOverview {
 /** Spend + counts by class and by model over a window (spec USAGE-COST-LIMITS §7.1 cards). */
 export interface UsageSummary {
   since: number;
+  /** Server `now` (ms) the window was computed against — the average denominator's upper bound. */
+  now: number;
+  /**
+   * Earliest event ts within `[since, now)`, or null when the window has no events.
+   * The console divides spend by the *actual* elapsed range (`now - firstTs`), not the
+   * nominal window width, so a 30d view a week into data averages over ~7d (§7.1 cards).
+   */
+  firstTs: number | null;
   total: number;
   byClass: Array<{ class: string; cost: number; events: number }>;
   byModel: Array<{ model: string; cost: number; events: number }>;
@@ -3043,7 +3051,7 @@ export class Storage {
    * Spend + counts grouped by class and by model over `[since, now)` (spec §4 /
    * §7.1 cards). One read, two aggregations.
    */
-  getUsageSummary(since: number): UsageSummary {
+  getUsageSummary(since: number, now: number): UsageSummary {
     return this.read((db) => {
       const byClass = db
         .prepare(
@@ -3057,8 +3065,15 @@ export class Storage {
              from usage_events where ts >= ? group by model_id order by cost desc`,
         )
         .all(since) as Array<{ model: string; cost: number; events: number }>;
+      // Actual data start within the window — anchors the console's per-period averages to
+      // the elapsed range rather than the nominal window (null ⇒ no events in window).
+      const firstTs = (
+        db.prepare(`select min(ts) as firstTs from usage_events where ts >= ?`).get(since) as {
+          firstTs: number | null;
+        }
+      ).firstTs;
       const total = byClass.reduce((sum, r) => sum + r.cost, 0);
-      return { since, total, byClass, byModel };
+      return { since, now, firstTs, total, byClass, byModel };
     });
   }
 

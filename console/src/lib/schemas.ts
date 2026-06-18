@@ -523,6 +523,10 @@ export type CostOverview = Schema.Schema.Type<typeof CostOverview>;
 /** GET /api/usage/summary — totals by class + by model over a window (§7.1 cards). */
 export const UsageSummary = Schema.Struct({
 	since: Schema.Number,
+	// `now` (server clock) + `firstTs` (earliest event in window, null when empty) let the
+	// card average spend over the *actual* elapsed data range, not the nominal window width.
+	now: Schema.Number,
+	firstTs: Schema.NullOr(Schema.Number),
 	total: Schema.Number,
 	byClass: Schema.Array(
 		Schema.Struct({ class: Schema.String, cost: Schema.Number, events: Schema.Number })

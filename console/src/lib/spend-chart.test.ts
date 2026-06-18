@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSpendChart, isSpendChartEmpty, type SpendSeriesRow } from './spend-chart';
+import { buildSpendChart, isSpendChartEmpty, niceTicks, type SpendSeriesRow } from './spend-chart';
 
 // Deterministic color stub so assertions don't depend on the page's palette.
 const color = (g: string) => `c:${g}`;
@@ -75,5 +75,38 @@ describe('isSpendChartEmpty', () => {
 	it('is false once any column has positive spend', () => {
 		const chart = buildSpendChart([{ bucket: 1, grp: 'tool', cost: 0.01 }], 1, colorFor);
 		expect(isSpendChartEmpty(chart)).toBe(false);
+	});
+});
+
+describe('niceTicks', () => {
+	it('returns a single zero tick when there is nothing to scale', () => {
+		expect(niceTicks(0)).toEqual({ niceMax: 0, step: 0, ticks: [0] });
+		expect(niceTicks(-5)).toEqual({ niceMax: 0, step: 0, ticks: [0] });
+		expect(niceTicks(NaN)).toEqual({ niceMax: 0, step: 0, ticks: [0] });
+	});
+
+	it('rounds the ceiling up to a whole number of round steps that covers max', () => {
+		const t = niceTicks(0.42, 4);
+		expect(t.step).toBeCloseTo(0.1, 10);
+		expect(t.niceMax).toBeCloseTo(0.5, 10); // ceil(0.42 / 0.1) = 5 steps
+		expect(t.ticks).toHaveLength(6); // 0,0.1,0.2,0.3,0.4,0.5
+		expect(t.ticks[0]).toBe(0);
+		expect(t.ticks[t.ticks.length - 1]).toBeCloseTo(t.niceMax, 10);
+	});
+
+	it('always reaches at least the data max, and ticks are evenly spaced', () => {
+		for (const max of [0.003, 0.012, 0.5, 1, 7.5, 123]) {
+			const t = niceTicks(max, 4);
+			expect(t.niceMax).toBeGreaterThanOrEqual(max);
+			for (let i = 1; i < t.ticks.length; i++) {
+				expect(t.ticks[i] - t.ticks[i - 1]).toBeCloseTo(t.step, 9);
+			}
+		}
+	});
+
+	it('uses 1/2/5 × 10ⁿ step magnitudes (e.g. ~$0.012 max → $0.005 step)', () => {
+		const t = niceTicks(0.012, 4);
+		expect(t.step).toBeCloseTo(0.005, 10);
+		expect(t.niceMax).toBeCloseTo(0.015, 10);
 	});
 });
