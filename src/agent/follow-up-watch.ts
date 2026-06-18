@@ -123,6 +123,11 @@ export type FollowUpRoute = "steer" | "park" | "resume" | "none";
  *    its agent is attached (the same gate `SessionManager.steer` applies — an attached
  *    agent queues a steered message even in the attachAgent→first-prompt gap); else
  *    **park** (created, or running-but-pre-attach) to drain when it goes live;
+ *  - owner still in memory and `resuming`: **park** — a session is `resuming` only
+ *    inside `runResumeSession`'s adopt→markRunning transition (no agent attached yet),
+ *    so it is the resume analogue of running-pre-attach: park it to drain at go-live
+ *    rather than letting it fall through to the durable row's (possibly already
+ *    `completed`) native fate;
  *  - owner gone from memory → settled: **resume** iff the durable row is `completed`
  *    (the only fold-resumable state, §5.3/§7.2); otherwise **none** (a
  *    discarded/interrupted/failed/pruned row → native fate at the call site).
@@ -135,6 +140,12 @@ export function decideFollowUpRoute(input: {
 }): FollowUpRoute {
   if (input.recordPresent && (input.recordStatus === "created" || input.recordStatus === "running")) {
     return input.recordStatus === "running" && input.agentAttached ? "steer" : "park";
+  }
+  // A present `resuming` record is running-pre-attach in disguise — park it (it drains on
+  // go-live). The genuinely-terminal-ish present states (`suspended`/`interrupted`/
+  // `failed-resumable`) intentionally fall through to the durable row's fate below.
+  if (input.recordPresent && input.recordStatus === "resuming") {
+    return "park";
   }
   return input.rowCompleted ? "resume" : "none";
 }

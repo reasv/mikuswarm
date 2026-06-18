@@ -235,9 +235,25 @@ test("decideFollowUpRoute: a live record outranks the durable row (steer/park wi
   );
 });
 
+test("decideFollowUpRoute: a present record in `resuming` → park (running-pre-attach analogue, #5)", () => {
+  // `resuming` is set only inside `runResumeSession`'s adopt→markRunning transition (no
+  // agent attached yet), so a present `resuming` record is the resume analogue of
+  // running-pre-attach: park (drains on go-live), NOT the durable row's fate. The route is
+  // park regardless of whether the row already flipped to `completed` (settle race).
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "resuming", agentAttached: false, rowCompleted: false }),
+    "park",
+  );
+  assert.equal(
+    decideFollowUpRoute({ recordPresent: true, recordStatus: "resuming", agentAttached: false, rowCompleted: true }),
+    "park",
+  );
+});
+
 test("decideFollowUpRoute: a present record in a terminal status falls through to the row", () => {
-  // record present but neither created nor running (e.g. interrupted, pending evict):
-  // the route is decided by the durable row, exactly as if the record were gone.
+  // record present but neither created/running nor `resuming` (e.g. interrupted, pending
+  // evict): the genuinely-terminal-ish present states (`suspended`/`interrupted`/
+  // `failed-resumable`) are decided by the durable row, exactly as if the record were gone.
   assert.equal(
     decideFollowUpRoute({ recordPresent: true, recordStatus: "interrupted", agentAttached: false, rowCompleted: true }),
     "resume",
@@ -303,13 +319,21 @@ test("resolveFollowUpRoute: record absent + terminal non-completed row → none 
 });
 
 test("resolveFollowUpRoute: the settle-window override is record-ABSENT only", () => {
-  // A PRESENT record in `resuming`/`running` is NOT the settle-window case — it is the
-  // live record's business (steer/park decided by `decideFollowUpRoute`), so the override
-  // must not fire. `resuming` is neither created nor running here → falls through to the
-  // row, which (not completed) is `none` — matching `decideFollowUpRoute` exactly. (The
-  // record-present `resuming → park` handling is issue #5's separate concern.)
+  // A PRESENT record is NOT the settle-window case — its route is the live record's
+  // business (decided by `decideFollowUpRoute`), so the record-absent override must not
+  // fire even when the raw row reads a pre-completion status. With #5 a present `resuming`
+  // record routes to **park** (running-pre-attach analogue) — note this is `decideFollowUpRoute`'s
+  // verdict, NOT the `resume` the settle-window override would wrongly produce if it fired
+  // on a present record.
   assert.equal(
     resolveFollowUpRoute({ recordPresent: true, recordStatus: "resuming", agentAttached: false, rawRowStatus: "running" }),
+    "park",
+  );
+  // A present record in a genuinely-terminal status DOES fall through to the raw row — but
+  // the settle-window override still must not fire (record present), so a raw `running`
+  // there yields `none` (its `rowCompleted:false` `decideFollowUpRoute` verdict), not `resume`.
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: true, recordStatus: "interrupted", agentAttached: false, rawRowStatus: "running" }),
     "none",
   );
   // A present running record with an attached agent steers, regardless of the raw row.
