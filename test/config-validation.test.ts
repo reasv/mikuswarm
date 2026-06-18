@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
+import { assertFollowupConfigValid } from "../src/app.ts";
 
 // A complete, env-free config so loadConfig reaches structural + cross-field
 // validation without tripping the "missing env var" guard. The
@@ -456,6 +457,76 @@ for (const { name, find, replace } of BROWSER_OUT_OF_BOUNDS_CASES) {
   });
 }
 
+// --- #9: shipped [agent.sessions.followup] defaults pass schema + cross-field validation ---
+
+// Mirrors the values config/00-defaults.toml ships in its [agent.sessions.followup]
+// block (spec FOLLOWUP-FOLDING §9): media 10s/30s, text 7s/15s, mention 5s/12s, all
+// enabled. Every lever must pass TypeBox validation AND `assertFollowupConfigValid`
+// (the app-wiring cross-field guard, which rejects wall_clock_ms < user_gap_ms and a
+// user_gap_ms with no wall_clock_ms). A future defaults drift — e.g. dropping a
+// `wall_clock_ms` — must fail THIS test, not only fail at boot.
+const FOLLOWUP_DEFAULTS_BLOCK = `
+[agent.sessions.followup.media]
+enabled = true
+user_gap_ms = 10000
+wall_clock_ms = 30000
+
+[agent.sessions.followup.text]
+enabled = true
+user_gap_ms = 7000
+wall_clock_ms = 15000
+
+[agent.sessions.followup.mention]
+enabled = true
+user_gap_ms = 5000
+wall_clock_ms = 12000
+`;
+
+test("config: shipped-shape [agent.sessions.followup] defaults pass schema validation (issue #9)", async () => {
+  await withConfigDir(`${BASE_CONFIG}${FOLLOWUP_DEFAULTS_BLOCK}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    const followup = config.agent.sessions.followup;
+    assert.ok(followup, "the [agent.sessions.followup] block is present");
+    // Exact spec-§9 values, all three levers.
+    assert.deepEqual(followup?.media, { enabled: true, user_gap_ms: 10_000, wall_clock_ms: 30_000 });
+    assert.deepEqual(followup?.text, { enabled: true, user_gap_ms: 7_000, wall_clock_ms: 15_000 });
+    assert.deepEqual(followup?.mention, { enabled: true, user_gap_ms: 5_000, wall_clock_ms: 12_000 });
+    // The shipped block must also clear the app-wiring cross-field guard.
+    assert.doesNotThrow(() => assertFollowupConfigValid(followup));
+  });
+});
+
+// Each case fat-fingers ONE followup lever so `assertFollowupConfigValid` rejects it,
+// guarding the cross-field invariants the schema alone can't (wall_clock vs user_gap,
+// and the dead-lever partial). The schema accepts these (both are Type.Optional
+// non-negative integers); the app-wiring guard is what must reject them.
+const FOLLOWUP_INVALID_CASES: Array<{ name: string; find: string; replace: string; error: RegExp }> = [
+  {
+    name: "media wall_clock_ms below its user_gap_ms",
+    find: "user_gap_ms = 10000\nwall_clock_ms = 30000",
+    replace: "user_gap_ms = 10000\nwall_clock_ms = 5000",
+    error: /wall_clock_ms \(5000\) must be >= user_gap_ms \(10000\)/,
+  },
+  {
+    name: "text user_gap_ms with wall_clock_ms dropped (dead lever)",
+    find: "user_gap_ms = 7000\nwall_clock_ms = 15000",
+    replace: "user_gap_ms = 7000",
+    error: /user_gap_ms is set but wall_clock_ms is missing/,
+  },
+];
+
+for (const { name, find, replace, error } of FOLLOWUP_INVALID_CASES) {
+  test(`config: invalid [agent.sessions.followup] rejected by cross-field guard — ${name} (issue #9)`, async () => {
+    const block = FOLLOWUP_DEFAULTS_BLOCK.replace(find, replace);
+    assert.ok(block.includes(replace), "precondition: the bad value was substituted in");
+    await withConfigDir(`${BASE_CONFIG}${block}`, async (dir) => {
+      // The schema admits the partial/inverted block; the cross-field guard rejects it.
+      const config = await loadConfig(dir, { env: false });
+      assert.throws(() => assertFollowupConfigValid(config.agent.sessions.followup), error);
+    });
+  });
+}
+
 test("config: [reactions] block parses and exposes its knobs", async () => {
   const toml = `${BASE_CONFIG}
 [reactions]
@@ -708,6 +779,31 @@ test("config: shipped config/00-defaults.toml validates under strict unknown-key
       const config = await loadConfig(dir, { env: false });
       assert.equal(config.app.name, "mikuswarm");
       assert.equal(config.captioning?.worker_count, 2);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("config: REAL config/00-defaults.toml ships the exact §9 follow-up defaults (issue #9)", async () => {
+  // Loads the ACTUAL shipped file (not a hand-mirrored block) and asserts the
+  // [agent.sessions.followup] defaults are present, exactly spec-§9, and clear the
+  // cross-field guard. This is the test that catches a drift in the file itself — a
+  // dropped `wall_clock_ms` (silently inert lever) or an inverted window would fail
+  // here rather than only at boot. Copy ONLY the defaults so a git-ignored local
+  // overlay (config/90-local.toml) can't perturb the load (same rationale as #29).
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-config-followup-"));
+  try {
+    await copyFile(path.join(REPO_ROOT, "config", "00-defaults.toml"), path.join(dir, "00-defaults.toml"));
+    await withEnv(SHIPPED_TOML_ENV, async () => {
+      const config = await loadConfig(dir, { env: false });
+      const followup = config.agent.sessions.followup;
+      assert.ok(followup, "the shipped defaults include [agent.sessions.followup]");
+      assert.deepEqual(followup?.media, { enabled: true, user_gap_ms: 10_000, wall_clock_ms: 30_000 });
+      assert.deepEqual(followup?.text, { enabled: true, user_gap_ms: 7_000, wall_clock_ms: 15_000 });
+      assert.deepEqual(followup?.mention, { enabled: true, user_gap_ms: 5_000, wall_clock_ms: 12_000 });
+      // The shipped block must clear the app-wiring cross-field guard (the boot check).
+      assert.doesNotThrow(() => assertFollowupConfigValid(followup));
     });
   } finally {
     await rm(dir, { recursive: true, force: true });

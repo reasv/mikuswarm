@@ -437,6 +437,32 @@ test("FollowUpWatch: most-recent arm overwrites and resets the GC timer", () => 
   assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s2");
 });
 
+test("FollowUpWatch: fold-resume re-arm keeps the chain linear (resume-chain invariance, §7 / #10)", () => {
+  // Models the resume-chain re-arm: `runResumeSession` calls `armFollowUpWatch(inbound,
+  // record.id)` (app.ts) after a settled→resume fold, re-pointing the SAME
+  // (timeline, sender) watch at the RESUMED session id. So a subsequent same-sender
+  // follow-up chains into the resumed session, not the now-consumed original — the
+  // chain stays linear across mixed fresh / reply-resume / follow-up-resume steps.
+  const t = fakeTimers();
+  const watch = new FollowUpWatch(30_000, t.now, t.schedule, t.cancel);
+  // The original trigger launched session s1 → arm names s1.
+  watch.arm(TK, "@alice:server.org", { sessionId: "s1", triggerOriginTs: 1_000, armedAtWallClock: 0 });
+  assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s1");
+  // A quick follow-up settled→resumes s1 as s1prime; runResumeSession re-arms with the
+  // resumed id and re-anchors the user-gap clock to the resume turn's origin ts.
+  t.advance(5_000);
+  watch.arm(TK, "@alice:server.org", { sessionId: "s1prime", triggerOriginTs: 6_000, armedAtWallClock: 5_000 });
+  // Most-recent-wins: the watch now names the resumed session, and the next follow-up
+  // would fold into s1prime. Exactly one entry — the chain did not branch.
+  assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s1prime");
+  assert.equal(watch.size, 1, "the re-arm replaced the entry in place — the chain stays linear");
+  // The re-arm reset the GC timer (the superseded one was cancelled): 26s more (31s since
+  // the FIRST arm, 26s since the re-arm) and the resumed entry is still live.
+  assert.equal(t.pending(), 1, "the original watch's GC timer was cancelled by the re-arm");
+  t.advance(26_000);
+  assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s1prime");
+});
+
 test("FollowUpWatch: GC timer evicts after the lifetime", () => {
   const t = fakeTimers();
   const watch = new FollowUpWatch(30_000, t.now, t.schedule, t.cancel);
@@ -644,12 +670,25 @@ test("evaluateFollowUpResumeGate: ANY throw degrades to no-resume, never propaga
 // ── foldFollowUp precedence (faithful model, §6 single-consumption + §5 routing) ──
 //
 // Models the synchronous `foldFollowUp` fork in handleInbound (src/app.ts): the guard
-// chain (reply-skip → self-skip → watch lookup → trigger-hold raw-skip → dedup → gate)
-// then the route dispatch. The pieces it composes are the REAL ones — a real
-// `FollowUpWatch`, a real `steeredEventIds` Set, `classifyFollowUpForm`,
+// chain (reply-skip → self-skip → watch lookup → trigger-hold raw-skip → dedup → gate →
+// already-grouped precedence) then the route dispatch. The pieces it composes are the
+// REAL ones — a real `FollowUpWatch`, a real `steeredEventIds` Set, `classifyFollowUpForm`,
 // `followUpGateDecision`, `resolveFollowUpRoute`; only the control-flow ordering is
-// reproduced here (the live function fires detached deliveries this model does not).
-// Mirrors the duplicate-reply-mitigation `admit` model.
+// reproduced here. Mirrors the duplicate-reply-mitigation `admit` model.
+//
+// SCOPE — this model asserts PRECEDENCE (which destination a follow-up event is routed
+// to, and that it is consumed exactly once), NOT the live dispatch. Deliberately OUT of
+// the model's scope (the real function fires these as detached promises / side effects in
+// closures that have no unit harness):
+//   • the steer→resume fallback when the owner settled mid-download (`steerFollowUp`);
+//   • the park→drain on go-live (`drainPendingFollowUpsIntoSession`);
+//   • the native-fate redispatch vs inert action (`revertFollowUpToNativeFate`) — the
+//     DECISION it keys on is covered separately by `nativeFateAction` below, but the
+//     `redispatchCoReply` call / inert no-op themselves are not exercised here;
+//   • the real DM-vs-group `wouldTrigger` derivation (`resumeContextFor(...) === "dm" ||
+//     mentionedSelf`) — the model takes `wouldTrigger` as a given input rather than
+//     deriving it, so it asserts the raw-vs-post-hold dedup precedence, not the room-type
+//     classification.
 
 type FoldOutcome = "skip" | "deduped" | "steer" | "park" | "resume" | "none";
 
@@ -664,12 +703,15 @@ function fold(args: {
   wouldTrigger: boolean;
   // `rawRowStatus` is the durable row's status as the call site reads it (review #3): for
   // back-compat a test may instead pass `rowCompleted` (mapped to `completed`/undefined).
+  // `groupedEventIds` mirrors the live owner record's `trigger.event.trigger.groupedEventIds`
+  // — the §6-#1 belt-and-suspenders precedence clause keys on it.
   owner: {
     recordPresent: boolean;
     recordStatus?: string;
     agentAttached?: boolean;
     rowCompleted?: boolean;
     rawRowStatus?: string;
+    groupedEventIds?: string[];
   };
   now: number;
 }): FoldOutcome {
@@ -690,6 +732,11 @@ function fold(args: {
     now: args.now,
   });
   if (!passes) return "skip";
+  // Belt-and-suspenders precedence (§6 #1): if the live owner already grouped this event
+  // into its trigger turn (the 2s hold), it is turn-1 content, not a follow-up — leave it
+  // (`foldFollowUp` returns false → "skip"). Ordered AFTER the gate and AFTER the
+  // `record = sessions.get()` read, BEFORE the route decision — exactly app.ts:2343→2352.
+  if (args.owner.groupedEventIds?.includes(ev.id)) return "skip";
   const route = resolveFollowUpRoute({
     recordPresent: args.owner.recordPresent,
     recordStatus: args.owner.recordStatus,
@@ -834,4 +881,71 @@ test("fold: settle window — owner evicted but row still 'running' → resume +
     "resume",
   );
   assert.ok(steered.has("evt-1"), "the consumed follow-up must be marked steered (single-consumption)");
+});
+
+test("fold: an event already grouped into the owner's trigger turn is left alone (§6 #1 precedence, #12)", () => {
+  // Belt-and-suspenders clause (§6 #1): the 2s trigger hold may already have grabbed this
+  // event into the owner's turn-1 group (`record.trigger.event.trigger.groupedEventIds`).
+  // It is then turn-1 content, not a follow-up — `foldFollowUp` returns false ("skip"),
+  // even though the gate passes and the owner is a steerable running session. It is NOT
+  // consumed by the fold (it belongs to the owner's trigger, which renders it). This guards
+  // the precedence between the trigger hold and the fold. Structurally near-impossible
+  // given arm-after-launch, but asserted because the production code asserts it.
+  const steered = new Set<string>();
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered, config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), // gate passes (3s ≤ 7s text gap), would steer…
+      trigger: false, wouldTrigger: false,
+      // …but the live owner already grouped evt-1 into its trigger turn (the 2s hold).
+      owner: { ...RUNNING_ATTACHED, groupedEventIds: ["other-evt", "evt-1"] },
+      now: 2_000,
+    }),
+    "skip",
+  );
+  assert.equal(steered.has("evt-1"), false, "an already-grouped event is NOT consumed by the fold");
+  // Control: with the SAME steerable owner but the event NOT in its trigger group, the
+  // gate-passing follow-up steers (and is consumed) — isolating the precedence clause as
+  // the only difference.
+  const steered2 = new Set<string>();
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered: steered2, config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: false, wouldTrigger: false,
+      owner: { ...RUNNING_ATTACHED, groupedEventIds: ["other-evt"] }, now: 2_000,
+    }),
+    "steer",
+  );
+  assert.ok(steered2.has("evt-1"), "a non-grouped gate-passing follow-up steers and is consumed");
+});
+
+// ── revertFollowUpToNativeFate action (faithful predicate, §5.2/§6 #3, #11) ──────
+//
+// The native-fate DECISION, mirrored from `revertFollowUpToNativeFate` (app.ts): a
+// trigger-bearing follow-up (re-`@`, or any DM message — `inbound.trigger` present, since
+// those fold on their post-hold delivery) re-dispatches as its own session
+// (`redispatchCoReply`); a bare GROUP follow-up (no trigger) reverts to inert (it is
+// already a persisted timeline event — nothing to do, = today, no loss).
+//
+// SCOPE: this asserts the branch PREDICATE only. The action's side effects — the
+// `redispatchCoReply(inbound)` call and the inert no-op — live inline in a `createApp`
+// closure with no unit harness, so they are not exercised here (see the tracker note for
+// #11). Mirrors the repo's pure-predicate modelling convention (cf. `decideFollowUpRoute`).
+type NativeFateAction = "redispatch" | "inert";
+function nativeFateAction(inbound: { trigger?: unknown }): NativeFateAction {
+  return inbound.trigger ? "redispatch" : "inert";
+}
+
+test("nativeFateAction: a trigger-bearing follow-up re-dispatches as its own session (#11)", () => {
+  // Post-hold delivery of a re-`@` / DM follow-up carries `inbound.trigger`, so a lost
+  // fold (abandoned owner, capability-gated resume, CAS loss, setup throw) re-dispatches —
+  // the user explicitly addressed the bot, so it must get a response.
+  assert.equal(nativeFateAction({ trigger: { type: "mention" } }), "redispatch");
+});
+
+test("nativeFateAction: a bare-group follow-up reverts to inert (#11)", () => {
+  // A bare group follow-up never triggered (no `@`, not a DM), so `inbound.trigger` is
+  // absent: native fate is inert — no parallel session is spawned (= today, no loss).
+  assert.equal(nativeFateAction({ trigger: undefined }), "inert");
+  assert.equal(nativeFateAction({}), "inert");
 });
