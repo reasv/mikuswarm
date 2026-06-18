@@ -12,6 +12,7 @@ export {
   hasImageAttachment,
   maxWallClockMs,
   decideFollowUpRoute,
+  resolveFollowUpRoute,
   type FollowUpForm,
   type FollowUpRoute,
   type FollowUpWatchEntry,

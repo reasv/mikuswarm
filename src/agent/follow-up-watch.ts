@@ -139,6 +139,52 @@ export function decideFollowUpRoute(input: {
   return input.rowCompleted ? "resume" : "none";
 }
 
+/**
+ * Resolve the route with the **settle-window discrimination** layered on top of the
+ * pure {@link decideFollowUpRoute} (spec §5.3; review issue #3). `SessionManager`'s
+ * `markCompleted` does update-in-memory→`completed`, then enqueues the `completed`
+ * persist on the single-writer queue (NOT drained synchronously), then evicts the
+ * in-memory record synchronously. So in the window between evict and the queued write
+ * draining, a fold observes the record **absent** while the durable row still reads
+ * its pre-completion status (`running`/`resuming`) — and `decideFollowUpRoute` returns
+ * `none` (record gone, row not yet `completed`), demoting a just-settled session to
+ * native fate in the feature's hottest window.
+ *
+ * This wrapper detects exactly that case — record absent **and** the raw durable
+ * status is one a session passes *through* on its way to `completed` — and routes to
+ * **resume**. `resumeFollowUp` then `await storage.waitForIdle()`s before the gate, so
+ * the queued `completed` write has drained by the time the gate (and the FIFO-ordered
+ * CAS) read the row. A genuinely-terminal non-completed status (`discarded` /
+ * `interrupted` / `failed-resumable`) or a missing row stays `none` → native fate.
+ *
+ * `decideFollowUpRoute` is left untouched (its pinned `recordPresent:false,
+ * rowCompleted:false → "none"` contract is the *post-drain* truth); the ambiguity is a
+ * pre-drain race only this caller, which can `waitForIdle`, is positioned to resolve.
+ */
+export function resolveFollowUpRoute(input: {
+  recordPresent: boolean;
+  recordStatus: string | undefined;
+  agentAttached: boolean;
+  rawRowStatus: string | undefined;
+}): FollowUpRoute {
+  const route = decideFollowUpRoute({
+    recordPresent: input.recordPresent,
+    recordStatus: input.recordStatus,
+    agentAttached: input.agentAttached,
+    rowCompleted: input.rawRowStatus === "completed",
+  });
+  if (
+    route === "none" &&
+    !input.recordPresent &&
+    (input.rawRowStatus === "running" || input.rawRowStatus === "resuming")
+  ) {
+    // Ambiguous-settling: the record was evicted but the `completed` persist hasn't
+    // drained. Route to resume; `resumeFollowUp`'s `waitForIdle` settles the row.
+    return "resume";
+  }
+  return route;
+}
+
 /** True if ANY lever is enabled — i.e. follow-up folding is live at all (§9). */
 export function followUpConfigActive(config: FollowUpConfig): boolean {
   return config.media.enabled || config.text.enabled || config.mention.enabled;

@@ -9,6 +9,7 @@ import {
   hasImageAttachment,
   maxWallClockMs,
   decideFollowUpRoute,
+  resolveFollowUpRoute,
   type FollowUpConfig,
 } from "../src/agent/follow-up-watch.js";
 import { convertToLlm } from "../src/agent/convert.js";
@@ -244,6 +245,89 @@ test("decideFollowUpRoute: a present record in a terminal status falls through t
   assert.equal(
     decideFollowUpRoute({ recordPresent: true, recordStatus: "interrupted", agentAttached: false, rowCompleted: false }),
     "none",
+  );
+});
+
+// ── resolveFollowUpRoute (§5.3 settle-window discrimination, review #3) ───────
+// `resolveFollowUpRoute` wraps the pure `decideFollowUpRoute` and adds the ONLY new
+// behaviour for #3: when the record is gone but the durable row still reads a
+// pre-completion status (`running`/`resuming`) — the window between `markCompleted`'s
+// synchronous evict and its queued `completed` persist draining — it routes to
+// **resume** (the call site then `waitForIdle`s before the gate). Everything else must
+// match `decideFollowUpRoute` exactly.
+
+test("resolveFollowUpRoute: record absent + raw row 'running' → resume (settle window, #3)", () => {
+  // The regression #3 fixes: old code passed `rowCompleted: status === 'completed'`, so a
+  // row still reading `running` yielded `decideFollowUpRoute → none` → native fate,
+  // demoting a just-settled session in the feature's hottest window. Now → resume.
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: false, recordStatus: undefined, agentAttached: false, rawRowStatus: "running" }),
+    "resume",
+  );
+});
+
+test("resolveFollowUpRoute: record absent + raw row 'resuming' → resume (settle window, #3)", () => {
+  assert.equal(
+    resolveFollowUpRoute({
+      recordPresent: false,
+      recordStatus: undefined,
+      agentAttached: false,
+      rawRowStatus: "resuming",
+    }),
+    "resume",
+  );
+});
+
+test("resolveFollowUpRoute: record absent + raw row 'completed' → resume (already drained)", () => {
+  // The common, truly-settled case is unchanged: the row reads `completed` directly.
+  assert.equal(
+    resolveFollowUpRoute({
+      recordPresent: false,
+      recordStatus: undefined,
+      agentAttached: false,
+      rawRowStatus: "completed",
+    }),
+    "resume",
+  );
+});
+
+test("resolveFollowUpRoute: record absent + terminal non-completed row → none (native fate)", () => {
+  // A genuinely-terminal status is NOT a settle-window ambiguity — it stays native fate.
+  for (const rawRowStatus of ["discarded", "interrupted", "failed-resumable", undefined]) {
+    assert.equal(
+      resolveFollowUpRoute({ recordPresent: false, recordStatus: undefined, agentAttached: false, rawRowStatus }),
+      "none",
+      `rawRowStatus=${rawRowStatus}`,
+    );
+  }
+});
+
+test("resolveFollowUpRoute: the settle-window override is record-ABSENT only", () => {
+  // A PRESENT record in `resuming`/`running` is NOT the settle-window case — it is the
+  // live record's business (steer/park decided by `decideFollowUpRoute`), so the override
+  // must not fire. `resuming` is neither created nor running here → falls through to the
+  // row, which (not completed) is `none` — matching `decideFollowUpRoute` exactly. (The
+  // record-present `resuming → park` handling is issue #5's separate concern.)
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: true, recordStatus: "resuming", agentAttached: false, rawRowStatus: "running" }),
+    "none",
+  );
+  // A present running record with an attached agent steers, regardless of the raw row.
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: true, recordStatus: "running", agentAttached: true, rawRowStatus: "running" }),
+    "steer",
+  );
+});
+
+test("resolveFollowUpRoute: live-record routes are unchanged from decideFollowUpRoute", () => {
+  // steer / park decisions are delegated unchanged.
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: true, recordStatus: "created", agentAttached: false, rawRowStatus: undefined }),
+    "park",
+  );
+  assert.equal(
+    resolveFollowUpRoute({ recordPresent: true, recordStatus: "running", agentAttached: false, rawRowStatus: undefined }),
+    "park",
   );
 });
 
@@ -539,7 +623,7 @@ test("evaluateFollowUpResumeGate: ANY throw degrades to no-resume, never propaga
 // chain (reply-skip → self-skip → watch lookup → trigger-hold raw-skip → dedup → gate)
 // then the route dispatch. The pieces it composes are the REAL ones — a real
 // `FollowUpWatch`, a real `steeredEventIds` Set, `classifyFollowUpForm`,
-// `followUpGateDecision`, `decideFollowUpRoute`; only the control-flow ordering is
+// `followUpGateDecision`, `resolveFollowUpRoute`; only the control-flow ordering is
 // reproduced here (the live function fires detached deliveries this model does not).
 // Mirrors the duplicate-reply-mitigation `admit` model.
 
@@ -554,7 +638,15 @@ function fold(args: {
   trigger: boolean;
   /** DM || mentionedSelf — the set of follow-ups that double-deliver (raw + post-hold). */
   wouldTrigger: boolean;
-  owner: { recordPresent: boolean; recordStatus?: string; agentAttached?: boolean; rowCompleted?: boolean };
+  // `rawRowStatus` is the durable row's status as the call site reads it (review #3): for
+  // back-compat a test may instead pass `rowCompleted` (mapped to `completed`/undefined).
+  owner: {
+    recordPresent: boolean;
+    recordStatus?: string;
+    agentAttached?: boolean;
+    rowCompleted?: boolean;
+    rawRowStatus?: string;
+  };
   now: number;
 }): FoldOutcome {
   const ev = args.inbound;
@@ -574,11 +666,11 @@ function fold(args: {
     now: args.now,
   });
   if (!passes) return "skip";
-  const route = decideFollowUpRoute({
+  const route = resolveFollowUpRoute({
     recordPresent: args.owner.recordPresent,
     recordStatus: args.owner.recordStatus,
     agentAttached: !!args.owner.agentAttached,
-    rowCompleted: !!args.owner.rowCompleted,
+    rawRowStatus: args.owner.rawRowStatus ?? (args.owner.rowCompleted ? "completed" : undefined),
   });
   if (route !== "none") args.steered.add(ev.id); // consumed exactly once (markSteered)
   return route;
@@ -700,4 +792,22 @@ test("fold: a pre-attach (building) owner → park, drained when it goes live", 
     }),
     "park",
   );
+});
+
+test("fold: settle window — owner evicted but row still 'running' → resume + consumed (#3)", () => {
+  // The just-settled owner's record is gone (evicted by `markCompleted`) but its
+  // `completed` persist hasn't drained, so the durable row still reads `running`. The old
+  // route (rowCompleted check) demoted this to native fate; #3's `resolveFollowUpRoute`
+  // routes it to resume (and `resumeFollowUp` then `waitForIdle`s before the gate). Assert
+  // it folds (resume) AND is consumed exactly once (the event is marked steered).
+  const steered = new Set<string>();
+  assert.equal(
+    fold({
+      watch: armedWatch(), steered, config: defaultConfig(),
+      inbound: event({ timestamp: 1_003_000 }), trigger: false, wouldTrigger: false,
+      owner: { recordPresent: false, rawRowStatus: "running" }, now: 2_000,
+    }),
+    "resume",
+  );
+  assert.ok(steered.has("evt-1"), "the consumed follow-up must be marked steered (single-consumption)");
 });

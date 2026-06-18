@@ -30,7 +30,7 @@ import {
   followUpGateDecision,
   followUpConfigActive,
   maxWallClockMs,
-  decideFollowUpRoute,
+  resolveFollowUpRoute,
   hasImageAttachment,
   type FollowUpForm,
   type FollowUpConfig,
@@ -2329,11 +2329,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // gone from memory resumes iff its durable row is `completed` (the only
     // fold-resumable state, §5.3/§7.2) — a discarded/interrupted/failed/pruned row, or
     // a never-launched one, yields `none`.
-    const route = decideFollowUpRoute({
+    //
+    // Settle-window discrimination (review issue #3): `markCompleted` evicts the
+    // in-memory record SYNCHRONOUSLY but enqueues the `completed` persist on the
+    // single-writer queue. In that window a fold sees the record absent while the row
+    // still reads `running`/`resuming` — the pure decision would demote a just-settled
+    // session to native fate. `resolveFollowUpRoute` routes that case to **resume**;
+    // `resumeFollowUp` then `waitForIdle`s so the queued `completed` write drains before
+    // the gate + CAS read the row. Read the RAW row status once and pass it through.
+    const route = resolveFollowUpRoute({
       recordPresent: !!record,
       recordStatus: record?.status,
       agentAttached: !!sessions.getAgent(watch.sessionId),
-      rowCompleted: storage.getAgentSession(watch.sessionId)?.status === "completed",
+      rawRowStatus: storage.getAgentSession(watch.sessionId)?.status,
     });
     if (route === "none") {
       // Not foldable → native fate downstream: a trigger-bearing follow-up spawns its
@@ -2584,6 +2592,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     }
     resumeClaims.add(sessionId);
     try {
+      // Settle-window drain (review issue #3): a fold that reached `resume` may have done
+      // so while the owner's `completed` persist was still queued (the record was already
+      // evicted, but `getAgentSession` read its pre-completion `running`/`resuming` status
+      // — see `resolveFollowUpRoute`). Drain the single-writer queue so the gate below —
+      // and the FIFO-ordered CAS at `acceptResumeGeneration` — observe the settled
+      // `completed` row. Cheap when the queue is already empty; the common (truly-settled)
+      // case adds nothing. If the row settled to a terminal non-completed status instead,
+      // the gate fails → native fate (existing behaviour).
+      await storage.waitForIdle();
       const verdict = await evaluateFollowUpResumeGate({
         sessionId,
         getSession: () => storage.getAgentSession(sessionId),
@@ -2631,6 +2648,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
         logger.error("follow_up_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
         drainNextQueuedTrigger(inbound.timelineKey);
+        // The resumed session never went live, yet the follow-up was already consumed
+        // (`markSteered` in `foldFollowUp`, suppressing its trigger-hold twin). Revert it
+        // to native fate (review issue #4) so a trigger-bearing follow-up (re-`@` / DM)
+        // re-dispatches as its own session rather than vanishing; a bare-group one stays
+        // inert. Safe from double-dispatch: the follow-up here is the resume *trigger*,
+        // not a parked entry, so the discarded session's `revertAbandonedFollowUps` settle
+        // listener (which drains `pendingFollowUps`) never touches it.
+        revertFollowUpToNativeFate(inbound, "resume-setup-threw");
       }
     } finally {
       resumeClaims.delete(sessionId);
@@ -2683,10 +2708,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
-   * The one-line preamble prepended to a settled→resume follow-up's appended turn
-   * (spec §10). The follow-up IS the new turn (not an interjection to break out), so
-   * there is no `spawn_session` affordance — just the framing that a quick follow-up
-   * arrived (and, for a re-`@`, that it was an explicit re-address).
+   * The one-line preamble prepended to a settled-then-resume follow-up's appended turn
+   * (spec §10). The follow-up IS the new turn (not an interjection to break out), so the
+   * bare media/text forms carry no spawn_session affordance — just the framing that a
+   * quick follow-up arrived. The mention form (a re-@, the likeliest genuinely-separate
+   * ask) names spawn_session(message_id) so the resumed agent can fork it out (review
+   * Q1): the resume turn's trigger is retained for spawn_session in runResumeSession (the
+   * bare forms are not, matching this preamble).
    */
   function buildFollowUpResumePreamble(inbound: InboundChatEvent, form: FollowUpForm, gapMs: number): string {
     const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.id);
@@ -2698,9 +2726,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       );
     }
     if (form === "mention") {
+      const externalId = inbound.event.externalId;
+      const spawnHint = externalId
+        ? ` If it's a genuinely separate ask, call spawn_session(message_id="${escapeAttr(externalId)}") to give it its own session.`
+        : ``;
       return (
         `<follow_up reason="mention">${senderName} @'d you again ${n}s after your last reply — ` +
-        `probably amending or adding to it. Continue the same exchange.</follow_up>`
+        `probably amending or adding to it. Continue the same exchange.${spawnHint}</follow_up>`
       );
     }
     return (
@@ -3483,6 +3515,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
         logger.error("session_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
         drainNextQueuedTrigger(inbound.timelineKey);
+        // The resumed session never went live, yet we returned `true` (took over this
+        // trigger's slot) so the FRESH launch below never runs — the reply would get no
+        // response. Re-dispatch it as its own trigger (review issue #4, symmetric with
+        // `resumeFollowUp`) so the never-drop invariant holds. A reply reaching here is
+        // always trigger-bearing (resolved upstream in the provider hold), so this always
+        // re-dispatches. On the re-dispatched launch the row is no longer `completed`
+        // (the CAS bumped it; `markDiscarded` set it `discarded`), so `tryReplyResume`
+        // falls through to a FRESH session rather than looping. No double-dispatch: the
+        // discarded session adopted no parked entries (a reply trigger is not parked).
+        void redispatchCoReply(inbound).catch((redispatchError) => {
+          logger.error("session_resume_setup_redispatch_failed", {
+            sessionId,
+            timelineKey: inbound.timelineKey,
+            error: redispatchError instanceof Error ? redispatchError.message : String(redispatchError),
+          });
+        });
       }
       return true;
     } finally {
@@ -3633,6 +3681,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Follow-ups parked while this resumed session was building (§5.2) — steer them in
     // now that it is live (a follow-up resume can itself accrue a parked follow-up).
     drainPendingFollowUpsIntoSession(record.id);
+    // Resume-path `spawn_session` affordance for a re-`@` fold (review Q1): a mention-form
+    // follow-up resume names `spawn_session(message_id=…)` in its preamble (the bare
+    // media/text forms do not), but the tool resolves `message_id` ONLY from the in-memory
+    // `coReplyInbounds` map — preamble text alone yields `not_found`. Retain the resume
+    // turn's trigger so the call resolves; scoped to the **mention** form to match the
+    // preamble and preserve the "media/text follow-up IS the new turn" framing. The
+    // mention-form resume inbound is trigger-bearing, so the passthrough uses the real
+    // trigger (no synthesis). Cleaned up on settle / on use, like every other retention.
+    if (resumeLabel === "follow-up" && classifyFollowUpForm(record.trigger.event) === "mention") {
+      retainFollowUpForSpawn(record.trigger, record.id);
+    }
 
     const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
