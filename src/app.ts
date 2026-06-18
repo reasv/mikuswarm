@@ -2281,6 +2281,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    * — so it always names the session that actually handled the trigger. Skips
    * proactive launches (caller-guarded) and any trigger without a human external id
    * (synthetic) — neither has a human follow-up to fold.
+   *
+   * This seam is *before* the missing-target / budget-admission gates that may
+   * `markDiscarded` the just-launched session, so a watch can briefly name a session
+   * that never goes live (up to the GC lifetime). That is harmless: a fold against a
+   * discarded session finds the record gone and the durable row not `completed`, so
+   * `resolveFollowUpRoute` yields `none` → native fate. Arming here (not after
+   * `attachAgent`) is deliberate — it is the CLAIM-VISIBILITY window the fold targets.
    */
   function armFollowUpWatch(inbound: InboundChatEvent, sessionId: string): void {
     if (!followUpActive) return;

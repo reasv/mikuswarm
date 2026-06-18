@@ -6251,7 +6251,7 @@ create table if not exists session_interjections (
   external_id         text,   -- Matrix $… id of the inbound message
   sender_id           text,
   sender_display_name text,
-  kind                text not null,            -- 'reply' | 'co-reply'
+  kind                text not null,            -- 'reply' | 'co-reply' | 'follow-up'
   body                text not null default '', -- raw inbound body (search corpus)
   created_at          integer not null
 );
