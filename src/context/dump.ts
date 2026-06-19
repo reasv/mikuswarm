@@ -34,7 +34,12 @@ export async function dumpBuiltContext(
       ? {
           toolBlock: {
             tokenEstimate: context.toolBlock.tokenEstimate,
-            segments: context.toolBlock.segments,
+            // Per-tool name + tokens only; the full per-tool schema text is an
+            // inspector affordance, not dump payload.
+            segments: context.toolBlock.segments.map((s) => ({
+              name: s.name,
+              tokenEstimate: s.tokenEstimate,
+            })),
           },
         }
       : {}),

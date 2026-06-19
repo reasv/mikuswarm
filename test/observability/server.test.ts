@@ -1057,10 +1057,9 @@ test("GET /api/rooms/:key/context prepends the tool-definition block above syste
         toolBlock: {
           tokenEstimate: 1_280,
           segments: [
-            { name: "send_message", tokenEstimate: 800 },
-            { name: "react", tokenEstimate: 480 },
+            { name: "send_message", tokenEstimate: 800, text: '{"name":"send_message"}' },
+            { name: "react", tokenEstimate: 480, text: '{"name":"react"}' },
           ],
-          text: '[{"type":"function","function":{"name":"send_message"}}]',
         },
         messages: [
           { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 20 },
@@ -1078,14 +1077,15 @@ test("GET /api/rooms/:key/context prepends the tool-definition block above syste
       assert.equal(tools.tier, "tools");
       assert.equal(tools.tokenEstimate, 1_280);
       assert.equal(tools.preview, false);
+      assert.equal(tools.content, ""); // no flat dump — rendered hierarchically
       assert.equal(body.messages[1].type, "system");
-      // Per-tool breakdown rides on `segments` (system-prompt segment wire), so the
-      // existing MessageBlock expand renders it unchanged.
+      // Per-tool breakdown rides on a dedicated `tools` array (name + tokens + the
+      // tool's own definition text), so the console renders it hierarchically.
       assert.deepEqual(
-        tools.segments.map((s: any) => [s.label, s.tokenEstimate]),
+        tools.tools.map((t: any) => [t.name, t.tokenEstimate]),
         [["send_message", 800], ["react", 480]],
       );
-      assert.equal(tools.segments[0].tag, "tool");
+      assert.equal(tools.tools[0].text, '{"name":"send_message"}');
       // Whole-request estimate is unchanged by the display prepend (already folded).
       assert.equal(body.tokenEstimate, 1_300);
     });
@@ -1115,8 +1115,7 @@ test("GET /api/sessions/:id prepends the tool block when the factory resolves on
         assert.equal(sessionType, "default");
         return {
           tokenEstimate: 1_280,
-          segments: [{ name: "send_message", tokenEstimate: 1_280 }],
-          text: "[]",
+          segments: [{ name: "send_message", tokenEstimate: 1_280, text: '{"name":"send_message"}' }],
         };
       },
     } as unknown as AgentSessionFactory;

@@ -25,11 +25,17 @@ export interface ToolDefinitionLike {
   parameters: unknown;
 }
 
-/** One tool's token contribution within the block. */
+/** One tool's contribution within the block, with its own definition. */
 export interface ToolSegment {
   name: string;
   /** Token estimate of the tool's wire entry (primary tokenizer). */
   tokenEstimate: number;
+  /**
+   * Pretty-printed wire JSON of THIS tool's definition, shown when the tool's
+   * row is expanded in the inspector. Per-tool, so the UI can render the block
+   * hierarchically (tools → one tool → its schema) rather than one flat dump.
+   */
+  text: string;
 }
 
 export interface ToolBlockSummary {
@@ -41,10 +47,8 @@ export interface ToolBlockSummary {
    * BPE boundary effects), mirroring the system-prompt segment behaviour.
    */
   tokenEstimate: number;
-  /** Per-tool contribution, in declaration order. */
+  /** Per-tool contribution + definition, in declaration order. */
   segments: ToolSegment[];
-  /** Pretty-printed wire JSON of the tool definitions, for the inspector body. */
-  text: string;
 }
 
 /**
@@ -70,10 +74,10 @@ export function renderToolBlock(tools: ToolDefinitionLike[]): ToolBlockSummary {
   const segments: ToolSegment[] = tools.map((t, i) => ({
     name: t.name,
     tokenEstimate: estimateTokens(JSON.stringify(wire[i])),
+    text: JSON.stringify(wire[i], null, 2),
   }));
   return {
     tokenEstimate: tools.length > 0 ? estimateTokens(JSON.stringify(wire)) : 0,
     segments,
-    text: tools.length > 0 ? JSON.stringify(wire, null, 2) : "",
   };
 }

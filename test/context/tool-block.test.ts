@@ -20,6 +20,15 @@ test("renderToolBlock: one segment per tool, in declaration order, each > 0", ()
   for (const s of block.segments) assert.ok(s.tokenEstimate > 0, `${s.name} should cost tokens`);
 });
 
+test("renderToolBlock: each segment carries its OWN tool definition text", () => {
+  const block = renderToolBlock(TOOLS);
+  const send = block.segments.find((s) => s.name === "send_message")!;
+  assert.match(send.text, /"name": "send_message"/);
+  assert.match(send.text, /Send a message to the room/);
+  // Each tool's text is just that tool — never the whole block.
+  assert.doesNotMatch(send.text, /"react"/);
+});
+
 test("renderToolBlock: per-tool segments are close to (slightly under) the whole-block estimate", () => {
   const block = renderToolBlock(TOOLS);
   const segSum = block.segments.reduce((n, s) => n + s.tokenEstimate, 0);
@@ -30,15 +39,8 @@ test("renderToolBlock: per-tool segments are close to (slightly under) the whole
   assert.ok(block.tokenEstimate - segSum < 10, "segment sum should be within a few tokens of the whole");
 });
 
-test("renderToolBlock: empty tool set → zero estimate, empty segments, empty text", () => {
+test("renderToolBlock: empty tool set → zero estimate, empty segments", () => {
   const block = renderToolBlock([]);
   assert.equal(block.tokenEstimate, 0);
   assert.deepEqual(block.segments, []);
-  assert.equal(block.text, "");
-});
-
-test("renderToolBlock: text is the pretty-printed wire definitions", () => {
-  const block = renderToolBlock(TOOLS);
-  assert.match(block.text, /"type": "function"/);
-  assert.match(block.text, /"name": "send_message"/);
 });

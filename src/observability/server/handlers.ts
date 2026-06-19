@@ -705,28 +705,31 @@ function renderContextMessage(msg: ContextMessage | PersistedContextMessage): Re
 /**
  * Synthetic "tools" context message for the inspector (spec §10a): the
  * out-of-band tool-definition block rendered as a leading item ABOVE the system
- * message, with its per-tool breakdown carried on `segments` (reusing the
- * system-prompt segment wire). It is NOT a real message — the model receives it as
- * the request's `tools` field, never as content — so it is prepended only at the
- * wire-render boundary, never persisted into a snapshot or replayed on resume. Its
+ * message. It is NOT a real message — the model receives it as the request's
+ * `tools` field, never as content — so it is prepended only at the wire-render
+ * boundary, never persisted into a snapshot or replayed on resume. Its
  * `tokenEstimate` is already included in the build's `tokenEstimate`.
+ *
+ * The per-tool breakdown rides on a dedicated `tools` array (name + token cost +
+ * the tool's own definition text), so the console renders it HIERARCHICALLY:
+ * expand the block to see one collapsed row per tool (name + tokens), expand a
+ * row to see that tool's schema. `content` is empty — there is no flat dump.
  */
 function toolBlockMessage(block: ToolBlockSummary): Record<string, unknown> {
   return {
     type: "tools",
     role: "system",
-    content: block.text,
+    content: "",
     tier: "tools",
     tokenEstimate: block.tokenEstimate,
     timestamp: null,
     // The tool block frames the request; it is never a trigger-dependent preview
     // turn. Explicit so the room-context renderer treats it like the system prefix.
     preview: false,
-    segments: block.segments.map((s) => ({
-      tag: "tool",
-      label: s.name,
-      source: null,
+    tools: block.segments.map((s) => ({
+      name: s.name,
       tokenEstimate: s.tokenEstimate,
+      text: s.text,
     })),
   };
 }

@@ -4,6 +4,7 @@
 	import { tierMeta } from '$lib/tiers';
 	import { cn } from '$lib/utils';
 	import XmlHighlight from './XmlHighlight.svelte';
+	import ToolRow from './ToolRow.svelte';
 
 	let {
 		msg,
@@ -25,6 +26,13 @@
 		msg.segments ? [...msg.segments].sort((a, b) => b.tokenEstimate - a.tokenEstimate) : []
 	);
 	const segmentsTotal = $derived(segments.reduce((sum, s) => sum + s.tokenEstimate, 0));
+
+	// The tool-definition block (synthetic `tools` message) renders hierarchically:
+	// one collapsible row per tool, heaviest first, each holding its own schema.
+	// Mutually exclusive with the flat system-prompt `segments` table / content body.
+	const tools = $derived(
+		msg.tools ? [...msg.tools].sort((a, b) => b.tokenEstimate - a.tokenEstimate) : []
+	);
 </script>
 
 <div class={cn('border-l-2 pl-2', meta.accent)}>
@@ -53,43 +61,51 @@
 	</div>
 
 	{#if open}
-		{#if segments.length > 0}
-			<table class="mb-2 w-full text-[10px] tabular-nums">
-				<tbody>
-					{#each segments as seg (seg.tag + ':' + (seg.source ?? seg.label))}
-						<tr class="border-b border-border/40">
-							<td class="py-0.5 pr-2 font-medium">{seg.label}</td>
-							<td class="py-0.5 pr-2 text-muted-foreground/60">{seg.source ?? ''}</td>
-							<td class="py-0.5 text-right text-muted-foreground">{seg.tokenEstimate}</td>
+		{#if tools.length > 0}
+			<div class="mb-2 text-[10px] tabular-nums">
+				{#each tools as tool (tool.name)}
+					<ToolRow {tool} />
+				{/each}
+			</div>
+		{:else}
+			{#if segments.length > 0}
+				<table class="mb-2 w-full text-[10px] tabular-nums">
+					<tbody>
+						{#each segments as seg (seg.tag + ':' + (seg.source ?? seg.label))}
+							<tr class="border-b border-border/40">
+								<td class="py-0.5 pr-2 font-medium">{seg.label}</td>
+								<td class="py-0.5 pr-2 text-muted-foreground/60">{seg.source ?? ''}</td>
+								<td class="py-0.5 text-right text-muted-foreground">{seg.tokenEstimate}</td>
+							</tr>
+						{/each}
+						<tr>
+							<td class="py-0.5 pr-2 text-muted-foreground uppercase">segments Σ</td>
+							<td></td>
+							<td class="py-0.5 text-right text-muted-foreground tabular-nums">{segmentsTotal}</td>
 						</tr>
-					{/each}
-					<tr>
-						<td class="py-0.5 pr-2 text-muted-foreground uppercase">segments Σ</td>
-						<td></td>
-						<td class="py-0.5 text-right text-muted-foreground tabular-nums">{segmentsTotal}</td>
-					</tr>
-				</tbody>
-			</table>
-		{/if}
-		<div class="overflow-x-auto pb-2">
-			<XmlHighlight code={msg.content} />
-			{#if imageRefs.length > 0}
-				<div class="mt-2 flex flex-wrap gap-2">
-					{#each imageRefs as ref, i (ref.attachmentId ?? i)}
-						{#if ref.attachmentId}
-							<img
-								src={`/api/media/${encodeURIComponent(ref.attachmentId)}`}
-								alt="attachment"
-								class="max-h-40 rounded border"
-							/>
-						{:else}
-							<span class="rounded border px-2 py-1 text-xs text-muted-foreground">
-								[image {ref.mimeType ?? ''} {ref.sizeBytes ?? '?'}B]
-							</span>
-						{/if}
-					{/each}
-				</div>
+					</tbody>
+				</table>
 			{/if}
-		</div>
+			<div class="overflow-x-auto pb-2">
+				<XmlHighlight code={msg.content} />
+				{#if imageRefs.length > 0}
+					<div class="mt-2 flex flex-wrap gap-2">
+						{#each imageRefs as ref, i (ref.attachmentId ?? i)}
+							{#if ref.attachmentId}
+								<img
+									src={`/api/media/${encodeURIComponent(ref.attachmentId)}`}
+									alt="attachment"
+									class="max-h-40 rounded border"
+								/>
+							{:else}
+								<span class="rounded border px-2 py-1 text-xs text-muted-foreground">
+									[image {ref.mimeType ?? ''} {ref.sizeBytes ?? '?'}B]
+								</span>
+							{/if}
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
 	{/if}
 </div>
