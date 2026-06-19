@@ -1,17 +1,15 @@
 <script lang="ts">
 	import type { ContextMessageWire } from '$lib/schemas';
-	import { tierMeta, isCollapsible as collapsibleFor, defaultOpen, type VerbatimMode } from '$lib/tiers';
+	import { tierMeta, isCollapsible as collapsibleFor, defaultOpen } from '$lib/tiers';
 	import { cn } from '$lib/utils';
 	import MessageBlock from './MessageBlock.svelte';
 	import PreviewBanner from './PreviewBanner.svelte';
 
-	// `mode` drives default expansion (spec §10a vs §10b): `room` collapses only
-	// system/satellite/diary; `session` also collapses earlier summary/compact/rich
-	// tiers so the captured prefix doesn't bury the rollout below it. Defaults to `room`.
-	let {
-		messages,
-		mode = 'room'
-	}: { messages: readonly ContextMessageWire[]; mode?: VerbatimMode } = $props();
+	// Default expansion is uniform across the room-context preview and the
+	// session-input view: the system prompt, the `<system>` satellite block, the diary
+	// layer and the earlier summary/compact/rich tiers all collapse by default so the
+	// captured prefix doesn't bury the live trigger turn / rollout below it.
+	let { messages }: { messages: readonly ContextMessageWire[] } = $props();
 
 	// Per-tier token subtotals for the legend strip (spec §10a).
 	const tierTotals = $derived.by(() => {
@@ -42,7 +40,7 @@
 			{#if i === firstPreview && firstPreview >= 0}
 				<PreviewBanner />
 			{/if}
-			<MessageBlock {msg} collapsible={collapsibleFor(msg, mode)} open={defaultOpen(msg, mode)} />
+			<MessageBlock {msg} collapsible={collapsibleFor(msg)} open={defaultOpen(msg)} />
 		{/each}
 	</div>
 </div>

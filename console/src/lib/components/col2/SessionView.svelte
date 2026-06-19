@@ -225,7 +225,7 @@
 	{:else if session.isError}
 		<div class="p-4 text-sm text-destructive">{session.error.message}</div>
 	{:else}
-		<VerbatimContext messages={inputMessages} mode="session" />
+		<VerbatimContext messages={inputMessages} />
 		<div
 			class="sticky top-0 flex items-center justify-between border-y bg-background/80 px-3 py-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase backdrop-blur"
 		>
