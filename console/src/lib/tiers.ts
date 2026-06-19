@@ -12,6 +12,7 @@ export interface TierMeta {
 }
 
 const TIERS: Record<string, TierMeta> = {
+	tools: { label: 'tools', accent: 'border-l-fuchsia-400 text-fuchsia-500' },
 	system: { label: 'system', accent: 'border-l-zinc-400 text-zinc-500' },
 	diary: { label: 'diary', accent: 'border-l-teal-400 text-teal-500' },
 	summary: { label: 'summary', accent: 'border-l-violet-400 text-violet-500' },
@@ -52,14 +53,15 @@ export interface CollapsibleMessage {
 const SESSION_COLLAPSED_TIERS = new Set(['summary', 'compact', 'rich', 'mixed']);
 
 /**
- * Whether a verbatim message renders with a collapse toggle. System prompt, the
- * `<system>` satellite block, and the diary layer always get the affordance (both
- * modes, spec §10a) — the diary layer is a large static blob like the system prompt,
+ * Whether a verbatim message renders with a collapse toggle. The tool-definition
+ * block, the system prompt, the `<system>` satellite block, and the diary layer
+ * always get the affordance (both modes, spec §10a) — each is a large static blob,
  * not part of the conversation. In session mode the earlier summary/compact/rich
  * tiers also become collapsible so the captured prefix can be folded away (spec §10b).
  */
 export function isCollapsible(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
-	if (msg.type === 'system' || msg.type === 'satellite' || msg.tier === 'diary') return true;
+	if (msg.type === 'tools' || msg.type === 'system' || msg.type === 'satellite' || msg.tier === 'diary')
+		return true;
 	if (mode === 'session') return SESSION_COLLAPSED_TIERS.has(msg.tier ?? '');
 	return false;
 }

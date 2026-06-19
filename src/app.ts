@@ -32,6 +32,7 @@ import {
   loadResumeMaterial,
   loadCompletedSessionMaterial,
   SYNTHETIC_SESSION_TYPES,
+  filterTools,
   hasResumableWork,
   type ResumeMaterial,
   type ResumeWorkScope,
@@ -104,7 +105,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
-import { ProactiveScheduler } from "./proactive/index.js";
+import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
 import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeRateLimitedClaimGate, type BudgetHooks, type SpendDescriptor, type AdmissionResult } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
@@ -806,6 +807,72 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     config.observability?.llm_request_ring_size ?? DEFAULT_LLM_REQUEST_RING_SIZE,
   );
 
+  // Tool-definition resolver for the console inspector (ARCHITECTURE.md §10a). The
+  // room-context preview and session-detail views show the tool-definition block
+  // (its estimate + per-tool breakdown) above the system prompt. Tool definitions
+  // are config-static within a process run, so we build the set ON DEMAND from the
+  // real `buildSessionTools` (synthesizing the inbound from the timeline key) and
+  // apply the session type's allowlist (`filterTools`) so the displayed block
+  // matches the SAME set `create()` froze the estimate from — then memoize per type
+  // so the build happens at most once per type. A timeline that doesn't parse, an
+  // account that isn't configured, or a construction failure → no block (graceful).
+  const toolDefsByType = new Map<string, import("./context/index.js").ToolDefinitionLike[]>();
+  function resolveToolDefs(
+    timelineKey: string,
+    sessionType: string,
+  ): import("./context/index.js").ToolDefinitionLike[] | undefined {
+    const cached = toolDefsByType.get(sessionType);
+    if (cached) return cached;
+    const parsed = parseMatrixTimelineKey(timelineKey);
+    if (!parsed) return undefined;
+    const selfUserId = config.matrix.accounts[parsed.accountId]?.user_id;
+    const inbound: InboundChatEvent = {
+      provider: "matrix",
+      timelineKey,
+      event: {
+        id: `inspector-${sessionType}`,
+        timelineKey,
+        provider: "matrix",
+        role: "user",
+        sender: { id: selfUserId ?? "inspector", isSelf: true },
+        body: "",
+        timestamp: 0,
+        receivedAt: 0,
+      },
+      outboundTarget: {
+        provider: "matrix",
+        timelineKey,
+        accountId: parsed.accountId,
+        roomId: parsed.roomId,
+        threadId: parsed.threadId,
+      },
+    };
+    try {
+      const full = buildSessionTools(
+        inbound,
+        `inspector-${sessionType}`,
+        inbound.outboundTarget!,
+        sessionType,
+        new SessionUsageTracker(),
+      );
+      const filtered = filterTools(full, factory.resolveSessionType(sessionType));
+      const defs = filtered.map((t) => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      }));
+      toolDefsByType.set(sessionType, defs);
+      return defs;
+    } catch (error) {
+      logger.warn("tool_defs_inspector_build_failed", {
+        sessionType,
+        timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -816,6 +883,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     liveEvents,
     requestRing: llmRequestRing,
     budget: budgetHooks,
+    buildToolDefs: resolveToolDefs,
   });
 
   // ---------------------------------------------------------------------------

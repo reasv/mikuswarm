@@ -2,7 +2,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { streamSimple, completeSimple, createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { AppConfig } from "../config/index.js";
-import { dumpBuiltContext, CACHE_BOUNDARIES, type BuiltContext, type ContextBuilder } from "../context/index.js";
+import { dumpBuiltContext, CACHE_BOUNDARIES, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
@@ -97,6 +97,16 @@ export interface AgentFactoryOptions {
    * `buildPreview` is unavailable.
    */
   storage?: Storage;
+  /**
+   * Resolve a session type's tool set (structural wire subset) for a given
+   * timeline — injected by app wiring (it owns `buildSessionTools`). Used ONLY by
+   * the read-only inspector surfaces: the room-context preview ({@link buildPreview})
+   * folds the result into its estimate + tool block, and the session-detail view
+   * recomputes the block for display ({@link toolBlockFor}). The live session path
+   * never uses it — `create()` already has the real per-session tools. Absent
+   * (tests/headless) → no tool block (estimate is the message sum, as before).
+   */
+  buildToolDefs?: (timelineKey: string, sessionType: string) => ToolDefinitionLike[] | undefined;
   /**
    * Optional structured logger. Used to surface the tool-call cap being hit
    * (`agent_tool_call_cap_reached`). Optional so tests can construct a factory
@@ -633,6 +643,11 @@ export class AgentSessionFactory {
         workspace,
         sessionType: sessionTypeConfig,
         fallbackPrompt,
+        // The session's real, post-allowlist tool set — so the frozen estimate
+        // accounts for the tool-definition block the provider charges for (the
+        // dominant estimate-vs-actual gap). `filteredTools` (AgentTool[])
+        // structurally satisfies the wire subset.
+        tools: filteredTools,
         // The building session's id, for claim markers + the coordination gate
         // (spec DUPLICATE-REPLY-MITIGATION §4). `buildContext` drops it for the
         // generation modes (cutoff/condense/diary), which have no live answering.
@@ -834,6 +849,8 @@ export class AgentSessionFactory {
     sessionType: SessionTypeConfig | undefined;
     fallbackPrompt: string | undefined;
     selfSessionId?: string;
+    /** The session's resolved tool set (wire subset), for the estimate + tool block. */
+    tools?: ToolDefinitionLike[];
     summarizationCutoff?: { endTimestamp: number };
     condenseInputs?: { summaries: Summary[] };
     diaryRange?: { earliestTimestamp: number; latestTimestamp: number; summaryId: string };
@@ -849,6 +866,7 @@ export class AgentSessionFactory {
       workspace: args.workspace,
       sessionType: args.sessionType,
       fallbackPrompt: args.fallbackPrompt,
+      tools: args.tools,
       // Generation builds have no live answering → no claim markers / coordination.
       selfSessionId: generation ? undefined : args.selfSessionId,
       summarizationCutoff: args.summarizationCutoff,
@@ -889,6 +907,10 @@ export class AgentSessionFactory {
       workspace,
       sessionType: sessionTypeConfig,
       fallbackPrompt,
+      // The default session type's tool set, so the preview's estimate + tool
+      // block match what the next real session would send. Absent hook (tests) →
+      // no tool block, identical to the prior preview behaviour.
+      tools: this.options.buildToolDefs?.(timelineKey, "default"),
     });
 
     return {
@@ -897,6 +919,18 @@ export class AgentSessionFactory {
       finalTurnIndex: previewFinalTurnIndex(built),
       cacheBoundaries: [...CACHE_BOUNDARIES],
     };
+  }
+
+  /**
+   * Recompute the tool-definition block for a given timeline + session type, for
+   * the session-detail inspector (the persisted snapshot stores only the frozen
+   * estimate number, not the breakdown). Tool definitions are config-static within
+   * a process run, so this live recompute matches the block that session actually
+   * sent. Returns `undefined` when no tool-resolver is wired (tests/headless).
+   */
+  toolBlockFor(timelineKey: string, sessionType: string): ToolBlockSummary | undefined {
+    const tools = this.options.buildToolDefs?.(timelineKey, sessionType);
+    return tools && tools.length > 0 ? renderToolBlock(tools) : undefined;
   }
 }
 

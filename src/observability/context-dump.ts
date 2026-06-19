@@ -17,6 +17,15 @@ export interface ContextDump {
   triggerEventId?: string;
   tokenEstimate?: number;
   cacheBoundaries?: string[];
+  /**
+   * Tool-definition block accounting (out-of-band wire `tools[]`): the whole-block
+   * estimate (already included in `tokenEstimate`) plus the per-tool breakdown.
+   * Present only when the build was given a tool set. Not a message.
+   */
+  toolBlock?: {
+    tokenEstimate: number;
+    segments: Array<{ name: string; tokenEstimate: number }>;
+  };
   imageBlocks?: Array<{
     eventId: string;
     attachmentId: string;

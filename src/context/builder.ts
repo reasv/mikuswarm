@@ -32,6 +32,7 @@ import {
   renderSatelliteBlock,
   type SystemPromptSegment,
 } from "../workspace/prompt.js";
+import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from "./tool-block.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
@@ -82,6 +83,16 @@ export interface BuildContextOptions {
   workspace: WorkspaceContent;
   sessionType?: SessionTypeConfig;
   fallbackPrompt?: string;
+  /**
+   * The session's resolved tool set (post-allowlist), structurally reduced to the
+   * fields that hit the wire. When provided, the builder renders a
+   * {@link BuiltContext.toolBlock} and folds its estimate into
+   * {@link BuiltContext.tokenEstimate} — so the estimate accounts for the
+   * tool-definition block the provider charges for (the dominant source of the
+   * estimate-vs-actual gap). Absent (tests, generation builds that pass no tools)
+   * → no tool block and the estimate is the message sum, as before.
+   */
+  tools?: ToolDefinitionLike[];
   /** When set, build context for a level-1 summarization session. */
   summarizationCutoff?: {
     /** Cut context at this timestamp — no events past it are rendered. */
@@ -185,6 +196,15 @@ export interface BuiltContext {
    * {@link SystemPromptSegment}.
    */
   systemPromptSegments: SystemPromptSegment[];
+  /**
+   * The tool-definition block sent out-of-band with the request (its whole-block
+   * estimate + per-tool breakdown). Present only when {@link BuildContextOptions.tools}
+   * was supplied; its `tokenEstimate` is already folded into {@link tokenEstimate}
+   * above. Surfaced by the console inspector as a synthetic "tools" item above the
+   * system message (it is NOT a real message and is never sent as content). See
+   * {@link ToolBlockSummary}.
+   */
+  toolBlock?: ToolBlockSummary;
 }
 
 /**
@@ -712,14 +732,21 @@ export class ContextBuilder {
         imageBlocks,
       },
     ];
+    // Tool-definition block (out-of-band wire `tools[]`): folded into the estimate
+    // so it accounts for what the provider actually charges, and surfaced for the
+    // inspector. Not a message — never added to `messages` / sent as content.
+    const toolBlock =
+      options.tools && options.tools.length > 0 ? renderToolBlock(options.tools) : undefined;
+    const messageTokens = messages.reduce((sum, message) => sum + message.tokenEstimate, 0);
     return {
       messages,
-      tokenEstimate: messages.reduce((sum, message) => sum + message.tokenEstimate, 0),
+      tokenEstimate: messageTokens + (toolBlock?.tokenEstimate ?? 0),
       compactTokens: compacted.compactTokens,
       richTokens: compacted.richTokens,
       imageBlocks,
       renderedInputIds,
       systemPromptSegments,
+      toolBlock,
     };
   }
 

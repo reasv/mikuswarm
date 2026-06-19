@@ -12,6 +12,7 @@ export { convertToLlm } from "./convert.js";
 export {
   AgentSessionFactory,
   createModel,
+  filterTools,
   assertRunSettledCleanly,
   wasRunAborted,
   WorkerDrainAbortError,
