@@ -1894,18 +1894,38 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
    */
   function coalesceCoTargetReply(inbound: InboundChatEvent): boolean {
     const replyTarget = inbound.event.replyTo?.externalId;
-    if (!replyTarget) return false;
+    if (!replyTarget) return false; // not a reply — co-target N/A (no log: high volume)
+
+    // Every OTHER exit logs why this reply did not fold into a sibling session, with
+    // a `reason` discriminator. The silent false-returns here are exactly why the
+    // duplicate-session incident couldn't be root-caused from logs (notably the
+    // `disabled` case — co-target was off because `coalesce_window_ms` was dropped in
+    // the config merge). Fires only for replies, so it stays low-volume.
+    const noCoalesce = (reason: string, extra?: Record<string, unknown>): false => {
+      logger.info("co_target_not_coalesced", {
+        reason,
+        timelineKey: inbound.timelineKey,
+        eventId: inbound.event.id,
+        replyTarget,
+        ...extra,
+      });
+      return false;
+    };
+
     const windowMs = config.agent.sessions.coalesce_window_ms;
-    if (windowMs === undefined) return false;
+    if (windowMs === undefined) return noCoalesce("disabled");
 
     // The match is the FIRST claim (any attribution) whose own trigger replied to the
     // same beat — including an un-attributed (queued / pre-launch) one (spec
     // DEFERRED-COALESCING).
     const match = sessionClaims.coTargetClaim(inbound.timelineKey, replyTarget);
-    if (!match) return false;
+    if (!match) return noCoalesce("no_sibling");
     // Only near-simultaneous reactions to the SAME beat merge — bare proximity
     // would wrongly fold the independent questions of Case A.
-    if (Math.abs(inbound.event.timestamp - match.triggerTimestamp) > windowMs) return false;
+    const deltaMs = Math.abs(inbound.event.timestamp - match.triggerTimestamp);
+    if (deltaMs > windowMs) {
+      return noCoalesce("outside_window", { ownerSessionId: match.sessionId, deltaMs, windowMs });
+    }
 
     // Trigger-hold re-delivery dedup (shared with reply-steer): inject at most once.
     if (steeredEventIds.has(inbound.event.id)) return true;
@@ -1915,16 +1935,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       const outcome = trySteerCoReply(match.sessionId, inbound);
       if (outcome === "steered") return true;
       // Cannot hydrate the quote → spawn rather than inject a broken interjection.
-      if (outcome === "no-target") return false;
+      if (outcome === "no-target") return noCoalesce("no_hydration_target", { ownerSessionId: match.sessionId });
       // outcome === "not-live": owner attributed but not steerable. Defer only if it
       // is still in its build window (will go live); a terminal/settling owner →
       // spawn (§5.2 — a fresh session built after it settles sees its replies).
-      if (!coTargetOwnerSteerableSoon(true, sessions.get(match.sessionId)?.status)) return false;
+      const ownerStatus = sessions.get(match.sessionId)?.status;
+      if (!coTargetOwnerSteerableSoon(true, ownerStatus)) {
+        return noCoalesce("owner_settling", { ownerSessionId: match.sessionId, ownerStatus });
+      }
     } else {
       // Un-attributed owner (queued / accept→launch window): it WILL launch. Only
       // defer if the shared target exists so the interjection can hydrate at drain.
       const target = timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey);
-      if (!target || target.timelineKey !== inbound.timelineKey) return false;
+      if (!target || target.timelineKey !== inbound.timelineKey) return noCoalesce("no_hydration_target");
     }
 
     // Defer: suppress the spawn now, park keyed by the OWNER trigger's external id,

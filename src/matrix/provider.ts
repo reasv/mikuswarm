@@ -25,6 +25,18 @@ import type { EnrichmentCapabilities } from "../enrichment/index.js";
 
 type Handler = (event: InboundChatEvent) => void;
 
+/**
+ * Cap on how long a same-sender trigger burst can debounce-extend the trigger
+ * hold, expressed as a multiple of `trigger_hold_ms`. Each trigger-bearing
+ * follow-up resets the hold to a fresh `trigger_hold_ms`, but never past
+ * `holdStartedAt + trigger_hold_ms * this`, so a steady drip of messages can't
+ * hold a trigger open indefinitely (with the default 2000ms hold, a burst flushes
+ * after at most 8s). Kept as a code constant rather than config: it needs no
+ * per-deployment tuning and adding an optional key would re-expose the
+ * config-merge drop foot-gun that disabled co-target coalescing.
+ */
+const TRIGGER_HOLD_MAX_MULTIPLIER = 4;
+
 interface AccountRuntime {
   accountId: string;
   client: MatrixNativeClient;
@@ -293,20 +305,43 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
 
     const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
     const existing = this.pendingTriggers.get(key);
-    if (!inbound.trigger) {
-      if (existing) {
-        existing.event.trigger = {
-          ...existing.event.trigger!,
-          groupedEventIds: [...(existing.event.trigger?.groupedEventIds ?? []), inbound.event.id],
-        };
-        existing.event.event.trigger = existing.event.trigger;
+
+    // A same-sender message that arrives while a hold is open belongs to the same
+    // burst — the pending key is per-sender — so fold its event id into the held
+    // trigger: ONE grouped trigger → ONE session, whether or not the follow-up
+    // itself triggers. Previously only a NON-triggering follow-up grouped here; a
+    // trigger-bearing one flushed the hold early and spawned a twin session. Since
+    // Matrix auto-mentions the replied-to user, EVERY reply to the bot carries its
+    // own mention trigger, so consecutive same-sender replies always fragmented
+    // into separate sessions (the duplicate-session incident). Grouping them here
+    // is the upstream fix; co-target coalescing stays the cross-sender /
+    // out-of-window backstop.
+    if (existing) {
+      const heldTrigger = existing.event.trigger!;
+      const groupedTrigger = {
+        ...heldTrigger,
+        groupedEventIds: [...(heldTrigger.groupedEventIds ?? []), inbound.event.id],
+      };
+      existing.event.trigger = groupedTrigger;
+      existing.event.event.trigger = groupedTrigger;
+      // A trigger-bearing follow-up DEBOUNCES the hold so a longer burst keeps
+      // accreting; the reset is capped relative to the first message's
+      // holdStartedAt (TRIGGER_HOLD_MAX_MULTIPLIER) so a steady drip can't hold the
+      // trigger open forever. A non-triggering follow-up just rides the existing
+      // timer (its content is already in the group).
+      if (inbound.trigger) {
+        clearTimeout(existing.timer);
+        const heldStartedAt = heldTrigger.holdStartedAt ?? Date.now();
+        const cap = heldStartedAt + this.config.trigger_hold_ms * TRIGGER_HOLD_MAX_MULTIPLIER;
+        const deadline = Math.min(Date.now() + this.config.trigger_hold_ms, cap);
+        existing.timer = setTimeout(() => this.flushPendingTrigger(key), Math.max(0, deadline - Date.now()));
       }
       return;
     }
 
-    if (existing) {
-      this.flushPendingTrigger(key);
-    }
+    // No open hold: the non-triggering message was just ingested above; only a
+    // trigger opens a new hold.
+    if (!inbound.trigger) return;
 
     const holdStartedAt = Date.now();
     const timer = setTimeout(() => this.flushPendingTrigger(key), this.config.trigger_hold_ms);

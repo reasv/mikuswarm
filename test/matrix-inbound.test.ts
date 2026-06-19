@@ -295,3 +295,55 @@ test("Matrix provider delivers a trigger event TWICE — same event.id, trigger 
   assert.ok(deliveries[1].trigger, "second delivery carries the trigger");
   assert.equal(deliveries[1].event.id, eventId, "both deliveries share one event.id");
 });
+
+test("same-sender trigger-bearing follow-up groups into the open hold instead of spawning a twin", async () => {
+  // The duplicate-session incident: two replies to the bot from the same sender,
+  // both within the hold window. Because Matrix auto-mentions the replied-to user,
+  // each reply carries its OWN mention trigger — which previously flushed the held
+  // trigger and started a fresh hold, yielding two sessions. The follow-up must now
+  // fold into the held trigger: one grouped trigger-bearing delivery, not two.
+  const provider = new MatrixProvider();
+  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: 50 };
+
+  const deliveries: InboundChatEvent[] = [];
+  provider.subscribe((event) => deliveries.push(event));
+
+  const base: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "channel",
+    body: "first",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+    // Reply to a bot message → Matrix adds the bot to m.mentions → a mention trigger.
+    replyToId: "$bot-msg",
+    mentions: { userIds: ["@miku:example.org"] },
+    eventId: "$m1",
+  };
+  const ctx = { accountId: "miku", selfUserId: "@miku:example.org" };
+  const first = normalizeMatrixInboundEvent(base, ctx);
+  const second = normalizeMatrixInboundEvent({ ...base, eventId: "$m2", body: "second" }, ctx);
+  assert.equal(first.trigger?.type, "mention");
+  assert.equal(second.trigger?.type, "mention");
+
+  const emit = (provider as unknown as { emitWithTriggerHold(e: InboundChatEvent): void }).emitWithTriggerHold.bind(provider);
+  emit(first);
+  emit(second);
+
+  // Both immediate (ingestion) emits land with the trigger stripped; crucially the
+  // second did NOT flush the first — no trigger-bearing delivery yet.
+  assert.equal(deliveries.length, 2, "two ingestion emits, no early flush");
+  assert.ok(deliveries.every((d) => d.trigger === undefined), "no trigger-bearing delivery before the hold fires");
+
+  await new Promise((resolve) => setTimeout(resolve, 160));
+
+  const triggered = deliveries.filter((d) => d.trigger);
+  assert.equal(triggered.length, 1, "exactly one trigger-bearing delivery — no twin");
+  assert.equal(triggered[0].event.id, first.event.id, "the held (first) trigger is the one delivered");
+  assert.deepEqual(
+    triggered[0].trigger?.groupedEventIds,
+    [first.event.id, second.event.id],
+    "both messages are grouped under the single trigger",
+  );
+});
