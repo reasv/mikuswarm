@@ -33,6 +33,15 @@ export const SystemPromptSegmentWire = Schema.Struct({
 });
 export type SystemPromptSegmentWire = Schema.Schema.Type<typeof SystemPromptSegmentWire>;
 
+/** One tool's contribution + definition within the tool-definition block (tool-block.ts `ToolSegment`). */
+export const ToolWire = Schema.Struct({
+	name: Schema.String,
+	tokenEstimate: Schema.Number,
+	/** Pretty-printed wire JSON of this tool's definition, shown when its row expands. */
+	text: Schema.String
+});
+export type ToolWire = Schema.Schema.Type<typeof ToolWire>;
+
 /** A rendered context message (handlers.ts `renderContextMessage`). */
 export const ContextMessageWire = Schema.Struct({
 	type: Schema.String,
@@ -53,7 +62,14 @@ export const ContextMessageWire = Schema.Struct({
 	 * other message and on persisted session snapshots, which carry the system
 	 * prompt as one opaque blob.
 	 */
-	segments: Schema.optional(Schema.Array(SystemPromptSegmentWire))
+	segments: Schema.optional(Schema.Array(SystemPromptSegmentWire)),
+	/**
+	 * Per-tool breakdown of the tool-definition block — present ONLY on the
+	 * synthetic `tools` message the inspector prepends above the system prompt
+	 * (spec §10a). Each entry carries the tool's name, token cost, and its own
+	 * definition text, so the block renders hierarchically (block → tool → schema).
+	 */
+	tools: Schema.optional(Schema.Array(ToolWire))
 });
 export type ContextMessageWire = Schema.Schema.Type<typeof ContextMessageWire>;
 

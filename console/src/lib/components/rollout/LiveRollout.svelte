@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { streamSessionEvents } from '$lib/api/live';
+	import { consumeSessionStream } from '$lib/api/live';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
-	import { isInjectedUserTurn, type RolloutMsg } from '$lib/rollout';
+	import { isDuplicateInjectedTurn, isInjectedUserTurn, type RolloutMsg } from '$lib/rollout';
 	import Rollout from './Rollout.svelte';
 
 	// `onHead` surfaces the seed's sliced-off leading final-turn messages (the
@@ -23,6 +23,12 @@
 	// and shows a retry notice; authoritative events always win over tentative.
 	let tentative = $state<RolloutMsg | null>(null);
 	let retryNotice = $state<string | null>(null);
+	// Post-seed dedup window (not reactive — control state only). A turn committed
+	// to `agent.state.messages` just before we attach can appear in the seed AND
+	// fire a later `message_start`, rendering twice (the "printed twice, fixed on
+	// refresh" symptom). True from a `rollout_seed` until the first `turn_end`;
+	// while true, a `message_start` that duplicates a seeded turn is dropped.
+	let recentlySeeded = false;
 
 	// Fold a live AgentEvent into the accumulating message list (spec §10b). The
 	// per-event payloads are `any` upstream, so we narrow defensively.
@@ -38,9 +44,19 @@
 				const msgs = Array.isArray(evt.messages) ? (evt.messages as RolloutMsg[]) : [];
 				const start = typeof evt.rolloutStartIndex === 'number' ? evt.rolloutStartIndex : 0;
 				messages = msgs.slice(start);
+				// A seed is a fresh canonical snapshot: drop any in-flight ephemeral left
+				// over from a prior (dropped) connection, else a stale `streaming`/
+				// `tentative` partial would render on top of the now-committed message
+				// after a reconnect re-seeds.
+				streaming = null;
+				tentative = null;
+				retryNotice = null;
 				// Hand the leading final-turn messages (trigger turn) to the parent for
 				// the verbatim input view; the rollout itself begins at `start`.
 				onHead?.(msgs.slice(0, start));
+				// Open the dedup window: until the first turn_end, a message_start that
+				// re-delivers a turn already in this seed is a duplicate (see below).
+				recentlySeeded = true;
 				break;
 			}
 			case 'tentative_event': {
@@ -69,6 +85,9 @@
 				streaming = null;
 				tentative = null;
 				retryNotice = null;
+				// A turn committed: the seed/message_start race window is closed, so
+				// stop deduping (legitimate repeat interjections must fold normally).
+				recentlySeeded = false;
 				break;
 			}
 			case 'message_start': {
@@ -85,6 +104,10 @@
 				// not the rollout, and an early attach can surface its message_start here.
 				const m = evt.message as RolloutMsg | undefined;
 				if (m && isInjectedUserTurn(m) && m.type !== 'triggerGroup' && m.type !== 'satellite') {
+					// Drop a message_start that merely re-delivers a turn the seed already
+					// carried (only in the post-seed window, so steady-state repeats fold
+					// normally) — otherwise the injected turn renders twice.
+					if (recentlySeeded && isDuplicateInjectedTurn(messages, m)) break;
 					messages.push(m);
 				}
 				break;
@@ -112,6 +135,7 @@
 				// persisted record").
 				streaming = null;
 				tentative = null;
+				recentlySeeded = false;
 				break;
 		}
 	}
@@ -119,38 +143,38 @@
 	// Consume the live SSE stream for the current session ($lib/api/live.ts — a real
 	// event-log byte stream, NOT a query.live: live queries keep only the latest
 	// pending value under backpressure, which dropped burst-committed events like
-	// `turn_end` and left this view empty). Teardown aborts the controller, which
-	// kills the fetch end-to-end so the agent releases its `Agent.subscribe`
-	// listener immediately — independent of whether another event ever arrives (a
-	// quiet running session would otherwise leak the SSE connection until
-	// `agent_end`; spec §3.3 / §14).
+	// `turn_end` and left this view empty). `consumeSessionStream` adds reconnect +
+	// re-attach: it survives a dropped connection (proxy idle-timeout / network blip
+	// / agent restart) instead of freezing until a manual refresh, and re-checks on
+	// a clean settlement so a resumed run (resume / follow-up-fold reuse the same id)
+	// is picked up seamlessly. It resolves ONLY when the session is definitively
+	// terminal (`not_live`) or we abort. Teardown aborts the controller, which kills
+	// the in-flight fetch end-to-end so the agent releases its `Agent.subscribe`
+	// listener immediately (spec §3.3 / §14).
 	$effect(() => {
 		const id = sessionId;
 		messages = [];
 		streaming = null;
 		tentative = null;
 		retryNotice = null;
+		recentlySeeded = false;
 		contextSummary.set({ live: true });
-		let stop = false;
 		const controller = new AbortController();
-		(async () => {
-			try {
-				for await (const evt of streamSessionEvents(id, controller.signal)) {
-					if (stop) break;
-					fold(evt);
-				}
-			} catch {
-				/* aborted on teardown / disconnect — ignore */
-			}
-			if (!stop) {
+		void consumeSessionStream(id, {
+			signal: controller.signal,
+			onEvent: (evt) => fold(evt)
+		}).finally(() => {
+			// Resolved without an abort = the session is definitively terminal: the
+			// persisted record is now authoritative, so flip the live indicator and let
+			// SessionView refetch it. On teardown (aborted) we leave that to the next mount.
+			if (!controller.signal.aborted) {
 				contextSummary.set({ live: false });
 				onEnd?.();
 			}
-		})();
+		});
 		return () => {
-			stop = true;
 			// Abort the fetch so the SSE + agent subscription tears down now, without
-			// waiting for the next event.
+			// waiting for the next event (and so any pending reconnect backoff exits).
 			controller.abort();
 			contextSummary.set({ live: false });
 		};

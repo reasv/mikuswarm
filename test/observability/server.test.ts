@@ -70,6 +70,9 @@ function stubFactory(preview: PreviewContext): AgentSessionFactory {
     // sessionMeta also resolves the per-session cost ceiling (spec
     // SESSION-COST-LIMITS §6); unlimited in these fixtures.
     resolveSessionCostCeiling: () => undefined,
+    // Session-detail prepends the tool-definition block (§10a); no tools wired
+    // in these fixtures → no block.
+    toolBlockFor: () => undefined,
   } as unknown as AgentSessionFactory;
 }
 
@@ -80,6 +83,7 @@ const throwingFactory = {
   // Exercised by the session list/detail routes via sessionMeta; fixed here.
   resolveSessionContextCeiling: () => 128_000,
   resolveSessionCostCeiling: () => undefined,
+  toolBlockFor: () => undefined,
 } as unknown as AgentSessionFactory;
 
 async function withServer(
@@ -318,6 +322,7 @@ test("sessionMeta surfaces ACTUALS usage as a grouped object + echoes context/li
         return 8_000;
       },
       resolveSessionCostCeiling: () => undefined,
+      toolBlockFor: () => undefined,
     } as unknown as AgentSessionFactory;
 
     await withServer({ storage, factory }, async (base) => {
@@ -1032,6 +1037,94 @@ test("GET /api/rooms/:key/context flags the final turn preview and externalizes 
       assert.equal(ref.__imageRef, true);
       assert.equal(ref.attachmentId, "evt-1:attach:0");
       assert.equal(ref.mimeType, "image/png");
+    });
+  });
+});
+
+test("GET /api/rooms/:key/context prepends the tool-definition block above system (§10a)", async () => {
+  await withStorage(async (storage) => {
+    const preview: PreviewContext = {
+      syntheticTriggerEventId: null,
+      finalTurnIndex: -1,
+      cacheBoundaries: [...CACHE_BOUNDARIES],
+      built: {
+        // Whole estimate already includes the tool block (the builder folds it).
+        tokenEstimate: 1_300,
+        compactTokens: 10,
+        richTokens: 20,
+        imageBlocks: [],
+        systemPromptSegments: [],
+        toolBlock: {
+          tokenEstimate: 1_280,
+          segments: [
+            { name: "send_message", tokenEstimate: 800, text: '{"name":"send_message"}' },
+            { name: "react", tokenEstimate: 480, text: '{"name":"react"}' },
+          ],
+        },
+        messages: [
+          { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 20 },
+        ],
+      },
+    } as unknown as PreviewContext;
+
+    await withServer({ storage, factory: stubFactory(preview) }, async (base) => {
+      const body = (await (
+        await fetch(`${base}/api/rooms/${encodeURIComponent(TK)}/context`)
+      ).json()) as any;
+      // Tools item is FIRST, above the system message, and not a "preview" turn.
+      const tools = body.messages[0];
+      assert.equal(tools.type, "tools");
+      assert.equal(tools.tier, "tools");
+      assert.equal(tools.tokenEstimate, 1_280);
+      assert.equal(tools.preview, false);
+      assert.equal(tools.content, ""); // no flat dump — rendered hierarchically
+      assert.equal(body.messages[1].type, "system");
+      // Per-tool breakdown rides on a dedicated `tools` array (name + tokens + the
+      // tool's own definition text), so the console renders it hierarchically.
+      assert.deepEqual(
+        tools.tools.map((t: any) => [t.name, t.tokenEstimate]),
+        [["send_message", 800], ["react", 480]],
+      );
+      assert.equal(tools.tools[0].text, '{"name":"send_message"}');
+      // Whole-request estimate is unchanged by the display prepend (already folded).
+      assert.equal(body.tokenEstimate, 1_300);
+    });
+  });
+});
+
+test("GET /api/sessions/:id prepends the tool block when the factory resolves one", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-tools0001", sessionType: "default" }));
+    await storage.saveAgentSessionSnapshot("s-tools0001", {
+      snapshotJson: JSON.stringify([
+        { type: "system", role: "system", content: "system prompt", tier: "system", tokenEstimate: 20 },
+      ]),
+      dumpPath: null,
+      // Frozen estimate already includes the tool block (folded at build time).
+      tokenEstimate: 1_300,
+    });
+
+    const factory = {
+      buildPreview: () => {
+        throw new Error("buildPreview should not be called in this test");
+      },
+      resolveSessionContextCeiling: () => 128_000,
+      resolveSessionCostCeiling: () => undefined,
+      toolBlockFor: (timelineKey: string, sessionType: string) => {
+        assert.equal(timelineKey, TK);
+        assert.equal(sessionType, "default");
+        return {
+          tokenEstimate: 1_280,
+          segments: [{ name: "send_message", tokenEstimate: 1_280, text: '{"name":"send_message"}' }],
+        };
+      },
+    } as unknown as AgentSessionFactory;
+
+    await withServer({ storage, factory }, async (base) => {
+      const body = (await (await fetch(`${base}/api/sessions/s-tools0001`)).json()) as any;
+      assert.equal(body.contextSnapshot[0].type, "tools");
+      assert.equal(body.contextSnapshot[0].tokenEstimate, 1_280);
+      assert.equal(body.contextSnapshot[1].type, "system");
     });
   });
 });

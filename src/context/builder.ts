@@ -32,6 +32,7 @@ import {
   renderSatelliteBlock,
   type SystemPromptSegment,
 } from "../workspace/prompt.js";
+import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from "./tool-block.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
@@ -82,6 +83,16 @@ export interface BuildContextOptions {
   workspace: WorkspaceContent;
   sessionType?: SessionTypeConfig;
   fallbackPrompt?: string;
+  /**
+   * The session's resolved tool set (post-allowlist), structurally reduced to the
+   * fields that hit the wire. When provided, the builder renders a
+   * {@link BuiltContext.toolBlock} and folds its estimate into
+   * {@link BuiltContext.tokenEstimate} — so the estimate accounts for the
+   * tool-definition block the provider charges for (the dominant source of the
+   * estimate-vs-actual gap). Absent (tests, generation builds that pass no tools)
+   * → no tool block and the estimate is the message sum, as before.
+   */
+  tools?: ToolDefinitionLike[];
   /** When set, build context for a level-1 summarization session. */
   summarizationCutoff?: {
     /** Cut context at this timestamp — no events past it are rendered. */
@@ -185,6 +196,15 @@ export interface BuiltContext {
    * {@link SystemPromptSegment}.
    */
   systemPromptSegments: SystemPromptSegment[];
+  /**
+   * The tool-definition block sent out-of-band with the request (its whole-block
+   * estimate + per-tool breakdown). Present only when {@link BuildContextOptions.tools}
+   * was supplied; its `tokenEstimate` is already folded into {@link tokenEstimate}
+   * above. Surfaced by the console inspector as a synthetic "tools" item above the
+   * system message (it is NOT a real message and is never sent as content). See
+   * {@link ToolBlockSummary}.
+   */
+  toolBlock?: ToolBlockSummary;
 }
 
 /**
@@ -712,14 +732,21 @@ export class ContextBuilder {
         imageBlocks,
       },
     ];
+    // Tool-definition block (out-of-band wire `tools[]`): folded into the estimate
+    // so it accounts for what the provider actually charges, and surfaced for the
+    // inspector. Not a message — never added to `messages` / sent as content.
+    const toolBlock =
+      options.tools && options.tools.length > 0 ? renderToolBlock(options.tools) : undefined;
+    const messageTokens = messages.reduce((sum, message) => sum + message.tokenEstimate, 0);
     return {
       messages,
-      tokenEstimate: messages.reduce((sum, message) => sum + message.tokenEstimate, 0),
+      tokenEstimate: messageTokens + (toolBlock?.tokenEstimate ?? 0),
       compactTokens: compacted.compactTokens,
       richTokens: compacted.richTokens,
       imageBlocks,
       renderedInputIds,
       systemPromptSegments,
+      toolBlock,
     };
   }
 
@@ -755,6 +782,14 @@ export class ContextBuilder {
      * `lowerBoundTimestamp` is the newest message the session already has.
      */
     gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
+    /**
+     * One-line preamble prepended to the rendered trigger group (spec
+     * FOLLOWUP-FOLDING §10). Set only for a settled→resume follow-up fold, so the
+     * resumed rollout knows the appended turn arrived as a quick same-sender
+     * follow-up (and, for a re-`@`, that it was explicitly re-addressed). Absent for
+     * an ordinary reply-resume — the reply itself is the address.
+     */
+    triggerPreamble?: string;
   }): Promise<AgentMessage> {
     const now = options.trigger.timestamp;
 
@@ -770,7 +805,12 @@ export class ContextBuilder {
     triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
     const imageBlocks = await this.selectImageBlocks(options.trigger);
     this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
-    const triggerContent = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+    const renderedTrigger = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+    // A follow-up fold prepends a one-line preamble so the resumed rollout sees the
+    // appended turn as a quick same-sender follow-up (§10); a plain reply-resume has none.
+    const triggerContent = options.triggerPreamble
+      ? `${options.triggerPreamble}\n\n${renderedTrigger}`
+      : renderedTrigger;
 
     // Fresh satellite at the new (volatile) position. runtime_state always; tail
     // per toggle; retrieved_memory never (§11); the browser note rides in
@@ -1250,6 +1290,18 @@ export class ContextBuilder {
     for (const id of trigger.trigger?.groupedEventIds ?? []) {
       ids.add(id);
     }
+    // Also union the DURABLE group from the `trigger_group_id` column (FOLLOWUP-FOLDING
+    // review #2). The in-memory `groupedEventIds` is authoritative on the live `build`
+    // path, but a resume re-reads the trigger from `event_json` (provider-hold group
+    // only), dropping backward-lookback members; those survive only in the column.
+    // Unioning makes the rendered-TEXT path consistent with the image path
+    // (`getMediaAssetsForTriggerGroup`, same key) and immune to the in-memory loss.
+    // A no-op for `build`, where the column holds exactly the same member ids
+    // `setTriggerGroup` wrote from that group (and is empty until persisted, so it can
+    // only ever add ids already present). Synchronous (`read`).
+    for (const id of this.storage.getTriggerGroupMemberIds(trigger.id)) {
+      ids.add(id);
+    }
     return ids;
   }
 
@@ -1380,6 +1432,34 @@ export class ContextBuilder {
       splitMessages: opts.splitMessages,
       splitGapMs: opts.splitGapMs,
     });
+  }
+
+  /**
+   * Condition a SINGLE event's own image attachments into inference-ready
+   * {@link ImageBlock}s (spec FOLLOWUP-FOLDING §5.1). Used by the steer path for a
+   * folded **media** follow-up, which has no trigger group of its own (the fold
+   * suppresses its accept): `selectImageBlocks` falls through its trigger-group
+   * cascade to the event's own `imageAttachments`, so passing the bare event yields
+   * exactly its pixels. Empty when the model is non-multimodal, the image isn't
+   * downloaded yet, or `processImageForInference` throws — the caller then steers a
+   * caption-only interjection rather than blocking (§5.1 no-pixels branch).
+   */
+  async conditionEventImages(event: CanonicalChatEvent): Promise<ImageBlock[]> {
+    return this.selectImageBlocks(event);
+  }
+
+  /**
+   * Mark an event's attachments that were conditioned into {@link ImageBlock}s, so the
+   * renderer emits `image_block="true"` on them (renderer.ts) — telling the model the
+   * loose vision block and the `<attachment>` are the same image. Public wrapper over
+   * the trigger-group-scoped {@link markImageBlocks}, used by the steer path for a
+   * folded media follow-up / image co-reply (spec FOLLOWUP-FOLDING §5.1): there the
+   * blocks come from {@link conditionEventImages}, not a trigger-group build, so the
+   * `build` (live) / `buildResumeTurn` (resume) marking does not run. The passed
+   * `events` must be the SAME objects subsequently rendered (the mark mutates them).
+   */
+  markEventImageBlocks(events: CanonicalChatEvent[], blocks: ImageBlock[]): void {
+    this.markImageBlocks(events, new Set(blocks.map((b) => b.attachmentId)));
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {

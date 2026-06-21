@@ -4,6 +4,7 @@ import {
 	contentText,
 	collectToolResults,
 	coerceContextMessage,
+	isDuplicateInjectedTurn,
 	isInjectedUserTurn
 } from './rollout';
 
@@ -108,5 +109,25 @@ describe('rollout helpers', () => {
 		});
 		expect(cm.tokenEstimate).toBe(123);
 		expect(cm.tier).toBe('trigger');
+	});
+
+	it('detects an injected user turn already present (seed/message_start dedup)', () => {
+		const seed = [
+			{ role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
+			{ type: 'interjection', content: 'ping' },
+			{ role: 'user', content: [{ type: 'text', text: 'continue' }] }
+		];
+		// A re-delivered interjection (distinct object, same content) is a duplicate.
+		expect(isDuplicateInjectedTurn(seed, { type: 'interjection', content: 'ping' })).toBe(true);
+		// A forced-completion `role:'user'` prompt matched by flattened text.
+		expect(
+			isDuplicateInjectedTurn(seed, { role: 'user', content: [{ type: 'text', text: 'continue' }] })
+		).toBe(true);
+		// A genuinely new interjection is NOT a duplicate.
+		expect(isDuplicateInjectedTurn(seed, { type: 'interjection', content: 'pong' })).toBe(false);
+		// Assistant messages are never matched (not injected user turns).
+		expect(
+			isDuplicateInjectedTurn(seed, { role: 'assistant', content: [{ type: 'text', text: 'hi' }] })
+		).toBe(false);
 	});
 });

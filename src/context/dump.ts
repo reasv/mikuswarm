@@ -26,6 +26,23 @@ export async function dumpBuiltContext(
     triggerEventId,
     tokenEstimate: context.tokenEstimate,
     cacheBoundaries: [...CACHE_BOUNDARIES],
+    // Tool-definition block (out-of-band wire `tools[]`): its estimate is already
+    // inside `tokenEstimate` above; surface the whole + per-tool breakdown so the
+    // dump explains the otherwise-invisible bulk of the estimate (dump/estimate
+    // parity, issue #9). Omitted when no tools were supplied to the build.
+    ...(context.toolBlock
+      ? {
+          toolBlock: {
+            tokenEstimate: context.toolBlock.tokenEstimate,
+            // Per-tool name + tokens only; the full per-tool schema text is an
+            // inspector affordance, not dump payload.
+            segments: context.toolBlock.segments.map((s) => ({
+              name: s.name,
+              tokenEstimate: s.tokenEstimate,
+            })),
+          },
+        }
+      : {}),
     imageBlocks: context.imageBlocks.map((block, index) => ({
       eventId: block.eventId,
       attachmentId: block.attachmentId,

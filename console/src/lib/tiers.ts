@@ -12,6 +12,7 @@ export interface TierMeta {
 }
 
 const TIERS: Record<string, TierMeta> = {
+	tools: { label: 'tools', accent: 'border-l-fuchsia-400 text-fuchsia-500' },
 	system: { label: 'system', accent: 'border-l-zinc-400 text-zinc-500' },
 	diary: { label: 'diary', accent: 'border-l-teal-400 text-teal-500' },
 	summary: { label: 'summary', accent: 'border-l-violet-400 text-violet-500' },
@@ -28,17 +29,6 @@ export function tierMeta(tier: Tier): TierMeta {
 	return (tier && TIERS[tier]) || FALLBACK;
 }
 
-/**
- * Verbatim renderer mode (spec §10):
- * - `room`   — §10a: the live `build()` output; only the system prompt, the
- *   `<system>` satellite block and the diary layer collapse by default.
- * - `session`— §10b: the captured input context above a session rollout; the final
- *   user turn / trigger stays expanded, while earlier tiers (summary/compact/rich)
- *   AND system/satellite collapse by default so the long prefix doesn't bury the
- *   rollout below the fold.
- */
-export type VerbatimMode = 'room' | 'session';
-
 /** A message's collapse-relevant shape (subset of `ContextMessageWire`). */
 export interface CollapsibleMessage {
 	type?: string | null;
@@ -46,30 +36,34 @@ export interface CollapsibleMessage {
 }
 
 /**
- * The earlier-context tiers that collapse by default in session mode (spec §10b).
- * `diary` is absent because it collapses in BOTH modes (handled in `isCollapsible`).
+ * The earlier-context tiers that collapse by default. The summary → compact → rich
+ * progression (plus `mixed`) folds away so the captured prefix doesn't bury the live
+ * trigger turn / rollout below it. `diary` is handled separately in `isCollapsible`
+ * (it collapses regardless of tier name). Applied **uniformly** across both verbatim
+ * views — the live room-context preview and the session-input view: the room view
+ * used to leave these tiers expanded, but the two are now aligned.
  */
-const SESSION_COLLAPSED_TIERS = new Set(['summary', 'compact', 'rich', 'mixed']);
+const COLLAPSED_TIERS = new Set(['summary', 'compact', 'rich', 'mixed']);
 
 /**
- * Whether a verbatim message renders with a collapse toggle. System prompt, the
- * `<system>` satellite block, and the diary layer always get the affordance (both
- * modes, spec §10a) — the diary layer is a large static blob like the system prompt,
- * not part of the conversation. In session mode the earlier summary/compact/rich
- * tiers also become collapsible so the captured prefix can be folded away (spec §10b).
+ * Whether a verbatim message renders with a collapse toggle. The tool-definition
+ * block, the system prompt, the `<system>` satellite block, and the diary layer
+ * always get the affordance — each is a large static blob, not part of the
+ * conversation — and the earlier summary/compact/rich/mixed tiers fold too so the
+ * captured prefix can be tucked away. The final user turn / trigger carries none of
+ * these tiers, so it stays expanded.
  */
-export function isCollapsible(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
-	if (msg.type === 'system' || msg.type === 'satellite' || msg.tier === 'diary') return true;
-	if (mode === 'session') return SESSION_COLLAPSED_TIERS.has(msg.tier ?? '');
-	return false;
+export function isCollapsible(msg: CollapsibleMessage): boolean {
+	if (msg.type === 'tools' || msg.type === 'system' || msg.type === 'satellite' || msg.tier === 'diary')
+		return true;
+	return COLLAPSED_TIERS.has(msg.tier ?? '');
 }
 
 /**
- * Default `open` state for a collapsible verbatim message. System/satellite/diary start
- * collapsed in both modes; in session mode the earlier tiers also start collapsed,
- * while the final user turn / trigger stays expanded (spec §10a/§10b). Non-collapsible
- * messages are always open.
+ * Default `open` state for a collapsible verbatim message. Every collapsible message
+ * (system/satellite/diary + the earlier tiers) starts collapsed; the final user turn
+ * / trigger and any non-collapsible message stay open.
  */
-export function defaultOpen(msg: CollapsibleMessage, mode: VerbatimMode): boolean {
-	return !isCollapsible(msg, mode);
+export function defaultOpen(msg: CollapsibleMessage): boolean {
+	return !isCollapsible(msg);
 }

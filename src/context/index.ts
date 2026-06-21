@@ -14,6 +14,12 @@ export {
   type ContextMessage,
   type ImageBlock,
 } from "./builder.js";
+export {
+  renderToolBlock,
+  type ToolBlockSummary,
+  type ToolSegment,
+  type ToolDefinitionLike,
+} from "./tool-block.js";
 export { dumpBuiltContext, CACHE_BOUNDARIES } from "./dump.js";
 export {
   selectSummaries,

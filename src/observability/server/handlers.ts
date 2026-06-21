@@ -4,6 +4,7 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { ContextMessage } from "../../context/builder.js";
+import type { ToolBlockSummary } from "../../context/index.js";
 import { externalizeImages } from "../../agent/session-capture.js";
 import { isFinalTurnMessage } from "../../agent/factory.js";
 import type { AgentSessionRow, AgentSessionStatus, ToolInvocationRow } from "../../storage/index.js";
@@ -46,6 +47,9 @@ export async function roomContext(
     // snapshot path (sessionDetail) never sets it, so the field is absent there.
     ...(msg.type === "system" ? { segments: built.systemPromptSegments } : {}),
   }));
+  // The tool-definition block renders as a leading item above the system message
+  // (spec §10a). Its estimate is already inside `built.tokenEstimate`.
+  if (built.toolBlock) messages.unshift(toolBlockMessage(built.toolBlock) as (typeof messages)[number]);
   sendJson(res, 200, {
     timelineKey: ctx.params.key,
     preview: true,
@@ -180,9 +184,18 @@ export function sessionDetail(
     // (timestamp/tier/imageBlocks) were dropped by serialization, but the
     // console decodes both endpoints through one strict ContextMessageWire
     // schema (present-or-null fields, refs under `imageRefs`).
-    contextSnapshot: parseJsonArray(row.context_snapshot_json).map((msg) =>
-      renderContextMessage(msg as PersistedContextMessage),
-    ),
+    // The persisted snapshot stores only the frozen estimate number, not the tool
+    // breakdown; recompute the (config-static) tool block for this session's type
+    // and prepend it above the system message, mirroring the room preview. Its
+    // estimate is already inside the row's frozen `tokenEstimate`.
+    contextSnapshot: (() => {
+      const snapshot = parseJsonArray(row.context_snapshot_json).map((msg) =>
+        renderContextMessage(msg as PersistedContextMessage),
+      );
+      const toolBlock = ctx.deps.factory.toolBlockFor(row.timeline_key, row.session_type);
+      if (toolBlock) snapshot.unshift(toolBlockMessage(toolBlock) as (typeof snapshot)[number]);
+      return snapshot;
+    })(),
     transcript,
     rolloutStartIndex: rolloutStartIndex(transcript),
     contextDumpPath: row.context_dump_path,
@@ -686,6 +699,38 @@ function renderContextMessage(msg: ContextMessage | PersistedContextMessage): Re
     tokenEstimate: msg.tokenEstimate ?? null,
     timestamp: msg.timestamp ?? null,
     imageRefs: msg.imageBlocks ? externalizeImages(msg.imageBlocks) : undefined,
+  };
+}
+
+/**
+ * Synthetic "tools" context message for the inspector (spec §10a): the
+ * out-of-band tool-definition block rendered as a leading item ABOVE the system
+ * message. It is NOT a real message — the model receives it as the request's
+ * `tools` field, never as content — so it is prepended only at the wire-render
+ * boundary, never persisted into a snapshot or replayed on resume. Its
+ * `tokenEstimate` is already included in the build's `tokenEstimate`.
+ *
+ * The per-tool breakdown rides on a dedicated `tools` array (name + token cost +
+ * the tool's own definition text), so the console renders it HIERARCHICALLY:
+ * expand the block to see one collapsed row per tool (name + tokens), expand a
+ * row to see that tool's schema. `content` is empty — there is no flat dump.
+ */
+function toolBlockMessage(block: ToolBlockSummary): Record<string, unknown> {
+  return {
+    type: "tools",
+    role: "system",
+    content: "",
+    tier: "tools",
+    tokenEstimate: block.tokenEstimate,
+    timestamp: null,
+    // The tool block frames the request; it is never a trigger-dependent preview
+    // turn. Explicit so the room-context renderer treats it like the system prefix.
+    preview: false,
+    tools: block.segments.map((s) => ({
+      name: s.name,
+      tokenEstimate: s.tokenEstimate,
+      text: s.text,
+    })),
   };
 }
 

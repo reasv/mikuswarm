@@ -57,9 +57,15 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
       return [
         {
           role: "user",
-          content: `<interjection>\n${message.content}\n</interjection>`,
+          // Carry real image pixels when the interjection has them (spec
+          // FOLLOWUP-FOLDING §3 — a steered media follow-up / an image-bearing
+          // co-reply); falls back to the bare string when absent (the common case).
+          content: contentWithImages(
+            `<interjection>\n${message.content}\n</interjection>`,
+            message.imageBlocks,
+          ),
           timestamp: Date.now(),
-        },
+        } as Message,
       ];
     }
 

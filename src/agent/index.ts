@@ -4,6 +4,21 @@ export {
   type AgentSessionStatus,
 } from "./session-manager.js";
 export { SessionClaims, type SessionClaim, coTargetOwnerSteerableSoon } from "./session-claims.js";
+export {
+  FollowUpWatch,
+  classifyFollowUpForm,
+  followUpGateDecision,
+  followUpConfigActive,
+  hasImageAttachment,
+  maxWallClockMs,
+  decideFollowUpRoute,
+  resolveFollowUpRoute,
+  type FollowUpForm,
+  type FollowUpRoute,
+  type FollowUpWatchEntry,
+  type FollowUpLeverConfig,
+  type FollowUpConfig,
+} from "./follow-up-watch.js";
 export type {
   ChatEventMessage,
   InterjectionMessage,
@@ -12,6 +27,7 @@ export { convertToLlm } from "./convert.js";
 export {
   AgentSessionFactory,
   createModel,
+  filterTools,
   assertRunSettledCleanly,
   wasRunAborted,
   WorkerDrainAbortError,

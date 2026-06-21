@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
-import { ContextBuilder } from "../src/context/index.js";
+import { ContextBuilder, type ImageBlock } from "../src/context/index.js";
 import { renderRichMessage } from "../src/context/renderer.js";
 import { estimateTokens } from "../src/context/tokens.js";
 import { loadCompletedSessionMaterial, SessionClaims } from "../src/agent/index.js";
@@ -733,6 +733,108 @@ test("buildResumeTurn: gap truncates on the token budget and marks the omission 
     const keptTokens = ["FIVE", "FOUR", "THREE", "TWO", "ONE"].filter((t) => turn.content.includes(t));
     const keptCount = keptTokens.length;
     assert.equal(keptCount, 5 - omitted, "kept + omitted accounts for the whole window (contiguous cut)");
+  } finally {
+    storage.close();
+    resetAgentTimezone();
+  }
+});
+
+// ── FOLLOWUP-FOLDING review #1: markEventImageBlocks sets image_block on render ───
+//
+// The steer path conditions a folded media follow-up / image co-reply via
+// `conditionEventImages`, then must mark the SAME rendered event so the renderer
+// emits `image_block="true"` (telling the model the loose vision block and the
+// `<attachment>` are one image). `build`/`buildResumeTurn` mark via the private
+// `markImageBlocks`; the steer path has no trigger-group build, so it uses the new
+// public `markEventImageBlocks` wrapper. Pre-fix the steer render was caption-only.
+
+test("markEventImageBlocks: marked attachment renders image_block=true; unmarked does not (review #1)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    const make = (): CanonicalChatEvent => ({
+      ...ev("img-evt", "look at this", 5000),
+      attachments: [
+        { id: "att-0", mediaType: "image", filename: "pic.png", localPath: "/x/pic.png", caption: "a cat" },
+      ],
+    });
+
+    // Control: an un-marked event renders caption-only — NO image_block attribute.
+    const unmarked = make();
+    const unmarkedOut = renderRichMessage(unmarked);
+    assert.ok(unmarkedOut.includes("[caption: a cat]"), "caption renders regardless");
+    assert.ok(!unmarkedOut.includes('image_block="true"'), "unmarked attachment carries no image_block");
+
+    // Mark the conditioned attachment by id (what the steer path does with the blocks
+    // it conditioned), then render the SAME object.
+    const marked = make();
+    const blocks: ImageBlock[] = [
+      { eventId: "img-evt", attachmentId: "att-0", mediaType: "image/png", dataBase64: "QUJD" },
+    ];
+    builder.markEventImageBlocks([marked], blocks);
+    const markedOut = renderRichMessage(marked);
+    assert.ok(markedOut.includes('image_block="true"'), "marked attachment renders image_block=\"true\"");
+    assert.ok(markedOut.includes("[caption: a cat]"), "caption still renders alongside the block marker");
+
+    // A block whose attachmentId matches nothing leaves the event untouched (no-op).
+    const noMatch = make();
+    builder.markEventImageBlocks([noMatch], [
+      { eventId: "img-evt", attachmentId: "other", mediaType: "image/png", dataBase64: "QUJD" },
+    ]);
+    assert.ok(!renderRichMessage(noMatch).includes('image_block="true"'), "non-matching block marks nothing");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── FOLLOWUP-FOLDING review #2: buildResumeTurn unions the trigger_group_id column ──
+//
+// Regression: `runResumeSession` hydration re-reads the trigger event from
+// `event_json` (provider-hold group only), dropping backward-lookback members from
+// the in-memory `groupedEventIds`. `resolveTriggerGroupIds` previously read the group
+// ONLY from that in-memory field, so a reply-resume whose trigger group grabbed
+// lookback members rendered without their TEXT (the image survived via the column).
+// Fix: `resolveTriggerGroupIds` also unions the durable `trigger_group_id` column, so
+// the lookback member is materialized + rendered regardless of the in-memory event.
+
+test("buildResumeTurn: includes a lookback-grouped member's text via the trigger_group_id column (review #2)", async () => {
+  configureAgentTimezone("UTC");
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const timeline = new TimelineStore(storage);
+  const builder = new ContextBuilder(timeline, minimalConfig(), storage);
+  try {
+    // A backward-lookback member that landed BEFORE the trigger and was grouped into
+    // the trigger's group at accept time (persisted in the trigger_group_id column).
+    await timeline.append(ev("lookback-img", "LOOKBACK-MEMBER-BODY", 3900));
+    const trigger = ev("reply1", "what do you think?", 4000);
+    await timeline.append(trigger);
+    // The durable group: setTriggerGroup writes trigger_group_id = trigger.id on every
+    // member (mirrors the live accept path).
+    await storage.setTriggerGroup(trigger.id, [trigger.id, "lookback-img"]);
+
+    // Mimic the runResumeSession hydration: the in-memory trigger event is re-read from
+    // event_json and carries ONLY the provider-hold group (here: none) — the lookback
+    // member is absent from groupedEventIds, living only in the column.
+    const degradedTrigger: CanonicalChatEvent = {
+      ...trigger,
+      trigger: { type: "reply", reason: "r", triggeredBy: trigger.sender, groupedEventIds: [trigger.id] },
+    };
+
+    const turn = (await builder.buildResumeTurn({
+      timelineKey: TK,
+      trigger: degradedTrigger,
+      activeSessions: [],
+      workspace: tailWorkspace,
+      selfSessionId: "s1",
+      tail: true,
+    })) as unknown as ResumeTurnShape;
+
+    assert.ok(turn.content.includes("what do you think?"), "the trigger itself renders");
+    assert.ok(
+      turn.content.includes("LOOKBACK-MEMBER-BODY"),
+      "the lookback-grouped member's TEXT is restored via the trigger_group_id column union (review #2)",
+    );
   } finally {
     storage.close();
     resetAgentTimezone();
