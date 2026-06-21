@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { BackfetchTargetKind } from "../../storage/index.js";
+import { roomIdFromTimelineKey } from "../../timeline/index.js";
 import type { RequestContext } from "./types.js";
 import { sendJson, sendError } from "./responses.js";
 
@@ -17,7 +18,10 @@ const VALID_TARGETS: ReadonlySet<string> = new Set([
   "count",
 ]);
 
-const BASE_KEY_RE = /^matrix:([^:]+):(room|dm):(.+)$/;
+// Account-id capture only; the room id is parsed by the canonical
+// `roomIdFromTimelineKey` (src/timeline/router.ts) to avoid divergence. Keep the
+// kind segment (`room|dm`) in sync with that helper.
+const ACCOUNT_KEY_RE = /^matrix:([^:]+):(?:room|dm):.+$/;
 
 /** GET /api/backfetch/jobs — every job, newest first (empty when not wired). */
 export function backfetchJobs(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
@@ -46,10 +50,10 @@ export async function startBackfetchJob(
   if (timelineKey.includes(":thread:")) {
     return sendError(res, 400, "timelineKey must be a base room/dm key, not a thread");
   }
-  const m = BASE_KEY_RE.exec(timelineKey);
-  if (!m) return sendError(res, 400, `unrecognized timelineKey: ${timelineKey}`);
+  const m = ACCOUNT_KEY_RE.exec(timelineKey);
+  const roomId = roomIdFromTimelineKey(timelineKey);
+  if (!m || !roomId) return sendError(res, 400, `unrecognized timelineKey: ${timelineKey}`);
   const accountId = m[1]!;
-  const roomId = m[3]!;
 
   const targetKind = q.get("targetKind") ?? "";
   if (!VALID_TARGETS.has(targetKind)) {
@@ -76,8 +80,10 @@ export async function startBackfetchJob(
     targetKind: targetKind as BackfetchTargetKind,
     targetValue: targetKind === "date" || targetKind === "count" ? targetValueRaw : null,
     captionAfter: parseBool(q.get("captionAfter")),
-    safetyCap: parseNonNegInt(q.get("safetyCap")),
-    timeoutMs: parseNonNegInt(q.get("timeoutMs")),
+    // Clamp operator overrides to absurd-value guards (not policy): the run is
+    // self-limiting and pausable, but an unbounded cap/timeout makes no sense.
+    safetyCap: parseNonNegInt(q.get("safetyCap"), 10_000_000),
+    timeoutMs: parseNonNegInt(q.get("timeoutMs"), 86_400_000), // 24h
   });
   if (!result.ok) return sendError(res, 409, result.reason);
   sendJson(res, 200, { job: result.job });
@@ -120,15 +126,20 @@ export async function promoteBackfetchCaptions(
   res: ServerResponse,
   ctx: RequestContext,
 ): Promise<void> {
+  // Intentionally NOT gated on `deps.enabled`: promote is decoupled from the
+  // fetch feature flag (spec §7.3 — it operates on already-stored media).
   const deps = ctx.deps.backfetch;
   if (!deps) return sendError(res, 503, "backfetch not wired");
   const q = ctx.url.searchParams;
   const timelineKey = q.get("timelineKey")?.trim();
   if (!timelineKey) return sendError(res, 400, "timelineKey is required");
-  const promoted = await deps.promoteCaptions(timelineKey, {
-    fromTs: parseTs(q.get("fromTs")),
-    toTs: parseTs(q.get("toTs")),
-  });
+  const fromTs = parseTs(q.get("fromTs"));
+  const toTs = parseTs(q.get("toTs"));
+  // An inverted range matches nothing; reject it rather than 200 with promoted=0.
+  if (fromTs != null && toTs != null && fromTs > toTs) {
+    return sendError(res, 400, "fromTs must be <= toTs");
+  }
+  const promoted = await deps.promoteCaptions(timelineKey, { fromTs, toTs });
   sendJson(res, 200, { promoted });
 }
 
@@ -148,10 +159,11 @@ function parseBool(v: string | null): boolean {
   return v === "1" || v === "true";
 }
 
-function parseNonNegInt(v: string | null): number | undefined {
+function parseNonNegInt(v: string | null, max?: number): number | undefined {
   if (v == null) return undefined;
   const n = Number.parseInt(v, 10);
-  return Number.isFinite(n) && n >= 0 ? n : undefined;
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return max != null ? Math.min(n, max) : n;
 }
 
 function parseTs(v: string | null): number | null {

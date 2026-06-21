@@ -15,6 +15,8 @@ import {
   type ConsoleServer,
   type ConsoleServerDeps,
 } from "../../src/observability/server/index.js";
+import type { BackfetchConsoleDeps } from "../../src/observability/server/types.js";
+import type { BackfetchJobInput, BackfetchJobRow } from "../../src/storage/index.js";
 import { registerSecret, resetRedactionRegistry } from "../../src/config/index.js";
 import { CACHE_BOUNDARIES } from "../../src/context/index.js";
 
@@ -97,6 +99,7 @@ async function withServer(
     sessions: deps.sessions ?? new SessionManager(),
     workspaceRoot: deps.workspaceRoot ?? "/tmp",
     logger: deps.logger ?? silentLogger,
+    backfetch: deps.backfetch,
   };
   const server: ConsoleServer = createObservabilityServer(full);
   await server.start();
@@ -1125,6 +1128,76 @@ test("GET /api/sessions/:id prepends the tool block when the factory resolves on
       assert.equal(body.contextSnapshot[0].type, "tools");
       assert.equal(body.contextSnapshot[0].tokenEstimate, 1_280);
       assert.equal(body.contextSnapshot[1].type, "system");
+    });
+  });
+});
+
+// --- message-backfetch console routes -------------------------------------
+
+function fakeBackfetch(): {
+  deps: BackfetchConsoleDeps;
+  starts: BackfetchJobInput[];
+  promotes: { timelineKey: string; range?: { fromTs?: number | null; toTs?: number | null } }[];
+} {
+  const starts: BackfetchJobInput[] = [];
+  const promotes: { timelineKey: string; range?: { fromTs?: number | null; toTs?: number | null } }[] = [];
+  const deps: BackfetchConsoleDeps = {
+    enabled: true,
+    list: () => [],
+    start: async (input) => {
+      starts.push(input);
+      return { ok: true, job: { id: "bf-1", ...input } as unknown as BackfetchJobRow };
+    },
+    pause: async () => ({ ok: true }),
+    resume: async () => ({ ok: true }),
+    cancel: async () => ({ ok: true }),
+    promoteCaptions: async (timelineKey, range) => {
+      promotes.push({ timelineKey, range });
+      return 0;
+    },
+  };
+  return { deps, starts, promotes };
+}
+
+test("POST /api/backfetch/caption-promote rejects an inverted fromTs>toTs range with 400 (issue #6)", async () => {
+  await withStorage(async (storage) => {
+    const { deps, promotes } = fakeBackfetch();
+    await withServer({ storage, backfetch: deps }, async (base) => {
+      const res = await fetch(
+        `${base}/api/backfetch/caption-promote?timelineKey=${encodeURIComponent(TK)}&fromTs=2000&toTs=1000`,
+        { method: "POST", headers: { "x-console-request": "1" } },
+      );
+      assert.equal(res.status, 400);
+      assert.equal(promotes.length, 0, "promoteCaptions must NOT run for an inverted range");
+
+      // A well-ordered range still passes through.
+      const ok = await fetch(
+        `${base}/api/backfetch/caption-promote?timelineKey=${encodeURIComponent(TK)}&fromTs=1000&toTs=2000`,
+        { method: "POST", headers: { "x-console-request": "1" } },
+      );
+      assert.equal(ok.status, 200);
+      assert.equal(promotes.length, 1);
+      assert.deepEqual(promotes[0]!.range, { fromTs: 1000, toTs: 2000 });
+    });
+  });
+});
+
+test("POST /api/backfetch/jobs clamps absurd safetyCap/timeoutMs operator overrides (issue #7)", async () => {
+  await withStorage(async (storage) => {
+    const { deps, starts } = fakeBackfetch();
+    await withServer({ storage, backfetch: deps }, async (base) => {
+      const res = await fetch(
+        `${base}/api/backfetch/jobs?timelineKey=${encodeURIComponent(TK)}&targetKind=beginning` +
+          `&safetyCap=999999999999&timeoutMs=999999999999`,
+        { method: "POST", headers: { "x-console-request": "1" } },
+      );
+      assert.equal(res.status, 200);
+      assert.equal(starts.length, 1);
+      assert.equal(starts[0]!.safetyCap, 10_000_000);
+      assert.equal(starts[0]!.timeoutMs, 86_400_000);
+      // A sane value passes through untouched.
+      assert.equal(starts[0]!.accountId, "miku");
+      assert.equal(starts[0]!.roomId, "!room:example.org");
     });
   });
 });
