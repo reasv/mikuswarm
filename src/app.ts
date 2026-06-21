@@ -4471,9 +4471,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // Resume interrupted message-backfetch jobs only AFTER startup gap backfetch
   // settles (§10.2): a room must not be backfetched while still frozen by the gap
   // coordinator. Each job runs in the background from its persisted cursor.
-  void gapBackfetchRun.then(() => {
-    if (!draining) messageBackfetch.resumeAll();
-  });
+  void gapBackfetchRun
+    .then(() => {
+      if (!draining) messageBackfetch.resumeAll();
+    })
+    .catch((error) => {
+      logger.error("message_backfetch_resume_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
 
   if (retentionDays > 0) {
     void runInactiveRetention();

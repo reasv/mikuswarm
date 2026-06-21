@@ -251,6 +251,73 @@ test("count target stops at the requested number of stored rows", async () => {
   await h.storage.close();
 });
 
+test("count target resume tops up to the target without over-fetching", async () => {
+  // A count=5 job that already stored 3 in a prior run resumes: it must fetch only
+  // the remaining 2, not 5 more. The page offers 4 below-floor events; only 2 land.
+  const client = new ScriptedClient([
+    page(
+      [
+        summary({ eventId: "$e070", timestamp: 70 }),
+        summary({ eventId: "$e060", timestamp: 60 }),
+        summary({ eventId: "$e050", timestamp: 50 }),
+        summary({ eventId: "$e040", timestamp: 40 }),
+      ],
+      "t2",
+    ),
+  ]);
+  const h = await makeHarness(client);
+  await seedLive(h.timeline, h.storage, "$e100", 100);
+  const job = await h.storage.insertBackfetchJob({
+    roomId: ROOM,
+    accountId: ACCOUNT,
+    timelineKey: ROOM_TK,
+    targetKind: "count",
+    targetValue: "5",
+  });
+  // Simulate a prior run that stored 3 and parked at a cursor.
+  await h.storage.updateBackfetchJob(job.id, { status: "paused", stored: 3, cursorToken: "resume-token" });
+
+  const res = await h.coordinator.resumeJob(job.id);
+  assert.equal(res.ok, true);
+  assert.equal(await waitForTerminal(h, job.id), "completed");
+  const done = h.storage.getBackfetchJob(job.id)!;
+  assert.equal(done.stopReason, "count");
+  // 3 prior + 2 this run = the target 5 (NOT 3 + 5).
+  assert.equal(done.stored, 5);
+  // Only the first 2 of the 4 offered events were stored.
+  assert.deepEqual(storedExternalIds(h.storage), ["$e060", "$e070", "$e100"]);
+  await h.storage.close();
+});
+
+test("count target resume at the target completes without paging", async () => {
+  // A count=2 job that already stored 2 resumes: it short-circuits to completed and
+  // never calls the client.
+  const client = new ScriptedClient([
+    page([summary({ eventId: "$e070", timestamp: 70 })], null),
+  ]);
+  const h = await makeHarness(client);
+  await seedLive(h.timeline, h.storage, "$e100", 100);
+  const job = await h.storage.insertBackfetchJob({
+    roomId: ROOM,
+    accountId: ACCOUNT,
+    timelineKey: ROOM_TK,
+    targetKind: "count",
+    targetValue: "2",
+  });
+  await h.storage.updateBackfetchJob(job.id, { status: "paused", stored: 2, cursorToken: "resume-token" });
+
+  const res = await h.coordinator.resumeJob(job.id);
+  assert.equal(res.ok, true);
+  assert.equal(await waitForTerminal(h, job.id), "completed");
+  const done = h.storage.getBackfetchJob(job.id)!;
+  assert.equal(done.stopReason, "count");
+  assert.equal(done.stored, 2);
+  // No paging happened — the client was never read.
+  assert.equal(client.calls.length, 0);
+  assert.deepEqual(storedExternalIds(h.storage), ["$e100"]);
+  await h.storage.close();
+});
+
 test("date target stops at the requested instant (window)", async () => {
   const client = new ScriptedClient([
     page(

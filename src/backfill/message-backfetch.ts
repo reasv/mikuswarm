@@ -210,9 +210,16 @@ export class MessageBackfetchCoordinator {
     return this.opts.storage.listBackfetchJobs(limit);
   }
 
-  /** Await all in-flight jobs to park (shutdown). */
+  /**
+   * Await all in-flight jobs to park (shutdown). Re-snapshots in a loop so a job
+   * launched after a prior snapshot (e.g. a late `resumeAll()` racing teardown) is
+   * still awaited. Each run parks and removes itself from the running map, so the
+   * loop terminates once no new jobs are launched (shutdown sets `isDraining()`).
+   */
   async drain(): Promise<void> {
-    await Promise.allSettled([...this.running.values()]);
+    while (this.running.size > 0) {
+      await Promise.allSettled([...this.running.values()]);
+    }
   }
 
   // --- internals ---------------------------------------------------------------
@@ -269,8 +276,13 @@ export class MessageBackfetchCoordinator {
     const countTarget =
       job.targetKind === "count" ? Math.max(0, Number.parseInt(job.targetValue ?? "0", 10) || 0) : 0;
     const safetyCap = job.safetyCap > 0 ? job.safetyCap : config.defaultSafetyCap;
+    // For a count target the cap is cross-run: subtract rows already stored by a
+    // prior (paused/drained) run so a resume tops up to `countTarget` rather than
+    // fetching the full count again. paginateBackward seeds its own counter to 0
+    // each run, so it must be told only the *remaining* allowance.
+    const remainingCount = job.targetKind === "count" ? Math.max(0, countTarget - job.stored) : 0;
     const maxMessages =
-      job.targetKind === "count" ? countTarget : safetyCap; // 0 ⇒ unbounded for the non-count targets
+      job.targetKind === "count" ? remainingCount : safetyCap; // 0 ⇒ unbounded for the non-count targets
     const timeoutMs = job.timeoutMs > 0 ? job.timeoutMs : config.defaultTimeoutMs;
     const utdHaltThreshold = job.targetKind === "oldest_decryptable" ? config.utdHaltThreshold : 0;
 
@@ -382,31 +394,38 @@ export class MessageBackfetchCoordinator {
     let stopReason: BackwardPaginateStopReason | undefined;
     let finalStatus: BackfetchJobStatus;
     let finalError: string | null = null;
-    try {
-      const result = await paginateBackward({
-        client,
-        roomId: job.roomId,
-        pageSize: config.pageSize,
-        maxMessages,
-        timeoutMs,
-        utdHaltThreshold,
-        logger: this.opts.logger,
-        readFailedEvent: "message_backfetch_read_failed",
-        logFields: { jobId: job.id, roomId: job.roomId },
-        initialBefore: job.cursorToken ?? undefined,
-        onMessage,
-        onPage,
-      });
-      stopReason = result.stopReason;
-      stored = result.stored > stored ? result.stored : stored; // engine count is authoritative for the run total
-      finalStatus = finalStatusFor(job.targetKind, result.stopReason);
-      if (result.errored) finalError = result.error ?? "read error";
-    } catch (error) {
-      if (error instanceof JobStopSignal) {
-        finalStatus = error.outcome;
-      } else {
-        finalStatus = "failed";
-        finalError = error instanceof Error ? error.message : String(error);
+    if (job.targetKind === "count" && remainingCount === 0) {
+      // A resumed count job that already reached its target: complete without paging
+      // (paginateBackward's per-run counter starts at 0 and would otherwise over-fetch).
+      stopReason = "count";
+      finalStatus = finalStatusFor(job.targetKind, "count");
+    } else {
+      try {
+        const result = await paginateBackward({
+          client,
+          roomId: job.roomId,
+          pageSize: config.pageSize,
+          maxMessages,
+          timeoutMs,
+          utdHaltThreshold,
+          logger: this.opts.logger,
+          readFailedEvent: "message_backfetch_read_failed",
+          logFields: { jobId: job.id, roomId: job.roomId },
+          initialBefore: job.cursorToken ?? undefined,
+          onMessage,
+          onPage,
+        });
+        stopReason = result.stopReason;
+        stored = result.stored > stored ? result.stored : stored; // engine count is authoritative for the run total
+        finalStatus = finalStatusFor(job.targetKind, result.stopReason);
+        if (result.errored) finalError = result.error ?? "read error";
+      } catch (error) {
+        if (error instanceof JobStopSignal) {
+          finalStatus = error.outcome;
+        } else {
+          finalStatus = "failed";
+          finalError = error instanceof Error ? error.message : String(error);
+        }
       }
     }
 
