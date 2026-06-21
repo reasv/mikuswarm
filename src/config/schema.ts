@@ -383,6 +383,29 @@ const ResumeWorkGateSchema = StrictObject({
   group: Type.Optional(ResumeWorkGateContextSchema),
 });
 
+// Follow-up folding (spec FOLLOWUP-FOLDING §9): fold a quick same-sender follow-up
+// (forced-split media, a trailing bare-text thought, or an amending re-`@`) into the
+// session its immediately-prior triggering message produced, instead of losing it,
+// answering it in isolation, or spawning a parallel twin. Three independent levers,
+// each a two-clock gate; every field optional so a partial block degrades to the
+// safe code default (folding off), with 00-defaults.toml shipping the full block.
+// Cross-field checks (each lever's user_gap_ms ≤ wall_clock_ms) live in app.ts.
+const FollowUpLeverSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  // Max user-perceived gap (origin-ts diff) trigger→follow-up. Tighter as the
+  // address gets more explicit (media loosest, re-`@` tightest).
+  user_gap_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Watch lifetime; absorbs upload/federation/decrypt/caption lag without
+  // resurrecting an ancient session.
+  wall_clock_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+const FollowUpSchema = StrictObject({
+  media: Type.Optional(FollowUpLeverSchema),
+  text: Type.Optional(FollowUpLeverSchema),
+  mention: Type.Optional(FollowUpLeverSchema),
+});
+
 const ResumeSchema = StrictObject({
   // Reserve the scarce single resume for the ORIGINAL trigger sender (§6/§7):
   // a reply from a different user → FRESH. Global; inert in DMs (the asker is the
@@ -1102,6 +1125,11 @@ export const AppConfigSchema = StrictObject({
       // by default per context; the whole block is optional so omitting it leaves
       // resume off. Cross-field validation in app.ts.
       resume: Type.Optional(ResumeSchema),
+      // Follow-up folding (spec FOLLOWUP-FOLDING §9): fold quick same-sender
+      // follow-ups (media/text/re-`@`) into the prior triggering message's session.
+      // Whole block optional; omitting it leaves folding off. Cross-field checks
+      // (per-lever user_gap_ms ≤ wall_clock_ms) in app.ts.
+      followup: Type.Optional(FollowUpSchema),
     }),
     system: StrictObject({
       fallback_prompt: Type.Optional(Type.String()),

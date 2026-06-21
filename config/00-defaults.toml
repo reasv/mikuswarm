@@ -104,6 +104,31 @@ extra_exempt_tools = []
 scope = "since_last_turn"   # a single lookup can't swallow the room's back-and-forth
 extra_exempt_tools = []
 
+# Follow-up folding (spec FOLLOWUP-FOLDING). Matrix sends text and media as separate
+# events, so a "look at this" + image (either order), or a quick "actually, London"
+# correction, splits one intent across messages. Each quick same-sender follow-up is
+# folded into the session its immediately-prior triggering message produced —
+# STEERED into it if running, PARKED if still building, or RESUMED if it just
+# completed — instead of being lost, answered half-blind, or spawned as a twin.
+# Three independent levers, each a TWO-clock gate: user_gap_ms (origin-ts diff, the
+# gap as the user felt it) AND wall_clock_ms (watch lifetime; absorbs upload/decrypt/
+# caption lag). Both must pass. Replies are never folded (they keep their own paths).
+# All on by default; per-lever enabled=false disables that form.
+[agent.sessions.followup.media]
+enabled = true
+user_gap_ms = 10000      # forced-split image — highest confidence it's a continuation
+wall_clock_ms = 30000    # generous: covers upload + federation + decrypt + captioning
+
+[agent.sessions.followup.text]
+enabled = true
+user_gap_ms = 7000       # tighter — the text could have carried the @ and didn't
+wall_clock_ms = 15000    # text has no upload/caption lag, so less slack needed
+
+[agent.sessions.followup.mention]
+enabled = true
+user_gap_ms = 5000       # tightest — an explicit re-@ may be a genuinely new ask
+wall_clock_ms = 12000
+
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 
