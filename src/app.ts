@@ -176,9 +176,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         group: model.rate_limit_group,
         source: `models.${key}`,
       })),
-      // captioning references `[models.*]` by name now (spec MODEL-FALLBACK §2.3),
-      // so its rate_limit_group is validated via the models loop above.
-      { group: config.retrieval?.embedding?.remote?.rate_limit_group, source: "retrieval.embedding.remote" },
+      // captioning + remote embedding reference `[models.*]` by name now (spec
+      // MODEL-FALLBACK §2.3), so their rate_limit_group is validated via the models
+      // loop above.
     ];
     for (const { group, source } of groupRefs) {
       if (group && group !== "default" && !llmGroups[group]) {
@@ -356,6 +356,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       httpProxyUrl: config.network?.http_proxy_url,
       scheduler: llmScheduler,
       budget: budgetHooks,
+      // Unified registry (spec MODEL-FALLBACK §2.3): resolve the remote embedding
+      // model ref to its [models.*] chain (head + fallback members).
+      embeddingChain: retrievalConfig.embedding.remote
+        ? resolveModelChain(retrievalConfig.embedding.remote.model, config.models)
+        : undefined,
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       logger: logger.child("retrieval"),
     });
     // Reconcile the touched file after every memory mutation (diary append /

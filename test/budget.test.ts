@@ -739,54 +739,50 @@ test("#11 normalizeLimits: omitting knownModelIds skips the model check entirely
 // ---------------------------------------------------------------------------
 
 test("collectZeroCostModelIds: zero-rate models in the set, paid excluded", () => {
+  // After the unified registry (spec MODEL-FALLBACK §2.3) EVERY consumer references
+  // `[models.*]` by name, so zero-cost collection scans ONLY config.models, keyed
+  // by the LOGICAL id (block name).
   const config = {
     models: {
-      default: { id: "free", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
+      caption: { id: "free", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
       big: { id: "paid", cost: { input: 3, output: 15, cache_read: 0, cache_write: 0 } },
       bare: { id: "bare" }, // no cost block → zero
     },
-    retrieval: { embedding: { remote: { id: "emb", cost_per_mtok: 0 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
-  // Agent models are keyed by their LOGICAL id (config block name; spec
-  // MODEL-FALLBACK §2.2), not the upstream `id`.
-  assert.equal(zero.has("default"), true);
+  assert.equal(zero.has("caption"), true);
   assert.equal(zero.has("bare"), true);
-  assert.equal(zero.has("emb"), true);
-  assert.equal(zero.has("big"), false); // the paid agent block
+  assert.equal(zero.has("big"), false); // the paid block
   assert.equal(zero.has("free"), false); // a wire id, never a logical id
 });
 
-test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", () => {
+test("collectZeroCostModelIds: a per-image-only charge makes an image model paid", () => {
+  // An image-gen model can price purely per-image with zero token rates (spec
+  // MODEL-FALLBACK §2.3); the flat per_image counts toward "is this model free?".
   const config = {
     models: {
-      default: { id: "x" },
-      // Agent block keyed by an id image-gen also prices (paid) — cross-lane.
-      shared: { id: "shared" }, // zero here (no cost block)
+      "imagegen-flat": { id: "img", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0, per_image: 0.04 } },
+      "imagegen-free": { id: "img2", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
     },
-    // remote embedding still defines its model inline; a paid embedding appearance
-    // overrides the zero agent appearance of the same id.
-    retrieval: { embedding: { remote: { id: "shared", cost_per_mtok: 5 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
-  assert.equal(zero.has("shared"), false);
+  assert.equal(zero.has("imagegen-flat"), false); // per_image > 0 → paid
+  assert.equal(zero.has("imagegen-free"), true);
 });
 
-test("#11 collectKnownModelIds: union of every configured model id (zero ∪ paid), across all lanes", () => {
+test("#11 collectKnownModelIds: every configured model id (zero ∪ paid)", () => {
+  // Unified registry: all consumers reference [models.*], so the known set is just
+  // the config.models block names (spec MODEL-FALLBACK §2.3).
   const config = {
     models: {
       default: { id: "free", cost: { input: 0, output: 0 } },
       big: { id: "paid", cost: { input: 3, output: 15 } },
+      caption: { id: "cap-wire" },
+      grok: { id: "x-ai/grok" },
     },
-    // captioning / image_gen / x_search now reference [models.*] by name (spec
-    // MODEL-FALLBACK §2.3); their models are config.models entries, not lane ids.
-    // Only remote embedding remains an inline lane.
-    retrieval: { embedding: { remote: { id: "emb" } } },
   } as never;
   const ids = collectKnownModelIds(config);
-  // Agent models are known by their LOGICAL id (block name); the still-inline
-  // embedding lane by its wire id. Zero-cost AND paid alike.
-  for (const id of ["default", "big", "emb"]) {
+  for (const id of ["default", "big", "caption", "grok"]) {
     assert.equal(ids.has(id), true, `${id} is a known configured model id`);
   }
   assert.equal(ids.has("free"), false); // wire id, not a logical id

@@ -49,14 +49,9 @@ export interface ResolvedRetrievalConfig {
     provider: "local" | "remote";
     local: { model: string; dim: number };
     remote: {
-      id: string;
-      endpoint: string;
-      apiKey: string;
+      /** `[models.*]` block name (spec MODEL-FALLBACK §2.3); the chain is resolved at app wiring. */
+      model: string;
       dim: number;
-      /** LLM rate-limit group (spec §9.4); unset = `default`. */
-      rateLimitGroup?: string;
-      /** USD per 1M input tokens for usage accounting (spec USAGE-COST-LIMITS §9). */
-      costPerMtok?: number;
       /** Chars-per-token estimate when the response omits a token count (§9). */
       charsPerToken?: number;
     } | null;
@@ -114,12 +109,8 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       },
       remote: remoteBlock
         ? {
-            id: remoteBlock.id,
-            endpoint: remoteBlock.endpoint,
-            apiKey: remoteBlock.api_key,
+            model: remoteBlock.model,
             dim: remoteBlock.dim,
-            rateLimitGroup: remoteBlock.rate_limit_group,
-            costPerMtok: remoteBlock.cost_per_mtok,
             charsPerToken: remoteBlock.chars_per_token,
           }
         : null,
@@ -198,9 +189,13 @@ export function activeEmbeddingDim(resolved: ResolvedRetrievalConfig): number {
     : resolved.embedding.local.dim;
 }
 
-/** The id of the currently-active embedding model, for `index_meta`/`model_id`. */
+/**
+ * Logical id of the currently-active embedding model, for display/index_meta. For
+ * remote this is the `[models.*]` ref (spec MODEL-FALLBACK §2.3); the vector index
+ * itself keys on the resolved head wire id (`provider.modelId`) at ensureSchema.
+ */
 export function activeEmbeddingModelId(resolved: ResolvedRetrievalConfig): string {
   return resolved.embedding.provider === "remote" && resolved.embedding.remote
-    ? resolved.embedding.remote.id
+    ? resolved.embedding.remote.model
     : `local:${resolved.embedding.local.model}`;
 }

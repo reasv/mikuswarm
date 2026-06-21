@@ -687,14 +687,30 @@ provider = "local"                # 'local' | 'remote'
 model = "bge-small-en-v1.5"       # fastembed, 384-dim, English (§5c)
 dim = 384
 
-# Optional remote endpoint; OpenRouter-compatible (§5d). When set (and provider is
-# "remote", or provider is unset), it becomes the active model and `dim` governs the
-# vector index width. Leave commented to use the local model.
+# Optional remote endpoint. Unified registry (spec MODEL-FALLBACK §2.3): `model`
+# REFERENCES a [models.*] block (endpoint/id/api_key + cost.input = USD/1M input
+# tokens + any fallback chain live there); only `dim` (vector index width) and the
+# optional `chars_per_token` estimate stay here. When set (and provider is "remote",
+# or unset), it becomes the active model. A `fallback` chain on the referenced model
+# MUST be vector-compatible (same dim AND space). Leave commented to use local.
 # [retrieval.embedding.remote]
-# id = "openai/text-embedding-3-small"
-# endpoint = "https://<our-proxy>/api/v1"
-# api_key = "${OPENROUTER_KEY}"
+# model = "embed-remote"            # a [models.*] block name
 # dim = 1536
+#
+# [models.embed-remote]
+# id = "openai/text-embedding-3-small"
+# provider = "openrouter"
+# api = "openai-completions"
+# endpoint = "${OPENROUTER_BASE_URL}"
+# api_key = "${LLM_API_KEY}"
+# multimodal = false
+# max_tokens = 1
+# context_window = 8192
+# [models.embed-remote.cost]
+# input = 0   # USD per 1M input tokens
+# output = 0
+# cache_read = 0
+# cache_write = 0
 
 # Chat-history search & recap (ARCHITECTURE.md §9e). The FTS5 + metadata index that
 # backs the search_messages / recap / user_activity tools is ALWAYS built (plain

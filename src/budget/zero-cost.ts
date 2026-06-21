@@ -48,12 +48,9 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     mark(logicalId, zeroCost);
   }
 
-  // captioning + image_gen + x_search reference `[models.*]` by name (spec MODEL-FALLBACK §2.3),
-  // so their models — and per_image pricing on `[models.*].cost` — are already
-  // covered by the agent-models loop above.
-
-  const remote = config.retrieval?.embedding?.remote;
-  if (remote) mark(remote.id, (remote.cost_per_mtok ?? 0) === 0);
+  // captioning + image_gen + x_search + remote embedding all reference `[models.*]`
+  // by name (spec MODEL-FALLBACK §2.3), so their models — and per_image pricing on
+  // `[models.*].cost` — are already covered by the agent-models loop above.
 
   // A paid appearance in any lane overrides a zero appearance elsewhere.
   for (const id of paid) zero.delete(id);
@@ -77,9 +74,7 @@ export function collectKnownModelIds(config: AppConfig): Set<string> {
   // MODEL-FALLBACK §2.2) — the id a `[[limits]].models` selector matches.
   for (const logicalId of Object.keys(config.models ?? {})) add(logicalId);
 
-  // captioning / image_gen / x_search reference `[models.*]` by name (spec
-  // MODEL-FALLBACK §2.3) — already counted as known via the agent-models loop above.
-
-  add(config.retrieval?.embedding?.remote?.id);
+  // captioning / image_gen / x_search / remote embedding reference `[models.*]` by
+  // name (spec MODEL-FALLBACK §2.3) — already counted via the agent-models loop above.
   return ids;
 }

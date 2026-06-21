@@ -196,19 +196,18 @@ const ReactionsSchema = StrictObject({
 // auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
 // configs stay valid; `enabled` is the master switch for the whole index.
 const RetrievalEmbeddingRemoteSchema = StrictObject({
-  // OpenRouter-compatible embeddings endpoint (§5d). `dim` is REQUIRED when remote
-  // is the active provider — it governs the vector index width (§5a/§6).
-  id: Type.String({ minLength: 1 }),
-  endpoint: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
+  // Unified registry (spec MODEL-FALLBACK §2.3): `[models.*]` block name for the
+  // embeddings endpoint — connection (endpoint/id/api_key), rate-limit group, and
+  // cost (its `cost.input` is the USD/1M-input-token rate) live on the referenced
+  // block. The old inline id/endpoint/api_key/rate_limit_group/cost_per_mtok are
+  // gone. NOTE: a `fallback` chain on the referenced model must produce
+  // VECTOR-COMPATIBLE embeddings (same `dim` AND embedding space) — the dim check
+  // rejects a wrong-width member, but a same-dim different-space model would
+  // silently corrupt the cache/index; in practice point fallback at the same
+  // model on a different endpoint.
+  model: Type.String({ minLength: 1 }),
+  // REQUIRED when remote is active — governs the vector index width (§5a/§6).
   dim: Type.Integer({ minimum: 1 }),
-  // LLM rate-limit group (spec §9.4): only meaningful when remote embedding is
-  // the active provider (local ONNX never touches the scheduler). Unset = `default`.
-  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
-  // USD per 1,000,000 input tokens for usage accounting (spec USAGE-COST-LIMITS
-  // §9). Unset/0 = untracked (the remote model emits a zero-cost `usage_events`
-  // row, invisible to the BudgetEngine but counted in the console).
-  cost_per_mtok: Type.Optional(Type.Number({ minimum: 0 })),
   // Chars-per-token estimate used to price a response that omits a token count
   // (§9). Defaults to 4 when unset.
   chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),

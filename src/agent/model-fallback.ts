@@ -285,19 +285,32 @@ interface ChooseMember {
  */
 export function chooseChainMember(
   members: ChooseMember[],
-  deps: { scheduler?: LlmScheduler; isModelAvailable?: (logicalId: string) => boolean },
+  deps: {
+    scheduler?: LlmScheduler;
+    isModelAvailable?: (logicalId: string) => boolean;
+    /**
+     * Members already attempted THIS call (fetch consumers, spec §6): excluded
+     * from selection so each member is tried at most once per call and an
+     * environmental failure falls over to the NEXT member rather than re-hitting
+     * the same one. Omitted (the agent StreamFn path) → no exclusion, because
+     * Layer-0 retry re-resolves across whole attempts and §8a health drives reuse.
+     */
+    tried?: Set<string>;
+  },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
+  const tried = deps.tried;
   const head = members[0]!;
   const headState = scheduler ? scheduler.modelHealth(head.healthKey) : "healthy";
   const viable = (m: ChooseMember): boolean => {
+    if (tried?.has(m.logicalId)) return false;
     const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
     if (!healthy) return false;
     return !deps.isModelAvailable || deps.isModelAvailable(m.logicalId);
   };
   if (viable(head)) return { index: 0, reason: "primary" };
   // Head unhealthy with an open probe window → this attempt is the canary (§4).
-  if (headState === "unhealthy" && scheduler?.isProbeDue(head.healthKey)) {
+  if (!tried?.has(head.logicalId) && headState === "unhealthy" && scheduler?.isProbeDue(head.healthKey)) {
     return { index: 0, reason: "canary" };
   }
   for (let i = 0; i < members.length; i++) {
@@ -384,18 +397,25 @@ export async function runFetchWithFallback<T>(
 ): Promise<T> {
   const members = buildFetchChain(chain, options.capability);
   const scheduler = options.scheduler;
-  // chain length + 1: enough to try each member once and let a failed canary
-  // still fall to a downstream member on the next pass.
-  const maxAttempts = members.length + 1;
+  // Each member is attempted AT MOST ONCE per call (the consumer's own retry layer
+  // re-drives across calls, by which point §8a health has shifted). An
+  // environmental failure falls over to the NEXT viable member; a single-member
+  // chain therefore makes exactly one attempt (no double-hit), and the canary case
+  // (head probe-due → fall to a fallback when the probe fails) is covered because
+  // the canaried head is added to `tried`.
+  const tried = new Set<string>();
   let lastError: unknown;
-  for (let n = 0; n < maxAttempts; n++) {
-    // A single-member chain has no fallback to choose — dispatch it directly (no
-    // health reads), mirroring buildModelFallback's single-candidate fast path.
+  for (let n = 0; n < members.length; n++) {
+    // Single-member chain → dispatch directly (no health reads), mirroring
+    // buildModelFallback's single-candidate fast path.
     const { index, reason } =
       members.length === 1
         ? { index: 0, reason: "primary" as FallbackReason }
-        : chooseChainMember(members, { scheduler, isModelAvailable: options.isModelAvailable });
+        : chooseChainMember(members, { scheduler, isModelAvailable: options.isModelAvailable, tried });
     const member = members[index]!;
+    // No fresh member left (the resolver fell back to an already-tried head) → stop.
+    if (tried.has(member.logicalId)) break;
+    tried.add(member.logicalId);
     if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
       options.logger?.info("model_fallback_resolved", {
         consumer: options.consumer,
@@ -418,12 +438,16 @@ export async function runFetchWithFallback<T>(
     try {
       outcome = await attempt(member);
     } catch (error) {
-      // An uncaught throw from the fetch is treated as environmental unless it is
-      // the caller's abort (neutral teardown — never a model-health signal).
+      // The caller's abort is a NEUTRAL teardown — release and rethrow WITHOUT
+      // feeding noteOutcome (never a model-health signal). Any other throw is
+      // environmental and falls over to the next member.
       const aborted = error instanceof Error && error.name === "AbortError";
-      scheduler?.noteOutcome(member.group, member.healthKey, aborted ? "aborted" : "environmental");
+      if (aborted) {
+        release?.();
+        throw error;
+      }
+      scheduler?.noteOutcome(member.group, member.healthKey, "environmental");
       release?.();
-      if (aborted) throw error;
       lastError = error;
       continue;
     }
