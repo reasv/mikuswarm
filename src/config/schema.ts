@@ -878,24 +878,13 @@ const BrowserSchema = StrictObject({
 
 export type BrowserConfig = Static<typeof BrowserSchema>;
 
-// Image generation/editing via Google's Gemini "nano banana" models. `base_url`
-// is the Gemini API endpoint root (the
-// tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
-// `Authorization: Bearer`. The `api_key` field name matches the secret regex so
-// it auto-registers for log redaction.
-// One per-tier image cost block (spec AUXILIARY-USAGE-TRACKING §7.2): the four
-// USD/1M-token rates plus an optional flat per-image charge. All >= 0.
-const ImageCostBlock = StrictObject({
-  input: Type.Number({ minimum: 0 }),
-  output: Type.Number({ minimum: 0 }),
-  cache_read: Type.Number({ minimum: 0 }),
-  cache_write: Type.Number({ minimum: 0 }),
-  per_image: Type.Optional(Type.Number({ minimum: 0 })),
-});
-
+// Image generation/editing via Google's Gemini "nano banana" models. Unified
+// registry (spec MODEL-FALLBACK §2.3): the `pro`/`flash` tiers REFERENCE
+// `[models.*]` blocks by name — each carrying `endpoint` (the Gemini API root;
+// the tool appends `/v1beta/models/<id>:generateContent`), `id` (wire model),
+// `api_key`, `cost` (incl. the optional flat `per_image`), and any `fallback`
+// chain. `base_url`/`api_key`/`costs` are gone (moved onto the referenced models).
 const ImageGenSchema = StrictObject({
-  base_url: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
   models: StrictObject({
     pro: Type.String({ minLength: 1 }),
     flash: Type.String({ minLength: 1 }),
@@ -905,17 +894,6 @@ const ImageGenSchema = StrictObject({
   // truncated before any image is produced (see src/tools/image-gen.ts).
   max_output_tokens: Type.Optional(Type.Number({ minimum: 256 })),
   output_subdir: Type.Optional(Type.String()),
-  // Per-tier USD cost rates for auxiliary usage accounting (spec
-  // AUXILIARY-USAGE-TRACKING §7.2). Image models price differently per tier
-  // (pro vs flash) and Gemini bills the generated image as `candidatesTokenCount`
-  // (output tokens) — so token rates are USD/1M tokens like everywhere else.
-  // `per_image` is an OPTIONAL flat USD charge added once per generated image,
-  // for endpoints that quote per-image pricing. Set token rates, the flat charge,
-  // both, or neither (unset = 0 = untracked). 00-defaults leaves it unset.
-  costs: Type.Optional(StrictObject({
-    pro: Type.Optional(ImageCostBlock),
-    flash: Type.Optional(ImageCostBlock),
-  })),
 });
 
 // X.com search via Grok-as-subagent (spec/X-SEARCH.md; ARCHITECTURE.md §10).

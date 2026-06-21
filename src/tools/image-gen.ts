@@ -14,8 +14,12 @@ import {
   conditionImageBufferForInference,
   type ImageProcessingOptions,
 } from "../media/index.js";
-import { modelHealthKey, parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
-import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
+import {
+  runFetchWithFallback,
+  type ModelChainEntry,
+  type FetchChainMember,
+} from "../agent/model-fallback.js";
 import { computeUsageCost, type CostRates, type RawTokenUsage } from "../agent/usage.js";
 
 // ---------------------------------------------------------------------------
@@ -52,6 +56,19 @@ const REFERENCE_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const USER_AGENT = "MikuAgent/0.1 (mikuswarm image_generate)";
 /** All-zero rates: usage captured, cost "untracked" (spec §7.2 unset case). */
 const ZERO_COST_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+/** Per-model cost rates (incl. flat per_image) from a resolved `[models.*]` block (spec MODEL-FALLBACK §2.3). */
+function costRatesOf(config: ModelChainEntry["config"]): CostRates {
+  return config.cost
+    ? {
+        input: config.cost.input,
+        output: config.cost.output,
+        cacheRead: config.cost.cache_read,
+        cacheWrite: config.cost.cache_write,
+        perImage: config.cost.per_image,
+      }
+    : ZERO_COST_RATES;
+}
 
 const ASPECT_RATIOS = [
   "1:1",
@@ -179,21 +196,24 @@ export interface ImageGenToolContext {
    */
   recordToolUsage?: (record: ToolUsageRecord) => void;
   /**
-   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called before the paid
-   * generation with the resolved model id; returns an agent-facing error message
-   * when a covering period rule is over budget (the call is then refused as a
-   * tool error, never thrown), else undefined. Absent = no period budgeting.
+   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called with a member's
+   * LOGICAL id; returns an agent-facing error message when a covering period rule
+   * is over budget. With fallback the call is refused only when EVERY chain member
+   * of the chosen tier is over budget. Absent = no period budgeting.
    */
-  checkBudget?: (modelId: string) => string | undefined;
+  checkBudget?: (logicalModelId: string) => string | undefined;
   /**
-   * Per-tier USD/1M-token cost rates (+ optional flat `per_image`) — spec §5/§7.2.
-   * Keyed by model alias; unset/all-zero ⇒ usage captured, cost 0 ("untracked").
+   * Budget availability by logical id (spec §3/§7) — skips an over-cap member.
    */
-  costRates?: Partial<Record<ModelAlias, CostRates>>;
+  isModelAvailable?: (logicalId: string) => boolean;
+  /**
+   * Per-tier resolved model chains (spec MODEL-FALLBACK §2.3): each alias points
+   * at a `[models.*]` head plus its `fallback` members (connection + cost +
+   * per-model probe cap live on the block). Replaces the old inline base_url /
+   * api_key / models / costs.
+   */
+  chains: Record<ModelAlias, ModelChainEntry[]>;
   config?: {
-    base_url?: string;
-    api_key?: string;
-    models?: { pro?: string; flash?: string };
     timeout_ms?: number;
     max_output_tokens?: number;
     output_subdir?: string;
@@ -258,26 +278,23 @@ const ImageGenSchema = Type.Object(
 // ---------------------------------------------------------------------------
 
 export function createImageGenTool(context: ImageGenToolContext): AgentTool {
-  const baseUrl = normalizeBaseUrl(context.config?.base_url);
-  const apiKey = (context.config?.api_key ?? "").trim();
-  const proModel = (context.config?.models?.pro ?? "").trim();
-  const flashModel = (context.config?.models?.flash ?? "").trim();
-  if (!apiKey) {
-    throw new Error("image_gen.api_key must be configured.");
+  for (const alias of MODEL_ALIASES) {
+    if (!context.chains[alias]?.length) {
+      throw new Error(`image_gen.models.${alias} must reference a configured [models.*] block.`);
+    }
   }
-  if (!proModel || !flashModel) {
-    throw new Error("image_gen.models.pro and image_gen.models.flash must both be configured.");
-  }
-  // modelId is interpolated into the request URL path; reject anything that
-  // could alter the path (slashes, dot-segments, etc.). Fail fast at construction.
+  // A member's wire id is interpolated into the request URL path; reject anything
+  // that could alter the path (slashes, dot-segments, etc.). Fail fast at construction.
   const MODEL_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
-  if (!MODEL_ID_PATTERN.test(proModel)) {
-    throw new Error(`image_gen.models.pro must match ${MODEL_ID_PATTERN}, got "${proModel}".`);
+  for (const alias of MODEL_ALIASES) {
+    for (const member of context.chains[alias]!) {
+      if (!MODEL_ID_PATTERN.test(member.config.id)) {
+        throw new Error(
+          `image_gen model "${member.logicalId}".id must match ${MODEL_ID_PATTERN}, got "${member.config.id}".`,
+        );
+      }
+    }
   }
-  if (!MODEL_ID_PATTERN.test(flashModel)) {
-    throw new Error(`image_gen.models.flash must match ${MODEL_ID_PATTERN}, got "${flashModel}".`);
-  }
-  const models: Record<ModelAlias, string> = { pro: proModel, flash: flashModel };
   const timeoutMs = context.config?.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxOutputTokens = context.config?.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const outputSubdir = normalizeSubdir(context.config?.output_subdir);
@@ -305,7 +322,8 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         return textError("image_generate requires a non-empty 'prompt'.");
       }
       const alias: ModelAlias = params.model ?? "pro";
-      const modelId = models[alias];
+      const chain = context.chains[alias]!;
+      const tierLabel = chain[0]!.logicalId; // labels messages/logs; member chosen per attempt
       if (params.image_size === "512" && alias !== "flash") {
         return textError(
           "image_size '512' is only supported by the flash model. Use model:'flash', or choose 1K/2K/4K.",
@@ -313,10 +331,15 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       }
 
       // Period-budget gate (spec USAGE-COST-LIMITS §6.3): refuse the paid call as
-      // a tool error (the agent sees it and adapts) when this tool/model is over
-      // budget — before loading references or issuing the POST.
-      const budgetError = context.checkBudget?.(modelId);
-      if (budgetError) return textError(budgetError);
+      // a tool error only when EVERY chain member of the chosen tier is over
+      // budget — a model-scoped cap on the head just falls to the next member (§7).
+      if (context.checkBudget) {
+        const available = chain.some((m) => !context.checkBudget!(m.logicalId));
+        if (!available) {
+          const msg = context.checkBudget(chain[0]!.logicalId);
+          if (msg) return textError(msg);
+        }
+      }
 
       // Edit mode: load reference images as inlineData parts.
       let refs: ReferenceImage[] = [];
@@ -329,74 +352,57 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       }
 
       const body = buildRequestBody({ prompt, refs, aspectRatio: params.aspect_ratio, imageSize: params.image_size, maxOutputTokens });
-      const url = `${baseUrl}/v1beta/models/${modelId}:generateContent`;
 
-      // Scheduler admission at fixed `default`@`interactive` (spec §5.6): the
-      // POST draws on the same scarce budget as live agent requests, so it must
-      // be admitted — an uncoordinated image-gen call would starve a live reply.
-      // Orthogonal to the per-host limiter inside guardedFetch (it bounds the
-      // Gemini *host*; the scheduler bounds the *budget*).
-      // Health key (spec LLM-FAILURE-HANDLING §5): the image model's failure
-      // domain, derived the same way as agent sessions' — endpoint + model id.
-      const healthKey = modelHealthKey({ baseUrl, id: modelId });
-      let release: (() => void) | undefined;
-      if (context.scheduler) {
-        // Bound the admission wait (#14): compose a per-call wall-clock timeout
-        // with the agent's own abort signal so an image-model outage gives up
-        // within the interactive budget instead of parking the chat turn until
-        // the next half-open probe window. A rejected acquire arms nothing, so
-        // the only teardown is the timer + the listener cleared in `finally`.
-        const admitCtrl = new AbortController();
-        const onAgentAbort = () => admitCtrl.abort();
-        const admitTimer = setTimeout(() => admitCtrl.abort(), admissionMaxWaitMs);
-        if (agentSignal) {
-          if (agentSignal.aborted) admitCtrl.abort();
-          else agentSignal.addEventListener("abort", onAgentAbort, { once: true });
-        }
-        try {
-          release = await context.scheduler.acquire({
-            group: "default",
-            priority: "interactive",
-            key: "image-gen",
-            modelKey: healthKey,
-            signal: admitCtrl.signal,
-          });
-        } catch (error) {
-          return textError(`Image generation request failed (model ${modelId}): ${errMessage(error)}`);
-        } finally {
-          clearTimeout(admitTimer);
-          if (agentSignal) agentSignal.removeEventListener("abort", onAgentAbort);
-        }
+      // Bound the admission wait (#14): compose a per-call wall-clock timeout with
+      // the agent's abort signal so an image-model outage gives up within the
+      // interactive budget instead of parking the chat turn until the next probe
+      // window. `runFetchWithFallback` (spec MODEL-FALLBACK §6) owns admission
+      // (fixed `default`@`interactive` per member), both-axes health feeding, and
+      // transparent fallover across the tier's chain.
+      const admitCtrl = new AbortController();
+      const onAgentAbort = () => admitCtrl.abort();
+      const admitTimer = setTimeout(() => admitCtrl.abort(), admissionMaxWaitMs);
+      if (agentSignal) {
+        if (agentSignal.aborted) admitCtrl.abort();
+        else agentSignal.addEventListener("abort", onAgentAbort, { once: true });
       }
-      let result: GeminiResponse | { httpError: ToolTextResult; status: number; retryAfterMs?: number };
+      let result: GeminiResponse;
+      let billed: FetchChainMember | undefined;
+      let lastHttpError: ToolTextResult | undefined;
       try {
-        result = await postGenerate({ url, apiKey, body, dispatcher, timeoutMs });
+        result = await runFetchWithFallback<GeminiResponse>(
+          chain,
+          {
+            consumer: `image_generate:${alias}`,
+            priority: "interactive",
+            scheduler: context.scheduler,
+            isModelAvailable: context.isModelAvailable,
+            probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
+            signal: admitCtrl.signal,
+          },
+          async (member) => {
+            billed = member;
+            const url = `${member.config.endpoint.replace(/\/+$/, "")}/v1beta/models/${member.config.id}:generateContent`;
+            const r = await postGenerate({ url, apiKey: member.config.api_key, body, dispatcher, timeoutMs });
+            if ("httpError" in r) {
+              lastHttpError = r.httpError;
+              // A 400/413/422 is THIS request's content (deterministic on replay)
+              // and never falls over (§9); other statuses are environmental.
+              const kind = r.status === 400 || r.status === 413 || r.status === 422 ? "content" : "environmental";
+              return { ok: false, kind, status: r.status, retryAfterMs: r.retryAfterMs, error: new Error(`image generation HTTP ${r.status}`) };
+            }
+            return { ok: true, value: r };
+          },
+        );
       } catch (error) {
-        const message = errMessage(error);
-        context.scheduler?.noteOutcome(
-          "default",
-          healthKey,
-          classifyLlmError(message, undefined),
-          extractStatus(message.toLowerCase()),
-        );
-        return textError(`Image generation request failed (model ${modelId}): ${message}`);
+        // All members failed (or a content failure short-circuited): surface the
+        // last formatted HTTP error result if we have one, else a generic message.
+        if (lastHttpError) return lastHttpError;
+        return textError(`Image generation request failed (model ${tierLabel}): ${errMessage(error)}`);
       } finally {
-        release?.();
+        clearTimeout(admitTimer);
+        if (agentSignal) agentSignal.removeEventListener("abort", onAgentAbort);
       }
-      if ("httpError" in result) {
-        // Feed the group's unconditional 429/503 backoff (§5.3) with the real
-        // status and the server's Retry-After (clamped by the scheduler), and
-        // the model-health streak (§5; 429 excluded inside noteOutcome).
-        context.scheduler?.noteOutcome(
-          "default",
-          healthKey,
-          classifyLlmError(`${result.status} image generation failed`, undefined),
-          result.status,
-          result.retryAfterMs,
-        );
-        return result.httpError;
-      }
-      context.scheduler?.noteOutcome("default", healthKey, undefined);
 
       const extracted = extractImage(result);
       if (!extracted.image) {
@@ -428,14 +434,16 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       // recorded (the call left no measurable spend). Never touches the §8b
       // session counters (§4 invariant).
       const usage = parseGeminiUsage(result.usageMetadata, 1);
-      if (usage && context.recordToolUsage) {
-        const cost = computeUsageCost(context.costRates?.[alias] ?? ZERO_COST_RATES, usage).total;
+      if (usage && context.recordToolUsage && billed) {
+        // Attributed to the member actually billed (spec MODEL-FALLBACK §2.2/§6.1).
+        const cost = computeUsageCost(costRatesOf(billed.config), usage).total;
         try {
           context.recordToolUsage({
             agentSessionId: context.agentSessionId ?? null,
             toolName: "image_generate",
             toolCallId: toolCallId ?? null,
-            modelId,
+            modelId: billed.config.id,
+            logicalModelId: billed.logicalId,
             provider: "gemini",
             usage,
             cost,
@@ -471,7 +479,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       const text = [
         `## Image ${isEdit ? "edit" : "generation"}`,
         "",
-        `Saved to \`${relPath}\` using \`${modelId}\` (${alias}).`,
+        `Saved to \`${relPath}\` using \`${billed?.config.id ?? tierLabel}\` (${alias}).`,
         ...(params.aspect_ratio ? [`- aspect ratio: ${params.aspect_ratio}`] : []),
         ...(params.image_size ? [`- size hint: ${params.image_size}`] : []),
         ...(isEdit ? [`- edited from ${refs.length} reference image(s)`] : []),
@@ -491,7 +499,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         ],
         details: {
           path: relPath,
-          model: modelId,
+          model: billed?.config.id ?? tierLabel,
           modelAlias: alias,
           isEdit,
           mimeType: extracted.image.mimeType,

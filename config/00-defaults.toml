@@ -482,14 +482,11 @@ download_subdir = "downloads/danbooru"
 suggest_on_empty = true
 max_suggestions = 6
 
-# Image generation / editing via Google's Gemini "nano banana" models.
-# `base_url` is the Gemini API endpoint ROOT — the tool appends
-# /v1beta/models/<model>:generateContent. This is the Google/Gemini API base
-# (GEMINI_BASE_URL), distinct from the Anthropic model endpoint. `api_key` is
-# sent as `Authorization: Bearer`.
+# Image generation / editing via Google's Gemini "nano banana" models. Unified
+# registry (spec MODEL-FALLBACK §2.3): the pro/flash tiers REFERENCE [models.*]
+# blocks by name (endpoint/id/api_key/cost + any fallback chain live there). The
+# tool appends /v1beta/models/<id>:generateContent to the model's endpoint.
 [image_gen]
-base_url = "${GEMINI_BASE_URL}"
-api_key = "${LLM_API_KEY}"
 timeout_ms = 120000
 # Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
 # Many gateways default this cap low, truncating before any image is emitted.
@@ -497,8 +494,42 @@ max_output_tokens = 32768
 output_subdir = "generated-images"
 
 [image_gen.models]
-pro = "gemini-3-pro-image"
-flash = "gemini-3.1-flash-image"
+pro = "imagegen-pro"
+flash = "imagegen-flash"
+
+# The image-gen model blocks (referenced above). `endpoint` is the Gemini API
+# ROOT (GEMINI_BASE_URL); `id` is the wire model; pricing — incl. an optional flat
+# per_image — lives in each block's [cost]. Add a `fallback` chain here to fall a
+# tier over to a cheaper/alternate image model transparently.
+[models.imagegen-pro]
+id = "gemini-3-pro-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 32768
+context_window = 32768
+[models.imagegen-pro.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+[models.imagegen-flash]
+id = "gemini-3.1-flash-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 32768
+context_window = 32768
+[models.imagegen-flash.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
 
 # X.com (Twitter) search via Grok-as-subagent (spec/X-SEARCH.md). Routes through
 # OpenRouter/LlmGateway: `base_url` is the OpenRouter API ROOT (the tool appends

@@ -42,7 +42,10 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
   // MODEL-FALLBACK §2.2) — that is what the agent-loop ledger row stamps and what
   // the budget selector matches, distinct from the upstream `model.id`.
   for (const [logicalId, model] of Object.entries(config.models ?? {})) {
-    mark(logicalId, tokenRatesZero(model.cost));
+    // An image model can price purely per-image (zero token rates), so the flat
+    // `per_image` charge counts toward "is this model free?" (spec MODEL-FALLBACK §2.3).
+    const zeroCost = tokenRatesZero(model.cost) && (model.cost?.per_image ?? 0) === 0;
+    mark(logicalId, zeroCost);
   }
 
   const cap = config.captioning;
@@ -53,16 +56,9 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     }
   }
 
-  const ig = config.image_gen;
-  if (ig) {
-    const proZero = tokenRatesZero(ig.costs?.pro) && (ig.costs?.pro?.per_image ?? 0) === 0;
-    const flashZero = tokenRatesZero(ig.costs?.flash) && (ig.costs?.flash?.per_image ?? 0) === 0;
-    mark(ig.models.pro, proZero);
-    mark(ig.models.flash, flashZero);
-  }
-
-  // x_search references `[models.*]` by name (spec MODEL-FALLBACK §2.3), so its
-  // models are already covered by the agent-models loop above (cost on the block).
+  // image_gen + x_search reference `[models.*]` by name (spec MODEL-FALLBACK §2.3),
+  // so their models — and per_image pricing on `[models.*].cost` — are already
+  // covered by the agent-models loop above.
 
   const remote = config.retrieval?.embedding?.remote;
   if (remote) mark(remote.id, (remote.cost_per_mtok ?? 0) === 0);

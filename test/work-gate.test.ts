@@ -232,20 +232,23 @@ const STRICT_FACTORY_CONTEXTS: Record<string, () => unknown> = {
   }),
   createImageGenTool: () => ({
     fetchClient: tolerantContextStub(),
-    config: {
-      base_url: "https://example.org/google",
-      models: { flash: "gemini-2.5-flash", pro: "gemini-2.5-pro" },
-      api_key: "k",
+    // Unified registry (spec MODEL-FALLBACK §2.3): tiers reference resolved chains.
+    chains: {
+      pro: [{ logicalId: "ig-pro", config: { id: "gemini-2.5-pro", endpoint: "https://example.org/google", api_key: "k" } }],
+      flash: [{ logicalId: "ig-flash", config: { id: "gemini-2.5-flash", endpoint: "https://example.org/google", api_key: "k" } }],
     },
+    config: {},
   }),
   createXSearchTool: () => ({
     workspaceRoot: "/tmp",
+    fastChain: [{ logicalId: "grok", config: { id: "grok-2", endpoint: "https://example.org/grok", api_key: "k" } }],
+    deepChain: [{ logicalId: "grok", config: { id: "grok-2", endpoint: "https://example.org/grok", api_key: "k" } }],
     fxTwitterClient: tolerantContextStub(),
     statusHosts: [],
     fetchClient: tolerantContextStub(),
     downloadSizeLimit: 1000,
     cache: tolerantContextStub(),
-    config: { base_url: "https://example.org/grok", api_key: "k", model: "grok-2" },
+    config: {},
   }),
 };
 

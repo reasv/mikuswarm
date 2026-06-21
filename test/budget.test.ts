@@ -764,9 +764,9 @@ test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", (
       // Agent block keyed by an id image-gen also prices (paid) — cross-lane.
       shared: { id: "shared" }, // zero here (no cost block)
     },
-    // image_gen still defines its tiers inline; a paid tier overrides the zero
-    // agent appearance of the same id.
-    image_gen: { models: { pro: "shared", flash: "f" }, costs: { pro: { input: 5, output: 5 } } },
+    // captioning still defines its model inline; a paid caption model overrides
+    // the zero agent appearance of the same id.
+    captioning: { model: { id: "shared", cost: { input: 5, output: 5, cache_read: 0, cache_write: 0 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
   assert.equal(zero.has("shared"), false);

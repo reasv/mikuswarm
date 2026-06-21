@@ -130,12 +130,24 @@ function baseContext(input: {
     downloadSizeLimit: 10 * 1024 * 1024,
     inlineImageMaxBytes,
     inferenceImageOptions: defaultInferenceImageOptions(inlineImageMaxBytes),
-    config: {
-      base_url: input.serverUrl,
-      api_key: "test-key",
-      models: { pro: "gemini-3-pro-image", flash: "gemini-3.1-flash-image" },
-      output_subdir: "generated-images",
-    },
+    chains: imageGenChains(input.serverUrl),
+    config: { output_subdir: "generated-images" },
+  };
+}
+
+/** Single-member pro/flash chains pointed at a loopback Gemini server (spec MODEL-FALLBACK §2.3). */
+function imageGenChains(serverUrl: string): ImageGenToolContext["chains"] {
+  const base = {
+    provider: "gemini",
+    endpoint: serverUrl,
+    api_key: "test-key",
+    multimodal: true,
+    max_tokens: 32768,
+    context_window: 32768,
+  };
+  return {
+    pro: [{ logicalId: "imagegen-pro", config: { ...base, id: "gemini-3-pro-image" } as never }],
+    flash: [{ logicalId: "imagegen-flash", config: { ...base, id: "gemini-3.1-flash-image" } as never }],
   };
 }
 
@@ -188,14 +200,23 @@ test("extractImage: reads camelCase, snake_case, and reports MAX_TOKENS with no 
 // Construction-time validation
 // ---------------------------------------------------------------------------
 
-test("createImageGenTool throws when api_key or models are missing", () => {
+test("createImageGenTool throws when a tier references no model chain", () => {
+  const bare = { workspaceRoot: "/tmp", fetchClient: {} as any, downloadSizeLimit: 1, inlineImageMaxBytes: 1, inferenceImageOptions: defaultInferenceImageOptions(1) };
   assert.throws(
-    () => createImageGenTool({ workspaceRoot: "/tmp", fetchClient: {} as any, downloadSizeLimit: 1, inlineImageMaxBytes: 1, inferenceImageOptions: defaultInferenceImageOptions(1), config: { base_url: "https://x.test", models: { pro: "p", flash: "f" } } }),
-    /api_key/,
+    () => createImageGenTool({ ...bare, chains: { pro: imageGenChains("https://x.test").pro, flash: [] } }),
+    /image_gen\.models\.flash must reference/,
   );
+  // A member whose wire id would alter the URL path is rejected.
   assert.throws(
-    () => createImageGenTool({ workspaceRoot: "/tmp", fetchClient: {} as any, downloadSizeLimit: 1, inlineImageMaxBytes: 1, inferenceImageOptions: defaultInferenceImageOptions(1), config: { base_url: "https://x.test", api_key: "k", models: { pro: "p", flash: "" } } }),
-    /models\.pro and image_gen\.models\.flash/,
+    () =>
+      createImageGenTool({
+        ...bare,
+        chains: {
+          pro: [{ logicalId: "bad", config: { id: "../escape", provider: "gemini", endpoint: "https://x.test", api_key: "k", multimodal: true, max_tokens: 1, context_window: 1 } as never }],
+          flash: imageGenChains("https://x.test").flash,
+        },
+      }),
+    /must match/,
   );
 });
 
@@ -256,12 +277,13 @@ test("image_generate records a tool_invocations ledger row with parsed usage + c
     const records: import("../src/tools/image-gen.js").ToolUsageRecord[] = [];
     try {
       const ctx = baseContext({ workspaceRoot: workspace, serverUrl: server.url, fetchClient: stub.client });
+      // Pricing lives on the referenced [models.*] block now (spec MODEL-FALLBACK
+      // §2.3): pro = $2/1M input, $30/1M output, plus a flat $0.04 per image.
+      ctx.chains.pro[0]!.config.cost = { input: 2, output: 30, cache_read: 0, cache_write: 0, per_image: 0.04 } as never;
       const tool = createImageGenTool({
         ...ctx,
         agentSessionId: "s-img",
         recordToolUsage: (r) => records.push(r),
-        // pro: $2/1M input, $30/1M output, plus a flat $0.04 per image.
-        costRates: { pro: { input: 2, output: 30, cacheRead: 0, cacheWrite: 0, perImage: 0.04 } },
       });
       await tool.execute("call-img-1", { prompt: "a yellow square" });
 
@@ -441,7 +463,8 @@ test("createImageGenTool throws when output_subdir escapes the workspace", () =>
           downloadSizeLimit: 1,
           inlineImageMaxBytes: 1,
           inferenceImageOptions: defaultInferenceImageOptions(1),
-          config: { base_url: "https://x.test", api_key: "k", models: { pro: "p", flash: "f" }, output_subdir: subdir },
+          chains: imageGenChains("https://x.test"),
+          config: { output_subdir: subdir },
         }),
       /output_subdir/,
       `expected ${subdir} to be rejected`,

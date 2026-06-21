@@ -389,10 +389,12 @@ export async function runFetchWithFallback<T>(
   const maxAttempts = members.length + 1;
   let lastError: unknown;
   for (let n = 0; n < maxAttempts; n++) {
-    const { index, reason } = chooseChainMember(members, {
-      scheduler,
-      isModelAvailable: options.isModelAvailable,
-    });
+    // A single-member chain has no fallback to choose — dispatch it directly (no
+    // health reads), mirroring buildModelFallback's single-candidate fast path.
+    const { index, reason } =
+      members.length === 1
+        ? { index: 0, reason: "primary" as FallbackReason }
+        : chooseChainMember(members, { scheduler, isModelAvailable: options.isModelAvailable });
     const member = members[index]!;
     if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
       options.logger?.info("model_fallback_resolved", {

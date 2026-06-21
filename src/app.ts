@@ -3173,10 +3173,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
             checkBudget: makeToolBudgetCheck("image_generate"),
-            // Per-tier cost rates (spec §7.2): snake_case config block → CostRates.
-            costRates: {
-              pro: toImageCostRates(config.image_gen.costs?.pro),
-              flash: toImageCostRates(config.image_gen.costs?.flash),
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+            // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
+            // [models.*] chain (head + fallback members); pricing lives on the model.
+            chains: {
+              pro: resolveModelChain(config.image_gen.models.pro, config.models),
+              flash: resolveModelChain(config.image_gen.models.flash, config.models),
             },
             config: config.image_gen,
           })]
