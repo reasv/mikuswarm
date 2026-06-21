@@ -3081,11 +3081,13 @@ export class Storage {
         "ma.download_status = 'complete'",
         "ma.media_type in ('image', 'video', 'audio')",
         "te.is_backfetch = 1",
-        "(te.timeline_key = @key or te.timeline_key like @threadPrefix)",
+        "(te.timeline_key = @key or te.timeline_key like @threadPrefix escape '\\')",
       ];
       const params: Record<string, unknown> = {
         key: timelineKey,
-        threadPrefix: `${timelineKey}:thread:%`,
+        // SQLite LIKE: escape %/_/\ in the timeline key so a key containing a
+        // wildcard can't broaden the match (mirrors resolveEditTargetTimelineKey).
+        threadPrefix: `${timelineKey.replace(/[\\%_]/g, "\\$&")}:thread:%`,
         now,
       };
       if (range?.fromTs != null) {
@@ -3116,46 +3118,72 @@ export class Storage {
    * Generates `id` and timestamps. Returns the persisted row.
    */
   insertBackfetchJob(input: BackfetchJobInput): Promise<BackfetchJobRow> {
+    return this.write((db) => this.insertBackfetchJobRow(db, input));
+  }
+
+  /**
+   * Atomic single-flight create (spec §8.2). Checks for an existing non-terminal
+   * job (queued/running/paused) for the room and inserts the new job in one
+   * synchronous write-queue callback, so two concurrent operator starts for the
+   * same room can never both pass the check. Returns the inserted row, or the
+   * existing active job when one was found (caller maps that to a 409).
+   */
+  insertBackfetchJobIfNoActive(
+    input: BackfetchJobInput,
+  ): Promise<{ inserted: true; job: BackfetchJobRow } | { inserted: false; active: BackfetchJobRow }> {
     return this.write((db) => {
-      const now = Date.now();
-      const row: BackfetchJobRow = {
-        id: `bfjob_${nanoid(10)}`,
-        roomId: input.roomId,
-        accountId: input.accountId,
-        timelineKey: input.timelineKey,
-        targetKind: input.targetKind,
-        targetValue: input.targetValue ?? null,
-        captionAfter: input.captionAfter ?? false,
-        status: "queued",
-        cursorToken: null,
-        oldestReachedEventId: null,
-        oldestReachedTs: null,
-        fetched: 0,
-        stored: 0,
-        stopReason: null,
-        floorEventId: null,
-        safetyCap: input.safetyCap ?? 0,
-        timeoutMs: input.timeoutMs ?? 0,
-        error: null,
-        createdAt: now,
-        updatedAt: now,
-      };
-      db.prepare(
-        `insert into backfetch_jobs (
-          id, room_id, account_id, timeline_key, target_kind, target_value, caption_after,
-          status, cursor_token, oldest_reached_event_id, oldest_reached_ts, fetched, stored,
-          stop_reason, floor_event_id, safety_cap, timeout_ms, error, created_at, updated_at
-        ) values (
-          @id, @roomId, @accountId, @timelineKey, @targetKind, @targetValue, @captionAfter,
-          @status, @cursorToken, @oldestReachedEventId, @oldestReachedTs, @fetched, @stored,
-          @stopReason, @floorEventId, @safetyCap, @timeoutMs, @error, @createdAt, @updatedAt
-        )`,
-      ).run({
-        ...row,
-        captionAfter: row.captionAfter ? 1 : 0,
-      });
-      return row;
+      const existing = db
+        .prepare(
+          `select * from backfetch_jobs
+           where room_id = ? and status in ('queued', 'running', 'paused')
+           order by created_at desc limit 1`,
+        )
+        .get(input.roomId) as BackfetchJobDbRow | undefined;
+      if (existing) return { inserted: false, active: mapBackfetchJobRow(existing) };
+      return { inserted: true, job: this.insertBackfetchJobRow(db, input) };
     });
+  }
+
+  /** Build + insert a backfetch job row. Must run inside a write() callback. */
+  private insertBackfetchJobRow(db: Database.Database, input: BackfetchJobInput): BackfetchJobRow {
+    const now = Date.now();
+    const row: BackfetchJobRow = {
+      id: `bfjob_${nanoid(10)}`,
+      roomId: input.roomId,
+      accountId: input.accountId,
+      timelineKey: input.timelineKey,
+      targetKind: input.targetKind,
+      targetValue: input.targetValue ?? null,
+      captionAfter: input.captionAfter ?? false,
+      status: "queued",
+      cursorToken: null,
+      oldestReachedEventId: null,
+      oldestReachedTs: null,
+      fetched: 0,
+      stored: 0,
+      stopReason: null,
+      floorEventId: null,
+      safetyCap: input.safetyCap ?? 0,
+      timeoutMs: input.timeoutMs ?? 0,
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.prepare(
+      `insert into backfetch_jobs (
+        id, room_id, account_id, timeline_key, target_kind, target_value, caption_after,
+        status, cursor_token, oldest_reached_event_id, oldest_reached_ts, fetched, stored,
+        stop_reason, floor_event_id, safety_cap, timeout_ms, error, created_at, updated_at
+      ) values (
+        @id, @roomId, @accountId, @timelineKey, @targetKind, @targetValue, @captionAfter,
+        @status, @cursorToken, @oldestReachedEventId, @oldestReachedTs, @fetched, @stored,
+        @stopReason, @floorEventId, @safetyCap, @timeoutMs, @error, @createdAt, @updatedAt
+      )`,
+    ).run({
+      ...row,
+      captionAfter: row.captionAfter ? 1 : 0,
+    });
+    return row;
   }
 
   /** A single backfetch job by id, or undefined. */
@@ -3194,7 +3222,7 @@ export class Storage {
     return row ? mapBackfetchJobRow(row) : undefined;
   }
 
-  /** Jobs in a 'running' state at startup — resumed by the coordinator (spec §8.1). */
+  /** Jobs in a 'running' or 'queued' state at startup — resumed by the coordinator (spec §8.1). */
   listResumableBackfetchJobs(): BackfetchJobRow[] {
     const rows = this.read((db) =>
       db

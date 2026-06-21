@@ -133,14 +133,17 @@ export class MessageBackfetchCoordinator {
     input: BackfetchJobInput,
   ): Promise<{ ok: true; job: BackfetchJobRow } | { ok: false; reason: string }> {
     if (!this.opts.config.enabled) return { ok: false, reason: "backfetch disabled" };
-    const active = this.opts.storage.getActiveBackfetchJobForRoom(input.roomId);
-    if (active) return { ok: false, reason: `a job is already active for this room (${active.id})` };
     if (!this.opts.selfUserIds.has(input.accountId)) {
       return { ok: false, reason: `unknown account ${input.accountId}` };
     }
-    const job = await this.opts.storage.insertBackfetchJob(input);
-    this.launch(job);
-    return { ok: true, job };
+    // Atomic single-flight: the active-job check and the insert run in one
+    // write-queue callback so two concurrent starts for a room can't both pass.
+    const result = await this.opts.storage.insertBackfetchJobIfNoActive(input);
+    if (!result.inserted) {
+      return { ok: false, reason: `a job is already active for this room (${result.active.id})` };
+    }
+    this.launch(result.job);
+    return { ok: true, job: result.job };
   }
 
   /** Pause a job. A running job parks at the next page; a queued one parks now. */

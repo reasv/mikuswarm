@@ -370,6 +370,33 @@ test("single-flight: a second job for the same room is rejected", async () => {
   await h.storage.close();
 });
 
+test("single-flight: concurrent inserts for one room — only one is admitted", async () => {
+  // The check-and-insert runs in a single write-queue callback, so two starts
+  // launched without awaiting between them can't both pass the active check.
+  const client = new ScriptedClient([page([], null)]);
+  const h = await makeHarness(client);
+  await seedLive(h.timeline, h.storage, "$e100", 100);
+  const input = {
+    roomId: ROOM,
+    accountId: ACCOUNT,
+    timelineKey: ROOM_TK,
+    targetKind: "beginning" as const,
+  };
+  const [a, b] = await Promise.all([
+    h.storage.insertBackfetchJobIfNoActive(input),
+    h.storage.insertBackfetchJobIfNoActive(input),
+  ]);
+  const inserted = [a, b].filter((r) => r.inserted);
+  const rejected = [a, b].filter((r) => !r.inserted);
+  assert.equal(inserted.length, 1);
+  assert.equal(rejected.length, 1);
+  // The rejection points at the one that was actually inserted.
+  const insertedId = inserted[0].inserted ? inserted[0].job.id : "";
+  const rejectedActiveId = !rejected[0].inserted ? rejected[0].active.id : "";
+  assert.equal(rejectedActiveId, insertedId);
+  await h.storage.close();
+});
+
 test("resume uses the stored cursor token as the initial backward continuation", async () => {
   const client = new ScriptedClient([
     page([summary({ eventId: "$e070", timestamp: 70 }), summary({ eventId: "$e060", timestamp: 60 })], null),
