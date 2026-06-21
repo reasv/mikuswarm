@@ -146,10 +146,15 @@ llm_request_backoff_base_ms = 500   # local backoff (healthy model, unthrottled 
 llm_request_backoff_max_ms = 15000
 llm_request_max_wait_ms = 120000    # interactive-class wall-clock budget (~the edge of a reply still being useful)
 # Per-model health (failure domain, derived from endpoint+model id): after this
-# many consecutive environmental failures the model turns unhealthy — one probe
-# request per fixed interval; on probe success every waiter resumes together.
+# many consecutive environmental failures the model turns unhealthy. While
+# unhealthy the scheduler probes on a CAPPED EXPONENTIAL BACKOFF (spec
+# MODEL-FALLBACK §4.1, replacing the old fixed llm_probe_interval_ms): the first
+# probe fires after _base_ms (aggressive — catch a quick recovery while work
+# rides any fallback), doubling on each failed probe up to _max_ms, reset to base
+# on recovery. A model can pin a tighter ceiling via models.*.llm_probe_backoff_max_ms.
 llm_unhealthy_threshold = 3
-llm_probe_interval_ms = 60000
+llm_probe_backoff_base_ms = 10000
+llm_probe_backoff_max_ms = 300000
 # Optional static phrase sent to the room when a user-triggered session gives
 # up (parks failed-resumable / build-wait timeout). Empty = silent (default).
 # The actual error is never included. Proactive/synthetic sessions never send it.
@@ -196,6 +201,19 @@ image_input_bytes = 5242880
 # (incl. reasoning). Set a larger value for a model that is slow to FIRST token.
 # Defaults to the recovery value; shipped explicitly per the explicit-config rule.
 llm_request_max_wait_ms = 120000
+
+# Model fallback (spec MODEL-FALLBACK §2.1). A fallback chain on a model makes it a
+# transparent COMPOSITE: a request is served by the first up chain member, the
+# caller never sees the primary was down, and the primary is auto-canaried back when
+# it recovers. Example (commented — set in local config):
+#   fallback = ["default-backup"]              # an ordered list of [models.*] names
+# Role-specific chains come from VIRTUAL models that inherit a real model and add
+# only their own fallback:
+#   [models.caption-premium]
+#   inherits = "gemini-flash"                  # deep-merge endpoint/api/key/cost/window
+#   fallback = ["caption-cheap"]
+# Optional per-model probe-backoff ceiling (else recovery.llm_probe_backoff_max_ms):
+#   llm_probe_backoff_max_ms = 60000
 
 [models.default.cost]
 input = 0

@@ -251,7 +251,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // natural per-model config block.
     health: {
       unhealthyThreshold: config.recovery?.llm_unhealthy_threshold,
-      probeIntervalMs: config.recovery?.llm_probe_interval_ms,
+      // Capped-backoff probe cadence (spec MODEL-FALLBACK §4.1). Per-model caps
+      // ride the model config's `llm_probe_backoff_max_ms`, threaded through
+      // admission — there is no natural per-model health config block here.
+      probeBackoffBaseMs: config.recovery?.llm_probe_backoff_base_ms,
+      probeBackoffMaxMs: config.recovery?.llm_probe_backoff_max_ms,
     },
     logger: logger.child("llm-scheduler"),
   });
@@ -982,6 +986,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       resolveModelId: (sessionType) => {
         try {
           return factory.resolveModelId(sessionType);
+        } catch {
+          return undefined;
+        }
+      },
+      // Logical id (chain-head config block name) for the session-level gates —
+      // the dimension `[[limits]].models` matches (spec MODEL-FALLBACK §2.2).
+      resolveLogicalModelId: (sessionType) => {
+        try {
+          return factory.resolveLogicalModelId(sessionType);
         } catch {
           return undefined;
         }
@@ -4591,8 +4604,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
         // probe during a caption-model outage would otherwise block until the
-        // far-later `llmScheduler.stop()` rejects it (~N×llm_probe_interval_ms
-        // stall). Stopping the clients first rejects those queued waiters now.
+        // far-later `llmScheduler.stop()` rejects it (a capped-backoff probe
+        // window stall). Stopping the clients first rejects those queued waiters now.
         for (const client of captionClients.values()) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();

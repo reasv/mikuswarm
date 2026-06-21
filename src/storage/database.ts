@@ -914,6 +914,14 @@ export interface UsageEventRow {
   trigger_sender_id: string | null;
   tool_name: string | null;
   model_id: string;
+  /**
+   * The LOGICAL model id — the config block name (spec MODEL-FALLBACK §2.2),
+   * distinct from `model_id` (the upstream wire id). Budget scoping / `[[limits]]`
+   * `models` selector / console grouping key on THIS; `model_id` is retained for
+   * provenance ("actually billed") and health attribution. Backfilled equal to
+   * `model_id` for legacy rows (the norm when block name == upstream id).
+   */
+  logical_model_id: string;
   provider: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -939,6 +947,12 @@ export interface UsageEventInput {
   triggerSenderId?: string | null;
   toolName?: string | null;
   modelId: string;
+  /**
+   * Logical model id (config block name; spec MODEL-FALLBACK §2.2). Defaults to
+   * `modelId` when omitted — the common case where a consumer has no fallback /
+   * virtual model, so block name == wire id.
+   */
+  logicalModelId?: string | null;
   provider?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -3436,6 +3450,9 @@ export class Storage {
       trigger_sender_id: input.triggerSenderId ?? null,
       tool_name: input.toolName ?? null,
       model_id: input.modelId,
+      // Logical id defaults to the upstream id when a consumer has no fallback /
+      // virtual model (spec MODEL-FALLBACK §2.2 — block name == wire id).
+      logical_model_id: input.logicalModelId ?? input.modelId,
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,
@@ -3450,11 +3467,11 @@ export class Storage {
       db.prepare(
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
-           tool_name, model_id, provider, input_tokens, output_tokens, cache_read_tokens,
+           tool_name, model_id, logical_model_id, provider, input_tokens, output_tokens, cache_read_tokens,
            cache_write_tokens, images, cost_usd, ref, created_at
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
-           @tool_name, @model_id, @provider, @input_tokens, @output_tokens, @cache_read_tokens,
+           @tool_name, @model_id, @logical_model_id, @provider, @input_tokens, @output_tokens, @cache_read_tokens,
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
       ).run(row);
@@ -3482,7 +3499,7 @@ export class Storage {
     inClause("class", filter.classes);
     inClause("session_type", filter.sessionTypes);
     inClause("tool_name", filter.tools);
-    inClause("model_id", filter.models);
+    inClause("logical_model_id", filter.models);
     return this.read((db) => {
       const row = db
         .prepare(`select coalesce(sum(cost_usd), 0) as c from usage_events where ${clauses.join(" and ")}`)
@@ -3519,7 +3536,7 @@ export class Storage {
     inClause("class", filter.classes);
     inClause("session_type", filter.sessionTypes);
     inClause("tool_name", filter.tools);
-    inClause("model_id", filter.models);
+    inClause("logical_model_id", filter.models);
     return this.read((db) => {
       const row = db
         .prepare(`select min(ts) as t from usage_events where ${clauses.join(" and ")}`)
@@ -3540,10 +3557,12 @@ export class Storage {
              from usage_events where ts >= ? group by class order by cost desc`,
         )
         .all(since) as Array<{ class: string; cost: number; events: number }>;
+      // Group by LOGICAL id (spec MODEL-FALLBACK §7): caption-premium and
+      // caption-cheap separate even on a shared upstream model.
       const byModel = db
         .prepare(
-          `select model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
-             from usage_events where ts >= ? group by model_id order by cost desc`,
+          `select logical_model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
+             from usage_events where ts >= ? group by logical_model_id order by cost desc`,
         )
         .all(since) as Array<{ model: string; cost: number; events: number }>;
       // Actual data start within the window — anchors the console's per-period averages to
@@ -3563,7 +3582,8 @@ export class Storage {
    * (spec §7.1 chart). Returns one row per (bucket, group) with summed cost.
    */
   getUsageTimeseries(since: number, bucketMs: number, groupBy: "class" | "model"): UsageTimeseriesRow[] {
-    const groupCol = groupBy === "model" ? "model_id" : "class";
+    // "model" groups by LOGICAL id (spec MODEL-FALLBACK §7), consistent with byModel.
+    const groupCol = groupBy === "model" ? "logical_model_id" : "class";
     return this.read((db) => {
       // `cast(... as integer)` forces an integer FLOOR: a bound numeric parameter
       // makes `ts / ?` floating-point in SQLite, so without the cast the bucket
@@ -6978,6 +6998,9 @@ create table if not exists usage_events (
   trigger_sender_id text,
   tool_name text,
   model_id text not null,
+  -- Logical model id (config block name; spec MODEL-FALLBACK §2.2), distinct from
+  -- model_id (upstream wire id). Budget selectors + console grouping key on this.
+  logical_model_id text not null default '',
   provider text,
   input_tokens integer,
   output_tokens integer,
@@ -6999,6 +7022,7 @@ create index if not exists idx_usage_events_ts        on usage_events(ts);
 create index if not exists idx_usage_events_session   on usage_events(agent_session_id, ts);
 create index if not exists idx_usage_events_class_ts   on usage_events(class, ts);
 create index if not exists idx_usage_events_model_ts   on usage_events(model_id, ts);
+create index if not exists idx_usage_events_logical_model_ts on usage_events(logical_model_id, ts);
 create index if not exists idx_usage_events_tool_ts    on usage_events(tool_name, ts);
 `;
 
@@ -7552,7 +7576,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 29;
+export const LATEST_SCHEMA_VERSION = 30;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -8514,6 +8538,25 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       db.exec(`drop table media_assets_old;`);
       db.exec(MEDIA_ASSETS_INDEXES);
     }
+  },
+  // index 29 (v29 -> v30): logical model id on the usage ledger (spec
+  // MODEL-FALLBACK §2.2/§7). One additive NOT NULL column (default '') +
+  // its index, then backfill `logical_model_id = model_id` for every legacy row
+  // (the norm where the config block name equals the upstream wire id; a
+  // documented grouping discontinuity otherwise). Guarded for rewound test
+  // fixtures and idempotent: skipped when the table is absent (SCHEMA builds it at
+  // the latest shape) or the column already exists. Fresh DBs never run this.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
+    if (!hasTable("usage_events")) return;
+    const columns = db.pragma(`table_info(usage_events)`) as Array<{ name: string }>;
+    if (columns.some((c) => c.name === "logical_model_id")) return;
+    db.exec(`alter table usage_events add column logical_model_id text not null default '';`);
+    db.exec(`update usage_events set logical_model_id = model_id;`);
+    db.exec(
+      `create index if not exists idx_usage_events_logical_model_ts on usage_events(logical_model_id, ts);`,
+    );
   },
 ];
 

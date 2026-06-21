@@ -38,8 +38,11 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     else paid.add(id);
   };
 
-  for (const model of Object.values(config.models ?? {})) {
-    mark(model.id, tokenRatesZero(model.cost));
+  // Agent models are keyed by their LOGICAL id (config block name; spec
+  // MODEL-FALLBACK §2.2) — that is what the agent-loop ledger row stamps and what
+  // the budget selector matches, distinct from the upstream `model.id`.
+  for (const [logicalId, model] of Object.entries(config.models ?? {})) {
+    mark(logicalId, tokenRatesZero(model.cost));
   }
 
   const cap = config.captioning;
@@ -86,7 +89,9 @@ export function collectKnownModelIds(config: AppConfig): Set<string> {
     if (id) ids.add(id);
   };
 
-  for (const model of Object.values(config.models ?? {})) add(model.id);
+  // Agent models contribute their LOGICAL id (config block name; spec
+  // MODEL-FALLBACK §2.2) — the id a `[[limits]].models` selector matches.
+  for (const logicalId of Object.keys(config.models ?? {})) add(logicalId);
 
   const cap = config.captioning;
   if (cap) {

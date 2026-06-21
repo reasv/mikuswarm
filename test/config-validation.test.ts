@@ -866,3 +866,67 @@ thinking_level = "maximum"
     );
   });
 });
+
+// --- Model inheritance + fallback (spec MODEL-FALLBACK §2.1) ---
+
+test("config: a virtual model inherits its parent's connection fields and overrides only its own", async () => {
+  const toml = `${BASE_CONFIG}
+[models.caption-cheap]
+inherits = "default"
+[models.caption-premium]
+inherits = "default"
+fallback = ["caption-cheap"]
+context_window = 64000
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    const premium = config.models["caption-premium"]!;
+    // Inherited from default:
+    assert.equal(premium.id, "test-model");
+    assert.equal(premium.endpoint, "http://localhost");
+    assert.equal(premium.api_key, "test-key");
+    // Own overrides:
+    assert.equal(premium.context_window, 64000);
+    assert.deepEqual(premium.fallback, ["caption-cheap"]);
+    // `inherits` is stripped after resolution.
+    assert.equal((premium as Record<string, unknown>).inherits, undefined);
+  });
+});
+
+test("config: transitive inheritance resolves through a chain", async () => {
+  const toml = `${BASE_CONFIG}
+[models.mid]
+inherits = "default"
+max_tokens = 4096
+[models.leaf]
+inherits = "mid"
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    const leaf = config.models["leaf"]!;
+    assert.equal(leaf.id, "test-model"); // from default
+    assert.equal(leaf.max_tokens, 4096); // from mid
+  });
+});
+
+test("config: an inheritance cycle fails fast", async () => {
+  const toml = `${BASE_CONFIG}
+[models.a]
+inherits = "b"
+[models.b]
+inherits = "a"
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /inheritance cycle/i);
+  });
+});
+
+test("config: inheriting an unknown model fails fast", async () => {
+  const toml = `${BASE_CONFIG}
+[models.orphan]
+inherits = "nope"
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /inherits unknown model "nope"/i);
+  });
+});

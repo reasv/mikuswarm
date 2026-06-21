@@ -10,10 +10,10 @@ import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
   modelHealthKey,
-  withSchedulerAdmission,
   type LlmScheduler,
   type PriorityClass,
 } from "./scheduler.js";
+import { buildModelFallback, resolveModelChain } from "./model-fallback.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage, Summary } from "../storage/index.js";
@@ -338,13 +338,23 @@ export class AgentSessionFactory {
     return types[sessionType] ?? types["default"];
   }
 
-  /** Resolve the model id used by a session type (for summary record provenance). */
+  /** Resolve the upstream model id used by a session type (for summary record provenance). */
   resolveModelId(sessionType: string): string {
     const cfg = this.resolveSessionType(sessionType);
     const modelKey = cfg?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     return modelConfig.id;
+  }
+
+  /**
+   * Resolve the LOGICAL model id (config block name) a session type's agent-loop
+   * spend is scoped under (spec MODEL-FALLBACK §2.2) — the chain head's name, what
+   * a `[[limits]].models` selector matches and what the ledger stamps. Distinct
+   * from {@link resolveModelId} (the upstream wire id) when block name != wire id.
+   */
+  resolveLogicalModelId(sessionType: string): string {
+    return this.resolveSessionType(sessionType)?.model ?? "default";
   }
 
   /**
@@ -366,13 +376,10 @@ export class AgentSessionFactory {
     const modelKey = sessionTypeConfig?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
-    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4):
-    // resolved ONCE here and fed to every consumer — enforcement (below), the
-    // pi-ai Model descriptor (so any future window-keyed mechanism triggers
-    // against the ceiling the session is actually judged against), and the
-    // text-editor read budget (app.ts buildSessionTools, via the same resolver).
-    // No consumer reads `context_window` directly (U3). Always a number.
-    const contextCeiling = this.resolveSessionContextCeiling(session.sessionType);
+    // Effective fallback chain (spec MODEL-FALLBACK §2.1/§9): the head plus the
+    // logical ids named in its `fallback`. A request is served by the first
+    // chain member that is up — resolved per Layer-0 attempt, transparently.
+    const chain = resolveModelChain(modelKey, this.options.config.models);
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
     // once and fed to the hard-cap pre-flight below. `undefined` = unlimited.
     const costCeiling = this.resolveSessionCostCeiling(session.sessionType);
@@ -381,7 +388,6 @@ export class AgentSessionFactory {
     // (background/proactive). Resolved once for every per-request ledger row.
     const triggerSenderId =
       session.trigger.trigger?.triggeredBy?.id ?? session.trigger.event.sender?.id ?? null;
-    const model = createModelFromConfig(modelConfig, contextCeiling);
     // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
     // chosen stream fn so an environmental failure re-issues the exact same
     // request — buffered to the terminal event, partials discarded — before the
@@ -389,14 +395,9 @@ export class AgentSessionFactory {
     // origin + class tags (`[llm-request:<class>]`) the runner's typed
     // `phase:"llm"` rejection depends on (Decision C / #14).
     const recovery = this.options.config.recovery;
-    const baseStreamFn = withSdkRetriesDisabled(
-      (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
-    );
     // Scheduler admission (spec §5.4): group from the model
     // (`rate_limit_group`, unset = `default`), priority from the session type
-    // (override > configured > built-in default). Admission wraps the BASE fn,
-    // *inside* the retry, so each Layer-1 attempt re-acquires a fresh slot at
-    // the same (group, priority) and no slot is held across backoff sleeps.
+    // (override > configured > built-in default).
     const scheduler = this.options.scheduler;
     const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
     // The session type's OWN class — the workload category. `opts.priority` (a
@@ -411,18 +412,54 @@ export class AgentSessionFactory {
     // attribution, §9.2): the agent issues one request at a time per session,
     // so a single slot per created agent is race-free.
     const admissionWait: { last?: number } = {};
-    const admittedStreamFn = scheduler
-      ? withSchedulerAdmission(baseStreamFn, scheduler, {
-          group: rateLimitGroup,
-          priority,
-          key: opts?.escalationKey,
-          sessionId: session.id,
-          sessionType: session.sessionType,
-          onAdmissionWait: (waitMs) => {
-            admissionWait.last = waitMs;
-          },
-        })
-      : baseStreamFn;
+    // Per-attempt resolved member (spec MODEL-FALLBACK §6.1): the logical id the
+    // composite chose for the in-flight attempt, so the ledger row is attributed
+    // to the member actually billed even when the head fell to a fallback.
+    const resolvedMember: { logicalId: string } = { logicalId: modelKey };
+    const budgetEngine = this.options.budget?.engine;
+    // Transparent composite stream fn (spec MODEL-FALLBACK §3): capability
+    // pre-filter + min-over-chain ceiling fixed once at build, member chosen per
+    // attempt inside the composed fn. Admission composes per-candidate INSIDE
+    // this and outside it sits Layer-0 retry — each attempt re-resolves + re-
+    // acquires a fresh slot at the same (group, priority). A single-member chain
+    // degrades to the bare admitted stream (no health reads, no resolution log).
+    const fallback = buildModelFallback(chain, {
+      consumer: "agent",
+      makeBase: (cfg) =>
+        withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
+      makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
+      contextOverride: sessionTypeConfig?.max_context_tokens,
+      scheduler,
+      admission: scheduler
+        ? {
+            priority,
+            key: opts?.escalationKey,
+            sessionId: session.id,
+            sessionType: session.sessionType,
+            onAdmissionWait: (waitMs) => {
+              admissionWait.last = waitMs;
+            },
+          }
+        : undefined,
+      isModelAvailable: budgetEngine ? (id) => budgetEngine.isModelAvailable(id) : undefined,
+      logger: this.options.logger,
+      sessionId: session.id,
+      onResolve: (id) => {
+        resolvedMember.logicalId = id;
+      },
+    });
+    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
+    // + MODEL-FALLBACK §3 #2): the MINIMUM `context_window` across the surviving
+    // chain (min'd with the session-type override), valid for whichever member
+    // serves a given attempt — so the "ceiling resolved once" invariant holds.
+    // Fed to enforcement (below), the head model descriptor, and the text-editor
+    // read budget (app.ts buildSessionTools, via the chain-aware resolver).
+    const contextCeiling = fallback.operativeContextWindow;
+    // Representative (head) descriptor — initialState.model, the isQueueWaitPoint
+    // key, and the ledger-fallback model id. The composite substitutes the chosen
+    // member's descriptor + key per attempt.
+    const model = createModelFromConfig(modelConfig, contextCeiling);
+    const admittedStreamFn = fallback.streamFn;
     // Per-class retry budget (spec §6): interactive-class work (live chat +
     // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
     // class work (summaries, diaries — must eventually exist) is unbounded.
@@ -490,14 +527,20 @@ export class AgentSessionFactory {
           const budget = this.options.budget;
           if (budget?.record) {
             const u = message.usage;
+            // Exact attribution under fallback (spec MODEL-FALLBACK §2.2/§6.1):
+            // `model_id` is the UPSTREAM wire id actually billed (the committed
+            // message's `model`/`provider`), `logical_model_id` is the chain
+            // member chosen for this attempt — so a request that fell to `Y` is
+            // billed and budget-scoped to `Y`, not the head.
             budget.record({
               class: "agent_loop",
               agentSessionId: session.id,
               sessionType: session.sessionType,
               timelineKey: session.timelineKey,
               triggerSenderId,
-              modelId: model.id,
-              provider: model.provider ?? null,
+              modelId: message.model ?? model.id,
+              logicalModelId: resolvedMember.logicalId,
+              provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,
               cacheReadTokens: u.cacheRead ?? null,
@@ -818,7 +861,18 @@ export class AgentSessionFactory {
           `it is required to resolve the session context ceiling`,
       );
     }
-    return composeSessionContextCeiling(contextWindow, cfg?.max_context_tokens);
+    // Min-over-chain ceiling (spec MODEL-FALLBACK §3 #2): the operative ceiling
+    // must be valid for WHICHEVER fallback member serves an attempt, so it is the
+    // minimum `context_window` across the surviving chain. Mirrors
+    // `buildModelFallback`'s `operativeContextWindow` so the factory, the
+    // text-editor read budget, and the console cannot drift.
+    const chain = resolveModelChain(modelKey, this.options.config.models);
+    let minWindow = contextWindow;
+    for (const entry of chain) {
+      const w = entry.config.context_window;
+      if (typeof w === "number") minWindow = Math.min(minWindow, w);
+    }
+    return composeSessionContextCeiling(minWindow, cfg?.max_context_tokens);
   }
 
   /**

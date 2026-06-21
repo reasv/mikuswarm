@@ -82,7 +82,7 @@ export class InferenceClient {
    * scheduler `acquire` below so a queued caption waiter is rejected promptly at
    * shutdown instead of lingering until the next half-open probe window. Without
    * it, `captionPool.stop()` (which awaits in-flight workers) could stall for
-   * N×`llm_probe_interval_ms` during a caption-model outage, because only the
+   * up to one capped-backoff probe window during a caption-model outage, because only the
    * later `llmScheduler.stop()` would otherwise reject the queued waiter.
    */
   private readonly stopController = new AbortController();

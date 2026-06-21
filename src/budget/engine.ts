@@ -56,7 +56,14 @@ export interface SpendDescriptor {
   class: string;
   sessionType?: string;
   tool?: string;
+  /** Upstream wire model id (provenance). */
   modelId: string;
+  /**
+   * LOGICAL model id (config block name; spec MODEL-FALLBACK §2.2) — the
+   * dimension the `models` selector and the zero-cost bypass match on. Falls back
+   * to `modelId` when omitted (the common no-virtual-model case).
+   */
+  logicalModelId?: string;
   provider?: string;
 }
 
@@ -127,15 +134,22 @@ export interface BudgetEngineOptions {
     tools?: string[];
     models?: string[];
   }) => number | null;
-  /** Model ids whose configured cost rate is zero (§2.2). */
+  /** LOGICAL model ids whose configured cost rate is zero (§2.2; spec MODEL-FALLBACK §2.2). */
   zeroCostModelIds: Set<string>;
   /**
    * Structural dependency cascade (§2.1): session type → prerequisite session
    * types that must be available for it to be admitted.
    */
   dependencies: Record<string, string[]>;
-  /** Resolve a session type's model id (for dependency descriptors). */
+  /** Resolve a session type's upstream model id (provenance on dependency descriptors). */
   resolveModelId: (sessionType: string) => string | undefined;
+  /**
+   * Resolve a session type's LOGICAL model id — the config block name a
+   * `[[limits]].models` selector matches (spec MODEL-FALLBACK §2.2). Used by the
+   * session-level gates so they scope on the same dimension the ledger records.
+   * Absent → the session gate's logical dimension falls back to the upstream id.
+   */
+  resolveLogicalModelId?: (sessionType: string) => string | undefined;
   logger: Logger;
   now?: () => number;
   /** Fraction at which a rule is "near" its cap in the console (default 0.8). */
@@ -291,7 +305,9 @@ export class BudgetEngine {
     if (s.sessionTypes && (d.sessionType === undefined || !s.sessionTypes.includes(d.sessionType)))
       return false;
     if (s.tools && (d.tool === undefined || !s.tools.includes(d.tool))) return false;
-    if (s.models && !s.models.includes(d.modelId)) return false;
+    // `models` matches the LOGICAL id (spec MODEL-FALLBACK §2.2), falling back to
+    // the upstream id when no logical id was supplied (block name == wire id).
+    if (s.models && !s.models.includes(d.logicalModelId ?? d.modelId)) return false;
     return true;
   }
 
@@ -312,7 +328,7 @@ export class BudgetEngine {
    * over the cap (cap 0 → always blocks any covered non-free spend).
    */
   check(descriptor: SpendDescriptor): CheckResult {
-    if (this.isZeroCost(descriptor.modelId)) {
+    if (this.isZeroCost(descriptor.logicalModelId ?? descriptor.modelId)) {
       return { allowed: true, blockingRules: [] };
     }
     const now = this.now();
@@ -339,10 +355,14 @@ export class BudgetEngine {
   isClassAvailable(sessionType: string): boolean {
     const modelId = this.options.resolveModelId(sessionType);
     if (modelId === undefined) return true; // unresolvable → don't block on it
-    return this.check({ class: "agent_loop", sessionType, modelId }).allowed;
+    const logicalModelId = this.options.resolveLogicalModelId?.(sessionType);
+    return this.check({ class: "agent_loop", sessionType, modelId, logicalModelId }).allowed;
   }
 
-  /** Is the named model currently within budget (hook for deferred fallback, §6.2)? */
+  /**
+   * Is the named LOGICAL model currently within budget (spec MODEL-FALLBACK §3/§7
+   * — the per-attempt fallback resolver drops a member that fails this)?
+   */
   isModelAvailable(modelId: string): boolean {
     if (this.isZeroCost(modelId)) return true;
     const now = this.now();
@@ -364,7 +384,12 @@ export class BudgetEngine {
    * class it depends on to be available. Used at the triggered/proactive gates.
    */
   checkAdmission(sessionType: string, modelId: string): AdmissionResult {
-    const own = this.check({ class: "agent_loop", sessionType, modelId });
+    const own = this.check({
+      class: "agent_loop",
+      sessionType,
+      modelId,
+      logicalModelId: this.options.resolveLogicalModelId?.(sessionType),
+    });
     if (!own.allowed) {
       return { allowed: false, ownBlocking: own.blockingRules, primary: own.primary };
     }
@@ -372,7 +397,12 @@ export class BudgetEngine {
     for (const dep of deps) {
       const depModel = this.options.resolveModelId(dep);
       if (depModel === undefined) continue;
-      const depCheck = this.check({ class: "agent_loop", sessionType: dep, modelId: depModel });
+      const depCheck = this.check({
+        class: "agent_loop",
+        sessionType: dep,
+        modelId: depModel,
+        logicalModelId: this.options.resolveLogicalModelId?.(dep),
+      });
       if (!depCheck.allowed) {
         return {
           allowed: false,
@@ -403,6 +433,7 @@ export class BudgetEngine {
       sessionType: event.sessionType ?? undefined,
       tool: event.toolName ?? undefined,
       modelId: event.modelId,
+      logicalModelId: event.logicalModelId ?? undefined,
       provider: event.provider ?? undefined,
     };
     const now = this.now();

@@ -468,6 +468,22 @@ const TimelineSchema = StrictObject({
 });
 
 const ModelSchema = StrictObject({
+  // Model inheritance (spec MODEL-FALLBACK §2.1). When set, the named `[models.*]`
+  // block is deep-merged UNDER this one (child fields win, everything else
+  // inherited) at config load, BEFORE schema validation — so a VIRTUAL model can
+  // reuse a real model's connection properties (endpoint/api/key/cost/window/…)
+  // and override only what differs, crucially its own `fallback` chain. Transitive;
+  // cycles fail fast at load. The loader strips `inherits` after merging, so a
+  // resolved model is a plain real model.
+  inherits: Type.Optional(Type.String({ minLength: 1 })),
+  // Per-model fallback chain (spec MODEL-FALLBACK §2.1). An ordered list of
+  // `[models.*]` block names (logical ids); a request to THIS model is served by
+  // the first chain member that is up, transparently. The chain is exactly the
+  // one written here — a member's own `fallback` does NOT transitively extend it
+  // (§9, head's chain only). Fallbacks live ONLY on models; there is no per-tool
+  // or per-session-type fallback config. The model itself is the implicit head, so
+  // a chain of `["Y","Z"]` resolves as `[self, Y, Z]`.
+  fallback: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   id: Type.String({ minLength: 1 }),
   // pi-ai provider string. Besides naming the upstream, it drives the OAI
   // provider's compat AUTO-DETECTION (request dialect): e.g. "together" turns
@@ -565,6 +581,12 @@ const ModelSchema = StrictObject({
   // interactive-class sessions (chat/proactive); background-class work is
   // unbounded regardless.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Per-model override of the unhealthy-probe backoff CEILING (spec MODEL-FALLBACK
+  // §4.1). While this model is unhealthy the scheduler probes on a capped
+  // exponential backoff (base → ×2 → cap); a model with an especially poor
+  // fallback can pin a tighter cap here so it returns to the primary sooner.
+  // Unset = the global `recovery.llm_probe_backoff_max_ms`.
+  llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
   compat: Type.Optional(StrictObject({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
@@ -1018,10 +1040,16 @@ const RecoverySchema = StrictObject({
   // (summaries/diaries) is deliberately unbounded — it waits out any outage.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // Per-model health (spec §5): consecutive environmental failures before the
-  // model turns unhealthy (half-open admission), and the FIXED probe cadence
-  // while unhealthy (never grows — recovery is detected within one window).
+  // model turns unhealthy (half-open admission).
   llm_unhealthy_threshold: Type.Optional(Type.Number({ minimum: 1 })),
-  llm_probe_interval_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Probe cadence while unhealthy — a per-episode CAPPED EXPONENTIAL BACKOFF
+  // (spec MODEL-FALLBACK §4.1, REPLACING the old fixed `llm_probe_interval_ms`).
+  // First probe fires `..._base_ms` after turning unhealthy (aggressive, to catch
+  // a quick recovery while work rides the fallback), doubling on each failed probe
+  // up to `..._max_ms`, reset to base on recovery. A model can pin a tighter cap
+  // via its own `models.*.llm_probe_backoff_max_ms`.
+  llm_probe_backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // User-facing failure notice (spec §8.3): when non-empty, sent verbatim to
   // the session's room when a USER-TRIGGERED chat session stops trying on its
   // own (parked failed-resumable, or its build timed out waiting on summary

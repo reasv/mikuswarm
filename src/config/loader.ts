@@ -19,6 +19,76 @@ function shallowMergeByTopLevel(configs: PlainObject[]): PlainObject {
   return Object.assign({}, ...configs);
 }
 
+/**
+ * Deep-merge `child` over `base` (spec MODEL-FALLBACK §2.1 model inheritance):
+ * nested plain objects merge recursively, arrays and scalars from `child` replace
+ * `base` wholesale. Neither input is mutated. "Child fields win, everything else
+ * inherited."
+ */
+function deepMergeOver(base: PlainObject, child: PlainObject): PlainObject {
+  const out: PlainObject = { ...base };
+  for (const [key, value] of Object.entries(child)) {
+    const prior = out[key];
+    if (isPlainObject(prior) && isPlainObject(value)) {
+      out[key] = deepMergeOver(prior, value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve `[models.*].inherits` (spec MODEL-FALLBACK §2.1) IN PLACE on the merged
+ * config, BEFORE schema validation — a virtual model omits the required fields it
+ * inherits, so it must be filled in before TypeBox sees it. For each model that
+ * declares `inherits`, deep-merge the named parent UNDER it (transitively).
+ * Cycles, unknown parents, and a non-object model block fail fast here. The
+ * resolved blocks have `inherits` stripped, so they validate as plain real models.
+ */
+function resolveModelInheritance(merged: PlainObject): void {
+  const models = merged.models;
+  if (!isPlainObject(models)) return; // absent/malformed → schema validation reports it
+  const resolved = new Map<string, PlainObject>();
+  const resolving = new Set<string>();
+
+  const resolve = (name: string): PlainObject => {
+    const cached = resolved.get(name);
+    if (cached) return cached;
+    const raw = models[name];
+    if (!isPlainObject(raw)) {
+      throw new Error(`Invalid config: model "${name}" is not a table`);
+    }
+    const parentName = raw.inherits;
+    if (parentName === undefined) {
+      const own = { ...raw };
+      resolved.set(name, own);
+      return own;
+    }
+    if (typeof parentName !== "string" || parentName.length === 0) {
+      throw new Error(`Invalid config: model "${name}".inherits must be a model name`);
+    }
+    if (!(parentName in models)) {
+      throw new Error(`Invalid config: model "${name}" inherits unknown model "${parentName}"`);
+    }
+    if (resolving.has(name)) {
+      throw new Error(
+        `Invalid config: model inheritance cycle through "${name}" (inherits "${parentName}")`,
+      );
+    }
+    resolving.add(name);
+    const parent = resolve(parentName);
+    resolving.delete(name);
+    const out = deepMergeOver(parent, raw);
+    delete out.inherits; // resolved away — the block is now a plain real model
+    resolved.set(name, out);
+    return out;
+  };
+
+  for (const name of Object.keys(models)) resolve(name);
+  for (const [name, block] of resolved) models[name] = block;
+}
+
 function substituteEnv(value: unknown, missing = new Set<string>()): unknown {
   if (typeof value === "string") {
     return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => {
@@ -116,6 +186,9 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   if (missingEnv.size > 0) {
     throw new Error(`Missing environment variables referenced by config: ${[...missingEnv].sort().join(", ")}`);
   }
+  // Resolve model inheritance (spec MODEL-FALLBACK §2.1) before structural
+  // validation — virtual models omit the required fields they inherit.
+  resolveModelInheritance(merged as PlainObject);
   if (!Value.Check(AppConfigSchema, merged)) {
     throw new Error(`Invalid config: ${formatValidationErrors(merged)}`);
   }

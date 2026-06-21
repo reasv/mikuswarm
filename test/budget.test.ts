@@ -748,16 +748,21 @@ test("collectZeroCostModelIds: zero-rate models in the set, paid excluded", () =
     retrieval: { embedding: { remote: { id: "emb", cost_per_mtok: 0 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
-  assert.equal(zero.has("free"), true);
+  // Agent models are keyed by their LOGICAL id (config block name; spec
+  // MODEL-FALLBACK §2.2), not the upstream `id`.
+  assert.equal(zero.has("default"), true);
   assert.equal(zero.has("bare"), true);
   assert.equal(zero.has("emb"), true);
-  assert.equal(zero.has("paid"), false);
+  assert.equal(zero.has("big"), false); // the paid agent block
+  assert.equal(zero.has("free"), false); // a wire id, never a logical id
 });
 
 test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", () => {
   const config = {
     models: {
-      default: { id: "shared" }, // zero here
+      default: { id: "x" },
+      // Agent block keyed by the same LOGICAL id x_search prices paid.
+      shared: { id: "shared" }, // zero here (no cost block)
     },
     x_search: { model: "shared", cost: { input: 5, output: 5 } }, // paid here
   } as never;
@@ -777,9 +782,11 @@ test("#11 collectKnownModelIds: union of every configured model id (zero ∪ pai
     retrieval: { embedding: { remote: { id: "emb" } } },
   } as never;
   const ids = collectKnownModelIds(config);
-  // Zero-cost AND paid models alike are "known" (the union is for the dead-rule check).
-  for (const id of ["free", "paid", "cap-model", "img-cap", "ig-pro", "ig-flash", "xs", "xs-deep", "emb"]) {
+  // Agent models are known by their LOGICAL id (block name); other lanes still by
+  // their wire id (phase-A — unmigrated). Zero-cost AND paid alike are "known".
+  for (const id of ["default", "big", "cap-model", "img-cap", "ig-pro", "ig-flash", "xs", "xs-deep", "emb"]) {
     assert.equal(ids.has(id), true, `${id} is a known configured model id`);
   }
+  assert.equal(ids.has("free"), false); // wire id, not a logical id
   assert.equal(ids.has("nonexistent"), false);
 });

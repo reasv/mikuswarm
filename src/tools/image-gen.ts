@@ -155,7 +155,7 @@ export interface ImageGenToolContext {
   /**
    * Wall-clock bound on the scheduler-admission wait (#14), in ms. During an
    * image-model outage a queued admission is otherwise released only once per
-   * half-open probe window (≤ ~`llm_probe_interval_ms`), outside the session's
+   * half-open probe window (capped backoff, §4.1), outside the session's
    * own budget. Composed with the agent's abort signal so the tool call gives up
    * within the interactive budget instead of stalling the chat turn. Defaults to
    * 120_000 when unset (matches `llm_request_max_wait_ms`'s shipped default).

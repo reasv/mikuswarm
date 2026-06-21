@@ -515,7 +515,7 @@ function failEnvironmental(scheduler: LlmScheduler, modelKey: string, times = 1,
 test("model health: threshold consecutive environmental failures turn the model unhealthy and gate admission", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 3, probeIntervalMs: 50_000 },
+    health: { unhealthyThreshold: 3, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
   });
   failEnvironmental(scheduler, MODEL_A, 3);
 
@@ -534,7 +534,7 @@ test("model health: threshold consecutive environmental failures turn the model 
 test("model health: an unhealthy model never head-of-line-blocks a healthy model in the same group", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
   });
   failEnvironmental(scheduler, MODEL_A, 1);
 
@@ -559,7 +559,7 @@ test("model health: an unhealthy model never head-of-line-blocks a healthy model
 test("model health: probe window elapses → exactly ONE probe admitted; success re-awakens all waiters", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 2 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 20 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 20 },
   });
   failEnvironmental(scheduler, MODEL_A, 1);
 
@@ -593,7 +593,7 @@ test("model health: probe window elapses → exactly ONE probe admitted; success
 test("model health: a failed probe stays unhealthy and schedules the next fixed window", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 25 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 25, probeBackoffMaxMs: 25 },
   });
   failEnvironmental(scheduler, MODEL_A, 1);
 
@@ -619,10 +619,54 @@ test("model health: a failed probe stays unhealthy and schedules the next fixed 
   scheduler.stop();
 });
 
+test("model health: capped-backoff probe cadence grows ×2 per failed probe and caps (MODEL-FALLBACK §4.1)", () => {
+  const scheduler = new LlmScheduler({
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 100 },
+  });
+  const delays: number[] = [];
+  const note = () => {
+    const t0 = Date.now();
+    scheduler.noteOutcome("default", MODEL_A, "environmental"); // !429 → feeds the streak/probe
+    const np = scheduler.snapshot().models.find((m) => m.key === MODEL_A)!.nextProbeAt;
+    delays.push(np - t0);
+  };
+  note(); // healthy → unhealthy: first window = base (20)
+  note(); // failed probe: 40
+  note(); // 80
+  note(); // min(160,100) = 100 (capped)
+  note(); // stays 100
+  // Allow a couple ms of clock slack between the captured t0 and the set nextProbeAt.
+  const near = (got: number, want: number) => assert.ok(Math.abs(got - want) <= 5, `delay ${got} ≈ ${want}`);
+  near(delays[0]!, 20);
+  near(delays[1]!, 40);
+  near(delays[2]!, 80);
+  near(delays[3]!, 100);
+  near(delays[4]!, 100);
+});
+
+test("model health: a per-model probe-backoff-cap override tightens the ceiling (MODEL-FALLBACK §4.1)", async () => {
+  const scheduler = new LlmScheduler({
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 100_000 },
+  });
+  // Record a tight per-model cap on sight (as withSchedulerAdmission threads it).
+  const release = await scheduler.acquire({ modelKey: MODEL_A, probeBackoffMaxMs: 30 });
+  release();
+  const delay = () => {
+    const t0 = Date.now();
+    scheduler.noteOutcome("default", MODEL_A, "environmental");
+    const np = scheduler.snapshot().models.find((m) => m.key === MODEL_A)!.nextProbeAt;
+    return np - t0;
+  };
+  delay(); // unhealthy: 20
+  const d2 = delay(); // min(40, 30) = 30 (the override caps below the global 100_000)
+  assert.ok(Math.abs(d2 - 30) <= 5, `capped at the per-model override: ${d2} ≈ 30`);
+  scheduler.stop();
+});
+
 test("model health: a plain 429 feeds the group throttle but never the model streak", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1, backoff_base_ms: 1, backoff_max_ms: 2 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
   });
   // Three 429s — with threshold 1, ANY streak contribution would flip the
   // model unhealthy. It must stay healthy (the budget is talking, not the model).
@@ -636,7 +680,7 @@ test("model health: a plain 429 feeds the group throttle but never the model str
 test("model health: content and aborted outcomes are neutral", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 2, probeIntervalMs: 50_000 },
+    health: { unhealthyThreshold: 2, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
   });
   scheduler.noteOutcome("default", MODEL_A, "environmental");
   scheduler.noteOutcome("default", MODEL_A, "content");
@@ -656,7 +700,7 @@ test("composed stack: an empty-ending probe stream settles the probe and never h
   // settles → every later waiter for the model is gated until restart).
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 20 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 20 },
   });
   const MODEL_KEY = modelHealthKey(MODEL);
   failEnvironmental(scheduler, MODEL_KEY, 1); // → unhealthy; next admission is the probe
@@ -713,7 +757,7 @@ test("modelHealthKey derives from endpoint + id", () => {
 test("snapshot exposes group budget state, queued waiters with attribution, and model health", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 1 } },
-    health: { unhealthyThreshold: 1, probeIntervalMs: 50_000 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
   });
   const release = await scheduler.acquire({
     priority: "interactive",
