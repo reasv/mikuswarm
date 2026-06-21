@@ -5,7 +5,12 @@ import { createAssistantMessageEventStream, type Model, type Api } from "@earend
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 import { LlmScheduler } from "../src/agent/scheduler.js";
-import { buildModelFallback, resolveModelChain, type ModelChainEntry } from "../src/agent/model-fallback.js";
+import {
+  buildModelFallback,
+  resolveModelChain,
+  runFetchWithFallback,
+  type ModelChainEntry,
+} from "../src/agent/model-fallback.js";
 
 // ---------------------------------------------------------------------------
 // Transparent model fallback (spec MODEL-FALLBACK §3/§9). Per-attempt resolution
@@ -212,4 +217,76 @@ test("capability pre-filter drops an incapable member but never the head", async
   assert.deepEqual(fb.survivorLogicalIds, ["X", "Z"], "the text-only Y is filtered out; head retained");
   await drive(fb.streamFn);
   assert.deepEqual(calls, ["wire-Z"], "falls past the dropped Y to the capable Z");
+});
+
+// --- Fetch-shaped fallback (spec MODEL-FALLBACK §6 rows 3-5) ---
+
+function chainOf(...logicalIds: string[]): ModelChainEntry[] {
+  return logicalIds.map((id) => ({
+    logicalId: id,
+    config: modelCfg({ id: `wire-${id}`, endpoint: `https://gw/${id}` }),
+  }));
+}
+
+test("runFetchWithFallback: single-member chain makes exactly one attempt", async () => {
+  const calls: string[] = [];
+  const value = await runFetchWithFallback<string>(
+    chainOf("X"),
+    { consumer: "test", priority: "background" },
+    async (m) => {
+      calls.push(m.logicalId);
+      return { ok: true, value: "ok" };
+    },
+  );
+  assert.equal(value, "ok");
+  assert.deepEqual(calls, ["X"], "exactly one attempt, no retry of a single member");
+});
+
+test("runFetchWithFallback: an environmental failure falls over to the next member, each tried once", async () => {
+  const calls: string[] = [];
+  const value = await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "test", priority: "background" },
+    async (m) => {
+      calls.push(m.logicalId);
+      if (m.logicalId === "X") return { ok: false, kind: "environmental", error: new Error("X down") };
+      return { ok: true, value: `served-by-${m.logicalId}` };
+    },
+  );
+  assert.equal(value, "served-by-Y");
+  assert.deepEqual(calls, ["X", "Y"], "X tried once, then fell over to Y");
+});
+
+test("runFetchWithFallback: a content failure does NOT fall over and is rethrown", async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    () =>
+      runFetchWithFallback<string>(
+        chainOf("X", "Y"),
+        { consumer: "test", priority: "background" },
+        async (m) => {
+          calls.push(m.logicalId);
+          return { ok: false, kind: "content", error: new Error("bad input") };
+        },
+      ),
+    /bad input/,
+  );
+  assert.deepEqual(calls, ["X"], "content failure never falls over to Y (§9)");
+});
+
+test("runFetchWithFallback: all members environmental → throws the last error", async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    () =>
+      runFetchWithFallback<string>(
+        chainOf("X", "Y"),
+        { consumer: "test", priority: "background" },
+        async (m) => {
+          calls.push(m.logicalId);
+          return { ok: false, kind: "environmental", error: new Error(`${m.logicalId} down`) };
+        },
+      ),
+    /Y down/,
+  );
+  assert.deepEqual(calls, ["X", "Y"], "both tried once, then gave up");
 });
