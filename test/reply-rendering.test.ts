@@ -103,6 +103,9 @@ function makeWorker(
     persistEnrichmentResults: async (eventId: string, result: EnrichmentResult) => {
       persisted.push({ eventId, result });
     },
+    // Backfetch provenance lookup (caption deferral, MESSAGE-BACKFETCH §7.3); the
+    // fixtures here are all live events.
+    isBackfetchEvent: () => false,
   } as unknown as Storage;
   const capabilities = {
     messageSummary: async (params: { roomId: string; eventId: string }) => {

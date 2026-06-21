@@ -115,6 +115,7 @@ import {
 } from "./search/index.js";
 import { performInitialBackfill } from "./backfill/index.js";
 import { GapBackfetchCoordinator, type GapBackfetchConfig } from "./backfill/coordinator.js";
+import { MessageBackfetchCoordinator, type MessageBackfetchConfig } from "./backfill/message-backfetch.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager } from "./sandbox/index.js";
 import { BrowserSession } from "./browser/index.js";
@@ -1285,6 +1286,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     },
     isDraining: () => draining,
     logger: logger.child("gap-backfetch"),
+  });
+
+  // Message-only history backfetch (ARCHITECTURE.md §7d): console-triggered jobs
+  // that page history BELOW each room's context floor into the search-only region.
+  // Shares the same per-account read client + self-id map as gap backfetch.
+  const messageBackfetchConfig: MessageBackfetchConfig = {
+    enabled: config.backfetch?.enabled ?? false,
+    pageSize: config.backfetch?.page_size ?? 100,
+    maxBacklog: config.backfetch?.max_backlog ?? 500,
+    pageMinIntervalMs: config.backfetch?.page_min_interval_ms ?? 0,
+    defaultSafetyCap: config.backfetch?.default_safety_cap ?? 50000,
+    defaultTimeoutMs: config.backfetch?.default_timeout_ms ?? 0,
+    utdHaltThreshold: config.backfetch?.utd_halt_threshold ?? 50,
+    captionBackfetched: config.backfetch?.caption_backfetched ?? false,
+  };
+  const messageBackfetch = new MessageBackfetchCoordinator({
+    storage,
+    timeline,
+    config: messageBackfetchConfig,
+    getClient: (accountId) =>
+      provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+    selfUserIds: gapBackfetchSelfIds,
+    notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
+    notifyCaptions: () => captionPool.notifyNewWork(),
+    enqueueChatSearch: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
+    isDraining: () => draining,
+    logger: logger.child("message-backfetch"),
   });
 
   provider.subscribe((inbound) => {
@@ -3545,6 +3573,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
   });
 
+  // Resume interrupted message-backfetch jobs only AFTER startup gap backfetch
+  // settles (§10.2): a room must not be backfetched while still frozen by the gap
+  // coordinator. Each job runs in the background from its persisted cursor.
+  void gapBackfetchRun.then(() => {
+    if (!draining) messageBackfetch.resumeAll();
+  });
+
   if (retentionDays > 0) {
     void runInactiveRetention();
     retentionTimer = setInterval(() => {
@@ -3584,6 +3619,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       resumeSession: manualResumeSession,
       // Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11).
       gapBackfetch: () => gapBackfetch.snapshot(),
+      // Message-only history backfetch jobs surface (ARCHITECTURE.md §7d): list +
+      // start/pause/resume/cancel + retroactive caption promote.
+      backfetch: {
+        enabled: messageBackfetch.enabled,
+        list: (limit?: number) => messageBackfetch.snapshot(limit),
+        start: (input) => messageBackfetch.startJob(input),
+        pause: (id) => messageBackfetch.pauseJob(id),
+        resume: (id) => messageBackfetch.resumeJob(id),
+        cancel: (id) => messageBackfetch.cancelJob(id),
+        promoteCaptions: (timelineKey, range) => messageBackfetch.promoteCaptions(timelineKey, range),
+      },
       // Period-budget rule statuses for the Usage & Cost page (spec USAGE-COST-LIMITS §7).
       budgetEngine: budgetHooks.engine,
       logger: logger.child("console"),
@@ -3605,6 +3651,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // `waitForRuns` 10s race; on timeout we proceed (an outstanding commit is
         // idempotent + oldest-first, so the gap simply re-derives next startup).
         await waitForGapBackfetch(gapBackfetchRun, logger);
+        // Park in-flight message-backfetch jobs (§3 — no atomicity, so each persists
+        // its cursor at the page boundary and resumes next startup). `draining` is
+        // set, so each running job throws JobStopSignal('paused') at its next page
+        // and quiesces before storage teardown.
+        await messageBackfetch.drain();
         // Cancel context builds waiting on summarization jobs BEFORE any pool
         // teardown: once the summarization pool stops, nothing can drive a
         // waited job to terminal, so a waiting build would otherwise poll until

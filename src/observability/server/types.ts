@@ -9,6 +9,27 @@ import type { SessionLiveEventBus } from "../live-events.js";
 import type { LlmScheduler } from "../../agent/scheduler.js";
 import type { LlmRequestRing } from "../../agent/request-ring.js";
 import type { BudgetEngine } from "../../budget/index.js";
+import type { BackfetchJobInput, BackfetchJobRow } from "../../storage/index.js";
+
+/** The message-backfetch console surface (spec MESSAGE-BACKFETCH §8). */
+export interface BackfetchConsoleDeps {
+  /** Whether the feature is enabled (start/resume are inert when false). */
+  enabled: boolean;
+  /** Current jobs, newest first. */
+  list: (limit?: number) => BackfetchJobRow[];
+  /** Create + start a job (single-flight per room enforced by the coordinator). */
+  start: (
+    input: BackfetchJobInput,
+  ) => Promise<{ ok: true; job: BackfetchJobRow } | { ok: false; reason: string }>;
+  pause: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  resume: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  cancel: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Retroactive deferred→pending caption promote for a room/range; returns count. */
+  promoteCaptions: (
+    timelineKey: string,
+    range?: { fromTs?: number | null; toTs?: number | null },
+  ) => Promise<number>;
+}
 
 /**
  * Live references the read-only observability console holds (spec §8). In-process
@@ -64,6 +85,13 @@ export interface ConsoleServerDeps {
    * the route returns an empty list (feature disabled or not wired).
    */
   gapBackfetch?: () => unknown[];
+  /**
+   * Message-only history backfetch surface (spec MESSAGE-BACKFETCH §8;
+   * ARCHITECTURE.md §7d): the job list + the operator actions
+   * (start/pause/resume/cancel) + the retroactive deferred→pending caption
+   * promote. Optional: absent ⇒ the routes 503 (feature disabled / not wired).
+   */
+  backfetch?: BackfetchConsoleDeps;
   /**
    * The period-cost BudgetEngine (spec USAGE-COST-LIMITS §6/§7), for the
    * `GET /api/usage/budgets` rule-status list. Optional: absent = the route

@@ -638,6 +638,23 @@ kickoff_prompt = """
 It is {time}. No message is addressed to you right now — you have not been triggered. Read the recent conversation above and decide, honestly, whether you have something genuinely worth adding: a thought, a follow-up, a reaction, something that fits the moment. If you do, say it with send_message — one message, natural, not forced. If you do not, output exactly NO_REPLY. Staying quiet is the normal, common outcome; only post when it actually adds something.
 """
 
+# Message-only history backfetch (ARCHITECTURE.md §7d). Console/operator-triggered
+# jobs page a room's history BELOW its context floor into the search-only region:
+# the paged-in messages are persisted, enriched, and indexed for search_messages /
+# recap / user_activity, but are NEVER summarized, journaled, embedded, or rendered
+# in the live context — and the room's perceived beginning-of-history never moves.
+# Off by default; jobs are started from the console, each with its own target +
+# optional safety caps.
+[backfetch]
+enabled = false              # master switch (off by default)
+page_size = 100              # /messages page size (clamped 1–1000)
+max_backlog = 500            # pause paging while this many backfetch rows await enrichment (0 = no pause)
+page_min_interval_ms = 0     # optional throttle between pages (0 = none)
+default_safety_cap = 50000   # default max stored per 'beginning' job before parking 'paused' (0 = unbounded)
+default_timeout_ms = 0       # default per-run wall-clock budget (0 = none)
+utd_halt_threshold = 50      # consecutive-UTD halt for the 'oldest_decryptable' target (0 = off)
+caption_backfetched = false  # default for new jobs' caption_after toggle (never auto-captions under caption_all)
+
 # The proactive session type: identical to a default chat session (all tools, same
 # model) plus a standing instruction. No `tools` allowlist ⇒ inherits all tools, so
 # a proactive check-in can search, recap, react, browse, etc. just like a reply.

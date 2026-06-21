@@ -108,10 +108,15 @@ export class EnrichmentWorker {
       }
     }
 
+    // Captionable, downloaded assets are queued 'pending' — EXCEPT on a backfetched
+    // event, where they are 'deferred' (spec MESSAGE-BACKFETCH §7.3): inert until an
+    // operator retroactively promotes them, regardless of caption_all. This keeps
+    // backfetch captioning opt-in and decoupled from the always-on text indexing.
+    const isBackfetch = this.options.storage.isBackfetchEvent(event.id);
     const captionableTypes = ["image", "video", "audio"];
     for (const asset of result.mediaAssets) {
       if (captionableTypes.includes(asset.media_type) && asset.download_status === "complete") {
-        asset.caption_status = "pending";
+        asset.caption_status = isBackfetch ? "deferred" : "pending";
       } else {
         asset.caption_status = "skipped";
       }

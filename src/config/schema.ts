@@ -1069,6 +1069,33 @@ const TokenizerSchema = StrictObject({
   glm_tokenizer_path: Type.Optional(Type.String({ minLength: 1 })),
 });
 
+// Message-only history backfetch (spec MESSAGE-BACKFETCH §9; ARCHITECTURE.md §7d).
+// Console/operator-triggered jobs that page a room's history BELOW its context
+// floor into the search-only region (indexed + enriched, never summarized/diaried/
+// embedded/rendered). Master switch off by default; per-job targets carry their own
+// caps, these are the engine-wide knobs + per-job defaults.
+const BackfetchSchema = StrictObject({
+  // Master switch. Off ⇒ startJob/resume are no-ops and the console surface is inert.
+  enabled: Type.Optional(Type.Boolean()),
+  // /messages page size (clamped 1–1000 by the engine). Default 100.
+  page_size: Type.Optional(Type.Number({ minimum: 1, maximum: 1000 })),
+  // Pause paging while this many backfetched rows await enrichment, so a single job
+  // can't flood the pool (§6.4). 0 ⇒ no backlog pause. Default 500.
+  max_backlog: Type.Optional(Type.Number({ minimum: 0 })),
+  // Optional throttle between pages (ms). 0 ⇒ no throttle (default).
+  page_min_interval_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Default max stored per job for an unbounded ('beginning') target. A hit parks
+  // the job 'paused' (resumable). 0 ⇒ unbounded. Default 50000.
+  default_safety_cap: Type.Optional(Type.Number({ minimum: 0 })),
+  // Default per-run wall-clock budget (ms); a hit parks 'paused'. 0 ⇒ none (default).
+  default_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  // Consecutive-UTD halt for the 'oldest_decryptable' target. 0 disables. Default 50.
+  utd_halt_threshold: Type.Optional(Type.Number({ minimum: 0 })),
+  // Default value of a new job's caption_after toggle. NEVER makes the live claimer
+  // pick up deferred rows — only drives the post-fetch promote (§7.3). Default false.
+  caption_backfetched: Type.Optional(Type.Boolean()),
+});
+
 export const AppConfigSchema = StrictObject({
   app: StrictObject({
     name: Type.String(),
@@ -1200,6 +1227,7 @@ export const AppConfigSchema = StrictObject({
   search: Type.Optional(SearchSchema),
   reactions: Type.Optional(ReactionsSchema),
   proactive: Type.Optional(ProactiveSchema),
+  backfetch: Type.Optional(BackfetchSchema),
   sillytavern: Type.Optional(StrictObject({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
@@ -1270,6 +1298,7 @@ export type ReactionsConfig = Static<typeof ReactionsSchema>;
 export type ImageGenConfig = Static<typeof ImageGenSchema>;
 export type XSearchConfig = Static<typeof XSearchSchema>;
 export type SauceNaoConfig = Static<typeof SauceNaoSchema>;
+export type BackfetchConfig = Static<typeof BackfetchSchema>;
 export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;

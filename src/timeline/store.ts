@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { Storage, TimelineCompactionState } from "../storage/index.js";
+import type { Storage, TimelineCompactionState, TimelineCursor } from "../storage/index.js";
 import type { CanonicalChatEvent, TimelineState } from "../types.js";
 import { applyEditToCanonical, editStatus, type EditReplacement } from "./edits.js";
 
@@ -28,7 +28,18 @@ export class TimelineStore {
     return this.storage.updateTimelineEvent(eventId, updater);
   }
 
-  appendIfMissing(event: CanonicalChatEvent, enrichmentStatus?: string): Promise<{ event: CanonicalChatEvent; duplicate: boolean }> {
+  /**
+   * Insert an event only if no row with its canonical id exists yet (dedup on
+   * resume/replay). `options.isBackfetch` marks the row as message-only backfetch
+   * provenance (spec MESSAGE-BACKFETCH §5) — set only by the backfetch coordinator
+   * so the enrichment worker defers its captioning and the row is excluded from the
+   * first-class pipeline by the context floor.
+   */
+  appendIfMissing(
+    event: CanonicalChatEvent,
+    enrichmentStatus?: string,
+    options?: { isBackfetch?: boolean },
+  ): Promise<{ event: CanonicalChatEvent; duplicate: boolean }> {
     return this.storage.readAndWrite((db) => {
       const existing = db
         .prepare(`select event_json from timeline_events where id = ?`)
@@ -41,13 +52,17 @@ export class TimelineStore {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          agent_session_generation, event_json, enrichment_status, created_at, updated_at
+          agent_session_generation, event_json, enrichment_status, is_backfetch, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+          @agentSessionGeneration, @eventJson, @enrichmentStatus, @isBackfetch, @createdAt, @updatedAt
         )`,
-      ).run({ ...timelineEventParams(event, now), enrichmentStatus: enrichmentStatus ?? "pending" });
+      ).run({
+        ...timelineEventParams(event, now),
+        enrichmentStatus: enrichmentStatus ?? "pending",
+        isBackfetch: options?.isBackfetch ? 1 : 0,
+      });
 
       // Replay a pending edit that arrived before this target was stored (issue
       // #12). Scoped by (provider, externalId, timelineKey) for the same
@@ -224,16 +239,34 @@ export class TimelineStore {
   }
 
   queryForContext(timelineKey: string, state?: TimelineCompactionState): CanonicalChatEvent[] {
-    return this.storage.getTimelineEventsForContext(
+    return this.clampToFloor(
       timelineKey,
-      state?.compactStartEventId ?? state?.richStartEventId,
-      1000,
+      this.storage.getTimelineEventsForContext(
+        timelineKey,
+        state?.compactStartEventId ?? state?.richStartEventId,
+        1000,
+      ),
     );
   }
 
   /** Events strictly after the given event (exclusive cursor); used when that event is covered by a summary. */
   queryAfterContext(timelineKey: string, afterEventId: string): CanonicalChatEvent[] {
-    return this.storage.getTimelineEventsAfter(timelineKey, afterEventId, 1000);
+    return this.clampToFloor(timelineKey, this.storage.getTimelineEventsAfter(timelineKey, afterEventId, 1000));
+  }
+
+  /**
+   * Lower-bound clamp to the context floor (spec MESSAGE-BACKFETCH §4.4): drop any
+   * event sorting strictly BELOW the floor by the canonical
+   * `(timestamp, received_at, id)` order, so the first-class pipeline (context
+   * rendering + summarization, the only callers of queryForContext/queryAfterContext)
+   * never reaches into the search-only backfetched region. A no-op — and zero extra
+   * work beyond one indexed lookup — for every timeline with no floor set (the
+   * normal case; §4.5 guarantees backfetched events are the only ones below it).
+   */
+  private clampToFloor(timelineKey: string, events: CanonicalChatEvent[]): CanonicalChatEvent[] {
+    const floor = this.storage.getContextFloorCursor(timelineKey);
+    if (!floor) return events;
+    return events.filter((e) => !cursorBelowFloor(e, floor));
   }
 
   getCompactionState(timelineKey: string): TimelineCompactionState | undefined {
@@ -378,6 +411,18 @@ function findAssistantEchoCandidate(db: Database.Database, event: CanonicalChatE
     (candidate) => !candidate.externalId && normalizeBody(candidate.body) === normalizedBody,
   );
   return fuzzyMatches.length === 1 ? fuzzyMatches[0] : undefined;
+}
+
+/**
+ * True when `event` sorts strictly below `floor` in the canonical
+ * `(timestamp, received_at, id)` order — i.e. it is a below-floor (search-only)
+ * backfetched event that the first-class pipeline must exclude. The floor event
+ * itself is first-class (`>= floor` is kept).
+ */
+function cursorBelowFloor(event: CanonicalChatEvent, floor: TimelineCursor): boolean {
+  if (event.timestamp !== floor.timestamp) return event.timestamp < floor.timestamp;
+  if (event.receivedAt !== floor.receivedAt) return event.receivedAt < floor.receivedAt;
+  return event.id < floor.id;
 }
 
 function timelineEventParams(event: CanonicalChatEvent, now: number) {

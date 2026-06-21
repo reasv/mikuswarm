@@ -483,6 +483,118 @@ export interface TimelineCursor {
   id: string;
 }
 
+/** Operator target for a message-only backfetch job (spec MESSAGE-BACKFETCH §6.3). */
+export type BackfetchTargetKind = "beginning" | "date" | "oldest_decryptable" | "count";
+
+/** Lifecycle of a backfetch job (spec MESSAGE-BACKFETCH §8.1). */
+export type BackfetchJobStatus =
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/** A `backfetch_jobs` row in camelCase (spec MESSAGE-BACKFETCH §8.1). */
+export interface BackfetchJobRow {
+  id: string;
+  roomId: string;
+  accountId: string;
+  timelineKey: string;
+  targetKind: BackfetchTargetKind;
+  /** ISO date for 'date'; positive integer (as text) for 'count'; null otherwise. */
+  targetValue: string | null;
+  captionAfter: boolean;
+  status: BackfetchJobStatus;
+  cursorToken: string | null;
+  oldestReachedEventId: string | null;
+  oldestReachedTs: number | null;
+  fetched: number;
+  stored: number;
+  stopReason: string | null;
+  floorEventId: string | null;
+  /** Max stored per run (0 = unbounded) and wall-clock budget ms (0 = none). */
+  safetyCap: number;
+  timeoutMs: number;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Fields an operator supplies to create a backfetch job. */
+export interface BackfetchJobInput {
+  roomId: string;
+  accountId: string;
+  timelineKey: string;
+  targetKind: BackfetchTargetKind;
+  targetValue?: string | null;
+  captionAfter?: boolean;
+  safetyCap?: number;
+  timeoutMs?: number;
+}
+
+/** Mutable progress/state fields patched as a job runs. */
+export interface BackfetchJobPatch {
+  status?: BackfetchJobStatus;
+  cursorToken?: string | null;
+  oldestReachedEventId?: string | null;
+  oldestReachedTs?: number | null;
+  fetched?: number;
+  stored?: number;
+  stopReason?: string | null;
+  floorEventId?: string | null;
+  error?: string | null;
+}
+
+/** Raw `backfetch_jobs` row shape (snake_case, as stored). */
+interface BackfetchJobDbRow {
+  id: string;
+  room_id: string;
+  account_id: string;
+  timeline_key: string;
+  target_kind: string;
+  target_value: string | null;
+  caption_after: number;
+  status: string;
+  cursor_token: string | null;
+  oldest_reached_event_id: string | null;
+  oldest_reached_ts: number | null;
+  fetched: number;
+  stored: number;
+  stop_reason: string | null;
+  floor_event_id: string | null;
+  safety_cap: number;
+  timeout_ms: number;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function mapBackfetchJobRow(row: BackfetchJobDbRow): BackfetchJobRow {
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    accountId: row.account_id,
+    timelineKey: row.timeline_key,
+    targetKind: row.target_kind as BackfetchTargetKind,
+    targetValue: row.target_value,
+    captionAfter: row.caption_after === 1,
+    status: row.status as BackfetchJobStatus,
+    cursorToken: row.cursor_token,
+    oldestReachedEventId: row.oldest_reached_event_id,
+    oldestReachedTs: row.oldest_reached_ts,
+    fetched: row.fetched,
+    stored: row.stored,
+    stopReason: row.stop_reason,
+    floorEventId: row.floor_event_id,
+    safetyCap: row.safety_cap,
+    timeoutMs: row.timeout_ms,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 interface SummaryRow {
   id: string;
   timeline_key: string;
@@ -1059,7 +1171,10 @@ export interface CaptionEligibility {
  */
 function captionEligibleSql(e: CaptionEligibility): string {
   if (e.captionAll) return "1"; // every event eligible — nothing deferred
-  const clauses = ["te.trigger_group_id is not null"];
+  // `te.is_backfetch = 1` mirrors the claimPendingCaptions predicate (spec
+  // MESSAGE-BACKFETCH §7.3): a promoted backfetched 'pending' row IS claimable, so
+  // the monitor must count it as real pending, not derived-deferred.
+  const clauses = ["te.trigger_group_id is not null", "te.is_backfetch = 1"];
   if (e.captionAssistant) clauses.push("te.role = 'assistant'");
   return `(${clauses.join(" or ")})`;
 }
@@ -1068,6 +1183,7 @@ function captionEligibleSql(e: CaptionEligibility): string {
 function captionEligibleRow(row: Record<string, unknown>, e: CaptionEligibility): boolean {
   if (e.captionAll) return true;
   if (row.trigger_group_id != null) return true;
+  if (Number(row.is_backfetch ?? 0) === 1) return true;
   return e.captionAssistant && row.role === "assistant";
 }
 
@@ -1329,7 +1445,7 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
         te.timeline_key as room, ma.created_at as created_at, ma.updated_at as updated_at,
         ma.original_filename as original_filename, ma.media_type as media_type,
         ma.caption as caption, ma.caption_error as caption_error,
-        te.trigger_group_id as trigger_group_id, te.role as role
+        te.trigger_group_id as trigger_group_id, te.role as role, te.is_backfetch as is_backfetch
       from media_assets ma
       join timeline_events te on te.id = ma.event_id`,
     project: (row, maxRetries, eligibility) => {
@@ -1664,6 +1780,38 @@ export class Storage {
     return row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
   }
 
+  /**
+   * Whether a stored event entered via message-only backfetch (spec
+   * MESSAGE-BACKFETCH §5). Read by the enrichment worker to choose the `deferred`
+   * caption state (§7.3). False for any missing row.
+   */
+  isBackfetchEvent(id: string): boolean {
+    const row = this.read((db) =>
+      db.prepare(`select is_backfetch from timeline_events where id = ?`).get(id) as
+        | { is_backfetch: number }
+        | undefined,
+    );
+    return (row?.is_backfetch ?? 0) === 1;
+  }
+
+  /**
+   * Count of backfetched events still awaiting/under enrichment (spec
+   * MESSAGE-BACKFETCH §6.4 drain-aware pacing): `is_backfetch=1` with
+   * enrichment_status in pending/processing. The coordinator pauses paging while
+   * this exceeds the configured backlog so a single job can't flood the pool.
+   */
+  countPendingBackfetchEnrichment(): number {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select count(*) as c from timeline_events
+           where is_backfetch = 1 and enrichment_status in ('pending', 'processing')`,
+        )
+        .get() as { c: number },
+    );
+    return row.c;
+  }
+
   /** Current enrichment_status of a stored event, or undefined if absent. */
   getEnrichmentStatus(id: string): string | undefined {
     const row = this.read((db) =>
@@ -1725,6 +1873,75 @@ export class Storage {
   }
 
   /**
+   * The context floor event id for a timeline (spec MESSAGE-BACKFETCH §4), or
+   * undefined when none is set (the normal state — no backfetch has run). The
+   * floor is the oldest event the first-class pipeline may consider; everything
+   * strictly below it is the search-only backfetched region.
+   */
+  getContextFloorEventId(timelineKey: string): string | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select context_floor_event_id from timeline_compaction_state where timeline_key = ?`)
+        .get(timelineKey) as { context_floor_event_id: string | null } | undefined,
+    );
+    return row?.context_floor_event_id ?? undefined;
+  }
+
+  /**
+   * The context floor resolved to a `(timestamp, received_at, id)` cursor, for the
+   * lower-bound clamp in context/summarization queries (§4.4/§4.5). Returns
+   * undefined when no floor is set OR the floor event has since been pruned — in
+   * both cases callers apply no clamp (a pruned floor can only mean its whole
+   * first-class neighbourhood is gone, never that below-floor rows should surface).
+   */
+  getContextFloorCursor(timelineKey: string): TimelineCursor | undefined {
+    const floorId = this.getContextFloorEventId(timelineKey);
+    if (!floorId) return undefined;
+    return this.getEventCursor(timelineKey, floorId);
+  }
+
+  /**
+   * Pin the context floor to `eventId` IFF it is currently unset (spec §4.3 —
+   * "set once, never moved"). Creates the `timeline_compaction_state` row when
+   * absent (a backfetch may target a timeline that has never been activated),
+   * seeding the minimal `state_json` + the default `'inactive'` lifecycle exactly
+   * like `setTimelineState` so the row is well-formed for every other reader.
+   * Returns whether this call set it and the resulting floor id (the freshly-set
+   * one, or the pre-existing floor when a prior job/run already pinned it).
+   */
+  setContextFloorIfUnset(timelineKey: string, eventId: string): Promise<{ set: boolean; floorEventId: string }> {
+    return this.write((db) => {
+      const now = Date.now();
+      const existing = db
+        .prepare(`select context_floor_event_id from timeline_compaction_state where timeline_key = ?`)
+        .get(timelineKey) as { context_floor_event_id: string | null } | undefined;
+      if (existing === undefined) {
+        const seedState: TimelineCompactionState = {
+          schemaVersion: 1,
+          timelineKey,
+          compactStartEventId: null,
+          richStartEventId: null,
+          updatedAt: now,
+        };
+        db.prepare(
+          `insert into timeline_compaction_state (
+            timeline_key, compact_start_event_id, rich_start_event_id, state_json,
+            context_floor_event_id, updated_at
+          ) values (@timelineKey, null, null, @stateJson, @floor, @updatedAt)`,
+        ).run({ timelineKey, stateJson: JSON.stringify(seedState), floor: eventId, updatedAt: now });
+        return { set: true, floorEventId: eventId };
+      }
+      if (existing.context_floor_event_id != null) {
+        return { set: false, floorEventId: existing.context_floor_event_id };
+      }
+      db.prepare(
+        `update timeline_compaction_state set context_floor_event_id = ?, updated_at = ? where timeline_key = ?`,
+      ).run(eventId, now, timelineKey);
+      return { set: true, floorEventId: eventId };
+    });
+  }
+
+  /**
    * Current lifecycle state of a timeline. A missing `timeline_compaction_state`
    * row means the channel has never been triggered, i.e. `'inactive'` (§2).
    */
@@ -1778,6 +1995,27 @@ export class Storage {
         .get(...timelineKeys) as { id: string; timestamp: number } | undefined,
     );
     return row ? { timestamp: row.timestamp, id: row.id } : undefined;
+  }
+
+  /**
+   * The oldest event id currently held for a timeline key by the canonical
+   * `(timestamp, received_at, id)` ordering, or undefined when the key holds no
+   * events. Used to pin the context floor before the first below-floor backfetch
+   * insert (spec MESSAGE-BACKFETCH §4.3): the floor is set to this current-oldest
+   * so every paged-in older event sorts strictly below it (§4.5).
+   */
+  getOldestEventId(timelineKey: string): string | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select id from timeline_events
+           where timeline_key = ?
+           order by timestamp asc, received_at asc, id asc
+           limit 1`,
+        )
+        .get(timelineKey) as { id: string } | undefined,
+    );
+    return row?.id;
   }
 
   /**
@@ -2745,13 +2983,20 @@ export class Storage {
 
   claimPendingCaptions(limit: number, captionAll: boolean, captionAssistantMessages = false): Promise<MediaAssetRow[]> {
     return this.write((db) => {
+      // `te.is_backfetch = 1` admits a promoted backfetched row (spec
+      // MESSAGE-BACKFETCH §7.3). A backfetched event has no trigger group and is
+      // captioned 'deferred' by the enrichment worker, so its presence as 'pending'
+      // can ONLY be the operator's retroactive deferred→pending promote — that
+      // promote IS the opt-in, claimable regardless of caption_all. It sorts last
+      // (bucket 1, old timestamp) so live work always outranks it.
       const rows = db.prepare(
         `select ma.*, te.timeline_key as timeline_key from media_assets ma
          join timeline_events te on ma.event_id = te.id
          where ma.caption_status = 'pending'
            and ma.download_status = 'complete'
            and ma.media_type in ('image', 'video', 'audio')
-           and (te.trigger_group_id is not null or ? = 1 or (te.role = 'assistant' and ? = 1))
+           and (te.trigger_group_id is not null or ? = 1 or (te.role = 'assistant' and ? = 1)
+                or te.is_backfetch = 1)
          order by
            case when te.trigger_group_id is not null then 0 else 1 end,
            te.timestamp desc
@@ -2812,6 +3057,177 @@ export class Storage {
              caption_total_tokens = ?, caption_cost = ?, updated_at = ?
          where id = ?`,
       ).run(caption, model, inputTokens, outputTokens, cacheReadTokens, totalTokens, captionCost, Date.now(), assetId);
+    });
+  }
+
+  /**
+   * Retroactively promote deferred backfetched captions to pending (spec
+   * MESSAGE-BACKFETCH §7.3) for a timeline key (its base key plus any thread
+   * children), optionally bounded to a `[fromTs, toTs]` event-timestamp sub-range.
+   * Flips `caption_status` 'deferred' → 'pending' only for downloaded captionable
+   * assets on backfetched (`is_backfetch=1`) events; the normal caption pool then
+   * drains them under the existing budget gate at lowest priority. Returns the
+   * number of rows promoted (so a caller can skip the wake when nothing matched).
+   * Bumps `updated_at` so the pipeline monitor reflects the change.
+   */
+  promoteBackfetchedCaptions(
+    timelineKey: string,
+    range?: { fromTs?: number | null; toTs?: number | null },
+  ): Promise<number> {
+    return this.write((db) => {
+      const now = Date.now();
+      const clauses = [
+        "ma.caption_status = 'deferred'",
+        "ma.download_status = 'complete'",
+        "ma.media_type in ('image', 'video', 'audio')",
+        "te.is_backfetch = 1",
+        "(te.timeline_key = @key or te.timeline_key like @threadPrefix)",
+      ];
+      const params: Record<string, unknown> = {
+        key: timelineKey,
+        threadPrefix: `${timelineKey}:thread:%`,
+        now,
+      };
+      if (range?.fromTs != null) {
+        clauses.push("te.timestamp >= @fromTs");
+        params.fromTs = range.fromTs;
+      }
+      if (range?.toTs != null) {
+        clauses.push("te.timestamp <= @toTs");
+        params.toTs = range.toTs;
+      }
+      const result = db
+        .prepare(
+          `update media_assets
+             set caption_status = 'pending', updated_at = @now
+           where id in (
+             select ma.id from media_assets ma
+             join timeline_events te on te.id = ma.event_id
+             where ${clauses.join(" and ")}
+           )`,
+        )
+        .run(params);
+      return result.changes;
+    });
+  }
+
+  /**
+   * Insert a new backfetch job (spec MESSAGE-BACKFETCH §8.1), status 'queued'.
+   * Generates `id` and timestamps. Returns the persisted row.
+   */
+  insertBackfetchJob(input: BackfetchJobInput): Promise<BackfetchJobRow> {
+    return this.write((db) => {
+      const now = Date.now();
+      const row: BackfetchJobRow = {
+        id: `bfjob_${nanoid(10)}`,
+        roomId: input.roomId,
+        accountId: input.accountId,
+        timelineKey: input.timelineKey,
+        targetKind: input.targetKind,
+        targetValue: input.targetValue ?? null,
+        captionAfter: input.captionAfter ?? false,
+        status: "queued",
+        cursorToken: null,
+        oldestReachedEventId: null,
+        oldestReachedTs: null,
+        fetched: 0,
+        stored: 0,
+        stopReason: null,
+        floorEventId: null,
+        safetyCap: input.safetyCap ?? 0,
+        timeoutMs: input.timeoutMs ?? 0,
+        error: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.prepare(
+        `insert into backfetch_jobs (
+          id, room_id, account_id, timeline_key, target_kind, target_value, caption_after,
+          status, cursor_token, oldest_reached_event_id, oldest_reached_ts, fetched, stored,
+          stop_reason, floor_event_id, safety_cap, timeout_ms, error, created_at, updated_at
+        ) values (
+          @id, @roomId, @accountId, @timelineKey, @targetKind, @targetValue, @captionAfter,
+          @status, @cursorToken, @oldestReachedEventId, @oldestReachedTs, @fetched, @stored,
+          @stopReason, @floorEventId, @safetyCap, @timeoutMs, @error, @createdAt, @updatedAt
+        )`,
+      ).run({
+        ...row,
+        captionAfter: row.captionAfter ? 1 : 0,
+      });
+      return row;
+    });
+  }
+
+  /** A single backfetch job by id, or undefined. */
+  getBackfetchJob(id: string): BackfetchJobRow | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select * from backfetch_jobs where id = ?`).get(id) as BackfetchJobDbRow | undefined,
+    );
+    return row ? mapBackfetchJobRow(row) : undefined;
+  }
+
+  /** All backfetch jobs, newest first (console list). */
+  listBackfetchJobs(limit = 200): BackfetchJobRow[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(`select * from backfetch_jobs order by created_at desc limit ?`)
+        .all(limit) as BackfetchJobDbRow[],
+    );
+    return rows.map(mapBackfetchJobRow);
+  }
+
+  /**
+   * The single non-terminal job for a room (queued/running/paused), if any —
+   * enforces single-flight per room (spec §8.2) so the cursor + floor stay
+   * unambiguous. Newest first if (defensively) more than one exists.
+   */
+  getActiveBackfetchJobForRoom(roomId: string): BackfetchJobRow | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select * from backfetch_jobs
+           where room_id = ? and status in ('queued', 'running', 'paused')
+           order by created_at desc limit 1`,
+        )
+        .get(roomId) as BackfetchJobDbRow | undefined,
+    );
+    return row ? mapBackfetchJobRow(row) : undefined;
+  }
+
+  /** Jobs in a 'running' state at startup — resumed by the coordinator (spec §8.1). */
+  listResumableBackfetchJobs(): BackfetchJobRow[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(`select * from backfetch_jobs where status in ('running', 'queued') order by created_at asc`)
+        .all() as BackfetchJobDbRow[],
+    );
+    return rows.map(mapBackfetchJobRow);
+  }
+
+  /** Patch a job's mutable progress/state fields; bumps `updated_at`. */
+  updateBackfetchJob(id: string, patch: BackfetchJobPatch): Promise<void> {
+    return this.write((db) => {
+      const sets: string[] = [];
+      const params: Record<string, unknown> = { id, updatedAt: Date.now() };
+      const assign = (col: string, key: string, value: unknown): void => {
+        sets.push(`${col} = @${key}`);
+        params[key] = value;
+      };
+      if (patch.status !== undefined) assign("status", "status", patch.status);
+      if (patch.cursorToken !== undefined) assign("cursor_token", "cursorToken", patch.cursorToken);
+      if (patch.oldestReachedEventId !== undefined)
+        assign("oldest_reached_event_id", "oldestReachedEventId", patch.oldestReachedEventId);
+      if (patch.oldestReachedTs !== undefined)
+        assign("oldest_reached_ts", "oldestReachedTs", patch.oldestReachedTs);
+      if (patch.fetched !== undefined) assign("fetched", "fetched", patch.fetched);
+      if (patch.stored !== undefined) assign("stored", "stored", patch.stored);
+      if (patch.stopReason !== undefined) assign("stop_reason", "stopReason", patch.stopReason);
+      if (patch.floorEventId !== undefined) assign("floor_event_id", "floorEventId", patch.floorEventId);
+      if (patch.error !== undefined) assign("error", "error", patch.error);
+      if (sets.length === 0) return;
+      db.prepare(
+        `update backfetch_jobs set ${sets.join(", ")}, updated_at = @updatedAt where id = @id`,
+      ).run(params);
     });
   }
 
@@ -6540,6 +6956,144 @@ create index if not exists idx_usage_events_model_ts   on usage_events(model_id,
 create index if not exists idx_usage_events_tool_ts    on usage_events(tool_name, ts);
 `;
 
+// media_assets table + its indexes, factored out of the canonical SCHEMA so the
+// v28->v29 CHECK-widening rebuild recreates the EXACT same shape (fresh and
+// rebuilt DBs can't drift). The two are separate consts because the rebuild
+// recreates indexes as a distinct post-copy step.
+const MEDIA_ASSETS_SCHEMA = `
+create table if not exists media_assets (
+  id text primary key,
+  event_id text not null references timeline_events(id) on delete cascade,
+  role text not null,
+  source_index integer,
+  link_preview_id text references link_previews(id) on delete cascade,
+  local_path text,
+  mime_type text,
+  media_type text not null,
+  size_bytes integer,
+  width integer,
+  height integer,
+  duration_seconds real,
+  original_filename text,
+  detected_content text,
+  detected_metadata_json text,
+  caption text,
+  caption_model text,
+  -- 'deferred' (spec MESSAGE-BACKFETCH §7.3): a captionable asset on a backfetched
+  -- (is_backfetch=1) event. The enrichment worker assigns it instead of 'pending'
+  -- so the row is INERT — claimPendingCaptions never considers 'deferred', even
+  -- under caption_all=true — until an operator retroactively promotes it
+  -- (deferred → pending) for a room/range. Keeps backfetch captioning opt-in and
+  -- decoupled from the always-on text indexing.
+  caption_status text not null default 'pending'
+    check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped', 'deferred')),
+  caption_error text,
+  -- Durable caption retry counter (ARCHITECTURE.md §11 pipeline monitor). Mirrors
+  -- timeline_events.enrichment_retries / summarization_jobs.attempts /
+  -- summaries.diary_attempts: incremented at claim time inside the CAS so "what's
+  -- retrying" survives a restart and is visible to the DB-derived pipeline counts
+  -- (the captioning pool previously tracked this in-memory only).
+  caption_attempts integer not null default 0,
+  -- Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §8.1), written
+  -- atomically with the caption result. Nullable: legacy rows and gateways that
+  -- omit usage read as "unknown" (never 0). caption_total_tokens =
+  -- input+output+cacheRead; caption_cost is USD. A separate lane from
+  -- agent_sessions.usage_* (§4). Added via the v20->v21 migration for existing DBs.
+  caption_input_tokens integer,
+  caption_output_tokens integer,
+  caption_cache_read_tokens integer,
+  caption_total_tokens integer,
+  caption_cost real,
+  download_status text not null default 'complete'
+    check(download_status in ('complete', 'failed')),
+  download_error text,
+  created_at integer not null,
+  -- Last-mutated wall clock, bumped on every caption claim/result/status write.
+  -- The pipeline monitor sorts the captioning queue reverse-chron on this (= "most
+  -- recently processed"); media_assets otherwise only carried created_at. Inserts
+  -- seed it to created_at; the v7→v8 migration backfills existing rows likewise.
+  updated_at integer
+);
+`;
+
+const MEDIA_ASSETS_INDEXES = `
+create index if not exists idx_media_assets_event
+  on media_assets(event_id, role, source_index);
+
+create index if not exists idx_media_assets_preview
+  on media_assets(link_preview_id)
+  where link_preview_id is not null;
+
+create index if not exists idx_media_assets_caption_eligible
+  on media_assets(caption_status, download_status, media_type)
+  where caption_status in ('pending', 'processing');
+
+-- Pipeline monitor: keyset pagination of the captioning queue, reverse-chron on
+-- (updated_at, id) across full history (ARCHITECTURE.md §11).
+create index if not exists idx_media_assets_updated
+  on media_assets(updated_at, id);
+
+-- Pipeline monitor: status-filtered keyset pagination ("what is failing?"). The
+-- pre-existing partial index only covers pending/processing; a status=failed /
+-- complete / skipped list must filter+sort without a full scan, so a non-partial
+-- composite ordered to match the keyset sort (status, updated_at, id) is needed
+-- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
+-- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
+create index if not exists idx_media_assets_status_updated
+  on media_assets(caption_status, updated_at, id);
+`;
+
+// Message-only history backfetch jobs (spec MESSAGE-BACKFETCH §8.1;
+// ARCHITECTURE.md §7d). Persistent + resumable: a console/operator-triggered job
+// that pages a room's history BELOW its context floor into the search-only
+// region. Resumability is trivial (no atomicity — the search-only region is never
+// rendered/summarized, so every committed page is independently consistent): on
+// restart a `running` job resumes from `cursor_token`. Single-flight per room
+// keeps the cursor + floor unambiguous. DDL shared with the v28→v29 migration.
+const BACKFETCH_JOBS_SCHEMA = `
+create table if not exists backfetch_jobs (
+  id text primary key,
+  room_id text not null,
+  account_id text not null,
+  timeline_key text not null,
+  -- The operator target (spec §6.3): how the descent decides where to stop.
+  target_kind text not null
+    check(target_kind in ('beginning', 'date', 'oldest_decryptable', 'count')),
+  -- ISO date for 'date'; positive integer for 'count'; NULL for the others.
+  target_value text,
+  -- §7.3 sugar: run the deferred→pending caption promote for this job's own
+  -- fetched range on completion. The promote stands alone (operator action); this
+  -- flag is convenience only and never makes the live claimer pick up deferred rows.
+  caption_after integer not null default 0,
+  status text not null default 'queued'
+    check(status in ('queued', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+  -- Backward continuation token (§6.2): the next_batch of the last page fetched.
+  cursor_token text,
+  oldest_reached_event_id text,
+  oldest_reached_ts integer,
+  -- Progress counters (fetched = summaries seen; stored = newly-committed rows).
+  fetched integer not null default 0,
+  stored integer not null default 0,
+  -- Last BackwardPaginateStopReason of a run segment (telemetry / why it paused).
+  stop_reason text,
+  -- The floor this job pinned for its timeline key (audit; §4.3). NULL until the
+  -- first below-floor insert sets it (or reuses a pre-existing floor).
+  floor_event_id text,
+  -- Optional per-run safety caps (§6.3): max stored (0 = unbounded) and wall-clock
+  -- budget ms (0 = none). Combinable with any primary target.
+  safety_cap integer not null default 0,
+  timeout_ms integer not null default 0,
+  error text,
+  created_at integer not null,
+  updated_at integer not null
+);
+
+create index if not exists idx_backfetch_jobs_status
+  on backfetch_jobs(status, created_at);
+create index if not exists idx_backfetch_jobs_room
+  on backfetch_jobs(room_id, created_at desc);
+`;
+
 // Canonical schema, version 1. This is the COMPLETE current schema with every
 // constraint baked in from the start — there is no patch-an-old-DB step (this
 // software has never been deployed, so there are no legacy databases to
@@ -6586,6 +7140,14 @@ create table if not exists timeline_events (
   -- sentinel value marks a row permanently retired (e.g. missing room/event id).
   redecrypt_attempts integer not null default 0,
   trigger_group_id text,
+  -- Provenance marker (spec MESSAGE-BACKFETCH §5): 1 iff this row entered via the
+  -- message-only history backfetch (ARCHITECTURE.md §7d) — paged in from BELOW the
+  -- room's context floor and kept search-only (indexed + enriched, never
+  -- summarized/diaried/embedded/rendered). Immutable per-event, distinct from the
+  -- movable context_floor_event_id which records *visibility*. Used by the
+  -- enrichment worker to defer captioning (§7.3) and by the caption claim/promote
+  -- path. Default 0 = the ordinary live/initial/gap ingest.
+  is_backfetch integer not null default 0,
   created_at integer not null,
   updated_at integer not null,
   -- Generated from event_json so undecryptable (UTD) events are cheaply
@@ -6663,7 +7225,17 @@ create table if not exists timeline_compaction_state (
   state_json text not null,
   timeline_state text not null default 'inactive'
     check(timeline_state in ('inactive', 'activating', 'active', 'backfilling')),
-  backfill_fence_timestamp integer,
+  -- Context floor (spec MESSAGE-BACKFETCH §4; ARCHITECTURE.md §7d): the oldest
+  -- event id the FIRST-CLASS pipeline (context rendering + summarization) may
+  -- consider for this timeline. NULL = no floor = today's behaviour exactly (the
+  -- normal state for every room that has never been backfetched). Set ONCE to the
+  -- timeline's current-oldest event id, immediately before the first below-floor
+  -- backfetch insert, and never moved by this feature (moving it down — making the
+  -- search-only region first-class — is the deferred full-backfetch feature §12).
+  -- An event id (not a timestamp) for exact positioning, resolved to
+  -- (timestamp, received_at, id) via the cursor lookup, same convention as
+  -- compact_start_event_id / rich_start_event_id.
+  context_floor_event_id text,
   updated_at integer not null
 );
 
@@ -6705,78 +7277,8 @@ create table if not exists link_previews (
 create index if not exists idx_link_previews_event
   on link_previews(event_id, context, preview_index);
 
-create table if not exists media_assets (
-  id text primary key,
-  event_id text not null references timeline_events(id) on delete cascade,
-  role text not null,
-  source_index integer,
-  link_preview_id text references link_previews(id) on delete cascade,
-  local_path text,
-  mime_type text,
-  media_type text not null,
-  size_bytes integer,
-  width integer,
-  height integer,
-  duration_seconds real,
-  original_filename text,
-  detected_content text,
-  detected_metadata_json text,
-  caption text,
-  caption_model text,
-  caption_status text not null default 'pending'
-    check(caption_status in ('pending', 'processing', 'complete', 'failed', 'skipped')),
-  caption_error text,
-  -- Durable caption retry counter (ARCHITECTURE.md §11 pipeline monitor). Mirrors
-  -- timeline_events.enrichment_retries / summarization_jobs.attempts /
-  -- summaries.diary_attempts: incremented at claim time inside the CAS so "what's
-  -- retrying" survives a restart and is visible to the DB-derived pipeline counts
-  -- (the captioning pool previously tracked this in-memory only).
-  caption_attempts integer not null default 0,
-  -- Auxiliary caption usage/cost (spec AUXILIARY-USAGE-TRACKING §8.1), written
-  -- atomically with the caption result. Nullable: legacy rows and gateways that
-  -- omit usage read as "unknown" (never 0). caption_total_tokens =
-  -- input+output+cacheRead; caption_cost is USD. A separate lane from
-  -- agent_sessions.usage_* (§4). Added via the v20->v21 migration for existing DBs.
-  caption_input_tokens integer,
-  caption_output_tokens integer,
-  caption_cache_read_tokens integer,
-  caption_total_tokens integer,
-  caption_cost real,
-  download_status text not null default 'complete'
-    check(download_status in ('complete', 'failed')),
-  download_error text,
-  created_at integer not null,
-  -- Last-mutated wall clock, bumped on every caption claim/result/status write.
-  -- The pipeline monitor sorts the captioning queue reverse-chron on this (= "most
-  -- recently processed"); media_assets otherwise only carried created_at. Inserts
-  -- seed it to created_at; the v7→v8 migration backfills existing rows likewise.
-  updated_at integer
-);
-
-create index if not exists idx_media_assets_event
-  on media_assets(event_id, role, source_index);
-
-create index if not exists idx_media_assets_preview
-  on media_assets(link_preview_id)
-  where link_preview_id is not null;
-
-create index if not exists idx_media_assets_caption_eligible
-  on media_assets(caption_status, download_status, media_type)
-  where caption_status in ('pending', 'processing');
-
--- Pipeline monitor: keyset pagination of the captioning queue, reverse-chron on
--- (updated_at, id) across full history (ARCHITECTURE.md §11).
-create index if not exists idx_media_assets_updated
-  on media_assets(updated_at, id);
-
--- Pipeline monitor: status-filtered keyset pagination ("what is failing?"). The
--- pre-existing partial index only covers pending/processing; a status=failed /
--- complete / skipped list must filter+sort without a full scan, so a non-partial
--- composite ordered to match the keyset sort (status, updated_at, id) is needed
--- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
--- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
-create index if not exists idx_media_assets_status_updated
-  on media_assets(caption_status, updated_at, id);
+${MEDIA_ASSETS_SCHEMA}
+${MEDIA_ASSETS_INDEXES}
 
 create table if not exists summaries (
   id text primary key,
@@ -6997,13 +7499,14 @@ ${USAGE_EVENTS_SCHEMA}
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
-${REACTIONS_SCHEMA}`;
+${REACTIONS_SCHEMA}
+${BACKFETCH_JOBS_SCHEMA}`;
 
 // Latest schema version. SCHEMA above defines version 1 in full; MIGRATIONS
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 28;
+export const LATEST_SCHEMA_VERSION = 29;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -7887,6 +8390,83 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
            where m.caption_status='complete' and m.caption_cost is not null`,
         ).run();
       }
+    }
+  },
+  // index 28 (v28 -> v29): message-only history backfetch (spec MESSAGE-BACKFETCH;
+  // ARCHITECTURE.md §7d). Four additive changes, all guarded for rewound test
+  // fixtures and idempotent:
+  //   1. `timeline_compaction_state.context_floor_event_id` (§4.2) — the per-key
+  //      first-class floor; NULL = today's behaviour. Drop the reserved-but-unused
+  //      `backfill_fence_timestamp` in the same step to avoid two dead "fence"
+  //      concepts (it was reserved for RESUMABLE-SESSIONS §9.2 and never written).
+  //   2. `timeline_events.is_backfetch` (§5) — immutable provenance marker.
+  //   3. `backfetch_jobs` table (§8.1) via the shared DDL.
+  //   4. Widen `media_assets.caption_status` CHECK to admit 'deferred' (§7.3).
+  //      SQLite can't ALTER a CHECK, so the table is rebuilt per the official
+  //      table-redefinition procedure (same as the v12->v13 chat_index rebuild):
+  //      no FK references TO media_assets and no triggers/FTS on it, so the rebuild
+  //      is a plain rename → create-new → copy → drop → recreate-indexes. The
+  //      column copy is intersection-based (only columns present in BOTH the old
+  //      and new shapes) so a minimal legacy fixture can't fail the migration; the
+  //      outer transaction runs with foreign_keys ON, and `defer_foreign_keys=ON`
+  //      postpones the media_assets→{timeline_events,link_previews} FK checks to
+  //      COMMIT, covering the mid-rebuild window. Fresh DBs build everything from
+  //      SCHEMA and never run this step.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
+    const columnsOf = (table: string): string[] =>
+      (db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((c) => c.name);
+
+    // 1. Context floor column + drop the dead fence column.
+    if (hasTable("timeline_compaction_state")) {
+      const cols = columnsOf("timeline_compaction_state");
+      if (!cols.includes("context_floor_event_id")) {
+        db.exec(`alter table timeline_compaction_state add column context_floor_event_id text;`);
+      }
+      if (cols.includes("backfill_fence_timestamp")) {
+        db.exec(`alter table timeline_compaction_state drop column backfill_fence_timestamp;`);
+      }
+    }
+
+    // 2. Provenance marker.
+    if (hasTable("timeline_events") && !columnsOf("timeline_events").includes("is_backfetch")) {
+      db.exec(`alter table timeline_events add column is_backfetch integer not null default 0;`);
+    }
+
+    // 3. Jobs table.
+    db.exec(BACKFETCH_JOBS_SCHEMA);
+
+    // 4. Widen the caption_status CHECK by rebuilding media_assets. Skip entirely
+    //    if the table is absent (minimal fixture) — SCHEMA then builds it at the
+    //    latest shape. Also requires `link_previews` (the rebuilt table's FK
+    //    parent): a real DB always has that v1 base table, but a degenerate legacy
+    //    test fixture may omit it, in which case the deferred FK check would fail at
+    //    the migration COMMIT; skipping leaves the old (narrower) CHECK in place,
+    //    harmless since such a fixture never writes a 'deferred' row. defer_foreign_
+    //    keys is transaction-scoped and auto-resets at COMMIT, leaving foreign_keys
+    //    itself ON.
+    if (hasTable("media_assets") && hasTable("link_previews")) {
+      db.pragma("defer_foreign_keys = ON");
+      // The canonical (target) column order. Copy only columns the OLD table also
+      // has, so a partial legacy shape degrades gracefully (new columns default).
+      const targetCols = [
+        "id", "event_id", "role", "source_index", "link_preview_id", "local_path",
+        "mime_type", "media_type", "size_bytes", "width", "height", "duration_seconds",
+        "original_filename", "detected_content", "detected_metadata_json", "caption",
+        "caption_model", "caption_status", "caption_error", "caption_attempts",
+        "caption_input_tokens", "caption_output_tokens", "caption_cache_read_tokens",
+        "caption_total_tokens", "caption_cost", "download_status", "download_error",
+        "created_at", "updated_at",
+      ];
+      const oldCols = new Set(columnsOf("media_assets"));
+      const copyCols = targetCols.filter((c) => oldCols.has(c));
+      const copyList = copyCols.join(", ");
+      db.exec(`alter table media_assets rename to media_assets_old;`);
+      db.exec(MEDIA_ASSETS_SCHEMA);
+      db.exec(`insert into media_assets (${copyList}) select ${copyList} from media_assets_old;`);
+      db.exec(`drop table media_assets_old;`);
+      db.exec(MEDIA_ASSETS_INDEXES);
     }
   },
 ];

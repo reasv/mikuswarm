@@ -173,7 +173,10 @@ test("fresh database opens at the latest user_version with the full canonical sc
       ),
     );
     assert.ok(csColumns.has("timeline_state"), "timeline_state column should exist");
-    assert.ok(csColumns.has("backfill_fence_timestamp"), "backfill_fence_timestamp column should exist");
+    // The dead `backfill_fence_timestamp` was dropped in v28->v29 (MESSAGE-BACKFETCH
+    // §4.2); its slot is now the message-backfetch context floor.
+    assert.ok(!csColumns.has("backfill_fence_timestamp"), "dead backfill_fence_timestamp column should be gone");
+    assert.ok(csColumns.has("context_floor_event_id"), "context_floor_event_id column should exist");
 
     // media_assets.caption_error exists.
     const maColumns = storage.read((db) =>

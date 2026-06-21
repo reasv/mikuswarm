@@ -468,6 +468,50 @@ export type GapBackfetchRoom = Schema.Schema.Type<typeof GapBackfetchRoom>;
 export const GapBackfetchSnapshot = Schema.Array(GapBackfetchRoom);
 export type GapBackfetchSnapshot = Schema.Schema.Type<typeof GapBackfetchSnapshot>;
 
+/**
+ * One message-only history backfetch job (ARCHITECTURE.md §7d; spec
+ * MESSAGE-BACKFETCH §8.1). Persistent + resumable — `cursorToken` is the backward
+ * continuation it resumes from; `floorEventId` the context floor it pinned.
+ */
+export const BackfetchJob = Schema.Struct({
+	id: Schema.String,
+	roomId: Schema.String,
+	accountId: Schema.String,
+	timelineKey: Schema.String,
+	targetKind: Schema.String,
+	targetValue: Schema.NullOr(Schema.String),
+	captionAfter: Schema.Boolean,
+	status: Schema.String,
+	cursorToken: Schema.NullOr(Schema.String),
+	oldestReachedEventId: Schema.NullOr(Schema.String),
+	oldestReachedTs: Schema.NullOr(Schema.Number),
+	fetched: Schema.Number,
+	stored: Schema.Number,
+	stopReason: Schema.NullOr(Schema.String),
+	floorEventId: Schema.NullOr(Schema.String),
+	safetyCap: Schema.Number,
+	timeoutMs: Schema.Number,
+	error: Schema.NullOr(Schema.String),
+	createdAt: Schema.Number,
+	updatedAt: Schema.Number
+});
+export type BackfetchJob = Schema.Schema.Type<typeof BackfetchJob>;
+
+export const BackfetchJobsResponse = Schema.Struct({
+	jobs: Schema.Array(BackfetchJob),
+	enabled: Schema.Boolean
+});
+export type BackfetchJobsResponse = Schema.Schema.Type<typeof BackfetchJobsResponse>;
+
+export const StartBackfetchResponse = Schema.Struct({ job: BackfetchJob });
+export type StartBackfetchResponse = Schema.Schema.Type<typeof StartBackfetchResponse>;
+
+export const BackfetchActionResponse = Schema.Struct({ ok: Schema.Boolean });
+export type BackfetchActionResponse = Schema.Schema.Type<typeof BackfetchActionResponse>;
+
+export const PromoteCaptionsResponse = Schema.Struct({ promoted: Schema.Number });
+export type PromoteCaptionsResponse = Schema.Schema.Type<typeof PromoteCaptionsResponse>;
+
 /** One settled Layer-0 attempt (GET /api/llm-requests, newest-first). */
 export const LlmRequestRecord = Schema.Struct({
 	ts: Schema.Number,

@@ -33,6 +33,14 @@ import {
   retryPipelineItem,
   retryFailedPipelineItems,
 } from "./pipeline-handlers.js";
+import {
+  backfetchJobs,
+  startBackfetchJob,
+  pauseBackfetchJob,
+  resumeBackfetchJob,
+  cancelBackfetchJob,
+  promoteBackfetchCaptions,
+} from "./backfetch-handlers.js";
 import type { ConsoleServerDeps } from "./types.js";
 
 export type { ConsoleServerDeps } from "./types.js";
@@ -87,6 +95,12 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/summaries/:id", summaryDetail)
     .add("GET", "/api/scheduler", schedulerSnapshot)
     .add("GET", "/api/gap-backfetch", gapBackfetchSnapshot)
+    .add("GET", "/api/backfetch/jobs", backfetchJobs)
+    .add("POST", "/api/backfetch/jobs", startBackfetchJob)
+    .add("POST", "/api/backfetch/jobs/:id/pause", pauseBackfetchJob)
+    .add("POST", "/api/backfetch/jobs/:id/resume", resumeBackfetchJob)
+    .add("POST", "/api/backfetch/jobs/:id/cancel", cancelBackfetchJob)
+    .add("POST", "/api/backfetch/caption-promote", promoteBackfetchCaptions)
     .add("GET", "/api/llm-requests", llmRequests)
     .add("GET", "/api/cost-overview", costOverview)
     .add("GET", "/api/usage/summary", usageSummary)

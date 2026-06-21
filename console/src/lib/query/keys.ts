@@ -27,6 +27,8 @@ export const keys = {
 	llmRequests: () => ['llm-requests'] as const,
 	// Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11) — polled.
 	gapBackfetch: () => ['gap-backfetch'] as const,
+	// Message-only history backfetch jobs (ARCHITECTURE.md §7d) — polled list.
+	backfetchJobs: () => ['backfetch-jobs'] as const,
 	// Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING §10.4).
 	costOverview: () => ['cost-overview'] as const,
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7) — polled ledger views + budgets.

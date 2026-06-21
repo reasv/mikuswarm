@@ -18,9 +18,11 @@
 				? 'scheduler'
 				: page.url.pathname.startsWith('/gap-backfetch')
 					? 'gap-backfetch'
-					: page.url.pathname.startsWith('/usage-cost')
-						? 'usage-cost'
-						: 'conversations'
+					: page.url.pathname.startsWith('/backfetch')
+						? 'backfetch'
+						: page.url.pathname.startsWith('/usage-cost')
+							? 'usage-cost'
+							: 'conversations'
 	);
 </script>
 
@@ -71,6 +73,17 @@
 					: 'text-muted-foreground hover:text-foreground'
 			)}
 		>
+			Gap
+		</a>
+		<a
+			href="/backfetch"
+			class={cn(
+				'rounded px-2 py-0.5 transition-colors',
+				area === 'backfetch'
+					? 'bg-background font-medium text-foreground shadow-sm'
+					: 'text-muted-foreground hover:text-foreground'
+			)}
+		>
 			Backfetch
 		</a>
 		<a
@@ -95,6 +108,10 @@
 	{:else if area === 'gap-backfetch'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			<span>startup gap backfetch</span>
+		</nav>
+	{:else if area === 'backfetch'}
+		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
+			<span>history backfetch</span>
 		</nav>
 	{:else if area === 'usage-cost'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">

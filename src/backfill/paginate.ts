@@ -76,6 +76,23 @@ export interface BackwardPaginateOptions {
     summary: MatrixMessageSummary,
     timestamp: number,
   ) => Promise<MessageDisposition> | MessageDisposition;
+  /**
+   * Initial backward continuation token (spec MESSAGE-BACKFETCH §6.1). Omitted ⇒
+   * start from the room head (today's behaviour for both existing callers). A
+   * stored token from a prior run resumes paging from the next-older page; an
+   * arbitrary valid `/messages` token is accepted by the native side unchanged.
+   */
+  initialBefore?: string;
+  /**
+   * Called after each fully-processed page, BEFORE the next read, with that page's
+   * next-older continuation token (`null` when the homeserver returned none). Lets
+   * a caller persist the resume cursor and pace/pause between pages
+   * (message-backfetch's drain-aware throttle, §6.4). Not called for the page on
+   * which a mid-page stop fired (cap/window/floor/UTD) — the prior page's token is
+   * already the correct resume point, and re-paging the partial page dedups
+   * idempotently. Awaited, so a returned promise back-pressures pagination.
+   */
+  onPage?: (nextBatch: string | null) => Promise<void> | void;
 }
 
 /**
@@ -177,7 +194,8 @@ export async function paginateBackward(
   // Consecutive-UTD counter: advanced per recorded UTD message, reset on any
   // recorded non-UTD message. A long run means no useful forward progress.
   let consecutiveUtd = 0;
-  let before: string | undefined;
+  // Start from the caller's resume token when given, else the room head.
+  let before: string | undefined = options.initialBefore;
 
   while (true) {
     const remaining = deadline - Date.now();
@@ -244,6 +262,10 @@ export async function paginateBackward(
     if (stop) break;
 
     const nextBefore = page.nextBatch ?? undefined;
+    // Per-page hook (resume-cursor persistence + drain-aware pacing). Fires for
+    // every fully-processed page, including the last (nextBefore null ⇒ caller
+    // records the terminal cursor). Awaited so the caller can back-pressure.
+    if (options.onPage) await options.onPage(nextBefore ?? null);
     if (!nextBefore) {
       result.exhausted = true;
       break;
