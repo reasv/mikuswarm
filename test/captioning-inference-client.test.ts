@@ -47,7 +47,14 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
 
     const client = new InferenceClient({
       modality: "image",
-      model: { id: "caption-model", endpoint: "http://127.0.0.1:9", api_key: "k" },
+      // Single-member chain (spec MODEL-FALLBACK §2.3): caption() reads the file
+      // then goes straight to the per-member scheduler acquire.
+      chain: [
+        {
+          logicalId: "caption-model",
+          config: { id: "caption-model", endpoint: "http://127.0.0.1:9", api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never,
+        },
+      ],
       prompt: "describe",
       maxChars: 100,
       maxTokens: 256,

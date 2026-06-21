@@ -164,6 +164,9 @@ export class CaptionWorkerPool {
             record({
               class: "caption",
               modelId: result.model,
+              // Logical id of the billed chain member (spec MODEL-FALLBACK §2.2) —
+              // the budget/grouping dimension, distinct from the upstream wire id.
+              logicalModelId: result.logicalModelId,
               // Provider + channel attribution (parity with tool/agent_loop rows):
               // provider from the caption client's model config; timeline_key
               // recovered by claimPendingCaptions' event_id → timeline_events join.

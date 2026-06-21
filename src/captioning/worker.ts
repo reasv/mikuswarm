@@ -16,7 +16,7 @@ export interface CaptionWorkerOptions {
    * Optional so tests construct a bare worker.
    */
   recordUsage?: (
-    result: { model: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
+    result: { model: string; logicalModelId: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
     asset: MediaAssetRow,
   ) => void;
 }
@@ -39,7 +39,7 @@ export class CaptionWorker {
    */
   private async persist(
     asset: MediaAssetRow,
-    result: { caption: string; model: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
+    result: { caption: string; model: string; logicalModelId: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
   ): Promise<void> {
     await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
     this.options.recordUsage?.(result, asset);

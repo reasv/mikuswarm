@@ -764,9 +764,9 @@ test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", (
       // Agent block keyed by an id image-gen also prices (paid) — cross-lane.
       shared: { id: "shared" }, // zero here (no cost block)
     },
-    // captioning still defines its model inline; a paid caption model overrides
-    // the zero agent appearance of the same id.
-    captioning: { model: { id: "shared", cost: { input: 5, output: 5, cache_read: 0, cache_write: 0 } } },
+    // remote embedding still defines its model inline; a paid embedding appearance
+    // overrides the zero agent appearance of the same id.
+    retrieval: { embedding: { remote: { id: "shared", cost_per_mtok: 5 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
   assert.equal(zero.has("shared"), false);
@@ -778,16 +778,15 @@ test("#11 collectKnownModelIds: union of every configured model id (zero ∪ pai
       default: { id: "free", cost: { input: 0, output: 0 } },
       big: { id: "paid", cost: { input: 3, output: 15 } },
     },
-    captioning: { model: { id: "cap-model" }, image: { model: { id: "img-cap" } } },
-    image_gen: { models: { pro: "ig-pro", flash: "ig-flash" } },
-    // x_search now references [models.*] by name (spec MODEL-FALLBACK §2.3); its
-    // grok model would be a config.models entry, not a separate lane id.
+    // captioning / image_gen / x_search now reference [models.*] by name (spec
+    // MODEL-FALLBACK §2.3); their models are config.models entries, not lane ids.
+    // Only remote embedding remains an inline lane.
     retrieval: { embedding: { remote: { id: "emb" } } },
   } as never;
   const ids = collectKnownModelIds(config);
   // Agent models are known by their LOGICAL id (block name); the still-inline
-  // lanes (captioning/image_gen/embedding) by their wire id. Zero-cost AND paid alike.
-  for (const id of ["default", "big", "cap-model", "img-cap", "ig-pro", "ig-flash", "emb"]) {
+  // embedding lane by its wire id. Zero-cost AND paid alike.
+  for (const id of ["default", "big", "emb"]) {
     assert.equal(ids.has(id), true, `${id} is a known configured model id`);
   }
   assert.equal(ids.has("free"), false); // wire id, not a logical id

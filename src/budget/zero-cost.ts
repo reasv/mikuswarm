@@ -48,15 +48,7 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     mark(logicalId, zeroCost);
   }
 
-  const cap = config.captioning;
-  if (cap) {
-    mark(cap.model?.id, tokenRatesZero(cap.model?.cost));
-    for (const modality of [cap.image, cap.video, cap.audio]) {
-      mark(modality?.model?.id, tokenRatesZero(modality?.model?.cost));
-    }
-  }
-
-  // image_gen + x_search reference `[models.*]` by name (spec MODEL-FALLBACK §2.3),
+  // captioning + image_gen + x_search reference `[models.*]` by name (spec MODEL-FALLBACK §2.3),
   // so their models — and per_image pricing on `[models.*].cost` — are already
   // covered by the agent-models loop above.
 
@@ -85,20 +77,8 @@ export function collectKnownModelIds(config: AppConfig): Set<string> {
   // MODEL-FALLBACK §2.2) — the id a `[[limits]].models` selector matches.
   for (const logicalId of Object.keys(config.models ?? {})) add(logicalId);
 
-  const cap = config.captioning;
-  if (cap) {
-    add(cap.model?.id);
-    for (const modality of [cap.image, cap.video, cap.audio]) add(modality?.model?.id);
-  }
-
-  const ig = config.image_gen;
-  if (ig) {
-    add(ig.models.pro);
-    add(ig.models.flash);
-  }
-
-  // x_search references `[models.*]` by name (spec MODEL-FALLBACK §2.3) — already
-  // counted as known via the agent-models loop above.
+  // captioning / image_gen / x_search reference `[models.*]` by name (spec
+  // MODEL-FALLBACK §2.3) — already counted as known via the agent-models loop above.
 
   add(config.retrieval?.embedding?.remote?.id);
   return ids;

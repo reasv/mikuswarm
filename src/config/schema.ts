@@ -707,35 +707,10 @@ const FxTwitterSchema = StrictObject({
   })),
 });
 
-const CaptioningModelSchema = StrictObject({
-  id: Type.String({ minLength: 1 }),
-  endpoint: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
-  // pi-ai provider label recorded on the unified ledger's caption rows so a
-  // caption's upstream is attributable like an agent-loop or tool row (spec
-  // USAGE-COST-LIMITS §3.1). Accounting provenance only — captioning drives the
-  // OAI client directly, so this does NOT affect request dialect. Unset = the
-  // ledger row's `provider` stays null.
-  provider: Type.Optional(Type.String({ minLength: 1 })),
-  // USD/1M-token cost rates for auxiliary (out-of-loop) usage accounting (spec
-  // AUXILIARY-USAGE-TRACKING §7.1) — identical shape to `[models.*].cost`. Token
-  // usage is captured regardless; this only prices it. Resolution (app wiring):
-  // modality model's cost → top-level `[captioning.model].cost` → unset (= 0 =
-  // untracked). 00-defaults leaves it unset per the explicit-deployment-config
-  // convention; real rates live in local config.
-  cost: Type.Optional(StrictObject({
-    input: Type.Number({ minimum: 0 }),
-    output: Type.Number({ minimum: 0 }),
-    cache_read: Type.Number({ minimum: 0 }),
-    cache_write: Type.Number({ minimum: 0 }),
-  })),
-  // LLM rate-limit group (spec §9.2/§9.4). Captioning typically sits on a
-  // separate, generous budget (OpenRouter) — declare that group under
-  // `[rate_limits.llm.*]` and name it here. Unset = `default` (shares the
-  // scarce main budget — usually NOT what you want for captioning).
-  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
-});
-
+// Unified registry (spec MODEL-FALLBACK §2.3): captioning models are NAMED
+// references into `[models.*]` (connection / provider / cost / rate_limit_group /
+// any `fallback` chain live on the referenced block) — the old inline caption
+// model block (id/endpoint/api_key/provider/cost/rate_limit_group) is gone.
 // NOTE: the per-modality `concurrency` alias (deprecated transitional knob) was
 // removed (review issue #29): caption-inference concurrency is governed by the
 // captioning rate-limit group's `max_in_flight` ([rate_limits.llm.*], spec §9.4).
@@ -744,11 +719,15 @@ const ModalityConfigSchema = StrictObject({
   max_chars: Type.Optional(Type.Number({ minimum: 1 })),
   max_tokens: Type.Optional(Type.Number({ minimum: 1 })),
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
-  model: Type.Optional(CaptioningModelSchema),
+  // `[models.*]` block name for this modality; unset = the top-level captioning
+  // `model`, else the `default` model.
+  model: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const CaptioningSchema = StrictObject({
-  model: Type.Optional(CaptioningModelSchema),
+  // `[models.*]` block name shared by all modalities unless overridden per
+  // modality; unset = the `default` model.
+  model: Type.Optional(Type.String({ minLength: 1 })),
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
   caption_assistant_messages: Type.Optional(Type.Boolean()),

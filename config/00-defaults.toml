@@ -402,10 +402,11 @@ backoff_max_ms = 30000
 # slowed); 429/503 backoff is unconditional in code, the knobs below only tune it.
 # Everything (all agent session types, image_generate, captioning, remote
 # embedding) lands in `default` unless its model block sets `rate_limit_group` to
-# another group declared here — e.g. captioning on a separate OpenRouter budget:
+# another group declared here — e.g. the caption model on a separate OpenRouter
+# budget:
 #   [rate_limits.llm.openrouter]
 #   max_in_flight = 16
-#   [captioning.model]
+#   [models.caption]            # captioning references this by name
 #   rate_limit_group = "openrouter"
 [rate_limits.llm.default]
 max_in_flight = 2
@@ -424,20 +425,38 @@ ssrf_guard = true
 # Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
 # http_proxy_url = "http://proxy.internal:8080"
 
-# Caption-inference concurrency is governed by the model's LLM rate-limit group
-# (`max_in_flight` under [rate_limits.llm.*], via [captioning.model].rate_limit_group);
-# there is no per-modality concurrency knob.
+# Captioning references a [models.*] block by name (spec MODEL-FALLBACK §2.3): the
+# `model` here is a logical id; connection, pricing, rate-limit group, and any
+# `fallback` chain live on the referenced block ([models.caption] below). A
+# modality may override `model` with its own ref. Caption-inference concurrency is
+# governed by that model's LLM rate-limit group (`max_in_flight` under
+# [rate_limits.llm.*]); there is no per-modality concurrency knob. The headline §2.2
+# case — cap an expensive caption model and fall to a cheap one — is a virtual
+# model: `[models.caption-premium] inherits = "caption"  fallback = ["caption-cheap"]`.
 [captioning]
+model = "caption"
 worker_count = 2
 caption_all = false
 caption_assistant_messages = false
 trigger_wait_timeout_ms = 45000
 max_retries = 2
 
-[captioning.model]
+# The caption model block (referenced above). Pricing — set real rates in local
+# config — lives in [models.caption.cost]; unset = usage captured, cost untracked.
+[models.caption]
 id = "google/gemini-3.5-flash"
+provider = "openrouter"
+api = "openai-completions"
 endpoint = "${OPENROUTER_BASE_URL}"
 api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 4096
+context_window = 128000
+[models.caption.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
 
 [captioning.image]
 prompt = "Describe the image."

@@ -111,7 +111,7 @@ import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
-import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
+import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
@@ -176,11 +176,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         group: model.rate_limit_group,
         source: `models.${key}`,
       })),
-      { group: config.captioning?.model?.rate_limit_group, source: "captioning.model" },
-      ...(["image", "video", "audio"] as const).map((modality) => ({
-        group: config.captioning?.[modality]?.model?.rate_limit_group,
-        source: `captioning.${modality}.model`,
-      })),
+      // captioning references `[models.*]` by name now (spec MODEL-FALLBACK §2.3),
+      // so its rate_limit_group is validated via the models loop above.
       { group: config.retrieval?.embedding?.remote?.rate_limit_group, source: "retrieval.embedding.remote" },
     ];
     for (const { group, source } of groupRefs) {
@@ -557,66 +554,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       : undefined;
 
   const captioningConfig = config.captioning ?? {};
-  const sharedModel = {
-    id: captioningConfig.model?.id ?? "google/gemini-3.5-flash",
-    endpoint: captioningConfig.model?.endpoint ?? config.models.default.endpoint,
-    api_key: captioningConfig.model?.api_key ?? config.models.default.api_key,
-    // Accounting provenance recorded on caption usage_events rows; never inherited
-    // across a different modality model (parity with cost), only carried verbatim.
-    provider: captioningConfig.model?.provider ?? null,
-  };
-
-  function resolveModalityModel(modalityConfig?: {
-    model?: { id?: string; endpoint?: string; api_key?: string; provider?: string };
-  }) {
-    return {
-      id: modalityConfig?.model?.id ?? sharedModel.id,
-      endpoint: modalityConfig?.model?.endpoint ?? sharedModel.endpoint,
-      api_key: modalityConfig?.model?.api_key ?? sharedModel.api_key,
-      provider: modalityConfig?.model?.provider ?? sharedModel.provider,
-    };
-  }
-
-  // Rate-limit group for a captioning modality (spec §9.4): the group attaches to
-  // the model BLOCK actually in use — a modality override's own group field wins;
-  // else the shared captioning model's; only when no captioning model block exists
-  // at all (full fallback onto models.default) does the default model's group
-  // apply. Unset resolves to `default` inside the scheduler.
-  function resolveModalityRateLimitGroup(modalityConfig?: { model?: { rate_limit_group?: string } }): string | undefined {
-    if (modalityConfig?.model) return modalityConfig.model.rate_limit_group;
-    if (captioningConfig.model) return captioningConfig.model.rate_limit_group;
-    return config.models.default.rate_limit_group;
-  }
-
-  // Auxiliary caption cost rates (spec AUXILIARY-USAGE-TRACKING §5/§7.1): the
-  // config cost block is snake_case USD/1M tokens; map to the CostRates shape.
-  // Cost is a property of a SPECIFIC model and is never inherited across models —
-  // resolveCaptionCost applies the top-level [captioning.model].cost only when the
-  // modality actually runs the shared model. A modality that overrides the model to
-  // a different id without its own cost block has UNKNOWN cost (untracked, not the
-  // shared model's rates); we warn so that silent gap is visible. Never falls back
-  // to models.default.
-  function resolveModalityCost(modality: MediaModality, modalityConfig?: {
-    model?: { id?: string; cost?: { input: number; output: number; cache_read: number; cache_write: number } };
-  }): CostRates | undefined {
-    const { rates, unpricedOverride } = resolveCaptionCost({
-      modalityModelId: modalityConfig?.model?.id,
-      modalityCost: modalityConfig?.model?.cost,
-      sharedModelId: sharedModel.id,
-      topLevelCost: captioningConfig.model?.cost,
-    });
-    if (unpricedOverride) {
-      logger.warn("caption_cost_untracked_model_override", {
-        modality,
-        modality_model: modalityConfig?.model?.id,
-        shared_model: sharedModel.id,
-        detail:
-          "captioning modality overrides the model but sets no [captioning." +
-          modality +
-          ".model.cost]; its usage will be tracked with unknown cost ([captioning.model].cost is not inherited across different models)",
-      });
-    }
-    return rates;
+  // Unified registry (spec MODEL-FALLBACK §2.3): captioning references `[models.*]`
+  // by name. A modality's own `model` ref wins; else the top-level captioning
+  // `model`; else the `default` model. Connection, pricing, rate-limit group, and
+  // any `fallback` chain all live on the referenced block — the old shared-model /
+  // per-modality cost-inheritance machinery is gone (pricing is on the model).
+  function resolveModalityChain(modalityConfig?: { model?: string }) {
+    const ref = modalityConfig?.model ?? captioningConfig.model ?? "default";
+    return resolveModelChain(ref, config.models);
   }
 
   // Image-gen per-tier cost block (spec §7.2): snake_case config → CostRates,
@@ -654,24 +599,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const captionClients = new Map<MediaModality, InferenceClient>([
     ["image", new InferenceClient({
       modality: "image",
-      model: resolveModalityModel(imageConfig),
+      chain: resolveModalityChain(imageConfig),
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
-      costRates: resolveModalityCost("image", imageConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       imageProcessing: inferenceImageOptions,
     })],
     ["video", new InferenceClient({
       modality: "video",
-      model: resolveModalityModel(videoConfig),
+      chain: resolveModalityChain(videoConfig),
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
       maxTokens: videoConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
-      costRates: resolveModalityCost("video", videoConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
         maxResolution: mediaVideoConfig.max_resolution ?? 480,
@@ -686,13 +629,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     })],
     ["audio", new InferenceClient({
       modality: "audio",
-      model: resolveModalityModel(audioConfig),
+      chain: resolveModalityChain(audioConfig),
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
-      costRates: resolveModalityCost("audio", audioConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {
         maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
@@ -751,11 +693,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
     budget: budgetHooks,
+    // Representative LOGICAL id for the pool's coarse claim gate (spec §8e): the
+    // captioning model REF (spec MODEL-FALLBACK §2.3 unified registry), what a
+    // `[[limits]].models` selector matches; the per-attempt ledger records the
+    // exact billed member.
     captionModelId:
-      config.captioning?.model?.id ??
-      config.captioning?.image?.model?.id ??
-      config.captioning?.video?.model?.id ??
-      config.captioning?.audio?.model?.id,
+      config.captioning?.model ??
+      config.captioning?.image?.model ??
+      config.captioning?.video?.model ??
+      config.captioning?.audio?.model ??
+      "default",
     logger,
   });
 
