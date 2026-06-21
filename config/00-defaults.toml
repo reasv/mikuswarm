@@ -225,6 +225,28 @@ cache_write = 0
 supports_cache_control_on_tools = false
 supports_long_cache_retention = false
 
+# Grok model backing the x_search tool (spec MODEL-FALLBACK §2.3 unified registry).
+# x_search references this by name; connection + pricing live here. Add a `fallback`
+# chain or point x_search.deep_model at a separate reasoning [models.*] block as
+# needed. context_window is set so the model is self-describing; x_search does not
+# enforce a per-session context ceiling against it.
+[models.grok]
+id = "x-ai/grok-4.3"
+provider = "openrouter"
+api = "openai-completions"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 8192
+context_window = 128000
+# Per-MTok USD rates for the Grok call's usage_events / tool_invocations rows.
+# Unset = usage captured, cost untracked (0); set real rates in local config.
+[models.grok.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
 [context.tiers]
 rich_target_tokens = 4000
 rich_max_tokens = 8000
@@ -488,10 +510,11 @@ flash = "gemini-3.1-flash-image"
 # x_fetch — nothing is persisted to channel history / the retrieval corpus.
 [x_search]
 enabled = true
-base_url = "${OPENROUTER_BASE_URL}"
-api_key = "${LLM_API_KEY}"
-model = "x-ai/grok-4.3"             # effort=fast tier (default; quick non-reasoning)
-deep_model = "x-ai/grok-4.3"        # effort=deep tier (set to a reasoning model)
+# Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers REFERENCE
+# [models.*] blocks by name (connection + cost + any fallback chain live there).
+# base_url/api_key/cost are gone — see [models.grok] below.
+model = "grok"                      # effort=fast tier (default; quick non-reasoning)
+deep_model = "grok"                 # effort=deep tier (point at a reasoning model)
 timeout_ms = 60000                  # reasoning search is slow; graceful timeout
 cache_ttl_minutes = 10              # cache the (expensive) Grok synthesis; 0 = off
 hydrate_default = 5                 # cited tweets re-fetched verbatim via FxTwitter
@@ -500,13 +523,6 @@ caption_top = 4                     # images auto-captioned inline; rest → med
 source_text_chars = 600             # per-source verbatim text window in the Sources block
 enable_image_understanding = true   # Grok's vision over images it finds while searching
 enable_video_understanding = true   # Grok's vision over videos it finds while searching
-
-# Per-MTok USD rates for the Grok call's tool_invocations ledger row (X-SEARCH §7).
-# Left unset here per the explicit-deployment-config convention — set real rates in
-# local config; unset = usage captured, cost untracked (0).
-# [x_search.cost]
-# input = 0.0
-# output = 0.0
 
 # Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP), backing
 # the `find_source` tool: image → source URL + artist (the inverse of `danbooru`).

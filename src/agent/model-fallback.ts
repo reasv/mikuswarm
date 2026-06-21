@@ -193,43 +193,14 @@ export function buildModelFallback(
     };
   }
 
-  const scheduler = options.scheduler;
   let warnedThinking = false;
 
-  const choose = (): { candidate: Candidate; reason: FallbackReason } => {
-    const headCand = candidates[0]!;
-    // Untracked / no scheduler = healthy.
-    const headState = scheduler ? scheduler.modelHealth(headCand.healthKey) : "healthy";
-    const viable = (c: Candidate): boolean => {
-      const healthy = !scheduler || scheduler.modelHealth(c.healthKey) === "healthy";
-      if (!healthy) return false;
-      return !options.isModelAvailable || options.isModelAvailable(c.logicalId);
-    };
-
-    // Head viable → normal path.
-    if (viable(headCand)) return { candidate: headCand, reason: "primary" };
-    // Head unhealthy with an open probe window → THIS attempt is the canary
-    // (§4): route to the head so §8a admits it as the half-open probe.
-    if (headState === "unhealthy" && scheduler?.isProbeDue(headCand.healthKey)) {
-      return { candidate: headCand, reason: "canary" };
-    }
-    // First downstream member that is healthy AND in-budget.
-    for (const c of candidates) {
-      if (viable(c)) {
-        return {
-          candidate: c,
-          reason: headState === "unhealthy" ? "health-fallback" : "budget-fallback",
-        };
-      }
-    }
-    // Nothing healthy + in-budget — route to the head so it fails, Layer-0
-    // retries, and the per-class budget decides whole-chain park/wait; the head
-    // also gives §8a's organic admission-probe a real waiter to recover with.
-    return { candidate: headCand, reason: "all-unhealthy" };
-  };
-
   const streamFn: StreamFn = (model, context, streamOptions) => {
-    const { candidate, reason } = choose();
+    const { index, reason } = chooseChainMember(candidates, {
+      scheduler: options.scheduler,
+      isModelAvailable: options.isModelAvailable,
+    });
+    const candidate = candidates[index]!;
     options.onResolve?.(candidate.logicalId, reason);
     if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
       options.logger?.info("model_fallback_resolved", {
@@ -297,4 +268,185 @@ export function resolveModelChain(
     chain.push({ logicalId: name, config });
   }
   return chain;
+}
+
+// ─── Shared chain-order selection ────────────────────────────────────────────
+
+interface ChooseMember {
+  logicalId: string;
+  healthKey: string;
+}
+
+/**
+ * Choose one chain member for an attempt (spec §3), shared by the StreamFn
+ * resolver and the fetch-shaped one. Chain order, head special-cased for the
+ * canary. A member is viable iff its model is healthy (untracked / no scheduler =
+ * healthy) AND in-budget. Returns the index into `members` and the reason.
+ */
+export function chooseChainMember(
+  members: ChooseMember[],
+  deps: { scheduler?: LlmScheduler; isModelAvailable?: (logicalId: string) => boolean },
+): { index: number; reason: FallbackReason } {
+  const scheduler = deps.scheduler;
+  const head = members[0]!;
+  const headState = scheduler ? scheduler.modelHealth(head.healthKey) : "healthy";
+  const viable = (m: ChooseMember): boolean => {
+    const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
+    if (!healthy) return false;
+    return !deps.isModelAvailable || deps.isModelAvailable(m.logicalId);
+  };
+  if (viable(head)) return { index: 0, reason: "primary" };
+  // Head unhealthy with an open probe window → this attempt is the canary (§4).
+  if (headState === "unhealthy" && scheduler?.isProbeDue(head.healthKey)) {
+    return { index: 0, reason: "canary" };
+  }
+  for (let i = 0; i < members.length; i++) {
+    if (viable(members[i]!)) {
+      return { index: i, reason: headState === "unhealthy" ? "health-fallback" : "budget-fallback" };
+    }
+  }
+  // Nothing healthy + in-budget — route to the head so it fails and the caller's
+  // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter.
+  return { index: 0, reason: "all-unhealthy" };
+}
+
+// ─── Fetch-shaped fallback (spec §6 rows 3-5) ────────────────────────────────
+//
+// The non-agent inference clients (captioning, image-gen, x_search, remote
+// embedding) make raw fetches rather than going through pi-agent-core, so they
+// can't compose the StreamFn resolver above. `runFetchWithFallback` is the
+// fetch-shaped equivalent: it owns the same per-attempt member selection, the
+// scheduler admission around each attempt, and the both-axes `noteOutcome`
+// feeding — the consumer supplies only the per-member fetch via `attempt`.
+
+/** A chain member resolved for a fetch consumer. */
+export interface FetchChainMember {
+  logicalId: string;
+  config: ModelConfig;
+  /** Health failure domain `(endpoint, id)` — the same key §8a derives from the Model. */
+  healthKey: string;
+  /** Rate-limit group (`rate_limit_group` ?? "default"). */
+  group: string;
+}
+
+/** Outcome of one per-member fetch, mapped to the §3 failure taxonomy. */
+export type FetchAttemptOutcome<T> =
+  | { ok: true; value: T; status?: number }
+  /** Environmental (5xx/timeout/reset/empty) — feeds the streak, falls over to the next member. */
+  | { ok: false; kind: "environmental"; status?: number; retryAfterMs?: number; error: unknown }
+  /** Content/fatal (4xx-from-this-request, bad input) — NEVER triggers fallback (§9); rethrown. */
+  | { ok: false; kind: "content"; status?: number; error: unknown };
+
+export interface RunFetchFallbackOptions {
+  consumer: string;
+  priority: PriorityClass;
+  scheduler?: LlmScheduler;
+  isModelAvailable?: (logicalId: string) => boolean;
+  /** Drop incapable members (head retained); e.g. modality support. */
+  capability?: (config: ModelConfig) => boolean;
+  /** Per-model probe-backoff cap passthrough (from config). */
+  probeBackoffMaxMs?: (config: ModelConfig) => number | undefined;
+  signal?: AbortSignal;
+  logger?: Logger;
+  sessionId?: string;
+  /** Rate-limit gate for the resolution log (high-frequency consumers). */
+  rateLimitLog?: () => boolean;
+}
+
+/** Build the per-member runtime (capability-filtered, head retained) from a chain. */
+export function buildFetchChain(
+  chain: ModelChainEntry[],
+  capability?: (config: ModelConfig) => boolean,
+): FetchChainMember[] {
+  return chain
+    .filter((entry, i) => i === 0 || !capability || capability(entry.config))
+    .map((entry) => ({
+      logicalId: entry.logicalId,
+      config: entry.config,
+      healthKey: `${entry.config.endpoint ?? "unknown"}::${entry.config.id}`,
+      group: entry.config.rate_limit_group ?? "default",
+    }));
+}
+
+/**
+ * Run `attempt` against the chain with transparent fallback (spec §6). Selects a
+ * member per attempt (chain order; canary when the head's probe window is open),
+ * acquires a scheduler slot keyed on that member, runs the fetch, and feeds the
+ * outcome to §8a on both axes. An environmental failure falls over to the next
+ * member (bounded by `members.length`, plus one extra so a canary that fails can
+ * still reach a fallback); a content failure is rethrown without falling over.
+ * Returns the first member's successful value.
+ */
+export async function runFetchWithFallback<T>(
+  chain: ModelChainEntry[],
+  options: RunFetchFallbackOptions,
+  attempt: (member: FetchChainMember) => Promise<FetchAttemptOutcome<T>>,
+): Promise<T> {
+  const members = buildFetchChain(chain, options.capability);
+  const scheduler = options.scheduler;
+  // chain length + 1: enough to try each member once and let a failed canary
+  // still fall to a downstream member on the next pass.
+  const maxAttempts = members.length + 1;
+  let lastError: unknown;
+  for (let n = 0; n < maxAttempts; n++) {
+    const { index, reason } = chooseChainMember(members, {
+      scheduler,
+      isModelAvailable: options.isModelAvailable,
+    });
+    const member = members[index]!;
+    if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
+      options.logger?.info("model_fallback_resolved", {
+        consumer: options.consumer,
+        sessionId: options.sessionId,
+        chain: members.map((m) => m.logicalId),
+        chosen: member.logicalId,
+        reason,
+      });
+    }
+    const release = scheduler
+      ? await scheduler.acquire({
+          group: member.group,
+          priority: options.priority,
+          modelKey: member.healthKey,
+          probeBackoffMaxMs: options.probeBackoffMaxMs?.(member.config),
+          signal: options.signal,
+        })
+      : undefined;
+    let outcome: FetchAttemptOutcome<T>;
+    try {
+      outcome = await attempt(member);
+    } catch (error) {
+      // An uncaught throw from the fetch is treated as environmental unless it is
+      // the caller's abort (neutral teardown — never a model-health signal).
+      const aborted = error instanceof Error && error.name === "AbortError";
+      scheduler?.noteOutcome(member.group, member.healthKey, aborted ? "aborted" : "environmental");
+      release?.();
+      if (aborted) throw error;
+      lastError = error;
+      continue;
+    }
+    if (outcome.ok) {
+      scheduler?.noteOutcome(member.group, member.healthKey, undefined, outcome.status);
+      release?.();
+      return outcome.value;
+    }
+    if (outcome.kind === "content") {
+      // Content failures are deterministic on replay and never fall over (§9).
+      scheduler?.noteOutcome(member.group, member.healthKey, "content", outcome.status);
+      release?.();
+      throw outcome.error;
+    }
+    scheduler?.noteOutcome(
+      member.group,
+      member.healthKey,
+      "environmental",
+      outcome.status,
+      outcome.retryAfterMs,
+    );
+    release?.();
+    lastError = outcome.error;
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`${options.consumer}: all fallback members failed`);
 }

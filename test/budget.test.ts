@@ -761,10 +761,12 @@ test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", (
   const config = {
     models: {
       default: { id: "x" },
-      // Agent block keyed by the same LOGICAL id x_search prices paid.
+      // Agent block keyed by an id image-gen also prices (paid) — cross-lane.
       shared: { id: "shared" }, // zero here (no cost block)
     },
-    x_search: { model: "shared", cost: { input: 5, output: 5 } }, // paid here
+    // image_gen still defines its tiers inline; a paid tier overrides the zero
+    // agent appearance of the same id.
+    image_gen: { models: { pro: "shared", flash: "f" }, costs: { pro: { input: 5, output: 5 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
   assert.equal(zero.has("shared"), false);
@@ -778,13 +780,14 @@ test("#11 collectKnownModelIds: union of every configured model id (zero ∪ pai
     },
     captioning: { model: { id: "cap-model" }, image: { model: { id: "img-cap" } } },
     image_gen: { models: { pro: "ig-pro", flash: "ig-flash" } },
-    x_search: { model: "xs", deep_model: "xs-deep" },
+    // x_search now references [models.*] by name (spec MODEL-FALLBACK §2.3); its
+    // grok model would be a config.models entry, not a separate lane id.
     retrieval: { embedding: { remote: { id: "emb" } } },
   } as never;
   const ids = collectKnownModelIds(config);
-  // Agent models are known by their LOGICAL id (block name); other lanes still by
-  // their wire id (phase-A — unmigrated). Zero-cost AND paid alike are "known".
-  for (const id of ["default", "big", "cap-model", "img-cap", "ig-pro", "ig-flash", "xs", "xs-deep", "emb"]) {
+  // Agent models are known by their LOGICAL id (block name); the still-inline
+  // lanes (captioning/image_gen/embedding) by their wire id. Zero-cost AND paid alike.
+  for (const id of ["default", "big", "cap-model", "img-cap", "ig-pro", "ig-flash", "emb"]) {
     assert.equal(ids.has(id), true, `${id} is a known configured model id`);
   }
   assert.equal(ids.has("free"), false); // wire id, not a logical id

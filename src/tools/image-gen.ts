@@ -117,6 +117,11 @@ export interface ToolUsageRecord {
   /** pi-agent-core tool-call id, for matching this row to a rollout block (§10.3). */
   toolCallId: string | null;
   modelId: string;
+  /**
+   * Logical model id (config block name; spec MODEL-FALLBACK §2.2) — the budget/
+   * grouping dimension. Defaults to `modelId` when omitted (no virtual model).
+   */
+  logicalModelId?: string;
   provider: string;
   usage: RawTokenUsage;
   /** USD total from `computeUsageCost(...).total`. */

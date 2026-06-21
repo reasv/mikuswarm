@@ -61,12 +61,8 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     mark(ig.models.flash, flashZero);
   }
 
-  const xs = config.x_search;
-  if (xs) {
-    const xsZero = tokenRatesZero(xs.cost);
-    mark(xs.model, xsZero);
-    mark(xs.deep_model, xsZero);
-  }
+  // x_search references `[models.*]` by name (spec MODEL-FALLBACK §2.3), so its
+  // models are already covered by the agent-models loop above (cost on the block).
 
   const remote = config.retrieval?.embedding?.remote;
   if (remote) mark(remote.id, (remote.cost_per_mtok ?? 0) === 0);
@@ -105,11 +101,8 @@ export function collectKnownModelIds(config: AppConfig): Set<string> {
     add(ig.models.flash);
   }
 
-  const xs = config.x_search;
-  if (xs) {
-    add(xs.model);
-    add(xs.deep_model);
-  }
+  // x_search references `[models.*]` by name (spec MODEL-FALLBACK §2.3) — already
+  // counted as known via the agent-models loop above.
 
   add(config.retrieval?.embedding?.remote?.id);
   return ids;

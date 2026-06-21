@@ -562,6 +562,10 @@ const ModelSchema = StrictObject({
     output: Type.Number({ minimum: 0 }),
     cache_read: Type.Number({ minimum: 0 }),
     cache_write: Type.Number({ minimum: 0 }),
+    // Optional flat USD charge per generated image (spec MODEL-FALLBACK §2.3) —
+    // used by image-gen models that quote per-image pricing, moved here from the
+    // old inline `[image_gen.costs.*].per_image` when the registry was unified.
+    per_image: Type.Optional(Type.Number({ minimum: 0 })),
   })),
   streaming: Type.Optional(Type.Boolean()),
   // LLM rate-limit group (spec CONCURRENCY-AND-RATE-LIMITING §9.2): which shared
@@ -924,11 +928,12 @@ const ImageGenSchema = StrictObject({
 const XSearchSchema = StrictObject({
   // false → x_search is not registered. Defaults to true when the block exists.
   enabled: Type.Optional(Type.Boolean()),
-  base_url: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
-  // effort=fast tier (default); should be a quick non-reasoning Grok model.
-  model: Type.Optional(Type.String({ minLength: 1 })),
-  // effort=deep tier; set to a reasoning model for harder research tasks.
+  // Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers REFERENCE
+  // `[models.*]` blocks by name (each carrying endpoint/id/api_key/cost +
+  // optional `fallback` chain). `base_url`/`api_key`/`cost` are gone — they live
+  // on the referenced model. `model` (fast tier) is required when the block
+  // exists; `deep_model` defaults to `model`.
+  model: Type.String({ minLength: 1 }),
   deep_model: Type.Optional(Type.String({ minLength: 1 })),
   // Wall-clock bound on the Grok reasoning search (slow); graceful timeout.
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
@@ -947,11 +952,8 @@ const XSearchSchema = StrictObject({
   enable_video_understanding: Type.Optional(Type.Boolean()),
   // Overridable subagent scaffold (forces a live cited search; §4.2).
   system_prompt: Type.Optional(Type.String({ minLength: 1 })),
-  // Per-MTok USD rates for the Grok call's tool_invocations ledger row (§7).
-  cost: Type.Optional(StrictObject({
-    input: Type.Number({ minimum: 0 }),
-    output: Type.Number({ minimum: 0 }),
-  })),
+  // Pricing now lives on the referenced `[models.*]` block's `cost` (spec
+  // MODEL-FALLBACK §2.3) — the old inline `[x_search.cost]` is gone.
 });
 
 // Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP; backs

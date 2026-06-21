@@ -45,6 +45,13 @@ export {
 } from "./scheduler.js";
 export { LlmRequestRing, DEFAULT_LLM_REQUEST_RING_SIZE, type LlmRequestRecord } from "./request-ring.js";
 export {
+  buildModelFallback,
+  resolveModelChain,
+  runFetchWithFallback,
+  type ModelChainEntry,
+  type FetchChainMember,
+} from "./model-fallback.js";
+export {
   SessionRunner,
   SessionRunnerError,
   isResumableRunError,

@@ -20,6 +20,7 @@ import {
 import {
   AgentSessionFactory,
   LlmScheduler,
+  resolveModelChain,
   LlmRequestRing,
   DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
@@ -2980,6 +2981,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         triggerSenderId: inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id ?? null,
         toolName: record.toolName,
         modelId: record.modelId,
+        // Logical id for budget scoping / grouping (spec MODEL-FALLBACK §2.2),
+        // defaulting to the wire id when the tool has no virtual model.
+        logicalModelId: record.logicalModelId ?? record.modelId,
         provider: record.provider,
         inputTokens: record.usage.input,
         outputTokens: record.usage.output,
@@ -3203,6 +3207,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(config.x_search && (config.x_search.enabled ?? true)
         ? [createXSearchTool({
             config: config.x_search,
+            // Unified registry (spec MODEL-FALLBACK §2.3): resolve the fast/deep
+            // tiers to their `[models.*]` chains (head + fallback members).
+            fastChain: resolveModelChain(config.x_search.model, config.models),
+            deepChain: resolveModelChain(config.x_search.deep_model ?? config.x_search.model, config.models),
+            scheduler: llmScheduler,
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             workspaceRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,

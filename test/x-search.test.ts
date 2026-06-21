@@ -168,13 +168,10 @@ test("GrokResultCache: stores within TTL, expires after, 0 ttl disables", () => 
   assert.equal(off.get("k", 0), undefined);
 });
 
-test("resolveXSearchConfig: requires base_url + api_key, applies defaults", () => {
-  assert.throws(() => resolveXSearchConfig({ api_key: "k" }), /base_url/);
-  assert.throws(() => resolveXSearchConfig({ base_url: "https://x.test" }), /api_key/);
-  const cfg = resolveXSearchConfig({ base_url: "https://x.test/", api_key: "k" });
-  assert.equal(cfg.baseUrl, "https://x.test"); // trailing slash stripped
-  assert.equal(cfg.model, "x-ai/grok-4.3");
-  assert.equal(cfg.deepModel, "x-ai/grok-4.3"); // defaults to model
+test("resolveXSearchConfig: applies non-model defaults (model lives on the chain now)", () => {
+  // Connection/model fields moved onto the referenced [models.*] block (spec
+  // MODEL-FALLBACK §2.3); resolveXSearchConfig only defaults the non-model knobs.
+  const cfg = resolveXSearchConfig({});
   assert.equal(cfg.hydrateDefault, 5);
   assert.equal(cfg.captionTop, 4);
   assert.equal(cfg.enableImageUnderstanding, true); // forced on by default
@@ -277,8 +274,23 @@ async function makeHarness(opts: {
     },
   } as unknown as InferenceClient;
 
+  // Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers reference a
+  // [models.*] block — here a single-member chain pointed at the loopback server.
+  const grokModel = {
+    id: "x-ai/grok-4.3",
+    provider: "openrouter",
+    endpoint: opts.serverUrl,
+    api_key: "test-key",
+    multimodal: true,
+    max_tokens: 8192,
+    context_window: 128000,
+  } as never;
+  const grokChain = [{ logicalId: "grok", config: grokModel }];
+
   const context: XSearchToolContext = {
-    config: { base_url: opts.serverUrl, api_key: "test-key", ...opts.rawConfig },
+    config: { ...opts.rawConfig },
+    fastChain: grokChain,
+    deepChain: grokChain,
     workspaceRoot,
     fxTwitterClient,
     statusHosts: STATUS_HOSTS,
