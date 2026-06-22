@@ -251,6 +251,40 @@ function windowSince(window: string | null, now: number): number {
   }
 }
 
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+const WEEK_MS = 7 * DAY_MS;
+const MONTH_MS = 30 * DAY_MS; // approximate, fixed-width (epoch-aligned), like the console's "per month"
+const YEAR_MS = 365 * DAY_MS;
+
+/**
+ * Pick a chart/series bucket width from the actual data span, so a histogram stays
+ * legible as the range grows: days → weeks → months → years. Thresholds keep each
+ * resolution under a readable column count (≤~31 daily, ≤52 weekly, ≤36 monthly).
+ * Used for the open-ended "all time" window; bounded windows pick a fixed width below.
+ */
+function bucketMsForSpan(spanMs: number): number {
+  if (spanMs <= 2 * DAY_MS) return HOUR_MS;
+  if (spanMs <= 31 * DAY_MS) return DAY_MS;
+  if (spanMs <= 52 * WEEK_MS) return WEEK_MS;
+  if (spanMs <= 36 * MONTH_MS) return MONTH_MS;
+  return YEAR_MS;
+}
+
+/**
+ * Bucket width for the spend timeseries / leaderboard series of a window. Bounded
+ * windows keep their fixed granularity (hourly ≤24h, daily otherwise); the open-ended
+ * "all time" window scales with the actual data span ({@link bucketMsForSpan}), anchored
+ * at the earliest event (`minTs`, null when the ledger is empty → daily as a harmless
+ * default). Shared by both endpoints so the Total card and the leaderboard cards re-bin
+ * their sub-period averages against the identical width.
+ */
+function seriesBucketMs(window: string | null, now: number, minTs: number | null): number {
+  if (window === "24h" || window === "today" || window === null) return HOUR_MS;
+  if (window === "all") return minTs == null ? DAY_MS : bucketMsForSpan(now - minTs);
+  return DAY_MS;
+}
+
 /** GET /api/usage/summary?window=… — totals by class + by model (§7.1 cards). */
 export function usageSummary(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   // One `now` for both the window boundary and the average-denominator upper bound, so the
@@ -263,10 +297,14 @@ export function usageSummary(_req: IncomingMessage, res: ServerResponse, ctx: Re
 /** GET /api/usage/timeseries?window=&bucket=&groupBy=class|model — chart series (§7.1). */
 export function usageTimeseries(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const window = ctx.url.searchParams.get("window");
-  const since = windowSince(window, Date.now());
+  const now = Date.now();
+  const since = windowSince(window, now);
   const groupBy = ctx.url.searchParams.get("groupBy") === "model" ? "model" : "class";
-  // Hourly buckets for ≤24h windows, daily otherwise (§7.1 chart).
-  const bucketMs = window === "24h" || window === "today" || window === null ? 3_600_000 : 86_400_000;
+  // Bucket width scales with the range (hourly ≤24h, daily for bounded windows, and
+  // day→week→month→year for "all time" so the histogram stays legible). Only "all"
+  // needs the earliest-event lookup; bounded windows ignore the `minTs` argument.
+  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since }) : null;
+  const bucketMs = seriesBucketMs(window, now, minTs);
   sendJson(res, 200, { series: ctx.deps.storage.getUsageTimeseries(since, bucketMs, groupBy), bucketMs, groupBy });
 }
 
@@ -288,8 +326,9 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
   const now = Date.now();
   const since = windowSince(window, now);
   // Same bucket granularity as the timeseries so each user's sub-period averages re-bin
-  // identically to the Total card's.
-  const bucketMs = window === "24h" || window === "today" || window === null ? 3_600_000 : 86_400_000;
+  // identically to the Total card's (incl. the span-scaled "all time" width).
+  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since }) : null;
+  const bucketMs = seriesBucketMs(window, now, minTs);
   // The console paginates the user list client-side down to the lowest non-zero spender,
   // so return the full ranking (bounded by a generous safety cap, not a small top-N).
   const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 1000, 1), 5000);

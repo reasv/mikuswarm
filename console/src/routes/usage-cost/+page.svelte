@@ -258,11 +258,16 @@
 	function fmtAxisUsd(v: number, step: number): string {
 		return v === 0 ? '$0' : `$${v.toFixed(axisDecimals(step))}`;
 	}
+	// X-axis tick label, scaled to the bucket width: hour for sub-day, day for day/week,
+	// month+year for monthly, year alone for yearly — so an all-time chart that buckets by
+	// month/year doesn't repeat bare "Jan 1" labels with no year.
 	function fmtBucket(bucket: number, bucketMs: number): string {
 		const d = new Date(bucket);
-		return bucketMs < 86_400_000
-			? d.toLocaleTimeString([], { hour: '2-digit' })
-			: d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+		if (bucketMs < 86_400_000) return d.toLocaleTimeString([], { hour: '2-digit' });
+		if (bucketMs >= 360 * 86_400_000) return String(d.getFullYear());
+		if (bucketMs >= 28 * 86_400_000)
+			return d.toLocaleDateString([], { month: 'short', year: '2-digit' });
+		return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 	}
 	// Full bucket span for the hover tooltip header (the column's x-axis position).
 	function fmtBucketRange(bucket: number, bucketMs: number): string {
@@ -272,7 +277,16 @@
 			const hm = { hour: '2-digit', minute: '2-digit' } as const;
 			return `${start.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${start.toLocaleTimeString([], hm)}–${end.toLocaleTimeString([], hm)}`;
 		}
-		return start.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+		if (bucketMs >= 360 * 86_400_000) return String(start.getFullYear());
+		if (bucketMs >= 28 * 86_400_000)
+			return start.toLocaleDateString([], { month: 'long', year: 'numeric' });
+		// Day / week buckets: show the inclusive span (a single day reads as one date).
+		const last = new Date(bucket + bucketMs - 86_400_000);
+		const opts = { month: 'short', day: 'numeric' } as const;
+		const startStr = start.toLocaleDateString([], opts);
+		return bucketMs <= 86_400_000
+			? start.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })
+			: `${startStr} – ${last.toLocaleDateString([], opts)}`;
 	}
 	const STATE_BADGE: Record<string, string> = {
 		ok: 'bg-emerald-500/15 text-emerald-500',

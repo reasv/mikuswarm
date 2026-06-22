@@ -34,6 +34,7 @@ const WEEK = 7 * DAY;
 // matching how `per week` already approximates with 7-day bins. Good enough for an
 // all-time spend *rate* without dragging calendar arithmetic into a pure helper.
 const MONTH = 30 * DAY;
+const YEAR = 365 * DAY;
 
 /** One sub-period breakdown (e.g. "per day") over the window's actual data range. */
 export interface SubPeriodStat {
@@ -77,13 +78,15 @@ function subPeriodsFor(window: string): Array<{ label: string; periodMs: number 
 				{ label: 'per week', periodMs: WEEK }
 			];
 		case 'all':
-			// All-time uses daily buckets, so per-hour is unresolvable (and skipped by the
-			// granularity guard). Break it down per day / week / month instead. Each finer
-			// period is dropped automatically when the data range can't cover it once.
+			// All-time buckets scale with the data span (day→week→month→year), so offer the
+			// matching sub-periods. Each is dropped automatically when it's finer than the
+			// series bucket (granularity guard) or longer than the data range — so a young
+			// deployment shows per day/week, a multi-year one shows per month/year.
 			return [
 				{ label: 'per day', periodMs: DAY },
 				{ label: 'per week', periodMs: WEEK },
-				{ label: 'per month', periodMs: MONTH }
+				{ label: 'per month', periodMs: MONTH },
+				{ label: 'per year', periodMs: YEAR }
 			];
 		default:
 			return [{ label: 'per hour', periodMs: HOUR }];

@@ -187,4 +187,27 @@ describe('buildSpendAverages', () => {
 		});
 		expect(out.stats.map((s) => s.label)).toEqual(['per day']);
 	});
+
+	it('all-time with yearly buckets shows only per-year', () => {
+		// A multi-year span buckets yearly; the finer sub-periods are below the bucket and
+		// dropped, leaving just per year.
+		const YEAR = 365 * DAY;
+		const series: SpendSeriesRow[] = [0, 1, 2].map((i) => ({
+			bucket: i * YEAR,
+			grp: 'agent_loop',
+			cost: 100
+		}));
+		const out = buildSpendAverages({
+			total: 300,
+			firstTs: 0,
+			now: 3 * YEAR,
+			series,
+			bucketMs: YEAR,
+			window: 'all'
+		});
+		expect(out.stats.map((s) => s.label)).toEqual(['per year']);
+		const yr = out.stats.find((s) => s.label === 'per year')!;
+		expect(yr.n).toBe(3);
+		expect(yr.avg).toBeCloseTo(100, 6);
+	});
 });
