@@ -201,6 +201,8 @@ export interface LlmSchedulerSnapshot {
     probeInFlight: boolean;
     /** Epoch ms of the next admissible probe; 0 when healthy/immediate. */
     nextProbeAt: number;
+    /** Current capped-backoff probe delay (ms); reset to base on recovery (§4.1). */
+    probeDelayMs: number;
     lastFailure: { ts: number; status?: number; class: LlmErrorClass } | null;
     waiters: number;
   }>;
@@ -554,6 +556,10 @@ export class LlmScheduler {
         health.state = "healthy";
         health.unhealthySince = 0;
         health.nextProbeAt = 0;
+        // Reset the capped backoff to base on recovery (spec §4.1) so the next
+        // unhealthy episode starts aggressive again rather than carrying over a
+        // grown delay from the prior outage.
+        health.probeDelayMs = this.probeBackoffBaseMs;
         this.logger?.info("llm_model_recovered", {
           model: modelKey,
           outageMs,
@@ -796,6 +802,7 @@ export class LlmScheduler {
         consecutiveFailures: health.consecutiveFailures,
         probeInFlight: health.probeInFlight,
         nextProbeAt: health.state === "unhealthy" ? health.nextProbeAt : 0,
+        probeDelayMs: health.probeDelayMs,
         lastFailure: health.lastFailure ?? null,
         waiters: this.countModelWaiters(health.key),
       })),

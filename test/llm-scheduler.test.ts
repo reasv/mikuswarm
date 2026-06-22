@@ -644,6 +644,41 @@ test("model health: capped-backoff probe cadence grows ×2 per failed probe and 
   near(delays[4]!, 100);
 });
 
+test("model health: recovery resets the probe backoff to base (MODEL-FALLBACK §4.1)", () => {
+  const scheduler = new LlmScheduler({
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 1000 },
+  });
+  const windowDelay = (): number => {
+    const t0 = Date.now();
+    scheduler.noteOutcome("default", MODEL_A, "environmental"); // !429 → feeds the streak/probe
+    const np = scheduler.snapshot().models.find((m) => m.key === MODEL_A)!.nextProbeAt;
+    return np - t0;
+  };
+  const near = (got: number, want: number) => assert.ok(Math.abs(got - want) <= 5, `delay ${got} ≈ ${want}`);
+
+  // First outage: grow the delay past base via failed probes.
+  near(windowDelay(), 20); // healthy → unhealthy: first window = base
+  near(windowDelay(), 40); // failed probe ×2
+  near(windowDelay(), 80); // failed probe ×2 — the delay is now well above base
+
+  // The model recovers (a clean outcome on the in-flight probe).
+  scheduler.noteOutcome("default", MODEL_A, undefined);
+  assert.equal(scheduler.modelHealth(MODEL_A), "healthy", "clean outcome recovers the model");
+
+  // The reset happens AT recovery, observable in the window before any next
+  // transition: probeDelayMs is back at base (20), not the grown 80. This is the
+  // assertion that actually guards the recovery-branch reset — the next-outage
+  // path resets to base unconditionally and would mask a missing reset here.
+  assert.equal(
+    scheduler.snapshot().models.find((m) => m.key === MODEL_A)!.probeDelayMs,
+    20,
+    "probeDelayMs is reset to base AT recovery, not carried over from the prior outage",
+  );
+
+  // A LATER outage must also start its first probe window back at the base delay.
+  near(windowDelay(), 20);
+});
+
 test("model health: a per-model probe-backoff-cap override tightens the ceiling (MODEL-FALLBACK §4.1)", async () => {
   const scheduler = new LlmScheduler({
     health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 100_000 },

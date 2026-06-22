@@ -435,10 +435,13 @@ export class AgentSessionFactory {
     // raw inputs (trigger attachments / resume snapshot imageBlocks) because this
     // runs BEFORE buildContext — a SAFE over-approximation (any raw image ⇒
     // require multimodal for the whole session). The head is never dropped, so the
-    // enforcement ceiling is still resolved ONCE over the surviving chain; it can
-    // only be EQUAL OR LARGER than the full-chain `resolveSessionContextCeiling`
-    // (which has no image info), so both stay ≤ every serving member's window — the
-    // "ceiling resolved once" invariant holds (see that method's comment below).
+    // enforcement ceiling (`buildModelFallback`'s `operativeContextWindow`, used at
+    // `contextCeiling` below) is still resolved ONCE over the capability-SURVIVING
+    // chain; it can only be EQUAL OR LARGER than the FULL-chain min computed by
+    // `resolveSessionContextCeiling` (which has no per-session image info), so both
+    // stay ≤ every serving member's window — the "ceiling resolved once" invariant
+    // holds. The two ceilings differ deliberately; see `resolveSessionContextCeiling`
+    // below for the matching half of this cross-reference.
     const requiresMultimodal = rawInputsRequireMultimodal(session, opts);
     // Transparent composite stream fn (spec MODEL-FALLBACK §3): capability
     // pre-filter + min-over-chain ceiling fixed once at build, member chosen per
@@ -890,12 +893,15 @@ export class AgentSessionFactory {
     // minimum `context_window` across the chain. This is the FULL-chain min — the
     // conservative value used by the text-editor read budget and the console,
     // which have no per-session image-presence info. The create-path enforcement
-    // ceiling (`buildModelFallback`'s `operativeContextWindow`) is the min over the
+    // ceiling (`buildModelFallback`'s `operativeContextWindow`, computed in `create`
+    // above where `requiresMultimodal` is known) is instead the min over the
     // capability-SURVIVING chain: for an image-bearing session a text-only member
     // is dropped from selection, so that ceiling can only be EQUAL OR LARGER than
-    // this one (never smaller). Both are resolved once and both stay ≤ the
-    // `context_window` of every member that can actually serve, so neither can
-    // overflow a serving model — the "ceiling resolved once" invariant holds.
+    // this one (never smaller). The two ceilings differ deliberately; see the
+    // `requiresMultimodal` comment in `create` above for the matching half of this
+    // cross-reference. Both are resolved once and both stay ≤ the `context_window`
+    // of every member that can actually serve, so neither can overflow a serving
+    // model — the "ceiling resolved once" invariant holds.
     const chain = resolveModelChain(modelKey, this.options.config.models);
     let minWindow = contextWindow;
     for (const entry of chain) {

@@ -142,9 +142,17 @@ export function buildModelFallback(
     const w = entry.config.context_window;
     if (typeof w === "number") minWindow = Math.min(minWindow, w);
   }
-  // Fall back to the head's window if none declared one (defensive; the agent
-  // path requires context_window so this is the non-agent convenience case).
-  if (!Number.isFinite(minWindow)) minWindow = head.config.context_window ?? 0;
+  // No member declares a context_window → a clear error rather than a silent 0
+  // ceiling (which would later mis-judge every request as over the limit). This
+  // mirrors the agent path's `resolveSessionContextCeiling` / `createModelFromConfig`
+  // throw; app-wiring validation requires the window for session-resolved models,
+  // so this is a defensive backstop never reached in normal operation.
+  if (!Number.isFinite(minWindow)) {
+    throw new Error(
+      `buildModelFallback: no chain member declares a context_window ` +
+        `(head "${head.logicalId}"); it is required to resolve the operative ceiling`,
+    );
+  }
   const operativeContextWindow =
     options.contextOverride !== undefined
       ? Math.min(minWindow, options.contextOverride)
@@ -310,7 +318,17 @@ export function chooseChainMember(
   };
   if (viable(head)) return { index: 0, reason: "primary" };
   // Head unhealthy with an open probe window → this attempt is the canary (§4).
-  if (!tried?.has(head.logicalId) && headState === "unhealthy" && scheduler?.isProbeDue(head.healthKey)) {
+  // Gated on budget: an over-budget head must not be canaried — a successful probe
+  // can't lead to use while over budget (`viable()` requires in-budget), so the
+  // probe would be wasted spend on a model deliberately shut off for cost. No
+  // stranding: `nextProbeAt` only advances when a probe fires, so the head becomes
+  // probe-due again as soon as the budget window resets and recovers then.
+  if (
+    !tried?.has(head.logicalId) &&
+    headState === "unhealthy" &&
+    scheduler?.isProbeDue(head.healthKey) &&
+    (!deps.isModelAvailable || deps.isModelAvailable(head.logicalId))
+  ) {
     return { index: 0, reason: "canary" };
   }
   for (let i = 0; i < members.length; i++) {

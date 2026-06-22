@@ -155,6 +155,66 @@ test("head unhealthy AND probe-due → canary (the head serves the probe)", asyn
   assert.deepEqual(resolved, ["X"]);
 });
 
+test("head unhealthy + probe-due but OVER BUDGET → NOT canaried, falls to a viable Y", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", HEAD_KEY, "environmental"); // → unhealthy, window ~1ms out
+  await new Promise((r) => setTimeout(r, 10)); // let the probe window open
+  assert.equal(scheduler.isProbeDue(HEAD_KEY), true);
+  const calls: string[] = [];
+  const resolved: string[] = [];
+  const fb = buildModelFallback([HEAD, Y], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    scheduler,
+    isModelAvailable: (id) => id !== "X", // X over budget — a probe can't lead to use
+    onResolve: (id) => resolved.push(id),
+  });
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-Y"], "an over-budget probe-due head is not canaried — Y serves");
+  assert.deepEqual(resolved, ["Y"]);
+});
+
+test("head unhealthy + probe-due + over budget, no viable fallback → all-unhealthy (still no wasted probe)", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", HEAD_KEY, "environmental");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(scheduler.isProbeDue(HEAD_KEY), true);
+  const calls: string[] = [];
+  const resolved: string[] = [];
+  const fb = buildModelFallback([HEAD, Y], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    scheduler,
+    isModelAvailable: () => false, // whole chain over budget
+    onResolve: (id) => resolved.push(id),
+  });
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-X"], "routes to head as all-unhealthy, not as a budget-blocked canary");
+  assert.deepEqual(resolved, ["X"]);
+});
+
+test("head unhealthy + probe-due AND in budget → still canaried", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", HEAD_KEY, "environmental");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(scheduler.isProbeDue(HEAD_KEY), true);
+  const calls: string[] = [];
+  const resolved: string[] = [];
+  const fb = buildModelFallback([HEAD, Y], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    scheduler,
+    isModelAvailable: () => true, // head in budget — the probe can lead to use
+    onResolve: (id) => resolved.push(id),
+  });
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-X"], "an in-budget probe-due head is still canaried");
+  assert.deepEqual(resolved, ["X"]);
+});
+
 test("head healthy but over budget → budget-fallback to Y", async () => {
   const calls: string[] = [];
   const resolved: string[] = [];
@@ -200,6 +260,21 @@ test("operative context window is the min over the surviving chain (min'd with o
     contextOverride: 16_000,
   });
   assert.equal(withOverride.operativeContextWindow, 16_000);
+});
+
+test("buildModelFallback throws when NO chain member declares a context_window", () => {
+  const noWindowHead: ModelChainEntry = {
+    logicalId: "X",
+    config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: undefined }),
+  };
+  const noWindowY: ModelChainEntry = {
+    logicalId: "Y",
+    config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: undefined }),
+  };
+  assert.throws(
+    () => buildModelFallback([noWindowHead, noWindowY], { consumer: "test", makeBase: recordingBase([]), makeModel }),
+    /no chain member declares a context_window/,
+  );
 });
 
 test("capability pre-filter drops an incapable member but never the head", async () => {
