@@ -76,6 +76,137 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
   });
 });
 
+// #2: the on-demand caption tool lanes call caption() directly with no budget gate
+// of their own; runFetchWithFallback never hard-refuses on all-over-budget. The
+// centralized pre-check inside caption() must refuse BEFORE any paid work when no
+// chain member is in budget, and must NOT make a fetch.
+test("InferenceClient: all members over budget → caption() throws and makes NO fetch (#2)", async () => {
+  await withImageFile(async (filePath) => {
+    const server = await startCaptionServer("should-not-be-called");
+    try {
+      const chain: ModelChainEntry[] = [
+        { logicalId: "caption-head", config: { id: "caption-head", endpoint: server.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+        { logicalId: "caption-fallback", config: { id: "caption-fallback", endpoint: server.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+      ];
+      const client = new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: "describe",
+        maxChars: 100,
+        maxTokens: 256,
+        // Every member over budget.
+        isModelAvailable: () => false,
+      });
+      await assert.rejects(
+        () => client.caption({ filePath, mimeType: "image/png", filename: "test.png" }),
+        /over its period budget/,
+        "caption() refuses when no chain member is in budget",
+      );
+      assert.equal(server.hits(), 0, "no paid caption fetch was made");
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+// #2: a chain with AT LEAST ONE in-budget member still proceeds (the refusal only
+// fires on whole-chain exhaustion — a model-scoped cap on the head falls over).
+test("InferenceClient: at least one in-budget member → caption() proceeds (#2)", async () => {
+  await withImageFile(async (filePath) => {
+    const head = await startCaptionServer("from-head");
+    const fb = await startCaptionServer("from-fallback");
+    try {
+      const chain: ModelChainEntry[] = [
+        { logicalId: "caption-head", config: { id: "caption-head", endpoint: head.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+        { logicalId: "caption-fallback", config: { id: "caption-fallback", endpoint: fb.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+      ];
+      const client = new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: "describe",
+        maxChars: 100,
+        maxTokens: 256,
+        // Head over budget, fallback in budget → the pre-check passes; selection
+        // (no scheduler → head healthy + over-budget) drops the head, serves fb.
+        isModelAvailable: (id) => id === "caption-fallback",
+      });
+      const result = await client.caption({ filePath, mimeType: "image/png", filename: "test.png" });
+      assert.equal(result.caption, "from-fallback", "the in-budget fallback served the caption");
+      assert.equal(head.hits(), 0, "the over-budget head is skipped");
+      assert.equal(fb.hits(), 1, "the in-budget fallback served exactly once");
+    } finally {
+      await head.close();
+      await fb.close();
+    }
+  });
+});
+
+/** An OpenAI-style /chat/completions server returning an EMPTY caption body. */
+async function startEmptyCaptionServer(): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c as Buffer));
+    req.on("end", () => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      // 200 OK but empty content → describeMedia throws the status-less
+      // "Caption inference returned empty response" sentinel.
+      res.end(JSON.stringify({ model: "caption-model", choices: [{ message: { content: "" } }], usage: null }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no address");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    hits: () => hits,
+    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+  };
+}
+
+// #7: a status-less "empty response" caption failure is content-class, not
+// environmental — it must NOT feed the model-health streak (otherwise 3-in-a-row
+// would trip the breaker and mis-route ALL captioning to a fallback, attributing a
+// content/transient issue to an endpoint outage).
+test("InferenceClient: empty-response failure does NOT mark the model unhealthy (#7)", async () => {
+  await withImageFile(async (filePath) => {
+    const server = await startEmptyCaptionServer();
+    try {
+      // unhealthyThreshold: 1 → a single ENVIRONMENTAL failure would flip unhealthy.
+      const scheduler = new LlmScheduler({
+        health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
+      });
+      const healthKey = `${server.url}::caption-model`;
+      const chain: ModelChainEntry[] = [
+        { logicalId: "caption-model", config: { id: "caption-model", endpoint: server.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+      ];
+      const client = new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: "describe",
+        maxChars: 100,
+        maxTokens: 256,
+        scheduler,
+      });
+      await assert.rejects(
+        () => client.caption({ filePath, mimeType: "image/png", filename: "test.png" }),
+        /empty response/,
+        "empty-response failure rethrows (content-class, no fallover)",
+      );
+      assert.equal(server.hits(), 1, "the single member is hit exactly once (no fallover)");
+      assert.equal(
+        scheduler.modelHealth(healthKey),
+        "healthy",
+        "an empty-response failure did NOT feed the health streak",
+      );
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 /** An OpenAI-style /chat/completions loopback server returning a fixed caption. */
 async function startCaptionServer(
   caption: string,

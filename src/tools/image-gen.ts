@@ -368,7 +368,12 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       }
       let result: GeminiResponse;
       let billed: FetchChainMember | undefined;
-      let lastHttpError: ToolTextResult | undefined;
+      // Capture the member alongside its HTTP error so provenance stays exact
+      // (review issue #9): on whole-chain failure where the FINAL attempt threw a
+      // non-HTTP error, the surfaced `lastHttpError` belongs to an EARLIER member —
+      // folding the member's logical id into the message prevents misattributing
+      // that status to the model that actually failed last.
+      let lastHttpError: { member: string; result: ToolTextResult } | undefined;
       try {
         result = await runFetchWithFallback<GeminiResponse>(
           chain,
@@ -385,7 +390,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
             const url = `${member.config.endpoint.replace(/\/+$/, "")}/v1beta/models/${member.config.id}:generateContent`;
             const r = await postGenerate({ url, apiKey: member.config.api_key, body, dispatcher, timeoutMs, signal: admitCtrl.signal });
             if ("httpError" in r) {
-              lastHttpError = r.httpError;
+              lastHttpError = { member: member.logicalId, result: r.httpError };
               // A 400/413/422 is THIS request's content (deterministic on replay)
               // and never falls over (§9); other statuses are environmental.
               const kind = r.status === 400 || r.status === 413 || r.status === 422 ? "content" : "environmental";
@@ -403,7 +408,16 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
         // generation fetch, so we stop billing the run rather than waiting out
         // `timeout_ms`. `runFetchWithFallback` already skipped the health feed +
         // fall over for the neutral AbortError (spec MODEL-FALLBACK §9).
-        if (lastHttpError) return lastHttpError;
+        // Fold the failing member's logical id into the HTTP error so provenance
+        // is unambiguous (#9): when the LAST attempt threw a non-HTTP error,
+        // `lastHttpError` names an EARLIER member, so we must say which one rather
+        // than letting the bare status read as the final model's failure.
+        if (lastHttpError) {
+          return textError(
+            `Image generation failed (model ${tierLabel}, member ${lastHttpError.member}): ` +
+              `${lastHttpError.result.details.error}`,
+          );
+        }
         return textError(`Image generation request failed (model ${tierLabel}): ${errMessage(error)}`);
       } finally {
         clearTimeout(admitTimer);
@@ -859,23 +873,6 @@ async function writeOutputImage(
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-function normalizeBaseUrl(value: string | undefined): string {
-  const trimmed = (value ?? "").trim();
-  if (!trimmed) {
-    throw new Error("image_gen.base_url must be configured.");
-  }
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error(`image_gen.base_url must be a valid URL, got "${trimmed}".`);
-  }
-  if (!/^https?:$/.test(url.protocol)) {
-    throw new Error("image_gen.base_url must use http or https.");
-  }
-  return trimmed.replace(/\/+$/, "");
-}
 
 function normalizeSubdir(value: string | undefined): string {
   const raw = (value ?? DEFAULT_OUTPUT_SUBDIR).trim();

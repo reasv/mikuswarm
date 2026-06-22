@@ -13,10 +13,19 @@ export interface RemoteProviderOptions {
    * Resolved embedding model chain (spec MODEL-FALLBACK §2.3/§6): the referenced
    * `[models.*]` head plus any `fallback` members (connection / rate-limit group /
    * cost.input = USD per 1M input tokens, all on each block). The head's wire id
-   * is the cache/index key. A fallback member MUST be vector-compatible (same `dim`
-   * AND embedding space) — the dim check rejects a wrong width; a same-dim
-   * different-space model would corrupt the cache, so point fallback at the same
-   * model on a different endpoint.
+   * is the cache/index key.
+   *
+   * OPERATOR CONTRACT — fallback members MUST be vector-compatible: same `dim`
+   * AND the SAME embedding space (i.e. the same model, e.g. served on a different
+   * endpoint). Only the `dim` (vector width) is ENFORCED — `parseEmbeddings`
+   * rejects a wrong width (see the dim guard there). The embedding SPACE is NOT
+   * and CANNOT be enforced from a vector: a same-dim but different-space fallback
+   * passes the dim guard, mixes incompatible vectors into the one index keyed on
+   * the head's id, and SILENTLY DEGRADES retrieval (no error, just worse hits).
+   * Same-`id`-only hardening was rejected because one model legitimately carries
+   * different ids across backends, which would break valid cross-backend failover.
+   * So point a fallback at the SAME model on a different endpoint — never at a
+   * different model that merely happens to share the dimension.
    */
   chain: ModelChainEntry[];
   dim: number;
@@ -228,6 +237,10 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
       if (!Array.isArray(d.embedding)) {
         throw new Error(`embeddings endpoint returned a malformed embedding element at index ${d.index} (${modelId})`);
       }
+      // Dim guard — the ONLY enforced vector-compatibility check across fallback
+      // members (see the RemoteProviderOptions.chain operator contract). It catches
+      // a wrong vector WIDTH; it CANNOT catch a same-dim/different-space member,
+      // which silently degrades retrieval. Width mismatch is fatal, not a fallover.
       if (d.embedding.length !== this.dim) {
         throw new Error(`embedding dim ${d.embedding.length} != configured ${this.dim} for ${modelId}`);
       }

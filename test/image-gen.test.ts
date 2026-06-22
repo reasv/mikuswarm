@@ -726,6 +726,39 @@ function twoMemberProChains(headUrl: string, fbUrl: string): ImageGenToolContext
   };
 }
 
+// #9: on whole-chain failure where an EARLIER member returned an HTTP error and
+// the FINAL attempt threw a non-HTTP error, the surfaced message must name the
+// member whose HTTP status it reports (the earlier head), not misattribute it to
+// the model that failed last.
+test("image_generate 2-member chain: earlier HTTP error + last non-HTTP throw → message names the HTTP member (#9)", async () => {
+  await withWorkspace(async (workspace) => {
+    // Head returns HTTP 500 (environmental → falls over, recording lastHttpError
+    // for `imagegen-pro`). The fallback points at a CLOSED port so its postGenerate
+    // throws a non-HTTP network error as the LAST attempt.
+    const head = await startGeminiServer(() => ({ status: 500, json: { error: "head exploded" } }));
+    const dead = await startGeminiServer(() => ({ json: {} }));
+    const deadUrl = dead.url;
+    await dead.close(); // free the port so the fallback fetch is refused (non-HTTP throw)
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: head.url, fetchClient: stub.client });
+      ctx.chains = twoMemberProChains(head.url, deadUrl);
+      const tool = createImageGenTool(ctx);
+      const result: any = await tool.execute("provenance", { prompt: "a yellow square" });
+
+      assert.equal(result.content[0].type, "text");
+      // Provenance is unambiguous: the message names the member that produced the
+      // HTTP error (the head), not the last (network-failing) member.
+      assert.match(result.content[0].text, /member imagegen-pro\b/);
+      assert.match(result.content[0].text, /HTTP 500/);
+      assert.ok(result.details.error);
+    } finally {
+      await head.close();
+      await stub.cleanup();
+    }
+  });
+});
+
 test("image_generate 2-member chain: head over budget → the fallback member serves (#14)", async () => {
   await withWorkspace(async (workspace) => {
     const b64 = await smallPngBase64();

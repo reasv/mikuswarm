@@ -126,6 +126,24 @@ export class InferenceClient {
   async caption(request: CaptionRequest): Promise<CaptionResponse> {
     if (this.stopped) throw new Error("InferenceClient is stopped");
 
+    // Period-budget pre-check (spec MODEL-FALLBACK §7, review issue #2). Centralizes
+    // the "caller refuses when ALL members over budget" refusal for EVERY caption
+    // caller — the worker pool (which has its own pause gate) and the three on-demand
+    // tool lanes (x_search captionOneImage, media, danbooru) which call caption()
+    // directly with no budget gate of their own. runFetchWithFallback deprioritizes
+    // over-budget members but never hard-refuses (it routes to the head with reason
+    // "all-unhealthy" and still bills), so without this an all-over-budget chain
+    // would execute a paid caption. Refuse BEFORE any paid work when no chain member
+    // is available; mirrors the chain.some(...) tool-gate pattern in image-gen /
+    // x_search. When isModelAvailable is absent (not wired), behavior is unchanged.
+    const isAvailable = this.options.isModelAvailable;
+    if (isAvailable && !this.options.chain.some((m) => isAvailable(m.logicalId))) {
+      throw new Error(
+        `caption:${this.options.modality} refused: every model in the caption fallback ` +
+          `chain (${this.options.chain.map((m) => m.logicalId).join(", ")}) is over its period budget`,
+      );
+    }
+
     let processed: ProcessedMedia | undefined;
     let data: Buffer;
     let mimeType = request.mimeType;
@@ -209,6 +227,17 @@ export class InferenceClient {
           if (this.stopController.signal.aborted) throw err;
           const message = err instanceof Error ? err.message : String(err);
           const status = extractStatus(message.toLowerCase());
+          // A status-less "empty response" (HTTP 200 but empty body, thrown by
+          // describeMedia) is NOT an endpoint outage — it is a deterministic-ish
+          // content result for that input. Classifying it `content` keeps it out
+          // of the model-health streak (3 environmental-in-a-row would otherwise
+          // trip the breaker and mis-route ALL captioning to the fallback) and,
+          // per the §3 taxonomy, rethrows it without falling over to another
+          // member (review issue #7). Only this exact sentinel — genuine
+          // 5xx/timeout/reset still fall through to environmental below.
+          if (status === undefined && message.includes("Caption inference returned empty response")) {
+            return { ok: false as const, kind: "content", status, error: err };
+          }
           const kind = status === 400 || status === 413 || status === 422 ? "content" : "environmental";
           return { ok: false as const, kind, status, error: err };
         }
