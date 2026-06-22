@@ -13,6 +13,7 @@
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
+	import RoomPicker from '$lib/components/RoomPicker.svelte';
 
 	// Message-only history backfetch (ARCHITECTURE.md §7d): operator-triggered jobs
 	// that page a room's history BELOW its context floor into the SEARCH-ONLY region
@@ -139,12 +140,8 @@
 			</p>
 			<div class="flex flex-wrap items-end gap-2 text-xs">
 				<label class="flex flex-col gap-1">
-					<span class="text-muted-foreground">base timeline key</span>
-					<input
-						bind:value={timelineKey}
-						placeholder="matrix:acct:room:!abc:server"
-						class="w-80 rounded border bg-background px-2 py-1 font-mono"
-					/>
+					<span class="text-muted-foreground">base room</span>
+					<RoomPicker bind:value={timelineKey} placeholder="select or type a room" />
 				</label>
 				<label class="flex flex-col gap-1">
 					<span class="text-muted-foreground">target</span>
