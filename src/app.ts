@@ -699,16 +699,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
     budget: budgetHooks,
-    // Representative LOGICAL id for the pool's coarse claim gate (spec §8e): the
-    // captioning model REF (spec MODEL-FALLBACK §2.3 unified registry), what a
-    // `[[limits]].models` selector matches; the per-attempt ledger records the
-    // exact billed member.
-    captionModelId:
+    // Representative fallback chain (LOGICAL ids) for the pool's coarse claim gate
+    // (spec §8e / MODEL-FALLBACK §6): the captioning model REF's chain (spec §2.3
+    // unified registry). The gate parks only when EVERY member is over budget, so a
+    // head-only cap still lets the per-attempt resolver serve from a fallback; the
+    // per-attempt ledger records the exact billed member.
+    captionModelIds: resolveModelChain(
       config.captioning?.model ??
-      config.captioning?.image?.model ??
-      config.captioning?.video?.model ??
-      config.captioning?.audio?.model ??
-      "default",
+        config.captioning?.image?.model ??
+        config.captioning?.video?.model ??
+        config.captioning?.audio?.model ??
+        "default",
+      config.models,
+    ).map((m) => m.logicalId),
     logger,
   });
 
@@ -1087,7 +1090,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             modelId = undefined;
           }
           if (modelId === undefined) continue; // unresolvable → don't block on it
-          out.push({ class: "agent_loop", sessionType, modelId });
+          // Logical id (chain-head block name) so a `models=["default"]` rule that
+          // scopes on the logical dimension parks this pool too — without it the
+          // descriptor carries only the upstream wire id and the rule silently
+          // fails to match (review #4; session types bind model="default" ≠ wire id).
+          let logicalModelId: string | undefined;
+          try {
+            logicalModelId = factory.resolveLogicalModelId(sessionType);
+          } catch {
+            logicalModelId = undefined;
+          }
+          out.push({ class: "agent_loop", sessionType, modelId, logicalModelId });
         }
         return out;
       },
@@ -3986,16 +3999,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       } catch {
         admissionModelId = undefined;
       }
+      // Chain-aware admission (spec MODEL-FALLBACK §6.1): gate on the WHOLE fallback
+      // chain (logical ids), so a model-scoped cap on the primary doesn't refuse a
+      // session an in-budget fallback could serve. Resolution is isolated like the
+      // model-id resolution above — a throw leaves it undefined → head-only gate.
+      let admissionChain: string[] | undefined;
+      try {
+        admissionChain = factory.resolveModelChainLogicalIds(session.sessionType);
+      } catch {
+        admissionChain = undefined;
+      }
       // Exception-isolated, fail-open admission decision (review #7): a throw inside
       // the engine call would unwind to the dispatch `catch` (releaseClaimFor +
       // rethrow, but NOT `triggerCoordinator.complete`), leaking the per-timeline
       // slot. `safeCheckAdmission` returns undefined on a throw → we fall through to
       // a normal launch (admit), so a budget-engine bug never stops the bot replying.
       const admission = admissionModelId
-        ? safeCheckAdmission(budgetHooks.engine, session.sessionType, admissionModelId, logger, {
-            sessionId: session.id,
-            timelineKey: session.timelineKey,
-          })
+        ? safeCheckAdmission(
+            budgetHooks.engine,
+            session.sessionType,
+            admissionModelId,
+            logger,
+            { sessionId: session.id, timelineKey: session.timelineKey },
+            admissionChain,
+          )
         : undefined;
       if (admission && !admission.allowed) {
         const gate = admission.dependency ? "dependency" : "trigger_admission";
@@ -4699,7 +4726,7 @@ export function decideRetentionSweep(params: {
 }
 
 /** The slice of {@link BudgetEngine} the budget admission/defer gates consume. */
-type AdmissionEngine = Pick<BudgetEngine, "checkAdmission" | "accurateResetsAt">;
+type AdmissionEngine = Pick<BudgetEngine, "checkAdmission" | "checkAdmissionChain" | "accurateResetsAt">;
 
 /**
  * Exception-isolated session-admission check (spec USAGE-COST-LIMITS, review #7).
@@ -4718,9 +4745,18 @@ export function safeCheckAdmission(
   modelId: string,
   logger: Logger,
   context: Record<string, unknown> = {},
+  /**
+   * Effective fallback chain as LOGICAL ids, head-first (spec MODEL-FALLBACK §6.1).
+   * When supplied the gate admits if ANY chain member is in-budget; omitted ⇒ the
+   * head-only `checkAdmission`. Resolution is isolated by the caller (a throw there
+   * leaves it undefined → head-only, not a leak).
+   */
+  chainLogicalIds?: string[],
 ): AdmissionResult | undefined {
   try {
-    return engine.checkAdmission(sessionType, modelId);
+    return chainLogicalIds
+      ? engine.checkAdmissionChain(sessionType, modelId, chainLogicalIds)
+      : engine.checkAdmission(sessionType, modelId);
   } catch (error) {
     logger.warn("usage_admission_check_threw", {
       ...context,

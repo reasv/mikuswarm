@@ -12,7 +12,7 @@ import { EmbedWorkerPool } from "./embed-worker.js";
 import { VectorStore } from "./vector-store.js";
 import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding/index.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
-import { makeRateLimitedClaimGate, type BudgetHooks } from "../budget/index.js";
+import { makeChainClaimGate, type BudgetHooks } from "../budget/index.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
@@ -191,10 +191,21 @@ export async function createRetrievalSubsystem(
       // embedding work runs before startup completes.
       shouldPause:
         remoteActive && config.embedding.remote
-          ? makeRateLimitedClaimGate({
+          ? makeChainClaimGate({
               engine: () => opts.budget?.engine,
-              // Logical id (block name) — the dimension budget rules match (spec MODEL-FALLBACK §2.2).
-              descriptors: () => [{ class: "embedding", modelId: config.embedding.remote!.model }],
+              // Chain-aware (spec MODEL-FALLBACK §6): one descriptor per chain member
+              // (LOGICAL ids — the dimension budget rules match, §2.2), head-first.
+              // The gate parks only when EVERY member is over budget; a head-only cap
+              // lets the per-attempt resolver fall to the next in-budget member. Falls
+              // back to the bare remote model ref if no chain was resolved.
+              descriptors: () => {
+                const chain = opts.embeddingChain;
+                const ids =
+                  chain && chain.length > 0
+                    ? chain.map((m) => m.logicalId)
+                    : [config.embedding.remote!.model];
+                return ids.map((modelId) => ({ class: "embedding", modelId }));
+              },
             })
           : undefined,
       logger,

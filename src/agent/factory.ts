@@ -358,6 +358,18 @@ export class AgentSessionFactory {
   }
 
   /**
+   * Resolve a session type's effective fallback chain as LOGICAL ids (config block
+   * names), head first (spec MODEL-FALLBACK §6.1). The launch-admission gate gates
+   * on the WHOLE chain — admit when ANY member is in-budget — rather than the bare
+   * head, so a model-scoped cap on the primary doesn't wrongly refuse a session for
+   * which an in-budget fallback exists. Mirrors `create`'s `resolveModelChain` call.
+   */
+  resolveModelChainLogicalIds(sessionType: string): string[] {
+    const modelKey = this.resolveSessionType(sessionType)?.model ?? "default";
+    return resolveModelChain(modelKey, this.options.config.models).map((m) => m.logicalId);
+  }
+
+  /**
    * Create an Agent for the given session.
    *
    * Loads workspace content from disk (workspace files, tail instructions, skills)

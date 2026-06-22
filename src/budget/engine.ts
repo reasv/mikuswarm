@@ -382,15 +382,48 @@ export class BudgetEngine {
    * Session-admission check combining the session's own covering rules with the
    * structural dependency cascade (§2.1): a dependent session also requires every
    * class it depends on to be available. Used at the triggered/proactive gates.
+   *
+   * Gates on the session's HEAD logical id only. Prefer {@link checkAdmissionChain}
+   * at the launch gate so a model-scoped cap on the primary doesn't refuse a session
+   * for which an in-budget fallback exists (spec MODEL-FALLBACK §6.1).
    */
   checkAdmission(sessionType: string, modelId: string): AdmissionResult {
-    const own = this.check({
-      class: "agent_loop",
-      sessionType,
-      modelId,
-      logicalModelId: this.options.resolveLogicalModelId?.(sessionType),
-    });
-    if (!own.allowed) {
+    const head = this.options.resolveLogicalModelId?.(sessionType);
+    return this.checkAdmissionChain(sessionType, modelId, head ? [head] : []);
+  }
+
+  /**
+   * Chain-aware session-admission check (spec MODEL-FALLBACK §6.1). The session's
+   * OWN spend is admissible iff ANY chain member's covering rules have headroom —
+   * the per-attempt resolver would serve the first in-budget member, so refusing on
+   * the primary's exhausted budget would wrongly drop a session a fallback could
+   * serve. A WILDCARD (no `models` selector) rule at cap covers every member, so it
+   * still refuses (correct: global exhaustion has no cheaper escape). The structural
+   * dependency cascade (§2.1) is unchanged — it gates on each dependency's head.
+   *
+   * `chainLogicalIds` is head-first; an empty list falls back to gating on the
+   * descriptor's upstream id (the no-virtual-model case). The reported `ownBlocking`
+   * /`primary` come from the HEAD's check (the canonical refusal context) when the
+   * whole chain is over budget.
+   */
+  checkAdmissionChain(
+    sessionType: string,
+    modelId: string,
+    chainLogicalIds: string[],
+  ): AdmissionResult {
+    const logicalIds = chainLogicalIds.length > 0 ? chainLogicalIds : [undefined];
+    let headCheck: CheckResult | undefined;
+    let admitted = false;
+    for (const logicalModelId of logicalIds) {
+      const result = this.check({ class: "agent_loop", sessionType, modelId, logicalModelId });
+      if (headCheck === undefined) headCheck = result;
+      if (result.allowed) {
+        admitted = true;
+        break;
+      }
+    }
+    if (!admitted) {
+      const own = headCheck!;
       return { allowed: false, ownBlocking: own.blockingRules, primary: own.primary };
     }
     const deps = this.options.dependencies[sessionType] ?? [];
@@ -559,5 +592,47 @@ export function makeRateLimitedClaimGate(opts: {
       return true;
     }
     return false;
+  };
+}
+
+/**
+ * Build a CHAIN-AWARE worker-pool claim gate (spec MODEL-FALLBACK §6): a
+ * `() => boolean` that parks the pool ONLY when EVERY chain member is over budget —
+ * the per-attempt resolver would serve the first in-budget member, so a head-only
+ * cap must NOT park the pool. This is the worker-pool analogue of the image-gen/
+ * x_search `chain.some((m) => !checkBudget(m))` tool gates, and the inverse of
+ * {@link makeRateLimitedClaimGate} (which parks if ANY descriptor is over budget —
+ * correct for distinct session types, wrong for fallback chain members).
+ *
+ * On pause it emits ONE rate-limited (≤1/min) `usage_limit_blocked` log naming the
+ * rules blocking the HEAD member (the canonical refusal context for the chain).
+ * `descriptors` is resolved lazily each call (head-first); an empty result never
+ * parks. The `engine` may be a concrete engine or a late-bound source (the embed
+ * pool, wired before the engine; while undefined the gate never parks).
+ */
+export function makeChainClaimGate(opts: {
+  engine: BudgetEngine | (() => BudgetEngine | undefined);
+  /** The chain members' prospective spends, head-first. */
+  descriptors: () => SpendDescriptor[];
+  now?: () => number;
+}): () => boolean {
+  const now = opts.now ?? Date.now;
+  const resolveEngine =
+    typeof opts.engine === "function" ? opts.engine : () => opts.engine as BudgetEngine;
+  let lastPauseLog = 0;
+  return () => {
+    const engine = resolveEngine();
+    if (!engine) return false; // engine not yet wired → never park, never log
+    const chain = opts.descriptors();
+    if (chain.length === 0) return false; // no chain → never park
+    const available = chain.some((descriptor) => engine.check(descriptor).allowed);
+    if (available) return false;
+    const head = chain[0]!;
+    const t = now();
+    if (t - lastPauseLog > 60_000) {
+      lastPauseLog = t;
+      engine.logBlocked("worker_claim", engine.check(head).blockingRules, head);
+    }
+    return true;
   };
 }
