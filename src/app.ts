@@ -205,6 +205,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // §6.1). Extracted to a pure function so it can be unit-tested directly
   // without booting the whole agent; the throw/message behavior is identical.
   validateContextTokenCeilings(config);
+  // Model fallback-chain fail-fast (spec MODEL-FALLBACK §2.1/§6.1). The agent
+  // path resolves a session type's chain LAZILY (per-session, in `factory.create`),
+  // so without this a dangling `fallback` reference on `[models.default]` or an
+  // `agent.session_types.*` model would only surface on the first live trigger —
+  // not at boot. Sweep the whole registry so EVERY `[models.*]` chain (incl.
+  // unreferenced ones) is validated here too. Pure `resolveModelChain` calls.
+  validateModelFallbackChains(config);
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
   // under the assembled-document cap — anything else is a config typo that
@@ -3942,6 +3949,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Seed the durable row's model at creation (resolveModelId mirrors the diary/
     // summarize workers) so the model is present from the outset; the per-request
     // write-back rewrites it with the actually-billed model.
+    //
+    // The seed is the UPSTREAM wire id (head's resolved `id`), not the spec §6.1
+    // "head's logical id". That is deliberate and correct: `agent_sessions` has no
+    // logical-id column, the per-attempt budget gate keys on LOGICAL ids via
+    // `resolveModelChainLogicalIds` (the chain-admission gate below), and the
+    // per-request `usage_events` ledger stamps the exact billed logical id (§7).
+    // The §6.1 "seed with the head's logical id" obligation is therefore discharged
+    // by the chain gate + per-request ledger; `agent_sessions.model_id` stays the
+    // upstream id as provisional provenance until the first request rewrites it.
     const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType));
     sessions.markRunning(session.id);
     // Attribute the claim added at accept time to this session and release it when
@@ -4868,6 +4884,29 @@ export function validateContextTokenCeilings(config: AppConfig): void {
           `exceeds context_window (${window}) of its model "${modelKey}"`,
       );
     }
+  }
+}
+
+/**
+ * Fail-fast validation of every model fallback chain (spec MODEL-FALLBACK
+ * §2.1 "cycles fail fast at app wiring" / §6.1). `resolveModelChain` throws on a
+ * `fallback` that names a non-existent `[models.*]` block; calling it eagerly at
+ * boot turns a dangling reference into a clear startup error instead of a
+ * first-trigger surprise (the agent path resolves session-type chains lazily).
+ *
+ * Sweeping ALL `Object.keys(config.models)` (rather than only `default` +
+ * `agent.session_types.*` models) is the single cleanest implementation: it
+ * additionally validates the chains of models referenced only by the non-agent
+ * consumers AND of entirely unreferenced models (so a typo in any block's
+ * `fallback` is caught regardless of who points at it). A model with no
+ * `fallback` resolves to a single-member chain and is fine; only a DANGLING
+ * reference throws. Extracted (like {@link validateContextTokenCeilings}) so it
+ * can be unit-tested without booting the agent.
+ */
+export function validateModelFallbackChains(config: AppConfig): void {
+  for (const logicalId of Object.keys(config.models)) {
+    // Throws "model … fallback references unknown model …" on a dangling ref.
+    resolveModelChain(logicalId, config.models);
   }
 }
 

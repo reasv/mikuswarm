@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
-import { assertFollowupConfigValid } from "../src/app.ts";
+import { assertFollowupConfigValid, validateModelFallbackChains } from "../src/app.ts";
 
 // A complete, env-free config so loadConfig reaches structural + cross-field
 // validation without tripping the "missing env var" guard. The
@@ -928,6 +928,84 @@ inherits = "nope"
 `;
   await withConfigDir(toml, async (dir) => {
     await assert.rejects(() => loadConfig(dir, { env: false }), /inherits unknown model "nope"/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1 (+ folds #8, + the dangling-at-load half of #17): a dangling
+// `fallback` reference is NOT caught by loadConfig (schema/inheritance only
+// validate `inherits`; `fallback` names are resolved later by
+// `resolveModelChain`). Without an eager boot-time sweep the agent path resolves
+// session-type chains LAZILY, so the typo would only surface on the first live
+// trigger. `validateModelFallbackChains` sweeps the WHOLE registry at startup so
+// EVERY chain — referenced or not — is validated (the #8 fold).
+// ---------------------------------------------------------------------------
+
+test("config: dangling fallback on [models.default] is rejected at wiring (issue #1)", async () => {
+  const toml = `${BASE_CONFIG.replace(
+    "[models.default]\nid = \"test-model\"",
+    "[models.default]\nfallback = [\"typo\"]\nid = \"test-model\"",
+  )}`;
+  await withConfigDir(toml, async (dir) => {
+    // loadConfig accepts it (a `fallback` array of strings is schema-valid)…
+    const config = await loadConfig(dir, { env: false });
+    // …the wiring-time chain sweep rejects it with a naming error.
+    assert.throws(
+      () => validateModelFallbackChains(config),
+      /default.*fallback references unknown model "typo"/,
+      "a dangling fallback on the default model must fail-fast at wiring",
+    );
+  });
+});
+
+test("config: dangling fallback on a session-type model is rejected at wiring (issue #1)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.chat]
+inherits = "default"
+fallback = ["does-not-exist"]
+
+[agent.session_types.default]
+model = "chat"
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.throws(
+      () => validateModelFallbackChains(config),
+      /chat.*fallback references unknown model "does-not-exist"/,
+    );
+  });
+});
+
+test("config: dangling fallback on an UNREFERENCED model is rejected at wiring (issue #1 / #8)", async () => {
+  // `unused` is referenced by no session type / consumer — the whole-registry
+  // sweep is what catches its dangling chain (the #8 fold).
+  const toml = `${BASE_CONFIG}
+[models.unused]
+inherits = "default"
+fallback = ["ghost"]
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.throws(
+      () => validateModelFallbackChains(config),
+      /unused.*fallback references unknown model "ghost"/,
+    );
+  });
+});
+
+test("config: a valid fallback chain passes the wiring sweep (issue #1)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.cheap]
+inherits = "default"
+
+[models.premium]
+inherits = "default"
+fallback = ["cheap"]
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    // A real chain + the no-fallback models (default/cheap/premium) all resolve.
+    assert.doesNotThrow(() => validateModelFallbackChains(config));
   });
 });
 

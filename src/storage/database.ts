@@ -3488,8 +3488,11 @@ export class Storage {
       tool_name: input.toolName ?? null,
       model_id: input.modelId,
       // Logical id defaults to the upstream id when a consumer has no fallback /
-      // virtual model (spec MODEL-FALLBACK §2.2 — block name == wire id).
-      logical_model_id: input.logicalModelId ?? input.modelId,
+      // virtual model (spec MODEL-FALLBACK §2.2 — block name == wire id). `||`
+      // (not `??`) so an explicit empty string also falls back to `modelId`: a
+      // `''` logical id would mis-scope budget (§8e) and mis-group the ledger/
+      // console (§7), so it's never a valid stored value.
+      logical_model_id: input.logicalModelId || input.modelId,
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,

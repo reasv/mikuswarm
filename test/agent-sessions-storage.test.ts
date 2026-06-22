@@ -2159,3 +2159,34 @@ test("v22 -> v23 builds agent_sessions_fts and backfills existing rows", async (
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// --- Issue #10: logical_model_id empty-string footgun ---
+// `insertUsageEvent` must use `||` (not `??`) so an explicit empty-string
+// logicalModelId falls back to the upstream modelId. A stored `''` would
+// mis-scope budget (§8e) and mis-group the ledger/console (§7).
+test("insertUsageEvent: empty-string logicalModelId falls back to upstream modelId (issue #10)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Empty string: must NOT be stored as '' — falls back to model_id.
+    await storage.insertUsageEvent({ class: "agent_loop", modelId: "wire-model-a", logicalModelId: "", costUsd: 0.1 });
+    // Omitted (undefined): existing behavior — also falls back to model_id.
+    await storage.insertUsageEvent({ class: "agent_loop", modelId: "wire-model-b", costUsd: 0.2 });
+    // Explicit non-empty logical id: preserved verbatim.
+    await storage.insertUsageEvent({ class: "agent_loop", modelId: "wire-model-c", logicalModelId: "logical-c", costUsd: 0.3 });
+    await storage.waitForIdle();
+
+    const rows = storage.read((db) =>
+      db
+        .prepare(`select model_id, logical_model_id from usage_events order by model_id`)
+        .all() as Array<{ model_id: string; logical_model_id: string }>,
+    );
+    assert.deepEqual(rows, [
+      { model_id: "wire-model-a", logical_model_id: "wire-model-a" }, // '' → fell back
+      { model_id: "wire-model-b", logical_model_id: "wire-model-b" }, // undefined → fell back
+      { model_id: "wire-model-c", logical_model_id: "logical-c" }, // explicit preserved
+    ]);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
