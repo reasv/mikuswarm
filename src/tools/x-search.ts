@@ -17,7 +17,7 @@ import {
   type ModelChainEntry,
   type FetchChainMember,
 } from "../agent/model-fallback.js";
-import type { LlmScheduler } from "../agent/scheduler.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
 import { escapeXml, escapeAttr } from "../context/xml.js";
 import { formatAgentTimestamp } from "../time/index.js";
 import type { ToolUsageRecord } from "./image-gen.js";
@@ -391,6 +391,10 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
                 enableVideoUnderstanding: enableVideo,
                 imageDataUrls,
               });
+              // postGrok throws an AbortError on agent-signal cancellation so the
+              // helper's neutral branch fires (no health hit, clean teardown — §9);
+              // an HTTP/parse/timeout failure comes back as a tagged `{ error }`
+              // carrying the status so 4xx maps to content (never falls over).
               const result = await postGrok({
                 url: `${member.config.endpoint.replace(/\/+$/, "")}/chat/completions`,
                 apiKey: member.config.api_key,
@@ -399,14 +403,31 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
                 timeoutMs: config.timeoutMs,
                 signal: agentSignal,
               });
-              // A graceful {error} is environmental → fall over to the next member.
               if ("error" in result) {
-                return { ok: false, kind: "environmental", error: new Error(result.error) };
+                // A 400/413/422 is THIS request's content (deterministic on
+                // replay) and never falls over or marks the head unhealthy (§9);
+                // every other failure (5xx/timeout/parse/reset) is environmental.
+                const kind =
+                  result.status === 400 || result.status === 413 || result.status === 422
+                    ? "content"
+                    : "environmental";
+                return {
+                  ok: false,
+                  kind,
+                  status: result.status,
+                  retryAfterMs: result.retryAfterMs,
+                  error: new Error(result.error),
+                };
               }
               return { ok: true, value: result };
             },
           );
         } catch (error) {
+          // An agent-signal abort is a neutral cancellation, not a tool failure:
+          // rethrow it so the cancelled turn unwinds cleanly rather than surfacing
+          // a spurious "X search failed" (the helper already skipped the health
+          // feed + fall over for it — spec MODEL-FALLBACK §9).
+          if (error instanceof Error && error.name === "AbortError") throw error;
           return textError(`X search failed (model ${model}): ${errMessage(error)}`);
         }
         grok = live;
@@ -573,6 +594,21 @@ interface OpenRouterResponse {
   };
 }
 
+/**
+ * Tagged failure of a Grok POST. `status` rides along (when known) so the caller
+ * maps a deterministic 4xx (400/413/422) to a content failure that never falls
+ * over or marks the head unhealthy (spec MODEL-FALLBACK §9); every other failure
+ * is environmental. An agent-signal abort is NOT a `{ error }` — `postGrok`
+ * THROWS an `AbortError` so the fallback helper's neutral teardown branch fires
+ * (no streak hit, clean cancellation), mirroring the captioning/embedding
+ * siblings' `if (signal.aborted) throw err`.
+ */
+interface GrokPostError {
+  error: string;
+  status?: number;
+  retryAfterMs?: number;
+}
+
 async function postGrok(input: {
   url: string;
   apiKey: string;
@@ -580,7 +616,7 @@ async function postGrok(input: {
   dispatcher: Dispatcher | undefined;
   timeoutMs: number;
   signal?: AbortSignal;
-}): Promise<GrokResult | { error: string }> {
+}): Promise<GrokResult | GrokPostError> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), input.timeoutMs);
   // Compose the agent's abort signal with the wall-clock timeout so a cancelled
@@ -609,7 +645,12 @@ async function postGrok(input: {
     });
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
-      return { error: input.signal?.aborted ? "request aborted" : `timed out after ${input.timeoutMs}ms` };
+      // An agent-signal abort is a neutral teardown — rethrow the AbortError so
+      // the helper classifies the cancellation neutral (never a health signal,
+      // no fall over). A bare wall-clock timeout (signal not aborted) is
+      // environmental and falls over to the next member.
+      if (input.signal?.aborted) throw abortError();
+      return { error: `timed out after ${input.timeoutMs}ms` };
     }
     return { error: errMessage(error) };
   } finally {
@@ -619,13 +660,18 @@ async function postGrok(input: {
 
   if (!response.ok) {
     const snippet = await safeReadText(response);
-    return { error: `HTTP ${response.status}${snippet ? ` (${snippet})` : ""}` };
+    return {
+      error: `HTTP ${response.status}${snippet ? ` (${snippet})` : ""}`,
+      status: response.status,
+      retryAfterMs: parseRetryAfterMs(response.headers),
+    };
   }
   let parsed: OpenRouterResponse;
   try {
     parsed = (await readJsonCapped(response, controller)) as OpenRouterResponse;
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
+      if (input.signal?.aborted) throw abortError();
       return { error: `timed out after ${input.timeoutMs}ms` };
     }
     return { error: `unreadable response: ${errMessage(error)}` };
@@ -634,6 +680,13 @@ async function postGrok(input: {
   const synthesis = extractSynthesis(parsed);
   const citations = extractCitations(parsed);
   return { synthesis, citations, usage: parseOpenAiUsage(parsed.usage), model: input.body.model as string };
+}
+
+/** A neutral abort error whose `name` the fallback helper keys on (spec §9). */
+function abortError(): Error {
+  const err = new Error("request aborted");
+  err.name = "AbortError";
+  return err;
 }
 
 /** Flatten the assistant message content into plain text. */
@@ -819,6 +872,10 @@ async function captionOneImage(
           toolName: "x_search",
           toolCallId: meta.toolCallId,
           modelId: result.model,
+          // The billed member's block name (its fallback may have chosen a
+          // different member than the head) — groups caption spend under the
+          // logical id like the Grok row, not the upstream wire id.
+          logicalModelId: result.logicalModelId,
           provider: "openrouter",
           usage: result.usage,
           cost: result.cost ?? 0,
