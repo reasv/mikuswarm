@@ -482,6 +482,7 @@ describe('usage & cost schemas', () => {
 					modelId: 'anthropic/claude',
 					sessionType: 'default',
 					timelineKey: '!abc:m',
+					channelLabel: 'General (Acme)',
 					triggerSender: 'Alice',
 					status: 'completed',
 					completedAt: 9_000,
@@ -508,6 +509,7 @@ describe('usage & cost schemas', () => {
 			modelId: null,
 			sessionType: 'summarize',
 			timelineKey: '!def:m',
+			channelLabel: '!def:m',
 			triggerSender: null,
 			status: 'running',
 			completedAt: null,
@@ -546,7 +548,8 @@ describe('usage & cost schemas', () => {
 					cache_write_tokens: 0,
 					images: 1,
 					cost_usd: 0.08,
-					ref: 'workspace/out.png'
+					ref: 'workspace/out.png',
+					channel_label: 'General (Acme)'
 				}
 			]
 		});
@@ -574,7 +577,8 @@ describe('usage & cost schemas', () => {
 			cache_write_tokens: null,
 			images: null,
 			cost_usd: 0,
-			ref: null
+			ref: null,
+			channel_label: null
 		});
 		expect(out.agent_session_id).toBeNull();
 		expect(out.input_tokens).toBeNull();

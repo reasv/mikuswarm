@@ -243,6 +243,9 @@ function windowSince(window: string | null, now: number): number {
       const d = new Date(now);
       return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
     }
+    case "all":
+      // Epoch start — every event ever (the console's "All time" range).
+      return 0;
     default:
       return now - 24 * 3_600_000;
   }
@@ -287,7 +290,9 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
   // Same bucket granularity as the timeseries so each user's sub-period averages re-bin
   // identically to the Total card's.
   const bucketMs = window === "24h" || window === "today" || window === null ? 3_600_000 : 86_400_000;
-  const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 10, 1), 50);
+  // The console paginates the user list client-side down to the lowest non-zero spender,
+  // so return the full ranking (bounded by a generous safety cap, not a small top-N).
+  const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 1000, 1), 5000);
   sendJson(res, 200, ctx.deps.storage.getUsageLeaderboard(since, now, bucketMs, limit));
 }
 

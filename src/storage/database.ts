@@ -926,6 +926,16 @@ export interface UsageEventRow {
 }
 
 /**
+ * A {@link UsageEventRow} carrying the resolved human channel label (`Name (Space)`
+ * from `room_metadata`, else the raw `timeline_key`) for the console's recent
+ * paid-calls table. Joined on read; `channel_label` is null only when the event
+ * has no `timeline_key` at all.
+ */
+export interface UsageEventRowWithChannel extends UsageEventRow {
+  channel_label: string | null;
+}
+
+/**
  * Insert payload for {@link Storage.insertUsageEvent}. The store generates `id`
  * and `created_at`; `ts` defaults to now when omitted. Every other column maps
  * directly to {@link UsageEventRow}.
@@ -1030,6 +1040,8 @@ export interface UsageSessionRow {
   modelId: string | null;
   sessionType: string;
   timelineKey: string;
+  /** Human room label (`Name (Space)`) from `room_metadata`, falling back to `timelineKey`. */
+  channelLabel: string;
   triggerSender: string | null;
   status: string;
   completedAt: number | null;
@@ -1050,13 +1062,26 @@ export interface UsageLeaderboardSeriesPoint {
 }
 
 /**
- * One leaderboard user — the per-user equivalent of the console's Total-spend card
- * (§7.1 leaderboard tab). `series` carries this user's per-bucket totals (same
- * `bucketMs` as the page chart) so the card can reuse the sub-period averaging.
+ * One leaderboard entry — the per-actor equivalent of the console's Total-spend card
+ * (§7.1 leaderboard tab). `series` carries this actor's per-bucket totals (same
+ * `bucketMs` as the page chart) so the card can reuse the sub-period averaging; it is
+ * only populated for carded entries (top-N users + the system actors).
+ *
+ * Two kinds share this shape (`kind`):
+ * - `'user'` — a real human, attributed by `trigger_sender_id`; carries a contiguous
+ *   `rank` (1..N over humans). `senderId` is the matrix id.
+ * - `'system'` — a non-human/self actor (Summarization, Diary, Proactive), attributed
+ *   by `session_type`; carries a `comparisonRank` = where it would place if it were a
+ *   user. `senderId` holds the actor label.
  */
 export interface UsageLeaderboardUser {
   senderId: string;
   displayName: string | null;
+  kind: "user" | "system";
+  /** Contiguous 1..N rank among humans. Set for `kind:'user'`. */
+  rank?: number;
+  /** Where this actor would place if it were a user. Set for `kind:'system'`. */
+  comparisonRank?: number;
   total: number;
   events: number;
   sessions: number;
@@ -1065,19 +1090,31 @@ export interface UsageLeaderboardUser {
   series: UsageLeaderboardSeriesPoint[];
 }
 
-/** Per-user spend leaderboard over a window (§7.1 leaderboard tab). */
+/** Reference stats over the non-zero human users in the window (§7.1 leaderboard). */
+export interface UsageLeaderboardUserStats {
+  count: number;
+  average: number;
+  median: number;
+}
+
+/** Per-actor spend leaderboard over a window (§7.1 leaderboard tab). */
 export interface UsageLeaderboard {
   /** Server `now` (ms) the window was computed against — each card's average denominator upper bound. */
   now: number;
-  /** Bucket width (ms) of every user's `series` — hourly for ≤24h windows, daily otherwise. */
+  /** Bucket width (ms) of every actor's `series` — hourly for ≤24h windows, daily otherwise. */
   bucketMs: number;
   /**
    * Grand total over EVERY event in the window, including non-attributable
-   * (null-sender) spend. The denominator for each user's share-of-total, matching the
-   * Total-spend card; per-user shares therefore sum to ≤ 100%.
+   * (null-sender) spend. The denominator for each actor's share-of-total, matching the
+   * Total-spend card; per-actor shares therefore sum to ≤ 100%.
    */
   grandTotal: number;
+  /** Average/median spend over the non-zero human users — the System & self reference cards. */
+  userStats: UsageLeaderboardUserStats;
+  /** Real humans, ranked contiguously 1..N by spend (zero-spend excluded). */
   users: UsageLeaderboardUser[];
+  /** Non-human/self actors (Summarization, Diary, Proactive), each with a comparison rank. */
+  systemActors: UsageLeaderboardUser[];
 }
 
 /**
@@ -3593,6 +3630,12 @@ export class Storage {
              s.model_id as modelId,
              s.session_type as sessionType,
              s.timeline_key as timelineKey,
+             -- Human room label (Name + parent space) from the cached room_metadata, else
+             -- the raw timeline key so the cell still identifies the room before resolution.
+             coalesce(
+               (select m.display_name from room_metadata m where m.timeline_key = s.timeline_key),
+               s.timeline_key
+             ) as channelLabel,
              s.trigger_sender_display_name as triggerSender,
              s.status as status,
              s.completed_at as completedAt,
@@ -3631,33 +3674,56 @@ export class Storage {
    * Recent paid non-agent-loop events — tool / caption / embedding (spec §7.1
    * table 6), newest first.
    */
-  getUsageRecentToolCalls(limit: number): UsageEventRow[] {
+  getUsageRecentToolCalls(limit: number): UsageEventRowWithChannel[] {
     return this.read((db) => {
+      // Left-join the cached room label so the console shows `Name (Space)` rather than
+      // a raw timeline key; `channel_label` falls back to the key, and is null only when
+      // the event has no timeline_key at all (background caption/embedding).
       return db
         .prepare(
-          `select * from usage_events
-             where class in ('tool', 'caption', 'embedding')
-             order by ts desc limit ?`,
+          `select e.*, coalesce(m.display_name, e.timeline_key) as channel_label
+             from usage_events e
+             left join room_metadata m on m.timeline_key = e.timeline_key
+             where e.class in ('tool', 'caption', 'embedding')
+             order by e.ts desc limit ?`,
         )
-        .all(limit) as UsageEventRow[];
+        .all(limit) as UsageEventRowWithChannel[];
     });
   }
 
   /**
-   * Top-`limit` users by spend over `[since, now)` (spec §7.1 leaderboard tab) — the
-   * per-user equivalent of the Total-spend card. Attribution is by `trigger_sender_id`;
-   * background (caption/embedding) and self-initiated (proactive) events carry a null
-   * sender and are **excluded** here (so the per-user totals sum to ≤ `grandTotal`,
-   * which still counts them). Each user carries its per-bucket `series` so the console
-   * can reuse the sub-period averaging it runs for the Total card.
+   * Per-actor spend leaderboard over `[since, now)` (spec §7.1 leaderboard tab). The
+   * console renders this as a humans-only ranking plus a separate "System & self"
+   * block, so two attribution models are returned side by side:
+   *
+   * - **users** — real humans, attributed by `trigger_sender_id`, ranked contiguously
+   *   1..N by spend (zero-spend excluded). Up to `limit` are returned so the console can
+   *   paginate to the lowest non-zero spender.
+   * - **systemActors** — non-human/self workloads, attributed by `session_type`
+   *   (summarize+condense → Summarization, diary → Diary, proactive → Proactive). These
+   *   carry a `comparisonRank` = where each *would* place if it were a user. Keyed on
+   *   session_type (not sender) because that spend is split across the synthetic `system`
+   *   sender AND null-sender tool rows — only the type captures it whole.
+   *
+   * Background caption/embedding (null session_type AND null sender) belong to neither
+   * list but still count in `grandTotal` (the share denominator). `series` (for the
+   * sub-period card averages) is computed only for carded entries — the top
+   * {@link CARD_COUNT} users plus every system actor — to keep the payload small.
    */
   getUsageLeaderboard(since: number, now: number, bucketMs: number, limit: number): UsageLeaderboard {
+    // Non-human/self session types, and the display label each maps to.
+    const SYSTEM_TYPES = ["summarize", "condense", "diary", "proactive"] as const;
+    const SYSTEM_PLACEHOLDERS = SYSTEM_TYPES.map(() => "?").join(", ");
+    const ACTOR_CASE =
+      "case session_type when 'summarize' then 'Summarization' when 'condense' then 'Summarization' " +
+      "when 'diary' then 'Diary' when 'proactive' then 'Proactive' end";
+    // How many top users / system actors get a sparkline series.
+    const CARD_COUNT = 10;
     return this.read((db) => {
-      // Top-N senders by spend, with counts and the active range. The display name lives
-      // on `agent_sessions` (the ledger only stores the id), so resolve it with a
-      // correlated subquery that runs ONLY over the already-limited N rows (the CTE
-      // bounds the scan before the per-row lookup) and picks each sender's most-recent
-      // non-null name.
+      // Human users: attributed by sender, with system session types excluded (coalesce
+      // so a null-type-but-has-sender row still counts as human). Non-zero only, ordered
+      // by spend; capped at `limit` for pagination. Display name resolved per-row from the
+      // most-recent non-null name on agent_sessions (the ledger only stores the id).
       const users = db
         .prepare(
           `with top as (
@@ -3669,7 +3735,9 @@ export class Storage {
                     max(ts) as lastTs
                from usage_events
               where ts >= ? and trigger_sender_id is not null
+                and coalesce(session_type, '') not in (${SYSTEM_PLACEHOLDERS})
               group by trigger_sender_id
+             having coalesce(sum(cost_usd), 0) > 0
               order by total desc
               limit ?
            )
@@ -3683,7 +3751,39 @@ export class Storage {
              from top
             order by top.total desc`,
         )
-        .all(since, limit) as Array<Omit<UsageLeaderboardUser, "series">>;
+        .all(since, ...SYSTEM_TYPES, limit) as Array<{
+        senderId: string;
+        total: number;
+        events: number;
+        sessions: number;
+        firstTs: number;
+        lastTs: number;
+        displayName: string | null;
+      }>;
+
+      // System actors: attributed by session_type, collapsed to the display label.
+      const actors = db
+        .prepare(
+          `select ${ACTOR_CASE} as actorKey,
+                  coalesce(sum(cost_usd), 0) as total,
+                  count(*) as events,
+                  count(distinct agent_session_id) as sessions,
+                  min(ts) as firstTs,
+                  max(ts) as lastTs
+             from usage_events
+            where ts >= ? and session_type in (${SYSTEM_PLACEHOLDERS})
+            group by actorKey
+           having coalesce(sum(cost_usd), 0) > 0
+            order by total desc`,
+        )
+        .all(since, ...SYSTEM_TYPES) as Array<{
+        actorKey: string;
+        total: number;
+        events: number;
+        sessions: number;
+        firstTs: number;
+        lastTs: number;
+      }>;
 
       // Grand total over EVERY event in the window (incl. non-attributable) — the share
       // denominator, matching the Total-spend card.
@@ -3693,14 +3793,13 @@ export class Storage {
         }
       ).t;
 
-      // Per-(sender, bucket) spend for just the top-N, feeding each card's sub-period
-      // averages (`buildSpendAverages` re-bins these). One grouped pass over the window,
-      // restricted to the surfaced senders. `cast(... as integer)` forces an integer
-      // FLOOR (a bound numeric `?` makes `ts / ?` float in SQLite), matching getUsageTimeseries.
+      // Per-(sender, bucket) spend for the carded users, feeding each card's sub-period
+      // averages (`buildSpendAverages` re-bins these). `cast(... as integer)` forces an
+      // integer FLOOR (a bound numeric `?` makes `ts / ?` float in SQLite).
       const seriesBySender = new Map<string, UsageLeaderboardSeriesPoint[]>();
-      if (users.length > 0) {
-        const ids = users.map((u) => u.senderId);
-        const placeholders = ids.map(() => "?").join(", ");
+      const cardSenderIds = users.slice(0, CARD_COUNT).map((u) => u.senderId);
+      if (cardSenderIds.length > 0) {
+        const placeholders = cardSenderIds.map(() => "?").join(", ");
         const rows = db
           .prepare(
             `select trigger_sender_id as senderId,
@@ -3708,10 +3807,15 @@ export class Storage {
                     coalesce(sum(cost_usd), 0) as cost
                from usage_events
               where ts >= ? and trigger_sender_id in (${placeholders})
+                and coalesce(session_type, '') not in (${SYSTEM_PLACEHOLDERS})
               group by senderId, bucket
               order by bucket asc`,
           )
-          .all(bucketMs, bucketMs, since, ...ids) as Array<{ senderId: string; bucket: number; cost: number }>;
+          .all(bucketMs, bucketMs, since, ...cardSenderIds, ...SYSTEM_TYPES) as Array<{
+          senderId: string;
+          bucket: number;
+          cost: number;
+        }>;
         for (const r of rows) {
           const list = seriesBySender.get(r.senderId) ?? [];
           list.push({ bucket: r.bucket, cost: r.cost });
@@ -3719,11 +3823,77 @@ export class Storage {
         }
       }
 
+      // Per-(actor, bucket) spend for every system actor (there are at most three).
+      const seriesByActor = new Map<string, UsageLeaderboardSeriesPoint[]>();
+      if (actors.length > 0) {
+        const rows = db
+          .prepare(
+            `select ${ACTOR_CASE} as actorKey,
+                    cast(ts / ? as integer) * ? as bucket,
+                    coalesce(sum(cost_usd), 0) as cost
+               from usage_events
+              where ts >= ? and session_type in (${SYSTEM_PLACEHOLDERS})
+              group by actorKey, bucket
+              order by bucket asc`,
+          )
+          .all(bucketMs, bucketMs, since, ...SYSTEM_TYPES) as Array<{
+          actorKey: string;
+          bucket: number;
+          cost: number;
+        }>;
+        for (const r of rows) {
+          const list = seriesByActor.get(r.actorKey) ?? [];
+          list.push({ bucket: r.bucket, cost: r.cost });
+          seriesByActor.set(r.actorKey, list);
+        }
+      }
+
+      // Reference stats over the non-zero human users (the System & self cards).
+      const totals = users.map((u) => u.total);
+      const count = totals.length;
+      const average = count > 0 ? totals.reduce((s, v) => s + v, 0) / count : 0;
+      // `totals` is already sorted descending, so the middle element(s) give the median.
+      let median = 0;
+      if (count > 0) {
+        const mid = Math.floor(count / 2);
+        median = count % 2 === 1 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2;
+      }
+
+      const userEntries: UsageLeaderboardUser[] = users.map((u, i) => ({
+        senderId: u.senderId,
+        displayName: u.displayName,
+        kind: "user",
+        rank: i + 1,
+        total: u.total,
+        events: u.events,
+        sessions: u.sessions,
+        firstTs: u.firstTs,
+        lastTs: u.lastTs,
+        series: seriesBySender.get(u.senderId) ?? [],
+      }));
+
+      // comparisonRank = where this actor would sit in the human ranking: one past the
+      // number of users who outspent it. `users` is sorted descending.
+      const systemEntries: UsageLeaderboardUser[] = actors.map((a) => ({
+        senderId: a.actorKey,
+        displayName: a.actorKey,
+        kind: "system",
+        comparisonRank: users.filter((u) => u.total > a.total).length + 1,
+        total: a.total,
+        events: a.events,
+        sessions: a.sessions,
+        firstTs: a.firstTs,
+        lastTs: a.lastTs,
+        series: seriesByActor.get(a.actorKey) ?? [],
+      }));
+
       return {
         now,
         bucketMs,
         grandTotal,
-        users: users.map((u) => ({ ...u, series: seriesBySender.get(u.senderId) ?? [] })),
+        userStats: { count, average, median },
+        users: userEntries,
+        systemActors: systemEntries,
       };
     });
   }

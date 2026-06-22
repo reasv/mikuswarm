@@ -11,6 +11,17 @@ export function fmtUsd(n: number): string {
 	return `$${n.toFixed(n < 1 ? 4 : 2)}`;
 }
 
+/**
+ * USD for tight, repeated cells (the sub-period averages table): `$0`, `<$0.001`, three
+ * decimals under $1, two above. Lower precision than {@link fmtUsd} — those columns are
+ * narrow and four decimals read as false precision for a per-period rate.
+ */
+export function fmtUsdAvg(n: number): string {
+	if (n === 0) return '$0';
+	if (n < 0.001) return '<$0.001';
+	return `$${n.toFixed(n < 1 ? 3 : 2)}`;
+}
+
 /** Integer with thousands separators; `—` for null. */
 export function fmtInt(n: number | null): string {
 	return n == null ? '—' : n.toLocaleString();

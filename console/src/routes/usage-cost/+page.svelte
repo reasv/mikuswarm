@@ -4,6 +4,7 @@
 	import { goto } from '$app/navigation';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
 	import SpendSummaryCard from '$lib/components/SpendSummaryCard.svelte';
+	import ChannelCell from '$lib/components/ChannelCell.svelte';
 	import {
 		getUsageSummary,
 		getUsageTimeseries,
@@ -32,7 +33,8 @@
 		{ id: '24h', label: '24h', utc: false },
 		{ id: '7d', label: '7d', utc: false },
 		{ id: '30d', label: '30d', utc: false },
-		{ id: 'month', label: 'This month', utc: true }
+		{ id: 'month', label: 'This month', utc: true },
+		{ id: 'all', label: 'All time', utc: false }
 	] as const;
 
 	// URL is the source of truth (ARCHITECTURE.md §11): the window, the class/model breakdown,
@@ -114,6 +116,23 @@
 	const total = $derived(summary.data?.total ?? 0);
 	const byClass = $derived(summary.data?.byClass ?? []);
 	const byModel = $derived(summary.data?.byModel ?? []);
+
+	// User-leaderboard pagination (client-side). The backend returns the full non-zero
+	// human ranking, so we page through it locally down to the lowest spender. The page
+	// resets to 0 whenever the window or active tab changes (a new ranking).
+	const USER_PAGE_SIZE = 25;
+	let userPage = $state(0);
+	$effect(() => {
+		void window;
+		void tab;
+		userPage = 0;
+	});
+	const lbUsers = $derived(leaderboard.data?.users ?? []);
+	const userPageCount = $derived(Math.max(1, Math.ceil(lbUsers.length / USER_PAGE_SIZE)));
+	const userPageSafe = $derived(Math.min(userPage, userPageCount - 1));
+	const pagedUsers = $derived(
+		lbUsers.slice(userPageSafe * USER_PAGE_SIZE, userPageSafe * USER_PAGE_SIZE + USER_PAGE_SIZE)
+	);
 
 	const rules = $derived(
 		// Blocked first, then near, then ok; ties by fill fraction (spec §7.1 #3).
@@ -590,6 +609,7 @@
 							<th class="py-1 pr-3 text-right font-medium" title="agent-LLM cost">llm $</th>
 							<th class="py-1 pr-3 text-right font-medium" title="tool-call cost">tool $</th>
 							<th class="py-1 pr-3 text-right font-medium">total $</th>
+							<th class="py-1 pr-3 font-medium">status</th>
 							<th class="py-1 pr-3 font-medium">channel</th>
 							<th class="py-1 font-medium">trigger</th>
 						</tr>
@@ -617,13 +637,14 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px] font-semibold">
 									{fmtUsd(s.agentCost + s.toolCost)}
 								</td>
-								<td class="py-1 pr-3 max-w-[12rem] truncate text-[10px]" title={s.timelineKey}>
-									{s.timelineKey}
+								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{s.status}</td>
+								<td class="py-1 pr-3 text-[10px]">
+									<ChannelCell label={s.channelLabel} id={s.timelineKey} />
 								</td>
 								<td class="py-1 text-[11px]">{s.triggerSender ?? 'N/A'}</td>
 							</tr>
 						{:else}
-							<tr><td colspan="14" class="py-2 text-xs text-muted-foreground">no sessions</td></tr>
+							<tr><td colspan="15" class="py-2 text-xs text-muted-foreground">no sessions</td></tr>
 						{/each}
 					</tbody>
 				</table>
@@ -660,8 +681,12 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.cache_read_tokens)}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{t.images ? fmtInt(t.images) : '—'}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtUsd(t.cost_usd)}</td>
-								<td class="py-1 max-w-[12rem] truncate text-[10px]" title={t.timeline_key ?? ''}>
-									{t.timeline_key ?? '—'}
+								<td class="py-1 text-[10px]">
+									{#if t.timeline_key}
+										<ChannelCell label={t.channel_label ?? t.timeline_key} id={t.timeline_key} />
+									{:else}
+										<span class="text-muted-foreground">—</span>
+									{/if}
 								</td>
 							</tr>
 						{:else}
@@ -676,82 +701,167 @@
 					<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
 						Loading…
 					</div>
-				{:else if lb.users.length === 0}
+				{:else if lb.users.length === 0 && lb.systemActors.length === 0}
 					<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
-						No user-attributable spend in this window. Background (caption / embedding) and
-						self-initiated spend isn’t tied to a user.
+						No spend in this window.
 					</div>
 				{:else}
-					<!-- Top-10 user cards: the per-user equivalent of the Total-spend card. auto-fill
-					     grid so they wrap to fit the viewport rather than each hogging a full row. -->
-					<div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(17rem,1fr))]">
-						{#each lb.users as u, i (u.senderId)}
-							<SpendSummaryCard
-								label={u.displayName ?? u.senderId}
-								titleAttr={u.senderId}
-								total={u.total}
-								firstTs={u.firstTs}
-								now={lb.now}
-								series={u.series}
-								bucketMs={lb.bucketMs}
-								windowId={window}
-								rank={i + 1}
-								shareOfTotal={lb.grandTotal > 0 ? u.total / lb.grandTotal : null}
-								events={u.events}
-								sessions={u.sessions}
-							/>
-						{/each}
-					</div>
-
-					<!-- Leaderboard table: the same users with precise figures + active range. -->
-					<div class="mt-4 overflow-x-auto">
-						<table class="w-full text-sm">
-							<thead class="text-left text-xs text-muted-foreground">
-								<tr class="border-b">
-									<th class="py-1 pr-3 text-right font-medium">#</th>
-									<th class="py-1 pr-3 font-medium">user</th>
-									<th class="py-1 pr-3 text-right font-medium">spend</th>
-									<th
-										class="py-1 pr-3 text-right font-medium"
-										title="share of total spend in this window"
-									>
-										share
-									</th>
-									<th class="py-1 pr-3 text-right font-medium">events</th>
-									<th class="py-1 pr-3 text-right font-medium">sessions</th>
-									<th class="py-1 pr-3 font-medium">first seen</th>
-									<th class="py-1 font-medium">last seen</th>
-								</tr>
-							</thead>
-							<tbody>
-								{#each lb.users as u, i (u.senderId)}
-									<tr class="border-b border-border/50">
-										<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
-											{i + 1}
-										</td>
-										<td class="max-w-[20rem] truncate py-1 pr-3" title={u.senderId}>
-											{u.displayName ?? u.senderId}
-										</td>
-										<td class="py-1 pr-3 text-right font-mono text-[11px] font-semibold">
-											{fmtUsd(u.total)}
-										</td>
-										<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
-											{lb.grandTotal > 0 ? fmtPct(u.total / lb.grandTotal) : '—'}
-										</td>
-										<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.events)}</td>
-										<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.sessions)}</td>
-										<td class="py-1 pr-3 text-[10px] text-muted-foreground">{fmtTime(u.firstTs)}</td>
-										<td class="py-1 text-[10px] text-muted-foreground">{fmtTime(u.lastTs)}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-						<div class="mt-1.5 text-[10px] text-muted-foreground">
-							Top users by spend over the selected window, attributed by trigger sender.
-							Background (caption / embedding) and self-initiated spend has no user and is
-							excluded, so per-user shares sum to ≤ 100% of total.
+					<!-- Users — humans only, ranked 1..N. Top-10 cards (per-user equivalent of the
+					     Total-spend card; auto-fill grid wraps to the viewport) over a paginated full
+					     ranking that reaches the lowest non-zero spender. -->
+					{#if lb.users.length > 0}
+						<div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(17rem,1fr))]">
+							{#each lb.users.slice(0, 10) as u (u.senderId)}
+								<SpendSummaryCard
+									label={u.displayName ?? u.senderId}
+									titleAttr={u.senderId}
+									total={u.total}
+									firstTs={u.firstTs}
+									now={lb.now}
+									series={u.series}
+									bucketMs={lb.bucketMs}
+									windowId={window}
+									rank={u.rank}
+									shareOfTotal={lb.grandTotal > 0 ? u.total / lb.grandTotal : null}
+									events={u.events}
+									sessions={u.sessions}
+								/>
+							{/each}
 						</div>
-					</div>
+
+						<!-- Full user ranking, paginated client-side. -->
+						{@const pageStart = userPageSafe * USER_PAGE_SIZE}
+						<div class="mt-4 overflow-x-auto">
+							<table class="w-full text-sm">
+								<thead class="text-left text-xs text-muted-foreground">
+									<tr class="border-b">
+										<th class="py-1 pr-3 text-right font-medium">#</th>
+										<th class="py-1 pr-3 font-medium">user</th>
+										<th class="py-1 pr-3 text-right font-medium">spend</th>
+										<th class="py-1 pr-3 text-right font-medium" title="share of total spend in this window">
+											share
+										</th>
+										<th class="py-1 pr-3 text-right font-medium">events</th>
+										<th class="py-1 pr-3 text-right font-medium">sessions</th>
+										<th class="py-1 pr-3 font-medium">first seen</th>
+										<th class="py-1 font-medium">last seen</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each pagedUsers as u (u.senderId)}
+										<tr class="border-b border-border/50">
+											<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
+												{u.rank}
+											</td>
+											<td class="max-w-[20rem] truncate py-1 pr-3" title={u.senderId}>
+												{u.displayName ?? u.senderId}
+											</td>
+											<td class="py-1 pr-3 text-right font-mono text-[11px] font-semibold">
+												{fmtUsd(u.total)}
+											</td>
+											<td class="py-1 pr-3 text-right font-mono text-[11px] text-muted-foreground">
+												{lb.grandTotal > 0 ? fmtPct(u.total / lb.grandTotal) : '—'}
+											</td>
+											<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.events)}</td>
+											<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(u.sessions)}</td>
+											<td class="py-1 pr-3 text-[10px] text-muted-foreground">{fmtTime(u.firstTs)}</td>
+											<td class="py-1 text-[10px] text-muted-foreground">{fmtTime(u.lastTs)}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+							<div class="mt-2 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+								<span>
+									Showing {pageStart + 1}–{pageStart + pagedUsers.length} of {lbUsers.length} user{lbUsers.length === 1 ? '' : 's'} with spend
+								</span>
+								{#if userPageCount > 1}
+									<div class="flex items-center gap-1">
+										<button
+											class="rounded border px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+											disabled={userPageSafe === 0}
+											onclick={() => (userPage = userPageSafe - 1)}
+										>
+											Prev
+										</button>
+										<span class="tabular-nums">Page {userPageSafe + 1} / {userPageCount}</span>
+										<button
+											class="rounded border px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+											disabled={userPageSafe >= userPageCount - 1}
+											onclick={() => (userPage = userPageSafe + 1)}
+										>
+											Next
+										</button>
+									</div>
+								{/if}
+							</div>
+							<div class="mt-1.5 text-[10px] text-muted-foreground">
+								Users by spend over the selected window, attributed by trigger sender. Zero-spend
+								users are omitted; per-user shares sum to ≤ 100% of total (system / self and
+								background spend are not users).
+							</div>
+						</div>
+					{:else}
+						<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+							No human-user spend in this window.
+						</div>
+					{/if}
+
+					<!-- System & self: non-human/self actors kept OUT of the user ranking, plus
+					     average/median reference cards so each can be compared to a typical user. -->
+					<section class="mt-6">
+						<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+							System &amp; self
+						</h2>
+						<div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(17rem,1fr))]">
+							<!-- Reference stat cards (no sparkline) over the non-zero human users. -->
+							<div class="rounded-lg border border-dashed p-3">
+								<div class="text-xs text-muted-foreground">Average user</div>
+								<div class="mt-1 font-mono text-2xl font-semibold">
+									{lb.userStats.count > 0 ? fmtUsd(lb.userStats.average) : '—'}
+								</div>
+								<div class="mt-0.5 text-[10px] text-muted-foreground">
+									over {fmtInt(lb.userStats.count)} user{lb.userStats.count === 1 ? '' : 's'} with spend
+								</div>
+							</div>
+							<div class="rounded-lg border border-dashed p-3">
+								<div class="text-xs text-muted-foreground">Median user</div>
+								<div class="mt-1 font-mono text-2xl font-semibold">
+									{lb.userStats.count > 0 ? fmtUsd(lb.userStats.median) : '—'}
+								</div>
+								<div class="mt-0.5 text-[10px] text-muted-foreground">
+									over {fmtInt(lb.userStats.count)} user{lb.userStats.count === 1 ? '' : 's'} with spend
+								</div>
+							</div>
+							<!-- One card per system/self actor, marked + carrying its comparison rank. -->
+							{#each lb.systemActors as a (a.senderId)}
+								<SpendSummaryCard
+									label={a.displayName ?? a.senderId}
+									total={a.total}
+									firstTs={a.firstTs}
+									now={lb.now}
+									series={a.series}
+									bucketMs={lb.bucketMs}
+									windowId={window}
+									rank={a.comparisonRank}
+									shareOfTotal={lb.grandTotal > 0 ? a.total / lb.grandTotal : null}
+									events={a.events}
+									sessions={a.sessions}
+									system={true}
+								/>
+							{/each}
+						</div>
+						{#if lb.systemActors.length === 0}
+							<div class="mt-2 rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+								No system / self spend in this window.
+							</div>
+						{/if}
+						<div class="mt-1.5 text-[10px] text-muted-foreground">
+							Summarization &amp; Diary are background maintenance; Proactive is Miku’s
+							self-initiated posts. Each card’s rank shows where it would place among users;
+							average / median are over users who spent &gt; 0 this period. Background caption /
+							embedding has no actor and is excluded here but still counted in the total.
+						</div>
+					</section>
 				{/if}
 			{/if}
 		</section>

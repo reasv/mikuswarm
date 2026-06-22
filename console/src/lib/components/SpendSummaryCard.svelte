@@ -8,8 +8,9 @@
 	// card always did. The repeated averaging-basis footnote shows only on the Total card
 	// (it explains the whole page once — repeating it under 10 user cards is noise).
 	import { buildSpendAverages } from '$lib/spend-averages';
-	import { fmtUsd, fmtInt, fmtElapsed, fmtPct } from '$lib/usage-format';
+	import { fmtUsd, fmtUsdAvg, fmtInt, fmtElapsed, fmtPct } from '$lib/usage-format';
 	import { cn } from '$lib/utils';
+	import BotIcon from '@lucide/svelte/icons/bot';
 
 	type SeriesPoint = { bucket: number; cost: number };
 
@@ -25,7 +26,8 @@
 		shareOfTotal = undefined,
 		events = undefined,
 		sessions = undefined,
-		titleAttr = undefined
+		titleAttr = undefined,
+		system = false
 	}: {
 		/** Card heading — `Total spend`, or the user's display name. */
 		label: string;
@@ -46,6 +48,12 @@
 		sessions?: number;
 		/** Full-text tooltip for the (possibly truncated) label, e.g. the raw sender id. */
 		titleAttr?: string;
+		/**
+		 * Non-human/self actor (Summarization / Diary / Proactive): renders a bot icon +
+		 * muted violet accent so it's unmistakable, and reads `rank` as a *comparison* rank
+		 * ("would be #N among users") rather than a leaderboard position.
+		 */
+		system?: boolean;
 	} = $props();
 
 	const isLeaderboard = $derived(rank != null);
@@ -68,7 +76,9 @@
 	);
 
 	// Subtle medal accents for the top three; the rest use the neutral muted chip.
+	// System actors never get a medal — they use a distinct violet chip.
 	function medalClass(r: number): string {
+		if (system) return 'bg-violet-500/20 text-violet-600 dark:text-violet-300';
 		if (r === 1) return 'bg-amber-500/20 text-amber-600 dark:text-amber-400';
 		if (r === 2) return 'bg-slate-400/25 text-slate-600 dark:text-slate-300';
 		if (r === 3) return 'bg-orange-700/20 text-orange-700 dark:text-orange-400';
@@ -76,7 +86,7 @@
 	}
 </script>
 
-<div class="flex flex-col rounded-lg border p-3">
+<div class={cn('flex flex-col rounded-lg border p-3', system && 'border-violet-500/40 bg-violet-500/[0.03]')}>
 	<div class="flex items-start justify-between gap-2">
 		{#if isLeaderboard}
 			<div class="flex min-w-0 items-center gap-1.5">
@@ -85,9 +95,13 @@
 						'inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded px-1 font-mono text-[10px] font-semibold tabular-nums',
 						medalClass(rank ?? 0)
 					)}
+					title={system ? `would rank #${rank} among users` : undefined}
 				>
-					{rank}
+					{#if system}#{/if}{rank}
 				</span>
+				{#if system}
+					<BotIcon class="size-3.5 shrink-0 text-violet-500" aria-label="system actor" />
+				{/if}
 				<span class="truncate text-sm font-medium text-foreground" title={titleAttr ?? label}>
 					{label}
 				</span>
@@ -134,10 +148,10 @@
 					{#each averages.stats as s (s.label)}
 						<tr>
 							<td class="py-0.5 pr-2 text-left text-muted-foreground">{s.label}</td>
-							<td class="py-0.5 pl-2 text-right font-semibold text-foreground">{fmtUsd(s.avg)}</td>
-							<td class="py-0.5 pl-2 text-right">{s.min == null ? '—' : fmtUsd(s.min)}</td>
-							<td class="py-0.5 pl-2 text-right">{s.max == null ? '—' : fmtUsd(s.max)}</td>
-							<td class="py-0.5 pl-2 text-right">{s.stdev == null ? '—' : fmtUsd(s.stdev)}</td>
+							<td class="py-0.5 pl-2 text-right font-semibold text-foreground">{fmtUsdAvg(s.avg)}</td>
+							<td class="py-0.5 pl-2 text-right">{s.min == null ? '—' : fmtUsdAvg(s.min)}</td>
+							<td class="py-0.5 pl-2 text-right">{s.max == null ? '—' : fmtUsdAvg(s.max)}</td>
+							<td class="py-0.5 pl-2 text-right">{s.stdev == null ? '—' : fmtUsdAvg(s.stdev)}</td>
 							<td class="py-0.5 pl-2 text-right text-muted-foreground">{s.n}</td>
 						</tr>
 					{/each}

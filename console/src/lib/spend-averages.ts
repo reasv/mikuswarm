@@ -30,6 +30,10 @@ import type { SpendSeriesRow } from './spend-chart';
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
+// Approximate, fixed-width "month" (30 days) — epoch-aligned bins, not calendar months,
+// matching how `per week` already approximates with 7-day bins. Good enough for an
+// all-time spend *rate* without dragging calendar arithmetic into a pure helper.
+const MONTH = 30 * DAY;
 
 /** One sub-period breakdown (e.g. "per day") over the window's actual data range. */
 export interface SubPeriodStat {
@@ -71,6 +75,15 @@ function subPeriodsFor(window: string): Array<{ label: string; periodMs: number 
 			return [
 				{ label: 'per day', periodMs: DAY },
 				{ label: 'per week', periodMs: WEEK }
+			];
+		case 'all':
+			// All-time uses daily buckets, so per-hour is unresolvable (and skipped by the
+			// granularity guard). Break it down per day / week / month instead. Each finer
+			// period is dropped automatically when the data range can't cover it once.
+			return [
+				{ label: 'per day', periodMs: DAY },
+				{ label: 'per week', periodMs: WEEK },
+				{ label: 'per month', periodMs: MONTH }
 			];
 		default:
 			return [{ label: 'per hour', periodMs: HOUR }];

@@ -729,12 +729,12 @@ test("getUsageRecentSessions: tool rollup join — toolCost/toolCalls, no-tool s
 });
 
 // ---------------------------------------------------------------------------
-// getUsageLeaderboard: per-user spend ranking — the per-user equivalent of the
-// Total-spend card (§7.1 leaderboard tab). Attribution is by trigger_sender_id;
-// null-sender (background / self-initiated) spend is EXCLUDED from the users but
-// still counted in grandTotal (so per-user shares sum to <= 100%). Display name
-// resolves to the most-recent NON-null agent_sessions name for the sender; each
-// user carries its per-bucket series for the card's sub-period averaging.
+// getUsageLeaderboard: per-actor spend ranking (§7.1 leaderboard tab). Humans are
+// attributed by trigger_sender_id (system session types excluded), ranked 1..N,
+// zero-spend dropped; null-sender background spend is excluded but still counted in
+// grandTotal. Display name resolves to the most-recent NON-null agent_sessions name.
+// `userStats` carries mean/median over the non-zero humans. System actors are covered
+// in the next test. Each carded actor carries its per-bucket series.
 // ---------------------------------------------------------------------------
 
 test("getUsageLeaderboard: ranks by spend, resolves latest name, excludes null-sender, buckets series", async () => {
@@ -810,6 +810,18 @@ test("getUsageLeaderboard: ranks by spend, resolves latest name, excludes null-s
     assert.equal(carol!.displayName, null);
     assert.ok(Math.abs(carol!.total - 0.1) < 1e-9);
 
+    // Every user is kind:'user' with a contiguous 1..N rank.
+    assert.deepEqual(lb.users.map((u) => u.kind), ["user", "user", "user"]);
+    assert.deepEqual(lb.users.map((u) => u.rank), [1, 2, 3]);
+
+    // No system session types here → no system actors.
+    assert.deepEqual(lb.systemActors, []);
+
+    // Reference stats over the (non-zero) human users: mean and median of [6, 4, 0.1].
+    assert.equal(lb.userStats.count, 3);
+    assert.ok(Math.abs(lb.userStats.average - 10.1 / 3) < 1e-9);
+    assert.equal(lb.userStats.median, 4, "median of sorted [6, 4, 0.1]");
+
     // limit is honored: top-1 is the highest spender only, grandTotal unaffected.
     const top1 = storage.getUsageLeaderboard(0, 10_000, 1_000, 1);
     assert.equal(top1.users.length, 1);
@@ -820,6 +832,59 @@ test("getUsageLeaderboard: ranks by spend, resolves latest name, excludes null-s
     const empty = storage.getUsageLeaderboard(50_000, 60_000, 1_000, 10);
     assert.equal(empty.users.length, 0);
     assert.equal(empty.grandTotal, 0);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// getUsageLeaderboard: non-human/self workloads are attributed by session_type and
+// returned SEPARATELY from the human ranking. summarize+condense collapse to one
+// "Summarization" actor; diary → "Diary"; proactive → "Proactive". Each carries a
+// comparisonRank (where it would sit among users) and is excluded from `users` even
+// when (as for proactive) it has a non-null sender.
+// ---------------------------------------------------------------------------
+
+test("getUsageLeaderboard: system actors split by session_type, comparisonRank, excluded from users", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Humans: Alice 10, Bob 4.
+    await storage.insertUsageEvent({ ts: 1_000, class: "agent_loop", sessionType: "default", agentSessionId: "s-alice", triggerSenderId: "@alice:x", modelId: "opus", costUsd: 10 });
+    await storage.insertUsageEvent({ ts: 1_000, class: "agent_loop", sessionType: "default", agentSessionId: "s-bob", triggerSenderId: "@bob:x", modelId: "opus", costUsd: 4 });
+
+    // System workloads. summarize(5) + condense(1) → Summarization 6; diary 3;
+    // proactive 8 carries the bot's OWN sender (non-null) yet must not be a user.
+    await storage.insertUsageEvent({ ts: 2_000, class: "agent_loop", sessionType: "summarize", agentSessionId: "s-sum", triggerSenderId: "system", modelId: "opus", costUsd: 5 });
+    await storage.insertUsageEvent({ ts: 2_000, class: "agent_loop", sessionType: "condense", agentSessionId: "s-con", triggerSenderId: "system", modelId: "opus", costUsd: 1 });
+    await storage.insertUsageEvent({ ts: 3_000, class: "agent_loop", sessionType: "diary", agentSessionId: "s-diary", triggerSenderId: "system", modelId: "opus", costUsd: 3 });
+    await storage.insertUsageEvent({ ts: 3_000, class: "agent_loop", sessionType: "proactive", agentSessionId: "s-pro", triggerSenderId: "@miku:x", modelId: "opus", costUsd: 8 });
+    // A diary tool row with a NULL sender — still attributed to Diary by its type.
+    await storage.insertUsageEvent({ ts: 3_500, class: "tool", toolName: "find_source", sessionType: "diary", agentSessionId: "s-diary", modelId: "sauce", costUsd: 1 });
+    await storage.waitForIdle();
+
+    const lb = storage.getUsageLeaderboard(0, 10_000, 1_000, 10);
+
+    // Users: only the two humans; the bot's @miku sender does NOT leak in via proactive.
+    assert.deepEqual(lb.users.map((u) => u.senderId), ["@alice:x", "@bob:x"]);
+    assert.deepEqual(lb.users.map((u) => u.rank), [1, 2]);
+
+    // System actors, by spend desc: Proactive 8, Summarization 6, Diary (3 + 1 tool) 4.
+    assert.deepEqual(lb.systemActors.map((a) => a.senderId), ["Proactive", "Summarization", "Diary"]);
+    assert.deepEqual(lb.systemActors.map((a) => a.displayName), ["Proactive", "Summarization", "Diary"]);
+    assert.deepEqual(lb.systemActors.map((a) => a.kind), ["system", "system", "system"]);
+    assert.deepEqual(lb.systemActors.map((a) => a.total), [8, 6, 4]);
+    // comparisonRank = 1 + (#users outspending it): Proactive 8 → only Alice(10) → 2;
+    // Summarization 6 → Alice → 2; Diary 4 → Alice → 2 (Bob is 4, not strictly >4).
+    assert.deepEqual(lb.systemActors.map((a) => a.comparisonRank), [2, 2, 2]);
+
+    // System actors carry a per-bucket series too (for their cards).
+    const summ = lb.systemActors.find((a) => a.senderId === "Summarization")!;
+    assert.deepEqual(summ.series, [{ bucket: 2_000, cost: 6 }]);
+
+    // userStats over the humans [10, 4]: mean 7, median 7.
+    assert.equal(lb.userStats.count, 2);
+    assert.equal(lb.userStats.average, 7);
+    assert.equal(lb.userStats.median, 7);
   } finally {
     await storage.waitForIdle();
     storage.close();

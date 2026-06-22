@@ -147,4 +147,44 @@ describe('buildSpendAverages', () => {
 		expect(week.max).toBeCloseTo(49, 10);
 		expect(week.avg).toBeCloseTo((16 * 7) / (16 / 7), 6); // total ÷ (16d / 7d)
 	});
+
+	it('all-time breaks down per day / week / month (daily buckets, ~75 days of data)', () => {
+		// 75 days of $2/day over daily buckets. per-hour is unresolvable at daily granularity
+		// (skipped); per-day/week/month all fit (>30d elapsed) and report in that order.
+		const days = 75;
+		const series: SpendSeriesRow[] = Array.from({ length: days }, (_, i) => ({
+			bucket: i * DAY,
+			grp: 'agent_loop',
+			cost: 2
+		}));
+		const out = buildSpendAverages({
+			total: days * 2,
+			firstTs: 0,
+			now: days * DAY,
+			series,
+			bucketMs: DAY,
+			window: 'all'
+		});
+		expect(out.stats.map((s) => s.label)).toEqual(['per day', 'per week', 'per month']);
+		const month = out.stats.find((s) => s.label === 'per month')!;
+		expect(month.n).toBe(2); // floor(75 / 30) fully-elapsed 30-day months
+		expect(month.avg).toBeCloseTo((days * 2) / (days / 30), 6); // total ÷ (75d / 30d)
+	});
+
+	it('all-time drops per-week / per-month when the data range is too short', () => {
+		// Only ~3 days of data: per-day fits, but per-week/month can't elapse once → dropped.
+		const out = buildSpendAverages({
+			total: 6,
+			firstTs: 0,
+			now: 3 * DAY,
+			series: [
+				{ bucket: 0, grp: 'agent_loop', cost: 2 },
+				{ bucket: DAY, grp: 'agent_loop', cost: 2 },
+				{ bucket: 2 * DAY, grp: 'agent_loop', cost: 2 }
+			],
+			bucketMs: DAY,
+			window: 'all'
+		});
+		expect(out.stats.map((s) => s.label)).toEqual(['per day']);
+	});
 });

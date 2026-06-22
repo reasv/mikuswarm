@@ -613,6 +613,8 @@ export const UsageSessionRow = Schema.Struct({
 	modelId: Schema.NullOr(Schema.String),
 	sessionType: Schema.String,
 	timelineKey: Schema.String,
+	// Human room label (`Name (Space)`) from room_metadata, falling back to the raw key.
+	channelLabel: Schema.String,
 	triggerSender: Schema.NullOr(Schema.String),
 	status: Schema.String,
 	completedAt: Schema.NullOr(Schema.Number),
@@ -646,7 +648,10 @@ export const UsageEventRow = Schema.Struct({
 	cache_write_tokens: Schema.NullOr(Schema.Number),
 	images: Schema.NullOr(Schema.Number),
 	cost_usd: Schema.Number,
-	ref: Schema.NullOr(Schema.String)
+	ref: Schema.NullOr(Schema.String),
+	// Human room label (`Name (Space)`) from room_metadata, else the raw key; null only
+	// when the event has no timeline_key (background caption/embedding).
+	channel_label: Schema.NullOr(Schema.String)
 });
 export const UsageToolCalls = Schema.Struct({ toolCalls: Schema.Array(UsageEventRow) });
 export type UsageToolCalls = Schema.Schema.Type<typeof UsageToolCalls>;
@@ -682,10 +687,19 @@ export const UsageLeaderboardSeriesPoint = Schema.Struct({
 	cost: Schema.Number
 });
 
-/** One leaderboard user — the per-user equivalent of the Total-spend card (§7.1 leaderboard). */
+/**
+ * One leaderboard entry — the per-actor equivalent of the Total-spend card (§7.1
+ * leaderboard). `kind:'user'` rows are humans with a contiguous `rank`; `kind:'system'`
+ * rows are non-human/self actors (Summarization/Diary/Proactive) with a `comparisonRank`
+ * (where they would place among users). `senderId` is the matrix id for users, the actor
+ * label for system actors.
+ */
 export const UsageLeaderboardUser = Schema.Struct({
 	senderId: Schema.String,
 	displayName: Schema.NullOr(Schema.String),
+	kind: Schema.String,
+	rank: Schema.optional(Schema.Number),
+	comparisonRank: Schema.optional(Schema.Number),
 	total: Schema.Number,
 	events: Schema.Number,
 	sessions: Schema.Number,
@@ -694,13 +708,22 @@ export const UsageLeaderboardUser = Schema.Struct({
 	series: Schema.Array(UsageLeaderboardSeriesPoint)
 });
 
-/** GET /api/usage/leaderboard — top users by spend over a window, each with its averaging series. */
+/** Reference stats over the non-zero human users in the window (System & self cards). */
+export const UsageLeaderboardUserStats = Schema.Struct({
+	count: Schema.Number,
+	average: Schema.Number,
+	median: Schema.Number
+});
+
+/** GET /api/usage/leaderboard — humans-only ranking + a separate System & self block. */
 export const UsageLeaderboard = Schema.Struct({
 	now: Schema.Number,
 	bucketMs: Schema.Number,
 	// Grand total over EVERY event in the window (incl. non-attributable) — the share
-	// denominator, so per-user shares sum to ≤ 100%.
+	// denominator, so per-actor shares sum to ≤ 100%.
 	grandTotal: Schema.Number,
-	users: Schema.Array(UsageLeaderboardUser)
+	userStats: UsageLeaderboardUserStats,
+	users: Schema.Array(UsageLeaderboardUser),
+	systemActors: Schema.Array(UsageLeaderboardUser)
 });
 export type UsageLeaderboard = Schema.Schema.Type<typeof UsageLeaderboard>;
