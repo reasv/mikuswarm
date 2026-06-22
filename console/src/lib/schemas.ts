@@ -442,7 +442,12 @@ export const SchedulerModel = Schema.Struct({
 			class: Schema.String
 		})
 	),
-	waiters: Schema.Number
+	waiters: Schema.Number,
+	// Config annotations (spec MODEL-FALLBACK section 8): the LOGICAL id(s) that
+	// resolve to this health key + whether any carries a fallback chain (its probe
+	// is the canary). Defaulted for snapshots served without the annotation map.
+	logicalIds: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+	hasFallback: Schema.optionalWith(Schema.Boolean, { default: () => false })
 });
 export type SchedulerModel = Schema.Schema.Type<typeof SchedulerModel>;
 

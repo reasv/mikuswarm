@@ -228,3 +228,25 @@ test("resolveSessionCostCeiling: a global default of 0 means unlimited", () => {
   const factory = makeCostFactory({ global: 0, sessionTypes: { default: {} } });
   assert.equal(factory.resolveSessionCostCeiling("default"), undefined);
 });
+
+// === spec MODEL-FALLBACK §8: scheduler-snapshot annotation map ================
+
+test("buildModelHealthAnnotations: maps health key → logical ids + has-fallback", async () => {
+  const { buildModelHealthAnnotations } = await import("../src/app.js");
+  const models = {
+    // Two logical ids share ONE upstream (endpoint+id) → one health key; the
+    // virtual one carries a fallback chain, so hasFallback ORs true.
+    "gemini-flash": { id: "gemini-2.5-flash", endpoint: "https://gw/google" },
+    "caption-premium": { id: "gemini-2.5-flash", endpoint: "https://gw/google", fallback: ["caption-cheap"] },
+    "caption-cheap": { id: "gemini-lite", endpoint: "https://gw/google" },
+    default: { id: "opus", endpoint: "https://gw/anthropic" },
+  } as never;
+  const map = buildModelHealthAnnotations(models);
+
+  const shared = map["https://gw/google::gemini-2.5-flash"]!;
+  assert.deepEqual([...shared.logicalIds].sort(), ["caption-premium", "gemini-flash"]);
+  assert.equal(shared.hasFallback, true, "a shared key is fallback-bearing if ANY logical id has a chain");
+
+  assert.deepEqual(map["https://gw/google::gemini-lite"], { logicalIds: ["caption-cheap"], hasFallback: false });
+  assert.deepEqual(map["https://gw/anthropic::opus"], { logicalIds: ["default"], hasFallback: false });
+});

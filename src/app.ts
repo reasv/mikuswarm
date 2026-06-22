@@ -4491,6 +4491,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       liveEvents,
       // Scheduler snapshot + request ring (spec §9.1/§9.2).
       scheduler: llmScheduler,
+      // Health-key → logical id(s) + has-fallback map (spec MODEL-FALLBACK §8): lets
+      // the scheduler view show the config name and label a fallback-bearing model's
+      // probe window as the canary. Built from config.models (multiple logical ids
+      // can share one health key via inheritance/rename).
+      modelHealthAnnotations: buildModelHealthAnnotations(config.models),
       llmRequestRing,
       workspaceRoot,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
@@ -4775,6 +4780,27 @@ export function safeProactiveDeferUntil(
  * check is gone. Throws on the first offending entry. Called from
  * {@link startMikuAgent}.
  */
+/**
+ * Build the scheduler-snapshot annotation map (spec MODEL-FALLBACK §8): health key
+ * (`endpoint::id`, as `modelHealthKey` derives it) → the LOGICAL ids ([models.*]
+ * block names) resolving to it and whether ANY carries a `fallback` chain. Several
+ * logical ids can share one health key (inheritance / pure-rename virtual models),
+ * so ids aggregate and `hasFallback` ORs. Lets the console show the config name and
+ * label a fallback-bearing model's probe window as the canary.
+ */
+export function buildModelHealthAnnotations(
+  models: AppConfig["models"],
+): Record<string, { logicalIds: string[]; hasFallback: boolean }> {
+  const out: Record<string, { logicalIds: string[]; hasFallback: boolean }> = {};
+  for (const [logicalId, model] of Object.entries(models)) {
+    const key = `${model.endpoint ?? "unknown"}::${model.id}`;
+    const entry = (out[key] ??= { logicalIds: [], hasFallback: false });
+    entry.logicalIds.push(logicalId);
+    if ((model.fallback?.length ?? 0) > 0) entry.hasFallback = true;
+  }
+  return out;
+}
+
 export function validateContextTokenCeilings(config: AppConfig): void {
   // Require `context_window` on a model and return it. `who` names the call site
   // (a session type, or the always-resolvable default model) for the error.
