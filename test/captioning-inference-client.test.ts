@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import http from "node:http";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { InferenceClient } from "../src/captioning/inference-client.js";
-import type { LlmScheduler } from "../src/agent/scheduler.js";
+import { LlmScheduler, type LlmScheduler as LlmSchedulerType } from "../src/agent/scheduler.js";
+import type { ModelChainEntry } from "../src/agent/model-fallback.js";
 
 async function withImageFile(run: (filePath: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-caption-"));
@@ -43,7 +45,7 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
           );
         }),
       noteOutcome: () => {},
-    } as unknown as LlmScheduler;
+    } as unknown as LlmSchedulerType;
 
     const client = new InferenceClient({
       modality: "image",
@@ -71,5 +73,71 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
     client.stop();
     await assert.rejects(() => pending, /aborted/, "queued acquire rejects on stop()");
     assert.equal(acquireSignal!.aborted, true, "stop() aborted the acquire signal");
+  });
+});
+
+/** An OpenAI-style /chat/completions loopback server returning a fixed caption. */
+async function startCaptionServer(
+  caption: string,
+): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c as Buffer));
+    req.on("end", () => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ model: "caption-model", choices: [{ message: { content: caption } }], usage: null }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no address");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    hits: () => hits,
+    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+  };
+}
+
+// spec MODEL-FALLBACK §6 (caption row): a 2-member chain whose HEAD is unhealthy
+// (per §8a health) falls over to the fallback member, which serves the caption.
+test("InferenceClient: 2-member chain — head unhealthy → fallback member serves the caption", async () => {
+  await withImageFile(async (filePath) => {
+    const head = await startCaptionServer("from-head");
+    const fb = await startCaptionServer("from-fallback");
+    try {
+      // Mark the head's model UNHEALTHY (probe window far out) so chooseChainMember
+      // skips it (not probe-due) and selects the in-budget healthy fallback.
+      const scheduler = new LlmScheduler({
+        health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
+      });
+      const headKey = `${head.url}::caption-head`;
+      scheduler.noteOutcome("default", headKey, "environmental"); // → unhealthy
+
+      const chain: ModelChainEntry[] = [
+        { logicalId: "caption-head", config: { id: "caption-head", endpoint: head.url, api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never },
+        { logicalId: "caption-fallback", config: { id: "caption-fallback", endpoint: fb.url, api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never },
+      ];
+
+      const client = new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: "describe",
+        maxChars: 100,
+        maxTokens: 256,
+        scheduler,
+      });
+
+      const result = await client.caption({ filePath, mimeType: "image/png", filename: "test.png" });
+      assert.equal(result.caption, "from-fallback", "the fallback member served the caption");
+      assert.equal(result.logicalModelId, "caption-fallback");
+      assert.equal(head.hits(), 0, "the unhealthy head member is never hit");
+      assert.equal(fb.hits(), 1, "the fallback member served exactly once");
+    } finally {
+      await head.close();
+      await fb.close();
+    }
   });
 });

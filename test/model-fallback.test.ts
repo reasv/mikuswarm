@@ -219,6 +219,65 @@ test("capability pre-filter drops an incapable member but never the head", async
   assert.deepEqual(calls, ["wire-Z"], "falls past the dropped Y to the capable Z");
 });
 
+test("thinking-degrade: chosen member without reasoning clears `reasoning` + warns ONCE", async () => {
+  // Head is healthy → always chosen (primary), and declares `reasoning: false`.
+  const textHead: ModelChainEntry = {
+    logicalId: "X",
+    config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", reasoning: false }),
+  };
+  // Capture the streamOptions the base actually receives so we can assert the
+  // resolver cleared `reasoning` for the no-thinking member.
+  const seen: Array<Record<string, unknown> | undefined> = [];
+  const capturingBase: (cfg: any) => StreamFn = () =>
+    ((model, _context, opts) => {
+      seen.push(opts as Record<string, unknown> | undefined);
+      const stream = createAssistantMessageEventStream();
+      const message: any = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider ?? "test",
+        model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop",
+        timestamp: 0,
+      };
+      stream.push({ type: "done", reason: "stop", message });
+      stream.end(message);
+      return stream;
+    }) as StreamFn;
+
+  const warnings: Array<{ event: string; data?: Record<string, unknown> }> = [];
+  const logger: any = {
+    warn: (event: string, data?: Record<string, unknown>) => warnings.push({ event, data }),
+    info: () => {},
+  };
+
+  // Two-member chain (Y healthy) so the resolver path — not the single-candidate
+  // fast path — runs; the head stays primary so the no-thinking member is chosen.
+  const fb = buildModelFallback([textHead, Y], {
+    consumer: "test",
+    makeBase: capturingBase,
+    makeModel,
+    logger,
+  });
+
+  const model = makeModel(textHead.config, 100_000);
+  // Drive TWICE with `reasoning` set, to prove the once-only `warnedThinking` guard.
+  for (let i = 0; i < 2; i++) {
+    const stream = fb.streamFn(model, {} as never, { reasoning: "high" } as never);
+    for await (const _ of stream) { /* drain */ }
+  }
+
+  assert.equal(seen.length, 2);
+  for (const opts of seen) {
+    assert.equal((opts as { reasoning?: unknown }).reasoning, undefined, "reasoning cleared for the no-thinking member");
+  }
+  const degraded = warnings.filter((w) => w.event === "model_fallback_thinking_degraded");
+  assert.equal(degraded.length, 1, "the thinking-degrade warn fires exactly once across both attempts");
+  assert.equal(degraded[0]?.data?.model, "X");
+});
+
 // --- Fetch-shaped fallback (spec MODEL-FALLBACK §6 rows 3-5) ---
 
 function chainOf(...logicalIds: string[]): ModelChainEntry[] {

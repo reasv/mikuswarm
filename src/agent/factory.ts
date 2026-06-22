@@ -21,7 +21,7 @@ import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
 import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
-import type { CanonicalChatEvent } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { BudgetHooks } from "../budget/index.js";
 
 /**
@@ -429,6 +429,17 @@ export class AgentSessionFactory {
     // to the member actually billed even when the head fell to a fallback.
     const resolvedMember: { logicalId: string } = { logicalId: modelKey };
     const budgetEngine = this.options.budget?.engine;
+    // Capability pre-filter (spec MODEL-FALLBACK §3 #1): when the session's RAW
+    // inputs carry image content, every viable member must be `multimodal` so a
+    // fall-over never ships image blocks to a text-only fallback. Derived from the
+    // raw inputs (trigger attachments / resume snapshot imageBlocks) because this
+    // runs BEFORE buildContext — a SAFE over-approximation (any raw image ⇒
+    // require multimodal for the whole session). The head is never dropped, so the
+    // enforcement ceiling is still resolved ONCE over the surviving chain; it can
+    // only be EQUAL OR LARGER than the full-chain `resolveSessionContextCeiling`
+    // (which has no image info), so both stay ≤ every serving member's window — the
+    // "ceiling resolved once" invariant holds (see that method's comment below).
+    const requiresMultimodal = rawInputsRequireMultimodal(session, opts);
     // Transparent composite stream fn (spec MODEL-FALLBACK §3): capability
     // pre-filter + min-over-chain ceiling fixed once at build, member chosen per
     // attempt inside the composed fn. Admission composes per-candidate INSIDE
@@ -440,6 +451,7 @@ export class AgentSessionFactory {
       makeBase: (cfg) =>
         withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
       makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
+      capability: requiresMultimodal ? (cfg) => cfg.multimodal === true : undefined,
       contextOverride: sessionTypeConfig?.max_context_tokens,
       scheduler,
       admission: scheduler
@@ -875,9 +887,15 @@ export class AgentSessionFactory {
     }
     // Min-over-chain ceiling (spec MODEL-FALLBACK §3 #2): the operative ceiling
     // must be valid for WHICHEVER fallback member serves an attempt, so it is the
-    // minimum `context_window` across the surviving chain. Mirrors
-    // `buildModelFallback`'s `operativeContextWindow` so the factory, the
-    // text-editor read budget, and the console cannot drift.
+    // minimum `context_window` across the chain. This is the FULL-chain min — the
+    // conservative value used by the text-editor read budget and the console,
+    // which have no per-session image-presence info. The create-path enforcement
+    // ceiling (`buildModelFallback`'s `operativeContextWindow`) is the min over the
+    // capability-SURVIVING chain: for an image-bearing session a text-only member
+    // is dropped from selection, so that ceiling can only be EQUAL OR LARGER than
+    // this one (never smaller). Both are resolved once and both stay ≤ the
+    // `context_window` of every member that can actually serve, so neither can
+    // overflow a serving model — the "ceiling resolved once" invariant holds.
     const chain = resolveModelChain(modelKey, this.options.config.models);
     let minWindow = contextWindow;
     for (const entry of chain) {
@@ -1117,6 +1135,65 @@ function syntheticPlaceholderEvent(timelineKey: string): CanonicalChatEvent {
     timestamp: now,
     receivedAt: now,
   };
+}
+
+/**
+ * Will this session's raw inputs send image content to the model? (spec
+ * MODEL-FALLBACK §3 #1, the agent-path capability pre-filter.)
+ *
+ * `buildModelFallback` runs at create time BEFORE `buildContext`, so the frozen
+ * post-compaction content is not yet available — image presence is read from the
+ * RAW inputs the session is built from:
+ *
+ * - Fresh launch: the trigger event's own image attachments and any reply-quoted
+ *   image attachments. (Grouped-event / trigger-group-asset images are not
+ *   chased here — a store walk the builder owns — but the common image cases ride
+ *   on the trigger or its reply.)
+ * - Resume: any message in the persisted prefix snapshot that carries
+ *   `imageBlocks`, plus the trigger-event attachments of the fresh appended turn.
+ *
+ * This is a deliberate, SAFE over-approximation (#6): "any image in the raw
+ * inputs ⇒ require multimodal for the WHOLE session", so a session that carries a
+ * picture is never allowed to fall over to a text-only fallback member (which
+ * would receive image blocks it cannot serve). Generation modes (summarize /
+ * condense / diary) and proactive sessions never send image pixels, so they
+ * impose no requirement and keep the full fallback chain.
+ */
+export function rawInputsRequireMultimodal(
+  session: AgentSessionRecord,
+  opts?: CreateAgentOptions,
+): boolean {
+  // Generation + proactive sessions never carry image pixels (builder forces
+  // `imageBlocks = []` for both), so they impose no multimodal requirement.
+  if (opts?.summarizationCutoff || opts?.condenseInputs || opts?.diaryRange || opts?.proactive) {
+    return false;
+  }
+  if (opts?.resume) {
+    if (opts.resume.snapshot.some(messageHasImageBlock)) return true;
+    if (opts.resume.transcript?.some(messageHasImageBlock)) return true;
+    // Reply-resume appends a fresh trigger turn; failure-recovery resume re-issues
+    // the seeded tail. Either way the trigger event's own images count.
+  }
+  return triggerEventCarriesImage(session.trigger.event);
+}
+
+/** Does this agent message carry at least one image content block? */
+function messageHasImageBlock(message: AgentMessage): boolean {
+  const blocks = (message as { imageBlocks?: unknown }).imageBlocks;
+  return Array.isArray(blocks) && blocks.length > 0;
+}
+
+/**
+ * Does this trigger event (or its quoted reply) carry an image attachment? Mirrors
+ * the builder's own `mediaType === "image" && localPath` predicate
+ * (`selectImageAttachments`), kept cheap (no store walk) for the create-time
+ * over-approximation.
+ */
+function triggerEventCarriesImage(event: CanonicalChatEvent): boolean {
+  const isImage = (a: AttachmentMeta): boolean => a.mediaType === "image" && Boolean(a.localPath);
+  if ((event.attachments ?? []).some(isImage)) return true;
+  if ((event.replyTo?.attachments ?? []).some(isImage)) return true;
+  return false;
 }
 
 /**

@@ -383,7 +383,7 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
           async (member) => {
             billed = member;
             const url = `${member.config.endpoint.replace(/\/+$/, "")}/v1beta/models/${member.config.id}:generateContent`;
-            const r = await postGenerate({ url, apiKey: member.config.api_key, body, dispatcher, timeoutMs });
+            const r = await postGenerate({ url, apiKey: member.config.api_key, body, dispatcher, timeoutMs, signal: admitCtrl.signal });
             if ("httpError" in r) {
               lastHttpError = r.httpError;
               // A 400/413/422 is THIS request's content (deterministic on replay)
@@ -397,6 +397,12 @@ export function createImageGenTool(context: ImageGenToolContext): AgentTool {
       } catch (error) {
         // All members failed (or a content failure short-circuited): surface the
         // last formatted HTTP error result if we have one, else a generic message.
+        // An agent-signal abort / admission timeout also lands here and degrades to
+        // a text error (image_generate's established contract; #14) — the in-flight
+        // POST abort #7 fixes is that `admitCtrl.signal` now actually CANCELS the
+        // generation fetch, so we stop billing the run rather than waiting out
+        // `timeout_ms`. `runFetchWithFallback` already skipped the health feed +
+        // fall over for the neutral AbortError (spec MODEL-FALLBACK §9).
         if (lastHttpError) return lastHttpError;
         return textError(`Image generation request failed (model ${tierLabel}): ${errMessage(error)}`);
       } finally {
@@ -554,9 +560,24 @@ async function postGenerate(input: {
   body: Record<string, unknown>;
   dispatcher: Dispatcher | undefined;
   timeoutMs: number;
+  /**
+   * Agent-abort / admission-timeout signal (spec MODEL-FALLBACK §10; #7). Composed
+   * with the per-call `timeoutMs` controller so EITHER an agent cancel / admission
+   * timeout OR the wall-clock timeout aborts the in-flight generation POST —
+   * without this an admitted generation bills until `timeoutMs` even after the
+   * turn is cancelled. Mirrors x_search's `postGrok`.
+   */
+  signal?: AbortSignal;
 }): Promise<GeminiResponse | { httpError: ToolTextResult; status: number; retryAfterMs?: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
+  // Compose the agent/admission abort with the wall-clock timeout so a cancelled
+  // turn or admission timeout aborts the request promptly, not just a slow upstream.
+  const onAgentAbort = () => controller.abort();
+  if (input.signal) {
+    if (input.signal.aborted) controller.abort();
+    else input.signal.addEventListener("abort", onAgentAbort, { once: true });
+  }
   let response: Response;
   try {
     // Route through the shared egress chokepoint: SSRF guard + per-host admission
@@ -581,7 +602,13 @@ async function postGenerate(input: {
     });
   } catch (error) {
     clearTimeout(timeout);
+    if (input.signal) input.signal.removeEventListener("abort", onAgentAbort);
     if ((error as { name?: string })?.name === "AbortError") {
+      // Agent cancel / admission timeout (the composed signal fired) is a NEUTRAL
+      // teardown — rethrow an AbortError so `runFetchWithFallback` classifies it
+      // neutral (no health signal, no fall-over). A bare wall-clock timeout (the
+      // signal never fired) stays environmental and falls over to the next member.
+      if (input.signal?.aborted) throw abortError();
       throw new Error(`timed out after ${input.timeoutMs}ms`);
     }
     throw error;
@@ -603,18 +630,28 @@ async function postGenerate(input: {
     try {
       return (await readJsonCapped(response, controller)) as GeminiResponse;
     } catch (error) {
-      // A timeout that fires mid-stream aborts `reader.read()` with an
-      // AbortError; surface the same friendly message as the fetch-level abort.
-      // The cap-exceeded guard throws a plain Error (not AbortError) with its
-      // own explicit message, so it is not clobbered here.
+      // A timeout/abort that fires mid-stream aborts `reader.read()` with an
+      // AbortError; surface the same classification as the fetch-level abort (an
+      // agent cancel / admission timeout is neutral, a bare wall-clock timeout is
+      // environmental). The cap-exceeded guard throws a plain Error (not
+      // AbortError) with its own explicit message, so it is not clobbered here.
       if ((error as { name?: string })?.name === "AbortError") {
+        if (input.signal?.aborted) throw abortError();
         throw new Error(`timed out after ${input.timeoutMs}ms`);
       }
       throw error;
     }
   } finally {
     clearTimeout(timeout);
+    if (input.signal) input.signal.removeEventListener("abort", onAgentAbort);
   }
+}
+
+/** A neutral abort error whose `name` `runFetchWithFallback` keys on (spec §9). */
+function abortError(): Error {
+  const err = new Error("image generation aborted");
+  err.name = "AbortError";
+  return err;
 }
 
 /** Stream the JSON body with a running byte cap so a runaway response (or a

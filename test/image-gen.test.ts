@@ -651,3 +651,133 @@ test("image_generate composes the agent abort signal into the admission wait (#1
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// In-flight generation POST abort (#7)
+// ---------------------------------------------------------------------------
+
+test("image_generate aborts the in-flight generation POST on agent cancel (#7)", async () => {
+  await withWorkspace(async (workspace) => {
+    // A server that NEVER responds, so the only way the call returns is the
+    // fetch being aborted (by the agent signal threaded into postGenerate).
+    let reqReceived = false;
+    let reqClosed = false;
+    const server = http.createServer((req) => {
+      reqReceived = true;
+      req.resume(); // drain the request body so headers/handler settle
+      // The socket closes when the client (our aborted fetch) tears it down.
+      req.socket.on("close", () => { reqClosed = true; });
+      // intentionally never call res.end()
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("no address");
+    const url = `http://127.0.0.1:${address.port}`;
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: url, fetchClient: stub.client });
+      // No scheduler → admission is bypassed and the POST runs immediately; a large
+      // per-call timeout so ONLY the agent abort (not the wall-clock timeout) can
+      // end the in-flight POST. On the OLD behavior (signal not threaded into
+      // postGenerate) this would hang until timeout_ms.
+      ctx.config = { ...ctx.config, timeout_ms: 60_000 };
+
+      const tool = createImageGenTool(ctx);
+      const agent = new AbortController();
+      // Abort once the POST is in flight (give it room to connect under test load).
+      setTimeout(() => agent.abort(), 300);
+      const start = Date.now();
+      const result: any = await tool.execute("inflight-abort", { prompt: "x" }, agent.signal);
+      const elapsed = Date.now() - start;
+
+      // The POST reached the server (admission bypassed, generation in flight) and
+      // the call returned WAY before timeout_ms (60s) — only the threaded agent
+      // abort can do that. On the OLD behavior (signal not threaded) this hangs
+      // until timeout_ms and `elapsed` would be ~60s.
+      assert.equal(reqReceived, true, "the generation POST was actually issued");
+      assert.ok(elapsed < 10_000, `agent abort cancelled the in-flight POST promptly, took ${elapsed}ms`);
+      assert.equal(result.content[0].type, "text");
+      assert.match(result.content[0].text, /Image generation request failed/);
+      assert.match(result.content[0].text, /aborted/, "surfaces a neutral abort, not a wall-clock timeout");
+      // The upstream connection was torn down by the abort (the bill stops).
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(reqClosed, true, "the upstream generation request socket was closed, not left billing");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await stub.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2-member chain fallback / budget (spec MODEL-FALLBACK §6/§7; #14)
+// ---------------------------------------------------------------------------
+
+/** A pro tier with two members pointed at two distinct loopback servers, so the
+ *  test can observe WHICH endpoint served a generation. */
+function twoMemberProChains(headUrl: string, fbUrl: string): ImageGenToolContext["chains"] {
+  const base = { provider: "gemini", api_key: "test-key", multimodal: true, max_tokens: 32768, context_window: 32768 };
+  return {
+    pro: [
+      { logicalId: "imagegen-pro", config: { ...base, id: "gemini-3-pro-image", endpoint: headUrl } as never },
+      { logicalId: "imagegen-pro-fb", config: { ...base, id: "gemini-3-pro-image", endpoint: fbUrl } as never },
+    ],
+    flash: [{ logicalId: "imagegen-flash", config: { ...base, id: "gemini-3.1-flash-image", endpoint: headUrl } as never }],
+  };
+}
+
+test("image_generate 2-member chain: head over budget → the fallback member serves (#14)", async () => {
+  await withWorkspace(async (workspace) => {
+    const b64 = await smallPngBase64();
+    let headHit = false;
+    let fbHit = false;
+    const head = await startGeminiServer(() => { headHit = true; return { json: geminiImageResponse(b64) }; });
+    const fb = await startGeminiServer(() => { fbHit = true; return { json: geminiImageResponse(b64) }; });
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: head.url, fetchClient: stub.client });
+      ctx.chains = twoMemberProChains(head.url, fb.url);
+      // The head logical id is over period budget; the fallback is available.
+      ctx.isModelAvailable = (id) => id !== "imagegen-pro";
+      ctx.checkBudget = (id) => (id === "imagegen-pro" ? "head over budget" : undefined);
+
+      const tool = createImageGenTool(ctx);
+      const result: any = await tool.execute("budget-fallover", { prompt: "a yellow square" });
+
+      assert.equal(headHit, false, "the over-budget head member is skipped");
+      assert.equal(fbHit, true, "the in-budget fallback member serves the generation");
+      assert.ok(result.content.some((c: any) => c.type === "image"), "an image was produced by the fallback");
+    } finally {
+      await head.close();
+      await fb.close();
+      await stub.cleanup();
+    }
+  });
+});
+
+test("image_generate 2-member chain: BOTH members over budget → tool budget error (#14)", async () => {
+  await withWorkspace(async (workspace) => {
+    let anyHit = false;
+    const head = await startGeminiServer(() => { anyHit = true; return { json: geminiImageResponse("AAAA") }; });
+    const fb = await startGeminiServer(() => { anyHit = true; return { json: geminiImageResponse("AAAA") }; });
+    const stub = makeStubFetchClient({ buffer: Buffer.from("unused") });
+    try {
+      const ctx = baseContext({ workspaceRoot: workspace, serverUrl: head.url, fetchClient: stub.client });
+      ctx.chains = twoMemberProChains(head.url, fb.url);
+      // Every chain member is over budget → the tool-level `chain.some` gate refuses.
+      ctx.checkBudget = () => "all members over budget";
+      ctx.isModelAvailable = () => false;
+
+      const tool = createImageGenTool(ctx);
+      const result: any = await tool.execute("budget-refused", { prompt: "x" });
+
+      assert.equal(anyHit, false, "no generation POST is made when the whole chain is over budget");
+      assert.equal(result.content[0].type, "text");
+      assert.match(result.content[0].text, /all members over budget/);
+    } finally {
+      await head.close();
+      await fb.close();
+      await stub.cleanup();
+    }
+  });
+});
