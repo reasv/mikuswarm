@@ -196,19 +196,18 @@ const ReactionsSchema = StrictObject({
 // auto-retrieval injected per trigger (ARCHITECTURE.md §9d). Optional so existing
 // configs stay valid; `enabled` is the master switch for the whole index.
 const RetrievalEmbeddingRemoteSchema = StrictObject({
-  // OpenRouter-compatible embeddings endpoint (§5d). `dim` is REQUIRED when remote
-  // is the active provider — it governs the vector index width (§5a/§6).
-  id: Type.String({ minLength: 1 }),
-  endpoint: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
+  // Unified registry (spec MODEL-FALLBACK §2.3): `[models.*]` block name for the
+  // embeddings endpoint — connection (endpoint/id/api_key), rate-limit group, and
+  // cost (its `cost.input` is the USD/1M-input-token rate) live on the referenced
+  // block. The old inline id/endpoint/api_key/rate_limit_group/cost_per_mtok are
+  // gone. NOTE: a `fallback` chain on the referenced model must produce
+  // VECTOR-COMPATIBLE embeddings (same `dim` AND embedding space) — the dim check
+  // rejects a wrong-width member, but a same-dim different-space model would
+  // silently corrupt the cache/index; in practice point fallback at the same
+  // model on a different endpoint.
+  model: Type.String({ minLength: 1 }),
+  // REQUIRED when remote is active — governs the vector index width (§5a/§6).
   dim: Type.Integer({ minimum: 1 }),
-  // LLM rate-limit group (spec §9.4): only meaningful when remote embedding is
-  // the active provider (local ONNX never touches the scheduler). Unset = `default`.
-  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
-  // USD per 1,000,000 input tokens for usage accounting (spec USAGE-COST-LIMITS
-  // §9). Unset/0 = untracked (the remote model emits a zero-cost `usage_events`
-  // row, invisible to the BudgetEngine but counted in the console).
-  cost_per_mtok: Type.Optional(Type.Number({ minimum: 0 })),
   // Chars-per-token estimate used to price a response that omits a token count
   // (§9). Defaults to 4 when unset.
   chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
@@ -468,6 +467,22 @@ const TimelineSchema = StrictObject({
 });
 
 const ModelSchema = StrictObject({
+  // Model inheritance (spec MODEL-FALLBACK §2.1). When set, the named `[models.*]`
+  // block is deep-merged UNDER this one (child fields win, everything else
+  // inherited) at config load, BEFORE schema validation — so a VIRTUAL model can
+  // reuse a real model's connection properties (endpoint/api/key/cost/window/…)
+  // and override only what differs, crucially its own `fallback` chain. Transitive;
+  // cycles fail fast at load. The loader strips `inherits` after merging, so a
+  // resolved model is a plain real model.
+  inherits: Type.Optional(Type.String({ minLength: 1 })),
+  // Per-model fallback chain (spec MODEL-FALLBACK §2.1). An ordered list of
+  // `[models.*]` block names (logical ids); a request to THIS model is served by
+  // the first chain member that is up, transparently. The chain is exactly the
+  // one written here — a member's own `fallback` does NOT transitively extend it
+  // (§9, head's chain only). Fallbacks live ONLY on models; there is no per-tool
+  // or per-session-type fallback config. The model itself is the implicit head, so
+  // a chain of `["Y","Z"]` resolves as `[self, Y, Z]`.
+  fallback: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   id: Type.String({ minLength: 1 }),
   // pi-ai provider string. Besides naming the upstream, it drives the OAI
   // provider's compat AUTO-DETECTION (request dialect): e.g. "together" turns
@@ -546,6 +561,10 @@ const ModelSchema = StrictObject({
     output: Type.Number({ minimum: 0 }),
     cache_read: Type.Number({ minimum: 0 }),
     cache_write: Type.Number({ minimum: 0 }),
+    // Optional flat USD charge per generated image (spec MODEL-FALLBACK §2.3) —
+    // used by image-gen models that quote per-image pricing, moved here from the
+    // old inline `[image_gen.costs.*].per_image` when the registry was unified.
+    per_image: Type.Optional(Type.Number({ minimum: 0 })),
   })),
   streaming: Type.Optional(Type.Boolean()),
   // LLM rate-limit group (spec CONCURRENCY-AND-RATE-LIMITING §9.2): which shared
@@ -565,6 +584,12 @@ const ModelSchema = StrictObject({
   // interactive-class sessions (chat/proactive); background-class work is
   // unbounded regardless.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Per-model override of the unhealthy-probe backoff CEILING (spec MODEL-FALLBACK
+  // §4.1). While this model is unhealthy the scheduler probes on a capped
+  // exponential backoff (base → ×2 → cap); a model with an especially poor
+  // fallback can pin a tighter cap here so it returns to the primary sooner.
+  // Unset = the global `recovery.llm_probe_backoff_max_ms`.
+  llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
   compat: Type.Optional(StrictObject({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
@@ -681,35 +706,10 @@ const FxTwitterSchema = StrictObject({
   })),
 });
 
-const CaptioningModelSchema = StrictObject({
-  id: Type.String({ minLength: 1 }),
-  endpoint: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
-  // pi-ai provider label recorded on the unified ledger's caption rows so a
-  // caption's upstream is attributable like an agent-loop or tool row (spec
-  // USAGE-COST-LIMITS §3.1). Accounting provenance only — captioning drives the
-  // OAI client directly, so this does NOT affect request dialect. Unset = the
-  // ledger row's `provider` stays null.
-  provider: Type.Optional(Type.String({ minLength: 1 })),
-  // USD/1M-token cost rates for auxiliary (out-of-loop) usage accounting (spec
-  // AUXILIARY-USAGE-TRACKING §7.1) — identical shape to `[models.*].cost`. Token
-  // usage is captured regardless; this only prices it. Resolution (app wiring):
-  // modality model's cost → top-level `[captioning.model].cost` → unset (= 0 =
-  // untracked). 00-defaults leaves it unset per the explicit-deployment-config
-  // convention; real rates live in local config.
-  cost: Type.Optional(StrictObject({
-    input: Type.Number({ minimum: 0 }),
-    output: Type.Number({ minimum: 0 }),
-    cache_read: Type.Number({ minimum: 0 }),
-    cache_write: Type.Number({ minimum: 0 }),
-  })),
-  // LLM rate-limit group (spec §9.2/§9.4). Captioning typically sits on a
-  // separate, generous budget (OpenRouter) — declare that group under
-  // `[rate_limits.llm.*]` and name it here. Unset = `default` (shares the
-  // scarce main budget — usually NOT what you want for captioning).
-  rate_limit_group: Type.Optional(Type.String({ minLength: 1 })),
-});
-
+// Unified registry (spec MODEL-FALLBACK §2.3): captioning models are NAMED
+// references into `[models.*]` (connection / provider / cost / rate_limit_group /
+// any `fallback` chain live on the referenced block) — the old inline caption
+// model block (id/endpoint/api_key/provider/cost/rate_limit_group) is gone.
 // NOTE: the per-modality `concurrency` alias (deprecated transitional knob) was
 // removed (review issue #29): caption-inference concurrency is governed by the
 // captioning rate-limit group's `max_in_flight` ([rate_limits.llm.*], spec §9.4).
@@ -718,11 +718,15 @@ const ModalityConfigSchema = StrictObject({
   max_chars: Type.Optional(Type.Number({ minimum: 1 })),
   max_tokens: Type.Optional(Type.Number({ minimum: 1 })),
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
-  model: Type.Optional(CaptioningModelSchema),
+  // `[models.*]` block name for this modality; unset = the top-level captioning
+  // `model`, else the `default` model.
+  model: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const CaptioningSchema = StrictObject({
-  model: Type.Optional(CaptioningModelSchema),
+  // `[models.*]` block name shared by all modalities unless overridden per
+  // modality; unset = the `default` model.
+  model: Type.Optional(Type.String({ minLength: 1 })),
   worker_count: Type.Optional(Type.Number({ minimum: 1 })),
   caption_all: Type.Optional(Type.Boolean()),
   caption_assistant_messages: Type.Optional(Type.Boolean()),
@@ -852,24 +856,13 @@ const BrowserSchema = StrictObject({
 
 export type BrowserConfig = Static<typeof BrowserSchema>;
 
-// Image generation/editing via Google's Gemini "nano banana" models. `base_url`
-// is the Gemini API endpoint root (the
-// tool appends `/v1beta/models/<model>:generateContent`); `api_key` is sent as
-// `Authorization: Bearer`. The `api_key` field name matches the secret regex so
-// it auto-registers for log redaction.
-// One per-tier image cost block (spec AUXILIARY-USAGE-TRACKING §7.2): the four
-// USD/1M-token rates plus an optional flat per-image charge. All >= 0.
-const ImageCostBlock = StrictObject({
-  input: Type.Number({ minimum: 0 }),
-  output: Type.Number({ minimum: 0 }),
-  cache_read: Type.Number({ minimum: 0 }),
-  cache_write: Type.Number({ minimum: 0 }),
-  per_image: Type.Optional(Type.Number({ minimum: 0 })),
-});
-
+// Image generation/editing via Google's Gemini "nano banana" models. Unified
+// registry (spec MODEL-FALLBACK §2.3): the `pro`/`flash` tiers REFERENCE
+// `[models.*]` blocks by name — each carrying `endpoint` (the Gemini API root;
+// the tool appends `/v1beta/models/<id>:generateContent`), `id` (wire model),
+// `api_key`, `cost` (incl. the optional flat `per_image`), and any `fallback`
+// chain. `base_url`/`api_key`/`costs` are gone (moved onto the referenced models).
 const ImageGenSchema = StrictObject({
-  base_url: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
   models: StrictObject({
     pro: Type.String({ minLength: 1 }),
     flash: Type.String({ minLength: 1 }),
@@ -879,17 +872,6 @@ const ImageGenSchema = StrictObject({
   // truncated before any image is produced (see src/tools/image-gen.ts).
   max_output_tokens: Type.Optional(Type.Number({ minimum: 256 })),
   output_subdir: Type.Optional(Type.String()),
-  // Per-tier USD cost rates for auxiliary usage accounting (spec
-  // AUXILIARY-USAGE-TRACKING §7.2). Image models price differently per tier
-  // (pro vs flash) and Gemini bills the generated image as `candidatesTokenCount`
-  // (output tokens) — so token rates are USD/1M tokens like everywhere else.
-  // `per_image` is an OPTIONAL flat USD charge added once per generated image,
-  // for endpoints that quote per-image pricing. Set token rates, the flat charge,
-  // both, or neither (unset = 0 = untracked). 00-defaults leaves it unset.
-  costs: Type.Optional(StrictObject({
-    pro: Type.Optional(ImageCostBlock),
-    flash: Type.Optional(ImageCostBlock),
-  })),
 });
 
 // X.com search via Grok-as-subagent (spec/X-SEARCH.md; ARCHITECTURE.md §10).
@@ -902,11 +884,12 @@ const ImageGenSchema = StrictObject({
 const XSearchSchema = StrictObject({
   // false → x_search is not registered. Defaults to true when the block exists.
   enabled: Type.Optional(Type.Boolean()),
-  base_url: Type.String({ minLength: 1 }),
-  api_key: Type.String({ minLength: 1 }),
-  // effort=fast tier (default); should be a quick non-reasoning Grok model.
-  model: Type.Optional(Type.String({ minLength: 1 })),
-  // effort=deep tier; set to a reasoning model for harder research tasks.
+  // Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers REFERENCE
+  // `[models.*]` blocks by name (each carrying endpoint/id/api_key/cost +
+  // optional `fallback` chain). `base_url`/`api_key`/`cost` are gone — they live
+  // on the referenced model. `model` (fast tier) is required when the block
+  // exists; `deep_model` defaults to `model`.
+  model: Type.String({ minLength: 1 }),
   deep_model: Type.Optional(Type.String({ minLength: 1 })),
   // Wall-clock bound on the Grok reasoning search (slow); graceful timeout.
   timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
@@ -925,11 +908,8 @@ const XSearchSchema = StrictObject({
   enable_video_understanding: Type.Optional(Type.Boolean()),
   // Overridable subagent scaffold (forces a live cited search; §4.2).
   system_prompt: Type.Optional(Type.String({ minLength: 1 })),
-  // Per-MTok USD rates for the Grok call's tool_invocations ledger row (§7).
-  cost: Type.Optional(StrictObject({
-    input: Type.Number({ minimum: 0 }),
-    output: Type.Number({ minimum: 0 }),
-  })),
+  // Pricing now lives on the referenced `[models.*]` block's `cost` (spec
+  // MODEL-FALLBACK §2.3) — the old inline `[x_search.cost]` is gone.
 });
 
 // Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP; backs
@@ -1018,10 +998,16 @@ const RecoverySchema = StrictObject({
   // (summaries/diaries) is deliberately unbounded — it waits out any outage.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // Per-model health (spec §5): consecutive environmental failures before the
-  // model turns unhealthy (half-open admission), and the FIXED probe cadence
-  // while unhealthy (never grows — recovery is detected within one window).
+  // model turns unhealthy (half-open admission).
   llm_unhealthy_threshold: Type.Optional(Type.Number({ minimum: 1 })),
-  llm_probe_interval_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Probe cadence while unhealthy — a per-episode CAPPED EXPONENTIAL BACKOFF
+  // (spec MODEL-FALLBACK §4.1, REPLACING the old fixed `llm_probe_interval_ms`).
+  // First probe fires `..._base_ms` after turning unhealthy (aggressive, to catch
+  // a quick recovery while work rides the fallback), doubling on each failed probe
+  // up to `..._max_ms`, reset to base on recovery. A model can pin a tighter cap
+  // via its own `models.*.llm_probe_backoff_max_ms`.
+  llm_probe_backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // User-facing failure notice (spec §8.3): when non-empty, sent verbatim to
   // the session's room when a USER-TRIGGERED chat session stops trying on its
   // own (parked failed-resumable, or its build timed out waiting on summary

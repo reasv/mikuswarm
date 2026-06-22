@@ -65,6 +65,16 @@ export interface ConsoleServerDeps {
    */
   scheduler?: LlmScheduler;
   /**
+   * Config-derived per-health-key annotations for the scheduler snapshot (spec
+   * MODEL-FALLBACK §8): maps a model's health key (`endpoint::id`) → the LOGICAL
+   * ids ([models.*] block names) that resolve to it and whether ANY of them
+   * carries a `fallback` chain. The snapshot keys on the health key (config-blind),
+   * so this lets the console show the logical name(s) and label an unhealthy
+   * fallback-bearing model's probe window as the **canary**. Optional: absent =
+   * the snapshot is served unannotated.
+   */
+  modelHealthAnnotations?: Record<string, { logicalIds: string[]; hasFallback: boolean }>;
+  /**
    * In-memory Layer-0 attempt ring backing `GET /api/llm-requests` (spec
    * §9.2). Optional: absent = the route 503s.
    */

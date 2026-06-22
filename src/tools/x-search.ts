@@ -12,6 +12,12 @@ import type { FxApiTweet } from "../fxtwitter/types.js";
 import type { InferenceClient } from "../captioning/inference-client.js";
 import { parseOpenAiUsage } from "../captioning/describe.js";
 import { computeUsageCost, type CostRates, type RawTokenUsage } from "../agent/usage.js";
+import {
+  runFetchWithFallback,
+  type ModelChainEntry,
+  type FetchChainMember,
+} from "../agent/model-fallback.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../agent/scheduler.js";
 import { escapeXml, escapeAttr } from "../context/xml.js";
 import { formatAgentTimestamp } from "../time/index.js";
 import type { ToolUsageRecord } from "./image-gen.js";
@@ -35,7 +41,6 @@ const RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 /** Max images the model may attach to one Grok query (vision context, not corpus). */
 const MAX_INPUT_IMAGES = 4;
 
-const DEFAULT_MODEL = "x-ai/grok-4.3";
 const DEFAULT_SYSTEM_PROMPT = [
   "You are an X.com (Twitter) search subagent. You have live X search and an auxiliary general web search.",
   "X is the priority corpus; lean on web results only when they add value the X posts cannot.",
@@ -49,6 +54,18 @@ const DEFAULT_SYSTEM_PROMPT = [
 /** All-zero rates: usage captured, cost "untracked" (mirrors image-gen/captioning). */
 const ZERO_COST_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+/** Per-model cost rates from a resolved `[models.*]` block (spec MODEL-FALLBACK §2.3). */
+function costRatesOf(config: ModelChainEntry["config"]): CostRates {
+  return config.cost
+    ? {
+        input: config.cost.input,
+        output: config.cost.output,
+        cacheRead: config.cost.cache_read,
+        cacheWrite: config.cost.cache_write,
+      }
+    : ZERO_COST_RATES;
+}
+
 // ---------------------------------------------------------------------------
 // Resolved configuration
 // ---------------------------------------------------------------------------
@@ -56,8 +73,9 @@ const ZERO_COST_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWri
 /** Raw `[x_search]` config block (snake_case), as validated by the schema. */
 export interface XSearchRawConfig {
   enabled?: boolean;
-  base_url?: string;
-  api_key?: string;
+  // model/deep_model are `[models.*]` REFERENCES (spec MODEL-FALLBACK §2.3) —
+  // connection + cost live on the referenced block, resolved at app wiring into
+  // the fast/deep chains passed via XSearchToolContext.
   model?: string;
   deep_model?: string;
   timeout_ms?: number;
@@ -69,14 +87,9 @@ export interface XSearchRawConfig {
   enable_image_understanding?: boolean;
   enable_video_understanding?: boolean;
   system_prompt?: string;
-  cost?: { input: number; output: number };
 }
 
 interface ResolvedXSearchConfig {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  deepModel: string;
   timeoutMs: number;
   cacheTtlMs: number;
   hydrateDefault: number;
@@ -86,24 +99,11 @@ interface ResolvedXSearchConfig {
   enableImageUnderstanding: boolean;
   enableVideoUnderstanding: boolean;
   systemPrompt: string;
-  costRates: CostRates;
 }
 
-/**
- * Resolve the raw `[x_search]` block into a fully-defaulted shape. `base_url`
- * and `api_key` are required (fail fast at construction, like image-gen).
- */
+/** Resolve the non-model `[x_search]` knobs into a fully-defaulted shape. */
 export function resolveXSearchConfig(raw?: XSearchRawConfig): ResolvedXSearchConfig {
-  const baseUrl = normalizeBaseUrl(raw?.base_url);
-  const apiKey = (raw?.api_key ?? "").trim();
-  if (!apiKey) throw new Error("x_search.api_key must be configured.");
-  const model = (raw?.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-  const deepModel = (raw?.deep_model ?? model).trim() || model;
   return {
-    baseUrl,
-    apiKey,
-    model,
-    deepModel,
     timeoutMs: raw?.timeout_ms ?? 60_000,
     cacheTtlMs: Math.max(0, (raw?.cache_ttl_minutes ?? 10) * 60_000),
     hydrateDefault: raw?.hydrate_default ?? 5,
@@ -113,23 +113,7 @@ export function resolveXSearchConfig(raw?: XSearchRawConfig): ResolvedXSearchCon
     enableImageUnderstanding: raw?.enable_image_understanding ?? true,
     enableVideoUnderstanding: raw?.enable_video_understanding ?? true,
     systemPrompt: (raw?.system_prompt ?? "").trim() || DEFAULT_SYSTEM_PROMPT,
-    costRates: raw?.cost
-      ? { input: raw.cost.input, output: raw.cost.output, cacheRead: 0, cacheWrite: 0 }
-      : ZERO_COST_RATES,
   };
-}
-
-function normalizeBaseUrl(value: string | undefined): string {
-  const trimmed = (value ?? "").trim();
-  if (!trimmed) throw new Error("x_search.base_url must be configured.");
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error(`x_search.base_url must be a valid URL, got "${trimmed}".`);
-  }
-  if (!/^https?:$/.test(url.protocol)) throw new Error("x_search.base_url must use http or https.");
-  return trimmed.replace(/\/+$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,8 +185,19 @@ export function buildCacheKey(input: {
 // ---------------------------------------------------------------------------
 
 export interface XSearchToolContext {
-  /** Raw `[x_search]` config block. */
+  /** Raw `[x_search]` config block (non-model knobs only). */
   config: XSearchRawConfig;
+  /**
+   * Resolved fast/deep model chains (spec MODEL-FALLBACK §2.3/§6): each is the
+   * referenced `[models.*]` head plus its `fallback` members, resolved at app
+   * wiring. The Grok call runs through `runFetchWithFallback` over the chain.
+   */
+  fastChain: ModelChainEntry[];
+  deepChain: ModelChainEntry[];
+  /** §8a scheduler — admission + health per Grok attempt (was previously unadmitted). */
+  scheduler?: LlmScheduler;
+  /** Budget availability by logical id (spec §3/§7) — skips an over-cap member. */
+  isModelAvailable?: (logicalId: string) => boolean;
   /** Agent workspace root — resolves local image paths passed via `images`. */
   workspaceRoot: string;
   /** Shared FxTwitter client (hydration), same instance x_fetch uses. */
@@ -224,12 +219,12 @@ export interface XSearchToolContext {
   /** Durable usage-ledger sink (§7); also feeds the in-memory cost lane. */
   recordToolUsage?: (record: ToolUsageRecord) => void;
   /**
-   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called before the paid Grok
-   * call with the resolved model id; returns an agent-facing error message when a
-   * covering period rule is over budget (the call is refused, not thrown), else
-   * undefined. Absent = no period budgeting.
+   * Period-budget gate (spec USAGE-COST-LIMITS §6.3). Called with a member's
+   * LOGICAL id; returns an agent-facing error message when a covering period rule
+   * is over budget, else undefined. With fallback the call is refused only when
+   * EVERY chain member is over budget. Absent = no period budgeting.
    */
-  checkBudget?: (modelId: string) => string | undefined;
+  checkBudget?: (logicalModelId: string) => string | undefined;
   /** Clock injection for cache TTL + tookMs (defaults to Date.now). */
   now?: () => number;
 }
@@ -324,7 +319,10 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
       }
 
       const effort: "fast" | "deep" = params.effort ?? "fast";
-      const model = effort === "deep" ? config.deepModel : config.model;
+      const chain = effort === "deep" ? context.deepChain : context.fastChain;
+      // The head logical id labels the cache key + logs; the member actually
+      // billed is chosen per attempt by the fallback resolver.
+      const model = chain[0]!.logicalId;
       const hydrate = Math.min(params.hydrate ?? config.hydrateDefault, config.hydrateMax);
       const enableVideo = config.enableVideoUnderstanding;
 
@@ -346,9 +344,15 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
       if (!grok) {
         // Period-budget gate (spec USAGE-COST-LIMITS §6.3): a cache HIT above is
         // free and always allowed; only the live (billable) Grok call is gated.
-        // Over budget → refuse as a tool error before issuing the call.
-        const budgetError = context.checkBudget?.(model);
-        if (budgetError) return textError(budgetError);
+        // With fallback, the call is refused only when EVERY chain member is over
+        // budget (a model-scoped cap on the head just falls to the next member, §7).
+        if (context.checkBudget) {
+          const available = chain.some((m) => !context.checkBudget!(m.logicalId));
+          if (!available) {
+            const msg = context.checkBudget(chain[0]!.logicalId);
+            if (msg) return textError(msg);
+          }
+        }
         // Attached images become base64 data-URL blocks on the user turn (vision
         // context for source-finding — §10). A load failure is a clear error, not
         // a silent degrade: the model needs to know its image never reached Grok.
@@ -358,42 +362,90 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
         } catch (error) {
           return textError(`x_search could not load an attached image: ${errMessage(error)}`);
         }
-        const body = buildGrokRequestBody({
-          model,
-          query,
-          systemPrompt: config.systemPrompt,
-          allowedHandles,
-          excludedHandles,
-          fromDate: params.from_date,
-          toDate: params.to_date,
-          enableImageUnderstanding: config.enableImageUnderstanding,
-          enableVideoUnderstanding: enableVideo,
-          imageDataUrls,
-        });
-        let live: GrokResult | { error: string };
+        // Transparent Grok-tier fallback (spec MODEL-FALLBACK §6): the chain is
+        // tried in order, the chosen member's endpoint/id/key/cost used per attempt.
+        let live: GrokResult;
+        let billed: FetchChainMember | undefined;
         try {
-          live = await postGrok({
-            url: `${config.baseUrl}/chat/completions`,
-            apiKey: config.apiKey,
-            body,
-            dispatcher,
-            timeoutMs: config.timeoutMs,
-            signal: agentSignal,
-          });
+          live = await runFetchWithFallback<GrokResult>(
+            chain,
+            {
+              consumer: `x_search:${effort}`,
+              priority: "interactive",
+              scheduler: context.scheduler,
+              isModelAvailable: context.isModelAvailable,
+              probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
+              signal: agentSignal,
+            },
+            async (member) => {
+              billed = member;
+              const body = buildGrokRequestBody({
+                model: member.config.id,
+                query,
+                systemPrompt: config.systemPrompt,
+                allowedHandles,
+                excludedHandles,
+                fromDate: params.from_date,
+                toDate: params.to_date,
+                enableImageUnderstanding: config.enableImageUnderstanding,
+                enableVideoUnderstanding: enableVideo,
+                imageDataUrls,
+              });
+              // postGrok throws an AbortError on agent-signal cancellation so the
+              // helper's neutral branch fires (no health hit, clean teardown — §9);
+              // an HTTP/parse/timeout failure comes back as a tagged `{ error }`
+              // carrying the status so 4xx maps to content (never falls over).
+              const result = await postGrok({
+                url: `${member.config.endpoint.replace(/\/+$/, "")}/chat/completions`,
+                apiKey: member.config.api_key,
+                body,
+                dispatcher,
+                timeoutMs: config.timeoutMs,
+                signal: agentSignal,
+              });
+              if ("error" in result) {
+                // A 400/413/422 is THIS request's content (deterministic on
+                // replay) and never falls over or marks the head unhealthy (§9);
+                // every other failure (5xx/timeout/parse/reset) is environmental.
+                const kind =
+                  result.status === 400 || result.status === 413 || result.status === 422
+                    ? "content"
+                    : "environmental";
+                return {
+                  ok: false,
+                  kind,
+                  status: result.status,
+                  retryAfterMs: result.retryAfterMs,
+                  error: new Error(result.error),
+                };
+              }
+              return { ok: true, value: result };
+            },
+          );
         } catch (error) {
+          // An agent-signal abort is a neutral cancellation, not a tool failure:
+          // rethrow it so the cancelled turn unwinds cleanly rather than surfacing
+          // a spurious "X search failed" (the helper already skipped the health
+          // feed + fall over for it — spec MODEL-FALLBACK §9).
+          if (error instanceof Error && error.name === "AbortError") throw error;
           return textError(`X search failed (model ${model}): ${errMessage(error)}`);
-        }
-        if ("error" in live) {
-          // Graceful: no throw, just surface what went wrong (§8).
-          return textError(`X search failed (model ${model}): ${live.error}`);
         }
         grok = live;
         cached = false;
         context.cache.set(cacheKey, grok, now());
 
-        // Grok-call ledger row (§7): one billable subagent call. Usage may be
+        // Grok-call ledger row (§7): one billable subagent call, attributed to the
+        // member actually billed (its wire id + logical id + cost). Usage may be
         // null (gateway omitted it) — then nothing is recorded. Never throws.
-        recordGrokUsage(context, { toolCallId, model, baseUrl: config.baseUrl, usage: grok.usage, costRates: config.costRates });
+        if (billed) {
+          recordGrokUsage(context, {
+            toolCallId,
+            modelId: billed.config.id,
+            logicalModelId: billed.logicalId,
+            usage: grok.usage,
+            costRates: costRatesOf(billed.config),
+          });
+        }
       }
 
       // 2) Hydrate citations via FxTwitter (§5). Drop+count unreachable/non-X
@@ -542,6 +594,21 @@ interface OpenRouterResponse {
   };
 }
 
+/**
+ * Tagged failure of a Grok POST. `status` rides along (when known) so the caller
+ * maps a deterministic 4xx (400/413/422) to a content failure that never falls
+ * over or marks the head unhealthy (spec MODEL-FALLBACK §9); every other failure
+ * is environmental. An agent-signal abort is NOT a `{ error }` — `postGrok`
+ * THROWS an `AbortError` so the fallback helper's neutral teardown branch fires
+ * (no streak hit, clean cancellation), mirroring the captioning/embedding
+ * siblings' `if (signal.aborted) throw err`.
+ */
+interface GrokPostError {
+  error: string;
+  status?: number;
+  retryAfterMs?: number;
+}
+
 async function postGrok(input: {
   url: string;
   apiKey: string;
@@ -549,7 +616,7 @@ async function postGrok(input: {
   dispatcher: Dispatcher | undefined;
   timeoutMs: number;
   signal?: AbortSignal;
-}): Promise<GrokResult | { error: string }> {
+}): Promise<GrokResult | GrokPostError> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), input.timeoutMs);
   // Compose the agent's abort signal with the wall-clock timeout so a cancelled
@@ -578,7 +645,12 @@ async function postGrok(input: {
     });
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
-      return { error: input.signal?.aborted ? "request aborted" : `timed out after ${input.timeoutMs}ms` };
+      // An agent-signal abort is a neutral teardown — rethrow the AbortError so
+      // the helper classifies the cancellation neutral (never a health signal,
+      // no fall over). A bare wall-clock timeout (signal not aborted) is
+      // environmental and falls over to the next member.
+      if (input.signal?.aborted) throw abortError();
+      return { error: `timed out after ${input.timeoutMs}ms` };
     }
     return { error: errMessage(error) };
   } finally {
@@ -588,13 +660,18 @@ async function postGrok(input: {
 
   if (!response.ok) {
     const snippet = await safeReadText(response);
-    return { error: `HTTP ${response.status}${snippet ? ` (${snippet})` : ""}` };
+    return {
+      error: `HTTP ${response.status}${snippet ? ` (${snippet})` : ""}`,
+      status: response.status,
+      retryAfterMs: parseRetryAfterMs(response.headers),
+    };
   }
   let parsed: OpenRouterResponse;
   try {
     parsed = (await readJsonCapped(response, controller)) as OpenRouterResponse;
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
+      if (input.signal?.aborted) throw abortError();
       return { error: `timed out after ${input.timeoutMs}ms` };
     }
     return { error: `unreadable response: ${errMessage(error)}` };
@@ -603,6 +680,13 @@ async function postGrok(input: {
   const synthesis = extractSynthesis(parsed);
   const citations = extractCitations(parsed);
   return { synthesis, citations, usage: parseOpenAiUsage(parsed.usage), model: input.body.model as string };
+}
+
+/** A neutral abort error whose `name` the fallback helper keys on (spec §9). */
+function abortError(): Error {
+  const err = new Error("request aborted");
+  err.name = "AbortError";
+  return err;
 }
 
 /** Flatten the assistant message content into plain text. */
@@ -788,6 +872,10 @@ async function captionOneImage(
           toolName: "x_search",
           toolCallId: meta.toolCallId,
           modelId: result.model,
+          // The billed member's block name (its fallback may have chosen a
+          // different member than the head) — groups caption spend under the
+          // logical id like the Grok row, not the upstream wire id.
+          logicalModelId: result.logicalModelId,
           provider: "openrouter",
           usage: result.usage,
           cost: result.cost ?? 0,
@@ -811,7 +899,13 @@ async function captionOneImage(
 
 function recordGrokUsage(
   context: XSearchToolContext,
-  input: { toolCallId: string | null; model: string; baseUrl: string; usage: RawTokenUsage | null; costRates: CostRates },
+  input: {
+    toolCallId: string | null;
+    modelId: string;
+    logicalModelId: string;
+    usage: RawTokenUsage | null;
+    costRates: CostRates;
+  },
 ): void {
   if (!input.usage || !context.recordToolUsage) return;
   const cost = computeUsageCost(input.costRates, input.usage).total;
@@ -820,7 +914,8 @@ function recordGrokUsage(
       agentSessionId: context.agentSessionId ?? null,
       toolName: "x_search",
       toolCallId: input.toolCallId,
-      modelId: input.model,
+      modelId: input.modelId,
+      logicalModelId: input.logicalModelId,
       provider: "openrouter",
       usage: input.usage,
       cost,

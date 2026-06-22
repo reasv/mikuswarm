@@ -146,10 +146,15 @@ llm_request_backoff_base_ms = 500   # local backoff (healthy model, unthrottled 
 llm_request_backoff_max_ms = 15000
 llm_request_max_wait_ms = 120000    # interactive-class wall-clock budget (~the edge of a reply still being useful)
 # Per-model health (failure domain, derived from endpoint+model id): after this
-# many consecutive environmental failures the model turns unhealthy — one probe
-# request per fixed interval; on probe success every waiter resumes together.
+# many consecutive environmental failures the model turns unhealthy. While
+# unhealthy the scheduler probes on a CAPPED EXPONENTIAL BACKOFF (spec
+# MODEL-FALLBACK §4.1, replacing the old fixed llm_probe_interval_ms): the first
+# probe fires after _base_ms (aggressive — catch a quick recovery while work
+# rides any fallback), doubling on each failed probe up to _max_ms, reset to base
+# on recovery. A model can pin a tighter ceiling via models.*.llm_probe_backoff_max_ms.
 llm_unhealthy_threshold = 3
-llm_probe_interval_ms = 60000
+llm_probe_backoff_base_ms = 10000
+llm_probe_backoff_max_ms = 300000
 # Optional static phrase sent to the room when a user-triggered session gives
 # up (parks failed-resumable / build-wait timeout). Empty = silent (default).
 # The actual error is never included. Proactive/synthetic sessions never send it.
@@ -197,6 +202,19 @@ image_input_bytes = 5242880
 # Defaults to the recovery value; shipped explicitly per the explicit-config rule.
 llm_request_max_wait_ms = 120000
 
+# Model fallback (spec MODEL-FALLBACK §2.1). A fallback chain on a model makes it a
+# transparent COMPOSITE: a request is served by the first up chain member, the
+# caller never sees the primary was down, and the primary is auto-canaried back when
+# it recovers. Example (commented — set in local config):
+#   fallback = ["default-backup"]              # an ordered list of [models.*] names
+# Role-specific chains come from VIRTUAL models that inherit a real model and add
+# only their own fallback:
+#   [models.caption-premium]
+#   inherits = "gemini-flash"                  # deep-merge endpoint/api/key/cost/window
+#   fallback = ["caption-cheap"]
+# Optional per-model probe-backoff ceiling (else recovery.llm_probe_backoff_max_ms):
+#   llm_probe_backoff_max_ms = 60000
+
 [models.default.cost]
 input = 0
 output = 0
@@ -206,6 +224,28 @@ cache_write = 0
 [models.default.compat]
 supports_cache_control_on_tools = false
 supports_long_cache_retention = false
+
+# Grok model backing the x_search tool (spec MODEL-FALLBACK §2.3 unified registry).
+# x_search references this by name; connection + pricing live here. Add a `fallback`
+# chain or point x_search.deep_model at a separate reasoning [models.*] block as
+# needed. context_window is set so the model is self-describing; x_search does not
+# enforce a per-session context ceiling against it.
+[models.grok]
+id = "x-ai/grok-4.3"
+provider = "openrouter"
+api = "openai-completions"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 8192
+context_window = 128000
+# Per-MTok USD rates for the Grok call's usage_events / tool_invocations rows.
+# Unset = usage captured, cost untracked (0); set real rates in local config.
+[models.grok.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
 
 [context.tiers]
 rich_target_tokens = 4000
@@ -362,10 +402,11 @@ backoff_max_ms = 30000
 # slowed); 429/503 backoff is unconditional in code, the knobs below only tune it.
 # Everything (all agent session types, image_generate, captioning, remote
 # embedding) lands in `default` unless its model block sets `rate_limit_group` to
-# another group declared here — e.g. captioning on a separate OpenRouter budget:
+# another group declared here — e.g. the caption model on a separate OpenRouter
+# budget:
 #   [rate_limits.llm.openrouter]
 #   max_in_flight = 16
-#   [captioning.model]
+#   [models.caption]            # captioning references this by name
 #   rate_limit_group = "openrouter"
 [rate_limits.llm.default]
 max_in_flight = 2
@@ -384,20 +425,41 @@ ssrf_guard = true
 # Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
 # http_proxy_url = "http://proxy.internal:8080"
 
-# Caption-inference concurrency is governed by the model's LLM rate-limit group
-# (`max_in_flight` under [rate_limits.llm.*], via [captioning.model].rate_limit_group);
-# there is no per-modality concurrency knob.
+# Captioning references a [models.*] block by name (spec MODEL-FALLBACK §2.3): the
+# `model` here is a logical id; connection, pricing, rate-limit group, and any
+# `fallback` chain live on the referenced block ([models.caption] below). A
+# modality may override `model` with its own ref. Caption-inference concurrency is
+# governed by that model's LLM rate-limit group (`max_in_flight` under
+# [rate_limits.llm.*]); there is no per-modality concurrency knob. The headline §2.2
+# case — cap an expensive caption model and fall to a cheap one — is a virtual
+# model: `[models.caption-premium] inherits = "caption"  fallback = ["caption-cheap"]`.
+# MIGRATION: `model` is now a [models.*] block NAME (a string), not an inline table.
+# The old `[captioning.model]` table form (id/endpoint/api_key/...) is rejected — move
+# those keys into a [models.*] block and point `model` at it by name.
 [captioning]
+model = "caption"
 worker_count = 2
 caption_all = false
 caption_assistant_messages = false
 trigger_wait_timeout_ms = 45000
 max_retries = 2
 
-[captioning.model]
+# The caption model block (referenced above). Pricing — set real rates in local
+# config — lives in [models.caption.cost]; unset = usage captured, cost untracked.
+[models.caption]
 id = "google/gemini-3.5-flash"
+provider = "openrouter"
+api = "openai-completions"
 endpoint = "${OPENROUTER_BASE_URL}"
 api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 4096
+context_window = 128000
+[models.caption.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
 
 [captioning.image]
 prompt = "Describe the image."
@@ -442,14 +504,14 @@ download_subdir = "downloads/danbooru"
 suggest_on_empty = true
 max_suggestions = 6
 
-# Image generation / editing via Google's Gemini "nano banana" models.
-# `base_url` is the Gemini API endpoint ROOT — the tool appends
-# /v1beta/models/<model>:generateContent. This is the Google/Gemini API base
-# (GEMINI_BASE_URL), distinct from the Anthropic model endpoint. `api_key` is
-# sent as `Authorization: Bearer`.
+# Image generation / editing via Google's Gemini "nano banana" models. Unified
+# registry (spec MODEL-FALLBACK §2.3): the pro/flash tiers REFERENCE [models.*]
+# blocks by name (endpoint/id/api_key/cost + any fallback chain live there). The
+# tool appends /v1beta/models/<id>:generateContent to the model's endpoint.
+# MIGRATION: the old per-tier `[image_gen.costs.*]` price keys are gone — pricing now
+# lives in each referenced block's [models.*.cost]. `[image_gen.models]` maps tier →
+# [models.*] block NAME.
 [image_gen]
-base_url = "${GEMINI_BASE_URL}"
-api_key = "${LLM_API_KEY}"
 timeout_ms = 120000
 # Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
 # Many gateways default this cap low, truncating before any image is emitted.
@@ -457,8 +519,42 @@ max_output_tokens = 32768
 output_subdir = "generated-images"
 
 [image_gen.models]
-pro = "gemini-3-pro-image"
-flash = "gemini-3.1-flash-image"
+pro = "imagegen-pro"
+flash = "imagegen-flash"
+
+# The image-gen model blocks (referenced above). `endpoint` is the Gemini API
+# ROOT (GEMINI_BASE_URL); `id` is the wire model; pricing — incl. an optional flat
+# per_image — lives in each block's [cost]. Add a `fallback` chain here to fall a
+# tier over to a cheaper/alternate image model transparently.
+[models.imagegen-pro]
+id = "gemini-3-pro-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 32768
+context_window = 32768
+[models.imagegen-pro.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+[models.imagegen-flash]
+id = "gemini-3.1-flash-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+multimodal = true
+max_tokens = 32768
+context_window = 32768
+[models.imagegen-flash.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
 
 # X.com (Twitter) search via Grok-as-subagent (spec/X-SEARCH.md). Routes through
 # OpenRouter/LlmGateway: `base_url` is the OpenRouter API ROOT (the tool appends
@@ -470,10 +566,14 @@ flash = "gemini-3.1-flash-image"
 # x_fetch — nothing is persisted to channel history / the retrieval corpus.
 [x_search]
 enabled = true
-base_url = "${OPENROUTER_BASE_URL}"
-api_key = "${LLM_API_KEY}"
-model = "x-ai/grok-4.3"             # effort=fast tier (default; quick non-reasoning)
-deep_model = "x-ai/grok-4.3"        # effort=deep tier (set to a reasoning model)
+# Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers REFERENCE
+# [models.*] blocks by name (connection + cost + any fallback chain live there).
+# base_url/api_key/cost are gone — see [models.grok] below.
+# MIGRATION: `model`/`deep_model` are [models.*] block NAMES (strings); the old
+# `[x_search.cost]` table and inline base_url/api_key keys are rejected — move them
+# into the referenced [models.*] block.
+model = "grok"                      # effort=fast tier (default; quick non-reasoning)
+deep_model = "grok"                 # effort=deep tier (point at a reasoning model)
 timeout_ms = 60000                  # reasoning search is slow; graceful timeout
 cache_ttl_minutes = 10              # cache the (expensive) Grok synthesis; 0 = off
 hydrate_default = 5                 # cited tweets re-fetched verbatim via FxTwitter
@@ -482,13 +582,6 @@ caption_top = 4                     # images auto-captioned inline; rest → med
 source_text_chars = 600             # per-source verbatim text window in the Sources block
 enable_image_understanding = true   # Grok's vision over images it finds while searching
 enable_video_understanding = true   # Grok's vision over videos it finds while searching
-
-# Per-MTok USD rates for the Grok call's tool_invocations ledger row (X-SEARCH §7).
-# Left unset here per the explicit-deployment-config convention — set real rates in
-# local config; unset = usage captured, cost untracked (0).
-# [x_search.cost]
-# input = 0.0
-# output = 0.0
 
 # Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP), backing
 # the `find_source` tool: image → source URL + artist (the inverse of `danbooru`).
@@ -603,14 +696,33 @@ provider = "local"                # 'local' | 'remote'
 model = "bge-small-en-v1.5"       # fastembed, 384-dim, English (§5c)
 dim = 384
 
-# Optional remote endpoint; OpenRouter-compatible (§5d). When set (and provider is
-# "remote", or provider is unset), it becomes the active model and `dim` governs the
-# vector index width. Leave commented to use the local model.
+# Optional remote endpoint. Unified registry (spec MODEL-FALLBACK §2.3): `model`
+# REFERENCES a [models.*] block (endpoint/id/api_key + cost.input = USD/1M input
+# tokens + any fallback chain live there); only `dim` (vector index width) and the
+# optional `chars_per_token` estimate stay here. When set (and provider is "remote",
+# or unset), it becomes the active model. A `fallback` chain on the referenced model
+# MUST be vector-compatible (same dim AND space). Leave commented to use local.
+# MIGRATION: `model` is a [models.*] block NAME; the old inline
+# `retrieval.embedding.remote.cost_per_mtok` (and endpoint/api_key) keys are rejected —
+# pricing now lives in [models.*.cost] (input = USD per 1M tokens).
 # [retrieval.embedding.remote]
-# id = "openai/text-embedding-3-small"
-# endpoint = "https://<our-proxy>/api/v1"
-# api_key = "${OPENROUTER_KEY}"
+# model = "embed-remote"            # a [models.*] block name
 # dim = 1536
+#
+# [models.embed-remote]
+# id = "openai/text-embedding-3-small"
+# provider = "openrouter"
+# api = "openai-completions"
+# endpoint = "${OPENROUTER_BASE_URL}"
+# api_key = "${LLM_API_KEY}"
+# multimodal = false
+# max_tokens = 1
+# context_window = 8192
+# [models.embed-remote.cost]
+# input = 0   # USD per 1M input tokens
+# output = 0
+# cache_read = 0
+# cache_write = 0
 
 # Chat-history search & recap (ARCHITECTURE.md §9e). The FTS5 + metadata index that
 # backs the search_messages / recap / user_activity tools is ALWAYS built (plain

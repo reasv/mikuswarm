@@ -23,6 +23,7 @@ import type { FxTwitterClient } from "../src/fxtwitter/client.js";
 import type { FxApiTweet } from "../src/fxtwitter/types.js";
 import { resolveFxTwitterConfig } from "../src/fxtwitter/types.js";
 import type { InferenceClient } from "../src/captioning/inference-client.js";
+import type { LlmScheduler } from "../src/agent/scheduler.js";
 import { setEgressGuardEnabled } from "../src/tools/ssrf.js";
 
 // postGrok routes through guardedFetch; the SSRF guard would block the loopback
@@ -168,13 +169,10 @@ test("GrokResultCache: stores within TTL, expires after, 0 ttl disables", () => 
   assert.equal(off.get("k", 0), undefined);
 });
 
-test("resolveXSearchConfig: requires base_url + api_key, applies defaults", () => {
-  assert.throws(() => resolveXSearchConfig({ api_key: "k" }), /base_url/);
-  assert.throws(() => resolveXSearchConfig({ base_url: "https://x.test" }), /api_key/);
-  const cfg = resolveXSearchConfig({ base_url: "https://x.test/", api_key: "k" });
-  assert.equal(cfg.baseUrl, "https://x.test"); // trailing slash stripped
-  assert.equal(cfg.model, "x-ai/grok-4.3");
-  assert.equal(cfg.deepModel, "x-ai/grok-4.3"); // defaults to model
+test("resolveXSearchConfig: applies non-model defaults (model lives on the chain now)", () => {
+  // Connection/model fields moved onto the referenced [models.*] block (spec
+  // MODEL-FALLBACK §2.3); resolveXSearchConfig only defaults the non-model knobs.
+  const cfg = resolveXSearchConfig({});
   assert.equal(cfg.hydrateDefault, 5);
   assert.equal(cfg.captionTop, 4);
   assert.equal(cfg.enableImageUnderstanding, true); // forced on by default
@@ -273,12 +271,35 @@ async function makeHarness(opts: {
       captionCalls.push(req.filename);
       if (opts.caption instanceof Error) throw opts.caption;
       const c = opts.caption ?? { caption: "an image", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, cost: 0.001 };
-      return { caption: c.caption, model: "google/gemini-3.5-flash", usage: c.usage ?? null, cost: c.cost ?? null };
+      // `model` is the upstream wire id; `logicalModelId` is the billed [models.*]
+      // block name (the fallback-aware grouping dimension — spec MODEL-FALLBACK §2.2).
+      return {
+        caption: c.caption,
+        model: "google/gemini-3.5-flash",
+        logicalModelId: "grok",
+        usage: c.usage ?? null,
+        cost: c.cost ?? null,
+      };
     },
   } as unknown as InferenceClient;
 
+  // Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers reference a
+  // [models.*] block — here a single-member chain pointed at the loopback server.
+  const grokModel = {
+    id: "x-ai/grok-4.3",
+    provider: "openrouter",
+    endpoint: opts.serverUrl,
+    api_key: "test-key",
+    multimodal: true,
+    max_tokens: 8192,
+    context_window: 128000,
+  } as never;
+  const grokChain = [{ logicalId: "grok", config: grokModel }];
+
   const context: XSearchToolContext = {
-    config: { base_url: opts.serverUrl, api_key: "test-key", ...opts.rawConfig },
+    config: { ...opts.rawConfig },
+    fastChain: grokChain,
+    deepChain: grokChain,
     workspaceRoot,
     fxTwitterClient,
     statusHosts: STATUS_HOSTS,
@@ -581,6 +602,232 @@ test("x_search: no citations → synthesis only, coverage reports 0 posts", asyn
     assert.match(text, /nothing relevant on X/);
     assert.match(text, /Grok cited 0 posts/);
     assert.equal(h.fxCalls.length, 0);
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Failure taxonomy + fallback (spec MODEL-FALLBACK §3/§6/§9)
+// ---------------------------------------------------------------------------
+
+/** Build a [models.*]-style block pointed at a loopback endpoint. */
+function modelEntry(logicalId: string, endpoint: string) {
+  return {
+    logicalId,
+    config: {
+      id: `wire/${logicalId}`,
+      provider: "openrouter",
+      endpoint,
+      api_key: "test-key",
+      multimodal: true,
+      max_tokens: 8192,
+      context_window: 128000,
+    },
+  } as never;
+}
+
+/** The §8a health key the fetch helper derives for a member (`endpoint::id`). */
+function healthKeyOf(endpoint: string, logicalId: string): string {
+  return `${endpoint}::wire/${logicalId}`;
+}
+
+interface StubScheduler {
+  scheduler: LlmScheduler;
+  noteCalls: Array<{ key: string; kind: unknown; status?: number }>;
+  acquiredKeys: string[];
+}
+
+/**
+ * Minimal scheduler stub covering just what `runFetchWithFallback` calls:
+ * `modelHealth` / `isProbeDue` / `acquire` / `noteOutcome`. `unhealthy` lists
+ * health keys reported unhealthy so selection falls over; `noteCalls` records
+ * every health-feed so a test can assert content/abort did NOT feed the streak.
+ */
+function makeStubScheduler(opts: { unhealthy?: string[]; probeDue?: string[] } = {}): StubScheduler {
+  const unhealthy = new Set(opts.unhealthy ?? []);
+  const probeDue = new Set(opts.probeDue ?? []);
+  const noteCalls: Array<{ key: string; kind: unknown; status?: number }> = [];
+  const acquiredKeys: string[] = [];
+  const scheduler = {
+    modelHealth: (key: string) => (unhealthy.has(key) ? "unhealthy" : "healthy"),
+    isProbeDue: (key: string) => probeDue.has(key),
+    async acquire(o: { modelKey?: string }) {
+      if (o.modelKey) acquiredKeys.push(o.modelKey);
+      return () => {};
+    },
+    noteOutcome: (_group: string, key: string, kind: unknown, status?: number) => {
+      noteCalls.push({ key, kind, status });
+    },
+  } as unknown as LlmScheduler;
+  return { scheduler, noteCalls, acquiredKeys };
+}
+
+test("x_search: HTTP 400 is content — no fallover, no health streak hit", async () => {
+  // Head returns a deterministic 400 (malformed body); fallback would succeed if
+  // hit. A content failure must NOT fall over and must NOT feed the head's streak.
+  const head = await startOpenRouter(() => ({ status: 400, json: { error: "malformed" } }));
+  const fb = await startOpenRouter(() => ({ json: grokResponse("fallback answer", []) }));
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: head.url });
+  const chain = [modelEntry("head", head.url), modelEntry("fb", fb.url)];
+  h.context.fastChain = chain;
+  h.context.deepChain = chain;
+  h.context.scheduler = stub.scheduler;
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    // Surfaced as a text error (not thrown), reporting the 400.
+    assert.match(result.content[0].text, /X search failed/);
+    assert.match(result.content[0].text, /HTTP 400/);
+    // Content NEVER falls over: the fallback endpoint is untouched.
+    assert.equal(head.count(), 1, "head hit once");
+    assert.equal(fb.count(), 0, "content failure must not fall over to the fallback");
+    // The head's health streak is fed `content` (excluded from the streak), NEVER
+    // `environmental` — a request-specific 400 must not mark the model unhealthy.
+    const headKey = healthKeyOf(head.url, "head");
+    const headNotes = stub.noteCalls.filter((n) => n.key === headKey);
+    assert.equal(headNotes.length, 1);
+    assert.equal(headNotes[0].kind, "content");
+    assert.equal(headNotes[0].status, 400);
+    assert.ok(!stub.noteCalls.some((n) => n.kind === "environmental"), "no environmental feed");
+  } finally {
+    await head.close();
+    await fb.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: a 5xx is environmental — falls over to the fallback member", async () => {
+  // Contrast with the 400 case: a 503 IS environmental, so it falls over and the
+  // fallback member's successful answer is returned.
+  const head = await startOpenRouter(() => ({ status: 503, json: { error: "down" } }));
+  const fb = await startOpenRouter(() => ({ json: grokResponse("fallback synthesis", []) }));
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: head.url });
+  const chain = [modelEntry("head", head.url), modelEntry("fb", fb.url)];
+  h.context.fastChain = chain;
+  h.context.deepChain = chain;
+  h.context.scheduler = stub.scheduler;
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    assert.match(result.content[0].text, /fallback synthesis/);
+    assert.equal(head.count(), 1);
+    assert.equal(fb.count(), 1, "5xx falls over to the fallback");
+    // Head fed environmental (status carried), fallback fed a clean success.
+    const headNote = stub.noteCalls.find((n) => n.key === healthKeyOf(head.url, "head"));
+    assert.equal(headNote?.kind, "environmental");
+    assert.equal(headNote?.status, 503);
+  } finally {
+    await head.close();
+    await fb.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: agent abort surfaces cleanly (neutral) — no 'X search failed', no health feed", async () => {
+  // A server that hangs so the agent's abort wins the race. The abort must throw
+  // out cleanly (neutral) rather than degrade to a "X search failed" text error,
+  // and it must NOT feed the head's health streak.
+  let hangRes: http.ServerResponse | undefined;
+  const server = http.createServer((_req, res) => {
+    hangRes = res; // never respond
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("no address");
+  const url = `http://127.0.0.1:${addr.port}`;
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: url });
+  h.context.scheduler = stub.scheduler;
+  try {
+    const tool = createXSearchTool(h.context);
+    const controller = new AbortController();
+    const p = tool.execute("c", { query: "q" }, controller.signal);
+    // Let the request reach the (hanging) server, then cancel the turn.
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    await assert.rejects(
+      () => p as Promise<unknown>,
+      (err: any) => err?.name === "AbortError",
+      "an aborted turn rethrows the AbortError, not a 'X search failed' text result",
+    );
+    // Neutral teardown: the abort never fed the model-health streak.
+    assert.equal(stub.noteCalls.length, 0, "abort must not feed any health outcome");
+    assert.equal(h.records.length, 0, "nothing billable recorded on a cancelled call");
+  } finally {
+    hangRes?.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await h.cleanup();
+  }
+});
+
+test("x_search: head over budget → fallback member's endpoint is hit", async () => {
+  const head = await startOpenRouter(() => ({ json: grokResponse("head answer", []) }));
+  const fb = await startOpenRouter(() => ({ json: grokResponse("fallback answer", []) }));
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: head.url });
+  const chain = [modelEntry("head", head.url), modelEntry("fb", fb.url)];
+  h.context.fastChain = chain;
+  h.context.deepChain = chain;
+  h.context.scheduler = stub.scheduler;
+  // Head is over budget (a covering rule at cap); fallback is in budget. Both the
+  // tool-level chain.some gate (checkBudget) and the helper's per-member skip
+  // (isModelAvailable) are derived from the same budget engine in production.
+  h.context.checkBudget = (id) => (id === "head" ? "head over budget" : undefined);
+  h.context.isModelAvailable = (id) => id !== "head";
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    assert.match(result.content[0].text, /fallback answer/);
+    assert.equal(head.count(), 0, "over-budget head is skipped");
+    assert.equal(fb.count(), 1, "fallback member is hit");
+  } finally {
+    await head.close();
+    await fb.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: BOTH members over budget → tool returns the budget error, no Grok call", async () => {
+  const head = await startOpenRouter(() => ({ json: grokResponse("head", []) }));
+  const fb = await startOpenRouter(() => ({ json: grokResponse("fb", []) }));
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: head.url });
+  const chain = [modelEntry("head", head.url), modelEntry("fb", fb.url)];
+  h.context.fastChain = chain;
+  h.context.deepChain = chain;
+  h.context.scheduler = stub.scheduler;
+  // Every member over budget → the tool-level chain.some gate refuses the call.
+  h.context.checkBudget = () => "period budget exhausted";
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    assert.match(result.content[0].text, /period budget exhausted/);
+    assert.equal(head.count(), 0, "no Grok call when every member is over budget");
+    assert.equal(fb.count(), 0);
+    assert.equal(h.records.length, 0);
+  } finally {
+    await head.close();
+    await fb.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: caption ledger row carries the logical model id", async () => {
+  const server = await startOpenRouter(() => ({ json: grokResponse("s", ["https://x.com/a/status/1"]) }));
+  const h = await makeHarness({ serverUrl: server.url });
+  try {
+    const tool = createXSearchTool(h.context);
+    await tool.execute("c", { query: "q" });
+    const caption = h.records.find((r) => r.ref?.startsWith("caption:"))!;
+    assert.ok(caption, "a caption row was recorded");
+    // The InferenceClient stub returns logicalModelId "grok"; the row must thread
+    // it so spend groups under the logical id, not just the wire model id.
+    assert.equal(caption.logicalModelId, "grok");
+    assert.equal(caption.modelId, "google/gemini-3.5-flash");
   } finally {
     await server.close();
     await h.cleanup();

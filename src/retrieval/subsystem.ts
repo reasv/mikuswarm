@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { LlmScheduler } from "../agent/scheduler.js";
+import type { ModelChainEntry } from "../agent/model-fallback.js";
 import type { Tokenizer } from "../context/tokenizer/types.js";
 import { getRetrievalTokenizer } from "../context/tokenizer/registry.js";
 import { MemoryIndexer } from "./indexer.js";
@@ -11,7 +12,7 @@ import { EmbedWorkerPool } from "./embed-worker.js";
 import { VectorStore } from "./vector-store.js";
 import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding/index.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
-import { makeRateLimitedClaimGate, type BudgetHooks } from "../budget/index.js";
+import { makeChainClaimGate, type BudgetHooks } from "../budget/index.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
@@ -44,6 +45,14 @@ export interface CreateSubsystemOptions {
    */
   budget?: BudgetHooks;
   /**
+   * Resolved remote embedding chain (spec MODEL-FALLBACK §2.3): the `[models.*]`
+   * head + any fallback members, resolved by app.ts (which holds `config.models`).
+   * Required when the remote provider is active.
+   */
+  embeddingChain?: ModelChainEntry[];
+  /** Budget availability by logical id (spec MODEL-FALLBACK §3/§7) for the remote chain. */
+  isModelAvailable?: (logicalId: string) => boolean;
+  /**
    * Embedder-matched tokenizer for chunking (spec/TOKENIZER-SWAP.md §5.3). Defaults
    * to the registry's retrieval tokenizer (`[tokenizer].retrieval`, default
    * `gpt-tokenizer`); injectable for tests.
@@ -72,7 +81,7 @@ export async function createRetrievalSubsystem(
   // asymmetry with the remote-without-block fail-fast above is visible.
   if (config.embedding.provider === "local" && config.embedding.remote) {
     logger?.warn("retrieval_remote_block_ignored", {
-      remoteModel: config.embedding.remote.id,
+      remoteModel: config.embedding.remote.model,
       note: "provider is 'local' so the configured [retrieval.embedding.remote] block is ignored; set provider='remote' (or unset it) to use the remote model",
     });
   }
@@ -108,25 +117,26 @@ export async function createRetrievalSubsystem(
   try {
     const cacheDir = path.join(opts.dataDir, "models", "fastembed");
     await mkdir(cacheDir, { recursive: true });
-    const remoteId = config.embedding.remote?.id;
+    const remoteModelRef = config.embedding.remote?.model;
     const p = createEmbeddingProvider(config, {
       cacheDir,
       httpProxyUrl: opts.httpProxyUrl,
       scheduler: opts.scheduler,
-      // Remote-embedding usage row (spec §9): emitted with the active model id; no
-      // session attribution (background enrichment). Local provider never calls this.
-      // `budget.record` is read at CALL time, not construction time: the holder is
-      // filled by app.ts AFTER this subsystem is built (finding #21), so capturing
-      // `opts.budget.record` here would freeze it to `undefined` and silently drop
-      // every embedding row. The optional-chain no-ops until the holder is filled —
-      // safe, since no embedding work runs before startup completes.
-      onEmbeddingUsage: remoteId
-        ? (promptTokens, costUsd) => {
+      isModelAvailable: opts.isModelAvailable,
+      // Resolved [models.*] chain (spec MODEL-FALLBACK §2.3), supplied by app.ts.
+      embeddingChain: opts.embeddingChain,
+      // Remote-embedding usage row (spec §9): the billed member's upstream id +
+      // LOGICAL id (spec MODEL-FALLBACK §2.2) attribute the row exactly. No session
+      // attribution (background enrichment). Local provider never calls this.
+      // `budget.record` is read at CALL time, not construction time (finding #21).
+      onEmbeddingUsage: remoteModelRef
+        ? (info) => {
             opts.budget?.record?.({
               class: "embedding",
-              modelId: remoteId,
-              inputTokens: promptTokens,
-              costUsd,
+              modelId: info.modelId,
+              logicalModelId: info.logicalModelId,
+              inputTokens: info.promptTokens,
+              costUsd: info.costUsd,
             });
           }
         : undefined,
@@ -181,9 +191,21 @@ export async function createRetrievalSubsystem(
       // embedding work runs before startup completes.
       shouldPause:
         remoteActive && config.embedding.remote
-          ? makeRateLimitedClaimGate({
+          ? makeChainClaimGate({
               engine: () => opts.budget?.engine,
-              descriptors: () => [{ class: "embedding", modelId: config.embedding.remote!.id }],
+              // Chain-aware (spec MODEL-FALLBACK §6): one descriptor per chain member
+              // (LOGICAL ids — the dimension budget rules match, §2.2), head-first.
+              // The gate parks only when EVERY member is over budget; a head-only cap
+              // lets the per-attempt resolver fall to the next in-budget member. Falls
+              // back to the bare remote model ref if no chain was resolved.
+              descriptors: () => {
+                const chain = opts.embeddingChain;
+                const ids =
+                  chain && chain.length > 0
+                    ? chain.map((m) => m.logicalId)
+                    : [config.embedding.remote!.model];
+                return ids.map((modelId) => ({ class: "embedding", modelId }));
+              },
             })
           : undefined,
       logger,

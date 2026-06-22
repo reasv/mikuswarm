@@ -115,18 +115,26 @@
 									model.health === 'unhealthy' ? 'bg-red-500' : 'bg-emerald-500'
 								)}
 							></span>
-							<span class="truncate font-mono text-xs" title={model.key}>{model.key}</span>
+							<span
+								class="truncate font-mono text-xs"
+								title={model.logicalIds.length ? `${model.logicalIds.join(', ')} → ${model.key}` : model.key}
+							>
+								{model.logicalIds.length ? model.logicalIds.join(', ') : model.key}
+							</span>
 						</div>
 						<div class="mt-1 flex items-center gap-3 font-mono text-[11px] text-muted-foreground">
 							<span title="consecutive environmental failures">streak {model.consecutiveFailures}</span>
 							<span title="queued waiters on this model">waiters {model.waiters}</span>
 						</div>
 						{#if model.health === 'unhealthy'}
+							<!-- A fallback-bearing model's probe IS the canary (spec MODEL-FALLBACK
+							     section 8): traffic is on the fallback, the probe is the only signal
+							     the primary is back. Label it so, vs an organic probe. -->
 							<div class="mt-1 text-xs text-red-400">
 								{#if model.probeInFlight}
-									probe in flight…
+									{model.hasFallback ? 'canary in flight…' : 'probe in flight…'}
 								{:else}
-									next probe {fmtCountdown(model.nextProbeAt)}
+									{model.hasFallback ? 'canary pending' : 'next probe'} {fmtCountdown(model.nextProbeAt)}
 								{/if}
 							</div>
 						{/if}

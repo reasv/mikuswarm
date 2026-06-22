@@ -78,6 +78,29 @@ test("#7 safeCheckAdmission: a non-throwing engine passes the decision through u
   assert.equal(warns.length, 0, "no error log on the happy/deny path");
 });
 
+test("#1 safeCheckAdmission: a supplied chain routes through checkAdmissionChain", () => {
+  // The launch gate (spec MODEL-FALLBACK §6.1) passes the session's whole fallback
+  // chain so an in-budget fallback admits even when the head is capped. Verify the
+  // chain arg dispatches to `checkAdmissionChain` (not the head-only path).
+  const { logger } = capturingLogger();
+  const seen: { chain?: string[]; viaChain: boolean } = { viaChain: false };
+  const engine = {
+    checkAdmission(): AdmissionResult {
+      return blocked; // head-only path would refuse
+    },
+    checkAdmissionChain(_t: string, _m: string, chain: string[]): AdmissionResult {
+      seen.viaChain = true;
+      seen.chain = chain;
+      return allowed; // chain-aware path admits (a fallback is in budget)
+    },
+    accurateResetsAt: () => undefined,
+  };
+  const result = safeCheckAdmission(engine, "default", "m1", logger, {}, ["primary", "fallback"]);
+  assert.equal(seen.viaChain, true, "the chain arg dispatches to checkAdmissionChain");
+  assert.deepEqual(seen.chain, ["primary", "fallback"], "the resolved chain is forwarded");
+  assert.equal(result?.allowed, true, "an in-budget fallback admits despite a capped head");
+});
+
 // --- #7 proactive defer fail-open --------------------------------------------
 
 test("#7 safeProactiveDeferUntil: a throwing engine FAILS OPEN (no defer) and logs", () => {

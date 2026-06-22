@@ -10,10 +10,10 @@ import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
   modelHealthKey,
-  withSchedulerAdmission,
   type LlmScheduler,
   type PriorityClass,
 } from "./scheduler.js";
+import { buildModelFallback, resolveModelChain } from "./model-fallback.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage, Summary } from "../storage/index.js";
@@ -21,7 +21,7 @@ import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
 import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
-import type { CanonicalChatEvent } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { BudgetHooks } from "../budget/index.js";
 
 /**
@@ -338,13 +338,35 @@ export class AgentSessionFactory {
     return types[sessionType] ?? types["default"];
   }
 
-  /** Resolve the model id used by a session type (for summary record provenance). */
+  /** Resolve the upstream model id used by a session type (for summary record provenance). */
   resolveModelId(sessionType: string): string {
     const cfg = this.resolveSessionType(sessionType);
     const modelKey = cfg?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     return modelConfig.id;
+  }
+
+  /**
+   * Resolve the LOGICAL model id (config block name) a session type's agent-loop
+   * spend is scoped under (spec MODEL-FALLBACK §2.2) — the chain head's name, what
+   * a `[[limits]].models` selector matches and what the ledger stamps. Distinct
+   * from {@link resolveModelId} (the upstream wire id) when block name != wire id.
+   */
+  resolveLogicalModelId(sessionType: string): string {
+    return this.resolveSessionType(sessionType)?.model ?? "default";
+  }
+
+  /**
+   * Resolve a session type's effective fallback chain as LOGICAL ids (config block
+   * names), head first (spec MODEL-FALLBACK §6.1). The launch-admission gate gates
+   * on the WHOLE chain — admit when ANY member is in-budget — rather than the bare
+   * head, so a model-scoped cap on the primary doesn't wrongly refuse a session for
+   * which an in-budget fallback exists. Mirrors `create`'s `resolveModelChain` call.
+   */
+  resolveModelChainLogicalIds(sessionType: string): string[] {
+    const modelKey = this.resolveSessionType(sessionType)?.model ?? "default";
+    return resolveModelChain(modelKey, this.options.config.models).map((m) => m.logicalId);
   }
 
   /**
@@ -366,13 +388,10 @@ export class AgentSessionFactory {
     const modelKey = sessionTypeConfig?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
-    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4):
-    // resolved ONCE here and fed to every consumer — enforcement (below), the
-    // pi-ai Model descriptor (so any future window-keyed mechanism triggers
-    // against the ceiling the session is actually judged against), and the
-    // text-editor read budget (app.ts buildSessionTools, via the same resolver).
-    // No consumer reads `context_window` directly (U3). Always a number.
-    const contextCeiling = this.resolveSessionContextCeiling(session.sessionType);
+    // Effective fallback chain (spec MODEL-FALLBACK §2.1/§9): the head plus the
+    // logical ids named in its `fallback`. A request is served by the first
+    // chain member that is up — resolved per Layer-0 attempt, transparently.
+    const chain = resolveModelChain(modelKey, this.options.config.models);
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
     // once and fed to the hard-cap pre-flight below. `undefined` = unlimited.
     const costCeiling = this.resolveSessionCostCeiling(session.sessionType);
@@ -381,7 +400,6 @@ export class AgentSessionFactory {
     // (background/proactive). Resolved once for every per-request ledger row.
     const triggerSenderId =
       session.trigger.trigger?.triggeredBy?.id ?? session.trigger.event.sender?.id ?? null;
-    const model = createModelFromConfig(modelConfig, contextCeiling);
     // Layer-0 transparent request retry (spec LLM-FAILURE-HANDLING §4) wraps the
     // chosen stream fn so an environmental failure re-issues the exact same
     // request — buffered to the terminal event, partials discarded — before the
@@ -389,14 +407,9 @@ export class AgentSessionFactory {
     // origin + class tags (`[llm-request:<class>]`) the runner's typed
     // `phase:"llm"` rejection depends on (Decision C / #14).
     const recovery = this.options.config.recovery;
-    const baseStreamFn = withSdkRetriesDisabled(
-      (modelConfig.streaming ?? true) ? streamSimple : wrapCompleteAsStream,
-    );
     // Scheduler admission (spec §5.4): group from the model
     // (`rate_limit_group`, unset = `default`), priority from the session type
-    // (override > configured > built-in default). Admission wraps the BASE fn,
-    // *inside* the retry, so each Layer-1 attempt re-acquires a fresh slot at
-    // the same (group, priority) and no slot is held across backoff sleeps.
+    // (override > configured > built-in default).
     const scheduler = this.options.scheduler;
     const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
     // The session type's OWN class — the workload category. `opts.priority` (a
@@ -411,18 +424,66 @@ export class AgentSessionFactory {
     // attribution, §9.2): the agent issues one request at a time per session,
     // so a single slot per created agent is race-free.
     const admissionWait: { last?: number } = {};
-    const admittedStreamFn = scheduler
-      ? withSchedulerAdmission(baseStreamFn, scheduler, {
-          group: rateLimitGroup,
-          priority,
-          key: opts?.escalationKey,
-          sessionId: session.id,
-          sessionType: session.sessionType,
-          onAdmissionWait: (waitMs) => {
-            admissionWait.last = waitMs;
-          },
-        })
-      : baseStreamFn;
+    // Per-attempt resolved member (spec MODEL-FALLBACK §6.1): the logical id the
+    // composite chose for the in-flight attempt, so the ledger row is attributed
+    // to the member actually billed even when the head fell to a fallback.
+    const resolvedMember: { logicalId: string } = { logicalId: modelKey };
+    const budgetEngine = this.options.budget?.engine;
+    // Capability pre-filter (spec MODEL-FALLBACK §3 #1): when the session's RAW
+    // inputs carry image content, every viable member must be `multimodal` so a
+    // fall-over never ships image blocks to a text-only fallback. Derived from the
+    // raw inputs (trigger attachments / resume snapshot imageBlocks) because this
+    // runs BEFORE buildContext — a SAFE over-approximation (any raw image ⇒
+    // require multimodal for the whole session). The head is never dropped, so the
+    // enforcement ceiling is still resolved ONCE over the surviving chain; it can
+    // only be EQUAL OR LARGER than the full-chain `resolveSessionContextCeiling`
+    // (which has no image info), so both stay ≤ every serving member's window — the
+    // "ceiling resolved once" invariant holds (see that method's comment below).
+    const requiresMultimodal = rawInputsRequireMultimodal(session, opts);
+    // Transparent composite stream fn (spec MODEL-FALLBACK §3): capability
+    // pre-filter + min-over-chain ceiling fixed once at build, member chosen per
+    // attempt inside the composed fn. Admission composes per-candidate INSIDE
+    // this and outside it sits Layer-0 retry — each attempt re-resolves + re-
+    // acquires a fresh slot at the same (group, priority). A single-member chain
+    // degrades to the bare admitted stream (no health reads, no resolution log).
+    const fallback = buildModelFallback(chain, {
+      consumer: "agent",
+      makeBase: (cfg) =>
+        withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
+      makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
+      capability: requiresMultimodal ? (cfg) => cfg.multimodal === true : undefined,
+      contextOverride: sessionTypeConfig?.max_context_tokens,
+      scheduler,
+      admission: scheduler
+        ? {
+            priority,
+            key: opts?.escalationKey,
+            sessionId: session.id,
+            sessionType: session.sessionType,
+            onAdmissionWait: (waitMs) => {
+              admissionWait.last = waitMs;
+            },
+          }
+        : undefined,
+      isModelAvailable: budgetEngine ? (id) => budgetEngine.isModelAvailable(id) : undefined,
+      logger: this.options.logger,
+      sessionId: session.id,
+      onResolve: (id) => {
+        resolvedMember.logicalId = id;
+      },
+    });
+    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
+    // + MODEL-FALLBACK §3 #2): the MINIMUM `context_window` across the surviving
+    // chain (min'd with the session-type override), valid for whichever member
+    // serves a given attempt — so the "ceiling resolved once" invariant holds.
+    // Fed to enforcement (below), the head model descriptor, and the text-editor
+    // read budget (app.ts buildSessionTools, via the chain-aware resolver).
+    const contextCeiling = fallback.operativeContextWindow;
+    // Representative (head) descriptor — initialState.model, the isQueueWaitPoint
+    // key, and the ledger-fallback model id. The composite substitutes the chosen
+    // member's descriptor + key per attempt.
+    const model = createModelFromConfig(modelConfig, contextCeiling);
+    const admittedStreamFn = fallback.streamFn;
     // Per-class retry budget (spec §6): interactive-class work (live chat +
     // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
     // class work (summaries, diaries — must eventually exist) is unbounded.
@@ -490,14 +551,20 @@ export class AgentSessionFactory {
           const budget = this.options.budget;
           if (budget?.record) {
             const u = message.usage;
+            // Exact attribution under fallback (spec MODEL-FALLBACK §2.2/§6.1):
+            // `model_id` is the UPSTREAM wire id actually billed (the committed
+            // message's `model`/`provider`), `logical_model_id` is the chain
+            // member chosen for this attempt — so a request that fell to `Y` is
+            // billed and budget-scoped to `Y`, not the head.
             budget.record({
               class: "agent_loop",
               agentSessionId: session.id,
               sessionType: session.sessionType,
               timelineKey: session.timelineKey,
               triggerSenderId,
-              modelId: model.id,
-              provider: model.provider ?? null,
+              modelId: message.model ?? model.id,
+              logicalModelId: resolvedMember.logicalId,
+              provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,
               cacheReadTokens: u.cacheRead ?? null,
@@ -818,7 +885,24 @@ export class AgentSessionFactory {
           `it is required to resolve the session context ceiling`,
       );
     }
-    return composeSessionContextCeiling(contextWindow, cfg?.max_context_tokens);
+    // Min-over-chain ceiling (spec MODEL-FALLBACK §3 #2): the operative ceiling
+    // must be valid for WHICHEVER fallback member serves an attempt, so it is the
+    // minimum `context_window` across the chain. This is the FULL-chain min — the
+    // conservative value used by the text-editor read budget and the console,
+    // which have no per-session image-presence info. The create-path enforcement
+    // ceiling (`buildModelFallback`'s `operativeContextWindow`) is the min over the
+    // capability-SURVIVING chain: for an image-bearing session a text-only member
+    // is dropped from selection, so that ceiling can only be EQUAL OR LARGER than
+    // this one (never smaller). Both are resolved once and both stay ≤ the
+    // `context_window` of every member that can actually serve, so neither can
+    // overflow a serving model — the "ceiling resolved once" invariant holds.
+    const chain = resolveModelChain(modelKey, this.options.config.models);
+    let minWindow = contextWindow;
+    for (const entry of chain) {
+      const w = entry.config.context_window;
+      if (typeof w === "number") minWindow = Math.min(minWindow, w);
+    }
+    return composeSessionContextCeiling(minWindow, cfg?.max_context_tokens);
   }
 
   /**
@@ -1051,6 +1135,65 @@ function syntheticPlaceholderEvent(timelineKey: string): CanonicalChatEvent {
     timestamp: now,
     receivedAt: now,
   };
+}
+
+/**
+ * Will this session's raw inputs send image content to the model? (spec
+ * MODEL-FALLBACK §3 #1, the agent-path capability pre-filter.)
+ *
+ * `buildModelFallback` runs at create time BEFORE `buildContext`, so the frozen
+ * post-compaction content is not yet available — image presence is read from the
+ * RAW inputs the session is built from:
+ *
+ * - Fresh launch: the trigger event's own image attachments and any reply-quoted
+ *   image attachments. (Grouped-event / trigger-group-asset images are not
+ *   chased here — a store walk the builder owns — but the common image cases ride
+ *   on the trigger or its reply.)
+ * - Resume: any message in the persisted prefix snapshot that carries
+ *   `imageBlocks`, plus the trigger-event attachments of the fresh appended turn.
+ *
+ * This is a deliberate, SAFE over-approximation (#6): "any image in the raw
+ * inputs ⇒ require multimodal for the WHOLE session", so a session that carries a
+ * picture is never allowed to fall over to a text-only fallback member (which
+ * would receive image blocks it cannot serve). Generation modes (summarize /
+ * condense / diary) and proactive sessions never send image pixels, so they
+ * impose no requirement and keep the full fallback chain.
+ */
+export function rawInputsRequireMultimodal(
+  session: AgentSessionRecord,
+  opts?: CreateAgentOptions,
+): boolean {
+  // Generation + proactive sessions never carry image pixels (builder forces
+  // `imageBlocks = []` for both), so they impose no multimodal requirement.
+  if (opts?.summarizationCutoff || opts?.condenseInputs || opts?.diaryRange || opts?.proactive) {
+    return false;
+  }
+  if (opts?.resume) {
+    if (opts.resume.snapshot.some(messageHasImageBlock)) return true;
+    if (opts.resume.transcript?.some(messageHasImageBlock)) return true;
+    // Reply-resume appends a fresh trigger turn; failure-recovery resume re-issues
+    // the seeded tail. Either way the trigger event's own images count.
+  }
+  return triggerEventCarriesImage(session.trigger.event);
+}
+
+/** Does this agent message carry at least one image content block? */
+function messageHasImageBlock(message: AgentMessage): boolean {
+  const blocks = (message as { imageBlocks?: unknown }).imageBlocks;
+  return Array.isArray(blocks) && blocks.length > 0;
+}
+
+/**
+ * Does this trigger event (or its quoted reply) carry an image attachment? Mirrors
+ * the builder's own `mediaType === "image" && localPath` predicate
+ * (`selectImageAttachments`), kept cheap (no store walk) for the create-time
+ * over-approximation.
+ */
+function triggerEventCarriesImage(event: CanonicalChatEvent): boolean {
+  const isImage = (a: AttachmentMeta): boolean => a.mediaType === "image" && Boolean(a.localPath);
+  if ((event.attachments ?? []).some(isImage)) return true;
+  if ((event.replyTo?.attachments ?? []).some(isImage)) return true;
+  return false;
 }
 
 /**

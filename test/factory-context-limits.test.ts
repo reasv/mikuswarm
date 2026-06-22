@@ -228,3 +228,149 @@ test("resolveSessionCostCeiling: a global default of 0 means unlimited", () => {
   const factory = makeCostFactory({ global: 0, sessionTypes: { default: {} } });
   assert.equal(factory.resolveSessionCostCeiling("default"), undefined);
 });
+
+// === spec MODEL-FALLBACK §8: scheduler-snapshot annotation map ================
+
+test("buildModelHealthAnnotations: maps health key → logical ids + has-fallback", async () => {
+  const { buildModelHealthAnnotations } = await import("../src/app.js");
+  const models = {
+    // Two logical ids share ONE upstream (endpoint+id) → one health key; the
+    // virtual one carries a fallback chain, so hasFallback ORs true.
+    "gemini-flash": { id: "gemini-2.5-flash", endpoint: "https://gw/google" },
+    "caption-premium": { id: "gemini-2.5-flash", endpoint: "https://gw/google", fallback: ["caption-cheap"] },
+    "caption-cheap": { id: "gemini-lite", endpoint: "https://gw/google" },
+    default: { id: "opus", endpoint: "https://gw/anthropic" },
+  } as never;
+  const map = buildModelHealthAnnotations(models);
+
+  const shared = map["https://gw/google::gemini-2.5-flash"]!;
+  assert.deepEqual([...shared.logicalIds].sort(), ["caption-premium", "gemini-flash"]);
+  assert.equal(shared.hasFallback, true, "a shared key is fallback-bearing if ANY logical id has a chain");
+
+  assert.deepEqual(map["https://gw/google::gemini-lite"], { logicalIds: ["caption-cheap"], hasFallback: false });
+  assert.deepEqual(map["https://gw/anthropic::opus"], { logicalIds: ["default"], hasFallback: false });
+});
+
+test("buildModelHealthAnnotations: a model with no endpoint maps under unknown::<id> (issue #18)", async () => {
+  const { buildModelHealthAnnotations } = await import("../src/app.js");
+  // No `endpoint` → the health key uses the `unknown` sentinel (mirrors
+  // buildFetchChain / modelHealthKey: `${endpoint ?? "unknown"}::${id}`).
+  const models = { local: { id: "bge-small" } } as never;
+  const map = buildModelHealthAnnotations(models);
+  assert.deepEqual(map["unknown::bge-small"], { logicalIds: ["local"], hasFallback: false });
+});
+
+// === spec MODEL-FALLBACK §3 #1: agent-path capability pre-filter (image →
+// multimodal), derived from the RAW session inputs at create time (#6). ========
+
+/** Minimal session record with a trigger event carrying the given attachments. */
+function sessionWith(attachments: Array<{ mediaType: string; localPath?: string }>): any {
+  return {
+    id: "s-1",
+    timelineKey: "tk",
+    sessionType: "default",
+    status: "running",
+    createdAt: 0,
+    trigger: {
+      provider: "test",
+      timelineKey: "tk",
+      event: {
+        id: "e-1",
+        timelineKey: "tk",
+        provider: "test",
+        role: "user",
+        sender: { id: "u" },
+        body: "hi",
+        timestamp: 0,
+        receivedAt: 0,
+        attachments,
+      },
+    },
+  };
+}
+
+test("rawInputsRequireMultimodal: trigger image attachment ⇒ true; non-image ⇒ false", async () => {
+  const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
+  assert.equal(
+    rawInputsRequireMultimodal(sessionWith([{ mediaType: "image", localPath: "/m/a.png" }])),
+    true,
+  );
+  // A file attachment with no image → no requirement.
+  assert.equal(
+    rawInputsRequireMultimodal(sessionWith([{ mediaType: "file", localPath: "/m/a.pdf" }])),
+    false,
+  );
+  // An image attachment without a local path is not a real image block → false.
+  assert.equal(
+    rawInputsRequireMultimodal(sessionWith([{ mediaType: "image" }])),
+    false,
+  );
+  // No attachments at all → false.
+  assert.equal(rawInputsRequireMultimodal(sessionWith([])), false);
+});
+
+test("rawInputsRequireMultimodal: reply-quoted image ⇒ true", async () => {
+  const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
+  const session = sessionWith([]);
+  session.trigger.event.replyTo = { attachments: [{ mediaType: "image", localPath: "/m/q.png" }] };
+  assert.equal(rawInputsRequireMultimodal(session), true);
+});
+
+test("rawInputsRequireMultimodal: generation + proactive modes never require multimodal", async () => {
+  const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
+  const imaged = sessionWith([{ mediaType: "image", localPath: "/m/a.png" }]);
+  // Even with an image on the trigger, generation/proactive sessions send no pixels.
+  assert.equal(rawInputsRequireMultimodal(imaged, { proactive: true }), false);
+  assert.equal(rawInputsRequireMultimodal(imaged, { summarizationCutoff: { endTimestamp: 1 } }), false);
+  assert.equal(rawInputsRequireMultimodal(imaged, { condenseInputs: { summaries: [] } as any }), false);
+  assert.equal(
+    rawInputsRequireMultimodal(imaged, { diaryRange: { earliestTimestamp: 0, latestTimestamp: 1, summaryId: "x" } }),
+    false,
+  );
+});
+
+test("rawInputsRequireMultimodal: resume snapshot carrying imageBlocks ⇒ true", async () => {
+  const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
+  const session = sessionWith([]); // trigger itself has no image
+  const snapshot = [
+    { type: "chatEvent", role: "user", content: "earlier", imageBlocks: [{ mediaType: "image/png", dataBase64: "AAAA" }] } as any,
+  ];
+  assert.equal(rawInputsRequireMultimodal(session, { resume: { snapshot } }), true);
+  // A resume snapshot with no image blocks and a text-only trigger ⇒ false.
+  assert.equal(
+    rawInputsRequireMultimodal(session, { resume: { snapshot: [{ type: "chatEvent", role: "user", content: "t" } as any] } }),
+    false,
+  );
+});
+
+test("agent capability filter: image session drops a text-only fallback; text session keeps it", async () => {
+  const { buildModelFallback, resolveModelChain } = await import("../src/agent/model-fallback.js");
+  const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
+  const makeBase = () => ((): never => { throw new Error("unused"); }) as any;
+  const makeModel = (cfg: any, cw: number) => ({ id: cfg.id, baseUrl: cfg.endpoint, contextWindow: cw } as any);
+  const models = {
+    "head-mm": { id: "wire-head", endpoint: "https://gw/h", api_key: "k", multimodal: true, context_window: 100_000, fallback: ["fb-text"] },
+    "fb-text": { id: "wire-fb", endpoint: "https://gw/f", api_key: "k", multimodal: false, context_window: 100_000 },
+  } as never;
+  const chain = resolveModelChain("head-mm", models);
+
+  // Image-bearing session → require multimodal → the text-only fallback is dropped.
+  const imaged = sessionWith([{ mediaType: "image", localPath: "/m/a.png" }]);
+  const fbImage = buildModelFallback(chain, {
+    consumer: "agent",
+    makeBase,
+    makeModel,
+    capability: rawInputsRequireMultimodal(imaged) ? (c: any) => c.multimodal === true : undefined,
+  });
+  assert.deepEqual(fbImage.survivorLogicalIds, ["head-mm"], "text-only fallback dropped for an image session");
+
+  // Text-only session → no requirement → the full chain survives.
+  const textOnly = sessionWith([{ mediaType: "file", localPath: "/m/a.pdf" }]);
+  const fbText = buildModelFallback(chain, {
+    consumer: "agent",
+    makeBase,
+    makeModel,
+    capability: rawInputsRequireMultimodal(textOnly) ? (c: any) => c.multimodal === true : undefined,
+  });
+  assert.deepEqual(fbText.survivorLogicalIds, ["head-mm", "fb-text"], "full chain kept for a text-only session");
+});

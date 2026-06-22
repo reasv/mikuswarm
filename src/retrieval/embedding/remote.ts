@@ -1,37 +1,46 @@
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
 import type { Logger } from "../../observability/logger.js";
-import { modelHealthKey, parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
-import { classifyLlmError } from "../../agent/request-retry.js";
+import { parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
+import {
+  runFetchWithFallback,
+  type ModelChainEntry,
+  type FetchChainMember,
+} from "../../agent/model-fallback.js";
 import { type EmbeddingProvider, l2normalize } from "./provider.js";
 
 export interface RemoteProviderOptions {
-  id: string;
-  endpoint: string;
-  apiKey: string;
+  /**
+   * Resolved embedding model chain (spec MODEL-FALLBACK §2.3/§6): the referenced
+   * `[models.*]` head plus any `fallback` members (connection / rate-limit group /
+   * cost.input = USD per 1M input tokens, all on each block). The head's wire id
+   * is the cache/index key. A fallback member MUST be vector-compatible (same `dim`
+   * AND embedding space) — the dim check rejects a wrong width; a same-dim
+   * different-space model would corrupt the cache, so point fallback at the same
+   * model on a different endpoint.
+   */
+  chain: ModelChainEntry[];
   dim: number;
   batchSize: number;
   httpProxyUrl?: string;
   timeoutMs?: number;
   logger?: Logger;
   /**
-   * LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5.4): remote
-   * embedding draws on a real upstream budget, so each batch acquires a slot in
-   * `rateLimitGroup` at `background` priority. The local ONNX provider never
-   * touches the scheduler (no network).
+   * LLM request scheduler (spec §5.4): remote embedding draws on a real upstream
+   * budget, so each attempt acquires a slot at `background` priority (per-member
+   * group). The local ONNX provider never touches the scheduler (no network).
    */
   scheduler?: LlmScheduler;
-  /** Rate-limit group for embedding requests. Unset = `default`. */
-  rateLimitGroup?: string;
-  /** USD per 1M input tokens (spec USAGE-COST-LIMITS §9). Unset/0 = untracked. */
-  costPerMtok?: number;
+  /** Budget availability by logical id (spec §3/§7) — skips an over-cap member. */
+  isModelAvailable?: (logicalId: string) => boolean;
   /** Chars-per-token estimate when the response omits a token count (§9, default 4). */
   charsPerToken?: number;
   /**
    * Unified-ledger sink (spec USAGE-COST-LIMITS §9): called once per embedded
-   * batch with the prompt-token count (provider-reported, else estimated) and the
-   * computed USD cost, so a class='embedding' `usage_events` row can be emitted.
+   * batch with the prompt-token count, the computed USD cost, and the BILLED
+   * member's logical/upstream ids, so a class='embedding' `usage_events` row can
+   * be emitted with exact model attribution (spec MODEL-FALLBACK §2.2).
    */
-  onUsage?: (promptTokens: number, costUsd: number) => void;
+  onUsage?: (info: { promptTokens: number; costUsd: number; logicalModelId: string; modelId: string }) => void;
 }
 
 interface EmbeddingsResponse {
@@ -62,7 +71,9 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
 
   constructor(options: RemoteProviderOptions) {
     this.options = options;
-    this.modelId = options.id;
+    // The head's wire id is the stable cache/index key; fallback members must be
+    // vector-compatible (see RemoteProviderOptions.chain).
+    this.modelId = options.chain[0]!.config.id;
     this.dim = options.dim;
     this.dispatcher = options.httpProxyUrl ? new ProxyAgent(options.httpProxyUrl) : undefined;
   }
@@ -90,158 +101,139 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
   }
 
   private async embedBatch(input: string[], stopSignal?: AbortSignal): Promise<Float32Array[]> {
-    const url = `${this.options.endpoint.replace(/\/$/, "")}/embeddings`;
-    // Scheduler admission (spec §5.4) FIRST, before the HTTP timeout is armed: a
-    // queue wait or group backoff under contention must not burn the request's
-    // wall-clock budget (a long wait would otherwise abort the fetch the moment
-    // it was finally admitted). The external stop signal (shutdown) is the only
-    // thing that can abort the admission wait; a rejected acquire arms nothing,
-    // so there is no timer or listener to leak on that path (#10).
-    const group = this.options.rateLimitGroup ?? "default";
-    // Health key (spec LLM-FAILURE-HANDLING §5): the embedding model's failure
-    // domain, derived the same way as agent sessions' — endpoint + model id.
-    const healthKey = modelHealthKey({ baseUrl: this.options.endpoint, id: this.options.id });
-    const release = this.options.scheduler
-      ? await this.options.scheduler.acquire({ group, priority: "background", modelKey: healthKey, signal: stopSignal })
-      : undefined;
-    // Per-request timeout (armed only once admitted) combined with the optional
-    // external stop signal, so SIGTERM aborts an in-flight fetch without waiting
-    // the full timeout, while a normal request still bounds itself by the
-    // timeout alone (#11). Everything armed below is torn down in `finally`.
-    const controller = new AbortController();
-    // Track whether the EXTERNAL stop signal (shutdown) caused the abort. A
-    // fetch that throws because of the stop signal is a NEUTRAL shutdown event,
-    // not an environmental streak hit (#5) — the per-request timeout abort, by
-    // contrast, IS environmental and must feed the model health streak.
-    let stopAborted = false;
-    const onStop = () => {
-      stopAborted = true;
-      controller.abort();
-    };
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      if (stopSignal) {
-        if (stopSignal.aborted) {
-          stopAborted = true;
-          controller.abort();
-        } else {
-          stopSignal.addEventListener("abort", onStop, { once: true });
+    // Transparent embedding-model fallback (spec MODEL-FALLBACK §6): the chain is
+    // tried in order, each member's endpoint/id/api_key/cost used per attempt.
+    // `runFetchWithFallback` owns admission (background, per-member group/health),
+    // both-axes noteOutcome, and the canary. The external stop signal aborts both
+    // the admission wait and the in-flight fetch; a stop-abort surfaces as an
+    // AbortError the helper treats as NEUTRAL (never a health-streak hit, #5).
+    let billed: FetchChainMember | undefined;
+    let billedPromptTokens = 0;
+    const vectors = await runFetchWithFallback<Float32Array[]>(
+      this.options.chain,
+      {
+        consumer: "embedding",
+        priority: "background",
+        scheduler: this.options.scheduler,
+        isModelAvailable: this.options.isModelAvailable,
+        probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
+        signal: stopSignal,
+      },
+      async (member) => {
+        const url = `${member.config.endpoint.replace(/\/$/, "")}/embeddings`;
+        // Per-request timeout composed with the external stop signal (#11).
+        const controller = new AbortController();
+        const onStop = () => controller.abort();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        if (stopSignal) {
+          if (stopSignal.aborted) controller.abort();
+          else stopSignal.addEventListener("abort", onStop, { once: true });
         }
-      }
-      timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
-      let res: Awaited<ReturnType<typeof fetch>>;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${this.options.apiKey}`,
-          },
-          body: JSON.stringify({ model: this.options.id, input, encoding_format: "float" }),
-          signal: controller.signal,
-          dispatcher: this.dispatcher,
-        });
-      } catch (err) {
-        // A THROWN fetch (connection refused/reset, DNS failure, or a timeout
-        // abort) never reaches the response-path noteOutcome below, so a
-        // hard-down endpoint would otherwise never accrue a health streak or
-        // trip half-open probing (#5). Feed the model-health streak with an
-        // environmental outcome and re-throw — EXCEPT when the external stop
-        // signal caused the abort: shutdown is neutral, not a streak hit. The
-        // post-response validation throws (dim mismatch, short response) are
-        // unaffected — they happen AFTER the early-success noteOutcome below
-        // and are never counted here.
-        if (!stopAborted) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.options.scheduler?.noteOutcome(group, healthKey, classifyLlmError(message, undefined));
+        timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
+        try {
+          let res: Awaited<ReturnType<typeof fetch>>;
+          try {
+            res = await fetch(url, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                authorization: `Bearer ${member.config.api_key}`,
+              },
+              body: JSON.stringify({ model: member.config.id, input, encoding_format: "float" }),
+              signal: controller.signal,
+              dispatcher: this.dispatcher,
+            });
+          } catch (err) {
+            // A stop-signal abort is a neutral teardown — propagate so the helper
+            // classifies it `aborted`. Other throws (reset/DNS/timeout) fall over.
+            if (stopSignal?.aborted) throw err;
+            return { ok: false as const, kind: "environmental" as const, error: err };
+          }
+          if (!res.ok) {
+            const status = res.status;
+            const retryAfterMs = parseRetryAfterMs(res.headers) ?? undefined;
+            const text = (await res.text()).slice(0, 200);
+            return {
+              ok: false as const,
+              kind: "environmental" as const,
+              status,
+              retryAfterMs,
+              error: new Error(`embeddings endpoint status ${status}: ${text}`),
+            };
+          }
+          try {
+            const out = await this.parseEmbeddings(res, input, member.config.id);
+            // Usage accounting (spec USAGE-COST-LIMITS §9): prompt tokens reported,
+            // else estimated from input chars ÷ chars-per-token; captured for the
+            // post-success onUsage with the billed member's per-MTok cost.input.
+            billed = member;
+            billedPromptTokens = out.promptTokens;
+            return { ok: true as const, value: out.vectors };
+          } catch (err) {
+            // A malformed/short/dim-mismatched response (silent-corruption guard):
+            // fall over rather than mis-map vectors to content hashes.
+            return { ok: false as const, kind: "environmental" as const, error: err };
+          }
+        } finally {
+          if (timeout !== undefined) clearTimeout(timeout);
+          if (stopSignal) stopSignal.removeEventListener("abort", onStop);
         }
-        throw err;
-      }
-      // Feed BOTH scheduler axes (spec LLM-FAILURE-HANDLING §5) with the
-      // response status — the group's unconditional 429/503 throttle backoff
-      // (with the server's Retry-After, clamped to the group's backoff_max_ms)
-      // and the embedding model's health streak (429 excluded inside).
-      this.options.scheduler?.noteOutcome(
-        group,
-        healthKey,
-        res.ok ? undefined : classifyLlmError(`${res.status} embeddings request failed`, undefined),
-        res.ok ? undefined : res.status,
-        res.ok ? undefined : parseRetryAfterMs(res.headers),
-      );
-      if (!res.ok) {
-        throw new Error(`embeddings endpoint status ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      }
-      // Lightweight response-size guard: the abort timeout bounds wall-clock, not
-      // bytes. A misbehaving (operator-configured) endpoint advertising an absurd
-      // body would otherwise balloon memory while we buffer it. Reject before reading
-      // when the declared content-length is implausible for an embeddings response.
-      const declaredLength = Number(res.headers.get("content-length"));
-      if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
-        throw new Error(
-          `embeddings endpoint response too large: ${declaredLength} bytes > ${MAX_RESPONSE_BYTES} (${this.options.id})`,
-        );
-      }
-      const json = (await res.json()) as EmbeddingsResponse;
-      // Usage accounting (spec USAGE-COST-LIMITS §9): prefer the provider-reported
-      // prompt-token count; else estimate from input character length ÷ a configured
-      // chars-per-token factor. Cost = tokens / 1e6 × the configured rate (0 when
-      // unset → a zero-cost row, counted in the console but invisible to budgets).
-      if (this.options.onUsage) {
-        const reported = json.usage?.prompt_tokens ?? json.usage?.total_tokens;
-        const promptTokens =
-          reported ??
-          Math.ceil(
-            input.reduce((sum, s) => sum + s.length, 0) / (this.options.charsPerToken ?? 4),
-          );
-        const cost = (promptTokens / 1e6) * (this.options.costPerMtok ?? 0);
-        this.options.onUsage(promptTokens, cost);
-      }
-      const data = json.data ?? [];
-      // The response must be a complete 0..n-1 permutation of the input: one vector
-      // per input, every index in range, no gaps or dupes. A short/partial/duplicated
-      // -index response would otherwise misalign vectors with content-hashes (silent
-      // corruption of memory_vec + embedding_cache). Validate and route any mismatch
-      // through the normal retry/failed path by throwing, rather than mis-mapping.
-      if (data.length !== input.length) {
-        throw new Error(
-          `embeddings endpoint returned ${data.length} vectors for ${input.length} inputs (${this.options.id})`,
-        );
-      }
-      const out = new Array<Float32Array | undefined>(input.length);
-      for (const d of data) {
-        if (!Number.isInteger(d.index) || d.index < 0 || d.index >= input.length) {
-          throw new Error(
-            `embeddings endpoint returned out-of-range index ${d.index} for ${input.length} inputs (${this.options.id})`,
-          );
-        }
-        if (out[d.index] !== undefined) {
-          throw new Error(
-            `embeddings endpoint returned duplicate index ${d.index} (${this.options.id})`,
-          );
-        }
-        // A malformed element (missing/non-array `embedding`) would otherwise raw-
-        // TypeError on `.length`; throw the same descriptive style so it routes
-        // through the normal retry path with a clear log.
-        if (!Array.isArray(d.embedding)) {
-          throw new Error(
-            `embeddings endpoint returned a malformed embedding element at index ${d.index} (${this.options.id})`,
-          );
-        }
-        if (d.embedding.length !== this.dim) {
-          throw new Error(
-            `embedding dim ${d.embedding.length} != configured ${this.dim} for ${this.options.id}`,
-          );
-        }
-        out[d.index] = l2normalize(d.embedding);
-      }
-      // Every slot is now filled: length matches and indices are a no-gap, no-dupe
-      // permutation, so the non-null assertion is safe.
-      return out.map((v) => v!);
-    } finally {
-      release?.();
-      if (timeout !== undefined) clearTimeout(timeout);
-      if (stopSignal) stopSignal.removeEventListener("abort", onStop);
+      },
+    );
+
+    if (this.options.onUsage && billed) {
+      const cost = (billedPromptTokens / 1e6) * (billed.config.cost?.input ?? 0);
+      this.options.onUsage({
+        promptTokens: billedPromptTokens,
+        costUsd: cost,
+        logicalModelId: billed.logicalId,
+        modelId: billed.config.id,
+      });
     }
+    return vectors;
+  }
+
+  /**
+   * Parse + validate an embeddings response into a complete 0..n-1 permutation of
+   * `input`-aligned, L2-normalized vectors (spec §5d). Any short/partial/
+   * duplicate-index/wrong-dim response throws (silent-corruption guard) — the
+   * caller routes that to fallover. Also returns the prompt-token count (reported
+   * or estimated) for usage accounting.
+   */
+  private async parseEmbeddings(
+    res: Awaited<ReturnType<typeof fetch>>,
+    input: string[],
+    modelId: string,
+  ): Promise<{ vectors: Float32Array[]; promptTokens: number }> {
+    const declaredLength = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+      throw new Error(`embeddings endpoint response too large: ${declaredLength} bytes > ${MAX_RESPONSE_BYTES} (${modelId})`);
+    }
+    const json = (await res.json()) as EmbeddingsResponse;
+    const reported = json.usage?.prompt_tokens ?? json.usage?.total_tokens;
+    const promptTokens =
+      reported ?? Math.ceil(input.reduce((sum, s) => sum + s.length, 0) / (this.options.charsPerToken ?? 4));
+    const data = json.data ?? [];
+    if (data.length !== input.length) {
+      throw new Error(`embeddings endpoint returned ${data.length} vectors for ${input.length} inputs (${modelId})`);
+    }
+    const out = new Array<Float32Array | undefined>(input.length);
+    for (const d of data) {
+      if (!Number.isInteger(d.index) || d.index < 0 || d.index >= input.length) {
+        throw new Error(`embeddings endpoint returned out-of-range index ${d.index} for ${input.length} inputs (${modelId})`);
+      }
+      if (out[d.index] !== undefined) {
+        throw new Error(`embeddings endpoint returned duplicate index ${d.index} (${modelId})`);
+      }
+      if (!Array.isArray(d.embedding)) {
+        throw new Error(`embeddings endpoint returned a malformed embedding element at index ${d.index} (${modelId})`);
+      }
+      if (d.embedding.length !== this.dim) {
+        throw new Error(`embedding dim ${d.embedding.length} != configured ${this.dim} for ${modelId}`);
+      }
+      out[d.index] = l2normalize(d.embedding);
+    }
+    return { vectors: out.map((v) => v!), promptTokens };
   }
 
   async close(): Promise<void> {

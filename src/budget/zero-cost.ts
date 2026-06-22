@@ -38,35 +38,19 @@ export function collectZeroCostModelIds(config: AppConfig): Set<string> {
     else paid.add(id);
   };
 
-  for (const model of Object.values(config.models ?? {})) {
-    mark(model.id, tokenRatesZero(model.cost));
+  // Agent models are keyed by their LOGICAL id (config block name; spec
+  // MODEL-FALLBACK §2.2) — that is what the agent-loop ledger row stamps and what
+  // the budget selector matches, distinct from the upstream `model.id`.
+  for (const [logicalId, model] of Object.entries(config.models ?? {})) {
+    // An image model can price purely per-image (zero token rates), so the flat
+    // `per_image` charge counts toward "is this model free?" (spec MODEL-FALLBACK §2.3).
+    const zeroCost = tokenRatesZero(model.cost) && (model.cost?.per_image ?? 0) === 0;
+    mark(logicalId, zeroCost);
   }
 
-  const cap = config.captioning;
-  if (cap) {
-    mark(cap.model?.id, tokenRatesZero(cap.model?.cost));
-    for (const modality of [cap.image, cap.video, cap.audio]) {
-      mark(modality?.model?.id, tokenRatesZero(modality?.model?.cost));
-    }
-  }
-
-  const ig = config.image_gen;
-  if (ig) {
-    const proZero = tokenRatesZero(ig.costs?.pro) && (ig.costs?.pro?.per_image ?? 0) === 0;
-    const flashZero = tokenRatesZero(ig.costs?.flash) && (ig.costs?.flash?.per_image ?? 0) === 0;
-    mark(ig.models.pro, proZero);
-    mark(ig.models.flash, flashZero);
-  }
-
-  const xs = config.x_search;
-  if (xs) {
-    const xsZero = tokenRatesZero(xs.cost);
-    mark(xs.model, xsZero);
-    mark(xs.deep_model, xsZero);
-  }
-
-  const remote = config.retrieval?.embedding?.remote;
-  if (remote) mark(remote.id, (remote.cost_per_mtok ?? 0) === 0);
+  // captioning + image_gen + x_search + remote embedding all reference `[models.*]`
+  // by name (spec MODEL-FALLBACK §2.3), so their models — and per_image pricing on
+  // `[models.*].cost` — are already covered by the agent-models loop above.
 
   // A paid appearance in any lane overrides a zero appearance elsewhere.
   for (const id of paid) zero.delete(id);
@@ -86,26 +70,11 @@ export function collectKnownModelIds(config: AppConfig): Set<string> {
     if (id) ids.add(id);
   };
 
-  for (const model of Object.values(config.models ?? {})) add(model.id);
+  // Agent models contribute their LOGICAL id (config block name; spec
+  // MODEL-FALLBACK §2.2) — the id a `[[limits]].models` selector matches.
+  for (const logicalId of Object.keys(config.models ?? {})) add(logicalId);
 
-  const cap = config.captioning;
-  if (cap) {
-    add(cap.model?.id);
-    for (const modality of [cap.image, cap.video, cap.audio]) add(modality?.model?.id);
-  }
-
-  const ig = config.image_gen;
-  if (ig) {
-    add(ig.models.pro);
-    add(ig.models.flash);
-  }
-
-  const xs = config.x_search;
-  if (xs) {
-    add(xs.model);
-    add(xs.deep_model);
-  }
-
-  add(config.retrieval?.embedding?.remote?.id);
+  // captioning / image_gen / x_search / remote embedding reference `[models.*]` by
+  // name (spec MODEL-FALLBACK §2.3) — already counted via the agent-models loop above.
   return ids;
 }

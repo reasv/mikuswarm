@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BudgetEngine, makeRateLimitedClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
+import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
 import type { UsageEventInput } from "../src/storage/database.js";
 import { normalizeLimits, type RawLimitRule } from "../src/budget/normalize.js";
 import { parseDuration, resolveWindow, isValidTimeZone } from "../src/budget/window.js";
@@ -155,6 +155,82 @@ test("checkAdmission: allowed when own + deps have headroom", () => {
   const rules: LimitRule[] = [{ name: "global", maxUsd: 100, window: dayWindow, selector: {} }];
   const engine = engineWith(rules, {}, { deps: { default: ["summarize"] } });
   assert.equal(engine.checkAdmission("default", "m1").allowed, true);
+});
+
+// ---------------------------------------------------------------------------
+// #1/#19a — chain-aware launch admission gate (spec MODEL-FALLBACK §6.1)
+// ---------------------------------------------------------------------------
+
+test("#19a checkAdmissionChain: capped PRIMARY + in-budget FALLBACK ⇒ admitted", () => {
+  // A model-scoped cap on the chain HEAD must NOT refuse the session when a
+  // fallback member is in budget — the per-attempt resolver would serve the
+  // fallback. The pre-fix head-only `checkAdmission` refused here.
+  const rules: LimitRule[] = [
+    { name: "primary-cap", maxUsd: 1, window: dayWindow, selector: { models: ["primary"] } },
+  ];
+  const engine = engineWith(rules);
+  engine.record({ class: "agent_loop", sessionType: "default", modelId: "wire", logicalModelId: "primary", costUsd: 5 });
+  // Head-only gate would refuse (primary is over its cap)...
+  assert.equal(
+    engine.checkAdmissionChain("default", "wire", ["primary"]).allowed,
+    false,
+    "head-only chain is refused when the primary is capped",
+  );
+  // ...but the whole chain admits because the fallback has headroom.
+  assert.equal(
+    engine.checkAdmissionChain("default", "wire", ["primary", "fallback"]).allowed,
+    true,
+    "an in-budget fallback member admits the session",
+  );
+});
+
+test("#19a checkAdmissionChain: GLOBAL (wildcard) cap refuses every chain member", () => {
+  // A wildcard rule (no `models` selector) covers every member, so no fallback can
+  // escape it — the gate still refuses (global exhaustion has no cheaper escape).
+  const rules: LimitRule[] = [{ name: "global", maxUsd: 1, window: dayWindow, selector: {} }];
+  const engine = engineWith(rules);
+  engine.record({ class: "agent_loop", sessionType: "default", modelId: "wire", logicalModelId: "primary", costUsd: 5 });
+  const adm = engine.checkAdmissionChain("default", "wire", ["primary", "fallback"]);
+  assert.equal(adm.allowed, false, "a global cap refuses the whole chain");
+  assert.equal(adm.ownBlocking.map((b) => b.name).includes("global"), true);
+  assert.equal(adm.primary?.name, "global");
+});
+
+test("#19a checkAdmissionChain: dependency cascade preserved even with an in-budget own chain", () => {
+  // Own chain has headroom, but the structural summarization dependency is over
+  // budget → still refused on the dependency (cascade unchanged by the chain path).
+  const rules: LimitRule[] = [
+    { name: "summ-cap", maxUsd: 1, window: dayWindow, selector: { sessionTypes: ["summarize"] } },
+  ];
+  const engine = engineWith(rules, {}, {
+    deps: { default: ["summarize"] },
+    resolve: (t) => (t === "summarize" ? "sm" : "m1"),
+  });
+  engine.record({ class: "agent_loop", sessionType: "summarize", modelId: "sm", costUsd: 2 });
+  const adm = engine.checkAdmissionChain("default", "m1", ["primary", "fallback"]);
+  assert.equal(adm.allowed, false);
+  assert.equal(adm.dependency?.sessionType, "summarize");
+  assert.equal(adm.ownBlocking.length, 0);
+});
+
+test("#1 checkAdmission delegates to the head-only chain (back-compat)", () => {
+  // The legacy head-only `checkAdmission` is now `checkAdmissionChain` with the
+  // single head logical id; a model-scoped cap on that head refuses (no fallback).
+  const rules: LimitRule[] = [
+    { name: "head-cap", maxUsd: 1, window: dayWindow, selector: { models: ["head"] } },
+  ];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "wire",
+    resolveLogicalModelId: () => "head",
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+  engine.record({ class: "agent_loop", sessionType: "default", modelId: "wire", logicalModelId: "head", costUsd: 5 });
+  assert.equal(engine.checkAdmission("default", "wire").allowed, false);
 });
 
 test("ruleStatuses: one entry per rule with state + fraction", () => {
@@ -313,6 +389,107 @@ test("#2 claim gate: empty descriptor list never parks (all session types unreso
   const gate = makeRateLimitedClaimGate({ engine, descriptors: () => [] });
   assert.equal(gate(), false, "no descriptors → never blocks (unresolvable model ids)");
   assert.equal(warns.filter((w) => w.message === "usage_limit_blocked").length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// #13 — logical-vs-upstream selector discrimination (headline §2.2)
+// ---------------------------------------------------------------------------
+
+test("#13 selector matches the LOGICAL id, not the shared upstream wire id", () => {
+  // Two lanes share ONE upstream wire id ("gemini") but carry distinct LOGICAL ids
+  // (caption-premium vs image-flash). A rule scoped to models=["caption-premium"]
+  // must count ONLY the premium lane and leave the shared-upstream image lane free.
+  // Pre-§2.2 (matching on the wire id) this rule would have caught BOTH lanes.
+  const rules: LimitRule[] = [
+    { name: "premium-cap", maxUsd: 1, window: dayWindow, selector: { models: ["caption-premium"] } },
+  ];
+  const engine = engineWith(rules);
+  // Spend on the image lane (same wire id) does NOT count against the premium rule.
+  engine.record({ class: "tool", tool: "image_generate", modelId: "gemini", logicalModelId: "image-flash", costUsd: 5 });
+  assert.equal(
+    engine.check({ class: "tool", tool: "image_generate", modelId: "gemini", logicalModelId: "image-flash" }).allowed,
+    true,
+    "the shared-upstream image lane is NOT blocked by the caption-scoped rule",
+  );
+  // The premium caption lane is still in budget too (nothing recorded there yet).
+  assert.equal(
+    engine.check({ class: "caption", modelId: "gemini", logicalModelId: "caption-premium" }).allowed,
+    true,
+    "premium lane within budget before its own spend",
+  );
+  // Now push the premium lane over its own cap.
+  engine.record({ class: "caption", modelId: "gemini", logicalModelId: "caption-premium", costUsd: 2 });
+  assert.equal(
+    engine.check({ class: "caption", modelId: "gemini", logicalModelId: "caption-premium" }).allowed,
+    false,
+    "the caption-scoped rule counts only the premium logical lane and now blocks it",
+  );
+  assert.equal(
+    engine.check({ class: "tool", tool: "image_generate", modelId: "gemini", logicalModelId: "image-flash" }).allowed,
+    true,
+    "the shared-upstream image lane stays unblocked despite the same wire id",
+  );
+  // isModelAvailable keys on the logical id too: premium unavailable, image free.
+  assert.equal(engine.isModelAvailable("caption-premium"), false);
+  assert.equal(engine.isModelAvailable("image-flash"), true);
+});
+
+// ---------------------------------------------------------------------------
+// #2 — makeChainClaimGate: park ONLY when EVERY chain member is over budget
+// ---------------------------------------------------------------------------
+
+test("#2 chain gate: head over budget but fallback in budget ⇒ does NOT park", () => {
+  // The pool-level chain gate mirrors the image-gen/x_search `chain.some` tool gate:
+  // a head-only cap must not park the pool — the per-attempt resolver falls to the
+  // in-budget fallback. Pre-fix the single-descriptor gate parked the whole pool.
+  const rules: LimitRule[] = [
+    { name: "head-cap", maxUsd: 1, window: dayWindow, selector: { models: ["embed-large"] } },
+  ];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "embedding", modelId: "embed-large" }, cost: 5 },
+  ]);
+  const gate = makeChainClaimGate({
+    engine,
+    descriptors: () => [
+      { class: "embedding", modelId: "embed-large" },
+      { class: "embedding", modelId: "embed-small" },
+    ],
+  });
+  assert.equal(gate(), false, "an in-budget fallback member keeps the pool running");
+  assert.equal(warns.filter((w) => w.message === "usage_limit_blocked").length, 0, "no pause log");
+});
+
+test("#2 chain gate: EVERY member over budget ⇒ parks + logs once naming the head's rules", () => {
+  const rules: LimitRule[] = [{ name: "all-cap", maxUsd: 1, window: dayWindow, selector: {} }];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "embedding", modelId: "embed-large" }, cost: 5 },
+  ]);
+  const gate = makeChainClaimGate({
+    engine,
+    descriptors: () => [
+      { class: "embedding", modelId: "embed-large" },
+      { class: "embedding", modelId: "embed-small" },
+    ],
+  });
+  assert.equal(gate(), true, "all members over a global cap → park");
+  const blocked = warns.filter((w) => w.message === "usage_limit_blocked");
+  assert.equal(blocked.length, 1);
+  assert.equal((blocked[0].fields?.descriptor as { modelId?: string }).modelId, "embed-large", "log names the head member");
+  assert.deepEqual((blocked[0].fields?.limits as { name: string }[]).map((l) => l.name), ["all-cap"]);
+});
+
+test("#2 chain gate: empty chain never parks; late-bound engine never parks while unresolved", () => {
+  const rules: LimitRule[] = [{ name: "g", maxUsd: 1, window: dayWindow, selector: {} }];
+  const { engine } = overBudgetEngine(rules, [
+    { descriptor: { class: "embedding", modelId: "embed-large" }, cost: 5 },
+  ]);
+  assert.equal(makeChainClaimGate({ engine, descriptors: () => [] })(), false, "empty chain → never park");
+  const holder: { engine?: BudgetEngine } = {};
+  const lateGate = makeChainClaimGate({
+    engine: () => holder.engine,
+    descriptors: () => [{ class: "embedding", modelId: "embed-large" }],
+  });
+  assert.equal(lateGate(), false, "engine not yet wired → never park");
 });
 
 // ---------------------------------------------------------------------------
@@ -739,47 +916,82 @@ test("#11 normalizeLimits: omitting knownModelIds skips the model check entirely
 // ---------------------------------------------------------------------------
 
 test("collectZeroCostModelIds: zero-rate models in the set, paid excluded", () => {
+  // After the unified registry (spec MODEL-FALLBACK §2.3) EVERY consumer references
+  // `[models.*]` by name, so zero-cost collection scans ONLY config.models, keyed
+  // by the LOGICAL id (block name).
   const config = {
     models: {
-      default: { id: "free", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
+      caption: { id: "free", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
       big: { id: "paid", cost: { input: 3, output: 15, cache_read: 0, cache_write: 0 } },
       bare: { id: "bare" }, // no cost block → zero
     },
-    retrieval: { embedding: { remote: { id: "emb", cost_per_mtok: 0 } } },
   } as never;
   const zero = collectZeroCostModelIds(config);
-  assert.equal(zero.has("free"), true);
+  assert.equal(zero.has("caption"), true);
   assert.equal(zero.has("bare"), true);
-  assert.equal(zero.has("emb"), true);
-  assert.equal(zero.has("paid"), false);
+  assert.equal(zero.has("big"), false); // the paid block
+  assert.equal(zero.has("free"), false); // a wire id, never a logical id
 });
 
-test("collectZeroCostModelIds: a paid appearance overrides a zero appearance", () => {
+test("collectZeroCostModelIds: a per-image-only charge makes an image model paid", () => {
+  // An image-gen model can price purely per-image with zero token rates (spec
+  // MODEL-FALLBACK §2.3); the flat per_image counts toward "is this model free?".
   const config = {
     models: {
-      default: { id: "shared" }, // zero here
+      "imagegen-flat": { id: "img", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0, per_image: 0.04 } },
+      "imagegen-free": { id: "img2", cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
     },
-    x_search: { model: "shared", cost: { input: 5, output: 5 } }, // paid here
   } as never;
   const zero = collectZeroCostModelIds(config);
-  assert.equal(zero.has("shared"), false);
+  assert.equal(zero.has("imagegen-flat"), false); // per_image > 0 → paid
+  assert.equal(zero.has("imagegen-free"), true);
 });
 
-test("#11 collectKnownModelIds: union of every configured model id (zero ∪ paid), across all lanes", () => {
+test("#11 collectKnownModelIds: every configured model id (zero ∪ paid)", () => {
+  // Unified registry: all consumers reference [models.*], so the known set is just
+  // the config.models block names (spec MODEL-FALLBACK §2.3).
   const config = {
     models: {
       default: { id: "free", cost: { input: 0, output: 0 } },
       big: { id: "paid", cost: { input: 3, output: 15 } },
+      caption: { id: "cap-wire" },
+      grok: { id: "x-ai/grok" },
     },
-    captioning: { model: { id: "cap-model" }, image: { model: { id: "img-cap" } } },
-    image_gen: { models: { pro: "ig-pro", flash: "ig-flash" } },
-    x_search: { model: "xs", deep_model: "xs-deep" },
-    retrieval: { embedding: { remote: { id: "emb" } } },
   } as never;
   const ids = collectKnownModelIds(config);
-  // Zero-cost AND paid models alike are "known" (the union is for the dead-rule check).
-  for (const id of ["free", "paid", "cap-model", "img-cap", "ig-pro", "ig-flash", "xs", "xs-deep", "emb"]) {
+  for (const id of ["default", "big", "caption", "grok"]) {
     assert.equal(ids.has(id), true, `${id} is a known configured model id`);
   }
+  assert.equal(ids.has("free"), false); // wire id, not a logical id
   assert.equal(ids.has("nonexistent"), false);
+});
+
+test("#19b a [[limits]] selector naming a virtual/fallback-member logical id does NOT warn", () => {
+  // A virtual (pure-rename) model AND a fallback-member block are both [models.*]
+  // blocks, so collectKnownModelIds returns their logical ids — a `models` selector
+  // naming either is a KNOWN reference and must earn no "unknown model" warning.
+  const config = {
+    models: {
+      default: { id: "wire-default", cost: { input: 1, output: 1 } },
+      // A pure-rename virtual model with a fallback chain into a cheaper member.
+      "caption-premium": { id: "wire-premium", fallback: ["caption-cheap"] },
+      "caption-cheap": { id: "wire-cheap", cost: { input: 0, output: 0 } },
+    },
+  } as never;
+  const known = collectKnownModelIds(config);
+  assert.equal(known.has("caption-premium"), true, "the virtual model is a known logical id");
+  assert.equal(known.has("caption-cheap"), true, "the fallback member is a known logical id");
+
+  const res = normalizeLimits(
+    [
+      { name: "virt", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["caption-premium"] },
+      { name: "member", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["caption-cheap"] },
+    ],
+    { ...normOpts, knownModelIds: known },
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.ok(
+    !res.warnings.some((w) => /unknown model/.test(w)),
+    "neither a virtual model nor a fallback member earns an unknown-model warning",
+  );
 });

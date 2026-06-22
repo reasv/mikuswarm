@@ -1,5 +1,6 @@
 import type { Logger } from "../../observability/logger.js";
 import type { LlmScheduler } from "../../agent/scheduler.js";
+import type { ModelChainEntry } from "../../agent/model-fallback.js";
 import type { ResolvedRetrievalConfig } from "../config.js";
 import { type EmbeddingProvider, LocalEmbeddingProvider } from "./provider.js";
 import { RemoteEmbeddingProvider } from "./remote.js";
@@ -14,11 +15,20 @@ export interface CreateProviderOptions {
   httpProxyUrl?: string;
   /** LLM scheduler — only the remote provider participates (spec §5.4). */
   scheduler?: LlmScheduler;
+  /** Budget availability by logical id (spec MODEL-FALLBACK §3/§7) for the remote chain. */
+  isModelAvailable?: (logicalId: string) => boolean;
+  /**
+   * Resolved remote embedding chain (spec MODEL-FALLBACK §2.3): the referenced
+   * `[models.*]` head + any fallback members, resolved at app wiring (where
+   * `config.models` is available). Required when the remote provider is active.
+   */
+  embeddingChain?: ModelChainEntry[];
   /**
    * Usage sink for the remote provider (spec USAGE-COST-LIMITS §9): one call per
-   * embedded batch with prompt tokens + computed USD cost. Local emits nothing.
+   * embedded batch with prompt tokens, computed USD cost, and the billed member's
+   * ids. Local emits nothing.
    */
-  onEmbeddingUsage?: (promptTokens: number, costUsd: number) => void;
+  onEmbeddingUsage?: (info: { promptTokens: number; costUsd: number; logicalModelId: string; modelId: string }) => void;
   logger?: Logger;
 }
 
@@ -34,16 +44,18 @@ export function createEmbeddingProvider(
   opts: CreateProviderOptions,
 ): EmbeddingProvider {
   if (config.embedding.provider === "remote" && config.embedding.remote) {
+    if (!opts.embeddingChain || opts.embeddingChain.length === 0) {
+      throw new Error(
+        `remote embedding model "${config.embedding.remote.model}" did not resolve to a [models.*] chain`,
+      );
+    }
     return new RemoteEmbeddingProvider({
-      id: config.embedding.remote.id,
-      endpoint: config.embedding.remote.endpoint,
-      apiKey: config.embedding.remote.apiKey,
+      chain: opts.embeddingChain,
       dim: config.embedding.remote.dim,
       batchSize: config.index.embedBatchSize,
       httpProxyUrl: opts.httpProxyUrl,
       scheduler: opts.scheduler,
-      rateLimitGroup: config.embedding.remote.rateLimitGroup,
-      costPerMtok: config.embedding.remote.costPerMtok,
+      isModelAvailable: opts.isModelAvailable,
       charsPerToken: config.embedding.remote.charsPerToken,
       onUsage: opts.onEmbeddingUsage,
       logger: opts.logger,

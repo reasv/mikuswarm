@@ -1,7 +1,12 @@
 import { readFile, unlink } from "node:fs/promises";
 import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
-import { modelHealthKey, type LlmScheduler } from "../agent/scheduler.js";
-import { classifyLlmError, extractStatus } from "../agent/request-retry.js";
+import { type LlmScheduler } from "../agent/scheduler.js";
+import { extractStatus } from "../agent/request-retry.js";
+import {
+  runFetchWithFallback,
+  type ModelChainEntry,
+  type FetchChainMember,
+} from "../agent/model-fallback.js";
 import { computeUsageCost, type CostRates, type RawTokenUsage } from "../agent/usage.js";
 import {
   processImageForInference,
@@ -17,29 +22,46 @@ import {
 /** All-zero cost rates: usage captured, cost "untracked" (spec §7.1 unset case). */
 const ZERO_RATES: CostRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+/** Per-model caption cost rates from a resolved `[models.*]` block (spec MODEL-FALLBACK §2.3). */
+function costRatesOf(config: ModelChainEntry["config"]): CostRates {
+  return config.cost
+    ? {
+        input: config.cost.input,
+        output: config.cost.output,
+        cacheRead: config.cost.cache_read,
+        cacheWrite: config.cost.cache_write,
+      }
+    : ZERO_RATES;
+}
+
+/** Build the caption wire-call descriptor from a resolved chain member. */
+function toCaptionModelConfig(config: ModelChainEntry["config"]): CaptionModelConfig {
+  return { id: config.id, endpoint: config.endpoint, api_key: config.api_key, provider: config.provider ?? null };
+}
+
 export interface InferenceClientOptions {
   modality: MediaModality;
-  model: CaptionModelConfig;
+  /**
+   * Resolved caption model chain (spec MODEL-FALLBACK §2.3/§6): the referenced
+   * `[models.*]` head plus its `fallback` members. The caption call runs through
+   * `runFetchWithFallback` over the chain — connection, pricing, rate-limit group,
+   * and per-model probe cap all live on each member's block (no separate
+   * `model`/`costRates`/`rateLimitGroup` options any more). This is the headline
+   * §2.2 case: cap an expensive caption model and fall to a cheap one transparently.
+   */
+  chain: ModelChainEntry[];
   prompt: string;
   maxChars: number;
   maxTokens: number;
   /**
-   * LLM request scheduler (spec §5.4): when set, every caption inference call
-   * acquires a slot in `rateLimitGroup` (at `background` priority — captioning
-   * sits on its own budget and needs no per-workload split, §9.4) around the
-   * network call only, not the local media processing.
+   * LLM request scheduler (spec §5.4): when set, every caption inference attempt
+   * acquires a slot in its member's rate-limit group (at `background` priority —
+   * captioning sits on its own budget and needs no per-workload split, §9.4)
+   * around the network call only, not the local media processing.
    */
   scheduler?: LlmScheduler;
-  /** Rate-limit group for caption inference. Unset = `default`. */
-  rateLimitGroup?: string;
-  /**
-   * USD/1M-token cost rates for this modality's caption model (spec
-   * AUXILIARY-USAGE-TRACKING §5/§7.1), resolved modality → top-level → unset.
-   * When unset (or all-zero), token usage is still captured but cost is 0
-   * ("untracked"). Auxiliary spend is a separate lane — never folded into the
-   * §8b session counters (spec §4).
-   */
-  costRates?: CostRates;
+  /** Budget availability by logical id (spec §3/§7) — skips an over-cap member. */
+  isModelAvailable?: (logicalId: string) => boolean;
   imageProcessing?: ImageProcessingOptions;
   videoProcessing?: VideoProcessingOptions;
   audioProcessing?: AudioProcessingOptions;
@@ -57,7 +79,10 @@ export interface CaptionRequest {
 
 export interface CaptionResponse {
   caption: string;
+  /** Upstream wire model id of the member actually billed. */
   model: string;
+  /** Logical id (config block name) of the billed member — for the ledger (spec MODEL-FALLBACK §2.2). */
+  logicalModelId: string;
   /** pi-ai provider label for this caption call (from config), or null when unset. */
   provider: string | null;
   /** Provider-reported token usage (spec §6.1), or null when the gateway omits it. */
@@ -82,7 +107,7 @@ export class InferenceClient {
    * scheduler `acquire` below so a queued caption waiter is rejected promptly at
    * shutdown instead of lingering until the next half-open probe window. Without
    * it, `captionPool.stop()` (which awaits in-flight workers) could stall for
-   * N×`llm_probe_interval_ms` during a caption-model outage, because only the
+   * up to one capped-backoff probe window during a caption-model outage, because only the
    * later `llmScheduler.stop()` would otherwise reject the queued waiter.
    */
   private readonly stopController = new AbortController();
@@ -137,75 +162,73 @@ export class InferenceClient {
       data = await readFile(request.filePath);
     }
 
-    // Scheduler admission (spec §5.4) wraps the network call only — media
-    // processing above runs unscheduled. Outcomes feed BOTH scheduler axes
-    // (spec LLM-FAILURE-HANDLING §5): the group's unconditional 429/503
-    // throttle backoff and the caption model's health streak — the health key
-    // derives from (endpoint, model id), the same failure domain agent
-    // sessions use, so a broken caption model trips half-open probing here
-    // too while this client's own pool-level retries stay in charge of the
-    // job lifecycle.
-    const group = this.options.rateLimitGroup ?? "default";
-    const healthKey = modelHealthKey({ baseUrl: this.options.model.endpoint, id: this.options.model.id });
-    const release = this.options.scheduler
-      ? await this.options.scheduler.acquire({
-          group,
-          priority: "background",
-          modelKey: healthKey,
-          // Shutdown abort seam (#6): a queued waiter is rejected the moment
-          // `stop()` fires (an `AbortError` from `acquire`, propagated out of
-          // `caption()` without touching `noteOutcome` — shutdown is neutral),
-          // so `captionPool.stop()` never stalls waiting for the next probe
-          // window during a caption-model outage.
-          signal: this.stopController.signal,
-        })
-      : undefined;
-    let result;
-    try {
-      result = await describeMedia({
-        modality: this.options.modality,
-        data,
-        mimeType,
-        prompt: request.prompt ?? this.options.prompt,
-        model: this.options.model,
-        maxChars: this.options.maxChars,
-        maxTokens: this.options.maxTokens,
-        timeoutMs: this.options.timeoutMs,
-        // Shutdown abort seam (#6): aborts an in-flight caption fetch at stop.
+    // Transparent caption-model fallback (spec MODEL-FALLBACK §6) over the chain:
+    // `runFetchWithFallback` owns per-attempt member selection, scheduler
+    // admission (`background` priority, per-member group/health key — the same
+    // (endpoint, model id) failure domain agent sessions use), both-axes
+    // `noteOutcome` feeding, and the canary. Media processing above runs
+    // unscheduled. The shutdown stop signal aborts admission + the in-flight
+    // fetch; a stop-abort surfaces as an AbortError that runFetchWithFallback
+    // treats as a NEUTRAL teardown (never a health-streak hit), so the pool's
+    // stop() never stalls for a probe window during a caption-model outage.
+    let billed: FetchChainMember | undefined;
+    const result = await runFetchWithFallback(
+      this.options.chain,
+      {
+        consumer: `caption:${this.options.modality}`,
+        priority: "background",
+        scheduler: this.options.scheduler,
+        isModelAvailable: this.options.isModelAvailable,
+        probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
         signal: this.stopController.signal,
-      });
-      this.options.scheduler?.noteOutcome(group, healthKey, undefined);
-    } catch (err) {
-      // A fetch aborted by the shutdown stop signal (#6) is a NEUTRAL shutdown
-      // event, not an environmental health-streak hit — do not feed noteOutcome
-      // for it (mirrors the remote-embedding stop-abort exclusion). All other
-      // failures still feed the model-health streak.
-      if (!this.stopController.signal.aborted) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.options.scheduler?.noteOutcome(
-          group,
-          healthKey,
-          classifyLlmError(message, undefined),
-          extractStatus(message.toLowerCase()),
-        );
-      }
-      throw err;
-    } finally {
-      release?.();
-    }
+      },
+      async (member) => {
+        billed = member;
+        try {
+          const r = await describeMedia({
+            modality: this.options.modality,
+            data,
+            mimeType,
+            prompt: request.prompt ?? this.options.prompt,
+            model: toCaptionModelConfig(member.config),
+            maxChars: this.options.maxChars,
+            maxTokens: this.options.maxTokens,
+            timeoutMs: this.options.timeoutMs,
+            signal: this.stopController.signal,
+          });
+          return { ok: true as const, value: r };
+        } catch (err) {
+          // A stop-signal abort is a neutral teardown — let it propagate so the
+          // helper classifies it `aborted` (never a streak hit). Other failures
+          // map to content (deterministic 4xx) / environmental (fall over).
+          if (this.stopController.signal.aborted) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          const status = extractStatus(message.toLowerCase());
+          const kind = status === 400 || status === 413 || status === 422 ? "content" : "environmental";
+          return { ok: false as const, kind, status, error: err };
+        }
+      },
+    );
 
     let caption = result.text;
     if (processed?.truncated && processed.processedRange && processed.totalDuration) {
       caption = formatTruncationWarning(caption, processed, request.context ?? "pipeline");
     }
 
-    // Auxiliary cost (spec §5/§11): compute from config rates when the provider
-    // reported usage. Cost is 0 (not null) when usage is known but no rates are
-    // configured — tokens are still recorded; only the price is "untracked".
+    // Auxiliary cost (spec §5/§11): priced from the BILLED member's [models.*]
+    // cost (spec MODEL-FALLBACK §2.3) when the provider reported usage. Cost is 0
+    // (not null) when usage is known but the model has no cost block ("untracked").
     const usage = result.usage;
-    const cost = usage ? computeUsageCost(this.options.costRates ?? ZERO_RATES, usage).total : null;
+    const cost = usage ? computeUsageCost(billed ? costRatesOf(billed.config) : ZERO_RATES, usage).total : null;
 
-    return { caption, model: result.model, provider: this.options.model.provider ?? null, usage, cost };
+    return {
+      caption,
+      model: result.model,
+      logicalModelId: billed?.logicalId ?? result.model,
+      provider: billed?.config.provider ?? null,
+      usage,
+      cost,
+    };
   }
 }
 

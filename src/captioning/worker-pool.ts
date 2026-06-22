@@ -24,13 +24,19 @@ export interface CaptionWorkerPoolOptions {
   activityBus?: PipelineActivityBus;
   /**
    * Period cost limits (spec USAGE-COST-LIMITS §6). `budget.record` emits the
-   * class='caption' ledger row; `budget.engine` + `captionModelId` drive the
+   * class='caption' ledger row; `budget.engine` + `captionModelIds` drive the
    * claim gate (§6.3): the pool stops claiming while the caption class is over
    * budget and resumes after the window rolls. Absent = no budgeting.
    */
   budget?: BudgetHooks;
-  /** Representative caption model id for the claim-gate descriptor (§6.3). */
-  captionModelId?: string;
+  /**
+   * Representative caption fallback chain as LOGICAL ids, head-first (spec
+   * MODEL-FALLBACK §2.3/§6). The claim gate parks only when EVERY member is over
+   * budget — a model-scoped cap on the head just falls to the next member at attempt
+   * time (mirrors the image-gen/x_search `chain.some` tool gates). An empty/absent
+   * list = no gate (no budgeting).
+   */
+  captionModelIds?: string[];
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -45,20 +51,26 @@ export class CaptionWorkerPool {
   constructor(private readonly options: CaptionWorkerPoolOptions) {}
 
   /**
-   * Budget claim gate (spec USAGE-COST-LIMITS §6.3): true while the caption class
-   * is over budget, so the pool parks (stops claiming) and resumes after the
-   * window rolls. Free-model captioning short-circuits inside `engine.check`.
+   * Budget claim gate (spec USAGE-COST-LIMITS §6.3, MODEL-FALLBACK §6): true only
+   * while EVERY chain member is over budget, so the pool parks (stops claiming) and
+   * resumes after the window rolls. A cap on the head alone does NOT park — the
+   * per-attempt resolver falls to the next in-budget member (mirrors the image-gen/
+   * x_search `chain.some` tool gates). Free-model captioning short-circuits inside
+   * `engine.check`. The pause log names the rules blocking the HEAD (the canonical
+   * refusal context for the chain).
    */
   private shouldPauseForBudget(): boolean {
     const engine = this.options.budget?.engine;
-    const modelId = this.options.captionModelId;
-    if (!engine || !modelId) return false;
-    const result = engine.check({ class: "caption", modelId });
-    if (!result.allowed) {
+    const chain = this.options.captionModelIds;
+    if (!engine || !chain || chain.length === 0) return false;
+    const available = chain.some((modelId) => engine.check({ class: "caption", modelId }).allowed);
+    if (!available) {
+      const headId = chain[0]!;
+      const result = engine.check({ class: "caption", modelId: headId });
       const now = Date.now();
       if (now - this.lastPauseLog > 60_000) {
         this.lastPauseLog = now;
-        engine.logBlocked("worker_claim", result.blockingRules, { class: "caption", modelId });
+        engine.logBlocked("worker_claim", result.blockingRules, { class: "caption", modelId: headId });
       }
       return true;
     }
@@ -164,6 +176,9 @@ export class CaptionWorkerPool {
             record({
               class: "caption",
               modelId: result.model,
+              // Logical id of the billed chain member (spec MODEL-FALLBACK §2.2) —
+              // the budget/grouping dimension, distinct from the upstream wire id.
+              logicalModelId: result.logicalModelId,
               // Provider + channel attribution (parity with tool/agent_loop rows):
               // provider from the caption client's model config; timeline_key
               // recovered by claimPendingCaptions' event_id → timeline_events join.

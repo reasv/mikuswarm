@@ -106,8 +106,18 @@ export interface LlmSchedulerOptions {
 export interface ModelHealthOptions {
   /** Consecutive environmental failures before a model turns unhealthy. `recovery.llm_unhealthy_threshold`. */
   unhealthyThreshold?: number;
-  /** Fixed probe cadence while unhealthy (never grows). `recovery.llm_probe_interval_ms`. */
-  probeIntervalMs?: number;
+  /**
+   * Probe cadence while unhealthy — a per-episode CAPPED EXPONENTIAL BACKOFF
+   * (spec MODEL-FALLBACK §4.1, superseding the old fixed `llm_probe_interval_ms`).
+   * The first probe fires `probeBackoffBaseMs` after the model turns unhealthy
+   * (aggressive — catch a transient blip and return to the better model fast);
+   * each failed probe doubles the delay, capped at `probeBackoffMaxMs`; recovery
+   * resets it to base. With a fallback, traffic flows to `Y` meanwhile, so there
+   * is no liveness pressure — base is short and the cap bounds the long-outage
+   * tail. `recovery.llm_probe_backoff_base_ms` / `recovery.llm_probe_backoff_max_ms`.
+   */
+  probeBackoffBaseMs?: number;
+  probeBackoffMaxMs?: number;
 }
 
 export interface AcquireOptions {
@@ -128,6 +138,14 @@ export interface AcquireOptions {
    * (health gating off — legacy callers, tests).
    */
   modelKey?: string;
+  /**
+   * Per-model override of the unhealthy-probe backoff ceiling (spec
+   * MODEL-FALLBACK §4.1; config `models.*.llm_probe_backoff_max_ms`). Recorded
+   * against `modelKey` on sight (idempotent, last-writer-wins) so the model's
+   * probe backoff caps tighter than the global `probeBackoffMaxMs` — useful for
+   * a model with an especially poor fallback. No-op without a `modelKey`.
+   */
+  probeBackoffMaxMs?: number;
   /** Attribution for the console scheduler view (spec §9.1). */
   sessionId?: string;
   /** Session type, or a pool label for non-session callers (captioning, …). */
@@ -244,6 +262,12 @@ interface ModelHealthState {
   probeInFlight: boolean;
   /** Epoch ms before which no probe may be admitted. 0 = immediately. */
   nextProbeAt: number;
+  /**
+   * Current per-episode probe backoff delay (ms) — set to the base when the
+   * model turns unhealthy, doubled (capped) on each failed probe, reset to base
+   * on recovery (spec MODEL-FALLBACK §4.1). `nextProbeAt` is `settleTs + this`.
+   */
+  probeDelayMs: number;
   /** Epoch ms the model turned unhealthy (for recovery logging). 0 = healthy. */
   unhealthySince: number;
   lastFailure?: { ts: number; status?: number; class: LlmErrorClass };
@@ -253,7 +277,11 @@ const DEFAULT_MAX_IN_FLIGHT = 2;
 const DEFAULT_BACKOFF_BASE_MS = 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60_000;
 const DEFAULT_UNHEALTHY_THRESHOLD = 3;
-const DEFAULT_PROBE_INTERVAL_MS = 60_000;
+// Capped-backoff probe cadence (spec MODEL-FALLBACK §4.1). Base is well under
+// the old fixed 60s so a quick recovery is caught fast (work is on the fallback
+// meanwhile); the cap bounds the long-outage tail.
+const DEFAULT_PROBE_BACKOFF_BASE_MS = 10_000;
+const DEFAULT_PROBE_BACKOFF_MAX_MS = 300_000;
 
 function abortError(): Error {
   const error = new Error("LLM scheduler wait aborted");
@@ -266,7 +294,15 @@ export class LlmScheduler {
   /** Per-model health, independent of (alongside) the groups (§5). */
   private readonly health = new Map<string, ModelHealthState>();
   private readonly unhealthyThreshold: number;
-  private readonly probeIntervalMs: number;
+  private readonly probeBackoffBaseMs: number;
+  private readonly probeBackoffMaxMs: number;
+  /**
+   * Per-model probe-backoff-cap overrides (spec MODEL-FALLBACK §4.1), keyed by
+   * model health key, recorded from `acquire`'s `probeBackoffMaxMs`. Kept apart
+   * from the health map so an override survives even before/after a model has a
+   * health entry and never pollutes the (failed-models-only) snapshot.
+   */
+  private readonly probeMaxOverrides = new Map<string, number>();
   private readonly logger?: Logger;
   /** Sticky escalations for keys not yet registered (§5.5). */
   private readonly stickyEscalations = new Map<string, PriorityClass>();
@@ -276,7 +312,8 @@ export class LlmScheduler {
   constructor(options: LlmSchedulerOptions = {}) {
     this.logger = options.logger;
     this.unhealthyThreshold = options.health?.unhealthyThreshold ?? DEFAULT_UNHEALTHY_THRESHOLD;
-    this.probeIntervalMs = options.health?.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS;
+    this.probeBackoffBaseMs = options.health?.probeBackoffBaseMs ?? DEFAULT_PROBE_BACKOFF_BASE_MS;
+    this.probeBackoffMaxMs = options.health?.probeBackoffMaxMs ?? DEFAULT_PROBE_BACKOFF_MAX_MS;
     for (const [name, cfg] of Object.entries(options.groups ?? {})) {
       this.groups.set(name, this.makeGroup(name, cfg));
     }
@@ -323,6 +360,10 @@ export class LlmScheduler {
    */
   acquire(opts: AcquireOptions = {}): Promise<ReleaseFn> {
     const group = this.getGroup(opts.group ?? "default");
+    // Record any per-model probe-backoff-cap override on sight (spec §4.1).
+    if (opts.modelKey && opts.probeBackoffMaxMs !== undefined) {
+      this.probeMaxOverrides.set(opts.modelKey, opts.probeBackoffMaxMs);
+    }
     const requested = opts.priority ?? "background";
     // A sticky escalation recorded before this entry registered (§5.5) is
     // adopted now — the priority is the max of requested and pinned.
@@ -443,9 +484,11 @@ export class LlmScheduler {
    *   failure feeds the streak — EXCEPT a plain 429, which is the shared
    *   budget talking, not evidence the model is unwell (503/529 feed both
    *   axes). At `llm_unhealthy_threshold` consecutive failures the model turns
-   *   unhealthy: half-open admission, one probe per `llm_probe_interval_ms`
-   *   (fixed cadence — recovery is detected within one window of the outage
-   *   ending, P6b). `content`/`aborted` outcomes are neutral — neither count
+   *   unhealthy: half-open admission, one probe per window where the window is a
+   *   per-episode CAPPED EXPONENTIAL BACKOFF (`llm_probe_backoff_base_ms` →
+   *   ×2-per-failed-probe → `llm_probe_backoff_max_ms`; spec MODEL-FALLBACK
+   *   §4.1, superseding the old fixed `llm_probe_interval_ms`).
+   *   `content`/`aborted` outcomes are neutral — neither count
    *   nor reset (one session's oversized context must not pause the model).
    */
   noteOutcome(
@@ -531,11 +574,13 @@ export class LlmScheduler {
 
     // Environmental failure. A plain 429 feeds only the group's throttle
     // backoff — shared-budget pressure is not evidence the model is unwell —
-    // but it still settles an in-flight probe inconclusively (next window).
+    // but it still settles an in-flight probe inconclusively (next window). An
+    // inconclusive settle reschedules at the CURRENT delay (no growth — a 429 is
+    // not failed-probe evidence, §4.1).
     if (status === 429) {
       if (health?.probeInFlight) {
         health.probeInFlight = false;
-        health.nextProbeAt = now + this.probeIntervalMs;
+        this.rescheduleProbe(health, now);
       }
       return;
     }
@@ -547,6 +592,7 @@ export class LlmScheduler {
         consecutiveFailures: 0,
         probeInFlight: false,
         nextProbeAt: 0,
+        probeDelayMs: this.probeBackoffBaseMs,
         unhealthySince: 0,
       };
       this.health.set(modelKey, health);
@@ -559,11 +605,14 @@ export class LlmScheduler {
         health.state = "unhealthy";
         health.unhealthySince = now;
         health.probeInFlight = false;
-        health.nextProbeAt = now + this.probeIntervalMs;
+        // First probe window: aggressive (the base), to catch a quick recovery.
+        health.probeDelayMs = this.probeBackoffBaseMs;
+        health.nextProbeAt = now + health.probeDelayMs;
         this.logger?.warn("llm_model_unhealthy", {
           model: modelKey,
           consecutiveFailures: health.consecutiveFailures,
           status,
+          nextProbeAt: health.nextProbeAt,
           waiters: this.countModelWaiters(modelKey),
         });
       }
@@ -573,16 +622,42 @@ export class LlmScheduler {
     // Already unhealthy: this settles the probe (the half-open admission rule
     // means at most one in-flight request exists for the model, so the settling
     // failure IS the probe — a pre-outage straggler failing here merely
-    // schedules the next window a little later, which is harmless).
+    // schedules the next window a little later, which is harmless). A FAILED
+    // probe grows the delay (×2, capped) — a sustained outage rapidly stops
+    // wasting calls (§4.1).
     health.probeInFlight = false;
-    health.nextProbeAt = now + this.probeIntervalMs;
+    this.failProbe(health, now);
     this.logger?.warn("llm_model_probe", {
       model: modelKey,
       success: false,
       status,
       nextProbeAt: health.nextProbeAt,
+      probeDelayMs: health.probeDelayMs,
       waiters: this.countModelWaiters(modelKey),
     });
+  }
+
+  /** Effective probe-backoff ceiling for a model (per-model override → global). */
+  private effectiveProbeMax(modelKey: string): number {
+    return this.probeMaxOverrides.get(modelKey) ?? this.probeBackoffMaxMs;
+  }
+
+  /**
+   * Advance the probe window after a FAILED probe (spec §4.1): double the delay,
+   * capped at the effective max, and schedule the next window from `now`.
+   */
+  private failProbe(health: ModelHealthState, now: number): void {
+    health.probeDelayMs = Math.min(health.probeDelayMs * 2, this.effectiveProbeMax(health.key));
+    health.nextProbeAt = now + health.probeDelayMs;
+  }
+
+  /**
+   * Reschedule the probe window WITHOUT growing the delay, for an inconclusive
+   * settle (a 429 absorbed the probe slot, or a stale-on-release safety net) —
+   * not failed-probe evidence, so the backoff must not grow (§4.1).
+   */
+  private rescheduleProbe(health: ModelHealthState, now: number): void {
+    health.nextProbeAt = now + health.probeDelayMs;
   }
 
   /**
@@ -599,7 +674,9 @@ export class LlmScheduler {
     if (!health || health.state !== "unhealthy" || !health.probeInFlight) return;
     const now = Date.now();
     health.probeInFlight = false;
-    health.nextProbeAt = now + this.probeIntervalMs;
+    // Inconclusive (no terminal outcome reached the streak) — reschedule at the
+    // current delay without growing it (§4.1).
+    this.rescheduleProbe(health, now);
     this.logger?.warn("llm_model_probe", {
       model: modelKey,
       success: false,
@@ -607,6 +684,32 @@ export class LlmScheduler {
       nextProbeAt: health.nextProbeAt,
       waiters: this.countModelWaiters(modelKey),
     });
+  }
+
+  /**
+   * Read-only health state of a model (spec MODEL-FALLBACK §3): the per-attempt
+   * fallback resolver consults this to skip an unhealthy chain head. Untracked
+   * (never failed) models are `healthy`. No mutation — the resolver only reads.
+   */
+  modelHealth(modelKey: string): "healthy" | "unhealthy" {
+    return this.health.get(modelKey)?.state ?? "healthy";
+  }
+
+  /**
+   * Read-only: is this model's half-open probe window open right now (spec
+   * MODEL-FALLBACK §3/§4)? True iff unhealthy, no probe in flight, and the
+   * backoff window has elapsed — the resolver routes the next attempt to the
+   * head AS the canary when this holds. Reads the same `probeInFlight` /
+   * `nextProbeAt` gate the pump uses, so resolver and pump agree.
+   */
+  isProbeDue(modelKey: string): boolean {
+    const health = this.health.get(modelKey);
+    return (
+      !!health &&
+      health.state === "unhealthy" &&
+      !health.probeInFlight &&
+      Date.now() >= health.nextProbeAt
+    );
   }
 
   /**
@@ -850,6 +953,8 @@ export interface AdmissionOptions {
   priority: PriorityClass;
   /** Escalation key registered for the whole wait (§5.5). */
   key?: string;
+  /** Per-model probe-backoff-cap override (spec MODEL-FALLBACK §4.1). */
+  probeBackoffMaxMs?: number;
   /** Attribution for the console scheduler view (spec §9.1). */
   sessionId?: string;
   sessionType?: string;
@@ -938,6 +1043,7 @@ export function withSchedulerAdmission(
           priority: options.priority,
           key: options.key,
           modelKey,
+          probeBackoffMaxMs: options.probeBackoffMaxMs,
           sessionId: options.sessionId,
           sessionType: options.sessionType,
           signal,

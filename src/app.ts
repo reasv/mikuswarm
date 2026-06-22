@@ -20,6 +20,7 @@ import {
 import {
   AgentSessionFactory,
   LlmScheduler,
+  resolveModelChain,
   LlmRequestRing,
   DEFAULT_LLM_REQUEST_RING_SIZE,
   SessionManager,
@@ -110,7 +111,7 @@ import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
-import { CaptionWorkerPool, InferenceClient, resolveCaptionCost, type MediaModality } from "./captioning/index.js";
+import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
@@ -175,12 +176,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         group: model.rate_limit_group,
         source: `models.${key}`,
       })),
-      { group: config.captioning?.model?.rate_limit_group, source: "captioning.model" },
-      ...(["image", "video", "audio"] as const).map((modality) => ({
-        group: config.captioning?.[modality]?.model?.rate_limit_group,
-        source: `captioning.${modality}.model`,
-      })),
-      { group: config.retrieval?.embedding?.remote?.rate_limit_group, source: "retrieval.embedding.remote" },
+      // captioning + remote embedding reference `[models.*]` by name now (spec
+      // MODEL-FALLBACK §2.3), so their rate_limit_group is validated via the models
+      // loop above.
     ];
     for (const { group, source } of groupRefs) {
       if (group && group !== "default" && !llmGroups[group]) {
@@ -251,7 +249,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // natural per-model config block.
     health: {
       unhealthyThreshold: config.recovery?.llm_unhealthy_threshold,
-      probeIntervalMs: config.recovery?.llm_probe_interval_ms,
+      // Capped-backoff probe cadence (spec MODEL-FALLBACK §4.1). Per-model caps
+      // ride the model config's `llm_probe_backoff_max_ms`, threaded through
+      // admission — there is no natural per-model health config block here.
+      probeBackoffBaseMs: config.recovery?.llm_probe_backoff_base_ms,
+      probeBackoffMaxMs: config.recovery?.llm_probe_backoff_max_ms,
     },
     logger: logger.child("llm-scheduler"),
   });
@@ -354,6 +356,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       httpProxyUrl: config.network?.http_proxy_url,
       scheduler: llmScheduler,
       budget: budgetHooks,
+      // Unified registry (spec MODEL-FALLBACK §2.3): resolve the remote embedding
+      // model ref to its [models.*] chain (head + fallback members).
+      embeddingChain: retrievalConfig.embedding.remote
+        ? resolveModelChain(retrievalConfig.embedding.remote.model, config.models)
+        : undefined,
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       logger: logger.child("retrieval"),
     });
     // Reconcile the touched file after every memory mutation (diary append /
@@ -552,66 +560,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       : undefined;
 
   const captioningConfig = config.captioning ?? {};
-  const sharedModel = {
-    id: captioningConfig.model?.id ?? "google/gemini-3.5-flash",
-    endpoint: captioningConfig.model?.endpoint ?? config.models.default.endpoint,
-    api_key: captioningConfig.model?.api_key ?? config.models.default.api_key,
-    // Accounting provenance recorded on caption usage_events rows; never inherited
-    // across a different modality model (parity with cost), only carried verbatim.
-    provider: captioningConfig.model?.provider ?? null,
-  };
-
-  function resolveModalityModel(modalityConfig?: {
-    model?: { id?: string; endpoint?: string; api_key?: string; provider?: string };
-  }) {
-    return {
-      id: modalityConfig?.model?.id ?? sharedModel.id,
-      endpoint: modalityConfig?.model?.endpoint ?? sharedModel.endpoint,
-      api_key: modalityConfig?.model?.api_key ?? sharedModel.api_key,
-      provider: modalityConfig?.model?.provider ?? sharedModel.provider,
-    };
-  }
-
-  // Rate-limit group for a captioning modality (spec §9.4): the group attaches to
-  // the model BLOCK actually in use — a modality override's own group field wins;
-  // else the shared captioning model's; only when no captioning model block exists
-  // at all (full fallback onto models.default) does the default model's group
-  // apply. Unset resolves to `default` inside the scheduler.
-  function resolveModalityRateLimitGroup(modalityConfig?: { model?: { rate_limit_group?: string } }): string | undefined {
-    if (modalityConfig?.model) return modalityConfig.model.rate_limit_group;
-    if (captioningConfig.model) return captioningConfig.model.rate_limit_group;
-    return config.models.default.rate_limit_group;
-  }
-
-  // Auxiliary caption cost rates (spec AUXILIARY-USAGE-TRACKING §5/§7.1): the
-  // config cost block is snake_case USD/1M tokens; map to the CostRates shape.
-  // Cost is a property of a SPECIFIC model and is never inherited across models —
-  // resolveCaptionCost applies the top-level [captioning.model].cost only when the
-  // modality actually runs the shared model. A modality that overrides the model to
-  // a different id without its own cost block has UNKNOWN cost (untracked, not the
-  // shared model's rates); we warn so that silent gap is visible. Never falls back
-  // to models.default.
-  function resolveModalityCost(modality: MediaModality, modalityConfig?: {
-    model?: { id?: string; cost?: { input: number; output: number; cache_read: number; cache_write: number } };
-  }): CostRates | undefined {
-    const { rates, unpricedOverride } = resolveCaptionCost({
-      modalityModelId: modalityConfig?.model?.id,
-      modalityCost: modalityConfig?.model?.cost,
-      sharedModelId: sharedModel.id,
-      topLevelCost: captioningConfig.model?.cost,
-    });
-    if (unpricedOverride) {
-      logger.warn("caption_cost_untracked_model_override", {
-        modality,
-        modality_model: modalityConfig?.model?.id,
-        shared_model: sharedModel.id,
-        detail:
-          "captioning modality overrides the model but sets no [captioning." +
-          modality +
-          ".model.cost]; its usage will be tracked with unknown cost ([captioning.model].cost is not inherited across different models)",
-      });
-    }
-    return rates;
+  // Unified registry (spec MODEL-FALLBACK §2.3): captioning references `[models.*]`
+  // by name. A modality's own `model` ref wins; else the top-level captioning
+  // `model`; else the `default` model. Connection, pricing, rate-limit group, and
+  // any `fallback` chain all live on the referenced block — the old shared-model /
+  // per-modality cost-inheritance machinery is gone (pricing is on the model).
+  function resolveModalityChain(modalityConfig?: { model?: string }) {
+    const ref = modalityConfig?.model ?? captioningConfig.model ?? "default";
+    return resolveModelChain(ref, config.models);
   }
 
   // Image-gen per-tier cost block (spec §7.2): snake_case config → CostRates,
@@ -649,24 +605,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const captionClients = new Map<MediaModality, InferenceClient>([
     ["image", new InferenceClient({
       modality: "image",
-      model: resolveModalityModel(imageConfig),
+      chain: resolveModalityChain(imageConfig),
       prompt: imageConfig.prompt ?? "Describe the image.",
       maxChars: imageConfig.max_chars ?? 500,
       maxTokens: imageConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(imageConfig),
-      costRates: resolveModalityCost("image", imageConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       imageProcessing: inferenceImageOptions,
     })],
     ["video", new InferenceClient({
       modality: "video",
-      model: resolveModalityModel(videoConfig),
+      chain: resolveModalityChain(videoConfig),
       prompt: videoConfig.prompt ?? "Describe the video.",
       maxChars: videoConfig.max_chars ?? 500,
       maxTokens: videoConfig.max_tokens ?? 2048,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(videoConfig),
-      costRates: resolveModalityCost("video", videoConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: videoConfig.timeout_ms,
       videoProcessing: {
         maxResolution: mediaVideoConfig.max_resolution ?? 480,
@@ -681,13 +635,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     })],
     ["audio", new InferenceClient({
       modality: "audio",
-      model: resolveModalityModel(audioConfig),
+      chain: resolveModalityChain(audioConfig),
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
-      rateLimitGroup: resolveModalityRateLimitGroup(audioConfig),
-      costRates: resolveModalityCost("audio", audioConfig),
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: {
         maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
@@ -746,11 +699,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       logger.error("caption_failed", { assetId, error: error instanceof Error ? error.message : String(error) }),
     activityBus: pipelineActivityBus,
     budget: budgetHooks,
-    captionModelId:
-      config.captioning?.model?.id ??
-      config.captioning?.image?.model?.id ??
-      config.captioning?.video?.model?.id ??
-      config.captioning?.audio?.model?.id,
+    // Representative fallback chain (LOGICAL ids) for the pool's coarse claim gate
+    // (spec §8e / MODEL-FALLBACK §6): the captioning model REF's chain (spec §2.3
+    // unified registry). The gate parks only when EVERY member is over budget, so a
+    // head-only cap still lets the per-attempt resolver serve from a fallback; the
+    // per-attempt ledger records the exact billed member.
+    captionModelIds: resolveModelChain(
+      config.captioning?.model ??
+        config.captioning?.image?.model ??
+        config.captioning?.video?.model ??
+        config.captioning?.audio?.model ??
+        "default",
+      config.models,
+    ).map((m) => m.logicalId),
     logger,
   });
 
@@ -986,6 +947,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           return undefined;
         }
       },
+      // Logical id (chain-head config block name) for the session-level gates —
+      // the dimension `[[limits]].models` matches (spec MODEL-FALLBACK §2.2).
+      resolveLogicalModelId: (sessionType) => {
+        try {
+          return factory.resolveLogicalModelId(sessionType);
+        } catch {
+          return undefined;
+        }
+      },
       logger: logger.child("budget"),
     });
 
@@ -1120,7 +1090,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             modelId = undefined;
           }
           if (modelId === undefined) continue; // unresolvable → don't block on it
-          out.push({ class: "agent_loop", sessionType, modelId });
+          // Logical id (chain-head block name) so a `models=["default"]` rule that
+          // scopes on the logical dimension parks this pool too — without it the
+          // descriptor carries only the upstream wire id and the rule silently
+          // fails to match (review #4; session types bind model="default" ≠ wire id).
+          let logicalModelId: string | undefined;
+          try {
+            logicalModelId = factory.resolveLogicalModelId(sessionType);
+          } catch {
+            logicalModelId = undefined;
+          }
+          out.push({ class: "agent_loop", sessionType, modelId, logicalModelId });
         }
         return out;
       },
@@ -2967,6 +2947,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         triggerSenderId: inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id ?? null,
         toolName: record.toolName,
         modelId: record.modelId,
+        // Logical id for budget scoping / grouping (spec MODEL-FALLBACK §2.2),
+        // defaulting to the wire id when the tool has no virtual model.
+        logicalModelId: record.logicalModelId ?? record.modelId,
         provider: record.provider,
         inputTokens: record.usage.input,
         outputTokens: record.usage.output,
@@ -3156,10 +3139,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
             checkBudget: makeToolBudgetCheck("image_generate"),
-            // Per-tier cost rates (spec §7.2): snake_case config block → CostRates.
-            costRates: {
-              pro: toImageCostRates(config.image_gen.costs?.pro),
-              flash: toImageCostRates(config.image_gen.costs?.flash),
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+            // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
+            // [models.*] chain (head + fallback members); pricing lives on the model.
+            chains: {
+              pro: resolveModelChain(config.image_gen.models.pro, config.models),
+              flash: resolveModelChain(config.image_gen.models.flash, config.models),
             },
             config: config.image_gen,
           })]
@@ -3190,6 +3175,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       ...(config.x_search && (config.x_search.enabled ?? true)
         ? [createXSearchTool({
             config: config.x_search,
+            // Unified registry (spec MODEL-FALLBACK §2.3): resolve the fast/deep
+            // tiers to their `[models.*]` chains (head + fallback members).
+            fastChain: resolveModelChain(config.x_search.model, config.models),
+            deepChain: resolveModelChain(config.x_search.deep_model ?? config.x_search.model, config.models),
+            scheduler: llmScheduler,
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             workspaceRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
@@ -4008,16 +3999,30 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       } catch {
         admissionModelId = undefined;
       }
+      // Chain-aware admission (spec MODEL-FALLBACK §6.1): gate on the WHOLE fallback
+      // chain (logical ids), so a model-scoped cap on the primary doesn't refuse a
+      // session an in-budget fallback could serve. Resolution is isolated like the
+      // model-id resolution above — a throw leaves it undefined → head-only gate.
+      let admissionChain: string[] | undefined;
+      try {
+        admissionChain = factory.resolveModelChainLogicalIds(session.sessionType);
+      } catch {
+        admissionChain = undefined;
+      }
       // Exception-isolated, fail-open admission decision (review #7): a throw inside
       // the engine call would unwind to the dispatch `catch` (releaseClaimFor +
       // rethrow, but NOT `triggerCoordinator.complete`), leaking the per-timeline
       // slot. `safeCheckAdmission` returns undefined on a throw → we fall through to
       // a normal launch (admit), so a budget-engine bug never stops the bot replying.
       const admission = admissionModelId
-        ? safeCheckAdmission(budgetHooks.engine, session.sessionType, admissionModelId, logger, {
-            sessionId: session.id,
-            timelineKey: session.timelineKey,
-          })
+        ? safeCheckAdmission(
+            budgetHooks.engine,
+            session.sessionType,
+            admissionModelId,
+            logger,
+            { sessionId: session.id, timelineKey: session.timelineKey },
+            admissionChain,
+          )
         : undefined;
       if (admission && !admission.allowed) {
         const gate = admission.dependency ? "dependency" : "trigger_admission";
@@ -4513,6 +4518,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       liveEvents,
       // Scheduler snapshot + request ring (spec §9.1/§9.2).
       scheduler: llmScheduler,
+      // Health-key → logical id(s) + has-fallback map (spec MODEL-FALLBACK §8): lets
+      // the scheduler view show the config name and label a fallback-bearing model's
+      // probe window as the canary. Built from config.models (multiple logical ids
+      // can share one health key via inheritance/rename).
+      modelHealthAnnotations: buildModelHealthAnnotations(config.models),
       llmRequestRing,
       workspaceRoot,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
@@ -4591,8 +4601,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
         // probe during a caption-model outage would otherwise block until the
-        // far-later `llmScheduler.stop()` rejects it (~N×llm_probe_interval_ms
-        // stall). Stopping the clients first rejects those queued waiters now.
+        // far-later `llmScheduler.stop()` rejects it (a capped-backoff probe
+        // window stall). Stopping the clients first rejects those queued waiters now.
         for (const client of captionClients.values()) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
@@ -4716,7 +4726,7 @@ export function decideRetentionSweep(params: {
 }
 
 /** The slice of {@link BudgetEngine} the budget admission/defer gates consume. */
-type AdmissionEngine = Pick<BudgetEngine, "checkAdmission" | "accurateResetsAt">;
+type AdmissionEngine = Pick<BudgetEngine, "checkAdmission" | "checkAdmissionChain" | "accurateResetsAt">;
 
 /**
  * Exception-isolated session-admission check (spec USAGE-COST-LIMITS, review #7).
@@ -4735,9 +4745,18 @@ export function safeCheckAdmission(
   modelId: string,
   logger: Logger,
   context: Record<string, unknown> = {},
+  /**
+   * Effective fallback chain as LOGICAL ids, head-first (spec MODEL-FALLBACK §6.1).
+   * When supplied the gate admits if ANY chain member is in-budget; omitted ⇒ the
+   * head-only `checkAdmission`. Resolution is isolated by the caller (a throw there
+   * leaves it undefined → head-only, not a leak).
+   */
+  chainLogicalIds?: string[],
 ): AdmissionResult | undefined {
   try {
-    return engine.checkAdmission(sessionType, modelId);
+    return chainLogicalIds
+      ? engine.checkAdmissionChain(sessionType, modelId, chainLogicalIds)
+      : engine.checkAdmission(sessionType, modelId);
   } catch (error) {
     logger.warn("usage_admission_check_threw", {
       ...context,
@@ -4797,6 +4816,27 @@ export function safeProactiveDeferUntil(
  * check is gone. Throws on the first offending entry. Called from
  * {@link startMikuAgent}.
  */
+/**
+ * Build the scheduler-snapshot annotation map (spec MODEL-FALLBACK §8): health key
+ * (`endpoint::id`, as `modelHealthKey` derives it) → the LOGICAL ids ([models.*]
+ * block names) resolving to it and whether ANY carries a `fallback` chain. Several
+ * logical ids can share one health key (inheritance / pure-rename virtual models),
+ * so ids aggregate and `hasFallback` ORs. Lets the console show the config name and
+ * label a fallback-bearing model's probe window as the canary.
+ */
+export function buildModelHealthAnnotations(
+  models: AppConfig["models"],
+): Record<string, { logicalIds: string[]; hasFallback: boolean }> {
+  const out: Record<string, { logicalIds: string[]; hasFallback: boolean }> = {};
+  for (const [logicalId, model] of Object.entries(models)) {
+    const key = `${model.endpoint ?? "unknown"}::${model.id}`;
+    const entry = (out[key] ??= { logicalIds: [], hasFallback: false });
+    entry.logicalIds.push(logicalId);
+    if ((model.fallback?.length ?? 0) > 0) entry.hasFallback = true;
+  }
+  return out;
+}
+
 export function validateContextTokenCeilings(config: AppConfig): void {
   // Require `context_window` on a model and return it. `who` names the call site
   // (a session type, or the always-resolvable default model) for the error.

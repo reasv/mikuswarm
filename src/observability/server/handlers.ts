@@ -371,7 +371,20 @@ export function schedulerSnapshot(
 ): void {
   const scheduler = ctx.deps.scheduler;
   if (!scheduler) return sendError(res, 503, "scheduler not wired");
-  sendJson(res, 200, scheduler.snapshot());
+  const snapshot = scheduler.snapshot();
+  // Annotate each model with its LOGICAL id(s) + whether it has a fallback chain
+  // (spec MODEL-FALLBACK §8), so the console can show the config name and label an
+  // unhealthy fallback-bearing model's probe window as the canary. The snapshot
+  // keys on the health key (config-blind); the map is the config bridge.
+  const annotations = ctx.deps.modelHealthAnnotations;
+  const models = annotations
+    ? snapshot.models.map((m) => ({
+        ...m,
+        logicalIds: annotations[m.key]?.logicalIds ?? [],
+        hasFallback: annotations[m.key]?.hasFallback ?? false,
+      }))
+    : snapshot.models;
+  sendJson(res, 200, { ...snapshot, models });
 }
 
 /**
