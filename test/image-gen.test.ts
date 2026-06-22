@@ -662,8 +662,14 @@ test("image_generate aborts the in-flight generation POST on agent cancel (#7)",
     // fetch being aborted (by the agent signal threaded into postGenerate).
     let reqReceived = false;
     let reqClosed = false;
+    // Deterministic "the POST has arrived" signal — abort only after this, instead
+    // of guessing with a wall-clock delay (which flaked when the connection wasn't
+    // established in time under concurrent in-file load).
+    let markReceived!: () => void;
+    const requestReceived = new Promise<void>((resolve) => { markReceived = resolve; });
     const server = http.createServer((req) => {
       reqReceived = true;
+      markReceived(); // unblock the abort below the instant the request lands
       req.resume(); // drain the request body so headers/handler settle
       // The socket closes when the client (our aborted fetch) tears it down.
       req.socket.on("close", () => { reqClosed = true; });
@@ -684,10 +690,25 @@ test("image_generate aborts the in-flight generation POST on agent cancel (#7)",
 
       const tool = createImageGenTool(ctx);
       const agent = new AbortController();
-      // Abort once the POST is in flight (give it room to connect under test load).
-      setTimeout(() => agent.abort(), 300);
       const start = Date.now();
-      const result: any = await tool.execute("inflight-abort", { prompt: "x" }, agent.signal);
+      // Start the call WITHOUT awaiting, then abort the moment the POST actually
+      // reaches the server (deterministic — no timing guess). A generous guard
+      // turns a genuine "request never issued" regression into a clear failure
+      // rather than a hang until the test-runner timeout.
+      const exec = tool.execute("inflight-abort", { prompt: "x" }, agent.signal);
+      let guardTimer: ReturnType<typeof setTimeout>;
+      await Promise.race([
+        requestReceived,
+        new Promise<void>((_, reject) => {
+          guardTimer = setTimeout(
+            () => reject(new Error("generation POST never reached the server")),
+            10_000,
+          );
+        }),
+      ]);
+      clearTimeout(guardTimer!);
+      agent.abort();
+      const result: any = await exec;
       const elapsed = Date.now() - start;
 
       // The POST reached the server (admission bypassed, generation in flight) and
