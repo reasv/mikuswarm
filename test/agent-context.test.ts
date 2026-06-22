@@ -455,7 +455,7 @@ function minimalConfig(overrides?: Partial<AppConfig>): AppConfig {
         provider: "test",
         endpoint: "http://localhost",
         api_key: "key",
-        multimodal: false,
+        input_modalities: ["text"],
         max_tokens: 4096,
         // context_window is the always-on enforcement base and is required for
         // any model a session type resolves to (spec CONTEXT-LIMIT-UNIFICATION
@@ -680,7 +680,7 @@ test("summarizationCutoff: image blocks are skipped", async () => {
         provider: "test",
         endpoint: "http://localhost",
         api_key: "key",
-        multimodal: true,
+        input_modalities: ["text", "image"],
         max_tokens: 4096,
       },
     },

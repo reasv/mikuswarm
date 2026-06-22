@@ -53,8 +53,9 @@ export interface BuildModelFallbackOptions {
   makeModel: (config: ModelConfig, contextWindow: number) => Model<Api>;
   /**
    * Capability pre-filter (spec §3 build-time #1): drop members that cannot
-   * serve the request's FIXED needs (image blocks → multimodal; caption
-   * modality; …). The head is never dropped — if the head fails capability the
+   * serve the request's FIXED needs (image blocks → `input_modalities` includes
+   * "image"; caption lane → includes its modality; …). The head is never dropped
+   * — if the head fails capability the
    * whole composite is unusable and the caller's normal "model can't serve"
    * path applies. Returns true when the member can serve.
    */

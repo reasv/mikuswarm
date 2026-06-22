@@ -333,7 +333,7 @@ function schedulerConfig(): AppConfig {
   return {
     app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
     agent: { sessions: { max_concurrent: 1, max_concurrent_dm: 1, forced_completion_retries: 0 }, system: {} },
-    models: { default: { id: "m", provider: "p", endpoint: "e", api_key: "k", multimodal: false, max_tokens: 1 } },
+    models: { default: { id: "m", provider: "p", endpoint: "e", api_key: "k", input_modalities: ["text"], max_tokens: 1 } },
     context: { tiers: { rich_target_tokens: 1, rich_max_tokens: 1, compact_target_tokens: 1, compact_max_tokens: 1 } },
     storage: { database_path: ":memory:" },
     workspace: { root_dir: "/tmp" },

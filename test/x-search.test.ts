@@ -290,7 +290,7 @@ async function makeHarness(opts: {
     provider: "openrouter",
     endpoint: opts.serverUrl,
     api_key: "test-key",
-    multimodal: true,
+    input_modalities: ["text", "image"],
     max_tokens: 8192,
     context_window: 128000,
   } as never;
@@ -621,7 +621,7 @@ function modelEntry(logicalId: string, endpoint: string) {
       provider: "openrouter",
       endpoint,
       api_key: "test-key",
-      multimodal: true,
+      input_modalities: ["text", "image"],
       max_tokens: 8192,
       context_window: 128000,
     },

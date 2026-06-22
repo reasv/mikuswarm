@@ -179,6 +179,11 @@ export class InferenceClient {
         priority: "background",
         scheduler: this.options.scheduler,
         isModelAvailable: this.options.isModelAvailable,
+        // Per-lane capability pre-filter (spec MODEL-FALLBACK §3/§6): drop chain
+        // members that don't accept THIS lane's modality so a heterogeneous chain
+        // never ships e.g. a video to an image-only fallback (worst case: a silent
+        // 200 with a hallucinated caption). The head is retained by buildFetchChain.
+        capability: (cfg) => cfg.input_modalities.includes(this.options.modality),
         probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
         signal: this.stopController.signal,
       },

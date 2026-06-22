@@ -54,7 +54,7 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
       chain: [
         {
           logicalId: "caption-model",
-          config: { id: "caption-model", endpoint: "http://127.0.0.1:9", api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never,
+          config: { id: "caption-model", endpoint: "http://127.0.0.1:9", api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never,
         },
       ],
       prompt: "describe",
@@ -117,8 +117,8 @@ test("InferenceClient: 2-member chain — head unhealthy → fallback member ser
       scheduler.noteOutcome("default", headKey, "environmental"); // → unhealthy
 
       const chain: ModelChainEntry[] = [
-        { logicalId: "caption-head", config: { id: "caption-head", endpoint: head.url, api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never },
-        { logicalId: "caption-fallback", config: { id: "caption-fallback", endpoint: fb.url, api_key: "k", multimodal: true, max_tokens: 256, context_window: 128000 } as never },
+        { logicalId: "caption-head", config: { id: "caption-head", endpoint: head.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
+        { logicalId: "caption-fallback", config: { id: "caption-fallback", endpoint: fb.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never },
       ];
 
       const client = new InferenceClient({
@@ -138,6 +138,64 @@ test("InferenceClient: 2-member chain — head unhealthy → fallback member ser
     } finally {
       await head.close();
       await fb.close();
+    }
+  });
+});
+
+// spec MODEL-FALLBACK §3/§6 (per-lane capability pre-filter, issue #3): on a video
+// lane, an image-only FALLBACK member is dropped by the capability predicate so the
+// video is never shipped to a model that can't see it (worst case: a silent 200
+// with a hallucinated caption). Here the head is unhealthy, the first fallback is
+// image-only (must be dropped despite being healthy + in-budget), and the second
+// fallback is video-capable and serves. Without the predicate, the image-only
+// fallback would have been selected and mis-captioned the video.
+test("InferenceClient: video lane drops an image-only fallback, serves from a video-capable one", async () => {
+  await withImageFile(async (filePath) => {
+    const head = await startCaptionServer("from-head");
+    const imageOnlyFb = await startCaptionServer("from-image-fallback");
+    const videoFb = await startCaptionServer("from-video-fallback");
+    try {
+      const scheduler = new LlmScheduler({
+        health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
+      });
+      // Mark the head unhealthy (probe far out) so selection falls past it.
+      scheduler.noteOutcome("default", `${head.url}::caption-head`, "environmental");
+
+      const chain: ModelChainEntry[] = [
+        {
+          logicalId: "caption-head",
+          config: { id: "caption-head", endpoint: head.url, api_key: "k", input_modalities: ["text", "image", "video"], max_tokens: 256, context_window: 128000 } as never,
+        },
+        {
+          logicalId: "caption-image-fallback",
+          config: { id: "caption-image-fallback", endpoint: imageOnlyFb.url, api_key: "k", input_modalities: ["text", "image"], max_tokens: 256, context_window: 128000 } as never,
+        },
+        {
+          logicalId: "caption-video-fallback",
+          config: { id: "caption-video-fallback", endpoint: videoFb.url, api_key: "k", input_modalities: ["text", "image", "video"], max_tokens: 256, context_window: 128000 } as never,
+        },
+      ];
+
+      const client = new InferenceClient({
+        modality: "video",
+        chain,
+        prompt: "describe",
+        maxChars: 100,
+        maxTokens: 256,
+        scheduler,
+        // No videoProcessing → caption() reads the file then goes straight to the fetch.
+      });
+
+      const result = await client.caption({ filePath, mimeType: "video/mp4", filename: "test.mp4" });
+      assert.equal(result.caption, "from-video-fallback", "the video-capable fallback served the caption");
+      assert.equal(result.logicalModelId, "caption-video-fallback");
+      assert.equal(head.hits(), 0, "the unhealthy head is never hit");
+      assert.equal(imageOnlyFb.hits(), 0, "the image-only fallback is filtered out for the video lane");
+      assert.equal(videoFb.hits(), 1, "the video-capable fallback served exactly once");
+    } finally {
+      await head.close();
+      await imageOnlyFb.close();
+      await videoFb.close();
     }
   });
 });

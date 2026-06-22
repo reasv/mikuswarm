@@ -264,7 +264,7 @@ function minimalConfig(): AppConfig {
     app: { name: "test", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
     agent: { sessions: { max_concurrent: 1, max_concurrent_dm: 1, forced_completion_retries: 0 }, system: {} },
     models: {
-      default: { id: "m", provider: "t", endpoint: "http://x", api_key: "k", multimodal: false, max_tokens: 4096 },
+      default: { id: "m", provider: "t", endpoint: "http://x", api_key: "k", input_modalities: ["text"], max_tokens: 4096 },
     },
     context: { tiers: { rich_target_tokens: 2000, rich_max_tokens: 4000, compact_target_tokens: 4000, compact_max_tokens: 8000 } },
     storage: { database_path: ":memory:" },

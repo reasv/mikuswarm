@@ -61,7 +61,7 @@ function minimalConfig(overrides?: Partial<AppConfig>): AppConfig {
         provider: "test",
         endpoint: "http://localhost",
         api_key: "key",
-        multimodal: false,
+        input_modalities: ["text"],
         max_tokens: 4096,
       },
     },

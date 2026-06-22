@@ -2914,6 +2914,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // type's override (or a non-default model) shapes the tool budget too.
     const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
 
+    // Whether the default (agent-loop) model accepts image input (spec
+    // MODEL-FALLBACK §3): gates vision-dependent tool wiring below (read_image
+    // inclusion, media/danbooru/find_source inline-vs-caption fallback).
+    const defaultModelSeesImages = config.models.default.input_modalities.includes("image");
+
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
     // x_search). Feeds the per-session cost ceiling's combined-spend lane in-memory
     // (spec SESSION-COST-LIMITS §4) and appends one durable `tool_invocations` row
@@ -3083,11 +3088,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         workspaceRoot,
         clients: captionClients,
         defaultPrompts,
-        modelHasVision: config.models.default.multimodal,
+        modelHasVision: defaultModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
         fetchClient,
       }),
-      ...(config.models.default.multimodal ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
+      ...(defaultModelSeesImages ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
       ...(retrieval
         ? [
@@ -3108,7 +3113,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         inferenceImageOptions,
         // When the default model lacks vision, `preview` describes the asset via
         // the captioning model instead of emitting an unusable image block.
-        modelHasVision: config.models.default.multimodal,
+        modelHasVision: defaultModelSeesImages,
         imageCaptionClient: captionClients.get("image"),
         fetchClient,
         httpProxyUrl: config.network?.http_proxy_url,
@@ -3167,7 +3172,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // read_image / danbooru preview, for the view-thumbnail path.
             inlineImageMaxBytes: resolveReadImageMaxBytes(config),
             inferenceImageOptions,
-            modelHasVision: config.models.default.multimodal,
+            modelHasVision: defaultModelSeesImages,
             rateLimiter: sauceNaoRateLimiter,
             maxWaitMs: config.saucenao.rate_limit?.max_wait_ms,
             httpProxyUrl: config.network?.http_proxy_url,

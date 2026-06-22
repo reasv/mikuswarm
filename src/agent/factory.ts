@@ -430,8 +430,9 @@ export class AgentSessionFactory {
     const resolvedMember: { logicalId: string } = { logicalId: modelKey };
     const budgetEngine = this.options.budget?.engine;
     // Capability pre-filter (spec MODEL-FALLBACK §3 #1): when the session's RAW
-    // inputs carry image content, every viable member must be `multimodal` so a
-    // fall-over never ships image blocks to a text-only fallback. Derived from the
+    // inputs carry image content, every viable member must accept image input
+    // (`input_modalities` includes "image") so a fall-over never ships image
+    // blocks to a text-only fallback. Derived from the
     // raw inputs (trigger attachments / resume snapshot imageBlocks) because this
     // runs BEFORE buildContext — a SAFE over-approximation (any raw image ⇒
     // require multimodal for the whole session). The head is never dropped, so the
@@ -454,7 +455,7 @@ export class AgentSessionFactory {
       makeBase: (cfg) =>
         withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
       makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
-      capability: requiresMultimodal ? (cfg) => cfg.multimodal === true : undefined,
+      capability: requiresMultimodal ? (cfg) => cfg.input_modalities.includes("image") : undefined,
       contextOverride: sessionTypeConfig?.max_context_tokens,
       scheduler,
       admission: scheduler
@@ -1370,7 +1371,12 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
     // effort value (e.g. GLM-5.2 on Together: xhigh → "max"). Undefined for
     // models that use pi-ai's native effort vocabulary. See ModelSchema.
     thinkingLevelMap: model.thinking_level_map,
-    input: model.multimodal ? ["text", "image"] : ["text"],
+    // pi-ai's Model.input only accepts ("text"|"image")[]; the agent loop /
+    // provider adapter cannot consume video/audio, so map the broader config
+    // `input_modalities` down to the supported subset (text baseline + image when
+    // the model accepts it). Per-lane video/audio capability is enforced upstream
+    // in the captioning fetch consumer, never threaded through this descriptor.
+    input: model.input_modalities.includes("image") ? ["text", "image"] : ["text"],
     cost: {
       input: model.cost?.input ?? 0,
       output: model.cost?.output ?? 0,

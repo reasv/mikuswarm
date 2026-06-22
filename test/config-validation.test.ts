@@ -28,7 +28,7 @@ id = "test-model"
 provider = "test"
 endpoint = "http://localhost"
 api_key = "test-key"
-multimodal = false
+input_modalities = ["text"]
 max_tokens = 1024
 
 [context.tiers]
@@ -701,7 +701,7 @@ ${block}`;
 const DICT_VALUE_UNKNOWN_KEY_CASES: Array<{ name: string; block: string; path: string }> = [
   { name: "[rate_limits.llm.<group>] max_rpm (deliberately unsupported)", block: `[rate_limits.llm.openrouter]\nmax_in_flight = 16\nmax_rpm = 60\n`, path: "rate_limits\\.llm\\.openrouter\\.max_rpm" },
   { name: "[agent.session_types.<type>] bogus knob", block: `[agent.session_types.custom]\nmodel = "default"\nbogus_knob = 1\n`, path: "agent\\.session_types\\.custom\\.bogus_knob" },
-  { name: "[models.<name>] bogus knob", block: `[models.alt]\nid = "m"\nprovider = "test"\nendpoint = "http://localhost"\napi_key = "k"\nmultimodal = false\nmax_tokens = 1024\nbogus = true\n`, path: "models\\.alt\\.bogus" },
+  { name: "[models.<name>] bogus knob", block: `[models.alt]\nid = "m"\nprovider = "test"\nendpoint = "http://localhost"\napi_key = "k"\ninput_modalities = ["text"]\nmax_tokens = 1024\nbogus = true\n`, path: "models\\.alt\\.bogus" },
   { name: "[matrix.accounts.<name>] bogus knob", block: `[matrix.accounts.second]\nhomeserver = "http://localhost"\nuser_id = "@x:localhost"\nstore_path = "./var/x"\nbogus = "y"\n`, path: "matrix\\.accounts\\.second\\.bogus" },
 ];
 
@@ -726,7 +726,7 @@ id = "alt"
 provider = "test"
 endpoint = "http://localhost"
 api_key = "k"
-multimodal = false
+input_modalities = ["text"]
 max_tokens = 512
 
 [agent.session_types.totally_custom_type]
@@ -834,7 +834,7 @@ id = "test-model-2"
 provider = "test"
 endpoint = "http://localhost"
 api_key = "test-key"
-multimodal = false
+input_modalities = ["text"]
 max_tokens = 1024
 reasoning = true
 thinking_level = "medium"
@@ -854,7 +854,7 @@ id = "test-model-2"
 provider = "test"
 endpoint = "http://localhost"
 api_key = "test-key"
-multimodal = false
+input_modalities = ["text"]
 max_tokens = 1024
 thinking_level = "maximum"
 `;
@@ -1086,6 +1086,67 @@ cost_per_mtok = 0.1
       () => loadConfig(dir, { env: false }),
       /cost_per_mtok|not a recognized config key/i,
       "the old retrieval.embedding.remote.cost_per_mtok key must fail-fast",
+    );
+  });
+});
+
+// spec MODEL-FALLBACK §3 (issue #3): `input_modalities` replaces the old
+// `multimodal` boolean as the capability predicate. A multi-element set validates
+// and round-trips; an unknown modality value, a non-array value, and a missing
+// field are all rejected (the field is required, mirroring the explicit-config
+// convention `multimodal` had).
+test("config: input_modalities multi-element set validates and round-trips (issue #3)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.caption_alt]
+id = "cap"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "k"
+input_modalities = ["text", "image", "video", "audio"]
+max_tokens = 1024
+context_window = 128000
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.deepEqual(config.models.caption_alt.input_modalities, ["text", "image", "video", "audio"]);
+    // The default model from BASE_CONFIG stays text-only.
+    assert.deepEqual(config.models.default.input_modalities, ["text"]);
+  });
+});
+
+test("config: input_modalities rejects an unknown modality value (issue #3)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.bad_modality]
+id = "m"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "k"
+input_modalities = ["text", "hologram"]
+max_tokens = 1024
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /input_modalities|Invalid config/i,
+      "an unknown modality literal must fail-fast",
+    );
+  });
+});
+
+test("config: input_modalities is required on a model block (issue #3)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.no_modality]
+id = "m"
+provider = "test"
+endpoint = "http://localhost"
+api_key = "k"
+max_tokens = 1024
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /input_modalities|Invalid config/i,
+      "a model block missing input_modalities must fail-fast",
     );
   });
 });

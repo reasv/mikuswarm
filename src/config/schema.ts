@@ -500,7 +500,23 @@ const ModelSchema = StrictObject({
   ])),
   endpoint: Type.String(),
   api_key: Type.String(),
-  multimodal: Type.Boolean(),
+  // The model's accepted INPUT modalities (spec MODEL-FALLBACK §3 capability
+  // pre-filter). "text" is the baseline; "image"/"video"/"audio" declare which
+  // non-text inputs the model can actually consume. Used as the fallback
+  // capability predicate everywhere a request carries non-text content: the
+  // agent path requires `includes("image")` when raw session inputs carry images,
+  // and each captioning lane requires its own modality (image/video/audio) so a
+  // heterogeneous chain never ships e.g. a video to an image-only fallback.
+  // Required (mirrors the explicit-config convention) — a text-only model is
+  // `["text"]`.
+  input_modalities: Type.Array(
+    Type.Union([
+      Type.Literal("text"),
+      Type.Literal("image"),
+      Type.Literal("video"),
+      Type.Literal("audio"),
+    ]),
+  ),
   max_tokens: Type.Number({ minimum: 1 }),
   reasoning: Type.Optional(Type.Boolean()),
   // Extended-thinking level requested on every LLM call made with this model

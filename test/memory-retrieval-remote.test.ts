@@ -53,7 +53,7 @@ test("RemoteEmbeddingProvider posts OpenAI-shaped requests and normalizes vector
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}/v1`, api_key: "secret-key", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}/v1`, api_key: "secret-key", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -85,7 +85,7 @@ test("RemoteEmbeddingProvider rejects a dim mismatch", async () => {
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -112,7 +112,7 @@ test("RemoteEmbeddingProvider throws on a short/partial response instead of misa
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -148,7 +148,7 @@ test("RemoteEmbeddingProvider throws on an out-of-range / duplicated index", asy
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -186,7 +186,7 @@ test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP tim
       noteOutcome: () => {},
     } as unknown as LlmScheduler;
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
       timeoutMs: 50,
@@ -208,7 +208,7 @@ test("RemoteEmbeddingProvider: a rejected admission leaks no stop-signal listene
     noteOutcome: () => {},
   } as unknown as LlmScheduler;
   const provider = new RemoteEmbeddingProvider({
-    chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: "http://127.0.0.1:9", api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+    chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: "http://127.0.0.1:9", api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
     dim: 4,
     batchSize: 8,
     scheduler,
@@ -250,7 +250,7 @@ test("RemoteEmbeddingProvider feeds status + Retry-After to the scheduler backof
       },
     } as unknown as LlmScheduler;
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
       scheduler,
@@ -279,7 +279,7 @@ test("RemoteEmbeddingProvider feeds noteOutcome environmental on a THROWN fetch 
   } as unknown as LlmScheduler;
   const provider = new RemoteEmbeddingProvider({
     // Reserved-discard port 9 with nothing bound → connect refused → fetch throws.
-    chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: "http://127.0.0.1:9", api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+    chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: "http://127.0.0.1:9", api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
     dim: 4,
     batchSize: 8,
     timeoutMs: 2000,
@@ -310,7 +310,7 @@ test("RemoteEmbeddingProvider: a stop-signal abort during fetch stays NEUTRAL (#
       },
     } as unknown as LlmScheduler;
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
       // Long timeout so the stop signal (not the per-request timeout) is what aborts.
@@ -368,7 +368,7 @@ test("RemoteEmbeddingProvider throws a descriptive error on a malformed embeddin
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -400,7 +400,7 @@ test("RemoteEmbeddingProvider rejects an absurdly large content-length before re
   const port = (server.address() as AddressInfo).port;
   try {
     const provider = new RemoteEmbeddingProvider({
-      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never }],
+      chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
     });
@@ -510,7 +510,7 @@ test("subsystem fail-fast: configured remote that errors on probe rejects at boo
             embeddingChain: [
               {
                 logicalId: "embed",
-                config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}/v1`, api_key: "k", multimodal: false, max_tokens: 1, context_window: 1 } as never,
+                config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}/v1`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never,
               },
             ],
           }),

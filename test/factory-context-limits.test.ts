@@ -349,8 +349,8 @@ test("agent capability filter: image session drops a text-only fallback; text se
   const makeBase = () => ((): never => { throw new Error("unused"); }) as any;
   const makeModel = (cfg: any, cw: number) => ({ id: cfg.id, baseUrl: cfg.endpoint, contextWindow: cw } as any);
   const models = {
-    "head-mm": { id: "wire-head", endpoint: "https://gw/h", api_key: "k", multimodal: true, context_window: 100_000, fallback: ["fb-text"] },
-    "fb-text": { id: "wire-fb", endpoint: "https://gw/f", api_key: "k", multimodal: false, context_window: 100_000 },
+    "head-mm": { id: "wire-head", endpoint: "https://gw/h", api_key: "k", input_modalities: ["text", "image"], context_window: 100_000, fallback: ["fb-text"] },
+    "fb-text": { id: "wire-fb", endpoint: "https://gw/f", api_key: "k", input_modalities: ["text"], context_window: 100_000 },
   } as never;
   const chain = resolveModelChain("head-mm", models);
 
@@ -360,7 +360,7 @@ test("agent capability filter: image session drops a text-only fallback; text se
     consumer: "agent",
     makeBase,
     makeModel,
-    capability: rawInputsRequireMultimodal(imaged) ? (c: any) => c.multimodal === true : undefined,
+    capability: rawInputsRequireMultimodal(imaged) ? (c: any) => c.input_modalities.includes("image") : undefined,
   });
   assert.deepEqual(fbImage.survivorLogicalIds, ["head-mm"], "text-only fallback dropped for an image session");
 
@@ -370,7 +370,7 @@ test("agent capability filter: image session drops a text-only fallback; text se
     consumer: "agent",
     makeBase,
     makeModel,
-    capability: rawInputsRequireMultimodal(textOnly) ? (c: any) => c.multimodal === true : undefined,
+    capability: rawInputsRequireMultimodal(textOnly) ? (c: any) => c.input_modalities.includes("image") : undefined,
   });
   assert.deepEqual(fbText.survivorLogicalIds, ["head-mm", "fb-text"], "full chain kept for a text-only session");
 });

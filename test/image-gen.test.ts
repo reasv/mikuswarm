@@ -141,7 +141,7 @@ function imageGenChains(serverUrl: string): ImageGenToolContext["chains"] {
     provider: "gemini",
     endpoint: serverUrl,
     api_key: "test-key",
-    multimodal: true,
+    input_modalities: ["text", "image"],
     max_tokens: 32768,
     context_window: 32768,
   };
@@ -212,7 +212,7 @@ test("createImageGenTool throws when a tier references no model chain", () => {
       createImageGenTool({
         ...bare,
         chains: {
-          pro: [{ logicalId: "bad", config: { id: "../escape", provider: "gemini", endpoint: "https://x.test", api_key: "k", multimodal: true, max_tokens: 1, context_window: 1 } as never }],
+          pro: [{ logicalId: "bad", config: { id: "../escape", provider: "gemini", endpoint: "https://x.test", api_key: "k", input_modalities: ["text", "image"], max_tokens: 1, context_window: 1 } as never }],
           flash: imageGenChains("https://x.test").flash,
         },
       }),
@@ -716,7 +716,7 @@ test("image_generate aborts the in-flight generation POST on agent cancel (#7)",
 /** A pro tier with two members pointed at two distinct loopback servers, so the
  *  test can observe WHICH endpoint served a generation. */
 function twoMemberProChains(headUrl: string, fbUrl: string): ImageGenToolContext["chains"] {
-  const base = { provider: "gemini", api_key: "test-key", multimodal: true, max_tokens: 32768, context_window: 32768 };
+  const base = { provider: "gemini", api_key: "test-key", input_modalities: ["text", "image"], max_tokens: 32768, context_window: 32768 };
   return {
     pro: [
       { logicalId: "imagegen-pro", config: { ...base, id: "gemini-3-pro-image", endpoint: headUrl } as never },

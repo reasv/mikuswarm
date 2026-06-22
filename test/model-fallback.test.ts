@@ -24,7 +24,7 @@ function modelCfg(over: Record<string, unknown> = {}): any {
     provider: "test",
     endpoint: "https://gw.example",
     api_key: "k",
-    multimodal: true,
+    input_modalities: ["text", "image"],
     max_tokens: 1000,
     context_window: 100_000,
     ...over,
@@ -60,7 +60,7 @@ function makeModel(cfg: any, cw: number): Model<Api> {
     provider: cfg.provider,
     baseUrl: cfg.endpoint,
     reasoning: cfg.reasoning ?? true,
-    input: cfg.multimodal ? ["text", "image"] : ["text"],
+    input: cfg.input_modalities.includes("image") ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: cw,
     maxTokens: cfg.max_tokens,
@@ -278,7 +278,7 @@ test("buildModelFallback throws when NO chain member declares a context_window",
 });
 
 test("capability pre-filter drops an incapable member but never the head", async () => {
-  const textOnlyY: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", multimodal: false }) };
+  const textOnlyY: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", input_modalities: ["text"] }) };
   const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 } });
   scheduler.noteOutcome("default", HEAD_KEY, "environmental"); // head unhealthy → would want a fallback
   const calls: string[] = [];
@@ -287,7 +287,7 @@ test("capability pre-filter drops an incapable member but never the head", async
     makeBase: recordingBase(calls),
     makeModel,
     scheduler,
-    capability: (cfg) => cfg.multimodal === true, // needs an image-capable member
+    capability: (cfg) => cfg.input_modalities.includes("image"), // needs an image-capable member
   });
   assert.deepEqual(fb.survivorLogicalIds, ["X", "Z"], "the text-only Y is filtered out; head retained");
   await drive(fb.streamFn);

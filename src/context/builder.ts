@@ -1440,7 +1440,7 @@ export class ContextBuilder {
    * folded **media** follow-up, which has no trigger group of its own (the fold
    * suppresses its accept): `selectImageBlocks` falls through its trigger-group
    * cascade to the event's own `imageAttachments`, so passing the bare event yields
-   * exactly its pixels. Empty when the model is non-multimodal, the image isn't
+   * exactly its pixels. Empty when the model cannot see images, the image isn't
    * downloaded yet, or `processImageForInference` throws — the caller then steers a
    * caption-only interjection rather than blocking (§5.1 no-pixels branch).
    */
@@ -1463,8 +1463,8 @@ export class ContextBuilder {
   }
 
   private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {
-    const multimodal = this.config.models.default?.multimodal ?? false;
-    if (!multimodal) return [];
+    const canSeeImages = this.config.models.default?.input_modalities?.includes("image") ?? false;
+    if (!canSeeImages) return [];
     const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
     const imageOpts = buildInferenceImageOptions(this.config.media?.image);

@@ -30,7 +30,7 @@ id = "test-model"
 provider = "test"
 endpoint = "http://localhost"
 api_key = "test-key"
-multimodal = false
+input_modalities = ["text"]
 max_tokens = 1024
 # Required for any session-resolved model (spec CONTEXT-LIMIT-UNIFICATION §2.5);
 # validateContextTokenCeilings fail-fasts at startup without it.

@@ -82,7 +82,7 @@ const ROOM = "!room:example.org";
 function reconstructTools(config: any): { tools: AgentTool[]; skipped: string[] } {
   const tools: AgentTool[] = [];
   const skipped: string[] = [];
-  const multimodal = config.models.default.multimodal ?? false;
+  const multimodal = config.models.default.input_modalities?.includes("image") ?? false;
 
   // [label, factory-thunk] — thunk throws are caught and recorded.
   const specs: Array<[string, () => AgentTool | AgentTool[]]> = [
