@@ -251,6 +251,15 @@ test("buildModelHealthAnnotations: maps health key → logical ids + has-fallbac
   assert.deepEqual(map["https://gw/anthropic::opus"], { logicalIds: ["default"], hasFallback: false });
 });
 
+test("buildModelHealthAnnotations: a model with no endpoint maps under unknown::<id> (issue #18)", async () => {
+  const { buildModelHealthAnnotations } = await import("../src/app.js");
+  // No `endpoint` → the health key uses the `unknown` sentinel (mirrors
+  // buildFetchChain / modelHealthKey: `${endpoint ?? "unknown"}::${id}`).
+  const models = { local: { id: "bge-small" } } as never;
+  const map = buildModelHealthAnnotations(models);
+  assert.deepEqual(map["unknown::bge-small"], { logicalIds: ["local"], hasFallback: false });
+});
+
 // === spec MODEL-FALLBACK §3 #1: agent-path capability pre-filter (image →
 // multimodal), derived from the RAW session inputs at create time (#6). ========
 

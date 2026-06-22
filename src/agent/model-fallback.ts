@@ -386,8 +386,10 @@ export function buildFetchChain(
  * member per attempt (chain order; canary when the head's probe window is open),
  * acquires a scheduler slot keyed on that member, runs the fetch, and feeds the
  * outcome to §8a on both axes. An environmental failure falls over to the next
- * member (bounded by `members.length`, plus one extra so a canary that fails can
- * still reach a fallback); a content failure is rethrown without falling over.
+ * member; the loop runs at most `members.length` iterations, which suffices even
+ * in the canary case because the canaried head occupies one of those iterations
+ * (it is added to `tried`, so a failing canary falls through to a real fallback
+ * within the same bound). A content failure is rethrown without falling over.
  * Returns the first member's successful value.
  */
 export async function runFetchWithFallback<T>(

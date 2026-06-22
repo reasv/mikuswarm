@@ -433,6 +433,9 @@ ssrf_guard = true
 # [rate_limits.llm.*]); there is no per-modality concurrency knob. The headline §2.2
 # case — cap an expensive caption model and fall to a cheap one — is a virtual
 # model: `[models.caption-premium] inherits = "caption"  fallback = ["caption-cheap"]`.
+# MIGRATION: `model` is now a [models.*] block NAME (a string), not an inline table.
+# The old `[captioning.model]` table form (id/endpoint/api_key/...) is rejected — move
+# those keys into a [models.*] block and point `model` at it by name.
 [captioning]
 model = "caption"
 worker_count = 2
@@ -505,6 +508,9 @@ max_suggestions = 6
 # registry (spec MODEL-FALLBACK §2.3): the pro/flash tiers REFERENCE [models.*]
 # blocks by name (endpoint/id/api_key/cost + any fallback chain live there). The
 # tool appends /v1beta/models/<id>:generateContent to the model's endpoint.
+# MIGRATION: the old per-tier `[image_gen.costs.*]` price keys are gone — pricing now
+# lives in each referenced block's [models.*.cost]. `[image_gen.models]` maps tier →
+# [models.*] block NAME.
 [image_gen]
 timeout_ms = 120000
 # Mandatory and high: Gemini emits the image AS output tokens (~1290 for 1K).
@@ -563,6 +569,9 @@ enabled = true
 # Unified registry (spec MODEL-FALLBACK §2.3): the fast/deep tiers REFERENCE
 # [models.*] blocks by name (connection + cost + any fallback chain live there).
 # base_url/api_key/cost are gone — see [models.grok] below.
+# MIGRATION: `model`/`deep_model` are [models.*] block NAMES (strings); the old
+# `[x_search.cost]` table and inline base_url/api_key keys are rejected — move them
+# into the referenced [models.*] block.
 model = "grok"                      # effort=fast tier (default; quick non-reasoning)
 deep_model = "grok"                 # effort=deep tier (point at a reasoning model)
 timeout_ms = 60000                  # reasoning search is slow; graceful timeout
@@ -693,6 +702,9 @@ dim = 384
 # optional `chars_per_token` estimate stay here. When set (and provider is "remote",
 # or unset), it becomes the active model. A `fallback` chain on the referenced model
 # MUST be vector-compatible (same dim AND space). Leave commented to use local.
+# MIGRATION: `model` is a [models.*] block NAME; the old inline
+# `retrieval.embedding.remote.cost_per_mtok` (and endpoint/api_key) keys are rejected —
+# pricing now lives in [models.*.cost] (input = USD per 1M tokens).
 # [retrieval.embedding.remote]
 # model = "embed-remote"            # a [models.*] block name
 # dim = 1536

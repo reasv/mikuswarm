@@ -930,3 +930,84 @@ inherits = "nope"
     await assert.rejects(() => loadConfig(dir, { env: false }), /inherits unknown model "nope"/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #15: the unified-registry migration (spec MODEL-FALLBACK §2.3) made the
+// reference fields point at a `[models.*]` block NAME and removed the old inline
+// forms. An operator who left the OLD config in place must fail-fast, not run
+// silently — each stale form below must be rejected by loadConfig.
+// ---------------------------------------------------------------------------
+
+test("config: old inline [captioning.model] TABLE form is rejected (issue #15)", async () => {
+  // `model` is now a [models.*] block NAME (a string); the old inline table
+  // (id/endpoint/api_key/...) is a type mismatch.
+  const toml = `${BASE_CONFIG}
+[captioning]
+[captioning.model]
+id = "google/gemini-3.5-flash"
+endpoint = "http://localhost"
+api_key = "k"
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /captioning\/model|Expected string|Invalid config/i,
+      "the old inline [captioning.model] table must fail-fast",
+    );
+  });
+});
+
+test("config: old [x_search.cost] table form is rejected (issue #15)", async () => {
+  // Pricing moved onto the referenced [models.*] block; [x_search.cost] is gone.
+  const toml = `${BASE_CONFIG}
+[x_search]
+model = "default"
+[x_search.cost]
+input = 1
+output = 2
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /x_search\.cost|not a recognized config key/i,
+      "the old [x_search.cost] table must fail-fast",
+    );
+  });
+});
+
+test("config: old [image_gen.costs.*] per-tier cost form is rejected (issue #15)", async () => {
+  // Per-tier pricing moved onto each referenced [models.*] block; the old
+  // [image_gen.costs.<tier>] keys are gone.
+  const toml = `${BASE_CONFIG}
+[image_gen]
+[image_gen.models]
+pro = "default"
+[image_gen.costs.pro]
+per_image = 0.01
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /image_gen\.costs|not a recognized config key/i,
+      "the old [image_gen.costs.*] per-tier cost keys must fail-fast",
+    );
+  });
+});
+
+test("config: old retrieval.embedding.remote.cost_per_mtok form is rejected (issue #15)", async () => {
+  // Pricing moved onto the referenced [models.*] block ([cost].input); the old
+  // inline cost_per_mtok key is gone.
+  const toml = `${BASE_CONFIG}
+[retrieval.embedding.remote]
+model = "default"
+dim = 1536
+cost_per_mtok = 0.1
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /cost_per_mtok|not a recognized config key/i,
+      "the old retrieval.embedding.remote.cost_per_mtok key must fail-fast",
+    );
+  });
+});

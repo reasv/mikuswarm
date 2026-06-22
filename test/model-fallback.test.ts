@@ -349,3 +349,98 @@ test("runFetchWithFallback: all members environmental → throws the last error"
   );
   assert.deepEqual(calls, ["X", "Y"], "both tried once, then gave up");
 });
+
+// The fetch-path canary/budget/all-unhealthy routing reuses §8a health via a real
+// LlmScheduler (same key derivation as buildFetchChain). healthKeys for chainOf:
+const FX_HEAD_KEY = "https://gw/X::wire-X";
+const FX_Y_KEY = "https://gw/Y::wire-Y";
+
+test("#19b runFetchWithFallback CANARY: probe-due unhealthy head → head canaried, fails, Y serves", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", FX_HEAD_KEY, "environmental"); // head unhealthy, ~1ms window
+  await new Promise((r) => setTimeout(r, 10)); // let the probe window open
+  assert.equal(scheduler.isProbeDue(FX_HEAD_KEY), true);
+
+  const calls: string[] = [];
+  const value = await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "test", priority: "background", scheduler },
+    async (m) => {
+      calls.push(m.logicalId);
+      // The probe-due head is routed as the canary; it fails environmental, so the
+      // attempt falls over to the next member within the same members.length bound.
+      if (m.logicalId === "X") return { ok: false, kind: "environmental", error: new Error("X canary failed") };
+      return { ok: true, value: `served-by-${m.logicalId}` };
+    },
+  );
+  assert.equal(value, "served-by-Y");
+  assert.deepEqual(calls, ["X", "Y"], "head canaried first, then fell over to Y");
+});
+
+test("#19b runFetchWithFallback BUDGET: head over budget (isModelAvailable) → Y serves", async () => {
+  const scheduler = new LlmScheduler();
+  const calls: string[] = [];
+  const value = await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "test", priority: "background", scheduler, isModelAvailable: (id) => id !== "X" },
+    async (m) => {
+      calls.push(m.logicalId);
+      return { ok: true, value: `served-by-${m.logicalId}` };
+    },
+  );
+  assert.equal(value, "served-by-Y");
+  assert.deepEqual(calls, ["Y"], "the over-budget head is skipped; Y serves directly");
+});
+
+test("#19b runFetchWithFallback ALL-UNHEALTHY: nothing healthy + in-budget → routes to the head", async () => {
+  // Both members unhealthy and NOT probe-due at the resolver's choice instant → the
+  // resolution is "all-unhealthy" and routes to the head. A short probe-backoff keeps
+  // the head's scheduler acquire (which then waits for that head's probe window) fast.
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 80, probeBackoffMaxMs: 80 } });
+  scheduler.noteOutcome("default", FX_HEAD_KEY, "environmental");
+  scheduler.noteOutcome("default", FX_Y_KEY, "environmental");
+  assert.equal(scheduler.isProbeDue(FX_HEAD_KEY), false, "the head is NOT probe-due at dispatch (window still closed)");
+  const calls: string[] = [];
+  const value = await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "test", priority: "background", scheduler },
+    async (m) => {
+      calls.push(m.logicalId);
+      return { ok: true, value: `served-by-${m.logicalId}` };
+    },
+  );
+  // The head is routed to (it serves here, or would fail so Layer-0 budgets the composite).
+  assert.equal(value, "served-by-X");
+  assert.deepEqual(calls, ["X"], "all-unhealthy routes to the head");
+});
+
+test("#19b runFetchWithFallback: model_fallback_resolved logs for a NON-primary resolution + is rate-limit gated", async () => {
+  // A budget-fallback to Y is a non-primary resolution → the resolution log fires.
+  const infos: Array<{ event: string; data?: Record<string, unknown> }> = [];
+  const logger: any = {
+    info: (event: string, data?: Record<string, unknown>) => infos.push({ event, data }),
+    warn: () => {},
+  };
+  // rateLimitLog returns true once, then false — proving the log is gated.
+  let allowed = 1;
+  const rateLimitLog = () => (allowed-- > 0);
+
+  // First call: head over budget → resolves to Y (non-primary), gate ALLOWS → logs.
+  await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "captioning", priority: "background", isModelAvailable: (id) => id !== "X", logger, rateLimitLog },
+    async (m) => ({ ok: true, value: m.logicalId }),
+  );
+  // Second call: same non-primary resolution, gate DENIES → no log.
+  await runFetchWithFallback<string>(
+    chainOf("X", "Y"),
+    { consumer: "captioning", priority: "background", isModelAvailable: (id) => id !== "X", logger, rateLimitLog },
+    async (m) => ({ ok: true, value: m.logicalId }),
+  );
+
+  const resolved = infos.filter((i) => i.event === "model_fallback_resolved");
+  assert.equal(resolved.length, 1, "the resolution log fires once and is suppressed when the rate-limit gate denies");
+  assert.equal(resolved[0]?.data?.chosen, "Y");
+  assert.equal(resolved[0]?.data?.reason, "budget-fallback");
+  assert.equal(resolved[0]?.data?.consumer, "captioning");
+});

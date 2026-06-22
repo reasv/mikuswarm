@@ -1485,6 +1485,119 @@ test("v25 -> v26 backfills resume_generation=0 on populated rows and NULL genera
 });
 
 // ---------------------------------------------------------------------------
+// Issue #12: populated-fixture v29 -> v30 migration (the logical_model_id step,
+// spec MODEL-FALLBACK §2.2/§7). Mirrors the v25 -> v26 populated-row test above:
+// a v29 `usage_events` table (no `logical_model_id` column, no
+// idx_usage_events_logical_model_ts index) with legacy rows is opened to LATEST;
+// the additive column lands, every legacy row backfills logical_model_id = model_id,
+// and the index exists. Fails if the backfill UPDATE or the index DDL is dropped.
+// ---------------------------------------------------------------------------
+
+/** The v29 `usage_events` shape: identical to the latest table MINUS the
+ *  `logical_model_id` column (added by the v29 -> v30 step) and its index. */
+const V29_USAGE_EVENTS = `
+create table usage_events (
+  id text primary key,
+  ts integer not null,
+  class text not null,
+  agent_session_id text,
+  session_type text,
+  timeline_key text,
+  trigger_sender_id text,
+  tool_name text,
+  model_id text not null,
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost_usd real not null default 0,
+  ref text,
+  created_at integer not null
+);
+create index if not exists idx_usage_events_ts        on usage_events(ts);
+create index if not exists idx_usage_events_session   on usage_events(agent_session_id, ts);
+create index if not exists idx_usage_events_class_ts   on usage_events(class, ts);
+create index if not exists idx_usage_events_model_ts   on usage_events(model_id, ts);
+create index if not exists idx_usage_events_tool_ts    on usage_events(tool_name, ts);
+`;
+
+test("v29 -> v30 backfills logical_model_id = model_id on legacy usage_events rows + adds index (issue #12)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v29-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS); // fresh-vs-existing probe keys on this table
+    legacy.exec(V29_USAGE_EVENTS);
+
+    const insertUsage = legacy.prepare(
+      `insert into usage_events (id, ts, class, model_id, cost_usd, created_at)
+         values (@id, @ts, @class, @modelId, @cost, @createdAt)`,
+    );
+    insertUsage.run({ id: "u-1", ts: 1_000, class: "agent_loop", modelId: "anthropic/claude", cost: 0.5, createdAt: 1_000 });
+    insertUsage.run({ id: "u-2", ts: 1_100, class: "tool", modelId: "google/gemini-3.5-flash", cost: 0.01, createdAt: 1_100 });
+    insertUsage.run({ id: "u-3", ts: 1_200, class: "summary", modelId: "x-ai/grok", cost: 0.02, createdAt: 1_200 });
+
+    legacy.pragma("user_version = 29");
+
+    // Sanity: the v29 fixture has neither the column nor the index yet.
+    const colsBefore = (legacy.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(!colsBefore.includes("logical_model_id"), "v29 fixture must NOT have logical_model_id yet");
+    assert.ok(
+      !(legacy.pragma(`index_list(usage_events)`) as Array<{ name: string }>)
+        .some((i) => i.name === "idx_usage_events_logical_model_ts"),
+      "v29 fixture must NOT have idx_usage_events_logical_model_ts yet",
+    );
+    legacy.close();
+
+    // Open through Storage: runs the v29 -> v30 step.
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+
+      // (a) The column exists post-migration.
+      const colsAfter = storage.read((db) =>
+        (db.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name),
+      );
+      assert.ok(colsAfter.includes("logical_model_id"), "logical_model_id column added");
+
+      // (b) Every legacy row backfilled logical_model_id = model_id.
+      const rows = storage.read((db) =>
+        db
+          .prepare(`select id, model_id, logical_model_id from usage_events order by id`)
+          .all() as Array<{ id: string; model_id: string; logical_model_id: string }>,
+      );
+      assert.equal(rows.length, 3, "all legacy rows survived the migration");
+      for (const row of rows) {
+        assert.equal(
+          row.logical_model_id,
+          row.model_id,
+          `row ${row.id} backfills logical_model_id = model_id`,
+        );
+      }
+
+      // (c) The index exists.
+      assert.ok(
+        storage.read((db) =>
+          (db.pragma(`index_list(usage_events)`) as Array<{ name: string }>)
+            .some((i) => i.name === "idx_usage_events_logical_model_ts"),
+        ),
+        "idx_usage_events_logical_model_ts created",
+      );
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Issue #9 (pairs with #1): the per-branch resume usage-seed choice.
 //
 // `resumeUsageSeed(row, mode)` is the pure factoring of the seed decision

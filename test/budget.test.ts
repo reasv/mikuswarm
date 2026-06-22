@@ -965,3 +965,33 @@ test("#11 collectKnownModelIds: every configured model id (zero ∪ paid)", () =
   assert.equal(ids.has("free"), false); // wire id, not a logical id
   assert.equal(ids.has("nonexistent"), false);
 });
+
+test("#19b a [[limits]] selector naming a virtual/fallback-member logical id does NOT warn", () => {
+  // A virtual (pure-rename) model AND a fallback-member block are both [models.*]
+  // blocks, so collectKnownModelIds returns their logical ids — a `models` selector
+  // naming either is a KNOWN reference and must earn no "unknown model" warning.
+  const config = {
+    models: {
+      default: { id: "wire-default", cost: { input: 1, output: 1 } },
+      // A pure-rename virtual model with a fallback chain into a cheaper member.
+      "caption-premium": { id: "wire-premium", fallback: ["caption-cheap"] },
+      "caption-cheap": { id: "wire-cheap", cost: { input: 0, output: 0 } },
+    },
+  } as never;
+  const known = collectKnownModelIds(config);
+  assert.equal(known.has("caption-premium"), true, "the virtual model is a known logical id");
+  assert.equal(known.has("caption-cheap"), true, "the fallback member is a known logical id");
+
+  const res = normalizeLimits(
+    [
+      { name: "virt", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["caption-premium"] },
+      { name: "member", max_usd: 1, window: { type: "rolling", duration: "1h" }, models: ["caption-cheap"] },
+    ],
+    { ...normOpts, knownModelIds: known },
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.ok(
+    !res.warnings.some((w) => /unknown model/.test(w)),
+    "neither a virtual model nor a fallback member earns an unknown-model warning",
+  );
+});
