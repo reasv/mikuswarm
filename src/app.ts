@@ -734,6 +734,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         type: event.type,
         state: "state" in event ? event.state : undefined,
         stage: "stage" in event ? event.stage : undefined,
+        // Lifecycle stages (restore_recovery / enable_backup) carry their outcome
+        // in `detail` — the load-bearing diagnostic for key-backup restore. Log it.
+        detail: "detail" in event ? event.detail : undefined,
       }),
     // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
     // store only — never wake a session. Writes are fire-and-forget through the

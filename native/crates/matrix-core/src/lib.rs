@@ -31,7 +31,8 @@ use crate::{
     },
     client::{
         channel_info_internal, create_poll_internal, delete_message_internal,
-        download_media_internal, edit_message_internal, join_room_internal,
+        download_media_internal, download_room_keys_for_room_internal, edit_message_internal,
+        join_room_internal,
         list_pins_internal, list_reactions_internal, member_info_internal,
         message_summary_internal, pin_message_internal, poll_vote_internal,
         react_message_internal, read_messages_internal, resolve_target_internal,
@@ -217,6 +218,28 @@ impl MatrixCoreClient {
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&result).map_err(|err| napi::Error::from_reason(err.to_string()))
+    }
+
+    /// Pull every backed-up megolm session for `room_id` from the server-side key
+    /// backup into the crypto store (per-room, bounded). Used to hydrate history
+    /// keys before a deep backfetch descent so it decrypts inline. No-op when no
+    /// backup/decryption key is available.
+    #[napi(js_name = "downloadRoomKeysForRoom")]
+    pub async fn download_room_keys_for_room(&self, room_id: String) -> napi::Result<()> {
+        let client = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("matrix client mutex poisoned"))?;
+            if !inner.is_running() {
+                return Err(napi::Error::from_reason("client is not running"));
+            }
+            inner.client().map_err(to_napi_error)?
+        };
+        download_room_keys_for_room_internal(&client, &room_id)
+            .await
+            .map_err(to_napi_error)?;
+        Ok(())
     }
 
     #[napi(js_name = "editMessage")]

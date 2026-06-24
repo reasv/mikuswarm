@@ -274,6 +274,29 @@ export class MessageBackfetchCoordinator {
       resumeFromCursor: job.cursorToken != null,
     });
 
+    // Hydrate this room's history keys from the server-side key backup before the
+    // descent so encrypted pre-device history decrypts inline instead of halting at
+    // a UTD wall. Per-room (the `get_backup_keys_for_room` endpoint — bounded, works
+    // for large accounts unlike `BackupDownloadStrategy::OneShot`), idempotent, and
+    // non-fatal: a failure just falls back to the UTD-halt + re-decryption-sweeper
+    // path. Only for the deep `oldest_decryptable` descent — date/count targets stay
+    // lightweight and the optional-method guard keeps mock clients working.
+    if (job.targetKind === "oldest_decryptable" && client.downloadRoomKeysForRoom) {
+      try {
+        await client.downloadRoomKeysForRoom(job.roomId);
+        this.opts.logger.info("message_backfetch_keys_hydrated", {
+          jobId: job.id,
+          roomId: job.roomId,
+        });
+      } catch (error) {
+        this.opts.logger.warn("message_backfetch_keys_hydrate_failed", {
+          jobId: job.id,
+          roomId: job.roomId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     // Per-run target → stop-condition mapping (§6.3).
     const targetMs = job.targetKind === "date" ? Date.parse(job.targetValue ?? "") : NaN;
     const countTarget =

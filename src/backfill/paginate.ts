@@ -8,6 +8,13 @@ import type {
 /** Minimal slice of the native client needed for backward history paging. */
 export interface BackfillReadClient {
   readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult>;
+  /**
+   * Pull every backed-up megolm session for `roomId` from the server-side key
+   * backup into the crypto store (per-room, bounded). Optional so test/mock
+   * clients need not implement it; the deep backfetch calls it before descending
+   * so encrypted history decrypts inline instead of halting at a UTD wall.
+   */
+  downloadRoomKeysForRoom?(roomId: string): Promise<void>;
 }
 
 /**

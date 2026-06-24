@@ -57,6 +57,7 @@ type NativeBindingClient = {
   resolveTarget(requestJson: string): Promise<string>;
   joinRoom(requestJson: string): Promise<string>;
   readMessages(requestJson: string): Promise<string>;
+  downloadRoomKeysForRoom(roomId: string): Promise<void>;
   messageSummary(requestJson: string): Promise<string>;
   editMessage(requestJson: string): Promise<string>;
   deleteMessage(requestJson: string): Promise<string>;
@@ -116,6 +117,15 @@ export class MatrixNativeClient {
 
   async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
     return parseNativeJson(await this.#client.readMessages(JSON.stringify(request)), "readMessages");
+  }
+
+  /**
+   * Pull every backed-up megolm session for `roomId` from the server-side key
+   * backup into the crypto store (per-room, bounded). No-op when no backup or
+   * backup decryption key is available.
+   */
+  async downloadRoomKeysForRoom(roomId: string): Promise<void> {
+    await this.#client.downloadRoomKeysForRoom(roomId);
   }
 
   async messageSummary(request: MatrixMessageSummaryRequest): Promise<MatrixMessageSummary | null> {

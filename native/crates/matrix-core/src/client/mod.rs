@@ -1297,6 +1297,29 @@ pub(crate) async fn set_typing_internal(
     Ok(())
 }
 
+/// Download every backed-up megolm session for a single room from the
+/// server-side key backup and import it into the crypto store. Scoped per-room
+/// (the `get_backup_keys_for_room` endpoint), so it stays bounded for large
+/// accounts — unlike `BackupDownloadStrategy::OneShot`'s unpaginated all-rooms
+/// download, which "doesn't work for any sizeable account". Used to hydrate a
+/// room's history keys before a deep backfetch descent so the descent can
+/// decrypt inline instead of halting at a UTD wall. Requires the backup
+/// decryption key to be loaded (done by `restore_recovery` at startup); a no-op
+/// when no backup or decryption key is available.
+pub(crate) async fn download_room_keys_for_room_internal(
+    client: &Client,
+    room_id: &str,
+) -> MatrixResult<()> {
+    let room_id: OwnedRoomId = RoomId::parse(room_id)?.to_owned();
+    client
+        .encryption()
+        .backups()
+        .download_room_keys_for_room(&room_id)
+        .await
+        .map_err(|err| MatrixError::State(err.to_string()))?;
+    Ok(())
+}
+
 pub(crate) async fn message_summary_internal(
     client: &Client,
     room_id: &str,
@@ -1580,15 +1603,25 @@ fn reaction_key_matches(key: &str, info: &crate::api::MatrixReactionInfo) -> boo
 async fn build_client(config: &MatrixClientConfig) -> MatrixResult<Client> {
     let encryption_settings = EncryptionSettings {
         auto_enable_cross_signing: false,
-        auto_enable_backups: false,
-        // Bulk-download all room keys from the server-side key backup as soon as
-        // the backup decryption key is imported — which `restore_recovery`'s
-        // `recovery().recover()` does from secret storage on every startup. The
-        // SDK default (`Manual`) never downloads any room keys, leaving history
-        // from before this device existed permanently undecryptable even though
-        // the keys sit in the backup; the re-decryption sweeper then heals stored
-        // UTD rows once the downloaded keys land in the crypto store.
-        backup_download_strategy: BackupDownloadStrategy::OneShot,
+        // Keep the server-side key backup enabled and maintained: every room key
+        // this device receives is uploaded to the backup so a future/other device
+        // can recover it. (Upload already happens once `recover()` enables the
+        // backup; this makes it robust even when no backup yet exists.)
+        auto_enable_backups: true,
+        // Heal undecryptable events by fetching the missing megolm session from the
+        // server-side key backup on each decryption failure — paginated, one session
+        // per UTD, retried on every failure (including stored UTD rows re-attempted
+        // by the re-decryption sweeper). This is the matrix-sdk default and what the
+        // prior harness used to decrypt full room history.
+        //
+        // Do NOT use `BackupDownloadStrategy::OneShot`: it calls `download_all_room_keys`
+        // exactly once — at the single startup that first transitions the backup to
+        // enabled — in one unpaginated request that, per matrix-sdk's own source note,
+        // "doesn't work for any sizeable account". That failure is swallowed by a
+        // `warn!` and never retried (every later startup short-circuits on the
+        // already-enabled backup), and OneShot does not install the per-UTD fallback
+        // handler — so all pre-device history stays permanently undecryptable.
+        backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
     };
 
     Ok(Client::builder()
