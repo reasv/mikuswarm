@@ -1622,6 +1622,48 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
   },
 };
 
+/**
+ * Message-type predicate for the `chat_index` activity queries (§9e) — the same dimensions
+ * `search_messages` filters on (`is_reply`/`has_attachment`/`has_link`/`attachment_types`),
+ * so `user_activity` can count e.g. only text posts, only images, only attachments. Returns
+ * bare-column SQL clauses (no table alias) plus the bound params, AND-combined by the caller.
+ * Param names are `@f…`-prefixed to avoid colliding with the queries' room/time/sender binds.
+ */
+export interface ChatTypeFilter {
+  isReply?: boolean;
+  hasAttachment?: boolean;
+  hasLink?: boolean;
+  /** csv tokens from {image,video,audio,file}; OR-matched, and implies has_attachment=1. */
+  attachmentTypes?: string[];
+}
+
+function chatTypeFilterClauses(filter: ChatTypeFilter | undefined, params: Record<string, unknown>): string[] {
+  const clauses: string[] = [];
+  if (!filter) return clauses;
+  if (filter.isReply !== undefined) {
+    clauses.push("is_reply = @fIsReply");
+    params.fIsReply = filter.isReply ? 1 : 0;
+  }
+  if (filter.hasAttachment !== undefined) {
+    clauses.push("has_attachment = @fHasAttachment");
+    params.fHasAttachment = filter.hasAttachment ? 1 : 0;
+  }
+  if (filter.hasLink !== undefined) {
+    clauses.push("has_link = @fHasLink");
+    params.fHasLink = filter.hasLink ? 1 : 0;
+  }
+  if (filter.attachmentTypes && filter.attachmentTypes.length > 0) {
+    // attachment_types is a csv of the fixed tokens image/video/audio/file — none is a
+    // substring of another, so a LIKE per requested type is unambiguous (mirrors searchChat).
+    const ors = filter.attachmentTypes.map((t, i) => {
+      params[`fAt${i}`] = `%${t}%`;
+      return `attachment_types like @fAt${i}`;
+    });
+    clauses.push(`has_attachment = 1 and (${ors.join(" or ")})`);
+  }
+  return clauses;
+}
+
 export class Storage {
   readonly db: Database.Database;
   private readonly queue: Array<WriteJob<any>> = [];
@@ -5529,6 +5571,7 @@ export class Storage {
     timelineKeys?: string[];
     sinceTs?: number;
     untilTs?: number;
+    filter?: ChatTypeFilter;
   }): Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }> {
     return this.read((db) => {
       const where: string[] = [];
@@ -5552,6 +5595,7 @@ export class Storage {
         where.push("timestamp < @untilTs");
         params.untilTs = opts.untilTs;
       }
+      where.push(...chatTypeFilterClauses(opts.filter, params));
       const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
       return db
         .prepare(
@@ -5596,6 +5640,7 @@ export class Storage {
     limit: number;
     order?: "most" | "least";
     maxMessages?: number;
+    filter?: ChatTypeFilter;
   }): {
     rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
     totalSenders: number;
@@ -5618,6 +5663,7 @@ export class Storage {
         where.push("timestamp < @untilTs");
         params.untilTs = opts.untilTs;
       }
+      where.push(...chatTypeFilterClauses(opts.filter, params));
       const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
       const dir = opts.order === "least" ? "asc" : "desc";
       const havingSql = opts.maxMessages !== undefined ? "having count(*) <= @maxMessages" : "";
@@ -5677,6 +5723,73 @@ export class Storage {
         lastAt: number;
       }>;
       return { rows, totalSenders };
+    });
+  }
+
+  /**
+   * Scope-wide totals for a window — the denominator and actual data span behind a
+   * `user_activity` report (§9e). The `total*`/`first*`/`last*` fields honour the optional
+   * type `filter` (so "% of total" and the considered span describe the *matching* subset),
+   * while `corpusFirstAt`/`corpusLastAt` ignore the type filter and report the span of the
+   * underlying corpus in the same room/window scope. That split keeps the coverage footnote
+   * honest: "30d requested, only 3d on record" is a property of the corpus, so filtering to
+   * (say) images must NOT make the warning fire just because images are recent. All `*At`
+   * fields are null when their respective set is empty.
+   */
+  chatActivityScope(opts: {
+    timelineKeys?: string[];
+    sinceTs?: number;
+    untilTs?: number;
+    filter?: ChatTypeFilter;
+  }): {
+    totalMessages: number;
+    distinctSenders: number;
+    firstAt: number | null;
+    lastAt: number | null;
+    corpusFirstAt: number | null;
+    corpusLastAt: number | null;
+  } {
+    return this.read((db) => {
+      const where: string[] = [];
+      const params: Record<string, unknown> = {};
+      if (opts.timelineKeys && opts.timelineKeys.length > 0) {
+        const keys = opts.timelineKeys.map((k, i) => {
+          params[`tk${i}`] = k;
+          return `@tk${i}`;
+        });
+        where.push(`timeline_key in (${keys.join(", ")})`);
+      }
+      if (opts.sinceTs !== undefined) {
+        where.push("timestamp >= @sinceTs");
+        params.sinceTs = opts.sinceTs;
+      }
+      if (opts.untilTs !== undefined) {
+        where.push("timestamp < @untilTs");
+        params.untilTs = opts.untilTs;
+      }
+      const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+      // The type filter lives INSIDE conditional aggregates rather than the WHERE, so the
+      // same single pass yields both the filtered totals and the unfiltered corpus span.
+      const typeClauses = chatTypeFilterClauses(opts.filter, params);
+      const match = typeClauses.length > 0 ? typeClauses.join(" and ") : "1";
+      return db
+        .prepare(
+          `select coalesce(sum(case when ${match} then 1 else 0 end), 0) as totalMessages,
+                  count(distinct case when ${match} then sender_id end) as distinctSenders,
+                  min(case when ${match} then timestamp end) as firstAt,
+                  max(case when ${match} then timestamp end) as lastAt,
+                  min(timestamp) as corpusFirstAt,
+                  max(timestamp) as corpusLastAt
+           from chat_index ${whereSql}`,
+        )
+        .get(params) as {
+        totalMessages: number;
+        distinctSenders: number;
+        firstAt: number | null;
+        lastAt: number | null;
+        corpusFirstAt: number | null;
+        corpusLastAt: number | null;
+      };
     });
   }
 

@@ -489,7 +489,106 @@ test("user_activity single-user path is unchanged by the roster bounding (#6)", 
     });
     const res = await tool.execute("t1", { user: "@alice", rooms: "all", last: "100000d" });
     const text = toolText(res);
-    assert.match(text, /@alice: 3 message\(s\) across 2 room\(s\)/);
+    // @alice posts 3 of the 4 seed messages → 75% of total; share now shown inline.
+    assert.match(text, /@alice: 3 message\(s\) \(75%\) across 2 room\(s\)/);
+  });
+});
+
+// ── user_activity message-type filters (§9e) ─────────────────────────────────
+const UA_NOW = 1_000_000_000_000;
+const UA_DAY = 24 * 60 * 60 * 1000;
+
+/** Seed timeline_events (FK) + chat_index rows with explicit type flags, then run the
+ *  user_activity tool over them with a NON-reconciling stub indexer — a live reconcile
+ *  would re-project the seeded events and reset the hand-set attachment/link/reply flags
+ *  (the events have no backing media), so the stub is what keeps the fixture intact. */
+async function withTypedActivity(
+  rows: Array<Partial<ChatIndexUpsert> & { eventId: string; senderId: string; timestamp: number }>,
+  run: (tool: ReturnType<typeof createUserActivityTool>) => Promise<void>,
+): Promise<void> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-ua-filter-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "test.db") });
+  try {
+    await seedEvents(storage, rows.map((r) => ({ id: r.eventId, room: r.timelineKey, timestamp: r.timestamp })));
+    await storage.upsertChatIndexRows(rows.map(idxRow));
+    const indexer = { ensureFreshForQuery: async () => {} } as unknown as ChatSearchIndexer;
+    const tool = createUserActivityTool({ storage, indexer, currentTimelineKey: ROOM_A, now: () => UA_NOW });
+    await run(tool);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// @img: 2 images + 1 text; @txt: 3 text; @vid: 1 video. 7 total (4 text, 3 attachments).
+const TYPED: Array<Partial<ChatIndexUpsert> & { eventId: string; senderId: string; timestamp: number }> = [
+  { eventId: "i1", senderId: "@img", timestamp: UA_NOW - 1 * UA_DAY, hasAttachment: 1, attachmentTypes: "image" },
+  { eventId: "i2", senderId: "@img", timestamp: UA_NOW - 2 * UA_DAY, hasAttachment: 1, attachmentTypes: "image" },
+  { eventId: "ix", senderId: "@img", timestamp: UA_NOW - 1 * UA_DAY, body: "look at this" },
+  { eventId: "t1", senderId: "@txt", timestamp: UA_NOW - 1 * UA_DAY, body: "hello" },
+  { eventId: "t2", senderId: "@txt", timestamp: UA_NOW - 2 * UA_DAY, body: "world" },
+  { eventId: "t3", senderId: "@txt", timestamp: UA_NOW - 3 * UA_DAY, body: "again" },
+  { eventId: "v1", senderId: "@vid", timestamp: UA_NOW - 1 * UA_DAY, hasAttachment: 1, attachmentTypes: "video" },
+];
+
+test("user_activity attachment_type:['image'] counts only image posts and labels the filter", async () => {
+  await withTypedActivity(TYPED, async (tool) => {
+    const res = await tool.execute("uf1", { rooms: [ROOM_A], attachment_type: ["image"] });
+    const text = toolText(res);
+    assert.match(text, /Activity roster — image attachments/);
+    // Only @img matched; 2 of 2 image messages → 100%; @txt/@vid absent.
+    assert.match(text, /@img — 2 msg\(s\) \(100%\)/);
+    assert.doesNotMatch(text, /@txt/);
+    assert.doesNotMatch(text, /@vid/);
+    assert.match(text, /These 1 sender\(s\) account for 2 of 2 message\(s\) \(100%\)/);
+    const d = res.details as { scope: { totalMessages: number }; filter: { attachmentTypes?: string[] } | null };
+    assert.equal(d.scope.totalMessages, 2); // denominator is the filtered subset
+    assert.deepEqual(d.filter?.attachmentTypes, ["image"]);
+  });
+});
+
+test("user_activity has_attachment:false counts only text posts", async () => {
+  await withTypedActivity(TYPED, async (tool) => {
+    const res = await tool.execute("uf2", { rooms: [ROOM_A], has_attachment: false });
+    const text = toolText(res);
+    assert.match(text, /text only \(no attachment\)/);
+    // 4 text messages total: @txt 3 (75%), @img 1 (25%); @vid (video only) absent.
+    assert.match(text, /@txt — 3 msg\(s\) \(75%\)/);
+    assert.match(text, /@img — 1 msg\(s\) \(25%\)/);
+    assert.doesNotMatch(text, /@vid/);
+    const d = res.details as { scope: { totalMessages: number } };
+    assert.equal(d.scope.totalMessages, 4);
+  });
+});
+
+test("user_activity single-user honours a type filter", async () => {
+  await withTypedActivity(TYPED, async (tool) => {
+    const res = await tool.execute("uf3", { user: "@img", rooms: [ROOM_A], attachment_type: ["image"] });
+    assert.match(toolText(res), /@img: 2 message\(s\) \(100%\)/);
+  });
+});
+
+test("coverage footnote stays a CORPUS property — a type filter doesn't false-trigger it", async () => {
+  // Corpus reaches back ~29d (an old text post); images exist only in the last day. The
+  // default 30d window IS covered by the corpus, so filtering to images must NOT warn even
+  // though the image span is recent. (If coverage keyed off the filtered span it would.)
+  const rows = [
+    { eventId: "old", senderId: "@txt", timestamp: UA_NOW - 29 * UA_DAY, body: "ancient history" },
+    { eventId: "img", senderId: "@img", timestamp: UA_NOW - 1 * UA_DAY, hasAttachment: 1, attachmentTypes: "image" },
+  ];
+  await withTypedActivity(rows, async (tool) => {
+    const res = await tool.execute("uf4", { rooms: [ROOM_A], attachment_type: ["image"] });
+    const text = toolText(res);
+    assert.doesNotMatch(text, /⚠ Coverage/);
+    assert.match(text, /@img — 1 msg\(s\)/);
+  });
+});
+
+test("include_silent is declined (with a note) when a type filter is active", async () => {
+  await withTypedActivity(TYPED, async (tool) => {
+    const res = await tool.execute("uf5", { rooms: [ROOM_A], include_silent: true, attachment_type: ["image"] });
+    assert.match(toolText(res), /never-posted members aren't listed alongside a message-type filter/);
   });
 });
 

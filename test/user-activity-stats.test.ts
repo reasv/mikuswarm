@@ -227,3 +227,87 @@ test("include_silent without a membership source notes the gap", async () => {
     assert.match((res.content[0] as { text: string }).text, /membership source unavailable/);
   });
 });
+
+test("single-user reports its share of total and the considered span", async () => {
+  // RECENT: 7 messages total (@a=4, @b=1, @c=2). @a's share is 4/7 ≈ 57%.
+  await withTool(RECENT, undefined, async (tool) => {
+    const res = await tool.execute("c13", { user: "@a", rooms: "all" });
+    const text = (res.content[0] as { text: string }).text;
+    assert.match(text, /@a: 4 message\(s\) \(57%\)/);
+    assert.match(text, /7 message\(s\) from 3 sender\(s\) considered, actual span /);
+    const d = res.details as {
+      scope: { totalMessages: number; distinctSenders: number; firstAt: number | null; lastAt: number | null };
+      senders: Array<{ senderId: string; percentOfTotal: number | null }>;
+    };
+    assert.equal(d.scope.totalMessages, 7);
+    assert.equal(d.scope.distinctSenders, 3);
+    assert.ok(d.scope.firstAt !== null && d.scope.lastAt !== null && d.scope.firstAt <= d.scope.lastAt);
+    assert.ok(Math.abs((d.senders[0].percentOfTotal ?? 0) - 4 / 7) < 1e-9);
+  });
+});
+
+test("roster lines carry each sender's share of total", async () => {
+  await withTool(RECENT, undefined, async (tool) => {
+    const res = await tool.execute("c14", { rooms: "all" });
+    const text = (res.content[0] as { text: string }).text;
+    // most_active order: @a (4/7=57%), @c (2/7=29%), @b (1/7=14%).
+    assert.match(text, /@a — 4 msg\(s\) \(57%\)/);
+    assert.match(text, /@c — 2 msg\(s\) \(29%\)/);
+    assert.match(text, /@b — 1 msg\(s\) \(14%\)/);
+    assert.match(text, /7 message\(s\) from 3 sender\(s\) considered/);
+  });
+});
+
+test("roster reports the combined weight of the listed senders", async () => {
+  await withTool(RECENT, undefined, async (tool) => {
+    // All 3 senders shown → they account for the full 7/7 (100%).
+    const all = await tool.execute("c18a", { rooms: "all" });
+    assert.match(
+      (all.content[0] as { text: string }).text,
+      /These 3 sender\(s\) account for 7 of 7 message\(s\) \(100%\)/,
+    );
+    const dAll = all.details as { shown: { senderCount: number; messages: number; percentOfTotal: number | null } };
+    assert.equal(dAll.shown.senderCount, 3);
+    assert.equal(dAll.shown.messages, 7);
+    assert.equal(dAll.shown.percentOfTotal, 1);
+
+    // Capped to the top sender → a proper slice: @a's 4 of 7 (57%).
+    const top = await tool.execute("c18b", { rooms: "all", limit: 1 });
+    const topText = (top.content[0] as { text: string }).text;
+    assert.match(topText, /These 1 sender\(s\) account for 4 of 7 message\(s\) \(57%\)/);
+    assert.match(topText, /\(\+2 more\)/);
+    const dTop = top.details as { shown: { messages: number; percentOfTotal: number | null } };
+    assert.equal(dTop.shown.messages, 4);
+    assert.ok(Math.abs((dTop.shown.percentOfTotal ?? 0) - 4 / 7) < 1e-9);
+  });
+});
+
+test("coverage footnote fires when data spans less than the requested window", async () => {
+  // RECENT spans only the last 3 days, but the default window asks for 30d.
+  await withTool(RECENT, undefined, async (tool) => {
+    const res = await tool.execute("c15", { rooms: "all" }); // default 30d
+    const text = (res.content[0] as { text: string }).text;
+    assert.match(text, /⚠ Coverage:/);
+    assert.match(text, /30d/); // the requested span
+    assert.match(text, /first 27d of the window/); // the uncovered head
+  });
+});
+
+test("no coverage footnote when the window is covered, but the span still shows", async () => {
+  // last:"3d" matches the actual data span exactly — nothing uncovered.
+  await withTool(RECENT, undefined, async (tool) => {
+    const res = await tool.execute("c16", { rooms: "all", last: "3d" });
+    const text = (res.content[0] as { text: string }).text;
+    assert.doesNotMatch(text, /⚠ Coverage:/);
+    assert.match(text, /7 message\(s\) from 3 sender\(s\) considered/);
+  });
+});
+
+test("open lower bound (all_time) shows the span without a coverage warning", async () => {
+  await withTool(RECENT, undefined, async (tool) => {
+    const res = await tool.execute("c17", { rooms: "all", all_time: true });
+    const text = (res.content[0] as { text: string }).text;
+    assert.doesNotMatch(text, /⚠ Coverage:/);
+    assert.match(text, /message\(s\) from 3 sender\(s\) considered/);
+  });
+});

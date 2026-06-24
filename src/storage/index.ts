@@ -4,6 +4,7 @@ export {
   MAX_REDECRYPT_ATTEMPTS,
   REDECRYPT_RETIRED,
   type StorageOptions,
+  type ChatTypeFilter,
   type TimelineCompactionState,
   type TimelineEventRow,
   type ReplyContextRow,
