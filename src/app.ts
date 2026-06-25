@@ -1337,7 +1337,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   });
   await mcpPool.start();
   const mcpTools = mcpPool.getEntries().flatMap((entry) =>
-    adaptMcpTools(entry.name, entry.tools, entry.client, logger.child("mcp")),
+    adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp")),
   );
 
   // Caches resolved human room labels in `room_metadata` so the observability

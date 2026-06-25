@@ -1,13 +1,13 @@
 import { Type } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, type CallToolResult, type Tool as McpToolDef } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "../observability/logger.js";
+import { isSessionTerminatedError, type McpClientPool } from "./client-pool.js";
 
 export function adaptMcpTool(
   serverName: string,
   toolDef: McpToolDef,
-  client: Client,
+  pool: McpClientPool,
   logger: Logger,
 ): AgentTool {
   const name = `mcp_${serverName}_${toolDef.name}`;
@@ -25,13 +25,47 @@ export function adaptMcpTool(
       params,
       signal,
     ): Promise<AgentToolResult<unknown>> => {
-      try {
+      const args = (params ?? {}) as Record<string, unknown>;
+      // Resolve the live client per call: reconnect() swaps in a fresh client on
+      // session loss, so a reference captured at adapter-build time would go stale.
+      const invoke = async (): Promise<CallToolResult> => {
+        const client = pool.getClient(serverName);
+        if (!client) {
+          throw new Error(`MCP server "${serverName}" is not connected`);
+        }
         // CallToolResultSchema validates at runtime, so the cast is safe
-        const result = await client.callTool(
-          { name: toolDef.name, arguments: (params ?? {}) as Record<string, unknown> },
+        return (await client.callTool(
+          { name: toolDef.name, arguments: args },
           CallToolResultSchema,
           { signal },
-        ) as CallToolResult;
+        )) as CallToolResult;
+      };
+
+      try {
+        let result: CallToolResult;
+        try {
+          result = await invoke();
+        } catch (error) {
+          // A dead Streamable HTTP session (server restart / timeout / LB
+          // re-route) is recoverable: re-initialize once and retry. Don't
+          // recover a caller-driven abort or a genuine tool error.
+          if (signal?.aborted || !isSessionTerminatedError(error)) {
+            throw error;
+          }
+          logger.warn("mcp_session_reconnect", {
+            server: serverName,
+            tool: toolDef.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          try {
+            await pool.reconnect(serverName);
+          } catch {
+            // Reconnect failed (server still down) — surface the original,
+            // more informative session error rather than the reconnect error.
+            throw error;
+          }
+          result = await invoke();
+        }
 
         if (result.isError) {
           const errorText = result.content
@@ -78,10 +112,10 @@ export function adaptMcpTool(
 export function adaptMcpTools(
   serverName: string,
   tools: McpToolDef[],
-  client: Client,
+  pool: McpClientPool,
   logger: Logger,
 ): AgentTool[] {
   return tools.map((toolDef) =>
-    adaptMcpTool(serverName, toolDef, client, logger),
+    adaptMcpTool(serverName, toolDef, pool, logger),
   );
 }

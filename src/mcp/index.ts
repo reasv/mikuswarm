@@ -1,5 +1,6 @@
 export {
   McpClientPool,
+  isSessionTerminatedError,
   type McpClientPoolOptions,
   type McpServerConfig,
   type McpServerEntry,
