@@ -1395,7 +1395,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     pageSize: config.backfetch?.page_size ?? 100,
     maxBacklog: config.backfetch?.max_backlog ?? 500,
     pageMinIntervalMs: config.backfetch?.page_min_interval_ms ?? 0,
-    defaultSafetyCap: config.backfetch?.default_safety_cap ?? 50000,
+    defaultSafetyCap: config.backfetch?.default_safety_cap ?? 0,
     defaultTimeoutMs: config.backfetch?.default_timeout_ms ?? 0,
     utdHaltThreshold: config.backfetch?.utd_halt_threshold ?? 50,
     captionBackfetched: config.backfetch?.caption_backfetched ?? false,

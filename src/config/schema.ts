@@ -1115,7 +1115,7 @@ const BackfetchSchema = StrictObject({
   // Optional throttle between pages (ms). 0 ⇒ no throttle (default).
   page_min_interval_ms: Type.Optional(Type.Number({ minimum: 0 })),
   // Default max stored per job for an unbounded ('beginning') target. A hit parks
-  // the job 'paused' (resumable). 0 ⇒ unbounded. Default 50000.
+  // the job 'paused' (resumable). 0 ⇒ unbounded (default).
   default_safety_cap: Type.Optional(Type.Number({ minimum: 0 })),
   // Default per-run wall-clock budget (ms); a hit parks 'paused'. 0 ⇒ none (default).
   default_timeout_ms: Type.Optional(Type.Number({ minimum: 0 })),

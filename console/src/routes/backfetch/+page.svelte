@@ -164,7 +164,7 @@
 				{/if}
 				<label class="flex flex-col gap-1">
 					<span class="text-muted-foreground" title="0/blank = config default">safety cap</span>
-					<input bind:value={safetyCap} placeholder="50000" class="w-24 rounded border bg-background px-2 py-1 font-mono" />
+					<input bind:value={safetyCap} placeholder="unlimited" class="w-24 rounded border bg-background px-2 py-1 font-mono" />
 				</label>
 				<label class="flex flex-col gap-1">
 					<span class="text-muted-foreground" title="0/blank = none">timeout (min)</span>
