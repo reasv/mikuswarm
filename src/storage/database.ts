@@ -3639,12 +3639,17 @@ export class Storage {
              from usage_events where ts >= ? group by class order by cost desc`,
         )
         .all(since) as Array<{ class: string; cost: number; events: number }>;
-      // Group by LOGICAL id (spec MODEL-FALLBACK §7): caption-premium and
-      // caption-cheap separate even on a shared upstream model.
+      // Group by the UPSTREAM wire id actually billed (`model_id`), NOT the
+      // logical/virtual block name. This cost page reports what was really spent
+      // on which real model: a virtual model (e.g. "default") and any legacy rows
+      // sharing its upstream must collapse into one row, otherwise the same model
+      // splits across buckets purely by whether the row predates the logical-id
+      // column. Budget scoping (`[[limits]].models`, §8e) still keys on
+      // `logical_model_id`; only this presentation aggregation uses `model_id`.
       const byModel = db
         .prepare(
-          `select logical_model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
-             from usage_events where ts >= ? group by logical_model_id order by cost desc`,
+          `select model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
+             from usage_events where ts >= ? group by model_id order by cost desc`,
         )
         .all(since) as Array<{ model: string; cost: number; events: number }>;
       // Actual data start within the window — anchors the console's per-period averages to
@@ -3664,8 +3669,10 @@ export class Storage {
    * (spec §7.1 chart). Returns one row per (bucket, group) with summed cost.
    */
   getUsageTimeseries(since: number, bucketMs: number, groupBy: "class" | "model"): UsageTimeseriesRow[] {
-    // "model" groups by LOGICAL id (spec MODEL-FALLBACK §7), consistent with byModel.
-    const groupCol = groupBy === "model" ? "logical_model_id" : "class";
+    // "model" groups by the UPSTREAM wire id actually billed (`model_id`),
+    // consistent with byModel — the cost chart reports real-model spend, not
+    // virtual/logical block names (budget scoping still keys on logical, §8e).
+    const groupCol = groupBy === "model" ? "model_id" : "class";
     return this.read((db) => {
       // `cast(... as integer)` forces an integer FLOOR: a bound numeric parameter
       // makes `ts / ?` floating-point in SQLite, so without the cast the bucket

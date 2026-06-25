@@ -590,6 +590,38 @@ test("getUsageSummary: groups by class and by model with totals (#18)", async ()
   );
 });
 
+test("getUsageSummary/getUsageTimeseries: by-model groups on the upstream model_id, not the logical/virtual block name", async () => {
+  // The cost page reports real-model spend. A virtual block ("default") and a
+  // legacy row that carried the bare wire id in logical_model_id both resolve to
+  // the SAME upstream model and must collapse into one bucket — not split by
+  // whether the row predates the logical-id column.
+  await withLedger(
+    [
+      // Virtual model "default" routing to the real GLM-5.2 upstream.
+      { ts: 1_000, class: "agent_loop", modelId: "glm-5.2", logicalModelId: "default", costUsd: 3 },
+      // Legacy/other-lane row: logical defaults to the same wire id.
+      { ts: 2_000, class: "agent_loop", modelId: "glm-5.2", logicalModelId: "glm-5.2", costUsd: 5 },
+      // A genuinely different upstream stays its own bucket.
+      { ts: 3_000, class: "tool", toolName: "x_search", modelId: "grok", logicalModelId: "grok", costUsd: 2 },
+    ],
+    async (storage) => {
+      const byModel = new Map(storage.getUsageSummary(0, 10_000).byModel.map((r) => [r.model, r]));
+      assert.equal(byModel.get("glm-5.2")?.cost, 8, "virtual + legacy rows merge on the real wire id");
+      assert.equal(byModel.get("glm-5.2")?.events, 2);
+      assert.equal(byModel.get("grok")?.cost, 2);
+      assert.equal(byModel.has("default"), false, "the virtual block name never appears as its own bucket");
+
+      const series = storage.getUsageTimeseries(0, 3_600_000, "model");
+      assert.equal(
+        series.filter((r) => r.grp === "glm-5.2").reduce((s, r) => s + r.cost, 0),
+        8,
+        "timeseries also groups by the real wire id",
+      );
+      assert.equal(series.some((r) => r.grp === "default"), false);
+    },
+  );
+});
+
 test("getUsageTimeseries: groups (bucket, grp) and sums cost, ascending bucket, by class or model (#18)", async () => {
   await withLedger(
     [

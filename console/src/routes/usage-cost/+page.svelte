@@ -374,7 +374,7 @@
 			<div class="rounded-lg border p-3">
 				<div class="text-xs text-muted-foreground">Top models</div>
 				<div class="mt-1 space-y-1">
-					{#each byModel.slice(0, 5) as m (m.model)}
+					{#each byModel.slice(0, 7) as m (m.model)}
 						<div class="flex items-center justify-between gap-2 text-xs">
 							<span class="max-w-[12rem] truncate font-mono text-[11px]" title={m.model}>{m.model}</span>
 							<span class="font-mono">{fmtUsd(m.cost)}</span>
