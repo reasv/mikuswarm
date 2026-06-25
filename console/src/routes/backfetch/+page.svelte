@@ -14,6 +14,7 @@
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
 	import RoomPicker from '$lib/components/RoomPicker.svelte';
+	import { roomsQuery } from '$lib/query/rooms';
 
 	// Message-only history backfetch (ARCHITECTURE.md §7d): operator-triggered jobs
 	// that page a room's history BELOW its context floor into the SEARCH-ONLY region
@@ -28,6 +29,15 @@
 
 	const jobs = $derived(jobsQuery.data?.jobs ?? []);
 	const enabled = $derived(jobsQuery.data?.enabled ?? false);
+
+	// Resolve human room labels the same way the RoomPicker popover does: GET
+	// /api/rooms already surfaces the `Name (Space)` label as `displayName`, keyed
+	// by timeline key. Join jobs onto it by timelineKey for the room-name column.
+	const rooms = roomsQuery();
+	const roomNames = $derived(
+		new Map((rooms.data?.rooms ?? []).map((r) => [r.timelineKey, r.displayName]))
+	);
+	const roomNameOf = (key: string): string | null => roomNames.get(key) ?? null;
 
 	const STATUS_CLASSES: Record<string, string> = {
 		queued: 'text-sky-500',
@@ -193,6 +203,7 @@
 			<table class="w-full text-sm">
 				<thead class="text-left text-xs text-muted-foreground">
 					<tr class="border-b">
+						<th class="py-1 pr-3 font-medium">name</th>
 						<th class="py-1 pr-3 font-medium">room</th>
 						<th class="py-1 pr-3 font-medium">target</th>
 						<th class="py-1 pr-3 font-medium">status</th>
@@ -206,6 +217,13 @@
 				<tbody>
 					{#each jobs as job (job.id)}
 						<tr class="border-b border-border/50 align-top">
+							<td class="py-1 pr-3 text-[11px]" title={roomNameOf(job.timelineKey) ?? job.timelineKey}>
+								{#if roomNameOf(job.timelineKey)}
+									<span class="truncate">{roomNameOf(job.timelineKey)}</span>
+								{:else}
+									<span class="text-muted-foreground">—</span>
+								{/if}
+							</td>
 							<td class="py-1 pr-3 font-mono text-[11px]" title={job.timelineKey}>
 								{job.roomId}
 								<span class="text-muted-foreground">({job.accountId})</span>
