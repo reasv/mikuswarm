@@ -683,7 +683,31 @@ export const RuleStatus = Schema.Struct({
 	})
 });
 export type RuleStatus = Schema.Schema.Type<typeof RuleStatus>;
-export const UsageBudgets = Schema.Struct({ rules: Schema.Array(RuleStatus) });
+
+/** One per-user / shared-pool meter status (spec PER-USER-LIMITS §14). */
+export const UserLimitStatus = Schema.Struct({
+	meterKey: Schema.String,
+	partitionKey: Schema.String,
+	isUserPartition: Schema.Boolean,
+	modelScope: Schema.optional(Schema.Array(Schema.String)),
+	spentUsd: Schema.Number,
+	capUsd: Schema.Number,
+	fraction: Schema.Number,
+	state: Schema.String,
+	window: Schema.Struct({
+		type: Schema.String,
+		period: Schema.optional(Schema.String),
+		duration: Schema.optional(Schema.String),
+		tz: Schema.optional(Schema.String)
+	}),
+	resetsAt: Schema.Number
+});
+export type UserLimitStatus = Schema.Schema.Type<typeof UserLimitStatus>;
+export const UsageBudgets = Schema.Struct({
+	rules: Schema.Array(RuleStatus),
+	// Optional for backward compatibility with an older BFF that omits it.
+	userLimits: Schema.optional(Schema.Array(UserLimitStatus))
+});
 export type UsageBudgets = Schema.Schema.Type<typeof UsageBudgets>;
 
 /** One per-bucket point feeding a leaderboard user's sub-period averages (§7.1 leaderboard). */

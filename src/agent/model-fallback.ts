@@ -107,6 +107,13 @@ export interface BuiltModelFallback {
   headLogicalId: string;
   /** Surviving members' logical ids, head-first — for the chain-availability budget gate (§6.1). */
   survivorLogicalIds: string[];
+  /**
+   * Surviving members (logical id + health failure-domain key), head-first — for the
+   * per-user selection HEALTH predicate (spec PER-USER-LIMITS §4.2 #2): the outer
+   * selector reuses {@link chooseChainMember} over these to ask "is any member of
+   * this model's chain up?" without dispatching.
+   */
+  survivorMembers: { logicalId: string; healthKey: string }[];
 }
 
 interface Candidate {
@@ -187,6 +194,7 @@ export function buildModelFallback(
   });
 
   const survivorLogicalIds = candidates.map((c) => c.logicalId);
+  const survivorMembers = candidates.map((c) => ({ logicalId: c.logicalId, healthKey: c.healthKey }));
 
   // Single-member chain → no fallback machinery; dispatch the head directly.
   if (candidates.length === 1) {
@@ -199,6 +207,7 @@ export function buildModelFallback(
       operativeContextWindow,
       headLogicalId: head.logicalId,
       survivorLogicalIds,
+      survivorMembers,
     };
   }
 
@@ -248,7 +257,13 @@ export function buildModelFallback(
     return next as Parameters<StreamFn>[2];
   }
 
-  return { streamFn, operativeContextWindow, headLogicalId: head.logicalId, survivorLogicalIds };
+  return {
+    streamFn,
+    operativeContextWindow,
+    headLogicalId: head.logicalId,
+    survivorLogicalIds,
+    survivorMembers,
+  };
 }
 
 /**

@@ -18,6 +18,11 @@ timezone = "UTC"
 # "wind down" interjection before the hard block at 100%.
 # max_session_cost_usd = 1.00
 cost_warn_fraction = 0.8
+# Per-user limits (spec PER-USER-LIMITS §5.3): the minimum affordable OUTPUT tokens
+# below which a model is judged unable to complete a turn within a user's remaining
+# budget — it is then skipped and selection degrades to the next preferred model.
+# Only consulted when [[user_limits]] is configured (the feature is off by default).
+user_limit_min_output_tokens = 256
 
 [observability]
 # Capacity of the in-memory Layer-0 LLM request ring backing

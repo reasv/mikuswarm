@@ -13,7 +13,12 @@ import {
   type LlmScheduler,
   type PriorityClass,
 } from "./scheduler.js";
-import { buildModelFallback, resolveModelChain } from "./model-fallback.js";
+import {
+  buildModelFallback,
+  chooseChainMember,
+  resolveModelChain,
+  type BuiltModelFallback,
+} from "./model-fallback.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
 import type { Storage, Summary } from "../storage/index.js";
@@ -22,7 +27,12 @@ import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
 import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
 import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
-import type { BudgetHooks } from "../budget/index.js";
+import type {
+  BudgetHooks,
+  UserLimitContext,
+  UserLimitEngine,
+  UserLimitResolution,
+} from "../budget/index.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -283,6 +293,28 @@ export interface CreateAgentOptions {
    * wait-or-omit entirely); resume creates skip the build altogether.
    */
   abortSignal?: AbortSignal;
+  /**
+   * Per-user limits selection input (spec PER-USER-LIMITS §6). Supplied ONLY for a
+   * human-triggered agent-loop session whose trigger ctx resolved to an ACTIVE
+   * per-user rule (the app builds it at Gate A). When present + active, the factory
+   * builds one fallback per preferred model and re-selects PER REQUEST (affordable ∧
+   * healthy ∧ fits — §4.2), caps output at the remaining headroom (§5.3), attributes
+   * the requested model to the ledger (§7), and records the served cost against the
+   * partitioned counters. Absent (background/proactive, or feature off) = today's
+   * single-model path, unchanged.
+   */
+  userLimit?: {
+    engine: UserLimitEngine;
+    resolution: UserLimitResolution;
+    ctx: UserLimitContext;
+  };
+  /**
+   * Dynamic §8d ceiling override (spec PER-USER-LIMITS §6.3): when set, replaces the
+   * statically-resolved per-session cost ceiling with `min(static, userTotalHeadroom)`
+   * computed by the app at launch, so the soft-warn + hard pre-flight reflect the
+   * user's REMAINING total headroom. Absent = the static ceiling (today's behavior).
+   */
+  costCeilingOverride?: number;
 }
 
 export interface CreatedAgent {
@@ -370,6 +402,24 @@ export class AgentSessionFactory {
   }
 
   /**
+   * The UPSTREAM wire id of a specific LOGICAL model (config block name) — the
+   * per-user-selected initial model's provenance for the §8e admission gate (spec
+   * PER-USER-LIMITS §6.1), distinct from {@link resolveModelId} which keys on a
+   * session type. Throws on an unknown id (the per-user normalizer already rejected
+   * dangling names, so this only fires on a genuine config bug).
+   */
+  resolveUpstreamModelId(logicalId: string): string {
+    const m = this.options.config.models[logicalId];
+    if (!m) throw new Error(`Model "${logicalId}" not found in config`);
+    return m.id;
+  }
+
+  /** A specific LOGICAL model's fallback chain as logical ids, head-first (§6.1). */
+  resolveModelChainLogicalIdsForModel(logicalId: string): string[] {
+    return resolveModelChain(logicalId, this.options.config.models).map((m) => m.logicalId);
+  }
+
+  /**
    * Create an Agent for the given session.
    *
    * Loads workspace content from disk (workspace files, tail instructions, skills)
@@ -388,13 +438,11 @@ export class AgentSessionFactory {
     const modelKey = sessionTypeConfig?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
-    // Effective fallback chain (spec MODEL-FALLBACK §2.1/§9): the head plus the
-    // logical ids named in its `fallback`. A request is served by the first
-    // chain member that is up — resolved per Layer-0 attempt, transparently.
-    const chain = resolveModelChain(modelKey, this.options.config.models);
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
-    // once and fed to the hard-cap pre-flight below. `undefined` = unlimited.
-    const costCeiling = this.resolveSessionCostCeiling(session.sessionType);
+    // once and fed to the hard-cap pre-flight below. `undefined` = unlimited. The
+    // per-user dynamic-ceiling override (PER-USER-LIMITS §6.3) replaces the static
+    // value with `min(static, userTotalHeadroom)` the app computed at launch.
+    const costCeiling = opts?.costCeilingOverride ?? this.resolveSessionCostCeiling(session.sessionType);
     // Triggering user for the unified usage ledger (spec USAGE-COST-LIMITS §3):
     // the explicit trigger origin, else the inbound event's sender, else null
     // (background/proactive). Resolved once for every per-request ledger row.
@@ -444,38 +492,56 @@ export class AgentSessionFactory {
     // holds. The two ceilings differ deliberately; see `resolveSessionContextCeiling`
     // below for the matching half of this cross-reference.
     const requiresMultimodal = rawInputsRequireMultimodal(session, opts);
-    // Transparent composite stream fn (spec MODEL-FALLBACK §3): capability
-    // pre-filter + min-over-chain ceiling fixed once at build, member chosen per
-    // attempt inside the composed fn. Admission composes per-candidate INSIDE
-    // this and outside it sits Layer-0 retry — each attempt re-resolves + re-
-    // acquires a fresh slot at the same (group, priority). A single-member chain
-    // degrades to the bare admitted stream (no health reads, no resolution log).
-    const fallback = buildModelFallback(chain, {
-      consumer: "agent",
-      makeBase: (cfg) =>
-        withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
-      makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
-      capability: requiresMultimodal ? (cfg) => cfg.input_modalities.includes("image") : undefined,
-      contextOverride: sessionTypeConfig?.max_context_tokens,
-      scheduler,
-      admission: scheduler
-        ? {
-            priority,
-            key: opts?.escalationKey,
-            sessionId: session.id,
-            sessionType: session.sessionType,
-            onAdmissionWait: (waitMs) => {
-              admissionWait.last = waitMs;
-            },
-          }
-        : undefined,
-      isModelAvailable: budgetEngine ? (id) => budgetEngine.isModelAvailable(id) : undefined,
-      logger: this.options.logger,
-      sessionId: session.id,
-      onResolve: (id) => {
-        resolvedMember.logicalId = id;
-      },
-    });
+    const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
+    // Per-user selection (spec PER-USER-LIMITS §6): when an ACTIVE per-user rule is
+    // supplied for this human session, the factory builds one composite per PREFERRED
+    // model and re-selects per request. `requestedMember` tracks the per-user
+    // selector's chosen model (the ledger's `requested_model_id`, §7), distinct from
+    // `resolvedMember` (the served chain member, set by the chosen composite's onResolve).
+    const userLimit = opts?.userLimit;
+    const userSelection = userLimit?.resolution.active === true;
+    const requestedMember: { logicalId: string } = { logicalId: modelKey };
+    // Shared builder so the default + each preferred composite are built identically
+    // (spec MODEL-FALLBACK §3): capability pre-filter + min-over-chain ceiling fixed
+    // once per chain, member chosen per attempt inside the composed fn. Memoized so a
+    // preferred model that equals the default key is not built twice (§4.2 build
+    // structure: one BuiltModelFallback per preferred model, ceiling resolved once each).
+    const builtFallbacks = new Map<string, BuiltModelFallback>();
+    const buildFor = (logicalId: string): BuiltModelFallback => {
+      const cached = builtFallbacks.get(logicalId);
+      if (cached) return cached;
+      const built = buildModelFallback(resolveModelChain(logicalId, this.options.config.models), {
+        consumer: "agent",
+        makeBase: (cfg) =>
+          withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
+        makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
+        capability: requiresMultimodal ? (cfg) => cfg.input_modalities.includes("image") : undefined,
+        contextOverride: sessionTypeConfig?.max_context_tokens,
+        scheduler,
+        admission: scheduler
+          ? {
+              priority,
+              key: opts?.escalationKey,
+              sessionId: session.id,
+              sessionType: session.sessionType,
+              onAdmissionWait: (waitMs) => {
+                admissionWait.last = waitMs;
+              },
+            }
+          : undefined,
+        isModelAvailable: isModelAvailableFn,
+        logger: this.options.logger,
+        sessionId: session.id,
+        onResolve: (id) => {
+          resolvedMember.logicalId = id;
+        },
+      });
+      builtFallbacks.set(logicalId, built);
+      return built;
+    };
+    // The default (session-type head) composite — also the representative descriptor
+    // source and the dispatch when per-user selection is inactive or collapses.
+    const fallback = buildFor(modelKey);
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
     // + MODEL-FALLBACK §3 #2): the MINIMUM `context_window` across the surviving
     // chain (min'd with the session-type override), valid for whichever member
@@ -487,7 +553,91 @@ export class AgentSessionFactory {
     // key, and the ledger-fallback model id. The composite substitutes the chosen
     // member's descriptor + key per attempt.
     const model = createModelFromConfig(modelConfig, contextCeiling);
-    const admittedStreamFn = fallback.streamFn;
+
+    // Per-user selectable set (spec §4.2): each preferred model whose chain can serve
+    // the request's capability needs (an entirely-incapable model is ABSENT). Empty
+    // (or no per-user rule) ⇒ the single default composite, today's behavior.
+    interface Selectable {
+      requestedLogicalId: string;
+      fallback: BuiltModelFallback;
+    }
+    const selectables: Selectable[] = [];
+    if (userSelection) {
+      const preferred = userLimit!.resolution.models ?? [modelKey];
+      for (const logicalId of preferred) {
+        if (!this.options.config.models[logicalId]) {
+          this.options.logger?.warn("user_limit_model_missing", { sessionId: session.id, model: logicalId });
+          continue;
+        }
+        const chainEntries = resolveModelChain(logicalId, this.options.config.models);
+        if (requiresMultimodal && !chainEntries.some((m) => m.config.input_modalities.includes("image"))) {
+          continue; // whole chain lacks the needed modality → absent from the set
+        }
+        selectables.push({ requestedLogicalId: logicalId, fallback: buildFor(logicalId) });
+      }
+      if (selectables.length === 0) {
+        // Rare (image session + an all-text-only user model set): degrade to the
+        // default composite with no per-user selection (the §8d/§8e gates still run).
+        this.options.logger?.warn("user_limit_selection_empty", {
+          sessionId: session.id,
+          timelineKey: session.timelineKey,
+        });
+      }
+    }
+    const userSelectionActive = userSelection && selectables.length > 0;
+    // Initial context-token estimate for the FIRST request's affordability estimate
+    // (no prior actuals yet; §5.3). Assigned after buildContext; read at request time.
+    const initialContextEstimate = { value: 0 };
+    // Per-request selection state the outer selector dispatches — re-resolved by the
+    // pre-flight before each request (§6.2); defaults to the most-preferred model.
+    let activeSelection: { fallback: BuiltModelFallback; requestedLogicalId: string; maxTokens?: number } =
+      userSelectionActive
+        ? { fallback: selectables[0]!.fallback, requestedLogicalId: selectables[0]!.requestedLogicalId }
+        : { fallback, requestedLogicalId: modelKey };
+    // The §4.2 resolver (affordable ∧ healthy ∧ fits). `observed` is the measured
+    // prior-context size (last committed `totalTokens`), else the initial estimate.
+    const resolveUserSelection = (
+      observed: number,
+    ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean } => {
+      const estimate = { priorContextTokens: observed };
+      let sawHealthyFit = false;
+      for (const s of selectables) {
+        const fits = s.fallback.operativeContextWindow >= observed;
+        const healthy = scheduler
+          ? chooseChainMember(s.fallback.survivorMembers, {
+              scheduler,
+              isModelAvailable: isModelAvailableFn,
+            }).reason !== "all-unhealthy"
+          : true;
+        const aff = userLimit!.engine.affordable(userLimit!.resolution, s.requestedLogicalId, estimate);
+        if (fits && healthy && aff.ok) {
+          return {
+            ok: true,
+            selection: {
+              fallback: s.fallback,
+              requestedLogicalId: s.requestedLogicalId,
+              maxTokens: aff.maxOutput,
+            },
+          };
+        }
+        if (fits && healthy) sawHealthyFit = true; // usable but unaffordable ⇒ budget cause
+      }
+      return { ok: false, budget: sawHealthyFit };
+    };
+    // The admitted stream fn: when per-user selection is active, an OUTER selector
+    // that dispatches the per-request-chosen composite with the budget-derived output
+    // cap (§5.3); otherwise the bare default composite (today's behavior).
+    const admittedStreamFn: StreamFn = userSelectionActive
+      ? (m, context, streamOptions) => {
+          const sel = activeSelection;
+          requestedMember.logicalId = sel.requestedLogicalId;
+          const opts2 =
+            sel.maxTokens !== undefined
+              ? ({ ...(streamOptions ?? {}), maxTokens: sel.maxTokens } as typeof streamOptions)
+              : streamOptions;
+          return sel.fallback.streamFn(m, context, opts2);
+        }
+      : fallback.streamFn;
     // Per-class retry budget (spec §6): interactive-class work (live chat +
     // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
     // class work (summaries, diaries — must eventually exist) is unbounded.
@@ -555,6 +705,32 @@ export class AgentSessionFactory {
           const budget = this.options.budget;
           if (budget?.record) {
             const u = message.usage;
+            const cost = u.cost?.total ?? 0;
+            // Per-user limits attribution (spec PER-USER-LIMITS §7): the REQUESTED
+            // virtual model the per-user selector chose for this request (distinct
+            // from `logical_model_id` under active fallback) + the single shared-pool
+            // key to denormalize. Both null when per-user selection is inactive. The
+            // in-memory partitioned counter records the ACTUAL served cost against the
+            // requested model's covering meters before the ledger write.
+            const requestedModelId = userSelectionActive ? requestedMember.logicalId : null;
+            const budgetPartition = userSelectionActive
+              ? userLimit!.resolution.ledgerPartitionKey ?? null
+              : null;
+            // The partitioned per-user counter is incremented centrally in app.ts's
+            // `recordUsageEvent` fan-in (the single place that covers BOTH the agent
+            // loop AND its tool lane, §6), keyed off the stamped `requestedModelId`.
+            // Here we only surface a budget-capped (output-truncated) turn — a
+            // degradation signal, not an organic completion (spec §5.4/§14).
+            if (userSelectionActive && message.stopReason === "length") {
+              this.options.logger?.info("user_limit_output_capped", {
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                requestedModel: requestedMember.logicalId,
+                servedModel: resolvedMember.logicalId,
+                maxTokens: activeSelection.maxTokens,
+                outputTokens: u.output ?? null,
+              });
+            }
             // Exact attribution under fallback (spec MODEL-FALLBACK §2.2/§6.1):
             // `model_id` is the UPSTREAM wire id actually billed (the committed
             // message's `model`/`provider`), `logical_model_id` is the chain
@@ -568,12 +744,14 @@ export class AgentSessionFactory {
               triggerSenderId,
               modelId: message.model ?? model.id,
               logicalModelId: resolvedMember.logicalId,
+              requestedModelId,
+              budgetPartition,
               provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,
               cacheReadTokens: u.cacheRead ?? null,
               cacheWriteTokens: u.cacheWrite ?? null,
-              costUsd: u.cost?.total ?? 0,
+              costUsd: cost,
             });
           }
         },
@@ -586,6 +764,12 @@ export class AgentSessionFactory {
         // provider is authority on an oversized seed). D3 from TOKEN-USAGE-TRACKING
         // is preserved verbatim.
         checkContextBudget: () => {
+          // Per-user selection owns the context "fits" check per attempt (spec §6.2):
+          // the chosen model's OWN operative ceiling governs, which may exceed the
+          // head's (an upgrade) — so defer to the selector below rather than the head's
+          // ceiling here. A context that fits no selectable model terminates via
+          // `checkCostBudget`'s resolver, not this head-only gate.
+          if (userSelectionActive) return undefined;
           const observed = usage.snapshot().contextTokens;
           if (observed === null || observed < contextCeiling) return undefined;
           this.options.logger?.warn("session_context_limit_exceeded", {
@@ -651,6 +835,35 @@ export class AgentSessionFactory {
                 `period cost limit exceeded (${result.primary?.name ?? "unknown"}); ` +
                 `resets at ${when} (session type ${session.sessionType})`
               );
+            }
+          }
+          // Per-user selection + estimation (spec PER-USER-LIMITS §6.2): re-resolve the
+          // preferred model PER REQUEST against the live partitioned counters, stash
+          // the chosen composite + budget-derived output cap for the outer selector,
+          // and terminate (content-class, no retry burn) only when NO preference
+          // qualifies — degradation finishes the rollout on a cheaper model rather than
+          // guillotining it. The first request uses the initial context estimate; later
+          // requests the last committed `totalTokens`.
+          if (userSelectionActive) {
+            const observed = usage.snapshot().contextTokens ?? initialContextEstimate.value;
+            const picked = resolveUserSelection(observed);
+            if (picked.ok) {
+              activeSelection = picked.selection;
+            } else {
+              const binding = userLimit!.engine.bindingConstraint(userLimit!.resolution);
+              this.options.logger?.warn("usage_limit_blocked", {
+                gate: "user_preflight",
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                userId: userLimit!.ctx.userId,
+                cause: picked.budget ? "budget" : "outage_or_context",
+                binding: binding
+                  ? { partitionKey: binding.partitionKey, capUsd: binding.cap, models: binding.modelScope }
+                  : undefined,
+              });
+              return picked.budget
+                ? `per-user budget exhausted: no affordable model remains for ${userLimit!.ctx.userId}`
+                : `per-user selection: no healthy model fits the accumulated context for ${userLimit!.ctx.userId}`;
             }
           }
           return undefined;
@@ -759,6 +972,9 @@ export class AgentSessionFactory {
       snapshotCompactTokens = built.compactTokens;
       snapshotRichTokens = built.richTokens;
       renderedInputIds = built.renderedInputIds;
+      // Seed the per-user first-request affordability estimate (§5.3) with the built
+      // context size — the only input basis before any request commits actuals.
+      initialContextEstimate.value = built.tokenEstimate ?? 0;
     }
 
     // Freeze the prefix so accidental reassignment of an element or the array throws
