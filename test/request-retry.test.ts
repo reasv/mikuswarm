@@ -158,6 +158,58 @@ test("withRequestRetry: retries a pre-commit retryable failure then succeeds", a
   assert.equal(final.stopReason, "stop");
 });
 
+// ── §5.4 budget-capped re-drive (spec PER-USER-LIMITS) ──────────────────────
+
+const lengthDone = (delta: string): AssistantMessageEvent => ({
+  type: "done",
+  reason: "length",
+  message: message({ stopReason: "length", content: [{ type: "text", text: delta }] }),
+});
+
+test("withRequestRetry: §5.4 re-drives a budget-capped length turn — discards it, delivers the re-selected turn", async () => {
+  const { fn, calls } = scriptedBase([
+    // Request 1: budget-capped (truncated) on the premium model.
+    { events: [startEvent(), textDeltaEvent("truncated…"), lengthDone("truncated…")] },
+    // Request 2 (re-selected cheaper model): a complete answer.
+    { events: [startEvent(), textDeltaEvent("full answer"), doneEvent()] },
+  ]);
+  const committed: string[] = [];
+  let truncationCalls = 0;
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    onRequestCommitted: (m) => committed.push(m.stopReason),
+    onBudgetTruncation: () => {
+      truncationCalls += 1;
+      return "reselect";
+    },
+  });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  const terminal = events[events.length - 1] as Extract<AssistantMessageEvent, { type: "done" }>;
+  assert.equal(terminal.reason, "stop", "delivers the re-selected (complete) turn");
+  assert.equal(calls(), 2, "re-issued once on the re-selected model");
+  assert.equal(truncationCalls, 1, "the budget-truncation hook fired for the capped turn");
+  // BOTH turns' spend is recorded (the truncated turn cost real money, then the re-drive).
+  assert.deepEqual(committed, ["length", "stop"]);
+  // The truncated content is NOT delivered to the agent (failed, not delivered).
+  const hasTruncated = events.some((e) => e.type === "text_delta" && e.delta.includes("truncated"));
+  assert.equal(hasTruncated, false, "truncated content discarded");
+});
+
+test("withRequestRetry: §5.4 accepts the truncated turn at the floor (hook declines)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), lengthDone("x")] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, { onBudgetTruncation: () => "accept" });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1, "no re-issue when the hook accepts");
+  assert.equal((events[events.length - 1] as Extract<AssistantMessageEvent, { type: "done" }>).reason, "length");
+});
+
+test("withRequestRetry: a length turn with no budget hook delivers normally (non-per-user)", async () => {
+  const { fn, calls } = scriptedBase([{ events: [startEvent(), lengthDone("x")] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST });
+  const events = await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 1, "no hook → no re-drive");
+  assert.equal((events[events.length - 1] as Extract<AssistantMessageEvent, { type: "done" }>).reason, "length");
+});
+
 test("withRequestRetry: a content error is forwarded without retrying", async () => {
   const { fn, calls } = scriptedBase([
     { events: [errorEvent("413 prompt is too long")] },

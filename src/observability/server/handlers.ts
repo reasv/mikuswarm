@@ -345,7 +345,9 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
 export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];
   const userLimits = ctx.deps.userLimitEngine?.statuses() ?? [];
-  sendJson(res, 200, { rules, userLimits });
+  // The currently-selected model of every live per-user session (spec §14).
+  const userSelections = ctx.deps.userLimitEngine?.activeSelections() ?? [];
+  sendJson(res, 200, { rules, userLimits, userSelections });
 }
 
 /**

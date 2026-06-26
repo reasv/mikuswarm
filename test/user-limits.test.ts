@@ -228,14 +228,14 @@ test("cascade: no matching rule ⇒ inert (matched=false, inactive)", () => {
 test("affordable: caps output at remaining headroom; reports unaffordable below viable_min", () => {
   const engine = makeEngine([{ user: "*", models: ["opus-premium"], limits: [{ max_usd: 5, window: ROLL24 }] }]);
   const r = engine.resolve({ userId: "@a:hs" });
-  const aff = engine.affordable(r, "opus-premium", { priorContextTokens: 10_000 });
+  const aff = engine.affordable(r, "opus-premium", { newTokens: 10_000 });
   assert.equal(aff.ok, true);
   // input_cost = 10000/1e6 * 15 = 0.15; max_output = floor((5-0.15)/(75/1e6)) = 64666; capped at model max 32000.
   assert.equal(aff.maxOutput, 32000);
 
   // A user already at the cap cannot afford a turn.
   engine.record(r, "opus-premium", 5);
-  const after = engine.affordable(r, "opus-premium", { priorContextTokens: 10_000 });
+  const after = engine.affordable(r, "opus-premium", { newTokens: 10_000 });
   assert.equal(after.ok, false);
 });
 
@@ -254,18 +254,53 @@ test("degradation: an exhausted premium sub-cap makes premium unaffordable but t
   // Spend the premium sub-cap (counts toward total + sub-cap).
   engine.record(r, "opus-premium", 2);
   // Premium: remaining = min(total 5-2=3, sub-cap 2-2=0) = 0 ⇒ unaffordable.
-  assert.equal(engine.affordable(r, "opus-premium", { priorContextTokens: 5000 }).ok, false);
+  assert.equal(engine.affordable(r, "opus-premium", { newTokens: 5000 }).ok, false);
   // Cheap: only the total covers it; remaining = 3 ⇒ affordable (rollout continues cheap).
-  assert.equal(engine.affordable(r, "glm-cheap", { priorContextTokens: 5000 }).ok, true);
+  assert.equal(engine.affordable(r, "glm-cheap", { newTokens: 5000 }).ok, true);
   // The reserved $3 is the difference the sub-cap guaranteed for continuation.
   assert.equal(engine.totalHeadroom(r), 3);
+});
+
+test("estimation: prior context is cache-read within the TTL, cache-write outside (§5.3)", () => {
+  // A model with explicit cache rates: read = 0.1×input, write = 1.25×input.
+  const cacheRates: Record<string, ModelCostRates> = {
+    cached: { inputPerMTok: 10, outputPerMTok: 10, cacheReadPerMTok: 1, cacheWritePerMTok: 12.5 },
+  };
+  const norm = normalizeUserLimits(
+    [{ user: "*", models: ["cached"], limits: [{ max_usd: 1, window: ROLL24 }] }],
+    { defaultTz: "UTC", knownModelIds: new Set(["cached"]) },
+  );
+  assert.deepEqual(norm.fatal, []);
+  const engine = new UserLimitEngine({
+    rules: norm.rules,
+    sumUsageCost: () => 0,
+    costRatesFor: (id) => cacheRates[id],
+    maxTokensFor: () => 1_000_000,
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 1,
+    logger,
+    now: () => 1_000_000,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // 1M cached tokens. Within the TTL: input_cost = 1M × $1/MTok = $1.00 → exhausts the
+  // whole $1 cap → no output affordable → UNAFFORDABLE only if cost ≥ cap. Make headroom
+  // explicit by comparing the two pricings' maxOutput.
+  const hot = engine.affordable(r, "cached", { cachedTokens: 500_000, newTokens: 0, withinCacheTtl: true });
+  const cold = engine.affordable(r, "cached", { cachedTokens: 500_000, newTokens: 0, withinCacheTtl: false });
+  // Hot prices 500k at cache-read ($0.50); cold prices it at cache-write ($6.25, > cap).
+  assert.equal(hot.ok, true, "cache-read keeps it affordable within the TTL");
+  assert.equal(cold.ok, false, "cache-write throughout exhausts the cap outside the TTL");
+  // New material is always cache-write even within the TTL.
+  const withNew = engine.affordable(r, "cached", { cachedTokens: 0, newTokens: 100_000, withinCacheTtl: true });
+  // 100k × $12.5/MTok = $1.25 > $1 cap → unaffordable.
+  assert.equal(withNew.ok, false, "new material priced at cache-write");
 });
 
 test("zero-cost model bypass: always affordable regardless of counters", () => {
   const engine = makeEngine([{ user: "*", models: ["free"], limits: [{ max_usd: 0, window: ROLL24 }] }]);
   const r = engine.resolve({ userId: "@a:hs" });
   // Even with a $0 total cap, a free model is affordable (cost = rate × tokens = 0).
-  assert.equal(engine.affordable(r, "free", { priorContextTokens: 100_000 }).ok, true);
+  assert.equal(engine.affordable(r, "free", { newTokens: 100_000 }).ok, true);
 });
 
 // ─── Partitioning ───────────────────────────────────────────────────────────
@@ -275,9 +310,9 @@ test("per-user partition: each user's spend is isolated (default {user_id})", ()
   const a = engine.resolve({ userId: "@a:hs" });
   const b = engine.resolve({ userId: "@b:hs" });
   engine.record(a, "glm-cheap", 5);
-  assert.equal(engine.affordable(a, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
+  assert.equal(engine.affordable(a, "glm-cheap", { newTokens: 1000 }).ok, false);
   // B is untouched by A's spend.
-  assert.equal(engine.affordable(b, "glm-cheap", { priorContextTokens: 1000 }).ok, true);
+  assert.equal(engine.affordable(b, "glm-cheap", { newTokens: 1000 }).ok, true);
   assert.equal(engine.totalHeadroom(b), 5);
 });
 
@@ -299,8 +334,8 @@ test("shared pool: distinct users share one meter and degrade together", () => {
   assert.equal(engine.totalHeadroom(b), 20);
   engine.record(b, "glm-cheap", 20);
   // Pool exhausted ⇒ both fail at once.
-  assert.equal(engine.affordable(a, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
-  assert.equal(engine.affordable(b, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
+  assert.equal(engine.affordable(a, "glm-cheap", { newTokens: 1000 }).ok, false);
+  assert.equal(engine.affordable(b, "glm-cheap", { newTokens: 1000 }).ok, false);
 });
 
 test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model spend", () => {
@@ -319,7 +354,7 @@ test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model
   engine.record(r, "glm-cheap", 8);
   const premiumBinding = engine.bindingConstraint(r, "opus-premium");
   // Premium remaining is still its full sub-cap (10), not reduced by cheap spend.
-  assert.equal(engine.affordable(r, "opus-premium", { priorContextTokens: 0 }).remainingUsd, 10);
+  assert.equal(engine.affordable(r, "opus-premium", { newTokens: 0 }).remainingUsd, 10);
   assert.equal(premiumBinding?.modelScope?.[0], "opus-premium");
 });
 

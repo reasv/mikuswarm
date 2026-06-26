@@ -6,6 +6,7 @@ import { dumpBuiltContext, CACHE_BOUNDARIES, renderToolBlock, type BuiltContext,
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
+import { estimateObjectTokens } from "../context/tokens.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
@@ -51,6 +52,12 @@ export function composeSessionContextCeiling(
 ): number {
   return typeof override === "number" ? Math.min(contextWindow, override) : contextWindow;
 }
+
+// Prompt-cache TTL (spec PER-USER-LIMITS §5.3): the window within which the prior
+// request's prompt is still a cache hit, so the per-user estimate prices that prefix
+// at cache-read and only the new material at cache-write. Anthropic's default cache
+// retention is ~5 min; conservative outside it (cache-write throughout).
+const PROMPT_CACHE_TTL_MS = 300_000;
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
@@ -585,21 +592,54 @@ export class AgentSessionFactory {
       }
     }
     const userSelectionActive = userSelection && selectables.length > 0;
-    // Initial context-token estimate for the FIRST request's affordability estimate
-    // (no prior actuals yet; §5.3). Assigned after buildContext; read at request time.
+    // Initial context-token estimate for the FIRST request (the built context size;
+    // §5.3). Assigned after buildContext; seeds the exact running counter below.
     const initialContextEstimate = { value: 0 };
+    // Exact running input-token counter (spec §5.3): `agent.state.messages` holds only
+    // the LIVE rollout (the frozen base is prepended by transformContext + already in
+    // `initialContextEstimate`), so we seed from the built size and add the EXACT
+    // tokenization of each new live message ONCE. `cachedTokensAtLastRequest` is the
+    // prior request's prompt size (cache-read within the TTL); `lastRequestAtMs` dates
+    // the prior request for the cache-TTL test. O(delta) per request, not O(context).
+    const ctxCounter = { running: 0, seenMsgs: -1, cachedAtLast: 0, lastRequestAtMs: 0 };
+    const refreshRunningContext = (): void => {
+      const msgs = agentRef.agent?.state.messages;
+      if (!msgs) return;
+      if (ctxCounter.seenMsgs < 0) {
+        // First observation: the built context (incl. the kickoff turn already in
+        // state) is `initialContextEstimate`; do not re-tokenize it.
+        ctxCounter.running = initialContextEstimate.value;
+        ctxCounter.seenMsgs = msgs.length;
+        return;
+      }
+      if (msgs.length > ctxCounter.seenMsgs) {
+        try {
+          ctxCounter.running += estimateObjectTokens(convertToLlm(msgs.slice(ctxCounter.seenMsgs)));
+        } catch {
+          /* tokenization is best-effort; leave the prior running total (conservative) */
+        }
+        ctxCounter.seenMsgs = msgs.length;
+      }
+    };
+    // Count of §5.4 budget-capped re-drives so far (bounds the re-drive to one per
+    // preferred model — once each tier has degraded, the floor is reached).
+    let budgetTruncationCount = 0;
     // Per-request selection state the outer selector dispatches — re-resolved by the
     // pre-flight before each request (§6.2); defaults to the most-preferred model.
     let activeSelection: { fallback: BuiltModelFallback; requestedLogicalId: string; maxTokens?: number } =
       userSelectionActive
         ? { fallback: selectables[0]!.fallback, requestedLogicalId: selectables[0]!.requestedLogicalId }
         : { fallback, requestedLogicalId: modelKey };
-    // The §4.2 resolver (affordable ∧ healthy ∧ fits). `observed` is the measured
-    // prior-context size (last committed `totalTokens`), else the initial estimate.
-    const resolveUserSelection = (
-      observed: number,
-    ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean } => {
-      const estimate = { priorContextTokens: observed };
+    // The §4.2 resolver (affordable ∧ healthy ∧ fits). Builds the §5.3 estimate from
+    // the exact running counter: the cache-read prior prompt + the cache-write new
+    // material, split at the prompt-cache TTL (PROMPT_CACHE_TTL_MS).
+    const resolveUserSelection = (): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean } => {
+      refreshRunningContext();
+      const observed = ctxCounter.running;
+      const newTokens = Math.max(0, observed - ctxCounter.cachedAtLast);
+      const withinCacheTtl =
+        ctxCounter.lastRequestAtMs > 0 && Date.now() - ctxCounter.lastRequestAtMs < PROMPT_CACHE_TTL_MS;
+      const estimate = { cachedTokens: ctxCounter.cachedAtLast, newTokens, withinCacheTtl };
       let sawHealthyFit = false;
       for (const s of selectables) {
         const fits = s.fallback.operativeContextWindow >= observed;
@@ -702,6 +742,14 @@ export class AgentSessionFactory {
         // is still maintained by the tracker's persistence subscriber.
         onRequestCommitted: (message: AssistantMessage) => {
           usage.record(message.usage);
+          if (userSelectionActive) {
+            // Advance the prompt-cache baseline (spec §5.3): the just-committed
+            // request's prompt is now the cached prefix for the NEXT request's
+            // estimate, dated for the cache-TTL test.
+            refreshRunningContext();
+            ctxCounter.cachedAtLast = ctxCounter.running;
+            ctxCounter.lastRequestAtMs = Date.now();
+          }
           const budget = this.options.budget;
           if (budget?.record) {
             const u = message.usage;
@@ -842,13 +890,19 @@ export class AgentSessionFactory {
           // the chosen composite + budget-derived output cap for the outer selector,
           // and terminate (content-class, no retry burn) only when NO preference
           // qualifies — degradation finishes the rollout on a cheaper model rather than
-          // guillotining it. The first request uses the initial context estimate; later
-          // requests the last committed `totalTokens`.
+          // guillotining it. The resolver reads the exact running context counter and
+          // the prompt-cache split internally (§5.3).
           if (userSelectionActive) {
-            const observed = usage.snapshot().contextTokens ?? initialContextEstimate.value;
-            const picked = resolveUserSelection(observed);
+            const picked = resolveUserSelection();
             if (picked.ok) {
               activeSelection = picked.selection;
+              // Surface the live selection for the console (spec §14).
+              userLimit!.engine.noteSelection(
+                session.id,
+                userLimit!.ctx.userId,
+                userLimit!.ctx.roomId,
+                picked.selection.requestedLogicalId,
+              );
             } else {
               const binding = userLimit!.engine.bindingConstraint(userLimit!.resolution);
               this.options.logger?.warn("usage_limit_blocked", {
@@ -868,6 +922,48 @@ export class AgentSessionFactory {
           }
           return undefined;
         },
+        // §5.4 budget-capped re-drive: a `length`-truncated turn that hit the per-user
+        // output cap (below the served model's own `max_tokens`) is failed-not-
+        // delivered. The counter was just incremented by the truncated spend, so
+        // re-running the resolver picks the next-cheaper model (its reserved
+        // headroom). Bounded by the preference-set size. Only wired for per-user
+        // sessions (so non-per-user truncations deliver normally).
+        ...(userSelectionActive
+          ? {
+              onBudgetTruncation: (committed: AssistantMessage): "reselect" | "accept" => {
+                const cap = activeSelection.maxTokens;
+                const servedDefault =
+                  this.options.config.models[resolvedMember.logicalId]?.max_tokens ?? Number.POSITIVE_INFINITY;
+                // A length stop with the cap == the model's own max is a legitimate
+                // long answer, not a budget cap → deliver it.
+                if (cap === undefined || cap >= servedDefault) return "accept";
+                // Bound re-drives by the number of distinct preferred models — once
+                // each has had a turn, the floor is reached; deliver what we have.
+                if (budgetTruncationCount >= selectables.length) return "accept";
+                const prev = requestedMember.logicalId;
+                const picked = resolveUserSelection();
+                if (picked.ok && picked.selection.requestedLogicalId !== prev) {
+                  budgetTruncationCount++;
+                  activeSelection = picked.selection;
+                  userLimit!.engine.noteSelection(
+                    session.id,
+                    userLimit!.ctx.userId,
+                    userLimit!.ctx.roomId,
+                    picked.selection.requestedLogicalId,
+                  );
+                  this.options.logger?.info("user_limit_redrive", {
+                    sessionId: session.id,
+                    timelineKey: session.timelineKey,
+                    from: prev,
+                    to: picked.selection.requestedLogicalId,
+                    truncatedOutputTokens: committed.usage?.output ?? null,
+                  });
+                  return "reselect";
+                }
+                return "accept"; // no cheaper model remains (the floor) → deliver
+              },
+            }
+          : {}),
       },
     );
 

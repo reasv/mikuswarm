@@ -136,6 +136,19 @@ export interface RequestRetryContext {
    * without consuming retry budget. The hook owns its own logging.
    */
   checkCostBudget?: () => string | undefined;
+  /**
+   * Budget-capped-truncation decision (spec PER-USER-LIMITS §5.4). Fired AFTER
+   * {@link onRequestCommitted} when a clean `done` carries `stopReason: "length"`,
+   * so the per-user counter already reflects the (real) truncated spend. The hook
+   * decides whether that turn was a per-user BUDGET cap (the remaining headroom
+   * could not buy a complete turn at this model) and, if so, re-selects a cheaper
+   * model and returns `"reselect"` — the wrapper then DISCARDS the truncated turn
+   * ("failed, not delivered") and re-issues on the re-selected model, which carries
+   * the reserved headroom. Returns `"accept"` when the truncation is the model's own
+   * `max_tokens` (a legitimate long answer) or no cheaper model remains (the floor).
+   * Only wired for per-user sessions; bounded by the wrapper to avoid loops.
+   */
+  onBudgetTruncation?: (committed: AssistantMessage) => "reselect" | "accept";
 }
 
 /**
@@ -508,6 +521,11 @@ export function withRequestRetry(
           surface(errorEvent, "content");
           return;
         }
+        // §5.4 budget-capped re-drive bound: a generous backstop in case the hook
+        // ever fails to converge (it self-bounds by the preference-set size). No
+        // realistic per-user model set degrades more times than this.
+        let budgetReselects = 0;
+        const maxBudgetReselects = 16;
         for (let attempt = 0; ; attempt++) {
           const attemptStart = Date.now();
           const buffered: AssistantMessageEvent[] = [];
@@ -620,6 +638,30 @@ export function withRequestRetry(
                   ctx.onRequestCommitted?.(committed);
                 } catch {
                   /* best-effort: the capture hook can never affect the run */
+                }
+              }
+              // §5.4: a per-user BUDGET-capped (output-truncated) turn is "failed,
+              // not delivered" — `onRequestCommitted` above already recorded its
+              // (real) spend, so the per-user counter now reflects it. Ask the hook
+              // whether to re-select a cheaper model; on `"reselect"` DISCARD the
+              // truncated buffer and re-issue (the outer selector dispatches the
+              // re-selected model with its reserved headroom). Bounded; only fires
+              // for per-user sessions (the hook is otherwise unset).
+              if (
+                committed?.stopReason === "length" &&
+                ctx.onBudgetTruncation &&
+                budgetReselects < maxBudgetReselects
+              ) {
+                let decision: "reselect" | "accept" = "accept";
+                try {
+                  decision = ctx.onBudgetTruncation(committed);
+                } catch {
+                  decision = "accept";
+                }
+                if (decision === "reselect") {
+                  budgetReselects++;
+                  tapDiscarded(attempt + 1, "budget-capped turn re-driven on a cheaper model");
+                  continue; // re-issue with the re-selected model; truncated content dropped
                 }
               }
               flush(outer, buffered);
