@@ -690,9 +690,8 @@ const EnrichmentSchema = StrictObject({
 
 // X.com enrichment via the FxTwitter API + the x_fetch tool (ARCHITECTURE.md
 // §7a/§10). Top-level rather than [enrichment.fxtwitter]: two consumers share
-// it (the enrichment worker and the x_fetch tool), and the shallow
-// top-level-table merge makes nested additions to [enrichment] a foot-gun for
-// existing local configs. No byte caps here — all media fetches ride the
+// it (the enrichment worker and the x_fetch tool), and a flat top-level table
+// keeps the two seams' config side by side. No byte caps here — all media fetches ride the
 // global media.download_size_limit. The compact-tier truncation (280/140) is
 // a renderer constant, not config. Cross-field sanity (default_max_chars <=
 // max_chars_limit <= max_total_chars) is validated at app wiring.

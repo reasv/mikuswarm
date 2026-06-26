@@ -69,6 +69,42 @@ async function withConfigDir(
   }
 }
 
+// Like withConfigDir but writes several files; loadConfig merges them in ascending
+// filename order (00 → 90 → …).
+async function withConfigDirs(
+  files: Record<string, string>,
+  fn: (dir: string) => Promise<void>,
+): Promise<void> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-config-"));
+  try {
+    for (const [name, toml] of Object.entries(files)) {
+      await writeFile(path.join(dir, name), toml, "utf8");
+    }
+    await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("config: layers deep-merge — local overrides a field and inherits omitted siblings", async () => {
+  // 90 redefines [agent.sessions] with only ONE field. Under the old shallow
+  // top-level merge the whole `agent` subtree was replaced, dropping the sibling
+  // session knobs (the resume/followup silent-drop foot-gun). Deep merge keeps them.
+  const override = `
+[agent.sessions]
+max_concurrent = 5
+`;
+  await withConfigDirs(
+    { "00-base.toml": BASE_CONFIG, "90-over.toml": override },
+    async (dir) => {
+      const config = await loadConfig(dir, { env: false });
+      assert.equal(config.agent.sessions.max_concurrent, 5); // override wins
+      assert.equal(config.agent.sessions.max_concurrent_dm, 1); // inherited from base
+      assert.equal(config.agent.sessions.forced_completion_retries, 0); // inherited from base
+    },
+  );
+});
+
 test("config: observability server enabled with blank auth_token is rejected (issue #5)", async () => {
   const toml = `${BASE_CONFIG}
 [observability.server]

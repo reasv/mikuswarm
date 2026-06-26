@@ -908,7 +908,12 @@ Guidelines:
 
 [matrix.accounts.miku]
 homeserver = "${MATRIX_HOMESERVER}"
-access_token = "${MATRIX_ACCESS_TOKEN}"
+# access_token is intentionally NOT defaulted here: it is mutually exclusive with
+# password login (provider.ts selects token when present and non-empty, else
+# password), and because config layers now DEEP-merge, a templated default would
+# force MATRIX_ACCESS_TOKEN to be set on EVERY deployment — including the
+# password-login path that legitimately omits it. A token-login deployment sets
+# access_token in its own config layer.
 password = "${MATRIX_PASSWORD}"
 recovery_key = "${MATRIX_RECOVERY_KEY}"
 user_id = "${MATRIX_USER_ID}"
