@@ -50,19 +50,19 @@ coalesce_window_ms = 60000
 
 # Resumable sessions (spec RESUMABLE-SESSIONS). Replying to a message the bot sent
 # continues THAT session as a multi-turn rollout (it remembers what it did) instead
-# of spawning a fresh, amnesiac session. Off by default in both contexts; opt in
-# per context below. A wrong guess degrades to a fresh session, never to corruption
-# or message loss.
+# of spawning a fresh, amnesiac session. On by default in both contexts; set a
+# context false below to disable it there. A wrong guess degrades to a fresh
+# session, never to corruption or message loss.
 [agent.sessions.resume]
 # Reserve the scarce single resume for the original asker (§6/§7): a reply from a
 # different user starts a fresh session. Global; inert in DMs. Explicit agent
 # delegations bypass this — it gates human replies only.
 same_user_only = true
 
-# Resume is off unless the message's context is enabled here (§14).
+# Resume is on by default per context; set false to disable it there (§14).
 [agent.sessions.resume.enabled]
-dm = false
-group = false
+dm = true
+group = true
 
 # Resume time window (§7), per context. A reply more than this many ms after the
 # session completed starts a fresh session. 0 or -1 = unlimited.
