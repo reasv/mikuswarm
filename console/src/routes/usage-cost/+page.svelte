@@ -142,6 +142,15 @@
 		})
 	);
 
+	// Per-user / shared-pool meters (spec PER-USER-LIMITS §14), same blocked→near→ok
+	// ordering. Each carries its rendered partition key + optional model sub-scope.
+	const userLimits = $derived(
+		[...(budgets.data?.userLimits ?? [])].sort((a, b) => {
+			const rank = (s: string) => (s === 'blocked' ? 0 : s === 'near' ? 1 : 2);
+			return rank(a.state) - rank(b.state) || b.fraction - a.fraction;
+		})
+	);
+
 	// Stable color per group. Known classes get fixed hues; models cycle a palette.
 	const CLASS_COLORS: Record<string, string> = {
 		agent_loop: '#6366f1', // indigo
@@ -583,6 +592,57 @@
 				</div>
 			{/if}
 		</section>
+
+		<!-- 4b. Per-user limits — materialized per-user / shared-pool meters (spec
+		     PER-USER-LIMITS §14). Only shown when the feature is active and at least
+		     one meter has materialized (a human session resolved a rule). -->
+		{#if userLimits.length > 0}
+			<section>
+				<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+					Per-user limits
+				</h2>
+				<div class="grid grid-cols-1 gap-2 md:grid-cols-2">
+					{#each userLimits as m (m.meterKey)}
+						<div class="rounded-lg border p-3">
+							<div class="flex items-center justify-between gap-2">
+								<span class="truncate font-mono text-sm font-semibold" title={m.partitionKey}>
+									{m.isUserPartition ? '👤' : '👥'}
+									{m.partitionKey}
+								</span>
+								<span
+									class={cn(
+										'rounded px-1.5 py-0.5 text-[10px] font-medium capitalize',
+										STATE_BADGE[m.state] ?? ''
+									)}
+								>
+									{m.state}
+								</span>
+							</div>
+							<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+								<div
+									class={cn('h-full rounded-full', barColor(m.state))}
+									style={`width:${Math.min(100, m.fraction * 100).toFixed(1)}%`}
+								></div>
+							</div>
+							<div class="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+								<span class="font-mono text-foreground">
+									{fmtUsd(m.spentUsd)} / {fmtUsd(m.capUsd)}
+								</span>
+								<span>{(m.fraction * 100).toFixed(0)}%</span>
+							</div>
+							<div class="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
+								<span class="max-w-[60%] truncate">
+									{m.modelScope ? m.modelScope.join(', ') : 'all models'}
+								</span>
+								<span title={fmtTime(m.resetsAt)}>
+									{windowLabel(m.window)} · resets {fmtResetsIn(m.resetsAt)}
+								</span>
+							</div>
+						</div>
+					{/each}
+				</div>
+			</section>
+		{/if}
 
 		<!-- 5. Detail tabs — Recent sessions / Recent paid calls / User leaderboard. Limits stays
 		     above as its own always-visible section; these three switch via ?tab=. -->

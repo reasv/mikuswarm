@@ -328,8 +328,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 30", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 30);
+test("LATEST_SCHEMA_VERSION is 31", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 31);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1588,6 +1588,104 @@ test("v29 -> v30 backfills logical_model_id = model_id on legacy usage_events ro
         ),
         "idx_usage_events_logical_model_ts created",
       );
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Per-user limits: v30 -> v31 migration (spec PER-USER-LIMITS §8.3). A v30
+// `usage_events` table (logical_model_id present, but no requested_model_id /
+// budget_partition / room_id columns + seed indexes) with legacy rows is opened
+// to LATEST; the three additive NULLABLE columns land (legacy rows stay null —
+// no backfill), and the four seed indexes exist.
+// ---------------------------------------------------------------------------
+
+/** The v30 `usage_events` shape: the v29 table PLUS logical_model_id + its index,
+ *  but MINUS the per-user columns/indexes added by the v30 -> v31 step. */
+const V30_USAGE_EVENTS = `
+create table usage_events (
+  id text primary key,
+  ts integer not null,
+  class text not null,
+  agent_session_id text,
+  session_type text,
+  timeline_key text,
+  trigger_sender_id text,
+  tool_name text,
+  model_id text not null,
+  logical_model_id text not null default '',
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost_usd real not null default 0,
+  ref text,
+  created_at integer not null
+);
+create index if not exists idx_usage_events_ts        on usage_events(ts);
+create index if not exists idx_usage_events_logical_model_ts on usage_events(logical_model_id, ts);
+`;
+
+test("v30 -> v31 adds per-user columns (requested_model_id / budget_partition / room_id) + seed indexes, no backfill", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v30-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS);
+    legacy.exec(V30_USAGE_EVENTS);
+    legacy
+      .prepare(
+        `insert into usage_events (id, ts, class, model_id, logical_model_id, cost_usd, created_at)
+           values (@id, @ts, @class, @modelId, @logicalId, @cost, @createdAt)`,
+      )
+      .run({ id: "u-1", ts: 1_000, class: "agent_loop", modelId: "wire/opus", logicalId: "opus-premium", cost: 0.5, createdAt: 1_000 });
+    legacy.pragma("user_version = 30");
+
+    const colsBefore = (legacy.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(!colsBefore.includes("requested_model_id"), "v30 fixture must NOT have requested_model_id yet");
+    assert.ok(!colsBefore.includes("budget_partition"), "v30 fixture must NOT have budget_partition yet");
+    assert.ok(!colsBefore.includes("room_id"), "v30 fixture must NOT have room_id yet");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+      const colsAfter = storage.read((db) =>
+        (db.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name),
+      );
+      for (const col of ["requested_model_id", "budget_partition", "room_id"]) {
+        assert.ok(colsAfter.includes(col), `${col} column added`);
+      }
+      // Legacy row stays null on the new columns (no backfill — it pre-dates the meters).
+      const row = storage.read((db) =>
+        db
+          .prepare(`select requested_model_id, budget_partition, room_id from usage_events where id = 'u-1'`)
+          .get() as { requested_model_id: string | null; budget_partition: string | null; room_id: string | null },
+      );
+      assert.equal(row.requested_model_id, null, "legacy requested_model_id null");
+      assert.equal(row.budget_partition, null, "legacy budget_partition null");
+      assert.equal(row.room_id, null, "legacy room_id null");
+      const indexes = storage.read((db) =>
+        (db.pragma(`index_list(usage_events)`) as Array<{ name: string }>).map((i) => i.name),
+      );
+      for (const idx of [
+        "idx_usage_events_sender_ts",
+        "idx_usage_events_partition_ts",
+        "idx_usage_events_requested_model_ts",
+        "idx_usage_events_room_ts",
+      ]) {
+        assert.ok(indexes.includes(idx), `${idx} created`);
+      }
     } finally {
       await storage.waitForIdle();
       storage.close();

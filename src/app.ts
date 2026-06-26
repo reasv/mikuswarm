@@ -117,7 +117,7 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
-import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeRateLimitedClaimGate, type BudgetHooks, type SpendDescriptor, type AdmissionResult } from "./budget/index.js";
+import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeRateLimitedClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
@@ -351,6 +351,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // pause); the caption pool likewise reads both at call time in its worker loop.
   // Filled exactly once, before any work runs.
   const budgetHooks: BudgetHooks = {};
+
+  // Per-user cost limits & model selection (spec PER-USER-LIMITS). The engine is
+  // constructed in the budget-wiring block below (after the factory exists);
+  // `userLimitResolutions` holds each ACTIVE human session's frozen cascade
+  // resolution so the single `recordUsageEvent` fan-in can attribute BOTH the
+  // agent-loop AND tool lanes (§6) to its partitioned counters. Cleared on settle.
+  let userLimitEngine: UserLimitEngine | undefined;
+  const userLimitResolutions = new Map<string, { resolution: UserLimitResolution; ctx: UserLimitContext }>();
 
   const retrievalConfig = resolveRetrievalConfig(config.retrieval);
   let retrieval: RetrievalSubsystem | undefined;
@@ -969,6 +977,42 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       logger: logger.child("budget"),
     });
 
+    // Per-user limits engine (spec PER-USER-LIMITS §8.2). A sibling to the
+    // BudgetEngine, gating ONLY the human agent loop. Off (inert) when
+    // `[[user_limits]]` is absent/empty. Cross-field validation fails fast here,
+    // mirroring `normalizeLimits` (the explicit-deployment-config convention).
+    {
+      const normalizedUser = normalizeUserLimits(config.user_limits as never, {
+        defaultTz: config.agent.timezone ?? "UTC",
+        knownModelIds,
+      });
+      if (normalizedUser.fatal.length > 0) {
+        throw new Error(`invalid [[user_limits]] config:\n  ${normalizedUser.fatal.join("\n  ")}`);
+      }
+      for (const warning of normalizedUser.warnings)
+        logger.warn("user_limit_config_warning", { warning });
+      const ul = new UserLimitEngine({
+        rules: normalizedUser.rules,
+        sumUsageCost: (filter) => storage.sumUsageCost(filter),
+        minUsageTs: (filter) => storage.minUsageTs(filter),
+        // Face cost rates of the REQUESTED model (§7) — per-MTok, by logical id.
+        costRatesFor: (logicalId) => {
+          const m = config.models[logicalId];
+          if (!m) return undefined;
+          return { inputPerMTok: m.cost?.input ?? 0, outputPerMTok: m.cost?.output ?? 0 };
+        },
+        maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
+        zeroCostModelIds,
+        viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
+        logger: logger.child("user-limits"),
+      });
+      userLimitEngine = ul;
+      if (ul.enabled) {
+        ul.start();
+        logger.info("user_limits_active", { rules: normalizedUser.rules.length });
+      }
+    }
+
     const recordUsageEvent = (event: UsageEventInput): void => {
       // In-memory increment first (synchronous, hot-path authoritative), then the
       // durable append (queued, best-effort — a ledger failure must never fail
@@ -989,6 +1033,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       //      most once per logical event — a double-fire is counted twice by every
       //      covering rule.
       engine.record(event);
+      // Per-user partitioned counters (spec PER-USER-LIMITS §8.2): increment every
+      // covering meter for the triggering session's FROZEN resolution. Fires for BOTH
+      // the agent loop and its tool lane (§6) — the single fan-in is the one place
+      // that sees both. Coverage keys on the REQUESTED model (the agent-loop selector's
+      // choice), falling back to the lane's logical model (tool spend has no requested
+      // model → counts the fungible total, never a foreign sub-cap). Background/
+      // proactive lanes have no resolution entry and are skipped.
+      if (userLimitEngine && (event.class === "agent_loop" || event.class === "tool")) {
+        const entry = event.agentSessionId ? userLimitResolutions.get(event.agentSessionId) : undefined;
+        if (entry) {
+          const coverageModel = event.requestedModelId ?? event.logicalModelId ?? event.modelId;
+          userLimitEngine.record(entry.resolution, coverageModel, event.costUsd);
+        }
+      }
       void storage.insertUsageEvent(event).catch((error) => {
         logger.warn("usage_event_insert_failed", {
           class: event.class,
@@ -1021,6 +1079,46 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     } catch {
       return new Date(ms).toISOString();
     }
+  };
+
+  // Relative duration to a reset, compact ("3h 12m", "2d", "now") — the {resets_in}
+  // token of a per-user refusal (spec PER-USER-LIMITS §12).
+  const formatDurationShort = (ms: number): string => {
+    if (!(ms > 0)) return "now";
+    const totalMin = Math.round(ms / 60_000);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    if (h >= 24) {
+      const d = Math.floor(h / 24);
+      const rh = h % 24;
+      return rh ? `${d}d ${rh}h` : `${d}d`;
+    }
+    if (h > 0) return m ? `${h}h ${m}m` : `${h}h`;
+    return `${m}m`;
+  };
+
+  // Render a per-user refusal template (spec PER-USER-LIMITS §12): the richer token
+  // set resolved against the trigger + the binding constraint. `{resets_at}` /
+  // `{resets_in}` render empty for a cap-0 ban (no meaningful reset).
+  const renderUserLimitRefusal = (
+    template: string,
+    ctx: UserLimitContext,
+    binding: ResolvedConstraint | undefined,
+    displayName: string,
+  ): string => {
+    const resetsAt = binding ? userLimitEngine?.accurateResetsAt(binding) : undefined;
+    const window = binding
+      ? binding.window.type === "rolling"
+        ? `${binding.window.duration} rolling`
+        : `this ${binding.window.period} (${binding.window.tz})`
+      : "";
+    return template
+      .replace(/\{display_name\}/g, displayName)
+      .replace(/\{user_id\}/g, ctx.userId)
+      .replace(/\{limit\}/g, binding ? `$${binding.cap.toFixed(2)}` : "")
+      .replace(/\{window\}/g, window)
+      .replace(/\{resets_at\}/g, resetsAt !== undefined ? formatResetsAt(resetsAt) : "")
+      .replace(/\{resets_in\}/g, resetsAt !== undefined ? formatDurationShort(resetsAt - Date.now()) : "");
   };
 
   // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3): returns an
@@ -4009,6 +4107,74 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       drainNextQueuedTrigger(session.timelineKey);
       return;
     }
+    // Per-user limits — Gate A (spec PER-USER-LIMITS §6.1). Resolved BEFORE the §8e
+    // admission gate so the selected (possibly upgraded) model's chain — not the
+    // session-type default — is what §8e gates on. HUMAN agent loop only; proactive/
+    // background never gate. Build the trigger ctx, resolve the per-field cascade,
+    // refuse a banned / fully-out-of-budget user (the optional templated reply), and
+    // otherwise FREEZE the resolution for per-request selection + the dynamic ceiling.
+    let userLimitForCreate:
+      | { engine: UserLimitEngine; resolution: UserLimitResolution; ctx: UserLimitContext }
+      | undefined;
+    let userCeilingOverride: number | undefined;
+    // The per-user-selected INITIAL model (logical id), overriding the session-type
+    // default for the §8e admission chain (§6.1). Undefined when per-user is inactive.
+    let initialUserModel: string | undefined;
+    if (!proactive && userLimitEngine?.enabled) {
+      const userId = inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id;
+      if (userId) {
+        const ctx: UserLimitContext = { userId, roomId: roomIdFromTimelineKey(inbound.timelineKey) };
+        const resolution = userLimitEngine.resolve(ctx);
+        if (resolution.active) {
+          const preferred = resolution.models ?? [factory.resolveLogicalModelId(session.sessionType)];
+          // Coarse admission (§6.1): the first preferred model with headroom for a
+          // minimal first turn (prior context ≈ 0). Undefined ⇒ banned / fully out of
+          // budget → refuse here; the precise estimate + degradation run at Gate B.
+          initialUserModel = resolution.banned
+            ? undefined
+            : preferred.find(
+                (m) => userLimitEngine!.affordable(resolution, m, { priorContextTokens: 0 }).ok,
+              );
+          if (!initialUserModel) {
+            const displayName =
+              inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;
+            const binding = userLimitEngine.bindingConstraint(resolution);
+            logger.warn("usage_limit_blocked", {
+              gate: "user_admission",
+              sessionId: session.id,
+              timelineKey: session.timelineKey,
+              userId,
+              banned: resolution.banned,
+              binding: binding
+                ? { partitionKey: binding.partitionKey, capUsd: binding.cap, models: binding.modelScope }
+                : undefined,
+            });
+            const template = resolution.messageTemplate;
+            if (template) {
+              const body = renderUserLimitRefusal(template, ctx, binding, displayName);
+              void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
+                logger.warn("user_limit_rejection_send_failed", {
+                  sessionId: session.id,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              });
+            }
+            sessions.markDiscarded(session.id);
+            drainNextQueuedTrigger(session.timelineKey);
+            return;
+          }
+          userLimitForCreate = { engine: userLimitEngine, resolution, ctx };
+          userLimitResolutions.set(session.id, { resolution, ctx });
+          sessions.onSettle(session.id, () => userLimitResolutions.delete(session.id));
+          // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch).
+          // An exempt/uncapped user contributes ∞ → no change to the static ceiling.
+          const staticCeiling = factory.resolveSessionCostCeiling(session.sessionType);
+          const headroom = userLimitEngine.totalHeadroom(resolution);
+          const effective = Math.min(staticCeiling ?? Infinity, headroom ?? Infinity);
+          if (Number.isFinite(effective)) userCeilingOverride = effective;
+        }
+      }
+    }
     // Period cost limits — triggered/proactive admission gate (spec
     // USAGE-COST-LIMITS §6.3 / §2.1). Refuse to spawn when the session's own
     // covering rules are over budget OR a class it structurally depends on
@@ -4017,9 +4183,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // already clamps its cadence). Not queued — an hours-late autonomous reply is
     // worse than a clear "back at X". Reuses the discard/drain plumbing above.
     if (budgetHooks.engine) {
+      // Gate §8e on the per-user-SELECTED model's chain when active (spec
+      // PER-USER-LIMITS §6.1) — so a §8e per-model cap on the session-type default
+      // never refuses a session that will actually run on a different (upgraded)
+      // model. Falls back to the session-type default when per-user is inactive.
       let admissionModelId: string | undefined;
       try {
-        admissionModelId = factory.resolveModelId(session.sessionType);
+        admissionModelId = initialUserModel
+          ? factory.resolveUpstreamModelId(initialUserModel)
+          : factory.resolveModelId(session.sessionType);
       } catch {
         admissionModelId = undefined;
       }
@@ -4029,7 +4201,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // model-id resolution above — a throw leaves it undefined → head-only gate.
       let admissionChain: string[] | undefined;
       try {
-        admissionChain = factory.resolveModelChainLogicalIds(session.sessionType);
+        admissionChain = initialUserModel
+          ? factory.resolveModelChainLogicalIdsForModel(initialUserModel)
+          : factory.resolveModelChainLogicalIds(session.sessionType);
       } catch {
         admissionChain = undefined;
       }
@@ -4124,6 +4298,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         {
           proactive: proactive ? true : undefined,
           usage,
+          // Per-user selection input + dynamic ceiling (spec PER-USER-LIMITS §6).
+          // Undefined for proactive / non-active resolutions → today's single-model path.
+          userLimit: userLimitForCreate,
+          costCeilingOverride: userCeilingOverride,
           // Drain cancellation (spec §7.2): a build waiting on a summary job
           // aborts cleanly at shutdown instead of out-living the worker pool.
           abortSignal: drainAbort.signal,
@@ -4172,8 +4350,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // here.
     // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) and
     // share it between the settle log (self-contained spend-vs-ceiling line) and
-    // the soft-warn watcher, rather than resolving it twice.
-    const costCeiling = factory.resolveSessionCostCeiling(session.sessionType);
+    // the soft-warn watcher, rather than resolving it twice. The per-user dynamic
+    // ceiling (PER-USER-LIMITS §6.3) tightens it to the user's remaining headroom.
+    const costCeiling = userCeilingOverride ?? factory.resolveSessionCostCeiling(session.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: session.id,
@@ -4567,6 +4746,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       },
       // Period-budget rule statuses for the Usage & Cost page (spec USAGE-COST-LIMITS §7).
       budgetEngine: budgetHooks.engine,
+      // Per-user limits meters for the Usage & Cost page (spec PER-USER-LIMITS §14).
+      userLimitEngine,
       logger: logger.child("console"),
     });
     await consoleServer.start();
@@ -4601,6 +4782,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // Stop the proactive scheduler first: clear its per-channel timers so no
         // new proactive run is launched while the rest of the runtime tears down.
         proactiveScheduler.stop();
+        // Stop the per-user limits reconcile tick (spec PER-USER-LIMITS §8.2).
+        userLimitEngine?.stop();
         // Stop the console first: it stops accepting requests and tears down any
         // open SSE streams before the live state it reads begins shutting down.
         if (consoleServer) await consoleServer.stop();

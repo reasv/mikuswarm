@@ -1,0 +1,334 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  UserLimitEngine,
+  compileGlob,
+  homeserverOf,
+  renderPartition,
+  type ModelCostRates,
+  type NormalizedUserLimitRule,
+  type UserLimitContext,
+} from "../src/budget/user-limits.js";
+import { normalizeUserLimits, type RawUserLimitRule } from "../src/budget/normalize-user-limits.js";
+
+// A silent logger satisfying the engine's Logger shape.
+const logger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+  child() {
+    return logger;
+  },
+} as never;
+
+const RATES: Record<string, ModelCostRates> = {
+  // $15/$75 per MTok (Opus-class).
+  "opus-premium": { inputPerMTok: 15, outputPerMTok: 75 },
+  // $0.5/$2 per MTok (cheap).
+  "glm-cheap": { inputPerMTok: 0.5, outputPerMTok: 2 },
+  free: { inputPerMTok: 0, outputPerMTok: 0 },
+};
+const MAX_TOKENS: Record<string, number> = { "opus-premium": 32000, "glm-cheap": 8000, free: 8000 };
+const KNOWN_MODELS = new Set(["opus-premium", "glm-cheap", "free", "default"]);
+
+function normalize(raw: RawUserLimitRule[]): NormalizedUserLimitRule[] {
+  const r = normalizeUserLimits(raw, { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
+  assert.deepEqual(r.fatal, [], `unexpected fatals: ${r.fatal.join("; ")}`);
+  return r.rules;
+}
+
+function makeEngine(
+  raw: RawUserLimitRule[],
+  opts?: { sumUsageCost?: (f: { since: number }) => number; now?: number },
+): UserLimitEngine {
+  return new UserLimitEngine({
+    rules: normalize(raw),
+    sumUsageCost: opts?.sumUsageCost ?? (() => 0),
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => opts?.now ?? 1_000_000,
+  });
+}
+
+const ROLL24: RawUserLimitRule["window"] = { type: "rolling", duration: "24h" };
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+test("compileGlob: anchored fnmatch, * = any run incl empty, case-sensitive", () => {
+  assert.ok(compileGlob("@alice:hs.org")("@alice:hs.org"));
+  assert.ok(!compileGlob("@alice:hs.org")("@bob:hs.org"));
+  assert.ok(compileGlob("*:trusted.hs")("@x:trusted.hs"));
+  assert.ok(compileGlob("*:trusted.hs")(":trusted.hs")); // * matches empty
+  assert.ok(!compileGlob("*:trusted.hs")("@x:other.hs"));
+  assert.ok(!compileGlob("ABC")("abc")); // case-sensitive
+  // A literal dot is not a wildcard.
+  assert.ok(!compileGlob("a.c")("axc"));
+});
+
+test("homeserverOf + renderPartition", () => {
+  assert.equal(homeserverOf("@alice:hs.org"), "hs.org");
+  const ctx: UserLimitContext = { userId: "@alice:hs.org", roomId: "!room:hs.org" };
+  assert.equal(renderPartition("{user_id}", ctx), "@alice:hs.org");
+  assert.equal(renderPartition("room:{room_id}", ctx), "room:!room:hs.org");
+  assert.equal(renderPartition("hs:{homeserver}", ctx), "hs:hs.org");
+  assert.equal(renderPartition("staff", ctx), "staff");
+});
+
+// ─── Normalizer ─────────────────────────────────────────────────────────────
+
+test("normalize: max_usd shorthand expands to one fungible total constraint", () => {
+  const rules = normalize([{ user: "*", max_usd: 5, window: ROLL24 }]);
+  assert.equal(rules.length, 1);
+  assert.equal(rules[0]!.constraints.length, 1);
+  assert.equal(rules[0]!.constraints[0]!.maxUsd, 5);
+  assert.equal(rules[0]!.constraints[0]!.models, undefined);
+  assert.equal(rules[0]!.constraints[0]!.partition, "{user_id}");
+  assert.equal(rules[0]!.hasBudgetBlock, true);
+});
+
+test("normalize: max_usd = 0 is a ban; max_usd < 0 is exempt (no constraint)", () => {
+  const ban = normalize([{ user: "@x:h", max_usd: 0 }]);
+  assert.equal(ban[0]!.constraints.length, 1);
+  assert.equal(ban[0]!.constraints[0]!.maxUsd, 0);
+  const exempt = normalize([{ user: "@x:h", max_usd: -1 }]);
+  assert.equal(exempt[0]!.constraints.length, 0);
+  assert.equal(exempt[0]!.hasBudgetBlock, true);
+});
+
+test("normalize fatals: no match dimension, space (Phase 2), unknown model, sub-cap rules", () => {
+  const noDim = normalizeUserLimits([{ max_usd: 5, window: ROLL24 }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
+  assert.ok(noDim.fatal.some((f) => /at least one match dimension/.test(f)));
+
+  const space = normalizeUserLimits([{ space: "!s:h", max_usd: 5, window: ROLL24 }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
+  assert.ok(space.fatal.some((f) => /space matching not yet supported/.test(f)));
+
+  const unknown = normalizeUserLimits([{ user: "*", models: ["nope"] }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
+  assert.ok(unknown.fatal.some((f) => /unknown model "nope"/.test(f)));
+
+  // Sub-cap requires the rule to declare models.
+  const subNoModels = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 2, window: ROLL24, models: ["opus-premium"] }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(subNoModels.fatal.some((f) => /requires the rule to declare models/.test(f)));
+
+  // Sub-cap model not in the rule's models.
+  const subForeign = normalizeUserLimits(
+    [{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 2, window: ROLL24, models: ["opus-premium"] }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(subForeign.fatal.some((f) => /not in the rule's models/.test(f)));
+});
+
+test("normalize fatals: bad partition var, {space_id}, shorthand+limits, >1 shared pool", () => {
+  const badVar = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "{nope}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(badVar.fatal.some((f) => /unknown partition variable/.test(f)));
+
+  const space = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "space:{space_id}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(space.fatal.some((f) => /\{space_id\} partition not yet supported/.test(f)));
+
+  const both = normalizeUserLimits(
+    [{ user: "*", max_usd: 5, window: ROLL24, limits: [{ max_usd: 3, window: ROLL24 }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(both.fatal.some((f) => /either max_usd \(shorthand\) or limits/.test(f)));
+
+  const twoPools = normalizeUserLimits(
+    [
+      {
+        user: "*",
+        limits: [
+          { max_usd: 50, window: ROLL24, partition: "staff" },
+          { max_usd: 80, window: ROLL24, partition: "public" },
+        ],
+      },
+    ],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(twoPools.fatal.some((f) => /at most one shared pool/.test(f)));
+});
+
+test("normalize warns: positive sub-cap with no covering total, divergent static caps", () => {
+  const noTotal = normalizeUserLimits(
+    [{ user: "*", models: ["opus-premium", "glm-cheap"], limits: [{ max_usd: 2, window: ROLL24, models: ["opus-premium"] }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(noTotal.warnings.some((w) => /reserves no headroom/.test(w)));
+
+  const divergent = normalizeUserLimits(
+    [
+      {
+        user: "*",
+        limits: [
+          { max_usd: 50, window: ROLL24, partition: "staff" },
+          { max_usd: 80, window: ROLL24, partition: "staff" },
+        ],
+      },
+    ],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(divergent.warnings.some((w) => /divergent caps/.test(w)));
+});
+
+// ─── Cascade ──────────────────────────────────────────────────────────────────
+
+test("cascade: FIRST matching rule wins each value field; message cascades independently of the budget block", () => {
+  // Precedence is authored order — more-specific rules go ABOVE the general ones
+  // (spec §8.1: "Placed ABOVE … so it wins the cascade"). A message override and a
+  // ban therefore sit above the universal default + global budget.
+  const engine = makeEngine([
+    // 1) message override for one user (no budget block → budget cascades PAST).
+    { user: "@special:hs", trigger_rejection_message: "special refusal" },
+    // 2) ban a user (no message → message cascades PAST to rule 3).
+    { user: "@spammer:bad", max_usd: 0 },
+    // 3) universal default refusal message only.
+    { user: "*", trigger_rejection_message: "default refusal {resets_at}" },
+    // 4) global default budget.
+    { user: "*", models: ["opus-premium", "glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] },
+  ]);
+
+  // Special user: message from rule 1; budget block cascades past to rule 4.
+  const special = engine.resolve({ userId: "@special:hs" });
+  assert.equal(special.messageTemplate, "special refusal");
+  assert.deepEqual(special.models, ["opus-premium", "glm-cheap"]);
+  assert.equal(special.active, true);
+
+  // Spammer: banned (rule 2); message cascades past to rule 3.
+  const spammer = engine.resolve({ userId: "@spammer:bad" });
+  assert.equal(spammer.banned, true);
+  assert.equal(spammer.messageTemplate, "default refusal {resets_at}");
+
+  // Plain user: budget + message from the defaults (rules 3 + 4).
+  const plain = engine.resolve({ userId: "@joe:hs" });
+  assert.deepEqual(plain.models, ["opus-premium", "glm-cheap"]);
+  assert.equal(plain.messageTemplate, "default refusal {resets_at}");
+});
+
+test("cascade: no matching rule ⇒ inert (matched=false, inactive)", () => {
+  const engine = makeEngine([{ user: "@only:hs", max_usd: 5, window: ROLL24 }]);
+  const r = engine.resolve({ userId: "@other:hs" });
+  assert.equal(r.matched, false);
+  assert.equal(r.active, false);
+});
+
+// ─── Estimation + degradation ──────────────────────────────────────────────────
+
+test("affordable: caps output at remaining headroom; reports unaffordable below viable_min", () => {
+  const engine = makeEngine([{ user: "*", models: ["opus-premium"], limits: [{ max_usd: 5, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  const aff = engine.affordable(r, "opus-premium", { priorContextTokens: 10_000 });
+  assert.equal(aff.ok, true);
+  // input_cost = 10000/1e6 * 15 = 0.15; max_output = floor((5-0.15)/(75/1e6)) = 64666; capped at model max 32000.
+  assert.equal(aff.maxOutput, 32000);
+
+  // A user already at the cap cannot afford a turn.
+  engine.record(r, "opus-premium", 5);
+  const after = engine.affordable(r, "opus-premium", { priorContextTokens: 10_000 });
+  assert.equal(after.ok, false);
+});
+
+test("degradation: an exhausted premium sub-cap makes premium unaffordable but the cheap model still affordable", () => {
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["opus-premium", "glm-cheap"],
+      limits: [
+        { max_usd: 5, window: ROLL24 }, // fungible total
+        { max_usd: 2, window: ROLL24, models: ["opus-premium"] }, // premium sub-cap
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Spend the premium sub-cap (counts toward total + sub-cap).
+  engine.record(r, "opus-premium", 2);
+  // Premium: remaining = min(total 5-2=3, sub-cap 2-2=0) = 0 ⇒ unaffordable.
+  assert.equal(engine.affordable(r, "opus-premium", { priorContextTokens: 5000 }).ok, false);
+  // Cheap: only the total covers it; remaining = 3 ⇒ affordable (rollout continues cheap).
+  assert.equal(engine.affordable(r, "glm-cheap", { priorContextTokens: 5000 }).ok, true);
+  // The reserved $3 is the difference the sub-cap guaranteed for continuation.
+  assert.equal(engine.totalHeadroom(r), 3);
+});
+
+test("zero-cost model bypass: always affordable regardless of counters", () => {
+  const engine = makeEngine([{ user: "*", models: ["free"], limits: [{ max_usd: 0, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Even with a $0 total cap, a free model is affordable (cost = rate × tokens = 0).
+  assert.equal(engine.affordable(r, "free", { priorContextTokens: 100_000 }).ok, true);
+});
+
+// ─── Partitioning ───────────────────────────────────────────────────────────
+
+test("per-user partition: each user's spend is isolated (default {user_id})", () => {
+  const engine = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]);
+  const a = engine.resolve({ userId: "@a:hs" });
+  const b = engine.resolve({ userId: "@b:hs" });
+  engine.record(a, "glm-cheap", 5);
+  assert.equal(engine.affordable(a, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
+  // B is untouched by A's spend.
+  assert.equal(engine.affordable(b, "glm-cheap", { priorContextTokens: 1000 }).ok, true);
+  assert.equal(engine.totalHeadroom(b), 5);
+});
+
+test("shared pool: distinct users share one meter and degrade together", () => {
+  const engine = makeEngine([
+    {
+      user: ["@a:hs", "@b:hs"],
+      models: ["glm-cheap"],
+      limits: [{ max_usd: 50, window: ROLL24, partition: "staff" }],
+    },
+  ]);
+  const a = engine.resolve({ userId: "@a:hs" });
+  const b = engine.resolve({ userId: "@b:hs" });
+  // The shared-pool key is denormalized onto the ledger for both.
+  assert.equal(a.ledgerPartitionKey, "staff");
+  assert.equal(b.ledgerPartitionKey, "staff");
+  // A spends $30 of the shared $50; B sees only $20 remaining.
+  engine.record(a, "glm-cheap", 30);
+  assert.equal(engine.totalHeadroom(b), 20);
+  engine.record(b, "glm-cheap", 20);
+  // Pool exhausted ⇒ both fail at once.
+  assert.equal(engine.affordable(a, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
+  assert.equal(engine.affordable(b, "glm-cheap", { priorContextTokens: 1000 }).ok, false);
+});
+
+test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model spend", () => {
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["opus-premium", "glm-cheap"],
+      limits: [
+        { max_usd: 100, window: ROLL24 },
+        { max_usd: 10, window: ROLL24, models: ["opus-premium"] },
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Cheap spend counts toward the total only, never the opus-premium sub-cap.
+  engine.record(r, "glm-cheap", 8);
+  const premiumBinding = engine.bindingConstraint(r, "opus-premium");
+  // Premium remaining is still its full sub-cap (10), not reduced by cheap spend.
+  assert.equal(engine.affordable(r, "opus-premium", { priorContextTokens: 0 }).remainingUsd, 10);
+  assert.equal(premiumBinding?.modelScope?.[0], "opus-premium");
+});
+
+test("seed: a meter materializes from the ledger sum on first access", () => {
+  // The fake ledger reports $4 already spent for any matching filter.
+  const engine = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }], {
+    sumUsageCost: () => 4,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Seeded at $4 → only $1 headroom remains.
+  assert.equal(engine.totalHeadroom(r), 1);
+});

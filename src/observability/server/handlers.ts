@@ -335,10 +335,17 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
   sendJson(res, 200, ctx.deps.storage.getUsageLeaderboard(since, now, bucketMs, limit));
 }
 
-/** GET /api/usage/budgets — every configured rule's live status (§6.2 / §7.1 #3). */
+/**
+ * GET /api/usage/budgets — every configured period rule's live status (§6.2 /
+ * §7.1 #3) PLUS the per-user limits meters (spec PER-USER-LIMITS §14): each
+ * materialized per-user / shared-pool counter's spent/cap/resetsAt per binding
+ * constraint. `userLimits` is empty when the feature is off or no meter has
+ * materialized yet (no human session has resolved a rule since startup).
+ */
 export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];
-  sendJson(res, 200, { rules });
+  const userLimits = ctx.deps.userLimitEngine?.statuses() ?? [];
+  sendJson(res, 200, { rules, userLimits });
 }
 
 /**

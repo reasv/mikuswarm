@@ -1082,6 +1082,53 @@ const LimitRuleSchema = StrictObject({
   trigger_rejection_message: Type.Optional(Type.String()),
 });
 
+// Per-user cost limits & model selection (spec PER-USER-LIMITS). A SEPARATE
+// mechanism from `[[limits]]` above: partitioned per-user (or per shared-pool)
+// counters + a per-field cascade + a per-attempt model selection/degradation
+// action, gating ONLY the human-triggered agent loop. TypeBox covers shape;
+// cross-field semantics (cascade coherence, partition templates, sub-cap ⊆ models,
+// space=Phase-2 fatal, single shared pool per rule) live in `normalizeUserLimits`
+// (src/budget/normalize-user-limits.ts), invoked fail-fast from app.ts (§9).
+
+// A match dimension (`user`/`room`/`space`): a single glob/exact string OR a list
+// of them (OR within the dimension); omitted = wildcard (spec §8.1).
+const UserLimitMatchSchema = Type.Union([
+  Type.String({ minLength: 1 }),
+  Type.Array(Type.String({ minLength: 1 })),
+]);
+
+// One budget constraint inside a rule's `limits` set (spec §3.1/§3.5), ANDed with
+// the others. No `models` = the fungible total; `models = [...]` = a sub-cap that
+// only carves the total. `partition` is a template rendered from the trigger ctx
+// (default `{user_id}`); a value shared across users makes it a shared pool (§3.5).
+const UserLimitConstraintSchema = StrictObject({
+  max_usd: Type.Number({ minimum: 0 }),
+  window: LimitWindowSchema,
+  models: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  partition: Type.Optional(Type.String()),
+});
+
+const UserLimitRuleSchema = StrictObject({
+  // Match dimensions — single glob/exact or a list (any matches); omit = wildcard.
+  // `space` is Phase 2 (a normalizer fatal until space matching lands, §11).
+  user: Type.Optional(UserLimitMatchSchema),
+  room: Type.Optional(UserLimitMatchSchema),
+  space: Type.Optional(UserLimitMatchSchema),
+  // Ordered preference set (registry block names; virtual or real, incl. upgrades),
+  // most-preferred first — the selection/degradation order (§4). Omit = the
+  // session-type default model (today's behavior: a cap on the default, no selection).
+  models: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // The constraint set (ANDed), each counter keyed by its `partition` (§3.5).
+  limits: Type.Optional(Type.Array(UserLimitConstraintSchema)),
+  // Shorthand (§3.4): a top-level `max_usd` (+ optional `window`) the normalizer
+  // expands into a single fungible-total constraint. `max_usd` is `Type.Number()`
+  // with NO minimum (unlike §8e) — `0` = ban, `< 0` = exempt (no constraint emitted).
+  max_usd: Type.Optional(Type.Number()),
+  window: Type.Optional(LimitWindowSchema),
+  // Templated refusal (§12); cascades INDEPENDENTLY of the model-budget block.
+  trigger_rejection_message: Type.Optional(Type.String()),
+});
+
 // Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). Per-consumer selection: the
 // `primary` tokenizer measures everything that bounds what we send the chat model
 // (context tiers, summarization, diary, auto-retrieval, search coverage); the
@@ -1178,6 +1225,14 @@ export const AppConfigSchema = StrictObject({
     // budget interjection fires (spec SESSION-COST-LIMITS §2.1). Strictly in
     // (0,1); defaults to 0.8 (00-defaults.toml). Ignored when no ceiling resolves.
     cost_warn_fraction: Type.Optional(Type.Number({ exclusiveMinimum: 0, exclusiveMaximum: 1 })),
+    // Per-user limits (spec PER-USER-LIMITS §5.3 / §16 Q1): the minimum affordable
+    // OUTPUT tokens below which a model is judged unable to complete a turn within
+    // the user's remaining budget — so it is skipped and selection degrades to the
+    // next preference (the `viable_min` floor). Larger = degrade earlier (avoid
+    // near-useless premium turns); smaller = squeeze the premium model to the last
+    // cent. Defaults to 256 (00-defaults.toml). Only consulted when `[[user_limits]]`
+    // is active.
+    user_limit_min_output_tokens: Type.Optional(Type.Number({ minimum: 1 })),
     disabled_tools: Type.Optional(Type.Array(Type.String())),
     // Named IANA time zone (e.g. "UTC", "America/New_York", "Asia/Tokyo"). All
     // timestamps the agent can see are rendered in this zone; the server's real
@@ -1322,6 +1377,11 @@ export const AppConfigSchema = StrictObject({
   // own-scope budget rules enforced across the app by the BudgetEngine. Unset/
   // empty = no period limits (the §8d per-run ceiling is orthogonal, unchanged).
   limits: Type.Optional(Type.Array(LimitRuleSchema)),
+  // Per-user cost limits & model selection (spec PER-USER-LIMITS): partitioned
+  // per-user / shared-pool budgets + per-attempt model selection/degradation, for
+  // the HUMAN-triggered agent loop only. Unset/empty = feature off (zero behavior
+  // change). Ordered: precedence is authored order (CSS-style cascade, §8.1).
+  user_limits: Type.Optional(Type.Array(UserLimitRuleSchema)),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;

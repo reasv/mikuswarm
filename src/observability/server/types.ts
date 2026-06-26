@@ -8,7 +8,7 @@ import type { PipelineRegistry, PipelineActivityBus } from "../pipelines.js";
 import type { SessionLiveEventBus } from "../live-events.js";
 import type { LlmScheduler } from "../../agent/scheduler.js";
 import type { LlmRequestRing } from "../../agent/request-ring.js";
-import type { BudgetEngine } from "../../budget/index.js";
+import type { BudgetEngine, UserLimitEngine } from "../../budget/index.js";
 import type { BackfetchJobInput, BackfetchJobRow } from "../../storage/index.js";
 
 /** The message-backfetch console surface (spec MESSAGE-BACKFETCH §8). */
@@ -108,6 +108,12 @@ export interface ConsoleServerDeps {
    * returns an empty list (no `[[limits]]` configured / not wired).
    */
   budgetEngine?: BudgetEngine;
+  /**
+   * The per-user limits engine (spec PER-USER-LIMITS §14), for the
+   * `GET /api/usage/budgets` `userLimits` status list (per-user / shared-pool
+   * meters). Optional: absent / disabled = an empty list.
+   */
+  userLimitEngine?: UserLimitEngine;
   logger: Logger;
 }
 

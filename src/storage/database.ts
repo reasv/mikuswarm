@@ -922,6 +922,24 @@ export interface UsageEventRow {
    * `model_id` for legacy rows (the norm when block name == upstream id).
    */
   logical_model_id: string;
+  /**
+   * The REQUESTED virtual model id chosen by the per-user selector (spec
+   * PER-USER-LIMITS §7), distinct from `logical_model_id` (the SERVED chain member)
+   * under active fallback. Per-user sub-caps scope on THIS so an outage backup still
+   * counts toward its requested model's sub-cap. Null for pre-feature rows + every
+   * non-per-user lane (background/proactive/tool).
+   */
+  requested_model_id: string | null;
+  /**
+   * The rendered SHARED-POOL partition key this event belongs to (spec
+   * PER-USER-LIMITS §3.5) — a literal (`staff`/`public`), `room:<id>`, `space:<id>`,
+   * or `hs:<server>`. Null when the event joins no shared pool (the per-user `{user_id}`
+   * default needs no denormalization — it reseeds off `trigger_sender_id`).
+   */
+  budget_partition: string | null;
+  /** Bare Matrix room id derived from `timeline_key` (spec PER-USER-LIMITS §8.3) — the
+   *  sturdy room-scoped seed for per-user-per-room counters + per-room pools. */
+  room_id: string | null;
   provider: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -963,6 +981,17 @@ export interface UsageEventInput {
    * virtual model, so block name == wire id.
    */
   logicalModelId?: string | null;
+  /**
+   * Requested virtual model the per-user selector chose (spec PER-USER-LIMITS §7),
+   * distinct from `logicalModelId` (served) under active fallback. Omitted by every
+   * non-per-user caller → stored null.
+   */
+  requestedModelId?: string | null;
+  /**
+   * Rendered shared-pool partition key (spec PER-USER-LIMITS §3.5). Omitted when the
+   * event joins no shared pool → stored null.
+   */
+  budgetPartition?: string | null;
   provider?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -986,6 +1015,36 @@ export interface UsageCostFilter {
   sessionTypes?: string[];
   tools?: string[];
   models?: string[];
+  // Per-user limits seed/recompute dimensions (spec PER-USER-LIMITS §8.3). Same
+  // AND-of-dimensions / OR-within-a-list semantics as the columns above.
+  /** `trigger_sender_id IN (…)` — the per-user `{user_id}` counter seed. */
+  triggerSenderIds?: string[];
+  /** `budget_partition IN (…)` — a shared-pool meter seed (the rendered key). */
+  partitionKeys?: string[];
+  /** `room_id IN (…)` — room-scoped seed (derived bare room id, §16 Q2 choice). */
+  roomIds?: string[];
+  /**
+   * A per-user sub-cap's REQUESTED-model scope (spec §7): matches `requested_model_id`,
+   * falling back to `logical_model_id` for pre-feature rows whose requested id is null
+   * (so an opus-premium sub-cap still counts legacy opus-premium spend). OR-within-list.
+   */
+  requestedModelIds?: string[];
+}
+
+/**
+ * Extract the bare Matrix room id from a `timeline_key` (spec PER-USER-LIMITS §8.3),
+ * a duplicate of `roomIdFromTimelineKey` (src/timeline/router.ts) kept LOCAL so the
+ * storage layer never imports from the timeline layer. Keys are
+ * `matrix:<account>:room:<roomId>[:thread:<root>]` / `matrix:<account>:dm:<roomId>`;
+ * a Matrix room id itself contains a colon, so capture everything between the
+ * `room:`/`dm:` marker and an optional `:thread:` suffix. Returns null for a missing
+ * or malformed key so the denormalized column stays clean.
+ */
+function roomIdFromTimelineKey(timelineKey: string | undefined): string | null {
+  if (!timelineKey) return null;
+  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
+  const roomId = match?.[1];
+  return roomId && roomId.length > 0 ? roomId : null;
 }
 
 /**
@@ -3535,6 +3594,14 @@ export class Storage {
       // `''` logical id would mis-scope budget (§8e) and mis-group the ledger/
       // console (§7), so it's never a valid stored value.
       logical_model_id: input.logicalModelId || input.modelId,
+      // Per-user limits (spec PER-USER-LIMITS §8.3). `requested_model_id` and
+      // `budget_partition` come straight from the per-user recorder (null for every
+      // other lane). `room_id` is DERIVED here from `timeline_key` so every caller
+      // stays simple and the stored id matches what the engine's `room:{room_id}`
+      // partition / room-scoped seed uses (same extraction as `roomIdFromTimelineKey`).
+      requested_model_id: input.requestedModelId ?? null,
+      budget_partition: input.budgetPartition ?? null,
+      room_id: roomIdFromTimelineKey(input.timelineKey ?? undefined),
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,
@@ -3549,11 +3616,13 @@ export class Storage {
       db.prepare(
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
-           tool_name, model_id, logical_model_id, provider, input_tokens, output_tokens, cache_read_tokens,
+           tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id,
+           provider, input_tokens, output_tokens, cache_read_tokens,
            cache_write_tokens, images, cost_usd, ref, created_at
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
-           @tool_name, @model_id, @logical_model_id, @provider, @input_tokens, @output_tokens, @cache_read_tokens,
+           @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id,
+           @provider, @input_tokens, @output_tokens, @cache_read_tokens,
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
       ).run(row);
@@ -3566,7 +3635,16 @@ export class Storage {
    * startup and to RECOMPUTE rolling windows on the periodic tick. Dimension
    * arrays AND together (OR within each list); an omitted dimension is wildcard.
    */
-  sumUsageCost(filter: UsageCostFilter): number {
+  /**
+   * Build the shared `WHERE` clause + bound params for {@link sumUsageCost} /
+   * {@link minUsageTs} from a {@link UsageCostFilter}. Dimension arrays AND together
+   * (OR within each list); an omitted dimension is a wildcard. The per-user
+   * `requestedModelIds` dimension (spec PER-USER-LIMITS §7) additionally folds in
+   * pre-feature rows whose `requested_model_id` is null by falling back to
+   * `logical_model_id` for those, so an `opus-premium` sub-cap still counts legacy
+   * `opus-premium` spend recorded before this feature shipped.
+   */
+  private usageCostClauses(filter: UsageCostFilter): { clauses: string[]; params: unknown[] } {
     const clauses: string[] = ["ts >= ?"];
     const params: unknown[] = [filter.since];
     if (filter.until !== undefined) {
@@ -3582,6 +3660,21 @@ export class Storage {
     inClause("session_type", filter.sessionTypes);
     inClause("tool_name", filter.tools);
     inClause("logical_model_id", filter.models);
+    inClause("trigger_sender_id", filter.triggerSenderIds);
+    inClause("budget_partition", filter.partitionKeys);
+    inClause("room_id", filter.roomIds);
+    if (filter.requestedModelIds && filter.requestedModelIds.length > 0) {
+      const ph = filter.requestedModelIds.map(() => "?").join(", ");
+      clauses.push(
+        `(requested_model_id in (${ph}) or (requested_model_id is null and logical_model_id in (${ph})))`,
+      );
+      params.push(...filter.requestedModelIds, ...filter.requestedModelIds);
+    }
+    return { clauses, params };
+  }
+
+  sumUsageCost(filter: UsageCostFilter): number {
+    const { clauses, params } = this.usageCostClauses(filter);
     return this.read((db) => {
       const row = db
         .prepare(`select coalesce(sum(cost_usd), 0) as c from usage_events where ${clauses.join(" and ")}`)
@@ -3604,21 +3697,7 @@ export class Storage {
    * sooner than the `now + durationMs` upper bound the gate cheaply uses (§5 #5).
    */
   minUsageTs(filter: UsageCostFilter): number | null {
-    const clauses: string[] = ["ts >= ?"];
-    const params: unknown[] = [filter.since];
-    if (filter.until !== undefined) {
-      clauses.push("ts < ?");
-      params.push(filter.until);
-    }
-    const inClause = (column: string, values: string[] | undefined): void => {
-      if (!values || values.length === 0) return;
-      clauses.push(`${column} in (${values.map(() => "?").join(", ")})`);
-      params.push(...values);
-    };
-    inClause("class", filter.classes);
-    inClause("session_type", filter.sessionTypes);
-    inClause("tool_name", filter.tools);
-    inClause("logical_model_id", filter.models);
+    const { clauses, params } = this.usageCostClauses(filter);
     return this.read((db) => {
       const row = db
         .prepare(`select min(ts) as t from usage_events where ${clauses.join(" and ")}`)
@@ -7294,6 +7373,20 @@ create table if not exists usage_events (
   -- Logical model id (config block name; spec MODEL-FALLBACK §2.2), distinct from
   -- model_id (upstream wire id). Budget selectors + console grouping key on this.
   logical_model_id text not null default '',
+  -- Per-user limits (spec PER-USER-LIMITS §8.3) — all three nullable, written for
+  -- the human agent loop only; null for legacy rows + background/proactive lanes.
+  --   requested_model_id: the REQUESTED virtual model the per-user selector chose
+  --     (§7), distinct from logical_model_id (the SERVED chain member) under active
+  --     fallback. Per-user sub-caps scope on THIS so an outage backup still counts
+  --     toward its requested model's sub-cap.
+  --   budget_partition: the rendered SHARED-POOL key (§3.5) this event belongs to
+  --     (literal/room/space/hs); null when the event joins no shared pool. Pool
+  --     membership is a cascade outcome, irreducible from intrinsic columns.
+  --   room_id: the bare Matrix room id (derived from timeline_key) for room-scoped
+  --     per-user counters + per-room pools — sturdier than a timeline_key LIKE.
+  requested_model_id text,
+  budget_partition text,
+  room_id text,
   provider text,
   input_tokens integer,
   output_tokens integer,
@@ -7317,6 +7410,13 @@ create index if not exists idx_usage_events_class_ts   on usage_events(class, ts
 create index if not exists idx_usage_events_model_ts   on usage_events(model_id, ts);
 create index if not exists idx_usage_events_logical_model_ts on usage_events(logical_model_id, ts);
 create index if not exists idx_usage_events_tool_ts    on usage_events(tool_name, ts);
+-- Per-user limits seed/recompute indexes (spec PER-USER-LIMITS §8.3): per-user
+-- counters reseed off trigger_sender_id; shared pools off budget_partition; room
+-- scoping off the derived room_id; requested-model sub-caps off requested_model_id.
+create index if not exists idx_usage_events_sender_ts on usage_events(trigger_sender_id, ts);
+create index if not exists idx_usage_events_partition_ts on usage_events(budget_partition, ts);
+create index if not exists idx_usage_events_requested_model_ts on usage_events(requested_model_id, ts);
+create index if not exists idx_usage_events_room_ts on usage_events(room_id, ts);
 `;
 
 // media_assets table + its indexes, factored out of the canonical SCHEMA so the
@@ -7869,7 +7969,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 30;
+export const LATEST_SCHEMA_VERSION = 31;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -8850,6 +8950,28 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     db.exec(
       `create index if not exists idx_usage_events_logical_model_ts on usage_events(logical_model_id, ts);`,
     );
+  },
+  // index 30 (v30 -> v31): per-user limits ledger columns (spec PER-USER-LIMITS
+  // §8.3). Three additive NULLABLE columns + their seed indexes. No backfill: old
+  // rows pre-date the per-user meters, so null is correct (the sub-cap filter
+  // falls back to logical_model_id for null requested_model_id rows; pool/room
+  // seeds simply skip pre-feature spend). Idempotent + guarded for rewound test
+  // fixtures: skipped when the table is absent or the columns already exist.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
+    if (!hasTable("usage_events")) return;
+    const columns = db.pragma(`table_info(usage_events)`) as Array<{ name: string }>;
+    if (columns.some((c) => c.name === "budget_partition")) return;
+    db.exec(`alter table usage_events add column requested_model_id text;`);
+    db.exec(`alter table usage_events add column budget_partition text;`);
+    db.exec(`alter table usage_events add column room_id text;`);
+    db.exec(`create index if not exists idx_usage_events_sender_ts on usage_events(trigger_sender_id, ts);`);
+    db.exec(`create index if not exists idx_usage_events_partition_ts on usage_events(budget_partition, ts);`);
+    db.exec(
+      `create index if not exists idx_usage_events_requested_model_ts on usage_events(requested_model_id, ts);`,
+    );
+    db.exec(`create index if not exists idx_usage_events_room_ts on usage_events(room_id, ts);`);
   },
 ];
 
