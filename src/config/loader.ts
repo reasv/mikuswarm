@@ -15,8 +15,19 @@ function isPlainObject(value: unknown): value is PlainObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function shallowMergeByTopLevel(configs: PlainObject[]): PlainObject {
-  return Object.assign({}, ...configs);
+/**
+ * Merge parsed config files in ascending filename order, each file **deep-merged
+ * OVER** the accumulated result: nested tables merge recursively, while arrays and
+ * scalars from the later (higher-priority) file replace wholesale (`deepMergeOver`).
+ * This is what makes `00-defaults.toml` behave as real defaults — a partial
+ * `[agent.sessions]` in `90-local.toml` overrides only the fields it sets and
+ * inherits every sibling it omits (e.g. the `resume`/`followup` sub-tables), rather
+ * than the whole `agent` subtree being dropped. (Previously a shallow `Object.assign`
+ * by top-level key wholesale-replaced each top-level table — the silent
+ * default-drop foot-gun this replaces.)
+ */
+export function mergeConfigLayers(configs: PlainObject[]): PlainObject {
+  return configs.reduce<PlainObject>((acc, cfg) => deepMergeOver(acc, cfg), {});
 }
 
 /**
@@ -182,7 +193,7 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   }
 
   const missingEnv = new Set<string>();
-  const merged = substituteEnv(shallowMergeByTopLevel(parsed), missingEnv);
+  const merged = substituteEnv(mergeConfigLayers(parsed), missingEnv);
   if (missingEnv.size > 0) {
     throw new Error(`Missing environment variables referenced by config: ${[...missingEnv].sort().join(", ")}`);
   }
