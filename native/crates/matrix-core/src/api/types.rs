@@ -457,6 +457,13 @@ pub struct MatrixChannelInfo {
     /// as `Room Name (Space Name)`. `None` when the room advertises no
     /// spec-legitimate, name-resolvable parent space.
     pub parent_space_name: Option<String>,
+    /// Room ids of ALL spec-legitimate parent spaces (Reciprocal preferred over
+    /// WithPowerlevel, tie-broken by lowest room id — best-first), for per-user
+    /// limits SPACE matching (spec PER-USER-LIMITS §11): a `space` predicate matches
+    /// if ANY ancestor here matches, and the first entry is the canonical parent the
+    /// `{space_id}` partition + the denormalized `space_id` ledger column use. Empty
+    /// when the room advertises no legitimate parent space.
+    pub parent_space_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

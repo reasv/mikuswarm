@@ -33,8 +33,13 @@ import { type WindowSpec, resolveWindow } from "./window.js";
 export interface UserLimitContext {
   userId: string;
   roomId?: string;
-  /** Phase 2 (§11) — always undefined in the first slice (space match is a fatal). */
-  spaceId?: string;
+  /**
+   * The triggering room's parent space ids (spec §11), best-first — a `space`
+   * predicate matches if ANY entry matches, and the first is the canonical parent
+   * the `{space_id}` partition + the `space_id` ledger column use. Resolved at Gate A
+   * only when a rule references space (else empty / undefined).
+   */
+  spaceIds?: string[];
 }
 
 // ─── Normalized rules (output of normalize-user-limits.ts) ────────────────────
@@ -91,6 +96,8 @@ export interface ResolvedConstraint {
   isUserPartition: boolean;
   /** Concrete room id when the rule is room-matched (sturdy room-narrowed seed, §16 Q2). */
   roomScope?: string;
+  /** Canonical parent space id when the rule is space-matched (space-narrowed seed, §11). */
+  spaceScope?: string;
   /** Source rule order + index (diagnostics / console). */
   source: { ruleOrder: number; index: number };
 }
@@ -202,6 +209,7 @@ interface SeedFilter {
   triggerSenderIds?: string[];
   partitionKeys?: string[];
   roomIds?: string[];
+  spaceIds?: string[];
   requestedModelIds?: string[];
 }
 
@@ -249,6 +257,20 @@ function matchDimension(globs: string[] | undefined, value: string | undefined):
   return globs.some((g) => compileGlob(g)(value));
 }
 
+/**
+ * True when ANY glob matches ANY value (spec §11): the `space` dimension matches if
+ * any of the room's parent spaces matches any rule glob (a room may belong to
+ * several). OR within the dimension AND across the value list.
+ */
+function matchMultiDimension(globs: string[] | undefined, values: string[] | undefined): boolean {
+  if (!globs) return true; // omitted dimension = wildcard
+  if (!values || values.length === 0) return false;
+  return globs.some((g) => {
+    const re = compileGlob(g);
+    return values.some((v) => re(v));
+  });
+}
+
 /** The homeserver suffix of a Matrix user id (`@a:hs.org` → `hs.org`), else "". */
 export function homeserverOf(userId: string): string {
   const i = userId.indexOf(":");
@@ -272,7 +294,8 @@ export function renderPartition(template: string, ctx: UserLimitContext): string
       case "homeserver":
         return homeserverOf(ctx.userId);
       case "space_id":
-        return ctx.spaceId ?? "";
+        // The canonical (best) parent space — first of the best-first list (§11).
+        return ctx.spaceIds?.[0] ?? "";
       default:
         return "";
     }
@@ -294,12 +317,19 @@ export class UserLimitEngine {
   private readonly nearThreshold: number;
   private readonly tickMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
+  /** True when any rule references space (a `space` match or a `{space_id}` partition). */
+  readonly usesSpace: boolean;
 
   constructor(private readonly options: UserLimitEngineOptions) {
     this.rules = [...options.rules].sort((a, b) => a.order - b.order);
     this.now = options.now ?? Date.now;
     this.nearThreshold = Math.min(0.999, Math.max(0.001, options.nearThreshold ?? 0.8));
     this.tickMs = options.tickMs ?? 60_000;
+    // Whether ANY rule needs the (costly) parent-space resolution at Gate A (§11) —
+    // a `space` match dimension or a `{space_id}` partition template.
+    this.usesSpace = this.rules.some(
+      (r) => r.space !== undefined || r.constraints.some((c) => c.partition.includes("{space_id}")),
+    );
   }
 
   /** True when any rule is configured (the feature is on). */
@@ -334,7 +364,7 @@ export class UserLimitEngine {
       (r) =>
         matchDimension(r.user, ctx.userId) &&
         matchDimension(r.room, ctx.roomId) &&
-        matchDimension(r.space, ctx.spaceId),
+        matchMultiDimension(r.space, ctx.spaceIds),
     );
     if (matching.length === 0) {
       return { matched: false, active: false, banned: false, constraints: [] };
@@ -375,10 +405,11 @@ export class UserLimitEngine {
   ): ResolvedConstraint {
     const partitionKey = renderPartition(c.partition, ctx);
     const isUserPartition = !c.shared;
-    // A room-matched rule narrows every meter to the trigger's room (sturdy
-    // room-scoped seed via the derived room_id column, §16 Q2) — so a per-user or
-    // pool counter on a room-scoped rule counts only that room's spend.
+    // A room/space-matched rule narrows every meter to the trigger's room / canonical
+    // parent space (sturdy seed via the room_id / space_id column, §16 Q2 / §11) — so
+    // a per-user or pool counter on a scoped rule counts only that room's/space's spend.
     const roomScope = rule.room ? ctx.roomId : undefined;
+    const spaceScope = rule.space ? ctx.spaceIds?.[0] : undefined;
     const modelScope = c.models ? [...c.models].sort() : undefined;
     const meterKey = [
       isUserPartition ? "u" : "p",
@@ -386,6 +417,7 @@ export class UserLimitEngine {
       modelScope ? modelScope.join(",") : "*",
       windowKey(c.window),
       roomScope ?? "*",
+      spaceScope ?? "*",
     ].join("#");
     return {
       meterKey,
@@ -395,6 +427,7 @@ export class UserLimitEngine {
       partitionKey,
       isUserPartition,
       roomScope,
+      spaceScope,
       source: { ruleOrder: rule.order, index: c.index },
     };
   }
@@ -406,6 +439,7 @@ export class UserLimitEngine {
     if (c.isUserPartition) seed.triggerSenderIds = [c.partitionKey];
     else seed.partitionKeys = [c.partitionKey];
     if (c.roomScope) seed.roomIds = [c.roomScope];
+    if (c.spaceScope) seed.spaceIds = [c.spaceScope];
     if (c.modelScope) seed.requestedModelIds = c.modelScope;
     return seed;
   }

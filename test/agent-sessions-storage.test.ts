@@ -328,8 +328,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 31", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 31);
+test("LATEST_SCHEMA_VERSION is 32", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 32);
 });
 
 test("opening a v4 DB without agent_sessions migrates it and creates the table", async () => {
@@ -1686,6 +1686,87 @@ test("v30 -> v31 adds per-user columns (requested_model_id / budget_partition / 
       ]) {
         assert.ok(indexes.includes(idx), `${idx} created`);
       }
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Per-user limits SPACE matching: v31 -> v32 migration (spec PER-USER-LIMITS §11).
+// A v31 `usage_events` table (the per-user columns present, but no `space_id`
+// column / index) is opened to LATEST; the additive nullable column + its seed
+// index land, no backfill.
+// ---------------------------------------------------------------------------
+
+/** The v31 `usage_events` shape: latest MINUS the v31->v32 `space_id` column/index. */
+const V31_USAGE_EVENTS = `
+create table usage_events (
+  id text primary key,
+  ts integer not null,
+  class text not null,
+  agent_session_id text,
+  session_type text,
+  timeline_key text,
+  trigger_sender_id text,
+  tool_name text,
+  model_id text not null,
+  logical_model_id text not null default '',
+  requested_model_id text,
+  budget_partition text,
+  room_id text,
+  provider text,
+  input_tokens integer,
+  output_tokens integer,
+  cache_read_tokens integer,
+  cache_write_tokens integer,
+  images integer,
+  cost_usd real not null default 0,
+  ref text,
+  created_at integer not null
+);
+create index if not exists idx_usage_events_ts on usage_events(ts);
+`;
+
+test("v31 -> v32 adds the space_id column + seed index, no backfill", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-v31-rows-"));
+  const dbPath = path.join(dir, "legacy.db");
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(V6_TIMELINE_EVENTS);
+    legacy.exec(V31_USAGE_EVENTS);
+    legacy
+      .prepare(
+        `insert into usage_events (id, ts, class, model_id, logical_model_id, cost_usd, created_at)
+           values (@id, @ts, @class, @modelId, @logicalId, @cost, @createdAt)`,
+      )
+      .run({ id: "u-1", ts: 1_000, class: "agent_loop", modelId: "wire/glm", logicalId: "glm", cost: 0.1, createdAt: 1_000 });
+    legacy.pragma("user_version = 31");
+    const colsBefore = (legacy.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(!colsBefore.includes("space_id"), "v31 fixture must NOT have space_id yet");
+    legacy.close();
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        storage.read((db) => db.pragma("user_version", { simple: true }) as number),
+        LATEST_SCHEMA_VERSION,
+      );
+      const colsAfter = storage.read((db) =>
+        (db.pragma(`table_info(usage_events)`) as Array<{ name: string }>).map((c) => c.name),
+      );
+      assert.ok(colsAfter.includes("space_id"), "space_id column added");
+      const row = storage.read((db) =>
+        db.prepare(`select space_id from usage_events where id = 'u-1'`).get() as { space_id: string | null },
+      );
+      assert.equal(row.space_id, null, "legacy space_id null (no backfill)");
+      const indexes = storage.read((db) =>
+        (db.pragma(`index_list(usage_events)`) as Array<{ name: string }>).map((i) => i.name),
+      );
+      assert.ok(indexes.includes("idx_usage_events_space_ts"), "idx_usage_events_space_ts created");
     } finally {
       await storage.waitForIdle();
       storage.close();

@@ -309,6 +309,12 @@ export type MatrixChannelInfo = {
   // `<ROOM>` label as `Room Name (Space Name)`. Absent when the room has no
   // spec-legitimate, name-resolvable parent space.
   parentSpaceName?: string;
+  // Room ids of ALL spec-legitimate parent spaces, best-first (spec PER-USER-LIMITS
+  // §11): a `space` predicate matches if ANY entry matches, and the first is the
+  // canonical parent the `{space_id}` partition + `space_id` ledger column use.
+  // Always present (possibly empty) from the current native module; optional for
+  // forward-compatibility with an older `.node` that predates the field.
+  parentSpaceIds?: string[];
 };
 
 export type MatrixUploadMediaThumbnail = {
