@@ -150,6 +150,8 @@
 			return rank(a.state) - rank(b.state) || b.fraction - a.fraction;
 		})
 	);
+	// Currently-selected model per live per-user session (spec §14).
+	const userSelections = $derived([...(budgets.data?.userSelections ?? [])]);
 
 	// Stable color per group. Known classes get fixed hues; models cycle a palette.
 	const CLASS_COLORS: Record<string, string> = {
@@ -596,11 +598,25 @@
 		<!-- 4b. Per-user limits — materialized per-user / shared-pool meters (spec
 		     PER-USER-LIMITS §14). Only shown when the feature is active and at least
 		     one meter has materialized (a human session resolved a rule). -->
-		{#if userLimits.length > 0}
+		{#if userLimits.length > 0 || userSelections.length > 0}
 			<section>
 				<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
 					Per-user limits
 				</h2>
+				{#if userSelections.length > 0}
+					<!-- Currently-selected model per live per-user session (spec §14). -->
+					<div class="mb-2 flex flex-wrap gap-1.5">
+						{#each userSelections as sel (sel.userId + sel.model)}
+							<span
+								class="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground"
+								title={`${sel.userId}${sel.roomId ? ' · ' + sel.roomId : ''} → ${sel.model}`}
+							>
+								<span class="font-mono text-foreground">{sel.userId}</span>
+								→ <span class="font-mono text-foreground">{sel.model}</span>
+							</span>
+						{/each}
+					</div>
+				{/if}
 				<div class="grid grid-cols-1 gap-2 md:grid-cols-2">
 					{#each userLimits as m (m.meterKey)}
 						<div class="rounded-lg border p-3">

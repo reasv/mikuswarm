@@ -30,6 +30,7 @@ export {
   type AffordabilityResult,
   type ModelCostRates,
   type UserLimitStatus,
+  type UserLimitSelection,
   type UserLimitEngineOptions,
 } from "./user-limits.js";
 export {

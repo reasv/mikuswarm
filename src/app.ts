@@ -995,11 +995,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         rules: normalizedUser.rules,
         sumUsageCost: (filter) => storage.sumUsageCost(filter),
         minUsageTs: (filter) => storage.minUsageTs(filter),
-        // Face cost rates of the REQUESTED model (§7) — per-MTok, by logical id.
+        // Face cost rates of the REQUESTED model (§7) — per-MTok, by logical id,
+        // incl. the prompt-cache rates the §5.3 estimate prices prior context at.
         costRatesFor: (logicalId) => {
           const m = config.models[logicalId];
           if (!m) return undefined;
-          return { inputPerMTok: m.cost?.input ?? 0, outputPerMTok: m.cost?.output ?? 0 };
+          return {
+            inputPerMTok: m.cost?.input ?? 0,
+            outputPerMTok: m.cost?.output ?? 0,
+            cacheReadPerMTok: m.cost?.cache_read ?? 0,
+            cacheWritePerMTok: m.cost?.cache_write ?? 0,
+          };
         },
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
@@ -3418,7 +3424,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType)];
     const initialModel = resolution.banned
       ? undefined
-      : preferred.find((m) => userLimitEngine!.affordable(resolution, m, { priorContextTokens: 0 }).ok);
+      : preferred.find((m) => userLimitEngine!.affordable(resolution, m, {}).ok);
     if (!initialModel) {
       const displayName =
         inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;
@@ -3434,7 +3440,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       };
     }
     userLimitResolutions.set(sessionId, { resolution, ctx });
-    sessions.onSettle(sessionId, () => userLimitResolutions.delete(sessionId));
+    sessions.onSettle(sessionId, () => {
+      userLimitResolutions.delete(sessionId);
+      userLimitEngine?.clearSelection(sessionId); // drop the live console selection (§14)
+    });
     // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch). An
     // exempt/uncapped user contributes ∞ → no change to the static ceiling.
     const staticCeiling = factory.resolveSessionCostCeiling(sessionType);

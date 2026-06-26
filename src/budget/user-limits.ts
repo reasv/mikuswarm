@@ -124,12 +124,23 @@ export interface UserLimitResolution {
 
 export interface AffordabilityEstimate {
   /**
-   * Measured prior-context tokens (the last committed request's `totalTokens`),
-   * or the initial context estimate for the first request. The dominant — and
-   * essentially only — input term (§5.2); incremental new material is small and
-   * folded in conservatively by pricing the whole basis at the uncached input rate.
+   * Tokens already present in the PRIOR request's prompt (spec §5.3) — a cache hit
+   * (`cache_read`) when the prior request is within the prompt-cache TTL, otherwise
+   * folded into the cache-write basis. Default 0 (the first request has no prior).
    */
-  priorContextTokens: number;
+  cachedTokens?: number;
+  /**
+   * NEW tokens since the prior request (the assistant's last output + tool results +
+   * framing, tokenized exactly with the §9 primary tokenizer) — priced at
+   * `cache_write`. On the first request this is the whole rendered context. Default 0.
+   */
+  newTokens?: number;
+  /**
+   * True when the prior request is within the prompt-cache TTL (~5 min) so its prompt
+   * is still a cache hit; false (default) ⇒ price the whole input at cache-write
+   * (conservative — slightly under-utilizes the cache, never under-charges, §5.3).
+   */
+  withinCacheTtl?: boolean;
 }
 
 export interface AffordabilityResult {
@@ -149,6 +160,10 @@ export interface AffordabilityResult {
 export interface ModelCostRates {
   inputPerMTok: number;
   outputPerMTok: number;
+  /** Cache-read rate (prompt-cache hit). 0/absent ⇒ falls back to `inputPerMTok`. */
+  cacheReadPerMTok?: number;
+  /** Cache-write rate (prompt-cache establish). 0/absent ⇒ falls back to `inputPerMTok`. */
+  cacheWritePerMTok?: number;
 }
 
 export interface UserLimitEngineOptions {
@@ -188,6 +203,14 @@ interface SeedFilter {
   partitionKeys?: string[];
   roomIds?: string[];
   requestedModelIds?: string[];
+}
+
+/** A live session's currently-selected model, for the console (spec §14). */
+export interface UserLimitSelection {
+  userId: string;
+  roomId?: string;
+  /** The REQUESTED virtual model the per-user selector is currently dispatching. */
+  model: string;
 }
 
 /** Per-binding-constraint status for the console (spec §14). */
@@ -265,6 +288,8 @@ function windowKey(w: WindowSpec): string {
 export class UserLimitEngine {
   private readonly rules: NormalizedUserLimitRule[];
   private readonly meters = new Map<string, MeterState>();
+  /** Live per-session currently-selected model (spec §14), keyed by session id. */
+  private readonly activeModels = new Map<string, UserLimitSelection>();
   private readonly now: () => number;
   private readonly nearThreshold: number;
   private readonly tickMs: number;
@@ -483,7 +508,18 @@ export class UserLimitEngine {
         remainingUsd: remaining,
       };
     }
-    const inputCost = (estimate.priorContextTokens / 1_000_000) * rates.inputPerMTok;
+    // Input cost with the prompt-cache model (§5.3): within the cache TTL the prior
+    // prompt is a cache-read hit and only the new material is cache-write; otherwise
+    // the whole input is priced at cache-write (conservative). A model without cache
+    // rates falls back to the plain input rate for both, so this degrades to
+    // `tokens × input_price` for non-caching models.
+    const cached = estimate.cachedTokens ?? 0;
+    const fresh = estimate.newTokens ?? 0;
+    const readRate = (rates.cacheReadPerMTok ?? 0) > 0 ? rates.cacheReadPerMTok! : rates.inputPerMTok;
+    const writeRate = (rates.cacheWritePerMTok ?? 0) > 0 ? rates.cacheWritePerMTok! : rates.inputPerMTok;
+    const inputCost = estimate.withinCacheTtl
+      ? (cached / 1_000_000) * readRate + (fresh / 1_000_000) * writeRate
+      : ((cached + fresh) / 1_000_000) * writeRate;
     const outputPricePerToken = rates.outputPerMTok / 1_000_000;
     const affordableOutput = Math.floor((remaining - inputCost) / outputPricePerToken);
     if (!(affordableOutput > this.options.viableMinOutputTokens)) {
@@ -568,6 +604,23 @@ export class UserLimitEngine {
     const minTs = this.options.minUsageTs?.({ since: meter.windowStart, ...meter.seed });
     if (minTs === undefined || minTs === null) return this.now() + c.window.durationMs;
     return minTs + c.window.durationMs;
+  }
+
+  // ─── Live selection registry (§14) ─────────────────────────────────────────
+
+  /** Record a live session's currently-selected model (spec §14, console surface). */
+  noteSelection(sessionId: string, userId: string, roomId: string | undefined, model: string): void {
+    this.activeModels.set(sessionId, { userId, roomId, model });
+  }
+
+  /** Drop a settled session's selection (called on settle). */
+  clearSelection(sessionId: string): void {
+    this.activeModels.delete(sessionId);
+  }
+
+  /** The currently-selected model of every live per-user session (spec §14). */
+  activeSelections(): UserLimitSelection[] {
+    return [...this.activeModels.values()];
   }
 
   // ─── Console statuses (§14) ────────────────────────────────────────────────

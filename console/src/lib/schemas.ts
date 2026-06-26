@@ -703,10 +703,19 @@ export const UserLimitStatus = Schema.Struct({
 	resetsAt: Schema.Number
 });
 export type UserLimitStatus = Schema.Schema.Type<typeof UserLimitStatus>;
+
+/** A live per-user session's currently-selected model (spec PER-USER-LIMITS §14). */
+export const UserLimitSelection = Schema.Struct({
+	userId: Schema.String,
+	roomId: Schema.optional(Schema.String),
+	model: Schema.String
+});
+export type UserLimitSelection = Schema.Schema.Type<typeof UserLimitSelection>;
 export const UsageBudgets = Schema.Struct({
 	rules: Schema.Array(RuleStatus),
-	// Optional for backward compatibility with an older BFF that omits it.
-	userLimits: Schema.optional(Schema.Array(UserLimitStatus))
+	// Optional for backward compatibility with an older BFF that omits them.
+	userLimits: Schema.optional(Schema.Array(UserLimitStatus)),
+	userSelections: Schema.optional(Schema.Array(UserLimitSelection))
 });
 export type UsageBudgets = Schema.Schema.Type<typeof UsageBudgets>;
 
