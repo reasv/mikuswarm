@@ -3379,6 +3379,106 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   /**
+   * The per-user limits gate decision for ONE human agent-loop session (spec
+   * PER-USER-LIMITS §6.1), shared by the fresh launch AND every resume path — a
+   * resume is the SAME logical event (same user/room/budget), it merely continues
+   * an existing session, so the gate applies identically. Builds the trigger ctx,
+   * resolves the per-field cascade, and either reports `denied` (banned / fully out
+   * of budget) or returns the selection inputs to thread into `factory.create`. When
+   * admitted it FREEZES the resolution on the recording map (+ a settle cleanup), so
+   * the partitioned counter is incremented live for both the agent-loop and tool
+   * lanes of every spending path — not just fresh launches. Posting the refusal and
+   * the discard/return control flow stay with the caller (a user trigger refuses; a
+   * proactive/background path never calls this at all).
+   */
+  interface UserLimitGate {
+    active: boolean;
+    denied: boolean;
+    userLimit?: { engine: UserLimitEngine; resolution: UserLimitResolution; ctx: UserLimitContext };
+    ceilingOverride?: number;
+    /** The selected initial model (logical id) — the §8e admission chain (§6.1). */
+    initialModel?: string;
+    /** Populated only when `denied`, for the templated refusal (§12). */
+    refusal?: { ctx: UserLimitContext; binding?: ResolvedConstraint; displayName: string; template?: string };
+  }
+  function resolveUserLimitGate(
+    inbound: InboundChatEvent,
+    sessionId: string,
+    sessionType: string,
+  ): UserLimitGate {
+    if (!userLimitEngine?.enabled) return { active: false, denied: false };
+    const userId = inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id;
+    if (!userId) return { active: false, denied: false };
+    const ctx: UserLimitContext = { userId, roomId: roomIdFromTimelineKey(inbound.timelineKey) };
+    const resolution = userLimitEngine.resolve(ctx);
+    if (!resolution.active) return { active: false, denied: false };
+    // Coarse admission (§6.1): the first preferred model with headroom for a minimal
+    // first turn (prior context ≈ 0). Undefined ⇒ banned / fully out of budget; the
+    // precise estimate + degradation run per request at Gate B inside the factory.
+    const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType)];
+    const initialModel = resolution.banned
+      ? undefined
+      : preferred.find((m) => userLimitEngine!.affordable(resolution, m, { priorContextTokens: 0 }).ok);
+    if (!initialModel) {
+      const displayName =
+        inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;
+      return {
+        active: true,
+        denied: true,
+        refusal: {
+          ctx,
+          binding: userLimitEngine.bindingConstraint(resolution),
+          displayName,
+          template: resolution.messageTemplate,
+        },
+      };
+    }
+    userLimitResolutions.set(sessionId, { resolution, ctx });
+    sessions.onSettle(sessionId, () => userLimitResolutions.delete(sessionId));
+    // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch). An
+    // exempt/uncapped user contributes ∞ → no change to the static ceiling.
+    const staticCeiling = factory.resolveSessionCostCeiling(sessionType);
+    const headroom = userLimitEngine.totalHeadroom(resolution);
+    const effective = Math.min(staticCeiling ?? Infinity, headroom ?? Infinity);
+    return {
+      active: true,
+      denied: false,
+      userLimit: { engine: userLimitEngine, resolution, ctx },
+      ceilingOverride: Number.isFinite(effective) ? effective : undefined,
+      initialModel,
+    };
+  }
+
+  /** Log + post a denied user trigger's templated refusal (spec §12/§14). */
+  function postUserLimitRefusal(
+    target: NonNullable<InboundChatEvent["outboundTarget"]>,
+    sessionId: string,
+    timelineKey: string,
+    gate: UserLimitGate,
+  ): void {
+    const r = gate.refusal;
+    if (!r) return;
+    logger.warn("usage_limit_blocked", {
+      gate: "user_admission",
+      sessionId,
+      timelineKey,
+      userId: r.ctx.userId,
+      binding: r.binding
+        ? { partitionKey: r.binding.partitionKey, capUsd: r.binding.cap, models: r.binding.modelScope }
+        : undefined,
+    });
+    if (r.template) {
+      const body = renderUserLimitRefusal(r.template, r.ctx, r.binding, r.displayName);
+      void provider.send(target, { body, agentSessionId: sessionId }).catch((error) => {
+        logger.warn("user_limit_rejection_send_failed", {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
+  /**
    * Run one resume-in-place attempt for a session (spec
    * CONCURRENCY-AND-RATE-LIMITING §6.2): rebuild the tool set, re-create the
    * agent from the persisted snapshot + transcript (skipping the context build
@@ -3403,6 +3503,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     if (!material) return { outcome: "unresumable", error: "no resumable snapshot/transcript" };
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
+
+    // Per-user limits also gate the manual console recovery of a parked session
+    // (spec PER-USER-LIMITS §6): it is still the user's spend, so it must degrade /
+    // cap / count identically. Skip proactive sessions (no triggering user). A denied
+    // (banned / out-of-budget) user blocks the recovery with a content-class outcome —
+    // the console shows the budget reason — rather than spending unrestricted.
+    const isProactiveResume = record.sessionType === (config.proactive?.session_type ?? "proactive");
+    const recoveryGate = isProactiveResume
+      ? undefined
+      : resolveUserLimitGate(inbound, record.id, record.sessionType);
+    if (recoveryGate?.denied) {
+      logger.warn("usage_limit_blocked", {
+        gate: "user_resume",
+        sessionId: record.id,
+        timelineKey: record.timelineKey,
+        userId: recoveryGate.refusal?.ctx.userId,
+      });
+      return { outcome: "content", error: "per-user budget exhausted — resume blocked" };
+    }
 
     let agent;
     // Resume usage seed (spec TOKEN-USAGE-TRACKING §4.3, §6.2/D3 + SESSION-COST-LIMITS
@@ -3444,10 +3563,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // that arrived after the crash), which a launch would too.
       try {
         ({ agent, finalTurn: kickoff, snapshot, tokenEstimate } = await factory.create(record, tools, {
-          proactive:
-            record.sessionType === (config.proactive?.session_type ?? "proactive") ? true : undefined,
+          proactive: isProactiveResume ? true : undefined,
           abortSignal: drainAbort.signal,
           usage,
+          userLimit: recoveryGate?.userLimit,
+          costCeilingOverride: recoveryGate?.ceilingOverride,
         }));
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
@@ -3466,6 +3586,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         ({ agent } = await factory.create(record, tools, {
           resume: material,
           usage,
+          userLimit: recoveryGate?.userLimit,
+          costCeilingOverride: recoveryGate?.ceilingOverride,
         }));
       } catch (error) {
         return {
@@ -3482,8 +3604,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // this run actually used (overwriting the stale original).
     // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) and
     // share it between the settle log (self-contained spend-vs-ceiling line) and
-    // the soft-warn watcher, rather than resolving it twice.
-    const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
+    // the soft-warn watcher, rather than resolving it twice. The per-user dynamic
+    // ceiling (PER-USER-LIMITS §6.3) tightens it to the user's remaining headroom.
+    const costCeiling = recoveryGate?.ceilingOverride ?? factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: record.id,
@@ -3873,6 +3996,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       resumeLabel,
     });
 
+    // Per-user limits — Gate A for a resume (spec PER-USER-LIMITS §6). A resume is the
+    // SAME event as a fresh trigger from the per-user system's view (same replying
+    // user, same room, same budget), so the identical gate runs: a banned / out-of-
+    // budget user is refused (the reply gets the templated "out of budget" message and
+    // the session stays completed), otherwise the resolution is frozen so per-request
+    // selection / capping / live counter recording all apply to the continued rollout.
+    const resumeGate = resolveUserLimitGate(inbound, record.id, record.sessionType);
+    if (resumeGate.denied) {
+      postUserLimitRefusal(target, record.id, record.timelineKey, resumeGate);
+      sessions.markDiscarded(record.id);
+      drainNextQueuedTrigger(record.timelineKey);
+      return;
+    }
+
     // Usage continues accumulating from the row (continue-mode seed).
     const usage = new SessionUsageTracker(
       resumeUsageSeed(row, "continue"),
@@ -3924,6 +4061,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           triggerPreamble: continuation.triggerPreamble,
         },
         usage,
+        // Per-user selection + dynamic ceiling apply to a resume exactly as to a
+        // fresh launch (spec PER-USER-LIMITS §6).
+        userLimit: resumeGate.userLimit,
+        costCeilingOverride: resumeGate.ceilingOverride,
         abortSignal: drainAbort.signal,
       }));
       if (!kickoff) throw new Error("resume continuation produced no appended turn");
@@ -3958,7 +4099,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       retainFollowUpForSpawn(record.trigger, record.id);
     }
 
-    const costCeiling = factory.resolveSessionCostCeiling(record.sessionType);
+    // Effective ceiling reflects the user's remaining headroom (spec §6.3), as for a launch.
+    const costCeiling = resumeGate.ceilingOverride ?? factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: record.id,
@@ -4107,73 +4249,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       drainNextQueuedTrigger(session.timelineKey);
       return;
     }
-    // Per-user limits — Gate A (spec PER-USER-LIMITS §6.1). Resolved BEFORE the §8e
+    // Per-user limits — Gate A (spec PER-USER-LIMITS §6.1), resolved BEFORE the §8e
     // admission gate so the selected (possibly upgraded) model's chain — not the
     // session-type default — is what §8e gates on. HUMAN agent loop only; proactive/
-    // background never gate. Build the trigger ctx, resolve the per-field cascade,
-    // refuse a banned / fully-out-of-budget user (the optional templated reply), and
-    // otherwise FREEZE the resolution for per-request selection + the dynamic ceiling.
-    let userLimitForCreate:
-      | { engine: UserLimitEngine; resolution: UserLimitResolution; ctx: UserLimitContext }
-      | undefined;
+    // background never gate. A denied (banned / out-of-budget) user is refused with
+    // the optional templated reply; otherwise the resolution is frozen for
+    // per-request selection + the dynamic ceiling. Identical logic runs in the resume
+    // paths (`resolveUserLimitGate` is shared) — a resume is the same event.
+    let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
-    // The per-user-selected INITIAL model (logical id), overriding the session-type
-    // default for the §8e admission chain (§6.1). Undefined when per-user is inactive.
     let initialUserModel: string | undefined;
-    if (!proactive && userLimitEngine?.enabled) {
-      const userId = inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id;
-      if (userId) {
-        const ctx: UserLimitContext = { userId, roomId: roomIdFromTimelineKey(inbound.timelineKey) };
-        const resolution = userLimitEngine.resolve(ctx);
-        if (resolution.active) {
-          const preferred = resolution.models ?? [factory.resolveLogicalModelId(session.sessionType)];
-          // Coarse admission (§6.1): the first preferred model with headroom for a
-          // minimal first turn (prior context ≈ 0). Undefined ⇒ banned / fully out of
-          // budget → refuse here; the precise estimate + degradation run at Gate B.
-          initialUserModel = resolution.banned
-            ? undefined
-            : preferred.find(
-                (m) => userLimitEngine!.affordable(resolution, m, { priorContextTokens: 0 }).ok,
-              );
-          if (!initialUserModel) {
-            const displayName =
-              inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;
-            const binding = userLimitEngine.bindingConstraint(resolution);
-            logger.warn("usage_limit_blocked", {
-              gate: "user_admission",
-              sessionId: session.id,
-              timelineKey: session.timelineKey,
-              userId,
-              banned: resolution.banned,
-              binding: binding
-                ? { partitionKey: binding.partitionKey, capUsd: binding.cap, models: binding.modelScope }
-                : undefined,
-            });
-            const template = resolution.messageTemplate;
-            if (template) {
-              const body = renderUserLimitRefusal(template, ctx, binding, displayName);
-              void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
-                logger.warn("user_limit_rejection_send_failed", {
-                  sessionId: session.id,
-                  error: error instanceof Error ? error.message : String(error),
-                });
-              });
-            }
-            sessions.markDiscarded(session.id);
-            drainNextQueuedTrigger(session.timelineKey);
-            return;
-          }
-          userLimitForCreate = { engine: userLimitEngine, resolution, ctx };
-          userLimitResolutions.set(session.id, { resolution, ctx });
-          sessions.onSettle(session.id, () => userLimitResolutions.delete(session.id));
-          // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch).
-          // An exempt/uncapped user contributes ∞ → no change to the static ceiling.
-          const staticCeiling = factory.resolveSessionCostCeiling(session.sessionType);
-          const headroom = userLimitEngine.totalHeadroom(resolution);
-          const effective = Math.min(staticCeiling ?? Infinity, headroom ?? Infinity);
-          if (Number.isFinite(effective)) userCeilingOverride = effective;
-        }
+    if (!proactive) {
+      const gate = resolveUserLimitGate(inbound, session.id, session.sessionType);
+      if (gate.denied) {
+        postUserLimitRefusal(target, session.id, session.timelineKey, gate);
+        sessions.markDiscarded(session.id);
+        drainNextQueuedTrigger(session.timelineKey);
+        return;
       }
+      userLimitForCreate = gate.userLimit;
+      userCeilingOverride = gate.ceilingOverride;
+      initialUserModel = gate.initialModel;
     }
     // Period cost limits — triggered/proactive admission gate (spec
     // USAGE-COST-LIMITS §6.3 / §2.1). Refuse to spawn when the session's own
