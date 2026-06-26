@@ -1051,6 +1051,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (entry) {
           const coverageModel = event.requestedModelId ?? event.logicalModelId ?? event.modelId;
           userLimitEngine.record(entry.resolution, coverageModel, event.costUsd);
+          // Stamp the canonical parent space (§11) from the frozen ctx — it cannot be
+          // derived from intrinsic columns, so the recorder supplies it centrally.
+          if (entry.ctx.spaceIds?.[0] && event.spaceId === undefined) {
+            event = { ...event, spaceId: entry.ctx.spaceIds[0] };
+          }
         }
       }
       void storage.insertUsageEvent(event).catch((error) => {
@@ -1125,6 +1130,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       .replace(/\{window\}/g, window)
       .replace(/\{resets_at\}/g, resetsAt !== undefined ? formatResetsAt(resetsAt) : "")
       .replace(/\{resets_in\}/g, resetsAt !== undefined ? formatDurationShort(resetsAt - Date.now()) : "");
+  };
+
+  // Resolve a room's legitimate parent space ids (best-first) for per-user-limits
+  // SPACE matching (spec PER-USER-LIMITS §11). One per-room native `channelInfo`
+  // lookup at Gate A — called ONLY when a rule references space. Never rejects: a
+  // malformed key / lookup failure resolves to none (the room matches no space rule).
+  const resolveParentSpaceIds = async (timelineKey: string): Promise<string[]> => {
+    try {
+      const accountId = timelineKey.split(":")[1];
+      const roomId = roomIdFromTimelineKey(timelineKey);
+      if (!roomId) return [];
+      const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+      const info = await client.channelInfo({ roomId });
+      return info.parentSpaceIds ?? [];
+    } catch (error) {
+      logger.debug("resolve_parent_space_ids_failed", {
+        timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
   };
 
   // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3): returns an
@@ -3407,15 +3433,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     /** Populated only when `denied`, for the templated refusal (§12). */
     refusal?: { ctx: UserLimitContext; binding?: ResolvedConstraint; displayName: string; template?: string };
   }
-  function resolveUserLimitGate(
+  async function resolveUserLimitGate(
     inbound: InboundChatEvent,
     sessionId: string,
     sessionType: string,
-  ): UserLimitGate {
+  ): Promise<UserLimitGate> {
     if (!userLimitEngine?.enabled) return { active: false, denied: false };
     const userId = inbound.trigger?.triggeredBy?.id ?? inbound.event.sender?.id;
     if (!userId) return { active: false, denied: false };
-    const ctx: UserLimitContext = { userId, roomId: roomIdFromTimelineKey(inbound.timelineKey) };
+    // Parent-space resolution (§11) — only when a rule references space (the call is a
+    // per-room native lookup; skip it entirely for space-less deployments). Best-first
+    // ancestor ids; any failure degrades to none (the room matches no space rule).
+    let spaceIds: string[] | undefined;
+    if (userLimitEngine.usesSpace) {
+      spaceIds = await resolveParentSpaceIds(inbound.timelineKey);
+    }
+    const ctx: UserLimitContext = {
+      userId,
+      roomId: roomIdFromTimelineKey(inbound.timelineKey),
+      spaceIds,
+    };
     const resolution = userLimitEngine.resolve(ctx);
     if (!resolution.active) return { active: false, denied: false };
     // Coarse admission (§6.1): the first preferred model with headroom for a minimal
@@ -3521,7 +3558,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const isProactiveResume = record.sessionType === (config.proactive?.session_type ?? "proactive");
     const recoveryGate = isProactiveResume
       ? undefined
-      : resolveUserLimitGate(inbound, record.id, record.sessionType);
+      : await resolveUserLimitGate(inbound, record.id, record.sessionType);
     if (recoveryGate?.denied) {
       logger.warn("usage_limit_blocked", {
         gate: "user_resume",
@@ -4011,7 +4048,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // budget user is refused (the reply gets the templated "out of budget" message and
     // the session stays completed), otherwise the resolution is frozen so per-request
     // selection / capping / live counter recording all apply to the continued rollout.
-    const resumeGate = resolveUserLimitGate(inbound, record.id, record.sessionType);
+    const resumeGate = await resolveUserLimitGate(inbound, record.id, record.sessionType);
     if (resumeGate.denied) {
       postUserLimitRefusal(target, record.id, record.timelineKey, resumeGate);
       sessions.markDiscarded(record.id);
@@ -4269,7 +4306,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let userCeilingOverride: number | undefined;
     let initialUserModel: string | undefined;
     if (!proactive) {
-      const gate = resolveUserLimitGate(inbound, session.id, session.sessionType);
+      const gate = await resolveUserLimitGate(inbound, session.id, session.sessionType);
       if (gate.denied) {
         postUserLimitRefusal(target, session.id, session.timelineKey, gate);
         sessions.markDiscarded(session.id);

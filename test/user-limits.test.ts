@@ -101,12 +101,13 @@ test("normalize: max_usd = 0 is a ban; max_usd < 0 is exempt (no constraint)", (
   assert.equal(exempt[0]!.hasBudgetBlock, true);
 });
 
-test("normalize fatals: no match dimension, space (Phase 2), unknown model, sub-cap rules", () => {
+test("normalize fatals: no match dimension, unknown model, sub-cap rules", () => {
   const noDim = normalizeUserLimits([{ max_usd: 5, window: ROLL24 }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
   assert.ok(noDim.fatal.some((f) => /at least one match dimension/.test(f)));
 
+  // `space` is a valid match dimension (§11 second slice) — not a fatal.
   const space = normalizeUserLimits([{ space: "!s:h", max_usd: 5, window: ROLL24 }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
-  assert.ok(space.fatal.some((f) => /space matching not yet supported/.test(f)));
+  assert.deepEqual(space.fatal, []);
 
   const unknown = normalizeUserLimits([{ user: "*", models: ["nope"] }], { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
   assert.ok(unknown.fatal.some((f) => /unknown model "nope"/.test(f)));
@@ -126,18 +127,19 @@ test("normalize fatals: no match dimension, space (Phase 2), unknown model, sub-
   assert.ok(subForeign.fatal.some((f) => /not in the rule's models/.test(f)));
 });
 
-test("normalize fatals: bad partition var, {space_id}, shorthand+limits, >1 shared pool", () => {
+test("normalize fatals: bad partition var, shorthand+limits, >1 shared pool", () => {
   const badVar = normalizeUserLimits(
     [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "{nope}" }] }],
     { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
   );
   assert.ok(badVar.fatal.some((f) => /unknown partition variable/.test(f)));
 
+  // `{space_id}` is a valid partition variable now (§11) — not a fatal.
   const space = normalizeUserLimits(
-    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "space:{space_id}" }] }],
+    [{ space: "!s:h", user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "space:{space_id}" }] }],
     { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
   );
-  assert.ok(space.fatal.some((f) => /\{space_id\} partition not yet supported/.test(f)));
+  assert.deepEqual(space.fatal, []);
 
   const both = normalizeUserLimits(
     [{ user: "*", max_usd: 5, window: ROLL24, limits: [{ max_usd: 3, window: ROLL24 }] }],
@@ -356,6 +358,42 @@ test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model
   // Premium remaining is still its full sub-cap (10), not reduced by cheap spend.
   assert.equal(engine.affordable(r, "opus-premium", { newTokens: 0 }).remainingUsd, 10);
   assert.equal(premiumBinding?.modelScope?.[0], "opus-premium");
+});
+
+test("space matching (§11): matches ANY parent space; per-space pool shares across users", () => {
+  const engine = makeEngine([
+    // A space-scoped shared pool for two users; matches if the room is under !spaceB.
+    {
+      user: ["@a:hs", "@b:hs"],
+      space: "!spaceB:hs",
+      models: ["glm-cheap"],
+      limits: [{ max_usd: 30, window: ROLL24, partition: "space:{space_id}" }],
+    },
+  ]);
+  // A room with two parent spaces (best-first): !spaceA (canonical), !spaceB.
+  const ctxA: UserLimitContext = { userId: "@a:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs", "!spaceB:hs"] };
+  const ctxB: UserLimitContext = { userId: "@b:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs", "!spaceB:hs"] };
+  const a = engine.resolve(ctxA);
+  // Matches via the SECOND parent (!spaceB), even though the rule's space glob isn't
+  // the canonical first parent — "any ancestor matches".
+  assert.equal(a.active, true);
+  // The pool/partition + ledger key use the CANONICAL (first) parent space.
+  assert.equal(a.ledgerPartitionKey, "space:!spaceA:hs");
+  const b = engine.resolve(ctxB);
+  // Shared per-space pool: A's spend is visible to B (one meter).
+  engine.record(a, "glm-cheap", 20);
+  assert.equal(engine.totalHeadroom(b), 10);
+
+  // A room under neither space does not match.
+  const outside = engine.resolve({ userId: "@a:hs", roomId: "!r2:hs", spaceIds: ["!other:hs"] });
+  assert.equal(outside.active, false);
+  // The engine flags that it needs space resolution.
+  assert.equal(engine.usesSpace, true);
+});
+
+test("usesSpace is false when no rule references space (skips the resolution)", () => {
+  const engine = makeEngine([{ user: "*", max_usd: 5, window: ROLL24 }]);
+  assert.equal(engine.usesSpace, false);
 });
 
 test("seed: a meter materializes from the ledger sum on first access", () => {

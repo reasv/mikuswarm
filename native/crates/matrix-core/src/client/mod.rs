@@ -1171,6 +1171,10 @@ pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> Mat
         .get_room(&room_id)
         .ok_or_else(|| MatrixError::State(format!("room {room_id} is not known to the client")))?;
 
+    // Resolve all legitimate parent spaces once (best-first): the diary `<ROOM>`
+    // label uses the best parent's name; per-user limits SPACE matching (§11) uses
+    // every parent id, with the first as the canonical `{space_id}` / ledger value.
+    let parents = resolve_parent_spaces(&room).await;
     Ok(MatrixChannelInfo {
         room_id: room.room_id().to_string(),
         display_name: room.display_name().await.ok().and_then(display_name_or_none),
@@ -1183,32 +1187,33 @@ pub(crate) async fn channel_info_internal(client: &Client, room_id: &str) -> Mat
         joined: room.state() == RoomState::Joined,
         is_direct: room.is_direct().await.unwrap_or(false),
         member_count: Some(room.clone_info().active_members_count() as u64),
-        parent_space_name: resolve_parent_space_name(&room).await,
+        parent_space_name: resolve_best_parent_space_name(&parents).await,
+        parent_space_ids: parents.iter().map(|(_, id, _)| id.to_string()).collect(),
     })
 }
 
-/// Resolve the display name (or canonical alias) of the room's single legitimate
-/// parent space, for the diary header's `<ROOM>` label (ARCHITECTURE.md §9c).
+/// Collect ALL spec-legitimate parent spaces of `room`, best-first — for the diary
+/// header's `<ROOM>` label (the best parent's name, ARCHITECTURE.md §9c) AND per-user
+/// limits SPACE matching (all parent ids, spec PER-USER-LIMITS §11).
 ///
 /// Iterates `Room::parent_spaces()`, keeping ONLY spec-legitimate parents
 /// (`ParentSpace::Reciprocal` and `::WithPowerlevel`) and dropping
 /// `::Illegitimate` / `::Unverifiable` (unconfirmed / unauthenticated claims).
-/// Matrix permits multiple parents, so the pick is deterministic — prefer
-/// `Reciprocal` over `WithPowerlevel`, tie-break by lowest room id — yielding one
-/// suffix. For the chosen parent, prefer its display name, else its canonical
-/// alias. Returns `None` (no suffix) when there is no legitimate, name-resolvable
-/// parent; any error in resolution degrades to `None` rather than failing the call.
-async fn resolve_parent_space_name(room: &Room) -> Option<String> {
+/// Matrix permits multiple parents; the order is deterministic — `Reciprocal`
+/// before `WithPowerlevel`, tie-broken by lowest room id — so the first entry is the
+/// canonical parent. Any error in resolution degrades to an empty list rather than
+/// failing the call. The `rank` (0 = Reciprocal, 1 = WithPowerlevel) is retained for
+/// the sort key.
+async fn resolve_parent_spaces(room: &Room) -> Vec<(u8, OwnedRoomId, Room)> {
     use futures_util::StreamExt;
 
     let stream = match room.parent_spaces().await {
         Ok(stream) => stream,
-        Err(_) => return None,
+        Err(_) => return Vec::new(),
     };
     futures_util::pin_mut!(stream);
 
-    // rank: 0 = Reciprocal (preferred), 1 = WithPowerlevel.
-    let mut best: Option<(u8, OwnedRoomId, Room)> = None;
+    let mut parents: Vec<(u8, OwnedRoomId, Room)> = Vec::new();
     while let Some(item) = stream.next().await {
         let (rank, parent_room) = match item {
             Ok(ParentSpace::Reciprocal(parent)) => (0u8, parent),
@@ -1217,16 +1222,18 @@ async fn resolve_parent_space_name(room: &Room) -> Option<String> {
             Ok(ParentSpace::Illegitimate(_)) | Ok(ParentSpace::Unverifiable(_)) | Err(_) => continue,
         };
         let parent_id = parent_room.room_id().to_owned();
-        let replace = match &best {
-            None => true,
-            Some((best_rank, best_id, _)) => rank < *best_rank || (rank == *best_rank && parent_id < *best_id),
-        };
-        if replace {
-            best = Some((rank, parent_id, parent_room));
-        }
+        parents.push((rank, parent_id, parent_room));
     }
+    // Best-first: Reciprocal before WithPowerlevel, tie-break by lowest room id.
+    parents.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    parents
+}
 
-    let parent_room = best?.2;
+/// The best (first) parent space's display name, else its canonical alias, for the
+/// diary header's `<ROOM>` suffix. `None` when there is no legitimate, name-resolvable
+/// parent. Takes the pre-resolved, best-first list from {@link resolve_parent_spaces}.
+async fn resolve_best_parent_space_name(parents: &[(u8, OwnedRoomId, Room)]) -> Option<String> {
+    let parent_room = &parents.first()?.2;
     if let Ok(name) = parent_room.display_name().await {
         if let Some(name) = display_name_or_none(name) {
             return Some(name);

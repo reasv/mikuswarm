@@ -46,7 +46,7 @@ export interface NormalizeUserLimitsResult {
   warnings: string[];
 }
 
-const KNOWN_PARTITION_VARS = new Set(["user_id", "room_id", "homeserver"]);
+const KNOWN_PARTITION_VARS = new Set(["user_id", "room_id", "homeserver", "space_id"]);
 const DEFAULT_SHORTHAND_WINDOW: RawWindow = { type: "rolling", duration: "24h" };
 
 function asList(v: string | string[] | undefined): string[] | undefined {
@@ -89,9 +89,6 @@ export function normalizeUserLimits(
 
     if (!user && !room && !space) {
       fatal.push(`${label}: at least one match dimension (user/room/space) is required`);
-    }
-    if (space) {
-      fatal.push(`${label}: space matching not yet supported (Phase 2 — spec §11)`);
     }
 
     // ── Models (the preference set) ──
@@ -157,12 +154,10 @@ export function normalizeUserLimits(
         const window = parseWindow(c.window, `limits[${index}]`);
         if (!window) return;
         const partition = c.partition ?? "{user_id}";
-        // Partition template var validation (§9): only known vars; {space_id} is a
-        // Phase-2 fatal (same gate as the `space` match field).
+        // Partition template var validation (§9): only known vars (incl. {space_id},
+        // §11 second slice).
         for (const v of partitionVars(partition)) {
-          if (v === "space_id") {
-            fatal.push(`${label} limits[${index}]: {space_id} partition not yet supported (Phase 2)`);
-          } else if (!KNOWN_PARTITION_VARS.has(v)) {
+          if (!KNOWN_PARTITION_VARS.has(v)) {
             fatal.push(`${label} limits[${index}]: unknown partition variable "{${v}}"`);
           }
         }

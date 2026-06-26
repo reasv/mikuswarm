@@ -940,6 +940,10 @@ export interface UsageEventRow {
   /** Bare Matrix room id derived from `timeline_key` (spec PER-USER-LIMITS §8.3) — the
    *  sturdy room-scoped seed for per-user-per-room counters + per-room pools. */
   room_id: string | null;
+  /** Canonical parent space id (resolved + frozen at admission, spec PER-USER-LIMITS
+   *  §11) — the space-scoped seed for per-user-per-space counters + per-space pools.
+   *  Null when the room has no parent space or the deployment uses no space rules. */
+  space_id: string | null;
   provider: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -992,6 +996,11 @@ export interface UsageEventInput {
    * event joins no shared pool → stored null.
    */
   budgetPartition?: string | null;
+  /**
+   * Canonical parent space id of the triggering room (spec PER-USER-LIMITS §11),
+   * resolved + frozen at admission. Omitted (no space rules / no parent) → null.
+   */
+  spaceId?: string | null;
   provider?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -1023,6 +1032,8 @@ export interface UsageCostFilter {
   partitionKeys?: string[];
   /** `room_id IN (…)` — room-scoped seed (derived bare room id, §16 Q2 choice). */
   roomIds?: string[];
+  /** `space_id IN (…)` — space-scoped seed (canonical parent space id, §11). */
+  spaceIds?: string[];
   /**
    * A per-user sub-cap's REQUESTED-model scope (spec §7): matches `requested_model_id`,
    * falling back to `logical_model_id` for pre-feature rows whose requested id is null
@@ -3602,6 +3613,9 @@ export class Storage {
       requested_model_id: input.requestedModelId ?? null,
       budget_partition: input.budgetPartition ?? null,
       room_id: roomIdFromTimelineKey(input.timelineKey ?? undefined),
+      // Space id (§11) cannot be derived from intrinsic columns — it is supplied by
+      // the per-user recorder from the session's frozen resolution (null otherwise).
+      space_id: input.spaceId ?? null,
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,
@@ -3616,12 +3630,12 @@ export class Storage {
       db.prepare(
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
-           tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id,
+           tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id, space_id,
            provider, input_tokens, output_tokens, cache_read_tokens,
            cache_write_tokens, images, cost_usd, ref, created_at
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
-           @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id,
+           @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id, @space_id,
            @provider, @input_tokens, @output_tokens, @cache_read_tokens,
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
@@ -3663,6 +3677,7 @@ export class Storage {
     inClause("trigger_sender_id", filter.triggerSenderIds);
     inClause("budget_partition", filter.partitionKeys);
     inClause("room_id", filter.roomIds);
+    inClause("space_id", filter.spaceIds);
     if (filter.requestedModelIds && filter.requestedModelIds.length > 0) {
       const ph = filter.requestedModelIds.map(() => "?").join(", ");
       clauses.push(
@@ -7384,9 +7399,13 @@ create table if not exists usage_events (
   --     membership is a cascade outcome, irreducible from intrinsic columns.
   --   room_id: the bare Matrix room id (derived from timeline_key) for room-scoped
   --     per-user counters + per-room pools — sturdier than a timeline_key LIKE.
+  --   space_id: the canonical parent space id (resolved + frozen at admission, §11)
+  --     for space-scoped per-user counters + per-space pools. Null when the room has
+  --     no parent space, or for a deployment without space rules.
   requested_model_id text,
   budget_partition text,
   room_id text,
+  space_id text,
   provider text,
   input_tokens integer,
   output_tokens integer,
@@ -7417,6 +7436,7 @@ create index if not exists idx_usage_events_sender_ts on usage_events(trigger_se
 create index if not exists idx_usage_events_partition_ts on usage_events(budget_partition, ts);
 create index if not exists idx_usage_events_requested_model_ts on usage_events(requested_model_id, ts);
 create index if not exists idx_usage_events_room_ts on usage_events(room_id, ts);
+create index if not exists idx_usage_events_space_ts on usage_events(space_id, ts);
 `;
 
 // media_assets table + its indexes, factored out of the canonical SCHEMA so the
@@ -7969,7 +7989,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // holds the ordered steps that advance an existing database from one version to
 // the next. Bump this (and append a MIGRATIONS entry) whenever the schema
 // changes.
-export const LATEST_SCHEMA_VERSION = 31;
+export const LATEST_SCHEMA_VERSION = 32;
 
 // Ordered, additive migration steps. The runner's loop consults
 // `MIGRATIONS[version]` for each `version` from the DB's current version up to
@@ -8972,6 +8992,19 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       `create index if not exists idx_usage_events_requested_model_ts on usage_events(requested_model_id, ts);`,
     );
     db.exec(`create index if not exists idx_usage_events_room_ts on usage_events(room_id, ts);`);
+  },
+  // index 31 (v31 -> v32): per-user limits SPACE matching (spec PER-USER-LIMITS §11,
+  // second slice). One additive NULLABLE column + its seed index. No backfill (old
+  // rows pre-date space matching; the canonical parent space cannot be reconstructed
+  // from intrinsic columns anyway). Idempotent + guarded for rewound fixtures.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
+    if (!hasTable("usage_events")) return;
+    const columns = db.pragma(`table_info(usage_events)`) as Array<{ name: string }>;
+    if (columns.some((c) => c.name === "space_id")) return;
+    db.exec(`alter table usage_events add column space_id text;`);
+    db.exec(`create index if not exists idx_usage_events_space_ts on usage_events(space_id, ts);`);
   },
 ];
 
