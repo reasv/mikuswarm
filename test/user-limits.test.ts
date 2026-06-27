@@ -263,6 +263,61 @@ test("degradation: an exhausted premium sub-cap makes premium unaffordable but t
   assert.equal(engine.totalHeadroom(r), 3);
 });
 
+test("affordable: additive thinking budget is reserved within the issued cap and charged (#4)", () => {
+  // glm-cheap: $0.5/$2 per MTok. Total cap $5, no prior context (input_cost ≈ 0).
+  // affordableOutput = floor(5 / (2/1e6)) = 2_500_000 total billed output.
+  const engine = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Without thinking, the cap is the model default max (8000 < 2.5M affordable).
+  const noThink = engine.affordable(r, "glm-cheap", { newTokens: 0 }, 0);
+  assert.equal(noThink.ok, true);
+  assert.equal(noThink.maxOutput, 8000);
+
+  // Tight budget so the model-default cap does NOT clamp: $0.02 buys
+  // floor(0.02 / (2/1e6)) = 10_000 total output. A 2048-token thinking budget must be
+  // RESERVED inside the issued base cap → base = 10000 − 2048 = 7952, so the wire cap
+  // (base + thinking) = 10000 stays within budget rather than overshooting to 12048.
+  const tight = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 0.02, window: ROLL24 }] }]);
+  const rt = tight.resolve({ userId: "@a:hs" });
+  const noThinkTight = tight.affordable(rt, "glm-cheap", { newTokens: 0 }, 0);
+  assert.equal(noThinkTight.maxOutput, 8000); // model default clamps (10000 > 8000)
+  const thinkTight = tight.affordable(rt, "glm-cheap", { newTokens: 0 }, 2048);
+  assert.equal(thinkTight.ok, true);
+  // base = min(modelDefaultMax 8000, affordableOutput 10000 − 2048 = 7952) = 7952.
+  assert.equal(thinkTight.maxOutput, 7952);
+  // The reserved thinking budget keeps base + thinking == the un-thinking affordable
+  // output (10000) — never above it.
+  assert.equal(thinkTight.maxOutput + 2048, 10000);
+});
+
+test("affordable: a loose budget caps at the REQUESTED model's own max_tokens — the #9 disambiguator basis", () => {
+  // The §5.4 re-drive disambiguation (#9) compares the issued cap against the REQUESTED
+  // model's `max_tokens`: a length stop with `cap >= requestedModelMax` is a legitimate
+  // long answer (accept), `cap < requestedModelMax` is a budget cap (re-drive). This
+  // pins the load-bearing property: when the budget does NOT bind, the cap equals the
+  // requested model's own max — so the disambiguator never misreads a natural length
+  // stop as a budget cap (and vice-versa), independent of any served fallback member.
+  const engine = makeEngine([{ user: "*", models: ["opus-premium"], limits: [{ max_usd: 100, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  const aff = engine.affordable(r, "opus-premium", { newTokens: 1_000 });
+  assert.equal(aff.ok, true);
+  assert.equal(aff.maxOutput, MAX_TOKENS["opus-premium"], "loose budget ⇒ cap == requested model max");
+
+  // A bound budget caps BELOW the requested model max → the disambiguator reads "budget".
+  const tight = makeEngine([{ user: "*", models: ["opus-premium"], limits: [{ max_usd: 1, window: ROLL24 }] }]);
+  const rt = tight.resolve({ userId: "@a:hs" });
+  const affTight = tight.affordable(rt, "opus-premium", { newTokens: 1_000 });
+  assert.ok(affTight.ok && affTight.maxOutput < MAX_TOKENS["opus-premium"]!, "bound budget ⇒ cap below model max");
+});
+
+test("affordable: thinking budget that consumes the whole turn makes it unaffordable (#4)", () => {
+  // $0.02 buys 10_000 total output; a 16384 thinking budget leaves a NEGATIVE base
+  // (< viable_min) ⇒ the model cannot complete a turn within budget.
+  const engine = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 0.02, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  assert.equal(engine.affordable(r, "glm-cheap", { newTokens: 0 }, 16384).ok, false);
+});
+
 test("estimation: prior context is cache-read within the TTL, cache-write outside (§5.3)", () => {
   // A model with explicit cache rates: read = 0.1×input, write = 1.25×input.
   const cacheRates: Record<string, ModelCostRates> = {

@@ -502,11 +502,20 @@ export class UserLimitEngine {
    * `viable_min` turn. A zero-cost model (or no covering constraint) is always
    * affordable. The `min` ranges over EVERY covering constraint — per-user and
    * shared-pool alike (§8.2).
+   *
+   * `thinkingBudgetTokens` (#4) is the extended-thinking output the provider will
+   * BILL on top of the issued base `max_tokens` (additive Anthropic/Gemini paths;
+   * 0 for adaptive-thinking models, the OpenAI effort path, and thinking-off). The
+   * budgeted (and viable-min) basis is the TOTAL billed output (text + thinking), but
+   * the returned `maxOutput` is the BASE cap to issue, so that after the provider adds
+   * the thinking budget the wire cap — and thus the billed output — stays within the
+   * authorized headroom. Default 0 → today's behavior.
    */
   affordable(
     resolution: UserLimitResolution,
     requestedModelId: string,
     estimate: AffordabilityEstimate,
+    thinkingBudgetTokens = 0,
   ): AffordabilityResult {
     const modelDefaultMax = this.options.maxTokensFor(requestedModelId);
     // Zero-cost bypass (§5.3): a free model can never move or be blocked.
@@ -555,11 +564,20 @@ export class UserLimitEngine {
       ? (cached / 1_000_000) * readRate + (fresh / 1_000_000) * writeRate
       : ((cached + fresh) / 1_000_000) * writeRate;
     const outputPricePerToken = rates.outputPerMTok / 1_000_000;
+    // The remaining headroom must pay for the TOTAL billed output — base text PLUS the
+    // additive thinking budget the provider bills on top (#4) — so the affordable
+    // total is priced at the output rate over both. The issued base cap then RESERVES
+    // the thinking budget inside it: `base = affordableOutput − thinkingBudget`, so the
+    // provider's `min(base + thinkingBudget, modelMax)` wire cap never exceeds what the
+    // budget bought. The viable-min predicate is applied to the base (text) portion —
+    // a turn whose budget is entirely consumed by thinking cannot complete.
+    const thinking = Math.max(0, thinkingBudgetTokens);
     const affordableOutput = Math.floor((remaining - inputCost) / outputPricePerToken);
-    if (!(affordableOutput > this.options.viableMinOutputTokens)) {
-      return { ok: false, maxOutput: Math.max(0, affordableOutput), binding, remainingUsd: remaining };
+    const affordableBase = affordableOutput - thinking;
+    if (!(affordableBase > this.options.viableMinOutputTokens)) {
+      return { ok: false, maxOutput: Math.max(0, affordableBase), binding, remainingUsd: remaining };
     }
-    const maxOutput = Math.min(modelDefaultMax ?? affordableOutput, affordableOutput);
+    const maxOutput = Math.min(modelDefaultMax ?? affordableBase, affordableBase);
     return { ok: true, maxOutput, binding, remainingUsd: remaining };
   }
 

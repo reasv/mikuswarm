@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AgentSessionFactory, composeSessionContextCeiling } from "../src/agent/factory.js";
+import { AgentSessionFactory, additiveThinkingBudgetTokens, composeSessionContextCeiling } from "../src/agent/factory.js";
 import { validateContextTokenCeilings } from "../src/app.js";
 import type { AppConfig } from "../src/config/index.js";
 
@@ -373,4 +373,73 @@ test("agent capability filter: image session drops a text-only fallback; text se
     capability: rawInputsRequireMultimodal(textOnly) ? (c: any) => c.input_modalities.includes("image") : undefined,
   });
   assert.deepEqual(fbText.survivorLogicalIds, ["head-mm", "fb-text"], "full chain kept for a text-only session");
+});
+
+// === spec PER-USER-LIMITS §5.3 / review #4 ===================================
+// `additiveThinkingBudgetTokens` returns the extended-thinking output a provider
+// BILLS on top of the issued base `max_tokens` (so the per-user affordability
+// estimate can reserve it). Additive only where the provider actually adds it:
+// Anthropic non-adaptive (older) + Google/Gemini; 0 for adaptive Anthropic
+// (Opus/Sonnet 4.6+ effort hint), the OpenAI effort path, and thinking off.
+
+/** Minimal ModelConfig shape touched by additiveThinkingBudgetTokens. */
+function modelCfg(opts: {
+  id: string;
+  api?: "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai";
+  max_tokens?: number;
+  reasoning?: boolean;
+}): any {
+  return { id: opts.id, api: opts.api, max_tokens: opts.max_tokens ?? 32_000, reasoning: opts.reasoning };
+}
+
+test("additiveThinkingBudgetTokens: off / disabled-capability ⇒ 0 (#4)", () => {
+  assert.equal(additiveThinkingBudgetTokens(modelCfg({ id: "claude-3-5-sonnet" }), "off"), 0);
+  assert.equal(
+    additiveThinkingBudgetTokens(modelCfg({ id: "claude-3-5-sonnet", reasoning: false }), "high"),
+    0,
+  );
+});
+
+test("additiveThinkingBudgetTokens: Anthropic NON-adaptive is additive, per-level (#4)", () => {
+  const m = modelCfg({ id: "claude-3-5-sonnet", api: "anthropic-messages" });
+  assert.equal(additiveThinkingBudgetTokens(m, "minimal"), 1024);
+  assert.equal(additiveThinkingBudgetTokens(m, "low"), 2048);
+  assert.equal(additiveThinkingBudgetTokens(m, "medium"), 8192);
+  assert.equal(additiveThinkingBudgetTokens(m, "high"), 16384);
+  // xhigh clamps to high (pi-ai clampReasoning) → 16384.
+  assert.equal(additiveThinkingBudgetTokens(m, "xhigh"), 16384);
+});
+
+test("additiveThinkingBudgetTokens: Anthropic ADAPTIVE (Opus/Sonnet 4.6+) is 0 — effort hint, no add (#4)", () => {
+  for (const id of ["claude-opus-4-6", "claude-opus-4.7", "claude-sonnet-4-6"]) {
+    assert.equal(
+      additiveThinkingBudgetTokens(modelCfg({ id, api: "anthropic-messages" }), "high"),
+      0,
+      `${id} must not be penalized`,
+    );
+  }
+});
+
+test("additiveThinkingBudgetTokens: Google/Gemini separate-lane budget is additive (#4)", () => {
+  const m = modelCfg({ id: "gemini-2.5-pro", api: "google-generative-ai" });
+  assert.equal(additiveThinkingBudgetTokens(m, "medium"), 8192);
+  assert.equal(additiveThinkingBudgetTokens(m, "high"), 16384);
+});
+
+test("additiveThinkingBudgetTokens: OpenAI effort path adds nothing (fits within max_tokens) (#4)", () => {
+  assert.equal(
+    additiveThinkingBudgetTokens(modelCfg({ id: "gpt-5", api: "openai-completions" }), "high"),
+    0,
+  );
+  assert.equal(
+    additiveThinkingBudgetTokens(modelCfg({ id: "gpt-5", api: "openai-responses" }), "high"),
+    0,
+  );
+});
+
+test("additiveThinkingBudgetTokens: additive portion never exceeds the model's own max_tokens (#4)", () => {
+  // A tiny-max model: the 16384 high budget clamps to max_tokens (pi-ai clamps the
+  // wire cap to modelMax too).
+  const m = modelCfg({ id: "claude-3-5-haiku", api: "anthropic-messages", max_tokens: 4_000 });
+  assert.equal(additiveThinkingBudgetTokens(m, "high"), 4_000);
 });

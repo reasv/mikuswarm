@@ -44,6 +44,7 @@ import {
   loadCompletedSessionMaterial,
   SYNTHETIC_SESSION_TYPES,
   filterTools,
+  additiveThinkingBudgetTokens,
   hasResumableWork,
   type ResumeMaterial,
   type ResumeWorkScope,
@@ -3458,10 +3459,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Coarse admission (§6.1): the first preferred model with headroom for a minimal
     // first turn (prior context ≈ 0). Undefined ⇒ banned / fully out of budget; the
     // precise estimate + degradation run per request at Gate B inside the factory.
+    // The additive extended-thinking budget (#4) is reserved here too so Gate A's
+    // initial pick matches Gate B's per-attempt selection — a model affordable only
+    // because thinking was ignored must not be admitted as the initial model. The
+    // thinking level is the session-type head's config (fixed for the rollout).
     const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType)];
+    const sessionThinkingLevel =
+      config.models[factory.resolveLogicalModelId(sessionType)]?.thinking_level ?? "off";
+    const thinkingBudgetForModel = (m: string): number => {
+      const mc = config.models[m];
+      return mc ? additiveThinkingBudgetTokens(mc, sessionThinkingLevel) : 0;
+    };
     const initialModel = resolution.banned
       ? undefined
-      : preferred.find((m) => userLimitEngine!.affordable(resolution, m, {}).ok);
+      : preferred.find(
+          (m) => userLimitEngine!.affordable(resolution, m, {}, thinkingBudgetForModel(m)).ok,
+        );
     if (!initialModel) {
       const displayName =
         inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;

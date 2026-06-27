@@ -445,6 +445,12 @@ export class AgentSessionFactory {
     const modelKey = sessionTypeConfig?.model ?? "default";
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
+    // Extended-thinking level for this session (the head model's config, default off).
+    // Fixed for the whole rollout — it flows as pi-ai `options.reasoning` on every
+    // request regardless of which per-user model serves — and is the basis for the
+    // per-requested-model additive thinking budget the affordability estimate reserves
+    // (#4). Resolved once here; also fed verbatim to the Agent's `initialState` below.
+    const thinkingLevel: ThinkingLevel = modelConfig.thinking_level ?? "off";
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
     // once and fed to the hard-cap pre-flight below. `undefined` = unlimited. The
     // per-user dynamic-ceiling override (PER-USER-LIMITS §6.3) replaces the static
@@ -567,12 +573,21 @@ export class AgentSessionFactory {
     interface Selectable {
       requestedLogicalId: string;
       fallback: BuiltModelFallback;
+      /**
+       * Additive extended-thinking budget the provider bills on top of this requested
+       * model's issued `max_tokens` at the session thinking level (#4). Folded into the
+       * affordability output basis and reserved inside the issued cap so the wire
+       * `max_tokens` (post-pi-ai) never exceeds the authorized budget. 0 for adaptive /
+       * OpenAI-effort / thinking-off models.
+       */
+      thinkingBudgetTokens: number;
     }
     const selectables: Selectable[] = [];
     if (userSelection) {
       const preferred = userLimit!.resolution.models ?? [modelKey];
       for (const logicalId of preferred) {
-        if (!this.options.config.models[logicalId]) {
+        const requestedConfig = this.options.config.models[logicalId];
+        if (!requestedConfig) {
           this.options.logger?.warn("user_limit_model_missing", { sessionId: session.id, model: logicalId });
           continue;
         }
@@ -580,11 +595,20 @@ export class AgentSessionFactory {
         if (requiresMultimodal && !chainEntries.some((m) => m.config.input_modalities.includes("image"))) {
           continue; // whole chain lacks the needed modality → absent from the set
         }
-        selectables.push({ requestedLogicalId: logicalId, fallback: buildFor(logicalId) });
+        selectables.push({
+          requestedLogicalId: logicalId,
+          fallback: buildFor(logicalId),
+          thinkingBudgetTokens: additiveThinkingBudgetTokens(requestedConfig, thinkingLevel),
+        });
       }
       if (selectables.length === 0) {
-        // Rare (image session + an all-text-only user model set): degrade to the
-        // default composite with no per-user selection (the §8d/§8e gates still run).
+        // Rare (image session + an all-text-only user model set): the capability filter
+        // emptied the preference set. Per spec §4.2 a capability-missing model is ABSENT
+        // from the set, so when NONE qualifies the outcome is TERMINAL — a per-user
+        // content-class deny — NOT a fall-through to the ungated session-type default
+        // (which would let an image trigger bypass the per-user gate, #3). Flagged here
+        // and enforced as the first-request terminal in `checkCostBudget` below; the
+        // §8d ceiling (`costCeilingOverride`) and per-user counting still apply.
         this.options.logger?.warn("user_limit_selection_empty", {
           sessionId: session.id,
           timelineKey: session.timelineKey,
@@ -592,6 +616,9 @@ export class AgentSessionFactory {
       }
     }
     const userSelectionActive = userSelection && selectables.length > 0;
+    // The capability filter emptied an ACTIVE per-user preference set (#3): a terminal
+    // per-user deny, distinct from "no per-user rule" — never an ungated default path.
+    const userSelectionCapabilityDenied = userSelection && selectables.length === 0;
     // Initial context-token estimate for the FIRST request (the built context size;
     // §5.3). Assigned after buildContext; seeds the exact running counter below.
     const initialContextEstimate = { value: 0 };
@@ -614,7 +641,14 @@ export class AgentSessionFactory {
       }
       if (msgs.length > ctxCounter.seenMsgs) {
         try {
-          ctxCounter.running += estimateObjectTokens(convertToLlm(msgs.slice(ctxCounter.seenMsgs)));
+          // Tokenize only the slice that the wire context actually carries: mirror
+          // `transformContext`'s `.filter(isLiveRuntimeMessage)` so the running counter
+          // matches what is sent (chatEvents / text-only assistant turns are dropped on
+          // the wire) rather than over-counting them (#10). `seenMsgs` still advances by
+          // the full observed length — a dropped message is permanently accounted as
+          // "seen, contributes nothing", never re-tokenized on a later refresh.
+          const slice = msgs.slice(ctxCounter.seenMsgs).filter(isLiveRuntimeMessage);
+          if (slice.length > 0) ctxCounter.running += estimateObjectTokens(convertToLlm(slice));
         } catch {
           /* tokenization is best-effort; leave the prior running total (conservative) */
         }
@@ -626,9 +660,28 @@ export class AgentSessionFactory {
     let budgetTruncationCount = 0;
     // Per-request selection state the outer selector dispatches — re-resolved by the
     // pre-flight before each request (§6.2); defaults to the most-preferred model.
+    // DEFENSIVE initial cap (#13): the per-user pre-flight (`checkCostBudget` →
+    // `resolveUserSelection`) overwrites `activeSelection.maxTokens` with the precise
+    // per-request cap before request 1 — but `withRequestRetry` SWALLOWS a throw in
+    // that pre-flight (degrades to "no local block"), and an undefined `maxTokens`
+    // would then ship request 1 — the most expensive — uncapped. So seed a cap from
+    // the first selectable's affordable output at a ≈0 prior-context estimate
+    // (mirroring Gate A's `affordable(…, {})`), with the additive thinking budget
+    // reserved (#4). `initialContextEstimate.value` is still 0 here (the build/resume
+    // branch runs later), so this is a zero-context cap by construction. A non-per-user
+    // session keeps no cap (today's behavior).
     let activeSelection: { fallback: BuiltModelFallback; requestedLogicalId: string; maxTokens?: number } =
       userSelectionActive
-        ? { fallback: selectables[0]!.fallback, requestedLogicalId: selectables[0]!.requestedLogicalId }
+        ? {
+            fallback: selectables[0]!.fallback,
+            requestedLogicalId: selectables[0]!.requestedLogicalId,
+            maxTokens: userLimit!.engine.affordable(
+              userLimit!.resolution,
+              selectables[0]!.requestedLogicalId,
+              {},
+              selectables[0]!.thinkingBudgetTokens,
+            ).maxOutput,
+          }
         : { fallback, requestedLogicalId: modelKey };
     // The §4.2 resolver (affordable ∧ healthy ∧ fits). Builds the §5.3 estimate from
     // the exact running counter: the cache-read prior prompt + the cache-write new
@@ -649,7 +702,12 @@ export class AgentSessionFactory {
               isModelAvailable: isModelAvailableFn,
             }).reason !== "all-unhealthy"
           : true;
-        const aff = userLimit!.engine.affordable(userLimit!.resolution, s.requestedLogicalId, estimate);
+        const aff = userLimit!.engine.affordable(
+          userLimit!.resolution,
+          s.requestedLogicalId,
+          estimate,
+          s.thinkingBudgetTokens,
+        );
         if (fits && healthy && aff.ok) {
           return {
             ok: true,
@@ -885,6 +943,24 @@ export class AgentSessionFactory {
               );
             }
           }
+          // Capability-deny terminal (#3, spec §4.2): an ACTIVE per-user rule whose
+          // entire preference set was emptied by the capability pre-filter (e.g. an
+          // image trigger against a text-only user model set) is a TERMINAL per-user
+          // outcome — a content-class deny (no retry burn) — not a fall-through to the
+          // ungated default. Enforced on every request (the mismatch is structural).
+          if (userSelectionCapabilityDenied) {
+            this.options.logger?.warn("usage_limit_blocked", {
+              gate: "user_preflight",
+              sessionId: session.id,
+              timelineKey: session.timelineKey,
+              userId: userLimit!.ctx.userId,
+              cause: "capability",
+            });
+            return (
+              `per-user selection: no model in the user's set can serve this request's ` +
+              `content (capability mismatch) for ${userLimit!.ctx.userId}`
+            );
+          }
           // Per-user selection + estimation (spec PER-USER-LIMITS §6.2): re-resolve the
           // preferred model PER REQUEST against the live partitioned counters, stash
           // the chosen composite + budget-derived output cap for the outer selector,
@@ -932,11 +1008,18 @@ export class AgentSessionFactory {
           ? {
               onBudgetTruncation: (committed: AssistantMessage): "reselect" | "accept" => {
                 const cap = activeSelection.maxTokens;
-                const servedDefault =
-                  this.options.config.models[resolvedMember.logicalId]?.max_tokens ?? Number.POSITIVE_INFINITY;
-                // A length stop with the cap == the model's own max is a legitimate
-                // long answer, not a budget cap → deliver it.
-                if (cap === undefined || cap >= servedDefault) return "accept";
+                // Disambiguate budget-cap vs legitimate length stop against the
+                // REQUESTED model's OWN `max_tokens` — the value `cap` was derived from
+                // (`affordable` returns `min(requestedModelMax, affordableBase)`), NOT
+                // the SERVED fallback member's max (#9). Using the served member's max
+                // mis-compares a requested-derived cap against a different model under
+                // active fallback. This stays correct after #4: when the budget did not
+                // bind, `cap == requestedModelMax` (≥ the natural max) → a genuine long
+                // answer, deliver; when it bound, `cap < requestedModelMax` → a budget
+                // cap, re-drive on a cheaper model with reserved headroom.
+                const requestedDefault =
+                  this.options.config.models[requestedMember.logicalId]?.max_tokens ?? Number.POSITIVE_INFINITY;
+                if (cap === undefined || cap >= requestedDefault) return "accept";
                 // Bound re-drives by the number of distinct preferred models — once
                 // each has had a turn, the floor is reached; deliver what we have.
                 if (budgetTruncationCount >= selectables.length) return "accept";
@@ -1004,6 +1087,21 @@ export class AgentSessionFactory {
       // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
       // from aliasing — and freezing — the caller's array (§6).
       frozenBaseSeed = [...opts.resume.snapshot];
+      // Seed the per-user running-input estimate from the RESUMED context size (#1).
+      // The fresh-build branch sets `initialContextEstimate` from `built.tokenEstimate`;
+      // the resume branch never builds, so without this the first
+      // `refreshRunningContext()` would mark the whole resumed transcript+snapshot as
+      // already-counted against a 0 baseline → input_cost ≈ $0 → the §5.3 output cap is
+      // removed and §5.4 degradation never fires (uncapped overshoot on every reply-
+      // resume / follow-up-resume / continue-mode recovery). Prefer the last committed
+      // request's actual context size (`usage.snapshot().contextTokens`, already loaded
+      // for continue-mode via `usageSeedFromRow`); fall back to the summed snapshot +
+      // transcript `tokenEstimate`s when no actuals exist (a fresh-mode resume that
+      // never committed — though that path rebuilds and does not enter this branch).
+      initialContextEstimate.value =
+        usage.snapshot().contextTokens ??
+        sumMessageTokenEstimates(opts.resume.snapshot) +
+          sumMessageTokenEstimates(opts.resume.transcript ?? []);
       // Reply-resume of a COMPLETED session (spec RESUMABLE-SESSIONS §9/§11): build
       // the fresh appended turn (gap + fresh satellite + trigger group) and return
       // it as the kickoff. The frozen prefix above is the ORIGINAL snapshot, reused
@@ -1104,7 +1202,7 @@ export class AgentSessionFactory {
         // (retry → admission → streamSimple). The model descriptor's
         // `reasoning` flag above only declares capability; this is what
         // actually requests thinking.
-        thinkingLevel: modelConfig.thinking_level ?? "off",
+        thinkingLevel,
       },
       transformContext: async (messages) => [
         ...frozenBase,
@@ -1503,6 +1601,23 @@ function messageHasImageBlock(message: AgentMessage): boolean {
 }
 
 /**
+ * Σ of the per-message `tokenEstimate`s carried on a persisted message array (the
+ * builder stamps it on the tier/trigger messages). Used only as the FALLBACK seed
+ * for a resumed session's running-input estimate when no committed-request actuals
+ * exist (#1) — actuals (`usage.snapshot().contextTokens`) are preferred. Messages
+ * without an estimate contribute 0 (conservative under-count, the same basis the
+ * verbatim renderer uses).
+ */
+function sumMessageTokenEstimates(messages: AgentMessage[]): number {
+  let total = 0;
+  for (const m of messages) {
+    const est = (m as { tokenEstimate?: unknown }).tokenEstimate;
+    if (typeof est === "number" && est > 0) total += est;
+  }
+  return total;
+}
+
+/**
  * Does this trigger event (or its quoted reply) carry an image attachment? Mirrors
  * the builder's own `mediaType === "image" && localPath` predicate
  * (`selectImageAttachments`), kept cheap (no store walk) for the create-time
@@ -1647,6 +1762,77 @@ function isLiveRuntimeMessage(message: AgentMessage): boolean {
     return Array.isArray(typed.content) && typed.content.some((block: any) => block?.type === "toolCall");
   }
   return false;
+}
+
+/** Effective extended-thinking level for a model (config, default off). */
+type ThinkingLevel = NonNullable<ModelConfig["thinking_level"]>;
+
+/**
+ * Per-level extended-thinking token budgets (#4) — the SAME mapping pi-ai's
+ * `adjustMaxTokensForThinking` uses (`simple-options.js`): the additive budget a
+ * provider reserves/bills on top of the base `max_tokens` for thinking. `xhigh`
+ * clamps to `high` exactly as pi-ai's `clampReasoning` does. No custom
+ * `thinking_budgets` are wired in this app's config, so this fixed map is
+ * authoritative; if that ever changes, thread the override through here.
+ */
+const THINKING_BUDGET_BY_LEVEL: Record<Exclude<ThinkingLevel, "off">, number> = {
+  minimal: 1024,
+  low: 2048,
+  medium: 8192,
+  high: 16384,
+  xhigh: 16384, // clampReasoning("xhigh") === "high" → 16384
+};
+
+/**
+ * Does this Anthropic model use ADAPTIVE thinking (Opus 4.6+/4.7, Sonnet 4.6)?
+ * Mirrors pi-ai's `supportsAdaptiveThinking` (`anthropic.js`). Adaptive models
+ * take an effort HINT with no additive `max_tokens` budget — the wire cap stays at
+ * the requested `max_tokens` and billed output never exceeds it — so they must NOT
+ * be penalized in the affordability output basis (#4).
+ */
+function modelUsesAdaptiveThinking(modelId: string): boolean {
+  return (
+    modelId.includes("opus-4-6") ||
+    modelId.includes("opus-4.6") ||
+    modelId.includes("opus-4-7") ||
+    modelId.includes("opus-4.7") ||
+    modelId.includes("sonnet-4-6") ||
+    modelId.includes("sonnet-4.6")
+  );
+}
+
+/**
+ * The extended-thinking token budget the provider will ADD on top of the issued
+ * base `max_tokens` (and bill) for this model at `level` (#4). Returns 0 when no
+ * additive budget applies, so folding it into the per-user affordability basis and
+ * reserving it within the issued cap is a no-op for non-additive paths:
+ *
+ * - thinking off / capability absent → 0.
+ * - Anthropic non-adaptive (older models) → pi-ai `adjustMaxTokensForThinking`
+ *   sets the wire cap to `min(base + thinkingBudget, modelMax)` → ADDITIVE.
+ * - Anthropic ADAPTIVE (Opus 4.6+/4.7, Sonnet 4.6) → effort hint, base unchanged → 0.
+ * - Google/Gemini → thinking runs in a SEPARATE lane billed on top of
+ *   `maxOutputTokens` (= base) → ADDITIVE.
+ * - OpenAI completions/responses (incl. Together/OpenRouter) → reasoning effort,
+ *   thinking fits WITHIN `max_tokens`; pi-ai does not inflate the cap → 0.
+ *
+ * The budget is also capped at the model's own `max_tokens` (pi-ai itself clamps
+ * the wire cap to `modelMax`, so the additive portion can never exceed it).
+ */
+export function additiveThinkingBudgetTokens(model: ModelConfig, level: ThinkingLevel): number {
+  if (level === "off" || model.reasoning === false) return 0;
+  const budget = THINKING_BUDGET_BY_LEVEL[level];
+  const api = model.api ?? "anthropic-messages";
+  let additive: number;
+  if (api === "anthropic-messages") {
+    additive = modelUsesAdaptiveThinking(model.id) ? 0 : budget;
+  } else if (api === "google-generative-ai") {
+    additive = budget;
+  } else {
+    // openai-completions / openai-responses: reasoning effort, no max_tokens inflation.
+    additive = 0;
+  }
+  return Math.min(additive, model.max_tokens);
 }
 
 export function createModel(config: AppConfig): Model<Api> {
