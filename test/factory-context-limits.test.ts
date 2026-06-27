@@ -420,10 +420,37 @@ test("additiveThinkingBudgetTokens: Anthropic ADAPTIVE (Opus/Sonnet 4.6+) is 0 �
   }
 });
 
-test("additiveThinkingBudgetTokens: Google/Gemini separate-lane budget is additive (#4)", () => {
-  const m = modelCfg({ id: "gemini-2.5-pro", api: "google-generative-ai" });
-  assert.equal(additiveThinkingBudgetTokens(m, "medium"), 8192);
-  assert.equal(additiveThinkingBudgetTokens(m, "high"), 16384);
+test("additiveThinkingBudgetTokens: Gemini uses its MODEL-SPECIFIC native budget, not the flat map (#4)", () => {
+  // Mirrors pi-ai getGoogleBudget: 2.5-pro high=32768 (NOT the flat Anthropic 16384),
+  // 2.5-flash high=24576, 2.5-flash-lite high=24576. A high max_tokens so no clamp.
+  const pro = modelCfg({ id: "gemini-2.5-pro", api: "google-generative-ai", max_tokens: 64_000 });
+  const flash = modelCfg({ id: "gemini-2.5-flash", api: "google-generative-ai", max_tokens: 64_000 });
+  const lite = modelCfg({ id: "gemini-2.5-flash-lite", api: "google-generative-ai", max_tokens: 64_000 });
+
+  // pro-high MUST be 32768 — would have been the old flat-map 16384.
+  assert.equal(additiveThinkingBudgetTokens(pro, "high"), 32768);
+  assert.notEqual(additiveThinkingBudgetTokens(pro, "high"), 16384);
+  // flash-high / lite-high: 24576 each (flash-lite is matched before flash).
+  assert.equal(additiveThinkingBudgetTokens(flash, "high"), 24576);
+  assert.equal(additiveThinkingBudgetTokens(lite, "high"), 24576);
+
+  // Level boundary: pro minimal=128, low=2048, medium=8192; flash minimal=128, lite minimal=512.
+  assert.equal(additiveThinkingBudgetTokens(pro, "minimal"), 128);
+  assert.equal(additiveThinkingBudgetTokens(pro, "low"), 2048);
+  assert.equal(additiveThinkingBudgetTokens(pro, "medium"), 8192);
+  assert.equal(additiveThinkingBudgetTokens(lite, "minimal"), 512);
+
+  // xhigh clamps to high (pi-ai clampReasoning) → the pro high budget.
+  assert.equal(additiveThinkingBudgetTokens(pro, "xhigh"), 32768);
+
+  // The model-specific budget is still clamped to the model's own max_tokens.
+  const proTiny = modelCfg({ id: "gemini-2.5-pro", api: "google-generative-ai", max_tokens: 10_000 });
+  assert.equal(additiveThinkingBudgetTokens(proTiny, "high"), 10_000);
+
+  // Unrecognized Gemini id (getGoogleBudget would return -1, e.g. a level-based
+  // Gemini-3 model): fall back to the flat per-level map, never the -1 sentinel.
+  const g3 = modelCfg({ id: "gemini-3-pro", api: "google-generative-ai", max_tokens: 64_000 });
+  assert.equal(additiveThinkingBudgetTokens(g3, "high"), 16384);
 });
 
 test("additiveThinkingBudgetTokens: OpenAI effort path adds nothing (fits within max_tokens) (#4)", () => {

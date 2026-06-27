@@ -1802,6 +1802,43 @@ function modelUsesAdaptiveThinking(modelId: string): boolean {
 }
 
 /**
+ * Gemini's NATIVE per-(model, level) thinking-budget tokens — a faithful mirror of
+ * pi-ai's `getGoogleBudget` (`providers/google.js`) (#4). Gemini bills thinking in a
+ * SEPARATE lane on top of `maxOutputTokens` (= our base `max_tokens`), and unlike the
+ * flat Anthropic map the budget is MODEL-FAMILY-specific (2.5-pro high=32768, not the
+ * Anthropic 16384). We mirror it rather than import it because pi-ai exports it only
+ * internally; keep this in lock-step with `getGoogleBudget` if pi-ai ever revises the
+ * tables. Our `ThinkingLevel` maps onto pi-ai's `effort` exactly as `clampReasoning`
+ * does: `xhigh → high`; all other non-off levels pass through 1:1 (`off` is handled by
+ * the caller before we get here, so it never reaches this function).
+ *
+ * `getGoogleBudget` returns -1 for any model id it doesn't recognize (Gemini 3 /
+ * Gemma 4 take an enum `thinkingLevel`, NOT a token budget, so there is no fixed
+ * additive token count for them). For those unmatched ids we fall back to the flat
+ * `THINKING_BUDGET_BY_LEVEL` value — a conservative non-negative reservation — rather
+ * than propagate the -1 sentinel into the affordability basis.
+ */
+function geminiThinkingBudgetTokens(modelId: string, level: Exclude<ThinkingLevel, "off">): number {
+  // clampReasoning: xhigh → high; everything else 1:1 onto pi-ai's effort scale.
+  const effort: "minimal" | "low" | "medium" | "high" = level === "xhigh" ? "high" : level;
+  // Mirrors pi-ai getGoogleBudget's per-family tables (no custom thinking_budgets are
+  // wired in this app's config, so the default tables are authoritative). Order matters:
+  // 2.5-flash-lite is checked before 2.5-flash (the latter substring-matches the former).
+  if (modelId.includes("2.5-pro")) {
+    return { minimal: 128, low: 2048, medium: 8192, high: 32768 }[effort];
+  }
+  if (modelId.includes("2.5-flash-lite")) {
+    return { minimal: 512, low: 2048, medium: 8192, high: 24576 }[effort];
+  }
+  if (modelId.includes("2.5-flash")) {
+    return { minimal: 128, low: 2048, medium: 8192, high: 24576 }[effort];
+  }
+  // Unrecognized id (getGoogleBudget would return -1): no fixed token budget — fall
+  // back to the flat per-level map as a conservative non-negative reservation.
+  return THINKING_BUDGET_BY_LEVEL[level];
+}
+
+/**
  * The extended-thinking token budget the provider will ADD on top of the issued
  * base `max_tokens` (and bill) for this model at `level` (#4). Returns 0 when no
  * additive budget applies, so folding it into the per-user affordability basis and
@@ -1812,7 +1849,9 @@ function modelUsesAdaptiveThinking(modelId: string): boolean {
  *   sets the wire cap to `min(base + thinkingBudget, modelMax)` → ADDITIVE.
  * - Anthropic ADAPTIVE (Opus 4.6+/4.7, Sonnet 4.6) → effort hint, base unchanged → 0.
  * - Google/Gemini → thinking runs in a SEPARATE lane billed on top of
- *   `maxOutputTokens` (= base) → ADDITIVE.
+ *   `maxOutputTokens` (= base) → ADDITIVE. The reserved amount is Gemini's
+ *   model-specific native budget (e.g. 2.5-pro high=32768), NOT the flat Anthropic
+ *   map — see {@link geminiThinkingBudgetTokens} (mirrors pi-ai `getGoogleBudget`).
  * - OpenAI completions/responses (incl. Together/OpenRouter) → reasoning effort,
  *   thinking fits WITHIN `max_tokens`; pi-ai does not inflate the cap → 0.
  *
@@ -1827,7 +1866,9 @@ export function additiveThinkingBudgetTokens(model: ModelConfig, level: Thinking
   if (api === "anthropic-messages") {
     additive = modelUsesAdaptiveThinking(model.id) ? 0 : budget;
   } else if (api === "google-generative-ai") {
-    additive = budget;
+    // Gemini bills thinking in a separate lane on top of max_tokens, at a
+    // MODEL-SPECIFIC budget (pi-ai getGoogleBudget) — not the flat Anthropic map.
+    additive = geminiThinkingBudgetTokens(model.id, level);
   } else {
     // openai-completions / openai-responses: reasoning effort, no max_tokens inflation.
     additive = 0;
