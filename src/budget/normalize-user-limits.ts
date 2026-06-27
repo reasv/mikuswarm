@@ -66,6 +66,16 @@ function isStaticPartition(template: string): boolean {
 }
 
 /**
+ * True when the template contains a lone, unmatched brace — a `{` or `}` that is not
+ * part of a well-formed `{var}` (issue #7). Strips every well-formed `{...}` group;
+ * any residual brace is malformed. Without this, `"{user_id"` (missing `}`) matches
+ * no variable and silently degrades to a literal global pool instead of failing.
+ */
+function hasUnbalancedBrace(template: string): boolean {
+  return /[{}]/.test(template.replace(/\{[^{}]*\}/g, ""));
+}
+
+/**
  * Normalize + validate `[[user_limits]]` (spec §9). `defaultTz` backfills an
  * omitted calendar tz; `knownModelIds` is the union of configured model ids — a
  * `models` / sub-cap reference outside it is FATAL (unlike §8e's soft warn: a
@@ -154,6 +164,14 @@ export function normalizeUserLimits(
         const window = parseWindow(c.window, `limits[${index}]`);
         if (!window) return;
         const partition = c.partition ?? "{user_id}";
+        // A lone unmatched brace is fatal (§9) — a malformed template like "{user_id"
+        // (missing `}`) must NOT silently degrade to a literal global pool (#7).
+        if (hasUnbalancedBrace(partition)) {
+          fatal.push(
+            `${label} limits[${index}]: malformed partition template "${partition}" ` +
+              `(unmatched "{" or "}"; a variable must be written "{name}")`,
+          );
+        }
         // Partition template var validation (§9): only known vars (incl. {space_id},
         // §11 second slice).
         for (const v of partitionVars(partition)) {

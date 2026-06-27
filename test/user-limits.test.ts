@@ -29,9 +29,17 @@ const RATES: Record<string, ModelCostRates> = {
   // $0.5/$2 per MTok (cheap).
   "glm-cheap": { inputPerMTok: 0.5, outputPerMTok: 2 },
   free: { inputPerMTok: 0, outputPerMTok: 0 },
+  // Output genuinely free, input PAID ($10/MTok in) — exercises the #8 branch. NOT in
+  // zeroCostModelIds, so the zero-cost bypass does not apply.
+  "output-free": { inputPerMTok: 10, outputPerMTok: 0 },
 };
-const MAX_TOKENS: Record<string, number> = { "opus-premium": 32000, "glm-cheap": 8000, free: 8000 };
-const KNOWN_MODELS = new Set(["opus-premium", "glm-cheap", "free", "default"]);
+const MAX_TOKENS: Record<string, number> = {
+  "opus-premium": 32000,
+  "glm-cheap": 8000,
+  free: 8000,
+  "output-free": 8000,
+};
+const KNOWN_MODELS = new Set(["opus-premium", "glm-cheap", "free", "default", "output-free"]);
 
 function normalize(raw: RawUserLimitRule[]): NormalizedUserLimitRule[] {
   const r = normalizeUserLimits(raw, { defaultTz: "UTC", knownModelIds: KNOWN_MODELS });
@@ -493,4 +501,202 @@ test("seed: a meter materializes from the ledger sum on first access", () => {
   const r = engine.resolve({ userId: "@a:hs" });
   // Seeded at $4 → only $1 headroom remains.
   assert.equal(engine.totalHeadroom(r), 1);
+});
+
+// ─── #6: console meter-key parsing with `#` in a literal partition / model id ────
+
+test("statuses (#6): a literal partition containing `#` reports correct console fields", () => {
+  // The meter key is `#`-joined; a literal partition with `#` would mis-split if the
+  // console re-derived fields positionally from the key. The structured fields stored
+  // on the meter must report the FULL literal partition + cap + scope intact.
+  const engine = makeEngine([
+    {
+      user: ["@a:hs", "@b:hs"],
+      models: ["glm-cheap"],
+      // A literal pool name that itself contains the `#` key separator.
+      limits: [{ max_usd: 50, window: ROLL24, partition: "team#alpha" }],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  engine.record(r, "glm-cheap", 10); // materializes the meter
+  const statuses = engine.statuses();
+  assert.equal(statuses.length, 1);
+  const s = statuses[0]!;
+  assert.equal(s.partitionKey, "team#alpha", "the full literal partition survives `#`");
+  assert.equal(s.isUserPartition, false);
+  assert.equal(s.capUsd, 50, "cap recovered correctly despite `#` in the key");
+  assert.equal(s.spentUsd, 10);
+  assert.equal(s.modelScope, undefined, "a fungible total has no model scope");
+});
+
+test("statuses (#6): a model-scoped sub-cap with `#` in the model id reports correctly", () => {
+  // A model id containing `#` lives both in the meter key's scope segment and in the
+  // capOfMeter scope match — both must use the structured scope, not a `#`-substring.
+  const rates: Record<string, ModelCostRates> = {
+    "mdl#hash": { inputPerMTok: 1, outputPerMTok: 1 },
+    "glm-cheap": { inputPerMTok: 0.5, outputPerMTok: 2 },
+  };
+  const norm = normalizeUserLimits(
+    [
+      {
+        user: "*",
+        models: ["mdl#hash", "glm-cheap"],
+        limits: [
+          { max_usd: 100, window: ROLL24 },
+          { max_usd: 7, window: ROLL24, models: ["mdl#hash"] },
+        ],
+      },
+    ],
+    { defaultTz: "UTC", knownModelIds: new Set(["mdl#hash", "glm-cheap"]) },
+  );
+  assert.deepEqual(norm.fatal, []);
+  const engine = new UserLimitEngine({
+    rules: norm.rules,
+    sumUsageCost: () => 0,
+    minUsageTs: () => null,
+    costRatesFor: (id) => rates[id],
+    maxTokensFor: () => 8000,
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => 1_000_000,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  engine.record(r, "mdl#hash", 3); // hits total + sub-cap → materializes both meters
+  const sub = engine.statuses().find((s) => s.modelScope !== undefined);
+  assert.ok(sub, "the sub-cap meter is present");
+  assert.deepEqual(sub!.modelScope, ["mdl#hash"], "the model id with `#` survives intact");
+  assert.equal(sub!.capUsd, 7, "the sub-cap's own cap is recovered, not the total's");
+});
+
+// ─── #7: unclosed partition brace is a normalizer fatal (not a silent literal) ──
+
+test("normalize fatal (#7): an unclosed partition brace is fatal, not a silent literal", () => {
+  const unclosed = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "{user_id" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(
+    unclosed.fatal.some((f) => /malformed partition template/.test(f)),
+    "a missing `}` must be fatal so it cannot degrade to a literal global pool",
+  );
+
+  // A stray closing brace is equally malformed.
+  const strayClose = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "room_id}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(strayClose.fatal.some((f) => /malformed partition template/.test(f)));
+});
+
+test("normalize (#7): well-formed and pure-literal partitions still pass", () => {
+  const ok = normalizeUserLimits(
+    [
+      { user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "{user_id}" }] },
+      { room: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "room:{room_id}" }] },
+      { user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "hs:{homeserver}" }] },
+      { user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "staff" }] },
+      // A prefix+suffix around a var (the keyspace-ownership pattern from §3.5).
+      { room: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "premium-room:{room_id}" }] },
+    ],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.deepEqual(ok.fatal, [], `no fatal expected: ${ok.fatal.join("; ")}`);
+});
+
+// ─── #8: zero/absent-output-rate path must still subtract input cost ─────────────
+
+test("affordable (#8): an output-free, input-PAID model is denied when input alone blows the budget", () => {
+  // output-free: $10/MTok input, $0/MTok output. NOT a zero-cost model.
+  const engine = makeEngine([{ user: "*", models: ["output-free"], limits: [{ max_usd: 1, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // 200k input tokens × $10/MTok = $2.00 > $1 cap → input alone exceeds budget → DENY.
+  const over = engine.affordable(r, "output-free", { newTokens: 200_000 });
+  assert.equal(over.ok, false, "input alone over budget must be unaffordable even with free output");
+  assert.equal(over.maxOutput, 0);
+  // 50k input × $10/MTok = $0.50 < $1 cap → affordable; output cap stays the model default.
+  const under = engine.affordable(r, "output-free", { newTokens: 50_000 });
+  assert.equal(under.ok, true, "input under budget stays affordable");
+  assert.equal(under.maxOutput, MAX_TOKENS["output-free"], "free output ⇒ cap is the model default");
+});
+
+test("affordable (#8): a truly zero-COST model stays affordable regardless of input size", () => {
+  // `free` (in zeroCostModelIds): both rates zero → the bypass must keep it affordable
+  // no matter how large the input — the #8 input-cost guard must not over-deny it.
+  const engine = makeEngine([{ user: "*", models: ["free"], limits: [{ max_usd: 0, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  assert.equal(engine.affordable(r, "free", { newTokens: 10_000_000 }).ok, true);
+});
+
+// ─── #17: empty `{space_id}` partition on a space-less room skips the pool ───────
+
+test("space pool (#17): a space-less trigger skips the `space:` pool but keeps the total", () => {
+  // A rule with a per-user fungible total AND a per-space shared pool, matched by user
+  // only (so it admits space-less rooms too).
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["glm-cheap"],
+      limits: [
+        { max_usd: 5, window: ROLL24 }, // per-user fungible total
+        { max_usd: 30, window: ROLL24, partition: "space:{space_id}" }, // per-space pool
+      ],
+    },
+  ]);
+  // No parent space resolved (a space-less DM / room).
+  const spaceless = engine.resolve({ userId: "@a:hs", roomId: "!dm:hs", spaceIds: [] });
+  // The space pool constraint is SKIPPED — only the fungible total remains.
+  assert.equal(spaceless.constraints.length, 1, "the empty-{space_id} pool is dropped");
+  assert.equal(spaceless.constraints[0]!.modelScope, undefined);
+  assert.equal(spaceless.constraints[0]!.isUserPartition, true);
+  // No shared pool ⇒ nothing to denormalize onto the ledger.
+  assert.equal(spaceless.ledgerPartitionKey, undefined);
+  // The per-user total still applies and binds.
+  assert.equal(engine.totalHeadroom(spaceless), 5);
+  engine.record(spaceless, "glm-cheap", 5);
+  assert.equal(engine.affordable(spaceless, "glm-cheap", { newTokens: 0 }).ok, false);
+  // Critically: no `space:` meter was created — only the per-user total meter exists.
+  const meterPartitions = engine.statuses().map((s) => s.partitionKey);
+  assert.deepEqual(meterPartitions, ["@a:hs"], "no degenerate `space:` pool meter");
+  assert.ok(!meterPartitions.includes("space:"), "space-less rooms are not pooled together");
+});
+
+test("space pool (#17): a real parent space DOES create a per-space pool", () => {
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["glm-cheap"],
+      limits: [
+        { max_usd: 5, window: ROLL24 },
+        { max_usd: 30, window: ROLL24, partition: "space:{space_id}" },
+      ],
+    },
+  ]);
+  // A room with a real canonical parent space.
+  const inSpace = engine.resolve({ userId: "@a:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs"] });
+  assert.equal(inSpace.constraints.length, 2, "both the total and the space pool resolve");
+  assert.equal(inSpace.ledgerPartitionKey, "space:!spaceA:hs");
+  const pool = inSpace.constraints.find((c) => !c.isUserPartition);
+  assert.ok(pool, "the space pool constraint is present");
+  assert.equal(pool!.partitionKey, "space:!spaceA:hs");
+});
+
+test("space pool (#17): two distinct space-less rooms are NOT pooled together", () => {
+  // The bug pooled all space-less rooms into one `space:` bucket. With the fix, neither
+  // creates a pool meter, so one room's spend cannot drain another's (no shared meter).
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["glm-cheap"],
+      limits: [{ max_usd: 30, window: ROLL24, partition: "space:{space_id}" }],
+    },
+  ]);
+  const roomA = engine.resolve({ userId: "@a:hs", roomId: "!a:hs", spaceIds: [] });
+  const roomB = engine.resolve({ userId: "@b:hs", roomId: "!b:hs", spaceIds: [] });
+  // Neither resolves a pool constraint (and this rule has no total) → inactive budget.
+  assert.equal(roomA.constraints.length, 0);
+  assert.equal(roomB.constraints.length, 0);
+  // Recording against A's resolution materializes no meter at all.
+  engine.record(roomA, "glm-cheap", 25);
+  assert.equal(engine.statuses().length, 0, "no `space:` meter materialized for space-less rooms");
 });

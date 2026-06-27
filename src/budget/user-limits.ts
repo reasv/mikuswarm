@@ -202,6 +202,14 @@ interface MeterState {
   window: WindowSpec;
   /** Ledger seed filter (window bounds added at seed/recompute). */
   seed: SeedFilter;
+  /**
+   * Structured key fields, stored verbatim (NOT re-parsed from `meterKey`) so the
+   * console surface stays correct even when a literal partition or model id contains
+   * the `#` key separator (issue #6). Populated once at materialization.
+   */
+  partitionKey: string;
+  isUserPartition: boolean;
+  modelScope?: string[];
 }
 
 /** Seed/recompute filter for one meter (the dimensions identifying its spend). */
@@ -277,29 +285,54 @@ export function homeserverOf(userId: string): string {
   return i >= 0 ? userId.slice(i + 1) : "";
 }
 
+/** Resolve a single known partition variable against a ctx (empty when absent). */
+function resolvePartitionVar(key: string, ctx: UserLimitContext): string {
+  switch (key) {
+    case "user_id":
+      return ctx.userId;
+    case "room_id":
+      return ctx.roomId ?? "";
+    case "homeserver":
+      return homeserverOf(ctx.userId);
+    case "space_id":
+      // The canonical (best) parent space — first of the best-first list (§11).
+      return ctx.spaceIds?.[0] ?? "";
+    default:
+      return "";
+  }
+}
+
 /**
  * Render a partition template (spec §3.5/§10) against a ctx. Known vars:
- * `{user_id}` / `{room_id}` / `{homeserver}` (and `{space_id}` in Phase 2). An
- * unresolved var renders empty — the normalizer has already rejected unknown
- * vars + Phase-2 `{space_id}`, so this only fires for a `{room_id}` template on a
- * trigger that somehow lacks a room (never in practice).
+ * `{user_id}` / `{room_id}` / `{homeserver}` / `{space_id}`.
  */
 export function renderPartition(template: string, ctx: UserLimitContext): string {
-  return template.replace(/\{(user_id|room_id|homeserver|space_id)\}/g, (_m, key: string) => {
-    switch (key) {
-      case "user_id":
-        return ctx.userId;
-      case "room_id":
-        return ctx.roomId ?? "";
-      case "homeserver":
-        return homeserverOf(ctx.userId);
-      case "space_id":
-        // The canonical (best) parent space — first of the best-first list (§11).
-        return ctx.spaceIds?.[0] ?? "";
-      default:
-        return "";
-    }
+  return template.replace(/\{(user_id|room_id|homeserver|space_id)\}/g, (_m, key: string) =>
+    resolvePartitionVar(key, ctx),
+  );
+}
+
+/**
+ * Render a partition AND report whether any of its template variables resolved to
+ * empty (no value in the ctx). An empty *variable* means the pool it would key has
+ * no real identity — e.g. `space:{space_id}` on a space-less room renders to the
+ * bare prefix `"space:"`, which would otherwise pool every unrelated space-less
+ * room into one bucket (#17). The caller skips such a shared-pool constraint
+ * entirely (mirroring how an empty space *match* skips the rule), rather than
+ * inventing a degenerate shared meter. A pure-literal partition (no variables) and
+ * `{user_id}` (always present) never report `emptyVar`.
+ */
+function renderPartitionChecked(
+  template: string,
+  ctx: UserLimitContext,
+): { key: string; emptyVar: boolean } {
+  let emptyVar = false;
+  const key = template.replace(/\{(user_id|room_id|homeserver|space_id)\}/g, (_m, varName: string) => {
+    const value = resolvePartitionVar(varName, ctx);
+    if (value === "") emptyVar = true;
+    return value;
   });
+  return { key, emptyVar };
 }
 
 function windowKey(w: WindowSpec): string {
@@ -378,9 +411,15 @@ export class UserLimitEngine {
       return { matched: true, active: false, banned: false, constraints: [], messageTemplate };
     }
 
-    const constraints: ResolvedConstraint[] = budgetRule.constraints.map((c) =>
-      this.resolveConstraint(budgetRule, c, ctx),
-    );
+    const constraints: ResolvedConstraint[] = [];
+    for (const c of budgetRule.constraints) {
+      const resolved = this.resolveConstraint(budgetRule, c, ctx);
+      // A shared-pool constraint whose partition variable resolved empty (e.g.
+      // `space:{space_id}` on a space-less room) keys no real pool — skip it rather
+      // than pooling unrelated events together (#17). The rule's fungible total and
+      // any non-empty-partition constraint on the SAME rule still apply.
+      if (resolved !== undefined) constraints.push(resolved);
+    }
     // The single shared-pool key to denormalize (Phase-1: ≤ 1 distinct per rule).
     const ledgerPartitionKey = constraints.find((c) => !c.isUserPartition)?.partitionKey;
     const banned =
@@ -402,9 +441,14 @@ export class UserLimitEngine {
     rule: NormalizedUserLimitRule,
     c: NormalizedConstraint,
     ctx: UserLimitContext,
-  ): ResolvedConstraint {
-    const partitionKey = renderPartition(c.partition, ctx);
+  ): ResolvedConstraint | undefined {
+    const { key: partitionKey, emptyVar } = renderPartitionChecked(c.partition, ctx);
     const isUserPartition = !c.shared;
+    // A shared pool whose partition template has an unresolved/empty variable keys no
+    // meaningful meter (#17) — signal "skip" so unrelated events aren't pooled. The
+    // per-user `{user_id}` partition is never shared, so an empty here is only ever a
+    // shared template (`space:{space_id}` etc.); a pure-literal partition has no vars.
+    if (c.shared && emptyVar) return undefined;
     // A room/space-matched rule narrows every meter to the trigger's room / canonical
     // parent space (sturdy seed via the room_id / space_id column, §16 Q2 / §11) — so
     // a per-user or pool counter on a scoped rule counts only that room's/space's spend.
@@ -459,6 +503,9 @@ export class UserLimitEngine {
       resetsAt: w.resetsAt,
       window: c.window,
       seed,
+      partitionKey: c.partitionKey,
+      isUserPartition: c.isUserPartition,
+      modelScope: c.modelScope,
     };
     this.meters.set(c.meterKey, state);
     return state;
@@ -540,9 +587,10 @@ export class UserLimitEngine {
       }
     }
     const rates = this.options.costRatesFor(requestedModelId);
-    // No rates known (shouldn't happen for a configured model) → treat as free to
-    // avoid wrongly denying; the §8e/§8d gates still bound such a model elsewhere.
-    if (!rates || rates.outputPerMTok <= 0) {
+    // No rates known at all (shouldn't happen for a configured model) → treat as free
+    // to avoid wrongly denying; the §8e/§8d gates still bound such a model elsewhere.
+    // (A genuinely free model is caught earlier by the zeroCostModelIds bypass.)
+    if (!rates) {
       const ok = remaining > 0;
       return {
         ok,
@@ -555,7 +603,8 @@ export class UserLimitEngine {
     // prompt is a cache-read hit and only the new material is cache-write; otherwise
     // the whole input is priced at cache-write (conservative). A model without cache
     // rates falls back to the plain input rate for both, so this degrades to
-    // `tokens × input_price` for non-caching models.
+    // `tokens × input_price` for non-caching models. Computed BEFORE the output-rate
+    // branch so an output-free / input-paid model is still charged for its input (#8).
     const cached = estimate.cachedTokens ?? 0;
     const fresh = estimate.newTokens ?? 0;
     const readRate = (rates.cacheReadPerMTok ?? 0) > 0 ? rates.cacheReadPerMTok! : rates.inputPerMTok;
@@ -563,6 +612,19 @@ export class UserLimitEngine {
     const inputCost = estimate.withinCacheTtl
       ? (cached / 1_000_000) * readRate + (fresh / 1_000_000) * writeRate
       : ((cached + fresh) / 1_000_000) * writeRate;
+    // Output genuinely free (zero/absent output price, but input may be priced): the
+    // output cap can stay at the model default, but the request is still UNAFFORDABLE
+    // when the input alone exceeds the remaining headroom (#8 — previously this branch
+    // ignored inputCost and could admit an input-paid model over budget).
+    if (rates.outputPerMTok <= 0) {
+      const ok = remaining - inputCost > 0;
+      return {
+        ok,
+        maxOutput: ok ? modelDefaultMax ?? this.options.viableMinOutputTokens : 0,
+        binding,
+        remainingUsd: remaining,
+      };
+    }
     const outputPricePerToken = rates.outputPerMTok / 1_000_000;
     // The remaining headroom must pay for the TOTAL billed output — base text PLUS the
     // additive thinking budget the provider bills on top (#4) — so the affordable
@@ -704,17 +766,18 @@ export class UserLimitEngine {
     const out: UserLimitStatus[] = [];
     for (const [meterKey, state] of this.meters) {
       this.rollIfNeeded(state);
-      const [kind, partitionKey, scope] = meterKey.split("#");
-      const cap = capOfMeter(this.rules, meterKey) ?? 0;
+      // Read the structured key fields off the meter (NOT re-split from `meterKey`),
+      // so a literal partition / model id containing `#` reports correctly (#6).
+      const cap = capOfMeter(this.rules, state) ?? 0;
       const fraction = cap > 0 ? state.spent / cap : state.spent > 0 ? Infinity : 1;
       const blocked = state.spent >= cap && cap >= 0;
       const near = !blocked && fraction >= this.nearThreshold;
       const w = state.window;
       out.push({
         meterKey,
-        partitionKey: partitionKey ?? "",
-        isUserPartition: kind === "u",
-        modelScope: scope && scope !== "*" ? scope.split(",") : undefined,
+        partitionKey: state.partitionKey,
+        isUserPartition: state.isUserPartition,
+        modelScope: state.modelScope,
         spentUsd: state.spent,
         capUsd: cap,
         fraction: Number.isFinite(fraction) ? fraction : 1,
@@ -731,20 +794,22 @@ export class UserLimitEngine {
 }
 
 /**
- * The cap of a meter, recovered from the rule set by its key (console only). A
- * meter can be referenced by several constraints; report the smallest cap (the
- * binding one) for the status badge. Returns undefined when no rule references it
- * (a meter materialized by a rule that has since changed — never in steady state).
+ * The cap of a meter, recovered from the rule set (console only). A meter can be
+ * referenced by several constraints; report the smallest cap (the binding one) for
+ * the status badge. Matches constraints on the meter's STRUCTURED key fields
+ * (model scope + window, the portion intrinsic to the constraint) rather than a
+ * substring of the `#`-joined key — so a literal partition or model id containing
+ * `#` is matched correctly (#6). Returns undefined when no rule references it (a
+ * meter materialized by a rule that has since changed — never in steady state).
  */
-function capOfMeter(rules: NormalizedUserLimitRule[], meterKey: string): number | undefined {
+function capOfMeter(rules: NormalizedUserLimitRule[], meter: MeterState): number | undefined {
+  const meterScope = meter.modelScope ? [...meter.modelScope].sort().join(",") : "*";
+  const meterWk = windowKey(meter.window);
   let min: number | undefined;
   for (const rule of rules) {
     for (const c of rule.constraints) {
-      // Reconstruct the model-scope + window portion of the key (partition/room are
-      // ctx-dependent, so match on the suffix that is intrinsic to the constraint).
       const scope = c.models ? [...c.models].sort().join(",") : "*";
-      const wk = windowKey(c.window);
-      if (meterKey.includes(`#${scope}#${wk}#`)) {
+      if (scope === meterScope && windowKey(c.window) === meterWk) {
         min = min === undefined ? c.maxUsd : Math.min(min, c.maxUsd);
       }
     }
