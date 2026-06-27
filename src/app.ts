@@ -359,6 +359,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // resolution so the single `recordUsageEvent` fan-in can attribute BOTH the
   // agent-loop AND tool lanes (§6) to its partitioned counters. Cleared on settle.
   let userLimitEngine: UserLimitEngine | undefined;
+  // Hoisted out of the period-cost-limits init block so the user-limit gate (§6.3)
+  // can see it: the dynamic §8d ceiling must not tighten to $0 for a zero-cost
+  // initial model (issue #4). Assigned alongside the BudgetEngine build below.
+  let zeroCostModelIds = new Set<string>();
   const userLimitResolutions = new Map<string, { resolution: UserLimitResolution; ctx: UserLimitContext }>();
 
   const retrievalConfig = resolveRetrievalConfig(config.retrieval);
@@ -940,7 +944,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // or is blocked by a rule). Collected across every config site that prices a
     // model — agent models, captioning, image-gen tiers, x_search, remote
     // embeddings — so a free model in any lane is recognized.
-    const zeroCostModelIds = collectZeroCostModelIds(config);
+    zeroCostModelIds = collectZeroCostModelIds(config);
 
     // Structural dependency cascade (§2.1): triggered (default) + proactive
     // sessions cannot run if summarization cannot (they need fresh summaries for
@@ -1058,6 +1062,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       if (userLimitEngine && (event.class === "agent_loop" || event.class === "tool")) {
         const entry = event.agentSessionId ? userLimitResolutions.get(event.agentSessionId) : undefined;
         if (entry) {
+          // For an agent_loop event with an `entry` (the only branch that reaches
+          // here), `requestedModelId` is always set by the selector, so the
+          // `?? logicalModelId ?? modelId` tail never decides coverage on this
+          // per-user-active path — it only matters for events with no `entry`
+          // (where `coverageModel` is unused). No null-`requestedModelId` per-user
+          // agent-loop case exists; the tail is defensive, not a real fallback.
           const coverageModel =
             event.class === "tool"
               ? undefined
@@ -3509,7 +3519,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch). An
     // exempt/uncapped user contributes ∞ → no change to the static ceiling.
     const staticCeiling = factory.resolveSessionCostCeiling(sessionType);
-    const headroom = userLimitEngine.totalHeadroom(resolution);
+    // Zero-cost bypass (§5.3/§2.2): a free initial model must stay launchable even
+    // when the fungible total is exactly at cap (`totalHeadroom === 0`). Letting
+    // headroom tighten the §8d ceiling to `$0` would make the factory's hard
+    // pre-flight deny the FIRST request of a session that costs nothing (issue #4),
+    // and fire the soft-warn spuriously — both derive from this override. So treat
+    // per-user headroom as ∞ for the ceiling when the admitted model is zero-cost.
+    const headroom = zeroCostModelIds.has(initialModel)
+      ? undefined
+      : userLimitEngine.totalHeadroom(resolution);
     const effective = Math.min(staticCeiling ?? Infinity, headroom ?? Infinity);
     return {
       active: true,

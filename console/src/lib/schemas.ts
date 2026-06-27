@@ -706,6 +706,9 @@ export type UserLimitStatus = Schema.Schema.Type<typeof UserLimitStatus>;
 
 /** A live per-user session's currently-selected model (spec PER-USER-LIMITS §14). */
 export const UserLimitSelection = Schema.Struct({
+	// Optional for backward compatibility with an older BFF that omits it; the
+	// `{#each}` key falls back when absent.
+	sessionId: Schema.optional(Schema.String),
 	userId: Schema.String,
 	roomId: Schema.optional(Schema.String),
 	model: Schema.String
