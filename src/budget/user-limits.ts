@@ -233,6 +233,9 @@ interface SeedFilter {
 
 /** A live session's currently-selected model, for the console (spec §14). */
 export interface UserLimitSelection {
+  /** The owning session — the stable per-selection key (two concurrent
+   *  same-user/same-model sessions are distinct rows; console keys on this). */
+  sessionId: string;
   userId: string;
   roomId?: string;
   /** The REQUESTED virtual model the per-user selector is currently dispatching. */
@@ -792,7 +795,7 @@ export class UserLimitEngine {
 
   /** Record a live session's currently-selected model (spec §14, console surface). */
   noteSelection(sessionId: string, userId: string, roomId: string | undefined, model: string): void {
-    this.activeModels.set(sessionId, { userId, roomId, model });
+    this.activeModels.set(sessionId, { sessionId, userId, roomId, model });
   }
 
   /** Drop a settled session's selection (called on settle). */

@@ -1041,6 +1041,12 @@ export interface UsageCostFilter {
    * whose requested id is null (so an opus-premium sub-cap still counts legacy
    * opus-premium agent-loop spend). Null-requested `class = 'tool'` rows are EXCLUDED
    * — tool spend never seeds a model-scoped sub-cap (issue #14). OR-within-list.
+   *
+   * AGENT-LOOP-ONLY scoping: the null-fallback clause hardcodes `class = 'agent_loop'`,
+   * so this dimension must NOT be combined with a non-agent-loop `classes` filter
+   * (e.g. `classes: ['tool']`) — the two would AND into the always-false
+   * `class IN ('tool') AND class = 'agent_loop'`, silently under-counting (issue #9).
+   * No caller sets both today; keep it that way.
    */
   requestedModelIds?: string[];
 }
@@ -3689,7 +3695,10 @@ export class Storage {
       // x_search→Grok) drops out here, mirroring the in-memory `record` which passes
       // no coverage model for tool spend. Non-null `requested_model_id` rows match by
       // the requested id directly (class-independent — the agent loop is the only
-      // lane that stamps it), so no double-count.
+      // lane that stamps it), so no double-count. NOTE (issue #9): this hardcoded
+      // `class = 'agent_loop'` makes `requestedModelIds` agent-loop-only scoping —
+      // it must not be combined with a non-agent-loop `classes` filter (see the
+      // `UsageCostFilter.requestedModelIds` doc), or the two AND to always-empty.
       clauses.push(
         `(requested_model_id in (${ph}) or (requested_model_id is null and class = 'agent_loop' and logical_model_id in (${ph})))`,
       );
@@ -8992,7 +9001,12 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
       !!db.prepare(`select 1 from sqlite_master where type='table' and name=?`).get(name);
     if (!hasTable("usage_events")) return;
     const columns = db.pragma(`table_info(usage_events)`) as Array<{ name: string }>;
-    if (columns.some((c) => c.name === "budget_partition")) return;
+    // Guard on the FIRST column this step adds: a partial application would land
+    // `requested_model_id` before `budget_partition`/`room_id`, so guarding on the
+    // 2nd column would let such a rewind re-issue `add column requested_model_id`
+    // and abort on the duplicate. (Unreachable under the single-transaction wrapper
+    // today; this keeps the latent fragility clean — issue #8.)
+    if (columns.some((c) => c.name === "requested_model_id")) return;
     db.exec(`alter table usage_events add column requested_model_id text;`);
     db.exec(`alter table usage_events add column budget_partition text;`);
     db.exec(`alter table usage_events add column room_id text;`);

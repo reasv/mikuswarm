@@ -606,7 +606,10 @@
 				{#if userSelections.length > 0}
 					<!-- Currently-selected model per live per-user session (spec §14). -->
 					<div class="mb-2 flex flex-wrap gap-1.5">
-						{#each userSelections as sel (sel.userId + sel.model)}
+						<!-- Key on the per-session id (unique even for two concurrent same-user/
+						     same-model sessions); fall back to a composite + index for an older
+						     BFF that omits sessionId. -->
+						{#each userSelections as sel, i (sel.sessionId ?? sel.userId + sel.model + i)}
 							<span
 								class="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground"
 								title={`${sel.userId}${sel.roomId ? ' · ' + sel.roomId : ''} → ${sel.model}`}
