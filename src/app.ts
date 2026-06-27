@@ -1043,15 +1043,36 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // Per-user partitioned counters (spec PER-USER-LIMITS §8.2): increment every
       // covering meter for the triggering session's FROZEN resolution. Fires for BOTH
       // the agent loop and its tool lane (§6) — the single fan-in is the one place
-      // that sees both. Coverage keys on the REQUESTED model (the agent-loop selector's
-      // choice), falling back to the lane's logical model (tool spend has no requested
-      // model → counts the fungible total, never a foreign sub-cap). Background/
+      // that sees both. The agent loop keys coverage on the REQUESTED model (the
+      // selector's choice, §7), so it counts the fungible total, shared pools, AND the
+      // sub-caps that model is in. The tool lane has no requested model and passes
+      // `undefined`, so `record` skips ALL model-scoped sub-caps and credits only the
+      // model-agnostic total + pools (issue #14): a sub-cap reserves agent-loop
+      // degradation headroom, NOT a bound on tools. Consequence (operator-decided):
+      // once a user's sub-cap on model X is exhausted, the agent loop degrades off X
+      // but tools hardwired to X (e.g. x_search→Grok) keep using X, bounded only by
+      // the user's fungible total / pools — a sub-cap gates agent-loop MODEL SELECTION
+      // only, never tool usage of the same upstream model. The ledger reseed mirrors
+      // this via the agent-loop-gated null-fallback in `usageCostClauses`. Background/
       // proactive lanes have no resolution entry and are skipped.
       if (userLimitEngine && (event.class === "agent_loop" || event.class === "tool")) {
         const entry = event.agentSessionId ? userLimitResolutions.get(event.agentSessionId) : undefined;
         if (entry) {
-          const coverageModel = event.requestedModelId ?? event.logicalModelId ?? event.modelId;
+          const coverageModel =
+            event.class === "tool"
+              ? undefined
+              : event.requestedModelId ?? event.logicalModelId ?? event.modelId;
           userLimitEngine.record(entry.resolution, coverageModel, event.costUsd);
+          // Stamp the shared-pool key (§3.5/§8.3) from the frozen resolution when the
+          // lane did not already supply it — the agent loop sets `budgetPartition`,
+          // but the tool lane does not, so without this backfill tool rows persist
+          // `budget_partition = NULL` and DROP OUT of the pool reseed (`tick()` /
+          // restart re-SUM filters on `budget_partition IN (…)`), silently under-
+          // counting shared pools after every re-sum (issue #2). One shared-pool key
+          // per session (the §8.3 single-column invariant). Mirrors the spaceId stamp.
+          if (entry.resolution.ledgerPartitionKey && (event.budgetPartition ?? null) === null) {
+            event = { ...event, budgetPartition: entry.resolution.ledgerPartitionKey };
+          }
           // Stamp the canonical parent space (§11) from the frozen ctx — it cannot be
           // derived from intrinsic columns, so the recorder supplies it centrally.
           if (entry.ctx.spaceIds?.[0] && event.spaceId === undefined) {

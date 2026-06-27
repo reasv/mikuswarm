@@ -601,16 +601,38 @@ export class UserLimitEngine {
   // ─── Recording (§8.2) ───────────────────────────────────────────────────────
 
   /**
-   * Record one committed agent-loop event against a session's FROZEN resolution
-   * (spec §8.2). Increments every meter whose model scope covers the REQUESTED
-   * model (the gate-on-virtual identity of §7) by the ACTUAL served cost. One event
-   * thus updates several meters (per-user total, per-user sub-cap, shared pool, pool
-   * sub-cap). No-op for a non-positive cost or an inactive resolution.
+   * Record one committed event against a session's FROZEN resolution (spec §8.2).
+   * Increments every meter whose model scope COVERS the spend by the ACTUAL served
+   * cost. One event thus updates several meters. No-op for a non-positive cost or an
+   * inactive resolution.
+   *
+   * Coverage depends on the event's lane:
+   *  - **Agent loop** — pass the REQUESTED model (the gate-on-virtual identity of
+   *    §7). Covers the fungible total, any shared pool, AND every sub-cap whose
+   *    `models` scope includes the requested model (per-user + pool sub-caps).
+   *  - **Tool lane** — pass `undefined`. Tool spend has no requested model and must
+   *    NOT touch a model-scoped sub-cap: a sub-cap reserves *agent-loop degradation*
+   *    headroom, so charging it for tool spend that happens to share the model name
+   *    (e.g. `x_search`→Grok when a session sub-caps Grok) is an over-restriction
+   *    footgun (issue #14). So a tool event credits ONLY the model-agnostic
+   *    constraints (fungible total + shared pools, `modelScope === undefined`) —
+   *    still drawing down the user's total and any pool, never a sub-cap. The ledger
+   *    reseed mirrors this (see `usageCostClauses`' agent-loop-gated null-fallback).
+   *    Tracking/attribution is unaffected: the ledger row keeps the tool's
+   *    `model_id`/`logical_model_id` for §8e aggregates and console top-models.
    */
-  record(resolution: UserLimitResolution, requestedModelId: string, costUsd: number): void {
+  record(
+    resolution: UserLimitResolution,
+    requestedModelId: string | undefined,
+    costUsd: number,
+  ): void {
     if (!(costUsd > 0)) return;
     for (const c of resolution.constraints) {
-      if (c.modelScope !== undefined && !c.modelScope.includes(requestedModelId)) continue;
+      if (c.modelScope !== undefined) {
+        // Sub-cap: tool spend (no requested model) never counts toward it; an
+        // agent-loop event counts only when the requested model is in scope.
+        if (requestedModelId === undefined || !c.modelScope.includes(requestedModelId)) continue;
+      }
       this.meterFor(c).spent += costUsd;
     }
   }

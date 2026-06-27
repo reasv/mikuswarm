@@ -1036,8 +1036,10 @@ export interface UsageCostFilter {
   spaceIds?: string[];
   /**
    * A per-user sub-cap's REQUESTED-model scope (spec §7): matches `requested_model_id`,
-   * falling back to `logical_model_id` for pre-feature rows whose requested id is null
-   * (so an opus-premium sub-cap still counts legacy opus-premium spend). OR-within-list.
+   * falling back to `logical_model_id` for pre-feature `class = 'agent_loop'` rows
+   * whose requested id is null (so an opus-premium sub-cap still counts legacy
+   * opus-premium agent-loop spend). Null-requested `class = 'tool'` rows are EXCLUDED
+   * — tool spend never seeds a model-scoped sub-cap (issue #14). OR-within-list.
    */
   requestedModelIds?: string[];
 }
@@ -3654,9 +3656,10 @@ export class Storage {
    * {@link minUsageTs} from a {@link UsageCostFilter}. Dimension arrays AND together
    * (OR within each list); an omitted dimension is a wildcard. The per-user
    * `requestedModelIds` dimension (spec PER-USER-LIMITS §7) additionally folds in
-   * pre-feature rows whose `requested_model_id` is null by falling back to
-   * `logical_model_id` for those, so an `opus-premium` sub-cap still counts legacy
-   * `opus-premium` spend recorded before this feature shipped.
+   * pre-feature `class = 'agent_loop'` rows whose `requested_model_id` is null by
+   * falling back to `logical_model_id` for those, so an `opus-premium` sub-cap still
+   * counts legacy `opus-premium` agent-loop spend recorded before this feature
+   * shipped — but NOT null-requested tool rows (issue #14; see the clause below).
    */
   private usageCostClauses(filter: UsageCostFilter): { clauses: string[]; params: unknown[] } {
     const clauses: string[] = ["ts >= ?"];
@@ -3680,8 +3683,18 @@ export class Storage {
     inClause("space_id", filter.spaceIds);
     if (filter.requestedModelIds && filter.requestedModelIds.length > 0) {
       const ph = filter.requestedModelIds.map(() => "?").join(", ");
+      // The null-fallback (matching pre-feature rows on `logical_model_id`) is gated
+      // to `class = 'agent_loop'` so it folds in only legacy AGENT-LOOP spend. Tool
+      // rows are also null-requested but must NOT seed a model-scoped sub-cap (issue
+      // #14): a sub-cap reserves agent-loop degradation headroom, never a bound on
+      // tool usage of the same upstream model — so a `class = 'tool'` null-requested
+      // row whose `logical_model_id` happens to match the sub-cap's scope (e.g.
+      // x_search→Grok) drops out here, mirroring the in-memory `record` which passes
+      // no coverage model for tool spend. Non-null `requested_model_id` rows match by
+      // the requested id directly (class-independent — the agent loop is the only
+      // lane that stamps it), so no double-count.
       clauses.push(
-        `(requested_model_id in (${ph}) or (requested_model_id is null and logical_model_id in (${ph})))`,
+        `(requested_model_id in (${ph}) or (requested_model_id is null and class = 'agent_loop' and logical_model_id in (${ph})))`,
       );
       params.push(...filter.requestedModelIds, ...filter.requestedModelIds);
     }

@@ -507,6 +507,86 @@ test("sumUsageCost: filters by each selector dimension and ANDs across dimension
   );
 });
 
+// ---------------------------------------------------------------------------
+// requestedModelIds null-fallback (spec PER-USER-LIMITS §7/§8.3): a sub-cap seed
+// matches `requested_model_id` directly AND folds in legacy `class='agent_loop'`
+// rows whose requested id is null via `logical_model_id` — but NOT null-requested
+// `class='tool'` rows (issue #14: tool spend never seeds a model-scoped sub-cap).
+// ---------------------------------------------------------------------------
+
+test("sumUsageCost requestedModelIds: agent-loop-gated null-fallback excludes tool rows, no double-count (#14)", async () => {
+  await withLedger(
+    [
+      // (a) Legacy agent-loop row: requested_model_id NULL, logical_model_id matches
+      //     the sub-cap scope → counted via the null-fallback (class='agent_loop').
+      { ts: 1_000, class: "agent_loop", modelId: "opus-up", logicalModelId: "opus-premium", costUsd: 1 },
+      // (b) Non-legacy agent-loop row under active fallback: requested_model_id matches
+      //     the scope, logical_model_id is the served BACKUP → counted ONCE by the
+      //     requested branch (no double-count even though logical_model_id differs).
+      { ts: 2_000, class: "agent_loop", modelId: "glm-up", logicalModelId: "glm-backup", requestedModelId: "opus-premium", costUsd: 2 },
+      // (c) Non-legacy agent-loop row whose logical_model_id == the scope but whose
+      //     requested_model_id is a DIFFERENT model → excluded (requested != scope, and
+      //     the null-fallback does not apply because requested is non-null).
+      { ts: 3_000, class: "agent_loop", modelId: "other-up", logicalModelId: "opus-premium", requestedModelId: "other-model", costUsd: 4 },
+      // (d) Tool row, requested_model_id NULL, logical_model_id == the scope (e.g.
+      //     x_search→Grok sharing a model name with the sub-cap) → EXCLUDED after #14:
+      //     the null-fallback is gated to class='agent_loop'.
+      { ts: 4_000, class: "tool", toolName: "x_search", modelId: "opus-up", logicalModelId: "opus-premium", costUsd: 8 },
+    ],
+    async (storage) => {
+      // The opus-premium sub-cap seed: (a) legacy fallback $1 + (b) requested $2 = $3.
+      // (c) other-model and (d) tool spend are both excluded.
+      assert.equal(sum(storage, { since: 0, requestedModelIds: ["opus-premium"] }), 3);
+      // The "other-model" sub-cap counts only (c)'s requested match — the legacy null
+      // row (a) does NOT leak in (its logical is opus-premium, not other-model).
+      assert.equal(sum(storage, { since: 0, requestedModelIds: ["other-model"] }), 4);
+      // Row (b) is counted once, not twice: its served logical_model_id ("glm-backup")
+      // does NOT separately seed a glm-backup sub-cap via the (agent-loop) null-fallback,
+      // because its requested_model_id is non-null.
+      assert.equal(sum(storage, { since: 0, requestedModelIds: ["glm-backup"] }), 0);
+      // The tool row (d) IS still counted by the model-agnostic seeds (total / pool):
+      // it draws down a fungible total (no requestedModelIds filter) as normal.
+      assert.equal(sum(storage, { since: 0 }), 15); // 1 + 2 + 4 + 8
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// partitionKeys (spec PER-USER-LIMITS §3.5/§8.3): a shared-pool meter reseeds off
+// the denormalized `budget_partition` column. A tool-lane row MUST carry the pool
+// key so the reseed includes its spend (issue #2 — the recorder backfills it).
+// ---------------------------------------------------------------------------
+
+test("sumUsageCost partitionKeys: a pooled tool row's budget_partition is included in the pool reseed (#2)", async () => {
+  await withLedger(
+    [
+      // Agent-loop spend in the "staff" pool.
+      { ts: 1_000, class: "agent_loop", modelId: "opus", budgetPartition: "staff", costUsd: 3 },
+      // Tool spend in the SAME pool — stamped with budget_partition by the recorder
+      // backfill (#2). Pre-fix this would persist NULL and DROP OUT of the reseed.
+      { ts: 2_000, class: "tool", toolName: "x_search", modelId: "grok", budgetPartition: "staff", costUsd: 5 },
+      // Unpooled spend (no budget_partition) — must NOT seed the staff pool.
+      { ts: 3_000, class: "tool", toolName: "find_source", modelId: "sauce", costUsd: 7 },
+      // A different pool — isolated.
+      { ts: 4_000, class: "agent_loop", modelId: "opus", budgetPartition: "public", costUsd: 11 },
+    ],
+    async (storage) => {
+      // The staff pool reseed sums BOTH the agent-loop ($3) and the tool ($5) row.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["staff"] }), 8);
+      // The unpooled tool row ($7) is excluded from every pool.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["public"] }), 11);
+      // Combined with a sub-cap's requestedModelIds, the pool key still scopes the seed
+      // (the tool row has no requested model, so it never seeds a model-scoped pool
+      // sub-cap — only the model-agnostic pool total above includes it).
+      assert.equal(
+        sum(storage, { since: 0, partitionKeys: ["staff"], requestedModelIds: ["grok"] }),
+        0,
+        "the pooled tool row does not seed a grok-scoped pool sub-cap (#14)",
+      );
+    },
+  );
+});
+
 test("sumUsageCost: window bounds are half-open [since, until) (#18)", async () => {
   await withLedger(
     [
