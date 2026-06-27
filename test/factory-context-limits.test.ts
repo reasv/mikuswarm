@@ -388,8 +388,15 @@ function modelCfg(opts: {
   api?: "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai";
   max_tokens?: number;
   reasoning?: boolean;
+  adaptive_thinking?: boolean;
 }): any {
-  return { id: opts.id, api: opts.api, max_tokens: opts.max_tokens ?? 32_000, reasoning: opts.reasoning };
+  return {
+    id: opts.id,
+    api: opts.api,
+    max_tokens: opts.max_tokens ?? 32_000,
+    reasoning: opts.reasoning,
+    adaptive_thinking: opts.adaptive_thinking,
+  };
 }
 
 test("additiveThinkingBudgetTokens: off / disabled-capability ⇒ 0 (#4)", () => {
@@ -418,6 +425,35 @@ test("additiveThinkingBudgetTokens: Anthropic ADAPTIVE (Opus/Sonnet 4.6+) is 0 �
       `${id} must not be penalized`,
     );
   }
+});
+
+test("additiveThinkingBudgetTokens: adaptive_thinking flag is authoritative; unset falls back to heuristic (#1)", () => {
+  // `true` ⇒ additive 0 even for an id the heuristic does NOT recognize (e.g. a
+  // newer adaptive Anthropic model the hardcoded list has drifted past).
+  assert.equal(
+    additiveThinkingBudgetTokens(
+      modelCfg({ id: "claude-opus-4-8", api: "anthropic-messages", adaptive_thinking: true }),
+      "high",
+    ),
+    0,
+    "adaptive_thinking:true must reserve 0 for an unlisted adaptive model",
+  );
+  // `false` ⇒ the flat budget even for an id the heuristic WOULD call adaptive
+  // (the explicit flag overrides the substring match).
+  assert.equal(
+    additiveThinkingBudgetTokens(
+      modelCfg({ id: "claude-opus-4-7", api: "anthropic-messages", adaptive_thinking: false }),
+      "high",
+    ),
+    16384,
+    "adaptive_thinking:false must force the flat additive budget",
+  );
+  // UNSET ⇒ heuristic preserved: a listed adaptive id (opus-4-7) still ⇒ 0.
+  assert.equal(
+    additiveThinkingBudgetTokens(modelCfg({ id: "claude-opus-4-7", api: "anthropic-messages" }), "high"),
+    0,
+    "unset flag must keep the opus-4-7 heuristic fallback",
+  );
 });
 
 test("additiveThinkingBudgetTokens: Gemini uses its MODEL-SPECIFIC native budget, not the flat map (#4)", () => {

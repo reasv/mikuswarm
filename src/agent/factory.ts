@@ -659,30 +659,48 @@ export class AgentSessionFactory {
     // preferred model — once each tier has degraded, the floor is reached).
     let budgetTruncationCount = 0;
     // Per-request selection state the outer selector dispatches — re-resolved by the
-    // pre-flight before each request (§6.2); defaults to the most-preferred model.
-    // DEFENSIVE initial cap (#13): the per-user pre-flight (`checkCostBudget` →
-    // `resolveUserSelection`) overwrites `activeSelection.maxTokens` with the precise
-    // per-request cap before request 1 — but `withRequestRetry` SWALLOWS a throw in
-    // that pre-flight (degrades to "no local block"), and an undefined `maxTokens`
-    // would then ship request 1 — the most expensive — uncapped. So seed a cap from
-    // the first selectable's affordable output at a ≈0 prior-context estimate
-    // (mirroring Gate A's `affordable(…, {})`), with the additive thinking budget
-    // reserved (#4). `initialContextEstimate.value` is still 0 here (the build/resume
-    // branch runs later), so this is a zero-context cap by construction. A non-per-user
-    // session keeps no cap (today's behavior).
-    let activeSelection: { fallback: BuiltModelFallback; requestedLogicalId: string; maxTokens?: number } =
-      userSelectionActive
-        ? {
-            fallback: selectables[0]!.fallback,
-            requestedLogicalId: selectables[0]!.requestedLogicalId,
-            maxTokens: userLimit!.engine.affordable(
+    // pre-flight before each request (§6.2); defaults to the first AFFORDABLE model.
+    // DEFENSIVE initial cap (#13/#5): the per-user pre-flight (`checkCostBudget` →
+    // `resolveUserSelection`) overwrites `activeSelection` with the precise per-request
+    // selection before request 1 — but `withRequestRetry` SWALLOWS a throw in that
+    // pre-flight (degrades to "no local block"), and request 1 — the most expensive —
+    // would then ship on whatever the seed holds. So mirror Gate A's `initialModel`
+    // pick: the FIRST selectable affordable at a ≈0 prior-context estimate
+    // (`affordable(…, {})`, additive thinking reserved (#4)), capped at its affordable
+    // output. When NONE is affordable (user already over budget at request 1) seed the
+    // most-preferred selectable with NO local cap — never a `maxTokens: 0`, which would
+    // draw a provider 400 — letting the swallowed-throw fallback dispatch uncapped
+    // (the pre-flight normally blocks; this is the degenerate degrade-to-no-block path).
+    // `initialContextEstimate.value` is still 0 here (the build/resume branch runs
+    // later), so this is a zero-context cap by construction. A non-per-user session
+    // keeps no cap (today's behavior).
+    let activeSelection: { fallback: BuiltModelFallback; requestedLogicalId: string; maxTokens?: number };
+    if (userSelectionActive) {
+      const seed =
+        selectables.find(
+          (s) =>
+            userLimit!.engine.affordable(
               userLimit!.resolution,
-              selectables[0]!.requestedLogicalId,
+              s.requestedLogicalId,
               {},
-              selectables[0]!.thinkingBudgetTokens,
-            ).maxOutput,
-          }
-        : { fallback, requestedLogicalId: modelKey };
+              s.thinkingBudgetTokens,
+            ).ok,
+        ) ?? selectables[0]!;
+      const aff = userLimit!.engine.affordable(
+        userLimit!.resolution,
+        seed.requestedLogicalId,
+        {},
+        seed.thinkingBudgetTokens,
+      );
+      activeSelection = {
+        fallback: seed.fallback,
+        requestedLogicalId: seed.requestedLogicalId,
+        // Omit the cap when nothing is affordable rather than ship a 0-token cap.
+        maxTokens: aff.ok ? aff.maxOutput : undefined,
+      };
+    } else {
+      activeSelection = { fallback, requestedLogicalId: modelKey };
+    }
     // The §4.2 resolver (affordable ∧ healthy ∧ fits). Builds the §5.3 estimate from
     // the exact running counter: the cache-read prior prompt + the cache-write new
     // material, split at the prompt-cache TTL (PROMPT_CACHE_TTL_MS).
@@ -1789,6 +1807,13 @@ const THINKING_BUDGET_BY_LEVEL: Record<Exclude<ThinkingLevel, "off">, number> = 
  * take an effort HINT with no additive `max_tokens` budget — the wire cap stays at
  * the requested `max_tokens` and billed output never exceeds it — so they must NOT
  * be penalized in the affordability output basis (#4).
+ *
+ * This is only the FALLBACK heuristic: a hand-copied substring list cannot mirror
+ * an upstream list that grows, so it has already drifted past the models it knows.
+ * `additiveThinkingBudgetTokens` consults the model config's `adaptive_thinking`
+ * flag FIRST and defers here only when that flag is unset. Operators declare newer
+ * adaptive Anthropic models (Opus 4.8+, future Sonnet/Opus) explicitly via the flag
+ * rather than extend this list.
  */
 function modelUsesAdaptiveThinking(modelId: string): boolean {
   return (
@@ -1847,7 +1872,11 @@ function geminiThinkingBudgetTokens(modelId: string, level: Exclude<ThinkingLeve
  * - thinking off / capability absent → 0.
  * - Anthropic non-adaptive (older models) → pi-ai `adjustMaxTokensForThinking`
  *   sets the wire cap to `min(base + thinkingBudget, modelMax)` → ADDITIVE.
- * - Anthropic ADAPTIVE (Opus 4.6+/4.7, Sonnet 4.6) → effort hint, base unchanged → 0.
+ * - Anthropic ADAPTIVE → effort hint, base unchanged → 0. Adaptivity is taken
+ *   from the model config's `adaptive_thinking` flag when set (AUTHORITATIVE:
+ *   `true` ⇒ 0, `false` ⇒ the flat additive budget); when unset it falls back to
+ *   the {@link modelUsesAdaptiveThinking} id heuristic (Opus 4.6/4.7, Sonnet 4.6).
+ *   Declare newer adaptive models (Opus 4.8+) via the flag — see schema docs.
  * - Google/Gemini → thinking runs in a SEPARATE lane billed on top of
  *   `maxOutputTokens` (= base) → ADDITIVE. The reserved amount is Gemini's
  *   model-specific native budget (e.g. 2.5-pro high=32768), NOT the flat Anthropic
@@ -1864,7 +1893,10 @@ export function additiveThinkingBudgetTokens(model: ModelConfig, level: Thinking
   const api = model.api ?? "anthropic-messages";
   let additive: number;
   if (api === "anthropic-messages") {
-    additive = modelUsesAdaptiveThinking(model.id) ? 0 : budget;
+    // The config flag is AUTHORITATIVE when set (operators declare adaptive models
+    // explicitly); only the unset case falls back to the drifting id heuristic.
+    const adaptive = model.adaptive_thinking ?? modelUsesAdaptiveThinking(model.id);
+    additive = adaptive ? 0 : budget;
   } else if (api === "google-generative-ai") {
     // Gemini bills thinking in a separate lane on top of max_tokens, at a
     // MODEL-SPECIFIC budget (pi-ai getGoogleBudget) — not the flat Anthropic map.

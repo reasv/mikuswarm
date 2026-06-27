@@ -536,6 +536,17 @@ const ModelSchema = StrictObject({
     Type.Literal("high"),
     Type.Literal("xhigh"),
   ])),
+  // Whether this Anthropic model uses ADAPTIVE thinking (an effort HINT with no
+  // additive `max_tokens` budget — the wire cap stays at the issued `max_tokens`
+  // and billed output never exceeds it). When set, AUTHORITATIVE for the per-user
+  // affordability basis (PER-USER-LIMITS §5): `true` ⇒ reserve 0 thinking tokens
+  // inside the issued cap (no over-reservation), `false` ⇒ the flat per-level
+  // additive budget. When UNSET, a hardcoded id heuristic (Opus 4.6/4.7, Sonnet
+  // 4.6) decides — so set `adaptive_thinking = true` explicitly for adaptive
+  // Anthropic models NEWER than that list (e.g. Opus 4.8+) to avoid a phantom
+  // reservation that can spuriously deny a within-budget user. Only consulted on
+  // the anthropic-messages path; Gemini/OpenAI budgets are derived separately.
+  adaptive_thinking: Type.Optional(Type.Boolean()),
   // Per-level remap of `thinking_level` → the provider's wire value for the
   // reasoning-effort knob (pi-ai `Model.thinkingLevelMap`). Needed when the
   // upstream's effort vocabulary differs from pi-ai's `ThinkingLevel` enum
@@ -1109,7 +1120,8 @@ const UserLimitConstraintSchema = StrictObject({
 
 const UserLimitRuleSchema = StrictObject({
   // Match dimensions — single glob/exact or a list (any matches); omit = wildcard.
-  // `space` is Phase 2 (a normalizer fatal until space matching lands, §11).
+  // `space` matching is implemented (§11, schema v32): a rule may scope by Matrix
+  // space and `space` is accepted (no longer a normalizer fatal).
   user: Type.Optional(UserLimitMatchSchema),
   room: Type.Optional(UserLimitMatchSchema),
   space: Type.Optional(UserLimitMatchSchema),
