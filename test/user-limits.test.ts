@@ -415,6 +415,40 @@ test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model
   assert.equal(premiumBinding?.modelScope?.[0], "opus-premium");
 });
 
+test("record: tool spend (no coverage model) hits total + pool but NOT a same-named sub-cap (#14)", () => {
+  const engine = makeEngine([
+    {
+      user: ["@a:hs", "@b:hs"],
+      models: ["opus-premium", "glm-cheap"],
+      limits: [
+        { max_usd: 100, window: ROLL24 }, // per-user fungible total
+        { max_usd: 10, window: ROLL24, models: ["opus-premium"] }, // per-user premium sub-cap
+        { max_usd: 50, window: ROLL24, partition: "staff" }, // shared pool (binds before B's total)
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  const b = engine.resolve({ userId: "@b:hs" });
+
+  // Tool spend on a model that NAME-MATCHES the sub-cap (opus-premium). Passing
+  // `undefined` (the tool-lane coverage) must skip the model-scoped sub-cap entirely
+  // while still drawing down the model-agnostic total and shared pool.
+  engine.record(r, undefined, 8);
+
+  // A's total drew down by the tool spend ($100 − $8 = $92) → and the shared pool
+  // ($50 − $8 = $42) now binds A's headroom.
+  assert.equal(engine.totalHeadroom(r), 42);
+  // The shared pool is visible to B (one meter): B's untouched $100 total is bound by
+  // the pooled $50 − $8 = $42 — proof the tool spend hit the pool, not just A's total.
+  assert.equal(engine.affordable(b, "glm-cheap", { newTokens: 0 }).remainingUsd, 42);
+  // The opus-premium sub-cap is UNTOUCHED — full $10 headroom despite the name match.
+  assert.equal(engine.affordable(r, "opus-premium", { newTokens: 0 }).remainingUsd, 10);
+  // For contrast: an AGENT-LOOP event on opus-premium DOES hit the sub-cap.
+  engine.record(r, "opus-premium", 6);
+  // Sub-cap now $10 − $6 = $4 binds for premium (below the pool's $42 − $6 = $36).
+  assert.equal(engine.affordable(r, "opus-premium", { newTokens: 0 }).remainingUsd, 4);
+});
+
 test("space matching (§11): matches ANY parent space; per-space pool shares across users", () => {
   const engine = makeEngine([
     // A space-scoped shared pool for two users; matches if the room is under !spaceB.
