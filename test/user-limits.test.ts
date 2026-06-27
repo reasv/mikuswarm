@@ -553,6 +553,319 @@ test("seed: a meter materializes from the ledger sum on first access", () => {
   assert.equal(engine.totalHeadroom(r), 1);
 });
 
+// ─── #16: tick() reconcile — rolling re-SUM + calendar roll-with-reseed ─────────
+
+/** Reach the private periodic reconcile (the production timer calls it on tickMs). */
+function drivetick(engine: UserLimitEngine): void {
+  (engine as unknown as { tick(): void }).tick();
+}
+
+/** Read the live spent of the single materialized meter (off `statuses()`). */
+function onlySpent(engine: UserLimitEngine): number {
+  const s = engine.statuses();
+  assert.equal(s.length, 1, "exactly one meter materialized");
+  return s[0]!.spentUsd;
+}
+
+test("tick (#16): a rolling meter is re-SUMMED from the ledger on the periodic reconcile", () => {
+  // The ledger value GROWS between seed and tick (concurrent spend from another
+  // process / a row recorded outside this engine instance). A rolling tick must
+  // re-SUM and adopt the new authoritative total, discarding the in-memory estimate.
+  let ledger = 1;
+  let nowValue = 1_000_000;
+  const engine = new UserLimitEngine({
+    rules: normalize([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]),
+    sumUsageCost: () => ledger,
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Seeded at $1.
+  assert.equal(engine.totalHeadroom(r), 4);
+  // A local record bumps the in-memory meter to $1 + $2 = $3 (headroom $2).
+  engine.record(r, "glm-cheap", 2);
+  assert.equal(engine.totalHeadroom(r), 2);
+  // Meanwhile the authoritative ledger settled at $4 (a concurrent writer). Advance the
+  // clock and tick: the rolling window re-SUMs and the meter snaps to the ledger's $4,
+  // NOT the stale in-memory $3 — proving the reconcile is a re-SUM, not an accumulation.
+  ledger = 4;
+  nowValue += 60_000;
+  drivetick(engine);
+  assert.equal(onlySpent(engine), 4, "rolling tick adopts the re-SUMMED ledger total");
+  assert.equal(engine.totalHeadroom(r), 1);
+});
+
+test("tick (#16): a rolling tick re-SUMS within the ADVANCED window (since = now − duration)", () => {
+  // The re-SUM filter's `since` must track the advancing window so spend that has aged
+  // PAST the trailing window no longer counts. Assert the tick passes `since = now −
+  // durationMs` by having the fake ledger return a value keyed off the requested `since`.
+  let nowValue = 1_000_000;
+  const DURATION = 24 * 3_600_000;
+  let lastSince = -1;
+  const engine = new UserLimitEngine({
+    rules: normalize([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]),
+    sumUsageCost: (f) => {
+      lastSince = f.since;
+      return 0;
+    },
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Materialize the meter (resolve is lazy — the seed SUM fires on first meter access).
+  engine.totalHeadroom(r);
+  assert.equal(lastSince, nowValue - DURATION, "seed window starts one duration before now");
+  nowValue += 5 * 3_600_000; // advance 5h
+  drivetick(engine);
+  assert.equal(lastSince, nowValue - DURATION, "tick re-SUMS over the ADVANCED trailing window");
+});
+
+test("tick (#16): a calendar meter rolls and RESEEDS at the period boundary", () => {
+  // A calendar-day meter (UTC). Spend accrues, then the clock crosses midnight: the
+  // tick must roll the window forward AND reseed `spent` from the ledger SUM of the NEW
+  // window (here $0 — a fresh day), zeroing last period's accrual.
+  const DAY = "2026-06-27";
+  // 2026-06-27 12:00:00 UTC.
+  let nowValue = Date.parse(`${DAY}T12:00:00Z`);
+  let ledger = 0; // the ledger SUM the tick will reseed from for the NEW day.
+  let lastSince = -1;
+  const engine = new UserLimitEngine({
+    rules: normalize([
+      { user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: { type: "calendar", period: "day", tz: "UTC" } }] },
+    ]),
+    sumUsageCost: (f) => {
+      lastSince = f.since;
+      return ledger;
+    },
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Materialize the meter (resolve is lazy); the seed SUM fires here.
+  assert.equal(engine.totalHeadroom(r), 5);
+  // Seed window starts at today's UTC midnight; ledger is $0, so full $5 headroom.
+  assert.equal(lastSince, Date.parse(`${DAY}T00:00:00Z`), "calendar seed = start of the UTC day");
+  // Spend $4 today (in-memory).
+  engine.record(r, "glm-cheap", 4);
+  assert.equal(engine.totalHeadroom(r), 1);
+
+  // A tick BEFORE the boundary does NOT reseed a calendar meter (window unchanged) —
+  // the $4 in-memory accrual survives (calendar tick only acts on a crossed boundary).
+  nowValue += 3_600_000; // 13:00, same day
+  drivetick(engine);
+  assert.equal(engine.totalHeadroom(r), 1, "pre-boundary calendar tick keeps the in-memory accrual");
+
+  // Cross midnight into 2026-06-28. The ledger SUM for the new day is $0, so the meter
+  // rolls and reseeds to $0 → the full $5 is available again.
+  nowValue = Date.parse(`2026-06-28T00:30:00Z`);
+  drivetick(engine);
+  assert.equal(lastSince, Date.parse(`2026-06-28T00:00:00Z`), "reseed window = start of the NEW UTC day");
+  assert.equal(onlySpent(engine), 0, "calendar roll reseeds spent from the new period's ledger SUM");
+  assert.equal(engine.totalHeadroom(r), 5, "last day's $4 accrual is cleared on the roll");
+});
+
+// ─── #16: calendar window seeding + reset (the existing tests are all rolling 24h) ─
+
+test("calendar window (#16): seeds from the period start and resets at the next boundary", () => {
+  // A monthly calendar cap in a non-UTC zone (Asia/Tokyo) — exercise the tz-aware
+  // boundary math the rolling tests never touch. Seed window = start of the local month;
+  // resetsAt = start of next local month.
+  let nowValue = Date.parse("2026-06-15T03:00:00Z"); // 2026-06-15 12:00 JST
+  let lastSince = -1;
+  const engine = new UserLimitEngine({
+    rules: normalize([
+      { user: "*", models: ["glm-cheap"], limits: [{ max_usd: 9, window: { type: "calendar", period: "month", tz: "Asia/Tokyo" } }] },
+    ]),
+    sumUsageCost: (f) => {
+      lastSince = f.since;
+      return 0;
+    },
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Materialize the meter (resolve is lazy — the seed SUM fires on first meter access).
+  engine.totalHeadroom(r);
+  // The seed window starts at 2026-06-01 00:00 JST = 2026-05-31 15:00 UTC.
+  assert.equal(lastSince, Date.parse("2026-05-31T15:00:00Z"), "monthly seed = start of the local (JST) month");
+  // accurateResetsAt for a calendar window is the fixed boundary: 2026-07-01 00:00 JST.
+  const total = r.constraints[0]!;
+  assert.equal(engine.accurateResetsAt(total), Date.parse("2026-06-30T15:00:00Z"), "resets at the next local month boundary");
+});
+
+// ─── #16: accurateResetsAt — rolling min(ts)+duration and the cap-0 undefined path ─
+
+test("accurateResetsAt (#16): rolling reset = min(contributing ts) + duration", () => {
+  // The OLDEST contributing spend ages out at minTs + durationMs — far sooner than the
+  // cheap `now + durationMs` upper bound the gate uses. Provide a real minUsageTs.
+  const nowValue = 10_000_000;
+  const oldestTs = 9_000_000; // the oldest contributing row
+  const DURATION = 24 * 3_600_000;
+  const engine = new UserLimitEngine({
+    rules: normalize([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]),
+    sumUsageCost: () => 1,
+    minUsageTs: () => oldestTs,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  const total = r.constraints[0]!;
+  // minTs + duration, NOT now + duration — strictly earlier (the accurate ETA).
+  assert.equal(engine.accurateResetsAt(total), oldestTs + DURATION);
+  assert.ok(engine.accurateResetsAt(total)! < nowValue + DURATION, "accurate reset is earlier than the cheap upper bound");
+});
+
+test("accurateResetsAt (#16): falls back to now + duration when no contributing ts; undefined for a cap-0 ban", () => {
+  const nowValue = 10_000_000;
+  const DURATION = 24 * 3_600_000;
+  // (a) Rolling cap with NO contributing ts (minUsageTs null) → now + durationMs.
+  const rolling = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }], {
+    now: nowValue,
+  });
+  const rr = rolling.resolve({ userId: "@a:hs" });
+  assert.equal(rolling.accurateResetsAt(rr.constraints[0]!), nowValue + DURATION, "null minTs ⇒ now + duration");
+
+  // (b) A cap-0 ban has no meaningful reset instant → undefined (so {resets_at} renders
+  // empty). This is the path the cap-0 refusal test relies on; pin it directly here too.
+  const ban = makeEngine([{ user: "@x:hs", max_usd: 0 }]);
+  const br = ban.resolve({ userId: "@x:hs" });
+  assert.equal(ban.accurateResetsAt(br.constraints[0]!), undefined, "cap-0 ban has no reset");
+});
+
+// ─── #16: room-scoped seeding — two rooms → distinct meters / distinct seed filters ─
+
+test("room-scoped seeding (#16): two rooms under a room-matched rule get DISTINCT meters", () => {
+  // A room-matched rule narrows each per-user meter to the trigger's room (the sturdy
+  // room_id-column seed, §16 Q2). Two different rooms must NOT share a meter — one
+  // room's spend cannot drain another's, even for the same user.
+  const seedFilters: Array<{ since: number } & Record<string, unknown>> = [];
+  const engine = new UserLimitEngine({
+    rules: normalize([{ user: "*", room: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]),
+    sumUsageCost: (f) => {
+      seedFilters.push(f as { since: number });
+      return 0;
+    },
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => 1_000_000,
+  });
+  const inR1 = engine.resolve({ userId: "@a:hs", roomId: "!r1:hs" });
+  const inR2 = engine.resolve({ userId: "@a:hs", roomId: "!r2:hs" });
+  // Same user, different rooms → the resolved constraints carry DISTINCT room scopes.
+  assert.equal(inR1.constraints[0]!.roomScope, "!r1:hs");
+  assert.equal(inR2.constraints[0]!.roomScope, "!r2:hs");
+  assert.notEqual(inR1.constraints[0]!.meterKey, inR2.constraints[0]!.meterKey, "distinct meter keys per room");
+
+  // Spend the whole cap in !r1; !r2's meter is untouched (full headroom).
+  engine.record(inR1, "glm-cheap", 5);
+  assert.equal(engine.totalHeadroom(inR1), 0, "room 1 exhausted");
+  assert.equal(engine.totalHeadroom(inR2), 5, "room 2 unaffected by room 1's spend");
+
+  // The two meters seeded with DISTINCT room-narrowed seed filters: each carries its own
+  // roomIds alongside the shared trigger_sender_id (the per-user {user_id} partition).
+  const r1Seed = seedFilters.find((f) => Array.isArray(f.roomIds) && (f.roomIds as string[])[0] === "!r1:hs");
+  const r2Seed = seedFilters.find((f) => Array.isArray(f.roomIds) && (f.roomIds as string[])[0] === "!r2:hs");
+  assert.ok(r1Seed && r2Seed, "each room materialized its own seed");
+  assert.deepEqual(r1Seed!.triggerSenderIds, ["@a:hs"], "room 1 seed scopes to the user too");
+  assert.deepEqual(r2Seed!.triggerSenderIds, ["@a:hs"]);
+});
+
+// ─── #16: shared-pool SUB-CAP record + reseed filter ────────────────────────────
+
+test("shared-pool sub-cap (#16): record credits a pooled sub-cap and its reseed filter scopes pool + model", () => {
+  // A shared pool with BOTH a model-agnostic total AND a premium SUB-CAP on the same
+  // partition (`staff`). An agent-loop event on opus-premium must credit BOTH; a tool
+  // event (no requested model) must credit ONLY the pool total, never the pooled sub-cap
+  // (#14). The pooled sub-cap's reseed filter must scope partition AND requested model.
+  const poolSeeds: Array<Record<string, unknown>> = [];
+  const engine = new UserLimitEngine({
+    rules: normalize([
+      {
+        user: ["@a:hs", "@b:hs"],
+        models: ["opus-premium", "glm-cheap"],
+        limits: [
+          { max_usd: 50, window: ROLL24, partition: "staff" }, // shared pool total
+          { max_usd: 10, window: ROLL24, models: ["opus-premium"], partition: "staff" }, // pooled premium sub-cap
+        ],
+      },
+    ]),
+    sumUsageCost: (f) => {
+      poolSeeds.push(f as Record<string, unknown>);
+      return 0;
+    },
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => 1_000_000,
+  });
+  const a = engine.resolve({ userId: "@a:hs" });
+  // Both constraints are shared (denormalized onto the ledger as the same "staff" key).
+  assert.equal(a.ledgerPartitionKey, "staff");
+  const poolTotal = a.constraints.find((c) => c.modelScope === undefined)!;
+  const poolSub = a.constraints.find((c) => c.modelScope !== undefined)!;
+  assert.equal(poolTotal.isUserPartition, false);
+  assert.equal(poolSub.isUserPartition, false);
+
+  // An agent-loop event on opus-premium credits BOTH the pool total and the pooled
+  // sub-cap (the requested model is in scope).
+  engine.record(a, "opus-premium", 6);
+  assert.equal(engine.affordable(a, "opus-premium", { newTokens: 0 }).remainingUsd, 4, "pooled sub-cap drew down to $10−$6");
+  // A tool event (undefined model) credits ONLY the pool total, NOT the pooled sub-cap.
+  engine.record(a, undefined, 5);
+  // Pool total: $50 − $6 − $5 = $39 remaining.
+  assert.equal(engine.totalHeadroom(a), 39);
+  // Pooled sub-cap still only saw the $6 agent-loop spend → $4 remaining (the tool $5
+  // did NOT touch it).
+  assert.equal(engine.affordable(a, "opus-premium", { newTokens: 0 }).remainingUsd, 4, "tool spend skipped the pooled sub-cap (#14)");
+
+  // The pool is shared: B (the other pool member) sees the SAME drawn-down meters.
+  const b = engine.resolve({ userId: "@b:hs" });
+  assert.equal(engine.totalHeadroom(b), 39, "the pool total is one meter across members");
+  assert.equal(engine.affordable(b, "opus-premium", { newTokens: 0 }).remainingUsd, 4, "the pooled sub-cap is shared too");
+
+  // The pooled sub-cap's seed filter scopes BOTH the partition key AND the requested
+  // model (so the ledger reseed picks up exactly the pool's premium spend).
+  const subSeed = poolSeeds.find(
+    (f) => Array.isArray(f.partitionKeys) && (f.partitionKeys as string[])[0] === "staff" && f.requestedModelIds !== undefined,
+  );
+  assert.ok(subSeed, "the pooled sub-cap materialized a partition+model-scoped seed");
+  assert.deepEqual(subSeed!.partitionKeys, ["staff"]);
+  assert.deepEqual(subSeed!.requestedModelIds, ["opus-premium"]);
+  // It must NOT seed off trigger_sender_id (it's a shared pool, not a per-user meter).
+  assert.equal(subSeed!.triggerSenderIds, undefined, "a shared-pool sub-cap seeds off the partition, not the sender");
+});
+
 // ─── #6: console meter-key parsing with `#` in a literal partition / model id ────
 
 test("statuses (#6): a literal partition containing `#` reports correct console fields", () => {
