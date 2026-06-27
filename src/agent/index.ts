@@ -28,6 +28,7 @@ export {
   AgentSessionFactory,
   createModel,
   filterTools,
+  additiveThinkingBudgetTokens,
   assertRunSettledCleanly,
   wasRunAborted,
   WorkerDrainAbortError,

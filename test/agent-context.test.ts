@@ -3,6 +3,9 @@ import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "../src/agent/convert.js";
 import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext, withSdkRetriesDisabled } from "../src/agent/factory.js";
+import { SessionUsageTracker, type SessionUsageTotals } from "../src/agent/usage.js";
+import { estimateObjectTokens } from "../src/context/tokens.js";
+import type { UserLimitContext, UserLimitResolution } from "../src/budget/index.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import type { BuiltContext } from "../src/context/index.js";
 import { ContextBuilder, type BuildContextOptions } from "../src/context/builder.js";
@@ -416,6 +419,268 @@ test("factory does not alias the caller's resume transcript array", async () => 
 
   assert.equal(transcript.length, 1, "caller's transcript array must not be mutated");
   assert.equal((transcript[0] as any).content, "resumed question");
+});
+
+// === spec PER-USER-LIMITS §5.3 / review #1 ===================================
+// On RESUME the factory builds no context, so the running-input estimate must be
+// SEEDED from the resumed baseline (`usage.snapshot().contextTokens`) — otherwise
+// the first affordability estimate sees a 0-token context (input_cost ≈ $0), the
+// §5.3 output cap is removed, and §5.4 degradation never fires (uncapped overshoot
+// on every reply-resume / follow-up-resume / continue-mode recovery).
+test("resume seeds the per-user running estimate from the resumed context (#1)", async () => {
+  // A fake per-user engine that records every affordability estimate it is asked,
+  // and answers UNAFFORDABLE so the first request terminates content-class without
+  // ever touching a real provider stream.
+  const seenEstimates: Array<{ cachedTokens?: number; newTokens?: number }> = [];
+  const resolution = {
+    matched: true,
+    active: true,
+    banned: false,
+    models: ["default"],
+    constraints: [],
+    ledgerPartitionKey: undefined,
+  } as unknown as UserLimitResolution;
+  const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+  const engine = {
+    affordable(_r: unknown, _m: string, estimate: { cachedTokens?: number; newTokens?: number }) {
+      seenEstimates.push(estimate);
+      return { ok: false, maxOutput: 0, remainingUsd: 0 };
+    },
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  } as never;
+
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  // Continue-mode resume seed: the persisted row's context size (the LAST committed
+  // request's totalTokens) — what `usageSeedFromRow` loads. 12_345 ≠ 0 is the signal.
+  const seed: SessionUsageTotals = {
+    llmRequests: 3,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 12_345,
+  };
+  const usage = new SessionUsageTracker(seed);
+
+  const resumeSnapshot: AgentMessage[] = [
+    { type: "chatEvent", role: "user", content: "<message>prior</message>", timestamp: 1 } as any,
+  ];
+  const { agent } = await factory.create(chatSession(), [], {
+    resume: { snapshot: resumeSnapshot },
+    usage,
+    userLimit: { engine, resolution, ctx },
+  });
+
+  // Drive ONE request: the per-user pre-flight (`checkCostBudget` →
+  // `resolveUserSelection`) calls `affordable` with the running-counter estimate, then
+  // (unaffordable) terminates the run content-class — no provider stream is reached.
+  await agent.prompt({ role: "user", content: "resumed turn", timestamp: 2 } as any);
+
+  // The pre-flight estimate (from `resolveUserSelection`, distinct from the #13
+  // defensive `{}` cap computed at create) reflects the RESUMED context, not 0.
+  const preflight = seenEstimates.find((e) => (e.newTokens ?? 0) > 0);
+  assert.ok(preflight, "the resume pre-flight affordability estimate must carry non-zero new tokens");
+  assert.equal(
+    (preflight!.cachedTokens ?? 0) + (preflight!.newTokens ?? 0),
+    12_345,
+    "the seeded running estimate must equal the resumed context size",
+  );
+});
+
+// === spec PER-USER-LIMITS §4.2 / review #3 ===================================
+// An image-bearing session whose entire per-user model set is text-only is a
+// TERMINAL per-user content-class deny (the capability filter emptied the set) —
+// never a fall-through to the ungated session-type default.
+test("image session + text-only user model set is a terminal per-user deny, not ungated (#3)", async () => {
+  let affordableCalls = 0;
+  const resolution = {
+    matched: true,
+    active: true,
+    banned: false,
+    models: ["default"], // the only configured model is text-only (minimalConfig)
+    constraints: [],
+    ledgerPartitionKey: undefined,
+  } as unknown as UserLimitResolution;
+  const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+  const engine = {
+    affordable() {
+      affordableCalls++;
+      return { ok: true, maxOutput: 4096, remainingUsd: Infinity };
+    },
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  } as never;
+
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  // A session whose trigger carries an image attachment → requiresMultimodal.
+  const session = chatSession();
+  (session.trigger as any).event = {
+    ...(session.trigger as any).event,
+    attachments: [{ mediaType: "image", localPath: "/m/pic.png" }],
+  };
+
+  const { agent } = await factory.create(session, [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "<message>p</message>", timestamp: 1 } as any] },
+    usage: new SessionUsageTracker(),
+    userLimit: { engine, resolution, ctx },
+  });
+
+  await agent.prompt({ role: "user", content: "look at this", timestamp: 2 } as any);
+
+  // The run terminated with the capability-deny terminal — never an ungated request.
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /capability mismatch/,
+    "an image trigger against a text-only model set must terminate as a per-user capability deny",
+  );
+  // The deny is structural — it never reaches the affordability selector.
+  assert.equal(affordableCalls, 0, "no per-user affordability selection happens on the capability-deny path");
+});
+
+// === spec PER-USER-LIMITS §5.3 / review #10 ==================================
+// The running input counter must tokenize only the slice the wire context carries
+// (`isLiveRuntimeMessage`-filtered, mirroring `transformContext`) — a stray
+// historical `chatEvent` is dropped on the wire, so it must not inflate the
+// estimate (a conservative over-count, but an exactness drift).
+test("running counter ignores wire-dropped chatEvents (#10)", async () => {
+  const seenEstimates: Array<{ cachedTokens?: number; newTokens?: number }> = [];
+  const resolution = {
+    matched: true,
+    active: true,
+    banned: false,
+    models: ["default"],
+    constraints: [],
+    ledgerPartitionKey: undefined,
+  } as unknown as UserLimitResolution;
+  const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+  const engine = {
+    affordable(_r: unknown, _m: string, estimate: { cachedTokens?: number; newTokens?: number }) {
+      seenEstimates.push(estimate);
+      return { ok: false, maxOutput: 0, remainingUsd: 0 };
+    },
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  } as never;
+
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+  // Seed a known resumed baseline so the first observation fixes `running` and
+  // `seenMsgs`; subsequent refreshes tokenize only the FILTERED delta.
+  const seed: SessionUsageTotals = {
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 1_000,
+  };
+  const { agent } = await factory.create(chatSession(), [], {
+    resume: { snapshot: [] },
+    usage: new SessionUsageTracker(seed),
+    userLimit: { engine, resolution, ctx },
+  });
+
+  // Request 1: first observation seeds running=1000, seenMsgs=state.length. Terminates
+  // unaffordable (no provider stream reached).
+  await agent.prompt({ role: "user", content: "first", timestamp: 2 } as any);
+  const afterFirst = seenEstimates.length;
+
+  // Append a HUGE wire-DROPPED stray chatEvent. `transformContext` filters it out of the
+  // wire context, so the running counter must too — its tokens must NOT enter the
+  // estimate. A large body makes the contrast unambiguous: counted ⇒ the estimate
+  // balloons by ~10k+ tokens; filtered ⇒ it stays near the 1000 baseline.
+  const hugeBody = "lorem ipsum ".repeat(5_000); // ~10k words → ~10k+ tokens
+  const hugeChatEventTokens = estimateObjectTokens(
+    convertToLlm([{ type: "chatEvent", role: "user", content: `<message>${hugeBody}</message>`, timestamp: 3 } as any]),
+  );
+  assert.ok(hugeChatEventTokens > 5_000, "the stray chatEvent is large enough to dominate if counted");
+  agent.state.messages.push({
+    type: "chatEvent",
+    role: "user",
+    content: `<message>${hugeBody}</message>`,
+    timestamp: 3,
+  } as any);
+
+  await agent.prompt({ role: "user", content: "second", timestamp: 5 } as any);
+  assert.ok(seenEstimates.length > afterFirst, "the second request re-ran the pre-flight");
+  const preflight2 = seenEstimates[seenEstimates.length - 1];
+  const observed2 = (preflight2!.cachedTokens ?? 0) + (preflight2!.newTokens ?? 0);
+
+  // The wire-dropped chatEvent contributed nothing: the running estimate is far below
+  // `baseline + hugeChatEventTokens` (it would be ≥ that if the filter were missing).
+  assert.ok(
+    observed2 < 1_000 + hugeChatEventTokens,
+    `running counter must exclude wire-dropped chatEvents (observed ${observed2}, ` +
+      `would be ≥ ${1_000 + hugeChatEventTokens} if counted)`,
+  );
+});
+
+// === spec PER-USER-LIMITS §6.2 / review #13 ==================================
+// The initial per-user `activeSelection` must carry a DEFENSIVE `maxTokens` cap,
+// computed at create from the first selectable's affordable output at a ≈0 prior-
+// context estimate (mirroring Gate A). If the per-request pre-flight ever throws
+// (and `withRequestRetry` swallows it), request 1 still ships with this cap rather
+// than uncapped — the most-expensive request must never be ungated.
+test("per-user initial selection is seeded with a defensive output cap (#13)", async () => {
+  const estimatesAtCreate: Array<{ cachedTokens?: number; newTokens?: number } | undefined> = [];
+  let calls = 0;
+  const resolution = {
+    matched: true,
+    active: true,
+    banned: false,
+    models: ["default"],
+    constraints: [],
+    ledgerPartitionKey: undefined,
+  } as unknown as UserLimitResolution;
+  const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+  const engine = {
+    affordable(_r: unknown, _m: string, estimate: { cachedTokens?: number; newTokens?: number }) {
+      calls++;
+      // The FIRST call is the create-time defensive cap (estimate is the empty `{}`).
+      if (calls === 1) estimatesAtCreate.push(estimate);
+      return { ok: true, maxOutput: 1234, remainingUsd: Infinity };
+    },
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  } as never;
+
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+  // `create` alone must compute the defensive cap (an `affordable` call with the empty
+  // estimate) — no request issued. This is the seam #13 fixes: previously the initial
+  // `activeSelection` carried no `maxTokens`.
+  await factory.create(chatSession(), [], {
+    resume: { snapshot: [] },
+    usage: new SessionUsageTracker(),
+    userLimit: { engine, resolution, ctx },
+  });
+
+  assert.ok(calls >= 1, "create computed the defensive initial cap via affordable()");
+  const createEstimate = estimatesAtCreate[0]!;
+  // The defensive cap is computed at ≈0 prior context (mirroring Gate A's `{}`).
+  assert.ok(
+    (createEstimate.newTokens ?? 0) === 0 && (createEstimate.cachedTokens ?? 0) === 0,
+    "the defensive initial cap uses a zero-context estimate",
+  );
 });
 
 test("convertToLlm filters accidental system transcript messages", () => {
