@@ -5,6 +5,7 @@ import type { Logger } from "../observability/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
+import { roomIdFromTimelineKeyOpt } from "./timeline-key.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -1045,19 +1046,15 @@ export interface UsageCostFilter {
 }
 
 /**
- * Extract the bare Matrix room id from a `timeline_key` (spec PER-USER-LIMITS §8.3),
- * a duplicate of `roomIdFromTimelineKey` (src/timeline/router.ts) kept LOCAL so the
- * storage layer never imports from the timeline layer. Keys are
- * `matrix:<account>:room:<roomId>[:thread:<root>]` / `matrix:<account>:dm:<roomId>`;
- * a Matrix room id itself contains a colon, so capture everything between the
- * `room:`/`dm:` marker and an optional `:thread:` suffix. Returns null for a missing
- * or malformed key so the denormalized column stays clean.
+ * Extract the bare Matrix room id from a `timeline_key` (spec PER-USER-LIMITS §8.3)
+ * for the denormalized `room_id` column. Delegates to the shared leaf derivation in
+ * `./timeline-key.js` (the SAME regex the timeline layer's `roomIdFromTimelineKey`
+ * uses) so room-scoped seeding cannot drift; normalizes `undefined` → `null` for the
+ * SQLite column. The leaf lives under `src/storage/` so storage never imports the
+ * timeline layer.
  */
 function roomIdFromTimelineKey(timelineKey: string | undefined): string | null {
-  if (!timelineKey) return null;
-  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
-  const roomId = match?.[1];
-  return roomId && roomId.length > 0 ? roomId : null;
+  return roomIdFromTimelineKeyOpt(timelineKey) ?? null;
 }
 
 /**

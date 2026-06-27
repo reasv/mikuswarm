@@ -271,6 +271,56 @@ test("degradation: an exhausted premium sub-cap makes premium unaffordable but t
   assert.equal(engine.totalHeadroom(r), 3);
 });
 
+test("refusalBindingConstraint: reports the SOONEST-resetting over-cap window, not least-headroom (#5/§12)", () => {
+  // Two exhausted windows on the same user where least-headroom ≠ soonest-resetting:
+  //  - fungible TOTAL: cap $5, rolling 24h  → spent $9 ⇒ headroom −4 (LEAST), resets LATER (+24h)
+  //  - premium SUB-CAP: cap $5, rolling 1h  → spent $6 ⇒ headroom −1, resets SOONER (+1h)
+  // The §12 refusal must quote the soonest-resetting binding (the 1h sub-cap), so the
+  // user is told the EARLIEST instant they're unblocked — even though the 24h total has
+  // the least headroom. minUsageTs is null here, so accurateResetsAt = now + durationMs,
+  // making the 1h window's reset strictly earlier than the 24h window's.
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["opus-premium", "glm-cheap"],
+      limits: [
+        { max_usd: 5, window: { type: "rolling", duration: "24h" } }, // fungible total, later reset
+        { max_usd: 5, window: { type: "rolling", duration: "1h" }, models: ["opus-premium"] }, // sub-cap, sooner reset
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Drive the sub-cap (opus) to $6 (counts toward total + sub-cap), then push the total
+  // alone to $9 via a glm spend the sub-cap does NOT cover.
+  engine.record(r, "opus-premium", 6); // total 6, sub-cap 6
+  engine.record(r, "glm-cheap", 3); // total 9, sub-cap unchanged (6)
+
+  const total = r.constraints.find((c) => c.modelScope === undefined)!;
+  const subCap = r.constraints.find((c) => c.modelScope !== undefined)!;
+
+  // Least-headroom (affordability question) → the 24h TOTAL (headroom −4 < −1).
+  assert.equal(engine.bindingConstraint(r), total);
+  // Refusal binding (§12 question) → the 1h SUB-CAP (resets soonest among over-cap).
+  const refusal = engine.refusalBindingConstraint(r);
+  assert.equal(refusal, subCap);
+  // And its reset is strictly earlier than the total's — the message quotes the soonest.
+  assert.ok(engine.accurateResetsAt(refusal!)! < engine.accurateResetsAt(total)!);
+});
+
+test("refusalBindingConstraint: a cap-0 ban falls back to least-headroom with no reset (#5/§12)", () => {
+  // A pure ban (max_usd = 0): nothing is strictly OVER cap (spent 0 == cap 0), so the
+  // soonest-resetting selector finds no over-cap window and falls back to bindingConstraint
+  // (least-headroom), which still surfaces the ban. accurateResetsAt is undefined for a
+  // cap-0 ban, so {resets_at}/{resets_in} render empty (the author omits them) — the fix
+  // must not break this.
+  const engine = makeEngine([{ user: "@x:hs", max_usd: 0 }]);
+  const r = engine.resolve({ userId: "@x:hs" });
+  const binding = engine.refusalBindingConstraint(r);
+  assert.ok(binding, "ban still surfaces a binding constraint for the refusal");
+  assert.equal(binding!.cap, 0);
+  assert.equal(engine.accurateResetsAt(binding!), undefined, "cap-0 ban has no reset instant");
+});
+
 test("affordable: additive thinking budget is reserved within the issued cap and charged (#4)", () => {
   // glm-cheap: $0.5/$2 per MTok. Total cap $5, no prior context (input_cost ≈ 0).
   // affordableOutput = floor(5 / (2/1e6)) = 2_500_000 total billed output.
