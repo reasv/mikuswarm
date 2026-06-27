@@ -587,6 +587,94 @@ test("sumUsageCost partitionKeys: a pooled tool row's budget_partition is includ
   );
 });
 
+// ---------------------------------------------------------------------------
+// New per-user filter dimensions (spec PER-USER-LIMITS §8.3): triggerSenderIds /
+// roomIds / spaceIds each select the right rows and AND together with each other
+// (and with the model-agnostic dimensions). The `requestedModelIds` null-fallback
+// and `partitionKeys` reseed are covered above (#14/#2); this fills the remaining
+// per-user seed dimensions and a representative AND-combination (issue #15).
+// ---------------------------------------------------------------------------
+
+test("sumUsageCost: triggerSenderIds / roomIds / spaceIds select the right rows and AND together (#15)", async () => {
+  await withLedger(
+    [
+      // Alice in room !r1 (space !sX): two agent-loop rows.
+      { ts: 1_000, class: "agent_loop", triggerSenderId: "@alice:hs", timelineKey: "matrix:miku:room:!r1:hs", spaceId: "!sX:hs", modelId: "opus", costUsd: 1 },
+      { ts: 1_100, class: "agent_loop", triggerSenderId: "@alice:hs", timelineKey: "matrix:miku:room:!r1:hs", spaceId: "!sX:hs", modelId: "opus", costUsd: 2 },
+      // Alice in a DIFFERENT room !r2 (space !sY).
+      { ts: 2_000, class: "agent_loop", triggerSenderId: "@alice:hs", timelineKey: "matrix:miku:room:!r2:hs", spaceId: "!sY:hs", modelId: "opus", costUsd: 4 },
+      // Bob in room !r1 (space !sX).
+      { ts: 3_000, class: "agent_loop", triggerSenderId: "@bob:hs", timelineKey: "matrix:miku:room:!r1:hs", spaceId: "!sX:hs", modelId: "opus", costUsd: 8 },
+    ],
+    async (storage) => {
+      // triggerSenderIds (the per-user {user_id} seed): Alice = 1+2+4 = 7; Bob = 8.
+      assert.equal(sum(storage, { since: 0, triggerSenderIds: ["@alice:hs"] }), 7);
+      assert.equal(sum(storage, { since: 0, triggerSenderIds: ["@bob:hs"] }), 8);
+      // OR-within-list across senders.
+      assert.equal(sum(storage, { since: 0, triggerSenderIds: ["@alice:hs", "@bob:hs"] }), 15);
+
+      // roomIds (the room-scoped seed, matched on the DERIVED bare room id): !r1 holds
+      // Alice's two ($3) + Bob's ($8) = $11; !r2 holds Alice's $4.
+      assert.equal(sum(storage, { since: 0, roomIds: ["!r1:hs"] }), 11);
+      assert.equal(sum(storage, { since: 0, roomIds: ["!r2:hs"] }), 4);
+
+      // spaceIds (the canonical-parent-space seed): !sX holds !r1's three rows ($11);
+      // !sY holds the lone !r2 row ($4).
+      assert.equal(sum(storage, { since: 0, spaceIds: ["!sX:hs"] }), 11);
+      assert.equal(sum(storage, { since: 0, spaceIds: ["!sY:hs"] }), 4);
+
+      // AND across dimensions: a room/space-NARROWED per-user seed (sender + room +
+      // space) selects only Alice's spend inside !r1/!sX — her $4 in !r2 drops out and
+      // Bob's $8 in !r1 drops out. The result ($3) is strictly less than any single
+      // dimension, proving the dimensions intersect rather than union.
+      assert.equal(
+        sum(storage, { since: 0, triggerSenderIds: ["@alice:hs"], roomIds: ["!r1:hs"], spaceIds: ["!sX:hs"] }),
+        3,
+      );
+      // A combo with no overlapping row → 0 (Bob never spent in !r2).
+      assert.equal(sum(storage, { since: 0, triggerSenderIds: ["@bob:hs"], roomIds: ["!r2:hs"] }), 0);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// `room_id` derivation AT INSERT (spec PER-USER-LIMITS §8.3 / §16 Q2): the real
+// insert path must denormalize the bare room id from each `timeline_key` shape so
+// the `room:{room_id}` partition + room-scoped seed agree with the engine's ctx.
+// Exercises the persisted column via insertUsageEvent (not a pre-stamped value).
+// ---------------------------------------------------------------------------
+
+test("insertUsageEvent: room_id is DERIVED from timeline_key at insert across room/dm/thread/malformed (#15)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // `insertUsageEvent` mints its own id, so each row is pinned by a unique `ts`
+    // (used here purely as a selector — windows are wide-open in the reads below).
+    await storage.insertUsageEvent({ ts: 1_000, class: "agent_loop", modelId: "m", costUsd: 1, timelineKey: "matrix:miku:room:!abc:hs.org" });
+    await storage.insertUsageEvent({ ts: 2_000, class: "agent_loop", modelId: "m", costUsd: 1, timelineKey: "matrix:miku:dm:!dmroom:hs.org" });
+    await storage.insertUsageEvent({ ts: 3_000, class: "agent_loop", modelId: "m", costUsd: 1, timelineKey: "matrix:miku:room:!abc:hs.org:thread:$root" });
+    await storage.insertUsageEvent({ ts: 4_000, class: "agent_loop", modelId: "m", costUsd: 1, timelineKey: "not-a-timeline-key" });
+    await storage.insertUsageEvent({ ts: 5_000, class: "agent_loop", modelId: "m", costUsd: 1 }); // no timeline_key at all
+    await storage.waitForIdle();
+
+    const roomIdAt = (ts: number): string | null =>
+      storage.read((db) => (db.prepare(`select room_id from usage_events where ts = ?`).get(ts) as { room_id: string | null }).room_id);
+
+    assert.equal(roomIdAt(1_000), "!abc:hs.org", "bare room id for a room key");
+    assert.equal(roomIdAt(2_000), "!dmroom:hs.org", "bare room id for a dm key");
+    assert.equal(roomIdAt(3_000), "!abc:hs.org", "thread suffix stripped → same bare room id");
+    assert.equal(roomIdAt(4_000), null, "malformed key → null room_id");
+    assert.equal(roomIdAt(5_000), null, "absent timeline_key → null room_id");
+
+    // The derived room_id is what the roomIds seed filter matches on — a room and its
+    // thread sub-key collapse to one bare-room meter (the load-bearing property).
+    assert.equal(sum(storage, { since: 0, roomIds: ["!abc:hs.org"] }), 2, "room + thread rows share one bare-room meter");
+    assert.equal(sum(storage, { since: 0, roomIds: ["!dmroom:hs.org"] }), 1);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
 test("sumUsageCost: window bounds are half-open [since, until) (#18)", async () => {
   await withLedger(
     [
