@@ -200,6 +200,16 @@ interface MeterState {
   windowStart: number;
   resetsAt: number;
   window: WindowSpec;
+  /**
+   * The binding (least) cap of every constraint that maps to this meter (issue #2).
+   * Stored at materialization from `ResolvedConstraint.cap` and folded with `Math.min`
+   * each time another constraint touches the same meter, so `statuses()` reports the
+   * cap DIRECTLY instead of reverse-deriving it from the rule set (which ignored the
+   * partition/room/space dimensions and mis-reported a shared pool's cap). The
+   * in-memory enforcement path never reads this — affordability uses
+   * `ResolvedConstraint.cap` straight off the resolution.
+   */
+  cap: number;
   /** Ledger seed filter (window bounds added at seed/recompute). */
   seed: SeedFilter;
   /**
@@ -455,14 +465,19 @@ export class UserLimitEngine {
     const roomScope = rule.room ? ctx.roomId : undefined;
     const spaceScope = rule.space ? ctx.spaceIds?.[0] : undefined;
     const modelScope = c.models ? [...c.models].sort() : undefined;
-    const meterKey = [
+    // Unambiguous meter identity (#6): JSON-encode the structured tuple rather than
+    // `#`-join it, so a literal partition or model id that itself contains `#` can
+    // never collide two distinct meters or split one. The key is OPAQUE — the console
+    // reads structured fields off `MeterState`, never by splitting the key — so the
+    // encoding is free to change.
+    const meterKey = JSON.stringify([
       isUserPartition ? "u" : "p",
       partitionKey,
-      modelScope ? modelScope.join(",") : "*",
+      modelScope ?? null,
       windowKey(c.window),
-      roomScope ?? "*",
-      spaceScope ?? "*",
-    ].join("#");
+      roomScope ?? null,
+      spaceScope ?? null,
+    ]);
     return {
       meterKey,
       cap: c.maxUsd,
@@ -492,6 +507,10 @@ export class UserLimitEngine {
     const existing = this.meters.get(c.meterKey);
     if (existing) {
       this.rollIfNeeded(existing);
+      // Two constraints that share a meterKey share one counter; the binding (least)
+      // cap governs the badge (#2). Fold it on each touch so the order of first access
+      // doesn't matter.
+      existing.cap = Math.min(existing.cap, c.cap);
       return existing;
     }
     const now = this.now();
@@ -502,6 +521,7 @@ export class UserLimitEngine {
       windowStart: w.start,
       resetsAt: w.resetsAt,
       window: c.window,
+      cap: c.cap,
       seed,
       partitionKey: c.partitionKey,
       isUserPartition: c.isUserPartition,
@@ -793,8 +813,11 @@ export class UserLimitEngine {
     for (const [meterKey, state] of this.meters) {
       this.rollIfNeeded(state);
       // Read the structured key fields off the meter (NOT re-split from `meterKey`),
-      // so a literal partition / model id containing `#` reports correctly (#6).
-      const cap = capOfMeter(this.rules, state) ?? 0;
+      // so a literal partition / model id containing `#` reports correctly (#6). The
+      // cap is the binding (least) cap stored at materialization (#2) — never
+      // reverse-derived from the rule set, which ignored partition/room/space and
+      // mis-reported a shared pool's cap.
+      const cap = state.cap;
       const fraction = cap > 0 ? state.spent / cap : state.spent > 0 ? Infinity : 1;
       const blocked = state.spent >= cap && cap >= 0;
       const near = !blocked && fraction >= this.nearThreshold;
@@ -817,28 +840,4 @@ export class UserLimitEngine {
     }
     return out;
   }
-}
-
-/**
- * The cap of a meter, recovered from the rule set (console only). A meter can be
- * referenced by several constraints; report the smallest cap (the binding one) for
- * the status badge. Matches constraints on the meter's STRUCTURED key fields
- * (model scope + window, the portion intrinsic to the constraint) rather than a
- * substring of the `#`-joined key — so a literal partition or model id containing
- * `#` is matched correctly (#6). Returns undefined when no rule references it (a
- * meter materialized by a rule that has since changed — never in steady state).
- */
-function capOfMeter(rules: NormalizedUserLimitRule[], meter: MeterState): number | undefined {
-  const meterScope = meter.modelScope ? [...meter.modelScope].sort().join(",") : "*";
-  const meterWk = windowKey(meter.window);
-  let min: number | undefined;
-  for (const rule of rules) {
-    for (const c of rule.constraints) {
-      const scope = c.models ? [...c.models].sort().join(",") : "*";
-      if (scope === meterScope && windowKey(c.window) === meterWk) {
-        min = min === undefined ? c.maxUsd : Math.min(min, c.maxUsd);
-      }
-    }
-  }
-  return min;
 }

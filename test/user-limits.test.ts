@@ -1063,3 +1063,114 @@ test("space pool (#17): two distinct space-less rooms are NOT pooled together", 
   engine.record(roomA, "glm-cheap", 25);
   assert.equal(engine.statuses().length, 0, "no `space:` meter materialized for space-less rooms");
 });
+
+// ─── #2: statuses() reports the BINDING cap stored per meter, not a reverse-derive ─
+
+test("statuses (#2): a per-user total and a same-window shared pool report DISTINCT caps", () => {
+  // Flagship §8.1 rule-5 shape: a per-user fungible total ($5, {user_id}, 24h) AND a
+  // shared `public` pool ($100, 24h) — BOTH model-agnostic and on the SAME window. The
+  // old `capOfMeter` reverse-derived the cap by matching on (modelScope, window) only,
+  // so it returned min(5,100)=$5 for BOTH meters — the public pool's row showed cap $5
+  // and a wrong near/blocked badge. With the binding cap stored per meter, each reports
+  // its own cap.
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["glm-cheap"],
+      limits: [
+        { max_usd: 5, window: ROLL24 }, // per-user fungible total {user_id}
+        { max_usd: 100, window: ROLL24, partition: "public" }, // shared pool, SAME window
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Materialize both meters.
+  engine.record(r, "glm-cheap", 3);
+  const statuses = engine.statuses();
+  const userMeter = statuses.find((s) => s.isUserPartition);
+  const poolMeter = statuses.find((s) => !s.isUserPartition);
+  assert.ok(userMeter && poolMeter, "both the per-user total and the public pool materialized");
+  assert.equal(userMeter!.partitionKey, "@a:hs");
+  assert.equal(userMeter!.capUsd, 5, "the per-user total reports its OWN $5 cap");
+  assert.equal(poolMeter!.partitionKey, "public");
+  assert.equal(poolMeter!.capUsd, 100, "the shared pool reports its OWN $100 cap, not min(5,100)");
+  // The pool is well under cap ($3/$100) → `ok`, not a spurious `near`/`blocked`.
+  assert.equal(poolMeter!.state, "ok", "the public pool is not mis-badged from the $5 total");
+});
+
+test("statuses (#2): two constraints sharing a meterKey fold to the BINDING (least) cap", () => {
+  // Two model-agnostic constraints on the SAME partition + window collapse to one meter
+  // (same meterKey). The badge must use the binding (least) cap, regardless of which
+  // constraint materialized the meter first. The normalizer warns on divergent caps for
+  // a fully-static key, but the engine must still pick min defensively.
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["glm-cheap"],
+      limits: [
+        { max_usd: 100, window: ROLL24, partition: "staff" },
+        { max_usd: 40, window: ROLL24, partition: "staff" }, // same meter, tighter cap
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Both resolved constraints map to the same meterKey.
+  assert.equal(r.constraints.length, 2);
+  assert.equal(r.constraints[0]!.meterKey, r.constraints[1]!.meterKey, "shared meter identity");
+  engine.record(r, "glm-cheap", 1); // materializes + touches the shared meter
+  const statuses = engine.statuses();
+  assert.equal(statuses.length, 1, "the two constraints share ONE meter");
+  assert.equal(statuses[0]!.capUsd, 40, "the binding (least) cap governs the badge");
+});
+
+// ─── #2/money-path: record() no-ops on a non-positive / NaN cost ─────────────────
+
+test("record (money-path): a negative or NaN cost is a no-op (never moves a meter)", () => {
+  const engine = makeEngine([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Materialize the meter at $0 spent.
+  engine.record(r, "glm-cheap", 2);
+  assert.equal(engine.totalHeadroom(r), 3, "a real spend moved the meter");
+  // A negative cost (e.g. a refund the ledger should own, never the in-memory meter) is
+  // dropped — the `!(costUsd > 0)` guard rejects it.
+  engine.record(r, "glm-cheap", -1);
+  assert.equal(engine.totalHeadroom(r), 3, "a negative cost did not credit the meter");
+  // A NaN cost (a malformed usage event) is likewise a no-op — `!(NaN > 0)` is true.
+  engine.record(r, "glm-cheap", Number.NaN);
+  assert.equal(engine.totalHeadroom(r), 3, "a NaN cost did not corrupt the meter");
+  // The meter's recorded spend is exactly the one legitimate $2.
+  assert.equal(engine.statuses()[0]!.spentUsd, 2);
+});
+
+// ─── #16/money-path: a tick on a consistent ledger neither drops nor doubles ──────
+
+test("tick (money-path): a re-SUM equal to the in-memory total neither drops nor doubles", () => {
+  // The in-memory `record`ed total and the ledger SUM AGREE (the event was persisted
+  // and the rolling re-SUM sees exactly it). A rolling tick re-SUMs (it does not
+  // accumulate), so the meter must land on that same total — not $0 (dropped) nor $4
+  // (doubled).
+  let nowValue = 1_000_000;
+  const RECORDED = 2;
+  const engine = new UserLimitEngine({
+    rules: normalize([{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 5, window: ROLL24 }] }]),
+    // The ledger reports exactly what the in-memory path recorded (consistent state).
+    sumUsageCost: () => RECORDED,
+    minUsageTs: () => null,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => nowValue,
+  });
+  const r = engine.resolve({ userId: "@a:hs" });
+  // Seed sees the persisted $2; the in-memory record also reflects $2 (same event).
+  engine.record(r, "glm-cheap", RECORDED);
+  // In-memory meter is seed($2) + record($2) = $4 transiently (the seed pre-dated the
+  // record in this fake; the real path records after the seed too). The tick reconciles.
+  drivetick(engine);
+  // After the re-SUM the meter equals the authoritative ledger total — exactly $2,
+  // neither dropped to $0 nor doubled to $4.
+  assert.equal(onlySpent(engine), RECORDED, "the rolling re-SUM lands on the consistent total");
+  assert.equal(engine.totalHeadroom(r), 5 - RECORDED);
+});
