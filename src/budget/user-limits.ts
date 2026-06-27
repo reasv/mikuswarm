@@ -729,6 +729,32 @@ export class UserLimitEngine {
   }
 
   /**
+   * The binding constraint to report in a REFUSAL message (spec §12): when several
+   * windows are exhausted, the user is unblocked the moment the SOONEST-resetting
+   * binding constraint resets, so the message's `{resets_at}`/`{resets_in}` must
+   * quote that one — NOT the least-headroom one (a different question, served by
+   * `bindingConstraint`). Among constraints at/over cap (`spent >= cap`) pick the
+   * smallest `accurateResetsAt`; a cap-0 ban has no reset (`accurateResetsAt`
+   * undefined) and sorts last so a resetting window is preferred when present. Fall
+   * back to least-headroom only when nothing is strictly over cap (e.g. admitted
+   * elsewhere / numerically tied), preserving the old behaviour in that case.
+   */
+  refusalBindingConstraint(resolution: UserLimitResolution): ResolvedConstraint | undefined {
+    let binding: ResolvedConstraint | undefined;
+    let minResetsAt = Infinity;
+    for (const c of resolution.constraints) {
+      if (this.meterFor(c).spent < c.cap) continue; // only over/at-cap windows bind a refusal
+      const resetsAt = this.accurateResetsAt(c) ?? Infinity;
+      if (resetsAt < minResetsAt) {
+        minResetsAt = resetsAt;
+        binding = c;
+      }
+    }
+    // None strictly over cap (or all cap-0 bans): keep least-headroom selection.
+    return binding ?? this.bindingConstraint(resolution);
+  }
+
+  /**
    * Accurate reset instant for a resolved constraint's current window (§12 / §5 #5):
    * the fixed boundary for calendar; `min(contributing ts) + duration` for rolling
    * (off the hot path). Returns undefined for a cap-0 ban (no meaningful reset).

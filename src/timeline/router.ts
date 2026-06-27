@@ -1,4 +1,5 @@
 import type { InboundChatEvent } from "../types.js";
+import { roomIdFromTimelineKeyOpt } from "../storage/timeline-key.js";
 import { TimelineStore } from "./store.js";
 
 export interface RoutedTimelineEvent {
@@ -33,16 +34,12 @@ export function isDmTimeline(timelineKey: string): boolean {
 }
 
 /**
- * Extract the Matrix room id from a timeline key. Keys are shaped
- * `matrix:<account>:room:<roomId>[:thread:<root>]` or
- * `matrix:<account>:dm:<roomId>`. A Matrix room id (`!local:server`) itself
- * contains a colon, so this captures everything between the `room:`/`dm:` marker
- * and an optional `:thread:` suffix rather than splitting on every colon. The
- * `room|dm` kind segment is validated, so a malformed key returns `undefined`
- * (callers fall back / log rather than surfacing a garbage room id).
+ * Extract the Matrix room id from a timeline key (callers fall back / log rather
+ * than surfacing a garbage room id on a malformed key → `undefined`). Delegates to
+ * the shared leaf derivation in `src/storage/timeline-key.ts` so this and the
+ * storage-side `room_id` denormalization use ONE regex and cannot drift; see that
+ * module for the key grammar.
  */
 export function roomIdFromTimelineKey(timelineKey: string): string | undefined {
-  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
-  const roomId = match?.[1];
-  return roomId && roomId.length > 0 ? roomId : undefined;
+  return roomIdFromTimelineKeyOpt(timelineKey);
 }

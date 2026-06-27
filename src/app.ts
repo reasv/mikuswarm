@@ -1115,20 +1115,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   };
 
   // Relative duration to a reset, compact ("3h 12m", "2d", "now") — the {resets_in}
-  // token of a per-user refusal (spec PER-USER-LIMITS §12).
-  const formatDurationShort = (ms: number): string => {
-    if (!(ms > 0)) return "now";
-    const totalMin = Math.round(ms / 60_000);
-    const h = Math.floor(totalMin / 60);
-    const m = totalMin % 60;
-    if (h >= 24) {
-      const d = Math.floor(h / 24);
-      const rh = h % 24;
-      return rh ? `${d}d ${rh}h` : `${d}d`;
-    }
-    if (h > 0) return m ? `${h}h ${m}m` : `${h}h`;
-    return `${m}m`;
-  };
+  // token of a per-user refusal (spec PER-USER-LIMITS §12). Module-level + exported
+  // for direct testing (issue #11).
+  const formatDurationShort = formatRefusalDurationShort;
 
   // Render a per-user refusal template (spec PER-USER-LIMITS §12): the richer token
   // set resolved against the trigger + the binding constraint. `{resets_at}` /
@@ -3504,7 +3493,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         denied: true,
         refusal: {
           ctx,
-          binding: userLimitEngine.bindingConstraint(resolution),
+          // §12: report the SOONEST-resetting over-cap binding (so {resets_at}/
+          // {resets_in} quote the earliest unblock), not least-headroom (issue #5).
+          binding: userLimitEngine.refusalBindingConstraint(resolution),
           displayName,
           template: resolution.messageTemplate,
         },
@@ -5218,6 +5209,28 @@ export function buildModelHealthAnnotations(
     if ((model.fallback?.length ?? 0) > 0) entry.hasFallback = true;
   }
   return out;
+}
+
+/**
+ * Render a relative duration to a reset, compact ("3h 12m", "2d", "now") — the
+ * `{resets_in}` token of a per-user refusal (spec PER-USER-LIMITS §12). A
+ * non-positive duration is "now"; a positive but sub-minute duration rounds to 0
+ * minutes and is ALSO "now" rather than the misleading "0m" (issue #11 — the
+ * `!(ms > 0)` guard alone misses the rounds-to-zero case).
+ */
+export function formatRefusalDurationShort(ms: number): string {
+  if (!(ms > 0)) return "now";
+  const totalMin = Math.round(ms / 60_000);
+  if (totalMin === 0) return "now";
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h >= 24) {
+    const d = Math.floor(h / 24);
+    const rh = h % 24;
+    return rh ? `${d}d ${rh}h` : `${d}d`;
+  }
+  if (h > 0) return m ? `${h}h ${m}m` : `${h}h`;
+  return `${m}m`;
 }
 
 export function validateContextTokenCeilings(config: AppConfig): void {
