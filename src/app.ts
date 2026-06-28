@@ -3,6 +3,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
+import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
@@ -341,6 +342,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // which already calls path.resolve(workspaceRoot) for its bind mount below.
   const workspaceRoot = path.resolve(config.workspace.root_dir);
   await mkdir(workspaceRoot, { recursive: true });
+
+  // First-run workspace seeding (ARCHITECTURE.md §4 "First-run seeding"). Runs
+  // POST-config-load now that workspaceRoot is known. Copy-missing/never-overwrite:
+  // seeds templates/workspace/ only when the workspace is empty (no AGENTS.md AND
+  // no SOUL.md), then seeds skill files for every ON feature gate. A strict no-op
+  // on an established workspace (the live case) — never clobbers SOUL.md et al.
+  await seedWorkspace(workspaceRoot, logger);
+  await seedFeatureSkills(workspaceRoot, enabledFeatureNames(config.features), logger);
 
   // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
   // diary worker's appends and `write_memory`'s edits serialize through it so a
@@ -5275,13 +5284,26 @@ export function formatRefusalDurationShort(ms: number): string {
  * Single source of truth mapping a capability feature flag (`[features]`) to the
  * tool names it gates. A feature that is off (the default — absent table or key)
  * makes every tool in its list unavailable to the agent across ALL session types.
- * This is a pure capability gate; the skill-file seeding half of these features is
- * implemented in a later change and is not driven from here.
+ * This is a pure capability gate. The skill-file seeding half of these features
+ * is driven separately by `seedFeatureSkills` (src/bootstrap/seed.ts, wired in
+ * startMikuAgent via `enabledFeatureNames` below), which copies
+ * templates/features/<feature>/skills/* into the workspace for each ON feature.
  */
 export const FEATURE_TOOLS: Record<keyof NonNullable<AppConfig["features"]>, readonly string[]> = {
   character_card: ["character_card_create", "character_card_read", "character_card_edit"],
   danbooru: ["danbooru"],
 };
+
+/**
+ * Names of the features whose gate is strictly `true` (the same on-criterion as
+ * `gatedOutFeatureTools`). Drives first-run feature-skill seeding. A feature name
+ * here matches its `templates/features/<name>/` directory.
+ */
+export function enabledFeatureNames(features: AppConfig["features"]): string[] {
+  return (Object.keys(FEATURE_TOOLS) as (keyof typeof FEATURE_TOOLS)[]).filter(
+    (key) => features?.[key] === true,
+  );
+}
 
 /**
  * The set of tool names excluded because their owning feature is not turned on.
