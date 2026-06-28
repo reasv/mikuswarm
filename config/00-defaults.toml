@@ -500,9 +500,9 @@ prompt = "Transcribe and describe the audio."
 max_chars = 2000
 timeout_ms = 60000
 
-[sillytavern]
-output_subdir = "cards/sillytavern"
-export_subdir = "exports/sillytavern"
+[character_card]
+output_subdir = "cards/character"
+export_subdir = "exports/character"
 default_excerpt_chars = 2000
 max_excerpt_chars = 4000
 max_summary_entries = 20

@@ -10,9 +10,9 @@ import {
   buildProxyDispatcher,
 } from "../src/enrichment/fetch-client.js";
 import {
-  createSillyTavernCardCreateTool,
-  type SillyTavernCardToolContext,
-} from "../src/tools/sillytavern-card.js";
+  createCharacterCardCreateTool,
+  type CharacterCardToolContext,
+} from "../src/tools/character-card.js";
 
 function makeFetchClient(): FetchClient {
   return new FetchClient({
@@ -137,7 +137,7 @@ test("buildProxyDispatcher returns undefined for empty/missing URL", () => {
 // Item 4 — Excerpt bounds
 // ---------------------------------------------------------------------------
 
-function makeSillyTavernContext(config: SillyTavernCardToolContext["config"]): SillyTavernCardToolContext {
+function makeCharacterCardContext(config: CharacterCardToolContext["config"]): CharacterCardToolContext {
   return {
     workspaceRoot: "/tmp",
     fetchClient: makeFetchClient(),
@@ -146,16 +146,16 @@ function makeSillyTavernContext(config: SillyTavernCardToolContext["config"]): S
   };
 }
 
-test("createSillyTavernCardCreateTool throws when max_excerpt_chars < default_excerpt_chars", () => {
+test("createCharacterCardCreateTool throws when max_excerpt_chars < default_excerpt_chars", () => {
   assert.throws(
     () =>
-      createSillyTavernCardCreateTool(
-        makeSillyTavernContext({
+      createCharacterCardCreateTool(
+        makeCharacterCardContext({
           default_excerpt_chars: 4000,
           max_excerpt_chars: 1000,
         }),
       ),
-    /sillytavern\.max_excerpt_chars must be >= sillytavern\.default_excerpt_chars\./,
+    /character_card\.max_excerpt_chars must be >= character_card\.default_excerpt_chars\./,
   );
 });
 
