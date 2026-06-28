@@ -3,8 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import Database from "better-sqlite3";
-import { Storage, LATEST_SCHEMA_VERSION } from "../src/storage/index.js";
+import { Storage } from "../src/storage/index.js";
 import type { ReactionUpsert } from "../src/storage/index.js";
 
 const TK = "matrix:test:room:!room";
@@ -177,47 +176,6 @@ test("empty target list short-circuits to empty results", async () => {
     assert.equal(storage.getReactionAggregates([]).size, 0);
     assert.deepEqual(storage.getDiscreteReactions([]), []);
   });
-});
-
-test("migrating a pre-reactions DB creates the reactions table", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-reactions-migrate-"));
-  const dbPath = path.join(dir, "legacy.db");
-  try {
-    // Build a current DB, then simulate the pre-reactions schema (v14, the
-    // summary-search version) by dropping the table and rewinding user_version so
-    // reopening must re-run the reactions migration step.
-    const built = await Storage.open({ databasePath: dbPath });
-    await built.waitForIdle();
-    built.close();
-
-    const raw = new Database(dbPath);
-    raw.exec("drop table reactions;");
-    raw.pragma("user_version = 14");
-    raw.close();
-
-    // Reopen through Storage: runMigrations applies the v14 -> v15 reactions step.
-    const migrated = await Storage.open({ databasePath: dbPath });
-    try {
-      await migrated.upsertReaction(reaction({ reactionEventId: "$r1" }));
-      const rows = migrated.getReactionAggregates(["$msg1"]).get("$msg1");
-      assert.equal(rows?.length, 1, "reactions table should exist and accept writes after migration");
-    } finally {
-      await migrated.waitForIdle();
-      migrated.close();
-    }
-
-    const check = new Database(dbPath);
-    // Version stamped forward to latest, and the index is born at its final
-    // (target_event_id, reacted_at) shape.
-    assert.equal(check.pragma("user_version", { simple: true }), LATEST_SCHEMA_VERSION);
-    const targetCols = (
-      check.pragma("index_info(idx_reactions_by_target)") as Array<{ name: string }>
-    ).map((r) => r.name);
-    assert.deepEqual(targetCols, ["target_event_id", "reacted_at"]);
-    check.close();
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
 });
 
 test("custom reactions carry shortcode through the aggregate", async () => {

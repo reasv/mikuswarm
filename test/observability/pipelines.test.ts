@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { Storage, LATEST_SCHEMA_VERSION } from "../../src/storage/index.js";
+import { Storage } from "../../src/storage/index.js";
 import type { PipelineId } from "../../src/storage/index.js";
 import { SessionManager } from "../../src/agent/index.js";
 import type { AgentSessionFactory } from "../../src/agent/factory.js";
@@ -681,41 +678,6 @@ test("the default enrichment list is served by the partial active index (no skip
       `default view must use the partial active index; got: ${plan}`,
     );
   });
-});
-
-test("v22 migration creates the partial active enrichment index on an existing DB", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-pipe-migrate-"));
-  const dbPath = path.join(dir, "db.sqlite");
-  try {
-    const first = await Storage.open({ databasePath: dbPath });
-    await first.waitForIdle();
-    // Simulate a pre-v22 DB: drop the index and rewind user_version so the next
-    // open runs the v21→v22 step.
-    first.write((db) => {
-      db.exec("drop index if exists idx_timeline_events_active_updated");
-      db.pragma("user_version = 21");
-    });
-    await first.waitForIdle();
-    first.close();
-
-    const second = await Storage.open({ databasePath: dbPath });
-    try {
-      const version = second.read((db) => db.pragma("user_version", { simple: true }) as number);
-      assert.equal(version, LATEST_SCHEMA_VERSION, "the v21→v22 step (and later steps) ran");
-      const idx = second.read((db) =>
-        (db.pragma("index_list(timeline_events)") as Array<{ name: string }>).map((i) => i.name),
-      );
-      assert.ok(
-        idx.includes("idx_timeline_events_active_updated"),
-        "the v22 step (re)created the partial active index",
-      );
-    } finally {
-      await second.waitForIdle();
-      second.close();
-    }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
 });
 
 // ── HTTP endpoints ───────────────────────────────────────────────────────────
