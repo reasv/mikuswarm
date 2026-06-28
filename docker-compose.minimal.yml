@@ -1,0 +1,115 @@
+# MikuSwarm — MINIMAL stack from published images: agent + console ONLY.
+#
+# The smallest real deployment — just the chat agent and its observability
+# console, pulled from GHCR. No egress firewall sidecar, no CloakBrowser-Manager,
+# no docker-socket sandbox. Genuinely "copy folder + .env + up":
+#     cp .env.example .env   # fill REQUIRED vars (NO DOCKER_GID needed here)
+#     docker compose -f docker-compose.minimal.yml up -d
+#
+# IMAGE SELECTION (parameterized, set in .env — same as docker-compose.ghcr.yml):
+#     ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-<svc>:${MIKUSWARM_TAG:-latest}
+#
+# REDUCED ISOLATION — read before deploying:
+#   The full stack (docker-compose.ghcr.yml) confines the agent behind a bridge
+#   egress FIREWALL and runs untrusted bash/search_files inside a throwaway
+#   SANDBOX container. The minimal stack has NEITHER. In their place, the overlay
+#   docker/96-minimal.toml (mounted into the agent below) re-enables the in-process
+#   guards: the app-layer SSRF guard is turned back ON (the only thing keeping the
+#   agent's outbound fetches off your private network), and BOTH the sandbox and
+#   the browser are DISABLED. Consequences:
+#     • The agent's bash / search_files tools are UNAVAILABLE (no sandbox).
+#     • The browser-use tools are UNAVAILABLE (no Manager).
+#     • Egress safety rests entirely on the app-layer SSRF guard, not a firewall.
+#   No docker socket is mounted, so the agent is NOT handed daemon control and you
+#   do NOT need DOCKER_GID in .env. If you want sandboxed bash or the browser, use
+#   docker-compose.ghcr.yml (full stack) instead.
+#
+# State still lives in the relative binds (./var, ./workspaces/miku, ./debug),
+# created+chowned by the one-shot `init` provisioner so the non-root agent can
+# write them. The baked docker/95-docker.toml still applies UNDER 96-minimal.toml
+# (lexicographic merge); 96-minimal wins where they overlap (ssrf_guard, sandbox).
+
+name: miku
+
+networks:
+  miku:
+    name: miku
+    enable_ipv6: false
+
+services:
+  # One-shot provisioner — pre-creates and chowns the agent-owned bind dirs to
+  # MIKUSWARM_UID:MIKUSWARM_GID before the agent starts (otherwise Docker auto-creates the
+  # gitignored bind sources root-owned and the non-root agent cannot write them).
+  init:
+    image: busybox:latest
+    container_name: mikuswarm-init
+    user: "0:0"
+    network_mode: none
+    environment:
+      MIKUSWARM_UID: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}"
+      MIKUSWARM_GID: "${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    volumes:
+      - ./var:/provision/var
+      - ./workspaces:/provision/workspaces
+      - ./debug:/provision/debug
+    command:
+      - sh
+      - -ceu
+      - |
+        mkdir -p /provision/var /provision/workspaces/miku /provision/debug
+        chown "$$MIKUSWARM_UID:$$MIKUSWARM_GID" \
+          /provision/var \
+          /provision/workspaces \
+          /provision/workspaces/miku \
+          /provision/debug
+    restart: "no"
+
+  agent:
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-agent:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm
+    restart: unless-stopped
+    # Only gate: the bind dirs must be writable. No egress sidecar to wait on.
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    # Non-root: run as the operator's host uid:gid so the binds stay host-owned.
+    # NO group_add / docker socket here — minimal mounts no socket (sandbox off).
+    user: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}:${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    env_file: .env
+    environment:
+      MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+      HOME: /tmp
+    # Pin external DNS to public resolvers (parity with the full stack; harmless
+    # without the firewall, and keeps behavior identical if you later add one).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./workspaces/miku:/app/workspaces/miku
+      - ./var:/app/var
+      - ./debug:/app/debug
+      - ./config/90-local.toml:/app/config/90-local.toml:ro
+      # Minimal overlay: loads AFTER the baked /app/config/95-docker.toml
+      # (lexicographic 96 > 95) and re-enables the in-process guards — ssrf_guard
+      # ON, sandbox + browser OFF. Without this bind the agent would inherit
+      # 95-docker's "ssrf_guard off / sandbox on" infra assumptions and fail.
+      - ./docker/96-minimal.toml:/app/config/96-minimal.toml:ro
+    networks: [miku]
+
+  console:
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-console:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm-console
+    restart: unless-stopped
+    user: "${MIKUSWARM_UID:?host uid — run `id -u`}:${MIKUSWARM_GID:?host gid — run `id -g`}"
+    environment:
+      MIKUSWARM_CONSOLE_API_URL: "http://agent:8799"
+      MIKUSWARM_CONSOLE_TOKEN: "${MIKUSWARM_CONSOLE_TOKEN:?set MIKUSWARM_CONSOLE_TOKEN in .env}"
+      HOST: "0.0.0.0"
+      PORT: "5173"
+      ORIGIN: "${MIKUSWARM_CONSOLE_ORIGIN:-http://127.0.0.1:5173}"
+    ports:
+      - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
+    depends_on: [agent]
+    networks: [miku]
