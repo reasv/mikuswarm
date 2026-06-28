@@ -228,15 +228,25 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       `fxtwitter.tool: max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit}) must be <= max_total_chars (${fxTwitterConfig.tool.maxTotalChars})`,
     );
   }
-  // [saucenao] cross-field sanity (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5; app-wiring
-  // per the proactive-posting precedent): the schema keeps `api_key` optional so a
-  // disabled block needn't carry a `${SAUCENAO_API_KEY}` template that would fail
-  // startup when the env var is unset — but an *enabled* block with no key is a
-  // misconfiguration the `find_source` tool would only catch at construction time.
-  if (config.saucenao?.enabled === true && !(config.saucenao.api_key ?? "").trim()) {
-    throw new Error(
-      "saucenao.enabled is true but saucenao.api_key is missing/empty — set a SauceNAO API key (e.g. api_key = \"${SAUCENAO_API_KEY}\") or set enabled = false.",
-    );
+  // [saucenao] graceful key-gated degrade (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5;
+  // app-wiring per the proactive-posting precedent). `enabled = true` is the shipped
+  // default so a fresh public deploy advertises the capability, but SauceNAO needs a
+  // per-account API key. The schema keeps `api_key` optional so a key-less deploy
+  // needn't carry a `${SAUCENAO_API_KEY}` template that would fail startup when the
+  // env var is unset. When enabled WITHOUT a key, we do NOT crash: we log one warning
+  // and treat `find_source` as disabled (the tool is simply not registered below).
+  // The operative gate is `sauceNaoEnabled` (enabled AND a non-empty key); with a key
+  // present behaviour is identical to before.
+  const sauceNaoConfig =
+    config.saucenao?.enabled === true && (config.saucenao.api_key ?? "").trim().length > 0
+      ? config.saucenao
+      : undefined;
+  const sauceNaoEnabled = sauceNaoConfig !== undefined;
+  if (config.saucenao?.enabled === true && !sauceNaoEnabled) {
+    logger.warn("saucenao_disabled_no_api_key", {
+      message:
+        "saucenao.enabled is true but no api_key is set — find_source is disabled. Set a SauceNAO API key (e.g. api_key = \"${SAUCENAO_API_KEY}\") to enable reverse-image source lookup.",
+    });
   }
   // [tokenizer] cross-field validation + init (spec TOKENIZER-SWAP §5.4). Selecting
   // `glm` for either consumer requires a readable `glm_tokenizer_path` — TypeBox
@@ -572,10 +582,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // per-session limiter would not bound the shared budget. Built only when the
   // tool is enabled.
   const sauceNaoRateLimiter =
-    config.saucenao?.enabled === true
+    sauceNaoConfig
       ? new SauceNaoRateLimiter({
-          shortWindowMax: config.saucenao.rate_limit?.short_window_max ?? 6,
-          shortWindowMs: config.saucenao.rate_limit?.short_window_ms ?? 30_000,
+          shortWindowMax: sauceNaoConfig.rate_limit?.short_window_max ?? 6,
+          shortWindowMs: sauceNaoConfig.rate_limit?.short_window_ms ?? 30_000,
         })
       : undefined;
 
@@ -3317,8 +3327,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         : []),
       // find_source (spec SAUCENAO-SOURCE-LOOKUP): reverse-image search via
       // SauceNAO — image → source URL + artist (inverse of `danbooru`). Gated on
-      // saucenao.enabled; shares the process-wide per-account quota limiter.
-      ...(config.saucenao?.enabled === true && sauceNaoRateLimiter
+      // `sauceNaoEnabled` (saucenao.enabled AND a non-empty api_key — enabled
+      // without a key soft-disables the tool, see the warning above); shares the
+      // process-wide per-account quota limiter.
+      ...(sauceNaoConfig && sauceNaoRateLimiter
         ? [createFindSourceTool({
             workspaceRoot,
             fetchClient,
@@ -3328,9 +3340,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             inferenceImageOptions,
             modelHasVision: defaultModelSeesImages,
             rateLimiter: sauceNaoRateLimiter,
-            maxWaitMs: config.saucenao.rate_limit?.max_wait_ms,
+            maxWaitMs: sauceNaoConfig.rate_limit?.max_wait_ms,
             httpProxyUrl: config.network?.http_proxy_url,
-            config: config.saucenao,
+            config: sauceNaoConfig,
           })]
         : []),
       // x_search (spec/X-SEARCH.md): Grok-as-subagent X.com search, grounded by
