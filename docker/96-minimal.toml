@@ -1,0 +1,50 @@
+# =============================================================================
+# 96-minimal.toml — overlay for the MINIMAL Compose deployment (agent + console
+# only; docker-compose.minimal.yml).
+#
+# Loads AFTER 95-docker.toml (lexicographic: 96 > 95) so it WINS where they
+# overlap. The minimal stack has NO egress firewall sidecar, NO CloakBrowser-
+# Manager, and (per the choice below) NO socket-mounted sandbox — so the
+# isolation that 95-docker.toml relies on those services for is GONE, and this
+# overlay must restore the in-process guards in their place:
+#
+#   [network]  — ssrf_guard back ON. 95-docker turns it OFF because the bridge
+#                firewall is the boundary there; minimal has no such firewall, so
+#                the app-layer SSRF guard is the ONLY thing keeping the agent's
+#                outbound fetches off the host's private network. It MUST be on.
+#
+#   [sandbox]  — DISABLED. The build-based / ghcr stacks let the agent drive the
+#                host docker daemon over a mounted socket to run bash/search_files
+#                in a confined container. Minimal deliberately does NOT mount the
+#                docker socket (simpler footprint, no DOCKER_GID needed, no
+#                daemon-control privilege handed to the container). With no socket
+#                there is no sandbox, so disable it here — otherwise startup fails
+#                fast trying to reach the daemon. TRADEOFF: the agent's bash /
+#                search_files tools are unavailable in the minimal deployment.
+#
+#   [browser]  — DISABLED. The CloakBrowser-Manager is not part of the minimal
+#                stack, so the browser tools have no backend. Disable to avoid the
+#                agent advertising tools that cannot connect.
+#
+# SHALLOW-MERGE CONTRACT (loader.ts: Object.assign by top-level table): each table
+# below REPLACES the earlier same-named table wholesale. [network] here replaces
+# 95-docker's [network] (the only key that table carried was ssrf_guard, so
+# nothing is lost). [sandbox] replaces 95-docker's full [sandbox] table — that is
+# fine, a single `enabled = false` is self-complete for a disabled sandbox.
+# [browser] replaces whatever 90-local.toml set. [observability.server] is NOT
+# redefined here, so 95-docker's console-API binding stays in force.
+# =============================================================================
+
+# App-layer SSRF guard ON — the sole egress boundary in the minimal stack.
+[network]
+ssrf_guard = true
+
+# Sandbox OFF — no docker socket is mounted in docker-compose.minimal.yml, so the
+# agent has no daemon to create the sandbox container in. bash/search_files are
+# therefore disabled in the minimal deployment.
+[sandbox]
+enabled = false
+
+# Browser OFF — no CloakBrowser-Manager service in the minimal stack.
+[browser]
+enabled = false

@@ -1,0 +1,185 @@
+# MikuSwarm — full stack from PUBLISHED images (image-pull, no build).
+#
+# This is the canonical, full-topology deployment for OUTSIDERS: it mirrors the
+# build-based docker-compose.yml service-for-service, but every first-party
+# service PULLS a published GHCR image instead of building from source. One
+# command brings the whole stack up once the images exist:
+#     docker compose -f docker-compose.ghcr.yml up -d
+#
+# AT PUBLISH TIME (Phase 5) this file becomes the default `docker-compose.yml`
+# via `git mv`, and the current build-based compose is retained under another
+# name for source-tree development. UNTIL the GHCR images are published, the
+# maintainer keeps using the build-based docker-compose.yml — this file cannot
+# come up before its images exist.
+#
+# IMAGE SELECTION (parameterized, no username hardcoded — set in .env):
+#     MIKUSWARM_IMAGE_PREFIX   registry+owner, default ghcr.io/OWNER
+#     MIKUSWARM_TAG            image tag,      default latest
+#   ⇒  ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-<svc>:${MIKUSWARM_TAG:-latest}
+#
+# SANDBOX IMAGE (NOT a compose service — read this):
+#   The agent creates and drives the sandbox container at RUNTIME via the mounted
+#   docker socket; it never appears as a compose service. The sandbox IMAGE must
+#   merely EXIST on the host daemon before the agent starts, or startup fails fast.
+#   With image-pull you do NOT build it — pull the published one and point the
+#   agent's sandbox image config key at it:
+#       docker pull ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-sandbox:${MIKUSWARM_TAG:-latest}
+#   then set, in your config (the baked docker/95-docker.toml ships
+#   [sandbox].image = "mikuswarm-sandbox:24.04"; override it in config/90-local.toml):
+#       [sandbox]
+#       image = "ghcr.io/OWNER/mikuswarm-sandbox:latest"   # match what you pulled
+#   (Or re-tag the pulled image locally to "mikuswarm-sandbox:24.04" if you prefer
+#   not to override config.) The [sandbox].network "mikuswarm-sandbox" is created by the
+#   agent at runtime; the egress sidecar reconciles its firewall once it exists.
+#
+# MANAGER (CloakBrowser-Manager) is NOT published — it is an upstream submodule we
+# do not redistribute, so it stays BUILD-based from vendor/cloakbrowser-manager
+# (see that service below). Everything else pulls.
+#
+# Topology, networks, binds, uid/gid, depends_on/health gating, DNS pins and the
+# isolation rationale are IDENTICAL to docker-compose.yml — see that file's header
+# comments for the full design narrative; they are not repeated here.
+
+name: miku
+
+networks:
+  miku:
+    name: miku
+    enable_ipv6: false
+  mikuswarm-browser:
+    name: mikuswarm-browser
+    enable_ipv6: false
+  mikuswarm-browser-ctl:
+    name: mikuswarm-browser-ctl
+    internal: true
+    enable_ipv6: false
+
+services:
+  # Firewall sidecar — applies/reconciles the bridge egress rules from the HOST
+  # network namespace (the SSRF boundary under compose; the app-layer guard is off
+  # in docker/95-docker.toml). Healthy ⇔ the agent-bridge rules are in place.
+  egress:
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-egress:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm-egress
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      MIKUSWARM_AGENT_NETWORK: miku
+      MIKUSWARM_SANDBOX_NETWORK: mikuswarm-sandbox
+      MIKUSWARM_BROWSER_NETWORK: mikuswarm-browser
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # One-shot provisioner — pre-creates the agent-owned bind dirs and chowns them to
+  # MIKUSWARM_UID:MIKUSWARM_GID before the agent/manager start. Runs as root (the only thing
+  # that can chown root-owned auto-created dirs), then exits. Upstream busybox; no
+  # first-party image to publish, so it stays a public-image pull.
+  init:
+    image: busybox:latest
+    container_name: mikuswarm-init
+    user: "0:0"
+    network_mode: none
+    environment:
+      MIKUSWARM_UID: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}"
+      MIKUSWARM_GID: "${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    volumes:
+      - ./var:/provision/var
+      - ./workspaces:/provision/workspaces
+      - ./debug:/provision/debug
+    command:
+      - sh
+      - -ceu
+      - |
+        mkdir -p /provision/var/browser-downloads /provision/workspaces/miku /provision/debug
+        chown "$$MIKUSWARM_UID:$$MIKUSWARM_GID" \
+          /provision/var \
+          /provision/var/browser-downloads \
+          /provision/workspaces \
+          /provision/workspaces/miku \
+          /provision/debug
+    restart: "no"
+
+  agent:
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-agent:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm
+    restart: unless-stopped
+    # Fail-closed: wait for the egress firewall to be healthy AND the init
+    # provisioner to have made the bind dirs writable by the non-root agent.
+    depends_on:
+      egress:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    # Non-root: run as the operator's host uid:gid (binds stay host-user-owned).
+    # The docker socket gid is added via group_add so the agent can drive the
+    # daemon to create/exec the sandbox container at runtime.
+    user: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}:${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    group_add:
+      - "${DOCKER_GID:?gid of /var/run/docker.sock — run `stat -c %g /var/run/docker.sock`}"
+    env_file: .env
+    environment:
+      MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+      HOME: /tmp
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./workspaces/miku:/app/workspaces/miku
+      - ./var:/app/var
+      - ./debug:/app/debug
+      - ./var/browser-downloads:/app/var/browser-downloads
+      - ./config/90-local.toml:/app/config/90-local.toml:ro
+    networks: [miku, mikuswarm-browser-ctl]
+
+  console:
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-console:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm-console
+    restart: unless-stopped
+    user: "${MIKUSWARM_UID:?host uid — run `id -u`}:${MIKUSWARM_GID:?host gid — run `id -g`}"
+    environment:
+      MIKUSWARM_CONSOLE_API_URL: "http://agent:8799"
+      MIKUSWARM_CONSOLE_TOKEN: "${MIKUSWARM_CONSOLE_TOKEN:?set MIKUSWARM_CONSOLE_TOKEN in .env}"
+      HOST: "0.0.0.0"
+      PORT: "5173"
+      ORIGIN: "${MIKUSWARM_CONSOLE_ORIGIN:-http://127.0.0.1:5173}"
+    ports:
+      - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
+    depends_on: [agent]
+    networks: [miku]
+
+  # CloakBrowser-Manager — the browser-use backend (ARCHITECTURE.md §11b). NOT
+  # published to GHCR (upstream submodule we do not redistribute), so this is the
+  # ONE service that still BUILDS from source, from the pinned submodule
+  # vendor/cloakbrowser-manager. Initialize submodules before `up`:
+  #     git submodule update --init --recursive
+  # The agent degrades gracefully if it is down, so the agent does NOT depend_on it.
+  manager:
+    build:
+      context: ./vendor/cloakbrowser-manager
+    image: mikuswarm-cloakbrowser-manager:pinned
+    container_name: mikuswarm-cloakbrowser-manager
+    restart: unless-stopped
+    init: true
+    depends_on:
+      egress:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - AUTH_TOKEN=${BROWSER_AUTH_TOKEN:?set BROWSER_AUTH_TOKEN in .env (match [browser].auth_token)}
+    volumes:
+      - ./var/browser-data:/data
+      - ./var/browser-downloads:/downloads
+    networks: [mikuswarm-browser, mikuswarm-browser-ctl]
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    shm_size: "1g"
+    mem_limit: "4g"
+    cpus: 2
