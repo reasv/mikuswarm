@@ -40,8 +40,8 @@ import type { PriorityClass } from "./scheduler.js";
 // so the console can render tentative tokens and clear them on retry. Nothing
 // product-level consumes partials.
 //
-// This wrapper does NOT distinguish a 429 originating at the gateway (LlmGateway,
-// which already retries internally) from a 429 at the true upstream: it backs off
+// This wrapper does NOT distinguish a 429 originating at the LLM gateway
+// (which already retries internally) from a 429 at the true upstream: it backs off
 // and retries either way, which is always safe (spec §5.3 — 429 backoff is an
 // unconditional invariant).
 // =============================================================================

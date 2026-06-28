@@ -413,7 +413,7 @@ export function gapBackfetchSnapshot(
 
 /**
  * GET /api/llm-requests — the in-memory Layer-0 attempt ring (spec §9.2),
- * newest-first. Deliberately not durable: llm-gateway holds the authoritative
+ * newest-first. Deliberately not durable: the LLM gateway holds the authoritative
  * wire log; this adds session/priority attribution, admission wait, attempt
  * numbering, and failures that never reached the wire.
  */

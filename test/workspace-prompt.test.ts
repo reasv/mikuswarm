@@ -416,10 +416,10 @@ describe("satellite block rendering", () => {
     };
 
     const group = renderSatelliteBlock(
-      makeRuntimeInput({ channelLabel: "general (ExampleChat)", isDirect: false }),
+      makeRuntimeInput({ channelLabel: "general (Example Server)", isDirect: false }),
       workspace,
     );
-    assert.ok(group.includes("Channel: general (ExampleChat)"));
+    assert.ok(group.includes("Channel: general (Example Server)"));
     assert.ok(group.includes("Type: group room"));
 
     const dm = renderSatelliteBlock(

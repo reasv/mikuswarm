@@ -27,7 +27,7 @@ user_limit_min_output_tokens = 256
 [observability]
 # Capacity of the in-memory Layer-0 LLM request ring backing
 # GET /api/llm-requests (spec LLM-FAILURE-HANDLING §9.2). Newest-first,
-# fixed-capacity; not durable (llm-gateway holds the authoritative wire log).
+# fixed-capacity; not durable (the LLM gateway holds the authoritative wire log).
 llm_request_ring_size = 500
 
 # In-process observability console (read-only HTTP + SSE; spec/OBSERVABILITY-UI.md
@@ -572,7 +572,7 @@ cache_read = 0
 cache_write = 0
 
 # X.com (Twitter) search via Grok-as-subagent (spec/X-SEARCH.md). Routes through
-# OpenRouter/LlmGateway: `base_url` is the OpenRouter API ROOT (the tool appends
+# OpenRouter via the LLM gateway: `base_url` is the OpenRouter API ROOT (the tool appends
 # /chat/completions), reusing the existing OPENROUTER_BASE_URL + LLM_API_KEY — no
 # new credential, no new egress host. Grok returns a cited synthesis; miku then
 # re-fetches the cited tweets through its own FxTwitter pipeline (verbatim text +

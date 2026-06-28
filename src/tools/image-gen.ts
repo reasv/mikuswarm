@@ -596,7 +596,7 @@ async function postGenerate(input: {
   try {
     // Route through the shared egress chokepoint: SSRF guard + per-host admission
     // and the unconditional 429/503 backoff (spec Design D). Since image-gen shares
-    // the Gemini/LlmGateway host with no other heavy traffic, the per-host limiter is
+    // the Gemini gateway host with no other heavy traffic, the per-host limiter is
     // effectively just the backoff safety net here.
     response = await guardedFetch(input.url, {
       method: "POST",

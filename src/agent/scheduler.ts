@@ -11,7 +11,7 @@ import { classifyLlmError, extractStatus, type LlmErrorClass } from "./request-r
 // =============================================================================
 // Local LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A).
 //
-// The deployment's LLM budget is scarce and SHARED (one LlmGateway account ≈ 4 rpm
+// The deployment's LLM budget is scarce and SHARED (one gateway account ≈ 4 rpm
 // spanning every agent session type plus the image-gen tool), and the upstream
 // gateway queue is FIFO and provider-blind. Local priority can only mean anything
 // if the number of outstanding (sent-but-unfinished) requests stays small — a
@@ -968,7 +968,7 @@ export interface AdmissionOptions {
   /**
    * Called with the admission-queue wait of each attempt (ms), right after a
    * slot is acquired. The factory uses it to stamp `admissionWaitMs` onto the
-   * request ring entry (spec §9.2) — the one number llm-gateway cannot see.
+   * request ring entry (spec §9.2) — the one number the gateway cannot see.
    */
   onAdmissionWait?: (waitMs: number) => void;
 }
