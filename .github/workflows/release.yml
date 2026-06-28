@@ -1,0 +1,84 @@
+# Release — build and push MikuSwarm container images to GHCR.
+#
+# Fires on a pushed v* tag OR a published GitHub release. Images are published
+# under the repository owner's namespace (no hardcoded username):
+#   ghcr.io/<owner>/mikuswarm-agent
+#   ghcr.io/<owner>/mikuswarm-console
+#   ghcr.io/<owner>/mikuswarm-sandbox
+#   ghcr.io/<owner>/mikuswarm-egress
+#
+# The CloakBrowser-Manager image is deliberately NOT published here — it is an
+# upstream submodule (vendor/cloakbrowser-manager, CloakHQ/CloakBrowser-Manager)
+# and the compose stack builds it from that submodule directly.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    name: Build & push ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: agent
+            dockerfile: Dockerfile
+            context: .
+          - component: console
+            dockerfile: console/Dockerfile
+            context: ./console
+          - component: sandbox
+            dockerfile: docker/Dockerfile.sandbox
+            context: ./docker
+          - component: egress
+            dockerfile: docker/Dockerfile.egress
+            context: ./docker
+    steps:
+      - name: Checkout
+        # No submodules: none of these images build the cloakbrowser-manager
+        # submodule, so a recursive checkout is unnecessary.
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mikuswarm-${{ matrix.component }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          # amd64 only for now. arm64 can be added later, but the Rust/napi
+          # cross-build cost for the agent image is unverified.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
