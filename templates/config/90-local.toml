@@ -1,0 +1,179 @@
+# 90-local.toml — your local deployment config (STARTER)
+# ===========================================================================
+# This file is the highest-priority config layer: it DEEP-MERGES over
+# config/00-defaults.toml (which ships every other knob with a sane default).
+# You only need to set here what is REQUIRED for your deployment or what you
+# want to override. The required blocks below are not optional — the process
+# fails fast at startup if a model has no endpoint/key or Matrix has no account.
+#
+# Secrets are referenced as ${ENV_VAR} and substituted from your environment
+# (or a .env file) at load time. NEVER paste real tokens/keys into this file —
+# put them in the environment and reference them here. Fill in every ${...}
+# below before first boot.
+#
+# Env vars you will typically set (names are conventions, not magic):
+#   LLM_API_KEY          shared bearer key for your LLM gateway / providers
+#   ANTHROPIC_BASE_URL   base URL for the Anthropic-style endpoint (chat model)
+#   OPENROUTER_BASE_URL  base URL for the OpenRouter-style endpoint (captioning, grok)
+#   GEMINI_BASE_URL      base URL for the Gemini endpoint (image generation)
+#   MATRIX_HOMESERVER    https URL of your Matrix homeserver
+#   MATRIX_USER_ID       full mxid of the bot account, e.g. @mybot:example.org
+#   MATRIX_PASSWORD      bot account password (password-login path)
+#   MATRIX_RECOVERY_KEY  Secure Storage / cross-signing recovery key (for E2EE)
+#   MATRIX_DEVICE_ID     a stable device id for the bot session
+# (Each provider's base_url is its own sibling URL — do not derive one from another.)
+# ===========================================================================
+
+# --- Turn Matrix on ---------------------------------------------------------
+# Defaults ship matrix.enabled = false so an unconfigured deploy stays inert.
+# Flip it on once the account block below is filled in.
+[matrix]
+enabled = true
+
+# --- Matrix account ---------------------------------------------------------
+# The bot's login. Two mutually-exclusive auth paths:
+#   * Password login: set `password` (shown below). Leave `access_token` unset.
+#   * Token login:    set `access_token = "${MATRIX_ACCESS_TOKEN}"` instead, and
+#                     remove `password`. Token wins when present and non-empty.
+# `recovery_key` unlocks E2EE secret storage so the bot can read encrypted rooms.
+# `store_path` is where the encrypted Matrix state lives (keep it on a persistent
+# volume); the default under ./var is usually fine.
+[matrix.accounts.bot]
+homeserver = "${MATRIX_HOMESERVER}"
+user_id = "${MATRIX_USER_ID}"
+password = "${MATRIX_PASSWORD}"
+recovery_key = "${MATRIX_RECOVERY_KEY}"
+device_id = "${MATRIX_DEVICE_ID}"
+store_path = "./var/matrix/bot"
+# access_token = "${MATRIX_ACCESS_TOKEN}"   # token-login alternative to password
+
+# --- Operating timezone -----------------------------------------------------
+# Every date the agent sees is rendered in this IANA zone (never the server's).
+# Set it to the zone your community lives in.
+[agent]
+timezone = "UTC"
+
+# --- Chat model -------------------------------------------------------------
+# The primary model the agent replies with. Point `endpoint` at your gateway and
+# set real per-MTok USD rates under [models.default.cost] so usage/cost tracking
+# is accurate (leave at 0 only if you genuinely don't want cost tracking).
+# `id` is the wire model name your endpoint expects. `api` is the wire dialect
+# ("anthropic-messages" | "openai-completions" | "openai-responses" |
+# "google-generative-ai"). `context_window` is the enforced ceiling — keep it
+# safely below the provider's true window.
+[models.default]
+id = "claude-opus-4-7"
+provider = "anthropic"
+api = "anthropic-messages"
+endpoint = "${ANTHROPIC_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+input_modalities = ["text", "image"]
+max_tokens = 16384
+reasoning = true
+thinking_level = "off"
+context_window = 128000
+
+[models.default.cost]
+input = 0          # USD per 1M input tokens — set your real rate
+output = 0         # USD per 1M output tokens
+cache_read = 0
+cache_write = 0
+
+# --- Captioning model -------------------------------------------------------
+# Multimodal model that captions inbound images/video/audio. Can be a cheaper
+# model than the chat model. Must declare every modality it captions.
+[models.caption]
+id = "google/gemini-3.5-flash"
+provider = "openrouter"
+api = "openai-completions"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+input_modalities = ["text", "image", "video", "audio"]
+max_tokens = 4096
+context_window = 128000
+
+[models.caption.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+# --- X search model (Grok) --------------------------------------------------
+# Backs the x_search tool (X/Twitter discovery via Grok-as-subagent). If you
+# don't want X search, set [x_search].enabled = false instead of configuring it.
+[models.grok]
+id = "x-ai/grok-4.3"
+provider = "openrouter"
+api = "openai-completions"
+endpoint = "${OPENROUTER_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+input_modalities = ["text", "image"]
+max_tokens = 8192
+context_window = 128000
+
+[models.grok.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+# --- Image generation models ------------------------------------------------
+# Back the image_generate tool's pro/flash tiers (Gemini "nano banana").
+# `endpoint` is the Gemini API ROOT. If you don't want image generation, you can
+# omit these and the tool simply won't be available.
+[models.imagegen-pro]
+id = "gemini-3-pro-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+input_modalities = ["text", "image"]
+max_tokens = 32768
+context_window = 32768
+
+[models.imagegen-pro.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+[models.imagegen-flash]
+id = "gemini-3.1-flash-image"
+provider = "gemini"
+api = "google-generative-ai"
+endpoint = "${GEMINI_BASE_URL}"
+api_key = "${LLM_API_KEY}"
+input_modalities = ["text", "image"]
+max_tokens = 32768
+context_window = 32768
+
+[models.imagegen-flash.cost]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+# ===========================================================================
+# OPTIONAL — everything below is off/defaulted unless you opt in. Uncomment and
+# fill in to enable. See config/00-defaults.toml for the full set of knobs and
+# their documentation.
+# ===========================================================================
+
+# --- SauceNAO reverse-image source lookup (find_source tool) ----------------
+# Needs a free SauceNAO API key. Without the key the tool is simply not
+# registered (one startup warning, no crash). Set the key to enable it:
+# [saucenao]
+# api_key = "${SAUCENAO_API_KEY}"
+
+# --- Observability console --------------------------------------------------
+# Read-only operator console (HTTP + SSE on localhost). Off by default.
+# [observability.server]
+# enabled = true
+# auth_token = "${CONSOLE_TOKEN}"   # required as a bearer token when set
+
+# --- Proactive posting ------------------------------------------------------
+# Let the bot post on its own initiative in explicitly opted-in channels only.
+# [proactive]
+# enabled = true
+# [[proactive.channels]]
+# room_id = "!yourRoomId:example.org"
