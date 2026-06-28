@@ -5,9 +5,9 @@ import type { PriorityClass } from "./scheduler.js";
 // In-memory LLM request ring (spec LLM-FAILURE-HANDLING §9.2).
 //
 // Records every settled Layer-0 attempt for the console's `GET
-// /api/llm-requests`. Deliberately NOT durable: llm-gateway holds the
+// /api/llm-requests`. Deliberately NOT durable: the LLM gateway holds the
 // authoritative request/response log upstream; this ring adds only what
-// llm-gateway cannot see — session/priority attribution, admission wait, attempt
+// the gateway cannot see — session/priority attribution, admission wait, attempt
 // numbering, and failures that never reached the wire (admission aborts,
 // empty streams).
 // =============================================================================

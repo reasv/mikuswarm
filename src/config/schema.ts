@@ -792,7 +792,7 @@ const ObservabilityServerSchema = StrictObject({
 const ObservabilitySchema = StrictObject({
   server: Type.Optional(ObservabilityServerSchema),
   // Capacity of the in-memory LLM request ring backing GET /api/llm-requests
-  // (spec LLM-FAILURE-HANDLING §9.2). Not durable by design — llm-gateway holds
+  // (spec LLM-FAILURE-HANDLING §9.2). Not durable by design — the LLM gateway holds
   // the authoritative wire log; this adds session/priority attribution,
   // admission wait, attempt numbering, and failures that never hit the wire.
   llm_request_ring_size: Type.Optional(Type.Number({ minimum: 1 })),
@@ -906,7 +906,7 @@ const ImageGenSchema = StrictObject({
 });
 
 // X.com search via Grok-as-subagent (spec/X-SEARCH.md; ARCHITECTURE.md §10).
-// Routes through OpenRouter/LlmGateway — `base_url` is the OpenRouter API root
+// Routes through OpenRouter via the LLM gateway — `base_url` is the OpenRouter API root
 // (the tool appends `/chat/completions`), `api_key` is sent as
 // `Authorization: Bearer` (the field name matches the secret regex, so it
 // auto-registers for log redaction). Reuses the existing `${OPENROUTER_BASE_URL}`

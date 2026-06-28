@@ -824,7 +824,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   const liveEvents = new SessionLiveEventBus();
 
   // In-memory Layer-0 attempt ring (spec §9.2) — console attribution only;
-  // llm-gateway keeps the durable wire log upstream.
+  // the LLM gateway keeps the durable wire log upstream.
   const llmRequestRing = new LlmRequestRing(
     config.observability?.llm_request_ring_size ?? DEFAULT_LLM_REQUEST_RING_SIZE,
   );
