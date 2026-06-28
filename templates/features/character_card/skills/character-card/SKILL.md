@@ -5,7 +5,7 @@ description: Create, read, and edit Character Card V2 PNGs via the `character_ca
 
 # Character Card Workflow
 
-**Purpose:** Create character card PNGs (Character Card V2 format, compatible with tools like SillyTavern) from structured definitions plus an image, inspect existing cards without flooding context, and patch them in place.
+**Purpose:** Create character card PNGs (the widely-supported Character Card V2 standard) from structured definitions plus an image, inspect existing cards without flooding context, and patch them in place.
 
 > These tools exist only when the character-card feature is enabled. If `character_card_create` is not in your tool list, this skill does not apply.
 
