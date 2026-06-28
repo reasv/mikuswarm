@@ -434,6 +434,18 @@ ssrf_guard = true
 # Optional outbound HTTP(S) proxy for all tool fetches (leave unset for none).
 # http_proxy_url = "http://proxy.internal:8080"
 
+# MCP servers (ARCHITECTURE.md §4 / MCP integration). Each [mcp.servers.<name>]
+# block declares a remote MCP endpoint whose tools are exposed to the agent as
+# `mcp_<server>_<tool>`. Shipped by default: the KEYLESS Exa MCP, which provides the
+# live web tools (web_search_exa, web_search_advanced_exa, web_fetch_exa) — the
+# replacement for the built-in web_search / web_fetch, which are disabled by default
+# (see [agent].disabled_tools above). The Exa public endpoint needs no API key, so
+# this default works out-of-box on a fresh deploy. The `?tools=...` query restricts
+# the server to the three web tools. Add credentialed MCP servers (with a `headers`
+# Authorization bearer) only in local config, where the secret lives in .env.
+[mcp.servers.exa]
+url = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa"
+
 # Captioning references a [models.*] block by name (spec MODEL-FALLBACK §2.3): the
 # `model` here is a logical id; connection, pricing, rate-limit group, and any
 # `fallback` chain live on the referenced block ([models.caption] below). A
@@ -600,12 +612,14 @@ enable_video_understanding = true   # Grok's vision over videos it finds while s
 
 # Reverse-image source lookup via SauceNAO (spec SAUCENAO-SOURCE-LOOKUP), backing
 # the `find_source` tool: image → source URL + artist (the inverse of `danbooru`).
-# Opt-in and disabled by default. `api_key` is deliberately NOT templated here:
-# a `${SAUCENAO_API_KEY}` default would fail startup whenever the env var is unset
-# (env substitution errors on missing vars before validation). Set it explicitly
-# in local config, e.g.  api_key = "${SAUCENAO_API_KEY}"  alongside enabled = true.
+# Default-ON so a fresh deploy advertises the capability, but it DEGRADES GRACEFULLY:
+# SauceNAO needs a per-account API key, and `api_key` is deliberately NOT templated
+# here (a `${SAUCENAO_API_KEY}` default would fail startup whenever the env var is
+# unset — env substitution errors on missing vars before validation). With no key,
+# startup logs ONE warning and `find_source` is simply not registered (no crash). To
+# enable it, set the key explicitly in local config:  api_key = "${SAUCENAO_API_KEY}".
 [saucenao]
-enabled = false
+enabled = true
 base_url = "https://saucenao.com"
 numres = 8                   # results requested per search
 max_results_limit = 16       # hard cap on the per-call `limit` parameter
