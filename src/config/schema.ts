@@ -1329,7 +1329,7 @@ export const AppConfigSchema = StrictObject({
   reactions: Type.Optional(ReactionsSchema),
   proactive: Type.Optional(ProactiveSchema),
   backfetch: Type.Optional(BackfetchSchema),
-  sillytavern: Type.Optional(StrictObject({
+  character_card: Type.Optional(StrictObject({
     output_subdir: Type.Optional(Type.String()),
     export_subdir: Type.Optional(Type.String()),
     default_excerpt_chars: Type.Optional(Type.Number({ minimum: 256 })),

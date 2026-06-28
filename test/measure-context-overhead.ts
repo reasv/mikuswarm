@@ -140,10 +140,10 @@ function reconstructTools(config: any): { tools: AgentTool[]; skipped: string[] 
   if (config.saucenao?.enabled === true) {
     specs.push(["find_source", () => T.createFindSourceTool({ workspaceRoot: WS, fetchClient: STUB, inlineImageMaxBytes: 5_000_000, inferenceImageOptions: {}, modelHasVision: multimodal, rateLimiter: STUB, maxWaitMs: 30000, httpProxyUrl: config.network?.http_proxy_url, config: config.saucenao } as any)]);
   }
-  if (config.sillytavern) {
-    specs.push(["sillytavern_card_create", () => T.createSillyTavernCardCreateTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.sillytavern } as any)]);
-    specs.push(["sillytavern_card_read", () => T.createSillyTavernCardReadTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.sillytavern } as any)]);
-    specs.push(["sillytavern_card_edit", () => T.createSillyTavernCardEditTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.sillytavern } as any)]);
+  if (config.character_card) {
+    specs.push(["character_card_create", () => T.createCharacterCardCreateTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.character_card } as any)]);
+    specs.push(["character_card_read", () => T.createCharacterCardReadTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.character_card } as any)]);
+    specs.push(["character_card_edit", () => T.createCharacterCardEditTool({ workspaceRoot: WS, fetchClient: STUB, downloadSizeLimit: 10_000_000, config: config.character_card } as any)]);
   }
   // x_fetch (fxtwitter) — config shape is computed in app.ts; best-effort.
   if (config.fxtwitter) {

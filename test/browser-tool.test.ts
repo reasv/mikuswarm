@@ -301,7 +301,7 @@ test("tool: a stale element ref on screenshot surfaces as ref_expired (#9)", asy
 // pi-ai's re-exported typebox uses different Kind symbols than the direct
 // @sinclair/typebox dep, so a cross-package Value.Check throws "Unknown type".
 // Instead validate the emitted JSON Schema fragment directly (same approach as
-// sillytavern-card.test.ts): pull `maxLength` off the `text` property and check
+// character-card.test.ts): pull `maxLength` off the `text` property and check
 // a candidate string against it.
 function checkMaxLength(schema: { maxLength?: number }, value: string): boolean {
   if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return false;

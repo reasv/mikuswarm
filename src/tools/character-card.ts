@@ -21,7 +21,7 @@ import { escapeAttr, escapeXml } from "../context/xml.js";
 // chunk records (length field + name + data + CRC) stays within the buffer.
 const PNG_MAX_CHUNK_DATA_LENGTH = 16 * 1024 * 1024;
 
-// Hard ceiling for `*_from_file` text inputs. Text fields in SillyTavern cards
+// Hard ceiling for `*_from_file` text inputs. Text fields in character cards
 // are typically a few KB; 1 MiB is generous enough for unusual cases while
 // still preventing a single workspace file from being slurped wholesale into
 // model context.
@@ -31,7 +31,7 @@ const TEXT_INPUT_FILE_MAX_BYTES = 1024 * 1024;
 // Context
 // ---------------------------------------------------------------------------
 
-export interface SillyTavernCardToolContext {
+export interface CharacterCardToolContext {
   workspaceRoot: string;
   fetchClient: FetchClient;
   downloadSizeLimit: number;
@@ -44,7 +44,7 @@ export interface SillyTavernCardToolContext {
   };
 }
 
-type ResolvedSillyTavernConfig = {
+type ResolvedCharacterCardConfig = {
   outputSubdir: string;
   exportSubdir: string;
   defaultExcerptChars: number;
@@ -52,17 +52,17 @@ type ResolvedSillyTavernConfig = {
   maxSummaryEntries: number;
 };
 
-function resolveConfig(context: SillyTavernCardToolContext): ResolvedSillyTavernConfig {
+function resolveConfig(context: CharacterCardToolContext): ResolvedCharacterCardConfig {
   const defaultExcerptChars = context.config?.default_excerpt_chars ?? 2000;
   const maxExcerptChars = context.config?.max_excerpt_chars ?? 4000;
   if (maxExcerptChars < defaultExcerptChars) {
     throw new Error(
-      "sillytavern.max_excerpt_chars must be >= sillytavern.default_excerpt_chars.",
+      "character_card.max_excerpt_chars must be >= character_card.default_excerpt_chars.",
     );
   }
   return {
-    outputSubdir: context.config?.output_subdir ?? "cards/sillytavern",
-    exportSubdir: context.config?.export_subdir ?? "exports/sillytavern",
+    outputSubdir: context.config?.output_subdir ?? "cards/character",
+    exportSubdir: context.config?.export_subdir ?? "exports/character",
     defaultExcerptChars,
     maxExcerptChars,
     maxSummaryEntries: context.config?.max_summary_entries ?? 20,
@@ -381,7 +381,7 @@ const CardCreateSchema = Type.Object(
 const CardReadSchema = Type.Object(
   {
     path: Type.String({
-      description: "Path to a SillyTavern card PNG or JSON file. Relative paths resolve under the agent workspace.",
+      description: "Path to a character card PNG or JSON file. Relative paths resolve under the agent workspace.",
     }),
     view: Type.Optional(
       Type.Unsafe<CardView>({
@@ -604,7 +604,7 @@ const EditOperationSchema = Type.Union([
 const CardEditSchema = Type.Object(
   {
     path: Type.String({
-      description: "Path to an existing SillyTavern card PNG or JSON file. Relative paths resolve under the agent workspace.",
+      description: "Path to an existing character card PNG or JSON file. Relative paths resolve under the agent workspace.",
     }),
     outputPath: Type.Optional(
       Type.String({
@@ -632,13 +632,13 @@ const CardEditSchema = Type.Object(
 // Factory functions
 // ---------------------------------------------------------------------------
 
-export function createSillyTavernCardCreateTool(context: SillyTavernCardToolContext): AgentTool {
+export function createCharacterCardCreateTool(context: CharacterCardToolContext): AgentTool {
   const resolvedConfig = resolveConfig(context);
   return {
-    name: "sillytavern_card_create",
-    label: "SillyTavern Card Create",
+    name: "character_card_create",
+    label: "Character Card Create",
     description:
-      "Create a SillyTavern-compatible character card PNG from a structured V2-style card definition plus an image path or image URL. " +
+      "Create a Character Card v2 PNG from a structured V2-style card definition plus an image path or image URL. " +
       "This tool is a deterministic renderer/writer: the model should think through the card definition first, then call the tool with structured fields. " +
       "It can also write a normalized JSON sidecar draft into the workspace for longer multi-step workflows.",
     parameters: CardCreateSchema,
@@ -653,13 +653,13 @@ export function createSillyTavernCardCreateTool(context: SillyTavernCardToolCont
   };
 }
 
-export function createSillyTavernCardReadTool(context: SillyTavernCardToolContext): AgentTool {
+export function createCharacterCardReadTool(context: CharacterCardToolContext): AgentTool {
   const resolvedConfig = resolveConfig(context);
   return {
-    name: "sillytavern_card_read",
-    label: "SillyTavern Card Read",
+    name: "character_card_read",
+    label: "Character Card Read",
     description:
-      "Read a SillyTavern card PNG or JSON file without dumping the whole card into model context. " +
+      "Read a character card PNG or JSON file without dumping the whole card into model context. " +
       "Default summary mode reports structure plus per-field char and line counts. Excerpt modes return one bounded slice at a time with explicit truncation markers, nextOffset, and remaining counts. " +
       "When the full text is needed, export_text writes the selected field or lorebook entry to a workspace file instead of returning it inline.",
     parameters: CardReadSchema,
@@ -672,14 +672,14 @@ export function createSillyTavernCardReadTool(context: SillyTavernCardToolContex
   };
 }
 
-export function createSillyTavernCardEditTool(context: SillyTavernCardToolContext): AgentTool {
+export function createCharacterCardEditTool(context: CharacterCardToolContext): AgentTool {
   const resolvedConfig = resolveConfig(context);
   return {
-    name: "sillytavern_card_edit",
-    label: "SillyTavern Card Edit",
+    name: "character_card_edit",
+    label: "Character Card Edit",
     description:
-      "Edit an existing SillyTavern card with patch-style operations instead of rewriting the entire card. " +
-      "Use sillytavern_card_read first to inspect bounded summaries or excerpts, then apply targeted operations such as set_field, set_field_from_file, add/update/remove lorebook entries, or replace_image. " +
+      "Edit an existing character card with patch-style operations instead of rewriting the entire card. " +
+      "Use character_card_read first to inspect bounded summaries or excerpts, then apply targeted operations such as set_field, set_field_from_file, add/update/remove lorebook entries, or replace_image. " +
       "This keeps large fields out of the model context while still allowing precise edits.",
     parameters: CardEditSchema,
     execute: async (_toolCallId, rawParams) =>
@@ -699,7 +699,7 @@ export function createSillyTavernCardEditTool(context: SillyTavernCardToolContex
 
 async function executeCreate(input: {
   workspaceRoot: string;
-  config: ResolvedSillyTavernConfig;
+  config: ResolvedCharacterCardConfig;
   fetchClient: FetchClient;
   downloadSizeLimit: number;
   params: CardCreateParams;
@@ -746,9 +746,9 @@ async function executeCreate(input: {
 
   const summary = buildCardSummary(normalizedCard, input.config);
   const lines = [
-    "## SillyTavern Card Create",
+    "## Character Card Create",
     "",
-    `Created a SillyTavern card PNG at \`${output.workspacePath}\`.`,
+    `Created a character card PNG at \`${output.workspacePath}\`.`,
     "",
     "How this worked:",
     `- normalized the structured card input to Character Card V2`,
@@ -786,7 +786,7 @@ async function executeCreate(input: {
 
 async function executeRead(input: {
   workspaceRoot: string;
-  config: ResolvedSillyTavernConfig;
+  config: ResolvedCharacterCardConfig;
   params: CardReadParams;
 }) {
   const workspaceRoot = input.workspaceRoot;
@@ -855,7 +855,7 @@ async function executeRead(input: {
 
 async function executeEdit(input: {
   workspaceRoot: string;
-  config: ResolvedSillyTavernConfig;
+  config: ResolvedCharacterCardConfig;
   fetchClient: FetchClient;
   downloadSizeLimit: number;
   params: CardEditParams;
@@ -1012,7 +1012,7 @@ async function executeEdit(input: {
 
   const summary = buildCardSummary(normalizedCard, input.config);
   const lines = [
-    "## SillyTavern Card Edit",
+    "## Character Card Edit",
     "",
     `Wrote the edited card to \`${outputInfo.workspacePath}\`.`,
     "",
@@ -1075,10 +1075,10 @@ function describeTargetForWrapping(target: TextTarget): string {
   }
 }
 
-function buildReadSummaryResult(parsed: ParsedCardFile, config: ResolvedSillyTavernConfig) {
+function buildReadSummaryResult(parsed: ParsedCardFile, config: ResolvedCharacterCardConfig) {
   const summary = buildCardSummary(parsed.normalizedCard, config);
   const lines = [
-    "## SillyTavern Card Summary",
+    "## Character Card Summary",
     "",
     "This view returns structure and per-field sizes only. It does not inline large text bodies.",
     "",
@@ -1131,7 +1131,7 @@ function buildReadSummaryResult(parsed: ParsedCardFile, config: ResolvedSillyTav
   };
 }
 
-function buildBookIndexResult(parsed: ParsedCardFile, config: ResolvedSillyTavernConfig, params: CardReadParams) {
+function buildBookIndexResult(parsed: ParsedCardFile, config: ResolvedCharacterCardConfig, params: CardReadParams) {
   const entries = parsed.normalizedCard.data.character_book?.entries ?? [];
   const offset = clampInteger(params.entryOffset ?? 0, 0, entries.length);
   const limit = clampInteger(params.entryLimit ?? config.maxSummaryEntries, 1, config.maxSummaryEntries);
@@ -1139,7 +1139,7 @@ function buildBookIndexResult(parsed: ParsedCardFile, config: ResolvedSillyTaver
   const remaining = Math.max(entries.length - (offset + slice.length), 0);
 
   const lines = [
-    "## SillyTavern Card Book Index",
+    "## Character Card Book Index",
     "",
     `Source: \`${parsed.workspacePath}\``,
     `Entries returned: ${slice.length} of ${entries.length}`,
@@ -1182,7 +1182,7 @@ function buildBookIndexResult(parsed: ParsedCardFile, config: ResolvedSillyTaver
 
 function buildTextExcerptResult(input: {
   parsed: ParsedCardFile;
-  config: ResolvedSillyTavernConfig;
+  config: ResolvedCharacterCardConfig;
   target: TextTarget;
   offset: number;
   maxChars?: number;
@@ -1199,7 +1199,7 @@ function buildTextExcerptResult(input: {
   );
   const fieldName = describeTargetForWrapping(input.target);
   const lines = [
-    "## SillyTavern Card Excerpt",
+    "## Character Card Excerpt",
     "",
     `Source: \`${input.parsed.workspacePath}\``,
     `Target: ${resolved.label}`,
@@ -1239,7 +1239,7 @@ function buildTextExcerptResult(input: {
 
 async function exportTextTarget(input: {
   parsed: ParsedCardFile;
-  config: ResolvedSillyTavernConfig;
+  config: ResolvedCharacterCardConfig;
   workspaceRoot: string;
   params: CardReadParams;
 }) {
@@ -1260,7 +1260,7 @@ async function exportTextTarget(input: {
   const metrics = getTextMetrics(resolved.text);
 
   const lines = [
-    "## SillyTavern Card Export",
+    "## Character Card Export",
     "",
     `Exported ${resolved.label} to \`${output.workspacePath}\`.`,
     "",
@@ -1289,7 +1289,7 @@ async function exportTextTarget(input: {
 
 async function exportCardJson(
   parsed: ParsedCardFile,
-  config: ResolvedSillyTavernConfig,
+  config: ResolvedCharacterCardConfig,
   workspaceRoot: string,
   outputPath: string | undefined,
 ) {
@@ -1313,7 +1313,7 @@ async function exportCardJson(
       {
         type: "text" as const,
         text: [
-          "## SillyTavern Card JSON Export",
+          "## Character Card JSON Export",
           "",
           `Exported the normalized full card JSON to \`${output.workspacePath}\`.`,
           `Chars: ${metrics.chars}`,
@@ -1338,7 +1338,7 @@ async function exportCardJson(
 // Card summary
 // ---------------------------------------------------------------------------
 
-function buildCardSummary(card: V2, config: ResolvedSillyTavernConfig) {
+function buildCardSummary(card: V2, config: ResolvedCharacterCardConfig) {
   const fieldStats = Object.fromEntries(
     TEXT_FIELDS.map((field) => {
       const value = card.data[field] ?? "";
@@ -1608,7 +1608,7 @@ function decodeCardFromPng(buffer: Buffer): unknown {
       const jsonText = Buffer.from(decoded.text, "base64").toString("utf8");
       return JSON.parse(jsonText);
     } catch (error) {
-      throw new Error(`Failed to decode embedded SillyTavern card metadata: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Failed to decode embedded character card metadata: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   throw new Error("PNG does not contain a `chara` tEXt chunk with embedded card JSON.");

@@ -41,11 +41,11 @@ export {
   type UserProfileToolContext,
 } from "./user-profile.js";
 export {
-  createSillyTavernCardCreateTool,
-  createSillyTavernCardReadTool,
-  createSillyTavernCardEditTool,
-  type SillyTavernCardToolContext,
-} from "./sillytavern-card.js";
+  createCharacterCardCreateTool,
+  createCharacterCardReadTool,
+  createCharacterCardEditTool,
+  type CharacterCardToolContext,
+} from "./character-card.js";
 export { createEmojiListTool, type EmojiToolContext } from "./emoji.js";
 export { createReactTool, type ReactToolContext } from "./react.js";
 export { createEditMessageTool, type EditMessageToolContext } from "./edit-message.js";
