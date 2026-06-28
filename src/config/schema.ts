@@ -405,6 +405,23 @@ const FollowUpSchema = StrictObject({
   mention: Type.Optional(FollowUpLeverSchema),
 });
 
+// Capability feature gates. Each boolean turns a related group of agent tools ON.
+// Every flag is OFF by default: an absent `[features]` table — or an absent key —
+// means the feature is disabled, so its tools are NOT registered for ANY session
+// type (a global capability gate, composed with `agent.disabled_tools`: a tool
+// excluded by EITHER mechanism is unavailable). The feature→tools mapping lives in
+// src/app.ts (FEATURE_TOOLS). Turning a flag on (e.g. `[features]\ncharacter_card =
+// true`) restores its tools.
+//   - character_card → character_card_create / character_card_read / character_card_edit
+//   - danbooru       → the `danbooru` search tool
+// NOTE: this phase gates only tool availability. A later change will also drive
+// skill-file seeding off these flags; that behaviour is NOT implemented yet, so do
+// not assume it here.
+const FeaturesSchema = StrictObject({
+  character_card: Type.Optional(Type.Boolean()),
+  danbooru: Type.Optional(Type.Boolean()),
+});
+
 const ResumeSchema = StrictObject({
   // Reserve the scarce single resume for the ORIGINAL trigger sender (§6/§7):
   // a reply from a different user → FRESH. Global; inert in DMs (the asker is the
@@ -1196,6 +1213,9 @@ export const AppConfigSchema = StrictObject({
     ]),
     context_dump_dir: Type.String(),
   }),
+  // Capability feature gates (off by default). When a feature is off, its tools are
+  // not available to the agent in any session type; see FeaturesSchema above.
+  features: Type.Optional(FeaturesSchema),
   agent: StrictObject({
     sessions: StrictObject({
       max_concurrent: Type.Number({ minimum: 1 }),

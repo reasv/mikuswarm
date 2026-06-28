@@ -1490,7 +1490,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       })
     : null;
 
+  // Tools made unavailable by EITHER mechanism: the explicit `agent.disabled_tools`
+  // allowlist subtraction, or a capability feature gate (`[features]`) being off.
+  // Both feed the single tool-set filter in buildSessionTools, so one code path owns
+  // exclusion for every session type. Feature gates default OFF: with no `[features]`
+  // table (or an absent key) the feature's tools are excluded here.
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
+  for (const tool of gatedOutFeatureTools(config.features)) {
+    disabledTools.add(tool);
+  }
 
   const mcpPool = new McpClientPool({
     servers: config.mcp?.servers ?? {},
@@ -5261,6 +5269,32 @@ export function formatRefusalDurationShort(ms: number): string {
   }
   if (h > 0) return m ? `${h}h ${m}m` : `${h}h`;
   return `${m}m`;
+}
+
+/**
+ * Single source of truth mapping a capability feature flag (`[features]`) to the
+ * tool names it gates. A feature that is off (the default — absent table or key)
+ * makes every tool in its list unavailable to the agent across ALL session types.
+ * This is a pure capability gate; the skill-file seeding half of these features is
+ * implemented in a later change and is not driven from here.
+ */
+export const FEATURE_TOOLS: Record<keyof NonNullable<AppConfig["features"]>, readonly string[]> = {
+  character_card: ["character_card_create", "character_card_read", "character_card_edit"],
+  danbooru: ["danbooru"],
+};
+
+/**
+ * The set of tool names excluded because their owning feature is not turned on.
+ * A feature counts as on only when its flag is strictly `true`; any other value
+ * (absent table, absent key, or `false`) leaves the feature off and its tools out.
+ */
+export function gatedOutFeatureTools(features: AppConfig["features"]): Set<string> {
+  const excluded = new Set<string>();
+  for (const key of Object.keys(FEATURE_TOOLS) as (keyof typeof FEATURE_TOOLS)[]) {
+    if (features?.[key] === true) continue;
+    for (const name of FEATURE_TOOLS[key]) excluded.add(name);
+  }
+  return excluded;
 }
 
 export function validateContextTokenCeilings(config: AppConfig): void {
