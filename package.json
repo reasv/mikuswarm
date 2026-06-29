@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "AGPL-3.0-only",
   "scripts": {
     "build": "pnpm fetch:tokenizer && pnpm build:native && tsc --noEmit",
     "build:native": "napi build --platform --manifest-path native/crates/matrix-core/Cargo.toml --js-package-name mikuswarm --output-dir npm",
