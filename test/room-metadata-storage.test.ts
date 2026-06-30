@@ -47,6 +47,37 @@ test("listConsoleRooms falls back to the timeline key when no label is cached", 
   }
 });
 
+test("listConsoleRooms folds thread sub-timelines into their parent room", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const thread = `${TK}:thread:$root`;
+    const sibling = "matrix:miku:room:!other:example.org";
+    // Room with one own event + two thread events, plus an unrelated sibling room.
+    await storage.appendTimelineEvent(event("e1", TK));
+    await storage.appendTimelineEvent(event("t1", thread));
+    await storage.appendTimelineEvent(event("t2", thread));
+    await storage.appendTimelineEvent(event("o1", sibling));
+    await storage.setRoomDisplayName(TK, "General");
+
+    const rooms = storage.listConsoleRooms();
+    // The thread is NOT a separate row — it collapses into the room.
+    assert.equal(
+      rooms.filter((r) => r.timeline_key === thread).length,
+      0,
+      "thread sub-timeline must not list as its own room",
+    );
+    const row = rooms.find((r) => r.timeline_key === TK);
+    assert.ok(row, "expected a single room row keyed by the room (not the thread)");
+    assert.equal(row.display_name, "General");
+    // event_count sums the room + its threads (1 own + 2 thread = 3).
+    assert.equal(row.event_count, 3);
+    // The sibling room is unaffected (no over-matching across rooms).
+    assert.equal(rooms.find((r) => r.timeline_key === sibling)?.event_count, 1);
+  } finally {
+    storage.close();
+  }
+});
+
 test("setRoomDisplayName upserts the label and refreshes resolved_at", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

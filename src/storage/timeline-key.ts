@@ -26,3 +26,15 @@ export function roomIdFromTimelineKeyOpt(timelineKey: string | undefined): strin
   const roomId = match?.[1];
   return roomId && roomId.length > 0 ? roomId : undefined;
 }
+
+/**
+ * SQLite `LIKE … escape '\'` pattern matching every thread sub-timeline of a room
+ * (`<roomKey>:thread:<root>`). The room key's LIKE metacharacters (`%`, `_`, `\`)
+ * are escaped so a room id that contains them can't broaden the match. Pairs with
+ * a `timeline_key = <roomKey>` arm to select a room together with its threads —
+ * the console treats a room and its threads as one room (mirrors
+ * `resolveEditTargetTimelineKey`).
+ */
+export function threadKeyLikePattern(roomKey: string): string {
+  return `${roomKey.replace(/[\\%_]/g, "\\$&")}:thread:%`;
+}

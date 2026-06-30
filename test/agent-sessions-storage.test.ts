@@ -859,6 +859,57 @@ test("getAgentSessionTimelineFacets: distinct types present in the room, sorted"
   });
 });
 
+// A room subsumes its thread sub-timelines in the console drill-down (mirrors
+// `listConsoleRooms` folding threads into their parent room): a session that
+// landed on a `<room>:thread:<root>` timeline is reachable — and counted — from
+// the room key, without leaking sessions from a different room.
+test("room session drill-down includes thread sub-timelines, scoped to the room", async () => {
+  await withStorage(async (storage) => {
+    const room = "matrix:miku:room:!thr:example.org";
+    const thread = `${room}:thread:$root`;
+    const sibling = "matrix:miku:room:!sib:example.org";
+    await storage.insertAgentSession(
+      baseInsert({ id: "s-room", timelineKey: room, triggerBody: "room msg", createdAt: 100 }),
+    );
+    await storage.insertAgentSession(
+      baseInsert({
+        id: "s-thread",
+        timelineKey: thread,
+        sessionType: "diary",
+        triggerBody: "thread msg",
+        createdAt: 200,
+      }),
+    );
+    // A sibling room whose own thread must NOT leak into `room`'s drill-down.
+    await storage.insertAgentSession(
+      baseInsert({
+        id: "s-sibling",
+        timelineKey: `${sibling}:thread:$x`,
+        triggerBody: "sibling msg",
+        createdAt: 300,
+      }),
+    );
+
+    // Plain list: room + thread session, reverse-chron; sibling excluded.
+    assert.deepEqual(
+      storage.getAgentSessionsByTimeline(room).map((r) => r.id),
+      ["s-thread", "s-room"],
+    );
+    // Search: an empty filter matches the same room+thread set.
+    assert.deepEqual(
+      storage.searchAgentSessionsByTimeline(room, {}).map((r) => r.id),
+      ["s-thread", "s-room"],
+    );
+    // Type facets aggregate across the room and its threads.
+    assert.deepEqual(storage.getAgentSessionTimelineFacets(room).types, ["default", "diary"]);
+    // Sibling room sees only its own thread session.
+    assert.deepEqual(
+      storage.getAgentSessionsByTimeline(sibling).map((r) => r.id),
+      ["s-sibling"],
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Interjection search (ARCHITECTURE.md §8/§11): a session is reachable by an
 // interjection's text, not only its trigger — the "timeline message → session"
