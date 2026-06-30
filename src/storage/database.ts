@@ -5,7 +5,7 @@ import type { Logger } from "../observability/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
-import { roomIdFromTimelineKeyOpt } from "./timeline-key.js";
+import { roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -6413,20 +6413,26 @@ export class Storage {
   }
 
   /**
-   * Sessions for a timeline, reverse-chron by creation (spec §8,
-   * `GET /api/rooms/:key/sessions`). The `idx_agent_sessions_timeline`
-   * index covers this ordering. Read-only.
+   * Sessions for a room, reverse-chron by creation (spec §8,
+   * `GET /api/rooms/:key/sessions`). Matches the room key AND its thread
+   * sub-timelines (`<roomKey>:thread:%`), so the room subsumes its threads exactly
+   * as `listConsoleRooms` aggregates them — a session that landed on a thread
+   * timeline stays reachable from its room. Read-only.
    */
   getAgentSessionsByTimeline(timelineKey: string, limit = 100): AgentSessionRow[] {
     return this.read((db) =>
       db
         .prepare(
           `select * from agent_sessions
-           where timeline_key = ?
+           where timeline_key = @key or timeline_key like @threadPrefix escape '\\'
            order by created_at desc
-           limit ?`,
+           limit @limit`,
         )
-        .all(timelineKey, limit) as AgentSessionRow[],
+        .all({
+          key: timelineKey,
+          threadPrefix: threadKeyLikePattern(timelineKey),
+          limit,
+        }) as AgentSessionRow[],
     );
   }
 
@@ -6455,8 +6461,15 @@ export class Storage {
   ): AgentSessionRow[] {
     const limit = opts.limit ?? 100;
     return this.read((db) => {
-      const where: string[] = ["s.timeline_key = @timelineKey"];
-      const params: Record<string, unknown> = { timelineKey, limit };
+      // Room + its thread sub-timelines, matching `getAgentSessionsByTimeline`.
+      const where: string[] = [
+        "(s.timeline_key = @timelineKey or s.timeline_key like @threadPrefix escape '\\')",
+      ];
+      const params: Record<string, unknown> = {
+        timelineKey,
+        threadPrefix: threadKeyLikePattern(timelineKey),
+        limit,
+      };
       if (opts.triggerMatch) {
         params.ftsMatch = opts.triggerMatch;
         where.push(
@@ -6503,13 +6516,17 @@ export class Storage {
    */
   getAgentSessionTimelineFacets(timelineKey: string): { types: string[] } {
     return this.read((db) => {
+      // Room + its thread sub-timelines, matching the sessions drill-down so the
+      // type menu offers exactly the types the listed sessions can have.
       const rows = db
         .prepare(
           `select distinct session_type from agent_sessions
-           where timeline_key = ?
+           where timeline_key = @key or timeline_key like @threadPrefix escape '\\'
            order by session_type`,
         )
-        .all(timelineKey) as Array<{ session_type: string }>;
+        .all({ key: timelineKey, threadPrefix: threadKeyLikePattern(timelineKey) }) as Array<{
+        session_type: string;
+      }>;
       return { types: rows.map((r) => r.session_type) };
     });
   }
@@ -6537,48 +6554,82 @@ export class Storage {
   }
 
   /**
-   * One row per timeline for the console room list (spec §8, `GET /api/rooms`),
+   * One row per ROOM for the console room list (spec §8, `GET /api/rooms`),
    * reverse-chron by latest activity. The anchor set is the UNION of timelines
    * that have `timeline_events` OR have `agent_sessions` rows (issue #6): a
    * timeline whose events were pruned (§13 delete-events / retention sweep) but
    * whose sessions persist must still appear so its sessions stay reachable via
-   * room→session drill-down. Session counts and lifecycle state are correlated
-   * subqueries; `last_activity_at` is the max event timestamp, falling back to
-   * the latest session activity (`max(created_at, updated_at)`) when no events
-   * survive, so reverse-chron ordering stays sensible. Pure read.
+   * room→session drill-down.
+   *
+   * Thread sub-timelines (`<roomKey>:thread:<root>`) are first-class timelines
+   * with their own context/summarization (matrix/inbound.ts), but they resolve to
+   * their parent room's label and would otherwise list as indistinguishable
+   * duplicate "rooms". So each anchor is mapped to its canonical room key (the
+   * `:thread:<root>` suffix stripped) and the union is **grouped by room**: one row
+   * per room, with `event_count`/`session_count` summed and `last_activity_at`
+   * maxed across the room and all its threads. The room→session drill-down
+   * (`getAgentSessionsByTimeline` &c.) matches the same room+threads set, so the
+   * aggregated count stays consistent and thread sessions remain reachable.
+   * `display_name`/`timeline_state` come from the room key itself. `last_activity_at`
+   * per timeline is its max event timestamp, falling back to the latest session
+   * activity (`max(created_at, updated_at)`) when no events survive, so reverse-chron
+   * ordering stays sensible. Pure read.
    */
   listConsoleRooms(limit = 500): RoomSummaryRow[] {
     return this.read((db) =>
       db
         .prepare(
-          `select
-             tk.timeline_key as timeline_key,
-             coalesce(
-               (select m.display_name from room_metadata m
-                 where m.timeline_key = tk.timeline_key),
-               tk.timeline_key
-             ) as display_name,
-             coalesce(
-               (select c.timeline_state from timeline_compaction_state c
-                 where c.timeline_key = tk.timeline_key),
-               'inactive'
-             ) as timeline_state,
-             coalesce(
-               (select max(te.timestamp) from timeline_events te
-                  where te.timeline_key = tk.timeline_key),
-               (select max(max(s.created_at, s.updated_at)) from agent_sessions s
-                  where s.timeline_key = tk.timeline_key),
-               0
-             ) as last_activity_at,
-             (select count(*) from timeline_events te
-                where te.timeline_key = tk.timeline_key) as event_count,
-             (select count(*) from agent_sessions s
-                where s.timeline_key = tk.timeline_key) as session_count
-           from (
+          `with anchors as (
              select timeline_key from timeline_events
              union
              select timeline_key from agent_sessions
-           ) tk
+           ),
+           mapped as (
+             select
+               -- Canonical room key: strip a :thread:<root> suffix so a room and its
+               -- threads collapse to one row. ':thread:' only ever appears as the
+               -- live-inserted separator (matrix/inbound.ts), never inside a room id.
+               case when anchors.timeline_key like '%:thread:%'
+                    then substr(anchors.timeline_key, 1,
+                                instr(anchors.timeline_key, ':thread:') - 1)
+                    else anchors.timeline_key end as room_key,
+               (select count(*) from timeline_events te
+                  where te.timeline_key = anchors.timeline_key) as event_count,
+               (select count(*) from agent_sessions s
+                  where s.timeline_key = anchors.timeline_key) as session_count,
+               coalesce(
+                 (select max(te.timestamp) from timeline_events te
+                    where te.timeline_key = anchors.timeline_key),
+                 (select max(max(s.created_at, s.updated_at)) from agent_sessions s
+                    where s.timeline_key = anchors.timeline_key),
+                 0
+               ) as last_activity_at
+             from anchors
+           ),
+           rooms as (
+             select room_key,
+                    max(last_activity_at) as last_activity_at,
+                    sum(event_count) as event_count,
+                    sum(session_count) as session_count
+             from mapped
+             group by room_key
+           )
+           select
+             rooms.room_key as timeline_key,
+             coalesce(
+               (select m.display_name from room_metadata m
+                 where m.timeline_key = rooms.room_key),
+               rooms.room_key
+             ) as display_name,
+             coalesce(
+               (select c.timeline_state from timeline_compaction_state c
+                 where c.timeline_key = rooms.room_key),
+               'inactive'
+             ) as timeline_state,
+             rooms.last_activity_at as last_activity_at,
+             rooms.event_count as event_count,
+             rooms.session_count as session_count
+           from rooms
            order by last_activity_at desc
            limit ?`,
         )
