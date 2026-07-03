@@ -121,8 +121,15 @@ fn build_custom_emoji_placeholder(attrs: &str) -> String {
 /// event actually carrying an `m.in_reply_to` relation — a non-reply message
 /// that happens to start with `> ` is a legitimate markdown quote and must be
 /// left alone. A body that is *only* fallback resolves to the empty string.
+///
+/// Only a spec-shaped fallback is stripped: its first line names the quoted
+/// sender in angle brackets (`> <@user:server> …`, or `> * <@user:server> …`
+/// for emotes). Reply fallbacks are deprecated (Matrix 1.3) and clients such
+/// as Cinny and Element X send replies without one — there, a reply whose
+/// text starts with `> ` is the user's own markdown quote, and stripping on
+/// the bare `>` prefix deleted it (whole-quote replies became empty).
 fn strip_reply_fallback(body: &str) -> String {
-    if !body.starts_with('>') {
+    if !(body.starts_with("> <") || body.starts_with("> * <")) {
         return body.to_string();
     }
     let mut rest: Vec<&str> = Vec::new();
@@ -785,6 +792,29 @@ mod tests {
         );
         // A body that doesn't start with a quote is untouched.
         assert_eq!(strip_reply_fallback("plain message"), "plain message");
+        // The emote fallback form (`> * <user> …`) is stripped too.
+        assert_eq!(
+            strip_reply_fallback("> * <@a:example.org> waves\n\nhi back"),
+            "hi back",
+        );
+    }
+
+    #[test]
+    fn strip_reply_fallback_keeps_user_markdown_quotes() {
+        // A fallback-less reply (Cinny, Element X — fallbacks are deprecated)
+        // whose text is the user's own markdown quote must survive intact,
+        // including the whole-message-is-a-quote case that used to empty out.
+        assert_eq!(
+            strip_reply_fallback(">how's it feel to know"),
+            ">how's it feel to know",
+        );
+        assert_eq!(
+            strip_reply_fallback("> trap character\n> not fleur\n\nmissed opportunity"),
+            "> trap character\n> not fleur\n\nmissed opportunity",
+        );
+        // `> <` requires the sender bracket immediately after the marker; a
+        // quote of bracketed text further in stays a user quote.
+        assert_eq!(strip_reply_fallback("> quoting <b>bold</b>"), "> quoting <b>bold</b>");
     }
 
     #[test]

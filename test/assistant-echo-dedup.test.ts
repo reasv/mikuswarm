@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Storage } from "../src/storage/index.js";
+import { LATEST_SCHEMA_VERSION, Storage } from "../src/storage/index.js";
 import { AssistantEchoResolver, TimelineStore } from "../src/timeline/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
@@ -234,7 +234,7 @@ test("v1→v2 migration removes existing matrix: duplicates and remaps reference
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 2, "migration stamps v2");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "migration chain stamps the latest version");
 
       const ids = storage.read((db) =>
         (db.prepare(`select id from timeline_events order by id`).all() as Array<{ id: string }>).map((r) => r.id),
