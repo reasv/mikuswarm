@@ -46,6 +46,7 @@ function makeProvider(): { provider: ChatProvider; calls: SendCall[] } {
 function makeTimeline(): TimelineStore {
   return {
     append: async () => {},
+    ingestAssistantSend: async () => "appended" as const,
   } as unknown as TimelineStore;
 }
 

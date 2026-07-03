@@ -29,8 +29,14 @@ export class TimelineStore {
   }
 
   /**
-   * Insert an event only if no row with its canonical id exists yet (dedup on
-   * resume/replay). `options.isBackfetch` marks the row as message-only backfetch
+   * Insert an event only if no row for the same message exists yet (dedup on
+   * resume/replay). Existence is checked by canonical id first, then — for events
+   * carrying an `externalId` — by `(provider, external_id, timeline_key)`: a bot
+   * self-message is stored under an `assistant:{session}:{eventId}:{chunk}`
+   * canonical id by `send_message`, while re-fetched history keys the same Matrix
+   * event `matrix:{account}:{eventId}`, so an id-only check can never see the
+   * match and would duplicate every self-sent message it re-fetches.
+   * `options.isBackfetch` marks the row as message-only backfetch
    * provenance (spec MESSAGE-BACKFETCH §5) — set only by the backfetch coordinator
    * so the enrichment worker defers its captioning and the row is excluded from the
    * first-class pipeline by the context floor.
@@ -46,6 +52,23 @@ export class TimelineStore {
         .get(event.id) as { event_json: string } | undefined;
       if (existing) {
         return { event: JSON.parse(existing.event_json) as CanonicalChatEvent, duplicate: true };
+      }
+      // Scoped by timeline_key (not just provider+external_id) so two accounts
+      // sharing a room — same Matrix event id, different timeline keys — never
+      // dedup against each other's rows.
+      if (event.externalId) {
+        const byExternal = db
+          .prepare(
+            `select event_json from timeline_events
+             where provider = ? and external_id = ? and timeline_key = ?
+             limit 1`,
+          )
+          .get(event.provider, event.externalId, event.timelineKey) as
+          | { event_json: string }
+          | undefined;
+        if (byExternal) {
+          return { event: JSON.parse(byExternal.event_json) as CanonicalChatEvent, duplicate: true };
+        }
       }
       const now = Date.now();
       db.prepare(
@@ -134,6 +157,85 @@ export class TimelineStore {
     return updated;
   }
 
+  /**
+   * Persist a just-sent assistant message (send_message's post-send append) —
+   * the reverse direction of {@link ingestAssistantEcho}. The Matrix sync echo
+   * races the send tool's own append: when the echo wins, `ingestAssistantEcho`
+   * finds no assistant row and appends a `matrix:{account}:{eventId}` row, and a
+   * plain append here would then store the same event a second time under its
+   * `assistant:{session}:{eventId}:{chunk}` id. So the send merges into an
+   * existing self-sent row for the same `(provider, external_id)` when one
+   * exists: the stored row keeps its canonical id and server timestamp (mirroring
+   * the echo-second merge, where the echo contributes exactly those), and adopts
+   * the send's body/html, session attribution, and timeline key (the send's
+   * target key is authoritative — a DM self-echo can derive a mismatched key,
+   * see `findAssistantEchoCandidate`). Exactly one row per Matrix event, whichever
+   * side wins the race. The lookup is unscoped by timeline key for the same
+   * DM-mismatch reason, but only merges into a self-sent assistant row — another
+   * account's received copy of the event (role `user`, not self) never matches.
+   */
+  ingestAssistantSend(event: CanonicalChatEvent): Promise<"merged" | "appended"> {
+    return this.storage.readAndWrite((db) => {
+      let existing: CanonicalChatEvent | undefined;
+      if (event.externalId) {
+        const row = db
+          .prepare(`select event_json from timeline_events where provider = ? and external_id = ? limit 1`)
+          .get(event.provider, event.externalId) as { event_json: string } | undefined;
+        const candidate = row ? (JSON.parse(row.event_json) as CanonicalChatEvent) : undefined;
+        if (candidate?.role === "assistant" && candidate.sender.isSelf) existing = candidate;
+      }
+
+      if (!existing) {
+        // No echo row yet (the common case: send wins the race). Same insert the
+        // plain append performed here before the merge existed — default
+        // 'pending' status, so an assistant message with links/media still flows
+        // through enrichment.
+        const now = Date.now();
+        db.prepare(
+          `insert into timeline_events (
+            id, external_id, timeline_key, provider, role, sender_id,
+            sender_display_name, body, timestamp, received_at, agent_session_id,
+            agent_session_generation, event_json, enrichment_status, created_at, updated_at
+          ) values (
+            @id, @externalId, @timelineKey, @provider, @role, @senderId,
+            @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
+            @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+          )`,
+        ).run({ ...timelineEventParams(event, now), enrichmentStatus: "pending" });
+        return "appended";
+      }
+
+      const updated: CanonicalChatEvent = {
+        ...event,
+        id: existing.id,
+        timestamp: existing.timestamp,
+        receivedAt: Math.min(existing.receivedAt, event.receivedAt),
+        // The send-side event never carries attachment metadata (send_message
+        // persists text/html only); the echo's attachments hold the mxc refs the
+        // enrichment worker downloads from. Never clobber them.
+        attachments: event.attachments?.length ? event.attachments : existing.attachments,
+      };
+      db.prepare(
+        `update timeline_events
+         set external_id = @externalId,
+             timeline_key = @timelineKey,
+             provider = @provider,
+             role = @role,
+             sender_id = @senderId,
+             sender_display_name = @senderDisplayName,
+             body = @body,
+             timestamp = @timestamp,
+             received_at = @receivedAt,
+             agent_session_id = @agentSessionId,
+             agent_session_generation = @agentSessionGeneration,
+             event_json = @eventJson,
+             updated_at = @updatedAt
+         where id = @id`,
+      ).run(timelineEventParams(updated, Date.now()));
+      return "merged";
+    });
+  }
+
   ingestAssistantEcho(event: CanonicalChatEvent): Promise<"enriched" | "appended"> {
     return this.storage.readAndWrite((db) => {
       const existing = findAssistantEchoCandidate(db, event);
@@ -158,6 +260,12 @@ export class TimelineStore {
         externalId: event.externalId ?? existing.externalId,
         timestamp: event.timestamp,
         receivedAt: Math.min(existing.receivedAt, event.receivedAt),
+        // The send-side row has no attachment metadata (send_message persists
+        // text/html only); adopt the echo's attachments — their mxc refs are what
+        // the enrichment worker downloads from. Previously the echo's attachments
+        // were dropped here, so assistant-sent media only got enriched when the
+        // echo won the race and landed its own (duplicate) row.
+        attachments: existing.attachments?.length ? existing.attachments : event.attachments,
       };
       db.prepare(
         `update timeline_events
