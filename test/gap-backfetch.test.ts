@@ -1522,3 +1522,93 @@ function silentLogger() {
     },
   } as never;
 }
+
+// ── Bot self-message dedup (assistant-echo duplicates) ─────────────────────
+
+/** Seed a bot-sent message the way send_message persists it: an `assistant:` canonical id. */
+async function seedAssistantRow(
+  timeline: TimelineStore,
+  storage: Storage,
+  eventId: string,
+  timestamp: number,
+): Promise<void> {
+  const event: CanonicalChatEvent = {
+    id: `assistant:sess-1:${eventId}:0`,
+    externalId: eventId,
+    timelineKey: ROOM_TK,
+    provider: "matrix",
+    agentSessionId: "sess-1",
+    role: "assistant",
+    sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
+    body: "bot reply",
+    timestamp,
+    receivedAt: timestamp,
+  };
+  await timeline.append(event);
+  await storage.setTimelineState(ROOM_TK, "active");
+}
+
+test("floor stop recognizes a bot-sent floor stored under an assistant: canonical id via its external id", async () => {
+  // The newest committed event is the bot's own message: send_message stored it as
+  // `assistant:sess-1:$f:0`, so the descent's re-derived `matrix:miku:$f` candidate
+  // id can never equal floor.id — only the external-id comparison stops here.
+  // Without it the descent would page past the floor and re-buffer the bot's own
+  // message (the historical duplicate-row bug).
+  const h = await makeHarness([
+    page(
+      [
+        summary({ eventId: "$c", timestamp: 3000 }),
+        summary({ eventId: "$f", timestamp: 2000, sender: SELF, body: "bot reply" }),
+      ],
+      "tok1",
+    ),
+    page([summary({ eventId: "$old", timestamp: 500 })], null),
+  ]);
+  await seedAssistantRow(h.timeline, h.storage, "$f", 2000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  assert.equal(h.client.calls.length, 1, "stopped on the first page at the assistant-row floor");
+  assert.deepEqual(h.recording.inserted, [`matrix:${ACCOUNT}:$c`], "only the genuine gap event commits");
+  assert.equal(
+    h.storage.read((db) =>
+      (db.prepare(`select count(*) as n from timeline_events where external_id = '$f'`).get() as { n: number }).n,
+    ),
+    1,
+    "the bot's own floor message is not duplicated",
+  );
+  h.storage.close();
+});
+
+test("commit dedups a re-fetched same-ms bot message against its assistant: row by external id", async () => {
+  // Floor = a user message at ts 2000; the bot's reply $s shares that millisecond
+  // and is already stored under an assistant: id. The descent must buffer $s (same
+  // ts, not the floor event — #4 exact-match), and the commit must then drop it by
+  // (provider, external_id, timeline_key) instead of inserting a matrix: duplicate.
+  const h = await makeHarness([
+    page(
+      [
+        summary({ eventId: "$c", timestamp: 3000 }),
+        summary({ eventId: "$s", timestamp: 2000, sender: SELF, body: "bot reply" }),
+        summary({ eventId: "$u", timestamp: 2000 }), // the floor — exact id match
+      ],
+      null,
+    ),
+  ]);
+  await seedFloor(h.timeline, h.storage, "$u", 2000);
+  await seedAssistantRow(h.timeline, h.storage, "$s", 2000);
+
+  h.coordinator.prepare();
+  await h.coordinator.run();
+
+  assert.deepEqual(h.recording.inserted, [`matrix:${ACCOUNT}:$c`], "the self message dedups at commit");
+  assert.equal(
+    h.storage.read((db) =>
+      (db.prepare(`select count(*) as n from timeline_events where external_id = '$s'`).get() as { n: number }).n,
+    ),
+    1,
+    "exactly one row for the bot's same-ms message",
+  );
+  h.storage.close();
+});

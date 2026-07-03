@@ -43,8 +43,14 @@ import {
 /** Floor = the room's committed high-water by the canonical `(timestamp, …, id)` ordering. */
 interface Floor {
   timestamp: number;
-  /** Full canonical id (`matrix:<account>:<eventId>`) of the high-water event. */
+  /**
+   * Full canonical id of the high-water event — `matrix:<account>:<eventId>` for
+   * a received message, but `assistant:<session>:<eventId>:<chunk>` when the
+   * newest committed event is a bot-sent message (send_message's own append).
+   */
   id: string;
+  /** The floor event's Matrix `$…` event id, when it has one. */
+  externalId?: string;
 }
 
 type BufferItem =
@@ -432,17 +438,27 @@ export class GapBackfetchCoordinator {
       // exact timestamp that is not the floor event itself sorts canonically *above*
       // the floor and is a genuine gap event that must be recovered — regardless of
       // how its eventId sorts against floor.id. The only same-ms boundary is the
-      // floor event itself, uniquely identified by its canonical id. We therefore
-      // stop on an exact id match (`=== floor.id`) or any strictly-older timestamp;
+      // floor event itself, uniquely identified by its canonical id — OR by its
+      // Matrix event id when the floor is a bot-sent message: send_message stores
+      // those under `assistant:<session>:<eventId>:<chunk>` canonical ids, which the
+      // re-derived `matrix:` candidate id can never equal, so the external-id
+      // comparison is what recognizes an assistant-row floor. We therefore stop on
+      // an exact canonical-id or external-id match, or any strictly-older timestamp;
       // the re-fetched floor event is buffered and harmlessly deduped at commit
-      // (`appendIfMissing` drops the already-committed row). (A plain `<=`/`<` id
-      // compare would mistake same-ms gap events with a lower eventId for the floor
-      // and silently drop them — commit-time dedup cannot recover an event that was
-      // never buffered.) If the floor event is never re-fetched, the descent stops
-      // at the first strictly-older event after buffering the same-ms layer.
+      // (`appendIfMissing` drops the already-committed row — by canonical id, or by
+      // (provider, external_id, timeline_key) for a self message stored under an
+      // assistant id). (A plain `<=`/`<` id compare would mistake same-ms gap events
+      // with a lower eventId for the floor and silently drop them — commit-time
+      // dedup cannot recover an event that was never buffered.) If the floor event
+      // is never re-fetched, the descent stops at the first strictly-older event
+      // after buffering the same-ms layer.
       if (floor) {
         const candidateId = `matrix:${room.accountId}:${summary.eventId}`;
-        if (timestamp < floor.timestamp || candidateId === floor.id) {
+        if (
+          timestamp < floor.timestamp ||
+          candidateId === floor.id ||
+          (floor.externalId != null && summary.eventId === floor.externalId)
+        ) {
           return "floor";
         }
       }

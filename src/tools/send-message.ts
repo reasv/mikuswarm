@@ -178,7 +178,10 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             timestamp: receipt.deliveredAt,
             receivedAt: Date.now(),
           };
-          await context.timeline.append(event);
+          // Merge-aware append: the sync echo can land its own row for this event
+          // before this write (the echo race) — ingestAssistantSend folds the send
+          // into that row instead of storing the message twice.
+          await context.timeline.ingestAssistantSend(event);
 
           return {
             content: [{ type: "text", text: `sent: ${receipt.externalId ?? "local"}` }],
@@ -222,7 +225,8 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             timestamp: receipt.deliveredAt,
             receivedAt: Date.now(),
           };
-          await context.timeline.append(event);
+          // Merge-aware append — same echo-race handling as the html branch above.
+          await context.timeline.ingestAssistantSend(event);
           eventIds.push(receipt.externalId ?? "local");
         }
 

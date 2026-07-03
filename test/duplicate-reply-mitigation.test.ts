@@ -359,7 +359,10 @@ function sendCtx(overrides: Partial<SendMessageToolContext> = {}): SendMessageTo
     async setTyping() {},
   } as unknown as ChatProvider;
   const target: OutboundTarget = { provider: "matrix", timelineKey: TK, roomId: "!room:server.org" };
-  const timeline = { append: async () => {} } as unknown as TimelineStore;
+  const timeline = {
+    append: async () => {},
+    ingestAssistantSend: async () => "appended" as const,
+  } as unknown as TimelineStore;
   return { provider, target, timeline, agentSessionId: "s-self", ...overrides };
 }
 

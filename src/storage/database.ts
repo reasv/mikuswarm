@@ -1767,8 +1767,8 @@ export class Storage {
       // Distinguish a brand-new database from an existing one BEFORE applying
       // SCHEMA (which uses `if not exists` and so leaves no trace of which case we
       // are in). A fresh DB has no user tables yet; SCHEMA then builds the full
-      // genesis shape and runMigrations only stamps the version. The schema has a
-      // single genesis version, so no migration step runs in either case today.
+      // latest shape and runMigrations only stamps the version — migration steps
+      // run only for an existing DB stamped below LATEST.
       const isFreshDatabase =
         (
           writer
@@ -1791,8 +1791,8 @@ export class Storage {
           runMigrations(writer, true);
         })();
       } else {
-        // Existing DB: run runMigrations FIRST (a no-op today — no steps — but it
-        // throws if the DB is stamped above LATEST), then SCHEMA. SCHEMA's
+        // Existing DB: run runMigrations FIRST (applies any pending MIGRATIONS
+        // steps; throws if the DB is stamped above LATEST), then SCHEMA. SCHEMA's
         // `create table/index if not exists` reconciles the existing DB to the
         // genesis shape, creating any object it lacks; it is idempotent on a DB
         // already at the latest shape. The order is retained so any future
@@ -2140,25 +2140,34 @@ export class Storage {
   /**
    * The committed high-water mark across a set of timeline keys — the single
    * newest event by the canonical `(timestamp, received_at, id)` ordering used
-   * everywhere reads sort. Returns the event's `timestamp` and full canonical
-   * `id` (the gap-backfetch floor; ARCHITECTURE.md §7c §5.1), or `undefined` when
-   * none of the keys hold any event. Pass the explicit list of a room's keys
-   * (room/DM + thread) so the floor is the max across all its timelines.
+   * everywhere reads sort. Returns the event's `timestamp`, full canonical `id`,
+   * and its provider `externalId` (the gap-backfetch floor; ARCHITECTURE.md §7c
+   * §5.1 — the external id is what identifies the floor when it is a bot-sent
+   * message stored under an `assistant:…` canonical id, which a re-fetched
+   * `matrix:…` candidate id can never match), or `undefined` when none of the
+   * keys hold any event. Pass the explicit list of a room's keys (room/DM +
+   * thread) so the floor is the max across all its timelines.
    */
-  getHighWaterMark(timelineKeys: string[]): { timestamp: number; id: string } | undefined {
+  getHighWaterMark(
+    timelineKeys: string[],
+  ): { timestamp: number; id: string; externalId?: string } | undefined {
     if (timelineKeys.length === 0) return undefined;
     const placeholders = timelineKeys.map(() => "?").join(",");
     const row = this.read((db) =>
       db
         .prepare(
-          `select id, timestamp from timeline_events
+          `select id, timestamp, external_id from timeline_events
            where timeline_key in (${placeholders})
            order by timestamp desc, received_at desc, id desc
            limit 1`,
         )
-        .get(...timelineKeys) as { id: string; timestamp: number } | undefined,
+        .get(...timelineKeys) as
+        | { id: string; timestamp: number; external_id: string | null }
+        | undefined,
     );
-    return row ? { timestamp: row.timestamp, id: row.id } : undefined;
+    return row
+      ? { timestamp: row.timestamp, id: row.id, externalId: row.external_id ?? undefined }
+      : undefined;
   }
 
   /**
@@ -7642,14 +7651,15 @@ create index if not exists idx_backfetch_jobs_room
   on backfetch_jobs(room_id, created_at desc);
 `;
 
-// Canonical genesis schema, version 1. This is the COMPLETE current schema with
-// every constraint baked in from the start, expressed entirely with idempotent
+// Canonical schema. This is the COMPLETE current schema with every constraint
+// baked in from the start, expressed entirely with idempotent
 // `create … if not exists` DDL: a fresh database executes this block, is built
-// directly at the final shape, and is stamped `user_version = 1` by
-// `runMigrations`. The schema has a single genesis version (no migration
-// ladder) — evolve it by editing this block in place (keeping it idempotent),
-// and only add a MIGRATIONS step for a rename/transform that `if not exists`
-// cannot express.
+// directly at the final shape, and is stamped `user_version = LATEST` by
+// `runMigrations`. Structurally it is still the genesis (v1) shape — the only
+// MIGRATIONS step so far (v1→v2) is a data-only cleanup that changes no DDL.
+// Evolve the schema by editing this block in place (keeping it idempotent), and
+// only add a MIGRATIONS step for a rename/transform — or a data fix on existing
+// rows — that `if not exists` cannot express.
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -8050,32 +8060,115 @@ ${SUMMARY_SEARCH_SCHEMA}
 ${REACTIONS_SCHEMA}
 ${BACKFETCH_JOBS_SCHEMA}`;
 
-// Single-genesis schema version. SCHEMA above defines the complete current
-// shape (version 1) with idempotent `create … if not exists` DDL, so a fresh
-// database is built directly at the final shape. There is no migration ladder:
-// MIGRATIONS is empty. To evolve the schema, edit SCHEMA in place (it stays
-// idempotent) and, only if a column/table rename or data transform is needed
-// that `create if not exists` cannot express, bump LATEST_SCHEMA_VERSION and
-// add an ordered step to MIGRATIONS (the runner machinery below still supports
-// stepwise upgrades).
-export const LATEST_SCHEMA_VERSION = 1;
+// SCHEMA above defines the complete current shape with idempotent
+// `create … if not exists` DDL, so a fresh database is built directly at the
+// final shape and stamped straight to LATEST. To evolve the schema, edit SCHEMA
+// in place (it stays idempotent) and, only if a column/table rename or a data
+// transform on existing rows is needed that `create if not exists` cannot
+// express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
+export const LATEST_SCHEMA_VERSION = 2;
 
-// Ordered, additive migration steps, indexed so the step at index `i` migrates a
-// database at `user_version = i` up to `user_version = i + 1`. Currently empty:
-// the schema has a single genesis version and fresh DBs are built directly at the
-// latest shape by SCHEMA (see runMigrations). The runner still iterates this array
-// for any future stepwise upgrade.
-const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [];
+/**
+ * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
+ * Before `appendIfMissing` deduped by `(provider, external_id, timeline_key)` and
+ * `send_message` merged into an echo-created row (`ingestAssistantSend`), a
+ * bot-sent message could be stored twice — once under its
+ * `assistant:{session}:{eventId}:{chunk}` canonical id (the send tool's append)
+ * and once under `matrix:{account}:{eventId}` (the sync-echo race, or the gap
+ * backfetch re-keying self-sent history). The duplicate shares the original's
+ * timestamp but has a later received_at, so it sorts outside a summarization
+ * job's declared cursor range while the timestamp-cutoff level-1 render still
+ * includes it — tripping the declared-vs-rendered input-integrity assertion.
+ *
+ * Keep the `assistant:` row (it carries the session attribution), remap every
+ * reference to the `matrix:` duplicate onto it, and delete the duplicate:
+ * - `summary_events` lineage: drop the dup's row when the summary already lists
+ *   the assistant sibling (both rows were rendered), else remap.
+ * - `summaries.latest_event_id` / `summarization_jobs.input_{start,end}_id` /
+ *   `timeline_compaction_state` cursors: remap to the assistant sibling (it
+ *   sorts immediately below the dup — same timestamp, earlier received_at — so
+ *   every cursor stays semantically in place).
+ * - The dup's enrichment artifacts (`media_assets`/`link_previews`/
+ *   `reply_contexts`) are deleted with it; the assistant row has its own.
+ * - `chat_index` cleans itself via the ON DELETE CASCADE + its FTS triggers.
+ */
+function cleanupAssistantEchoDuplicates(db: Database.Database): void {
+  db.exec(`
+    create temp table dup_pairs as
+      select m.id as matrix_id, min(a.id) as assistant_id
+      from timeline_events m
+      join timeline_events a
+        on a.provider = m.provider
+       and a.external_id = m.external_id
+       and a.timeline_key = m.timeline_key
+       and a.id like 'assistant:%'
+      where m.id like 'matrix:%'
+        and m.external_id is not null
+        and m.role = 'assistant'
+      group by m.id;
+
+    delete from summary_events
+    where exists (
+      select 1 from dup_pairs dp
+      where dp.matrix_id = summary_events.event_id
+        and exists (
+          select 1 from summary_events se2
+          where se2.summary_id = summary_events.summary_id
+            and se2.event_id = dp.assistant_id
+        )
+    );
+    update summary_events
+    set event_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = summary_events.event_id)
+    where event_id in (select matrix_id from dup_pairs);
+
+    update summaries
+    set latest_event_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = summaries.latest_event_id)
+    where latest_event_id in (select matrix_id from dup_pairs);
+
+    update summarization_jobs
+    set input_start_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = summarization_jobs.input_start_id)
+    where input_start_id in (select matrix_id from dup_pairs);
+    update summarization_jobs
+    set input_end_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = summarization_jobs.input_end_id)
+    where input_end_id in (select matrix_id from dup_pairs);
+
+    update timeline_compaction_state
+    set compact_start_event_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = timeline_compaction_state.compact_start_event_id)
+    where compact_start_event_id in (select matrix_id from dup_pairs);
+    update timeline_compaction_state
+    set rich_start_event_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = timeline_compaction_state.rich_start_event_id)
+    where rich_start_event_id in (select matrix_id from dup_pairs);
+    update timeline_compaction_state
+    set context_floor_event_id = (select dp.assistant_id from dup_pairs dp where dp.matrix_id = timeline_compaction_state.context_floor_event_id)
+    where context_floor_event_id in (select matrix_id from dup_pairs);
+
+    delete from media_assets where event_id in (select matrix_id from dup_pairs);
+    delete from link_previews where event_id in (select matrix_id from dup_pairs);
+    delete from reply_contexts where event_id in (select matrix_id from dup_pairs);
+
+    delete from timeline_events where id in (select matrix_id from dup_pairs);
+
+    drop table dup_pairs;
+  `);
+}
+
+// Ordered migration steps, indexed so the step at index `i` migrates a database
+// at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
+// deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
+// builds directly at the latest shape (runMigrations then just stamps LATEST).
+const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
+  undefined,
+  cleanupAssistantEchoDuplicates,
+];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
-// callback (single-writer queue). The schema has a single genesis version, so
-// MIGRATIONS is empty and no step ever runs today; the loop and stamping logic
-// are retained for any future stepwise upgrade.
+// callback (single-writer queue).
 //   - Fresh DB (`isFresh`): SCHEMA has already built every table/index at the
-//     latest shape, so runMigrations only STAMPS user_version to LATEST.
-//   - Existing DB below LATEST: apply MIGRATIONS[current..<LATEST] in order
-//     (none today), then stamp LATEST. open() runs this before SCHEMA so any
-//     future legacy-shape ALTERs land before SCHEMA's latest-shape DDL.
+//     latest shape (which includes every data fix by construction), so
+//     runMigrations only STAMPS user_version to LATEST.
+//   - Existing DB below LATEST: apply MIGRATIONS[current..<LATEST] in order,
+//     then stamp LATEST. open() runs this before SCHEMA so any legacy-shape
+//     ALTERs land before SCHEMA's latest-shape DDL.
 //   - Existing DB already at LATEST: idempotent no-op.
 //   - Existing DB ABOVE LATEST: throw — refuse to open forward-versioned data.
 //     This is what guards a database stamped by a newer build until it is
