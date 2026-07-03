@@ -8066,7 +8066,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 2;
+export const LATEST_SCHEMA_VERSION = 3;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -8152,6 +8152,129 @@ function cleanupAssistantEchoDuplicates(db: Database.Database): void {
   `);
 }
 
+// Minimal HTML-entity decode for blockquote text recovered from a stored
+// htmlBody (the native renderer escapes only these plus numeric references).
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
+
+// Render a blockquote's inner HTML to trimmed plain-text lines (tags stripped
+// after <br>/block-close breaks, entities decoded last so escaped text never
+// reads as markup). Leading/trailing blank lines are dropped.
+function blockquoteHtmlToText(inner: string): string[] {
+  const text = decodeHtmlEntities(
+    inner
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(?:p|div|li|ul|ol|blockquote|pre|h[1-6]|table|tr)>/gi, "\n")
+      .replace(/<[^>]+>/g, ""),
+  );
+  const lines = text.split("\n").map((line) => line.trim());
+  while (lines.length > 0 && lines[0] === "") lines.shift();
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/**
+ * v2 → v3 (data-only, no DDL): repair reply bodies over-stripped by the native
+ * reply-fallback stripper. Until the matching native fix, `strip_reply_fallback`
+ * treated ANY leading `>`-prefixed lines of a reply body as the legacy rich-reply
+ * fallback. Clients that omit the (deprecated since Matrix 1.3) fallback — Cinny,
+ * Element X — send replies whose body is just the user's text; when that text
+ * itself started with a markdown quote (`> …` / `>…` greentext), the quote lines
+ * were deleted at ingest, and a whole-quote reply persisted as an empty body.
+ *
+ * The formatted body kept the content: after `<mx-reply>` stripping it begins
+ * with the user's own `<blockquote>`. Rebuild the plain body from it:
+ *  - candidates: replies (`event_json.replyTo` set) whose stored `htmlBody`
+ *    starts with `<blockquote`;
+ *  - skip rows whose body still contains the blockquote's first line — those
+ *    came from fallback-sending clients and were stripped correctly;
+ *  - repaired body = the blockquote text as `> `-prefixed lines, a blank line,
+ *    then the surviving remainder (if any); both the `body` column and
+ *    `event_json.body` are rewritten.
+ *
+ * Follow-on stores: `chat_index` needs no touch-up — the startup `reconcileAll`
+ * sweep re-projects every event and the changed `content_sig` marks repaired
+ * rows dirty. `reply_contexts` rows quoting a repaired event get the repaired
+ * text where the stored context body exactly equals the damaged body (the
+ * whole-quote case fell back to a formatted-body render at enrichment time and
+ * is left as-is). Summaries generated from damaged renders are LLM output and
+ * are not recomputed. Rows whose quote nests another blockquote are skipped
+ * rather than risk a wrong rebuild.
+ */
+function repairReplyFallbackOverstrip(db: Database.Database): void {
+  const candidates = db
+    .prepare(
+      `select id, external_id, body, event_json from timeline_events
+       where json_extract(event_json, '$.replyTo') is not null
+         and json_extract(event_json, '$.htmlBody') like '<blockquote%'`,
+    )
+    .all() as Array<{
+    id: string;
+    external_id: string | null;
+    body: string;
+    event_json: string;
+  }>;
+  if (candidates.length === 0) return;
+
+  const updateEvent = db.prepare(
+    "update timeline_events set body = ?, event_json = ?, updated_at = ? where id = ?",
+  );
+  const updateReplyContext = db.prepare(
+    "update reply_contexts set body = ? where reply_external_id = ? and body = ?",
+  );
+  // Fold to lowercase alphanumeric words for the already-carries-the-quote
+  // check: plain body and formatted body render the same source through
+  // different markdown/HTML paths (`**bold**` vs `bold`, stray punctuation
+  // differences), so only the word content is comparable.
+  const scrub = (text: string) =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+
+  for (const row of candidates) {
+    let eventJson: Record<string, unknown>;
+    try {
+      eventJson = JSON.parse(row.event_json) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const htmlBody = typeof eventJson.htmlBody === "string" ? eventJson.htmlBody : "";
+    // Attribute values may contain a literal `>` (Cinny emits
+    // `<blockquote data-md=">">`), so the open tag can't end at the first `>`
+    // — skip over quoted attribute strings when finding it.
+    const match = /^<blockquote\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\/blockquote>/i.exec(
+      htmlBody,
+    );
+    if (!match || match[1].toLowerCase().includes("<blockquote")) continue;
+    const quoteLines = blockquoteHtmlToText(match[1]);
+    if (quoteLines.length === 0) continue;
+    const remainder = row.body.trim();
+    if (remainder !== "") {
+      // Non-empty body: repair only when it verifiably lost the quote. A
+      // word-free quote (pure punctuation) can't be checked — leave it alone
+      // rather than risk prepending a duplicate.
+      const quoteKey = scrub(quoteLines[0]);
+      if (quoteKey === "" || scrub(row.body).includes(quoteKey)) continue;
+    }
+
+    const quote = quoteLines.map((line) => (line === "" ? ">" : `> ${line}`)).join("\n");
+    const repaired = remainder === "" ? quote : `${quote}\n\n${remainder}`;
+    eventJson.body = repaired;
+    updateEvent.run(repaired, JSON.stringify(eventJson), Date.now(), row.id);
+    if (row.external_id) updateReplyContext.run(repaired, row.external_id, row.body);
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -8159,6 +8282,7 @@ function cleanupAssistantEchoDuplicates(db: Database.Database): void {
 const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   undefined,
   cleanupAssistantEchoDuplicates,
+  repairReplyFallbackOverstrip,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
