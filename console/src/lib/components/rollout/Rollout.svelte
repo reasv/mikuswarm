@@ -2,17 +2,20 @@
 	import {
 		asMsg,
 		assistantBlocks,
+		coerceContextMessage,
 		collectToolResults,
 		contentText,
 		isInjectedUserTurn,
 		messageUsage,
 		type RolloutMsg
 	} from '$lib/rollout';
+	import { isCollapsible as collapsibleFor, defaultOpen } from '$lib/tiers';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import AssistantTextCard from './AssistantTextCard.svelte';
 	import ThinkingCard from './ThinkingCard.svelte';
 	import ToolCallCard from './ToolCallCard.svelte';
 	import InterjectionCard from './InterjectionCard.svelte';
+	import MessageBlock from '$lib/components/verbatim/MessageBlock.svelte';
 	import type { ToolInvocation } from '$lib/schemas';
 
 	// `toolUsage` maps a tool-call id → its auxiliary usage ledger row (spec
@@ -60,6 +63,21 @@
 						· {formatUsd(u.cost)}{/if}
 				</div>
 			{/if}
+		{:else if msg.type === 'triggerGroup' || msg.type === 'satellite'}
+			<!-- A final user turn (`triggerGroup`/`satellite`, `isFinalTurnMessage` in
+			     src/agent/factory.ts) that lands INSIDE the rollout slice. This happens on
+			     a resumed session: `buildResumeTurn` (src/context/builder.ts) appends a
+			     fresh `triggerGroup` after the completed transcript, and `rolloutStartIndex`
+			     (src/observability/server/handlers.ts) skips only the LEADING head run — so
+			     the resume turn is a rollout message, not a head turn. Render it with the
+			     verbatim MessageBlock (same tier gutter + XML highlight as the kickoff turn
+			     shown in the input view above), never the raw-JSON fallback below. -->
+			{@const kickoff = coerceContextMessage(msg)}
+			<MessageBlock
+				msg={kickoff}
+				collapsible={collapsibleFor(kickoff)}
+				open={defaultOpen(kickoff)}
+			/>
 		{:else if isInjectedUserTurn(msg)}
 			<!-- Injected user turns: interjections carry no `role` (just
 			     `{ type:'interjection', content }`, see src/agent/messages.ts), while
