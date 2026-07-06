@@ -32,3 +32,7 @@ tmp/
 
 # Review session scratch
 tmp/
+
+# Local Megolm key exports (Element/Cinny "Export E2E room keys") — secret, never commit.
+/cinny-keys.txt
+*-keys.txt
