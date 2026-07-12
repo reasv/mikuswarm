@@ -1965,6 +1965,16 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // reasoning-effort level is forwarded as `reasoning_effort`. Undefined =
       // leave auto-detection in place.
       supportsReasoningEffort: model.compat?.supports_reasoning_effort,
+      // Override whether the system prompt uses the OpenAI `developer` role.
+      // pi-ai enables it when reasoning is on for most providers; a proxied
+      // DeepSeek upstream rejects `developer`, so set false to force `system`.
+      // Undefined = leave auto-detection in place.
+      supportsDeveloperRole: model.compat?.supports_developer_role,
+      // Suppress pi-ai's empty-string `reasoning_content` stamp on reasoning-less
+      // assistant turns (auto-enabled for DeepSeek); V4 Pro thinking mode 400s on
+      // a present-but-empty value. Undefined = leave auto-detection in place.
+      requiresReasoningContentOnAssistantMessages:
+        model.compat?.requires_reasoning_content_on_assistant_messages,
     },
   };
 }
