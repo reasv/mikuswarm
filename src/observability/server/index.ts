@@ -123,6 +123,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    const startedAt = performance.now();
     try {
       if (!isAuthorized(req, url, deps.config.auth_token)) {
         return sendError(res, 401, "Unauthorized");
@@ -148,6 +149,16 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
       });
       if (!res.headersSent) sendError(res, 500, "Internal error");
       else res.end();
+    } finally {
+      const durationMs = performance.now() - startedAt;
+      const fields = {
+        method: req.method ?? "GET",
+        path: url.pathname,
+        status: res.statusCode,
+        durationMs: Math.round(durationMs * 10) / 10,
+      };
+      if (durationMs >= 250) log.warn("console_request_slow", fields);
+      else log.debug("console_request_completed", fields);
     }
   }
 

@@ -7,7 +7,11 @@ import type { ContextMessage } from "../../context/builder.js";
 import type { ToolBlockSummary } from "../../context/index.js";
 import { externalizeImages } from "../../agent/session-capture.js";
 import { isFinalTurnMessage } from "../../agent/factory.js";
-import type { AgentSessionRow, AgentSessionStatus, ToolInvocationRow } from "../../storage/index.js";
+import type {
+  AgentSessionMetaRow,
+  AgentSessionStatus,
+  ToolInvocationRow,
+} from "../../storage/index.js";
 import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
@@ -669,7 +673,7 @@ export function summaryDetail(
  * console schema for legacy/headless rows.
  */
 function sessionMeta(
-  row: AgentSessionRow,
+  row: AgentSessionMetaRow,
   factory: RequestContext["deps"]["factory"],
 ): Record<string, unknown> {
   const hasUsage = row.llm_requests !== null;

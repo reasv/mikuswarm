@@ -36,7 +36,10 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('AgentApiClient.post', () => {
-	afterEach(() => vi.unstubAllGlobals());
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
+	});
 
 	it('decodes a 200 response to the typed value', async () => {
 		vi.stubGlobal('fetch', async () =>
@@ -79,5 +82,21 @@ describe('AgentApiClient.post', () => {
 				expect((err as ApiError).message).toContain('not running');
 			}
 		}
+	});
+
+	it('logs slow BFF hops without exposing query-string content', async () => {
+		vi.stubGlobal('fetch', async () =>
+			jsonResponse(200, { sessionId: 's-1', status: 'interrupted' })
+		);
+		vi.spyOn(performance, 'now').mockReturnValueOnce(100).mockReturnValueOnce(400);
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+		await runPost('/api/sessions/s-1/abort?operator-secret-search');
+
+		expect(warn).toHaveBeenCalledOnce();
+		const record = JSON.parse(warn.mock.calls[0][0] as string) as Record<string, unknown>;
+		expect(record.message).toBe('agent_api_request_slow');
+		expect(record.path).toBe('/api/sessions/s-1/abort');
+		expect(record.durationMs).toBe(300);
 	});
 });

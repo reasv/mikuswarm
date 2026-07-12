@@ -40,6 +40,7 @@ const CONSOLE_REQUEST_HEADER = 'x-console-request';
 
 /** Shared request → decode pipeline for both verbs (the only difference is the method). */
 function request<A, I>(method: 'GET' | 'POST', path: string, schema: Schema.Schema<A, I>) {
+	const startedAt = performance.now();
 	return Effect.gen(function* () {
 		const res = yield* Effect.tryPromise({
 			try: (signal) =>
@@ -63,7 +64,25 @@ function request<A, I>(method: 'GET' | 'POST', path: string, schema: Schema.Sche
 		return yield* Schema.decodeUnknown(schema)(json).pipe(
 			Effect.mapError((cause) => new DecodeError({ path, cause }))
 		);
-	});
+	}).pipe(
+		Effect.ensuring(
+			Effect.sync(() => {
+				const durationMs = performance.now() - startedAt;
+				if (durationMs < 250) return;
+				console.warn(
+					JSON.stringify({
+						level: 'warn',
+						component: 'console.bff',
+						message: 'agent_api_request_slow',
+						method,
+						path: new URL(path, 'http://agent.invalid').pathname,
+						durationMs: Math.round(durationMs * 10) / 10,
+						time: new Date().toISOString()
+					})
+				);
+			})
+		)
+	);
 }
 
 export const AgentApiClientLive = Layer.succeed(AgentApiClient, {

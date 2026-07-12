@@ -813,6 +813,38 @@ test("searchAgentSessionsByTimeline: no filters == getAgentSessionsByTimeline", 
   });
 });
 
+test("session list reads omit heavyweight detail payloads", async () => {
+  await withStorage(async (storage) => {
+    await seedFilterRows(storage);
+    await storage.saveAgentSessionSnapshot("s-rocket-3", {
+      snapshotJson: JSON.stringify([{ type: "system", content: "large frozen context".repeat(100) }]),
+      dumpPath: "/tmp/s-rocket-3.json",
+      tokenEstimate: 123,
+    });
+    await storage.saveAgentSessionTranscript(
+      "s-rocket-3",
+      JSON.stringify([{ role: "assistant", content: "large rollout".repeat(100) }]),
+    );
+
+    const plain = storage.getAgentSessionsByTimeline(FILTER_ROOM);
+    const filtered = storage.searchAgentSessionsByTimeline(FILTER_ROOM, {
+      triggerMatch: sanitizeTriggerFtsMatch("rocket"),
+    });
+    for (const row of [...plain, ...filtered]) {
+      assert.equal(Object.hasOwn(row, "context_snapshot_json"), false);
+      assert.equal(Object.hasOwn(row, "context_dump_path"), false);
+      assert.equal(Object.hasOwn(row, "transcript_json"), false);
+    }
+
+    // The single-session detail read remains the full durable row; optimizing the
+    // list must not remove the context/rollout data the console opens on click.
+    const detail = storage.getAgentSession("s-rocket-3");
+    assert.ok(detail?.context_snapshot_json?.includes("large frozen context"));
+    assert.ok(detail?.transcript_json?.includes("large rollout"));
+    assert.equal(detail?.context_dump_path, "/tmp/s-rocket-3.json");
+  });
+});
+
 test("searchAgentSessionsByTimeline: FTS operators in user text can't inject syntax", async () => {
   await withStorage(async (storage) => {
     await seedFilterRows(storage);

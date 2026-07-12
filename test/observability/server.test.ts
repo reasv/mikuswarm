@@ -141,6 +141,41 @@ test("GET /api/rooms returns aggregated room rows", async () => {
   });
 });
 
+test("observability API records request duration without query-string content", async () => {
+  await withStorage(async (storage) => {
+    const records: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      debug(message, fields) {
+        records.push({ message, fields });
+      },
+      info() {},
+      warn(message, fields) {
+        records.push({ message, fields });
+      },
+      error() {},
+      child() {
+        return logger;
+      },
+    };
+
+    await withServer({ storage, logger }, async (base) => {
+      const res = await fetch(`${base}/api/rooms?operator-secret-search`);
+      assert.equal(res.status, 200);
+    });
+
+    const record = records.find(
+      (candidate) =>
+        candidate.message === "console_request_completed" ||
+        candidate.message === "console_request_slow",
+    );
+    assert.ok(record);
+    assert.equal(record.fields?.method, "GET");
+    assert.equal(record.fields?.path, "/api/rooms");
+    assert.equal(record.fields?.status, 200);
+    assert.equal(typeof record.fields?.durationMs, "number");
+  });
+});
+
 test("GET /api/rooms includes timelines with sessions but no events (issue #6)", async () => {
   await withStorage(async (storage) => {
     const eventfulTk = TK;
