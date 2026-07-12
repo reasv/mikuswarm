@@ -55,8 +55,8 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
     resumeWorkExempt: true,
     description: "Send a message to the current Matrix room. You must explicitly decide whether the message is a reply.",
     parameters: Type.Object({
-      message: Type.String({ description: "Message text. Can be empty string if sending media only." }),
-      html: Type.Optional(Type.String({ description: "Optional HTML body. If omitted and message contains :shortcode: patterns, HTML is generated automatically." })),
+      message: Type.String({ description: "Message text. Can be empty string if sending media only. An exact Matrix user ID like @name:server in the text is turned into a real mention automatically (pill + notification) — no special markup needed." }),
+      html: Type.Optional(Type.String({ description: "Optional HTML body. If omitted, HTML is generated automatically when the message contains :shortcode: emoji or @user:server mentions." })),
       is_reply: Type.Boolean({ description: "Whether this message is an explicit reply to another message. Set to false for standalone messages." }),
       reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
       media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),

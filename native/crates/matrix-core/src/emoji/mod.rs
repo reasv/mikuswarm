@@ -205,16 +205,36 @@ pub fn render_text_with_custom_emoji(
     room_id: Option<&str>,
     now_ms: i64,
 ) -> MatrixResult<Option<String>> {
-    let shortcode_pattern = Regex::new(":[A-Za-z0-9_+\\-]+:").expect("valid shortcode regex");
     let mut rendered = String::new();
+    let replaced = append_shortcode_rendered(config, body, room_id, now_ms, &mut rendered)?;
+    if !replaced {
+        return Ok(None);
+    }
+    Ok(Some(rendered.replace('\n', "<br/>")))
+}
+
+/// Render one plain-text `segment` into `out`, replacing `:shortcode:` runs with
+/// their custom-emoji `<img>` (or a unicode character) and HTML-escaping everything
+/// else. Returns whether any shortcode was replaced. The caller owns the final
+/// newline→`<br/>` pass so segments can be concatenated (e.g. around mention pills)
+/// before it runs. Shared by [`render_text_with_custom_emoji`] and the mention
+/// renderer (`crate::mentions`).
+pub(crate) fn append_shortcode_rendered(
+    config: &MatrixClientConfig,
+    segment: &str,
+    room_id: Option<&str>,
+    now_ms: i64,
+    out: &mut String,
+) -> MatrixResult<bool> {
+    let shortcode_pattern = Regex::new(":[A-Za-z0-9_+\\-]+:").expect("valid shortcode regex");
     let mut last_index = 0usize;
     let mut replaced = false;
 
-    for matched in shortcode_pattern.find_iter(body) {
+    for matched in shortcode_pattern.find_iter(segment) {
         let shortcode = matched.as_str();
-        rendered.push_str(&escape_html(&body[last_index..matched.start()]));
+        out.push_str(&escape_html(&segment[last_index..matched.start()]));
         if let Some(entry) = resolve_for_shortcode(config, shortcode, room_id, now_ms)? {
-            rendered.push_str(&format!(
+            out.push_str(&format!(
                 "<img data-mx-emoticon src=\"{}\" alt=\"{}\" title=\"{}\" height=\"32\" />",
                 escape_html(&entry.mxc_url),
                 escape_html(&entry.shortcode),
@@ -222,20 +242,16 @@ pub fn render_text_with_custom_emoji(
             ));
             replaced = true;
         } else if let Some(unicode) = resolve_unicode_for_shortcode(shortcode) {
-            rendered.push_str(unicode);
+            out.push_str(unicode);
             replaced = true;
         } else {
-            rendered.push_str(&escape_html(shortcode));
+            out.push_str(&escape_html(shortcode));
         }
         last_index = matched.end();
     }
 
-    if !replaced {
-        return Ok(None);
-    }
-
-    rendered.push_str(&escape_html(&body[last_index..]));
-    Ok(Some(rendered.replace('\n', "<br/>")))
+    out.push_str(&escape_html(&segment[last_index..]));
+    Ok(replaced)
 }
 
 pub fn list_entries_ranked(
@@ -323,7 +339,7 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn escape_html(value: &str) -> String {
+pub(crate) fn escape_html(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {

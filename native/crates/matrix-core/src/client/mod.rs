@@ -21,7 +21,7 @@ use matrix_sdk::{
         },
         events::room::pinned_events::RoomPinnedEventsEventContent,
         events::{
-            relation::RelationType, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            relation::RelationType, AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions,
             TimelineEventType,
         },
         serde::Raw,
@@ -54,7 +54,7 @@ use crate::{
         MatrixVerificationState, NativeLifecycleStage, StoredSession,
     },
     auth::session,
-    crypto, emoji, events, media, reactions, state, sync, MatrixError, MatrixResult,
+    crypto, emoji, events, media, mentions, reactions, state, sync, MatrixError, MatrixResult,
 };
 
 struct SharedState {
@@ -826,30 +826,49 @@ async fn build_message_content(
     reply_to_id: Option<&str>,
     thread_id: Option<&str>,
 ) -> MatrixResult<RoomMessageEventContent> {
-    let formatted = match html {
-        Some(value) => Some(value),
-        None => emoji::render_text_with_custom_emoji(
-            config,
-            &text,
-            Some(room.room_id().as_str()),
-            Utc::now().timestamp_millis(),
-        )?,
+    // Render pills + m.mentions from `text`. When the caller supplied its own HTML we
+    // keep that formatted body verbatim, but still derive m.mentions from the plain
+    // text so the referenced users are notified (see `mentions::detect_user_ids`).
+    let own_user_id = room.own_user_id();
+    let (formatted, mentioned) = match html {
+        Some(value) => (Some(value), mentions::detect_user_ids(&text, Some(own_user_id))),
+        None => {
+            let rendered = mentions::render_message_html(
+                config,
+                &text,
+                Some(room.room_id().as_str()),
+                Some(own_user_id),
+                Utc::now().timestamp_millis(),
+            )?;
+            (rendered.formatted, rendered.user_ids)
+        }
     };
+    let mentions = (!mentioned.is_empty()).then(|| Mentions::with_user_ids(mentioned));
+
     let reply = media::build_reply(reply_to_id, thread_id)?;
     if let Some(reply) = reply {
-        let base = match formatted {
+        let mut base = match formatted {
             Some(formatted) => RoomMessageEventContentWithoutRelation::text_html(text, formatted),
             None => RoomMessageEventContentWithoutRelation::text_plain(text),
         };
+        if let Some(mentions) = mentions {
+            base = base.add_mentions(mentions);
+        }
+        // `make_reply_event` merges (adds the replied-to sender) rather than
+        // overwriting, so the pills' m.mentions above survive.
         return room
             .make_reply_event(base, reply)
             .await
             .map_err(|err| MatrixError::State(format!("failed to build reply metadata: {err}")));
     }
-    Ok(match formatted {
+    let mut content = match formatted {
         Some(formatted) => RoomMessageEventContent::text_html(text, formatted),
         None => RoomMessageEventContent::text_plain(text),
-    })
+    };
+    if let Some(mentions) = mentions {
+        content = content.add_mentions(mentions);
+    }
+    Ok(content)
 }
 
 fn build_message_edit_content(
@@ -857,16 +876,22 @@ fn build_message_edit_content(
     room: &Room,
     text: &str,
 ) -> MatrixResult<RoomMessageEventContentWithoutRelation> {
-    let formatted = emoji::render_text_with_custom_emoji(
+    let own_user_id = room.own_user_id();
+    let rendered = mentions::render_message_html(
         config,
         text,
         Some(room.room_id().as_str()),
+        Some(own_user_id),
         Utc::now().timestamp_millis(),
     )?;
-    Ok(match formatted {
+    let mut content = match rendered.formatted {
         Some(formatted) => RoomMessageEventContentWithoutRelation::text_html(text, formatted),
         None => RoomMessageEventContentWithoutRelation::text_plain(text),
-    })
+    };
+    if !rendered.user_ids.is_empty() {
+        content = content.add_mentions(Mentions::with_user_ids(rendered.user_ids));
+    }
+    Ok(content)
 }
 
 pub(crate) async fn join_room_internal(client: &Client, target: &str) -> MatrixResult<MatrixJoinResult> {
