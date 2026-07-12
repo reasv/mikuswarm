@@ -652,6 +652,25 @@ const ModelSchema = StrictObject({
     // `thinking_level` (via `thinking_level_map`) is forwarded as
     // `reasoning_effort`. Unset = keep pi-ai's auto-detection.
     supports_reasoning_effort: Type.Optional(Type.Boolean()),
+    // Override whether the system prompt is sent with the OpenAI-style
+    // `developer` role. pi-ai uses `developer` whenever `reasoning` is on and it
+    // auto-detects the role as supported (true for most providers) — but some
+    // OAI-compatible upstreams behind a gateway (e.g. a proxied DeepSeek, whose
+    // API only accepts system/user/assistant/tool) reject `developer` with a
+    // deserialization 400. Set false to force the plain `system` role. Unset =
+    // keep pi-ai's auto-detection.
+    supports_developer_role: Type.Optional(Type.Boolean()),
+    // Override pi-ai's "reasoning_content required on every assistant message"
+    // safety net (auto-enabled for `provider = "deepseek"`). When on, pi-ai
+    // stamps `reasoning_content: ""` on any assistant turn that carried no
+    // thinking block — but DeepSeek V4 Pro thinking mode REJECTS a present-but-
+    // empty `reasoning_content` (400 "must be passed back to the API") on those
+    // reasoning-less turns (e.g. historical/plain context messages). Per DeepSeek
+    // docs the field is optional and ignored on non-tool-call turns, so omitting
+    // it is correct; set false to suppress the empty-string stamp. Real reasoning
+    // on tool-call turns is emitted independently (thinking-signature path) and
+    // is unaffected. Unset = keep pi-ai's auto-detection.
+    requires_reasoning_content_on_assistant_messages: Type.Optional(Type.Boolean()),
   })),
 });
 
