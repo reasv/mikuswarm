@@ -5,6 +5,7 @@ mod crypto;
 mod emoji;
 mod events;
 mod media;
+mod mentions;
 mod previews;
 mod reactions;
 mod state;
