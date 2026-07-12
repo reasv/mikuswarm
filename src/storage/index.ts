@@ -21,6 +21,7 @@ export {
   type DiaryJob,
   type AgentSessionStatus,
   type AgentSessionInsert,
+  type AgentSessionMetaRow,
   type AgentSessionRow,
   type ToolInvocationRow,
   type ToolInvocationInput,

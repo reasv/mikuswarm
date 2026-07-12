@@ -848,6 +848,46 @@ export interface AgentSessionRow {
   completed_at: number | null;
 }
 
+const AGENT_SESSION_META_COLUMN_NAMES = [
+  "id",
+  "timeline_key",
+  "session_type",
+  "status",
+  "model_id",
+  "trigger_event_id",
+  "trigger_external_id",
+  "trigger_body",
+  "token_estimate",
+  "llm_requests",
+  "usage_input_tokens",
+  "usage_output_tokens",
+  "usage_cache_read_tokens",
+  "usage_cache_write_tokens",
+  "usage_cost",
+  "context_tokens",
+  "no_reply",
+  "error",
+  "created_at",
+  "started_at",
+  "updated_at",
+  "completed_at",
+] as const satisfies readonly (keyof AgentSessionRow)[];
+
+/**
+ * Lightweight projection used by session-list reads. The heavyweight persisted
+ * context/transcript columns belong to the single-session detail path only; list
+ * endpoints must not materialize them merely to discard them in `sessionMeta`.
+ */
+export type AgentSessionMetaRow = Pick<
+  AgentSessionRow,
+  (typeof AGENT_SESSION_META_COLUMN_NAMES)[number]
+>;
+
+const AGENT_SESSION_META_COLUMNS = AGENT_SESSION_META_COLUMN_NAMES.join(", ");
+const AGENT_SESSION_META_COLUMNS_ALIASED = AGENT_SESSION_META_COLUMN_NAMES.map(
+  (column) => `s.${column}`,
+).join(", ");
+
 /**
  * One row of the auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING
  * §8.2): a generic per-invocation record for provider calls made by a tool via
@@ -6428,11 +6468,11 @@ export class Storage {
    * as `listConsoleRooms` aggregates them — a session that landed on a thread
    * timeline stays reachable from its room. Read-only.
    */
-  getAgentSessionsByTimeline(timelineKey: string, limit = 100): AgentSessionRow[] {
+  getAgentSessionsByTimeline(timelineKey: string, limit = 100): AgentSessionMetaRow[] {
     return this.read((db) =>
       db
         .prepare(
-          `select * from agent_sessions
+          `select ${AGENT_SESSION_META_COLUMNS} from agent_sessions
            where timeline_key = @key or timeline_key like @threadPrefix escape '\\'
            order by created_at desc
            limit @limit`,
@@ -6441,7 +6481,7 @@ export class Storage {
           key: timelineKey,
           threadPrefix: threadKeyLikePattern(timelineKey),
           limit,
-        }) as AgentSessionRow[],
+        }) as AgentSessionMetaRow[],
     );
   }
 
@@ -6467,7 +6507,7 @@ export class Storage {
       sessionTypes?: string[];
       limit?: number;
     } = {},
-  ): AgentSessionRow[] {
+  ): AgentSessionMetaRow[] {
     const limit = opts.limit ?? 100;
     return this.read((db) => {
       // Room + its thread sub-timelines, matching `getAgentSessionsByTimeline`.
@@ -6508,12 +6548,12 @@ export class Storage {
       }
       return db
         .prepare(
-          `select s.* from agent_sessions s
+          `select ${AGENT_SESSION_META_COLUMNS_ALIASED} from agent_sessions s
            where ${where.join(" and ")}
            order by s.created_at desc
            limit @limit`,
         )
-        .all(params) as AgentSessionRow[];
+        .all(params) as AgentSessionMetaRow[];
     });
   }
 
