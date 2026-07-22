@@ -107,7 +107,9 @@ test("v2→v3 migration rebuilds over-stripped reply quotes from the html blockq
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 3, "migration stamps v3");
+      // The reopen migrates all the way to LATEST (now v4 — the additive
+      // MULTI-SHARED-POOL child table rides after this v2→v3 repair step).
+      assert.equal(version, 4, "migration stamps the latest version");
 
       const emptied = bodyOf(storage, "matrix:miku:$emptied");
       assert.equal(emptied.body, "> how's it feel to know");

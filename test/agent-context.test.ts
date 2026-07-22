@@ -438,7 +438,7 @@ test("resume seeds the per-user running estimate from the resumed context (#1)",
     banned: false,
     models: ["default"],
     constraints: [],
-    ledgerPartitionKey: undefined,
+    ledgerPartitionKeys: [],
   } as unknown as UserLimitResolution;
   const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
   const engine = {
@@ -510,7 +510,7 @@ test("image session + text-only user model set is a terminal per-user deny, not 
     banned: false,
     models: ["textonly"], // per-user set is text-only, but the reply model (default) is multimodal
     constraints: [],
-    ledgerPartitionKey: undefined,
+    ledgerPartitionKeys: [],
   } as unknown as UserLimitResolution;
   const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
   const engine = {
@@ -580,7 +580,7 @@ test("running counter ignores wire-dropped chatEvents (#10)", async () => {
     banned: false,
     models: ["default"],
     constraints: [],
-    ledgerPartitionKey: undefined,
+    ledgerPartitionKeys: [],
   } as unknown as UserLimitResolution;
   const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
   const engine = {
@@ -664,7 +664,7 @@ test("per-user initial selection is seeded with a defensive output cap (#13)", a
     banned: false,
     models: ["default"],
     constraints: [],
-    ledgerPartitionKey: undefined,
+    ledgerPartitionKeys: [],
   } as unknown as UserLimitResolution;
   const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
   const engine = {

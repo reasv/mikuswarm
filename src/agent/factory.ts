@@ -836,15 +836,15 @@ export class AgentSessionFactory {
             const u = message.usage;
             const cost = u.cost?.total ?? 0;
             // Per-user limits attribution (spec PER-USER-LIMITS §7): the REQUESTED
-            // virtual model the per-user selector chose for this request (distinct
-            // from `logical_model_id` under active fallback) + the single shared-pool
-            // key to denormalize. Both null when per-user selection is inactive. The
-            // in-memory partitioned counter records the ACTUAL served cost against the
-            // requested model's covering meters before the ledger write.
+            // virtual model the per-user selector chose for this request (distinct from
+            // `logical_model_id` under active fallback), null when per-user selection is
+            // inactive. The SHARED-POOL key set (spec MULTI-SHARED-POOL §4) is NOT
+            // computed here: app.ts's `recordUsageEvent` fan-in owns it for BOTH the
+            // agent loop and the tool lane, model-aware via `sharedPoolKeys`, so the
+            // stamping lives in exactly one place. The in-memory partitioned counter
+            // records the ACTUAL served cost against the requested model's covering
+            // meters (incl. every shared pool) before the ledger write.
             const requestedModelId = userSelectionActive ? requestedMember.logicalId : null;
-            const budgetPartition = userSelectionActive
-              ? userLimit!.resolution.ledgerPartitionKey ?? null
-              : null;
             // The partitioned per-user counter is incremented centrally in app.ts's
             // `recordUsageEvent` fan-in (the single place that covers BOTH the agent
             // loop AND its tool lane, §6), keyed off the stamped `requestedModelId`.
@@ -874,7 +874,6 @@ export class AgentSessionFactory {
               modelId: message.model ?? model.id,
               logicalModelId: resolvedMember.logicalId,
               requestedModelId,
-              budgetPartition,
               provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,

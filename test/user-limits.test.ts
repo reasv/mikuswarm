@@ -155,6 +155,8 @@ test("normalize fatals: bad partition var, shorthand+limits, >1 shared pool", ()
   );
   assert.ok(both.fatal.some((f) => /either max_usd \(shorthand\) or limits/.test(f)));
 
+  // Two distinct shared pools in one rule are now ALLOWED (spec MULTI-SHARED-POOL §4):
+  // the overflow membership spills to usage_event_partitions. No fatal, no warning.
   const twoPools = normalizeUserLimits(
     [
       {
@@ -167,7 +169,26 @@ test("normalize fatals: bad partition var, shorthand+limits, >1 shared pool", ()
     ],
     { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
   );
-  assert.ok(twoPools.fatal.some((f) => /at most one shared pool/.test(f)));
+  assert.deepEqual(twoPools.fatal, []);
+  assert.equal(twoPools.rules.length, 1);
+  assert.equal(twoPools.rules[0]!.constraints.filter((c) => c.shared).length, 2);
+
+  // Beyond the bound (MAX_SHARED_POOLS_PER_RULE = 8) is fatal — bounds hot-path write
+  // amplification (one child insert per overflow pool per event).
+  const tooMany = normalizeUserLimits(
+    [
+      {
+        user: "*",
+        limits: Array.from({ length: 9 }, (_v, i) => ({
+          max_usd: 5,
+          window: ROLL24,
+          partition: `pool-${i}`,
+        })),
+      },
+    ],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.ok(tooMany.fatal.some((f) => /at most 8 shared pools/.test(f)));
 });
 
 test("normalize warns: positive sub-cap with no covering total, divergent static caps", () => {
@@ -442,8 +463,8 @@ test("shared pool: distinct users share one meter and degrade together", () => {
   const a = engine.resolve({ userId: "@a:hs" });
   const b = engine.resolve({ userId: "@b:hs" });
   // The shared-pool key is denormalized onto the ledger for both.
-  assert.equal(a.ledgerPartitionKey, "staff");
-  assert.equal(b.ledgerPartitionKey, "staff");
+  assert.deepEqual(a.ledgerPartitionKeys, ["staff"]);
+  assert.deepEqual(b.ledgerPartitionKeys, ["staff"]);
   // A spends $30 of the shared $50; B sees only $20 remaining.
   engine.record(a, "glm-cheap", 30);
   assert.equal(engine.totalHeadroom(b), 20);
@@ -451,6 +472,56 @@ test("shared pool: distinct users share one meter and degrade together", () => {
   // Pool exhausted ⇒ both fail at once.
   assert.equal(engine.affordable(a, "glm-cheap", { newTokens: 1000 }).ok, false);
   assert.equal(engine.affordable(b, "glm-cheap", { newTokens: 1000 }).ok, false);
+});
+
+test("multi shared pool: a nested rule joins two disjoint-value pools; both meter independently", () => {
+  // Overlapping pools (spec MULTI-SHARED-POOL §4): a per-space pool AND a global fleet
+  // pool at once — one event feeds BOTH, model-agnostically. Previously a load-time fatal.
+  const engine = makeEngine([
+    {
+      user: ["@a:hs", "@b:hs"],
+      space: "!spaceA:hs",
+      models: ["glm-cheap"],
+      limits: [
+        { max_usd: 20, window: ROLL24, partition: "space:{space_id}" }, // per-space pool
+        { max_usd: 100, window: ROLL24, partition: "fleet" }, // global fleet pool
+      ],
+    },
+  ]);
+  const ctx: UserLimitContext = { userId: "@a:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs"] };
+  const a = engine.resolve(ctx);
+  // Both distinct shared-pool keys are exposed for denormalization (superset, order-
+  // preserving — the first is the scalar fast-path member).
+  assert.deepEqual(a.ledgerPartitionKeys, ["space:!spaceA:hs", "fleet"]);
+  // A single model-agnostic event feeds BOTH pools (sharedPoolKeys narrows nothing here).
+  assert.deepEqual(engine.sharedPoolKeys(a, "glm-cheap"), ["space:!spaceA:hs", "fleet"]);
+  engine.record(a, "glm-cheap", 15);
+  // The per-space pool ($20) now binds A's headroom at $5 — tighter than the fleet's $85.
+  assert.equal(engine.totalHeadroom(a), 5);
+  // Another user @b in the same space shares BOTH meters.
+  const b = engine.resolve({ userId: "@b:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs"] });
+  assert.equal(engine.totalHeadroom(b), 5); // same $20 space pool − $15
+});
+
+test("sharedPoolKeys: model-scoped shared sub-cap joined only by a covering model; tool lane skips it", () => {
+  const engine = makeEngine([
+    {
+      user: "*",
+      models: ["opus-premium", "glm-cheap"],
+      limits: [
+        { max_usd: 100, window: ROLL24, partition: "fleet" }, // model-agnostic pool
+        { max_usd: 40, window: ROLL24, partition: "fleet-premium", models: ["opus-premium"] }, // pooled sub-cap
+      ],
+    },
+  ]);
+  const r = engine.resolve({ userId: "@a:hs" });
+  assert.deepEqual(r.ledgerPartitionKeys, ["fleet", "fleet-premium"]);
+  // An opus-premium event joins BOTH the model-agnostic pool and the premium sub-cap.
+  assert.deepEqual(engine.sharedPoolKeys(r, "opus-premium"), ["fleet", "fleet-premium"]);
+  // A glm-cheap event joins only the model-agnostic pool (not the opus-premium sub-cap).
+  assert.deepEqual(engine.sharedPoolKeys(r, "glm-cheap"), ["fleet"]);
+  // The tool lane (undefined coverage) also joins only the model-agnostic pool (#14).
+  assert.deepEqual(engine.sharedPoolKeys(r, undefined), ["fleet"]);
 });
 
 test("record keys coverage on the REQUESTED model: a sub-cap ignores other-model spend", () => {
@@ -525,7 +596,7 @@ test("space matching (§11): matches ANY parent space; per-space pool shares acr
   // the canonical first parent — "any ancestor matches".
   assert.equal(a.active, true);
   // The pool/partition + ledger key use the CANONICAL (first) parent space.
-  assert.equal(a.ledgerPartitionKey, "space:!spaceA:hs");
+  assert.deepEqual(a.ledgerPartitionKeys, ["space:!spaceA:hs"]);
   const b = engine.resolve(ctxB);
   // Shared per-space pool: A's spend is visible to B (one meter).
   engine.record(a, "glm-cheap", 20);
@@ -830,8 +901,9 @@ test("shared-pool sub-cap (#16): record credits a pooled sub-cap and its reseed 
     now: () => 1_000_000,
   });
   const a = engine.resolve({ userId: "@a:hs" });
-  // Both constraints are shared (denormalized onto the ledger as the same "staff" key).
-  assert.equal(a.ledgerPartitionKey, "staff");
+  // Both constraints are shared (denormalized onto the ledger as the same "staff" key);
+  // deduped ⇒ a single distinct key.
+  assert.deepEqual(a.ledgerPartitionKeys, ["staff"]);
   const poolTotal = a.constraints.find((c) => c.modelScope === undefined)!;
   const poolSub = a.constraints.find((c) => c.modelScope !== undefined)!;
   assert.equal(poolTotal.isUserPartition, false);
@@ -1013,7 +1085,7 @@ test("space pool (#17): a space-less trigger skips the `space:` pool but keeps t
   assert.equal(spaceless.constraints[0]!.modelScope, undefined);
   assert.equal(spaceless.constraints[0]!.isUserPartition, true);
   // No shared pool ⇒ nothing to denormalize onto the ledger.
-  assert.equal(spaceless.ledgerPartitionKey, undefined);
+  assert.deepEqual(spaceless.ledgerPartitionKeys, []);
   // The per-user total still applies and binds.
   assert.equal(engine.totalHeadroom(spaceless), 5);
   engine.record(spaceless, "glm-cheap", 5);
@@ -1038,7 +1110,7 @@ test("space pool (#17): a real parent space DOES create a per-space pool", () =>
   // A room with a real canonical parent space.
   const inSpace = engine.resolve({ userId: "@a:hs", roomId: "!r:hs", spaceIds: ["!spaceA:hs"] });
   assert.equal(inSpace.constraints.length, 2, "both the total and the space pool resolve");
-  assert.equal(inSpace.ledgerPartitionKey, "space:!spaceA:hs");
+  assert.deepEqual(inSpace.ledgerPartitionKeys, ["space:!spaceA:hs"]);
   const pool = inSpace.constraints.find((c) => !c.isUserPartition);
   assert.ok(pool, "the space pool constraint is present");
   assert.equal(pool!.partitionKey, "space:!spaceA:hs");

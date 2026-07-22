@@ -48,6 +48,14 @@ export interface NormalizeUserLimitsResult {
 
 const KNOWN_PARTITION_VARS = new Set(["user_id", "room_id", "homeserver", "space_id"]);
 const DEFAULT_SHORTHAND_WINDOW: RawWindow = { type: "rolling", duration: "24h" };
+/**
+ * Upper bound on DISTINCT shared-pool partition values in one rule (spec
+ * MULTI-SHARED-POOL §4). Each pool an event joins beyond the first costs one
+ * `usage_event_partitions` child insert on the hot path, so the cap bounds that
+ * write amplification. Realistic nesting (per-room + per-space + fleet) is 2–3;
+ * this leaves generous headroom while refusing pathological configs.
+ */
+const MAX_SHARED_POOLS_PER_RULE = 8;
 
 function asList(v: string | string[] | undefined): string[] | undefined {
   if (v === undefined) return undefined;
@@ -233,14 +241,21 @@ export function normalizeUserLimits(
       }
     }
 
-    // ── Phase-1: ≤ 1 distinct non-{user_id} partition value per rule (§8.3) ──
+    // ── ≤ MAX_SHARED_POOLS_PER_RULE distinct non-{user_id} partition values per rule
+    // (spec MULTI-SHARED-POOL §4). Multiple shared pools are now supported: a single
+    // event joins each covering pool, its first key denormalized on `budget_partition`
+    // and the rest spilled to `usage_event_partitions` (one child insert per overflow
+    // pool). The bound keeps that hot-path write amplification bounded — a rule with N
+    // distinct shared pools costs ≤ N-1 extra inserts per pooled event. (Was: a hard
+    // "at most one shared pool" fatal, when overflow membership had no storage.) ──
     const sharedTemplates = new Set(
       constraints.filter((c) => c.shared).map((c) => c.partition),
     );
-    if (sharedTemplates.size > 1) {
+    if (sharedTemplates.size > MAX_SHARED_POOLS_PER_RULE) {
       fatal.push(
-        `${label}: a rule may reference at most one shared pool (non-{user_id} partition) ` +
-          `in Phase 1 — found ${[...sharedTemplates].map((p) => `"${p}"`).join(", ")} (spec §8.3)`,
+        `${label}: a rule may reference at most ${MAX_SHARED_POOLS_PER_RULE} shared pools ` +
+          `(distinct non-{user_id} partitions) — found ${sharedTemplates.size}: ` +
+          `${[...sharedTemplates].map((p) => `"${p}"`).join(", ")} (spec MULTI-SHARED-POOL §4)`,
       );
     }
 

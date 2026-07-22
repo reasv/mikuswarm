@@ -118,11 +118,17 @@ export interface UserLimitResolution {
   models?: string[];
   constraints: ResolvedConstraint[];
   /**
-   * The single shared-pool partition key to denormalize onto each ledger row
-   * (§8.3); undefined when the session joins no shared pool. The Phase-1
-   * normalizer guarantees ≤ 1 distinct non-`{user_id}` value per rule.
+   * The DISTINCT shared-pool partition keys this session may denormalize onto its
+   * ledger rows (spec MULTI-SHARED-POOL §4) — the model-BLIND superset over every
+   * shared constraint (empty when the session joins no shared pool). The exact,
+   * model-AWARE subset a given event actually joins is computed per-event by
+   * {@link UserLimitEngine.sharedPoolKeys} (a model-scoped shared sub-cap is joined
+   * only when the event's requested model is in its scope). The recorder stamps the
+   * first key on `usage_events.budget_partition` and spills the rest to
+   * `usage_event_partitions` (Option A). A single rule may now declare several shared
+   * pools (up to the normalizer's bound), so this is a set, not a scalar.
    */
-  ledgerPartitionKey?: string;
+  ledgerPartitionKeys: string[];
   /** Templated refusal (§12), resolved independently. */
   messageTemplate?: string;
 }
@@ -413,7 +419,7 @@ export class UserLimitEngine {
         matchMultiDimension(r.space, ctx.spaceIds),
     );
     if (matching.length === 0) {
-      return { matched: false, active: false, banned: false, constraints: [] };
+      return { matched: false, active: false, banned: false, constraints: [], ledgerPartitionKeys: [] };
     }
     const budgetRule = matching.find((r) => r.hasBudgetBlock);
     const messageTemplate = matching.find((r) => r.messageTemplate !== undefined)?.messageTemplate;
@@ -421,7 +427,14 @@ export class UserLimitEngine {
     if (!budgetRule) {
       // Matched only message-override rules → no budget block ⇒ inert budget, but
       // the message still cascades (used only if some OTHER gate refuses; here none).
-      return { matched: true, active: false, banned: false, constraints: [], messageTemplate };
+      return {
+        matched: true,
+        active: false,
+        banned: false,
+        constraints: [],
+        ledgerPartitionKeys: [],
+        messageTemplate,
+      };
     }
 
     const constraints: ResolvedConstraint[] = [];
@@ -433,8 +446,13 @@ export class UserLimitEngine {
       // any non-empty-partition constraint on the SAME rule still apply.
       if (resolved !== undefined) constraints.push(resolved);
     }
-    // The single shared-pool key to denormalize (Phase-1: ≤ 1 distinct per rule).
-    const ledgerPartitionKey = constraints.find((c) => !c.isUserPartition)?.partitionKey;
+    // The DISTINCT shared-pool keys this session may denormalize (spec
+    // MULTI-SHARED-POOL §4) — model-blind superset; per-event narrowing is
+    // `sharedPoolKeys`. Order-preserving dedupe so the FIRST (scalar fast-path) key is
+    // stable across events of the same session.
+    const ledgerPartitionKeys = [
+      ...new Set(constraints.filter((c) => !c.isUserPartition).map((c) => c.partitionKey)),
+    ];
     const banned =
       budgetRule.models?.length === 0 ||
       constraints.some((c) => c.modelScope === undefined && c.cap === 0);
@@ -445,9 +463,31 @@ export class UserLimitEngine {
       banned,
       models: budgetRule.models,
       constraints,
-      ledgerPartitionKey,
+      ledgerPartitionKeys,
       messageTemplate,
     };
+  }
+
+  /**
+   * The DISTINCT shared-pool keys a single committed event actually joins (spec
+   * MULTI-SHARED-POOL §4) — the model-AWARE narrowing of `resolution.ledgerPartitionKeys`
+   * the recorder stamps onto the ledger. Coverage mirrors {@link record} EXACTLY: a
+   * model-agnostic shared pool (`modelScope === undefined`) is always joined; a
+   * model-scoped shared sub-cap is joined only when `coverageModelId` is in its scope.
+   * `coverageModelId` is the REQUESTED model for an agent-loop event and `undefined`
+   * for the tool lane (which never joins a model-scoped sub-cap, issue #14). Order
+   * follows constraint order so the first key is the stable scalar fast-path member.
+   */
+  sharedPoolKeys(resolution: UserLimitResolution, coverageModelId: string | undefined): string[] {
+    const keys: string[] = [];
+    for (const c of resolution.constraints) {
+      if (c.isUserPartition) continue;
+      if (c.modelScope !== undefined) {
+        if (coverageModelId === undefined || !c.modelScope.includes(coverageModelId)) continue;
+      }
+      if (!keys.includes(c.partitionKey)) keys.push(c.partitionKey);
+    }
+    return keys;
   }
 
   private resolveConstraint(
