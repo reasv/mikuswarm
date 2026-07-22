@@ -25,6 +25,11 @@ jobs:
         # browser image build, not by the unit tests.
         uses: actions/checkout@v4
 
+      - name: Install ripgrep
+        # The workspace search/memory tools spawn `rg`; the unit tests exercise
+        # that path, so ripgrep must be on PATH (not preinstalled on the runner).
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Setup Node 24 + pnpm
         uses: actions/setup-node@v4
         with:
