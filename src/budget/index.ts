@@ -3,6 +3,7 @@ export {
   BudgetEngine,
   makeRateLimitedClaimGate,
   makeChainClaimGate,
+  makeAgentLoopChainClaimGate,
   type AdmissionResult,
   type BlockingRule,
   type BudgetHooks,

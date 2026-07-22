@@ -150,6 +150,15 @@ export interface BudgetEngineOptions {
    * Absent → the session gate's logical dimension falls back to the upstream id.
    */
   resolveLogicalModelId?: (sessionType: string) => string | undefined;
+  /**
+   * Resolve a session type's FULL fallback chain as logical ids, head-first (spec
+   * MODEL-FALLBACK §6.1). Used by the dependency cascade so a prerequisite is judged
+   * unavailable only when EVERY chain member is over budget — a model-scoped cap on
+   * the prerequisite's head must not refuse a dependent session that the prerequisite
+   * could still serve on a fallback. Absent (or empty result) → the cascade falls
+   * back to the head-only `resolveLogicalModelId` behavior.
+   */
+  resolveModelChainLogicalIds?: (sessionType: string) => string[];
   logger: Logger;
   now?: () => number;
   /** Fraction at which a rule is "near" its cap in the console (default 0.8). */
@@ -399,7 +408,10 @@ export class BudgetEngine {
    * the primary's exhausted budget would wrongly drop a session a fallback could
    * serve. A WILDCARD (no `models` selector) rule at cap covers every member, so it
    * still refuses (correct: global exhaustion has no cheaper escape). The structural
-   * dependency cascade (§2.1) is unchanged — it gates on each dependency's head.
+   * dependency cascade (§2.1) is chain-aware too: a prerequisite is unavailable only
+   * when EVERY member of ITS chain is over budget (via `resolveModelChainLogicalIds`),
+   * so a model-scoped cap on a prerequisite's head does not refuse a dependent session
+   * the prerequisite could still serve on a fallback.
    *
    * `chainLogicalIds` is head-first; an empty list falls back to gating on the
    * descriptor's upstream id (the no-virtual-model case). The reported `ownBlocking`
@@ -430,18 +442,37 @@ export class BudgetEngine {
     for (const dep of deps) {
       const depModel = this.options.resolveModelId(dep);
       if (depModel === undefined) continue;
-      const depCheck = this.check({
-        class: "agent_loop",
-        sessionType: dep,
-        modelId: depModel,
-        logicalModelId: this.options.resolveLogicalModelId?.(dep),
-      });
-      if (!depCheck.allowed) {
+      // Chain-aware (spec MODEL-FALLBACK §6.1): the prerequisite is available iff ANY
+      // of ITS chain members has headroom — the prerequisite's own worker pool serves
+      // the first in-budget member (its claim gate is chain-aware too), so a cap on
+      // the prerequisite's head (e.g. summarization on GLM) must not refuse a dependent
+      // reply the prerequisite could still produce on a fallback (e.g. DeepSeek). A
+      // WILDCARD rule covers every member and still refuses (global exhaustion has no
+      // escape). Falls back to head-only when no chain resolver / empty chain.
+      const depChain = this.options.resolveModelChainLogicalIds?.(dep) ?? [];
+      const depLogicalIds: (string | undefined)[] =
+        depChain.length > 0 ? depChain : [this.options.resolveLogicalModelId?.(dep)];
+      let depHeadCheck: CheckResult | undefined;
+      let depAdmitted = false;
+      for (const logicalModelId of depLogicalIds) {
+        const depCheck = this.check({
+          class: "agent_loop",
+          sessionType: dep,
+          modelId: depModel,
+          logicalModelId,
+        });
+        if (depHeadCheck === undefined) depHeadCheck = depCheck;
+        if (depCheck.allowed) {
+          depAdmitted = true;
+          break;
+        }
+      }
+      if (!depAdmitted) {
         return {
           allowed: false,
           ownBlocking: [],
-          dependency: { sessionType: dep, blocking: depCheck.blockingRules },
-          primary: depCheck.primary,
+          dependency: { sessionType: dep, blocking: depHeadCheck!.blockingRules },
+          primary: depHeadCheck!.primary,
         };
       }
     }
@@ -634,5 +665,48 @@ export function makeChainClaimGate(opts: {
       engine.logBlocked("worker_claim", engine.check(head).blockingRules, head);
     }
     return true;
+  };
+}
+
+/**
+ * Build a MULTI-LANE chain-aware claim gate (spec MODEL-FALLBACK §6): a pool that
+ * serves several distinct session types (e.g. summarization does `summarize` +
+ * `condense`) parks when ANY lane cannot make progress, where a lane is a session
+ * type and can progress iff ANY member of ITS OWN fallback chain has headroom. This
+ * is the per-lane {@link makeChainClaimGate} composed across lanes with the
+ * distinct-session-type "park if any lane is stuck" conservatism of
+ * {@link makeRateLimitedClaimGate} — but chain-aware, so a model-scoped cap on a
+ * lane's HEAD (which the per-attempt resolver would fall past) never parks the pool.
+ *
+ * `lanes` is resolved lazily each call; each inner array is one lane's chain
+ * descriptors, head-first. An empty lane (unresolvable session type) is skipped —
+ * it never parks the pool. On pause it emits one rate-limited (≤1/min)
+ * `usage_limit_blocked` log naming the rules blocking the stuck lane's HEAD.
+ */
+export function makeAgentLoopChainClaimGate(opts: {
+  engine: BudgetEngine | (() => BudgetEngine | undefined);
+  lanes: () => SpendDescriptor[][];
+  now?: () => number;
+}): () => boolean {
+  const now = opts.now ?? Date.now;
+  const resolveEngine =
+    typeof opts.engine === "function" ? opts.engine : () => opts.engine as BudgetEngine;
+  let lastPauseLog = 0;
+  return () => {
+    const engine = resolveEngine();
+    if (!engine) return false; // engine not yet wired → never park, never log
+    for (const chain of opts.lanes()) {
+      if (chain.length === 0) continue; // unresolvable lane → don't park on it
+      const available = chain.some((descriptor) => engine.check(descriptor).allowed);
+      if (available) continue;
+      const head = chain[0]!;
+      const t = now();
+      if (t - lastPauseLog > 60_000) {
+        lastPauseLog = t;
+        engine.logBlocked("worker_claim", engine.check(head).blockingRules, head);
+      }
+      return true;
+    }
+    return false;
   };
 }
