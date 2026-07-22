@@ -1031,6 +1031,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         rules: normalizedUser.rules,
         sumUsageCost: (filter) => storage.sumUsageCost(filter),
         minUsageTs: (filter) => storage.minUsageTs(filter),
+        listUsageIdentities: (opts) => storage.listUsageIdentities(opts),
         // Face cost rates of the REQUESTED model (§7) — per-MTok, by logical id,
         // incl. the prompt-cache rates the §5.3 estimate prices prior context at.
         costRatesFor: (logicalId) => {
@@ -1046,10 +1047,22 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
         viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
+        // The bot's own MXIDs (per account) — excluded (with non-MXID system senders)
+        // from the per-user console surface, since per-user limits don't govern
+        // self/system/proactive spend (Gate A is skipped for those lanes).
+        selfUserIds: new Set(
+          Object.values(config.matrix.accounts)
+            .map((a) => a.user_id)
+            .filter((id): id is string => typeof id === "string" && id.length > 0),
+        ),
         logger: logger.child("user-limits"),
       });
       userLimitEngine = ul;
       if (ul.enabled) {
+        // Seed meters from the ledger BEFORE start()/first use so a partition
+        // partially consumed before this restart is visible immediately, not $0 until
+        // a live turn re-materializes it (symmetric with BudgetEngine's ctor seed).
+        ul.seedFromLedger();
         ul.start();
         logger.info("user_limits_active", { rules: normalizedUser.rules.length });
       }

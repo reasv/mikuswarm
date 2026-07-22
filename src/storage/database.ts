@@ -1102,6 +1102,17 @@ export interface UsageCostFilter {
 }
 
 /**
+ * A distinct spend identity in the ledger — a `trigger_sender_id` and, when a rule
+ * scopes by them, the `room_id` / `space_id` it spent under. {@link Storage.listUsageIdentities}
+ * returns these for {@link UserLimitEngine}'s startup meter seeding (spec PER-USER-LIMITS §14).
+ */
+export interface UsageIdentity {
+  senderId: string;
+  roomId?: string;
+  spaceId?: string;
+}
+
+/**
  * Extract the bare Matrix room id from a `timeline_key` (spec PER-USER-LIMITS §8.3)
  * for the denormalized `room_id` column. Delegates to the shared leaf derivation in
  * `./timeline-key.js` (the SAME regex the timeline layer's `roomIdFromTimelineKey`
@@ -3899,6 +3910,44 @@ export class Storage {
         .prepare(`select min(ts) as t from usage_events where ${clauses.join(" and ")}`)
         .get(...params) as { t: number | null };
       return row.t ?? null;
+    });
+  }
+
+  /**
+   * Distinct spend identities present in the ledger since `since` (ms epoch) — the
+   * inputs the {@link UserLimitEngine} replays at startup to re-materialize per-user
+   * meters that were partially consumed before a restart (spec PER-USER-LIMITS §14).
+   * The engine cannot enumerate its meter keys from config alone (they depend on the
+   * runtime trigger sender / room / parent space), so it discovers them from the
+   * ledger here. Only rows with a non-null `trigger_sender_id` are returned — a
+   * per-user `{user_id}` counter has no identity without a sender, and shared pools
+   * are re-materialized by replaying whichever senders DID spend (their ctx renders
+   * the pool key). `includeRoom` / `includeSpace` collapse the DISTINCT set to just
+   * the dimensions some rule actually scopes by, so a config with no room/space rules
+   * returns one row per sender rather than one per (sender, room, space).
+   */
+  listUsageIdentities(opts: {
+    since: number;
+    includeRoom: boolean;
+    includeSpace: boolean;
+  }): UsageIdentity[] {
+    const cols = ["trigger_sender_id as senderId"];
+    if (opts.includeRoom) cols.push("room_id as roomId");
+    if (opts.includeSpace) cols.push("space_id as spaceId");
+    const sql =
+      `select distinct ${cols.join(", ")} from usage_events ` +
+      `where ts >= ? and trigger_sender_id is not null`;
+    return this.read((db) => {
+      const rows = db.prepare(sql).all(opts.since) as Array<{
+        senderId: string;
+        roomId?: string | null;
+        spaceId?: string | null;
+      }>;
+      return rows.map((r) => ({
+        senderId: r.senderId,
+        roomId: r.roomId ?? undefined,
+        spaceId: r.spaceId ?? undefined,
+      }));
     });
   }
 

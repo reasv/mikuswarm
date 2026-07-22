@@ -24,7 +24,7 @@
 // =============================================================================
 
 import type { Logger } from "../observability/logger.js";
-import type { UsageCostFilter } from "../storage/database.js";
+import type { UsageCostFilter, UsageIdentity } from "../storage/database.js";
 import { type WindowSpec, resolveWindow } from "./window.js";
 
 // ─── Trigger context (§10) ───────────────────────────────────────────────────
@@ -100,6 +100,13 @@ export interface ResolvedConstraint {
   spaceScope?: string;
   /** Source rule order + index (diagnostics / console). */
   source: { ruleOrder: number; index: number };
+  /**
+   * Console ladder sort key (§14): caps order by the rule's `models` PREFERENCE list, not
+   * the authored constraint index. A single-model cap sorts at its model's preference
+   * position; a composite (≥2 models) sorts right AFTER its last member, with singles
+   * before composites at the same rung. Encoded `maxPrefIndex*1000 + memberCount`.
+   */
+  orderKey: number;
 }
 
 /** The cascade-resolved per-user budget + selection view for one trigger ctx. */
@@ -185,6 +192,17 @@ export interface UserLimitEngineOptions {
   sumUsageCost: (filter: UsageCostFilter) => number;
   /** Earliest contributing `ts` for the accurate rolling reset ETA (off the hot path). */
   minUsageTs?: (filter: UsageCostFilter) => number | null;
+  /**
+   * Distinct spend identities in the ledger since a timestamp — drives startup meter
+   * seeding (see {@link UserLimitEngine.seedFromLedger}). Optional, mirroring
+   * `minUsageTs`: when omitted, meters are NOT pre-seeded and materialize lazily on the
+   * first live gate/record for a partition (the pre-seeding restart-visibility gap).
+   */
+  listUsageIdentities?: (opts: {
+    since: number;
+    includeRoom: boolean;
+    includeSpace: boolean;
+  }) => UsageIdentity[];
   /** Face cost rates (per MTok) of a REQUESTED model, by logical id. */
   costRatesFor: (logicalId: string) => ModelCostRates | undefined;
   /** Model default `max_tokens`, by logical id — the upper bound on the output cap. */
@@ -194,6 +212,14 @@ export interface UserLimitEngineOptions {
   /** Minimum affordable output below which a model can't complete a turn (§5.3). */
   viableMinOutputTokens: number;
   logger: Logger;
+  /**
+   * The agent's OWN Matrix ids (one per configured account). Per-user limits apply only
+   * to human triggers that pass Gate A — proactive / background / self / system sessions
+   * skip it (ARCHITECTURE.md §8g) — so the console must not surface the bot's own accounts
+   * (or a non-MXID system sender like "system") as rate-limited "users". Seeding + the
+   * grouped console view drop any user partition that isn't a real MXID or is one of these.
+   */
+  selfUserIds?: ReadonlySet<string>;
   now?: () => number;
   /** Fraction at which a meter is "near" its cap (console). Default 0.8. */
   nearThreshold?: number;
@@ -226,6 +252,13 @@ interface MeterState {
   partitionKey: string;
   isUserPartition: boolean;
   modelScope?: string[];
+  /**
+   * Console ladder sort key — the PREFERENCE-order position of this cap (see
+   * `ResolvedConstraint.orderKey`): single caps at their model's preference index, a
+   * composite right after its last member. Folded with `Math.min` when constraints share
+   * a meter, so the order is stable. NOT the authored constraint index, NOT fill %.
+   */
+  orderIndex: number;
 }
 
 /** Seed/recompute filter for one meter (the dimensions identifying its spend). */
@@ -254,6 +287,8 @@ export interface UserLimitStatus {
   partitionKey: string;
   isUserPartition: boolean;
   modelScope?: string[];
+  /** Preference-order sort key — the ladder order the console renders in (§14). */
+  orderIndex: number;
   spentUsd: number;
   capUsd: number;
   fraction: number;
@@ -262,6 +297,18 @@ export interface UserLimitStatus {
     | { type: "rolling"; duration: string }
     | { type: "calendar"; period: "day" | "week" | "month"; tz: string };
   resetsAt: number;
+}
+
+/** One partition's rollup for the paginated console surface (spec §14). */
+export interface UserLimitGroup {
+  partitionKey: string;
+  isUserPartition: boolean;
+  /** Worst state across the partition's meters (the sort key + header badge). */
+  state: "ok" | "near" | "blocked";
+  /** Peak fill fraction across the partition's meters (secondary sort key). */
+  peakFraction: number;
+  /** All the partition's meters — the console folds them into one ladder strip. */
+  meters: UserLimitStatus[];
 }
 
 // ─── Glob + partition-template helpers ────────────────────────────────────────
@@ -371,6 +418,8 @@ export class UserLimitEngine {
   private timer: ReturnType<typeof setInterval> | undefined;
   /** True when any rule references space (a `space` match or a `{space_id}` partition). */
   readonly usesSpace: boolean;
+  /** True when any rule references room (a `room` match or a `{room_id}` partition). */
+  readonly usesRoom: boolean;
 
   constructor(private readonly options: UserLimitEngineOptions) {
     this.rules = [...options.rules].sort((a, b) => a.order - b.order);
@@ -381,6 +430,9 @@ export class UserLimitEngine {
     // a `space` match dimension or a `{space_id}` partition template.
     this.usesSpace = this.rules.some(
       (r) => r.space !== undefined || r.constraints.some((c) => c.partition.includes("{space_id}")),
+    );
+    this.usesRoom = this.rules.some(
+      (r) => r.room !== undefined || r.constraints.some((c) => c.partition.includes("{room_id}")),
     );
   }
 
@@ -399,6 +451,78 @@ export class UserLimitEngine {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
+    }
+  }
+
+  /**
+   * Re-materialize meters for spend already on the ledger this window (spec
+   * PER-USER-LIMITS §14). Call ONCE at startup before {@link start}, mirroring how
+   * {@link BudgetEngine} seeds its global rule meters in its constructor. Without it a
+   * partition partially consumed before a restart reads $0 until the next live
+   * gate/record for it lazily re-creates its meter (the restart-visibility gap).
+   *
+   * Meter keys depend on the runtime trigger sender / room / parent space, so they
+   * can't be enumerated from config — we discover the identities that DID spend from
+   * the ledger (`listUsageIdentities`) and replay each through the SAME
+   * `resolve()`→`meterFor()` path the live gates use, so the meterKey/seed logic is
+   * identical (no drift). `meterFor` sums each meter from the ledger, restoring its
+   * true accumulated spend. Zero-spend meters are then pruned: a full replay would
+   * materialize every sub-cap (incl. never-hit caps and cap-0 bans) at $0 for every
+   * past spender, flooding the console. Seeding restores *consumed* budget after a
+   * restart; a never-consumed cap has nothing to restore and the live path re-creates
+   * it lazily (enforcement is unaffected — bans still gate at resolve, not from a meter).
+   *
+   * Coverage corner: only non-null `trigger_sender_id` identities are replayed, so a
+   * shared pool whose window spend is EXCLUSIVELY autonomous (no human trigger, e.g.
+   * proactive-only) is not pre-seeded; it re-materializes on the next human turn that
+   * resolves it. Aggregate reply pools always carry human spend, so this rarely bites.
+   */
+  /**
+   * True when `senderId` is a real Matrix user the per-user limits actually govern — a
+   * genuine MXID (`@user:hs`) that is NOT the agent's own account. Excludes non-MXID
+   * system senders (e.g. "system") and the bot itself, whose spend rides lanes that skip
+   * Gate A (ARCHITECTURE.md §8g), so they must never appear as rate-limited "users".
+   */
+  private isEnforceableUser(senderId: string): boolean {
+    return senderId.startsWith("@") && !this.options.selfUserIds?.has(senderId);
+  }
+
+  seedFromLedger(): void {
+    const list = this.options.listUsageIdentities;
+    if (!list || this.rules.length === 0) return;
+    const now = this.now();
+    // Widest lookback across every constraint's current window — an identity that only
+    // spent inside a narrower window is still enumerated (it falls within the widest),
+    // and each meter sums its OWN window, so narrower meters read correctly.
+    let earliest: number | undefined;
+    for (const rule of this.rules) {
+      for (const c of rule.constraints) {
+        const start = resolveWindow(c.window, now).start;
+        if (earliest === undefined || start < earliest) earliest = start;
+      }
+    }
+    if (earliest === undefined) return; // no constraints anywhere → nothing to seed
+    const identities = list({
+      since: earliest,
+      includeRoom: this.usesRoom,
+      includeSpace: this.usesSpace,
+    });
+    for (const id of identities) {
+      // Never seed the bot itself or a non-MXID system sender — per-user limits don't
+      // govern their spend (Gate A is skipped for those lanes), so materializing a meter
+      // would surface a phantom "user" the console must not show.
+      if (!this.isEnforceableUser(id.senderId)) continue;
+      const ctx: UserLimitContext = {
+        userId: id.senderId,
+        roomId: id.roomId,
+        spaceIds: id.spaceId ? [id.spaceId] : undefined,
+      };
+      for (const c of this.resolve(ctx).constraints) this.meterFor(c);
+    }
+    // Prune every zero-spend meter a full replay materializes (a spender who never used
+    // a given sub-cap, plus cap-0 bans) — only consumed budget is worth pre-showing.
+    for (const [key, state] of this.meters) {
+      if (state.spent <= 0) this.meters.delete(key);
     }
   }
 
@@ -508,6 +632,21 @@ export class UserLimitEngine {
     const roomScope = rule.room ? ctx.roomId : undefined;
     const spaceScope = rule.space ? ctx.spaceIds?.[0] : undefined;
     const modelScope = c.models ? [...c.models].sort() : undefined;
+    // Preference-order sort key for the console ladder (§14): order caps by the rule's
+    // `models` preference list. A single-model cap → its model's preference index; a
+    // composite (≥2 models) → the MAX preference index of its members (so it lands right
+    // after the last model it's built from), then memberCount so a single precedes a
+    // composite at the same rung (e.g. sol, terra, sol+terra, glm). A fungible total
+    // (no scope) sorts first. Falls back to the authored index if the rule lists no models.
+    const prefIndex = (m: string): number => {
+      const i = rule.models?.indexOf(m) ?? -1;
+      return i < 0 ? (rule.models?.length ?? 0) : i; // unknown model → after all known
+    };
+    const orderKey = rule.models
+      ? modelScope && modelScope.length > 0
+        ? Math.max(...modelScope.map(prefIndex)) * 1000 + modelScope.length
+        : -1000
+      : c.index;
     // Unambiguous meter identity (#6): JSON-encode the structured tuple rather than
     // `#`-join it, so a literal partition or model id that itself contains `#` can
     // never collide two distinct meters or split one. The key is OPAQUE — the console
@@ -531,6 +670,7 @@ export class UserLimitEngine {
       roomScope,
       spaceScope,
       source: { ruleOrder: rule.order, index: c.index },
+      orderKey,
     };
   }
 
@@ -552,8 +692,10 @@ export class UserLimitEngine {
       this.rollIfNeeded(existing);
       // Two constraints that share a meterKey share one counter; the binding (least)
       // cap governs the badge (#2). Fold it on each touch so the order of first access
-      // doesn't matter.
+      // doesn't matter. The ladder order likewise folds to the least (earliest-authored)
+      // index for a stable console position.
       existing.cap = Math.min(existing.cap, c.cap);
+      existing.orderIndex = Math.min(existing.orderIndex, c.orderKey);
       return existing;
     }
     const now = this.now();
@@ -569,6 +711,7 @@ export class UserLimitEngine {
       partitionKey: c.partitionKey,
       isUserPartition: c.isUserPartition,
       modelScope: c.modelScope,
+      orderIndex: c.orderKey,
     };
     this.meters.set(c.meterKey, state);
     return state;
@@ -870,6 +1013,7 @@ export class UserLimitEngine {
         partitionKey: state.partitionKey,
         isUserPartition: state.isUserPartition,
         modelScope: state.modelScope,
+        orderIndex: state.orderIndex,
         spentUsd: state.spent,
         capUsd: cap,
         fraction: Number.isFinite(fraction) ? fraction : 1,
@@ -882,5 +1026,47 @@ export class UserLimitEngine {
       });
     }
     return out;
+  }
+
+  /**
+   * Every materialized meter grouped by partition and sorted hottest-first, split into
+   * `individuals` (per-user partitions) and `shared` pools (spec §14). The console
+   * paginates each side SERVER-side (`/api/usage/user-limits`) so the view scales to any
+   * number of users — the whole meter set never ships at once. The group sort MIRRORS
+   * the console's `buildLadder` group order (worst state, then peak fill, then key), so
+   * a server page is a contiguous top-slice under the same order the client renders in.
+   */
+  groupedStatuses(): { individuals: UserLimitGroup[]; shared: UserLimitGroup[] } {
+    const RANK = { blocked: 0, near: 1, ok: 2 } as const;
+    const groups = new Map<string, UserLimitGroup>();
+    for (const s of this.statuses()) {
+      // Defensively drop non-human user partitions (bot / system) even if one ever
+      // materialized at runtime — seeding already skips them (see isEnforceableUser).
+      if (s.isUserPartition && !this.isEnforceableUser(s.partitionKey)) continue;
+      const gk = `${s.isUserPartition ? "u" : "p"} ${s.partitionKey}`;
+      let g = groups.get(gk);
+      if (!g) {
+        g = {
+          partitionKey: s.partitionKey,
+          isUserPartition: s.isUserPartition,
+          state: "ok",
+          peakFraction: 0,
+          meters: [],
+        };
+        groups.set(gk, g);
+      }
+      g.meters.push(s);
+      if (RANK[s.state] < RANK[g.state]) g.state = s.state;
+      if (s.fraction > g.peakFraction) g.peakFraction = s.fraction;
+    }
+    const hot = (a: UserLimitGroup, b: UserLimitGroup): number =>
+      RANK[a.state] - RANK[b.state] ||
+      b.peakFraction - a.peakFraction ||
+      a.partitionKey.localeCompare(b.partitionKey);
+    const all = [...groups.values()];
+    return {
+      individuals: all.filter((g) => g.isUserPartition).sort(hot),
+      shared: all.filter((g) => !g.isUserPartition).sort(hot),
+    };
   }
 }

@@ -7,7 +7,8 @@ import {
 	UsageSessions,
 	UsageToolCalls,
 	UsageLeaderboard,
-	UsageBudgets
+	UsageBudgets,
+	UserLimitsPage
 } from '$lib/schemas';
 
 /**
@@ -50,5 +51,16 @@ export const getUsageLeaderboard = query(WindowArg, (arg) =>
 	apiGet(`/api/usage/leaderboard?window=${encodeURIComponent(arg.window)}`, UsageLeaderboard)
 );
 
-/** GET /api/usage/budgets — every configured rule's live status. */
+/** GET /api/usage/budgets — every configured rule's live status + live per-user picks. */
 export const getUsageBudgets = query(() => apiGet('/api/usage/budgets', UsageBudgets));
+
+/** Per-user-limits page selector: which scope (individuals / shared pools) + page. */
+const UserLimitsArg = Schema.standardSchemaV1(
+	Schema.Struct({ scope: Schema.String, page: Schema.Number })
+);
+
+/** GET /api/usage/user-limits?scope=&page= — one hottest-first page of per-user meters. */
+export const getUserLimits = query(UserLimitsArg, (arg) => {
+	const q = new URLSearchParams({ scope: arg.scope, page: String(arg.page) });
+	return apiGet(`/api/usage/user-limits?${q.toString()}`, UserLimitsPage);
+});

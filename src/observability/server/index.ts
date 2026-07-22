@@ -24,6 +24,7 @@ import {
   usageToolCalls,
   usageLeaderboard,
   usageBudgets,
+  usageUserLimits,
 } from "./handlers.js";
 import {
   listPipelines,
@@ -109,6 +110,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/usage/tool-calls", usageToolCalls)
     .add("GET", "/api/usage/leaderboard", usageLeaderboard)
     .add("GET", "/api/usage/budgets", usageBudgets)
+    .add("GET", "/api/usage/user-limits", usageUserLimits)
     .add("GET", "/api/pipelines", listPipelines)
     .add("GET", "/api/pipelines/stream", pipelineActivityStream)
     .add("GET", "/api/pipelines/:pool/items", pipelineItems)

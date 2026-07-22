@@ -341,17 +341,43 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
 
 /**
  * GET /api/usage/budgets — every configured period rule's live status (§6.2 /
- * §7.1 #3) PLUS the per-user limits meters (spec PER-USER-LIMITS §14): each
- * materialized per-user / shared-pool counter's spent/cap/resetsAt per binding
- * constraint. `userLimits` is empty when the feature is off or no meter has
- * materialized yet (no human session has resolved a rule since startup).
+ * §7.1 #3) plus the live per-user session selections (spec PER-USER-LIMITS §14).
+ * The (unbounded) per-user meters live on the paginated `/api/usage/user-limits`
+ * so this always-polled payload stays small; only `rules` + `userSelections` (both
+ * few) ride here.
  */
 export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];
-  const userLimits = ctx.deps.userLimitEngine?.statuses() ?? [];
   // The currently-selected model of every live per-user session (spec §14).
   const userSelections = ctx.deps.userLimitEngine?.activeSelections() ?? [];
-  sendJson(res, 200, { rules, userLimits, userSelections });
+  sendJson(res, 200, { rules, userSelections });
+}
+
+/** Per-user-limits page size — groups (users / pools), not meters, per page. */
+const USER_LIMITS_PAGE_SIZE = 20;
+
+/**
+ * GET /api/usage/user-limits?scope=individuals|shared&page=N — one page of the
+ * per-user / shared-pool meters (spec PER-USER-LIMITS §14), grouped by partition and
+ * sorted hottest-first SERVER-side so the view scales to any number of users. Returns
+ * the requested scope's page (all meters for the page's partitions) plus both scope
+ * group counts (`totals`, for the tab badges + pager). Empty when the feature is off.
+ */
+export function usageUserLimits(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  const grouped = ctx.deps.userLimitEngine?.groupedStatuses() ?? { individuals: [], shared: [] };
+  const scope = ctx.url.searchParams.get("scope") === "shared" ? "shared" : "individuals";
+  const groups = scope === "shared" ? grouped.shared : grouped.individuals;
+  const pageSize = USER_LIMITS_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(groups.length / pageSize));
+  const page = Math.min(Math.max(Number(ctx.url.searchParams.get("page")) || 0, 0), pageCount - 1);
+  const meters = groups.slice(page * pageSize, page * pageSize + pageSize).flatMap((g) => g.meters);
+  sendJson(res, 200, {
+    scope,
+    page,
+    pageSize,
+    meters,
+    totals: { individuals: grouped.individuals.length, shared: grouped.shared.length },
+  });
 }
 
 /**
