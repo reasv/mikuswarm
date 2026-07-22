@@ -2364,7 +2364,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const eventForRender = buildReplyHydratedEvent(inbound, target, followUpHydratedEvent(inbound));
     let imageBlocks: ImageBlock[] | undefined;
     try {
-      const blocks = await contextBuilder.conditionEventImages(eventForRender);
+      const blocks = await contextBuilder.conditionEventImages(
+        eventForRender,
+        factory.resolveSessionType(sessions.get(coReplySessionId)?.sessionType ?? "default"),
+      );
       if (blocks.length > 0) {
         imageBlocks = blocks;
         contextBuilder.markEventImageBlocks([eventForRender], blocks);
@@ -2730,7 +2733,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     let imageBlocks: ImageBlock[] | undefined;
     if (form === "media") {
       try {
-        const blocks = await contextBuilder.conditionEventImages(hydrated);
+        const blocks = await contextBuilder.conditionEventImages(
+          hydrated,
+          factory.resolveSessionType(sessions.get(sessionId)?.sessionType ?? "default"),
+        );
         if (blocks.length > 0) {
           imageBlocks = blocks;
           // Mark the same `hydrated` object the interjection renders so its
@@ -3095,10 +3101,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // type's override (or a non-default model) shapes the tool budget too.
     const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
 
-    // Whether the default (agent-loop) model accepts image input (spec
-    // MODEL-FALLBACK §3): gates vision-dependent tool wiring below (read_image
-    // inclusion, media/danbooru/find_source inline-vs-caption fallback).
-    const defaultModelSeesImages = config.models.default.input_modalities.includes("image");
+    // Whether THIS session's reply model — the session-type model, the one that
+    // actually serves the turn, NOT `[models.default]` (which may be a different,
+    // text-only model) — accepts image input (spec MODEL-FALLBACK §3). Gates
+    // vision-dependent tool wiring below (read_image inclusion, media/danbooru/
+    // find_source inline-vs-caption fallback) on the serving model's own capability,
+    // never another model's.
+    const replyModelConfig =
+      config.models[factory.resolveSessionType(sessionType)?.model ?? "default"] ?? config.models.default;
+    const replyModelSeesImages = replyModelConfig.input_modalities.includes("image");
 
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
     // x_search). Feeds the per-session cost ceiling's combined-spend lane in-memory
@@ -3251,7 +3262,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             config: config.browser,
             // Same shared per-model base64 cap read_image uses, so inline
             // screenshots respect the model's per-image budget (issue #2).
-            maxImageBytes: resolveReadImageMaxBytes(config),
+            maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
             // Upload paths resolve within (and are confined to) the workspace (§6).
             workspaceRoot,
           })]
@@ -3269,11 +3280,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         workspaceRoot,
         clients: captionClients,
         defaultPrompts,
-        modelHasVision: defaultModelSeesImages,
+        modelHasVision: replyModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
         fetchClient,
       }),
-      ...(defaultModelSeesImages ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config) })] : []),
+      ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
       createSearchMemoryTool({ workspaceRoot }),
       ...(retrieval
         ? [
@@ -3290,11 +3301,11 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createDanbooruTool({
         workspaceRoot,
         downloadSizeLimit,
-        inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+        inlineImageMaxBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
         inferenceImageOptions,
         // When the default model lacks vision, `preview` describes the asset via
         // the captioning model instead of emitting an unusable image block.
-        modelHasVision: defaultModelSeesImages,
+        modelHasVision: replyModelSeesImages,
         imageCaptionClient: captionClients.get("image"),
         fetchClient,
         httpProxyUrl: config.network?.http_proxy_url,
@@ -3308,7 +3319,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             // Same shared per-model base64 cap + conditioning pipeline as
             // read_image / the danbooru preview path, so view_media blocks
             // respect the model's per-image budget.
-            maxImageBytes: resolveReadImageMaxBytes(config),
+            maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
             inferenceImageOptions,
             config: fxTwitterConfig.tool,
             statusHosts: fxTwitterConfig.statusHosts,
@@ -3319,7 +3330,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             workspaceRoot,
             fetchClient,
             downloadSizeLimit,
-            inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+            inlineImageMaxBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
             inferenceImageOptions,
             httpProxyUrl: config.network?.http_proxy_url,
             scheduler: llmScheduler,
@@ -3353,9 +3364,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             fetchClient,
             // Same shared per-model base64 cap + conditioning pipeline as
             // read_image / danbooru preview, for the view-thumbnail path.
-            inlineImageMaxBytes: resolveReadImageMaxBytes(config),
+            inlineImageMaxBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
             inferenceImageOptions,
-            modelHasVision: defaultModelSeesImages,
+            modelHasVision: replyModelSeesImages,
             rateLimiter: sauceNaoRateLimiter,
             maxWaitMs: sauceNaoConfig.rate_limit?.max_wait_ms,
             httpProxyUrl: config.network?.http_proxy_url,
@@ -5671,9 +5682,11 @@ export async function evaluateFollowUpResumeGate(args: {
   }
 }
 
-function resolveReadImageMaxBytes(config: AppConfig): number {
+function resolveReadImageMaxBytes(config: AppConfig, perModelBytes?: number): number {
   const DEFAULT_PER_MODEL = 5_242_880; // 5 MB base64 (≈ 3.75 MB raw before encoding).
-  const perModel = config.models.default.image_input_bytes ?? DEFAULT_PER_MODEL;
+  // Keyed on the SERVING (reply) model's own `image_input_bytes`, passed by the
+  // caller — never a fixed `[models.default]` read (which may be a different model).
+  const perModel = perModelBytes ?? DEFAULT_PER_MODEL;
   const candidates = [
     perModel,
     config.media?.download_size_limit,

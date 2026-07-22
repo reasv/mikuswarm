@@ -497,14 +497,18 @@ test("resume seeds the per-user running estimate from the resumed context (#1)",
 // === spec PER-USER-LIMITS §4.2 / review #3 ===================================
 // An image-bearing session whose entire per-user model set is text-only is a
 // TERMINAL per-user content-class deny (the capability filter emptied the set) —
-// never a fall-through to the ungated session-type default.
+// never a fall-through to the ungated session-type default. Pixel delivery keys off
+// the SESSION'S reply model (the session-type `default` block here), so for the deny
+// to trigger the reply model must be image-capable (pixels are built ⇒ multimodal
+// required) while the per-user preference set has no image-capable member. (A
+// text-only reply model would ship no pixels and just caption — no deny.)
 test("image session + text-only user model set is a terminal per-user deny, not ungated (#3)", async () => {
   let affordableCalls = 0;
   const resolution = {
     matched: true,
     active: true,
     banned: false,
-    models: ["default"], // the only configured model is text-only (minimalConfig)
+    models: ["textonly"], // per-user set is text-only, but the reply model (default) is multimodal
     constraints: [],
     ledgerPartitionKey: undefined,
   } as unknown as UserLimitResolution;
@@ -519,7 +523,21 @@ test("image session + text-only user model set is a terminal per-user deny, not 
   } as never;
 
   const factory = new AgentSessionFactory({
-    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    config: minimalConfig({
+      app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
+      // The reply model (session-type `default`) is image-capable → pixels are built →
+      // multimodal required; the per-user set points at a separate TEXT-ONLY model.
+      models: {
+        default: {
+          id: "vision-model", provider: "test", endpoint: "http://localhost", api_key: "key",
+          input_modalities: ["text", "image"], max_tokens: 4096, context_window: 128_000,
+        },
+        textonly: {
+          id: "text-model", provider: "test", endpoint: "http://localhost", api_key: "key",
+          input_modalities: ["text"], max_tokens: 4096, context_window: 128_000,
+        },
+      },
+    } as any),
     contextBuilder: stubContextBuilder(triggerBuilt()),
     getActiveSessions: () => [],
   });

@@ -520,7 +520,10 @@ export class ContextBuilder {
     // consume summaries and wait on / escalate jobs (spec §7.1/§7.3).
 
     // Proactive's synthetic trigger carries no attachments — no image blocks.
-    const imageBlocks = generation || proactive ? [] : await this.selectImageBlocks(options.trigger);
+    const imageBlocks =
+      generation || proactive
+        ? []
+        : await this.selectImageBlocks(options.trigger, this.replyModelCanSeeImages(options.sessionType));
     const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
 
     this.markImageBlocks(triggerEvents, imageBlockIds);
@@ -803,7 +806,10 @@ export class ContextBuilder {
       if (event) triggerEvents.push(event);
     }
     triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
-    const imageBlocks = await this.selectImageBlocks(options.trigger);
+    const imageBlocks = await this.selectImageBlocks(
+      options.trigger,
+      this.replyModelCanSeeImages(options.sessionType),
+    );
     this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
     const renderedTrigger = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
     // A follow-up fold prepends a one-line preamble so the resumed rollout sees the
@@ -1444,8 +1450,11 @@ export class ContextBuilder {
    * downloaded yet, or `processImageForInference` throws — the caller then steers a
    * caption-only interjection rather than blocking (§5.1 no-pixels branch).
    */
-  async conditionEventImages(event: CanonicalChatEvent): Promise<ImageBlock[]> {
-    return this.selectImageBlocks(event);
+  async conditionEventImages(
+    event: CanonicalChatEvent,
+    sessionType?: SessionTypeConfig,
+  ): Promise<ImageBlock[]> {
+    return this.selectImageBlocks(event, this.replyModelCanSeeImages(sessionType));
   }
 
   /**
@@ -1462,8 +1471,25 @@ export class ContextBuilder {
     this.markImageBlocks(events, new Set(blocks.map((b) => b.attachmentId)));
   }
 
-  private async selectImageBlocks(trigger: CanonicalChatEvent): Promise<ImageBlock[]> {
-    const canSeeImages = this.config.models.default?.input_modalities?.includes("image") ?? false;
+  /**
+   * Whether a session's REPLY MODEL accepts image input — the model that will
+   * actually serve the turn, resolved from the session type (`sessionType.model`,
+   * falling back to the `default` registry block only when a session type declares
+   * no model override, in which case `default` genuinely IS its model). This gates
+   * whether trigger images are shipped as pixels; it is a property of the serving
+   * model alone — a fallback member's or an unrelated model's modality never
+   * influences it. Text-only reply models get captions (always rendered) and no
+   * pixel blocks.
+   */
+  replyModelCanSeeImages(sessionType?: SessionTypeConfig): boolean {
+    const modelKey = sessionType?.model ?? "default";
+    return this.config.models[modelKey]?.input_modalities?.includes("image") ?? false;
+  }
+
+  private async selectImageBlocks(
+    trigger: CanonicalChatEvent,
+    canSeeImages: boolean,
+  ): Promise<ImageBlock[]> {
     if (!canSeeImages) return [];
     const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
