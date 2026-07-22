@@ -14,8 +14,8 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.75.4",
-    "@earendil-works/pi-ai": "0.75.4",
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "0.34.49",
     "better-sqlite3": "12.10.0",

@@ -1,6 +1,7 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
-import { streamSimple, completeSimple, createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
+import { streamSimple, completeSimple } from "@earendil-works/pi-ai/compat";
 import type { AppConfig } from "../config/index.js";
 import { dumpBuiltContext, CACHE_BOUNDARIES, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
 import type { ContextMessage } from "../context/builder.js";
