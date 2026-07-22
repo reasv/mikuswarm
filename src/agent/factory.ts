@@ -491,21 +491,25 @@ export class AgentSessionFactory {
     // to the member actually billed even when the head fell to a fallback.
     const resolvedMember: { logicalId: string } = { logicalId: modelKey };
     const budgetEngine = this.options.budget?.engine;
-    // Capability pre-filter (spec MODEL-FALLBACK §3 #1): when the session's RAW
-    // inputs carry image content, every viable member must accept image input
-    // (`input_modalities` includes "image") so a fall-over never ships image
-    // blocks to a text-only fallback. Derived from the
-    // raw inputs (trigger attachments / resume snapshot imageBlocks) because this
-    // runs BEFORE buildContext — a SAFE over-approximation (any raw image ⇒
-    // require multimodal for the whole session). The head is never dropped, so the
-    // enforcement ceiling (`buildModelFallback`'s `operativeContextWindow`, used at
-    // `contextCeiling` below) is still resolved ONCE over the capability-SURVIVING
-    // chain; it can only be EQUAL OR LARGER than the FULL-chain min computed by
-    // `resolveSessionContextCeiling` (which has no per-session image info), so both
-    // stay ≤ every serving member's window — the "ceiling resolved once" invariant
-    // holds. The two ceilings differ deliberately; see `resolveSessionContextCeiling`
-    // below for the matching half of this cross-reference.
-    const requiresMultimodal = rawInputsRequireMultimodal(session, opts);
+    // Capability pre-filter (spec MODEL-FALLBACK §3 #1): pixels are shipped for a
+    // session ONLY when its own reply model (`modelConfig` — the session-type model,
+    // resolved above) accepts image input; the builder gates pixel-block creation on
+    // exactly that (`ContextBuilder.replyModelCanSeeImages`). So the requirement is
+    // "the reply model can see images AND the raw inputs carry one" — a model's own
+    // capability, never `[models.default]`'s or a fallback's. When it holds, every
+    // viable chain member must also accept image input so a fall-over never ships
+    // pixels to a text-only member (the head is never dropped). Derived from the raw
+    // inputs (trigger attachments / resume snapshot imageBlocks) because this runs
+    // BEFORE buildContext — a SAFE over-approximation (any raw image ⇒ require
+    // multimodal). The head-never-dropped rule keeps the enforcement ceiling
+    // (`buildModelFallback`'s `operativeContextWindow`, used at `contextCeiling`
+    // below) resolved ONCE over the capability-SURVIVING chain; it can only be EQUAL
+    // OR LARGER than the FULL-chain min computed by `resolveSessionContextCeiling`
+    // (which has no per-session image info), so both stay ≤ every serving member's
+    // window — the "ceiling resolved once" invariant holds. The two ceilings differ
+    // deliberately; see `resolveSessionContextCeiling` for the matching half.
+    const replyModelCanSeeImages = modelConfig.input_modalities.includes("image");
+    const requiresMultimodal = replyModelCanSeeImages && rawInputsRequireMultimodal(session, opts);
     const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
     // Per-user selection (spec PER-USER-LIMITS §6): when an ACTIVE per-user rule is
     // supplied for this human session, the factory builds one composite per PREFERRED
@@ -1588,12 +1592,11 @@ function syntheticPlaceholderEvent(timelineKey: string): CanonicalChatEvent {
  * - Resume: any message in the persisted prefix snapshot that carries
  *   `imageBlocks`, plus the trigger-event attachments of the fresh appended turn.
  *
- * This is a deliberate, SAFE over-approximation (#6): "any image in the raw
- * inputs ⇒ require multimodal for the WHOLE session", so a session that carries a
- * picture is never allowed to fall over to a text-only fallback member (which
- * would receive image blocks it cannot serve). Generation modes (summarize /
- * condense / diary) and proactive sessions never send image pixels, so they
- * impose no requirement and keep the full fallback chain.
+ * This detects only whether an image is PRESENT in the raw inputs; whether that
+ * image is actually shipped as pixels (vs captioned) is the reply model's own
+ * capability, applied by the caller (`create` ANDs this with the resolved reply
+ * model's `input_modalities`). Generation modes (summarize / condense / diary) and
+ * proactive sessions never send image pixels, so they short-circuit to false.
  */
 export function rawInputsRequireMultimodal(
   session: AgentSessionRecord,

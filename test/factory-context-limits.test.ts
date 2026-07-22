@@ -343,6 +343,38 @@ test("rawInputsRequireMultimodal: resume snapshot carrying imageBlocks ⇒ true"
   );
 });
 
+test("ContextBuilder.replyModelCanSeeImages: keys off the REPLY model, never [models.default]", async () => {
+  const { ContextBuilder } = await import("../src/context/builder.js");
+  const config = {
+    models: {
+      default: { input_modalities: ["text"] },        // text-only default
+      sol: { input_modalities: ["text", "image"] },   // image-capable reply model
+    },
+  } as any;
+  const cb = new ContextBuilder({} as any, config, {} as any);
+  // The bug this guards: one model's modality must NEVER gate another's. A session
+  // whose reply model is the image-capable "sol" ships pixels even though the
+  // `default` block is text-only.
+  assert.equal(cb.replyModelCanSeeImages({ model: "sol" } as any), true);
+  // A session on the text-only default (or a type with no model override) → captions.
+  assert.equal(cb.replyModelCanSeeImages({ model: "default" } as any), false);
+  assert.equal(cb.replyModelCanSeeImages(undefined), false);
+});
+
+test("createModelFromConfig: text-only member → input ['text'] (triggers pi-ai image strip); multimodal → ['text','image']", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  // pi-ai's `downgradeUnsupportedImages(messages, model)` replaces image blocks with a
+  // text placeholder whenever `model.input` lacks "image"; each fallback member is
+  // dispatched with ITS OWN descriptor (buildModelFallback → makeModel per member), so
+  // a text-only model that actually serves an image-bearing context strips the pixels.
+  // This locks OUR half: a text-only model's descriptor carries input ["text"].
+  const base = { context_window: 1000, max_tokens: 100 };
+  const textOnly = createModelFromConfig({ id: "glm", input_modalities: ["text"], ...base } as any);
+  assert.deepEqual(textOnly.input, ["text"], "text-only model descriptor must exclude image → pi-ai downgrades pixels");
+  const multimodal = createModelFromConfig({ id: "sol", input_modalities: ["text", "image"], ...base } as any);
+  assert.deepEqual(multimodal.input, ["text", "image"]);
+});
+
 test("agent capability filter: image session drops a text-only fallback; text session keeps it", async () => {
   const { buildModelFallback, resolveModelChain } = await import("../src/agent/model-fallback.js");
   const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
