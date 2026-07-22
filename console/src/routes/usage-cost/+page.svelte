@@ -154,17 +154,22 @@
 		caption: '#f59e0b', // amber
 		embedding: '#ec4899' // pink
 	};
+	// Categorical hues for the spend-over-time chart (one per model). Every pair is kept
+	// ≥~20° apart in hue so no two read as "the same color" (min pair is purple/fuchsia).
+	// Order stays scattered (not hue-sorted) so ADJACENT stacked segments also contrast.
+	// De-collided from the original: index 1 was emerald #10b981 (~13° from teal), index 8
+	// was yellow #eab308 (~15° from amber), index 9 was violet #8b5cf6 (~13° from purple).
 	const PALETTE = [
-		'#6366f1',
-		'#10b981',
-		'#f59e0b',
-		'#ec4899',
-		'#0ea5e9',
-		'#a855f7',
-		'#ef4444',
-		'#14b8a6',
-		'#eab308',
-		'#8b5cf6'
+		'#6366f1', // indigo
+		'#22c55e', // green   (was #10b981 emerald — too close to teal)
+		'#f59e0b', // amber
+		'#ec4899', // pink
+		'#0ea5e9', // sky
+		'#a855f7', // purple
+		'#ef4444', // red
+		'#14b8a6', // teal
+		'#84cc16', // lime    (was #eab308 yellow — too close to amber)
+		'#d946ef' // fuchsia (was #8b5cf6 violet — too close to indigo/purple)
 	];
 	function colorFor(group: string, index: number): string {
 		return CLASS_COLORS[group] ?? PALETTE[index % PALETTE.length];
