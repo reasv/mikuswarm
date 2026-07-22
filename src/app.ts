@@ -119,7 +119,7 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
-import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeRateLimitedClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
+import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
@@ -998,6 +998,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           return undefined;
         }
       },
+      // Full fallback chain (logical ids, head-first) for the chain-aware dependency
+      // cascade (spec MODEL-FALLBACK §6.1): a prerequisite (summarize/condense) is
+      // judged unavailable only when EVERY member of its chain is over budget, so a
+      // model-scoped cap on the prerequisite's head (e.g. GLM) does not refuse a
+      // dependent reply the prerequisite could still produce on a fallback (DeepSeek).
+      resolveModelChainLogicalIds: (sessionType) => {
+        try {
+          return factory.resolveModelChainLogicalIds(sessionType);
+        } catch {
+          return [];
+        }
+      },
       logger: logger.child("budget"),
     });
 
@@ -1246,22 +1258,33 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   // Shared agent-loop claim-gate builder for the summary/diary worker pools (spec
-  // USAGE-COST-LIMITS §6.3/§6.4, review #2). Returns a `shouldPause` closure that
-  // parks the pool while ANY of its `agent_loop` session types is over budget AND
-  // — mirroring the caption pool — emits one rate-limited (≤1/min) `usage_limit_blocked`
-  // log naming the hit rules. Model-id resolution matches the engine's
-  // `isClassAvailable` (resolve via `factory.resolveModelId`; an unresolvable type
-  // contributes no descriptor and never blocks). The rate-limited log + first-blocked
-  // selection live in the shared `makeRateLimitedClaimGate`; each pool gets its own
-  // gate (independent rate-limit clocks). `budgetHooks.engine` is set before pool
-  // construction, so it is always present here; absent = no gate (no budgeting).
+  // USAGE-COST-LIMITS §6.3/§6.4, review #2; MODEL-FALLBACK §6). Returns a `shouldPause`
+  // closure that parks the pool while ANY of its `agent_loop` session types cannot make
+  // progress — where a session type can progress iff ANY member of ITS OWN fallback
+  // chain is in budget (chain-aware, mirroring the caption/embed pools). A model-scoped
+  // cap on a type's HEAD (e.g. summarize on GLM=`default`) therefore degrades the pool
+  // to the in-budget fallback (DeepSeek) instead of parking — the per-attempt resolver
+  // would serve that member anyway. On pause it emits one rate-limited (≤1/min)
+  // `usage_limit_blocked` log naming the stuck lane's head rules. Each lane's chain is
+  // resolved via `factory.resolveModelChainLogicalIds` (logical ids the `[[limits]].models`
+  // selector matches); the head's upstream id is carried for provenance (matching keys
+  // on the logical id). An unresolvable session type contributes no lane and never parks.
+  // `budgetHooks.engine` is set before pool construction, so it is always present here;
+  // absent = no gate (no budgeting).
+  const safeResolveLogicalModelId = (sessionType: string): string | undefined => {
+    try {
+      return factory.resolveLogicalModelId(sessionType);
+    } catch {
+      return undefined;
+    }
+  };
   const makeAgentLoopClaimGate = (sessionTypes: readonly string[]): (() => boolean) => {
     const engine = budgetHooks.engine;
     if (!engine) return () => false;
-    return makeRateLimitedClaimGate({
+    return makeAgentLoopChainClaimGate({
       engine,
-      descriptors: () => {
-        const out: SpendDescriptor[] = [];
+      lanes: () => {
+        const lanes: SpendDescriptor[][] = [];
         for (const sessionType of sessionTypes) {
           let modelId: string | undefined;
           try {
@@ -1269,20 +1292,27 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
           } catch {
             modelId = undefined;
           }
-          if (modelId === undefined) continue; // unresolvable → don't block on it
-          // Logical id (chain-head block name) so a `models=["default"]` rule that
-          // scopes on the logical dimension parks this pool too — without it the
-          // descriptor carries only the upstream wire id and the rule silently
-          // fails to match (review #4; session types bind model="default" ≠ wire id).
-          let logicalModelId: string | undefined;
+          if (modelId === undefined) continue; // unresolvable → contribute no lane
+          let chain: string[];
           try {
-            logicalModelId = factory.resolveLogicalModelId(sessionType);
+            chain = factory.resolveModelChainLogicalIds(sessionType);
           } catch {
-            logicalModelId = undefined;
+            chain = [];
           }
-          out.push({ class: "agent_loop", sessionType, modelId, logicalModelId });
+          // Head-first logical ids the `[[limits]].models` selector matches; fall back
+          // to the head-only logical id when the chain can't resolve (no-virtual case).
+          const logicalIds: (string | undefined)[] =
+            chain.length > 0 ? chain : [safeResolveLogicalModelId(sessionType)];
+          lanes.push(
+            logicalIds.map((logicalModelId) => ({
+              class: "agent_loop" as const,
+              sessionType,
+              modelId,
+              logicalModelId,
+            })),
+          );
         }
-        return out;
+        return lanes;
       },
     });
   };

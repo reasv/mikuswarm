@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
+import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, makeAgentLoopChainClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
 import type { UsageEventInput } from "../src/storage/database.js";
 import { normalizeLimits, type RawLimitRule } from "../src/budget/normalize.js";
 import { parseDuration, resolveWindow, isValidTimeZone } from "../src/budget/window.js";
@@ -209,6 +209,61 @@ test("#19a checkAdmissionChain: dependency cascade preserved even with an in-bud
   engine.record({ class: "agent_loop", sessionType: "summarize", modelId: "sm", costUsd: 2 });
   const adm = engine.checkAdmissionChain("default", "m1", ["primary", "fallback"]);
   assert.equal(adm.allowed, false);
+  assert.equal(adm.dependency?.sessionType, "summarize");
+  assert.equal(adm.ownBlocking.length, 0);
+});
+
+test("chain-aware dependency: capped prerequisite HEAD + in-budget prereq FALLBACK ⇒ admitted", () => {
+  // A model-scoped cap on the summarization prerequisite's HEAD (GLM=`default`) must
+  // NOT refuse a dependent reply: summarization's own pool degrades to its in-budget
+  // fallback (DeepSeek) and still produces summaries, so the dependency is satisfied.
+  // Pre-fix (head-only dependency check) this refused the reply.
+  const rules: LimitRule[] = [
+    { name: "glm-cap", maxUsd: 1, window: dayWindow, selector: { models: ["default"] } },
+  ];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: { default: ["summarize", "condense"] },
+    resolveModelId: (t) => (t === "default" ? "sol-wire" : "glm-wire"),
+    resolveLogicalModelId: (t) => (t === "default" ? "sol" : "default"),
+    resolveModelChainLogicalIds: (t) =>
+      t === "default" ? ["sol", "default", "deepseek"] : ["default", "deepseek"],
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+  // Cap GLM (`default`) via a summarize request billed to the `default` chain member.
+  engine.record({ class: "agent_loop", sessionType: "summarize", modelId: "glm-wire", logicalModelId: "default", costUsd: 5 });
+  // summarize's head (`default`) is over budget, but its chain has DeepSeek in budget →
+  // the reply's dependency is satisfied and admission succeeds.
+  const adm = engine.checkAdmissionChain("default", "sol-wire", ["sol", "default", "deepseek"]);
+  assert.equal(adm.allowed, true, "an in-budget prerequisite fallback admits the dependent session");
+});
+
+test("chain-aware dependency: cap over the WHOLE prereq chain refuses on the dependency", () => {
+  // A cap covering every member of the prerequisite's chain (`default` + `deepseek`)
+  // leaves summarization no escape — no fallback can produce summaries — so the
+  // dependent reply is still refused, ON THE DEPENDENCY. The reply's OWN head (`sol`)
+  // is left in budget so the refusal isolates to the dependency, not own-chain.
+  const rules: LimitRule[] = [
+    { name: "bg-chain-cap", maxUsd: 1, window: dayWindow, selector: { models: ["default", "deepseek"] } },
+  ];
+  const engine = new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: { default: ["summarize", "condense"] },
+    resolveModelId: (t) => (t === "default" ? "sol-wire" : "glm-wire"),
+    resolveLogicalModelId: (t) => (t === "default" ? "sol" : "default"),
+    resolveModelChainLogicalIds: (t) =>
+      t === "default" ? ["sol", "default", "deepseek"] : ["default", "deepseek"],
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+  engine.record({ class: "agent_loop", sessionType: "summarize", modelId: "glm-wire", logicalModelId: "default", costUsd: 5 });
+  const adm = engine.checkAdmissionChain("default", "sol-wire", ["sol", "default", "deepseek"]);
+  assert.equal(adm.allowed, false, "the whole prereq chain is capped → no escape");
   assert.equal(adm.dependency?.sessionType, "summarize");
   assert.equal(adm.ownBlocking.length, 0);
 });
@@ -490,6 +545,62 @@ test("#2 chain gate: empty chain never parks; late-bound engine never parks whil
     descriptors: () => [{ class: "embedding", modelId: "embed-large" }],
   });
   assert.equal(lateGate(), false, "engine not yet wired → never park");
+});
+
+// ---------------------------------------------------------------------------
+// makeAgentLoopChainClaimGate — multi-lane chain-aware pool gate (summary/diary)
+// ---------------------------------------------------------------------------
+
+test("multi-lane gate: lane head capped but fallback in budget ⇒ does NOT park", () => {
+  // The summarization pool serves `summarize` + `condense`, each with its own chain
+  // (GLM=`default` → DeepSeek). A model-scoped cap on the shared head must degrade the
+  // pool to DeepSeek, not park it — else context compaction stalls and cascades.
+  const rules: LimitRule[] = [
+    { name: "glm-cap", maxUsd: 1, window: dayWindow, selector: { models: ["default"] } },
+  ];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", sessionType: "summarize", modelId: "glm-wire", logicalModelId: "default" }, cost: 5 },
+  ]);
+  const lane = (sessionType: string): SpendDescriptor[] => [
+    { class: "agent_loop", sessionType, modelId: "glm-wire", logicalModelId: "default" },
+    { class: "agent_loop", sessionType, modelId: "ds-wire", logicalModelId: "deepseek" },
+  ];
+  const gate = makeAgentLoopChainClaimGate({ engine, lanes: () => [lane("summarize"), lane("condense")] });
+  assert.equal(gate(), false, "an in-budget fallback keeps the pool running on DeepSeek");
+  assert.equal(warns.filter((w) => w.message === "usage_limit_blocked").length, 0, "no pause log");
+});
+
+test("multi-lane gate: a lane whose WHOLE chain is over budget ⇒ parks + logs the head", () => {
+  // A cap scoped to `condense` covers every member of that lane → the lane is stuck →
+  // the pool parks (any-lane-stuck), even though the `summarize` lane is fine.
+  const rules: LimitRule[] = [
+    { name: "condense-cap", maxUsd: 1, window: dayWindow, selector: { sessionTypes: ["condense"] } },
+  ];
+  const { engine, warns } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", sessionType: "condense", modelId: "glm-wire", logicalModelId: "default" }, cost: 5 },
+  ]);
+  const lane = (sessionType: string): SpendDescriptor[] => [
+    { class: "agent_loop", sessionType, modelId: "glm-wire", logicalModelId: "default" },
+    { class: "agent_loop", sessionType, modelId: "ds-wire", logicalModelId: "deepseek" },
+  ];
+  const gate = makeAgentLoopChainClaimGate({ engine, lanes: () => [lane("summarize"), lane("condense")] });
+  assert.equal(gate(), true, "a fully-stuck lane parks the pool");
+  const blocked = warns.filter((w) => w.message === "usage_limit_blocked");
+  assert.equal(blocked.length, 1);
+  assert.equal((blocked[0].fields?.descriptor as { sessionType?: string }).sessionType, "condense", "log names the stuck lane");
+});
+
+test("multi-lane gate: empty lanes never park; empty lane is skipped", () => {
+  const rules: LimitRule[] = [{ name: "g", maxUsd: 1, window: dayWindow, selector: {} }];
+  const { engine } = overBudgetEngine(rules, [
+    { descriptor: { class: "agent_loop", sessionType: "summarize", modelId: "glm-wire", logicalModelId: "default" }, cost: 5 },
+  ]);
+  assert.equal(makeAgentLoopChainClaimGate({ engine, lanes: () => [] })(), false, "no lanes → never park");
+  assert.equal(
+    makeAgentLoopChainClaimGate({ engine, lanes: () => [[], []] })(),
+    false,
+    "all-empty lanes (unresolvable session types) → never park",
+  );
 });
 
 // ---------------------------------------------------------------------------
