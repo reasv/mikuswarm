@@ -1,0 +1,343 @@
+# MikuSwarm — agent + observability console.
+#
+# One command brings up the agent and its console:
+#     docker compose -f docker-compose.dev.yml up -d --build
+#
+# SELF-CONTAINED: all state lives in this project folder (./workspaces/miku,
+# ./var) and every bind below is relative — no absolute host path appears in any
+# config or compose file. Copy the folder to any Docker host and `up` works; the
+# one host path the sandbox needs (its workspace bind source) is resolved by the
+# agent AT RUNTIME from its own container's mounts (workspace_bind_source =
+# "container", docker/95-docker.toml). Corollary: do NOT set `hostname:` on the
+# agent service — self-inspection relies on the default hostname (container ID).
+#
+# Prerequisites (see ARCHITECTURE.md "Running in Docker"):
+#   1. Build the sandbox image on the host daemon:  docker/build-sandbox.sh
+#      (the agent creates the sandbox container at runtime via the mounted
+#      socket; the image must already exist or startup fails fast).
+#   2. config/90-local.toml in place (identity/models/matrix) and
+#      cp .env.example .env, then fill in the secrets AND the host-identity vars
+#      (MIKUSWARM_UID/MIKUSWARM_GID/DOCKER_GID — see .env.example). The agent and console
+#      run as that host uid:gid, NOT root, so everything written into the
+#      relative binds (./var, ./workspaces/miku, ./debug) stays host-user-owned.
+#      Compose fails fast (`:?`) when any of the three is unset.
+#
+# Bind-dir ownership is NOT a manual step: the one-shot `init` service below
+# pre-creates the agent-owned bind dirs (incl. ./var/browser-downloads) and chowns
+# them to MIKUSWARM_UID:MIKUSWARM_GID before the agent/manager start, so a fresh `up` never
+# leaves them root-owned. (./var/browser-data is the one intentional exception —
+# the root Manager owns it.)
+#
+# Egress hardening is NOT a manual step: the `egress` sidecar below applies and
+# reconciles the bridge firewall (docker/egress-rules.sh — the SSRF boundary,
+# since the app-layer guard is off in docker, docker/95-docker.toml) from inside
+# the host network namespace. The agent depends_on it being healthy, so the
+# stack is fail-closed: no firewall, no agent. Reboots and network recreation
+# self-heal via the reconcile loop.
+#
+# The CloakBrowser-Manager (browser-use backend) IS part of this stack — the
+# `manager` service below. The agent reaches it by service name (http://manager:8080,
+# set as [browser].manager_url in config/90-local.toml) over the internal
+# `mikuswarm-browser-ctl` network, NOT host.docker.internal (which on raw dockerd/WSL2
+# can't reach a loopback-only published port). The whole [browser] table lives in
+# 90-local.toml — the 95-docker overlay can't carry just one key without dropping
+# the rest, per its shallow-merge contract. The egress sidecar firewalls the
+# Manager's browsing bridge automatically (no manual sudo step). It browses out only
+# via its own dedicated, hardened `mikuswarm-browser` bridge and is published to loopback
+# only — humans reach the noVNC GUI via SSH tunnel.
+#
+# NOT started here (by design):
+#   - The sandbox container — created/driven by the agent via /var/run/docker.sock.
+
+name: mikuswarm
+
+networks:
+  mikuswarm:
+    name: mikuswarm
+    # IPv6 off so docker/agent-egress-rules.sh gives a single closed IPv4
+    # boundary (its RFC1918 drops + DNS pin are IPv4); a v6-enabled bridge would
+    # route around them. Mirrors the sandbox/browser bridges.
+    enable_ipv6: false
+  # Dedicated, hardened bridge for the CloakBrowser-Manager — keeps the browser
+  # off the agent/DB/sandbox networks (its own SSRF boundary). Compose-owned (this
+  # replaces the former external network + docker/ensure-browser-network.sh). The
+  # egress sidecar reconciles its firewall by bridge name; IPv6 off for the same
+  # single-closed-IPv4-boundary reason as `mikuswarm`.
+  mikuswarm-browser:
+    name: mikuswarm-browser
+    enable_ipv6: false
+  # Control-plane link between the agent and the Manager. `internal: true` ⇒ no
+  # gateway to the host/LAN and no NAT, so it is purely container-to-container:
+  # the agent reaches the Manager by service name (http://manager:8080) over
+  # docker DNS without the loopback-publish hairpin (host.docker.internal →
+  # docker0 gateway can't reach a 127.0.0.1-only published port on raw dockerd /
+  # WSL2). It widens no SSRF surface — an internal network can't route outward, so
+  # the Manager still browses out ONLY via its hardened mikuswarm-browser bridge (its
+  # default route; this network has no gateway and is never chosen for egress).
+  mikuswarm-browser-ctl:
+    name: mikuswarm-browser-ctl
+    internal: true
+    enable_ipv6: false
+
+services:
+  # Firewall sidecar: applies/reconciles the bridge egress rules from the HOST
+  # network namespace. This is the privileged piece the agent itself must never
+  # be (the confined workload can't own its own firewall); it runs a pinned
+  # 50-line script, nothing else. network_mode: host + NET_ADMIN are granted by
+  # the daemon — no sudo, travels with the folder. Healthy ⇔ the agent-bridge
+  # rules are in place (the sandbox bridge is reconciled too once the agent
+  # creates it). See docker/egress-entrypoint.sh.
+  egress:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.egress
+    image: mikuswarm-egress:latest
+    container_name: mikuswarm-egress
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      MIKUSWARM_AGENT_NETWORK: mikuswarm
+      MIKUSWARM_SANDBOX_NETWORK: mikuswarm-sandbox
+      # The browser bridge is reconciled too (no --allow-intra — the Manager needs
+      # no compose peers), folding the former manual `sudo browser-egress-rules.sh`
+      # step into the loop. Applied before the health marker, so a healthy sidecar
+      # implies the browser firewall was applied that pass.
+      MIKUSWARM_BROWSER_NETWORK: mikuswarm-browser
+    volumes:
+      # Resolve network IDs → bridge names (read-only daemon queries).
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # One-shot provisioner: ensure the host bind directories the NON-ROOT agent
+  # writes into exist AND are owned by the agent's host uid:gid BEFORE the agent
+  # (or manager) starts. `var/`, `workspaces/`, `debug/` are gitignored, so on a
+  # fresh deploy Docker auto-creates any missing bind source ROOT-OWNED — which the
+  # non-root agent then cannot write to (the browser-download staging probe in
+  # src/app.ts fails fast on exactly that). This is the privileged piece that owns
+  # the fix: it runs as root (the only thing in the stack that can chown a
+  # root-owned dir), corrects ownership, and exits. agent + manager gate on its
+  # successful completion, so a started agent implies a writable tree — folding the
+  # former manual `mkdir -p && chown` pre-up step into the stack. Idempotent: on an
+  # already-correct tree every chown is a no-op.
+  init:
+    image: busybox:latest
+    container_name: mikuswarm-init
+    # Root so it can chown root-owned auto-created dirs; the ONLY non-host-uid
+    # service besides the manager. Does no networking.
+    user: "0:0"
+    network_mode: none
+    environment:
+      # Same host identity the agent runs as (.env); guarded so a missing value
+      # fails the stack here rather than silently chowning to a wrong owner.
+      MIKUSWARM_UID: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}"
+      MIKUSWARM_GID: "${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    volumes:
+      # The parents of every agent-owned bind. Mounting the parents (not each leaf)
+      # lets `mkdir -p` below create a missing leaf on the host THROUGH the bind.
+      - ./var:/provision/var
+      - ./workspaces:/provision/workspaces
+      - ./debug:/provision/debug
+    # Create the agent-owned dirs, then chown them NON-RECURSIVELY: only the
+    # directory entries the agent must create/unlink within need its ownership;
+    # existing children (e.g. the SQLite DB under ./var) are already correctly owned
+    # and left untouched. ./var/browser-data is deliberately ABSENT from this list —
+    # it stays root-owned (the Manager runs as root and owns its browser profile;
+    # see the `manager` service). $$VAR escapes compose interpolation so the value
+    # is expanded by the runtime shell, not by compose.
+    command:
+      - sh
+      - -ceu
+      - |
+        mkdir -p /provision/var/browser-downloads /provision/workspaces/miku /provision/debug
+        chown "$$MIKUSWARM_UID:$$MIKUSWARM_GID" \
+          /provision/var \
+          /provision/var/browser-downloads \
+          /provision/workspaces \
+          /provision/workspaces/miku \
+          /provision/debug
+    restart: "no"
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mikuswarm-agent:latest
+    container_name: mikuswarm-agent
+    restart: unless-stopped
+    # Fail-closed: do not start the agent until the egress firewall is verified
+    # in place (the app-layer SSRF guard is off under compose) AND the init
+    # provisioner has made the bind dirs writable by the non-root agent.
+    depends_on:
+      egress:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    # Non-root: run as the operator's host uid:gid so the DB (./var), workspace
+    # files, and context dumps land host-user-owned instead of root-owned. The
+    # docker socket is the only root-ish dependency, covered by group_add with
+    # the socket's gid (root:docker 660 on the host). The sandbox container
+    # inherits this same uid:gid at runtime (src/app.ts passes process.getuid()
+    # to the SandboxManager's --user), so its /workspace writes align too.
+    user: "${MIKUSWARM_UID:?host uid for the agent — run `id -u`}:${MIKUSWARM_GID:?host gid for the agent — run `id -g`}"
+    group_add:
+      - "${DOCKER_GID:?gid of /var/run/docker.sock — run `stat -c %g /var/run/docker.sock`}"
+    env_file: .env
+    environment:
+      MIKUSWARM_AGENT_CONFIG_DIR: /app/config
+      # The runtime uid has no /etc/passwd entry in the image, so HOME would be
+      # unset/"/". Nothing persistent lives in HOME (all state is under the
+      # binds), but the docker CLI and friends want a writable scratch HOME.
+      HOME: /tmp
+    # Pin external DNS to public resolvers so name resolution survives the
+    # agent-egress-rules.sh RFC1918 drops (the embedded resolver would otherwise
+    # forward to the host's LAN/loopback nameservers, which are blocked). Compose
+    # service names (agent/console) still resolve via docker's embedded DNS. Keep
+    # in sync with PUBLIC_RESOLVERS in docker/egress-rules.sh.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    extra_hosts:
+      # Generic host-gateway escape hatch. NOT used for the CloakBrowser-Manager
+      # (reached by service name over mikuswarm-browser-ctl) — on raw dockerd/WSL2 this
+      # resolves to the docker0 gateway, which can't reach a loopback-only published
+      # port anyway. Kept as a harmless general-purpose mapping.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Drive the host docker daemon to create/exec the sandbox container.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace, mounted where the relative [workspace].root_dir resolves
+      # in-container (cwd /app + ./workspaces/miku). The agent translates this
+      # mount back to its host-side source at runtime to bind the same dir into
+      # the sandbox (workspace_bind_source = "container", docker/95-docker.toml).
+      - ./workspaces/miku:/app/workspaces/miku
+      # Persistent data under the agent's data_dir (./var → /app/var): SQLite DB,
+      # Matrix E2EE crypto store, and the fastembed model cache.
+      - ./var:/app/var
+      # Context dumps (app.context_dump_dir ./debug/context) — kept on the host
+      # so observability output survives container recreation.
+      - ./debug:/app/debug
+      # Browser-download staging (ARCHITECTURE.md §11b): the agent-side view of
+      # the volume the Manager's Chromium downloads into ([browser]
+      # downloads_local_dir = "var/browser-downloads" in 90-local.toml).
+      # Deliberately OUTSIDE the workspace bind so in-flight, root-owned,
+      # guid-named files are invisible to the file tools and the sandbox; the
+      # agent copies finalized files into workspaces/miku/browser-downloads/.
+      # REDUNDANT-BUT-INTENTIONAL on the agent side: ./var:/app/var above
+      # already mounts this exact host path (same host source, nested target),
+      # so this bind adds no isolation here. It is kept only to mirror the
+      # manager-side bind below — where it is load-bearing (the SAME host dir is
+      # mounted at the browser's /downloads target) — and to make the shared
+      # staging topology explicit in one place. Edit both binds together.
+      - ./var/browser-downloads:/app/var/browser-downloads
+      # Operator identity config (gitignored): models, matrix account, captioning…
+      # Merges UNDER the baked 95-docker.toml overlay (lexicographic order).
+      - ./config/90-local.toml:/app/config/90-local.toml:ro
+    # mikuswarm: the agent's own egress bridge. mikuswarm-browser-ctl: the internal control
+    # link to the Manager (service-name reachability; see the network def above).
+    # The agent's default route stays on mikuswarm (mikuswarm-browser-ctl has no gateway).
+    networks: [mikuswarm, mikuswarm-browser-ctl]
+
+  console:
+    build:
+      context: ./console
+      dockerfile: Dockerfile
+    image: mikuswarm-console:latest
+    container_name: mikuswarm-console
+    restart: unless-stopped
+    # Non-root for parity with the agent. The console writes nothing (no binds),
+    # so any unprivileged uid works; reuse the host identity already in .env.
+    user: "${MIKUSWARM_UID:?host uid — run `id -u`}:${MIKUSWARM_GID:?host gid — run `id -g`}"
+    environment:
+      # Server→server hop over the compose network to the agent's read API.
+      MIKUSWARM_CONSOLE_API_URL: "http://agent:8799"
+      # Must match the agent's observability.server.auth_token (95-docker.toml).
+      MIKUSWARM_CONSOLE_TOKEN: "${MIKUSWARM_CONSOLE_TOKEN:?set MIKUSWARM_CONSOLE_TOKEN in .env}"
+      HOST: "0.0.0.0"
+      PORT: "5173"
+      # Public URL you load the console at in the browser. adapter-node uses this
+      # to compute its own origin for SvelteKit's remote-function CSRF check;
+      # WITHOUT it adapter-node assumes `https`, so plain-http access mismatches on
+      # scheme and every mutating button (resume/abort/retry) 403s with
+      # "Cross-site remote requests are forbidden" while GET reads still work.
+      # Must equal scheme+host+published-port as seen by the browser — override
+      # MIKUSWARM_CONSOLE_ORIGIN in .env if you change MIKUSWARM_CONSOLE_PUBLISH, reach the
+      # console via a non-loopback host, or front it with an https reverse proxy.
+      ORIGIN: "${MIKUSWARM_CONSOLE_ORIGIN:-http://127.0.0.1:5173}"
+    ports:
+      # The single externally published surface (token-gated). Override the host
+      # port with MIKUSWARM_CONSOLE_PUBLISH in .env.
+      - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
+    depends_on: [agent]
+    networks: [mikuswarm]
+
+  # CloakBrowser-Manager — the browser-use backend (ARCHITECTURE.md §11b). A headed
+  # stealth Chromium (the `cloakbrowser` binary) inside KasmVNC/Xvfb, a FastAPI
+  # REST control plane + CDP-over-WebSocket proxy + noVNC GUI, all on :8080. The
+  # agent connects in-process over CDP (playwright connectOverCDP) and degrades
+  # gracefully if this is down — so the agent does NOT depend_on it. Built from the
+  # pinned submodule (vendor/cloakbrowser-manager). Runs as root by design: the
+  # upstream image has no USER/PUID support and pre-downloads its binary into root's
+  # cache, so it is NOT pinned to the host uid:gid like the agent/console.
+  manager:
+    build:
+      context: ./vendor/cloakbrowser-manager
+    image: mikuswarm-cloakbrowser-manager:pinned
+    container_name: mikuswarm-cloakbrowser-manager
+    restart: unless-stopped
+    # PID 1 reaping for the Xvfb/VNC/Chromium process tree.
+    init: true
+    # Fail-closed: don't start until the egress firewall sidecar is healthy. The
+    # browser bridge is reconciled in the same pass that flips the marker healthy,
+    # so the RFC1918/link-local egress drops are in force before Chromium can browse.
+    # Also wait on init so the shared ./var/browser-downloads staging dir exists and
+    # is agent-owned before Chromium writes guid files the agent must later unlink.
+    depends_on:
+      egress:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    ports:
+      # Loopback ONLY — the harness reaches REST + CDP-WS here; humans reach the
+      # noVNC GUI via SSH tunnel (ssh -L 8080:localhost:8080 your-host). The
+      # dedicated bridge below is the egress boundary, not this published port.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Gates every /api/* route (REST + the CDP-WS upgrade) behind a bearer token.
+      # The agent passes the same value as [browser].auth_token (config/90-local.toml
+      # → "${BROWSER_AUTH_TOKEN}"); keep them in sync via .env.
+      - AUTH_TOKEN=${BROWSER_AUTH_TOKEN:?set BROWSER_AUTH_TOKEN in .env (match [browser].auth_token)}
+    volumes:
+      # Persistent "miku" identity: cookies, logins, prefs, fingerprint seed. Relative
+      # bind to keep the stack self-contained (no named volumes). This single path is
+      # root-owned (the Manager runs as root, above) — the one exception to the
+      # otherwise host-uid-owned tree; it holds only the regenerable browser profile.
+      - ./var/browser-data:/data
+      # Browser-download staging (ARCHITECTURE.md §11b/§11c): Chromium writes
+      # guid-named downloads here ([browser] downloads_dir = "/downloads"); the
+      # agent sees the same storage at /app/var/browser-downloads, copies
+      # completed files into the workspace, and unlinks the staging guid. This host
+      # dir MUST be owned by the agent's uid — `var/` is gitignored, so on a fresh
+      # deploy Docker would auto-create the missing bind source ROOT-OWNED, and the
+      # agent's in-container `mkdir -p` cannot fix that; a root-owned dir lets the
+      # agent copy out but not unlink the root-written guid files, silently leaking
+      # every download into ./var (app.ts probes this at startup and fails fast).
+      # The `init` service above now guarantees the correct ownership before this
+      # service starts (manager depends_on init), so no manual pre-up step is
+      # needed. Root can always write into an agent-uid-owned dir. Steady-state empty.
+      - ./var/browser-downloads:/downloads
+    # mikuswarm-browser: hardened egress bridge (default route — browsing goes here).
+    # mikuswarm-browser-ctl: internal control link so the agent reaches it by name.
+    networks: [mikuswarm-browser, mikuswarm-browser-ctl]
+    # Pin DNS to the public resolvers the browser-bridge egress rules permit (the
+    # RFC1918 drops would otherwise blackhole the host's embedded/LAN resolver).
+    # Keep in sync with PUBLIC_RESOLVERS in docker/egress-rules.sh.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # KasmVNC + headed Chromium need shared memory; the 64MB default crashes tabs.
+    shm_size: "1g"
+    # Headed Chromium + Xvfb + VNC: a single idle profile is ~512MB, but heavy/
+    # multi-tab pages spike well past that, so budget 4GiB to avoid OOM-killed tabs.
+    mem_limit: "4g"
+    cpus: 2
+    # Healthcheck (GET /api/status) is baked into the image.
