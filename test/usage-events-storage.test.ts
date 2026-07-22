@@ -163,6 +163,63 @@ test("sumUsageCost partitionKeys: a pooled tool row's budget_partition is includ
 });
 
 // ---------------------------------------------------------------------------
+// Overflow shared-pool memberships (spec MULTI-SHARED-POOL §4): an event joining
+// 2+ distinct pools stores its FIRST key on the budget_partition scalar and spills
+// the rest to usage_event_partitions. A pool reseed UNIONs the scalar + child halves,
+// so a key's spend is complete no matter which storage each contributing event used —
+// with no double-count (a given (event, key) pair lives in exactly one half).
+// ---------------------------------------------------------------------------
+
+test("sumUsageCost partitionKeys: overflow memberships union scalar + child, no double-count (MULTI-SHARED-POOL)", async () => {
+  await withLedger(
+    [
+      // Two pools: first ("space:!abc") on the scalar, second ("fleet") spills to child.
+      { ts: 1_000, class: "agent_loop", modelId: "opus", budgetPartitions: ["space:!abc", "fleet"], costUsd: 3 },
+      // Single pool via the legacy scalar form — "fleet" on the scalar column.
+      { ts: 2_000, class: "agent_loop", modelId: "opus", budgetPartition: "fleet", costUsd: 5 },
+      // Two pools, order reversed: "fleet" scalar, "space:!xyz" spills to child.
+      { ts: 3_000, class: "agent_loop", modelId: "opus", budgetPartitions: ["fleet", "space:!xyz"], costUsd: 7 },
+    ],
+    async (storage) => {
+      // "fleet" spend = child(3, from row1) + scalar(5, row2) + scalar(7, row3) = 15.
+      // Each row contributes to fleet via EXACTLY one half (child for row1, scalar for
+      // rows 2/3) → union all, no double-count.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["fleet"] }), 15);
+      // "space:!abc" only exists as row1's scalar (its first pool).
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["space:!abc"] }), 3);
+      // "space:!xyz" only exists as row3's overflow child.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["space:!xyz"] }), 7);
+      // A key present in neither half.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["nope"] }), 0);
+    },
+  );
+});
+
+test("sumUsageCost partitionKeys: a model-scoped pool sub-cap filters the child half too (MULTI-SHARED-POOL/#14)", async () => {
+  await withLedger(
+    [
+      // Agent-loop event: "fleet" scalar + "solpool" overflow child, requested = sol.
+      { ts: 1_000, class: "agent_loop", modelId: "sol-up", logicalModelId: "sol", requestedModelId: "sol", budgetPartitions: ["fleet", "solpool"], costUsd: 2 },
+      // Tool event in the same two pools, no requested model (tool lane). The overflow
+      // child row carries requested_model_id NULL → excluded from a model-scoped sub-cap.
+      { ts: 2_000, class: "tool", toolName: "x_search", modelId: "grok", budgetPartitions: ["fleet", "solpool"], costUsd: 4 },
+    ],
+    async (storage) => {
+      // The pooled sub-cap (solpool ∩ requested=sol): only the agent-loop $2 (the tool
+      // child row is null-requested → dropped by the child half's requested filter).
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["solpool"], requestedModelIds: ["sol"] }), 2);
+      // The model-agnostic solpool total counts BOTH memberships ($2 + $4) via the child
+      // half (both rows spilled solpool to the child).
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["solpool"] }), 6);
+      // A different requested model matches neither.
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["solpool"], requestedModelIds: ["glm"] }), 0);
+      // minUsageTs also unions: oldest solpool contributor is the $2 agent-loop row.
+      assert.equal(storage.minUsageTs({ since: 0, partitionKeys: ["solpool"] }), 1_000);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // New per-user filter dimensions (spec PER-USER-LIMITS §8.3): triggerSenderIds /
 // roomIds / spaceIds each select the right rows and AND together with each other
 // (and with the model-agnostic dimensions). The `requestedModelIds` null-fallback

@@ -1034,9 +1034,19 @@ export interface UsageEventInput {
   requestedModelId?: string | null;
   /**
    * Rendered shared-pool partition key (spec PER-USER-LIMITS §3.5). Omitted when the
-   * event joins no shared pool → stored null.
+   * event joins no shared pool → stored null. Legacy single-value form of
+   * {@link budgetPartitions}; when both are given `budgetPartitions` wins.
    */
   budgetPartition?: string | null;
+  /**
+   * The FULL set of rendered shared-pool keys this event joins (spec
+   * MULTI-SHARED-POOL §4). The first is denormalized on the `budget_partition` scalar
+   * (fast-path, unchanged); every additional key spills to `usage_event_partitions`
+   * (one child row per overflow pool). Empty / single-element ⇒ no child rows written
+   * — per-user-only and single-pool events cost exactly as before. Deduped by the
+   * store. Supersedes `budgetPartition` when present.
+   */
+  budgetPartitions?: string[];
   /**
    * Canonical parent space id of the triggering room (spec PER-USER-LIMITS §11),
    * resolved + frozen at admission. Omitted (no space rules / no parent) → null.
@@ -3638,6 +3648,17 @@ export class Storage {
       });
       return Promise.resolve();
     }
+    // Shared-pool membership (spec MULTI-SHARED-POOL §4): `budgetPartitions` (or the
+    // legacy single `budgetPartition`) is the full set of pools this event joins,
+    // deduped and order-preserving. The FIRST goes on the `budget_partition` scalar
+    // (fast-path, unchanged); the rest spill to `usage_event_partitions`. A 0/1-key
+    // event writes NO child rows — the common per-user-only / single-pool path.
+    const poolKeys = [
+      ...new Set(
+        input.budgetPartitions ?? (input.budgetPartition != null ? [input.budgetPartition] : []),
+      ),
+    ];
+    const overflowPoolKeys = poolKeys.slice(1);
     const now = Date.now();
     const row: UsageEventRow = {
       id: `usage_${nanoid(12)}`,
@@ -3661,7 +3682,7 @@ export class Storage {
       // stays simple and the stored id matches what the engine's `room:{room_id}`
       // partition / room-scoped seed uses (same extraction as `roomIdFromTimelineKey`).
       requested_model_id: input.requestedModelId ?? null,
-      budget_partition: input.budgetPartition ?? null,
+      budget_partition: poolKeys[0] ?? null,
       room_id: roomIdFromTimelineKey(input.timelineKey ?? undefined),
       // Space id (§11) cannot be derived from intrinsic columns — it is supplied by
       // the per-user recorder from the session's frozen resolution (null otherwise).
@@ -3690,6 +3711,21 @@ export class Storage {
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
       ).run(row);
+      // Overflow shared-pool memberships (spec MULTI-SHARED-POOL §4). Each carries the
+      // event's FULL cost (an event's whole spend counts toward every pool it joins —
+      // matching the in-memory `record()` which adds the full cost to each covered
+      // meter) plus the seed-relevant columns so the reseed's child half filters
+      // identically to the scalar half. Same txn as the parent row (atomic).
+      if (overflowPoolKeys.length > 0) {
+        const child = db.prepare(
+          `insert or ignore into usage_event_partitions
+             (event_id, partition_key, ts, cost_usd, requested_model_id, room_id, space_id)
+           values (?, ?, ?, ?, ?, ?, ?)`,
+        );
+        for (const key of overflowPoolKeys) {
+          child.run(row.id, key, row.ts, row.cost_usd, row.requested_model_id, row.room_id, row.space_id);
+        }
+      }
     });
   }
 
@@ -3709,7 +3745,12 @@ export class Storage {
    * counts legacy `opus-premium` agent-loop spend recorded before this feature
    * shipped — but NOT null-requested tool rows (issue #14; see the clause below).
    */
-  private usageCostClauses(filter: UsageCostFilter): { clauses: string[]; params: unknown[] } {
+  private usageCostClauses(
+    filter: UsageCostFilter,
+    opts: { partitionColumn?: "budget_partition" | "partition_key"; requestedModelLegacy?: boolean } = {},
+  ): { clauses: string[]; params: unknown[] } {
+    const partitionColumn = opts.partitionColumn ?? "budget_partition";
+    const requestedModelLegacy = opts.requestedModelLegacy ?? true;
     const clauses: string[] = ["ts >= ?"];
     const params: unknown[] = [filter.since];
     if (filter.until !== undefined) {
@@ -3726,33 +3767,98 @@ export class Storage {
     inClause("tool_name", filter.tools);
     inClause("logical_model_id", filter.models);
     inClause("trigger_sender_id", filter.triggerSenderIds);
-    inClause("budget_partition", filter.partitionKeys);
+    inClause(partitionColumn, filter.partitionKeys);
     inClause("room_id", filter.roomIds);
     inClause("space_id", filter.spaceIds);
     if (filter.requestedModelIds && filter.requestedModelIds.length > 0) {
       const ph = filter.requestedModelIds.map(() => "?").join(", ");
-      // The null-fallback (matching pre-feature rows on `logical_model_id`) is gated
-      // to `class = 'agent_loop'` so it folds in only legacy AGENT-LOOP spend. Tool
-      // rows are also null-requested but must NOT seed a model-scoped sub-cap (issue
-      // #14): a sub-cap reserves agent-loop degradation headroom, never a bound on
-      // tool usage of the same upstream model — so a `class = 'tool'` null-requested
-      // row whose `logical_model_id` happens to match the sub-cap's scope (e.g.
-      // x_search→Grok) drops out here, mirroring the in-memory `record` which passes
-      // no coverage model for tool spend. Non-null `requested_model_id` rows match by
-      // the requested id directly (class-independent — the agent loop is the only
-      // lane that stamps it), so no double-count. NOTE (issue #9): this hardcoded
-      // `class = 'agent_loop'` makes `requestedModelIds` agent-loop-only scoping —
-      // it must not be combined with a non-agent-loop `classes` filter (see the
-      // `UsageCostFilter.requestedModelIds` doc), or the two AND to always-empty.
-      clauses.push(
-        `(requested_model_id in (${ph}) or (requested_model_id is null and class = 'agent_loop' and logical_model_id in (${ph})))`,
-      );
-      params.push(...filter.requestedModelIds, ...filter.requestedModelIds);
+      if (requestedModelLegacy) {
+        // The null-fallback (matching pre-feature rows on `logical_model_id`) is gated
+        // to `class = 'agent_loop'` so it folds in only legacy AGENT-LOOP spend. Tool
+        // rows are also null-requested but must NOT seed a model-scoped sub-cap (issue
+        // #14): a sub-cap reserves agent-loop degradation headroom, never a bound on
+        // tool usage of the same upstream model — so a `class = 'tool'` null-requested
+        // row whose `logical_model_id` happens to match the sub-cap's scope (e.g.
+        // x_search→Grok) drops out here, mirroring the in-memory `record` which passes
+        // no coverage model for tool spend. Non-null `requested_model_id` rows match by
+        // the requested id directly (class-independent — the agent loop is the only
+        // lane that stamps it), so no double-count. NOTE (issue #9): this hardcoded
+        // `class = 'agent_loop'` makes `requestedModelIds` agent-loop-only scoping —
+        // it must not be combined with a non-agent-loop `classes` filter (see the
+        // `UsageCostFilter.requestedModelIds` doc), or the two AND to always-empty.
+        clauses.push(
+          `(requested_model_id in (${ph}) or (requested_model_id is null and class = 'agent_loop' and logical_model_id in (${ph})))`,
+        );
+        params.push(...filter.requestedModelIds, ...filter.requestedModelIds);
+      } else {
+        // Child (usage_event_partitions) half of a pool reseed (spec MULTI-SHARED-POOL
+        // §4): no legacy null-fallback — overflow rows are born post-feature and carry
+        // `requested_model_id` verbatim (null for the tool lane, which is then excluded
+        // from a model-scoped sub-cap exactly as the scalar half's `class='tool'` drop).
+        // The table has no `class`/`logical_model_id` columns, so the plain form is both
+        // correct and the only valid one here.
+        clauses.push(`requested_model_id in (${ph})`);
+        params.push(...filter.requestedModelIds);
+      }
     }
     return { clauses, params };
   }
 
+  /**
+   * Inner UNION sub-query for a SHARED-POOL reseed (spec MULTI-SHARED-POOL §4): the
+   * scalar half (usage_events, first-pool memberships on `budget_partition`) UNION ALL
+   * the child half (usage_event_partitions, overflow memberships on `partition_key`).
+   * A given (event, pool-key) pair lives in EXACTLY ONE half — the key is either the
+   * event's first pool (scalar) or an overflow (child), never both — so UNION ALL never
+   * double-counts a single pool key. (The seed always passes ONE partition key per
+   * meter; passing several risks counting an event that joins two of them once per half,
+   * but no caller does — `seedFilterFor` emits a single key.) Only ts / requested-model /
+   * room / space dimensions reach this path (a shared-pool `seedFilterFor`), all of which
+   * exist on both tables; class/session/tool/trigger_sender dims are never set here.
+   */
+  private poolReseedUnion(filter: UsageCostFilter): { sql: string; params: unknown[] } {
+    // Enforce the child-half invariant the doc above describes: `usage_event_partitions`
+    // has only ts / requested-model / room / space columns, so a filter that ALSO scopes
+    // by class / session / tool / logical-model / trigger-sender would emit child SQL
+    // referencing a column that does not exist (a runtime error, not a silent wrong sum).
+    // A shared-pool `seedFilterFor` never sets these, so tripping this is a caller bug.
+    const incompatible =
+      (filter.classes?.length ?? 0) > 0 ||
+      (filter.sessionTypes?.length ?? 0) > 0 ||
+      (filter.tools?.length ?? 0) > 0 ||
+      (filter.models?.length ?? 0) > 0 ||
+      (filter.triggerSenderIds?.length ?? 0) > 0;
+    if (incompatible) {
+      throw new Error(
+        "poolReseedUnion: a shared-pool (partitionKeys) filter cannot also scope by " +
+          "class / sessionType / tool / model / triggerSenderId — those columns do not " +
+          "exist on usage_event_partitions (spec MULTI-SHARED-POOL §4).",
+      );
+    }
+    const scalar = this.usageCostClauses(filter, { partitionColumn: "budget_partition" });
+    const child = this.usageCostClauses(filter, {
+      partitionColumn: "partition_key",
+      requestedModelLegacy: false,
+    });
+    const sql =
+      `select ts, cost_usd from usage_events where ${scalar.clauses.join(" and ")} ` +
+      `union all ` +
+      `select ts, cost_usd from usage_event_partitions where ${child.clauses.join(" and ")}`;
+    return { sql, params: [...scalar.params, ...child.params] };
+  }
+
   sumUsageCost(filter: UsageCostFilter): number {
+    if (filter.partitionKeys && filter.partitionKeys.length > 0) {
+      // Shared-pool meter: sum across the scalar + child union so a pool's spend is
+      // complete regardless of which storage each contributing event used (§4).
+      const { sql, params } = this.poolReseedUnion(filter);
+      return this.read((db) => {
+        const row = db
+          .prepare(`select coalesce(sum(cost_usd), 0) as c from (${sql})`)
+          .get(...params) as { c: number };
+        return Number.isFinite(row.c) ? row.c : 0;
+      });
+    }
     const { clauses, params } = this.usageCostClauses(filter);
     return this.read((db) => {
       const row = db
@@ -3776,6 +3882,17 @@ export class Storage {
    * sooner than the `now + durationMs` upper bound the gate cheaply uses (§5 #5).
    */
   minUsageTs(filter: UsageCostFilter): number | null {
+    if (filter.partitionKeys && filter.partitionKeys.length > 0) {
+      // Shared-pool meter: oldest contributing spend across the scalar + child union
+      // (spec MULTI-SHARED-POOL §4) so the rolling-reset ETA reflects every member.
+      const { sql, params } = this.poolReseedUnion(filter);
+      return this.read((db) => {
+        const row = db.prepare(`select min(ts) as t from (${sql})`).get(...params) as {
+          t: number | null;
+        };
+        return row.t ?? null;
+      });
+    }
     const { clauses, params } = this.usageCostClauses(filter);
     return this.read((db) => {
       const row = db
@@ -7551,6 +7668,35 @@ create index if not exists idx_usage_events_partition_ts on usage_events(budget_
 create index if not exists idx_usage_events_requested_model_ts on usage_events(requested_model_id, ts);
 create index if not exists idx_usage_events_room_ts on usage_events(room_id, ts);
 create index if not exists idx_usage_events_space_ts on usage_events(space_id, ts);
+
+-- Overflow shared-pool memberships (spec MULTI-SHARED-POOL §4 Option A). A single
+-- usage_events row can carry only ONE budget_partition value, so when an event joins
+-- 2+ distinct shared pools (a nested rule, e.g. per-space AND global-fleet caps) the
+-- FIRST pool key is denormalized on usage_events.budget_partition (the scalar
+-- fast-path — unchanged) and every ADDITIONAL key is spilled here, one row per
+-- (event, pool). Per-user-only events and single-pool events write NOTHING here.
+-- A shared-pool meter re-seeds by UNIONing its scalar-column matches with its child
+-- matches (usageCostClauses / poolReseedUnion), so a key's spend sums correctly no
+-- matter which storage each contributing event used — no per-key mode registry, no
+-- back-fill. Columns mirror the usage_events seed dimensions so the child half of the
+-- union applies the SAME window / requested-model / room / space filters without a
+-- join back. WITHOUT ROWID keeps membership rows compact (the PK is the identity).
+create table if not exists usage_event_partitions (
+  event_id           text not null,
+  partition_key      text not null,
+  ts                 integer not null,
+  cost_usd           real not null,
+  -- Requested virtual model (spec PER-USER-LIMITS §7) for pool SUB-CAP scoping; null
+  -- for the tool lane (which never seeds a model-scoped sub-cap, issue #14) — mirrors
+  -- the scalar path. No legacy null-fallback here: child rows are born post-feature.
+  requested_model_id text,
+  -- Room / space narrowing for a shared pool declared on a room/space-matched rule
+  -- (mirrors usage_events.room_id / space_id so the union half filters identically).
+  room_id            text,
+  space_id           text,
+  primary key (event_id, partition_key)
+) without rowid;
+create index if not exists idx_uep_partition_ts on usage_event_partitions(partition_key, ts);
 `;
 
 // media_assets table + its indexes, factored out of the canonical SCHEMA so the
@@ -8106,7 +8252,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 3;
+export const LATEST_SCHEMA_VERSION = 4;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -8315,6 +8461,31 @@ function repairReplyFallbackOverstrip(db: Database.Database): void {
   }
 }
 
+/**
+ * v3→v4 (spec MULTI-SHARED-POOL §6): create the overflow-membership child table
+ * that lets one event belong to 2+ distinct shared pools. Purely ADDITIVE — a new
+ * empty table + index, no back-fill. Existing `budget_partition` scalar rows stay
+ * the authoritative store for their pool (the reseed UNIONs scalar + child), so a
+ * pool's pre-v4 history is found unchanged by the scalar half; nothing to migrate.
+ * `if not exists` makes it idempotent and harmless if SCHEMA (which also carries the
+ * DDL) already ran. Runs BEFORE SCHEMA in `open()`, so it must create its own table.
+ */
+function addUsageEventPartitions(db: Database.Database): void {
+  db.exec(
+    `create table if not exists usage_event_partitions (
+       event_id           text not null,
+       partition_key      text not null,
+       ts                 integer not null,
+       cost_usd           real not null,
+       requested_model_id text,
+       room_id            text,
+       space_id           text,
+       primary key (event_id, partition_key)
+     ) without rowid;
+     create index if not exists idx_uep_partition_ts on usage_event_partitions(partition_key, ts);`,
+  );
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -8323,6 +8494,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   undefined,
   cleanupAssistantEchoDuplicates,
   repairReplyFallbackOverstrip,
+  addUsageEventPartitions,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

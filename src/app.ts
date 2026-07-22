@@ -1104,15 +1104,20 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
               ? undefined
               : event.requestedModelId ?? event.logicalModelId ?? event.modelId;
           userLimitEngine.record(entry.resolution, coverageModel, event.costUsd);
-          // Stamp the shared-pool key (§3.5/§8.3) from the frozen resolution when the
-          // lane did not already supply it — the agent loop sets `budgetPartition`,
-          // but the tool lane does not, so without this backfill tool rows persist
-          // `budget_partition = NULL` and DROP OUT of the pool reseed (`tick()` /
-          // restart re-SUM filters on `budget_partition IN (…)`), silently under-
-          // counting shared pools after every re-sum (issue #2). One shared-pool key
-          // per session (the §8.3 single-column invariant). Mirrors the spaceId stamp.
-          if (entry.resolution.ledgerPartitionKey && (event.budgetPartition ?? null) === null) {
-            event = { ...event, budgetPartition: entry.resolution.ledgerPartitionKey };
+          // Stamp the shared-pool key SET (spec MULTI-SHARED-POOL §4) from the frozen
+          // resolution, model-aware via `sharedPoolKeys(coverageModel)`. This is the
+          // single place both lanes pass through, so both the agent loop and the tool
+          // lane get denormalized identically (without it a tool row would persist no
+          // pool key and DROP OUT of every pool reseed). The set is model-narrowed:
+          // the agent loop joins the model-agnostic total(s) + pools + any sub-cap its
+          // requested model is in; the tool lane (`coverageModel === undefined`) joins
+          // only the model-agnostic pools (never a sub-cap, issue #14) — exactly
+          // mirroring the in-memory `record` above. `insertUsageEvent` denormalizes the
+          // first key on `budget_partition` and spills the rest to
+          // `usage_event_partitions`. Empty ⇒ no stamp (per-user-only / unpooled).
+          const poolKeys = userLimitEngine.sharedPoolKeys(entry.resolution, coverageModel);
+          if (poolKeys.length > 0) {
+            event = { ...event, budgetPartitions: poolKeys };
           }
           // Stamp the canonical parent space (§11) from the frozen ctx — it cannot be
           // derived from intrinsic columns, so the recorder supplies it centrally.
