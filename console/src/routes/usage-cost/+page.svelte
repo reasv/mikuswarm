@@ -292,6 +292,8 @@
 	// Hovered column → a floating breakdown tooltip (per-group values + total + the
 	// bucket's time span), so the chart reads in absolute terms, not by colour alone.
 	let hovered = $state<number | null>(null);
+	// The legend model currently hovered/focused — dims every other series in the chart.
+	let hoveredGroup = $state<string | null>(null);
 	const hoverCol = $derived(hovered != null ? chart.columns[hovered] : undefined);
 	function tipLeftPct(i: number): number {
 		const n = chart.columns.length;
@@ -453,15 +455,27 @@
 				</div>
 			{:else}
 				<div class="rounded-lg border p-3">
-					<div class="mb-2 flex flex-wrap gap-3 text-[10px]">
+					<div class="mb-2 flex flex-wrap gap-1.5 text-[10px]">
 						{#each chart.groups as g (g)}
-							<span class="flex items-center gap-1.5">
+							<button
+								type="button"
+								class={cn(
+									'flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-0.5 transition-colors',
+									hoveredGroup === g
+										? 'bg-muted text-foreground'
+										: 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+								)}
+								onpointerenter={() => (hoveredGroup = g)}
+								onpointerleave={() => (hoveredGroup = null)}
+								onfocus={() => (hoveredGroup = g)}
+								onblur={() => (hoveredGroup = null)}
+							>
 								<span
-									class="inline-block size-2 rounded-sm"
-									style={`background:${chart.groupColor.get(g)}`}
+									class="inline-block size-2 shrink-0 rounded-sm transition-opacity"
+									style={`background:${chart.groupColor.get(g)}; opacity:${hoveredGroup == null || hoveredGroup === g ? 1 : 0.4}`}
 								></span>
 								<span class="max-w-[10rem] truncate font-mono" title={g}>{g}</span>
-							</span>
+							</button>
 						{/each}
 					</div>
 					<!-- relative wrapper anchors the absolutely-positioned hover tooltip -->
@@ -512,7 +526,15 @@
 								{#each col.segments as seg, si (seg.group)}
 									{@const prior = col.segments.slice(0, si).reduce((s, p) => s + p.cost, 0)}
 									{@const yTop = yFor(prior + seg.cost)}
-									<rect {x} y={yTop} width={bw} height={Math.max(0, yFor(prior) - yTop)} fill={seg.color} />
+									<rect
+										{x}
+										y={yTop}
+										width={bw}
+										height={Math.max(0, yFor(prior) - yTop)}
+										fill={seg.color}
+										class="transition-opacity"
+										style={`opacity:${hoveredGroup != null && seg.group !== hoveredGroup ? 0.12 : 1}`}
+									/>
 								{/each}
 								{#if i % xLabelEvery(n) === 0}
 									<text
