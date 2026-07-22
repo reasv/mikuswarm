@@ -9,7 +9,7 @@ set -u
 # reconciles the egress firewall (docker/egress-rules.sh) for the bridges this
 # compose deployment owns:
 #
-#   - the agent bridge (MIKUSWARM_AGENT_NETWORK, default "miku") with --allow-intra —
+#   - the agent bridge (MIKUSWARM_AGENT_NETWORK, default "mikuswarm") with --allow-intra —
 #     REQUIRED for health: the agent runs with the app-layer SSRF guard off
 #     (docker/95-docker.toml), so this firewall is the boundary. The agent
 #     service `depends_on` this container being healthy (fail-closed: no rules,
@@ -32,7 +32,7 @@ set -u
 # rules successfully.
 # =============================================================================
 
-AGENT_NET="${MIKUSWARM_AGENT_NETWORK:-miku}"
+AGENT_NET="${MIKUSWARM_AGENT_NETWORK:-mikuswarm}"
 SANDBOX_NET="${MIKUSWARM_SANDBOX_NETWORK:-mikuswarm-sandbox}"
 BROWSER_NET="${MIKUSWARM_BROWSER_NETWORK:-mikuswarm-browser}"
 INTERVAL="${MIKUSWARM_EGRESS_INTERVAL_S:-60}"

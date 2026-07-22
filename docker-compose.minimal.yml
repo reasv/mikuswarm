@@ -6,11 +6,11 @@
 #     cp .env.example .env   # fill REQUIRED vars (NO DOCKER_GID needed here)
 #     docker compose -f docker-compose.minimal.yml up -d
 #
-# IMAGE SELECTION (parameterized, set in .env — same as docker-compose.ghcr.yml):
-#     ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-<svc>:${MIKUSWARM_TAG:-latest}
+# IMAGE SELECTION (parameterized, set in .env — same as docker-compose.yml):
+#     ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/reasv}/mikuswarm-<svc>:${MIKUSWARM_TAG:-latest}
 #
 # REDUCED ISOLATION — read before deploying:
-#   The full stack (docker-compose.ghcr.yml) confines the agent behind a bridge
+#   The full stack (docker-compose.yml) confines the agent behind a bridge
 #   egress FIREWALL and runs untrusted bash/search_files inside a throwaway
 #   SANDBOX container. The minimal stack has NEITHER. In their place, the overlay
 #   docker/96-minimal.toml (mounted into the agent below) re-enables the in-process
@@ -22,18 +22,18 @@
 #     • Egress safety rests entirely on the app-layer SSRF guard, not a firewall.
 #   No docker socket is mounted, so the agent is NOT handed daemon control and you
 #   do NOT need DOCKER_GID in .env. If you want sandboxed bash or the browser, use
-#   docker-compose.ghcr.yml (full stack) instead.
+#   docker-compose.yml (full stack) instead.
 #
 # State still lives in the relative binds (./var, ./workspaces/miku, ./debug),
 # created+chowned by the one-shot `init` provisioner so the non-root agent can
 # write them. The baked docker/95-docker.toml still applies UNDER 96-minimal.toml
 # (lexicographic merge); 96-minimal wins where they overlap (ssrf_guard, sandbox).
 
-name: miku
+name: mikuswarm
 
 networks:
-  miku:
-    name: miku
+  mikuswarm:
+    name: mikuswarm
     enable_ipv6: false
 
 services:
@@ -65,8 +65,8 @@ services:
     restart: "no"
 
   agent:
-    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-agent:${MIKUSWARM_TAG:-latest}
-    container_name: mikuswarm
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/reasv}/mikuswarm-agent:${MIKUSWARM_TAG:-latest}
+    container_name: mikuswarm-agent
     restart: unless-stopped
     # Only gate: the bind dirs must be writable. No egress sidecar to wait on.
     depends_on:
@@ -96,10 +96,10 @@ services:
       # ON, sandbox + browser OFF. Without this bind the agent would inherit
       # 95-docker's "ssrf_guard off / sandbox on" infra assumptions and fail.
       - ./docker/96-minimal.toml:/app/config/96-minimal.toml:ro
-    networks: [miku]
+    networks: [mikuswarm]
 
   console:
-    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/OWNER}/mikuswarm-console:${MIKUSWARM_TAG:-latest}
+    image: ${MIKUSWARM_IMAGE_PREFIX:-ghcr.io/reasv}/mikuswarm-console:${MIKUSWARM_TAG:-latest}
     container_name: mikuswarm-console
     restart: unless-stopped
     user: "${MIKUSWARM_UID:?host uid — run `id -u`}:${MIKUSWARM_GID:?host gid — run `id -g`}"
@@ -112,4 +112,4 @@ services:
     ports:
       - "${MIKUSWARM_CONSOLE_PUBLISH:-5173}:5173"
     depends_on: [agent]
-    networks: [miku]
+    networks: [mikuswarm]

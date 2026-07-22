@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Idempotently create the dedicated bridge network for the Miku sandbox.
+# Idempotently create the dedicated bridge network for the MikuSwarm sandbox.
 # A dedicated bridge keeps the sandbox off the harness/DB/internal networks
 # (no access to local services). Outbound internet works via the bridge's NAT.
 #

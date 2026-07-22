@@ -153,7 +153,7 @@ flowchart LR
 MikuSwarm ships as Docker images on GHCR. Pick a compose file, fill in `.env`, and bring it up.
 
 1. **Choose a compose file:**
-   - `docker-compose.ghcr.yml` — the **full hardened stack** (agent + console + egress firewall + browser Manager + sandbox), pulled from published images. This is the canonical deployment.
+   - `docker-compose.yml` — the **full hardened stack** (agent + console + egress firewall + browser Manager + sandbox), pulled from published images. This is the default, canonical deployment. (To build the images from source instead, use `docker-compose.dev.yml`.)
    - `docker-compose.minimal.yml` — **agent + console only**. The simplest "copy + `.env` + up", with reduced isolation (no firewall, no browser, no sandbox; the app-layer SSRF guard is re-enabled in its place, and `bash`/`search_files`/`browser` tools are unavailable).
 
 2. **Configure the environment:**
@@ -165,7 +165,7 @@ MikuSwarm ships as Docker images on GHCR. Pick a compose file, fill in `.env`, a
 
 3. **Bring it up:**
    ```bash
-   docker compose -f docker-compose.ghcr.yml up -d
+   docker compose up -d
    # or: docker compose -f docker-compose.minimal.yml up -d
    ```
    On first run, **seeding** auto-populates an empty config directory and an empty workspace from the committed `templates/` tree (copy-missing, never-overwrite — it can never clobber an established deployment). The bot can then boot.

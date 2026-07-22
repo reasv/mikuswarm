@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Unified network-egress hardening for a Miku docker bridge (operator-run, root).
+# Unified network-egress hardening for a MikuSwarm docker bridge (operator-run, root).
 #
 # Restricts a bridge so its containers can reach the public internet but NOT
 # local/private networks (the host, the LAN, other docker networks, link-local —
@@ -13,7 +13,7 @@ set -euo pipefail
 # One engine, three callers (thin wrappers that just pass a network + tag):
 #   docker/sandbox-egress-rules.sh   mikuswarm-sandbox  bash-tool isolation
 #   docker/browser-egress-rules.sh   mikuswarm-browser  CloakBrowser-Manager isolation
-#   docker/agent-egress-rules.sh     miku          agent container (--allow-intra)
+#   docker/agent-egress-rules.sh     mikuswarm          agent container (--allow-intra)
 #
 # Usage:
 #   sudo docker/egress-rules.sh <network-name> <comment-tag> [--allow-intra]

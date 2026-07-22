@@ -20,8 +20,8 @@ ENV LC_ALL=C.UTF-8
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN --mount=type=cache,id=miku-ubuntu-apt-cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,id=miku-ubuntu-apt-lists,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=mikuswarm-ubuntu-apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=mikuswarm-ubuntu-apt-lists,target=/var/lib/apt,sharing=locked \
   apt-get update \
   && apt-get upgrade -y --no-install-recommends \
   && apt-get install -y --no-install-recommends \
