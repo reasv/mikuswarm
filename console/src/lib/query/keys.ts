@@ -40,5 +40,7 @@ export const keys = {
 	usageToolCalls: () => ['usage', 'tool-calls'] as const,
 	// `window` folds into the key so changing it refetches the leaderboard (cards + table).
 	usageLeaderboard: (window: string) => ['usage', 'leaderboard', window] as const,
-	usageBudgets: () => ['usage', 'budgets'] as const
+	usageBudgets: () => ['usage', 'budgets'] as const,
+	// scope + page fold into the key so switching tab / page refetches that slice.
+	usageUserLimits: (scope: string, page: number) => ['usage', 'user-limits', scope, page] as const
 };

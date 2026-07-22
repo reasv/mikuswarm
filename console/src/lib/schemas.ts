@@ -680,7 +680,12 @@ export const RuleStatus = Schema.Struct({
 		sessionTypes: Schema.optional(Schema.Array(Schema.String)),
 		tools: Schema.optional(Schema.Array(Schema.String)),
 		models: Schema.optional(Schema.Array(Schema.String))
-	})
+	}),
+	// Per-model spend for a multi-model rule (§14) — lets the console segment the bar as a
+	// composite. Optional/back-compat: absent for single-model rules and older BFFs.
+	components: Schema.optional(
+		Schema.Array(Schema.Struct({ model: Schema.String, spentUsd: Schema.Number }))
+	)
 });
 export type RuleStatus = Schema.Schema.Type<typeof RuleStatus>;
 
@@ -690,6 +695,9 @@ export const UserLimitStatus = Schema.Struct({
 	partitionKey: Schema.String,
 	isUserPartition: Schema.Boolean,
 	modelScope: Schema.optional(Schema.Array(Schema.String)),
+	// Optional for backward compatibility with an older BFF that omits it (falls back
+	// to fill-fraction ordering); the ladder order (config constraint index).
+	orderIndex: Schema.optional(Schema.Number),
 	spentUsd: Schema.Number,
 	capUsd: Schema.Number,
 	fraction: Schema.Number,
@@ -716,11 +724,30 @@ export const UserLimitSelection = Schema.Struct({
 export type UserLimitSelection = Schema.Schema.Type<typeof UserLimitSelection>;
 export const UsageBudgets = Schema.Struct({
 	rules: Schema.Array(RuleStatus),
-	// Optional for backward compatibility with an older BFF that omits them.
+	// Optional for backward compatibility with an older BFF that omits them. `userLimits`
+	// (the unbounded per-user meters) moved to the paginated `/api/usage/user-limits`;
+	// it is no longer sent here but stays optional so an older BFF still decodes.
 	userLimits: Schema.optional(Schema.Array(UserLimitStatus)),
 	userSelections: Schema.optional(Schema.Array(UserLimitSelection))
 });
 export type UsageBudgets = Schema.Schema.Type<typeof UsageBudgets>;
+
+/**
+ * One page of per-user / shared-pool meters (spec PER-USER-LIMITS §14). The BFF groups
+ * meters by partition and sorts hottest-first, then returns the requested scope's page
+ * (all meters for the page's partitions) + both scope group counts for the tab badges.
+ */
+export const UserLimitsPage = Schema.Struct({
+	scope: Schema.String, // "individuals" | "shared"
+	page: Schema.Number,
+	pageSize: Schema.Number,
+	meters: Schema.Array(UserLimitStatus),
+	totals: Schema.Struct({
+		individuals: Schema.Number,
+		shared: Schema.Number
+	})
+});
+export type UserLimitsPage = Schema.Schema.Type<typeof UserLimitsPage>;
 
 /** One per-bucket point feeding a leaderboard user's sub-period averages (§7.1 leaderboard). */
 export const UsageLeaderboardSeriesPoint = Schema.Struct({

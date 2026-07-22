@@ -106,6 +106,15 @@ export interface RuleStatus {
     | { type: "calendar"; period: "day" | "week" | "month"; tz: string };
   resetsAt: number;
   scope: RuleSelector;
+  /**
+   * Per-model spend within the window, in `scope.models` order — present only for a
+   * **multi-model** rule (≥2 models), so the console can render the bar as a segmented
+   * composite (the same treatment as a per-user composite cap). Each entry is a ledger
+   * `sumUsageCost` for that one model under the rule's other selector dimensions; the
+   * entries sum to `spentUsd`. Off the hot path (`ruleStatuses` only). Undefined for a
+   * single-model or model-agnostic rule (rendered as one plain health bar).
+   */
+  components?: { model: string; spentUsd: number }[];
 }
 
 export interface BudgetEngineOptions {
@@ -524,6 +533,23 @@ export class BudgetEngine {
         w.type === "rolling"
           ? ({ type: "rolling", duration: w.duration } as const)
           : ({ type: "calendar", period: w.period, tz: w.tz } as const);
+      // Per-model breakdown for a multi-model rule, so the console can segment the bar
+      // (composite composition) the same way a per-user composite cap does. Off the hot
+      // path — one ledger sum per constituent model within the rule's other dimensions.
+      const sel = state.rule.selector;
+      const components =
+        sel.models && sel.models.length >= 2
+          ? sel.models.map((m) => ({
+              model: m,
+              spentUsd: this.options.sumUsageCost({
+                since: state.windowStart,
+                classes: sel.classes,
+                sessionTypes: sel.sessionTypes,
+                tools: sel.tools,
+                models: [m],
+              }),
+            }))
+          : undefined;
       return {
         name: state.rule.name,
         spentUsd: state.spent,
@@ -531,6 +557,7 @@ export class BudgetEngine {
         fraction: Number.isFinite(fraction) ? fraction : 1,
         state: blocked ? "blocked" : near ? "near" : "ok",
         window,
+        components,
         // Accurate reset for the console countdown: a rolling rule resets when its
         // oldest contributing spend ages out, not at the full-duration upper bound
         // (§5 #5). Off the hot path, so the `minUsageTs` query is fine here.

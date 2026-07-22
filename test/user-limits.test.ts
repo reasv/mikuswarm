@@ -1246,3 +1246,151 @@ test("tick (money-path): a re-SUM equal to the in-memory total neither drops nor
   assert.equal(onlySpent(engine), RECORDED, "the rolling re-SUM lands on the consistent total");
   assert.equal(engine.totalHeadroom(r), 5 - RECORDED);
 });
+
+// ─── Startup ledger seeding (§14) ────────────────────────────────────────────
+
+const CAL_DAY: RawUserLimitRule["window"] = { type: "calendar", period: "day", tz: "UTC" };
+
+// A shipped-shape rule: a combined 5.6-style family + one single-model member, a GLM
+// anti-hog, a cap-0 ban sub-cap, and an all-users shared pool.
+function seedRule(): RawUserLimitRule[] {
+  return [
+    {
+      user: "*",
+      models: ["opus-premium", "glm-cheap", "default", "output-free"],
+      limits: [
+        { max_usd: 1.5, window: CAL_DAY, models: ["opus-premium"] },
+        { max_usd: 4, window: CAL_DAY, models: ["opus-premium", "glm-cheap"] },
+        { max_usd: 1.5, window: CAL_DAY, models: ["default"] },
+        { max_usd: 0, window: CAL_DAY, models: ["output-free"] },
+        { max_usd: 10, window: CAL_DAY, models: ["opus-premium"], partition: "all-users" },
+      ],
+    },
+  ];
+}
+
+function seedEngine(opts: {
+  identities?: Array<{ senderId: string; roomId?: string; spaceId?: string }>;
+  sum: (f: { triggerSenderIds?: string[]; partitionKeys?: string[]; requestedModelIds?: string[] }) => number;
+  selfUserIds?: ReadonlySet<string>;
+}): UserLimitEngine {
+  return new UserLimitEngine({
+    rules: normalize(seedRule()),
+    sumUsageCost: (f) => opts.sum(f),
+    minUsageTs: () => null,
+    listUsageIdentities: opts.identities ? () => opts.identities! : undefined,
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    selfUserIds: opts.selfUserIds,
+    logger,
+    now: () => 1_000_000,
+  });
+}
+
+test("seedFromLedger (§14): re-materializes partitions with prior spend, prunes $0 meters", () => {
+  const engine = seedEngine({
+    identities: [{ senderId: "@alice:hs" }, { senderId: "@bob:hs" }],
+    sum: (f) => {
+      const models = f.requestedModelIds ? [...f.requestedModelIds].sort().join(",") : undefined;
+      if (f.partitionKeys?.includes("all-users")) return 2; // whole-pool aggregate
+      if (f.triggerSenderIds?.includes("@alice:hs")) {
+        if (models === "opus-premium") return 1;
+        if (models === "glm-cheap,opus-premium") return 1.5;
+        return 0; // alice's default + output-free: nothing spent
+      }
+      return 0; // bob spent nothing at all
+    },
+  });
+  engine.seedFromLedger();
+  const s = engine.statuses();
+  const find = (pk: string, scope?: string[]) =>
+    s.find(
+      (m) =>
+        m.partitionKey === pk &&
+        JSON.stringify(m.modelScope ?? null) === JSON.stringify(scope ? [...scope].sort() : null),
+    );
+
+  // Alice's spent meters are visible immediately after a restart — no live turn needed.
+  assert.equal(find("@alice:hs", ["opus-premium"])?.spentUsd, 1);
+  assert.equal(find("@alice:hs", ["glm-cheap", "opus-premium"])?.spentUsd, 1.5);
+  // Preference-order key is surfaced for the console: opus-premium is preference index 0,
+  // single-model ⇒ 0*1000 + 1 = 1 (see ResolvedConstraint.orderKey).
+  assert.equal(find("@alice:hs", ["opus-premium"])?.orderIndex, 1);
+  // The shared pool materializes once, with the whole-pool sum (any spender's replay seeds it).
+  const pool = find("all-users", ["opus-premium"]);
+  assert.equal(pool?.spentUsd, 2);
+  assert.equal(pool?.isUserPartition, false);
+  // Every zero-spend meter is pruned — an unused sub-cap AND the cap-0 ban (both at $0);
+  // only consumed budget is pre-shown (enforcement is unaffected — they gate live).
+  assert.equal(find("@alice:hs", ["output-free"]), undefined);
+  assert.equal(find("@alice:hs", ["default"]), undefined);
+  // Bob spent nothing → none of his meters materialize (no $0 clutter).
+  assert.equal(s.filter((m) => m.partitionKey === "@bob:hs").length, 0);
+});
+
+test("seedFromLedger (§14): a no-op without a listUsageIdentities provider", () => {
+  const engine = seedEngine({ identities: undefined, sum: () => 5 });
+  engine.seedFromLedger();
+  assert.deepEqual(engine.statuses(), []);
+});
+
+test("seedFromLedger (§14): skips the bot's own accounts + non-MXID system senders", () => {
+  const engine = seedEngine({
+    // A real user, the bot itself, and a non-MXID system sender all have spend.
+    identities: [{ senderId: "@alice:hs" }, { senderId: "@miku:hs" }, { senderId: "system" }],
+    selfUserIds: new Set(["@miku:hs"]),
+    sum: (f) => {
+      const models = f.requestedModelIds ? [...f.requestedModelIds].sort().join(",") : undefined;
+      if (f.partitionKeys?.includes("all-users")) return 2;
+      return models === "opus-premium" ? 1 : 0; // any enforced sender has $1 opus spend
+    },
+  });
+  engine.seedFromLedger();
+  const partitions = new Set(engine.groupedStatuses().individuals.map((g) => g.partitionKey));
+  assert.deepEqual([...partitions], ["@alice:hs"]); // only the real human user
+  assert.ok(!partitions.has("@miku:hs"), "the bot's own account is excluded");
+  assert.ok(!partitions.has("system"), "a non-MXID system sender is excluded");
+});
+
+test("groupedStatuses (§14): partitions grouped, split individuals/shared, hottest-first", () => {
+  const rule: RawUserLimitRule[] = [
+    {
+      user: "*",
+      models: ["opus-premium"],
+      limits: [
+        { max_usd: 2, window: CAL_DAY, models: ["opus-premium"] },
+        { max_usd: 10, window: CAL_DAY, models: ["opus-premium"], partition: "all-users" },
+      ],
+    },
+  ];
+  const spend: Record<string, number> = { "@a:hs": 2, "@b:hs": 0.5, "@c:hs": 1.8 };
+  const engine = new UserLimitEngine({
+    rules: normalize(rule),
+    sumUsageCost: (f) => {
+      if (f.partitionKeys?.includes("all-users")) return 4;
+      const sender = f.triggerSenderIds?.[0];
+      return sender ? (spend[sender] ?? 0) : 0;
+    },
+    minUsageTs: () => null,
+    listUsageIdentities: () => [{ senderId: "@a:hs" }, { senderId: "@b:hs" }, { senderId: "@c:hs" }],
+    costRatesFor: (id) => RATES[id],
+    maxTokensFor: (id) => MAX_TOKENS[id],
+    zeroCostModelIds: new Set(["free"]),
+    viableMinOutputTokens: 256,
+    logger,
+    now: () => 1_000_000,
+  });
+  engine.seedFromLedger();
+  const g = engine.groupedStatuses();
+  // Hottest-first: @a (blocked, 100%), @c (near, 90%), @b (ok, 25%).
+  assert.deepEqual(g.individuals.map((x) => x.partitionKey), ["@a:hs", "@c:hs", "@b:hs"]);
+  assert.deepEqual(g.individuals.map((x) => x.state), ["blocked", "near", "ok"]);
+  assert.equal(g.individuals[0].peakFraction, 1);
+  // Each individual group holds only that user's own meter; the pool is its own group.
+  assert.deepEqual(g.individuals.map((x) => x.meters.length), [1, 1, 1]);
+  assert.deepEqual(g.shared.map((x) => x.partitionKey), ["all-users"]);
+  assert.equal(g.shared[0].isUserPartition, false);
+  assert.equal(g.shared[0].meters[0].spentUsd, 4);
+});

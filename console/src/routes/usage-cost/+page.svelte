@@ -11,7 +11,8 @@
 		getUsageSessions,
 		getUsageToolCalls,
 		getUsageLeaderboard,
-		getUsageBudgets
+		getUsageBudgets,
+		getUserLimits
 	} from '$lib/api/usage.remote';
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
@@ -19,6 +20,7 @@
 	import { fmtUsd, fmtInt, fmtPct } from '$lib/usage-format';
 	import { buildSpendChart, isSpendChartEmpty, niceTicks } from '$lib/spend-chart';
 	import { presentRule } from '$lib/rule-status';
+	import { buildLadder, buildSegments, type LadderGroup, type CapSegment } from '$lib/user-ladder';
 
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7): cards + a stacked spend chart,
 	// the always-shown Limits section (every configured rule + headroom), and the
@@ -142,14 +144,6 @@
 		})
 	);
 
-	// Per-user / shared-pool meters (spec PER-USER-LIMITS §14), same blocked→near→ok
-	// ordering. Each carries its rendered partition key + optional model sub-scope.
-	const userLimits = $derived(
-		[...(budgets.data?.userLimits ?? [])].sort((a, b) => {
-			const rank = (s: string) => (s === 'blocked' ? 0 : s === 'near' ? 1 : 2);
-			return rank(a.state) - rank(b.state) || b.fraction - a.fraction;
-		})
-	);
 	// Currently-selected model per live per-user session (spec §14).
 	const userSelections = $derived([...(budgets.data?.userSelections ?? [])]);
 
@@ -175,6 +169,43 @@
 	function colorFor(group: string, index: number): string {
 		return CLASS_COLORS[group] ?? PALETTE[index % PALETTE.length];
 	}
+
+	// Per-user limits are grouped + sorted + PAGINATED server-side (spec §14) so the
+	// section scales to any number of users. A nested tab picks the scope (individuals /
+	// shared pools); `ulPage` pages within it. Page resets whenever the scope changes.
+	let ulScope = $state<'individuals' | 'shared'>('individuals');
+	let ulPage = $state(0);
+	$effect(() => {
+		void ulScope;
+		ulPage = 0;
+	});
+	const userLimits = createQuery(() => ({
+		queryKey: keys.usageUserLimits(ulScope, ulPage),
+		queryFn: () => fresh(getUserLimits({ scope: ulScope, page: ulPage })),
+		placeholderData: keepPreviousData,
+		refetchInterval: 5000
+	}));
+	const ulTotals = $derived(userLimits.data?.totals ?? { individuals: 0, shared: 0 });
+	// The active scope's page, folded into partition strips (`$lib/user-ladder`, pure +
+	// unit-tested): one strip per user / shared pool; each cap renders as its OWN
+	// health-colored bar (no misleading per-user aggregate state). The BFF sends only this
+	// scope's meters, so exactly one of users/pools is populated.
+	const ladder = $derived(buildLadder(userLimits.data?.meters ?? []));
+	const ulStrips = $derived(ulScope === 'shared' ? ladder.pools : ladder.users);
+	const ulPageSize = $derived(userLimits.data?.pageSize ?? 20);
+	const ulScopeTotal = $derived(ulScope === 'shared' ? ulTotals.shared : ulTotals.individuals);
+	const ulPageCount = $derived(Math.max(1, Math.ceil(ulScopeTotal / ulPageSize)));
+	const ulPageSafe = $derived(Math.min(ulPage, ulPageCount - 1));
+	const hasUserLimits = $derived(
+		ulTotals.individuals > 0 || ulTotals.shared > 0 || (budgets.data?.userSelections?.length ?? 0) > 0
+	);
+	// If the active scope empties out (e.g. all shared pools reset away), fall back to
+	// individuals so a now-hidden tab isn't left selected.
+	$effect(() => {
+		if (ulScope === 'shared' && ulTotals.shared === 0 && ulTotals.individuals > 0) {
+			ulScope = 'individuals';
+		}
+	});
 
 	function fmtTime(ts: number | null): string {
 		return ts == null ? '—' : new Date(ts).toLocaleString();
@@ -306,6 +337,14 @@
 	};
 	function barColor(state: string): string {
 		return state === 'blocked' ? 'bg-red-500' : state === 'near' ? 'bg-amber-500' : 'bg-emerald-500';
+	}
+	// Health-colored text for a per-cap percent (matches barColor; ok stays muted).
+	function stateText(state: string): string {
+		return state === 'blocked'
+			? 'text-red-400'
+			: state === 'near'
+				? 'text-amber-500'
+				: 'text-muted-foreground';
 	}
 </script>
 
@@ -567,6 +606,25 @@
 								<div class="mt-2 rounded bg-muted px-2 py-1 text-[11px] font-medium text-muted-foreground">
 									{pres.label}
 								</div>
+							{:else if rule.components && rule.components.length >= 2}
+								<!-- Multi-model rule: segment the bar by per-model spend (same
+								     composite treatment as a per-user composite cap). -->
+								{@const segs = buildSegments(rule.components, rule.capUsd)}
+								{@const rem = Math.max(
+									0,
+									(rule.spentUsd - rule.components.reduce((n, c) => n + c.spentUsd, 0)) /
+										(rule.capUsd || 1)
+								)}
+								<div class="mt-2">
+									{@render segBar(segs, rem)}
+									{@render segLegend(segs)}
+								</div>
+								<div class="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+									<span class="font-mono text-foreground">
+										{fmtUsd(rule.spentUsd)} / {fmtUsd(rule.capUsd)}
+									</span>
+									<span>{pres.percentLabel}</span>
+								</div>
 							{:else}
 								<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
 									<div
@@ -595,10 +653,12 @@
 			{/if}
 		</section>
 
-		<!-- 4b. Per-user limits — materialized per-user / shared-pool meters (spec
-		     PER-USER-LIMITS §14). Only shown when the feature is active and at least
-		     one meter has materialized (a human session resolved a rule). -->
-		{#if userLimits.length > 0 || userSelections.length > 0}
+		<!-- 4b. Per-user limits — grouped "ladder strips" (spec PER-USER-LIMITS §14). One
+		     strip per user / shared pool; a combined cap (≥2 models) renders as a segmented
+		     bar with its single-model sub-caps as members, standalone caps as chips. Meters
+		     are seeded from the ledger at startup, so a partition partially consumed before
+		     a restart shows immediately (no waiting for a live turn to re-materialize it). -->
+		{#if hasUserLimits}
 			<section>
 				<h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
 					Per-user limits
@@ -620,48 +680,164 @@
 						{/each}
 					</div>
 				{/if}
-				<div class="grid grid-cols-1 gap-2 md:grid-cols-2">
-					{#each userLimits as m (m.meterKey)}
-						<div class="rounded-lg border p-3">
-							<div class="flex items-center justify-between gap-2">
-								<span class="truncate font-mono text-sm font-semibold" title={m.partitionKey}>
-									{m.isUserPartition ? '👤' : '👥'}
-									{m.partitionKey}
-								</span>
-								<span
-									class={cn(
-										'rounded px-1.5 py-0.5 text-[10px] font-medium capitalize',
-										STATE_BADGE[m.state] ?? ''
-									)}
-								>
-									{m.state}
+				<!-- Scope tabs — individuals vs shared pools, each paginated server-side. The
+				     Shared-pools tab only appears when at least one pool exists. -->
+				<div class="mb-2 flex items-center gap-1 text-xs">
+					<button
+						class={cn(
+							'rounded px-2 py-0.5 transition-colors',
+							ulScope === 'individuals'
+								? 'bg-muted font-medium text-foreground'
+								: 'text-muted-foreground hover:text-foreground'
+						)}
+						onclick={() => (ulScope = 'individuals')}
+					>
+						Individuals
+						<span class="tabular-nums text-muted-foreground">({ulTotals.individuals})</span>
+					</button>
+					{#if ulTotals.shared > 0}
+						<button
+							class={cn(
+								'rounded px-2 py-0.5 transition-colors',
+								ulScope === 'shared'
+									? 'bg-muted font-medium text-foreground'
+									: 'text-muted-foreground hover:text-foreground'
+							)}
+							onclick={() => (ulScope = 'shared')}
+						>
+							Shared pools
+							<span class="tabular-nums text-muted-foreground">({ulTotals.shared})</span>
+						</button>
+					{/if}
+				</div>
+
+				{#if ulStrips.length > 0}
+					<div class="grid grid-cols-1 gap-2 md:grid-cols-2">
+						{#each ulStrips as g (g.partitionKey)}
+							{@render strip(g)}
+						{/each}
+					</div>
+				{:else}
+					<div
+						class="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground"
+					>
+						No {ulScope === 'shared' ? 'shared pools' : 'individuals'} with spend yet.
+					</div>
+				{/if}
+
+				<!-- Server pagination: partitions (users / pools), hottest-first, per page. -->
+				{#if ulPageCount > 1}
+					<div
+						class="mt-2 flex items-center justify-end gap-1 text-[11px] text-muted-foreground"
+					>
+						<button
+							class="rounded border px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+							disabled={ulPageSafe === 0}
+							onclick={() => (ulPage = ulPageSafe - 1)}
+						>
+							Prev
+						</button>
+						<span class="tabular-nums">Page {ulPageSafe + 1} / {ulPageCount}</span>
+						<button
+							class="rounded border px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+							disabled={ulPageSafe >= ulPageCount - 1}
+							onclick={() => (ulPage = ulPageSafe + 1)}
+						>
+							Next
+						</button>
+					</div>
+				{/if}
+			</section>
+		{/if}
+
+		<!-- A composite (multi-model) bar: one non-health-colored slice per member + a
+		     neutral remainder. Shared by per-user composite caps AND multi-model global
+		     limits so both look identical. -->
+		{#snippet segBar(segments: CapSegment[], remainderFraction: number)}
+			<div class="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
+				{#each segments as seg (seg.model)}
+					<div
+						class="h-full"
+						style={`width:${(seg.widthFraction * 100).toFixed(2)}%; background-color:${seg.color}`}
+						title={`${seg.model}: ${fmtUsd(seg.spentUsd)}`}
+					></div>
+				{/each}
+				{#if remainderFraction > 0}
+					<div
+						class="h-full bg-muted-foreground/40"
+						style={`width:${(remainderFraction * 100).toFixed(2)}%`}
+						title="other"
+					></div>
+				{/if}
+			</div>
+		{/snippet}
+
+		<!-- Names the segment colors (a color key for the composite bar above). -->
+		{#snippet segLegend(segments: CapSegment[])}
+			<div class="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-muted-foreground">
+				{#each segments as seg (seg.model)}
+					<span class="inline-flex items-center gap-1">
+						<span
+							class="inline-block h-2 w-2 rounded-full"
+							style={`background-color:${seg.color}`}
+						></span>
+						{seg.model}
+					</span>
+				{/each}
+			</div>
+		{/snippet}
+
+		<!-- One partition strip: every cap as its OWN health-colored bar (green/amber/red by
+		     its own fill), ladder-ordered. The red bar IS the exhausted cap — no misleading
+		     per-user aggregate badge. Shared by the individuals + pools grids. -->
+		{#snippet strip(g: LadderGroup)}
+			<div class="rounded-lg border p-3">
+				<div class="flex items-center gap-2">
+					<span class="truncate font-mono text-sm font-semibold" title={g.partitionKey}>
+						{g.isUserPartition ? '👤' : '👥'}
+						{g.partitionKey}
+					</span>
+				</div>
+
+				<div class="mt-1.5 space-y-1.5">
+					{#each g.caps as cap (cap.meterKey)}
+						<div>
+							<div class="flex items-center justify-between text-[11px]">
+								<span class="font-mono text-foreground">{cap.label}</span>
+								<span class="font-mono text-muted-foreground">
+									{fmtUsd(cap.spentUsd)} / {fmtUsd(cap.capUsd)}
+									<span class={cn('ml-1 tabular-nums', stateText(cap.state))}
+										>{(cap.fraction * 100).toFixed(0)}%</span
+									>
 								</span>
 							</div>
-							<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-								<div
-									class={cn('h-full rounded-full', barColor(m.state))}
-									style={`width:${Math.min(100, m.fraction * 100).toFixed(1)}%`}
-								></div>
-							</div>
-							<div class="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
-								<span class="font-mono text-foreground">
-									{fmtUsd(m.spentUsd)} / {fmtUsd(m.capUsd)}
-								</span>
-								<span>{(m.fraction * 100).toFixed(0)}%</span>
-							</div>
-							<div class="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
-								<span class="max-w-[60%] truncate">
-									{m.modelScope ? m.modelScope.join(', ') : 'all models'}
-								</span>
-								<span title={fmtTime(m.resetsAt)}>
-									{windowLabel(m.window)} · resets {fmtResetsIn(m.resetsAt)}
-								</span>
-							</div>
+							{#if cap.isComposite}
+								<!-- Composition: one slice per member (non-health colors). The
+								     composite's own health is in the percent label, not the bar. -->
+								<div class="mt-0.5">
+									{@render segBar(cap.segments, cap.remainderFraction)}
+									{#if cap.segments.length > 0}{@render segLegend(cap.segments)}{/if}
+								</div>
+							{:else}
+								<div class="mt-0.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+									<div
+										class={cn('h-full rounded-full', barColor(cap.state))}
+										style={`width:${Math.min(100, cap.fraction * 100).toFixed(1)}%`}
+									></div>
+								</div>
+							{/if}
 						</div>
 					{/each}
 				</div>
-			</section>
-		{/if}
+
+				<div
+					class="mt-2 text-right text-[10px] text-muted-foreground"
+					title={fmtTime(g.resetsAt)}
+				>
+					resets {fmtResetsIn(g.resetsAt)}
+				</div>
+			</div>
+		{/snippet}
 
 		<!-- 5. Detail tabs — Recent sessions / Recent paid calls / User leaderboard. Limits stays
 		     above as its own always-visible section; these three switch via ?tab=. -->
