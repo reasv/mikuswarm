@@ -188,6 +188,18 @@ jobs:
         # submodule, so a recursive checkout is unnecessary.
         uses: actions/checkout@v7
 
+      # The agent (multi-GB Rust compile + onnxruntime) and sandbox images
+      # overflow the runner's ~14 GB free root disk mid-build. Reclaim the ~30 GB
+      # of preinstalled toolchains this job never touches (no Node/dotnet/etc. is
+      # used here — it only runs a Docker build).
+      - name: Free up disk space
+        if: matrix.component == 'agent' || matrix.component == 'sandbox'
+        run: |
+          echo "Before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/local/share/boost || true
+          echo "After:"; df -h /
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -221,4 +233,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
