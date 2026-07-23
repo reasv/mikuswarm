@@ -31,7 +31,7 @@ The honest trade-off: sessions are normally one rollout. Replying to a bot messa
 The architecture rests on three deliberately decoupled ideas:
 
 1. **A timeline**: a continuously growing, append-only event log per chat context (room, DM, thread). It observes the conversation the way any room participant would, regardless of whether the bot is "doing" anything.
-2. **Agent sessions**: ephemeral agent instances spawned in response to triggers. Each reads the timeline, does work, sends messages, and then terminates. There is no persistent agent process holding conversational state, only the timeline and the short-lived sessions that read from and write to it.
+2. **Agent sessions**: ephemeral agent instances spawned in response to triggers. Each reads the timeline, does work, sends messages, and then terminates. Conversational state lives entirely in the timeline and the short-lived sessions that read from and write to it; no persistent agent process sits in between.
 3. **Context assembly**: a deterministic pipeline that turns the timeline into token-budgeted, structured LLM context for each session.
 
 Because every trigger gets its own session, many can run at once. The interesting engineering is in keeping them from stepping on each other. The coordination layer includes:
@@ -43,6 +43,8 @@ Because every trigger gets its own session, many can run at once. The interestin
 - **Resumable sessions.** Replying to a message the bot sent **continues the session that produced it**, appending your reply as a new turn on the same rollout, so a multi-step task (a browser session, a research dig) carries its state forward instead of restarting amnesiac. A single-consumption guard keeps resumes linear, and a "work gate" ensures only genuinely stateful sessions resume.
 
 Each concurrent session sees the timeline as it stood when it started, is told about the other active sessions, shares no mutable state, and delivers messages that immediately appear on the timeline for its siblings to see.
+
+This is also why there is no subagent mechanic: every session already is one, in effect. A question that takes a hundred tool calls runs in its own parallel rollout without stalling anything else, and the session keeps the full chat context that a spawned subagent would lack. For the kinds of requests a room actually makes, seeing the whole conversation usually matters more than delegation.
 
 ---
 
@@ -69,7 +71,7 @@ flowchart TD
     FINAL -.->|becomes| LIVE
 ```
 
-As raw events age out of the rich and compact tiers they are **summarized, not dropped**; the volatile, cache-cheap final turn carries everything session-specific (the triggering messages, current runtime state, any auto-retrieved memory). See [ARCHITECTURE.md §9 / §9a](ARCHITECTURE.md).
+As raw events age out of the rich and compact tiers they are absorbed into the summary layer instead of being dropped; the volatile, cache-cheap final turn carries everything session-specific (the triggering messages, current runtime state, any auto-retrieved memory). See [ARCHITECTURE.md §9 / §9a](ARCHITECTURE.md).
 
 ### Session lifecycle
 
@@ -93,6 +95,8 @@ flowchart TD
 
 Sessions never deliver text implicitly: every message goes through the `send_message` tool, and the model's raw output is treated as private scratchpad. A turn ends only on an explicit `final: true` send or the literal `NO_REPLY` (intentional silence). See [ARCHITECTURE.md §8](ARCHITECTURE.md).
 
+Most triggers are human: a mention, a reply to the bot, a DM. With the opt-in proactive scheduler the bot can also open sessions on its own cadence and decide for itself whether the room warrants an unprompted post, which gives it a bit of a life of its own.
+
 ### Memory
 
 The bot is not write-only or goldfish-brained. Four cooperating subsystems give it real recall:
@@ -110,11 +114,11 @@ Persisted events are enriched out of band: attachments and linked media are down
 
 ### Tools
 
-Up to ~39 tools are available to a chat session: chat actions (`send_message`, `react`, `edit_message`, polls, pins, profile), web search/fetch, a **real stealth browser** (one persistent identity with shared cookies/logins, driven via an accessibility snapshot), a **Docker shell sandbox** for `bash`/`search_files`, file editing in a sandboxed workspace, media analysis, image generation, memory read/write, and remote **MCP** servers (the default ships keyless Exa web tools, no API key needed). Niche add-ons (`danbooru`, character cards, SauceNAO reverse-image lookup, X search) are gated off by default. See [ARCHITECTURE.md §10 / §11a / §11b](ARCHITECTURE.md).
+The toolkit is aimed at letting the bot do the same things the humans in the room can do from their own computers: look something up, poke at a website, run code, post an image. Up to ~39 tools are available to a chat session: chat actions (`send_message`, `react`, `edit_message`, polls, pins, profile), web search/fetch, a **real stealth browser** (one persistent identity with shared cookies/logins, driven via an accessibility snapshot), a **Docker shell sandbox** for `bash`/`search_files`, file editing in a sandboxed workspace, media analysis, image generation, memory read/write, and remote **MCP** servers (the default ships keyless Exa web tools, no API key needed). Niche add-ons (`danbooru`, character cards, SauceNAO reverse-image lookup, X search) are gated off by default. See [ARCHITECTURE.md §10 / §11a / §11b](ARCHITECTURE.md).
 
 ### Cost & budget limits
 
-Spend is bounded at three levels: a **per-session** USD ceiling (with a soft agent-facing warning before a hard cutoff), **period** limits (rolling/calendar windows over a unified usage ledger), and **per-user** limits with per-user model selection. Token usage is captured from actual provider reports, not estimates. See [ARCHITECTURE.md §8d–§8g](ARCHITECTURE.md).
+Spend is bounded at three levels: a **per-session** USD ceiling (with a soft agent-facing warning before a hard cutoff), **period** limits (rolling/calendar windows over a unified usage ledger), and **per-user** limits with per-user model selection. Token usage comes from the providers' own usage reports rather than local estimates. See [ARCHITECTURE.md §8d–§8g](ARCHITECTURE.md).
 
 ### Observability console
 
