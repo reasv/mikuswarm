@@ -16,6 +16,13 @@ export interface SandboxManagerOptions {
   containerName: string;
   network: string;
   /**
+   * DNS servers passed as `--dns`. Undefined ⇒ ["1.1.1.1", "8.8.8.8"] (default).
+   * Empty array ⇒ NO --dns: required when `network` is a "container:…"/"host"
+   * namespace join, where Docker forbids --dns — the sandbox then inherits that
+   * namespace's resolver (e.g. a VPN anchor's tunnel DNS). See [sandbox].dns.
+   */
+  dns?: string[];
+  /**
    * Workspace path bind-mounted into the sandbox. With `workspaceBindSource`
    * "host" (default) this IS the host path the daemon resolves. With
    * "container" it is the agent-side path, translated to its host-side mount
@@ -369,12 +376,17 @@ export class SandboxManager implements ExecBackend {
       "--user", `${options.uid}:${options.gid}`,
       "-v", `${options.workspaceHostDir}:${options.workspaceMount}`,
       "--workdir", options.workspaceMount,
-      "--dns", "1.1.1.1",
-      "--dns", "8.8.8.8",
       "--security-opt", "no-new-privileges:true",
       "--cap-drop", "ALL",
       "--pids-limit", String(options.pidsLimit ?? 512),
     ];
+    // `--dns` is incompatible with a shared network namespace (`--network
+    // container:…`/`host`), so an empty `dns` array omits it and the sandbox
+    // inherits the joined namespace's resolver. Undefined keeps the historical
+    // default. See [sandbox].dns.
+    for (const server of options.dns ?? ["1.1.1.1", "8.8.8.8"]) {
+      args.push("--dns", server);
+    }
     if (options.memory) args.push("--memory", options.memory);
     if (options.cpus !== undefined) args.push("--cpus", String(options.cpus));
     if (options.readOnlyRoot) {
