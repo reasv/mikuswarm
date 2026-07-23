@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 430" width="940" height="430" font-size="13" role="img" aria-labelledby="t d">
+  <title id="t">MikuSwarm harness</title>
+  <desc id="d">A center chatroom timeline. Two @miku messages each fork off a disposable, parallel agent session that reasons and runs tools on its own, then delivers a single reply back into the log.</desc>
+  <style>
+    text{ font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .t,.ta,.r,.s{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; font-size:12px; }
+    .panel{ fill:#ffffff; stroke:#d0d7de; stroke-width:1.5; }
+    .card{ fill:#f6f8fa; stroke:#d0d7de; stroke-width:1.5; stroke-dasharray:5 4; }
+    .band{ fill:#e6f6f4; }
+    .h{ fill:#59636e; font-weight:600; }
+    .m{ fill:#1f2328; }
+    .hk{ fill:#0b8f86; font-weight:700; }
+    .mk{ fill:#0b8f86; }
+    .men{ fill:#0b8f86; font-weight:600; }
+    .th{ fill:#8b949e; font-style:italic; }
+    .t{ fill:#1f2328; }
+    .ta{ fill:#59636e; }
+    .r{ fill:#8b949e; }
+    .s{ fill:#0b8f86; font-weight:600; }
+    .fork{ stroke:#8b949e; stroke-width:1.5; fill:none; }
+    .flow{ stroke:#0b8f86; stroke-width:1.8; fill:none; }
+  </style>
+  <defs>
+    <marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#0b8f86"/>
+    </marker>
+  </defs>
+
+  <rect class="band" x="334" y="263" width="292" height="30" rx="6"/>
+  <rect class="band" x="334" y="331" width="292" height="30" rx="6"/>
+
+  <rect class="panel" x="334" y="40" width="292" height="364" rx="10"/>
+
+  <path class="fork" d="M334,103 L280,103" marker-end="url(#af)"/>
+  <path class="flow" d="M280,273 L342,273" marker-end="url(#aa)"/>
+  <path class="fork" d="M626,171 L660,171" marker-end="url(#af)"/>
+  <path class="flow" d="M660,346 L618,346" marker-end="url(#aa)"/>
+
+  <rect class="card" x="30" y="88" width="250" height="200" rx="8"/>
+  <text class="th" x="46" y="120">is it down? check status</text>
+  <text class="t"  x="46" y="151">web_search</text>
+  <text class="ta" x="58" y="182">"openai api status"</text>
+  <text class="t"  x="46" y="213">fetch status.openai.com</text>
+  <text class="r"  x="46" y="244">→ 500s on /chat, 09:12 UTC</text>
+  <text class="s"  x="46" y="276">send_message</text>
+
+  <rect class="card" x="660" y="156" width="250" height="205" rx="8"/>
+  <text class="th" x="676" y="188">outage mascot, make it sad</text>
+  <text class="t"  x="676" y="219">generate_image</text>
+  <text class="ta" x="688" y="251">"robot crying at a</text>
+  <text class="ta" x="688" y="282">terminal, 500 error"</text>
+  <text class="r"  x="676" y="314">→ rendered 1024x1024</text>
+  <text class="s"  x="676" y="350">send_message</text>
+
+  <text class="h" x="350" y="74">neru</text><text class="m" x="430" y="74">ugh, build's red again</text>
+  <text class="hk" x="350" y="108">miku_fan</text><text x="430" y="108"><tspan class="men">@miku</tspan><tspan class="m"> is the openai</tspan></text>
+  <text class="h" x="350" y="142">kaito</text><text class="m" x="430" y="142">same, ci's flaky today</text>
+  <text class="hk" x="350" y="176">rin</text><text x="430" y="176"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
+  <text class="h" x="350" y="210">haku</text><text class="m" x="430" y="210">third time today</text>
+  <text class="h" x="350" y="244">luka</text><text class="m" x="430" y="244">lol</text>
+  <text class="hk" x="350" y="278">miku</text><text class="mk" x="430" y="278">status page: 500s</text>
+  <text class="h" x="350" y="312">kaito</text><text class="m" x="430" y="312">called it lol</text>
+  <text class="hk" x="350" y="346">miku</text><text class="mk" x="430" y="346">[ crying-robot.png ]</text>
+  <text class="h" x="350" y="380">rin</text><text class="m" x="430" y="380">perfect</text>
+</svg>

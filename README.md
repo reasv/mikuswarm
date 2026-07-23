@@ -2,6 +2,13 @@
 
 **A self-hosted agent that lives in your Matrix rooms as one of the members: anyone can @ it, and it answers with a real browser and a shell sandbox of its own. Underneath is a harness built for group chats: the chatroom is the database, and every reply runs as its own parallel, disposable agent session.**
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/harness-dark.svg">
+    <img alt="A chatroom timeline runs down the center. Two @miku messages each fork off a parallel, disposable agent session that reasons and runs its own tools off to the side, then sends a single reply back into the log." src="docs/harness-light.svg" width="880">
+  </picture>
+</p>
+
 MikuSwarm is built around one inversion: the conversation is not the agent's session. The chat lives in its own database, ingested verbatim and summarized continuously whether or not the agent is doing anything. Every time the bot is triggered, a fresh agent session spins up with context assembled from that log, works in parallel with any other sessions, says what it has to say through an explicit send tool, and is thrown away; its thinking, tool calls, and dead ends never enter the room's history. That is the part you cannot get by pointing an existing agent at a chatroom, and it is what makes a heavyweight, fully-tooled agent viable as one member of a busy room.
 
 The reason to want such an agent in a room at all comes from two places. OpenClaw and similar agents showed that an agent gets dramatically more useful when it lives in your messaging apps and owns a real computer (a browser, a shell, files, a schedule, a persistent identity) instead of being a chat window that only talks. @grok on X showed what happens when an agent is *public*: anyone can summon it mid-conversation to fact-check a claim, research a question, settle an argument as a neutral third party, or edit an image someone just posted, and the whole exchange lands in front of everyone, which changes what an agent is for. MikuSwarm is the combination: the first kind of toolkit doing the second kind of job, on a harness actually shaped for the room it lives in.
