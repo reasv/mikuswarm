@@ -583,7 +583,7 @@ output = 0
 cache_read = 0
 cache_write = 0
 
-# X.com (Twitter) search via Grok-as-subagent (spec/X-SEARCH.md). Routes through
+# X.com (Twitter) search via Grok-as-subagent. Routes through
 # OpenRouter via the LLM gateway: `base_url` is the OpenRouter API ROOT (the tool appends
 # /chat/completions), reusing the existing OPENROUTER_BASE_URL + LLM_API_KEY — no
 # new credential, no new egress host. Grok returns a cited synthesis; miku then

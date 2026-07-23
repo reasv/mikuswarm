@@ -941,7 +941,7 @@ const ImageGenSchema = StrictObject({
   output_subdir: Type.Optional(Type.String()),
 });
 
-// X.com search via Grok-as-subagent (spec/X-SEARCH.md; ARCHITECTURE.md §10).
+// X.com search via Grok-as-subagent (ARCHITECTURE.md §10).
 // Routes through OpenRouter via the LLM gateway — `base_url` is the OpenRouter API root
 // (the tool appends `/chat/completions`), `api_key` is sent as
 // `Authorization: Bearer` (the field name matches the secret regex, so it

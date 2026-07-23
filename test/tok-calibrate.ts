@@ -136,7 +136,7 @@ if (memoryDir) {
   const texts: string[] = [];
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir)) {
-      if (name === "SOUL.md") continue; // never read persona files
+      if (name === "SOUL.md") continue; // persona file, not a memory chunk
       const p = path.join(dir, name);
       const st = statSync(p);
       if (st.isDirectory()) walk(p);

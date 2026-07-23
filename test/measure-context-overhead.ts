@@ -232,8 +232,8 @@ async function main() {
   }
 
   // A representative small system prompt to isolate the system-prompt contribution
-  // from the chat-template floor. (The live persona prompt is huge and SOUL.md must
-  // never be read; this measures the per-token system cost, which is ~1:1.)
+  // from the chat-template floor. (The live persona prompt is huge; this measures
+  // the per-token system cost, which is ~1:1.)
   const sampleSystem = "You are a helpful assistant. Be concise.";
   const sysTokens = count(sampleSystem);
 
