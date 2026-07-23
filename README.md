@@ -49,7 +49,7 @@ Each session's prompt is **built once, at creation, and is append-only thereafte
 
 ```mermaid
 flowchart TD
-    SP["System prompt<br/>(persona + tool guidance,<br/>from SOUL.md / AGENTS.md /<br/>TOOLS.md + skills)"]
+    SP["System prompt<br/>(persona + tool guidance,<br/>from SOUL.md /<br/>AGENTS.md / TOOLS.md<br/>+ skills)"]
     DIARY["Recent diary<br/>(first-person memory,<br/>optional)"]
     SUM["Summary layer<br/>(rolling hierarchical<br/>summaries of old history)"]
     COMPACT["Compact tier<br/>(older messages,<br/>one-line format)"]
