@@ -1,7 +1,12 @@
-# Release — build and push MikuSwarm container images to GHCR.
+# Release — verify, then build and push MikuSwarm container images to GHCR.
 #
-# Fires on a pushed v* tag OR a published GitHub release. Images are published
-# under the repository owner's namespace (no hardcoded username):
+# Fires ONLY on a pushed v* tag OR a published GitHub release. There is no
+# push/PR CI: verification runs HERE, as a gate. The cheap checks (type-check,
+# unit tests, console build) run first; the expensive image builds/pushes wait
+# on them via `needs:`, so a botched release (failing type-check / tests) aborts
+# BEFORE any Docker build — no runner minutes wasted on a doomed publish.
+#
+# Images are published under the repository owner's namespace (no hardcoded user):
 #   ghcr.io/<owner>/mikuswarm-agent
 #   ghcr.io/<owner>/mikuswarm-console
 #   ghcr.io/<owner>/mikuswarm-sandbox
@@ -18,13 +23,148 @@ on:
   release:
     types: [published]
 
+# A tag push and a published-release for the same version both resolve to the
+# same tag ref — dedupe so we don't build the images twice.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1 — the agent's own checks: type-check (cheap, fails fast), then the
+  # native build + unit tests. Mirrors the local commands:
+  #   tsc --noEmit + build:native + fetch:tokenizer + npm test
+  # The heavyweight Docker integration tests (test/**/*.docker.test.ts) are NOT
+  # run here — they need a sandbox image and a daemon.
+  # ---------------------------------------------------------------------------
+  verify-agent:
+    name: Verify agent (type-check + native build + unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install ripgrep
+        # The workspace search/memory tools spawn `rg`; the unit tests exercise
+        # that path, so ripgrep must be on PATH (not preinstalled on the runner).
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Setup Node 24 + pnpm
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Enable corepack (pnpm@10.11.0)
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.11.0 --activate
+
+      - name: Setup Rust (pinned to rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.93.0
+
+      - name: Cache cargo + Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
+      - name: Get pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Type-check first — cheap, and uses the committed npm/index.d.ts, so it
+      # fails in seconds on a type error WITHOUT paying for the native build.
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # Skip the ~20-min Rust NAPI compile when native sources + toolchain are
+      # unchanged since a prior release (restores the built .node from cache).
+      - name: Cache built native module
+        id: native-cache
+        uses: actions/cache@v6
+        with:
+          path: npm/*.node
+          key: native-${{ runner.os }}-${{ hashFiles('native/**/*.rs', 'native/**/Cargo.toml', 'native/**/Cargo.lock', 'native/**/build.rs', 'rust-toolchain.toml') }}
+
+      - name: Build native module
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: pnpm build:native
+
+      - name: Fetch GLM tokenizer
+        # Checksum-verified download; needs network.
+        run: pnpm fetch:tokenizer
+
+      - name: Unit tests
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Gate 2 — the console's checks (svelte-check + adapter-node build).
+  # ---------------------------------------------------------------------------
+  verify-console:
+    name: Verify console (type-check + build)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Enable corepack (pnpm@10.11.0)
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.11.0 --activate
+
+      - name: Get pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-console-${{ hashFiles('console/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-console-
+
+      - name: Install dependencies
+        # Skip the playwright browser download — the svelte-check/build path does
+        # not need it (vitest browser tests are not run here).
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check (svelte-check)
+        run: pnpm check
+
+      - name: Build
+        run: pnpm build
+
+  # ---------------------------------------------------------------------------
+  # Expensive stage — build & push the images. Gated on BOTH verify jobs, so a
+  # failing check cancels the release before a single Docker layer is built.
+  # ---------------------------------------------------------------------------
   images:
     name: Build & push ${{ matrix.component }}
+    needs: [verify-agent, verify-console]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
