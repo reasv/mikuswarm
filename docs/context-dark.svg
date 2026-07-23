@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 1070" width="880" height="1070" font-size="13" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 978 1070" width="978" height="1070" font-size="13" role="img" aria-labelledby="t d">
   <title id="t">MikuSwarm context assembly</title>
-  <desc id="d">The context one agent session is built from, top to bottom: system prompt, diary, hierarchical summaries, compact and rich chat tiers, satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier back to the span of chat messages it renders; older chat fades upward into the summaries.</desc>
+  <desc id="d">The context one agent session is built from, top to bottom: system prompt, diary, hierarchical summaries, compact and rich chat tiers, satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier back to the span of chat messages it renders; older chat fades upward into the summaries. A right-hand column marks the frozen initial session context and the per-trigger agent session whose only output path to the chat is send_message.</desc>
   <style>
     text{ font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-    .x,.xm,.xi,.xd,.ct,.t,.ta,.r,.s{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; }
+    .x,.xm,.xi,.xd,.ct,.t,.ta,.r,.s,.sm{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; }
     .x{ font-size:11px; fill:#e6edf3; }
     .xm{ font-size:11px; fill:#9198a1; }
     .xi{ font-size:11px; fill:#9198a1; font-style:italic; }
@@ -26,6 +26,7 @@
     .lo{ font-size:12px; font-weight:600; fill:#d29922; }
     .lb{ font-size:12px; font-weight:600; fill:#58a6ff; }
     .lk{ font-size:12px; font-weight:600; fill:#db61a2; }
+    .lg{ font-size:12px; font-weight:600; fill:#3fb950; }
     .c3{ fill:#3d2b63; stroke:#a371f7; stroke-opacity:0.4; stroke-width:1; }
     .c2{ fill:#342456; stroke:#a371f7; stroke-opacity:0.4; stroke-width:1; }
     .c1{ fill:#2b1e47; stroke:#a371f7; stroke-opacity:0.4; stroke-width:1; }
@@ -41,10 +42,16 @@
     .r{ fill:#6e7681; }
     .s{ fill:#39c5bb; font-weight:600; }
     .skn{ fill:#6e7681; }
+    .box{ fill:#161b22; stroke:#30363d; stroke-width:1.5; }
+    .boxg{ fill:#12261e; stroke:#30363d; stroke-width:1.5; }
+    .bt{ font-size:11px; fill:#9198a1; }
+    .sm{ font-size:11px; fill:#39c5bb; font-weight:600; }
     .brp,.arp{ stroke:#a371f7; stroke-width:1.5; fill:none; }
     .bro,.aro{ stroke:#d29922; stroke-width:1.5; fill:none; }
     .brb,.arb{ stroke:#58a6ff; stroke-width:1.5; fill:none; }
     .ark{ stroke:#db61a2; stroke-width:1.5; fill:none; }
+    .brg,.arg{ stroke:#6e7681; stroke-width:1.5; fill:none; }
+    .brn,.arn{ stroke:#3fb950; stroke-width:1.5; fill:none; }
     .flow{ stroke:#39c5bb; stroke-width:1.8; fill:none; }
     .imgb{ fill:none; stroke:#30363d; stroke-width:1; }
   </style>
@@ -64,6 +71,12 @@
     <marker id="ma" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L9,5 L0,10 z" fill="#39c5bb"/>
     </marker>
+    <marker id="mg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+    <marker id="mn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/>
+    </marker>
     <linearGradient id="pf" gradientUnits="userSpaceOnUse" x1="0" y1="480" x2="0" y2="670">
       <stop offset="0" stop-color="#0d1117" stop-opacity="0"/>
       <stop offset="1" stop-color="#0d1117" stop-opacity="1"/>
@@ -72,123 +85,142 @@
       <stop offset="0" stop-color="#30363d" stop-opacity="0"/>
       <stop offset="1" stop-color="#30363d" stop-opacity="1"/>
     </linearGradient>
-    <clipPath id="imgclip"><rect x="126" y="928" width="56" height="56" rx="6"/></clipPath>
+    <clipPath id="imgclip"><rect x="104" y="928" width="56" height="56" rx="6"/></clipPath>
   </defs>
 
   <!-- chat panel: open top, fades out into the past -->
-  <path fill="url(#pf)" d="M30,480 L30,1027 Q30,1037 40,1037 L312,1037 Q322,1037 322,1027 L322,480 Z"/>
-  <path fill="none" stroke="url(#ps)" stroke-width="1.5" d="M30,480 L30,1027 Q30,1037 40,1037 L312,1037 Q322,1037 322,1027 L322,480"/>
+  <path fill="url(#pf)" d="M8,480 L8,1027 Q8,1037 18,1037 L270,1037 Q280,1037 280,1027 L280,480 Z"/>
+  <path fill="none" stroke="url(#ps)" stroke-width="1.5" d="M8,480 L8,1027 Q8,1037 18,1037 L270,1037 Q280,1037 280,1027 L280,480"/>
 
   <!-- session card -->
-  <rect class="card" x="470" y="30" width="380" height="954" rx="10"/>
-  <rect class="bgp" x="471" y="137" width="378" height="124"/>
-  <rect class="bgo" x="471" y="263" width="378" height="68"/>
-  <rect class="bgb" x="471" y="333" width="378" height="172"/>
-  <rect class="bgk" x="471" y="735" width="378" height="104"/>
+  <rect class="card" x="380" y="30" width="360" height="954" rx="10"/>
+  <rect class="bgp" x="381" y="137" width="358" height="124"/>
+  <rect class="bgo" x="381" y="263" width="358" height="68"/>
+  <rect class="bgb" x="381" y="333" width="358" height="172"/>
+  <rect class="bgk" x="381" y="735" width="358" height="104"/>
 
   <!-- system prompt -->
-  <text class="lbl" x="486" y="52">system prompt</text>
-  <text class="xm" x="486" y="71">SOUL.md · AGENTS.md · TOOLS.md · skills</text>
-  <line class="div" x1="470" y1="84" x2="850" y2="84"/>
+  <text class="lbl" x="396" y="52">system prompt</text>
+  <text class="xm" x="396" y="71">SOUL.md · AGENTS.md · TOOLS.md · skills</text>
+  <line class="div" x1="380" y1="84" x2="740" y2="84"/>
 
   <!-- diary -->
-  <text class="lbl" x="486" y="104">diary</text>
-  <text class="xi" x="486" y="123">last 2 days of entries, from every room</text>
-  <line class="div" x1="470" y1="136" x2="850" y2="136"/>
+  <text class="lbl" x="396" y="104">diary</text>
+  <text class="xi" x="396" y="123">last 2 days of entries, from every room</text>
+  <line class="div" x1="380" y1="136" x2="740" y2="136"/>
 
   <!-- hierarchical summaries -->
-  <text class="lp" x="486" y="156">hierarchical summaries</text>
-  <rect class="c3" x="486" y="166" width="232" height="18" rx="4"/>
-  <text class="ct" x="496" y="179">L3  Jul 17 → Jul 21</text>
-  <rect class="c2" x="486" y="188" width="232" height="18" rx="4"/>
-  <text class="ct" x="496" y="201">L2  Jul 22 → Jul 23</text>
-  <rect class="c1" x="486" y="210" width="232" height="18" rx="4"/>
-  <text class="ct" x="496" y="223">L1  Jul 24 08:03 → 10:41</text>
-  <rect class="c1" x="486" y="232" width="232" height="18" rx="4"/>
-  <text class="ct" x="496" y="245">L1  Jul 24 10:41 → 11:58</text>
-  <line class="div" x1="470" y1="262" x2="850" y2="262"/>
+  <text class="lp" x="396" y="156">hierarchical summaries</text>
+  <rect class="c3" x="396" y="166" width="232" height="18" rx="4"/>
+  <text class="ct" x="406" y="179">L3  Jul 17 → Jul 21</text>
+  <rect class="c2" x="396" y="188" width="232" height="18" rx="4"/>
+  <text class="ct" x="406" y="201">L2  Jul 22 → Jul 23</text>
+  <rect class="c1" x="396" y="210" width="232" height="18" rx="4"/>
+  <text class="ct" x="406" y="223">L1  Jul 24 08:03 → 10:41</text>
+  <rect class="c1" x="396" y="232" width="232" height="18" rx="4"/>
+  <text class="ct" x="406" y="245">L1  Jul 24 10:41 → 11:58</text>
+  <line class="div" x1="380" y1="262" x2="740" y2="262"/>
 
   <!-- compact tier -->
-  <text class="lo" x="486" y="282">compact</text>
-  <text class="x" x="486" y="301"><tspan class="xm">[11:58]</tspan> luka: requests timing out</text>
-  <text class="x" x="486" y="318"><tspan class="xm">[12:01]</tspan> kaito: yeah since noon</text>
-  <line class="div" x1="470" y1="332" x2="850" y2="332"/>
+  <text class="lo" x="396" y="282">compact</text>
+  <text class="x" x="396" y="301"><tspan class="xm">[11:58]</tspan> luka: requests timing out</text>
+  <text class="x" x="396" y="318"><tspan class="xm">[12:01]</tspan> kaito: yeah since noon</text>
+  <line class="div" x1="380" y1="332" x2="740" y2="332"/>
 
   <!-- rich tier -->
-  <text class="lb" x="486" y="352">rich</text>
-  <text class="x" x="486" y="371"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@neru:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:03"</tspan><tspan class="xt">&gt;</tspan></text>
-  <text class="x" x="498" y="388">ugh, build's red again</text>
-  <text class="x" x="486" y="405"><tspan class="xt">&lt;/message&gt;</tspan></text>
-  <text class="x" x="486" y="424"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@teto:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:04"</tspan></text>
-  <text class="x" x="498" y="441"><tspan class="xa">mentions_you</tspan><tspan class="xp">=</tspan><tspan class="xs">"true"</tspan><tspan class="xa"> external_id</tspan><tspan class="xp">=</tspan><tspan class="xs">"$vX3…"</tspan><tspan class="xt">&gt;</tspan></text>
-  <text class="x" x="498" y="458"><tspan class="xt">&lt;handled_by_session</tspan><tspan class="xa"> id</tspan><tspan class="xp">=</tspan><tspan class="xs">"01JX…"</tspan><tspan class="xt">/&gt;</tspan></text>
-  <text class="x" x="498" y="475"><tspan class="xk">@miku</tspan> is openai up</text>
-  <text class="x" x="486" y="492"><tspan class="xt">&lt;/message&gt;</tspan></text>
-  <line class="div" x1="470" y1="506" x2="850" y2="506"/>
+  <text class="lb" x="396" y="352">rich</text>
+  <text class="x" x="396" y="371"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@neru:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:03"</tspan><tspan class="xt">&gt;</tspan></text>
+  <text class="x" x="408" y="388">ugh, build's red again</text>
+  <text class="x" x="396" y="405"><tspan class="xt">&lt;/message&gt;</tspan></text>
+  <text class="x" x="396" y="424"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@teto:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:04"</tspan></text>
+  <text class="x" x="408" y="441"><tspan class="xa">mentions_you</tspan><tspan class="xp">=</tspan><tspan class="xs">"true"</tspan><tspan class="xa"> external_id</tspan><tspan class="xp">=</tspan><tspan class="xs">"$vX3…"</tspan><tspan class="xt">&gt;</tspan></text>
+  <text class="x" x="408" y="458"><tspan class="xt">&lt;handled_by_session</tspan><tspan class="xa"> id</tspan><tspan class="xp">=</tspan><tspan class="xs">"01JX…"</tspan><tspan class="xt">/&gt;</tspan></text>
+  <text class="x" x="408" y="475"><tspan class="xk">@miku</tspan> is openai up</text>
+  <text class="x" x="396" y="492"><tspan class="xt">&lt;/message&gt;</tspan></text>
+  <line class="div" x1="380" y1="506" x2="740" y2="506"/>
 
   <!-- satellite -->
-  <text class="lbl" x="486" y="526">satellite</text>
-  <text class="x" x="486" y="545"><tspan class="xt">&lt;retrieved_memory&gt;</tspan><tspan class="xd"> ⋮ </tspan><tspan class="xt">&lt;/retrieved_memory&gt;</tspan></text>
-  <text class="x" x="486" y="564"><tspan class="xt">&lt;runtime_state&gt;</tspan></text>
-  <text class="x" x="498" y="581">Current time: 2026-07-24 12:05</text>
-  <text class="x" x="498" y="598"><tspan class="xt">&lt;active_sessions&gt;</tspan></text>
-  <text class="x" x="510" y="615"><tspan class="xt">&lt;session</tspan><tspan class="xa"> triggered_by</tspan><tspan class="xp">=</tspan><tspan class="xs">"@miku is openai up"</tspan><tspan class="xt">/&gt;</tspan></text>
-  <text class="x" x="498" y="632"><tspan class="xt">&lt;/active_sessions&gt;</tspan></text>
-  <text class="x" x="486" y="649"><tspan class="xt">&lt;/runtime_state&gt;</tspan></text>
-  <text class="x" x="486" y="668"><tspan class="xt">&lt;tail_instructions</tspan><tspan class="xa"> source</tspan><tspan class="xp">=</tspan><tspan class="xs">"TAIL.md"</tspan><tspan class="xt">&gt;</tspan></text>
-  <text class="x" x="498" y="685">stay in character; deliver replies</text>
-  <text class="x" x="498" y="702">only via send_message</text>
-  <text class="x" x="486" y="719"><tspan class="xt">&lt;/tail_instructions&gt;</tspan></text>
-  <line class="div" x1="470" y1="734" x2="850" y2="734"/>
+  <text class="lbl" x="396" y="526">satellite</text>
+  <text class="x" x="396" y="545"><tspan class="xt">&lt;retrieved_memory&gt;</tspan><tspan class="xd"> ⋮ </tspan><tspan class="xt">&lt;/retrieved_memory&gt;</tspan></text>
+  <text class="x" x="396" y="564"><tspan class="xt">&lt;runtime_state&gt;</tspan></text>
+  <text class="x" x="408" y="581">Current time: 2026-07-24 12:05</text>
+  <text class="x" x="408" y="598"><tspan class="xt">&lt;active_sessions&gt;</tspan></text>
+  <text class="x" x="420" y="615"><tspan class="xt">&lt;session</tspan><tspan class="xa"> triggered_by</tspan><tspan class="xp">=</tspan><tspan class="xs">"@miku is openai up"</tspan><tspan class="xt">/&gt;</tspan></text>
+  <text class="x" x="408" y="632"><tspan class="xt">&lt;/active_sessions&gt;</tspan></text>
+  <text class="x" x="396" y="649"><tspan class="xt">&lt;/runtime_state&gt;</tspan></text>
+  <text class="x" x="396" y="668"><tspan class="xt">&lt;tail_instructions</tspan><tspan class="xa"> source</tspan><tspan class="xp">=</tspan><tspan class="xs">"TAIL.md"</tspan><tspan class="xt">&gt;</tspan></text>
+  <text class="x" x="408" y="685">stay in character; deliver replies</text>
+  <text class="x" x="408" y="702">only via send_message</text>
+  <text class="x" x="396" y="719"><tspan class="xt">&lt;/tail_instructions&gt;</tspan></text>
+  <line class="div" x1="380" y1="734" x2="740" y2="734"/>
 
   <!-- trigger -->
-  <text class="lk" x="486" y="754">trigger</text>
-  <text class="x" x="486" y="773"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@rin:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:05"</tspan></text>
-  <text class="x" x="498" y="790"><tspan class="xa">mentions_you</tspan><tspan class="xp">=</tspan><tspan class="xs">"true"</tspan><tspan class="xa"> external_id</tspan><tspan class="xp">=</tspan><tspan class="xs">"$kQ9…"</tspan><tspan class="xt">&gt;</tspan></text>
-  <text class="x" x="498" y="807"><tspan class="xk">@miku</tspan> make a mascot</text>
-  <text class="x" x="486" y="824"><tspan class="xt">&lt;/message&gt;</tspan></text>
-  <line class="divh" x1="470" y1="840" x2="850" y2="840"/>
+  <text class="lk" x="396" y="754">trigger</text>
+  <text class="x" x="396" y="773"><tspan class="xt">&lt;message</tspan><tspan class="xa"> sender</tspan><tspan class="xp">=</tspan><tspan class="xs">"@rin:…"</tspan><tspan class="xa"> time</tspan><tspan class="xp">=</tspan><tspan class="xs">"12:05"</tspan></text>
+  <text class="x" x="408" y="790"><tspan class="xa">mentions_you</tspan><tspan class="xp">=</tspan><tspan class="xs">"true"</tspan><tspan class="xa"> external_id</tspan><tspan class="xp">=</tspan><tspan class="xs">"$kQ9…"</tspan><tspan class="xt">&gt;</tspan></text>
+  <text class="x" x="408" y="807"><tspan class="xk">@miku</tspan> make a mascot</text>
+  <text class="x" x="396" y="824"><tspan class="xt">&lt;/message&gt;</tspan></text>
+  <line class="divh" x1="380" y1="840" x2="740" y2="840"/>
 
   <!-- rollout -->
-  <text class="th" x="486" y="864">a mascot for the outage… it should look pathetic</text>
-  <text class="t"  x="486" y="888">generate_image</text>
-  <text class="ta" x="498" y="905">"robot crying at a</text>
-  <text class="ta" x="498" y="922">terminal, 500 error"</text>
-  <text class="r"  x="486" y="944">→ rendered 1024x1024</text>
-  <text class="s"  x="486" y="968">send_message</text>
+  <text class="th" x="396" y="864">a mascot for the outage… it should look pathetic</text>
+  <text class="t"  x="396" y="888">generate_image</text>
+  <text class="ta" x="408" y="905">"robot crying at a</text>
+  <text class="ta" x="408" y="922">terminal, 500 error"</text>
+  <text class="r"  x="396" y="944">→ rendered 1024x1024</text>
+  <text class="s"  x="396" y="968">send_message</text>
 
-  <!-- brackets + connectors -->
-  <path class="brp" d="M326,500 L332,500 L332,645 L326,645"/>
-  <path class="arp" d="M334,572 L464,208" marker-end="url(#mp)"/>
-  <path class="bro" d="M326,655 L332,655 L332,707 L326,707"/>
-  <path class="aro" d="M334,681 L464,297" marker-end="url(#mo)"/>
-  <path class="brb" d="M326,715 L332,715 L332,767 L326,767"/>
-  <path class="arb" d="M334,741 L464,419" marker-end="url(#mb)"/>
-  <path class="ark" d="M322,783 L464,783" marker-end="url(#mk2)"/>
-  <path class="flow" d="M470,964 L328,964" marker-end="url(#ma)"/>
+  <!-- left brackets + connectors -->
+  <path class="brp" d="M282,500 L288,500 L288,645 L282,645"/>
+  <path class="arp" d="M290,572 L374,208" marker-end="url(#mp)"/>
+  <path class="bro" d="M282,655 L288,655 L288,707 L282,707"/>
+  <path class="aro" d="M290,681 L374,297" marker-end="url(#mo)"/>
+  <path class="brb" d="M282,715 L288,715 L288,767 L282,767"/>
+  <path class="arb" d="M290,741 L374,419" marker-end="url(#mb)"/>
+  <path class="ark" d="M280,783 L374,783" marker-end="url(#mk2)"/>
+  <path class="flow" d="M380,964 L286,964" marker-end="url(#ma)"/>
+
+  <!-- right column: session spans -->
+  <path class="brg" d="M744,34 L750,34 L750,836 L744,836"/>
+  <path class="arg" d="M752,435 L780,435" marker-end="url(#mg)"/>
+  <rect class="box" x="788" y="393" width="182" height="84" rx="8"/>
+  <text class="lbl" x="800" y="415">Initial Session Context</text>
+  <text class="bt" x="800" y="437">constructed once for</text>
+  <text class="bt" x="800" y="453">each session, then</text>
+  <text class="bt" x="800" y="469">frozen for that session</text>
+
+  <path class="brn" d="M744,846 L750,846 L750,982 L744,982"/>
+  <path class="arn" d="M752,913 L780,913" marker-end="url(#mn)"/>
+  <rect class="boxg" x="788" y="852" width="182" height="122" rx="8"/>
+  <text class="lg" x="800" y="874">Agent Session</text>
+  <text class="bt" x="800" y="892">one per trigger, handed</text>
+  <text class="bt" x="800" y="908">the frozen context;</text>
+  <text class="bt" x="800" y="924">gone when the rollout</text>
+  <text class="bt" x="800" y="940">ends. only <tspan class="sm">send_message</tspan></text>
+  <text class="bt" x="800" y="956">reaches the chat.</text>
 
   <!-- chat: skeleton rows fading into the past -->
   <g class="skn">
-    <rect x="46" y="502" width="44" height="9" rx="4.5" opacity="0.07"/><rect x="126" y="502" width="150" height="9" rx="4.5" opacity="0.07"/>
-    <rect x="46" y="528" width="44" height="9" rx="4.5" opacity="0.13"/><rect x="126" y="528" width="110" height="9" rx="4.5" opacity="0.13"/>
-    <rect x="46" y="554" width="44" height="9" rx="4.5" opacity="0.2"/><rect x="126" y="554" width="170" height="9" rx="4.5" opacity="0.2"/>
-    <rect x="46" y="580" width="44" height="9" rx="4.5" opacity="0.28"/><rect x="126" y="580" width="130" height="9" rx="4.5" opacity="0.28"/>
-    <rect x="46" y="606" width="44" height="9" rx="4.5" opacity="0.38"/><rect x="126" y="606" width="90" height="9" rx="4.5" opacity="0.38"/>
-    <rect x="46" y="632" width="44" height="9" rx="4.5" opacity="0.5"/><rect x="126" y="632" width="150" height="9" rx="4.5" opacity="0.5"/>
+    <rect x="24" y="502" width="44" height="9" rx="4.5" opacity="0.07"/><rect x="104" y="502" width="150" height="9" rx="4.5" opacity="0.07"/>
+    <rect x="24" y="528" width="44" height="9" rx="4.5" opacity="0.13"/><rect x="104" y="528" width="110" height="9" rx="4.5" opacity="0.13"/>
+    <rect x="24" y="554" width="44" height="9" rx="4.5" opacity="0.2"/><rect x="104" y="554" width="170" height="9" rx="4.5" opacity="0.2"/>
+    <rect x="24" y="580" width="44" height="9" rx="4.5" opacity="0.28"/><rect x="104" y="580" width="130" height="9" rx="4.5" opacity="0.28"/>
+    <rect x="24" y="606" width="44" height="9" rx="4.5" opacity="0.38"/><rect x="104" y="606" width="90" height="9" rx="4.5" opacity="0.38"/>
+    <rect x="24" y="632" width="44" height="9" rx="4.5" opacity="0.5"/><rect x="104" y="632" width="150" height="9" rx="4.5" opacity="0.5"/>
   </g>
 
   <!-- chat messages -->
-  <text class="h" x="46" y="667">luka</text><text class="m" x="126" y="667">requests timing out</text>
-  <text class="h" x="46" y="697">kaito</text><text class="m" x="126" y="697">yeah since noon</text>
-  <text class="h" x="46" y="727">neru</text><text class="m" x="126" y="727">ugh, build's red again</text>
-  <text class="hk" x="46" y="757">teto</text><text x="126" y="757"><tspan class="men">@miku</tspan><tspan class="m"> is openai up</tspan></text>
-  <text class="hk" x="46" y="787">rin</text><text x="126" y="787"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
-  <text class="h" x="46" y="817">haku</text><text class="m" x="126" y="817">third time today</text>
-  <text class="h" x="46" y="847">luka</text><text class="m" x="126" y="847">lol</text>
-  <text class="hk" x="46" y="877">miku</text><text class="mk" x="126" y="877">status page: 500s</text>
-  <text class="h" x="46" y="907">kaito</text><text class="m" x="126" y="907">called it lol</text>
-  <text class="hk" x="46" y="937">miku</text>
-  <image x="126" y="928" width="56" height="56" clip-path="url(#imgclip)" href="data:image/png;base64,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"/>
-  <rect class="imgb" x="126" y="928" width="56" height="56" rx="6"/>
-  <text class="h" x="46" y="1017">rin</text><text class="m" x="126" y="1017">perfect</text>
+  <text class="h" x="24" y="667">luka</text><text class="m" x="104" y="667">requests timing out</text>
+  <text class="h" x="24" y="697">kaito</text><text class="m" x="104" y="697">yeah since noon</text>
+  <text class="h" x="24" y="727">neru</text><text class="m" x="104" y="727">ugh, build's red again</text>
+  <text class="hk" x="24" y="757">teto</text><text x="104" y="757"><tspan class="men">@miku</tspan><tspan class="m"> is openai up</tspan></text>
+  <text class="hk" x="24" y="787">rin</text><text x="104" y="787"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
+  <text class="h" x="24" y="817">haku</text><text class="m" x="104" y="817">third time today</text>
+  <text class="h" x="24" y="847">luka</text><text class="m" x="104" y="847">lol</text>
+  <text class="hk" x="24" y="877">miku</text><text class="mk" x="104" y="877">status page: 500s</text>
+  <text class="h" x="24" y="907">kaito</text><text class="m" x="104" y="907">called it lol</text>
+  <text class="hk" x="24" y="937">miku</text>
+  <image x="104" y="928" width="56" height="56" clip-path="url(#imgclip)" href="data:image/png;base64,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"/>
+  <rect class="imgb" x="104" y="928" width="56" height="56" rx="6"/>
+  <text class="h" x="24" y="1017">rin</text><text class="m" x="104" y="1017">perfect</text>
 </svg>
