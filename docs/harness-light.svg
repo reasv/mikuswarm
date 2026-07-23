@@ -35,28 +35,28 @@
   <rect class="panel" x="334" y="40" width="292" height="364" rx="10"/>
 
   <path class="fork" d="M334,103 L280,103" marker-end="url(#af)"/>
-  <path class="flow" d="M280,273 L342,273" marker-end="url(#aa)"/>
+  <path class="flow" d="M280,275 L342,275" marker-end="url(#aa)"/>
   <path class="fork" d="M626,171 L660,171" marker-end="url(#af)"/>
-  <path class="flow" d="M660,346 L618,346" marker-end="url(#aa)"/>
+  <path class="flow" d="M660,343 L618,343" marker-end="url(#aa)"/>
 
-  <rect class="card" x="30" y="88" width="250" height="200" rx="8"/>
+  <rect class="card" x="30" y="88" width="250" height="202" rx="8"/>
   <text class="th" x="46" y="120">is it down? check status</text>
   <text class="t"  x="46" y="151">web_search</text>
   <text class="ta" x="58" y="182">"openai api status"</text>
   <text class="t"  x="46" y="213">fetch status.openai.com</text>
   <text class="r"  x="46" y="244">→ 500s on /chat, 09:12 UTC</text>
-  <text class="s"  x="46" y="276">send_message</text>
+  <text class="s"  x="46" y="279">send_message</text>
 
-  <rect class="card" x="660" y="156" width="250" height="205" rx="8"/>
+  <rect class="card" x="660" y="156" width="250" height="202" rx="8"/>
   <text class="th" x="676" y="188">outage mascot, make it sad</text>
   <text class="t"  x="676" y="219">generate_image</text>
   <text class="ta" x="688" y="251">"robot crying at a</text>
   <text class="ta" x="688" y="282">terminal, 500 error"</text>
   <text class="r"  x="676" y="314">→ rendered 1024x1024</text>
-  <text class="s"  x="676" y="350">send_message</text>
+  <text class="s"  x="676" y="347">send_message</text>
 
   <text class="h" x="350" y="74">neru</text><text class="m" x="430" y="74">ugh, build's red again</text>
-  <text class="hk" x="350" y="108">miku_fan</text><text x="430" y="108"><tspan class="men">@miku</tspan><tspan class="m"> is the openai</tspan></text>
+  <text class="hk" x="350" y="108">teto</text><text x="430" y="108"><tspan class="men">@miku</tspan><tspan class="m"> is the openai</tspan></text>
   <text class="h" x="350" y="142">kaito</text><text class="m" x="430" y="142">same, ci's flaky today</text>
   <text class="hk" x="350" y="176">rin</text><text x="430" y="176"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
   <text class="h" x="350" y="210">haku</text><text class="m" x="430" y="210">third time today</text>
