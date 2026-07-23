@@ -1,9 +1,7 @@
-# MikuSwarm
-
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/mikurundark.png">
-    <img alt="mikurun" src="docs/mikurun.png" width="880">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/title-dark.svg">
+    <img alt="MikuSwarm" src="docs/title-light.svg" width="880">
   </picture>
 </p>
 
