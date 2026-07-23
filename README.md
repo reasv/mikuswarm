@@ -49,19 +49,19 @@ Each session's prompt is **built once, at creation, and is append-only thereafte
 
 ```mermaid
 flowchart TD
-    SP["System prompt<br/>(persona + tool guidance, assembled<br/>from SOUL.md / AGENTS.md / TOOLS.md + skills)"]
-    DIARY["Recent diary<br/>(first-person memory, optional)"]
-    SUM["Summary layer<br/>(hierarchical rolling summaries of old history)"]
-    COMPACT["Compact tier<br/>(older messages, one-line format)"]
-    RICH["Rich tier<br/>(recent messages, full XML + metadata)"]
-    FINAL["Final user turn<br/>(retrieved memory + runtime/tail satellite<br/>+ trigger group + image blocks)"]
+    SP["System prompt<br/>(persona + tool guidance,<br/>from SOUL.md / AGENTS.md /<br/>TOOLS.md + skills)"]
+    DIARY["Recent diary<br/>(first-person memory,<br/>optional)"]
+    SUM["Summary layer<br/>(rolling hierarchical<br/>summaries of old history)"]
+    COMPACT["Compact tier<br/>(older messages,<br/>one-line format)"]
+    RICH["Rich tier<br/>(recent messages,<br/>full XML + metadata)"]
+    FINAL["Final user turn<br/>(retrieved memory +<br/>runtime/tail satellite +<br/>trigger group + images)"]
 
     SP --> DIARY --> SUM --> COMPACT --> RICH --> FINAL
 
-    FROZEN["frozen prefix (cached, never rebuilt)"]
-    LIVE["live turn (first message of the rollout)"]
-    SP -.belongs to.- FROZEN
-    FINAL -.becomes.- LIVE
+    FROZEN["frozen prefix<br/>(cached, never rebuilt)"]
+    LIVE["live turn<br/>(first message of rollout)"]
+    SP -.->|belongs to| FROZEN
+    FINAL -.->|becomes| LIVE
 ```
 
 As raw events age out of the rich and compact tiers they are **summarized, not dropped**; the volatile, cache-cheap final turn carries everything session-specific (the triggering messages, current runtime state, any auto-retrieved memory). See [ARCHITECTURE.md §9 / §9a](ARCHITECTURE.md).
@@ -70,15 +70,15 @@ As raw events age out of the rich and compact tiers they are **summarized, not d
 
 ```mermaid
 flowchart TD
-    IN["Inbound Matrix message"] --> TRIG{"Trigger?<br/>(@mention, DM, reply-to-bot)"}
-    TRIG -->|no| OBS["Append to timeline (observe only)"]
-    TRIG -->|yes| CLAIM["Accept + claim the message<br/>(synchronous — blocks duplicate twins)"]
+    IN["Inbound Matrix message"] --> TRIG{"Trigger?<br/>(@mention, DM,<br/>reply-to-bot)"}
+    TRIG -->|no| OBS["Append to timeline<br/>(observe only)"]
+    TRIG -->|yes| CLAIM["Accept + claim message<br/>(synchronous — blocks<br/>duplicate twins)"]
     CLAIM --> REPLY{"Reply to a bot<br/>message?"}
-    REPLY -->|"yes, completed session"| RESUME["Resume that session<br/>(append turn to existing rollout)"]
+    REPLY -->|"yes, completed session"| RESUME["Resume that session<br/>(append turn to<br/>existing rollout)"]
     REPLY -->|no| BUILD["Build frozen context<br/>(once, at creation)"]
     RESUME --> RUN
     BUILD --> RUN["LLM rollout"]
-    RUN <--> TOOLS["Tool calls<br/>(web, browser, bash, memory, media, …)"]
+    RUN <--> TOOLS["Tool calls<br/>(web, browser, bash,<br/>memory, media, …)"]
     RUN --> SEND["send_message tool<br/>(the only delivery path)"]
     SEND --> FINAL{"final: true?"}
     FINAL -->|no| RUN
