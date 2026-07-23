@@ -15,23 +15,21 @@
 # file IS the bring-up mechanism (for the standalone path).
 #
 # Bring up (standalone path only):
-#   1. docker/build-browser.sh                       # build image from submodule
-#   2. docker/ensure-browser-network.sh              # create the mikuswarm-browser bridge
-#   3. sudo MIKUSWARM_BROWSER_NETWORK=mikuswarm-browser \      # (hardening, root) block RFC1918
+#   1. docker/ensure-browser-network.sh              # create the mikuswarm-browser bridge
+#   2. sudo MIKUSWARM_BROWSER_NETWORK=mikuswarm-browser \      # (hardening, root) block RFC1918
 #        docker/browser-egress-rules.sh
-#   4. BROWSER_AUTH_TOKEN=<token> \
-#        docker compose -f docker/docker-compose.browser.yml up -d
+#   3. BROWSER_AUTH_TOKEN=<token> \
+#        docker compose -f docker/docker-compose.browser.yml up -d   # pulls the image
 #
 # The Manager binds 127.0.0.1:8080 only (localhost). Humans reach the noVNC GUI
 # via SSH tunnel: ssh -L 8080:localhost:8080 your-host
 
 services:
   manager:
-    image: ${MIKUSWARM_BROWSER_IMAGE:-mikuswarm-cloakbrowser-manager:pinned}
-    # Lets `docker compose -f docker/docker-compose.browser.yml build` build the
-    # pinned submodule into the tagged image. `build-browser.sh` does the same.
-    build:
-      context: ../vendor/cloakbrowser-manager
+    # Upstream's own published image, pinned by version tag — we neither fork nor
+    # patch it, so there is nothing to build. Override MIKUSWARM_BROWSER_IMAGE to
+    # track :latest (with Watchtower) or a different pin.
+    image: ${MIKUSWARM_BROWSER_IMAGE:-cloakhq/cloakbrowser-manager:v0.0.10}
     container_name: ${MIKUSWARM_BROWSER_CONTAINER:-mikuswarm-cloakbrowser-manager}
     restart: unless-stopped
     init: true

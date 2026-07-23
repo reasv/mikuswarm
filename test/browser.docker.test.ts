@@ -33,11 +33,11 @@ function imageAvailable(image: string): boolean {
   return spawnSync("docker", ["image", "inspect", image], { stdio: "ignore" }).status === 0;
 }
 
-/** Resolve the Manager image: explicit env, our pinned build, or the upstream image. */
+/** Resolve the Manager image: explicit env, the pinned upstream image, or :latest. */
 function resolveImage(): string | undefined {
   const candidates = [
     process.env.MIKUSWARM_BROWSER_IMAGE,
-    "mikuswarm-cloakbrowser-manager:pinned",
+    "cloakhq/cloakbrowser-manager:v0.0.10",
     "cloakhq/cloakbrowser-manager:latest",
   ].filter((v): v is string => Boolean(v));
   return candidates.find((img) => imageAvailable(img));
@@ -48,7 +48,7 @@ const image = noDocker ? undefined : resolveImage();
 const skip = noDocker
   ? "docker unavailable"
   : !image
-    ? "no CloakBrowser-Manager image (build docker/build-browser.sh or pull cloakhq/cloakbrowser-manager)"
+    ? "no CloakBrowser-Manager image (pull cloakhq/cloakbrowser-manager:v0.0.10)"
     : false;
 
 const silentLogger: Logger = {

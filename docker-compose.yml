@@ -30,9 +30,9 @@
 #   not to override config.) The [sandbox].network "mikuswarm-sandbox" is created by the
 #   agent at runtime; the egress sidecar reconciles its firewall once it exists.
 #
-# MANAGER (CloakBrowser-Manager) is NOT published — it is an upstream submodule we
-# do not redistribute, so it stays BUILD-based from vendor/cloakbrowser-manager
-# (see that service below). Everything else pulls.
+# MANAGER (CloakBrowser-Manager) is upstream's OWN published image, pulled directly
+# from Docker Hub (cloakhq/cloakbrowser-manager) and pinned by version tag — we
+# neither fork nor patch it, so there is nothing to build or vendor. Everything pulls.
 #
 # Topology, networks, binds, uid/gid, depends_on/health gating, DNS pins and the
 # isolation rationale are IDENTICAL to docker-compose.dev.yml — see that file's header
@@ -149,16 +149,14 @@ services:
     depends_on: [agent]
     networks: [mikuswarm]
 
-  # CloakBrowser-Manager — the browser-use backend (ARCHITECTURE.md §11b). NOT
-  # published to GHCR (upstream submodule we do not redistribute), so this is the
-  # ONE service that still BUILDS from source, from the pinned submodule
-  # vendor/cloakbrowser-manager. Initialize submodules before `up`:
-  #     git submodule update --init --recursive
-  # The agent degrades gracefully if it is down, so the agent does NOT depend_on it.
+  # CloakBrowser-Manager — the browser-use backend (ARCHITECTURE.md §11b). Pulled
+  # directly from upstream's OWN Docker Hub image (cloakhq/cloakbrowser-manager),
+  # pinned by version tag — we neither fork nor patch it, so there is nothing to
+  # build or vendor. Operators who want auto-updates can track :latest instead and
+  # label the service for Watchtower. The agent degrades gracefully if it is down,
+  # so the agent does NOT depend_on it.
   manager:
-    build:
-      context: ./vendor/cloakbrowser-manager
-    image: mikuswarm-cloakbrowser-manager:pinned
+    image: cloakhq/cloakbrowser-manager:v0.0.10
     container_name: mikuswarm-cloakbrowser-manager
     restart: unless-stopped
     init: true
