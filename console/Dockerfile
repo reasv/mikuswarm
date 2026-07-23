@@ -22,7 +22,9 @@ COPY package.json pnpm-lock.yaml .npmrc pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN pnpm build
+# In-build verification: svelte-check gates the build (a type error fails the
+# build → the image is never pushed), replacing the separate CI verify job.
+RUN pnpm check && pnpm build
 
 # -----------------------------------------------------------------------------
 # Runtime — node serving the adapter-node output

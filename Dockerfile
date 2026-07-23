@@ -59,6 +59,29 @@ RUN pnpm build:native
 COPY scripts ./scripts
 RUN pnpm fetch:tokenizer
 
+# In-build verification — type-check + unit tests against the just-compiled native
+# module. A failure fails the build, so a broken commit is NEVER pushed. This
+# replaces a separate CI "verify" job, which would recompile the same Rust module
+# a second time (GitHub Actions cache is per-git-ref, so a tag release can't reuse
+# another tag's cache — the double compile was pure waste). ripgrep: the
+# workspace-tool tests spawn `rg`. npm/index.js: the committed JS loader the tests
+# require to reach the built .node. The heavyweight Docker integration tests
+# (test/**/*.docker.test.ts) are excluded by the `npm test` glob (no daemon here).
+COPY npm/index.js npm/package.json ./npm/
+COPY tsconfig.json ./
+COPY src ./src
+COPY test ./test
+# config/00-defaults.toml + docker/95-docker.toml are read by config-validation
+# tests (copied from the repo root at REPO_ROOT); include them so the suite has
+# the same tree the standalone CI checkout had.
+COPY config ./config
+COPY docker/95-docker.toml ./docker/95-docker.toml
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ripgrep \
+  && rm -rf /var/lib/apt/lists/* \
+  && npx tsc --noEmit \
+  && npm test
+
 # -----------------------------------------------------------------------------
 # Runtime — slim base + only what the agent needs at run time.
 # -----------------------------------------------------------------------------
