@@ -18,12 +18,12 @@ concurrency:
 jobs:
   agent:
     name: Agent (type-check + native build + unit tests)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         # No submodules: the cloakbrowser-manager submodule is only used by the
         # browser image build, not by the unit tests.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install ripgrep
         # The workspace search/memory tools spawn `rg`; the unit tests exercise
@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Setup Node 24 + pnpm
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           # Pin pnpm to packageManager in package.json via corepack.
@@ -54,7 +54,7 @@ jobs:
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -79,16 +79,16 @@ jobs:
 
   console:
     name: Console (type-check + build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: console
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -102,7 +102,7 @@ jobs:
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-console-${{ hashFiles('console/pnpm-lock.yaml') }}

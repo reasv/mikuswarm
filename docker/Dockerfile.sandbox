@@ -44,7 +44,6 @@ RUN --mount=type=cache,id=mikuswarm-ubuntu-apt-cache,target=/var/cache/apt,shari
     lsof \
     make \
     netcat-openbsd \
-    npm \
     openssh-client \
     pkg-config \
     procps \
@@ -63,6 +62,16 @@ RUN --mount=type=cache,id=mikuswarm-ubuntu-apt-cache,target=/var/cache/apt,shari
     xz-utils \
     zip \
     zstd \
+  && rm -rf /var/lib/apt/lists/*
+
+# Node.js 24 from NodeSource — Ubuntu 24.04's apt nodejs/npm is Node 18. This
+# provides node, npm, and corepack for the agent's in-sandbox JS tooling.
+RUN --mount=type=cache,id=mikuswarm-ubuntu-apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=mikuswarm-ubuntu-apt-lists,target=/var/lib/apt,sharing=locked \
+  apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+  && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd
