@@ -7,7 +7,7 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/mikurundark.png">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/mikurunwhite.png">
     <img alt="mikurun" src="docs/mikurun.png" width="880">
   </picture>
 </p>
