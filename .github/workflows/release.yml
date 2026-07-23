@@ -15,9 +15,9 @@
 #   ghcr.io/<owner>/mikuswarm-sandbox
 #   ghcr.io/<owner>/mikuswarm-egress
 #
-# The CloakBrowser-Manager image is deliberately NOT published here — it is an
-# upstream submodule (vendor/cloakbrowser-manager, CloakHQ/CloakBrowser-Manager)
-# and the compose stack builds it from that submodule directly.
+# The CloakBrowser-Manager image is deliberately NOT built or published here — it
+# is upstream's own published image (cloakhq/cloakbrowser-manager on Docker Hub),
+# which we neither fork nor patch; the compose stack pulls it, pinned by tag.
 name: Release
 
 on:

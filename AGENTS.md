@@ -62,8 +62,7 @@ src/
   observability/    Structured JSON logging, context dumps
 native/             Rust NAPI module (matrix-sdk)
 config/             TOML config directory (lexicographic merge)
-docker/             Sandbox + browser images & lifecycle scripts (Dockerfile.sandbox, build/network/egress, compose; build-browser.sh builds the CloakBrowser-Manager, which runs as the `manager` service in the root docker-compose.yml — docker-compose.browser.yml + ensure-browser-network.sh + browser-egress-rules.sh are the retained standalone/non-compose path)
-vendor/             Pinned git submodules (cloakbrowser-manager — the browser-use backend; see ARCHITECTURE.md §11b)
+docker/             Sandbox + browser images & lifecycle scripts (Dockerfile.sandbox, build/network/egress, compose; the CloakBrowser-Manager runs as the `manager` service in the root docker-compose.yml, pulled from upstream's published image `cloakhq/cloakbrowser-manager` — docker-compose.browser.yml + ensure-browser-network.sh + browser-egress-rules.sh are the retained standalone/non-compose path)
 test/               Tests (Node built-in test runner via tsx)
 console/            SvelteKit observability console — separate BFF process, builds independently (see ARCHITECTURE.md §11 and console/README.md)
 ```

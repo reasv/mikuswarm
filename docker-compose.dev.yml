@@ -274,14 +274,13 @@ services:
   # stealth Chromium (the `cloakbrowser` binary) inside KasmVNC/Xvfb, a FastAPI
   # REST control plane + CDP-over-WebSocket proxy + noVNC GUI, all on :8080. The
   # agent connects in-process over CDP (playwright connectOverCDP) and degrades
-  # gracefully if this is down — so the agent does NOT depend_on it. Built from the
-  # pinned submodule (vendor/cloakbrowser-manager). Runs as root by design: the
-  # upstream image has no USER/PUID support and pre-downloads its binary into root's
-  # cache, so it is NOT pinned to the host uid:gid like the agent/console.
+  # gracefully if this is down — so the agent does NOT depend_on it. Pulled directly
+  # from upstream's own Docker Hub image (cloakhq/cloakbrowser-manager), pinned by
+  # version tag — we neither fork nor patch it. Runs as root by design: the upstream
+  # image has no USER/PUID support and pre-downloads its binary into root's cache,
+  # so it is NOT pinned to the host uid:gid like the agent/console.
   manager:
-    build:
-      context: ./vendor/cloakbrowser-manager
-    image: mikuswarm-cloakbrowser-manager:pinned
+    image: cloakhq/cloakbrowser-manager:v0.0.10
     container_name: mikuswarm-cloakbrowser-manager
     restart: unless-stopped
     # PID 1 reaping for the Xvfb/VNC/Chromium process tree.
