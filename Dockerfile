@@ -14,7 +14,7 @@
 # -----------------------------------------------------------------------------
 # Builder — toolchains + compile native artifacts. None of this ships to runtime.
 # -----------------------------------------------------------------------------
-FROM node:24-bookworm AS builder
+FROM node:24-trixie AS builder
 
 ENV PATH=/root/.cargo/bin:$PATH
 WORKDIR /app
@@ -62,7 +62,7 @@ RUN pnpm fetch:tokenizer
 # -----------------------------------------------------------------------------
 # Runtime — slim base + only what the agent needs at run time.
 # -----------------------------------------------------------------------------
-FROM node:24-bookworm-slim AS runtime
+FROM node:24-trixie-slim AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
@@ -84,7 +84,7 @@ RUN apt-get update \
   && install -m 0755 -d /etc/apt/keyrings \
   && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
   && chmod a+r /etc/apt/keyrings/docker.asc \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
        > /etc/apt/sources.list.d/docker.list \
   && apt-get update \
   && apt-get install -y --no-install-recommends docker-ce-cli \

@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------
 # Builder — install deps + vite build → /app/build
 # -----------------------------------------------------------------------------
-FROM node:24-bookworm AS builder
+FROM node:24-trixie AS builder
 
 # The console's only native-ish devDep is playwright (vitest browser tests). We
 # never run those here, so skip its multi-hundred-MB browser download.
@@ -27,7 +27,7 @@ RUN pnpm build
 # -----------------------------------------------------------------------------
 # Runtime — node serving the adapter-node output
 # -----------------------------------------------------------------------------
-FROM node:24-bookworm-slim AS runtime
+FROM node:24-trixie-slim AS runtime
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
