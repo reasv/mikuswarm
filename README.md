@@ -73,26 +73,26 @@ This is also why there is no subagent mechanic: every session already is one, in
 
 ### Context assembly
 
-Each session's prompt is **built once, at creation, and is append-only thereafter**, never rebuilt per turn. That makes the prefix byte-stable (cache-friendly), coherent (the session sees the world as it was when it started), and a clean base for persistence and resume. The build is a deterministic, token-budgeted, tiered layout:
+Each session's prompt is **built once, at creation, and is append-only thereafter**, never rebuilt per turn. That makes the prefix byte-stable (cache-friendly), coherent (the session sees the world as it was when it started), and a clean base for persistence and resume. The build is a deterministic, token-budgeted, tiered layout. Here is everything one session sees, and where it comes from:
 
-```mermaid
-flowchart TD
-    SP["System prompt<br/>(persona + tool guidance,<br/>from SOUL.md /<br/>AGENTS.md / TOOLS.md<br/>+ skills)"]
-    DIARY["Recent diary<br/>(first-person memory,<br/>optional)"]
-    SUM["Summary layer<br/>(rolling hierarchical<br/>summaries of old history)"]
-    COMPACT["Compact tier<br/>(older messages,<br/>one-line format)"]
-    RICH["Rich tier<br/>(recent messages,<br/>full XML + metadata)"]
-    FINAL["Final user turn<br/>(retrieved memory +<br/>runtime/tail satellite +<br/>trigger group + images)"]
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/context-dark.svg">
+    <img alt="One agent session's context, assembled from the chatroom at spawn: system prompt, diary, hierarchical summaries, a compact tier and a rich tier of chat messages, the satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier to the span of chat messages it covers; older chat fades upward into the summaries." src="docs/context-light.svg" width="880">
+  </picture>
+</p>
 
-    SP --> DIARY --> SUM --> COMPACT --> RICH --> FINAL
+The tiered scheme is an implementation of [lossless context management](https://papers.voltropy.com/LCM): aging history is never dropped; it is absorbed upward into rolling hierarchical summaries and coalesced again into higher levels as it ages further. A room conversation can therefore continue indefinitely under bounded context, with the agent always seeing the complete history of the room since it joined, at high resolution for recent messages and progressively lower resolution for older ones. The paper's authors ship the same mechanism as an OpenClaw plugin ([lossless-claw](https://github.com/martian-engineering/lossless-claw)), which ran this bot's predecessor. MikuSwarm reimplements it natively, with the chat timeline as the substrate instead of user/assistant turns, which buys a few things:
 
-    FROZEN["frozen prefix<br/>(cached, never rebuilt)"]
-    LIVE["live turn<br/>(first message of rollout)"]
-    SP -.->|belongs to| FROZEN
-    FINAL -.->|becomes| LIVE
-```
+- **Message-level granularity.** Summarization boundaries can fall between any two chat messages, and every summary is labeled with the exact timespan of the messages beneath it (the date ranges in the diagram), so the agent can place summarized events in time and the recap/search tools can select summaries by coverage. An OpenClaw bot instead receives recent chat pasted into a single user turn as text, where individual messages can no longer be separated.
+- **A compact tier between the summaries and the live window.** Messages aging out of the rich tier shed their XML envelope, IDs, and metadata, get truncated if very long, and are re-rendered as plain chatlog lines: username, time, text, captions and link-preview text. They stop being interactive (without IDs the agent cannot reply to them, react to them, or inspect them with tools), but they cost a fraction of the tokens while preserving conversational continuity.
+- **In-line expansion.** The upstream plugin uses dedicated subagents to expand summaries back out. MikuSwarm's sessions are focused enough to call the recap and history-search tools themselves, so the past arrives in the same context that will do the answering, with the full persona and conversation in view, with no blank-slate subagent paraphrasing old logs in between.
 
-As raw events age out of the rich and compact tiers they are absorbed into the summary layer instead of being dropped; the volatile, cache-cheap final turn carries everything session-specific (the triggering messages, current runtime state, any auto-retrieved memory). See [ARCHITECTURE.md §9 / §9a](ARCHITECTURE.md).
+**Every budget has a max and a target.** Summaries coalesce by fan-in (a configurable number of level-N summaries becomes one level-N+1, each produced under its own token cap), while the compact and rich tiers are bounded by measured token budgets, so context size has a hard ceiling no matter how long a channel runs. Crucially, each tier bound is a pair: when a tier reaches its max it is drained down to a lower target, and the drained messages flow backward into the tier behind it. A max-only bound would sit at the ceiling forever and shift the prefix on every message (the naive chatbot that drops its oldest message once full never hits prefix cache again). Draining to a target makes compaction events rare, keeps every tier's prefix byte-stable between them, and ensures each flush into the summary layer carries enough messages to seed new L1 summaries. The layout ages gracefully for the cache in general: the oldest context is held by the highest-level summaries, which change the least, and the churn (new messages, interleaved reaction events) is confined to the volatile end.
+
+**The satellite prompt.** Everything highly variable lives in a satellite block inserted after the chat context and before the trigger group: auto-retrieved memories, the current time and channel, and harness state such as the sibling sessions running in parallel. Because it sits past the end of the stable prefix, all of that per-session state can vary freely without invalidating a cached byte. Most agent stacks have no natural place for such a block; it exists here because context is *constructed* per session, a movable tail rather than an accumulating log. The satellite also restates the operator's tail instructions (TAIL.md) verbatim: attention is U-shaped over long contexts, and a long chat history tends to wash the system prompt out of the model's behaviour, so the rules that most need holding are repeated in the strongest position available, directly above the messages the session is about to answer. The trigger messages come last, which sets them apart without any instruction to focus on them exclusively; a persona bot should read the whole room, and is free to answer something else too.
+
+All of it is frozen at spawn; the rollout that follows only appends. Sessions are short-lived enough that their own tool calls and reasoning are never compacted or rewritten (a session that somehow outgrows its budget simply fails, a rare edge case), which keeps the agent-side context shaped like what the model was trained on. A resumed session appends the chat it missed plus a reduced satellite as part of the new turn. See [ARCHITECTURE.md §9 / §9a](ARCHITECTURE.md).
 
 ### Session lifecycle
 
