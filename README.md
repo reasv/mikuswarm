@@ -1,6 +1,6 @@
 # MikuSwarm
 
-**A self-hosted agent that lives in your Matrix rooms as one of the members: anyone can summon it, everyone sees its answers, it has a real browser and a sandbox of its own, and it remembers everything the room has ever said.**
+**A self-hosted agent that lives in your Matrix rooms as one of the members: anyone can @ it, it answers with a real browser and a shell sandbox of its own, and it follows the conversation even when nobody is talking to it.**
 
 MikuSwarm crosses two ideas. OpenClaw and similar agents showed that an agent gets dramatically more useful when it lives in your messaging apps and owns a real computer (a browser, a shell, files, a schedule, a persistent identity) instead of being a chat window that only talks. @grok on X showed what happens when an agent is *public*: anyone can summon it mid-conversation to fact-check a claim, research a question, settle an argument as a neutral third party, or edit an image someone just posted, and the whole exchange lands in front of everyone, which changes what an agent is for. MikuSwarm is the combination: an agent with the first kind of toolkit doing the second kind of job, living in a group chat as a member of it.
 
