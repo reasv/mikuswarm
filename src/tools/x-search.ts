@@ -23,8 +23,8 @@ import { formatAgentTimestamp } from "../time/index.js";
 import type { ToolUsageRecord } from "./image-gen.js";
 
 /**
- * `x_search` — Grok-as-subagent X.com search with native hydration & captioning
- * (spec/X-SEARCH.md). Grok searches and reasons over X for the agent like a
+ * `x_search` — Grok-as-subagent X.com search with native hydration & captioning.
+ * Grok searches and reasons over X for the agent like a
  * sub-agent and returns a cited synthesis; miku then *grounds* that synthesis by
  * re-fetching the cited tweets through its own FxTwitter pipeline (verbatim text
  * + media) and captioning the top images inline — so a fabricated citation is

@@ -14,7 +14,7 @@ MikuSwarm is built specifically for that messy, concurrent setting. The name is 
 
 A bit of positioning, kept honest:
 
-- **versus OpenClaw** — MikuSwarm replaces an earlier self-hosted agent the maintainer ran. OpenClaw handled busy multi-user rooms poorly because it was effectively serial and gave little control over how context was assembled or what the bot did under the hood. MikuSwarm was written to fix exactly that: explicit, inspectable context assembly and genuine per-trigger concurrency.
+- **versus OpenClaw** — OpenClaw is a single-user-shaped runtime: one long-lived agentic loop where the *session is the conversation*. Dropped into a busy many-user room it effectively serializes — handling one thing at a time while the room races ahead. MikuSwarm is built on the opposite premise: the conversation and the agent session are separate things, and each trigger runs as its own concurrent session assembled from a shared timeline.
 - **versus hosted assistants like Anthropic's @claude** — similar in spirit (a chat-native agent you can talk to in a room), but MikuSwarm is **self-hosted, model-agnostic, persona-driven, and purpose-built for shared multi-user chatrooms** rather than a hosted product. You own the data, choose the models, and shape the personality.
 
 MikuSwarm is a **general** many-user-chatroom agent: the headline is the concurrency, context, and session architecture. It ships with a neutral, replaceable default persona. (The art/anime-community tools — `danbooru`, character cards, reverse-image lookup — exist but are **off by default, opt-in add-ons**; they are genuinely niche, not a core assumption.)

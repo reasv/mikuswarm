@@ -580,7 +580,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     httpProxyUrl: config.network?.http_proxy_url,
   });
 
-  // Shared, cross-session Grok-result cache for x_search (spec X-SEARCH §9): one
+  // Shared, cross-session Grok-result cache for x_search: one
   // instance so a reactive and a proactive session hitting the same topic in a
   // busy channel dampen to a single Grok call. Only the expensive synthesis is
   // cached (pre-hydration); 0 minutes disables it.
@@ -3163,7 +3163,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
     // x_search). Feeds the per-session cost ceiling's combined-spend lane in-memory
     // (spec SESSION-COST-LIMITS §4) and appends one durable `tool_invocations` row
-    // (spec AUXILIARY-USAGE-TRACKING §8.2 / X-SEARCH §7). Both lanes are separate
+    // (spec AUXILIARY-USAGE-TRACKING §8.2). Both lanes are separate
     // from agent_sessions.usage_* (§8c §4); a sink failure never fails the tool.
     const recordToolUsage = (record: ToolUsageRecord) => {
       usage.recordToolCost(record.cost ?? 0);
@@ -3422,7 +3422,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
             config: sauceNaoConfig,
           })]
         : []),
-      // x_search (spec/X-SEARCH.md): Grok-as-subagent X.com search, grounded by
+      // x_search: Grok-as-subagent X.com search, grounded by
       // miku's own FxTwitter hydration + inline captioning. The Grok call goes to
       // OpenRouter — a different provider lane than the agent loop — so it is NOT
       // admitted through llmScheduler (§8); only the inline captions ride the
