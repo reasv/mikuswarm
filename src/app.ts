@@ -443,6 +443,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       image: config.sandbox.image,
       containerName: config.sandbox.container_name,
       network: config.sandbox.network,
+      dns: config.sandbox.dns,
       workspaceHostDir: path.resolve(workspaceRoot),
       workspaceBindSource: config.sandbox.workspace_bind_source,
       workspaceMount: config.sandbox.workspace_mount,

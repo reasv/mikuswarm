@@ -1329,6 +1329,15 @@ export const AppConfigSchema = StrictObject({
     image: Type.String(),
     container_name: Type.String(),
     network: Type.String(),
+    // DNS servers for the sandbox (`docker create --dns`). Unset ⇒
+    // ["1.1.1.1", "8.8.8.8"] (historical default — a bridge network where the
+    // daemon's embedded resolver is unreachable behind the egress firewall). Set
+    // to [] to emit NO --dns: REQUIRED when `network` is a namespace join
+    // ("container:…"/"host"), since Docker rejects --dns with a shared netns — the
+    // sandbox then inherits that namespace's resolver (e.g. a VPN anchor's tunnel
+    // DNS, so its egress + name resolution both ride the tunnel). Non-empty ⇒
+    // those servers verbatim.
+    dns: Type.Optional(Type.Array(Type.String())),
     workspace_mount: Type.String(),
     // How the sandbox bind source (`docker create -v <src>`) is derived from the
     // workspace root. "host" (default): the resolved path is used as-is — the

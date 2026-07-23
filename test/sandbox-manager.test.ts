@@ -241,6 +241,40 @@ test("createContainer: read_only_root off adds no --read-only and no tmpfs", asy
   assert.ok(!createArgs.includes("--tmpfs"));
 });
 
+const captureCreateArgs = () => {
+  let createArgs: string[] = [];
+  const { run } = fakeRunner((args) => {
+    if (args[0] === "network" && args[1] === "inspect") return ok();
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    if (args[0] === "inspect") return fail("No such object", 1);
+    if (args[0] === "create") {
+      createArgs = args;
+      return ok();
+    }
+    return ok();
+  });
+  return { run, get: () => createArgs };
+};
+const dnsValues = (args: string[]) => args.filter((_, i) => args[i - 1] === "--dns");
+
+test("createContainer: dns undefined ⇒ the historical default --dns 1.1.1.1 + 8.8.8.8", async () => {
+  const cap = captureCreateArgs();
+  await SandboxManager.ensure(baseOptions({ runDocker: cap.run })); // no dns override
+  assert.deepEqual(dnsValues(cap.get()), ["1.1.1.1", "8.8.8.8"]);
+});
+
+test("createContainer: dns [] ⇒ NO --dns (required for a container:/host netns join)", async () => {
+  const cap = captureCreateArgs();
+  await SandboxManager.ensure(baseOptions({ runDocker: cap.run, dns: [], network: "container:miku-vpn" }));
+  assert.ok(!cap.get().includes("--dns"), "emits no --dns so the netns resolver is inherited");
+});
+
+test("createContainer: dns non-empty ⇒ those servers verbatim", async () => {
+  const cap = captureCreateArgs();
+  await SandboxManager.ensure(baseOptions({ runDocker: cap.run, dns: ["10.64.0.1"] }));
+  assert.deepEqual(dnsValues(cap.get()), ["10.64.0.1"]);
+});
+
 test("waitForReady: surfaces the last probe's exit code and stderr on failure", async () => {
   const { run } = fakeRunner((args) => {
     if (args[0] === "network" && args[1] === "inspect") return ok();

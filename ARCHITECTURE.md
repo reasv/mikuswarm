@@ -2595,6 +2595,13 @@ exec_timeout_ms = 120000       # default per-command timeout (bash can override)
 max_output_bytes = 1048576     # cap per captured stream
 stop_on_shutdown = false
 # optional: memory, cpus, pids_limit, read_only_root, env, binds → docker create
+# dns: DNS servers for `docker create --dns`. Unset ⇒ ["1.1.1.1", "8.8.8.8"]
+#   (default — a bridge network where the daemon's embedded resolver is
+#   unreachable behind the egress firewall). Set to [] to emit NO --dns, which
+#   is REQUIRED when `network` is a namespace join ("container:…"/"host") —
+#   Docker rejects --dns with a shared netns, and the sandbox then inherits that
+#   namespace's resolver (e.g. a VPN anchor's tunnel DNS, so egress + resolution
+#   both ride the tunnel with no IP leak). A non-empty list is used verbatim.
 ```
 
 `src/config/schema.ts` makes the section optional (existing configs stay valid); `validateConfig` (`src/config/loader.ts`) rejects a relative `workspace_mount` when enabled. The image is built with `docker/build-sandbox.sh` (full dev toolchain — apt set, pnpm, uv, rust, homebrew — carried over from the OpenClaw sandbox).
