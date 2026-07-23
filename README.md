@@ -1,5 +1,9 @@
 # MikuSwarm
 
+<p align="center">
+  <img alt="mikurun" src="docs/mikurun.png" width="880">
+</p>
+
 **A self-hosted agent that lives in your Matrix rooms as one of the members: anyone can @ it, and it answers with a real browser and a shell sandbox of its own. Underneath is a harness built for group chats: the chatroom is the database, and every reply runs as its own parallel, disposable agent session.**
 
 <p align="center">
