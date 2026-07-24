@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { Schema } from 'effect';
-import { resolveFixture, DEMO_FEATURED_SESSION, DEMO_FEATURED_ROOM } from './fixtures';
+import {
+	resolveFixture,
+	DEMO_FEATURED_SESSION,
+	DEMO_FEATURED_ROOM,
+	DEMO_FEATURED_CAPTION_ITEM
+} from './fixtures';
 import {
 	UsageSummary,
 	UsageTimeseries,
@@ -13,7 +18,11 @@ import {
 	SessionsResponse,
 	SessionFacetsResponse,
 	RoomContextResponse,
-	SessionDetailResponse
+	SessionDetailResponse,
+	PipelinesResponse,
+	PipelineItemsResponse,
+	PipelineItemDetail,
+	CostOverview
 } from '$lib/schemas';
 
 /**
@@ -36,7 +45,12 @@ const cases: Case[] = [
 	{ path: `/api/rooms/${room}/sessions`, schema: SessionsResponse as never },
 	{ path: `/api/rooms/${room}/session-facets`, schema: SessionFacetsResponse as never },
 	{ path: `/api/rooms/${room}/context`, schema: RoomContextResponse as never },
-	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}`, schema: SessionDetailResponse as never }
+	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}`, schema: SessionDetailResponse as never },
+	{ path: '/api/pipelines', schema: PipelinesResponse as never },
+	{ path: '/api/cost-overview', schema: CostOverview as never },
+	{ path: '/api/pipelines/captioning/items', schema: PipelineItemsResponse as never },
+	{ path: '/api/pipelines/enrichment/items', schema: PipelineItemsResponse as never },
+	{ path: `/api/pipelines/captioning/items/${encodeURIComponent(DEMO_FEATURED_CAPTION_ITEM)}`, schema: PipelineItemDetail as never }
 ];
 
 const WINDOWS = ['today', '24h', '7d', '30d', 'month', 'all'];

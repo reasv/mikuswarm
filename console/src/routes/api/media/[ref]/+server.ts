@@ -1,6 +1,7 @@
 import { error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { apiBaseUrl, authHeaders } from '$lib/server/config';
+import { apiBaseUrl, authHeaders, demoMode } from '$lib/server/config';
+import { demoImageResponse } from '$lib/server/api/demo/media';
 
 /**
  * Same-origin image proxy (spec §8 `/api/media/:ref`). Image bytes are binary, so
@@ -9,6 +10,7 @@ import { apiBaseUrl, authHeaders } from '$lib/server/config';
  * and never sees the token.
  */
 export const GET: RequestHandler = async ({ params, fetch, setHeaders, request }) => {
+	if (demoMode) return demoImageResponse(params.ref);
 	const ref = encodeURIComponent(params.ref);
 	const upstream = await fetch(`${apiBaseUrl}/api/media/${ref}`, {
 		headers: authHeaders(),

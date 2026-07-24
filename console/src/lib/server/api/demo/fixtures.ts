@@ -880,6 +880,153 @@ function sessionDetailFixture(id: string, now: number): unknown {
 	};
 }
 
+// ── Pipeline monitor endpoints ──────────────────────────────────────────────
+
+const CAPTION_MODEL = 'google/gemini-3.5-flash';
+
+/** The four background pools + counts (ARCHITECTURE.md §11). Healthy, like a settled bot. */
+function pipelinesFixture(): unknown {
+	return {
+		pipelines: [
+			{
+				pool: 'enrichment',
+				enabled: true,
+				workerCount: 4,
+				maxRetries: 3,
+				inFlight: 0,
+				counts: { pending: 0, processing: 0, retrying: 0, done: 95436, failed: 0, skipped: 214, deferred: 0 },
+				usage: null
+			},
+			{
+				pool: 'captioning',
+				enabled: true,
+				workerCount: 2,
+				maxRetries: 2,
+				inFlight: 0,
+				// `deferred` = pending assets the pool won't claim under the current config.
+				counts: { pending: 0, processing: 0, retrying: 0, done: 275, failed: 0, skipped: 0, deferred: 6148 },
+				usage: {
+					captionedCount: 267,
+					totalInputTokens: 309000,
+					totalOutputTokens: 176000,
+					totalCost: 1.79
+				}
+			},
+			{
+				pool: 'summarization',
+				enabled: true,
+				workerCount: 1,
+				maxRetries: 3,
+				inFlight: 0,
+				counts: { pending: 0, processing: 0, retrying: 0, done: 901, failed: 0, skipped: 0, deferred: 0 },
+				usage: null
+			},
+			{
+				pool: 'diary',
+				enabled: true,
+				workerCount: 1,
+				maxRetries: 3,
+				inFlight: 0,
+				counts: { pending: 0, processing: 0, retrying: 0, done: 612, failed: 0, skipped: 8, deferred: 0 },
+				usage: null
+			}
+		]
+	};
+}
+
+// Curated captioning items. `scene` picks the demo media placeholder (media.ts) so the
+// caption matches what the placeholder actually draws. `hero` is deep-linked in the shot.
+interface CaptionItem {
+	id: string;
+	file: string;
+	scene: string;
+	roomIdx: number;
+	ageMin: number;
+	input: number;
+	output: number;
+	cost: number;
+	caption: string;
+}
+const CAPTION_ITEMS: CaptionItem[] = [
+	{ id: 'cap-meadow', file: 'sunset.jpg', scene: 'landscape', roomIdx: 1, ageMin: 22 * 60, input: 1124, output: 775, cost: 0.0086, caption: 'A landscape photo of rolling green hills beneath a warm sunset, the sun sitting low on the horizon and a couple of birds in the peach-and-lavender sky.' },
+	{ id: 'cap-sticker', file: 'sticker.png', scene: 'character', roomIdx: 0, ageMin: 34 * 60, input: 980, output: 512, cost: 0.0067, caption: 'A cute cartoon mascot with teal twin-tails and a small smile on a soft pastel background — reads like a chat sticker.' },
+	{ id: 'cap-thread', file: 'screenshot.png', scene: 'ui', roomIdx: 3, ageMin: 26 * 60, input: 1340, output: 690, cost: 0.0091, caption: 'A screenshot of a chat app: a short message thread with a teal header bar and a highlighted reply bubble at the bottom.' },
+	{ id: 'cap-poster', file: 'poster.jpg', scene: 'poster', roomIdx: 2, ageMin: 44 * 60, input: 1210, output: 604, cost: 0.0079, caption: 'A promotional poster for a fictional sci-fi game — bold title text over a dark purple-and-blue background with glowing orbs.' },
+	{ id: 'cap-swatch', file: 'art.png', scene: 'abstract', roomIdx: 1, ageMin: 51 * 60, input: 890, output: 430, cost: 0.0058, caption: 'A colourful abstract graphic: overlapping translucent circles in blue, pink and violet on a soft gradient.' },
+	{ id: 'cap-field', file: 'IMG_2048.jpeg', scene: 'landscape', roomIdx: 4, ageMin: 73 * 60, input: 1180, output: 742, cost: 0.0083, caption: 'An outdoor photo of a grassy field under a golden evening sky, layered hills fading into the distance.' },
+	{ id: 'cap-react', file: 'meme.png', scene: 'character', roomIdx: 0, ageMin: 96 * 60, input: 1015, output: 560, cost: 0.0071, caption: 'A reaction sticker of a teal-haired mascot making a cheerful expression on a pastel gradient.' },
+	{ id: 'cap-window', file: 'diagram.png', scene: 'ui', roomIdx: 3, ageMin: 128 * 60, input: 1265, output: 648, cost: 0.0085, caption: 'A screenshot of a simple app window with a header bar and a few lines of placeholder text.' }
+];
+
+/** The featured captioning item the demo pipelines screenshot should deep-link to. */
+export const DEMO_FEATURED_CAPTION_ITEM = CAPTION_ITEMS[0].id;
+
+function captionRef(it: CaptionItem): string {
+	return `att-${it.scene}-${it.id}`;
+}
+
+/** One captioning `PipelineItem` (shared by the list + the detail header). */
+function captionItem(it: CaptionItem, now: number): Record<string, unknown> {
+	const room = ROOMS[it.roomIdx];
+	const ts = now - it.ageMin * MIN;
+	return {
+		pool: 'captioning',
+		id: it.id,
+		status: 'complete',
+		attempts: 1,
+		maxRetries: 2,
+		retrying: false,
+		room: `matrix:miku:room:${room.key}`,
+		createdAt: ts - 4000,
+		updatedAt: ts,
+		inputSummary: `${it.file} · image`,
+		outputSummary: it.caption,
+		error: null,
+		sessionId: null
+	};
+}
+
+function pipelineItemsFixture(pool: string, status: string | null, now: number): unknown {
+	if (pool !== 'captioning') return { items: [], nextCursor: null };
+	const items = CAPTION_ITEMS.filter((_) => status == null || status === 'complete').map((it) =>
+		captionItem(it, now)
+	);
+	return { items, nextCursor: null };
+}
+
+function pipelineItemDetailFixture(pool: string, id: string, now: number): unknown | undefined {
+	if (pool !== 'captioning') return undefined;
+	const it = CAPTION_ITEMS.find((c) => c.id === id) ?? CAPTION_ITEMS[0];
+	return {
+		pool: 'captioning',
+		item: captionItem(it, now),
+		media: {
+			ref: captionRef(it),
+			role: 'source',
+			mediaType: 'image',
+			mimeType: it.file.endsWith('.png') ? 'image/png' : 'image/jpeg',
+			filename: it.file,
+			downloadStatus: 'complete',
+			captionStatus: 'complete',
+			caption: it.caption,
+			captionModel: CAPTION_MODEL,
+			hasBytes: true,
+			usage: {
+				input: it.input,
+				output: it.output,
+				cacheRead: 0,
+				total: it.input + it.output,
+				cost: it.cost
+			}
+		}
+	};
+}
+
+/** GET /api/cost-overview — the three spend lanes, side by side. */
+function costOverviewFixture(): unknown {
+	return { agentLoopCost: 128.4, toolCost: 6.2, captioningCost: 1.79 };
+}
+
 // ── Routing ─────────────────────────────────────────────────────────────────
 
 /** The featured session id the demo observability screenshot should deep-link to. */
@@ -915,8 +1062,13 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 			return userLimitsFixture(scope, page, now);
 		case '/api/rooms':
 			return roomsFixture(now);
+		case '/api/pipelines':
+			return pipelinesFixture();
+		case '/api/cost-overview':
+			return costOverviewFixture();
 	}
 
+	const status = params.get('status');
 	let m: RegExpMatchArray | null;
 	if ((m = pathname.match(/^\/api\/rooms\/([^/]+)\/sessions$/)))
 		return roomSessionsFixture(decodeURIComponent(m[1]), now);
@@ -926,6 +1078,10 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 		return roomContextFixture(decodeURIComponent(m[1]));
 	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)$/)))
 		return sessionDetailFixture(decodeURIComponent(m[1]), now);
+	if ((m = pathname.match(/^\/api\/pipelines\/([^/]+)\/items\/([^/]+)$/)))
+		return pipelineItemDetailFixture(m[1], decodeURIComponent(m[2]), now);
+	if ((m = pathname.match(/^\/api\/pipelines\/([^/]+)\/items$/)))
+		return pipelineItemsFixture(m[1], status, now);
 
 	return undefined;
 }

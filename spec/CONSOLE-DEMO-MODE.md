@@ -3,9 +3,11 @@
 **Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §11 "Console frontend" → "Demo mode";
 retained for review. Shipped: `MIKUSWARM_CONSOLE_DEMO` gate in `console/src/lib/server/config.ts`
 selecting `AgentApiClientDemo` (`server/api/client.demo.ts`) in `runtime.ts`; fixtures +
-router in `server/api/demo/fixtures.ts`; empty-SSE stub in `server/api/demo/sse.ts` wired into
-both stream routes; fidelity test `server/api/demo/fixtures.test.ts` (decodes every fixture
-through its wire schema). Docs: `console/README.md` "Demo mode", `console/.env.example`.
+router in `server/api/demo/fixtures.ts` (usage/cost, observability, and pipeline-monitor
+endpoints); empty-SSE stub in `server/api/demo/sse.ts` wired into both stream routes; SVG media
+placeholders in `server/api/demo/media.ts` wired into `routes/api/media/[ref]`; fidelity test
+`server/api/demo/fixtures.test.ts` (decodes every fixture through its wire schema). Docs:
+`console/README.md` "Demo mode", `console/.env.example`.
 
 ---
 
@@ -106,6 +108,20 @@ Observability / conversations (`/`):
 - `GET /api/rooms/:key/session-facets` → `SessionFacetsResponse`
 - `GET /api/rooms/:key/context` → `RoomContextResponse`
 - `GET /api/sessions/:id` → `SessionDetailResponse` (persisted snapshot + rollout transcript)
+
+Pipeline monitor (`/pipelines`):
+
+- `GET /api/pipelines` → `PipelinesResponse`
+- `GET /api/pipelines/:pool/items` → `PipelineItemsResponse`
+- `GET /api/pipelines/:pool/items/:id` → `PipelineItemDetail`
+- `GET /api/cost-overview` → `CostOverview`
+
+### 4.1a Media placeholders
+
+The captioning detail renders the source image through the `/api/media/:ref` proxy route (also
+not a remote function). In demo mode that route short-circuits to a synthesized, self-contained
+**SVG placeholder** (`server/api/demo/media.ts`) — original vector art, never a real photo — with
+the scene encoded in the ref (`att-<scene>-<n>`) so a fixture's caption matches what is drawn.
 
 ### 4.2 Live SSE streams
 
