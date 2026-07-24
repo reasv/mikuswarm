@@ -19,6 +19,16 @@ tools and agent layer; downstream consumer worker pools; storage/config/bootstra
 The Matrix layer itself (`src/matrix/`) is reviewed only for what it leaks past its
 boundary, since it is simply unused for Discord connections.
 
+**Second pass**: this document has since been cross-checked by ten further
+independent reviews (the nine clusters above, re-run blind, plus one covering
+`src/budget/`, `src/observability/`, `console/`, `src/sandbox/`, `src/browser/`,
+`src/mcp/`, `src/time/` — subsystems no first-pass cluster owned). Findings that
+survived line-by-line verification are folded in below and tagged
+**[2nd pass]**; first-pass claims the second pass corrected are tagged
+**[corrected]** with the original claim stated so the change is auditable. The
+first pass's eight root causes and their Blocker ratings were all independently
+rediscovered; nothing here retracts a Blocker.
+
 **Guiding constraint**: MikuSwarm is a public, general-purpose project. Every change
 proposed here must land as a generic, default-off upstream feature or config option,
 never a Discord-specific hack, so every deployment benefits and the project stays
@@ -50,6 +60,15 @@ The mismatches this audit turns on:
 | Threads | Sub-timelines of a room (`:thread:` sub-key) | Standalone channels with their own snowflake ids |
 | History | Backward pagination tokens (`next_batch`) | before/after snowflake message-id pagination |
 
+**[corrected] Snowflake uniqueness.** An earlier revision of this document asserted
+(in RC5) that Discord message ids "are unique only per channel". That is wrong.
+A Discord snowflake packs timestamp, worker id, process id, and an increment into
+64 bits and is **globally unique across Discord**; a channel id is required to
+*route* an API fetch, not to disambiguate the id. Both Matrix event ids and Discord
+message ids are therefore globally unique, and no argument in this document may
+rest on Discord ids colliding across channels. RC5's actual case — that Discord has
+no per-*reaction* id at all — is unaffected and stands on its own.
+
 ---
 
 ## 1. Executive summary: the shape of the problem
@@ -59,8 +78,9 @@ happy path is genuinely provider-neutral. The problem is that the rest of the
 codebase reaches around that interface: it parses Matrix-shaped strings directly,
 imports `MatrixNativeClient` into tool contexts, and depends on an off-interface surface
 (the `getClient`/`getEnrichmentCapabilities` escape-hatch methods, plus the
-`onReaction`/`onNativeEvent`/`onDiagnostics` constructor callbacks that deliver reactions
-and lifecycle events) that is not on the interface at all — see RC2.
+`onReaction`/`onNativeEvent`/`onDiagnostics`/`resolveReplyTrigger` constructor callbacks
+that deliver reactions, lifecycle events, and reply triggers) that is not on the
+interface at all — see RC2.
 
 The roughly forty Blocker and Significant findings below collapse into **8 recurring
 root causes**. Fixing those unblocks most subsystems, because they are all downstream
@@ -73,6 +93,16 @@ of the same handful of leaks. Two framing conclusions:
   Matrix scaffolding.
 - **Several Matrix-only paths are cleanly gate-able** rather than blocking:
   re-decryption, the `undecryptable` field, and backfill's pagination-token model.
+
+**[2nd pass] What the cross-check changed.** The eight root causes and every Blocker
+survived. The second pass added one new Blocker — the `isEnforceableUser` MXID sigil gate
+in `src/budget/` (RC3), a subsystem no first-pass cluster owned — plus roughly a dozen
+further sites, and corrected seven claims. Two corrections matter for design work
+downstream: **RC5 rested partly on a false premise** about Discord snowflake uniqueness
+(§0), which weakens its separate-table recommendation; and **RC3's rationale was
+contradicted by the very file it cited** (ARCHITECTURE.md:705). Both are fixed in place
+below. Every correction is tagged **[corrected]** with the original wording quoted, and
+claims the second pass *rejected* are recorded in §4.4 so they are not resurrected.
 
 ### The 8 root causes
 
@@ -119,8 +149,9 @@ opaque key, and it is parsed directly in at least these places outside `src/matr
 - `src/enrichment/worker-pool.ts:209-215` — `resolveCapabilityKey` checks
   `parts[0] === "matrix"`.
 - `src/timeline/router.ts:32-34` — `isDmTimeline` via `:dm:` substring.
-- `src/app.ts:3944` — `resolveDmContext`/`resumeContextFor`, a *second* independent DM
-  detector that reads `timelineKey.split(":")[2] === "dm"`. Distinct from
+- `src/app.ts:3944` — `resumeContextFor` **[corrected]** (an earlier revision also named
+  a `resolveDmContext`; no such function exists anywhere in `src/`), a *second*
+  independent DM detector that reads `timelineKey.split(":")[2] === "dm"`. Distinct from
   `isDmTimeline`; it drives resume-enablement (`src/app.ts:818,3997`), per-timeline
   concurrency, session-record classification (`src/app.ts:4173`), and — critically — the
   follow-up-folding gate at `src/app.ts:2675`
@@ -133,6 +164,22 @@ opaque key, and it is parsed directly in at least these places outside `src/matr
 - `src/redecryption/index.ts:547-548` — `threadTimelineKeyFrom`.
 - `src/backfill/coordinator.ts:148`, `src/backfill/message-backfetch.ts:99` — backfill
   regexes.
+- `src/observability/server/backfetch-handlers.ts:24` **[2nd pass]** —
+  `ACCOUNT_KEY_RE = /^matrix:([^:]+):(?:room|dm):.+$/`, used at `:53-56` to capture the
+  account id for the console's backfetch route. A Discord key 400s with
+  `unrecognized timelineKey`. This is a **13th** parse site in `src/observability/server/`,
+  a directory no first-pass cluster owned.
+- `src/app.ts:3563` **[2nd pass]** — `UserLimitContext.roomId` is populated from
+  `roomIdFromTimelineKey(inbound.timelineKey)` at the *live per-user-limit admission
+  gate* (Gate A), not only on the `usage_events` write path. For Discord it is
+  `undefined`, so every room-scoped `[[user_limits]]` rule silently fails to match.
+
+Key **construction** leaks the same format outward, not just parsing:
+
+- `src/backfill/coordinator.ts:229-231` **[2nd pass]** — builds
+  `matrix:${accountId}:dm:${roomId}` / `matrix:${accountId}:room:${roomId}` directly.
+  Key construction outside `src/matrix/` is the mirror image of the parse problem and
+  must move behind the same provider-registered functions.
 
 The dangerous property: `roomIdFromTimelineKeyOpt` returns `undefined` for any
 non-Matrix key, and callers **silently no-op** rather than raise. A Discord key would
@@ -157,8 +204,8 @@ provider should parse key internals. Consider a first-class `channelType` field 
 
 `src/app.ts:758` is a single `const provider = new MatrixProvider({...})`; roughly 200
 uses point at that one object. The off-interface surface the whole app depends on is
-wider than it first looks — **two public methods** plus **three constructor-option
-callbacks**, none on the `ChatProvider` interface:
+wider than it first looks — **two public methods** plus **four constructor-option
+callbacks** **[corrected: three]**, none on the `ChatProvider` interface:
 
 - `provider.getClient(target): MatrixNativeClient` — called at `src/app.ts:1215, 1505,
   1519, 1602, 1635, 3299, 4820`. Every session assembly, the redecryption sweep, and
@@ -173,10 +220,25 @@ callbacks**, none on the `ChatProvider` interface:
   backup, and login-lifecycle events flow through these into the observability console.
   A Discord provider has an analog (gateway/shard state) but no declared slot to deliver
   it.
+- `resolveReplyTrigger(args) => TriggerInfo | undefined` **[2nd pass]**
+  (`src/matrix/provider.ts:78`, wired at `src/app.ts:817`) — the reply-as-trigger
+  resolver (spec RESUMABLE-SESSIONS §5). Called from inside the trigger hold; the app
+  owns the timeline lookup and resume config while the provider stays resume-unaware.
+  Its `{ provider, externalId, timelineKey, sender }` signature is already
+  protocol-neutral, so this one is *portable as written* — but it is load-bearing for
+  reply-resume and has no declared slot on the interface, so a Discord provider that
+  omits it silently loses reply triggers.
 
 `provider: "matrix"` is hardcoded on synthetic events in:
 `src/agent/recovery.ts:666, 672, 680`; `src/backfill/classify.ts:65, 90`;
 `src/proactive/scheduler.ts:477, 487, 495`; and branches in `src/app.ts:872, 877, 885`.
+
+**[2nd pass]** Five further sites pass the literal **positionally** rather than as a
+`provider:` field, so a grep for `provider: "matrix"` misses them entirely — all on the
+backfill edit path, into `resolveEditTargetTimelineKey` / `applyEdit`:
+`src/backfill/coordinator.ts:611, 614`; `src/backfill/index.ts:159`;
+`src/backfill/message-backfetch.ts:361, 364`.
+
 The re-decryption startup at `src/app.ts:1594-1644` iterates
 `Object.entries(config.matrix.accounts)` directly.
 
@@ -203,9 +265,15 @@ appear in the prompt, yet it is rendered directly:
 - `src/context/reactions.ts:126-128` — reaction lines fall back to `senderId` when
   `senderDisplay` is null.
 
-Doc/code drift: **ARCHITECTURE.md §5 (line 370) documents `SenderInfo` as
+Doc/code drift **[corrected]**: ARCHITECTURE.md §5 (line 370) documents `SenderInfo` as
 `{ id, displayName, username, isSelf }`, but `username` does not exist in
-`src/types.ts`.** The three-field identity was partly designed and never landed.
+`src/types.ts`. An earlier revision read this as evidence that "the three-field identity
+was partly designed and never landed." It is not: **ARCHITECTURE.md:705 states the
+opposite outright** — *"Reply sender as `{ id, displayName }` (no `username` field —
+full provider ID used everywhere)"*. The two lines contradict each other and line 370 is
+simply a documentation error. Adding `username` is still the right call; the
+justification is that Discord needs it, not that it was previously designed. Fix line
+370 in the same commit that lands the field.
 
 All identity derivation is MXID-shaped:
 
@@ -216,6 +284,25 @@ All identity derivation is MXID-shaped:
   `/^@([^:]+):(.+)$/`.
 - `src/budget/user-limits.ts:348-349` — `homeserverOf(userId)` splits on `:`; the
   `{homeserver}` budget partition var yields `""` for Discord snowflakes.
+- `src/budget/user-limits.ts:486-487` **[2nd pass] · Blocker** — the MXID *sigil gate*,
+  missed entirely by the first pass and the most consequential identity leak found:
+  ```ts
+  private isEnforceableUser(senderId: string): boolean {
+    return senderId.startsWith("@") && !this.options.selfUserIds?.has(senderId);
+  }
+  ```
+  Every Discord snowflake fails `startsWith("@")`. This gates two paths:
+  `seedFromLedger()` (`:513`) skips seeding a meter for the user, so prior-window spend
+  is invisible after every restart; and `groupedStatuses()` (`:1045`) drops the user
+  from the console surface. Net effect: **per-user budget limits silently never enforce
+  and never display for Discord users**, even when a `[[user_limits]]` rule's `user`
+  glob matches the snowflake correctly. This is strictly worse than the
+  `{homeserver}`/`{space_id}` degradations above, which lose a *partition dimension* —
+  this one removes the user from enforcement altogether, with no error and no log.
+  **Direction**: make enforceability provider-supplied (an injected
+  `isEnforceable?: (id: string) => boolean`, or a provider `isUserIdentity()` method)
+  rather than an MXID shape test. Also update the JSDoc at `:218-220`, which calls
+  `selfUserIds` "the agent's OWN Matrix ids".
 - `src/context/builder.ts:1397-1401` — `resolveSelfUserId` reads
   `config.matrix.accounts[accountId]?.user_id`; returns `undefined` for Discord, so
   the "You" reaction label never fires and any self-gated logic degrades.
@@ -245,7 +332,15 @@ by construction: `react` (`src/tools/react.ts:3`), `emoji` (`src/tools/emoji.ts:
 `member-info` (`src/tools/member-info.ts:3`), `pins` (`src/tools/pins.ts:3`),
 `read-messages` (`src/tools/read-messages.ts:3`), `set-profile`
 (`src/tools/set-profile.ts:4`). They are wired via the off-interface
-`provider.getClient(target)` at `src/app.ts:3252-3264`, gated on `target.roomId`.
+`provider.getClient(target)`.
+
+**[corrected]** An earlier revision said all twelve are "wired at `src/app.ts:3252-3264`,
+gated on `target.roomId`". That block wires **eleven** (`emoji_list`, `react`,
+`edit_message`, `delete_message`, `pins`, `list_reactions`, `read_messages`,
+`member_info`, `channel_info`, `create_poll`, `poll_vote`). The twelfth, `set_profile`,
+is wired at **`src/app.ts:3304`, outside the gate** — it is constructed
+unconditionally on every session, so it is the one Matrix-native tool that does not even
+get the accidental `roomId` guard. Any capability gating must cover it explicitly.
 
 Only `send_message` routes through `ChatProvider.send`, and even it leaks Matrix into
 the model-facing schema (`src/tools/send-message.ts`):
@@ -257,7 +352,14 @@ the model-facing schema (`src/tools/send-message.ts`):
   markdown, no HTML; an HTML body renders as raw text.
 - `:61` `reply_to_id`: "**Matrix event ID** to reply to."
 - `:17` `MATRIX_MAX_CONTENT_BYTES = 60_000` (Matrix's 65536-byte event limit). Discord
-  is 2000 chars (4000 Nitro).
+  is 2000 chars (4000 Nitro). Note this constant gates **only** the custom-HTML path
+  (`:147-154`).
+- `:194` **[2nd pass]** `chunkMarkdownText(body, 4000)` — a *second*, independent
+  Matrix-derived size constant, and the operationally important one: it is the chunker
+  on the **plain-text send path**, i.e. every normal message. At 4000 it silently
+  exceeds Discord's 2000-char hard limit on the default path, where
+  `MATRIX_MAX_CONTENT_BYTES` never even runs. Both constants must become
+  provider-supplied.
 - `:127-135` `attachments` is always an array of one; `media` takes a single path.
   Discord allows up to 10 files in one message.
 - `:63` `as_voice` maps to a Matrix voice-message type.
@@ -282,8 +384,13 @@ model sees the right id format and terminology.
   single-column tombstone (`UPDATE reactions SET redacted_at = ? WHERE
   reaction_event_id = ?`). The design comment states "A Matrix event id is unique
   across rooms" as the invariant. Discord reactions have **no per-reaction event id**;
-  identity is the `(message_id, emoji, user_id)` triple, and message ids are unique
-  only per channel.
+  identity is the `(message_id, emoji, user_id)` triple. **[corrected]** An earlier
+  revision added "and message ids are unique only per channel" — that is false (see the
+  snowflake note under §0). Discord message ids *are* globally unique, so the stored
+  `target_event_id` needs no channel scoping and the schema's global-uniqueness
+  invariant survives a second provider intact. The real problem is confined to the
+  **primary key and the un-react path**: there is no per-reaction id to put in
+  `reaction_event_id`, and no id for a removal event to name.
 - `src/storage/database.ts:7591-7592` — `normalized_key` stores `mxc://server/mediaId`
   for custom emoji; all dedup and View-A aggregation group on it. Discord custom emoji
   identity is a numeric snowflake; the same-named emoji in two guilds are different
@@ -313,9 +420,19 @@ model sees the right id format and terminology.
 **Direction**: provider-agnostic reaction identity. For Matrix keep the `$` event id;
 for Discord construct a synthetic key like `discord:{messageId}:{emojiId}:{userId}`.
 Make `normalized_key` an opaque documented contract (unicode: codepoint sequence;
-custom: provider emoji id). This is the one area flagged **not reusable as-is**; a
-separate `discord_reactions` table (PK on the message/emoji/user triple) is likely
-cleaner than extending the Matrix table. Add a per-guild usable-emoji catalog with a
+custom: provider emoji id). This is the one area flagged **not reusable as-is**.
+
+**[corrected] On a separate `discord_reactions` table**: an earlier revision called this
+"likely cleaner", partly on the (false) premise that Discord ids collide across
+channels. With that premise removed, the case is weaker than it looked — the aggregate
+and discrete-view queries, the tombstone-not-delete design, and every stored column
+except the PK are reusable verbatim. A single table with a deterministic synthetic PK
+(`discord:{messageId}:{emojiId}:{userId}`) plus a `provider` discriminator is now the
+better-supported option; a second table remains defensible but is no longer the
+recommendation. Whichever is chosen, the **un-react path needs new work regardless**: a
+tombstone-by-triple query alongside today's tombstone-by-PK.
+
+Add a per-guild usable-emoji catalog with a
 `canBotSend(emojiId, guildId)` gate; `emoji_list` returns id + name + animated flag,
 scoped per guild. Resolve emoji at the TS provider level, not in Rust. Extend
 `ProviderCapabilities` with `allowedReactionKinds` / `customEmojiScoped`. Handle
@@ -339,6 +456,19 @@ The gate at `src/enrichment/worker.ts:59, 72-77` skips both download and reply
 resolution when `roomId` is `undefined` (i.e. for every Discord event). The
 `resolveLinkPreviews` failure is swallowed at `:331`, degrading to zero previews.
 
+**[2nd pass] A second, independent gate on the reply path**: even once `roomId` is
+solved, `src/enrichment/worker.ts:223` dispatches reply-attachment download on
+`summary.msgtype && isMediaMsgtype(summary.msgtype)`, and `isMediaMsgtype` (`:702-704`)
+tests against the literal Matrix content types `m.image`/`m.video`/`m.audio`/`m.file`;
+`mediaTypeForMsgtype` (`:706-712`) maps the same strings to the neutral
+`image`/`video`/`audio`/`file` vocabulary used everywhere else. A Discord
+`messageSummary` has no `msgtype` concept, so it either returns `undefined` (and every
+replied-to attachment is silently dropped) or is forced to synthesize a fake `"m.image"`
+— i.e. Matrix vocabulary inside Discord code. **Direction**: drop `msgtype` from the
+`messageSummary` return type in favour of
+`attachments?: Array<{ mediaType: "image"|"video"|"audio"|"file"; … }>`, which also
+resolves the `source_index: 0` gap below in the same change.
+
 **Good news** (already provider-neutral and reusable):
 
 - `src/enrichment/fetch-client.ts` — `FetchClient` provides timeout, size cap, retry,
@@ -354,7 +484,11 @@ resolution when `roomId` is `undefined` (i.e. for every Discord event). The
 - `src/types.ts:69-83`, `src/storage/database.ts:78-147` — `LinkPreviewMeta`,
   `LinkPreviewRow`, `MediaAssetRow` carry no Matrix-specific fields; `source_kind` is a
   free string, `payload_json` is opaque. `AttachmentMeta.remoteUrl` (`src/types.ts:44`)
-  already exists but is never set by the Matrix normalizer.
+  already exists but is **entirely dead** **[corrected: "never set by the Matrix
+  normalizer"]** — a whole-tree grep finds exactly one occurrence, its own declaration:
+  never written, never read. That makes it a clean, uncontended extension point for the
+  Discord CDN-URL-first media path rather than a field with existing semantics to
+  preserve.
 
 **Remaining multi-attachment gap**: `src/enrichment/worker.ts:243-289`
 (`downloadReplyAttachment`) hardcodes `source_index: 0` and downloads only the first
@@ -367,9 +501,18 @@ download params), a neutral reply fetch by channel handle + message id (or popul
 `event.replyTo` fully at Discord ingest), and an **optional** `resolveUrlPreviews`
 with a direct-HTTP fallback (absent means the framework scrapes `og:`/`twitter:` meta
 tags via `FetchClient`). Discord embeds can feed the same `LinkPreviewMeta` with
-`source_kind: "discord_embed"`, populated at ingest. Fix the capability routing at
-`src/enrichment/worker-pool.ts:209-215` to a provider registry rather than a `matrix:`
-prefix check.
+`source_kind: "discord_embed"`, populated at ingest.
+
+**[corrected] Capability routing is not the bug.** Earlier text here (and §3.2 finding 1,
+which rated it a Blocker) said to "fix the capability routing at
+`src/enrichment/worker-pool.ts:209-215` … rather than a `matrix:` prefix check".
+`resolveCapabilityKey` already handles this correctly — it special-cases the `matrix:`
+key shape and otherwise **falls through to `return event.provider`**, so a capability
+registered under `"discord"` resolves fine with no code change. The actual defect is the
+**wiring**: `src/app.ts:4922-4926` populates `providerCapabilities` only by iterating
+`Object.keys(config.matrix.accounts)`, so no `"discord"` entry ever exists and the event
+fails at `worker-pool.ts:170-171` with `No capabilities for discord`. §3.5 finding 5 had
+this right; §3.2 finding 1 did not.
 
 ### RC7 — Config and DB schema hardcode Matrix
 
@@ -406,6 +549,16 @@ no migration files):
 | `media_assets`, `link_previews`, `reply_contexts` | neutral | `reply_external_id` holds a Matrix event id by convention |
 | `chat_index` (FTS5), retrieval/embedding tables | Matrix-shaped indirectly | no direct Matrix columns |
 
+**[2nd pass] Matrix logic inside the migration chain.** The v3→v4 step
+`repairReplyFallbackOverstrip` (`src/storage/database.ts:8448`, registered at `:8545`)
+is a Matrix-HTML data repair: it selects on `json_extract(event_json, '$.htmlBody') like
+'<blockquote%'`, reasons about `<mx-reply>` stripping, and decodes HTML entities via
+`decodeHtmlEntities` (`:8391`). It runs over *all* `timeline_events` rows regardless of
+provider. It is harmless for Discord — no `htmlBody`, so the `like` filter excludes those
+rows — but it is protocol-specific logic sitting in the shared migration chain, and any
+future migration written the same way needs an explicit provider predicate rather than
+relying on a Matrix-only column being absent.
+
 **Direction**: add a `[discord]` config block as a peer of `[matrix]` (least invasive)
 or migrate both into a `providers[]` array with a `kind` discriminator. Generalize the
 `timeline_key` namespace and the `room_id`/`space_id` derivation (channel id / guild
@@ -420,7 +573,14 @@ live DB, especially renaming/​generalizing `usage_events.room_id`.
   `timeline.redecryption_sweep_interval_ms <= 0` (the default), and it is never called
   with Discord events. It imports `MatrixMessageSummary` and `mediaToAttachment` from
   `src/matrix/inbound.ts` directly; a `kind !== "matrix"` guard at the app
-  instantiation site is enough.
+  instantiation site is enough. **[2nd pass]** One latent hazard worth an explicit guard
+  anyway: `#probe` (`src/redecryption/index.ts:173-179`) treats an unresolvable
+  `roomIdFromTimelineKey` as "can never re-fetch" and calls `retireUndecrypted`, an
+  **irreversible** write that permanently removes the row from the candidate set. Today
+  no Discord row reaches it (the `is_undecryptable` generated column is always 0 for
+  them), so this is not a live bug — but the failure mode of any future path that does
+  reach it is silent, permanent data mutation rather than a skip. Make the non-Matrix
+  case an early `return` with a log, distinct from the genuine give-up case.
 - `src/types.ts:155-158` — `undecryptable` is a Matrix E2EE leak on the canonical
   type; the renderer branch (`src/context/renderer.ts:44, 74, 123`) never fires for
   Discord. Move to a `providerMeta` bag or a narrow `unreadable?: { reason }`.
@@ -489,9 +649,13 @@ contract and its consumers.
 13. `src/types.ts:196-199` · **Minor** · `DeliveryReceipt.externalIds` plural exists
     because Matrix `send` splits text + N media into N events; Discord sends one
     message with one id. Document that plural is for split-send providers.
-14. `src/types.ts:204-208` · **Minor** · `ProviderCapabilities.reactions?: boolean` is
+14. `src/types.ts:203-208` · **Minor** · `ProviderCapabilities.reactions?: boolean` is
     too coarse; Discord supports reactions but restricts custom emoji. Add
-    `allowedReactionKinds` / `customEmojiScoped`.
+    `allowedReactionKinds` / `customEmojiScoped`. **[2nd pass]** Note the struct is
+    currently **decorative**: `MatrixProvider` sets `capabilities.reactions = true`
+    (`src/matrix/provider.ts:88`) but nothing reads it — the reaction/emoji tools gate on
+    `roomId` presence (`src/app.ts:3252`), not on the flag. Whatever shape the capability
+    struct takes, the gating sites have to start consulting it.
 15. `src/tools/member-info.ts:5-8` and the 12 Matrix-native tools · **Blocker** · tools
     take `MatrixNativeClient` directly. See RC4.
 
@@ -520,8 +684,12 @@ is markdown, not HTML; provide a reaction ingest path (the current one imports
 
 Leak findings (those not already in root causes):
 
-1. `src/enrichment/worker-pool.ts:211` · **Blocker** · hardcoded `"matrix"` in
-   capability routing. See RC1/RC6.
+1. `src/app.ts:4922-4926` · **Blocker** · **[corrected]** — this entry previously read
+   "`src/enrichment/worker-pool.ts:211` · Blocker · hardcoded `"matrix"` in capability
+   routing", contradicting §3.5 finding 5, which rated the same lines Significant and
+   said they were fine. §3.5 was right: `resolveCapabilityKey` already falls through to
+   `event.provider`. The Blocker is the registration loop in `app.ts`, which only ever
+   iterates `config.matrix.accounts`. See RC6.
 2. `src/enrichment/types.ts` (whole file) · **Blocker** · Matrix field names. See RC6.
 3. `src/backfill/classify.ts:1,3,65,90` · **Blocker** · imports `mediaToAttachment`
    from `src/matrix/inbound.ts`, hardcodes `provider: "matrix"`, uses
@@ -551,10 +719,13 @@ Leak findings (those not already in root causes):
     fast-path. Route through a provider `setAvatar(url)` capability.
 15. `src/tools/user-profile.ts:1018` · **Minor** · `if (provider === "matrix")`
     localpart branch. See RC3.
-16. `src/enrichment/worker.ts:703` · **Minor** · `isMediaMsgtype()` checks Matrix
-    `m.image`/`m.video`/`m.audio`/`m.file` strings; verify it operates on
-    `event.attachments`, not raw Matrix message types. Variable `synapseMedia` at `:319`
-    is Synapse-named in shared code.
+16. `src/enrichment/worker.ts:702-712` · **Significant** **[corrected: Minor]** ·
+    `isMediaMsgtype()` / `mediaTypeForMsgtype()`. The first pass left this as an
+    unresolved "verify it operates on `event.attachments`, not raw Matrix message types".
+    **It does not**: both read `summary.msgtype` from the `messageSummary` capability
+    result, and `:223` uses `isMediaMsgtype` as the *sole dispatch gate* for
+    replied-to-message attachment download. Not a naming nit — a silent drop path. See
+    RC6. Variable `synapseMedia` at `:319` is Synapse-named in shared code.
 17. `src/tools/channel-info.ts`, `member-info.ts` · **Cosmetic** · schema descriptions
     embed Matrix id formats. See RC4.
 
@@ -567,6 +738,7 @@ Direct-import coupling map (every non-`src/matrix/` file importing from `src/mat
 | `src/backfill/coordinator.ts:6` | `MatrixMessageSummary` |
 | `src/backfill/message-backfetch.ts:12` | `MatrixMessageSummary` |
 | `src/backfill/index.ts:5` | `MatrixMessageSummary` |
+| `src/backfill/paginate.ts:2-6` **[2nd pass]** | `MatrixMessageSummary`, `MatrixReadMessagesRequest`, `MatrixReadMessagesResult` |
 | `src/redecryption/index.ts:6,7` | `MatrixMessageSummary`, `mediaToAttachment` |
 | `src/tools/react.ts:3` | `MatrixNativeClient` |
 | `src/tools/emoji.ts:3` | `MatrixNativeClient` |
@@ -583,6 +755,13 @@ Direct-import coupling map (every non-`src/matrix/` file importing from `src/mat
 
 Plus `parseMatrixTimelineKey` imported into `src/app.ts:121` and
 `src/agent/recovery.ts:8` from `src/proactive/index.js`.
+
+**[2nd pass]** The `paginate.ts` row above was missing from the first pass's table even
+though the table claims to list every such file — and it is the heaviest importer of the
+three, pulling the request *and* result types that define `BackfillReadClient`
+(`:9-18`). That interface, not `classify.ts`, is the real Discord blocker in
+`src/backfill/`: it types the whole pagination transport in Matrix NAPI terms
+(`next_batch` cursors, plus the E2EE-only optional `downloadRoomKeysForRoom`). See RC8.
 
 ### 3.3 Timeline, routing, triggers, edits, echo, activation
 (`src/timeline/`, plus the trigger-hold in `src/matrix/provider.ts` and
@@ -680,13 +859,26 @@ concepts surface as prompt text.
    `displayName ?? canonicalAlias ?? roomId` + parent space. Discord supplies a concrete
    impl: `channelName (guildName)`, `isDirect=false` for guild channels. Interface is
    generic; the `prompt.ts:229-231` "resolvable Matrix room" comment is doc-level only.
+   **[corrected: severity Minor → Significant]** The *interface* is generic, but the only
+   registered implementation (`src/app.ts:1514-1528`) calls `roomIdFromTimelineKey` then
+   `provider.getClient({ provider: "matrix", … })`, so for a Discord key it returns `null`
+   and the `Channel:`/`Type:` lines are **silently omitted from every Discord session's
+   runtime state**. Together with finding 10 that leaves a runtime-state block which is at
+   once noisier (raw key carrying a channel snowflake) and less informative (no
+   human-readable channel name) than the Matrix one. Same wiring shape as the diary
+   `resolveChannelLabel` Blocker at §3.8 finding 6 — one provider-dispatch change fixes
+   both, and they should be sequenced as a single item.
 6. `src/context/renderer.ts:97-98, 128-130` · **Non-issue** · `event.attachments` is
    already plural and both tiers iterate all of them; multi-image Discord messages render
    as multiple `<attachment>` blocks with no change.
 7. `src/types.ts:133`, `src/context/hydrate.ts:56` · **Cosmetic** · `htmlBody` is stored
    and hydrated but never read by the renderer; Matrix HTML is silently dropped, which is
-   harmless for Discord markdown. `htmlBody` serves only `emoji-resolve.ts` at enrichment
-   time.
+   harmless for Discord markdown. **[corrected]** The claim that "`htmlBody` serves only
+   `emoji-resolve.ts` at enrichment time" is wrong on both halves:
+   `recordInboundEmojiUsage` is called from `src/matrix/provider.ts:23` at **ingest**,
+   not enrichment; and `htmlBody` has a second consumer outside `src/matrix/` — the
+   v3→v4 migration reads it at `src/storage/database.ts:8453, 8486` (see RC7). Neither
+   changes the Discord conclusion, but the field is not as inert as stated.
 8. `src/types.ts:85-88`, `src/context/renderer.ts:142`, `src/matrix/inbound.ts:136-137` ·
    **Cosmetic** · `mentions.mentionedUserIds` stored but never rendered; only
    `mentionedSelf` reaches the model as `mentions_you="true"`. Trigger detection compares
@@ -696,6 +888,30 @@ concepts surface as prompt text.
    Discord. See RC8.
 10. `src/context/prompt.ts:247` · **Cosmetic** · the `Current timeline:` line renders the
     raw `timelineKey`; the LLM can distinguish protocols from the prefix.
+
+**[2nd pass] Three further opaque-id leaks into prompt text**, none caught by the first
+pass, all in the same class as finding 1 (RC3) and fixed alongside it:
+
+11. `src/context/renderer.ts:143, 157` · **Significant** · `external_id` is pushed as an
+    XML attribute onto **every** rich-tier `<message>` and `<reply_to>` element. For
+    Discord that is an 18-digit snowflake per line — a larger prompt cost than the
+    `sender=` attribute, since replies carry one too. It is not purely waste: the model
+    uses it to correlate claims and to target replies/reactions via tools. Decide
+    deliberately whether tools address messages by provider id (keep the attribute, and
+    accept it as the declared exception to "no snowflakes in the prompt") or by the
+    internal `id` (drop it). This is the sharpest form of open question 3 below.
+12. `src/context/reactions.ts:209-214` · **Minor** · `formatTargetRef` renders
+    `` `${owner} message [${targetEventId}]` `` on every discrete reaction line, so each
+    reaction line carries a snowflake too. The body snippet that follows already
+    identifies the message for the model; make the `[id]` bracket conditional on the
+    snippet being absent.
+13. `src/context/builder.ts:630-638` · **Significant** · auto-retrieval's **user lane**
+    (§9d) keys its "history with this person" sub-search on
+    `e.sender.displayName?.trim()`. On Matrix a display name is stable enough for this to
+    work. On Discord `displayName` would carry the **per-guild nickname**, which users
+    change freely — so a rename silently orphans that user's entire diary history from
+    recall, with no error. This is a direct argument for `username` (the stable global
+    handle) being the retrieval key once RC3 lands, not `displayName`.
 
 Identity-rendering verdict: the two-field model maps Discord's snowflake into `id` and
 leaves the renderer to display it, a direct failure. Add `username?: string` to
@@ -1014,6 +1230,13 @@ These persist wrong data that outlives any later code fix:
 - Profile workspace paths keyed on un-derivable Discord usernames.
 - The `timeline_key` namespace generalization and `reactions`/`room_id` changes are DB
   migrations that should land before live Discord traffic.
+- **[2nd pass]** Per-user budget **under-**enforcement via `isEnforceableUser`
+  (`src/budget/user-limits.ts:486-487`, RC3). Not data corruption in the same sense — no
+  wrong row is written — but it is the same "outlives the code fix" class: every Discord
+  session that runs before the fix has spent money outside the limits the operator
+  configured, and `seedFromLedger` will not retroactively account for it once the gate is
+  relaxed, because the meters for those windows were never materialized. Fix before
+  Discord traffic, not after.
 
 ### 4.3 What is already fine (bounds the work)
 
@@ -1024,6 +1247,29 @@ neutral · `FetchClient` SSRF-safe HTTP · `linked-media.ts` Discord CDN pattern
 processing count-agnostic · search/absence/summarization treat keys and ids as opaque
 strings · `LinkPreviewMeta`/`MediaAssetRow`/`LinkPreviewRow` neutral · renderers already
 iterate all attachments.
+
+**[2nd pass] Verified clean, with citations** (a confident "no coupling here" bounds the
+work as usefully as a finding): `src/sandbox/`, `src/browser/`, `src/saucenao/`,
+`src/mcp/`, `src/time/`, `src/workspace/loader.ts`, `src/bootstrap/seed.ts`,
+`src/index.ts`, and `docker/` carry no protocol coupling at all. `src/observability/`
+logging and secret redaction are pattern-based on key *names*
+(`api[_-]?key`/`token`/`password`/`secret`), so a Discord bot token is redacted by the
+existing rules with no change. The `console/` BFF routes treat `timelineKey`/`roomId` as
+opaque strings throughout; its only Matrix coupling is the backfetch page (`Rooms`
+label, `oldest_decryptable` option) plus the server-side regex now listed under RC1.
+
+### 4.4 Second-pass claims that did NOT survive verification
+
+Recorded so a later pass does not resurrect them:
+
+- **`idx_timeline_events_external` needs `timeline_key` scoping.** Proposed on the
+  grounds that Discord snowflakes collide across channels. They do not (see §0), and the
+  index (`src/storage/database.ts:7971`) is non-unique in any case, so no write can fail
+  on it. No change needed.
+- **`src/tools/user-activity.ts:427`'s `roomIdFromTimelineKey(tk) ?? tk` fallback leaks
+  the raw key.** It does not reach the model: the value is an internal grouping bucket
+  used to fetch each unique room's member roster once. Unlike the diary
+  `resolveChannelLabel` fallback (§3.8 finding 7), nothing persists or renders it.
 
 ---
 
@@ -1044,6 +1290,12 @@ default-off upstream feature.
    (RC8).
 
 RC1 and RC5 carry the most design surface and warrant their own design docs first.
+
+**[2nd pass] One item belongs ahead of all six**: the `isEnforceableUser` MXID sigil gate
+(RC3, `src/budget/user-limits.ts:486-487`). It is a few lines, depends on nothing else in
+this list, and is the only finding here whose cost is *money spent outside the operator's
+configured limits* rather than degraded behaviour that can be repaired later. Land it as
+a standalone generic fix before any Discord bring-up work starts.
 
 ---
 
@@ -1076,9 +1328,13 @@ Deduplicated across the nine reviews:
    `ChatProvider.send`?
 9. **`EnrichmentCapabilities` per-provider or per-account** (Synapse preview auth is
    per-account today; Discord CDN/embeds may be per-provider).
-10. **Reaction identity**: extend the `reactions` table with nullable columns, or a
-    separate `discord_reactions` table with a `(channel, message, emoji, user)` PK? How to
-    model Discord bulk-clear (remove-all, remove-emoji) in the tombstone scheme?
+10. **Reaction identity** **[revised]**: with the snowflake-collision premise removed
+    (§0), the choice is narrower than first stated — a `(message, emoji, user)` synthetic
+    PK on the existing table plus a `provider` discriminator, versus a separate
+    `discord_reactions` table. The separate table is no longer the presumed answer; state
+    the reason either way. Independently of that choice: how is Discord bulk-clear
+    (remove-all, remove-emoji) modelled in a tombstone scheme whose only removal path
+    today is a single-row update by PK?
 11. **`emoji_list` vs `react` coupling**: does `emoji_list` expose the numeric id and
     `react` accept a `name:id` pair, or does `react` resolve a plain name to an id
     internally (hiding the id from the model)? Animated emoji need an `animated` flag.
