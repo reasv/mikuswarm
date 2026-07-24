@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 978 1070" width="978" height="1070" font-size="13" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 988 1070" width="988" height="1070" font-size="13" role="img" aria-labelledby="t d">
   <title id="t">MikuSwarm context assembly</title>
   <desc id="d">The context one agent session is built from, top to bottom: system prompt, diary, hierarchical summaries, compact and rich chat tiers, satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier back to the span of chat messages it renders; older chat fades upward into the summaries. A right-hand column marks the frozen initial session context and the per-trigger agent session whose only output path to the chat is send_message.</desc>
   <style>
@@ -19,6 +19,7 @@
     .bgo{ fill:#fdf5ec; }
     .bgb{ fill:#f0f6fd; }
     .bgk{ fill:#fdf1f8; }
+    .bgs{ fill:#fdf0ee; }
     .div{ stroke:#d0d7de; stroke-width:1; }
     .divh{ stroke:#d0d7de; stroke-width:2; }
     .lbl{ font-size:12px; font-weight:600; fill:#59636e; }
@@ -27,6 +28,7 @@
     .lb{ font-size:12px; font-weight:600; fill:#0969da; }
     .lk{ font-size:12px; font-weight:600; fill:#bf3989; }
     .lg{ font-size:12px; font-weight:600; fill:#1a7f37; }
+    .lr{ font-size:12px; font-weight:600; fill:#d1242f; }
     .c3{ fill:#e3d2fa; stroke:#8250df; stroke-opacity:0.4; stroke-width:1; }
     .c2{ fill:#ebdefc; stroke:#8250df; stroke-opacity:0.4; stroke-width:1; }
     .c1{ fill:#f1e8fd; stroke:#8250df; stroke-opacity:0.4; stroke-width:1; }
@@ -44,6 +46,7 @@
     .skn{ fill:#8b949e; }
     .box{ fill:#f6f8fa; stroke:#d0d7de; stroke-width:1.5; }
     .boxg{ fill:#effaf3; stroke:#d0d7de; stroke-width:1.5; }
+    .boxr{ fill:#fdf0ee; stroke:#d0d7de; stroke-width:1.5; }
     .bt{ font-size:11px; fill:#59636e; }
     .sm{ font-size:11px; fill:#0b8f86; font-weight:600; }
     .brp,.arp{ stroke:#8250df; stroke-width:1.5; fill:none; }
@@ -52,6 +55,7 @@
     .ark{ stroke:#bf3989; stroke-width:1.5; fill:none; }
     .brg,.arg{ stroke:#8b949e; stroke-width:1.5; fill:none; }
     .brn,.arn{ stroke:#1a7f37; stroke-width:1.5; fill:none; }
+    .brr,.arr{ stroke:#d1242f; stroke-width:1.5; fill:none; }
     .flow{ stroke:#0b8f86; stroke-width:1.8; fill:none; }
     .imgb{ fill:none; stroke:#d0d7de; stroke-width:1; }
   </style>
@@ -77,6 +81,9 @@
     <marker id="mn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L9,5 L0,10 z" fill="#1a7f37"/>
     </marker>
+    <marker id="mr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#d1242f"/>
+    </marker>
     <linearGradient id="pf" gradientUnits="userSpaceOnUse" x1="0" y1="480" x2="0" y2="670">
       <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
       <stop offset="1" stop-color="#ffffff" stop-opacity="1"/>
@@ -98,6 +105,7 @@
   <rect class="bgo" x="381" y="263" width="358" height="68"/>
   <rect class="bgb" x="381" y="333" width="358" height="172"/>
   <rect class="bgk" x="381" y="735" width="358" height="104"/>
+  <rect class="bgs" x="381" y="507" width="358" height="226"/>
 
   <!-- system prompt -->
   <text class="lbl" x="396" y="52">system prompt</text>
@@ -140,7 +148,7 @@
   <line class="div" x1="380" y1="506" x2="740" y2="506"/>
 
   <!-- satellite -->
-  <text class="lbl" x="396" y="526">satellite</text>
+  <text class="lr" x="396" y="526">satellite</text>
   <text class="x" x="396" y="545"><tspan class="xt">&lt;retrieved_memory&gt;</tspan><tspan class="xd"> ⋮ </tspan><tspan class="xt">&lt;/retrieved_memory&gt;</tspan></text>
   <text class="x" x="396" y="564"><tspan class="xt">&lt;runtime_state&gt;</tspan></text>
   <text class="x" x="408" y="581">Current time: 2026-07-24 12:05</text>
@@ -182,22 +190,36 @@
 
   <!-- right column: session spans -->
   <path class="brg" d="M744,34 L750,34 L750,836 L744,836"/>
-  <path class="arg" d="M752,435 L780,435" marker-end="url(#mg)"/>
-  <rect class="box" x="788" y="393" width="182" height="84" rx="8"/>
-  <text class="lbl" x="800" y="415">Initial Session Context</text>
-  <text class="bt" x="800" y="437">constructed once for</text>
-  <text class="bt" x="800" y="453">each session, then</text>
-  <text class="bt" x="800" y="469">frozen for that session</text>
+  <path class="arg" d="M752,435 L790,435" marker-end="url(#mg)"/>
+  <rect class="box" x="798" y="393" width="182" height="84" rx="8"/>
+  <text class="lbl" x="810" y="415">Initial Session Context</text>
+  <text class="bt" x="810" y="437">constructed once for</text>
+  <text class="bt" x="810" y="453">each session, then</text>
+  <text class="bt" x="810" y="469">frozen for that session</text>
+
+  <path class="brr" d="M754,508 L760,508 L760,732 L754,732"/>
+  <path class="arr" d="M762,620 L790,620" marker-end="url(#mr)"/>
+  <rect class="boxr" x="798" y="531" width="182" height="178" rx="8"/>
+  <text class="lr" x="810" y="553">Satellite Block</text>
+  <text class="bt" x="810" y="571">added after the chat:</text>
+  <text class="bt" x="810" y="587">volatile state (memories</text>
+  <text class="bt" x="810" y="603">retrieved for the trigger,</text>
+  <text class="bt" x="810" y="619">the current time) without</text>
+  <text class="bt" x="810" y="635">invalidating the cached</text>
+  <text class="bt" x="810" y="651">prefix, plus a configurable</text>
+  <text class="bt" x="810" y="667">tail prompt restating key</text>
+  <text class="bt" x="810" y="683">instructions, a bit like</text>
+  <text class="bt" x="810" y="699">a prefill.</text>
 
   <path class="brn" d="M744,846 L750,846 L750,982 L744,982"/>
-  <path class="arn" d="M752,913 L780,913" marker-end="url(#mn)"/>
-  <rect class="boxg" x="788" y="852" width="182" height="122" rx="8"/>
-  <text class="lg" x="800" y="874">Agent Session</text>
-  <text class="bt" x="800" y="892">one per trigger, handed</text>
-  <text class="bt" x="800" y="908">the frozen context;</text>
-  <text class="bt" x="800" y="924">gone when the rollout</text>
-  <text class="bt" x="800" y="940">ends. only <tspan class="sm">send_message</tspan></text>
-  <text class="bt" x="800" y="956">reaches the chat.</text>
+  <path class="arn" d="M752,913 L790,913" marker-end="url(#mn)"/>
+  <rect class="boxg" x="798" y="852" width="182" height="122" rx="8"/>
+  <text class="lg" x="810" y="874">Agent Session</text>
+  <text class="bt" x="810" y="892">one per trigger, handed</text>
+  <text class="bt" x="810" y="908">the frozen context;</text>
+  <text class="bt" x="810" y="924">gone when the rollout</text>
+  <text class="bt" x="810" y="940">ends. only <tspan class="sm">send_message</tspan></text>
+  <text class="bt" x="810" y="956">reaches the chat.</text>
 
   <!-- chat: skeleton rows fading into the past -->
   <g class="skn">
