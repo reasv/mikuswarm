@@ -98,6 +98,11 @@ checks that `vX.Y.Z` matches `package.json`, extracts the changelog section, and
 publishes the GitHub release with those notes. Watch it under the repository's
 Actions tab.
 
+The workflow appends a generated **Container images** section (the four GHCR
+images with a `docker pull` for the tag) to the notes, so do not add an image
+list to the changelog yourself. The changelog carries only the user-visible
+changes; CI documents the artifacts.
+
 ### If it goes wrong
 
 - **Build fails:** no release is published. Fix forward, then move the tag:

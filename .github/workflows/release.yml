@@ -123,7 +123,11 @@ jobs:
   # the CHANGELOG.md section for this tag, extracted verbatim; `validate` first
   # fails the run on a malformed changelog, and `extract` fails if there is no
   # section for the tag — so a tag can never be released without its changelog
-  # entry. changelog.py is standard-library-only, so a bare python3 runs it.
+  # entry. changelog.py is standard-library-only, so a bare python3 runs it. A
+  # generated "Container images" section is appended to the notes, because the
+  # release's real artifacts are the GHCR images, not the source-code archives
+  # GitHub attaches automatically — the release page must say where they are and
+  # how to pull them.
   release:
     name: Publish GitHub release
     needs: images
@@ -151,6 +155,27 @@ jobs:
           python3 scripts/changelog.py extract \
             --tag "${GITHUB_REF_NAME}" \
             --output release-notes.md
+
+      # The images (agent/console/sandbox/egress) are pushed to GHCR by the
+      # `images` job above; list them with a copy-paste pull for this tag so the
+      # release documents its own deliverables. GHCR paths are lowercase, so the
+      # owner is lowercased to match what the metadata action pushed under.
+      - name: Append container image references
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          {
+            printf '\n## Container images\n\n'
+            printf 'Published to GHCR for `%s`:\n\n' "$tag"
+            printf '```\n'
+            for component in agent console sandbox egress; do
+              printf 'docker pull ghcr.io/%s/mikuswarm-%s:%s\n' "$owner" "$component" "$tag"
+            done
+            printf '```\n'
+          } >> release-notes.md
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
