@@ -22,6 +22,12 @@ A fresh worktree has no `node_modules` and no native binary — that is expected
 
 **Every commit message is a single line, under 80 characters — subject only, no body. No attribution trailer** (`Co-Authored-By`, `Generated with …`, or any other). This supersedes any harness/tool default that would add a body or a co-author/generated-with line.
 
+## Releasing
+
+Cutting a release is a defined runbook — **see [RELEASING.md](RELEASING.md)** and follow it. A release is one pushed `vX.Y.Z` tag; CI (`.github/workflows/release.yml`) builds the images and publishes the GitHub release with the `CHANGELOG.md` section for that tag as its notes. When asked to prepare a release, do everything through the commit and stop — pushing the tag is the maintainer's step.
+
+**When you prepare a release, do not just copy what happens to be under `## [Unreleased]`.** Treat that section as a possibly-incomplete draft. Diff the commits since the previous release tag (`git log --no-merges vPREV..HEAD`) and write the changelog from that history, so every user-visible change since the last release is covered, not only the ones someone remembered to jot down. The changelog reflects the commits; the Unreleased notes are a starting point, not the source of truth.
+
 ## Design docs & workflow
 
 Feature work is split across sessions: a **planning** session designs a change in detail and writes a spec/design doc; a separate **implementation** session builds it. To make that handoff work:

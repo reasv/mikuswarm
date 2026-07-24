@@ -1,7 +1,8 @@
-# Release — build and push MikuSwarm container images to GHCR.
+# Release — build and push MikuSwarm container images to GHCR, then publish a
+# GitHub release whose notes are the matching CHANGELOG.md section.
 #
-# Fires ONLY on a pushed v* tag OR a published GitHub release. There is no
-# push/PR CI. Verification is NOT a separate job: it runs inside each image's
+# Fires ONLY on a pushed v* tag. There is no push/PR CI. Verification is NOT a
+# separate job: it runs inside each image's
 # Dockerfile builder stage (agent: `tsc --noEmit` + `npm test`; console:
 # `svelte-check`), against the artifacts that stage already compiles. A failing
 # check fails the build, so a broken commit is never pushed — the same gate as a
@@ -18,16 +19,19 @@
 # The CloakBrowser-Manager image is deliberately NOT built or published here — it
 # is upstream's own published image (cloakhq/cloakbrowser-manager on Docker Hub),
 # which we neither fork nor patch; the compose stack pulls it, pinned by tag.
+#
+# After every image is built and pushed, the `release` job publishes the GitHub
+# release for the tag, with the body taken verbatim from the CHANGELOG.md section
+# for that version (see scripts/changelog.py and RELEASING.md). It gates on the
+# `images` job, so a version with a failed build never gets a release. The
+# trigger is tag-push only: the release this workflow publishes must not turn
+# around and trigger the workflow again.
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  release:
-    types: [published]
 
-# A tag push and a published-release for the same version both resolve to the
-# same tag ref — dedupe so we don't build the images twice.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -114,3 +118,42 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
+
+  # Publish the GitHub release once every image is built and pushed. The body is
+  # the CHANGELOG.md section for this tag, extracted verbatim; `validate` first
+  # fails the run on a malformed changelog, and `extract` fails if there is no
+  # section for the tag — so a tag can never be released without its changelog
+  # entry. changelog.py is standard-library-only, so a bare python3 runs it.
+  release:
+    name: Publish GitHub release
+    needs: images
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate changelog and confirm the release version matches the tag
+        run: |
+          set -euo pipefail
+          python3 scripts/changelog.py validate
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${pkg_version}"
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python3 scripts/changelog.py extract \
+            --tag "${GITHUB_REF_NAME}" \
+            --output release-notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: release-notes.md
+          generate_release_notes: false
