@@ -39,6 +39,13 @@ First, they are single-owner by design. The security model pairs the agent to it
 
 Second, and deeper: they treat the conversation as the agent session. There is one continuous user/assistant rollout per channel, and chat messages arrive inside it as metadata-wrapped user turns; nothing in the harness knows what a chatroom is. The consequences compound. Every message drags its JSON wrapper through the context window for as long as it stays in history. The channel serializes, because the running session *is* the channel: the agent cannot answer two people at once. And one hard question (a hundred browser tool calls, thinking blocks, failed retries) leaves its debris sitting in the middle of the conversation until compaction finally eats it, pushing the actual chat further and further away.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/rollout-dark.svg">
+    <img alt="A single continuous session per channel: chat messages arrive as JSON-wrapped user turns, one question's tool retries and fetched pages lodge in the middle of the conversation, and the next user's request queues behind it all. Callout boxes label the three failure modes: messages as wrapped turns, debris in the conversation, and a serialized channel." src="docs/rollout-light.svg" width="880">
+  </picture>
+</p>
+
 A group chat needs the opposite premise: **the conversation is not the session.** A room moves on its own, most of what happens there has nothing to do with the agent, and the agent has to work as one participant among many.
 
 So MikuSwarm is chat-first, as described at the top: the chatlog (the bot's own messages included) is the durable thing, and sessions are disposable readers and writers of it. Several consequences fall out. Summarization runs against the log continuously, so compaction is never something a reply has to wait for. Raw model output never reaches the room; only explicit `send_message` calls do, which also means models that leak thinking into their responses stay contained. Every trigger is an independent, parallel session over one shared history, which is the swarm in the name. And however much work an answer took, the messages the session chose to send are its only artifact: the room's history stays clean, and a slow research dig for one person never blocks a quick answer for another.
@@ -62,6 +69,13 @@ Because every trigger gets its own session, many can run at once. The interestin
 - **Co-target coalescing.** Two people replying to the *same* message within a short window are folded into one session as interjections rather than spawning duplicate answers.
 - **Follow-up folding.** A quick same-sender follow-up (the image that arrives just after `@miku look at this`, or a `@miku actually, London` correction) is folded into the session its predecessor produced, instead of being lost or answered half-blind. Depending on timing it steers into a running session, parks until it goes live, or resumes a just-completed one.
 - **Resumable sessions.** Replying to a message the bot sent **continues the session that produced it**, appending your reply as a new turn on the same rollout, so a multi-step task (a browser session, a research dig) carries its state forward instead of restarting amnesiac. A single-consumption guard keeps resumes linear, and a "work gate" ensures only genuinely stateful sessions resume. Basically, sessions that only contain thinking and send_message calls will never be resumed, only ones that contain meaningful tool calls and stateful work.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/swarm-dark.svg">
+    <img alt="A chatroom timeline on the left; disposable session cards to the right of it, on the same time axis. A long history-search session and a quick answer session overlap in parallel; a second reply to the same target message coalesces into the running session instead of spawning a twin; a same-sender follow-up folds into the long session mid-run; and a later reply to a bot message resumes the completed session on the same rollout." src="docs/swarm-light.svg" width="880">
+  </picture>
+</p>
 
 Each concurrent session sees the timeline as it stood when it started, is told about the other active sessions, shares no mutable state, and delivers messages that immediately appear on the timeline for its siblings to see.
 

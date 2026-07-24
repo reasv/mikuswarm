@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 460" width="940" height="460" font-size="13" role="img" aria-labelledby="t d">
+  <title id="t">One rollout per channel</title>
+  <desc id="d">A conversation-as-session harness pointed at a chatroom: a single continuous rollout where chat messages arrive as JSON-wrapped user turns, one question's tool retries and fetched pages lodge in the middle of the conversation, and the next user's request queues behind it all. Callout boxes label the three failure modes: wrapped turns, debris in the conversation, and a serialized channel.</desc>
+  <style>
+    text{ font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .x,.xm,.xd,.xk,.sh{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; font-size:11px; }
+    .x{ fill:#1f2328; }
+    .xm{ fill:#59636e; }
+    .xd{ fill:#8b949e; }
+    .xk{ fill:#0b8f86; font-weight:600; }
+    .th{ fill:#8b949e; font-style:italic; font-size:12px; }
+    .wait{ fill:#d1242f; font-style:italic; font-size:12px; }
+    .card{ fill:#f6f8fa; stroke:#d0d7de; stroke-width:1.5; stroke-dasharray:5 4; }
+    .sh{ font-size:11px; }
+    .shl{ fill:#8b949e; }
+    .shi{ fill:#59636e; font-weight:700; }
+    .div{ stroke:#d0d7de; stroke-width:1; }
+    .ctx{ fill:#ffffff; stroke:#d0d7de; stroke-width:1; }
+    .cl{ fill:#59636e; font-size:11px; font-weight:600; text-anchor:middle; }
+    .box{ fill:#f6f8fa; stroke:#d0d7de; stroke-width:1.5; }
+    .boxr{ fill:#fdf0ee; stroke:#d0d7de; stroke-width:1.5; }
+    .bl{ font-size:13px; font-weight:600; fill:#59636e; }
+    .blo{ font-size:13px; font-weight:600; fill:#bc4c00; }
+    .blr{ font-size:13px; font-weight:600; fill:#d1242f; }
+    .bt{ font-size:12px; fill:#59636e; }
+    .brg,.arg{ stroke:#8b949e; stroke-width:1.5; fill:none; }
+    .bro,.aro{ stroke:#bc4c00; stroke-width:1.5; fill:none; }
+    .brr,.arr{ stroke:#d1242f; stroke-width:1.5; fill:none; }
+  </style>
+  <defs>
+    <marker id="mg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+    <marker id="mo" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#bc4c00"/>
+    </marker>
+    <marker id="mr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#d1242f"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="30" y="40" width="440" height="400" rx="10"/>
+  <text class="sh" x="46" y="62"><tspan class="shl">Session</tspan> <tspan class="shi">#general</tspan> <tspan class="shl">· one per channel, forever</tspan></text>
+  <line class="div" x1="46" y1="70" x2="454" y2="70"/>
+  <rect class="ctx" x="46" y="78" width="200" height="24" rx="5"/>
+  <text class="cl" x="146" y="94">system prompt</text>
+
+  <text class="xm" x="46" y="120">{"role":"user","content":</text>
+  <text class="x"  x="58" y="137">"[12:03] &lt;neru&gt; ugh, build's red again",</text>
+  <text class="xd" x="58" y="154">"meta":{"sender":"@neru:…","event":"$mM2…"}}</text>
+  <text class="xm" x="46" y="172">{"role":"user","content":</text>
+  <text class="x"  x="58" y="189">"[12:04] &lt;teto&gt; <tspan class="xk">@miku</tspan> is openai up",</text>
+  <text class="xd" x="58" y="206">"meta":{"sender":"@teto:…","event":"$vX3…"}}</text>
+
+  <text class="th" x="46" y="226">checking the status page…</text>
+  <text class="x"  x="46" y="244">web_search "openai api status"</text>
+  <text class="xm" x="46" y="261">→ rate limited · retry 1 · retry 2</text>
+  <text class="x"  x="46" y="278">fetch status.openai.com</text>
+  <text class="xm" x="46" y="295">→ 78 KB of HTML into the context</text>
+  <text class="x"  x="46" y="312">fetch status.openai.com/history</text>
+  <text class="xm" x="46" y="329">→ 429 · retry · retry · gave up</text>
+  <text class="x"  x="46" y="348"><tspan class="xm">assistant:</tspan> status shows 500s on /chat</text>
+
+  <text class="xm" x="46" y="368">{"role":"user","content":</text>
+  <text class="x"  x="58" y="385">"[12:05] &lt;rin&gt; <tspan class="xk">@miku</tspan> make a mascot",</text>
+  <text class="xd" x="58" y="402">"meta":{"sender":"@rin:…","event":"$kQ9…"}}</text>
+  <text class="wait" x="46" y="424">rin waits for the whole turn above…</text>
+
+  <path class="brg" d="M478,112 L484,112 L484,212 L478,212"/>
+  <path class="arg" d="M486,162 L584,126" marker-end="url(#mg)"/>
+  <rect class="box" x="590" y="70" width="280" height="112" rx="8"/>
+  <text class="bl" x="600" y="92">Messages as wrapped turns</text>
+  <text class="bt" x="600" y="114">chat arrives as user turns inside the</text>
+  <text class="bt" x="600" y="132">rollout, and every message drags its</text>
+  <text class="bt" x="600" y="150">JSON wrapper through the context for</text>
+  <text class="bt" x="600" y="168">as long as it stays in history</text>
+
+  <path class="bro" d="M478,218 L484,218 L484,354 L478,354"/>
+  <path class="aro" d="M486,286 L584,256" marker-end="url(#mo)"/>
+  <rect class="box" x="590" y="200" width="280" height="112" rx="8"/>
+  <text class="blo" x="600" y="222">Debris in the conversation</text>
+  <text class="bt" x="600" y="244">one hard question leaves its retries,</text>
+  <text class="bt" x="600" y="262">fetched HTML and dead ends sitting in</text>
+  <text class="bt" x="600" y="280">the middle of the chat until</text>
+  <text class="bt" x="600" y="298">compaction finally eats them</text>
+
+  <path class="brr" d="M478,360 L484,360 L484,432 L478,432"/>
+  <path class="arr" d="M486,396 L584,388" marker-end="url(#mr)"/>
+  <rect class="boxr" x="590" y="340" width="280" height="94" rx="8"/>
+  <text class="blr" x="600" y="362">The channel serializes</text>
+  <text class="bt" x="600" y="384">the running session is the channel:</text>
+  <text class="bt" x="600" y="402">one reply at a time, so rin queues</text>
+  <text class="bt" x="600" y="420">behind teto's entire turn</text>
+</svg>

@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 420" width="940" height="420" font-size="13" role="img" aria-labelledby="t d">
+  <title id="t">MikuSwarm session coordination</title>
+  <desc id="d">A chatroom timeline runs down the left. Each trigger forks a disposable session card to the right, on the same time axis: a long history-search session and a quick answer session overlap in parallel; a second reply to the same target message coalesces into the running session as an interjection instead of spawning a twin; a same-sender follow-up folds into the long session mid-run; and a later reply to a bot message resumes the completed session on the same rollout.</desc>
+  <style>
+    text{ font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .t,.ta,.r,.s{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; font-size:12px; }
+    .panel{ fill:#0d1117; stroke:#30363d; stroke-width:1.5; }
+    .card{ fill:#161b22; stroke:#30363d; stroke-width:1.5; stroke-dasharray:5 4; }
+    .band{ fill:#123230; }
+    .h{ fill:#9198a1; font-weight:600; }
+    .m{ fill:#e6edf3; }
+    .hk{ fill:#39c5bb; font-weight:700; }
+    .mk{ fill:#39c5bb; }
+    .men{ fill:#39c5bb; font-weight:600; }
+    .rp{ fill:#6e7681; }
+    .th{ fill:#6e7681; font-style:italic; font-size:11px; }
+    .t{ fill:#e6edf3; }
+    .ta{ fill:#9198a1; }
+    .r{ fill:#6e7681; }
+    .s{ fill:#39c5bb; font-weight:600; }
+    .fork{ stroke:#6e7681; stroke-width:1.5; fill:none; }
+    .forkd{ stroke:#6e7681; stroke-width:1.5; fill:none; stroke-dasharray:4 3; }
+    .flow{ stroke:#39c5bb; stroke-width:1.8; fill:none; }
+    .ann{ fill:#9198a1; font-size:11px; font-weight:600; }
+    .sh{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; font-size:11px; }
+    .shl{ fill:#6e7681; }
+    .shi{ fill:#9198a1; font-weight:700; }
+    .div{ stroke:#30363d; stroke-width:1; }
+  </style>
+  <defs>
+    <marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L9,5 L0,10 z" fill="#39c5bb"/>
+    </marker>
+  </defs>
+
+  <rect class="band" x="34" y="205" width="362" height="30" rx="6"/>
+  <rect class="band" x="34" y="295" width="362" height="30" rx="6"/>
+  <rect class="band" x="34" y="355" width="362" height="30" rx="6"/>
+
+  <rect class="panel" x="30" y="40" width="370" height="360" rx="10"/>
+
+  <path class="fork" d="M400,95 L716,95" marker-end="url(#af)"/>
+  <path class="fork" d="M400,155 L541,155" marker-end="url(#af)"/>
+  <path class="forkd" d="M400,185 L541,185" marker-end="url(#af)"/>
+  <text class="ann" x="408" y="179">coalesced, no twin</text>
+  <path class="forkd" d="M400,245 L716,245" marker-end="url(#af)"/>
+  <text class="ann" x="408" y="239">follow-up, folded in</text>
+  <path class="forkd" d="M400,335 L541,335" marker-end="url(#af)"/>
+  <text class="ann" x="408" y="329">reply resumes it</text>
+  <path class="flow" d="M545,216 L404,216" marker-end="url(#aa)"/>
+  <path class="flow" d="M720,307 L404,307" marker-end="url(#aa)"/>
+  <path class="flow" d="M545,366 L404,366" marker-end="url(#aa)"/>
+
+  <rect class="card" x="720" y="90" width="180" height="230" rx="8"/>
+  <text class="sh" x="736" y="110"><tspan class="shl">Session</tspan> <tspan class="shi">s-Ht9wPzKfQe</tspan></text>
+  <line class="div" x1="736" y1="118" x2="884" y2="118"/>
+  <text class="t"  x="736" y="136">search_history</text>
+  <text class="ta" x="748" y="153">"gpu deals", march</text>
+  <text class="r"  x="736" y="170">→ 3 matches, skim</text>
+  <text class="t"  x="736" y="188">recap</text>
+  <text class="ta" x="748" y="205">#hardware, march</text>
+  <text class="r"  x="736" y="222">→ not the one</text>
+  <text class="th" x="736" y="244">+ teto: "wario meme in it"</text>
+  <text class="t"  x="736" y="262">search_history</text>
+  <text class="ta" x="748" y="279">"wario"</text>
+  <text class="r"  x="736" y="296">→ found $vN3…qT</text>
+  <text class="s"  x="736" y="311">send_message</text>
+
+  <rect class="card" x="545" y="148" width="155" height="82" rx="8"/>
+  <text class="sh" x="561" y="166"><tspan class="shl">Session</tspan> <tspan class="shi">s-Lq4RfDwn8k</tspan></text>
+  <line class="div" x1="561" y1="174" x2="684" y2="174"/>
+  <text class="t"  x="561" y="192">web_search</text>
+  <text class="r"  x="561" y="207">→ strike confirmed</text>
+  <text class="s"  x="561" y="222">send_message</text>
+
+  <rect class="card" x="545" y="330" width="155" height="62" rx="8"/>
+  <text class="sh" x="561" y="348"><tspan class="shl">Session</tspan> <tspan class="shi">s-Lq4RfDwn8k</tspan></text>
+  <line class="div" x1="561" y1="354" x2="684" y2="354"/>
+  <text class="s"  x="561" y="370">send_message</text>
+  <text class="th" x="561" y="386">same rollout, new turn</text>
+
+  <text class="h" x="46" y="70">neru</text><text class="m" x="110" y="70">kernel 6.16 is out btw</text>
+  <text class="hk" x="46" y="100">teto</text><text x="110" y="100"><tspan class="men">@miku</tspan><tspan class="m"> find the gpu deals thread</tspan></text>
+  <text class="h" x="46" y="130">luka</text><text class="m" x="110" y="130">eurostar strike today??</text>
+  <text class="hk" x="46" y="160">rin</text><text x="110" y="160"><tspan class="rp">↳ </tspan><tspan class="men">@miku</tspan><tspan class="m"> is this real?</tspan></text>
+  <text class="hk" x="46" y="190">kaito</text><text x="110" y="190"><tspan class="rp">↳ </tspan><tspan class="men">@miku</tspan><tspan class="m"> will it hit lille?</tspan></text>
+  <text class="hk" x="46" y="220">miku</text><text class="mk" x="110" y="220">real, lille delayed until noon</text>
+  <text class="hk" x="46" y="250">teto</text><text x="110" y="250"><tspan class="men">@miku</tspan><tspan class="m"> it had a wario meme in it</tspan></text>
+  <text class="h" x="46" y="280">haku</text><text class="m" x="110" y="280">lmao I remember that</text>
+  <text class="hk" x="46" y="310">miku</text><text class="mk" x="110" y="310">found it: matrix.to/#/$vN3…</text>
+  <text class="hk" x="46" y="340">rin</text><text x="110" y="340"><tspan class="rp">↳ </tspan><tspan class="m">and tomorrow?</tspan></text>
+  <text class="hk" x="46" y="370">miku</text><text class="mk" x="110" y="370">strike ends tonight, all normal</text>
+</svg>
