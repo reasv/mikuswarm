@@ -76,7 +76,7 @@ This is also why there is no subagent mechanic: every session already is one, in
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/context-dark.svg">
-    <img alt="One agent session's context, assembled from the chatroom at spawn: system prompt, diary, hierarchical summaries, a compact tier and a rich tier of chat messages, the satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier to the span of chat messages it covers; older chat fades upward into the summaries." src="docs/context-light.svg" width="968">
+    <img alt="One agent session's context, assembled from the chatroom at spawn: system prompt, diary, hierarchical summaries, a compact tier and a rich tier of chat messages, the satellite runtime state with tail instructions, and the trigger message, followed by the session's own rollout. Colored brackets map each tier to the span of chat messages it covers; older chat fades upward into the summaries." src="docs/context-light.svg" width="950">
   </picture>
 </p>
 
