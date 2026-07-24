@@ -1,6 +1,8 @@
 import { error } from '@sveltejs/kit';
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Schema } from 'effect';
 import { AgentApiClient, AgentApiClientLive } from './client';
+import { AgentApiClientDemo } from './client.demo';
+import { demoMode } from '../config';
 import type { ApiError, DecodeError, UpstreamError } from '../errors';
 
 /**
@@ -8,8 +10,14 @@ import type { ApiError, DecodeError, UpstreamError } from '../errors';
  * bodies build an Effect program and run it through `runApi`, which maps tagged
  * Effect failures onto SvelteKit `error(status, …)` (which throws) so the client
  * gets clean HTTP semantics rather than a raw Effect failure.
+ *
+ * The layer is chosen once at startup: the live fetch/decode client by default, or
+ * the fixture-backed demo client when `MIKUSWARM_CONSOLE_DEMO` is set (spec
+ * CONSOLE-DEMO-MODE). Everything downstream is layer-agnostic.
  */
-const runtime = ManagedRuntime.make(Layer.mergeAll(AgentApiClientLive));
+const runtime = ManagedRuntime.make(
+	Layer.mergeAll(demoMode ? AgentApiClientDemo : AgentApiClientLive)
+);
 
 type BffError = ApiError | UpstreamError | DecodeError;
 

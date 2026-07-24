@@ -1,6 +1,7 @@
 import { error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { apiBaseUrl, authHeaders } from '$lib/server/config';
+import { apiBaseUrl, authHeaders, demoMode } from '$lib/server/config';
+import { emptyEventStream } from '$lib/server/api/demo/sse';
 
 /**
  * Same-origin SSE proxy for the pipeline activity firehose
@@ -12,6 +13,7 @@ import { apiBaseUrl, authHeaders } from '$lib/server/config';
  * fetch on browser disconnect so the agent releases its activity-bus listener.
  */
 export const GET: RequestHandler = async ({ request, fetch }) => {
+	if (demoMode) return emptyEventStream();
 	const upstream = await fetch(`${apiBaseUrl}/api/pipelines/stream`, {
 		headers: { accept: 'text/event-stream', ...authHeaders() },
 		signal: request.signal

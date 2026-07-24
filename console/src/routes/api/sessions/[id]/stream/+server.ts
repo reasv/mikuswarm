@@ -1,6 +1,7 @@
 import { error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { apiBaseUrl, authHeaders } from '$lib/server/config';
+import { apiBaseUrl, authHeaders, demoMode } from '$lib/server/config';
+import { emptyEventStream } from '$lib/server/api/demo/sse';
 
 /**
  * Same-origin SSE proxy for the live session stream (spec §8
@@ -18,6 +19,7 @@ import { apiBaseUrl, authHeaders } from '$lib/server/config';
  * listener is released — no leaked subscriptions.
  */
 export const GET: RequestHandler = async ({ params, request, fetch }) => {
+	if (demoMode) return emptyEventStream();
 	const id = encodeURIComponent(params.id);
 	const upstream = await fetch(`${apiBaseUrl}/api/sessions/${id}/stream`, {
 		headers: { accept: 'text/event-stream', ...authHeaders() },

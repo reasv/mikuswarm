@@ -22,3 +22,12 @@ export const apiToken: string | undefined = env.MIKUSWARM_CONSOLE_TOKEN || undef
 export function authHeaders(): Record<string, string> {
 	return apiToken ? { authorization: `Bearer ${apiToken}` } : {};
 }
+
+/**
+ * Demo mode (spec CONSOLE-DEMO-MODE): when set, the BFF backs `AgentApiClient` with
+ * curated fixtures instead of proxying a live agent, so the real console UI renders
+ * against fake, non-sensitive data (for screenshots / demos / frontend dev). Default
+ * off — unset/empty leaves live behaviour untouched. `apiBaseUrl` / `apiToken` are
+ * ignored while on (there is no upstream to reach).
+ */
+export const demoMode: boolean = !!(env.MIKUSWARM_CONSOLE_DEMO && env.MIKUSWARM_CONSOLE_DEMO !== '0');
