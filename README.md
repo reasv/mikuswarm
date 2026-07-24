@@ -29,6 +29,13 @@ Concretely: the bot sits in your rooms and reads everything, like any other memb
 
 Everything runs on your own infrastructure against whatever models you configure. The shipped persona is a neutral, replaceable default, and the niche add-ons (danbooru search, character cards, reverse-image lookup, X.com search via Grok through OpenRouter) are off by default. One thing to be clear-eyed about: this is a public agent in a shared space. Anyone in the room can prompt it, and anything it can read you should assume the room can get out of it. Don't feed it secrets you wouldn't post in the channel.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/console-session-dark.png">
+    <img alt="The observability console showing one session: the room and session lists, the verbatim input context, the full rollout (thinking, replies, tool calls with args and results), and a session inspector detailing identifiers, timing, and token/cost breakdown." src="docs/console-session-light.png" width="880">
+  </picture>
+</p>
+
 ---
 
 ## Why a group chat needs a different harness
@@ -154,6 +161,13 @@ The toolkit is aimed at letting the bot do the same things the humans in the roo
 ### Cost & budget limits
 
 Spend is bounded at three levels: a **per-session** USD ceiling (with a soft agent-facing warning before a hard cutoff), **period** limits (rolling/calendar windows over a unified usage ledger), and **per-user** limits with per-user model selection. Token usage comes from the providers' own usage reports rather than local estimates. The per-user limits rules engine is extremely flexible and allows for almost any reasonable policy. It includes the ability to degrade the agent to use cheaper models for specific users, or whenever a user exceeds their personal limit for a given time period. It can also do the opposite, making the agent respond with more expensive models in specific channels or to specific users. See [ARCHITECTURE.md §8d–§8g](ARCHITECTURE.md).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/console-cost-dark.png">
+    <img alt="The console's Usage & Cost page: total-spend and top-models cards, a stacked spend-over-time chart, every configured period limit with its headroom bar, and per-user limits." src="docs/console-cost-light.png" width="880">
+  </picture>
+</p>
 
 ### Observability console
 
