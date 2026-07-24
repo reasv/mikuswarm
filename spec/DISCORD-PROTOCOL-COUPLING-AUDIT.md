@@ -57,8 +57,10 @@ The mismatches this audit turns on:
 The `ChatProvider` interface (`src/types.ts:210-218`) exists and its send/receive
 happy path is genuinely provider-neutral. The problem is that the rest of the
 codebase reaches around that interface: it parses Matrix-shaped strings directly,
-imports `MatrixNativeClient` into tool contexts, and calls two escape-hatch methods
-(`getClient`, `getEnrichmentCapabilities`) that are not on the interface at all.
+imports `MatrixNativeClient` into tool contexts, and depends on an off-interface surface
+(the `getClient`/`getEnrichmentCapabilities` escape-hatch methods, plus the
+`onReaction`/`onNativeEvent`/`onDiagnostics` constructor callbacks that deliver reactions
+and lifecycle events) that is not on the interface at all — see RC2.
 
 The roughly forty Blocker and Significant findings below collapse into **8 recurring
 root causes**. Fixing those unblocks most subsystems, because they are all downstream
@@ -117,6 +119,16 @@ opaque key, and it is parsed directly in at least these places outside `src/matr
 - `src/enrichment/worker-pool.ts:209-215` — `resolveCapabilityKey` checks
   `parts[0] === "matrix"`.
 - `src/timeline/router.ts:32-34` — `isDmTimeline` via `:dm:` substring.
+- `src/app.ts:3944` — `resolveDmContext`/`resumeContextFor`, a *second* independent DM
+  detector that reads `timelineKey.split(":")[2] === "dm"`. Distinct from
+  `isDmTimeline`; it drives resume-enablement (`src/app.ts:818,3997`), per-timeline
+  concurrency, session-record classification (`src/app.ts:4173`), and — critically — the
+  follow-up-folding gate at `src/app.ts:2675`
+  (`resumeContextFor(...) === "dm" || mentionedSelf`). If a Discord key does not place
+  `dm` in segment `[2]`, DM follow-ups silently misclassify as group.
+- `src/app.ts:3296-3301` — the `roomMembers` closure injected into `user_activity`,
+  regex `/^matrix:[^:]+:room:(.+?)(?::thread:.*)?$/`; returns `[]` for any Discord key
+  (see §3.7). Silently disables the tool's `include_silent` / never-posted roster.
 - `src/agent/recovery.ts:637` — session recovery.
 - `src/redecryption/index.ts:547-548` — `threadTimelineKeyFrom`.
 - `src/backfill/coordinator.ts:148`, `src/backfill/message-backfetch.ts:99` — backfill
@@ -144,14 +156,23 @@ provider should parse key internals. Consider a first-class `channelType` field 
 ### RC2 — No provider registry; `provider: "matrix"` hardcoded
 
 `src/app.ts:758` is a single `const provider = new MatrixProvider({...})`; roughly 200
-uses point at that one object. Two methods the whole app depends on are **not on the
-`ChatProvider` interface**:
+uses point at that one object. The off-interface surface the whole app depends on is
+wider than it first looks — **two public methods** plus **three constructor-option
+callbacks**, none on the `ChatProvider` interface:
 
 - `provider.getClient(target): MatrixNativeClient` — called at `src/app.ts:1215, 1505,
   1519, 1602, 1635, 3299, 4820`. Every session assembly, the redecryption sweep, and
   RoomLabelCache init call it.
 - `provider.getEnrichmentCapabilities(accountId): EnrichmentCapabilities` — returns a
   Matrix-shaped capability object (see RC6).
+- `onReaction(event, { accountId })` (`src/matrix/provider.ts:65`, wired at
+  `src/app.ts:777`) — reaction ingest is delivered here, **not** through `subscribe`.
+  A Discord provider must offer the same channel (see also §3.2 finding 7).
+- `onNativeEvent(event, context)` and `onDiagnostics(diagnostics, { accountId })`
+  (`src/matrix/provider.ts:55-66`, wired at `src/app.ts:764, 800`) — sync-state, key-
+  backup, and login-lifecycle events flow through these into the observability console.
+  A Discord provider has an analog (gateway/shard state) but no declared slot to deliver
+  it.
 
 `provider: "matrix"` is hardcoded on synthetic events in:
 `src/agent/recovery.ts:666, 672, 680`; `src/backfill/classify.ts:65, 90`;
@@ -161,7 +182,11 @@ The re-decryption startup at `src/app.ts:1594-1644` iterates
 
 **Direction**: extract an `IChatProvider` interface covering `subscribe`, `send`,
 `getClient`, `getEnrichmentCapabilities` (or split those into provider-supplied
-capability objects), `start`, `stop`. Hold `providers: IChatProvider[]` in `app.ts`.
+capability objects), `start`, `stop`, **plus the event-delivery hooks the app currently
+receives as constructor callbacks** — a reaction stream (`onReaction`) and a native
+lifecycle/diagnostics stream (`onNativeEvent`/`onDiagnostics`). These are load-bearing
+(reaction ingest and the observability console) and must be part of the contract, not
+Matrix-only construction details. Hold `providers: IChatProvider[]` in `app.ts`.
 Persist provider id with each session (`agent_sessions`) and read it back at resume
 instead of assuming Matrix.
 
@@ -813,12 +838,22 @@ Group E (agent layer):
   poll voting). See RC3.
 - `resolveParentSpaceIds` (`src/app.ts:1210-1222`) · **Significant** · queries Matrix
   Spaces; Discord's analog is the guild. Generalize to return `[guildId]` or remove.
+- `user_activity` `roomMembers` closure (`src/app.ts:3296-3301`) · **Significant** · the
+  membership source injected into `user_activity` (for `include_silent` / never-posted
+  users, §9e) hardcodes `/^matrix:[^:]+:room:(.+?)(?::thread:.*)?$/` then
+  `provider.getClient({ provider: "matrix", ... }).roomMembers(...)`. For any Discord key
+  the regex fails and it returns `[]`, so the roster silently degrades — no error. The
+  `user_activity` *tool file* is provider-neutral; the coupling is in this app-level
+  wiring. Make `roomMembers` a provider-dispatched callback. See RC1.
 
 Tool-surface verdict: provider-neutral as-is (no change): `search_messages`,
-`expand_summary`, `recap`, `user_activity`, the `memory` family, `diary_tool`,
+`expand_summary`, `recap`, the `memory` family, `diary_tool`,
 `summary_tool`, `browser`, `bash`, `file` family, `web`, `x_fetch`, `x_search`,
 `danbooru`, `find_source`, `image_gen`, `read_image`, `media`, `character_card` family,
-`workspace`, `delegate_to_session`. Need a capability gate + `ChannelClient` impl:
+`workspace`, `delegate_to_session`. Neutral tool but Matrix-coupled in its app wiring:
+`user_activity` (its `roomMembers` membership source, above — the tool itself needs no
+change once the closure is provider-dispatched). Need a capability gate + `ChannelClient`
+impl:
 `send_message`, `edit_message`, `delete_message`, `react`, `list_reactions`,
 `read_messages`, `member_info`, `channel_info`, `pins`, `set_profile`, `emoji_list`,
 `user_profile`. Need reshaping for Discord's model: `create_poll`/`poll_vote`,
