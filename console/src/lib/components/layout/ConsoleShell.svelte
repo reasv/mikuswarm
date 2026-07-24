@@ -32,7 +32,7 @@
 
 		<Resizable.Handle withHandle />
 
-		<!-- Col 3: detail (reserved; spec §12 / Phase 4) -->
+		<!-- Col 3: session inspector — raw record behind the selected session (spec §12) -->
 		<Resizable.Pane defaultSize={25} minSize={0} class="min-w-0">
 			<DetailPanel />
 		</Resizable.Pane>

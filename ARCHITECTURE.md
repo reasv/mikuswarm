@@ -2487,6 +2487,17 @@ process's memory.
   (§11 "CSRF guard"); the observability server requires it on mutating routes. The verbatim
   renderer uses Shiki for XML highlighting (presentation only — exact bytes preserved); images
   are proxied through a same-origin SvelteKit route. See `console/README.md`.
+- **Demo mode (`MIKUSWARM_CONSOLE_DEMO`, default off).** The `AgentApiClient` layer is chosen
+  once at BFF startup (`server/api/runtime.ts`): the live fetch/decode client normally, or a
+  fixture-backed `AgentApiClientDemo` (`server/api/client.demo.ts`) when the flag is set. The demo
+  client resolves a curated, non-sensitive fixture (`server/api/demo/fixtures.ts`) per request path
+  and decodes it through the *same* Effect Schema the live client uses, so a fixture that drifts
+  from the wire shape fails as a `DecodeError` exactly like a real backend drift (a unit test
+  decodes every fixture through its schema). Fixtures are computed against the wall clock at request
+  time, so the spend chart and "resets in" read as live. Everything downstream is layer-agnostic —
+  the real pages/components/CSS render unmodified. The SSE proxy routes short-circuit to an empty
+  stream in demo mode; a completed persisted session renders fully from `GET /api/sessions/:id`
+  alone. Purpose: screenshots, demos, and frontend dev without a live agent or populated database.
 
 **URL-driven selection.** The console has three top-level areas, switched by a `Conversations | Pipelines | Scheduler`
 segmented control in the top bar (links, so the URL is the source of truth via `$app/state`): `/`

@@ -67,6 +67,27 @@ browser ──(same-origin, no token)──▶ SvelteKit BFF ──(Bearer token
    > `HOST_HEADER` instead. `node` won't read `.env` on its own — pass
    > `--env-file=.env` or export the vars.
 
+## Demo mode (fixtures, no live agent)
+
+To render the real console UI against curated, non-sensitive **fake** data — for
+screenshots, demos, or frontend dev without a running agent + populated DB — set
+`MIKUSWARM_CONSOLE_DEMO=1` and skip step 1 entirely:
+
+```sh
+cd console
+MIKUSWARM_CONSOLE_DEMO=1 pnpm dev
+# then open http://localhost:5173
+#   /usage-cost                                  → Cost & Budget view
+#   /?room=!general:matrix.example.org&session=ses_op4kq2  → session observability
+```
+
+Demo mode swaps the BFF's `AgentApiClient` for a fixture-backed layer (spec
+`CONSOLE-DEMO-MODE`), so `MIKUSWARM_CONSOLE_API_URL` / `MIKUSWARM_CONSOLE_TOKEN` are
+ignored and no agent is contacted. Every fixture is invented (`matrix.example.org` ids,
+invented chat) and is decoded through the same Effect Schema as real responses, so it
+can never drift from the wire shape. It's read-only — the admin buttons are inert.
+Default off: without the flag the console behaves exactly as before.
+
 ## Scripts
 
 - `pnpm dev` / `pnpm build` / `pnpm start` (`node build/index.js`)
@@ -76,7 +97,9 @@ browser ──(same-origin, no token)──▶ SvelteKit BFF ──(Bearer token
 ## Layout (spec §11)
 
 Four zones: **Col 1** rooms (top) + sessions (bottom); **Col 2** room context (verbatim,
-§10a) or session input (§10a) + rollout (§10b); **Col 3** detail (reserved, Phase 4).
+§10a) or session input (§10a) + rollout (§10b); **Col 3** session inspector (the raw
+record behind the selected session — ids, timing, token/cost breakdown, tool-invocation
+ledger, context-dump path, raw JSON).
 
 ## shadcn-svelte components
 
