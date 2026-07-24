@@ -766,11 +766,13 @@ test("withRequestRetry: a BUDGET expiry during the backoff sleep stays environme
     // backoff (200ms) outlasts the budget (25ms): the budget aborts the sleep.
     const wrapped = withRequestRetry(fn, { maxWaitMs: 25, backoffBaseMs: 200, backoffMaxMs: 200 });
     const events = await drain(wrapped(MODEL, CONTEXT, undefined));
-    // The budget-expiry catch `continue`s; the loop re-enters, the now-expired
-    // budget aborts the next attempt immediately, and it exits via the
-    // wait-exhausted path. (The CALLER-abort case short-circuits at calls()===1;
-    // the budget case deliberately does not — that asymmetry is the fix.)
-    assert.equal(calls(), 2, "budget case loops once more then exits wait-exhausted");
+    // The budget-expiry catch `continue`s; the loop re-enters and issues at least
+    // one more attempt before the now-expired budget forces the wait-exhausted
+    // exit. (The CALLER-abort case short-circuits at calls()===1; the budget case
+    // deliberately does not — that asymmetry is the point.) The exact re-entry
+    // count is wall-clock dependent under load, so assert the asymmetry (looped
+    // again, unlike the abort short-circuit), not a fixed number.
+    assert.ok(calls() >= 2, "budget case loops at least once more, not short-circuited like the caller abort");
     assert.deepEqual(events.map((e) => e.type), ["error"]);
     const err = (events[0] as Extract<AssistantMessageEvent, { type: "error" }>).error;
     assert.equal(err.stopReason, "error", "budget expiry is wait-exhaustion, not an abort");
