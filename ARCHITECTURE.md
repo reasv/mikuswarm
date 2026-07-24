@@ -18,9 +18,8 @@ MikuSwarm treats the chat conversation and the agent session as **separate thing
 
 | Component | Choice |
 |-----------|--------|
-| Agent loop | `@earendil-works/pi-agent-core` 0.75.x |
-| LLM streaming | `@earendil-works/pi-ai` 0.75.x |
-| LLM backend | Anthropic-compatible API base (`ANTHROPIC_BASE_URL`; an operator gateway may proxy it) |
+| Agent loop | `@earendil-works/pi-agent-core` |
+| LLM streaming | `@earendil-works/pi-ai` |
 | Matrix transport | Rust native client via NAPI (`matrix-sdk`) |
 | Config | TOML folder with lexicographic merge |
 | Schema validation | TypeBox |
