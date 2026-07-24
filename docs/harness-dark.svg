@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 476" width="940" height="476" font-size="13" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 544" width="940" height="544" font-size="13" role="img" aria-labelledby="t d">
   <title id="t">MikuSwarm harness</title>
-  <desc id="d">A center chatroom timeline. Two @miku messages each fork off a disposable, parallel agent session that reasons and runs tools on its own, then delivers a single reply back into the log.</desc>
+  <desc id="d">A center chatroom timeline. Two @miku messages each fork off a disposable, parallel agent session that is handed a freshly constructed context (system prompt + chat context), reasons and runs tools on its own, then delivers a single reply back into the log.</desc>
   <style>
     text{ font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     .t,.ta,.r,.s{ font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace; font-size:12px; }
@@ -24,6 +24,8 @@
     .shl{ fill:#6e7681; }
     .shi{ fill:#9198a1; font-weight:700; }
     .div{ stroke:#30363d; stroke-width:1; }
+    .ctx{ fill:#0d1117; stroke:#30363d; stroke-width:1; }
+    .cl{ fill:#9198a1; font-size:11px; font-weight:600; text-anchor:middle; }
   </style>
   <defs>
     <marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -32,49 +34,59 @@
     <marker id="aa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L9,5 L0,10 z" fill="#39c5bb"/>
     </marker>
-    <clipPath id="imgclip"><rect x="430" y="337" width="56" height="56" rx="6"/></clipPath>
+    <clipPath id="imgclip"><rect x="430" y="405" width="56" height="56" rx="6"/></clipPath>
   </defs>
 
-  <rect class="band" x="334" y="263" width="292" height="30" rx="6"/>
-  <rect class="band" x="334" y="333" width="292" height="62" rx="6"/>
+  <rect class="band" x="334" y="331" width="292" height="30" rx="6"/>
+  <rect class="band" x="334" y="401" width="292" height="62" rx="6"/>
 
-  <rect class="panel" x="334" y="40" width="292" height="410" rx="10"/>
+  <rect class="panel" x="334" y="40" width="292" height="478" rx="10"/>
 
-  <path class="fork" d="M334,103 L280,103" marker-end="url(#af)"/>
-  <path class="flow" d="M280,275 L342,275" marker-end="url(#aa)"/>
-  <path class="fork" d="M626,171 L660,171" marker-end="url(#af)"/>
-  <path class="flow" d="M660,343 L618,343" marker-end="url(#aa)"/>
+  <path class="fork" d="M334,171 L280,171" marker-end="url(#af)"/>
+  <path class="flow" d="M280,343 L342,343" marker-end="url(#aa)"/>
+  <path class="fork" d="M626,239 L660,239" marker-end="url(#af)"/>
+  <path class="flow" d="M660,411 L618,411" marker-end="url(#aa)"/>
 
-  <rect class="card" x="30" y="60" width="250" height="230" rx="8"/>
-  <text class="sh" x="46" y="84"><tspan class="shl">Session</tspan> <tspan class="shi">s-KB8dqsR77V</tspan></text>
-  <line class="div" x1="46" y1="92" x2="264" y2="92"/>
-  <text class="th" x="46" y="120">is it down? check status</text>
-  <text class="t"  x="46" y="151">web_search</text>
-  <text class="ta" x="58" y="182">"openai api status"</text>
-  <text class="t"  x="46" y="213">fetch status.openai.com</text>
-  <text class="r"  x="46" y="244">→ 500s on /chat, 09:12 UTC</text>
-  <text class="s"  x="46" y="279">send_message</text>
+  <rect class="card" x="30" y="56" width="250" height="302" rx="8"/>
+  <text class="sh" x="46" y="80"><tspan class="shl">Session</tspan> <tspan class="shi">s-KB8dqsR77V</tspan></text>
+  <line class="div" x1="46" y1="88" x2="264" y2="88"/>
+  <rect class="ctx" x="46" y="98" width="218" height="30" rx="5"/>
+  <text class="cl" x="155" y="117">system prompt</text>
+  <rect class="ctx" x="46" y="134" width="218" height="30" rx="5"/>
+  <text class="cl" x="155" y="153">chat context</text>
+  <text class="th" x="46" y="188">is it down? check status</text>
+  <text class="t"  x="46" y="219">web_search</text>
+  <text class="ta" x="58" y="250">"openai api status"</text>
+  <text class="t"  x="46" y="281">fetch status.openai.com</text>
+  <text class="r"  x="46" y="312">→ 500s on /chat, 09:12 UTC</text>
+  <text class="s"  x="46" y="347">send_message</text>
 
-  <rect class="card" x="660" y="128" width="250" height="230" rx="8"/>
-  <text class="sh" x="676" y="152"><tspan class="shl">Session</tspan> <tspan class="shi">s-L7FrBvmwtx</tspan></text>
-  <line class="div" x1="676" y1="160" x2="894" y2="160"/>
-  <text class="th" x="676" y="188">it should look pathetic</text>
-  <text class="t"  x="676" y="219">generate_image</text>
-  <text class="ta" x="688" y="251">"robot crying at a</text>
-  <text class="ta" x="688" y="282">terminal, 500 error"</text>
-  <text class="r"  x="676" y="314">→ rendered 1024x1024</text>
-  <text class="s"  x="676" y="347">send_message</text>
+  <rect class="card" x="660" y="124" width="250" height="302" rx="8"/>
+  <text class="sh" x="676" y="148"><tspan class="shl">Session</tspan> <tspan class="shi">s-L7FrBvmwtx</tspan></text>
+  <line class="div" x1="676" y1="156" x2="894" y2="156"/>
+  <rect class="ctx" x="676" y="166" width="218" height="30" rx="5"/>
+  <text class="cl" x="785" y="185">system prompt</text>
+  <rect class="ctx" x="676" y="202" width="218" height="30" rx="5"/>
+  <text class="cl" x="785" y="221">chat context</text>
+  <text class="th" x="676" y="256">it should look pathetic</text>
+  <text class="t"  x="676" y="287">generate_image</text>
+  <text class="ta" x="688" y="319">"robot crying at a</text>
+  <text class="ta" x="688" y="350">terminal, 500 error"</text>
+  <text class="r"  x="676" y="382">→ rendered 1024x1024</text>
+  <text class="s"  x="676" y="415">send_message</text>
 
-  <text class="h" x="350" y="74">neru</text><text class="m" x="430" y="74">ugh, build's red again</text>
-  <text class="hk" x="350" y="108">teto</text><text x="430" y="108"><tspan class="men">@miku</tspan><tspan class="m"> is openai up</tspan></text>
-  <text class="h" x="350" y="142">kaito</text><text class="m" x="430" y="142">same, ci's flaky today</text>
-  <text class="hk" x="350" y="176">rin</text><text x="430" y="176"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
-  <text class="h" x="350" y="210">haku</text><text class="m" x="430" y="210">third time today</text>
-  <text class="h" x="350" y="244">luka</text><text class="m" x="430" y="244">lol</text>
-  <text class="hk" x="350" y="278">miku</text><text class="mk" x="430" y="278">status page: 500s</text>
-  <text class="h" x="350" y="312">kaito</text><text class="m" x="430" y="312">called it lol</text>
-  <text class="hk" x="350" y="346">miku</text>
-  <image x="430" y="337" width="56" height="56" clip-path="url(#imgclip)" href="data:image/png;base64,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"/>
-  <rect class="imgb" x="430" y="337" width="56" height="56" rx="6"/>
-  <text class="h" x="350" y="426">rin</text><text class="m" x="430" y="426">perfect</text>
+  <text class="h" x="350" y="74">luka</text><text class="m" x="430" y="74">requests timing out</text>
+  <text class="h" x="350" y="108">kaito</text><text class="m" x="430" y="108">yeah since noon</text>
+  <text class="h" x="350" y="142">neru</text><text class="m" x="430" y="142">ugh, build's red again</text>
+  <text class="hk" x="350" y="176">teto</text><text x="430" y="176"><tspan class="men">@miku</tspan><tspan class="m"> is openai up</tspan></text>
+  <text class="h" x="350" y="210">kaito</text><text class="m" x="430" y="210">same, ci's flaky today</text>
+  <text class="hk" x="350" y="244">rin</text><text x="430" y="244"><tspan class="men">@miku</tspan><tspan class="m"> make a mascot</tspan></text>
+  <text class="h" x="350" y="278">haku</text><text class="m" x="430" y="278">third time today</text>
+  <text class="h" x="350" y="312">luka</text><text class="m" x="430" y="312">lol</text>
+  <text class="hk" x="350" y="346">miku</text><text class="mk" x="430" y="346">status page: 500s</text>
+  <text class="h" x="350" y="380">kaito</text><text class="m" x="430" y="380">called it lol</text>
+  <text class="hk" x="350" y="414">miku</text>
+  <image x="430" y="405" width="56" height="56" clip-path="url(#imgclip)" href="data:image/png;base64,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"/>
+  <rect class="imgb" x="430" y="405" width="56" height="56" rx="6"/>
+  <text class="h" x="350" y="494">rin</text><text class="m" x="430" y="494">perfect</text>
 </svg>
