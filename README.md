@@ -164,8 +164,8 @@ Spend is bounded at three levels: a **per-session** USD ceiling (with a soft age
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/console-cost-dark.png">
-    <img alt="The console's Usage & Cost page: total-spend and top-models cards, a stacked spend-over-time chart, every configured period limit with its headroom bar, and per-user limits." src="docs/console-cost-light.png" width="880">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/console-leaderboard-dark.png">
+    <img alt="The console's Usage & Cost page: spend cards and a stacked spend-over-time chart, every configured period limit with its headroom bar, per-user limits, and a ranked user leaderboard with per-user spend cards and a System &amp; self breakdown." src="docs/console-leaderboard-light.png" width="880">
   </picture>
 </p>
 
