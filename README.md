@@ -173,6 +173,13 @@ Spend is bounded at three levels: a **per-session** USD ceiling (with a soft age
 
 An optional in-process HTTP + SSE console exposes the bot's internals: the durable record of every session (frozen context snapshot + full transcript), a live stream of a running session's events (including tentative tokens during inference retries), the LLM scheduler's state, and a preview of exactly what context the *next* session in any room would build. It is read-only except for a few operator actions (stop / resume / retry). See [ARCHITECTURE.md §11](ARCHITECTURE.md).
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/console-pipelines-dark.png">
+    <img alt="The console's pipeline monitor on the captioning pool: the four background pools with their queue counts and spend, the list of captioning jobs with their generated captions, and a detail pane showing one image, its caption, the model, and token/cost usage." src="docs/console-pipelines-light.png" width="880">
+  </picture>
+</p>
+
 ### Native Rust Matrix module
 
 The Matrix transport is a Rust NAPI module built on `matrix-sdk`, handling end-to-end encryption, media download/decryption, custom emoji, and link previews. See [ARCHITECTURE.md §6](ARCHITECTURE.md).
