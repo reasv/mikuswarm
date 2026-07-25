@@ -59,6 +59,7 @@ function makeEngine(
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => opts?.now ?? 1_000_000,
   });
@@ -414,6 +415,7 @@ test("estimation: prior context is cache-read within the TTL, cache-write outsid
     maxTokensFor: () => 1_000_000,
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 1,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => 1_000_000,
   });
@@ -652,6 +654,7 @@ test("tick (#16): a rolling meter is re-SUMMED from the ledger on the periodic r
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -689,6 +692,7 @@ test("tick (#16): a rolling tick re-SUMS within the ADVANCED window (since = now
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -723,6 +727,7 @@ test("tick (#16): a calendar meter rolls and RESEEDS at the period boundary", ()
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -771,6 +776,7 @@ test("calendar window (#16): seeds from the period start and resets at the next 
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -800,6 +806,7 @@ test("accurateResetsAt (#16): rolling reset = min(contributing ts) + duration", 
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -845,6 +852,7 @@ test("room-scoped seeding (#16): two rooms under a room-matched rule get DISTINC
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => 1_000_000,
   });
@@ -897,6 +905,7 @@ test("shared-pool sub-cap (#16): record credits a pooled sub-cap and its reseed 
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => 1_000_000,
   });
@@ -993,6 +1002,7 @@ test("statuses (#6): a model-scoped sub-cap with `#` in the model id reports cor
     maxTokensFor: () => 8000,
     zeroCostModelIds: new Set(),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => 1_000_000,
   });
@@ -1232,6 +1242,7 @@ test("tick (money-path): a re-SUM equal to the in-memory total neither drops nor
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: (id) => id.startsWith("@"),
     logger,
     now: () => nowValue,
   });
@@ -1273,6 +1284,7 @@ function seedEngine(opts: {
   identities?: Array<{ senderId: string; roomId?: string; spaceId?: string }>;
   sum: (f: { triggerSenderIds?: string[]; partitionKeys?: string[]; requestedModelIds?: string[] }) => number;
   selfUserIds?: ReadonlySet<string>;
+  isUserIdentity?: (id: string) => boolean;
 }): UserLimitEngine {
   return new UserLimitEngine({
     rules: normalize(seedRule()),
@@ -1283,6 +1295,7 @@ function seedEngine(opts: {
     maxTokensFor: (id) => MAX_TOKENS[id],
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
+    isUserIdentity: opts.isUserIdentity ?? ((id) => id.startsWith("@")),
     selfUserIds: opts.selfUserIds,
     logger,
     now: () => 1_000_000,
@@ -1336,9 +1349,9 @@ test("seedFromLedger (§14): a no-op without a listUsageIdentities provider", ()
   assert.deepEqual(engine.statuses(), []);
 });
 
-test("seedFromLedger (§14): skips the bot's own accounts + non-MXID system senders", () => {
+test("seedFromLedger (§14): skips the bot's own accounts + synthetic/system senders the predicate rejects", () => {
   const engine = seedEngine({
-    // A real user, the bot itself, and a non-MXID system sender all have spend.
+    // A real user, the bot itself, and a synthetic system sender all have spend.
     identities: [{ senderId: "@alice:hs" }, { senderId: "@miku:hs" }, { senderId: "system" }],
     selfUserIds: new Set(["@miku:hs"]),
     sum: (f) => {
@@ -1351,7 +1364,7 @@ test("seedFromLedger (§14): skips the bot's own accounts + non-MXID system send
   const partitions = new Set(engine.groupedStatuses().individuals.map((g) => g.partitionKey));
   assert.deepEqual([...partitions], ["@alice:hs"]); // only the real human user
   assert.ok(!partitions.has("@miku:hs"), "the bot's own account is excluded");
-  assert.ok(!partitions.has("system"), "a non-MXID system sender is excluded");
+  assert.ok(!partitions.has("system"), "a synthetic/system sender rejected by the predicate is excluded");
 });
 
 test("groupedStatuses (§14): partitions grouped, split individuals/shared, hottest-first", () => {
@@ -1377,6 +1390,7 @@ test("groupedStatuses (§14): partitions grouped, split individuals/shared, hott
     listUsageIdentities: () => [{ senderId: "@a:hs" }, { senderId: "@b:hs" }, { senderId: "@c:hs" }],
     costRatesFor: (id) => RATES[id],
     maxTokensFor: (id) => MAX_TOKENS[id],
+    isUserIdentity: (id) => id.startsWith("@"),
     zeroCostModelIds: new Set(["free"]),
     viableMinOutputTokens: 256,
     logger,
@@ -1393,4 +1407,57 @@ test("groupedStatuses (§14): partitions grouped, split individuals/shared, hott
   assert.deepEqual(g.shared.map((x) => x.partitionKey), ["all-users"]);
   assert.equal(g.shared[0].isUserPartition, false);
   assert.equal(g.shared[0].meters[0].spentUsd, 4);
+});
+
+// ─── Phase 0: isUserIdentity predicate (§6.4) ────────────────────────────────
+
+test("isEnforceableUser (Phase 0): Matrix-sigil predicate preserves existing behaviour", () => {
+  // Behaviour-identity regression guard; the companion test below proves the predicate is actually consulted.
+  // The default Matrix predicate `id.startsWith("@")` must produce the same seeding
+  // outcome as the old hardcoded test: @-prefixed ids are enforceable (show up in the
+  // grouped console); non-@ ids (system senders etc.) are skipped.
+  const engine = seedEngine({
+    identities: [
+      { senderId: "@alice:hs" }, // real Matrix user — enforceable
+      { senderId: "system" },    // non-@ synthetic sender — not enforceable
+      { senderId: "12345" },     // a numeric id (future provider style) — not enforceable with @ predicate
+    ],
+    sum: (f) => {
+      const models = f.requestedModelIds ? [...f.requestedModelIds].sort().join(",") : undefined;
+      if (f.triggerSenderIds?.includes("@alice:hs") && models === "opus-premium") return 1;
+      return 0;
+    },
+  });
+  engine.seedFromLedger();
+  const partitions = new Set(engine.groupedStatuses().individuals.map((g) => g.partitionKey));
+  assert.ok(partitions.has("@alice:hs"), "@-prefixed sender is surfaced");
+  assert.ok(!partitions.has("system"), "non-@ system sender is excluded");
+  assert.ok(!partitions.has("12345"), "non-@ numeric id is excluded");
+});
+
+test("isEnforceableUser (Phase 0): a custom predicate changes enforceability outcome", () => {
+  // Inject a custom predicate that treats numeric ids as valid user identities (simulating
+  // a future provider). Senders that pass the custom test must appear; those that fail must not.
+  const engine = seedEngine({
+    identities: [
+      { senderId: "42" },         // accepted by the custom predicate
+      { senderId: "system" },     // rejected by the custom predicate (not purely numeric)
+      { senderId: "@alice:hs" },  // also accepted (starts with @, but not numeric — excluded by predicate below)
+    ],
+    // Custom predicate: only numeric ids are "user identities".
+    isUserIdentity: (id) => /^\d+$/.test(id),
+    sum: (f) => {
+      const models = f.requestedModelIds ? [...f.requestedModelIds].sort().join(",") : undefined;
+      if (f.triggerSenderIds?.includes("42") && models === "opus-premium") return 1;
+      return 0;
+    },
+  });
+  engine.seedFromLedger();
+  const partitions = new Set(engine.groupedStatuses().individuals.map((g) => g.partitionKey));
+  // Only "42" satisfies the custom predicate — it must appear.
+  assert.ok(partitions.has("42"), "sender accepted by the custom predicate is surfaced");
+  // "@alice:hs" fails /^\d+$/ — excluded even though it would pass the Matrix predicate.
+  assert.ok(!partitions.has("@alice:hs"), "sender rejected by the custom predicate is excluded");
+  // "system" fails too.
+  assert.ok(!partitions.has("system"), "non-numeric system sender is excluded");
 });

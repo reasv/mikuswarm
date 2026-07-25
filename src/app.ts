@@ -1048,9 +1048,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
         viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
-        // The bot's own MXIDs (per account) — excluded (with non-MXID system senders)
-        // from the per-user console surface, since per-user limits don't govern
-        // self/system/proactive spend (Gate A is skipped for those lanes).
+        // Today the only enabled provider is Matrix, so a user identity is any id
+        // that starts with the Matrix sigil "@". Later phases will generalize this to
+        // `providers.some(p => p.ownsUserId(id))` once the provider registry lands.
+        isUserIdentity: (id) => id.startsWith("@"),
+        // The bot's own user ids (one per account) — excluded (with synthetic system
+        // senders) from the per-user console surface, since per-user limits don't
+        // govern self/system/proactive spend (Gate A is skipped for those lanes).
         selfUserIds: new Set(
           Object.values(config.matrix.accounts)
             .map((a) => a.user_id)
