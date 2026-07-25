@@ -4,6 +4,7 @@ import sharp from "sharp";
 import type { AppConfig } from "../config/index.js";
 import type { MatrixUploadMediaThumbnail } from "./native-types.js";
 import type {
+  ChannelClient,
   ChatProviderHost,
   DeliveryReceipt,
   IChatProvider,
@@ -13,6 +14,7 @@ import type {
   ProviderCapabilities,
   SelfIdentity,
 } from "../types.js";
+import { MatrixChannelClient } from "./channel-client.js";
 import { MatrixNativeClient } from "./native-client.js";
 import type {
   MatrixNativeConfig,
@@ -59,6 +61,7 @@ export class MatrixProvider implements IChatProvider {
     mediaUpload: true,
     maxAttachmentsPerMessage: 1,
     maxMessageChars: 4000,
+    maxContentBytes: 60_000,
     formatting: "html",
     edits: true,
     deletes: true,
@@ -386,8 +389,37 @@ export class MatrixProvider implements IChatProvider {
   }
 
   /**
-   * @deprecated External call sites will be replaced in Phase 2b once the provider
-   * registry lands and `ChannelClient` routes Matrix-specific tool calls.
+   * Return a `ChannelClient` scoped to the target's channel (§7.1).
+   * Returns `undefined` when the account is not running or the target has no channel.
+   */
+  channelClient(target: OutboundTarget): ChannelClient | undefined {
+    try {
+      const account = this.resolveAccount(target);
+      const roomId = target.roomId ?? parseTimelineKey(target.timelineKey)?.channelId;
+      if (!roomId) return undefined;
+      return new MatrixChannelClient(account.client, roomId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Update the bot's own profile (display name and/or avatar) for the given
+   * account. Delegates to the Matrix native client's `setProfile` call.
+   */
+  async setProfile(
+    accountId: string,
+    opts: { displayName?: string; avatarUrl?: string; avatarDataBase64?: string; avatarContentType?: string },
+  ): Promise<{ displayName?: string; avatarUrl?: string }> {
+    const account = this.accounts.get(accountId);
+    if (!account) throw new Error(`Matrix account not running: ${accountId}`);
+    return await account.client.setProfile(opts);
+  }
+
+  /**
+   * @deprecated Use {@link channelClient} instead. Kept for callers that still
+   * need the raw native client (enrichment wiring, serverIdsFor) until those
+   * sites are migrated in later phases.
    */
   getClient(target: OutboundTarget): MatrixNativeClient {
     return this.resolveAccount(target).client;

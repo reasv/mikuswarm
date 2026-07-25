@@ -260,6 +260,12 @@ export interface ProviderCapabilities {
   maxAttachmentsPerMessage: number;
   /** Safe body character budget (for chunking). */
   maxMessageChars: number;
+  /**
+   * Byte budget for the combined body + formatted_body in a single event (HTML
+   * send path). Matrix: 60 000 (within the 65 536-byte event limit). Absent on
+   * providers where no such cap applies; send_message falls back to 60 000.
+   */
+  maxContentBytes?: number;
   formatting: "html" | "markdown" | "plain";
   edits: boolean;
   deletes: boolean;
@@ -299,13 +305,193 @@ export interface ChatProviderHost {
   }): TriggerInfo | undefined;
 }
 
+// ── ChannelClient (spec DISCORD-SUPPORT-DESIGN §7.1) ──────────────────────────
+
+/** Cross-provider reaction listing for one message. */
+export interface ReactionEntry {
+  normalizedKey: string;
+  display: string;
+  kind: "unicode" | "custom" | "text";
+  shortcode?: string;
+  count: number;
+  users: string[];
+}
+export type ReactionListing = ReactionEntry[];
+
+/**
+ * Channel descriptor returned by {@link ChannelClient.channelInfo}.
+ * `label` is the human-readable channel name (e.g. `#channel-name (Server Name)`
+ * for Discord, `Room Name (Space Name)` for Matrix).
+ */
+export interface ChannelInfo {
+  /** Human-readable channel label (name + optional server/space suffix). */
+  label: string;
+  /**
+   * Display name for the channel/room without any server/space suffix.
+   * Matrix: the room's `displayName` from the native client (absent for unnamed rooms).
+   * Discord: the channel's name (absent for unnamed or unresolvable channels).
+   * The tool renders this as the `Name:` line; the `label` field incorporates it
+   * (plus a server/space suffix) for label-cache and diary consumers.
+   */
+  displayName?: string;
+  /** Native channel/room id. */
+  channelId: string;
+  /** Server/space/guild name (e.g. Matrix parent space, Discord guild). */
+  serverName?: string;
+  isDirect: boolean;
+  topic?: string;
+  memberCount?: number;
+  joined?: boolean;
+  canonicalAlias?: string;
+  altAliases?: string[];
+}
+
+/** A pinned message as returned by {@link ChannelClient.pins}. */
+export interface PinnedMessage {
+  externalId: string;
+  sender: SenderInfo;
+  body: string;
+  timestamp: number;
+}
+
+/** A sendable emoji entry returned by {@link ChannelClient.emojiList}. */
+export interface EmojiEntry {
+  shortcode: string;
+  animated?: boolean;
+}
+
+/** Member information returned by {@link ChannelClient.memberInfo}. */
+export interface MemberInfo {
+  userId: string;
+  displayName?: string;
+  avatarUrl?: string;
+  membership?: string;
+  isSelf: boolean;
+  isDirect: boolean;
+}
+
+/** Neutral history page request (spec §11.3). `cursor` = Matrix next_batch or snowflake. */
+export interface HistoryPageRequest {
+  cursor?: string;
+  limit?: number;
+  /** Older-than cursor (passed through from the read_messages `before` parameter). */
+  before?: string;
+  /** Newer-than cursor (passed through from the read_messages `after` parameter). */
+  after?: string;
+}
+
+/** One message in a history page (spec §11.3). */
+export interface HistorySummary {
+  externalId: string;
+  sender: SenderInfo;
+  timestamp: number;
+  body: string;
+  attachments?: AttachmentMeta[];
+  replyToExternalId?: string;
+  edited?: boolean;
+}
+
+/** Neutral history page result (spec §11.3). */
+export interface HistoryPageResult {
+  messages: HistorySummary[];
+  nextCursor?: string;
+  prevCursor?: string;
+}
+
+/** Create-poll request passed to {@link ChannelClient.createPoll}. */
+export interface CreatePollRequest {
+  question: string;
+  options: Array<{ id: string; text: string }>;
+  maxSelections?: number;
+}
+
+/** Result from {@link ChannelClient.createPoll}. */
+export interface CreatePollResult {
+  externalId: string;
+}
+
+/** Vote-poll request passed to {@link ChannelClient.votePoll}. */
+export interface VotePollRequest {
+  pollExternalId: string;
+  answerIds: string[];
+}
+
+/** Result from {@link ChannelClient.votePoll}. */
+export interface VotePollResult {
+  externalId: string;
+}
+
+/**
+ * Per-target action surface obtained from a provider (spec DISCORD-SUPPORT-DESIGN §7.1).
+ *
+ * Capabilities gating:
+ * - `members` is present iff `ProviderCapabilities.membershipRoster`.
+ * - `createPoll` is present iff `ProviderCapabilities.pollCreate`.
+ * - `votePoll` is present iff `ProviderCapabilities.pollVote`.
+ *
+ * All methods throw on failure; callers must catch and report errors.
+ */
+export interface ChannelClient {
+  /**
+   * Add a reaction. Optionally returns the resolved display text (e.g. the
+   * resolved emoji glyph or custom shortcode the platform used). Lean providers
+   * may return void.
+   */
+  react(externalId: string, emoji: string): Promise<{ display?: string } | void>;
+  unreact(externalId: string, emoji: string): Promise<{ removed?: number } | void>;
+  listReactions(externalId: string, limit?: number): Promise<ReactionListing>;
+  /**
+   * Edit a message. Optionally returns the new event/message id assigned by the
+   * platform. Lean providers may return void.
+   */
+  editMessage(externalId: string, body: string): Promise<{ externalId?: string } | void>;
+  deleteMessage(externalId: string, reason?: string): Promise<void>;
+  readMessages(req: HistoryPageRequest): Promise<HistoryPageResult>;
+  /** Look up a single message by its provider-native id. Returns undefined when not found. */
+  readMessage(externalId: string): Promise<HistorySummary | undefined>;
+  memberInfo(userId: string): Promise<MemberInfo | undefined>;
+  /** Present iff `ProviderCapabilities.membershipRoster`. */
+  members?(): Promise<SenderInfo[]>;
+  channelInfo(): Promise<ChannelInfo>;
+  pins(): Promise<PinnedMessage[]>;
+  /**
+   * Pin a message. Optionally returns the post-op total pin count. Lean
+   * providers may return void.
+   */
+  pinMessage(externalId: string): Promise<{ pinCount?: number } | void>;
+  /**
+   * Unpin a message. Optionally returns the post-op total pin count. Lean
+   * providers may return void.
+   */
+  unpinMessage(externalId: string): Promise<{ pinCount?: number } | void>;
+  emojiList(limit?: number): Promise<EmojiEntry[]>;
+  /** Present iff `ProviderCapabilities.pollCreate`. */
+  createPoll?(req: CreatePollRequest): Promise<CreatePollResult>;
+  /** Present iff `ProviderCapabilities.pollVote`. */
+  votePoll?(req: VotePollRequest): Promise<VotePollResult>;
+}
+
+/**
+ * Per-provider terminology used to assemble provider-aware tool descriptions
+ * (spec DISCORD-SUPPORT-DESIGN §7.1). The Matrix bundle reproduces today's
+ * tool schema strings exactly; the Discord bundle uses Discord vocabulary.
+ */
+export interface ProviderTerminology {
+  /** e.g. "Matrix event ID" or "Discord message ID" */
+  messageIdFmt: string;
+  /** e.g. "Matrix user ID (e.g. @user:server.com)" or "Discord user ID (snowflake)" */
+  userIdFmt: string;
+  /** e.g. "room" or "channel" */
+  channelNoun: string;
+  /** e.g. "Matrix" or "Discord" */
+  providerName: string;
+  /** mention description sentence embedded in send_message.message description */
+  mentionNote: string;
+}
+
 /**
  * Provider contract v2 (spec DISCORD-SUPPORT-DESIGN §3.1).
- * Implemented by MatrixProvider (Phase 2a). Discord provider (Phase 3+).
- *
- * Deferred members (not yet present):
- *   - `channelClient(target)` — Phase 4, ChannelClient type not yet defined
- *   - `history(target)` — Phase 6, HistoryClient type not yet defined
+ * Implemented by MatrixProvider (Phase 2). Discord provider (Phase 7).
  */
 export interface IChatProvider {
   readonly id: string;
@@ -319,8 +505,22 @@ export interface IChatProvider {
   getSelf(accountId: string): SelfIdentity | undefined;
   /** Shape test: "is this one of my user IDs?" — used for budget enforceability. */
   ownsUserId(id: string): boolean;
+  /** Tool/action surface for one target; undefined when the target is foreign. */
+  channelClient(target: OutboundTarget): ChannelClient | undefined;
   /** Enrichment capability object for one account; undefined when the account is foreign. */
   enrichment(accountId: string): EnrichmentCapabilities | undefined;
+  /**
+   * Update the bot's own profile (display name and/or avatar). Optional: absent on
+   * providers that do not support profile edits (or where it is not yet implemented).
+   * Discord: avatar + per-guild nick (global username rename excluded — §14).
+   * Matrix: display name + avatar upload.
+   */
+  setProfile?(accountId: string, opts: {
+    displayName?: string;
+    avatarUrl?: string;
+    avatarDataBase64?: string;
+    avatarContentType?: string;
+  }): Promise<{ displayName?: string; avatarUrl?: string }>;
 }
 
 /**

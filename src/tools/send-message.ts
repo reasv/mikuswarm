@@ -7,11 +7,12 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { IChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta, SenderInfo } from "../types.js";
+import type { IChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta, SenderInfo, ProviderTerminology } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
 import { guardedFetch } from "./ssrf.js";
 import { chunkMarkdownText } from "./chunk.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 /** Safe content budget for body + formatted_body within Matrix's 65 536-byte event limit. */
 const MATRIX_MAX_CONTENT_BYTES = 60_000;
@@ -44,6 +45,12 @@ export interface SendMessageToolContext {
    * guard (tests).
    */
   isClaimedByOther?: (externalId: string) => { sessionId?: string } | undefined;
+  /**
+   * Provider-aware terminology bundle for tool description strings (spec
+   * DISCORD-SUPPORT-DESIGN §7.1). Defaults to MATRIX_TERMINOLOGY so existing
+   * Matrix callers — and tests — need not be updated.
+   */
+  terminology?: ProviderTerminology;
 }
 
 /**
@@ -64,20 +71,53 @@ function resolveSelfSender(context: SendMessageToolContext): SenderInfo {
 }
 
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
+  // Optional-chain safe: resume-exempt.ts constructs tools with a stub context at
+  // module-load time to enumerate exempt tool names; `provider` is absent then.
+  const caps = context.provider?.capabilities;
+  // Byte budget for the combined body + formatted_body in the HTML send path.
+  // Reads from ProviderCapabilities.maxContentBytes (NIT1); falls back to the
+  // Matrix constant so the behaviour is byte-identical for callers that haven't
+  // set the capability yet.
+  const maxContentBytes = caps?.maxContentBytes ?? MATRIX_MAX_CONTENT_BYTES;
+  // For providers that allow multiple attachments per message (e.g. Discord),
+  // expose the array form. Single-attachment providers (e.g. Matrix) keep a plain
+  // string — same schema shape as before, so the Matrix tool schema is unchanged.
+  const maxAttachments = caps?.maxAttachmentsPerMessage ?? 1;
+  const mediaParam =
+    maxAttachments > 1
+      ? Type.Optional(
+          Type.Union(
+            [
+              Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }),
+              Type.Array(Type.String(), {
+                minItems: 1,
+                maxItems: maxAttachments,
+                description: `Array of paths/URLs to send as attachments (up to ${maxAttachments}).`,
+              }),
+            ],
+            { description: "Media attachment(s): a single path/URL, or an array of paths/URLs." },
+          ),
+        )
+      : Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }));
   return {
     name: "send_message",
     label: "Send message",
     // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — the effect IS
     // the chat message, so it leaves no rollout state worth continuing.
     resumeWorkExempt: true,
-    description: "Send a message to the current Matrix room. You must explicitly decide whether the message is a reply.",
+    description: `Send a message to the current ${t.providerName} ${t.channelNoun}. You must explicitly decide whether the message is a reply.`,
     parameters: Type.Object({
-      message: Type.String({ description: "Message text. Can be empty string if sending media only. An exact Matrix user ID like @name:server in the text is turned into a real mention automatically (pill + notification) — no special markup needed." }),
-      html: Type.Optional(Type.String({ description: "Optional HTML body. If omitted, HTML is generated automatically when the message contains :shortcode: emoji or @user:server mentions." })),
+      message: Type.String({ description: `Message text. Can be empty string if sending media only. ${t.mentionNote}` }),
+      ...(caps?.formatting === "html"
+        ? { html: Type.Optional(Type.String({ description: "Optional HTML body. If omitted, HTML is generated automatically when the message contains :shortcode: emoji or @user:server mentions." })) }
+        : {}),
       is_reply: Type.Boolean({ description: "Whether this message is an explicit reply to another message. Set to false for standalone messages." }),
-      reply_to_id: Type.Optional(Type.String({ description: "Matrix event ID to reply to. Required when is_reply is true." })),
-      media: Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." })),
-      as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })),
+      reply_to_id: Type.Optional(Type.String({ description: `${t.messageIdFmt} to reply to. Required when is_reply is true.` })),
+      media: mediaParam,
+      ...(caps?.voiceMessages
+        ? { as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })) }
+        : {}),
       final: Type.Boolean({ description: "Whether this is the final message of your turn. Set true if you are done — sending the message ends your turn. Set false ONLY when you will keep working and send more this turn (e.g. a progress update before a multi-step tool sequence); your turn stays open. There is no default — you must decide every time, just like is_reply." }),
     }),
     execute: async (_toolCallId, params) => {
@@ -86,7 +126,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         html?: string;
         is_reply: boolean;
         reply_to_id?: string;
-        media?: string;
+        media?: string | string[];
         as_voice?: boolean;
         final: boolean;
       };
@@ -122,9 +162,12 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       }
 
       // A send with no text, no HTML, and no media has nothing to deliver — it would
-      // produce an empty Matrix event (or, historically, silently send nothing). If you
+      // produce an empty event (or, historically, silently send nothing). If you
       // have nothing to say, terminate the turn by outputting exactly NO_REPLY instead.
-      if (!args.message.trim() && !args.html?.trim() && !args.media?.trim()) {
+      const hasMedia = Array.isArray(args.media)
+        ? args.media.some((s) => s.trim())
+        : (args.media?.trim() ?? "").length > 0;
+      if (!args.message.trim() && !args.html?.trim() && !hasMedia) {
         return {
           content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, output exactly NO_REPLY to end your turn silently." }],
           details: null,
@@ -141,19 +184,26 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       const body = args.message;
       const htmlBody = args.html;
 
+      // Normalise media to a list of non-empty strings.
+      const mediaRefs: string[] = args.media === undefined || args.media === null
+        ? []
+        : (Array.isArray(args.media) ? args.media : [args.media]).filter((s) => s.trim());
+
       let attachments: AttachmentMeta[] | undefined;
-      let tempPath: string | undefined;
-      if (args.media?.trim()) {
+      const tempPaths: string[] = [];
+      if (mediaRefs.length > 0) {
         try {
-          const mediaResult = await resolveMedia(args.media.trim(), context);
-          if (args.as_voice) {
-            mediaResult.attachment.asVoice = true;
+          const resolved = await Promise.all(mediaRefs.map((m) => resolveMedia(m.trim(), context)));
+          attachments = resolved.map((r, i) => {
+            if (i === 0 && args.as_voice) r.attachment.asVoice = true;
+            return r.attachment;
+          });
+          for (const r of resolved) {
+            if (r.tempPath) tempPaths.push(r.tempPath);
           }
-          attachments = [mediaResult.attachment];
-          tempPath = mediaResult.tempPath;
         } catch (err) {
           return {
-            content: [{ type: "text", text: `error: failed to resolve media "${args.media}": ${err instanceof Error ? err.message : String(err)}` }],
+            content: [{ type: "text", text: `error: failed to resolve media "${Array.isArray(args.media) ? args.media.join(", ") : args.media}": ${err instanceof Error ? err.message : String(err)}` }],
             details: null,
           };
         }
@@ -164,11 +214,11 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         if (htmlBody) {
           const combinedBytes =
             Buffer.byteLength(body, "utf8") + Buffer.byteLength(htmlBody, "utf8");
-          if (combinedBytes > MATRIX_MAX_CONTENT_BYTES) {
+          if (combinedBytes > maxContentBytes) {
             return {
               content: [{
                 type: "text",
-                text: `error: message with custom HTML is too large to send as a single event (${combinedBytes} bytes exceeds ${MATRIX_MAX_CONTENT_BYTES}-byte limit). To fix this, shorten the message, remove the html parameter to allow automatic chunking, or split into multiple send_message calls manually.`,
+                text: `error: message with custom HTML is too large to send as a single event (${combinedBytes} bytes exceeds ${maxContentBytes}-byte limit). To fix this, shorten the message, remove the html parameter to allow automatic chunking, or split into multiple send_message calls manually.`,
               }],
               details: null,
             };
@@ -207,8 +257,10 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
           };
         }
 
-        // No custom HTML — chunk the plaintext message as before.
-        const chunks = chunkMarkdownText(body, 4000);
+        // No custom HTML — chunk the plaintext message.
+        // Use the provider's character budget; fall back to 4000 for backward compat.
+        const maxChars = caps?.maxMessageChars ?? 4000;
+        const chunks = chunkMarkdownText(body, maxChars);
         // Media-only send: an empty body chunks to zero entries, so the send loop
         // below would never run and the attachment would be silently dropped.
         // Emit a single empty-body event to carry the attachment.
@@ -265,7 +317,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
         }
         throw err;
       } finally {
-        if (tempPath) await unlink(tempPath).catch(() => {});
+        await Promise.all(tempPaths.map((p) => unlink(p).catch(() => {})));
       }
     },
   };

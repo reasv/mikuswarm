@@ -1,13 +1,15 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { MatrixNativeClient } from "../matrix/native-client.js";
+import type { ChannelClient, ProviderTerminology } from "../types.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 export interface EditMessageToolContext {
-  client: MatrixNativeClient;
-  roomId: string;
+  channelClient: ChannelClient;
+  terminology?: ProviderTerminology;
 }
 
 export function createEditMessageTool(context: EditMessageToolContext): AgentTool {
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "edit_message",
     label: "Edit message",
@@ -15,7 +17,7 @@ export function createEditMessageTool(context: EditMessageToolContext): AgentToo
     resumeWorkExempt: true,
     description: "Edit one of your own previously sent messages. Only messages sent by you can be edited.",
     parameters: Type.Object({
-      message_id: Type.String({ description: "Matrix event ID of the message to edit." }),
+      message_id: Type.String({ description: `${t.messageIdFmt} of the message to edit.` }),
       text: Type.String({ description: "New message text to replace the original." }),
     }),
     execute: async (_toolCallId, params) => {
@@ -35,14 +37,11 @@ export function createEditMessageTool(context: EditMessageToolContext): AgentToo
       }
 
       try {
-        const result = await context.client.editMessage({
-          roomId: context.roomId,
-          messageId: args.message_id.trim(),
-          text: args.text,
-        });
+        const result = await context.channelClient.editMessage(args.message_id.trim(), args.text);
+        const newId = (result as { externalId?: string } | null | void)?.externalId;
         return {
-          content: [{ type: "text", text: `edited message, new event ID: ${result.eventId}` }],
-          details: result,
+          content: [{ type: "text", text: newId != null ? `edited message, new event ID: ${newId}` : `edited message` }],
+          details: null,
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

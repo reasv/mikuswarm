@@ -1,19 +1,21 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { MatrixNativeClient } from "../matrix/native-client.js";
+import type { ChannelClient, ProviderTerminology } from "../types.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 export interface MemberInfoToolContext {
-  client: MatrixNativeClient;
-  roomId: string;
+  channelClient: ChannelClient;
+  terminology?: ProviderTerminology;
 }
 
 export function createMemberInfoTool(context: MemberInfoToolContext): AgentTool {
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "member_info",
     label: "Member info",
-    description: "Get information about a room member including their display name, avatar, and membership state.",
+    description: `Get information about a ${t.channelNoun} member including their display name, avatar, and membership state.`,
     parameters: Type.Object({
-      user_id: Type.String({ description: "Matrix user ID (e.g. @user:server.com)." }),
+      user_id: Type.String({ description: `${t.userIdFmt}.` }),
     }),
     execute: async (_toolCallId, params) => {
       const args = params as { user_id: string };
@@ -26,10 +28,13 @@ export function createMemberInfoTool(context: MemberInfoToolContext): AgentTool 
       }
 
       try {
-        const info = await context.client.memberInfo({
-          roomId: context.roomId,
-          userId: args.user_id.trim(),
-        });
+        const info = await context.channelClient.memberInfo(args.user_id.trim());
+        if (!info) {
+          return {
+            content: [{ type: "text", text: `member "${args.user_id}" not found.` }],
+            details: null,
+          };
+        }
 
         const lines: string[] = [];
         lines.push(`User: ${info.userId}`);

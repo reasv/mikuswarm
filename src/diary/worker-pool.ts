@@ -12,7 +12,7 @@ import type { Logger } from "../observability/index.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { SummaryDraft, createDiaryTool } from "../tools/index.js";
-import { roomIdFromTimelineKey } from "../timeline/index.js";
+import { roomIdFromTimelineKey, parseTimelineKey } from "../timeline/index.js";
 import { attachSessionCapture } from "../agent/session-capture.js";
 import { agentDateStamp } from "../time/index.js";
 import { buildDiaryHeader, draftBeginsWithHeader } from "./header.js";
@@ -558,7 +558,12 @@ export class DiaryWorkerPool {
       this.options.logger.warn("diary_channel_label_unparseable_key", { timelineKey });
       return timelineKey;
     }
-    return roomId;
+    // Provider-aware fallback (spec DISCORD-SUPPORT-DESIGN §6.6/Q12):
+    // Matrix uses the bare room id (matching the pre-Phase-4 behaviour exactly).
+    // Non-matrix providers prefix with '#' so the fallback reads as a channel
+    // reference rather than an opaque id.
+    const provider = parseTimelineKey(timelineKey)?.provider;
+    return provider === "matrix" ? roomId : '#' + roomId;
   }
 }
 

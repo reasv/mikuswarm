@@ -393,7 +393,7 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
         silentNote =
           timelineKeys === undefined
             ? ' (include_silent needs a concrete room scope — pass rooms:"current" or a list; never-posted members not listed for rooms:"all")'
-            : " (membership source unavailable; never-posted members not listed)";
+            : " (roster unavailable on this channel; never-posted members not listed)";
       }
 
       let shown: SenderAgg[];
