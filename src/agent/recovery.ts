@@ -5,7 +5,7 @@ import type { AgentSessionRow } from "../storage/index.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { Logger } from "../observability/logger.js";
 import type { InboundChatEvent, SenderInfo } from "../types.js";
-import { parseMatrixTimelineKey } from "../proactive/index.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 import { mapBuiltMessages } from "./factory.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import type { ImageRef } from "./session-capture.js";
@@ -634,7 +634,7 @@ export function createManualResumeSession(
             "nothing to redo: the transcript ends at a clean boundary, or the resume material is unusable",
         };
       }
-      const parsed = parseMatrixTimelineKey(row.timeline_key);
+      const parsed = parseTimelineKey(row.timeline_key);
       const selfUserId = parsed ? deps.selfUserIdForAccount(parsed.accountId) : undefined;
       if (!parsed || !selfUserId) {
         return {
@@ -680,7 +680,7 @@ export function createManualResumeSession(
             provider: "matrix",
             timelineKey: row.timeline_key,
             accountId: parsed.accountId,
-            roomId: parsed.roomId,
+            roomId: parsed.channelId, // channelId = Matrix room id for this provider
             threadId: parsed.threadId,
           },
         };

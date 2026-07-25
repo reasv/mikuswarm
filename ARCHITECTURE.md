@@ -543,13 +543,38 @@ This architecture explicitly separates **observing** (timeline ingests all messa
 
 ### Timeline keys
 
+`timelineKey` is a provider-generic string used as the universal FK across ~20 tables. Its shape is a documented, parseable grammar (`src/storage/timeline-key.ts`):
+
+```
+<provider>:<accountId>:<kind>:<channelId>[:thread:<threadId>]
+  provider   [a-z0-9-]+      no colon (e.g. "matrix")
+  accountId  operator-chosen config key, no colon
+  kind       "room" | "dm"
+  channelId  provider-native id; MAY contain colons (Matrix room ids do)
+  threadId   provider-native id (no colons in practice)
+```
+
+Matrix keys are exactly this shape — no existing row needs to change:
+
 | Context | Format |
 |---------|--------|
 | Room | `matrix:{accountId}:room:{roomId}` |
 | DM | `matrix:{accountId}:dm:{roomId}` |
 | Thread | `matrix:{accountId}:room:{roomId}:thread:{threadRootId}` |
 
-DM detection checks for `:dm:` in the key.
+Because `channelId` may contain colons (Matrix room ids are `!local:server`), the `:thread:` suffix is detected from the **end** (last occurrence of `:thread:` in the remainder after the `kind:` segment). Kind is always the 3rd colon-delimited segment from the start.
+
+**Shared parser** — `src/storage/timeline-key.ts` is the single grammar module and single source of truth. Public API:
+- `parseTimelineKey(key)` → `ParsedTimelineKey | undefined` (returns `undefined` for malformed/absent keys)
+- `buildTimelineKey(parts)` → `string` (inverse of `parseTimelineKey`; round-trips are identity)
+- `channelIdFromTimelineKey(key)` → `string | undefined` (extracts the channel id; `undefined` for malformed/absent)
+- `timelineKindOf(key)` → `"room" | "dm" | undefined`
+- `roomIdFromTimelineKeyOpt` — deprecated alias of `channelIdFromTimelineKey`; kept for one release
+- `threadKeyLikePattern(roomKey)` — SQLite `LIKE` pattern for `<roomKey>:thread:%`
+
+All parse sites use these shared functions. No subsystem may parse the key with a local regex or `split(":")`. A present-but-malformed key logs `"timeline_key.malformed"` (structured JSON, consistent event name) rather than silently no-op-ing; absent/undefined keys keep their current behaviour (skip / return undefined).
+
+DM detection uses `timelineKindOf(key) === "dm"`. The `isDmTimeline` router helper delegates to the same function. For inbound events produced by a normalizer, `InboundChatEvent.channelType` (`"group" | "dm" | "thread"`) is populated at ingest; routing code that has the full event prefers `channelType` and falls back to `timelineKindOf(key)` for stored keys.
 
 ### Storage
 
@@ -627,7 +652,7 @@ Enrichment is a post-persistence, provider-agnostic system that processes timeli
 
 ### Enrichment worker pool (`src/enrichment/`)
 
-A pool of workers (configurable count, default 3) continuously polls the DB for events with `enrichment_status='pending'`, most recent first. Each worker claims an event (CAS to `'processing'`), then executes all enrichment for that message. The room id for room-bound capability calls is parsed from the timeline key by the shared `roomIdFromTimelineKey` (`src/timeline/router.ts`) — **never** a naive `split(":")`, which truncates classic `!local:server` room ids at the server colon and makes every room-bound call fail on an unknown room. If the key doesn't parse, the worker logs `enrichment_room_id_unresolved` and skips the room-bound steps (1, 2) while still running the body-only steps.
+A pool of workers (configurable count, default 3) continuously polls the DB for events with `enrichment_status='pending'`, most recent first. Each worker claims an event (CAS to `'processing'`), then executes all enrichment for that message. The channel id for channel-bound capability calls is extracted from the timeline key by the shared `channelIdFromTimelineKey` (`src/storage/timeline-key.ts`) — **never** a naive `split(":")`, which truncates classic `!local:server` room ids at the server colon and makes every room-bound call fail on an unknown room. If the key is present but doesn't parse, the worker logs `timeline_key.malformed` and skips the channel-bound steps (1, 2) while still running the body-only steps.
 
 1. **Download attachments** via provider `downloadMedia()` (streams directly to disk) → move to `msg-attach/` with content-addressed filenames (SHA-256 hash, base32 prefix, 13 chars). Move uses `rename()` with EXDEV fallback (`copyFile` + `unlink`) for cross-filesystem scenarios
 2. **Resolve reply context** via provider `messageSummary()` + `memberInfo()` → store sender, body, timestamp. A missing target (redacted/non-message — `messageSummary` returns null) or a thrown resolution failure degrades to a **stub row** (`reply_external_id` only) and is always logged (`enrichment_reply_target_missing` / `enrichment_reply_resolution_failed`) — never swallowed silently; the renderer marks a stub as unavailable (§9)

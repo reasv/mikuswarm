@@ -165,6 +165,21 @@ export interface InboundChatEvent {
   trigger?: TriggerInfo;
   outboundTarget?: OutboundTarget;
   /**
+   * Channel type populated at ingest by the provider normalizer. Routing prefers
+   * this field over parsing the `timelineKey` when it is present, so DM/thread
+   * detection works correctly even before the key is available (and for future
+   * providers whose key shape might differ). Falls back to `timelineKindOf(key)`
+   * in workers and subsystems that only have a stored key.
+   *
+   * - `"dm"` — direct message channel (1-on-1)
+   * - `"group"` — group channel / guild text channel
+   * - `"thread"` — sub-thread of a channel (Matrix thread, Discord thread/forum post)
+   *
+   * Not set on synthetic events (recovery, proactive, backfill) — callers fall
+   * back to key parsing in those cases.
+   */
+  channelType?: "group" | "dm" | "thread";
+  /**
    * Set when this inbound event is a message edit (`m.replace`). `event` carries
    * the replacement body/attachments (from `m.new_content`); `targetExternalId`
    * is the provider event id of the message being edited. The pipeline applies

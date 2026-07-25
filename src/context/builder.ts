@@ -7,6 +7,7 @@ import type { SessionClaims } from "../agent/session-claims.js";
 import type { PriorityClass } from "../agent/scheduler.js";
 import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 import type {
   Storage,
   MediaAssetRow,
@@ -1388,16 +1389,19 @@ export class ContextBuilder {
    * targets or no live reactions on them.
    */
   /**
-   * Resolve the bot's own Matrix user id for a build from its timelineKey
-   * (`matrix:{account}:room:{roomId}` / `:dm:` / with `:thread:` suffix — the
-   * account is the 2nd colon-segment) via `config.matrix.accounts[account].user_id`
-   * (same lookup as src/app.ts). Returns undefined when it can't be resolved; the
-   * caller then falls back to the reactor's display name.
+   * Resolve the bot's own Matrix user id for a build from its timelineKey via
+   * `config.matrix.accounts[account].user_id` (same lookup as src/app.ts).
+   * Uses the shared grammar parser to extract the accountId so the extraction
+   * is correct for provider-generic keys. Returns undefined when it can't be
+   * resolved; the caller then falls back to the reactor's display name.
+   *
+   * NOTE: the `config.matrix.accounts` lookup is Phase-2 scope (provider registry);
+   * the key parsing is Phase-1 scope (shared grammar). Only the parsing is changed here.
    */
   private resolveSelfUserId(timelineKey: string): string | undefined {
-    const accountId = timelineKey.split(":")[1];
-    if (accountId === undefined) return undefined;
-    return this.config.matrix.accounts[accountId]?.user_id;
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed) return undefined;
+    return this.config.matrix.accounts[parsed.accountId]?.user_id;
   }
 
   private buildDiscreteReactionLines(

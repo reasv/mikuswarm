@@ -1,30 +1,145 @@
 /**
- * Leaf helpers for parsing Matrix `timeline_key` strings (spec PER-USER-LIMITS §8.3).
+ * Universal `timeline_key` grammar (spec DISCORD-SUPPORT-DESIGN §4.1–4.2).
  *
- * This module is intentionally dependency-free so BOTH the storage layer (which
- * denormalizes `room_id` onto `usage_events` at insert) and the timeline layer
- * (which derives `ctx.roomId`) can share one regex. Room-scoped meter seeding is
- * correct only when those two derivations agree, so they MUST NOT drift — keeping
- * the regex here, with no heavy imports, lets storage own it without depending on
- * the timeline subsystem (the reason the two copies were originally duplicated).
+ * The key is a provider-generic string used as the universal FK across ~20 tables.
+ * Its shape is a documented, parseable grammar — NOT opaque — so all subsystems
+ * can extract provider/account/channel without per-site regexes:
  *
- * Keys are shaped `matrix:<account>:room:<roomId>[:thread:<root>]` or
- * `matrix:<account>:dm:<roomId>`. A Matrix room id (`!local:server`) itself
- * contains a colon, so the capture takes everything between the `room:`/`dm:`
- * marker and an optional `:thread:` suffix rather than splitting on every colon.
- * The `room|dm` kind segment is validated, so a malformed key yields no room id.
+ *   <provider>:<accountId>:<kind>:<channelId>[:thread:<threadId>]
+ *
+ *   provider   [a-z0-9-]+      no colon (e.g. "matrix", "discord")
+ *   accountId  operator-chosen config key, no colon
+ *   kind       "room" | "dm"
+ *   channelId  provider-native id; MAY contain colons (Matrix room ids do)
+ *   threadId   provider-native id (no colons in practice)
+ *
+ * Matrix keys are exactly this shape — no stored row changes meaning:
+ *   matrix:<account>:room:!local:server
+ *   matrix:<account>:dm:!dm:server
+ *   matrix:<account>:room:!local:server:thread:$root
+ *
+ * Discord keys (Phase 7, not yet implemented) follow the same grammar:
+ *   discord:<account>:room:<channelSnowflake>
+ *   discord:<account>:dm:<dmChannelSnowflake>
+ *   discord:<account>:room:<parentSnowflake>:thread:<threadSnowflake>
+ *
+ * Because channelId may contain colons, `:thread:` is detected from the END
+ * (last occurrence), not the start. Kind is always the 3rd colon-delimited
+ * segment from the start.
+ *
+ * This module is intentionally dependency-free so BOTH the storage layer
+ * (which denormalizes `room_id` onto `usage_events` at insert) and the
+ * timeline layer (which derives `ctx.roomId`) can share one implementation.
+ * Room-scoped meter seeding is correct only when those two derivations agree,
+ * so they MUST NOT drift.
  */
 
+export interface ParsedTimelineKey {
+  provider: string;
+  accountId: string;
+  kind: "room" | "dm";
+  channelId: string;
+  threadId?: string;
+}
+
 /**
- * Extract the bare Matrix room id from a `timeline_key`, or `undefined` for a
- * missing / malformed key. The single source of truth for the derivation; the
- * storage- and timeline-layer wrappers delegate here.
+ * Parse a `timeline_key` into its components, or return `undefined` for a
+ * missing or malformed key. This is the single source of truth for the grammar.
+ *
+ * Matrix room ids contain a colon (`!local:server`), so the channelId capture
+ * takes everything after the `kind:` marker and strips a trailing `:thread:<id>`
+ * suffix by searching for the LAST occurrence of `:thread:` — so a Matrix room id
+ * that happens to contain `:thread:` does not confuse the parser.
+ */
+export function parseTimelineKey(key: string): ParsedTimelineKey | undefined {
+  if (!key) return undefined;
+
+  // Segment 1: provider (no colon allowed)
+  const c1 = key.indexOf(":");
+  if (c1 === -1) return undefined;
+  const provider = key.slice(0, c1);
+  if (!provider || !/^[a-z0-9-]+$/.test(provider)) return undefined;
+
+  // Segment 2: accountId (no colon allowed)
+  const c2 = key.indexOf(":", c1 + 1);
+  if (c2 === -1) return undefined;
+  const accountId = key.slice(c1 + 1, c2);
+  if (!accountId) return undefined;
+
+  // Segment 3: kind (must be "room" or "dm")
+  const c3 = key.indexOf(":", c2 + 1);
+  if (c3 === -1) return undefined;
+  const kind = key.slice(c2 + 1, c3);
+  if (kind !== "room" && kind !== "dm") return undefined;
+
+  // Remainder: channelId[:thread:threadId]
+  const rest = key.slice(c3 + 1);
+  if (!rest) return undefined;
+
+  // Detect `:thread:` from the END (channelId is greedy)
+  const THREAD_MARKER = ":thread:";
+  const threadIdx = rest.lastIndexOf(THREAD_MARKER);
+  let channelId: string;
+  let threadId: string | undefined;
+
+  if (threadIdx !== -1) {
+    channelId = rest.slice(0, threadIdx);
+    threadId = rest.slice(threadIdx + THREAD_MARKER.length);
+    // Both parts must be non-empty
+    if (!channelId || !threadId) return undefined;
+  } else {
+    channelId = rest;
+  }
+
+  return { provider, accountId, kind, channelId, threadId };
+}
+
+/**
+ * Construct a `timeline_key` from its parsed components.
+ * Inverse of `parseTimelineKey`; round-trips are identity.
+ */
+export function buildTimelineKey(parts: {
+  provider: string;
+  accountId: string;
+  kind: "room" | "dm";
+  channelId: string;
+  threadId?: string;
+}): string {
+  const base = `${parts.provider}:${parts.accountId}:${parts.kind}:${parts.channelId}`;
+  return parts.threadId ? `${base}:thread:${parts.threadId}` : base;
+}
+
+/**
+ * Extract the channel id from a `timeline_key`, or `undefined` for a missing /
+ * malformed key. For Matrix this is the room id (`!local:server`); for Discord
+ * it is the channel snowflake. The single source of truth used by both the
+ * storage-layer `room_id` denormalization and the timeline-layer `ctx.roomId`,
+ * ensuring they never drift.
+ */
+export function channelIdFromTimelineKey(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  return parseTimelineKey(key)?.channelId;
+}
+
+/**
+ * Return the kind segment (`"room"` or `"dm"`) of a `timeline_key`, or
+ * `undefined` for a missing / malformed key.
+ */
+export function timelineKindOf(key: string | undefined): "room" | "dm" | undefined {
+  if (!key) return undefined;
+  return parseTimelineKey(key)?.kind;
+}
+
+/**
+ * Extract the bare channel id from a `timeline_key`, or `undefined` for a
+ * missing / malformed key.
+ *
+ * @deprecated Use {@link channelIdFromTimelineKey} instead. This alias exists
+ *   to keep the diff reviewable during the Phase-1 migration; it will be removed
+ *   in a follow-up phase once all callers are updated.
  */
 export function roomIdFromTimelineKeyOpt(timelineKey: string | undefined): string | undefined {
-  if (!timelineKey) return undefined;
-  const match = timelineKey.match(/^matrix:[^:]+:(?:room|dm):(.+?)(?::thread:.+)?$/);
-  const roomId = match?.[1];
-  return roomId && roomId.length > 0 ? roomId : undefined;
+  return channelIdFromTimelineKey(timelineKey);
 }
 
 /**

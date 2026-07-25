@@ -187,6 +187,8 @@ test("enrichment warns and skips room-bound work when the room id cannot be pars
   );
 
   assert.equal(h.summaryCalls.length, 0, "no capability call without a room id");
-  const warned = h.entries.find((entry) => entry.msg === "enrichment_room_id_unresolved");
-  assert.ok(warned, "unresolved room id is logged");
+  // Event name changed from "enrichment_room_id_unresolved" to the consistent
+  // cross-site "timeline_key.malformed" (spec DISCORD-SUPPORT-DESIGN §4.2).
+  const warned = h.entries.find((entry) => entry.msg === "timeline_key.malformed");
+  assert.ok(warned, "malformed timeline key is logged");
 });

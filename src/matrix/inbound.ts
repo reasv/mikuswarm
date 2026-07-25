@@ -64,6 +64,13 @@ export function normalizeMatrixInboundEvent(
   const trigger =
     event.undecryptable || edit ? undefined : detectTrigger(event, context, mentionedSelf);
   const timestamp = Date.parse(event.timestamp);
+  // Channel type for routing (spec DISCORD-SUPPORT-DESIGN §4.3): normalizer
+  // sets it at ingest so downstream code does not have to parse the key.
+  const channelType: InboundChatEvent["channelType"] = event.threadRootId
+    ? "thread"
+    : event.chatType === "direct"
+      ? "dm"
+      : "group";
 
   const canonical: CanonicalChatEvent = {
     id: `matrix:${context.accountId}:${event.eventId || nanoid()}`,
@@ -96,6 +103,7 @@ export function normalizeMatrixInboundEvent(
   return {
     provider: "matrix",
     timelineKey,
+    channelType,
     event: canonical,
     trigger,
     edit,

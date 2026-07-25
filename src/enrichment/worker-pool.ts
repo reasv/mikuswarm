@@ -9,6 +9,7 @@ import type { FxTwitterClient } from "../fxtwitter/client.js";
 import type { FxTwitterConfig } from "../fxtwitter/types.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 
 export interface EnrichmentWorkerPoolOptions {
   storage: Storage;
@@ -207,10 +208,14 @@ export class EnrichmentWorkerPool {
   }
 
   private resolveCapabilityKey(event: CanonicalChatEvent): string {
-    const parts = event.timelineKey.split(":");
-    if (parts[0] === "matrix" && parts.length >= 2) {
-      return `matrix:${parts[1]}`;
+    // Use the shared grammar parser (not a naive split) to extract provider + accountId.
+    // For Matrix, the capability is registered as "matrix:<accountId>"; for future providers
+    // the registry key will follow the same "<provider>:<accountId>" pattern.
+    const parsed = parseTimelineKey(event.timelineKey);
+    if (parsed) {
+      return `${parsed.provider}:${parsed.accountId}`;
     }
+    // Key is present but malformed — fall through to provider-level capability.
     return event.provider;
   }
 }
