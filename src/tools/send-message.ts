@@ -7,7 +7,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { ChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
+import type { IChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
 import { guardedFetch } from "./ssrf.js";
@@ -17,7 +17,7 @@ import { chunkMarkdownText } from "./chunk.js";
 const MATRIX_MAX_CONTENT_BYTES = 60_000;
 
 export interface SendMessageToolContext {
-  provider: ChatProvider;
+  provider: IChatProvider;
   target: OutboundTarget;
   timeline: TimelineStore;
   agentSessionId: string;

@@ -1,6 +1,6 @@
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { ChatProvider, OutboundTarget } from "../types.js";
+import type { IChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
 import {
   classifyLlmError,
@@ -53,7 +53,7 @@ export function isResumableRunError(error: unknown): boolean {
 }
 
 export interface SessionRunnerOptions {
-  provider?: ChatProvider;
+  provider?: IChatProvider;
   target?: OutboundTarget;
   /**
    * Suppress the typing indicator for the whole run (ARCHITECTURE.md §9g).

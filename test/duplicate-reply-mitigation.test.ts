@@ -6,7 +6,7 @@ import { renderRichMessage, renderCompactMessage } from "../src/context/renderer
 import { renderSatelliteBlock } from "../src/workspace/prompt.js";
 import { createSendMessageTool, type SendMessageToolContext } from "../src/tools/send-message.js";
 import { createSpawnSessionTool, type SpawnCoReplyResult } from "../src/tools/spawn-session.js";
-import type { CanonicalChatEvent, ChatProvider, OutboundTarget } from "../src/types.js";
+import type { CanonicalChatEvent, IChatProvider, OutboundTarget } from "../src/types.js";
 import type { TimelineStore } from "../src/timeline/index.js";
 import type { WorkspaceContent, SatelliteRuntimeInput } from "../src/workspace/types.js";
 
@@ -352,12 +352,15 @@ function sendCtx(overrides: Partial<SendMessageToolContext> = {}): SendMessageTo
     capabilities: {},
     async start() {},
     async stop() {},
-    subscribe() { return () => {}; },
+    accountIds() { return []; },
+    getSelf() { return undefined; },
+    ownsUserId() { return false; },
+    enrichment() { return undefined; },
     async send(target: OutboundTarget) {
       return { provider: "matrix", target, externalId: "$sent", deliveredAt: Date.now() };
     },
     async setTyping() {},
-  } as unknown as ChatProvider;
+  } as unknown as IChatProvider;
   const target: OutboundTarget = { provider: "matrix", timelineKey: TK, roomId: "!room:server.org" };
   const timeline = {
     append: async () => {},
@@ -372,7 +375,7 @@ test("send_message guard refuses a reply to a message another session claimed, w
     isClaimedByOther: (id) => (id === "$n3m7" ? { sessionId: "s-TQBfXQVCYQ" } : undefined),
   });
   // Spy on send to prove it never fires.
-  (ctx.provider as { send: ChatProvider["send"] }).send = async (target) => {
+  (ctx.provider as { send: IChatProvider["send"] }).send = async (target) => {
     sent = true;
     return { provider: "matrix", target, externalId: "$x", deliveredAt: Date.now() };
   };
@@ -393,7 +396,7 @@ test("send_message guard refuses a reply to a message claimed by a not-yet-named
   let sent = false;
   // The owner is un-attributed → marker carries no sessionId (review #4).
   const ctx = sendCtx({ isClaimedByOther: (id) => (id === "$n3m7" ? {} : undefined) });
-  (ctx.provider as { send: ChatProvider["send"] }).send = async (target) => {
+  (ctx.provider as { send: IChatProvider["send"] }).send = async (target) => {
     sent = true;
     return { provider: "matrix", target, externalId: "$x", deliveredAt: Date.now() };
   };
@@ -412,7 +415,7 @@ test("send_message guard refuses a reply to a message claimed by a not-yet-named
 test("send_message guard ignores non-reply sends and unclaimed reply targets", async () => {
   const sends: string[] = [];
   const ctx = sendCtx({ isClaimedByOther: (id) => (id === "$claimed" ? { sessionId: "s-o" } : undefined) });
-  (ctx.provider as { send: ChatProvider["send"] }).send = async (target) => {
+  (ctx.provider as { send: IChatProvider["send"] }).send = async (target) => {
     sends.push("sent");
     return { provider: "matrix", target, externalId: "$x", deliveredAt: Date.now() };
   };

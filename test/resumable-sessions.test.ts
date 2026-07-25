@@ -10,7 +10,8 @@ import { loadCompletedSessionMaterial, SessionClaims } from "../src/agent/index.
 // agent index) — used by the issue #13 catch-mechanism test below.
 import { rehydrateImages } from "../src/agent/recovery.js";
 import { configureAgentTimezone, resetAgentTimezone } from "../src/time/index.js";
-import { MatrixProvider, type MatrixProviderOptions } from "../src/matrix/provider.js";
+import { MatrixProvider } from "../src/matrix/provider.js";
+import type { ChatProviderHost } from "../src/types.js";
 import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import type { MatrixInboundEvent } from "../src/matrix/native-types.js";
 import type { AppConfig } from "../src/config/index.js";
@@ -854,13 +855,19 @@ const SELF = "@miku:example.org";
 const HOLD_MS = 5;
 const SETTLE_MS = 30;
 
-/** Build a provider whose `config`/hold is set, capturing every delivery. */
-function holdHarness(opts: Pick<MatrixProviderOptions, "resolveReplyTrigger">) {
-  const provider = new MatrixProvider(opts);
-  // emitWithTriggerHold only reads `config` truthiness + `trigger_hold_ms`.
-  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: HOLD_MS };
+/** Build a provider whose config/hold is set, capturing every delivery. */
+function holdHarness(opts: { resolveReplyTrigger?: ChatProviderHost["resolveReplyTrigger"] }) {
+  const provider = new MatrixProvider(
+    { enabled: false, trigger_hold_ms: HOLD_MS, accounts: {} } as AppConfig["matrix"],
+  );
   const deliveries: InboundChatEvent[] = [];
-  provider.subscribe((event) => deliveries.push(event));
+  // start() sets this.host synchronously (before the enabled check) so void is safe.
+  void provider.start({
+    onEvent: (event) => deliveries.push(event),
+    onError: () => {},
+    onReaction: () => {},
+    resolveReplyTrigger: opts.resolveReplyTrigger,
+  });
   const drive = (inbound: InboundChatEvent) =>
     (provider as unknown as { emitWithTriggerHold(e: InboundChatEvent): void }).emitWithTriggerHold(inbound);
   return { provider, deliveries, drive };
@@ -891,7 +898,7 @@ function nativeReply(args: {
 }
 
 /** A resolver that recognises one bot message id as resumable (the app's job). */
-function replyResolverFor(botMsgId: string): NonNullable<MatrixProviderOptions["resolveReplyTrigger"]> {
+function replyResolverFor(botMsgId: string): NonNullable<ChatProviderHost["resolveReplyTrigger"]> {
   return ({ externalId, sender }) =>
     externalId === botMsgId
       ? { type: "reply", reason: "reply to bot message", triggeredBy: { id: sender.id, displayName: sender.displayName } }

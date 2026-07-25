@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { createSendMessageTool, type SendMessageToolContext } from "../src/tools/send-message.js";
 import type {
-  ChatProvider,
+  IChatProvider,
   DeliveryReceipt,
   OutboundMessage,
   OutboundTarget,
@@ -18,7 +18,7 @@ interface SendCall {
   message: OutboundMessage;
 }
 
-function makeProvider(): { provider: ChatProvider; calls: SendCall[] } {
+function makeProvider(): { provider: IChatProvider; calls: SendCall[] } {
   const calls: SendCall[] = [];
   let counter = 0;
   const provider = {
@@ -26,9 +26,10 @@ function makeProvider(): { provider: ChatProvider; calls: SendCall[] } {
     capabilities: {},
     async start() {},
     async stop() {},
-    subscribe() {
-      return () => {};
-    },
+    accountIds() { return []; },
+    getSelf() { return undefined; },
+    ownsUserId() { return false; },
+    enrichment() { return undefined; },
     async send(target: OutboundTarget, message: OutboundMessage): Promise<DeliveryReceipt> {
       calls.push({ target, message });
       return {
@@ -39,7 +40,7 @@ function makeProvider(): { provider: ChatProvider; calls: SendCall[] } {
       };
     },
     async setTyping() {},
-  } as unknown as ChatProvider;
+  } as unknown as IChatProvider;
   return { provider, calls };
 }
 
