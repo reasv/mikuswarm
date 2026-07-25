@@ -13,6 +13,7 @@ import type { SessionManager } from "../agent/index.js";
 import type { Storage } from "../storage/index.js";
 import type { Logger } from "../observability/index.js";
 import { agentDayEndMs, agentDayStartMs, agentHourOfDayMs } from "../time/index.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 
 /**
  * Proactive posting scheduler (ARCHITECTURE.md §9g).
@@ -229,21 +230,6 @@ export function computeNextAttempt(p: {
   const next = p.now + gap;
   if (next >= p.windowEnd) return p.nextWindowOpen; // spill to the next window/day
   return next;
-}
-
-/**
- * Parse a Matrix per-room timeline key into account/room/thread parts. Accepts
- * both `room` and `dm` keys (DM timelines use `matrix:<account>:dm:<roomId>`,
- * see timelineKeyForMatrixEvent) — the same shape roomIdFromTimelineKey
- * accepts. Also used by session resume-in-place (src/app.ts) to reconstruct an
- * outbound target for a parked session whose original inbound is gone.
- */
-export function parseMatrixTimelineKey(
-  timelineKey: string,
-): { accountId: string; roomId: string; threadId?: string } | null {
-  const m = /^matrix:([^:]+):(?:room|dm):(.+?)(?::thread:(.*))?$/.exec(timelineKey);
-  if (!m) return null;
-  return { accountId: m[1]!, roomId: m[2]!, threadId: m[3] };
 }
 
 export interface ProactiveSchedulerOptions {
@@ -468,8 +454,19 @@ export class ProactiveScheduler {
    * never stored.
    */
   private buildSyntheticInbound(timelineKey: string, now: number): InboundChatEvent | null {
-    const parsed = parseMatrixTimelineKey(timelineKey);
-    if (!parsed) return null;
+    // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2) so this
+    // works correctly for any provider key, not just "matrix:…" keys.
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed) {
+      // Key is present but malformed — log a structured warning.
+      this.options.logger.warn("timeline_key.malformed", {
+        timelineKey,
+        site: "proactive_synthetic_inbound",
+      });
+      return null;
+    }
+    // NOTE: config.matrix.accounts lookup stays for Phase 1; Phase 2 moves it to
+    // provider.getSelf(accountId) via the registry.
     const selfUserId = this.options.config.matrix.accounts[parsed.accountId]?.user_id;
     if (!selfUserId) return null;
     const self: SenderInfo = { id: selfUserId, isSelf: true };
@@ -477,7 +474,7 @@ export class ProactiveScheduler {
       provider: "matrix",
       timelineKey,
       accountId: parsed.accountId,
-      roomId: parsed.roomId,
+      roomId: parsed.channelId, // channelId = Matrix room id for this provider
       threadId: parsed.threadId,
     };
     const trigger: TriggerInfo = { type: "timer", reason: "proactive", triggeredBy: self };

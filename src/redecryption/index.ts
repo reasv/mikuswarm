@@ -2,6 +2,7 @@ import type { Logger } from "../observability/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment, roomIdFromTimelineKey } from "../timeline/index.js";
 export { roomIdFromTimelineKey } from "../timeline/index.js";
+import { parseTimelineKey, buildTimelineKey } from "../storage/timeline-key.js";
 import type { CanonicalChatEvent, TimelineState } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { mediaToAttachment } from "../matrix/inbound.js";
@@ -539,14 +540,15 @@ export function decryptedCanonical(
 
 /**
  * Build the thread timeline key for a re-homed re-decrypted event from the
- * room/DM timeline key it was stored under. Reuses the existing key scheme
- * (`matrix:<account>:(room|dm):<roomId>[:thread:<root>]`); the account segment is
- * `[^:]+` and the room id may contain colons. Returns undefined if the source
- * key isn't a recognizable room/DM key or already carries a thread suffix.
+ * room/DM timeline key it was stored under. Uses the shared grammar parser so
+ * the base key extraction is correct for any provider and for Matrix room ids
+ * that contain colons. Returns undefined if the source key is not a recognizable
+ * room/DM key (returns the base key without a thread suffix when already threaded,
+ * then re-adds the new thread root).
  */
 function threadTimelineKeyFrom(timelineKey: string, threadRoot: string): string | undefined {
-  const match = timelineKey.match(/^(matrix:[^:]+:(?:room|dm):.+?)(?::thread:.+)?$/);
-  const base = match?.[1];
-  if (!base) return undefined;
-  return `${base}:thread:${threadRoot}`;
+  const parsed = parseTimelineKey(timelineKey);
+  if (!parsed) return undefined;
+  // Re-build using the base channel key (drop any existing thread suffix) then add the new root.
+  return buildTimelineKey({ ...parsed, threadId: threadRoot });
 }

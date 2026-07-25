@@ -183,12 +183,15 @@ test("roomIdFromTimelineKey extracts the room id, ignoring a thread suffix", () 
 test("roomIdFromTimelineKey returns undefined for malformed keys", () => {
   // Too few segments.
   assert.equal(roomIdFromTimelineKey("matrix:acct"), undefined);
-  // Unknown kind segment (the stricter regex validates room|dm).
+  // Unknown kind segment (the parser validates room|dm exactly).
   assert.equal(roomIdFromTimelineKey("matrix:acct:space:!abc:server"), undefined);
   // Empty room id.
   assert.equal(roomIdFromTimelineKey("matrix:acct:room:"), undefined);
-  // Wrong backend prefix.
-  assert.equal(roomIdFromTimelineKey("slack:acct:room:!abc:server"), undefined);
+  // With the universal grammar (spec DISCORD-SUPPORT-DESIGN §4.1), any valid
+  // [a-z0-9-]+ provider name is acceptable — "slack:acct:room:!abc:server" now
+  // parses correctly and returns "!abc:server". Use a genuinely invalid shape instead.
+  assert.equal(roomIdFromTimelineKey("UPPER:acct:room:!abc:server"), undefined); // upper-case provider
+  assert.equal(roomIdFromTimelineKey("matrix:acct:channel:!abc:server"), undefined); // invalid kind
   // Not a timeline key at all.
   assert.equal(roomIdFromTimelineKey("not-a-matrix-key"), undefined);
 });

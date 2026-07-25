@@ -7,7 +7,7 @@ import type { FetchClient } from "./fetch-client.js";
 import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 import { extractLinkedMediaUrls } from "./linked-media.js";
 import { detectCharacterCard } from "./card-detect.js";
-import { roomIdFromTimelineKey } from "../timeline/index.js";
+import { channelIdFromTimelineKey } from "../storage/timeline-key.js";
 import type { FxTwitterClient } from "../fxtwitter/client.js";
 import type { FxApiPhoto, FxApiTweet, FxTwitterConfig, XMediaSlot, XTweetPayload } from "../fxtwitter/types.js";
 import { FX_TWITTER_SOURCE_KIND } from "../fxtwitter/types.js";
@@ -52,15 +52,17 @@ export class EnrichmentWorker {
   constructor(private readonly options: EnrichmentWorkerOptions) {}
 
   async process(event: CanonicalChatEvent): Promise<void> {
-    // The shared parser, NOT a split(":") — Matrix room IDs contain a colon
-    // (`!local:server`), so naive splitting truncates the server part and every
-    // room-bound capability call (messageSummary, downloadMedia) then fails on
-    // an unknown room.
-    const roomId = roomIdFromTimelineKey(event.timelineKey);
+    // Use channelIdFromTimelineKey (the shared grammar parser) — never a naive
+    // split(":") — because Matrix room ids contain a colon (`!local:server`) and
+    // naive splitting truncates the server part, making every room-bound capability
+    // call fail with an unknown room.
+    const roomId = channelIdFromTimelineKey(event.timelineKey);
     if (!roomId) {
-      this.options.logger.warn("enrichment_room_id_unresolved", {
+      // Key is present on every canonical event; undefined means malformed.
+      this.options.logger.warn("timeline_key.malformed", {
         eventId: event.id,
         timelineKey: event.timelineKey,
+        site: "enrichment_worker",
       });
     }
     const result: EnrichmentResult = {

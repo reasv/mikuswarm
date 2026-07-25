@@ -8,6 +8,7 @@ import type {
 } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment } from "../timeline/index.js";
+import { timelineKindOf } from "../storage/timeline-key.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { classifyForRoom } from "./classify.js";
@@ -96,7 +97,7 @@ class JobStopSignal extends Error {
   }
 }
 
-const TIMELINE_KEY_RE = /^matrix:([^:]+):(room|dm):(.+?)(?::thread:(.*))?$/;
+// TIMELINE_KEY_RE removed: use timelineKindOf() from the shared grammar module.
 
 export class MessageBackfetchCoordinator {
   /** Control flags for jobs that are currently running (or about to). */
@@ -247,8 +248,7 @@ export class MessageBackfetchCoordinator {
 
   private async runJob(job: BackfetchJobRow, ctl: JobControl): Promise<void> {
     const { storage, timeline, config } = this.opts;
-    const parsed = TIMELINE_KEY_RE.exec(job.timelineKey);
-    const isDm = parsed?.[2] === "dm";
+    const isDm = timelineKindOf(job.timelineKey) === "dm";
     const selfUserId = this.opts.selfUserIds.get(job.accountId);
     if (!selfUserId) {
       await storage.updateBackfetchJob(job.id, { status: "failed", error: "unknown self user" });

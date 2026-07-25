@@ -11,6 +11,7 @@ import {
   ActivationCoordinator,
   applyEditToCanonical,
   AssistantEchoResolver,
+  channelTypeOf,
   editStatus,
   needsEnrichment,
   roomIdFromTimelineKey,
@@ -118,7 +119,8 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
-import { ProactiveScheduler, parseMatrixTimelineKey } from "./proactive/index.js";
+import { ProactiveScheduler } from "./proactive/index.js";
+import { parseTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
 import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
@@ -865,7 +867,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   ): import("./context/index.js").ToolDefinitionLike[] | undefined {
     const cached = toolDefsByType.get(sessionType);
     if (cached) return cached;
-    const parsed = parseMatrixTimelineKey(timelineKey);
+    // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2).
+    // NOTE: the config.matrix.accounts read stays — it is Phase 2 scope (provider registry).
+    const parsed = parseTimelineKey(timelineKey);
     if (!parsed) return undefined;
     const selfUserId = config.matrix.accounts[parsed.accountId]?.user_id;
     const inbound: InboundChatEvent = {
@@ -885,7 +889,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         provider: "matrix",
         timelineKey,
         accountId: parsed.accountId,
-        roomId: parsed.roomId,
+        roomId: parsed.channelId, // channelId = Matrix room id for this provider
         threadId: parsed.threadId,
       },
     };
@@ -1213,8 +1217,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // malformed key / lookup failure resolves to none (the room matches no space rule).
   const resolveParentSpaceIds = async (timelineKey: string): Promise<string[]> => {
     try {
-      const accountId = timelineKey.split(":")[1];
-      const roomId = roomIdFromTimelineKey(timelineKey);
+      const parsedKey = parseTimelineKey(timelineKey);
+      const accountId = parsedKey?.accountId;
+      const roomId = parsedKey?.channelId;
       if (!roomId) return [];
       const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
       const info = await client.channelInfo({ roomId });
@@ -1503,8 +1508,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // malformed key; both callers retry and fall back to the room id, so a failure
   // never blocks a job.
   const resolveChannelLabel = (timelineKey: string): Promise<string> => {
-    const accountId = timelineKey.split(":")[1];
-    const roomId = roomIdFromTimelineKey(timelineKey);
+    const parsedKey = parseTimelineKey(timelineKey);
+    const accountId = parsedKey?.accountId;
+    const roomId = parsedKey?.channelId;
     if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
     const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
     return client.channelLabel({ roomId });
@@ -1517,8 +1523,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // omitted (the raw timeline key still identifies the room).
   contextBuilder.resolveChannelContext = async (timelineKey) => {
     try {
-      const accountId = timelineKey.split(":")[1];
-      const roomId = roomIdFromTimelineKey(timelineKey);
+      const parsedKey = parseTimelineKey(timelineKey);
+      const accountId = parsedKey?.accountId;
+      const roomId = parsedKey?.channelId;
       if (!roomId) return null;
       const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
       return await client.channelContext({ roomId });
@@ -1941,7 +1948,8 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = inbound.outboundTarget;
     if (maxMessages <= 0 || !target?.roomId) return;
 
-    const accountId = target.accountId ?? inbound.timelineKey.split(":")[1];
+    const accountId = target.accountId ?? parseTimelineKey(inbound.timelineKey)?.accountId;
+    if (!accountId) return; // malformed key; can't proceed
     const selfUserId = config.matrix.accounts[accountId]?.user_id;
     if (!selfUserId) {
       logger.warn("initial_backfill_skipped", { timelineKey: inbound.timelineKey, reason: "unknown_self_user", accountId });
@@ -2676,7 +2684,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // is skipped here and falls through to `!inbound.trigger → inert`. A bare GROUP
     // follow-up has only one (raw) delivery and is never trigger-bearing.
     const wouldTrigger =
-      resumeContextFor(inbound.timelineKey) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
+      channelTypeOf(inbound) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
     if (wouldTrigger && !inbound.trigger) return false;
     if (steeredEventIds.has(inbound.event.id)) return true;
 
@@ -3293,15 +3301,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         indexer: chatSearchIndexer,
         currentTimelineKey: inbound.timelineKey,
         // Membership source for include_silent / never-posted users (§9e). Maps a
-        // timeline_key (`matrix:<account>:room:<roomId>[:thread:...]`) to the account's
-        // client and asks the native layer for the room's current joined members. A
-        // Matrix room id contains a colon (`!opaque:server`), so capture everything
-        // between `room:` and an optional `:thread:` suffix rather than splitting on `:`.
+        // timeline_key to the account's client and asks the native layer for the
+        // channel's current joined members. Uses the shared grammar parser so this
+        // works correctly for any provider key, including Matrix room ids with colons.
+        // Only returns members for "room" kind keys (DMs and threads always return []).
         roomMembers: async (timelineKey) => {
-          const m = /^matrix:[^:]+:room:(.+?)(?::thread:.*)?$/.exec(timelineKey);
-          if (!m) return [];
+          const parsedKey = parseTimelineKey(timelineKey);
+          if (!parsedKey || parsedKey.kind !== "room") return [];
           const client = provider.getClient({ provider: "matrix", timelineKey });
-          const members = await client.roomMembers({ roomId: m[1] });
+          const members = await client.roomMembers({ roomId: parsedKey.channelId });
           return members.map((mem) => ({ userId: mem.userId, displayName: mem.displayName }));
         },
       }),
@@ -3940,13 +3948,18 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     "login/cookies persist on the shared identity — reopen the browser tool if you need it.";
 
   /**
-   * DM vs group from the timeline key (`matrix:<acct>:dm:<room>` → dm). Reused by
-   * the provider's `resolveReplyTrigger` callback (reply-as-trigger, §5) and the
-   * resume fork; reply triggers themselves are now classified upstream in the
-   * provider's trigger hold, not synthesized here.
+   * DM vs group from the timeline key. Uses the shared grammar parser (spec
+   * DISCORD-SUPPORT-DESIGN §4.2) so the kind segment is read positionally, not
+   * by substring search — correct for Matrix and future provider keys alike.
+   * Falls back to "group" for malformed or absent keys (same as before).
+   *
+   * Reused by the provider's `resolveReplyTrigger` callback (reply-as-trigger,
+   * §5) and the resume fork; call sites that have a full `InboundChatEvent`
+   * should prefer `inbound.channelType` (spec §4.3) via the `channelTypeOf`
+   * helper before falling back to this key-based derivation.
    */
   function resumeContextFor(timelineKey: string): "dm" | "group" {
-    return timelineKey.split(":")[2] === "dm" ? "dm" : "group";
+    return timelineKindOf(timelineKey) === "dm" ? "dm" : "group";
   }
 
   /**
@@ -3998,7 +4011,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const target = inbound.outboundTarget;
     const replyExternalId = inbound.event.replyTo?.externalId;
     if (!target || !replyExternalId) return false;
-    const ctx = resumeContextFor(inbound.timelineKey);
+    const ctx = channelTypeOf(inbound); // prefer channelType (spec §4.3)
     const resumeCfg = config.agent.sessions.resume;
     if (resumeCfg?.enabled?.[ctx] !== true) return false; // §7 step 0: enabled? else FRESH
 

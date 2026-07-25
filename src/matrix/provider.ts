@@ -22,6 +22,7 @@ import type {
 import { normalizeMatrixInboundEvent } from "./inbound.js";
 import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 
 type Handler = (event: InboundChatEvent) => void;
 
@@ -387,7 +388,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
   }
 
   private resolveAccount(target: OutboundTarget): AccountRuntime {
-    const accountId = target.accountId ?? target.timelineKey.split(":")[1];
+    const accountId = target.accountId ?? parseTimelineKey(target.timelineKey)?.accountId ?? "";
     const account = this.accounts.get(accountId);
     if (!account) throw new Error(`Matrix account is not running: ${accountId}`);
     return account;

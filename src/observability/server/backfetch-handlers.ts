@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { BackfetchTargetKind } from "../../storage/index.js";
-import { roomIdFromTimelineKey } from "../../timeline/index.js";
+import { parseTimelineKey } from "../../storage/timeline-key.js";
 import type { RequestContext } from "./types.js";
 import { sendJson, sendError } from "./responses.js";
 
@@ -18,10 +18,7 @@ const VALID_TARGETS: ReadonlySet<string> = new Set([
   "count",
 ]);
 
-// Account-id capture only; the room id is parsed by the canonical
-// `roomIdFromTimelineKey` (src/timeline/router.ts) to avoid divergence. Keep the
-// kind segment (`room|dm`) in sync with that helper.
-const ACCOUNT_KEY_RE = /^matrix:([^:]+):(?:room|dm):.+$/;
+// Removed: ACCOUNT_KEY_RE — now uses parseTimelineKey() for all field extraction.
 
 /** GET /api/backfetch/jobs — every job, newest first (empty when not wired). */
 export function backfetchJobs(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
@@ -50,10 +47,10 @@ export async function startBackfetchJob(
   if (timelineKey.includes(":thread:")) {
     return sendError(res, 400, "timelineKey must be a base room/dm key, not a thread");
   }
-  const m = ACCOUNT_KEY_RE.exec(timelineKey);
-  const roomId = roomIdFromTimelineKey(timelineKey);
-  if (!m || !roomId) return sendError(res, 400, `unrecognized timelineKey: ${timelineKey}`);
-  const accountId = m[1]!;
+  const parsed = parseTimelineKey(timelineKey);
+  const roomId = parsed?.channelId;
+  const accountId = parsed?.accountId;
+  if (!parsed || !roomId || !accountId) return sendError(res, 400, `unrecognized timelineKey: ${timelineKey}`);
 
   const targetKind = q.get("targetKind") ?? "";
   if (!VALID_TARGETS.has(targetKind)) {

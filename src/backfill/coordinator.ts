@@ -2,6 +2,7 @@ import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment, type EditReplacement } from "../timeline/index.js";
+import { parseTimelineKey, buildTimelineKey } from "../storage/timeline-key.js";
 import type { CanonicalChatEvent, InboundChatEvent, TimelineState } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { classifyForRoom } from "./classify.js";
@@ -145,8 +146,6 @@ export interface GapBackfetchCoordinatorOptions {
   logger: Logger;
 }
 
-const TIMELINE_KEY_RE = /^matrix:([^:]+):(room|dm):(.+?)(?::thread:(.*))?$/;
-
 interface ParsedKey {
   accountId: string;
   kind: "room" | "dm";
@@ -154,10 +153,16 @@ interface ParsedKey {
   threadRootId?: string;
 }
 
+/**
+ * Parse a timeline key into the local coordinate system. Delegates to the shared
+ * grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2) so this and every other parse
+ * site agree on the grammar. The local `ParsedKey` type keeps `roomId`/`threadRootId`
+ * names that the rest of this file uses (= channelId/threadId from the shared type).
+ */
 function parseKey(timelineKey: string): ParsedKey | null {
-  const m = TIMELINE_KEY_RE.exec(timelineKey);
-  if (!m) return null;
-  return { accountId: m[1]!, kind: m[2] as "room" | "dm", roomId: m[3]!, threadRootId: m[4] };
+  const p = parseTimelineKey(timelineKey);
+  if (!p) return null;
+  return { accountId: p.accountId, kind: p.kind, roomId: p.channelId, threadRootId: p.threadId };
 }
 
 function roomKeyOf(accountId: string, roomId: string): string {
@@ -226,9 +231,14 @@ export class GapBackfetchCoordinator {
       // where recovered events are *based*, never how far the descent goes.
       const baseKind = this.selectBaseKind(accountId, roomId, keysByKind);
       const isDm = baseKind === "dm";
-      const baseTimelineKey = isDm
-        ? `matrix:${accountId}:dm:${roomId}`
-        : `matrix:${accountId}:room:${roomId}`;
+      // Use buildTimelineKey (shared grammar) rather than a template literal so
+      // key construction goes through the same module as parsing.
+      const baseTimelineKey = buildTimelineKey({
+        provider: "matrix",
+        accountId,
+        kind: isDm ? "dm" : "room",
+        channelId: roomId,
+      });
       // Floor = MAX across ALL the room's keys (room/DM + threads), independent of
       // the base-kind choice; this bounds the descent regardless (#7).
       const floor = this.opts.storage.getHighWaterMark(roomKeys);

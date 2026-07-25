@@ -7,6 +7,7 @@ import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import { MatrixProvider } from "../src/matrix/provider.js";
 import type { MatrixInboundEvent } from "../src/matrix/native-types.js";
 import type { InboundChatEvent } from "../src/types.js";
+import { channelTypeOf } from "../src/timeline/router.js";
 
 test("Matrix direct events keep dm timeline identity and exact outbound room target", () => {
   const nativeEvent: MatrixInboundEvent = {
@@ -345,5 +346,91 @@ test("same-sender trigger-bearing follow-up groups into the open hold instead of
     triggered[0].trigger?.groupedEventIds,
     [first.event.id, second.event.id],
     "both messages are grouped under the single trigger",
+  );
+});
+
+// ─── channelType (spec DISCORD-SUPPORT-DESIGN §4.3) ─────────────────────────
+
+const ctx = { accountId: "miku", selfUserId: "@miku:example.org" };
+
+test("normalizeMatrixInboundEvent: channelType is 'thread' when threadRootId present", () => {
+  const nativeEvent: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$ev1",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "channel",
+    body: "reply in thread",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+    threadRootId: "$root:example.org",
+  };
+  const inbound = normalizeMatrixInboundEvent(nativeEvent, ctx);
+  assert.equal(inbound.channelType, "thread");
+});
+
+test("normalizeMatrixInboundEvent: channelType is 'dm' for direct chats", () => {
+  const nativeEvent: MatrixInboundEvent = {
+    roomId: "!dm:example.org",
+    eventId: "$ev2",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "direct",
+    body: "hey",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+  };
+  const inbound = normalizeMatrixInboundEvent(nativeEvent, ctx);
+  assert.equal(inbound.channelType, "dm");
+});
+
+test("normalizeMatrixInboundEvent: channelType is 'group' for non-DM non-thread channels", () => {
+  const nativeEvent: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$ev3",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "channel",
+    body: "hello room",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+  };
+  const inbound = normalizeMatrixInboundEvent(nativeEvent, ctx);
+  assert.equal(inbound.channelType, "group");
+});
+
+test("channelTypeOf: prefers inbound.channelType over key-derived fallback", () => {
+  // Build a synthetic InboundChatEvent where the channelType field disagrees with
+  // what the key alone would say. The field must win.
+  const base: MatrixInboundEvent = {
+    roomId: "!room:example.org",
+    eventId: "$ev4",
+    senderId: "@alice:example.org",
+    senderName: "Alice",
+    chatType: "channel",
+    body: "hello",
+    timestamp: new Date(1_000).toISOString(),
+    media: [],
+    threadRootId: "$root",
+  };
+  // normalizeMatrixInboundEvent sets channelType "thread"; key kind is "room" → "group".
+  // channelTypeOf collapses "thread" → "group", same as key-derived — so to show
+  // preference we instead override channelType to "dm" on a non-DM key and check
+  // the field wins over the "group" that the key would produce.
+  const inbound = normalizeMatrixInboundEvent(base, ctx);
+  // Patch channelType to "dm" while the key remains a room/thread key.
+  const patched: InboundChatEvent = { ...inbound, channelType: "dm" };
+  assert.equal(
+    channelTypeOf(patched),
+    "dm",
+    "channelTypeOf must return 'dm' from channelType field, not 'group' from the key",
+  );
+
+  // When channelType is absent, falls back to key parsing.
+  const noField: InboundChatEvent = { ...inbound, channelType: undefined };
+  assert.equal(
+    channelTypeOf(noField),
+    "group",
+    "channelTypeOf must fall back to key parsing when channelType field is absent",
   );
 });
