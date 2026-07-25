@@ -105,6 +105,53 @@ test("getRoomMetadata returns undefined for an unknown timeline", async () => {
   }
 });
 
+test("setChannelMetadata: resolved_at unchanged on identical upsert, bumped on changed values", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const DISCORD_TK = "discord:main:room:200000000000000001";
+
+    // First write.
+    await storage.setChannelMetadata(DISCORD_TK, {
+      displayName: "#general (MyServer)",
+      serverId: "111111111111111111",
+      serverName: "MyServer",
+    });
+    const first = storage.getRoomMetadata(DISCORD_TK);
+    assert.ok(first, "metadata row created on first write");
+    assert.equal(first.displayName, "#general (MyServer)");
+
+    // Wait to ensure Date.now() inside the second write would return a later value
+    // if the change-guard were absent (so the assertion is non-trivially meaningful).
+    await new Promise<void>((r) => setTimeout(r, 5));
+
+    // Identical second write — resolved_at must stay the same.
+    await storage.setChannelMetadata(DISCORD_TK, {
+      displayName: "#general (MyServer)",
+      serverId: "111111111111111111",
+      serverName: "MyServer",
+    });
+    const second = storage.getRoomMetadata(DISCORD_TK);
+    assert.ok(second);
+    assert.equal(second.resolvedAt, first.resolvedAt,
+      "identical upsert must not bump resolved_at (change-guard)");
+
+    // Wait, then change display_name → resolved_at must be bumped.
+    await new Promise<void>((r) => setTimeout(r, 5));
+    await storage.setChannelMetadata(DISCORD_TK, {
+      displayName: "#general (RenamedServer)",
+      serverId: "111111111111111111",
+      serverName: "RenamedServer",
+    });
+    const third = storage.getRoomMetadata(DISCORD_TK);
+    assert.ok(third);
+    assert.ok(third.resolvedAt > first.resolvedAt,
+      "changed display_name/serverName must bump resolved_at");
+    assert.equal(third.displayName, "#general (RenamedServer)");
+  } finally {
+    storage.close();
+  }
+});
+
 test("listKnownTimelineKeys unions event and session timelines", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

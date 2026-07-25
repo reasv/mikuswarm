@@ -148,7 +148,7 @@ export async function performInitialBackfill(
       selfUserId,
       timelineKey,
       timestamp,
-      buildId: (externalId) => `matrix:${accountId}:${externalId}`,
+      buildId: (externalId) => `${provider}:${accountId}:${externalId}`,
     });
     if (!classified) return "skip"; // not part of the activated timeline
 

@@ -1,8 +1,5 @@
 /**
- * Discord provider — public exports (Phase 7a).
- *
- * Phase 7b will add: DiscordChannelClient, emoji catalog, history client,
- * reaction handlers, voice-message send, set_profile, identity upserts.
+ * Discord provider — public exports.
  */
 
 export { DiscordProvider, type DiscordProviderCallbacks, resolveMentionTokens } from "./provider.js";
@@ -25,3 +22,15 @@ export {
   type DiscordReferencedMessage,
   type DiscordNormalizeResult,
 } from "./normalizer.js";
+export { EmojiCatalog, type CatalogEmojiInfo } from "./emoji-catalog.js";
+export { DiscordChannelClient } from "./channel-client.js";
+export { DiscordHistoryClient } from "./history-client.js";
+export {
+  encodeVoiceMessage,
+  computeWaveform,
+  computeWaveformBase64,
+  cleanupVoiceFile,
+  voiceFileExists,
+  WAVEFORM_SAMPLE_COUNT,
+  type VoiceMessageEncodeResult,
+} from "./voice-message.js";

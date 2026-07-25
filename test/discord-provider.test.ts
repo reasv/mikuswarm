@@ -23,6 +23,7 @@
  *  - MAJOR: @username → <@id> mention resolution in send path (spec §7.3, §14)
  *  - MINOR: case-insensitive username match in resolveMentionTokens
  *  - NIT 2: MESSAGE_UPDATE routing — null editedTimestamp vs non-null
+ *  - MAJOR 7b: member_intent=false → ChannelClient.members is undefined; true → members() present
  */
 
 import { describe, it } from "node:test";
@@ -30,6 +31,8 @@ import assert from "node:assert/strict";
 
 import {
   DiscordProvider,
+  DiscordChannelClient,
+  EmojiCatalog,
   resolveMentionTokens,
   normalizeDiscordMessage,
   type DiscordProviderCallbacks,
@@ -43,9 +46,11 @@ import type { TextChannel, DMChannel } from "discord.js";
 
 // ── Minimal stubs ─────────────────────────────────────────────────────────────
 
-const noopCallbacks = {
+const noopCallbacks: import("../src/discord/provider.js").DiscordProviderCallbacks = {
   async mergeLateEmbeds() {},
   async storeIngestEmbeds() {},
+  async upsertUserIdentity() {},
+  async setChannelMetadata() {},
 };
 
 function makeDiscordConfig(
@@ -142,12 +147,9 @@ describe("DiscordProvider: capabilities", () => {
     assert.equal(p.capabilities.threads, true);
   });
 
-  it("voiceMessages = false (Phase 7b temporary lie, documented in capabilities JSDoc)", () => {
+  it("voiceMessages = true (Phase 7b: ogg/opus send + waveform implemented)", () => {
     const p = new DiscordProvider(makeDiscordConfig(), noopCallbacks);
-    // This is the ONLY temporary lie: voiceMessages will be flipped to true in Phase 7b
-    // once as_voice is implemented in send(). Until then it is false so the model
-    // never sees the as_voice parameter.
-    assert.equal(p.capabilities.voiceMessages, false);
+    assert.equal(p.capabilities.voiceMessages, true);
   });
 
   it("reactions = true (platform supports reactions; handlers come in Phase 7b)", () => {
@@ -467,6 +469,8 @@ describe("BLOCKER 1: referencedMessage — channel message cache lookup", () => 
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
       async storeIngestEmbeds() {},
+      async upsertUserIdentity() {},
+      async setChannelMetadata() {},
     };
     const provider = new DiscordProvider(makeDiscordConfig(), callbacks);
     (provider as unknown as Record<string, unknown>).host = {
@@ -548,6 +552,8 @@ describe("BLOCKER 2: storeIngestEmbeds runs after host.onEvent (FK ordering)", (
             } satisfies LinkPreviewRow);
           }
         },
+        async upsertUserIdentity() {},
+        async setChannelMetadata() {},
       };
 
       // Build an inbound event with embed previews using the normalizer directly
@@ -626,6 +632,8 @@ describe("MODERATE: trigger-hold FK ordering — embeds stored after hold flush"
             } satisfies LinkPreviewRow);
           }
         },
+        async upsertUserIdentity() {},
+        async setChannelMetadata() {},
       };
 
       // trigger_hold_ms = 5 ms (very short) so the hold fires well within the wait below
@@ -869,6 +877,8 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
         mergedPreviews.push(...previews);
       },
       async storeIngestEmbeds() {},
+      async upsertUserIdentity() {},
+      async setChannelMetadata() {},
     };
     const provider = new DiscordProvider(makeDiscordConfig(), callbacks);
     (provider as unknown as Record<string, unknown>).host = {
@@ -896,6 +906,8 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() { mergeCalled = true; },
       async storeIngestEmbeds() {},
+      async upsertUserIdentity() {},
+      async setChannelMetadata() {},
     };
     const provider = new DiscordProvider(makeDiscordConfig(), callbacks);
     (provider as unknown as Record<string, unknown>).host = {
@@ -913,5 +925,59 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
     const editMarker = (capturedInbound as { edit?: { targetExternalId?: string } }).edit;
     assert.ok(editMarker, "edit marker must be present");
     assert.equal(editMarker.targetExternalId, "111111111111111111");
+  });
+});
+
+// ── MAJOR: member_intent → ChannelClient.members absent/present ───────────────
+
+// DiscordChannelClient is constructed directly (no start() needed) with a
+// minimal stub discord.js client object. The constructor only stores the client
+// reference; no methods are called during construction.
+const stubDjsClient = {} as import("discord.js").Client;
+
+describe("DiscordChannelClient: members optional contract", () => {
+  it("member_intent=false → members is undefined (roster-unavailable path reachable)", () => {
+    const cc = new DiscordChannelClient(
+      stubDjsClient,
+      "200000000000000001", // channelId
+      "111111111111111111", // guildId
+      "999999999999999999", // selfUserId
+      false,                // memberIntentEnabled
+      new EmojiCatalog(),
+      "main",               // accountId
+    );
+    assert.equal(cc.members, undefined,
+      "members must be undefined when member_intent=false so client.members?.() short-circuits");
+  });
+
+  it("member_intent=true → members is a function", () => {
+    const cc = new DiscordChannelClient(
+      stubDjsClient,
+      "200000000000000001",
+      "111111111111111111",
+      "999999999999999999",
+      true,                 // memberIntentEnabled
+      new EmojiCatalog(),
+      "main",
+    );
+    assert.equal(typeof cc.members, "function",
+      "members must be a callable function when member_intent=true");
+  });
+
+  it("member_intent=false → ChannelClient interface: members? is correctly absent", () => {
+    // The ChannelClient interface defines members?() as optional.
+    // When absent, user_activity's roster-unavailable note must be reachable.
+    const cc = new DiscordChannelClient(
+      stubDjsClient,
+      "200000000000000001",
+      undefined,            // DM — no guildId
+      "999999999999999999",
+      false,
+      new EmojiCatalog(),
+      "main",
+    ) satisfies import("../src/types.js").ChannelClient;
+    // Optional-chaining on undefined must short-circuit to undefined (no throw).
+    const rosterResult = cc.members?.();
+    assert.equal(rosterResult, undefined, "cc.members?.() must be undefined when members is absent");
   });
 });

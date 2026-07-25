@@ -5,8 +5,10 @@ import type { AttachmentMeta, CanonicalChatEvent, HistorySummary } from "../type
  * an `m.replace` edit to route through `store.applyEdit` (never a standalone row),
  * or dropped (undefined) when it does not belong to the scope being fetched.
  *
- * The canonical event id matches `normalizeMatrixInboundEvent`'s scheme
- * (`matrix:<account>:<eventId>`), so live and backfilled rows dedup via
+ * The canonical event id is built by the caller-injected `buildId` function
+ * in `CommonContext` and is provider-specific — e.g. `matrix:<account>:<eventId>`
+ * for Matrix, `discord:<account>:<messageId>` for Discord — matching each
+ * provider's live-ingest scheme so live and backfilled rows always dedup via
  * `appendIfMissing`.
  */
 export type ClassifiedSummary =

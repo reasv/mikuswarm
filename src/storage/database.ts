@@ -2391,6 +2391,65 @@ export class Storage {
   }
 
   /**
+   * Upsert channel metadata for a Discord channel (or any provider) at ingest
+   * time (spec §6.6). Sets `display_name` (the label `#channel-name (Guild Name)`),
+   * `server_id` (guild snowflake for Discord), and `server_name` (guild name).
+   *
+   * Called by the Discord provider on every inbound message — idempotent; only
+   * touches columns whose values have changed. `resolved_at` is bumped only when
+   * `display_name`, `server_id`, or `server_name` actually change, so the hot
+   * per-message path avoids spurious writes on a quiet channel.
+   *
+   * Columns absent from a Matrix row stay null; Matrix calls `setRoomDisplayName`
+   * directly and never calls this method.
+   */
+  setChannelMetadata(
+    timelineKey: string,
+    meta: { displayName: string; serverId?: string; serverName?: string },
+  ): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into room_metadata (timeline_key, display_name, resolved_at, server_id, server_name)
+         values (@timelineKey, @displayName, @resolvedAt, @serverId, @serverName)
+         on conflict(timeline_key) do update set
+           display_name = excluded.display_name,
+           resolved_at  = case
+             when excluded.display_name is not room_metadata.display_name
+               or coalesce(excluded.server_id,   room_metadata.server_id)   is not room_metadata.server_id
+               or coalesce(excluded.server_name, room_metadata.server_name) is not room_metadata.server_name
+             then excluded.resolved_at
+             else room_metadata.resolved_at
+           end,
+           server_id    = coalesce(excluded.server_id, room_metadata.server_id),
+           server_name  = coalesce(excluded.server_name, room_metadata.server_name)`,
+      ).run({
+        timelineKey,
+        displayName: meta.displayName,
+        resolvedAt: Date.now(),
+        serverId: meta.serverId ?? null,
+        serverName: meta.serverName ?? null,
+      });
+    });
+  }
+
+  /**
+   * Return the `server_id` for a timeline key from `room_metadata`, or
+   * `undefined` when no row exists or the column is null.
+   *
+   * Used by `serverIdsFor` in app.ts to return the Discord guild id for the
+   * `{server_id}` / `{space_id}` per-user-limits partition variable (spec §6.4).
+   * Synchronous read on the same SQLite file.
+   */
+  getChannelServerId(timelineKey: string): string | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(`select server_id from room_metadata where timeline_key = ?`)
+        .get(timelineKey) as { server_id: string | null } | undefined,
+    );
+    return row?.server_id ?? undefined;
+  }
+
+  /**
    * Every distinct timeline key known to the store (events, sessions, or a
    * lifecycle row), regardless of state. Used by the startup room-label backfill
    * to resolve names for currently-idle rooms, and by the startup gap-backfetch
@@ -8385,7 +8444,11 @@ create table if not exists timeline_compaction_state (
 create table if not exists room_metadata (
   timeline_key text primary key,
   display_name text not null,
-  resolved_at integer not null
+  resolved_at integer not null,
+  -- Discord: guild (server) snowflake for serverIdsFor() / {server_id} partition var.
+  -- Null for Matrix rows and any provider that does not set server scope.
+  server_id    text,
+  server_name  text
 );
 
 create table if not exists reply_contexts (
@@ -8652,7 +8715,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 5;
+export const LATEST_SCHEMA_VERSION = 6;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -8902,6 +8965,32 @@ function addUserIdentityTables(db: Database.Database): void {
   db.exec(USER_IDENTITIES_SCHEMA);
 }
 
+/**
+ * v5→v6 (purely additive DDL): add `server_id` and `server_name` columns to
+ * `room_metadata` so Discord channel→guild mappings can be stored at ingest
+ * time (spec §6.6, §6.4). Both columns are nullable; existing Matrix rows keep
+ * null values and are unaffected. `if not exists` / `ALTER TABLE ADD COLUMN`
+ * is idempotent on SQLite — a re-run on an already-migrated DB is harmless.
+ *
+ * SQLite's ALTER TABLE ADD COLUMN does not support `if not exists`, but since
+ * this migration runs exactly once (version gate prevents double-execution), that
+ * is fine. The SCHEMA's `create table if not exists room_metadata` already carries
+ * the new columns, so fresh databases never reach this step.
+ */
+function addRoomMetadataServerColumns(db: Database.Database): void {
+  // Use PRAGMA table_info to guard against double-add when a test simulates
+  // an older user_version on a database that was physically created at v6+.
+  // SQLite does not support `ADD COLUMN IF NOT EXISTS`, so we check manually.
+  const cols = (db.pragma("table_info(room_metadata)") as Array<{ name: string }>)
+    .map((r) => r.name);
+  if (!cols.includes("server_id")) {
+    db.exec("alter table room_metadata add column server_id text");
+  }
+  if (!cols.includes("server_name")) {
+    db.exec("alter table room_metadata add column server_name text");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -8912,6 +9001,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   repairReplyFallbackOverstrip,
   addUsageEventPartitions,
   addUserIdentityTables,
+  addRoomMetadataServerColumns,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
