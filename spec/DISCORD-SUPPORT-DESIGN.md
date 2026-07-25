@@ -58,7 +58,7 @@ cited.
 | Q9 | Enrichment capabilities keying | Per account, registry key `<provider>:<accountId>`, derived via the shared parser; the wiring loop iterates all providers. §9.1 |
 | Q10 | Reaction identity | **Single `reactions` table.** Discord PK is the deterministic synthetic key `discord:<messageId>:<emojiKey>:<userId>`; un-react reconstructs the PK, so tombstone-by-PK survives. Bulk clears get two new tombstone queries. §10.1 |
 | Q11 | `emoji_list` / `react` coupling | The model never sees emoji snowflakes: `emoji_list` returns `:name:` + `animated` flag scoped to the sendable set; `react` resolves `:name:` → id internally. §10.3 |
-| Q12 | Diary room label | `#channel-name (Guild Name)`, mirroring `Room (Space)`. No provider prefix; the server name disambiguates. Fallback after retries is `#<channelId>`, never the raw key. §6.5 |
+| Q12 | Diary room label | `#channel-name (Guild Name)`, mirroring `Room (Space)`. No provider prefix; the server name disambiguates. Fallback after retries is `#<channelId>`, never the raw key. §6.6 |
 | Q13 | Profile workspace path | `deriveProviderUsername` gains a Discord branch returning the username; directory stays keyed on the stable hash, slug frozen at first observation. No alias/redirect machinery. §6.3 |
 | Q14 | DB migration path | No data rewrite: Matrix keys/ids already carry their prefix. Column names are kept with generalized semantics. New rule: every future migration touching provider-shaped data carries an explicit provider predicate. §11 |
 | — | `external_id` in the prompt (audit §3.4 finding 11) | **Keep it.** Tools address messages by provider id; that is the one declared exception to "no snowflakes in the prompt". Sender identity, by contrast, always renders as `username ?? id`. §6.2 |
@@ -296,7 +296,8 @@ places, both deliberate: `external_id` on `<message>`/`<reply_to>` (tools
 target messages by provider id — the declared exception) and nowhere else.
 `formatTargetRef`'s `[id]` bracket on reaction lines becomes conditional on the
 body snippet being absent (audit §3.4 finding 12). The auto-retrieval user lane
-keys on `username ?? displayName` so Discord nick changes stop orphaning diary
+keys on `username ?? displayName`, expanded with known prior names via the
+identity map (§6.5), so neither nick changes nor username renames orphan diary
 history (audit §3.4 finding 13).
 
 ### 6.3 Derivation and self-identity
@@ -328,10 +329,49 @@ history (audit §3.4 finding 13).
 - `usage_events.room_id` = channel id from the shared parser (thread keys
   resolve to the parent channel, as today). `usage_events.space_id` = server
   scope: Matrix canonical space (unchanged) or Discord guild id, resolved from
-  channel metadata (§6.5). `resolveParentSpaceIds` generalizes to
+  channel metadata (§6.6). `resolveParentSpaceIds` generalizes to
   `serverIdsFor(timelineKey)` returning `[guildId]` for Discord.
 
-### 6.5 Channel metadata and labels
+### 6.5 Identity mutation: applying renames gracefully
+
+Usernames, global display names, and guild nicks are all mutable. The bot
+renaming *itself* is excluded (§14), but **other people renaming must be
+observed and applied**, not merely tolerated. Two facts bound the problem:
+every `MESSAGE_CREATE` carries a fresh user object (username, global name) and
+member object (nick), so current identity arrives with every message without
+any privileged intent; and all storage, budget, and trigger paths key on the
+immutable snowflake, so a rename can only ever affect presentation and recall,
+never correlation. The failure modes to prevent: the model treating one person
+as two, and retrieval orphaning a user's history at the rename boundary.
+
+- **`user_identities` table** (additive DDL, §11.2): PK `(provider, user_id)` →
+  current `username`, `display_name`, first/last seen, updated-at — upserted at
+  ingest whenever a message shows a change (plus `GUILD_MEMBER_UPDATE` when
+  `member_intent` is on; without it, nick changes are picked up on the user's
+  next message, which is acceptable). Prior values are kept as alias-history
+  rows (bounded).
+- **Render-time current-identity resolution**: the context builder resolves
+  sender labels (the §6.2 `username ?? id` rule, compact labels, reaction
+  lines) through this map, falling back to the per-event stored values. Old
+  events therefore render under the person's *current* name, so a renamed user
+  is one person in the window, not two. Matrix does not populate the map in
+  v1, so the fallback path makes Matrix rendering byte-identical with **no
+  config knob** — the behaviour difference falls out of data presence, and
+  Matrix (which has the same displayName-drift problem) can opt in later by
+  simply upserting.
+- **Retrieval alias expansion**: the auto-retrieval user lane ORs the current
+  name with recent prior names from the alias history, so diary/history recall
+  survives renames instead of silently truncating at the rename date. Diary
+  prose already written under an old name is left as-is (it is historical
+  text); the alias expansion is what makes it findable.
+- **Profiles**: workspace dirs are hash-keyed and unaffected; the frozen slug
+  is cosmetic. The `user_identities` row is the machine record of "currently
+  known as"; profile prose remains the agent's own to update.
+- **Operator-side bot rename** (via the Discord developer portal): absorbed
+  automatically — self-detection is id-based, and `getSelf` refreshes from
+  `READY`/`USER_UPDATE`.
+
+### 6.6 Channel metadata and labels
 
 The Discord normalizer upserts channel metadata at ingest (channel id → guild
 id, channel name, guild name) into the existing `room_metadata` table (columns
@@ -548,6 +588,8 @@ derivable from the key prefix; the coordinator and console simply refuse/hide
 
 ### 11.2 What changes
 
+- New `user_identities` table + alias history (§6.5): purely additive DDL,
+  populated only by providers that opt in (Discord in v1).
 - `usage_events.room_id`/`space_id`: physical names kept, semantics
   generalized to channel/server scope (comments + ARCHITECTURE.md updated; the
   audit's suggested rename is declined as pure churn across the budget
@@ -694,7 +736,7 @@ now.
 | Poll creation (`create_poll`, reshaped) | ✅ | poll object on send + end-poll; schema reshaped (question, ≤10 answers, duration, multiselect) |
 | Outbound voice messages (`as_voice`) | ✅ | ogg/opus + waveform via existing ffmpeg pipeline, §12.4 |
 | Poll voting (`poll_vote`) | ❌ impossible | the Discord API has no endpoint for bots to vote; tool not offered on Discord sessions (`pollVote: false`) |
-| Global username rename | ❌ deliberate | usernames globally unique + rename rate-limited (~2/hr): a model-invocable rename can permanently lose the handle to a snipe or fail on collision. Per-guild nick covers the visible effect; the global handle stays operator-controlled |
+| Global username rename (bot renaming itself) | ❌ deliberate | usernames globally unique + rename rate-limited (~2/hr): a model-invocable rename can permanently lose the handle to a snipe or fail on collision. Per-guild nick covers the visible effect; the global handle stays operator-controlled. **Inbound** renames (other users, or the operator renaming the bot) are fully observed and applied — §6.5 |
 | Thread creation | ❌ not a Discord gate | no create-thread tool exists on *any* provider (Matrix threads are only replied-into). A new cross-provider capability → its own follow-up spec |
 | Group DMs | n/a | unreachable for bots |
 | Sharding | n/a | out of scope |
@@ -737,7 +779,9 @@ payoff.
   schema (unused yet), capability-registry wiring per provider, provider ids
   persisted/read on synthetic-event paths.
 - **Phase 3 — identity** (§6). `username`, rendering rule, `getSelf`,
-  derivations, retrieval user-lane key, partition vars.
+  derivations, the `user_identities` map + render-time resolution + retrieval
+  alias expansion (§6.5), partition vars. Test: with an empty identity map,
+  Matrix rendering is byte-identical.
 - **Phase 4 — `ChannelClient` + tool layer** (§7). Re-wire the 12 tools,
   capability gating (including `set_profile`), provider-aware schemas,
   `media[]`, provider size limits, conditional `resolveTriggerGroup`.
