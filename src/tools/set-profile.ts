@@ -1,12 +1,13 @@
 import { readFile, stat } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { MatrixNativeClient } from "../matrix/native-client.js";
+import type { IChatProvider } from "../types.js";
 import { guardedFetch } from "./ssrf.js";
 import { resolveWorkspacePath } from "./workspace.js";
 
 export interface SetProfileToolContext {
-  client: MatrixNativeClient;
+  provider: IChatProvider;
+  accountId: string;
   workspaceRoot?: string;
 }
 
@@ -29,6 +30,14 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
       if (args.display_name == null && !args.avatar?.trim()) {
         return {
           content: [{ type: "text", text: "error: at least one of display_name or avatar is required." }],
+          details: null,
+        };
+      }
+
+      const setProfile = context.provider.setProfile;
+      if (!setProfile) {
+        return {
+          content: [{ type: "text", text: "error: profile editing is not supported by this provider." }],
           details: null,
         };
       }
@@ -134,7 +143,7 @@ export function createSetProfileTool(context: SetProfileToolContext): AgentTool 
           }
         }
 
-        const result = await context.client.setProfile({
+        const result = await setProfile.call(context.provider, context.accountId, {
           displayName: args.display_name,
           avatarUrl,
           avatarDataBase64,

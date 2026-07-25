@@ -9,6 +9,7 @@
 
 import type {
   IChatProvider,
+  ChannelClient,
   ChatProviderHost,
   DeliveryReceipt,
   EnrichmentCapabilities,
@@ -88,6 +89,9 @@ export function makeFakeProvider(
       return false;
     },
     enrichment(_accountId: string): EnrichmentCapabilities | undefined {
+      return undefined;
+    },
+    channelClient(_target: OutboundTarget): ChannelClient | undefined {
       return undefined;
     },
   };

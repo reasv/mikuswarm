@@ -309,12 +309,13 @@ test("a failed run with exhausted retries marks the summary 'failed'", async () 
   });
 });
 
-test("channel-label resolution failure falls back to the room id in the header", async () => {
+test("channel-label resolution failure falls back to the bare room id for Matrix", async () => {
   await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
     await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
 
-    // resolveChannelLabel throws → the worker falls back to the room id parsed from
-    // the timeline key, so the dictated header carries "!room:server" as the room.
+    // resolveChannelLabel throws → the worker falls back to the raw room id
+    // for Matrix (spec DISCORD-SUPPORT-DESIGN §6.6/Q12 — Matrix uses bare room
+    // id, matching pre-Phase-4 behaviour; non-matrix providers use '#' prefix).
     const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000, room: "!room:server" });
     const factory = makeFakeFactory(async (tool, kickoff) => {
       assert.ok(kickoff.includes(header), "kickoff must carry the room-id-fallback header");
@@ -331,8 +332,70 @@ test("channel-label resolution failure falls back to the room id in the header",
 
     const files = await readdir(path.join(workspaceRoot, "memory"));
     const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
-    // roomIdFromTimelineKey("matrix:test:room:!room:server") === "!room:server".
+    // roomIdFromTimelineKey("matrix:test:room:!room:server") === "!room:server"; no '#' prefix for Matrix.
     assert.match(content, /· !room:server\n/);
+  });
+});
+
+test("channel-label resolution failure falls back to '#' + channelId for non-matrix providers", async () => {
+  // A non-matrix timeline key — uses "discord" as the provider prefix.
+  const DISCORD_TK = "discord:mybot:room:123456789";
+
+  await withFixture(async ({ storage, workspaceRoot, memoryWriter }) => {
+    // Insert a level-1 summary under the discord timeline key.
+    const e: CanonicalChatEvent = {
+      id: "d-a0",
+      timelineKey: DISCORD_TK,
+      provider: "discord",
+      role: "assistant",
+      sender: { id: "@bot#1234", displayName: "Bot", isSelf: true },
+      body: "discord message",
+      timestamp: 2000,
+      receivedAt: 2000,
+    };
+    await storage.appendTimelineEvent(e);
+    await storage.insertSummarizationJob({
+      id: "job-discord-sum1", timelineKey: DISCORD_TK, level: 1,
+      inputStartId: e.id, inputEndId: e.id,
+      inputTokenCount: 10, targetTokenCount: 100, maxRetries: 0,
+    });
+    await storage.insertSummaryWithLineage({
+      id: "discord-sum1", timelineKey: DISCORD_TK, level: 1, content: "summary",
+      earliestTimestamp: 2000, latestTimestamp: 2000,
+      latestEventId: e.id, eventCount: 1,
+      tokenCount: 10, modelId: "m", status: "complete", generatedAt: 2000,
+      eventIds: [e.id], jobId: "job-discord-sum1",
+    });
+
+    // resolveChannelLabel throws → falls back to '#' + channelId for non-matrix.
+    const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000, room: "#123456789" });
+    const factory = makeFakeFactory(async (tool, kickoff) => {
+      assert.ok(kickoff.includes(header), "non-matrix fallback header must use '#' + channelId");
+      await tool.execute("t", { command: "create", file_text: `${header}\ndiscord fallback test`, finalize: true });
+    });
+    const pool = new DiaryWorkerPool({
+      storage,
+      factory,
+      memoryWriter,
+      config: { worker_count: 1, max_retries: 0, per_session_budget_tokens: 1000 },
+      workspaceRoot,
+      resolveChannelLabel: async () => { throw new Error("unavailable"); },
+      logger: silentLogger,
+    });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => {
+      const row = storage.read((db) =>
+        db.prepare(`select diary_status from summaries where id = ?`).get("discord-sum1"),
+      ) as { diary_status: string | null } | undefined;
+      return row?.diary_status === "done";
+    });
+    await pool.stop();
+
+    const files = await readdir(path.join(workspaceRoot, "memory")).catch(() => [] as string[]);
+    const content = await readFile(path.join(workspaceRoot, "memory", files[0]!), "utf8");
+    // '#' + channelId for non-matrix.
+    assert.match(content, /· #123456789\n/);
   });
 });
 

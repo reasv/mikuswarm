@@ -1,10 +1,19 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { MatrixNativeClient } from "../matrix/native-client.js";
+import type { ChannelClient, ProviderTerminology } from "../types.js";
 
 export interface EmojiToolContext {
-  client: MatrixNativeClient;
-  roomId: string;
+  channelClient: ChannelClient;
+  /** Optional terminology bundle (unused by this tool; accepted for uniform context shape). */
+  terminology?: ProviderTerminology;
+  /**
+   * Optional resolver for a specific channel by id (M4/M5). When room_id is
+   * supplied and this resolver is present, the tool fetches emoji for that
+   * channel; when absent or returning undefined it falls back to the session
+   * channelClient. Implemented by buildSessionTools via IChatProvider.channelClient
+   * with a rebuilt target for the given channelId.
+   */
+  channelClientFor?: (channelId: string) => ChannelClient | undefined;
 }
 
 export function createEmojiListTool(context: EmojiToolContext): AgentTool {
@@ -18,19 +27,21 @@ export function createEmojiListTool(context: EmojiToolContext): AgentTool {
     }),
     execute: async (_toolCallId, params) => {
       const args = params as { room_id?: string; limit?: number };
-      const shortcodes = context.client.listKnownShortcodes({
-        roomId: args.room_id ?? context.roomId,
-        limit: args.limit ?? 50,
-      });
-      if (shortcodes.length === 0) {
+      const effectiveChannelId = args.room_id?.trim() || undefined;
+      const client = effectiveChannelId
+        ? (context.channelClientFor?.(effectiveChannelId) ?? context.channelClient)
+        : context.channelClient;
+      const entries = await client.emojiList(args.limit ?? 50);
+      if (entries.length === 0) {
         return {
           content: [{ type: "text", text: "No custom emoji found for this room." }],
           details: null,
         };
       }
+      const shortcodes = entries.map((e) => (e.animated ? `:${e.shortcode}: (animated)` : `:${e.shortcode}:`));
       return {
         content: [{ type: "text", text: shortcodes.join(", ") }],
-        details: { count: shortcodes.length },
+        details: { count: entries.length },
       };
     },
   };

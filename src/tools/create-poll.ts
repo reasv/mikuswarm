@@ -1,19 +1,21 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { MatrixNativeClient } from "../matrix/native-client.js";
+import type { ChannelClient, ProviderTerminology } from "../types.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 export interface CreatePollToolContext {
-  client: MatrixNativeClient;
-  roomId: string;
+  channelClient: ChannelClient;
+  terminology?: ProviderTerminology;
 }
 
 export function createCreatePollTool(context: CreatePollToolContext): AgentTool {
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "create_poll",
     label: "Create poll",
     // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — not work.
     resumeWorkExempt: true,
-    description: "Create a poll in the current room. Provide a question and 2-20 answer options.",
+    description: `Create a poll in the current ${t.channelNoun}. Provide a question and 2-20 answer options.`,
     parameters: Type.Object({
       question: Type.String({ description: "The poll question." }),
       options: Type.Array(Type.String({ description: "An answer option." }), { minItems: 2, maxItems: 20, description: "List of answer choices." }),
@@ -35,21 +37,22 @@ export function createCreatePollTool(context: CreatePollToolContext): AgentTool 
         };
       }
 
-      try {
-        const answers = args.options.map((text, i) => ({
-          id: `opt${i + 1}`,
-          text: text.trim(),
-        }));
+      if (!context.channelClient.createPoll) {
+        return {
+          content: [{ type: "text", text: "error: poll creation is not supported on this channel." }],
+          details: null,
+        };
+      }
 
-        const result = await context.client.createPoll({
-          roomId: context.roomId,
+      try {
+        const result = await context.channelClient.createPoll!({
           question: args.question.trim(),
-          answers,
+          options: args.options.map((text, i) => ({ id: `opt${i + 1}`, text: text.trim() })),
           maxSelections: args.max_selections,
         });
 
         return {
-          content: [{ type: "text", text: `poll created: ${result.eventId}` }],
+          content: [{ type: "text", text: `poll created: ${result.externalId}` }],
           details: result,
         };
       } catch (err) {

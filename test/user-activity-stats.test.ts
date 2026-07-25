@@ -224,7 +224,7 @@ test("include_silent for rooms:all is rejected with a note (no concrete scope)",
 test("include_silent without a membership source notes the gap", async () => {
   await withTool(RECENT, undefined, async (tool) => {
     const res = await tool.execute("c10", { rooms: [ROOM_A], include_silent: true });
-    assert.match((res.content[0] as { text: string }).text, /membership source unavailable/);
+    assert.match((res.content[0] as { text: string }).text, /roster unavailable on this channel/);
   });
 });
 

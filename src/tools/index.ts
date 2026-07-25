@@ -65,3 +65,4 @@ export { createPollVoteTool, type PollVoteToolContext } from "./poll-vote.js";
 export { createSummaryTool, SummaryDraft } from "./summary-tool.js";
 export { createDiaryTool } from "./diary-tool.js";
 export { createBashTool, type BashToolContext } from "./bash.js";
+export { MATRIX_TERMINOLOGY, DISCORD_TERMINOLOGY } from "./terminology.js";

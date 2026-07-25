@@ -108,6 +108,7 @@ import {
   createXSearchTool,
   GrokResultCache,
   createFindSourceTool,
+  MATRIX_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -122,7 +123,7 @@ import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
-import { parseTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
+import { parseTimelineKey, buildTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
 import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
@@ -1507,34 +1508,45 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   assertFollowupConfigValid(config.agent.sessions.followup);
 
   // Map a (per-room) timeline key to its account + room id and ask that account's
-  // Matrix client for a human room label. Shared by the diary header and the
-  // RoomLabelCache (which feeds the observability console room list). Rejects on a
-  // malformed key; both callers retry and fall back to the room id, so a failure
-  // never blocks a job.
-  const resolveChannelLabel = (timelineKey: string): Promise<string> => {
-    if (!matrixProvider) throw new Error(`cannot resolve channel label without a matrix provider`);
+  // Human channel label — used by the diary header and the RoomLabelCache (which
+  // feeds the observability console room list). Dispatches via the ChannelClient
+  // abstraction so it works for any registered provider. Rejects on a malformed key
+  // or absent provider; both callers retry and fall back to the room id, so a
+  // failure never blocks a job.
+  const resolveChannelLabel = async (timelineKey: string): Promise<string> => {
     const parsedKey = parseTimelineKey(timelineKey);
+    const providerId = parsedKey?.provider;
     const accountId = parsedKey?.accountId;
     const roomId = parsedKey?.channelId;
     if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
-    const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
-    return client.channelLabel({ roomId });
+    if (!providerId) throw new Error(`cannot resolve provider from timeline key "${timelineKey}"`);
+    const provider = providers.get(providerId);
+    if (!provider) throw new Error(`cannot resolve channel label: provider "${providerId}" not registered`);
+    const client = provider.channelClient({ provider: providerId, timelineKey, accountId });
+    if (!client) throw new Error(`cannot resolve channel label: no channel client for "${timelineKey}"`);
+    const info = await client.channelInfo();
+    return info.label;
   };
 
   // Feed the context builder's <runtime_state> channel descriptor (label + DM
-  // flag). Mirrors resolveChannelLabel but returns both fields from one
-  // channelInfo call, and — per the hook contract — never rejects: a malformed
-  // key or lookup failure resolves to null and the Channel/Type lines are simply
-  // omitted (the raw timeline key still identifies the room).
+  // flag). Dispatches via the ChannelClient abstraction so it works for any
+  // registered provider. Per the hook contract, never rejects: a malformed key,
+  // absent provider, or lookup failure resolves to null and the Channel/Type lines
+  // are simply omitted (the raw timeline key still identifies the channel).
   contextBuilder.resolveChannelContext = async (timelineKey) => {
-    if (!matrixProvider) return null; // no matrix provider — context unavailable (Phase 3+)
     try {
       const parsedKey = parseTimelineKey(timelineKey);
-      const accountId = parsedKey?.accountId;
-      const roomId = parsedKey?.channelId;
-      if (!roomId) return null;
-      const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
-      return await client.channelContext({ roomId });
+      if (!parsedKey) return null;
+      const provider = providers.get(parsedKey.provider);
+      if (!provider) return null;
+      const client = provider.channelClient({
+        provider: parsedKey.provider,
+        timelineKey,
+        accountId: parsedKey.accountId,
+      });
+      if (!client) return null;
+      const info = await client.channelInfo();
+      return { label: info.label, isDirect: info.isDirect };
     } catch (error) {
       logger.debug("resolve_channel_context_failed", {
         timelineKey,
@@ -2027,6 +2039,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   async function resolveTriggerGroup(inbound: InboundChatEvent): Promise<void> {
+    // Attachment-event grouping is only meaningful on providers that enforce one
+    // attachment per message (e.g. Matrix). Providers that allow multiple attachments
+    // in a single send (e.g. Discord) don't need it — the user includes all
+    // attachments in one message, so there's nothing to group across messages.
+    if (!providers.get(inbound.event.provider)?.capabilities.singleAttachmentPerMessage) return;
+
     const triggerEventId = inbound.event.id;
     const groupIds = new Set(inbound.trigger?.groupedEventIds ?? []);
     groupIds.add(triggerEventId);
@@ -3280,12 +3298,38 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         `session ${sessionId}: provider "${target.provider}" is not registered — cannot build send_message tool`,
       );
     }
-    // Resolve a Matrix-native client only when the target is Matrix-bound and the
-    // Matrix provider is registered. Matrix-only tools (emoji, react, etc.) are
-    // gated on this being non-null — they silently disappear for other providers
-    // until Phase 4 adds ChannelClient abstraction.
-    const matrixClient =
-      target.provider === "matrix" && matrixProvider ? matrixProvider.getClient(target) : undefined;
+    // Resolve the cross-provider ChannelClient for this session's target (spec
+    // DISCORD-SUPPORT-DESIGN §7.1). The 11 channel-scoped tools (emoji, react,
+    // edit, delete, pins, list_reactions, read_messages, member_info, channel_info,
+    // create_poll, poll_vote) are gated on this being non-null — they silently
+    // disappear when the target has no resolvable channel (e.g. a DM that didn't
+    // parse correctly, or a provider that hasn't implemented channelClient yet).
+    const channelClient = sessionProvider.channelClient(target);
+    // Terminology bundle for provider-aware tool description strings. Phase 4 only
+    // has Matrix; Phase 7 will wire the Discord bundle via the provider.
+    const terminology = MATRIX_TERMINOLOGY;
+    // Per-provider capabilities — used for individual tool gates below (spec §7.1/§3.3).
+    const caps = sessionProvider.capabilities;
+
+    // Resolver for a specific channel by id: used by emoji_list and channel_info
+    // tools when the caller passes an explicit room_id (M4/M5). Rebuilds a target
+    // timeline key for the given channelId and delegates to the provider's
+    // channelClient(). Only defined when the session target has an accountId so the
+    // rebuilt key is well-formed; undefined otherwise (tools fall back to the
+    // session channelClient).
+    const channelClientFor = channelClient && target.accountId
+      ? (channelId: string) =>
+          sessionProvider.channelClient({
+            provider: target.provider,
+            timelineKey: buildTimelineKey({
+              provider: target.provider,
+              accountId: target.accountId!,
+              kind: "room",
+              channelId,
+            }),
+            accountId: target.accountId,
+          })
+      : undefined;
 
     return [
       createSendMessageTool({
@@ -3296,6 +3340,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         agentSessionGeneration: resumeGeneration,
         workspaceRoot,
         mediaMaxBytes: downloadSizeLimit,
+        terminology,
         // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): a LIVE registry
         // lookup at send time (excluding self), so it catches a sibling that
         // claimed the reply-target after this session's context was built — the
@@ -3322,21 +3367,26 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       createSpawnSessionTool({
         spawnCoReply: (messageId) => spawnCoReplySession(messageId, sessionId),
       }),
-      // Matrix-native room tools — gated on having both a roomId AND a resolved
-      // matrix client. Non-Matrix providers don't get these until Phase 4 adds a
-      // generic ChannelClient abstraction.
-      ...(matrixClient && roomId ? [
-        createEmojiListTool({ client: matrixClient, roomId }),
-        createReactTool({ client: matrixClient, roomId }),
-        createEditMessageTool({ client: matrixClient, roomId }),
-        createDeleteMessageTool({ client: matrixClient, roomId }),
-        createPinsTool({ client: matrixClient, roomId }),
-        createListReactionsTool({ client: matrixClient, roomId }),
-        createReadMessagesTool({ client: matrixClient, roomId }),
-        createMemberInfoTool({ client: matrixClient, roomId }),
-        createChannelInfoTool({ client: matrixClient, roomId }),
-        createCreatePollTool({ client: matrixClient, roomId }),
-        createPollVoteTool({ client: matrixClient, roomId }),
+      // Channel-scoped tools — outer gate: provider must return a ChannelClient for
+      // the session target. Inner gates: per-capability flags (spec §7.1/§3.3).
+      // Matrix has all capabilities = true → tool set is identical to pre-Phase-4.
+      // channel_info and member_info are gated only on channelClient presence (no
+      // per-capability flag); the reaction/edit/delete/pins/history/poll tools each
+      // check their own capability flag.
+      ...(channelClient ? [
+        createChannelInfoTool({ channelClient, terminology, channelClientFor }),
+        createMemberInfoTool({ channelClient, terminology }),
+        ...(caps.reactions ? [
+          createEmojiListTool({ channelClient, terminology, channelClientFor }),
+          createReactTool({ channelClient, terminology }),
+          createListReactionsTool({ channelClient, terminology }),
+        ] : []),
+        ...(caps.edits ? [createEditMessageTool({ channelClient, terminology })] : []),
+        ...(caps.deletes ? [createDeleteMessageTool({ channelClient, terminology })] : []),
+        ...(caps.pins ? [createPinsTool({ channelClient, terminology })] : []),
+        ...(caps.history ? [createReadMessagesTool({ channelClient, terminology })] : []),
+        ...(caps.pollCreate ? [createCreatePollTool({ channelClient, terminology })] : []),
+        ...(caps.pollVote ? [createPollVoteTool({ channelClient, terminology })] : []),
       ] : []),
       // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
       // client, so available regardless of roomId and able to span all rooms.
@@ -3364,22 +3414,27 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         storage,
         indexer: chatSearchIndexer,
         currentTimelineKey: inbound.timelineKey,
-        // Membership source for include_silent / never-posted users (§9e). Maps a
-        // timeline_key to the account's client and asks the native layer for the
-        // channel's current joined members. Uses the shared grammar parser so this
-        // works correctly for any provider key, including Matrix room ids with colons.
-        // Only returns members for "room" kind keys (DMs and threads always return []).
+        // Membership source for include_silent / never-posted users (§9e). Resolves
+        // members via the ChannelClient abstraction so it works for any provider.
+        // Falls back to an empty list for DMs, thread keys, or when the provider's
+        // channelClient doesn't expose members() (ProviderCapabilities.membershipRoster
+        // = false — "roster unavailable on this channel").
         roomMembers: async (timelineKey) => {
-          if (!matrixProvider) return []; // no matrix provider — room members unavailable (Phase 3+)
           const parsedKey = parseTimelineKey(timelineKey);
           if (!parsedKey || parsedKey.kind !== "room") return [];
-          const client = matrixProvider.getClient({ provider: "matrix", timelineKey });
-          const members = await client.roomMembers({ roomId: parsedKey.channelId });
-          return members.map((mem) => ({ userId: mem.userId, displayName: mem.displayName }));
+          const provider = providers.get(parsedKey.provider);
+          if (!provider) return [];
+          const client = provider.channelClient({ provider: parsedKey.provider, timelineKey, accountId: parsedKey.accountId });
+          if (!client?.members) return [];
+          const members = await client.members();
+          return members.map((m) => ({ userId: m.id, displayName: m.displayName }));
         },
       }),
-      // set_profile uses the Matrix-native client; absent on non-Matrix sessions (Phase 4)
-      ...(matrixClient ? [createSetProfileTool({ client: matrixClient, workspaceRoot })] : []),
+      // set_profile is a provider-level capability (optional on IChatProvider).
+      // Present only when the provider implements it and an accountId is available.
+      ...(sessionProvider.setProfile && target.accountId
+        ? [createSetProfileTool({ provider: sessionProvider, accountId: target.accountId, workspaceRoot })]
+        : []),
       createWebFetchTool(),
       createWebSearchTool(),
       ...(browserSession && config.browser

@@ -361,9 +361,54 @@ The agent is not hardwired to Matrix. The `IChatProvider` interface defines the 
 - `getSelf(accountId)` — the bot's own `SelfIdentity` (`{ id, username?, displayName? }`) for one account; `undefined` if not started
 - `ownsUserId(id)` — shape test used for budget enforceability (Matrix: `id.startsWith("@")`)
 - `enrichment(accountId)` — `EnrichmentCapabilities` for one account; `undefined` when the account is not running
-- `capabilities` — `ProviderCapabilities` struct with load-bearing fields: `maxAttachmentsPerMessage`, `maxMessageChars`, `formatting`, `edits`, `deletes`, `pollCreate`, `pollVote`, `pins`, `voiceMessages`, `threads`, `history`, `encrypted`, `linkPreviews`, `singleAttachmentPerMessage`, `membershipRoster`, plus optional `typing`, `reactions`, `reactionKinds`, `customEmojiScoped`, `mediaUpload`
+- `capabilities` — `ProviderCapabilities` struct with load-bearing fields: `maxAttachmentsPerMessage`, `maxMessageChars`, `maxContentBytes` (optional; byte budget for HTML send path — Matrix: 60 000; absent = falls back to 60 000), `formatting`, `edits`, `deletes`, `pollCreate`, `pollVote`, `pins`, `voiceMessages`, `threads`, `history`, `encrypted`, `linkPreviews`, `singleAttachmentPerMessage`, `membershipRoster`, plus optional `typing`, `reactions`, `reactionKinds`, `customEmojiScoped`, `mediaUpload`
+- `channelClient(target: OutboundTarget): ChannelClient | undefined` — returns a `ChannelClient` scoped to the target's channel; `undefined` when the target is foreign to this provider or the channel is unresolvable (§ChannelClient below)
+- `setProfile?(accountId, opts): Promise<{…}>` — optional; update the bot's display name and/or avatar for one account. Matrix uploads avatar data via the native client; absent on providers that don't support profile edits
 
 The provider delivers **every** message through `host.onEvent`. It flags messages as triggers (mentions, DMs) but does not buffer non-trigger messages. The timeline ingests all events continuously; only triggers spawn sessions.
+
+### ChannelClient — per-channel action surface
+
+`ChannelClient` (`src/types.ts`) is the cross-provider interface for channel-scoped tool actions. It is obtained via `IChatProvider.channelClient(target)` and wraps one channel on one account. The 11 channel-scoped tools (emoji_list, react, edit_message, delete_message, pins, list_reactions, read_messages, member_info, channel_info, create_poll, poll_vote) receive a `ChannelClient` in their context and call its methods directly — they no longer depend on the Matrix-native client or any provider-specific type.
+
+Each tool in the set is individually gated: `channel_info` and `member_info` require only a non-null `channelClient`; the remaining 9 are further gated on the session provider's `ProviderCapabilities` flags (`reactions` for emoji_list/react/list_reactions; `edits`; `deletes`; `pins`; `history`; `pollCreate`; `pollVote`). The Matrix provider has all flags set to `true`, so the Matrix tool set is identical to the pre-Phase-4 full set of 11.
+
+`emoji_list` and `channel_info` accept an optional `room_id` parameter. When present, `buildSessionTools` resolves the named channel's `ChannelClient` via a `channelClientFor` closure (rebuilt target timeline key → `sessionProvider.channelClient()`), falling back to the session `channelClient` when the named channel is unresolvable.
+
+`ChannelClient` surface:
+- Always present: `react` → `{ display?: string } | void`, `unreact` → `{ removed?: number } | void`, `listReactions`, `editMessage` → `{ externalId?: string } | void`, `deleteMessage`, `readMessages`, `readMessage`, `memberInfo`, `channelInfo`, `pins`, `pinMessage` → `{ pinCount?: number } | void`, `unpinMessage` → `{ pinCount?: number } | void`, `emojiList`
+- Present iff `ProviderCapabilities.membershipRoster`: `members?()` → joined channel members
+- Present iff `ProviderCapabilities.pollCreate`: `createPoll?(req)`
+- Present iff `ProviderCapabilities.pollVote`: `votePoll?(req)`
+
+Optional return payloads: `react` returns the resolved display string the platform used (e.g. the custom emoji shortcode or glyph); `unreact` returns the count of reactions removed (`{ removed: number }`) for rich providers (Matrix always returns this); `editMessage` returns the new event/message id when the platform assigns one on edit; `pinMessage`/`unpinMessage` return the post-operation total pin count. Lean providers return `void` for any of these.
+
+`MatrixChannelClient` (`src/matrix/channel-client.ts`) wraps a `MatrixNativeClient` + `roomId` and delegates every method to the existing NAPI bindings. Constructed by `MatrixProvider.channelClient()`.
+
+`channelInfo()` returns `ChannelInfo`: `{ label, displayName?, channelId, isDirect, serverName?, topic?, memberCount?, joined?, canonicalAlias?, altAliases? }`. `label` is the full human-readable channel name (for Matrix: `displayName ?? canonicalAlias ?? roomId` with an optional ` (spaceName)` suffix). `displayName` is the bare display name without the server/space suffix; the `channel_info` tool renders it as a `Name:` line. The Matrix adapter sets `displayName` from the native `displayName` field and does not set `serverName` or `topic` (the Matrix native client does not expose them in the `channelInfo` call), so `Server:` and `Topic:` lines never appear in Matrix sessions — Matrix output is byte-identical to the pre-Phase-4 format.
+
+`resolveChannelLabel` (diary pool) and `contextBuilder.resolveChannelContext` (context builder) now dispatch via `providers.get(providerId)?.channelClient(target)?.channelInfo()` rather than the Matrix-native `channelLabel`/`channelContext`. The fallback label (when `channelInfo()` fails) is provider-aware: for Matrix (`provider === "matrix"`) it is the bare `channelId` (e.g. `!room:server`); for all other providers it is `'#' + channelId` (e.g. `#123456789` for a Discord channel snowflake).
+
+### ProviderTerminology bundles
+
+`ProviderTerminology` (`src/types.ts`) is a struct of provider-specific vocabulary strings used to construct tool description text:
+
+```ts
+{ messageIdFmt, userIdFmt, channelNoun, providerName, mentionNote }
+```
+
+`MATRIX_TERMINOLOGY` (`src/tools/terminology.ts`) substitutes the exact strings that the Matrix tool schemas have always shown, so the model's vocabulary is unchanged after Phase 4. `DISCORD_TERMINOLOGY` is defined for Phase 7.
+
+`buildSessionTools` passes `MATRIX_TERMINOLOGY` to all 11 channel-scoped tools and to `send_message`. When a Discord session provider is registered in Phase 7, the wiring will substitute `DISCORD_TERMINOLOGY`.
+
+`send_message` parameter schema adapts to `ProviderCapabilities`:
+- `html` parameter: present iff `capabilities.formatting === "html"` (Matrix: always included)
+- `as_voice` parameter: present iff `capabilities.voiceMessages` (Matrix: always included)
+- `media` parameter: plain string for single-attachment providers (`maxAttachmentsPerMessage === 1`); `string | string[]` union with `maxItems` for multi-attachment providers
+- Chunking limit: `capabilities.maxMessageChars` (Matrix: 4000, same as the previous hardcode)
+- HTML send byte cap: `capabilities.maxContentBytes` (Matrix: 60 000; absent on providers with no per-event byte limit, falls back to 60 000)
+
+All these conditions hold true for Matrix, so the Matrix session tool schema is byte-identical to what it was before Phase 4.
 
 A `[discord]` config block is validated at startup (peer of `[matrix]`; schema: `enabled`, `trigger_hold_ms`, `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`) but not yet consumed — the Discord provider is Phase 3+. `enabled = false` is the default.
 
@@ -397,7 +442,9 @@ const matrixProvider: MatrixProvider | undefined = (() => {
 })();
 ```
 
-This narrowing is the **single** `instanceof` check site. All Matrix-only subsystems (initial backfill, gap backfetch, message backfetch, redecryption sweeper, channel context/label resolver, enrichment capabilities, room-members tool, set_profile tool, emoji/react/pin/poll/read tools) gate on `matrixProvider` being non-null before using it. When `matrixProvider` is `undefined` (no Matrix in the registry), those subsystems are silently absent; the rest of the runtime operates normally.
+This narrowing is the **single** `instanceof` check site. Matrix-only subsystems that still gate on `matrixProvider` being non-null: initial backfill, gap backfetch, message backfetch, redecryption sweeper, and enrichment capabilities. When `matrixProvider` is `undefined` (no Matrix in the registry), those subsystems are silently absent; the rest of the runtime operates normally.
+
+Post-Phase 4, the 11 channel-scoped tools and `set_profile` no longer gate on `matrixProvider` — they use the `IChatProvider.channelClient()` / `IChatProvider.setProfile?()` abstraction through the generic provider registry. The channel context/label resolver and user_activity membership roster similarly dispatch through the generic `channelClient` path.
 
 ### buildMatrixHost — cast site documentation
 
@@ -733,7 +780,7 @@ The `sqlite-vec` `memory_vec` virtual table (and its `memory_vec_*` shadow table
 
 ### Trigger group resolution
 
-When a trigger fires, the hold-grouped event IDs and a lookback query are unified into a single **trigger group**. The lookback finds the most recent same-sender message with a media attachment within `trigger_group_lookback_ms` (default 20s) of the trigger timestamp, then includes all same-sender messages between that attachment message and the trigger — not just the single attachment message. All events in the group get their `trigger_group_id` column updated in one DB write, making their media assets visible to caption workers.
+When a trigger fires, the hold-grouped event IDs and a lookback query are unified into a single **trigger group**. The lookback finds the most recent same-sender message with a media attachment within `trigger_group_lookback_ms` (default 20s) of the trigger timestamp, then includes all same-sender messages between that attachment message and the trigger — not just the single attachment message. All events in the group get their `trigger_group_id` column updated in one DB write, making their media assets visible to caption workers. `resolveTriggerGroup` is gated on `ProviderCapabilities.singleAttachmentPerMessage`; providers that allow multiple attachments per message (e.g. Discord) return early without a lookback, since each user message already carries all its attachments together.
 
 ### Trigger coordination
 
