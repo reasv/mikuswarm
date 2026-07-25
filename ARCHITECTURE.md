@@ -413,16 +413,19 @@ Optional return payloads: `react` returns the resolved display string the platfo
 
 All these conditions hold true for Matrix, so the Matrix session tool schema is byte-identical to what it was before Phase 4.
 
-A `[discord]` config block is validated at startup (peer of `[matrix]`; schema: `enabled`, `trigger_hold_ms`, `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`) but not yet consumed — the Discord provider is Phase 3+. `enabled = false` is the default.
+A `[discord]` config block (peer of `[matrix]`) enables the Discord provider. Schema: `enabled` (default `false`), `trigger_hold_ms` (default 0), `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`. When `enabled = true` and at least one account is configured, `DiscordProvider` is constructed and registered in the providers map. See the **Discord Provider** section below for the full implementation details.
 
 ### Provider registry
 
 `startMikuAgent` builds a `Map<string, IChatProvider>` keyed by provider id (`"matrix"`, `"discord"`, …) from config:
 
-- `MatrixProvider` is constructed and registered as `"matrix"` iff `config.matrix.enabled !== false`. If the `opts.providers` seam is supplied (test injection path — `StartMikuAgentOptions`), it replaces the config-derived map entirely; this lets tests inject a fake provider without touching the Matrix SDK.
+- `MatrixProvider` is constructed and registered as `"matrix"` iff `config.matrix.enabled !== false`.
+- `DiscordProvider` is constructed and registered as `"discord"` iff `config.discord?.enabled && config.discord.accounts` has at least one account. `DiscordProvider` takes a `DiscordProviderCallbacks` object (closed over storage) for two async storage operations: `mergeLateEmbeds` (late-embed link preview upsert — spec §8.3) and `storeIngestEmbeds` (ingest-time embed write — spec §9.3).
+- If the `opts.providers` seam is supplied (test injection path — `StartMikuAgentOptions`), it replaces the config-derived map entirely; this lets tests inject a fake provider without touching any SDK.
 - **Zero-provider guard**: if the final registry is empty after construction (and after seam injection), `startMikuAgent` throws `"no enabled chat provider"` immediately — before any pool, storage, or validation step. This is a fatal config error; at least one provider must be enabled at startup.
-- At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers receive a generic host that wires `onEvent` and `onError` without Matrix-typed callbacks.
+- At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers (including `DiscordProvider`) receive the generic host that wires `onEvent`, `onReaction`, `onBulkReactionClear`, `onError`, and `resolveReplyTrigger` without Matrix-typed callbacks.
 - On `runtime.stop()`, every registered provider's `stop()` is called in registry iteration order.
+- **`isUserIdentity` predicate** (spec §6.4 / Phase 0): the budget engine's predicate is `providers.some(p => p.ownsUserId(id))`. For Matrix-only configs this is byte-identical to the old `id.startsWith("@")`; with Discord registered it also accepts numeric snowflakes (`/^\d+$/.test(id)`).  
 
 ### Outbound send routing
 
@@ -691,6 +694,148 @@ Matrix events never carry `sender.username` (the `SenderInfo` field is absent fo
 - `getUserIdentityAliases` returns `[]` → no extra names are added to the retrieval query
 
 The resulting context and retrieval output are byte-identical to what they would have been before this feature was added.
+
+## 6c. Discord Provider
+
+`src/discord/` implements the Discord gateway provider using discord.js v14. It splits into a pure normalizer module (`normalizer.ts`) and the live provider class (`provider.ts`).
+
+### Normalizer (`src/discord/normalizer.ts`)
+
+A pure-function module with no live discord.js Client references. The provider extracts plain data from discord.js objects and passes them here, making all normalization logic unit-testable without a gateway connection.
+
+**Key shapes** (spec §4.1):
+
+| Context | Timeline key |
+|---|---|
+| Guild text channel | `discord:<accountId>:room:<channelId>` |
+| DM channel | `discord:<accountId>:dm:<channelId>` |
+| Thread / forum post | `discord:<accountId>:room:<parentChannelId>:thread:<threadId>` |
+
+Thread detection uses `THREAD_CHANNEL_TYPES = {10 (AnnouncementThread), 11 (PublicThread), 12 (PrivateThread), 15 (Forum)}`. Forum post-channels appear as type-15 parent channels with thread children; their posts are therefore routed as `room:<parentId>:thread:<postId>` — identical to ordinary thread routing.
+
+Event id grammar: `discord:<accountId>:<messageSnowflake>`.
+
+`buildDiscordTimelineKey(accountId, channelId, channelType, parentChannelId?)` and `buildDiscordEventId(accountId, messageId)` are the canonical factories; all other code imports them rather than constructing keys inline.
+
+**Markup translation** — `translateDiscordMarkup(content, {users, roles, channels})`:
+
+| Discord token | Rendered as |
+|---|---|
+| `<@id>` / `<@!id>` | `@username` / `@displayName` (nick form for `!`) |
+| `<#id>` | `#channel-name` |
+| `<@&id>` | `@role-name` |
+| `<:name:id>` / `<a:name:id>` | `:name:` (static / animated custom emoji) |
+
+Unresolvable IDs (not in the passed maps) pass through verbatim so no information is destroyed.
+
+**Attachment normalisation**: `attachmentToMeta` maps `DiscordAttachmentData` to `AttachmentMeta`, inferring `mediaType` from MIME prefix and setting `asVoice`/`durationMs` when `isVoiceMessage=true` (Discord `IS_VOICE_MESSAGE` message flag 8192). Stickers are converted via `stickerToAttachment`, which maps the `StickerFormatType` enum (set by the provider in `extractMessageData`) to MIME type and filename extension: PNG (1) / APNG (2) → `image/png` / `.png`; GIF (4) → `image/gif` / `.gif`; Lottie (3) → `application/json` / `.json` with `mediaType: "file"` so the captioning worker (which only captions `image|video|audio`) skips it.
+
+**Embed → link previews** — `embedsToLinkPreviews(embeds)`: only embeds with a URL are converted. The same trailing-punctuation strip used by `DirectLinkPreviewClient` (`.replace(/[.,;:!?)"'\]}>]+$/, "")`) is applied so embed URL exclusion matching works correctly at enrichment time. Result `sourceKind` is `"discord_embed"` so the enrichment worker can skip re-scraping those URLs.
+
+**Trigger detection** — `detectDiscordTrigger(msg, ctx, isSelf)`:
+- DM channel (type 1) → `{ type: "dm" }`
+- Direct user mention of the bot snowflake → `{ type: "mention" }`
+- Role mentions and @everyone/here do NOT trigger
+- Own messages (`isSelf`) → `undefined`
+- Reply-to-bot trigger is resolved separately by the provider via `host.resolveReplyTrigger` after storing the event
+
+**Poll fallback**: when `msg.poll` is present and body content is empty, body is set to `[poll] <question> — <answer1>, <answer2>, ...`.
+
+**Reply context**: `buildReplyContext(ref)` populates `replyTo` fully at ingest time from the `referenced_message` payload included in the gateway event. Reply enrichment via REST is not needed for Discord (unlike Matrix where the SDK doesn't include it).
+
+**Emoji observations** — `extractEmojiObservations(content)`: captures `<:name:id>` and `<a:name:id>` pairs from the raw content string, deduplicated by id, and returned as `{name, id, animated}` triples. These are passed back by the provider for the emoji catalog (Phase 7b wires the catalog writes).
+
+**`DiscordNormalizeResult`** is the return type of `normalizeDiscordMessage`: `{ inbound: InboundChatEvent, emojiObservations, embedPreviews }`.
+
+### Provider (`src/discord/provider.ts`)
+
+`DiscordProvider` implements `IChatProvider`. One discord.js `Client` instance is created per configured account at `start()` time; reconnect and WebSocket resume are managed by discord.js.
+
+**Capabilities**:
+
+| Capability | Value | Note |
+|---|---|---|
+| `maxMessageChars` | 2000 | Discord API limit |
+| `maxAttachmentsPerMessage` | 10 | Discord API limit |
+| `formatting` | `"markdown"` | |
+| `typing` | `true` | |
+| `reactions` | `true` | Gateway events received; reaction routing is Phase 7b |
+| `reactionKinds` | `["unicode","custom"]` | No text-shortcode reactions on Discord |
+| `customEmojiScoped` | `true` | Guild-scoped sendability |
+| `edits` | `true` | |
+| `deletes` | `true` | |
+| `threads` | `true` | |
+| `pins` | `true` | |
+| `pollCreate` | `true` | ChannelClient method is 7b; tool absent while `channelClient()` returns `undefined` |
+| `pollVote` | `false` | No bot vote endpoint in Discord API |
+| `history` | `true` | History client is 7b; tool absent while `channelClient()` returns `undefined` (Phase 4 gates on both) |
+| `mediaUpload` | `false` | Local-file attach is the upload path; no Matrix-style MXC |
+| `encrypted` | `false` | |
+| `linkPreviews` | `"none"` | Embeds are handled at ingest, not via provider API |
+| `singleAttachmentPerMessage` | `false` | Discord allows up to 10 per message |
+| `membershipRoster` | computed | `true` iff any account has `member_intent = true` in config |
+| **`voiceMessages`** | **`false`** | **Temporary lie (Phase 7b)** — ogg/opus send + waveform not yet implemented; will be flipped to `true` in Phase 7b. The model does not see `as_voice` until then. |
+
+**`accountIds()`** returns `Object.keys(this.config.accounts ?? {})` — config keys, not the runtime map — so it works correctly before `start()` is called (e.g. for enrichment pool registration).
+
+**`ownsUserId(id)`**: `/^\d+$/.test(id)` — any all-digit string is treated as a Discord snowflake. Used by the budget predicate `isUserIdentity`.
+
+**`channelClient()`**: returns `undefined` — Phase 7b. Safe because Phase 4 tool wiring gates on `channelClient !== undefined` before consulting capability flags.
+
+**`enrichment(accountId)`**: returns an `EnrichmentCapabilities` stub when the account is running. `downloadMedia` throws (Discord attachments always have `remoteUrl`, so the enrichment worker never calls this path). `messageSummary` returns `null` (reply context is already complete at ingest). `resolveLinkPreviews` is absent (triggers `DirectLinkPreviewClient` fallback in the worker — see §7a). `memberInfo` returns a stub `{ displayName: undefined }` (Phase 7b).
+
+**`history()`**: returns `undefined` — Phase 7b.
+
+**Gateway intents**: `Guilds`, `GuildMessages`, `DirectMessages`, `MessageContent`, `GuildMessageReactions`, `DirectMessageReactions`, `GuildExpressions`; plus `GuildMembers` iff any account has `member_intent = true`.
+
+**Cache limits** (discord.js `makeCache`): `MessageManager / GuildMessageManager / DMMessageManager: {maxSize: 50}`, `GuildMemberManager: {maxSize: member_intent ? 200 : 0}`, `GuildEmojiManager: {maxSize: 500}`, `ThreadManager: {maxSize: 200}`. The timeline store is the source of truth for history; the client cache only needs what thread-parent resolution, member lookup, and emoji resolution require.
+
+**Inbound pipeline** (spec §8):
+
+1. `messageCreate` → `handleMessageCreate` → `extractMessageData` → `normalizeDiscordMessage` → `host.onEvent` (synchronously enqueues FIFO event insert) → optional `storeIngestEmbeds` callback (after `host.onEvent` so the `link_previews.event_id` FK is satisfied). On the immediate path (no trigger hold), FIFO enqueue order guarantees the event row is committed before the preview rows. On the held path, `embedPreviews` are carried inside the `PendingTrigger` structure and `storeIngestEmbeds` is called inside the hold flush callback **after** `host.onEvent`, preserving the same FK ordering.
+2. Trigger-hold (spec §8.4): mirrors the Matrix provider's hold mechanism. `trigger_hold_ms` delays trigger dispatch; a second trigger in the same channel resets the timer (bounded at `4 × trigger_hold_ms` from the FIRST trigger's `holdStartedAt`). Implemented with `TRIGGER_HOLD_MAX_MULTIPLIER = 4`. Each held event's `embedPreviews` are stored paired with that event's id and are flushed only at timer expiry, never before `host.onEvent` fires.
+3. Reply-to-bot: after trigger detection, if no trigger was found but the message is a reply, `host.resolveReplyTrigger` is called with the referenced message id; if it confirms the reply target is a bot message, the trigger is injected before `host.onEvent`.
+
+**Reply context extraction** (`extractMessageData`): gated on `message.reference?.messageId` alone (`message.mentions.repliedUser` can be null on partial payloads and must not suppress context). The referenced message body is read from `message.channel.messages.cache.get(messageId)` — the channel message cache (discord.js v14 does not expose `.referencedMessage` as a field). On cache miss, a stub is built from `message.mentions.repliedUser` if available (provides author info but empty body and zero timestamp).
+
+**Edit vs late-embed discrimination** (spec §8.3): `MESSAGE_UPDATE` fires for both user edits and Discord's async embed resolution. The discriminator is `message.editedTimestamp !== null`:
+- `editedTimestamp !== null` → user edit: normalize and route as `InboundChatEvent` with `edit: { targetExternalId: messageId }`. Trigger is always cleared on edits.
+- `editedTimestamp === null` → late-embed: call `callbacks.mergeLateEmbeds` with the new embed previews. The event is NOT routed to `host.onEvent` — doing so would re-trigger the agent (double-processing hazard).
+
+**Deletes**: `messageDelete` constructs a synthetic tombstone `CanonicalChatEvent` with a `nanoid`-suffixed id and routes it via the same `edit: { targetExternalId }` marker that Matrix redactions use.
+
+**Send** (`send(target, message)`):
+- `@username` mention resolution (`resolveMentionTokens`): before chunking, the outbound body is scanned for `@username` tokens (word-boundary; `@everyone`/`@here` always skipped). Each unique token is resolved against the guild member cache first, then via `guild.members.search({ query, limit: 10 })` REST on cache miss. DMs resolve only the DM recipient. Resolved tokens are replaced with `<@id>` Discord mention syntax in the body, and the user ids are added to `allowed_mentions.users`. Unresolved tokens pass through unchanged as plain text.
+- Body is chunked at 2000 characters using `chunkMarkdownText` (fence-aware) on the resolved body.
+- `reply: { messageReference: target.replyToId, failIfNotExists: false }` on the first chunk.
+- `allowed_mentions: { parse: [], users: [...resolvedIds], repliedUser: Boolean(replyRef) }` — `parse: []` prevents automatic @everyone/role pings; `users` carries only ids from `@username` resolution above; `repliedUser` controls whether the replied-to user receives a ping.
+- Attachments (local-path files) are attached to the last chunk only (or the single chunk if there is only one).
+- Returns a `DeliveryReceipt` with `externalId` pointing to the first sent message and `externalIds` listing all chunk message ids.
+
+**Typing** (`setTyping`): calls `channel.sendTyping()` and re-schedules itself every `TYPING_REFRESH_MS = 8000 ms` (Discord clears the indicator after ~10 s). Cancelled cleanly on `setTyping(false)` or `stop()`.
+
+**Guild allowlist**: per-account `guilds` config field (string array) restricts which guild ids the account listens to. DMs are allowed separately via `dm_enabled` (default `true`). The `isAllowed` filter applies on every inbound event before any processing.
+
+### `DiscordProviderCallbacks`
+
+Two async callbacks are injected at `DiscordProvider` construction time (not via `IChatProvider.start`) because the storage layer is initialized before the providers map is built in `app.ts`:
+
+- `mergeLateEmbeds(provider, externalId, timelineKey, previews)` — upserts late-embed link preview rows for an already-stored event. Called by `handleMessageUpdate` when `editedTimestamp === null`.
+- `storeIngestEmbeds(eventId, previews)` — writes `discord_embed` link preview rows at ingest time. The `link_previews.event_id → timeline_events(id)` FK (enforced with `PRAGMA foreign_keys = ON`) is satisfied on both ingest paths: on the **immediate path** (no trigger hold), `host.onEvent` synchronously enqueues the event write in the FIFO single-writer queue and `storeIngestEmbeds` then enqueues the preview writes behind it; on the **held path**, `embedPreviews` are carried inside `PendingTrigger` and `storeIngestEmbeds` is called inside the hold flush callback only after `host.onEvent` fires, so the event row is always written first.
+
+Both are silent no-ops when the event is not yet stored or when `previews` is empty.
+
+### Phase 7b gaps (absent, not stubbed)
+
+The following are intentionally absent from this phase:
+
+- `ChannelClient` implementation — `channelClient()` returns `undefined`; all channel-scoped tools (`read_messages`, `create_poll`, `react`, etc.) are absent for Discord.
+- Reaction emission — `messageReactionAdd` / `messageReactionRemove` / bulk-clear events are not yet wired to `host.onReaction` / `host.onBulkReactionClear`.
+- Emoji catalog writes — `emojiObservations` returned by the normalizer are not yet persisted.
+- History client — `history()` returns `undefined`.
+- Voice message send — `voiceMessages` capability is `false`; `as_voice` is not wired in `send()`.
+- `set_profile` — profile update RPC absent.
+- User identity / metadata upserts — `sender.username` is set on Discord events but `upsertUserIdentity` is not yet called from the Discord ingest path.
 
 ## 7. Timeline
 
