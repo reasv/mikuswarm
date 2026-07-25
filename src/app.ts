@@ -6,6 +6,7 @@ import type { AppConfig } from "./config/index.js";
 import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, makeBackfillReadClient } from "./matrix/index.js";
+import { DiscordProvider } from "./discord/index.js";
 import { ingestGenericReactionEvent } from "./timeline/index.js";
 import type { MatrixNativeClient, MatrixNativeEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
@@ -797,6 +798,56 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const providers: Map<string, IChatProvider> = opts?.providers ?? (() => {
     const map = new Map<string, IChatProvider>();
     if (matrixProviderInstance) map.set("matrix", matrixProviderInstance);
+
+    // Construct DiscordProvider when [discord] is enabled and has accounts.
+    // Callbacks close over storage (already initialized above) to perform
+    // late-embed merges and ingest-time embed writes without coupling the
+    // provider to the storage module directly (spec §8.3 / §9.3).
+    if (config.discord?.enabled && config.discord.accounts && Object.keys(config.discord.accounts).length > 0) {
+      const discordProvider = new DiscordProvider(config.discord, {
+        async mergeLateEmbeds(provider, externalId, timelineKey, previews) {
+          // Find the canonical event id from the stored event, then upsert each embed preview.
+          const event = storage.getTimelineEventByExternalId(provider, externalId, timelineKey);
+          if (!event) return; // Not yet stored (race) — silently ignore
+          for (let i = 0; i < previews.length; i++) {
+            const preview = previews[i]!;
+            await storage.insertLinkPreview({
+              id: `${event.id}:late_embed:${i}`,
+              event_id: event.id,
+              context: "message",
+              url: preview.url,
+              title: preview.title ?? null,
+              description: preview.description ?? null,
+              source_kind: "discord_embed",
+              preview_index: i,
+              fetched_at: preview.fetchedAt ?? Date.now(),
+              fetch_status: "complete",
+              created_at: Date.now(),
+            });
+          }
+        },
+        async storeIngestEmbeds(eventId, previews) {
+          for (let i = 0; i < previews.length; i++) {
+            const preview = previews[i]!;
+            await storage.insertLinkPreview({
+              id: `${eventId}:embed:${i}`,
+              event_id: eventId,
+              context: "message",
+              url: preview.url,
+              title: preview.title ?? null,
+              description: preview.description ?? null,
+              source_kind: "discord_embed",
+              preview_index: i,
+              fetched_at: preview.fetchedAt ?? Date.now(),
+              fetch_status: "complete",
+              created_at: Date.now(),
+            });
+          }
+        },
+      });
+      map.set("discord", discordProvider);
+    }
+
     return map;
   })();
 
@@ -1040,10 +1091,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
         viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
-        // TODO(phase3b): generalize to `providers.some(p => p.ownsUserId(id))`
-        // once identity is wired via getSelf (spec §6.3 / Phase 3). Matrix "@" sigil
-        // remains correct for all current Matrix-only deployments.
-        isUserIdentity: (id) => id.startsWith("@"),
+        // Spec §6.4 / Phase 0: dispatches to each registered provider's ownsUserId()
+        // shape test. For Matrix-only configs, MatrixProvider.ownsUserId is
+        // id.startsWith("@") — byte-identical to the pre-Phase-7 literal. For Discord,
+        // DiscordProvider.ownsUserId is /^\d+$/.test(id) (numeric snowflake).
+        // The composed predicate is: "id is owned by at least one registered provider."
+        isUserIdentity: (id) => [...providers.values()].some((p) => p.ownsUserId(id)),
         // The bot's own user ids (one per account) — excluded (with synthetic system
         // senders) from the per-user console surface, since per-user limits don't
         // govern self/system/proactive spend (Gate A is skipped for those lanes).
