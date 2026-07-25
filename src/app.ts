@@ -578,6 +578,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Claim registry for `<handled_by_session>` markers (DUPLICATE-REPLY-MITIGATION §4).
     sessionClaims,
   );
+  // §6.3: inject provider self-identity resolution so the builder uses the live
+  // provider identity rather than the static config.matrix.accounts read.
+  contextBuilder.getSelfUserId = (provider, accountId) =>
+    providers.get(provider)?.getSelf(accountId)?.id;
 
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
@@ -849,10 +853,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2).
     const parsed = parseTimelineKey(timelineKey);
     if (!parsed) return undefined;
-    // TODO(phase3): replace config.matrix.accounts read with
-    // `providers.get(parsed.provider)?.getSelf(parsed.accountId)?.id`
-    // (spec §6.3 identity / Phase 3 scope).
-    const selfUserId = config.matrix.accounts[parsed.accountId]?.user_id;
+    // §6.3: use provider self identity; falls back to undefined when the provider
+    // hasn't started yet (safe — the inspector synthetic inbound just gets no self).
+    const selfUserId = providers.get(parsed.provider)?.getSelf(parsed.accountId)?.id;
     const inbound: InboundChatEvent = {
       provider: parsed.provider,
       timelineKey,
@@ -1007,6 +1010,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const normalizedUser = normalizeUserLimits(config.user_limits as never, {
         defaultTz: config.agent.timezone ?? "UTC",
         knownModelIds,
+        // §6.4: warn when a partition var is used by no enabled provider.
+        enabledProviders: [...providers.keys()],
       });
       if (normalizedUser.fatal.length > 0) {
         throw new Error(`invalid [[user_limits]] config:\n  ${normalizedUser.fatal.join("\n  ")}`);
@@ -1033,15 +1038,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
         viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
-        // TODO(phase3): generalize to `providers.some(p => p.ownsUserId(id))`
+        // TODO(phase3b): generalize to `providers.some(p => p.ownsUserId(id))`
         // once identity is wired via getSelf (spec §6.3 / Phase 3). Matrix "@" sigil
         // remains correct for all current Matrix-only deployments.
         isUserIdentity: (id) => id.startsWith("@"),
         // The bot's own user ids (one per account) — excluded (with synthetic system
         // senders) from the per-user console surface, since per-user limits don't
         // govern self/system/proactive spend (Gate A is skipped for those lanes).
-        // TODO(phase3): build from `providers.flatMap(p => p.accountIds().map(id => p.getSelf(id)?.id))`
-        // (spec §6.3 identity / Phase 3 scope).
+        // NOTE: built from config rather than getSelf() because this runs before
+        // provider.start() is called — getSelf() returns undefined until start().
+        // A future boot-order change could move this post-start; for now the
+        // Matrix config is the authoritative source for pre-start self-id sets.
+        // TODO(phase7): include Discord self-ids from the Discord provider's configured accounts.
         selfUserIds: new Set(
           Object.values(config.matrix.accounts)
             .map((a) => a.user_id)
@@ -1194,27 +1202,39 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       .replace(/\{resets_in\}/g, resetsAt !== undefined ? formatDurationShort(resetsAt - Date.now()) : "");
   };
 
-  // Resolve a room's legitimate parent space ids (best-first) for per-user-limits
-  // SPACE matching (spec PER-USER-LIMITS §11). One per-room native `channelInfo`
-  // lookup at Gate A — called ONLY when a rule references space. Never rejects: a
-  // malformed key / lookup failure resolves to none (the room matches no space rule).
-  const resolveParentSpaceIds = async (timelineKey: string): Promise<string[]> => {
-    if (!matrixProvider) return []; // no matrix provider — no space ids (Phase 3+)
-    try {
-      const parsedKey = parseTimelineKey(timelineKey);
-      const accountId = parsedKey?.accountId;
-      const roomId = parsedKey?.channelId;
-      if (!roomId) return [];
-      const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
-      const info = await client.channelInfo({ roomId });
-      return info.parentSpaceIds ?? [];
-    } catch (error) {
-      logger.debug("resolve_parent_space_ids_failed", {
-        timelineKey,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return [];
+  // Resolve server-scope ids (space ids for Matrix, guild id for Discord) for the
+  // per-user-limits `{server_id}` / `{space_id}` partition vars and space matching
+  // (spec §6.4 / PER-USER-LIMITS §11). Called ONLY when a rule references space/server.
+  // Never rejects: a malformed key / lookup failure resolves to none.
+  const serverIdsFor = async (timelineKey: string): Promise<string[]> => {
+    const parsedKey = parseTimelineKey(timelineKey);
+    if (!parsedKey) return [];
+
+    if (parsedKey.provider === "matrix") {
+      // Matrix: canonical parent space ids from channelInfo (unchanged from before §6.4).
+      if (!matrixProvider) return [];
+      try {
+        const roomId = parsedKey.channelId;
+        if (!roomId) return [];
+        const client = matrixProvider.getClient({
+          provider: "matrix",
+          timelineKey,
+          accountId: parsedKey.accountId,
+        });
+        const info = await client.channelInfo({ roomId });
+        return info.parentSpaceIds ?? [];
+      } catch (error) {
+        logger.debug("server_ids_for_failed", {
+          timelineKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return [];
+      }
     }
+
+    // TODO(phase7): Discord — return [guildId] from channel metadata once the
+    // Discord normalizer upserts channel→guild mappings (§6.6 / §6.4).
+    return [];
   };
 
   // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3): returns an
@@ -1588,8 +1608,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     concurrency: config.timeline?.gap_backfetch_concurrency ?? 3,
   };
   // Matrix-only: gap backfetch self-ids and coordinator.
-  // TODO(phase3): build gapBackfetchSelfIds from provider.getSelf() once identity
-  // is wired (spec §6.3). For now, only the matrix provider contributes self-ids.
+  // TODO(phase7): extend gapBackfetchSelfIds with Discord self-ids from the Discord
+  // provider's configured accounts. Boot-ordering constraint: getSelf() is only
+  // valid after provider.start(), so Discord ids must be contributed post-start in
+  // Phase 7 rather than here at config time.
   const gapBackfetchSelfIds = new Map<string, string>();
   if (matrixProvider) {
     for (const [accountId, account] of Object.entries(config.matrix.accounts)) {
@@ -1940,8 +1962,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     const accountId = target.accountId ?? parseTimelineKey(inbound.timelineKey)?.accountId;
     if (!accountId) return; // malformed key; can't proceed
-    // TODO(phase3): replace with matrixProvider.getSelf(accountId)?.id once identity moves to provider
-    const selfUserId = config.matrix.accounts[accountId]?.user_id;
+    // §6.3: provider self identity. For Matrix, getSelf returns the configured
+    // user_id once start() has been called (initial backfill runs post-start).
+    const selfUserId = matrixProvider?.getSelf(accountId)?.id;
     if (!selfUserId) {
       logger.warn("initial_backfill_skipped", { timelineKey: inbound.timelineKey, reason: "unknown_self_user", accountId });
       return;
@@ -2309,7 +2332,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     prebuiltEventForRender?: CanonicalChatEvent,
   ): string {
     const eventForRender = prebuiltEventForRender ?? buildReplyHydratedEvent(inbound, target);
-    const senderName = inbound.event.sender.displayName ?? inbound.event.sender.id;
+    // §6.2: human-facing label uses `username ?? id` as the fallback.
+    const senderName = inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id;
     const externalId = inbound.event.externalId;
     return (
       `<interjection reason="co-reply">\n` +
@@ -3062,7 +3086,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     gapMs: number,
     hydrated: CanonicalChatEvent,
   ): string {
-    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.id);
+    // §6.2: human-facing label uses `username ?? id` as the fallback.
+    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id);
     const n = Math.max(0, Math.round(gapMs / 1000));
     const externalId = inbound.event.externalId;
     const spawnHint = externalId
@@ -3104,7 +3129,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * bare forms are not, matching this preamble).
    */
   function buildFollowUpResumePreamble(inbound: InboundChatEvent, form: FollowUpForm, gapMs: number): string {
-    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.id);
+    // §6.2: human-facing label uses `username ?? id` as the fallback.
+    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id);
     const n = Math.max(0, Math.round(gapMs / 1000));
     if (form === "media") {
       return (
@@ -3480,6 +3506,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         workspaceRoot,
         provider: inbound.provider,
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
+        senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
         senderDisplayName: (inbound.trigger?.triggeredBy ?? inbound.event.sender).displayName,
         config: config.user_profiles,
       }),
@@ -3487,6 +3514,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         workspaceRoot,
         provider: inbound.provider,
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
+        senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
         senderDisplayName: (inbound.trigger?.triggeredBy ?? inbound.event.sender).displayName,
         config: config.user_profiles,
       }),
@@ -3581,7 +3609,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // ancestor ids; any failure degrades to none (the room matches no space rule).
     let spaceIds: string[] | undefined;
     if (userLimitEngine.usesSpace) {
-      spaceIds = await resolveParentSpaceIds(inbound.timelineKey);
+      spaceIds = await serverIdsFor(inbound.timelineKey);
     }
     const ctx: UserLimitContext = {
       userId,
@@ -3610,8 +3638,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           (m) => userLimitEngine!.affordable(resolution, m, {}, thinkingBudgetForModel(m)).ok,
         );
     if (!initialModel) {
+      // §6.2: human-facing label for the refusal message. Mirrors the pre-3a cross-sender
+      // fall-through (triggeredBy first, then event.sender as backstop), extended with
+      // username for providers that carry it (Discord). Final fallback is the raw userId.
       const displayName =
-        inbound.trigger?.triggeredBy?.displayName ?? inbound.event.sender?.displayName ?? userId;
+        inbound.trigger?.triggeredBy?.displayName ??
+        inbound.trigger?.triggeredBy?.username ??
+        inbound.event.sender?.displayName ??
+        inbound.event.sender?.username ??
+        userId;
       return {
         active: true,
         denied: true,
@@ -3894,8 +3929,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // drain the coordinator is cleared by stop(), so the helper skips — same as
     // launchSession does.
     releaseTimelineSlot: (timelineKey) => drainNextQueuedTrigger(timelineKey),
-    // TODO(phase3): replace with matrixProvider?.getSelf(accountId)?.id once identity moves to provider
-    selfUserIdForAccount: (accountId) => config.matrix.accounts[accountId]?.user_id,
+    // §6.3: provider self identity for the resume-reattachment path. The resume runs
+    // post-start so getSelf is available; falls back to undefined (same handling as
+    // "unknown account") when the provider isn't registered.
+    selfUserIdForAccount: (accountId) => matrixProvider?.getSelf(accountId)?.id,
     runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
     markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
     markDiscarded: (id, error) => sessions.markDiscarded(id, { error }),
@@ -4830,6 +4867,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         logger,
       );
     },
+    // §6.3: wire provider self-identity so proactive synthetic inbounds carry the
+    // real provider identity rather than the static config.matrix.accounts read.
+    getSelf: (provider, accountId) => providers.get(provider)?.getSelf(accountId),
     logger: logger.child("proactive"),
   });
 

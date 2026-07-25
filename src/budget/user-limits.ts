@@ -360,29 +360,42 @@ export function homeserverOf(userId: string): string {
   return i >= 0 ? userId.slice(i + 1) : "";
 }
 
-/** Resolve a single known partition variable against a ctx (empty when absent). */
+/**
+ * Resolve a single known partition variable against a ctx (empty when absent).
+ *
+ * Canonical names: `{user_id}`, `{channel_id}`, `{server_id}`, `{homeserver}`.
+ * Aliases: `{room_id}` = `{channel_id}`; `{space_id}` = `{server_id}`.
+ * `{homeserver}` is Matrix-only; non-Matrix providers resolve it to "".
+ */
 function resolvePartitionVar(key: string, ctx: UserLimitContext): string {
   switch (key) {
     case "user_id":
       return ctx.userId;
     case "room_id":
+    case "channel_id":
       return ctx.roomId ?? "";
     case "homeserver":
       return homeserverOf(ctx.userId);
     case "space_id":
-      // The canonical (best) parent space — first of the best-first list (§11).
+    case "server_id":
+      // The canonical (best) parent space / server — first of the best-first list (§11).
       return ctx.spaceIds?.[0] ?? "";
     default:
       return "";
   }
 }
 
+/** All recognized partition variable names (canonical + aliases). */
+const PARTITION_VAR_REGEX = /\{(user_id|room_id|channel_id|homeserver|space_id|server_id)\}/g;
+
 /**
  * Render a partition template (spec §3.5/§10) against a ctx. Known vars:
- * `{user_id}` / `{room_id}` / `{homeserver}` / `{space_id}`.
+ * `{user_id}` / `{channel_id}` (`{room_id}` alias) / `{homeserver}` /
+ * `{server_id}` (`{space_id}` alias). `{channel_id}` and `{server_id}` are the
+ * canonical cross-provider names; `{room_id}` and `{space_id}` remain valid aliases.
  */
 export function renderPartition(template: string, ctx: UserLimitContext): string {
-  return template.replace(/\{(user_id|room_id|homeserver|space_id)\}/g, (_m, key: string) =>
+  return template.replace(PARTITION_VAR_REGEX, (_m, key: string) =>
     resolvePartitionVar(key, ctx),
   );
 }
@@ -390,19 +403,19 @@ export function renderPartition(template: string, ctx: UserLimitContext): string
 /**
  * Render a partition AND report whether any of its template variables resolved to
  * empty (no value in the ctx). An empty *variable* means the pool it would key has
- * no real identity — e.g. `space:{space_id}` on a space-less room renders to the
- * bare prefix `"space:"`, which would otherwise pool every unrelated space-less
- * room into one bucket (#17). The caller skips such a shared-pool constraint
- * entirely (mirroring how an empty space *match* skips the rule), rather than
- * inventing a degenerate shared meter. A pure-literal partition (no variables) and
- * `{user_id}` (always present) never report `emptyVar`.
+ * no real identity — e.g. `space:{server_id}` on a channel with no server scope
+ * renders to the bare prefix `"space:"`, which would otherwise pool every unrelated
+ * server-less channel into one bucket (#17). The caller skips such a shared-pool
+ * constraint entirely (mirroring how an empty space *match* skips the rule), rather
+ * than inventing a degenerate shared meter. A pure-literal partition (no variables)
+ * and `{user_id}` (always present) never report `emptyVar`.
  */
 function renderPartitionChecked(
   template: string,
   ctx: UserLimitContext,
 ): { key: string; emptyVar: boolean } {
   let emptyVar = false;
-  const key = template.replace(/\{(user_id|room_id|homeserver|space_id)\}/g, (_m, varName: string) => {
+  const key = template.replace(PARTITION_VAR_REGEX, (_m, varName: string) => {
     const value = resolvePartitionVar(varName, ctx);
     if (value === "") emptyVar = true;
     return value;
@@ -425,9 +438,15 @@ export class UserLimitEngine {
   private readonly nearThreshold: number;
   private readonly tickMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
-  /** True when any rule references space (a `space` match or a `{space_id}` partition). */
+  /**
+   * True when any rule references space (a `space` match or a `{space_id}` / `{server_id}`
+   * partition). `{server_id}` is the canonical Discord alias for `{space_id}`.
+   */
   readonly usesSpace: boolean;
-  /** True when any rule references room (a `room` match or a `{room_id}` partition). */
+  /**
+   * True when any rule references room (a `room` match or a `{room_id}` / `{channel_id}`
+   * partition). `{channel_id}` is the canonical Discord alias for `{room_id}`.
+   */
   readonly usesRoom: boolean;
 
   constructor(private readonly options: UserLimitEngineOptions) {
@@ -436,12 +455,22 @@ export class UserLimitEngine {
     this.nearThreshold = Math.min(0.999, Math.max(0.001, options.nearThreshold ?? 0.8));
     this.tickMs = options.tickMs ?? 60_000;
     // Whether ANY rule needs the (costly) parent-space resolution at Gate A (§11) —
-    // a `space` match dimension or a `{space_id}` partition template.
+    // a `space` match dimension, or a `{space_id}` / `{server_id}` (Discord alias) partition.
     this.usesSpace = this.rules.some(
-      (r) => r.space !== undefined || r.constraints.some((c) => c.partition.includes("{space_id}")),
+      (r) =>
+        r.space !== undefined ||
+        r.constraints.some(
+          (c) => c.partition.includes("{space_id}") || c.partition.includes("{server_id}"),
+        ),
     );
+    // Whether ANY rule needs room-id resolution — a `room` match, or a `{room_id}` /
+    // `{channel_id}` (Discord alias) partition.
     this.usesRoom = this.rules.some(
-      (r) => r.room !== undefined || r.constraints.some((c) => c.partition.includes("{room_id}")),
+      (r) =>
+        r.room !== undefined ||
+        r.constraints.some(
+          (c) => c.partition.includes("{room_id}") || c.partition.includes("{channel_id}"),
+        ),
     );
   }
 

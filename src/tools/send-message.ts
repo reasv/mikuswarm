@@ -7,7 +7,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { IChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta } from "../types.js";
+import type { IChatProvider, CanonicalChatEvent, OutboundTarget, AttachmentMeta, SenderInfo } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { resolveWorkspacePath } from "./workspace.js";
 import { guardedFetch } from "./ssrf.js";
@@ -44,6 +44,23 @@ export interface SendMessageToolContext {
    * guard (tests).
    */
   isClaimedByOther?: (externalId: string) => { sessionId?: string } | undefined;
+}
+
+/**
+ * Resolve the sender identity to stamp on assistant outbound events (§6.3).
+ * Uses the provider's own self-identity when available; falls back to the
+ * historic synthetic sentinel `{ id: "mikuswarm" }` when getSelf is unavailable
+ * (provider not yet started, or accountId missing from the target).
+ */
+function resolveSelfSender(context: SendMessageToolContext): SenderInfo {
+  const accountId = context.target.accountId;
+  const self = accountId ? context.provider.getSelf(accountId) : undefined;
+  if (self) {
+    return { id: self.id, username: self.username, displayName: self.displayName, isSelf: true };
+  }
+  // Fallback: pre-Phase-3 sentinel; used when provider.start() hasn't set the
+  // identity yet or accountId is absent (should be impossible in practice).
+  return { id: "mikuswarm", displayName: "Miku", isSelf: true };
 }
 
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
@@ -172,7 +189,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             agentSessionId: context.agentSessionId,
             agentSessionGeneration: context.agentSessionGeneration,
             role: "assistant",
-            sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
+            sender: resolveSelfSender(context),
             body,
             htmlBody,
             timestamp: receipt.deliveredAt,
@@ -220,7 +237,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
             agentSessionId: context.agentSessionId,
             agentSessionGeneration: context.agentSessionGeneration,
             role: "assistant",
-            sender: { id: "mikuswarm", displayName: "Miku", isSelf: true },
+            sender: resolveSelfSender(context),
             body: chunks[i],
             timestamp: receipt.deliveredAt,
             receivedAt: Date.now(),

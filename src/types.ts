@@ -22,7 +22,20 @@ export type ChatRole = "user" | "assistant";
 export type TimelineState = "inactive" | "activating" | "active" | "backfilling";
 
 export interface SenderInfo {
+  /**
+   * Stable opaque key (MXID for Matrix, snowflake for Discord, …). Used for DB
+   * storage, trigger matching, and tool addressing only — never rendered directly
+   * as a human-facing label.
+   */
   id: string;
+  /**
+   * Stable-ish unique handle (e.g. Discord `@username`). Mutable over months but
+   * much slower to change than `displayName`. Rendered in place of `id` wherever
+   * a human-facing label is needed (`username ?? id`). Matrix leaves this unset
+   * (behaviour byte-identical to before it was added).
+   */
+  username?: string;
+  /** Room/guild-scoped nickname; freely mutable. Rendered when it differs from `username ?? id`. */
   displayName?: string;
   isSelf?: boolean;
 }
