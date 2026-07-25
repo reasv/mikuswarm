@@ -233,6 +233,8 @@ export class GapBackfetchCoordinator {
       const isDm = baseKind === "dm";
       // Use buildTimelineKey (shared grammar) rather than a template literal so
       // key construction goes through the same module as parsing.
+      // TODO(phase6): provider hardcoded to "matrix" here — GapBackfetchCoordinator
+      // is Matrix-specific; generalizing it is Phase 6 (spec §11.3).
       const baseTimelineKey = buildTimelineKey({
         provider: "matrix",
         accountId,
@@ -432,7 +434,10 @@ export class GapBackfetchCoordinator {
     const floor = room.floor;
 
     const onMessage = (summary: MatrixMessageSummary, timestamp: number): MessageDisposition => {
+      // Derive provider from the room's base timeline key (shared grammar, spec §4.2).
+      const provider = parseTimelineKey(room.baseTimelineKey)?.provider ?? "matrix";
       const classified = classifyForRoom(summary, {
+        provider,
         accountId: room.accountId,
         selfUserId: room.selfUserId,
         baseTimelineKey: room.baseTimelineKey,
@@ -616,12 +621,14 @@ export class GapBackfetchCoordinator {
     const edits = room.backfillBuf
       .filter((i): i is Extract<BufferItem, { kind: "edit" }> => i.kind === "edit")
       .sort((a, b) => a.editTimestamp - b.editTimestamp);
+    // Derive provider from the room's base timeline key (shared grammar, spec §4.2).
+    const editProvider = parseTimelineKey(room.baseTimelineKey)?.provider ?? "matrix";
     for (const ed of edits) {
       const targetKey =
-        this.opts.timeline.resolveEditTargetTimelineKey("matrix", ed.targetExternalId, room.baseTimelineKey) ??
+        this.opts.timeline.resolveEditTargetTimelineKey(editProvider, ed.targetExternalId, room.baseTimelineKey) ??
         room.baseTimelineKey;
       const res = await this.opts.timeline.applyEdit(
-        "matrix",
+        editProvider,
         ed.targetExternalId,
         targetKey,
         ed.replacement,

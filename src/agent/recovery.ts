@@ -663,13 +663,13 @@ export function createManualResumeSession(
         if (senderId === selfUserId) sender.isSelf = true;
         const now = Date.now();
         const inbound: InboundChatEvent = {
-          provider: "matrix",
+          provider: parsed.provider,
           timelineKey: row.timeline_key,
           event: {
             id: row.trigger_event_id ?? `resume-${sessionId}`,
             externalId: row.trigger_external_id ?? undefined,
             timelineKey: row.timeline_key,
-            provider: "matrix",
+            provider: parsed.provider,
             role: "user",
             sender,
             body: row.trigger_body ?? "",
@@ -677,10 +677,10 @@ export function createManualResumeSession(
             receivedAt: now,
           },
           outboundTarget: {
-            provider: "matrix",
+            provider: parsed.provider,
             timelineKey: row.timeline_key,
             accountId: parsed.accountId,
-            roomId: parsed.channelId, // channelId = Matrix room id for this provider
+            roomId: parsed.channelId,
             threadId: parsed.threadId,
           },
         };

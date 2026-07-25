@@ -367,6 +367,63 @@ The provider delivers **every** message through `host.onEvent`. It flags message
 
 A `[discord]` config block is validated at startup (peer of `[matrix]`; schema: `enabled`, `trigger_hold_ms`, `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`) but not yet consumed — the Discord provider is Phase 3+. `enabled = false` is the default.
 
+### Provider registry
+
+`startMikuAgent` builds a `Map<string, IChatProvider>` keyed by provider id (`"matrix"`, `"discord"`, …) from config:
+
+- `MatrixProvider` is constructed and registered as `"matrix"` iff `config.matrix.enabled !== false`. If the `opts.providers` seam is supplied (test injection path — `StartMikuAgentOptions`), it replaces the config-derived map entirely; this lets tests inject a fake provider without touching the Matrix SDK.
+- **Zero-provider guard**: if the final registry is empty after construction (and after seam injection), `startMikuAgent` throws `"no enabled chat provider"` immediately — before any pool, storage, or validation step. This is a fatal config error; at least one provider must be enabled at startup.
+- At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers receive a generic host that wires `onEvent` and `onError` without Matrix-typed callbacks.
+- On `runtime.stop()`, every registered provider's `stop()` is called in registry iteration order.
+
+### Outbound send routing
+
+All best-effort (fire-and-forget) outbound sends from `app.ts` — user-admission refusals, failure notices, and budget-limit refusals — route through `sendViaProvider` (`src/timeline/send.ts`). This helper:
+
+1. **Looks up the provider** from the registry by `target.provider`.
+2. **If the provider is missing**, emits a structured `outbound_send_dropped_missing_provider` warn (fields: `site`, `targetProvider`, `timelineKey`) and returns — the previous `?.send(...)` pattern silently dropped the message AND skipped the `.catch`.
+3. **If found**, fires the send and invokes the per-site `onFailure` callback on rejection, preserving each site's existing log event name and session-id field exactly (`user_limit_rejection_send_failed`, `failure_notice_send_failed`, `usage_limit_rejection_send_failed`).
+
+`buildSessionTools` (the tool-set builder called at session launch and resume) similarly performs an explicit registry lookup for the session's provider. A missing provider is an impossible state once all callers embed `target.provider` correctly — rather than silently falling through to a wrong provider, it throws `"session <id>: provider \"<id>\" is not registered — cannot build send_message tool"`. This preserves Matrix sessions' byte-identical behavior (Matrix is always registered when matrix is enabled) while making unregistered-provider sessions fail loudly at tool-build time.
+
+### Matrix provider narrowing
+
+`MatrixProvider` exposes Matrix-specific methods (`getClient`, `getEnrichmentCapabilities`) not present on `IChatProvider`. These are only called from Matrix-specific paths gated on a runtime `instanceof` narrowing:
+
+```ts
+const matrixProvider: MatrixProvider | undefined = (() => {
+  const p = providers.get("matrix");
+  return p instanceof MatrixProvider ? p : undefined;
+})();
+```
+
+This narrowing is the **single** `instanceof` check site. All Matrix-only subsystems (initial backfill, gap backfetch, message backfetch, redecryption sweeper, channel context/label resolver, enrichment capabilities, room-members tool, set_profile tool, emoji/react/pin/poll/read tools) gate on `matrixProvider` being non-null before using it. When `matrixProvider` is `undefined` (no Matrix in the registry), those subsystems are silently absent; the rest of the runtime operates normally.
+
+### buildMatrixHost — cast site documentation
+
+`buildMatrixHost()` (inner function in `startMikuAgent`) is the **single documented as-cast site** for Matrix-specific event payload narrowings (three casts total, annotated "Cast 1/2/3 of 3"):
+
+- **Cast 1** — `ProviderLifecycleEvent` (= `unknown`) → `Exclude<MatrixNativeEvent, inbound|reaction>` in `onNativeEvent`
+- **Cast 2** — `ReactionStreamEvent` → `MatrixReactionStreamEvent` in `onReaction`
+- **Cast 3** — `unknown` → `ReturnType<MatrixNativeClient["start"]>` in `onDiagnostics`
+
+These casts are safe because `MatrixProvider.start()` ONLY calls these callbacks with the corresponding Matrix-specific types. A runtime provider-id guard at the start call (only `"matrix"` providers receive this host) provides defence in depth.
+
+### Per-provider capability wiring
+
+At startup, enrichment capabilities are wired for every registered provider using `IChatProvider.enrichment()` (not the Matrix-specific `getEnrichmentCapabilities`):
+
+```ts
+for (const p of providers.values()) {
+  for (const accountId of p.accountIds()) {
+    const caps = p.enrichment(accountId);
+    if (caps) enrichmentPool.options.providerCapabilities.set(`${p.id}:${accountId}`, caps);
+  }
+}
+```
+
+Capability keys are `<provider-id>:<account-id>` (e.g. `"matrix:acct1"`). This loop runs automatically for all registered providers without Matrix-specific branching.
+
 ### Canonical event model
 
 All providers normalize events to `CanonicalChatEvent`:

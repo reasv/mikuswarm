@@ -465,23 +465,24 @@ export class ProactiveScheduler {
       });
       return null;
     }
-    // NOTE: config.matrix.accounts lookup stays for Phase 1; Phase 2 moves it to
-    // provider.getSelf(accountId) via the registry.
+    // TODO(phase3): selfUserId lookup will move to provider.getSelf(accountId)
+    // via the registry (spec §6.3). For now, config.matrix.accounts is the only
+    // source for Matrix deployments (identity-related reads are Phase 3 scope).
     const selfUserId = this.options.config.matrix.accounts[parsed.accountId]?.user_id;
     if (!selfUserId) return null;
     const self: SenderInfo = { id: selfUserId, isSelf: true };
     const target: OutboundTarget = {
-      provider: "matrix",
+      provider: parsed.provider,
       timelineKey,
       accountId: parsed.accountId,
-      roomId: parsed.channelId, // channelId = Matrix room id for this provider
+      roomId: parsed.channelId,
       threadId: parsed.threadId,
     };
     const trigger: TriggerInfo = { type: "timer", reason: "proactive", triggeredBy: self };
     const event: CanonicalChatEvent = {
       id: `proactive-${nanoid(10)}`,
       timelineKey,
-      provider: "matrix",
+      provider: parsed.provider,
       role: "user",
       sender: self,
       body: "",
@@ -489,6 +490,6 @@ export class ProactiveScheduler {
       receivedAt: now,
       trigger,
     };
-    return { provider: "matrix", timelineKey, event, trigger, outboundTarget: target };
+    return { provider: parsed.provider, timelineKey, event, trigger, outboundTarget: target };
   }
 }

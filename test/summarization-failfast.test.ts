@@ -4,13 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
-import { startMikuAgent } from "../src/app.js";
+import { startMikuAgent, type StartMikuAgentOptions } from "../src/app.js";
+import { makeFakeProvider } from "./helpers/fake-provider.js";
+
+function fakeProviderOpts(): StartMikuAgentOptions {
+  return { providers: new Map([["fake", makeFakeProvider().provider]]) };
+}
 
 // A complete, env-free config that reaches startMikuAgent's summarization fail-fast
-// block (the symmetric sibling of the diary #3 check). Matrix is disabled
-// (provider.start is a no-op) and diary is disabled, so the only runtime-level
-// validation exercised is the summarization one. The summarize/condense session
-// types are appended per-test to vary their `tools` allowlists.
+// block (the symmetric sibling of the diary #3 check). Matrix is disabled and diary
+// is disabled, so the only runtime-level validation exercised is the summarization
+// one. The summarize/condense session types are appended per-test to vary their
+// `tools` allowlists.
 const BASE_CONFIG = (workspaceRoot: string) => `
 [app]
 name = "mikuswarm"
@@ -96,7 +101,7 @@ tools = ["summary_tool"]
 `;
   await withWorkspace(block, async (config) => {
     await assert.rejects(
-      () => startMikuAgent(config),
+      () => startMikuAgent(config, fakeProviderOpts()),
       /summary_tool/,
       "a summarize allowlist without summary_tool must fail-fast at startup",
     );
@@ -115,7 +120,7 @@ tools = ["search_memory"]
 `;
   await withWorkspace(block, async (config) => {
     await assert.rejects(
-      () => startMikuAgent(config),
+      () => startMikuAgent(config, fakeProviderOpts()),
       /summary_tool/,
       "a condense allowlist without summary_tool must fail-fast at startup",
     );
@@ -137,7 +142,7 @@ tools = ["summary_tool"]
   await withWorkspace(block, async (config) => {
     let runtime: Awaited<ReturnType<typeof startMikuAgent>> | undefined;
     try {
-      runtime = await startMikuAgent(config);
+      runtime = await startMikuAgent(config, fakeProviderOpts());
     } catch (error) {
       assert.doesNotMatch(
         error instanceof Error ? error.message : String(error),

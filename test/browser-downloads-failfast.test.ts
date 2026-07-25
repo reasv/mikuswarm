@@ -4,13 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
-import { startMikuAgent } from "../src/app.js";
+import { startMikuAgent, type StartMikuAgentOptions } from "../src/app.js";
+import { makeFakeProvider } from "./helpers/fake-provider.js";
+
+function fakeProviderOpts(): StartMikuAgentOptions {
+  return { providers: new Map([["fake", makeFakeProvider().provider]]) };
+}
 
 // Startup fail-fast for the browser-download staging config (issues #1 and #13).
 // A complete, env-free config that reaches startMikuAgent's `[browser]` download
-// validation block. Matrix is disabled (provider.start is a no-op) and the worker
-// pools are disabled, so the [browser] block is the validation under test. The
-// download keys are appended per-test.
+// validation block. Matrix is disabled and the worker pools are disabled, so the
+// [browser] block is the validation under test. The download keys are appended
+// per-test.
 //
 // Covers the cross-field "must be set together" check (issue #21), #1's
 // writability/deletability probe, and #13's absolute-path requirement.
@@ -106,7 +111,7 @@ downloads_local_dir = "${path.join(os.tmpdir(), "miku-dl-staging-rel")}"
 `;
   await withConfig(block, async (config) => {
     await assert.rejects(
-      () => startMikuAgent(config),
+      () => startMikuAgent(config, fakeProviderOpts()),
       /downloads_dir.*must be an absolute path/,
       "a relative downloads_dir must fail-fast at startup",
     );
@@ -118,7 +123,7 @@ test("startup rejects downloads_dir set WITHOUT downloads_local_dir (issue #21 c
   // pair describes ONE shared staging volume from two containers' viewpoints.
   await withConfig(`downloads_dir = "/downloads"\n`, async (config) => {
     await assert.rejects(
-      () => startMikuAgent(config),
+      () => startMikuAgent(config, fakeProviderOpts()),
       /must be set together/,
       "downloads_dir alone must fail-fast at startup",
     );
@@ -130,7 +135,7 @@ test("startup rejects downloads_local_dir set WITHOUT downloads_dir (issue #21 c
     `downloads_local_dir = "${path.join(os.tmpdir(), "miku-dl-staging-lonely")}"\n`,
     async (config) => {
       await assert.rejects(
-        () => startMikuAgent(config),
+        () => startMikuAgent(config, fakeProviderOpts()),
         /must be set together/,
         "downloads_local_dir alone must fail-fast at startup",
       );
@@ -147,7 +152,7 @@ test("startup accepts NEITHER key set — browser downloads disabled, no cross-f
   await withConfig("", async (config) => {
     let runtime: Awaited<ReturnType<typeof startMikuAgent>> | undefined;
     try {
-      runtime = await startMikuAgent(config);
+      runtime = await startMikuAgent(config, fakeProviderOpts());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       assert.doesNotMatch(message, /must be set together/, "neither key set must pass the cross-field check");
@@ -172,7 +177,7 @@ downloads_local_dir = "${path.join(os.tmpdir(), "miku-dl-staging-ok")}"
     async (config) => {
       let runtime: Awaited<ReturnType<typeof startMikuAgent>> | undefined;
       try {
-        runtime = await startMikuAgent(config);
+        runtime = await startMikuAgent(config, fakeProviderOpts());
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         assert.doesNotMatch(message, /must be an absolute path/, "absolute downloads_dir must pass #13");
@@ -198,7 +203,7 @@ test("startup probe fails fast when the staging dir is not writable+deletable (i
     (config.browser as { downloads_local_dir?: string }).downloads_local_dir = staging;
     try {
       await assert.rejects(
-        () => startMikuAgent(config),
+        () => startMikuAgent(config, fakeProviderOpts()),
         /not writable\+deletable/,
         "a non-writable+deletable staging dir must fail the startup probe",
       );

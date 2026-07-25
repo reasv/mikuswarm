@@ -20,6 +20,8 @@ export type ClassifiedSummary =
     };
 
 interface CommonContext {
+  /** Provider id (e.g. "matrix") — placed on every reconstructed event. */
+  provider: string;
   accountId: string;
   selfUserId: string;
   timestamp: number;
@@ -59,10 +61,12 @@ function buildEvent(
 ): CanonicalChatEvent {
   const isSelf = summary.sender === ctx.selfUserId;
   return {
+    // TODO(phase6): event id format is Matrix-specific; classify.ts will receive
+    // an injected id-constructor once HistoryClient is generalized (spec §11.3).
     id: `matrix:${ctx.accountId}:${summary.eventId}`,
     externalId: summary.eventId,
     timelineKey,
-    provider: "matrix",
+    provider: ctx.provider,
     role: isSelf ? "assistant" : "user",
     sender: { id: summary.sender, displayName: summary.senderName, isSelf },
     body: summary.body,
@@ -84,10 +88,12 @@ function buildUtdEvent(
 ): CanonicalChatEvent {
   const isSelf = summary.sender === ctx.selfUserId;
   return {
+    // TODO(phase6): event id format is Matrix-specific; classify.ts will receive
+    // an injected id-constructor once HistoryClient is generalized (spec §11.3).
     id: `matrix:${ctx.accountId}:${summary.eventId}`,
     externalId: summary.eventId,
     timelineKey: roomTimelineKey,
-    provider: "matrix",
+    provider: ctx.provider,
     role: isSelf ? "assistant" : "user",
     sender: { id: summary.sender, displayName: summary.senderName, isSelf },
     body: summary.body,

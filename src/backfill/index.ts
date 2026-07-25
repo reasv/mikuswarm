@@ -5,6 +5,7 @@ import { applyEditToCanonical, editStatus } from "../timeline/index.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { classifyForTimeline } from "./classify.js";
 import { paginateBackward, type BackfillReadClient, type MessageDisposition } from "./paginate.js";
+import { parseTimelineKey } from "../storage/timeline-key.js";
 
 export type { BackfillReadClient } from "./paginate.js";
 export { BackfillTimeoutError } from "./paginate.js";
@@ -113,6 +114,8 @@ export async function performInitialBackfill(
 ): Promise<InitialBackfillResult> {
   const { client, store, timelineKey, roomId, accountId, selfUserId, maxMessages, windowMs, logger } =
     options;
+  // Derive provider from the timeline key (shared grammar parser, spec §4.2).
+  const provider = parseTimelineKey(timelineKey)?.provider ?? "matrix";
 
   if (maxMessages <= 0) {
     return {
@@ -140,6 +143,7 @@ export async function performInitialBackfill(
     timestamp: number,
   ): Promise<MessageDisposition> => {
     const classified = classifyForTimeline(summary, {
+      provider,
       accountId,
       selfUserId,
       timelineKey,
@@ -156,7 +160,7 @@ export async function performInitialBackfill(
     if (classified.kind === "edit") {
       const { replacement, targetExternalId } = classified;
       const editResult = await store.applyEdit(
-        "matrix",
+        provider,
         targetExternalId,
         timelineKey,
         replacement,
