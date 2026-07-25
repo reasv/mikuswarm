@@ -4,6 +4,8 @@ import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { formatAgentTimestamp } from "../time/index.js";
+import type { ProviderTerminology } from "../types.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 // ---------------------------------------------------------------------------
 // Context
@@ -20,6 +22,8 @@ export interface UserProfileToolContext {
    */
   senderUsername?: string;
   senderDisplayName?: string;
+  /** Provider terminology — drives the senderId parameter description. */
+  terminology?: ProviderTerminology;
   config?: {
     root_dir?: string;
     default_excerpt_chars?: number;
@@ -157,31 +161,41 @@ async function withProfileWriteLock<T>(canonicalPath: string, task: () => Promis
 // Parameter schemas
 // ---------------------------------------------------------------------------
 
-const TargetSchema = Type.Optional(
-  Type.Object(
+/**
+ * Build the `target` sub-schema with a provider-aware senderId hint.
+ * Called inside each factory function so the description reflects the
+ * active terminology bundle. Matrix callers get the pre-Phase-8 string
+ * byte-identical ("Stable provider sender id, for example a Matrix mxid.").
+ */
+function buildTargetSchema(senderIdHint: string) {
+  return Type.Optional(
+    Type.Object(
+      {
+        mode: Type.Optional(Type.Union([Type.Literal("requester"), Type.Literal("explicit")])),
+        provider: Type.Optional(Type.String({ description: "Provider id such as matrix, discord, or telegram." })),
+        senderId: Type.Optional(Type.String({ description: `Stable provider sender id, ${senderIdHint}.` })),
+        username: Type.Optional(Type.String({ description: "Optional username/localpart hint for readability metadata." })),
+        displayName: Type.Optional(Type.String({ description: "Optional display-name hint for metadata." })),
+      },
+      { additionalProperties: false },
+    ),
+  );
+}
+
+function buildUserProfileReadSchema(senderIdHint: string) {
+  return Type.Object(
     {
-      mode: Type.Optional(Type.Union([Type.Literal("requester"), Type.Literal("explicit")])),
-      provider: Type.Optional(Type.String({ description: "Provider id such as matrix, discord, or telegram." })),
-      senderId: Type.Optional(Type.String({ description: "Stable provider sender id, for example a Matrix mxid." })),
-      username: Type.Optional(Type.String({ description: "Optional username/localpart hint for readability metadata." })),
-      displayName: Type.Optional(Type.String({ description: "Optional display-name hint for metadata." })),
+      target: buildTargetSchema(senderIdHint),
+      view: Type.Optional(
+        Type.Union([Type.Literal("exists"), Type.Literal("summary"), Type.Literal("excerpt")]),
+      ),
+      section: Type.Optional(Type.String({ description: "Section heading to read for excerpt mode." })),
+      maxChars: Type.Optional(Type.Integer({ minimum: 1 })),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
     },
     { additionalProperties: false },
-  ),
-);
-
-const UserProfileReadSchema = Type.Object(
-  {
-    target: TargetSchema,
-    view: Type.Optional(
-      Type.Union([Type.Literal("exists"), Type.Literal("summary"), Type.Literal("excerpt")]),
-    ),
-    section: Type.Optional(Type.String({ description: "Section heading to read for excerpt mode." })),
-    maxChars: Type.Optional(Type.Integer({ minimum: 1 })),
-    offset: Type.Optional(Type.Integer({ minimum: 0 })),
-  },
-  { additionalProperties: false },
-);
+  );
+}
 
 const EditOperationSchema = Type.Union([
   Type.Object(
@@ -227,14 +241,16 @@ const EditOperationSchema = Type.Union([
   ),
 ]);
 
-const UserProfileEditSchema = Type.Object(
-  {
-    target: TargetSchema,
-    createIfMissing: Type.Optional(Type.Boolean()),
-    operations: Type.Array(EditOperationSchema),
-  },
-  { additionalProperties: false },
-);
+function buildUserProfileEditSchema(senderIdHint: string) {
+  return Type.Object(
+    {
+      target: buildTargetSchema(senderIdHint),
+      createIfMissing: Type.Optional(Type.Boolean()),
+      operations: Type.Array(EditOperationSchema),
+    },
+    { additionalProperties: false },
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Factory functions
@@ -242,13 +258,14 @@ const UserProfileEditSchema = Type.Object(
 
 export function createUserProfileReadTool(context: UserProfileToolContext): AgentTool {
   validateUserProfileExcerptBounds(context);
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "user_profile_read",
     label: "User Profile Read",
     description:
       "Read file-backed per-user profiles from the workspace without guessing filenames. " +
       "By default this resolves to the current requester from trusted runtime context, but it can also target another explicit provider/sender id pair.",
-    parameters: UserProfileReadSchema,
+    parameters: buildUserProfileReadSchema(t.senderIdHint),
     execute: async (_toolCallId, rawParams) =>
       executeUserProfileRead({
         context,
@@ -259,13 +276,14 @@ export function createUserProfileReadTool(context: UserProfileToolContext): Agen
 
 export function createUserProfileEditTool(context: UserProfileToolContext): AgentTool {
   validateUserProfileExcerptBounds(context);
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "user_profile_edit",
     label: "User Profile Edit",
     description:
       "Create or update file-backed per-user profiles with patch-style operations instead of manual filename guessing and freeform markdown edits. " +
       "Defaults to the current requester from trusted runtime context, but explicit cross-user targets are also supported.",
-    parameters: UserProfileEditSchema,
+    parameters: buildUserProfileEditSchema(t.senderIdHint),
     execute: async (_toolCallId, rawParams) =>
       executeUserProfileEdit({
         context,

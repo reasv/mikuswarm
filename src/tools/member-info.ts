@@ -42,7 +42,7 @@ export function createMemberInfoTool(context: MemberInfoToolContext): AgentTool 
         if (info.avatarUrl) lines.push(`Avatar: ${info.avatarUrl}`);
         if (info.membership) lines.push(`Membership: ${info.membership}`);
         if (info.isSelf) lines.push(`(this is you)`);
-        if (info.isDirect) lines.push(`DM room: yes`);
+        if (info.isDirect) lines.push(`DM ${t.channelNoun}: yes`);
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],

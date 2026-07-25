@@ -8,7 +8,7 @@ Last updated: 2026-05-27.
 
 ## 1. Background
 
-MikuSwarm is a bespoke Matrix chatbot built on `@earendil-works/pi-agent-core` — the minimal agentic loop library.
+MikuSwarm is a multi-provider chatbot (Matrix, Discord) built on `@earendil-works/pi-agent-core` — the minimal agentic loop library.
 
 The core thesis is a conceptual shift about what an agent *is* in a chatroom. Most agent runtimes (OpenClaw among them) are built for back-and-forth assistant interactions with a single user, where the **session is the conversation**: one long-lived agentic loop that owns the dialogue from turn to turn. That model fits an assistant; it does not fit a shared, busy, many-user room, where dozens of overlapping conversations happen at once and no single loop can coherently own them all.
 
@@ -397,12 +397,12 @@ Optional return payloads: `react` returns the resolved display string the platfo
 `ProviderTerminology` (`src/types.ts`) is a struct of provider-specific vocabulary strings used to construct tool description text:
 
 ```ts
-{ messageIdFmt, userIdFmt, channelNoun, providerName, mentionNote }
+{ messageIdFmt, userIdFmt, channelNoun, providerName, mentionNote, senderIdHint, coReplyIdDescription, coReplyIdRequiredError }
 ```
 
-`MATRIX_TERMINOLOGY` (`src/tools/terminology.ts`) substitutes the exact strings that the Matrix tool schemas have always shown, so the model's vocabulary is unchanged after Phase 4. `DISCORD_TERMINOLOGY` is defined for Phase 7.
+`MATRIX_TERMINOLOGY` (`src/tools/terminology.ts`) substitutes the exact strings that the Matrix tool schemas have always shown, so the model's vocabulary is unchanged after Phase 4. `DISCORD_TERMINOLOGY` provides the Discord-native equivalents.
 
-`buildSessionTools` passes `MATRIX_TERMINOLOGY` to all 11 channel-scoped tools and to `send_message`. When a Discord session provider is registered in Phase 7, the wiring will substitute `DISCORD_TERMINOLOGY`.
+`buildSessionTools` selects the bundle from `target.provider` (`DISCORD_TERMINOLOGY` for `"discord"`, `MATRIX_TERMINOLOGY` otherwise) and passes it to all 12 provider-aware tools — the 11 `ChannelClient`-gated tools (emoji_list, react, edit_message, delete_message, pins, list_reactions, read_messages, member_info, channel_info, create_poll, poll_vote) plus `send_message`. The `user_profile_read`, `user_profile_edit`, and `spawn_session` tools also receive the bundle (for provider-specific description strings). All Matrix tool schemas are byte-identical to their pre-Phase-4 values.
 
 `send_message` parameter schema adapts to `ProviderCapabilities`:
 - `html` parameter: present iff `capabilities.formatting === "html"` (Matrix: always included)

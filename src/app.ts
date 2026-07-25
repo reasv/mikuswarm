@@ -111,6 +111,7 @@ import {
   GrokResultCache,
   createFindSourceTool,
   MATRIX_TERMINOLOGY,
+  DISCORD_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -871,9 +872,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         },
         onSelfResolved(accountId, selfId) {
           // Add Discord self-id to the budget engine's exclusion set and the
-          // backfetch coordinators' accountId→selfUserId maps (spec §6.3 /
-          // TODO(phase7) sites in app.ts). These sets/maps are already wired
-          // into the coordinators and UserLimitEngine by reference.
+          // backfetch coordinators' accountId→selfUserId maps (spec §6.3).
+          // These sets/maps are already wired into the coordinators and
+          // UserLimitEngine by reference.
           botSelfIdsForLimits.add(selfId);
           gapBackfetchSelfIds.set(accountId, selfId);
         },
@@ -1137,7 +1138,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // mutable Set at READY time via the Discord provider's onSelfResolved callback,
         // which fires after provider.start() and before any live events arrive.
         // Because UserLimitEngine stores the options object by reference, mutations
-        // to this Set are visible to isEnforceableUser() (spec §6.3 / TODO(phase7)).
+        // to this Set are visible to isEnforceableUser() (spec §6.3).
         selfUserIds: botSelfIdsForLimits,
         logger: logger.child("user-limits"),
       });
@@ -3408,9 +3409,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // disappear when the target has no resolvable channel (e.g. a DM that didn't
     // parse correctly, or a provider that hasn't implemented channelClient yet).
     const channelClient = sessionProvider.channelClient(target);
-    // Terminology bundle for provider-aware tool description strings. Phase 4 only
-    // has Matrix; Phase 7 will wire the Discord bundle via the provider.
-    const terminology = MATRIX_TERMINOLOGY;
+    // Terminology bundle for provider-aware tool description strings (spec §7.1).
+    // Matrix keeps its pre-Phase-4 strings byte-identical; Discord gets its own bundle.
+    const terminology = target.provider === "discord" ? DISCORD_TERMINOLOGY : MATRIX_TERMINOLOGY;
     // Per-provider capabilities — used for individual tool gates below (spec §7.1/§3.3).
     const caps = sessionProvider.capabilities;
 
@@ -3469,6 +3470,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // into it can be spun off.
       createSpawnSessionTool({
         spawnCoReply: (messageId) => spawnCoReplySession(messageId, sessionId),
+        terminology,
       }),
       // Channel-scoped tools — outer gate: provider must return a ChannelClient for
       // the session target. Inner gates: per-capability flags (spec §7.1/§3.3).
@@ -3693,6 +3695,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
         senderDisplayName: (inbound.trigger?.triggeredBy ?? inbound.event.sender).displayName,
+        terminology,
         config: config.user_profiles,
       }),
       createUserProfileEditTool({
@@ -3701,6 +3704,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
         senderDisplayName: (inbound.trigger?.triggeredBy ?? inbound.event.sender).displayName,
+        terminology,
         config: config.user_profiles,
       }),
       createCharacterCardCreateTool({ workspaceRoot, fetchClient, downloadSizeLimit, config: config.character_card }),

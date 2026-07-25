@@ -31,7 +31,9 @@ import { createPollVoteTool } from "../src/tools/poll-vote.js";
 import { createReactTool } from "../src/tools/react.js";
 import { createReadMessagesTool } from "../src/tools/read-messages.js";
 import { createSendMessageTool, type SendMessageToolContext } from "../src/tools/send-message.js";
+import { createSpawnSessionTool } from "../src/tools/spawn-session.js";
 import { MATRIX_TERMINOLOGY } from "../src/tools/terminology.js";
+import { createUserProfileEditTool, createUserProfileReadTool, type UserProfileToolContext } from "../src/tools/user-profile.js";
 import type {
   ChannelClient,
   EmojiEntry,
@@ -431,5 +433,140 @@ test("channel_info execute output for DM matches frozen HEAD format", async () =
       "Type: DM",
       "Joined: yes",
     ].join("\n"),
+  );
+});
+
+// ── M2f: emoji_list frozen strings (parameter description + empty-list message) ──
+
+test("emoji_list room_id parameter description with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", () => {
+  const tool = createEmojiListTool({ channelClient: STUB_CHANNEL_CLIENT, terminology: MATRIX_TERMINOLOGY });
+  const params = tool.parameters as { properties: Record<string, { description?: string }> };
+  assert.strictEqual(
+    params.properties["room_id"]?.description,
+    "Room ID to list emoji for. Defaults to the current room.",
+    "emoji_list room_id description must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+test("emoji_list empty-list execute output with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", async () => {
+  const emptyClient: ChannelClient = {
+    ...STUB_CHANNEL_CLIENT,
+    async emojiList(): Promise<EmojiEntry[]> { return []; },
+  };
+  const tool = createEmojiListTool({ channelClient: emptyClient, terminology: MATRIX_TERMINOLOGY });
+  const result = await tool.execute("call-emoji-1", {});
+  const text = result.content.find((c) => c.type === "text")?.text;
+  assert.strictEqual(
+    text,
+    "No custom emoji found for this room.",
+    "emoji_list empty-list message must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+// ── M2g: react not-found error frozen string ──────────────────────────────────
+
+test("react not-found error text with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", async () => {
+  const throwingClient: ChannelClient = {
+    ...STUB_CHANNEL_CLIENT,
+    async react() {
+      throw new Error("not found in this room");
+    },
+  };
+  const tool = createReactTool({ channelClient: throwingClient, terminology: MATRIX_TERMINOLOGY });
+  const result = await tool.execute("call-react-1", { message_id: "$abc123:example.com", emoji: "👍" });
+  const text = result.content.find((c) => c.type === "text")?.text;
+  assert.strictEqual(
+    text,
+    `error: message_id "$abc123:example.com" not found in this room. Use a valid event ID from the conversation context.`,
+    "react not-found error must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+// ── M2h: member_info DM output line frozen string ─────────────────────────────
+
+test("member_info DM room line with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", async () => {
+  const dmClient: ChannelClient = {
+    ...STUB_CHANNEL_CLIENT,
+    async memberInfo() {
+      return {
+        userId: "@alice:example.com",
+        isDirect: true,
+      };
+    },
+  };
+  const tool = createMemberInfoTool({ channelClient: dmClient, terminology: MATRIX_TERMINOLOGY });
+  const result = await tool.execute("call-member-1", { user_id: "@alice:example.com" });
+  const text = result.content.find((c) => c.type === "text")?.text;
+  assert.strictEqual(
+    text,
+    ["User: @alice:example.com", "DM room: yes"].join("\n"),
+    "member_info DM output must include 'DM room: yes' byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+// ── M2i: user_profile_read / user_profile_edit senderId parameter description ──
+
+const STUB_USER_PROFILE_CTX: UserProfileToolContext = {
+  workspaceRoot: "/tmp/test-workspace",
+  provider: "matrix",
+  senderId: "@alice:example.com",
+  terminology: MATRIX_TERMINOLOGY,
+};
+
+test("user_profile_read senderId parameter description with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", () => {
+  const tool = createUserProfileReadTool(STUB_USER_PROFILE_CTX);
+  // parameters: Type.Object({ target: Type.Optional(Type.Object({ senderId: Type.Optional(Type.String({...})) })) })
+  // TypeBox Optional does not alter the JSON Schema structure, so the path is straightforward.
+  const paramsSchema = tool.parameters as {
+    properties: Record<string, { properties?: Record<string, { description?: string }> }>;
+  };
+  const description = paramsSchema.properties["target"]?.properties?.["senderId"]?.description;
+  assert.strictEqual(
+    description,
+    "Stable provider sender id, for example a Matrix mxid.",
+    "user_profile_read senderId description must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+test("user_profile_edit senderId parameter description with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", () => {
+  const tool = createUserProfileEditTool(STUB_USER_PROFILE_CTX);
+  const paramsSchema = tool.parameters as {
+    properties: Record<string, { properties?: Record<string, { description?: string }> }>;
+  };
+  const description = paramsSchema.properties["target"]?.properties?.["senderId"]?.description;
+  assert.strictEqual(
+    description,
+    "Stable provider sender id, for example a Matrix mxid.",
+    "user_profile_edit senderId description must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+// ── M2j: spawn_session message_id description + required-error frozen strings ──
+
+test("spawn_session message_id description with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", () => {
+  const tool = createSpawnSessionTool({
+    spawnCoReply: async () => ({ status: "spawned" }),
+    terminology: MATRIX_TERMINOLOGY,
+  });
+  const params = tool.parameters as { properties: Record<string, { description?: string }> };
+  assert.strictEqual(
+    params.properties["message_id"]?.description,
+    "The Matrix event id ($…) of the co-reply message to spin off, as given in the co-reply interjection.",
+    "spawn_session message_id description must be byte-identical to the pre-Phase-8 Matrix baseline",
+  );
+});
+
+test("spawn_session required-error text with MATRIX_TERMINOLOGY is byte-identical to pre-Phase-8", async () => {
+  const tool = createSpawnSessionTool({
+    spawnCoReply: async () => ({ status: "spawned" }),
+    terminology: MATRIX_TERMINOLOGY,
+  });
+  // Pass an empty string to trigger the required-error path.
+  const result = await tool.execute("call-spawn-1", { message_id: "" });
+  const text = result.content.find((c) => c.type === "text")?.text;
+  assert.strictEqual(
+    text,
+    "error: message_id is required (the $… event id from the co-reply interjection).",
+    "spawn_session required-error must be byte-identical to the pre-Phase-8 Matrix baseline",
   );
 });

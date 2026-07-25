@@ -179,7 +179,7 @@ export interface DiscordProviderCallbacks {
    * Called when a Discord account's READY event fires and `self` is resolved.
    * Allows app.ts to add the Discord self-id to the selfUserIds budget set and
    * the gapBackfetchSelfIds map — both of which are built before provider.start()
-   * and cannot include Discord ids until after READY (spec §6.3 / TODO(phase7)).
+   * and cannot include Discord ids until after READY (spec §6.3).
    */
   onSelfResolved?(accountId: string, selfId: string): void;
 }

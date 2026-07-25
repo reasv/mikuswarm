@@ -23,6 +23,46 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Added
+
+- **Discord provider**: first-class Discord support. A `[discord]` config block
+  (peer of `[matrix]`, default `enabled = false`) wires one or more Discord bot
+  accounts. All user-facing behaviour — trigger detection, context assembly, tool
+  calls, memory, enrichment, reactions, polls, history backfetch, proactive
+  posting, budget enforcement, and the observability console — works across both
+  providers without provider-specific code paths in the agent layer.
+
+- **Cross-provider `ChannelClient` interface**: all channel-scoped tools
+  (`channel_info`, `member_info`, `emoji_list`, `react`, `list_reactions`,
+  `edit_message`, `delete_message`, `pins`, `read_messages`, `create_poll`,
+  `poll_vote`) now dispatch through a provider-neutral `ChannelClient` obtained
+  from the session's registered `IChatProvider`. Matrix behaviour is byte-identical
+  to before.
+
+- **Provider-aware tool descriptions**: a `ProviderTerminology` bundle drives
+  parameter descriptions in all 12 provider-aware tools. Discord sessions see
+  Discord-native vocabulary (channel, snowflake ID, etc.); Matrix sessions remain
+  byte-identical to their pre-Discord strings.
+
+- **Discord voice messages**: the agent can send ogg/opus voice messages to
+  Discord channels (transcoded from arbitrary audio via ffmpeg), matching the
+  existing Matrix voice-message capability.
+
+- **Discord polls**: `create_poll` is supported on Discord channels
+  (`capabilities.pollCreate = true`). `poll_vote` is not available on Discord
+  because Discord has no bot vote endpoint.
+
+- **Discord history backfetch**: history paging uses before-snowflake cursors for
+  Discord channels. The console backfetch form hides the `oldest_decryptable`
+  target (a Matrix E2EE concept) and uses provider-neutral wording for non-Matrix
+  timeline keys.
+
+### Changed
+
+- Tool description strings for Matrix sessions are byte-identical to their values
+  before Discord support was added. No model vocabulary change for existing Matrix
+  deployments.
+
 ## [v0.2.0] - 2026-07-24
 
 ### Added

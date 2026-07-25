@@ -1,6 +1,6 @@
 # Discord Support — Implementation Design
 
-**Status**: PROPOSED — implementation design for first-class Discord support.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md (Providers section and per-subsystem updates); retained for review.
 Builds directly on `spec/DISCORD-PROTOCOL-COUPLING-AUDIT.md` (the coupling
 baseline; its findings are treated as verified and are cited by root cause
 RC1–RC8 and open question Q1–Q14 without re-arguing them). This document makes

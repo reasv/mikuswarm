@@ -56,6 +56,12 @@ export async function startBackfetchJob(
   if (!VALID_TARGETS.has(targetKind)) {
     return sendError(res, 400, `targetKind must be one of beginning|date|oldest_decryptable|count`);
   }
+  // oldest_decryptable is a Matrix-only concept (E2EE key history). Reject it
+  // for any non-Matrix timeline key so non-Matrix providers don't see undefined
+  // behaviour from a targetKind the backfetch coordinator won't honour.
+  if (targetKind === "oldest_decryptable" && parsed.provider !== "matrix") {
+    return sendError(res, 400, `targetKind=oldest_decryptable is only supported for Matrix timeline keys`);
+  }
   const targetValueRaw = q.get("targetValue");
   // Validate target value for the kinds that require it.
   if (targetKind === "date") {

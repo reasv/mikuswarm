@@ -1,5 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
+import type { ProviderTerminology } from "../types.js";
+import { MATRIX_TERMINOLOGY } from "./terminology.js";
 
 /**
  * Outcome of spinning a coalesced co-reply off into its own session
@@ -21,6 +23,12 @@ export interface SpawnSessionToolContext {
    * coalesced here).
    */
   spawnCoReply: (messageId: string) => Promise<SpawnCoReplyResult>;
+  /**
+   * Provider terminology bundle. Drives the message_id parameter description
+   * and the required-error text so Matrix strings remain byte-identical to their
+   * pre-Phase-8 values. Defaults to MATRIX_TERMINOLOGY when absent.
+   */
+  terminology?: ProviderTerminology;
 }
 
 /**
@@ -34,6 +42,7 @@ export interface SpawnSessionToolContext {
  * spun *off* a sibling, it didn't hand over its own work.
  */
 export function createSpawnSessionTool(context: SpawnSessionToolContext): AgentTool {
+  const t = context.terminology ?? MATRIX_TERMINOLOGY;
   return {
     name: "spawn_session",
     label: "Spawn session",
@@ -47,8 +56,7 @@ export function createSpawnSessionTool(context: SpawnSessionToolContext): AgentT
       "end your turn.",
     parameters: Type.Object({
       message_id: Type.String({
-        description:
-          "The Matrix event id ($…) of the co-reply message to spin off, as given in the co-reply interjection.",
+        description: t.coReplyIdDescription,
       }),
     }),
     execute: async (_toolCallId, params) => {
@@ -56,7 +64,7 @@ export function createSpawnSessionTool(context: SpawnSessionToolContext): AgentT
       const messageId = args.message_id?.trim();
       if (!messageId) {
         return {
-          content: [{ type: "text", text: "error: message_id is required (the $… event id from the co-reply interjection)." }],
+          content: [{ type: "text", text: t.coReplyIdRequiredError }],
           details: null,
         };
       }
