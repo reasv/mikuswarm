@@ -9,8 +9,7 @@ import type {
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment } from "../timeline/index.js";
 import { timelineKindOf, parseTimelineKey } from "../storage/timeline-key.js";
-import type { CanonicalChatEvent } from "../types.js";
-import type { MatrixMessageSummary } from "../matrix/native-types.js";
+import type { CanonicalChatEvent, HistorySummary } from "../types.js";
 import { classifyForRoom } from "./classify.js";
 import {
   paginateBackward,
@@ -64,8 +63,8 @@ export interface MessageBackfetchCoordinatorOptions {
   storage: Storage;
   timeline: TimelineStore;
   config: MessageBackfetchConfig;
-  /** Resolve the native read client for an account (provider.getClient analogue). */
-  getClient: (accountId: string) => BackfillReadClient;
+  /** Resolve the native read client for an account + room (provider boundary). */
+  getClient: (accountId: string, roomId: string) => BackfillReadClient;
   /** Bot's own Matrix user id per account, for role assignment / self-detection. */
   selfUserIds: Map<string, string>;
   /** Nudge the enrichment pool for a single committed event. */
@@ -256,7 +255,7 @@ export class MessageBackfetchCoordinator {
     }
     let client: BackfillReadClient;
     try {
-      client = this.opts.getClient(job.accountId);
+      client = this.opts.getClient(job.accountId, job.roomId);
     } catch (error) {
       await storage.updateBackfetchJob(job.id, {
         status: "failed",
@@ -336,7 +335,7 @@ export class MessageBackfetchCoordinator {
     let oldest: CanonicalChatEvent | undefined;
 
     const onMessage = async (
-      summary: MatrixMessageSummary,
+      summary: HistorySummary,
       timestamp: number,
     ): Promise<MessageDisposition> => {
       fetched++;
@@ -353,6 +352,7 @@ export class MessageBackfetchCoordinator {
         baseTimelineKey: job.timelineKey,
         isDm,
         timestamp,
+        buildId: (externalId) => `matrix:${job.accountId}:${externalId}`,
       });
       if (!classified) return "skip";
 

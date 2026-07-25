@@ -1,11 +1,17 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { ChannelClient, ProviderTerminology } from "../types.js";
+import type { ChannelClient, ProviderCapabilities, ProviderTerminology } from "../types.js";
 
 export interface EmojiToolContext {
   channelClient: ChannelClient;
   /** Optional terminology bundle (unused by this tool; accepted for uniform context shape). */
   terminology?: ProviderTerminology;
+  /**
+   * When true, custom emoji are scoped to the server/guild rather than global
+   * (e.g. Discord). When false or absent (Matrix), emoji are platform-wide.
+   * Used to adjust the tool description; the provider enforces the actual scope.
+   */
+  customEmojiScoped?: ProviderCapabilities["customEmojiScoped"];
   /**
    * Optional resolver for a specific channel by id (M4/M5). When room_id is
    * supplied and this resolver is present, the tool fetches emoji for that
@@ -17,10 +23,13 @@ export interface EmojiToolContext {
 }
 
 export function createEmojiListTool(context: EmojiToolContext): AgentTool {
+  const scopeSuffix = context.customEmojiScoped
+    ? " These are custom emoji available on this server and can be used in messages as :shortcode: and in reactions."
+    : " These can be used in messages as :shortcode: and in reactions.";
   return {
     name: "emoji_list",
     label: "List custom emoji",
-    description: "List available custom emoji shortcodes. These can be used in messages as :shortcode: and in reactions.",
+    description: `List available custom emoji shortcodes.${scopeSuffix}`,
     parameters: Type.Object({
       room_id: Type.Optional(Type.String({ description: "Room ID to list emoji for. Defaults to the current room." })),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200, description: "Max number of shortcodes to return. Default 50." })),

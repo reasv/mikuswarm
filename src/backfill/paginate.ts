@@ -1,13 +1,9 @@
 import type { Logger } from "../observability/index.js";
-import type {
-  MatrixMessageSummary,
-  MatrixReadMessagesRequest,
-  MatrixReadMessagesResult,
-} from "../matrix/native-types.js";
+import type { HistoryPageRequest, HistoryPageResult, HistorySummary } from "../types.js";
 
-/** Minimal slice of the native client needed for backward history paging. */
+/** Minimal neutral paging client used by the backfill engine and its coordinators. */
 export interface BackfillReadClient {
-  readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult>;
+  readMessages(req: HistoryPageRequest): Promise<HistoryPageResult>;
   /**
    * Pull every backed-up megolm session for `roomId` from the server-side key
    * backup into the crypto store (per-room, bounded). Optional so test/mock
@@ -80,7 +76,7 @@ export interface BackwardPaginateOptions {
    * engine drives paging and owns all counting from the returned dispositions.
    */
   onMessage: (
-    summary: MatrixMessageSummary,
+    summary: HistorySummary,
     timestamp: number,
   ) => Promise<MessageDisposition> | MessageDisposition;
   /**
@@ -178,7 +174,9 @@ export class BackfillTimeoutError extends Error {}
 export async function paginateBackward(
   options: BackwardPaginateOptions,
 ): Promise<BackwardPaginateResult> {
-  const { client, roomId, maxMessages, timeoutMs, logger, readFailedEvent, onMessage } = options;
+  // roomId is not consumed here: the retyped BackfillReadClient captures it in its
+  // closure (makeBackfillReadClient); it stays on the options for logging callers.
+  const { client, maxMessages, timeoutMs, logger, readFailedEvent, onMessage } = options;
   const utdHaltThreshold = options.utdHaltThreshold ?? 50;
   const pageSize = Math.min(Math.max(options.pageSize ?? 100, 1), 1000);
   // `timeoutMs <= 0` means "no timeout": use an effectively-infinite deadline so
@@ -211,9 +209,9 @@ export async function paginateBackward(
       break;
     }
 
-    let page: MatrixReadMessagesResult;
+    let page: HistoryPageResult;
     try {
-      page = await withDeadline(client.readMessages({ roomId, limit: pageSize, before }), remaining);
+      page = await withDeadline(client.readMessages({ limit: pageSize, before }), remaining);
     } catch (error) {
       if (error instanceof BackfillTimeoutError) {
         result.timedOut = true;
@@ -234,8 +232,7 @@ export async function paginateBackward(
     let stop = false;
     for (const summary of page.messages) {
       result.fetched++;
-      const parsed = Date.parse(summary.timestamp);
-      const timestamp = Number.isFinite(parsed) ? parsed : Date.now();
+      const timestamp = summary.timestamp;
 
       const disposition = await onMessage(summary, timestamp);
       if (disposition === "skip" || disposition === "edit") continue;
@@ -268,7 +265,7 @@ export async function paginateBackward(
     }
     if (stop) break;
 
-    const nextBefore = page.nextBatch ?? undefined;
+    const nextBefore = page.nextCursor ?? undefined;
     // Per-page hook (resume-cursor persistence + drain-aware pacing). Fires for
     // every fully-processed page, including the last (nextBefore null ⇒ caller
     // records the terminal cursor). Awaited so the caller can back-pressure.

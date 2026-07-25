@@ -37,6 +37,7 @@ function chatEvent(
 function discrete(over: Partial<DiscreteReactionRow> & { reactionEventId: string }): DiscreteReactionRow {
   return {
     targetEventId: "$a1",
+    timelineKey: "matrix:main:room:!room:test",
     senderId: "@alice:test",
     senderDisplay: "Alice",
     normalizedKey: "👍",

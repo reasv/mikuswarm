@@ -7,6 +7,7 @@ import type {
   ChannelClient,
   ChatProviderHost,
   DeliveryReceipt,
+  HistoryClient,
   IChatProvider,
   InboundChatEvent,
   OutboundMessage,
@@ -20,9 +21,9 @@ import type {
   MatrixMessageSummary,
   MatrixNativeConfig,
   MatrixNativeEvent,
-  MatrixReactionStreamEvent,
 } from "./native-types.js";
 import { normalizeMatrixInboundEvent } from "./inbound.js";
+import { adaptMatrixReactionEvent } from "./reaction-ingest.js";
 import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
@@ -253,7 +254,10 @@ export class MatrixProvider implements IChatProvider {
     for (const nativeEvent of events) {
       if (nativeEvent.type === "reaction") {
         // Passive: persist only, never wake a session (ARCHITECTURE.md §9f).
-        this.host?.onReaction(nativeEvent.event, { accountId: account.accountId });
+        // Adapt here (provider boundary) so host.onReaction receives a properly-typed
+        // ReactionStreamEvent; buildMatrixHost.onReaction can call ingestReactionEvent
+        // directly with no further cast.
+        this.host?.onReaction(adaptMatrixReactionEvent(account.accountId, nativeEvent.event), { accountId: account.accountId });
         continue;
       }
       if (nativeEvent.type !== "inbound") {
@@ -396,6 +400,22 @@ export class MatrixProvider implements IChatProvider {
    * Returns `undefined` when the account is not running or the target has no channel.
    */
   channelClient(target: OutboundTarget): ChannelClient | undefined {
+    try {
+      const account = this.resolveAccount(target);
+      const roomId = target.roomId ?? parseTimelineKey(target.timelineKey)?.channelId;
+      if (!roomId) return undefined;
+      return new MatrixChannelClient(account.client, roomId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Neutral history paging client for one target (spec §11.3).
+   * Returns a `MatrixChannelClient` scoped to the resolved room; it already
+   * implements `HistoryClient` via `readMessages` + optional `downloadRoomKeys`.
+   */
+  history(target: OutboundTarget): HistoryClient | undefined {
     try {
       const account = this.resolveAccount(target);
       const roomId = target.roomId ?? parseTimelineKey(target.timelineKey)?.channelId;

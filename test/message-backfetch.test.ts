@@ -7,12 +7,7 @@ import {
 import type { BackfillReadClient } from "../src/backfill/paginate.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
-import type { CanonicalChatEvent } from "../src/types.js";
-import type {
-  MatrixMessageSummary,
-  MatrixReadMessagesRequest,
-  MatrixReadMessagesResult,
-} from "../src/matrix/native-types.js";
+import type { CanonicalChatEvent, HistorySummary, HistoryPageRequest, HistoryPageResult } from "../src/types.js";
 
 const ACCOUNT = "miku";
 const ROOM = "!room:example.org";
@@ -24,33 +19,34 @@ function iso(ms: number): string {
 }
 
 function summary(
-  over: Partial<MatrixMessageSummary> & { eventId: string; timestamp: number },
-): MatrixMessageSummary {
+  over: Partial<HistorySummary> & { externalId: string; timestamp: number },
+): HistorySummary {
   return {
-    eventId: over.eventId,
-    sender: over.sender ?? "@alice:example.org",
-    senderName: over.senderName,
+    externalId: over.externalId,
+    sender: over.sender ?? { id: "@alice:example.org" },
+    timestamp: over.timestamp,
     body: over.body ?? "hello",
-    msgtype: over.msgtype ?? "m.text",
-    timestamp: iso(over.timestamp),
-    relatesTo: over.relatesTo,
-    media: over.media,
+    attachments: over.attachments,
+    replyToExternalId: over.replyToExternalId,
+    edited: over.edited,
+    editTargetExternalId: over.editTargetExternalId,
+    threadRootExternalId: over.threadRootExternalId,
     undecryptable: over.undecryptable,
     sessionId: over.sessionId,
     utdReason: over.utdReason,
   };
 }
 
-function page(messages: MatrixMessageSummary[], nextBatch: string | null): MatrixReadMessagesResult {
-  return { messages, nextBatch, prevBatch: null };
+function page(messages: HistorySummary[], nextCursor: string | null): HistoryPageResult {
+  return { messages, nextCursor: nextCursor ?? undefined };
 }
 
 class ScriptedClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
-  constructor(private readonly pages: MatrixReadMessagesResult[]) {}
-  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+  constructor(private readonly pages: HistoryPageResult[]) {}
+  async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
     this.calls.push(request.before);
-    return this.pages[this.calls.length - 1] ?? { messages: [], nextBatch: null, prevBatch: null };
+    return this.pages[this.calls.length - 1] ?? { messages: [], nextCursor: undefined };
   }
 }
 
@@ -159,14 +155,14 @@ test("beginning: pins floor at current-oldest, stores only below-floor rows as i
   const client = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$e200", timestamp: 200 }),
-        summary({ eventId: "$e100", timestamp: 100 }), // current oldest = the floor
-        summary({ eventId: "$e090", timestamp: 90 }),
-        summary({ eventId: "$e080", timestamp: 80 }),
+        summary({ externalId: "$e200", timestamp: 200 }),
+        summary({ externalId: "$e100", timestamp: 100 }), // current oldest = the floor
+        summary({ externalId: "$e090", timestamp: 90 }),
+        summary({ externalId: "$e080", timestamp: 80 }),
       ],
       "t1",
     ),
-    page([summary({ eventId: "$e070", timestamp: 70 }), summary({ eventId: "$e060", timestamp: 60 })], null),
+    page([summary({ externalId: "$e070", timestamp: 70 }), summary({ externalId: "$e060", timestamp: 60 })], null),
   ]);
   const h = await makeHarness(client);
   await seedLive(h.timeline, h.storage, "$e100", 100);
@@ -223,10 +219,10 @@ test("count target stops at the requested number of stored rows", async () => {
   const client = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$e100", timestamp: 100 }),
-        summary({ eventId: "$e090", timestamp: 90 }),
-        summary({ eventId: "$e080", timestamp: 80 }),
-        summary({ eventId: "$e070", timestamp: 70 }),
+        summary({ externalId: "$e100", timestamp: 100 }),
+        summary({ externalId: "$e090", timestamp: 90 }),
+        summary({ externalId: "$e080", timestamp: 80 }),
+        summary({ externalId: "$e070", timestamp: 70 }),
       ],
       "t1",
     ),
@@ -257,10 +253,10 @@ test("count target resume tops up to the target without over-fetching", async ()
   const client = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$e070", timestamp: 70 }),
-        summary({ eventId: "$e060", timestamp: 60 }),
-        summary({ eventId: "$e050", timestamp: 50 }),
-        summary({ eventId: "$e040", timestamp: 40 }),
+        summary({ externalId: "$e070", timestamp: 70 }),
+        summary({ externalId: "$e060", timestamp: 60 }),
+        summary({ externalId: "$e050", timestamp: 50 }),
+        summary({ externalId: "$e040", timestamp: 40 }),
       ],
       "t2",
     ),
@@ -293,7 +289,7 @@ test("count target resume at the target completes without paging", async () => {
   // A count=2 job that already stored 2 resumes: it short-circuits to completed and
   // never calls the client.
   const client = new ScriptedClient([
-    page([summary({ eventId: "$e070", timestamp: 70 })], null),
+    page([summary({ externalId: "$e070", timestamp: 70 })], null),
   ]);
   const h = await makeHarness(client);
   await seedLive(h.timeline, h.storage, "$e100", 100);
@@ -322,9 +318,9 @@ test("date target stops at the requested instant (window)", async () => {
   const client = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$e100", timestamp: 100 }),
-        summary({ eventId: "$e090", timestamp: 90 }),
-        summary({ eventId: "$e050", timestamp: 50 }), // below the date floor (75) → window stop
+        summary({ externalId: "$e100", timestamp: 100 }),
+        summary({ externalId: "$e090", timestamp: 90 }),
+        summary({ externalId: "$e050", timestamp: 50 }), // below the date floor (75) → window stop
       ],
       "t1",
     ),
@@ -399,7 +395,7 @@ test("single-flight: concurrent inserts for one room — only one is admitted", 
 
 test("resume uses the stored cursor token as the initial backward continuation", async () => {
   const client = new ScriptedClient([
-    page([summary({ eventId: "$e070", timestamp: 70 }), summary({ eventId: "$e060", timestamp: 60 })], null),
+    page([summary({ externalId: "$e070", timestamp: 70 }), summary({ externalId: "$e060", timestamp: 60 })], null),
   ]);
   const h = await makeHarness(client);
   await seedLive(h.timeline, h.storage, "$e100", 100);
@@ -424,9 +420,9 @@ test("re-running over already-fetched history is idempotent (dedup, floor unchan
   const pages = [
     page(
       [
-        summary({ eventId: "$e100", timestamp: 100 }),
-        summary({ eventId: "$e090", timestamp: 90 }),
-        summary({ eventId: "$e080", timestamp: 80 }),
+        summary({ externalId: "$e100", timestamp: 100 }),
+        summary({ externalId: "$e090", timestamp: 90 }),
+        summary({ externalId: "$e080", timestamp: 80 }),
       ],
       null,
     ),
@@ -443,9 +439,9 @@ test("re-running over already-fetched history is idempotent (dedup, floor unchan
   const h2Client = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$e100", timestamp: 100 }),
-        summary({ eventId: "$e090", timestamp: 90 }),
-        summary({ eventId: "$e080", timestamp: 80 }),
+        summary({ externalId: "$e100", timestamp: 100 }),
+        summary({ externalId: "$e090", timestamp: 90 }),
+        summary({ externalId: "$e080", timestamp: 80 }),
       ],
       null,
     ),

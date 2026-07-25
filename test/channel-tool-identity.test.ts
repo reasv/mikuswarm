@@ -262,6 +262,51 @@ test("channel_info description with MATRIX_TERMINOLOGY is byte-identical to pre-
   );
 });
 
+// ── M2e: react emoji parameter description — frozen at parameter level ────────
+//
+// The `emoji` parameter description must be byte-identical to the pre-Phase-6
+// string when reactionKinds is ["unicode","custom","text"] (the Matrix default).
+// This freezes the parameter-level schema so drift here is caught immediately.
+
+test("react `emoji` parameter description is byte-identical to pre-Phase-6 for Matrix kinds", () => {
+  // Default (no reactionKinds arg) → ["unicode","custom","text"] → pre-Phase-6 string.
+  const tool = createReactTool({ channelClient: STUB_CHANNEL_CLIENT, terminology: MATRIX_TERMINOLOGY });
+  const params = tool.parameters as { properties: Record<string, { description?: string }> };
+  assert.strictEqual(
+    params.properties["emoji"]?.description,
+    "Emoji to react with. Unicode emoji (e.g. 👍) or :shortcode: (e.g. :custom_emoji:).",
+    "emoji parameter description must be byte-identical to the pre-Phase-6 Matrix baseline",
+  );
+});
+
+test("react `emoji` parameter description is computed for non-Matrix kinds (Discord: unicode+custom)", () => {
+  const tool = createReactTool({
+    channelClient: STUB_CHANNEL_CLIENT,
+    terminology: MATRIX_TERMINOLOGY,
+    reactionKinds: ["unicode", "custom"],
+  });
+  const params = tool.parameters as { properties: Record<string, { description?: string }> };
+  // Not the pre-Phase-6 string; must mention both unicode and custom.
+  assert.match(params.properties["emoji"]?.description ?? "", /unicode emoji/);
+  assert.match(params.properties["emoji"]?.description ?? "", /shortcode/);
+  assert.ok(
+    !(params.properties["emoji"]?.description ?? "").includes("raw text strings"),
+    "text kind must not appear when kinds is [unicode,custom]",
+  );
+});
+
+test("read_messages `message_id` parameter description is byte-identical to Matrix baseline", () => {
+  // Spot-check a second tool's parameter description to guard against drift in
+  // the terminology substitution path.
+  const tool = createReadMessagesTool({ channelClient: STUB_CHANNEL_CLIENT, terminology: MATRIX_TERMINOLOGY });
+  const params = tool.parameters as { properties: Record<string, { description?: string }> };
+  assert.match(
+    params.properties["message_id"]?.description ?? "",
+    /Matrix event ID/,
+    "read_messages message_id description must reference Matrix event ID with MATRIX_TERMINOLOGY",
+  );
+});
+
 // ── M2d: channel_info frozen execute output ───────────────────────────────────
 //
 // Frozen-output tests: the channel_info tool's execute output must be

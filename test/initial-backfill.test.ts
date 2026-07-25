@@ -3,14 +3,11 @@ import test from "node:test";
 import { performInitialBackfill, type BackfillReadClient } from "../src/backfill/index.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
-import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
-import type { CanonicalChatEvent } from "../src/types.js";
+import { normalizeMatrixInboundEvent, mediaToAttachment } from "../src/matrix/inbound.js";
+import type { CanonicalChatEvent, HistoryPageRequest, HistoryPageResult, HistorySummary } from "../src/types.js";
 import type {
   MatrixInboundEvent,
   MatrixInboundMedia,
-  MatrixMessageSummary,
-  MatrixReadMessagesRequest,
-  MatrixReadMessagesResult,
 } from "../src/matrix/native-types.js";
 
 const ACCOUNT = "miku";
@@ -22,26 +19,47 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-function summary(overrides: Partial<MatrixMessageSummary> & { eventId: string; timestamp: number }): MatrixMessageSummary {
+function summary(overrides: {
+  externalId: string;
+  timestamp: number;
+  sender?: string;
+  senderName?: string;
+  body?: string;
+  msgtype?: string;
+  /** Plain bare-reply (no relType). Mutually exclusive with thread/edit fields. */
+  replyToExternalId?: string;
+  /** Set when this message replaces another (m.replace rel). */
+  edited?: boolean;
+  editTargetExternalId?: string;
+  /** Set when this message belongs to a thread (m.thread rel). */
+  threadRootExternalId?: string;
+  media?: MatrixInboundMedia[];
+  undecryptable?: boolean;
+  sessionId?: string;
+  utdReason?: string;
+}): HistorySummary {
   return {
-    eventId: overrides.eventId,
-    sender: overrides.sender ?? "@alice:example.org",
-    senderName: overrides.senderName,
+    externalId: overrides.externalId,
+    sender: { id: overrides.sender ?? "@alice:example.org", displayName: overrides.senderName },
+    timestamp: overrides.timestamp,
     body: overrides.body ?? "hello",
-    msgtype: overrides.msgtype ?? "m.text",
-    timestamp: iso(overrides.timestamp),
-    relatesTo: overrides.relatesTo,
-    media: overrides.media,
-    undecryptable: overrides.undecryptable,
+    attachments: overrides.media
+      ? overrides.media.map((m) => mediaToAttachment(overrides.externalId, m))
+      : undefined,
+    replyToExternalId: overrides.replyToExternalId,
+    edited: overrides.edited,
+    editTargetExternalId: overrides.editTargetExternalId,
+    threadRootExternalId: overrides.threadRootExternalId,
+    undecryptable: overrides.undecryptable ? true : undefined,
     sessionId: overrides.sessionId,
     utdReason: overrides.utdReason,
   };
 }
 
 /** A UTD summary as the native layer surfaces it: empty body, undecryptable flag. */
-function utdSummary(eventId: string, timestamp: number): MatrixMessageSummary {
+function utdSummary(externalId: string, timestamp: number): HistorySummary {
   return summary({
-    eventId,
+    externalId,
     timestamp,
     body: "",
     undecryptable: true,
@@ -54,16 +72,16 @@ function utdSummary(eventId: string, timestamp: number): MatrixMessageSummary {
 class ScriptedClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
   readonly limits: Array<number | undefined> = [];
-  constructor(private readonly pages: MatrixReadMessagesResult[]) {}
-  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+  constructor(private readonly pages: HistoryPageResult[]) {}
+  async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
     this.calls.push(request.before);
     this.limits.push(request.limit);
-    return this.pages[this.calls.length - 1] ?? { messages: [], nextBatch: null, prevBatch: null };
+    return this.pages[this.calls.length - 1] ?? { messages: [], nextCursor: undefined };
   }
 }
 
-function page(messages: MatrixMessageSummary[], nextBatch: string | null): MatrixReadMessagesResult {
-  return { messages, nextBatch, prevBatch: null };
+function page(messages: HistorySummary[], nextCursor: string | null): HistoryPageResult {
+  return { messages, nextCursor: nextCursor ?? undefined };
 }
 
 async function withStores(run: (store: TimelineStore, storage: Storage) => Promise<void>): Promise<void> {
@@ -85,7 +103,7 @@ const BASE = {
 
 test("maxMessages = 0 performs no fetch", async () => {
   await withStores(async (store, storage) => {
-    const client = new ScriptedClient([page([summary({ eventId: "$a", timestamp: 1000 })], null)]);
+    const client = new ScriptedClient([page([summary({ externalId: "$a", timestamp: 1000 })], null)]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 0 });
     assert.equal(client.calls.length, 0, "client should not be called");
     assert.deepEqual(result, { fetched: 0, stored: 0, reachedCount: false, reachedWindow: false, exhausted: false, timedOut: false, errored: false, haltedOnUtd: false });
@@ -95,7 +113,7 @@ test("maxMessages = 0 performs no fetch", async () => {
 test("stores messages with canonical IDs and stops on exhaustion (no nextBatch)", async () => {
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 3000 }), summary({ eventId: "$b", timestamp: 2000 })], null),
+      page([summary({ externalId: "$a", timestamp: 3000 }), summary({ externalId: "$b", timestamp: 2000 })], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     assert.equal(result.stored, 2);
@@ -125,7 +143,7 @@ test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pe
   // 'inactive' (NOT pending) when activation fails after the fetch phase".)
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 3000 }), summary({ eventId: "$b", timestamp: 2000 })], null),
+      page([summary({ externalId: "$a", timestamp: 3000 }), summary({ externalId: "$b", timestamp: 2000 })], null),
     ]);
     await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
 
@@ -155,17 +173,17 @@ test("#4: a successful activation bulk-flips backfilled 'inactive' events to 'pe
 test("pageSize is passed through (clamped 1–1000) as the readMessages limit; defaults to 100", async () => {
   await withStores(async (store, storage) => {
     // Explicit pageSize flows through verbatim.
-    const c1 = new ScriptedClient([page([summary({ eventId: "$a", timestamp: 1000 })], null)]);
+    const c1 = new ScriptedClient([page([summary({ externalId: "$a", timestamp: 1000 })], null)]);
     await performInitialBackfill({ client: c1, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100, pageSize: 250 });
     assert.equal(c1.limits[0], 250, "explicit pageSize should be used as the read limit");
 
     // Omitted pageSize defaults to 100.
-    const c2 = new ScriptedClient([page([summary({ eventId: "$b", timestamp: 1000 })], null)]);
+    const c2 = new ScriptedClient([page([summary({ externalId: "$b", timestamp: 1000 })], null)]);
     await performInitialBackfill({ client: c2, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     assert.equal(c2.limits[0], 100, "omitted pageSize should default to 100");
 
     // Out-of-range pageSize is clamped to the 1–1000 bounds.
-    const c3 = new ScriptedClient([page([summary({ eventId: "$c", timestamp: 1000 })], null)]);
+    const c3 = new ScriptedClient([page([summary({ externalId: "$c", timestamp: 1000 })], null)]);
     await performInitialBackfill({ client: c3, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100, pageSize: 9999 });
     assert.equal(c3.limits[0], 1000, "pageSize should be clamped to the 1000 ceiling");
   });
@@ -174,9 +192,9 @@ test("pageSize is passed through (clamped 1–1000) as the readMessages limit; d
 test("stops after maxMessages newly-stored and threads the backward pagination token", async () => {
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 5000 }), summary({ eventId: "$b", timestamp: 4000 })], "tok1"),
-      page([summary({ eventId: "$c", timestamp: 3000 }), summary({ eventId: "$d", timestamp: 2000 })], "tok2"),
-      page([summary({ eventId: "$e", timestamp: 1000 })], null),
+      page([summary({ externalId: "$a", timestamp: 5000 }), summary({ externalId: "$b", timestamp: 4000 })], "tok1"),
+      page([summary({ externalId: "$c", timestamp: 3000 }), summary({ externalId: "$d", timestamp: 2000 })], "tok2"),
+      page([summary({ externalId: "$e", timestamp: 1000 })], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 3 });
     assert.equal(result.stored, 3);
@@ -192,9 +210,9 @@ test("stops at the first kept message older than the window floor, without stori
   await withStores(async (store, storage) => {
     // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 999_000 }), summary({ eventId: "$b", timestamp: 998_000 })], "tok1"),
-      page([summary({ eventId: "$c", timestamp: 996_000 }), summary({ eventId: "$d", timestamp: 994_000 })], "tok2"),
-      page([summary({ eventId: "$e", timestamp: 990_000 })], null),
+      page([summary({ externalId: "$a", timestamp: 999_000 }), summary({ externalId: "$b", timestamp: 998_000 })], "tok1"),
+      page([summary({ externalId: "$c", timestamp: 996_000 }), summary({ externalId: "$d", timestamp: 994_000 })], "tok2"),
+      page([summary({ externalId: "$e", timestamp: 990_000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE,
@@ -216,9 +234,9 @@ test("window is anchored to activation time, not the oldest stored event", async
     await storage.appendTimelineEvent(seedEvent("oldseed", 1_000), "inactive");
     // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 999_000 }), summary({ eventId: "$b", timestamp: 998_000 })], "tok1"),
-      page([summary({ eventId: "$c", timestamp: 994_000 }), summary({ eventId: "$d", timestamp: 993_000 })], "tok2"),
-      page([summary({ eventId: "$e", timestamp: 990_000 })], null),
+      page([summary({ externalId: "$a", timestamp: 999_000 }), summary({ externalId: "$b", timestamp: 998_000 })], "tok1"),
+      page([summary({ externalId: "$c", timestamp: 994_000 }), summary({ externalId: "$d", timestamp: 993_000 })], "tok2"),
+      page([summary({ externalId: "$e", timestamp: 990_000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE,
@@ -238,22 +256,22 @@ test("#1: the window-floor stop is not tripped by filtered-out (non-matching) me
     // events kept for THIS timeline — the non-thread noise must not trip it.
     // anchorTimestamp = 1_000_000; windowMs = 5000 → floor = 995_000.
     const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
-    const thread = (eventId: string, timestamp: number) =>
-      summary({ eventId, timestamp, relatesTo: { relType: "m.thread", eventId: "$root" } });
+    const thread = (externalId: string, timestamp: number) =>
+      summary({ externalId, timestamp, threadRootExternalId: "$root" });
     const client = new ScriptedClient([
       // Page 1: a thread message above the floor, plus old non-thread noise WAY
       // below the floor. Old behavior: noise drags pageMinTimestamp < floor →
       // stops here. New behavior: only $t1 (999_000) counts → keep paging.
       page([
         thread("$t1", 999_000),
-        summary({ eventId: "$noise1", timestamp: 100_000 }),
-        summary({ eventId: "$noise2", timestamp: 90_000 }),
+        summary({ externalId: "$noise1", timestamp: 100_000 }),
+        summary({ externalId: "$noise2", timestamp: 90_000 }),
       ], "tok1"),
       // Page 2: another in-window thread message + more old noise. Still no
       // thread message below the floor → keep paging.
       page([
         thread("$t2", 998_000),
-        summary({ eventId: "$noise3", timestamp: 80_000 }),
+        summary({ externalId: "$noise3", timestamp: 80_000 }),
       ], "tok2"),
       // Page 3: a thread message that finally crosses the floor → stop here.
       page([thread("$t3", 994_000)], "tok3"),
@@ -279,10 +297,10 @@ test("#1: a fully-filtered page leaves the floor untouched and paging continues 
     const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$noise1", timestamp: 100_000 }),
-        summary({ eventId: "$noise2", timestamp: 90_000 }),
+        summary({ externalId: "$noise1", timestamp: 100_000 }),
+        summary({ externalId: "$noise2", timestamp: 90_000 }),
       ], "tok1"),
-      page([summary({ eventId: "$mine", timestamp: 999_000, relatesTo: { relType: "m.thread", eventId: "$root" } })], null),
+      page([summary({ externalId: "$mine", timestamp: 999_000, threadRootExternalId: "$root" })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: threadTk, ...BASE,
@@ -306,9 +324,9 @@ test("a single sparse page spanning months stores only in-window messages (no ol
     const oldUtds = Array.from({ length: 10 }, (_, i) => utdSummary(`$utd${i}`, 1_000_000 - i * 1000));
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$recent1", timestamp: 9_999_000 }),
-        summary({ eventId: "$recent2", timestamp: 9_998_000 }),
-        summary({ eventId: "$stale", timestamp: 5_000_000 }),
+        summary({ externalId: "$recent1", timestamp: 9_999_000 }),
+        summary({ externalId: "$recent2", timestamp: 9_998_000 }),
+        summary({ externalId: "$stale", timestamp: 5_000_000 }),
         ...oldUtds,
       ], "tok1"),
       page([], null),
@@ -334,7 +352,7 @@ test("does not count duplicates (already-stored events) toward the limit", async
       "pending",
     );
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 5000 }), summary({ eventId: "$b", timestamp: 4000 })], null),
+      page([summary({ externalId: "$a", timestamp: 5000 }), summary({ externalId: "$b", timestamp: 4000 })], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     assert.equal(result.fetched, 2);
@@ -346,11 +364,11 @@ test("room timeline excludes thread messages and edits; sets role and replyTo", 
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$plain", timestamp: 5000, sender: "@alice:example.org" }),
-        summary({ eventId: "$self", timestamp: 4900, sender: SELF }),
-        summary({ eventId: "$reply", timestamp: 4800, relatesTo: { eventId: "$plain" } }),
-        summary({ eventId: "$thread", timestamp: 4700, relatesTo: { relType: "m.thread", eventId: "$root" } }),
-        summary({ eventId: "$edit", timestamp: 4600, relatesTo: { relType: "m.replace", eventId: "$plain" } }),
+        summary({ externalId: "$plain", timestamp: 5000, sender: "@alice:example.org" }),
+        summary({ externalId: "$self", timestamp: 4900, sender: SELF }),
+        summary({ externalId: "$reply", timestamp: 4800, replyToExternalId: "$plain" }),
+        summary({ externalId: "$thread", timestamp: 4700, threadRootExternalId: "$root" }),
+        summary({ externalId: "$edit", timestamp: 4600, edited: true, editTargetExternalId: "$plain" }),
       ], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
@@ -374,9 +392,9 @@ test("thread timeline keeps only that thread's messages", async () => {
     const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$plain", timestamp: 5000 }),
-        summary({ eventId: "$mine", timestamp: 4900, relatesTo: { relType: "m.thread", eventId: "$root" } }),
-        summary({ eventId: "$other", timestamp: 4800, relatesTo: { relType: "m.thread", eventId: "$otherRoot" } }),
+        summary({ externalId: "$plain", timestamp: 5000 }),
+        summary({ externalId: "$mine", timestamp: 4900, threadRootExternalId: "$root" }),
+        summary({ externalId: "$other", timestamp: 4800, threadRootExternalId: "$otherRoot" }),
       ], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: threadTk, ...BASE, maxMessages: 100 });
@@ -392,7 +410,7 @@ test("thread timeline keeps only that thread's messages", async () => {
 test("times out when reads hang, holding no longer than timeoutMs", async () => {
   await withStores(async (store, storage) => {
     const hangingClient: BackfillReadClient = {
-      readMessages: () => new Promise<MatrixReadMessagesResult>(() => {}),
+      readMessages: () => new Promise<HistoryPageResult>(() => {}),
     };
     const start = Date.now();
     const result = await performInitialBackfill({
@@ -417,11 +435,11 @@ test("terminates instead of spinning when the pagination token does not advance"
     );
     const client = new ScriptedClient([
       // First page advances the token normally (undefined → "stuck").
-      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+      page([summary({ externalId: "$a", timestamp: 5000 })], "stuck"),
       // Second page returns the same token it was handed: non-advancing.
-      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+      page([summary({ externalId: "$a", timestamp: 5000 })], "stuck"),
       // Would loop forever if reached.
-      page([summary({ eventId: "$a", timestamp: 5000 })], "stuck"),
+      page([summary({ externalId: "$a", timestamp: 5000 })], "stuck"),
     ]);
     const start = Date.now();
     const result = await performInitialBackfill({
@@ -445,8 +463,8 @@ test("keeps paginating when a page is fully deduped but the token advances", asy
       "pending",
     );
     const client = new ScriptedClient([
-      page([summary({ eventId: "$a", timestamp: 5000 })], "tok1"),
-      page([summary({ eventId: "$b", timestamp: 4000 })], null),
+      page([summary({ externalId: "$a", timestamp: 5000 })], "tok1"),
+      page([summary({ externalId: "$b", timestamp: 4000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100,
@@ -461,10 +479,10 @@ test("sets the errored flag on a read failure mid-pagination", async () => {
   await withStores(async (store, storage) => {
     let call = 0;
     const failingClient: BackfillReadClient = {
-      readMessages: async (request: MatrixReadMessagesRequest) => {
+      readMessages: async (_request: HistoryPageRequest) => {
         call++;
         if (call === 1) {
-          return page([summary({ eventId: "$a", timestamp: 5000 })], "tok1");
+          return page([summary({ externalId: "$a", timestamp: 5000 })], "tok1");
         }
         throw new Error("network down");
       },
@@ -486,7 +504,7 @@ test("backfilled media is stored as attachments with the live shape", async () =
       page(
         [
           summary({
-            eventId: "$img",
+            externalId: "$img",
             timestamp: 5000,
             msgtype: "m.image",
             body: "cat.png",
@@ -540,7 +558,7 @@ test("backfill and live produce identical attachments for equivalent media", asy
   // Backfill path attachments (run through the full converter via the store).
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
-      page([summary({ eventId, timestamp: 5000, msgtype: "m.image", body: "cat.png", media })], null),
+      page([summary({ externalId: eventId, timestamp: 5000, msgtype: "m.image", body: "cat.png", media })], null),
     ]);
     await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     const stored = store.getById(`matrix:${ACCOUNT}:${eventId}`);
@@ -553,7 +571,7 @@ test("backfill and live produce identical attachments for equivalent media", asy
 test("UTD summaries are stored as placeholders with the undecryptable flag and skipped status", async () => {
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
-      page([utdSummary("$utd", 5000), summary({ eventId: "$ok", timestamp: 4000 })], null),
+      page([utdSummary("$utd", 5000), summary({ externalId: "$ok", timestamp: 4000 })], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     assert.equal(result.stored, 2, "both the UTD placeholder and the normal message are stored");
@@ -576,7 +594,7 @@ test("halts paging after a long run of consecutive UTD events", async () => {
     const client = new ScriptedClient([
       page(first, "tok1"),
       page(second, "tok2"),
-      page([summary({ eventId: "$never", timestamp: 1000 })], null),
+      page([summary({ externalId: "$never", timestamp: 1000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
@@ -598,7 +616,7 @@ test("a non-UTD event resets the consecutive-UTD counter", async () => {
     const utdsA = Array.from({ length: 40 }, (_, i) => utdSummary(`$a${i}`, 200_000 - i));
     const utdsB = Array.from({ length: 40 }, (_, i) => utdSummary(`$b${i}`, 150_000 - i));
     const client = new ScriptedClient([
-      page([...utdsA, summary({ eventId: "$real", timestamp: 160_000 }), ...utdsB], null),
+      page([...utdsA, summary({ externalId: "$real", timestamp: 160_000 }), ...utdsB], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
@@ -631,7 +649,7 @@ test("#5: re-paged already-stored UTD duplicates do not advance the consecutive-
     const dupPage = Array.from({ length: 50 }, (_, i) => utdSummary(`$dup${i}`, 100_000 - i));
     const client = new ScriptedClient([
       page(dupPage, "tok1"),
-      page([summary({ eventId: "$fresh", timestamp: 50_000 })], null),
+      page([summary({ externalId: "$fresh", timestamp: 50_000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
@@ -651,7 +669,7 @@ test("#5: a run of newly-stored UTD duplicates still halts only on genuinely new
     const utds = Array.from({ length: 50 }, (_, i) => utdSummary(`$new${i}`, 100_000 - i));
     const client = new ScriptedClient([
       page(utds, "tok1"),
-      page([summary({ eventId: "$never", timestamp: 1000 })], null),
+      page([summary({ externalId: "$never", timestamp: 1000 })], null),
     ]);
     const result = await performInitialBackfill({
       client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 1000, utdHaltThreshold: 50,
@@ -671,12 +689,12 @@ test("#11: an edit later in a backward page is applied to its original earlier i
     // original keeps its pre-edit body and the m.replace is a separate event).
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$orig", timestamp: 5000, body: "original body" }),
+        summary({ externalId: "$orig", timestamp: 5000, body: "original body" }),
         summary({
-          eventId: "$edit",
+          externalId: "$edit",
           timestamp: 5001,
           body: "edited body",
-          relatesTo: { relType: "m.replace", eventId: "$orig" },
+          edited: true, editTargetExternalId: "$orig",
         }),
       ], null),
     ]);
@@ -696,12 +714,12 @@ test("#1: an edit appearing before its original (later backward page) parks and 
     // original lands in a later page — so the original still renders the edit.
     const client = new ScriptedClient([
       page([summary({
-        eventId: "$edit",
+        externalId: "$edit",
         timestamp: 5001,
         body: "edited body",
-        relatesTo: { relType: "m.replace", eventId: "$orig" },
+        edited: true, editTargetExternalId: "$orig",
       })], "tok1"),
-      page([summary({ eventId: "$orig", timestamp: 5000, body: "original body" })], null),
+      page([summary({ externalId: "$orig", timestamp: 5000, body: "original body" })], null),
     ]);
     const result = await performInitialBackfill({ client, store, storage, timelineKey: ROOM_TK, ...BASE, maxMessages: 100 });
     assert.equal(result.stored, 1, "only the original message is a stored row");
@@ -714,12 +732,12 @@ test("#1: a backfilled edit keeps the target 'inactive' (deferred to the activat
   await withStores(async (store, storage) => {
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$orig", timestamp: 5000, body: "original" }),
+        summary({ externalId: "$orig", timestamp: 5000, body: "original" }),
         summary({
-          eventId: "$edit",
+          externalId: "$edit",
           timestamp: 5001,
           body: "edited",
-          relatesTo: { relType: "m.replace", eventId: "$orig" },
+          edited: true, editTargetExternalId: "$orig",
         }),
       ], null),
     ]);
@@ -740,7 +758,7 @@ test("#5: a UTD event during thread backfill lands on the room timeline, not the
     const threadTk = `matrix:${ACCOUNT}:room:${ROOM}:thread:$root`;
     const client = new ScriptedClient([
       page([
-        summary({ eventId: "$mine", timestamp: 5000, relatesTo: { relType: "m.thread", eventId: "$root" } }),
+        summary({ externalId: "$mine", timestamp: 5000, threadRootExternalId: "$root" }),
         utdSummary("$utd", 4900),
       ], null),
     ]);

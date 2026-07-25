@@ -50,9 +50,48 @@ export interface SelfIdentity {
   displayName?: string;
 }
 
-/** Minimal cross-provider reaction event envelope. Phase 6 generalises the shape. */
+/**
+ * Generic cross-provider reaction event — the full pre-resolved envelope that
+ * providers deliver to {@link ChatProviderHost.onReaction} (spec §10.1, §12.6).
+ *
+ * PK contract (reaction_event_id):
+ *   Matrix  → the `$…` reaction event id (unchanged from before Phase 6).
+ *   Discord → the deterministic synthetic key `discord:<messageId>:<emojiKey>:<userId>`
+ *             where `emojiKey` is the `normalizedKey` value; reconstructible from
+ *             `MESSAGE_REACTION_REMOVE`'s (message, emoji, user) triple.
+ *
+ * normalized_key contract:
+ *   unicode → the emoji string (e.g. "👍"); unchanged.
+ *   Matrix custom → the `mxc://…` URL; unchanged.
+ *   Discord custom → `discord:<emojiSnowflake>` (same-named emoji in two guilds stay
+ *                    distinct; `display` carries the `:name:` for rendering).
+ *
+ * On "add" all optional fields are populated by the provider. On "remove" only
+ * the PK (`reactionEventId`) and routing fields are required; kind/display/
+ * normalizedKey are absent because the tombstone path keys only on the PK.
+ */
 export interface ReactionStreamEvent {
   action: "add" | "remove";
+  /** Storage PK — see contract above. */
+  reactionEventId: string;
+  /** Pre-built timeline key for the reactions table locality hint. */
+  timelineKey: string;
+  /** Stable sender id (MXID, Discord snowflake, …). */
+  senderId: string;
+  senderDisplay?: string;
+  /** Reaction or redaction timestamp (ms epoch). */
+  reactedAtMs: number;
+  // ── "add"-only fields ──────────────────────────────────────────────────────
+  /** Target message external id. Required for "add"; absent for "remove". */
+  targetEventId?: string;
+  /** Resolved reaction kind. Required for "add"; absent for "remove". */
+  kind?: "unicode" | "custom" | "text";
+  /** Display text: unicode glyph or ":shortcode:". Required for "add". */
+  display?: string;
+  /** Custom emoji shortcode (custom kind only). */
+  shortcode?: string;
+  /** Normalised reaction key — see contract above. Required for "add". */
+  normalizedKey?: string;
 }
 
 /** Cross-provider provider lifecycle / diagnostics event. Provider-specific shape. */
@@ -292,6 +331,13 @@ export interface ProviderCapabilities {
 export interface ChatProviderHost {
   onEvent(event: InboundChatEvent): void;
   onReaction(event: ReactionStreamEvent, ctx: { accountId: string }): void;
+  /**
+   * Provider-initiated bulk reaction clear (spec §10.4 — Discord MESSAGE_REACTION_REMOVE_ALL /
+   * MESSAGE_REACTION_REMOVE_EMOJI). `normalizedKey` absent ⇒ clear all emoji on the target;
+   * present ⇒ clear only that emoji. The host maps to `tombstoneReactionsByTargetEvent` or
+   * `tombstoneReactionsByTargetAndKey` respectively.
+   */
+  onBulkReactionClear?(args: { targetEventId: string; normalizedKey?: string }, ctx: { accountId: string }): void;
   /** Gateway/sync lifecycle + diagnostics for the console. Optional to emit. */
   onNativeEvent?(event: ProviderLifecycleEvent, ctx: { accountId: string }): void;
   onDiagnostics?(diagnostics: unknown, ctx: { accountId: string }): void;
@@ -389,6 +435,20 @@ export interface HistorySummary {
   attachments?: AttachmentMeta[];
   replyToExternalId?: string;
   edited?: boolean;
+  /** External id of the message this event replaces. Present only when `edited` is true. */
+  editTargetExternalId?: string;
+  /** Thread root's external id. Present only when this is a thread-child message. */
+  threadRootExternalId?: string;
+  /**
+   * Matrix-only — present when the message could not be decrypted (UTD).
+   * Mirrors {@link CanonicalChatEvent.undecryptable}; documented Matrix-only
+   * because only E2EE-capable providers produce UTD events.
+   */
+  undecryptable?: true;
+  /** Matrix-only — megolm session id whose key is missing when the event is undecryptable. */
+  sessionId?: string;
+  /** Matrix-only — reason code for decryption failure when the event is undecryptable. */
+  utdReason?: string;
 }
 
 /** Neutral history page result (spec §11.3). */
@@ -472,6 +532,27 @@ export interface ChannelClient {
 }
 
 /**
+ * Neutral history paging client (spec §11.3) — the provider-side counterpart
+ * to `ChannelClient.readMessages`, exposed via `IChatProvider.history()`.
+ * Matrix: backed by the existing `room.messages()` NAPI.
+ * Discord (Phase 7): before-snowflake paging (`GET /channels/{id}/messages?before=…`).
+ *
+ * Distinct from the internal `BackfillReadClient` in `src/backfill/paginate.ts`,
+ * which is also neutral (uses `HistoryPageRequest`/`HistoryPageResult`) but is
+ * scoped to the backfill engine. `HistoryClient` is the provider-facing interface;
+ * Phase 7 will wire it into the backfill path when a Discord provider is live.
+ */
+export interface HistoryClient {
+  readMessages(req: HistoryPageRequest): Promise<HistoryPageResult>;
+  /**
+   * Fetch all backed-up megolm sessions for the channel into the crypto store
+   * before a deep history descent. Optional — only Matrix encrypted rooms need
+   * this; Discord and plain-text Matrix channels leave it absent.
+   */
+  downloadRoomKeys?(): Promise<void>;
+}
+
+/**
  * Per-provider terminology used to assemble provider-aware tool descriptions
  * (spec DISCORD-SUPPORT-DESIGN §7.1). The Matrix bundle reproduces today's
  * tool schema strings exactly; the Discord bundle uses Discord vocabulary.
@@ -509,6 +590,14 @@ export interface IChatProvider {
   channelClient(target: OutboundTarget): ChannelClient | undefined;
   /** Enrichment capability object for one account; undefined when the account is foreign. */
   enrichment(accountId: string): EnrichmentCapabilities | undefined;
+  /**
+   * Neutral history paging client for one target (spec §11.3).
+   * Present iff `capabilities.history` is true and the target is in scope.
+   * Returns undefined for foreign targets or when history is unavailable.
+   * Matrix: wraps the native `room.messages()` call for the resolved roomId.
+   * Discord (Phase 7): before-snowflake paging.
+   */
+  history?(target: OutboundTarget): HistoryClient | undefined;
   /**
    * Update the bot's own profile (display name and/or avatar). Optional: absent on
    * providers that do not support profile edits (or where it is not yet implemented).

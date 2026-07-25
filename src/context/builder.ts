@@ -1524,6 +1524,41 @@ export class ContextBuilder {
     if (externalIds.length === 0) return [];
     const rows = this.storage.getDiscreteReactions(externalIds);
     if (rows.length === 0) return [];
+
+    // Reaction-line identity resolution (§6.5 / Phase 6): resolve sender labels
+    // through the user_identities map, deriving the provider from each row's
+    // timelineKey. With an empty map (Matrix-only deployments, where senders never
+    // populate user_identities) this is a no-op → byte-identical rendering.
+    const reactionPairs: Array<{ provider: string; userId: string }> = [];
+    const seenPairs = new Set<string>();
+    for (const row of rows) {
+      const parsed = parseTimelineKey(row.timelineKey);
+      if (!parsed) continue;
+      const pairKey = `${parsed.provider}:${row.senderId}`;
+      if (!seenPairs.has(pairKey)) {
+        seenPairs.add(pairKey);
+        reactionPairs.push({ provider: parsed.provider, userId: row.senderId });
+      }
+    }
+    const reactionIdentityMap =
+      reactionPairs.length > 0
+        ? this.storage.getUserIdentityMap(reactionPairs)
+        : new Map<string, CurrentIdentity>();
+    const resolvedRows =
+      reactionIdentityMap.size > 0
+        ? rows.map((row) => {
+            const parsed = parseTimelineKey(row.timelineKey);
+            if (!parsed) return row;
+            const current = reactionIdentityMap.get(`${parsed.provider}:${row.senderId}`);
+            if (!current) return row;
+            return {
+              ...row,
+              senderDisplay:
+                current.displayName ?? current.username ?? row.senderDisplay,
+            };
+          })
+        : rows;
+
     const targetInfo = new Map<string, ReactionTarget>();
     for (const target of targets) {
       if (!target.externalId) continue;
@@ -1538,7 +1573,7 @@ export class ContextBuilder {
     // Ascending message times across the whole rendered set — the seam signal for
     // episode splitting (count of messages between two reactions). §9f.
     const messageTimestamps = events.map((e) => e.timestamp).sort((a, b) => a - b);
-    return synthesizeReactionLines(rows, targetInfo, {
+    return synthesizeReactionLines(resolvedRows, targetInfo, {
       nameCap: opts.nameCap,
       selfUserId: opts.selfUserId,
       messageTimestamps,

@@ -1,6 +1,7 @@
 export { MatrixProvider } from "./provider.js";
 export { MatrixNativeClient } from "./native-client.js";
 export { RoomLabelCache } from "./room-label-cache.js";
+export { makeBackfillReadClient } from "./channel-client.js";
 export {
   normalizeMatrixInboundEvent,
   timelineKeyForMatrixEvent,

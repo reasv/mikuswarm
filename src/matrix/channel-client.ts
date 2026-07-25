@@ -80,6 +80,11 @@ export class MatrixChannelClient implements ChannelClient {
     };
   }
 
+  /** Fetch all backed-up megolm sessions for this room (HistoryClient.downloadRoomKeys). */
+  async downloadRoomKeys(): Promise<void> {
+    await this.#client.downloadRoomKeysForRoom(this.#roomId);
+  }
+
   async readMessage(externalId: string): Promise<HistorySummary | undefined> {
     const summary = await this.#client.messageSummary({ roomId: this.#roomId, eventId: externalId });
     if (!summary) return undefined;
@@ -175,13 +180,44 @@ export class MatrixChannelClient implements ChannelClient {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 import type { MatrixMessageSummary } from "./native-types.js";
+import { mediaToAttachment } from "./inbound.js";
+import type { BackfillReadClient } from "../backfill/paginate.js";
 
 function toHistorySummary(m: MatrixMessageSummary): HistorySummary {
+  const relType = m.relatesTo?.relType;
+  const relEventId = m.relatesTo?.eventId;
   return {
     externalId: m.eventId,
     sender: { id: m.sender, displayName: m.senderName },
     timestamp: /^\d+$/.test(m.timestamp) ? Number(m.timestamp) : new Date(m.timestamp).getTime(),
     body: m.body,
-    edited: m.relatesTo?.relType === "m.replace",
+    attachments: m.media ? m.media.map((media) => mediaToAttachment(m.eventId, media)) : undefined,
+    replyToExternalId: !relType && relEventId ? relEventId : undefined,
+    edited: relType === "m.replace",
+    editTargetExternalId: relType === "m.replace" ? relEventId : undefined,
+    threadRootExternalId: relType === "m.thread" ? relEventId : undefined,
+    undecryptable: m.undecryptable ? true : undefined,
+    sessionId: m.sessionId,
+    utdReason: m.utdReason,
+  };
+}
+
+/**
+ * Build a `BackfillReadClient` scoped to one room, backed by a native Matrix
+ * client. The roomId is captured in the closure so the neutral `HistoryPageRequest`
+ * (which carries no roomId) can be forwarded verbatim to the room-agnostic
+ * paginator while the native call still receives the correct room.
+ */
+export function makeBackfillReadClient(nativeClient: MatrixNativeClient, roomId: string): BackfillReadClient {
+  return {
+    readMessages: (req) =>
+      nativeClient
+        .readMessages({ roomId, limit: req.limit, before: req.before ?? req.cursor, after: req.after })
+        .then((result) => ({
+          messages: result.messages.map(toHistorySummary),
+          nextCursor: result.nextBatch ?? undefined,
+          prevCursor: result.prevBatch ?? undefined,
+        })),
+    downloadRoomKeysForRoom: (rId) => nativeClient.downloadRoomKeysForRoom(rId),
   };
 }

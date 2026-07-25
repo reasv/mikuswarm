@@ -86,6 +86,21 @@ test("enrichment() returns undefined before start()", () => {
   assert.equal(p.enrichment("main"), undefined);
 });
 
+test("history() returns undefined for an unstarted provider (unknown account)", () => {
+  const p = makeProvider();
+  // No accounts are running before start(); history() must return undefined for
+  // a foreign/unknown target rather than throwing.
+  const result = p.history({ provider: "matrix", timelineKey: "matrix:main:room:!r:h" });
+  assert.equal(result, undefined);
+});
+
+test("history() returns undefined when the target has no resolvable roomId", () => {
+  const p = makeProvider();
+  // A target with no roomId and no resolvable timelineKey yields undefined.
+  const result = p.history({ provider: "matrix" });
+  assert.equal(result, undefined);
+});
+
 // ── start() with enabled:false sets host but populates no accounts ────────────
 
 test("accountIds() remains empty when enabled:false after start()", async () => {

@@ -2,7 +2,7 @@ import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus } from "../timeline/index.js";
-import type { MatrixMessageSummary } from "../matrix/native-types.js";
+import type { HistorySummary } from "../types.js";
 import { classifyForTimeline } from "./classify.js";
 import { paginateBackward, type BackfillReadClient, type MessageDisposition } from "./paginate.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
@@ -139,7 +139,7 @@ export async function performInitialBackfill(
   const windowFloor = anchor - windowMs;
 
   const onMessage = async (
-    summary: MatrixMessageSummary,
+    summary: HistorySummary,
     timestamp: number,
   ): Promise<MessageDisposition> => {
     const classified = classifyForTimeline(summary, {
@@ -148,6 +148,7 @@ export async function performInitialBackfill(
       selfUserId,
       timelineKey,
       timestamp,
+      buildId: (externalId) => `matrix:${accountId}:${externalId}`,
     });
     if (!classified) return "skip"; // not part of the activated timeline
 
@@ -170,7 +171,7 @@ export async function performInitialBackfill(
       );
       logger?.debug("initial_backfill_edit", {
         timelineKey,
-        editEventId: summary.eventId,
+        editEventId: summary.externalId,
         targetExternalId,
         applied: editResult.applied,
       });

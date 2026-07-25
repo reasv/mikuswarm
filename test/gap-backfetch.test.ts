@@ -11,12 +11,7 @@ import { TimelineStore } from "../src/timeline/index.js";
 import { SummarizationIndexer } from "../src/summarization/index.js";
 import { selectSummaryCoverage } from "../src/context/summary-layer.js";
 import { estimateTokens } from "../src/context/index.js";
-import type { CanonicalChatEvent, InboundChatEvent } from "../src/types.js";
-import type {
-  MatrixMessageSummary,
-  MatrixReadMessagesRequest,
-  MatrixReadMessagesResult,
-} from "../src/matrix/native-types.js";
+import type { CanonicalChatEvent, InboundChatEvent, HistorySummary, HistoryPageRequest, HistoryPageResult } from "../src/types.js";
 
 const ACCOUNT = "miku";
 const ROOM = "!room:example.org";
@@ -27,32 +22,33 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-function summary(over: Partial<MatrixMessageSummary> & { eventId: string; timestamp: number }): MatrixMessageSummary {
+function summary(over: Partial<HistorySummary> & { externalId: string; timestamp: number }): HistorySummary {
   return {
-    eventId: over.eventId,
-    sender: over.sender ?? "@alice:example.org",
-    senderName: over.senderName,
+    externalId: over.externalId,
+    sender: over.sender ?? { id: "@alice:example.org" },
+    timestamp: over.timestamp,
     body: over.body ?? "hello",
-    msgtype: over.msgtype ?? "m.text",
-    timestamp: iso(over.timestamp),
-    relatesTo: over.relatesTo,
-    media: over.media,
+    attachments: over.attachments,
+    replyToExternalId: over.replyToExternalId,
+    edited: over.edited,
+    editTargetExternalId: over.editTargetExternalId,
+    threadRootExternalId: over.threadRootExternalId,
     undecryptable: over.undecryptable,
     sessionId: over.sessionId,
     utdReason: over.utdReason,
   };
 }
 
-function page(messages: MatrixMessageSummary[], nextBatch: string | null): MatrixReadMessagesResult {
-  return { messages, nextBatch, prevBatch: null };
+function page(messages: HistorySummary[], nextCursor: string | null): HistoryPageResult {
+  return { messages, nextCursor: nextCursor ?? undefined };
 }
 
 class ScriptedClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
-  constructor(private readonly pages: MatrixReadMessagesResult[]) {}
-  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+  constructor(private readonly pages: HistoryPageResult[]) {}
+  async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
     this.calls.push(request.before);
-    return this.pages[this.calls.length - 1] ?? { messages: [], nextBatch: null, prevBatch: null };
+    return this.pages[this.calls.length - 1] ?? { messages: [], nextCursor: undefined };
   }
 }
 
@@ -63,14 +59,14 @@ class ScriptedClient implements BackfillReadClient {
 class FailingAtClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
   constructor(
-    private readonly pages: MatrixReadMessagesResult[],
+    private readonly pages: HistoryPageResult[],
     private readonly failOnCall: number,
     private readonly error = new Error("simulated read failure"),
   ) {}
-  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+  async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
     this.calls.push(request.before);
     if (this.calls.length === this.failOnCall) throw this.error;
-    return this.pages[this.calls.length - 1] ?? { messages: [], nextBatch: null, prevBatch: null };
+    return this.pages[this.calls.length - 1] ?? { messages: [], nextCursor: undefined };
   }
 }
 
@@ -84,22 +80,22 @@ class FailingAtClient implements BackfillReadClient {
 class DelayingClient implements BackfillReadClient {
   readonly calls: Array<string | undefined> = [];
   constructor(
-    private readonly pages: MatrixReadMessagesResult[],
+    private readonly pages: HistoryPageResult[],
     private readonly delaysMs: number[],
   ) {}
-  async readMessages(request: MatrixReadMessagesRequest): Promise<MatrixReadMessagesResult> {
+  async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
     this.calls.push(request.before);
     const i = this.calls.length - 1;
     const delay = this.delaysMs[i] ?? 0;
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-    return this.pages[i] ?? { messages: [], nextBatch: null, prevBatch: null };
+    return this.pages[i] ?? { messages: [], nextCursor: undefined };
   }
 }
 
 /** A summary marked undecryptable (UTD), as the native client reports key-less events. */
-function utdSummary(over: { eventId: string; timestamp: number; sessionId?: string }): MatrixMessageSummary {
+function utdSummary(over: { externalId: string; timestamp: number; sessionId?: string }): HistorySummary {
   return summary({
-    eventId: over.eventId,
+    externalId: over.externalId,
     timestamp: over.timestamp,
     undecryptable: true,
     sessionId: over.sessionId ?? "sess-1",
@@ -166,7 +162,7 @@ const DEFAULT_CONFIG: GapBackfetchConfig = {
 };
 
 async function makeHarness(
-  pages: MatrixReadMessagesResult[],
+  pages: HistoryPageResult[],
   configOverride: Partial<GapBackfetchConfig> = {},
   storeOverride?: Pick<GapBackfetchCoordinatorOptions, "timeline">,
   clientOverride?: BackfillReadClient & { calls: Array<string | undefined> },
@@ -240,10 +236,10 @@ test("fills the gap: stops at floor, commits the gap oldest-first, unfreezes", a
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }), // the floor — stop here, not stored
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }), // the floor — stop here, not stored
       ],
       null,
     ),
@@ -269,7 +265,7 @@ test("no-gap fast path: first page reaches the floor, nothing committed", async 
   // The floor event ($a, === floor.id) is the exact-match boundary (#4): the descent
   // hard-stops on it and commits nothing.
   const h = await makeHarness([
-    page([summary({ eventId: "$a", timestamp: 1000 })], "tok1"),
+    page([summary({ externalId: "$a", timestamp: 1000 })], "tok1"),
   ]);
   await seedFloor(h.timeline, h.storage, "$a", 1000);
 
@@ -294,9 +290,9 @@ test("floor boundary: same-ms gap events on both sides of floor.id are recovered
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$n", timestamp: 2000 }), // same ts, id > floor.id → recovered
-        summary({ eventId: "$a", timestamp: 2000 }), // same ts, id < floor.id → recovered (the fix)
-        summary({ eventId: "$m", timestamp: 2000 }), // exactly the floor → stop
+        summary({ externalId: "$n", timestamp: 2000 }), // same ts, id > floor.id → recovered
+        summary({ externalId: "$a", timestamp: 2000 }), // same ts, id < floor.id → recovered (the fix)
+        summary({ externalId: "$m", timestamp: 2000 }), // exactly the floor → stop
       ],
       null,
     ),
@@ -320,8 +316,8 @@ test("backfetched messages carry no trigger and never replay as a session", asyn
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$b", timestamp: 2000, body: "hey @miku", sender: "@alice:example.org" }),
-        summary({ eventId: "$a", timestamp: 1000 }),
+        summary({ externalId: "$b", timestamp: 2000, body: "hey @miku", sender: { id: "@alice:example.org" } }),
+        summary({ externalId: "$a", timestamp: 1000 }),
       ],
       null,
     ),
@@ -340,7 +336,7 @@ test("backfetched messages carry no trigger and never replay as a session", asyn
 
 test("live events arriving during the freeze are buffered and replayed after commit (G4)", async () => {
   const h = await makeHarness([
-    page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+    page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
   ]);
   await seedFloor(h.timeline, h.storage, "$a", 1000);
 
@@ -364,12 +360,12 @@ test("cap leaves a hole below the oldest committed gap message and logs capped",
     [
       page(
         [
-          summary({ eventId: "$d", timestamp: 4000 }),
-          summary({ eventId: "$c", timestamp: 3000 }),
+          summary({ externalId: "$d", timestamp: 4000 }),
+          summary({ externalId: "$c", timestamp: 3000 }),
         ],
         "tok1",
       ),
-      page([summary({ eventId: "$b", timestamp: 2000 })], "tok2"),
+      page([summary({ externalId: "$b", timestamp: 2000 })], "tok2"),
     ],
     { maxMessages: 2 },
   );
@@ -398,9 +394,9 @@ test("window stop leaves a capped hole tagged reason 'window' (#6)", async () =>
     [
       page(
         [
-          summary({ eventId: "$d", timestamp: now - 1000 }),
-          summary({ eventId: "$c", timestamp: now - 2000 }),
-          summary({ eventId: "$b", timestamp: now - 100_000 }), // older than the window floor → stop
+          summary({ externalId: "$d", timestamp: now - 1000 }),
+          summary({ externalId: "$c", timestamp: now - 2000 }),
+          summary({ externalId: "$b", timestamp: now - 100_000 }), // older than the window floor → stop
         ],
         null,
       ),
@@ -429,8 +425,8 @@ test("timeout stop leaves a capped hole tagged reason 'timeout' (#6)", async () 
   // BackfillTimeoutError, which paginateBackward records as `timedOut` (not errored).
   const client = new DelayingClient(
     [
-      page([summary({ eventId: "$d", timestamp: 4000 }), summary({ eventId: "$c", timestamp: 3000 })], "tok1"),
-      page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+      page([summary({ externalId: "$d", timestamp: 4000 }), summary({ externalId: "$c", timestamp: 3000 })], "tok1"),
+      page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
     ],
     // Page 1 is instant; page 2 stalls well past the timeout so the deadline trips.
     [0, 1000],
@@ -458,9 +454,9 @@ test("whole-room capture: thread events route to their thread timeline key", asy
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$t1", timestamp: 3000, relatesTo: { relType: "m.thread", eventId: "$root" } }),
-        summary({ eventId: "$r1", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }),
+        summary({ externalId: "$t1", timestamp: 3000, threadRootExternalId: "$root" }),
+        summary({ externalId: "$r1", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }),
       ],
       null,
     ),
@@ -484,10 +480,10 @@ test("crash mid-commit (fails after K oldest rows) leaves a single gap above K n
   const pages1 = [
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }),
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }),
       ],
       null,
     ),
@@ -532,9 +528,9 @@ test("crash mid-commit (fails after K oldest rows) leaves a single gap above K n
   const pages2 = [
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }), // new floor — stop
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }), // new floor — stop
       ],
       null,
     ),
@@ -561,7 +557,7 @@ test("crash mid-commit (fails after K oldest rows) leaves a single gap above K n
 });
 
 test("disabled: prepare/run are no-ops and isFrozen is always false", async () => {
-  const h = await makeHarness([page([summary({ eventId: "$b", timestamp: 2000 })], null)], { enabled: false });
+  const h = await makeHarness([page([summary({ externalId: "$b", timestamp: 2000 })], null)], { enabled: false });
   await seedFloor(h.timeline, h.storage, "$a", 1000);
 
   h.coordinator.prepare();
@@ -576,9 +572,9 @@ test("every committed gap event lands strictly above the floor (guards the cover
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1500 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1500 }),
       ],
       null,
     ),
@@ -603,9 +599,9 @@ test("read failure mid-descent: nothing committed, room failed/frozen, high-wate
   // which never arrives because the 2nd readMessages rejects. The pre-fix code
   // committed the partial newest-suffix ($d,$c) and buried the unfetched older span.
   const pages = [
-    page([summary({ eventId: "$d", timestamp: 4000 }), summary({ eventId: "$c", timestamp: 3000 })], "tok1"),
+    page([summary({ externalId: "$d", timestamp: 4000 }), summary({ externalId: "$c", timestamp: 3000 })], "tok1"),
     // call #2 rejects (see failOnCall) — this page is never served.
-    page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+    page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
   ];
   const client = new FailingAtClient(pages, 2);
   const h = await makeHarness(pages, {}, undefined, client);
@@ -632,10 +628,10 @@ test("read failure mid-descent: nothing committed, room failed/frozen, high-wate
   const client2 = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -671,14 +667,14 @@ test("floor-bounded UTD run does not halt-and-bury: UTD stored 'skipped', descen
       page(
         [
           // 3 consecutive UTD events at the head (>= threshold) — a startup key-sync wall.
-          utdSummary({ eventId: "$utd3", timestamp: 7000 }),
-          utdSummary({ eventId: "$utd2", timestamp: 6000 }),
-          utdSummary({ eventId: "$utd1", timestamp: 5000 }),
+          utdSummary({ externalId: "$utd3", timestamp: 7000 }),
+          utdSummary({ externalId: "$utd2", timestamp: 6000 }),
+          utdSummary({ externalId: "$utd1", timestamp: 5000 }),
           // decryptable gap traffic below the UTD wall.
-          summary({ eventId: "$g", timestamp: 4000 }),
-          summary({ eventId: "$f", timestamp: 3000 }),
-          summary({ eventId: "$e", timestamp: 2000 }),
-          summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+          summary({ externalId: "$g", timestamp: 4000 }),
+          summary({ externalId: "$f", timestamp: 3000 }),
+          summary({ externalId: "$e", timestamp: 2000 }),
+          summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
         ],
         null,
       ),
@@ -715,10 +711,10 @@ test("floor-undefined descent still halts on a long UTD run (guard retained for 
     [
       page(
         [
-          utdSummary({ eventId: "$utd3", timestamp: 7000 }),
-          utdSummary({ eventId: "$utd2", timestamp: 6000 }),
-          utdSummary({ eventId: "$utd1", timestamp: 5000 }),
-          summary({ eventId: "$deep", timestamp: 4000 }), // below the wall — never reached
+          utdSummary({ externalId: "$utd3", timestamp: 7000 }),
+          utdSummary({ externalId: "$utd2", timestamp: 6000 }),
+          utdSummary({ externalId: "$utd1", timestamp: 5000 }),
+          summary({ externalId: "$deep", timestamp: 4000 }), // below the wall — never reached
         ],
         null,
       ),
@@ -754,12 +750,12 @@ test("equal-timestamp floor: same-ms lower-id gap event recovered; exact floor e
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$a", timestamp: 2000 }), // same ts, id < floor.id → recovered (the fix)
-        summary({ eventId: "$m", timestamp: 2000 }), // === floor.id → exact-match stop
+        summary({ externalId: "$a", timestamp: 2000 }), // same ts, id < floor.id → recovered (the fix)
+        summary({ externalId: "$m", timestamp: 2000 }), // === floor.id → exact-match stop
       ],
       "tok2",
     ),
-    page([summary({ eventId: "$pre", timestamp: 1000 })], null), // reached only if $m failed to stop
+    page([summary({ externalId: "$pre", timestamp: 1000 })], null), // reached only if $m failed to stop
   ]);
   await seedFloor(h.timeline, h.storage, "$m", 2000);
 
@@ -795,10 +791,10 @@ test("draining before commit: room does NOT commit, stays frozen, gap re-derivab
     [
       page(
         [
-          summary({ eventId: "$d", timestamp: 4000 }),
-          summary({ eventId: "$c", timestamp: 3000 }),
-          summary({ eventId: "$b", timestamp: 2000 }),
-          summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+          summary({ externalId: "$d", timestamp: 4000 }),
+          summary({ externalId: "$c", timestamp: 3000 }),
+          summary({ externalId: "$b", timestamp: 2000 }),
+          summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
         ],
         null,
       ),
@@ -837,10 +833,10 @@ test("draining before commit: room does NOT commit, stays frozen, gap re-derivab
       new ScriptedClient([
         page(
           [
-            summary({ eventId: "$d", timestamp: 4000 }),
-            summary({ eventId: "$c", timestamp: 3000 }),
-            summary({ eventId: "$b", timestamp: 2000 }),
-            summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+            summary({ externalId: "$d", timestamp: 4000 }),
+            summary({ externalId: "$c", timestamp: 3000 }),
+            summary({ externalId: "$b", timestamp: 2000 }),
+            summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
           ],
           null,
         ),
@@ -867,7 +863,7 @@ test("draining that flips true mid-run bails the commit (no partial writes)", as
   // only at room-launch time.
   let observed = 0;
   const h = await makeHarness(
-    [page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null)],
+    [page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null)],
     {},
     undefined,
     undefined,
@@ -894,9 +890,9 @@ test("mixed room/dm keys: base kind is the newest-high-water side (room wins), e
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$g2", timestamp: 5000 }),
-        summary({ eventId: "$g1", timestamp: 4000 }),
-        summary({ eventId: "$room", timestamp: 3000 }), // === room: floor (the MAX over all keys) → stop
+        summary({ externalId: "$g2", timestamp: 5000 }),
+        summary({ externalId: "$g1", timestamp: 4000 }),
+        summary({ externalId: "$room", timestamp: 3000 }), // === room: floor (the MAX over all keys) → stop
       ],
       null,
     ),
@@ -928,9 +924,9 @@ test("mixed room/dm keys: dm side newer ⇒ dm base chosen; single-kind groups e
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$g2", timestamp: 6000 }),
-        summary({ eventId: "$g1", timestamp: 5000 }),
-        summary({ eventId: "$dm", timestamp: 4000 }), // === dm: floor (MAX over all keys) → stop
+        summary({ externalId: "$g2", timestamp: 6000 }),
+        summary({ externalId: "$g1", timestamp: 5000 }),
+        summary({ externalId: "$dm", timestamp: 4000 }), // === dm: floor (MAX over all keys) → stop
       ],
       null,
     ),
@@ -951,7 +947,7 @@ test("mixed room/dm keys: dm side newer ⇒ dm base chosen; single-kind groups e
 test("single-kind group: no mixed-kind warning, unchanged behavior", async () => {
   // The normal case (room: only) must be completely unchanged: no mixed warning.
   const h = await makeHarness([
-    page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+    page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
   ]);
   await seedFloor(h.timeline, h.storage, "$a", 1000);
 
@@ -980,10 +976,10 @@ test("coverage cursor extends to the newest committed gap row after real summari
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000, body: longBody }),
-        summary({ eventId: "$c", timestamp: 3000, body: longBody }),
-        summary({ eventId: "$b", timestamp: 2000, body: longBody }),
-        summary({ eventId: "$a", timestamp: 1000 }), // the floor — stop, not stored
+        summary({ externalId: "$d", timestamp: 4000, body: longBody }),
+        summary({ externalId: "$c", timestamp: 3000, body: longBody }),
+        summary({ externalId: "$b", timestamp: 2000, body: longBody }),
+        summary({ externalId: "$a", timestamp: 1000 }), // the floor — stop, not stored
       ],
       null,
     ),
@@ -1088,10 +1084,10 @@ test("crash mid-fill: a discarded run commits nothing; a fresh coordinator re-de
   const pages1 = [
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1130,10 +1126,10 @@ test("crash mid-fill: a discarded run commits nothing; a fresh coordinator re-de
       new ScriptedClient([
         page(
           [
-            summary({ eventId: "$d", timestamp: 4000 }),
-            summary({ eventId: "$c", timestamp: 3000 }),
-            summary({ eventId: "$b", timestamp: 2000 }),
-            summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+            summary({ externalId: "$d", timestamp: 4000 }),
+            summary({ externalId: "$c", timestamp: 3000 }),
+            summary({ externalId: "$b", timestamp: 2000 }),
+            summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
           ],
           null,
         ),
@@ -1164,10 +1160,10 @@ test("compounding downtime: crash-K then new traffic then full close yields one 
   const client1 = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }),
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }),
       ],
       null,
     ),
@@ -1195,11 +1191,11 @@ test("compounding downtime: crash-K then new traffic then full close yields one 
   const client2 = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$f", timestamp: 6000 }),
-        summary({ eventId: "$e", timestamp: 5000 }),
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }), // new floor — stop
+        summary({ externalId: "$f", timestamp: 6000 }),
+        summary({ externalId: "$e", timestamp: 5000 }),
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }), // new floor — stop
       ],
       null,
     ),
@@ -1227,10 +1223,10 @@ test("compounding downtime: crash-K then new traffic then full close yields one 
   const client3 = new ScriptedClient([
     page(
       [
-        summary({ eventId: "$f", timestamp: 6000 }),
-        summary({ eventId: "$e", timestamp: 5000 }),
-        summary({ eventId: "$d", timestamp: 4000 }),
-        summary({ eventId: "$c", timestamp: 3000 }), // new floor — stop
+        summary({ externalId: "$f", timestamp: 6000 }),
+        summary({ externalId: "$e", timestamp: 5000 }),
+        summary({ externalId: "$d", timestamp: 4000 }),
+        summary({ externalId: "$c", timestamp: 3000 }), // new floor — stop
       ],
       null,
     ),
@@ -1258,8 +1254,8 @@ test("boundary overlap: a live @ that the descent also fetched is committed once
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$b", timestamp: 2000, body: "hey @miku", sender: "@alice:example.org" }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$b", timestamp: 2000, body: "hey @miku", sender: { id: "@alice:example.org" } }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1296,9 +1292,9 @@ test("commit dedup: a duplicate canonical id in the backfill buffer inserts exac
   // The same eventId appears twice across pages (server returned an overlapping
   // page boundary). The commit dedups by canonical id before inserting.
   const h = await makeHarness([
-    page([summary({ eventId: "$c", timestamp: 3000 }), summary({ eventId: "$b", timestamp: 2000 })], "tok1"),
+    page([summary({ externalId: "$c", timestamp: 3000 }), summary({ externalId: "$b", timestamp: 2000 })], "tok1"),
     // page 2 re-includes $b (overlap) plus reaches the floor.
-    page([summary({ eventId: "$b", timestamp: 2000 }), summary({ eventId: "$a", timestamp: 1000 })], null),
+    page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
   ]);
   await seedFloor(h.timeline, h.storage, "$a", 1000);
 
@@ -1324,9 +1320,9 @@ test("commit nudges: active gap rows fire enrichment, chat-search, and caption n
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$link", timestamp: 3000, body: "see http://example.com for details" }),
-        summary({ eventId: "$txt", timestamp: 2000, body: "plain text" }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$link", timestamp: 3000, body: "see http://example.com for details" }),
+        summary({ externalId: "$txt", timestamp: 2000, body: "plain text" }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1362,9 +1358,9 @@ test("commit status: an inactive timeline stores gap rows 'inactive' with no enr
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$b", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$b", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1395,9 +1391,9 @@ test("commit status: a UTD gap row is stored 'skipped' even on an inactive timel
   const h = await makeHarness([
     page(
       [
-        utdSummary({ eventId: "$utd", timestamp: 3000 }),
-        summary({ eventId: "$plain", timestamp: 2000 }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        utdSummary({ externalId: "$utd", timestamp: 3000 }),
+        summary({ externalId: "$plain", timestamp: 2000 }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1424,13 +1420,14 @@ test("commit edits: an m.replace in a backfetched page updates its gap target's 
     page(
       [
         summary({
-          eventId: "$edit",
+          externalId: "$edit",
           timestamp: 3000,
           body: "* edited body",
-          relatesTo: { relType: "m.replace", eventId: "$orig" },
+          edited: true,
+          editTargetExternalId: "$orig",
         }),
-        summary({ eventId: "$orig", timestamp: 2000, body: "original body" }),
-        summary({ eventId: "$a", timestamp: 1000 }), // floor — stop
+        summary({ externalId: "$orig", timestamp: 2000, body: "original body" }),
+        summary({ externalId: "$a", timestamp: 1000 }), // floor — stop
       ],
       null,
     ),
@@ -1453,7 +1450,7 @@ test("enumeration: a room known only via agent_sessions (no timeline_events) is 
   // timeline_compaction_state. A room that has only an agent_sessions row (e.g. a
   // session was created but its events were pruned/never persisted) must still be
   // enumerated and frozen so a gap there is recoverable.
-  const h = await makeHarness([page([summary({ eventId: "$x", timestamp: 1 })], null)]);
+  const h = await makeHarness([page([summary({ externalId: "$x", timestamp: 1 })], null)]);
   // No timeline_events, no compaction-state row — register the room ONLY via a
   // session row keyed to ROOM_TK.
   await h.storage.insertAgentSession({
@@ -1557,12 +1554,12 @@ test("floor stop recognizes a bot-sent floor stored under an assistant: canonica
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$f", timestamp: 2000, sender: SELF, body: "bot reply" }),
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$f", timestamp: 2000, sender: { id: SELF }, body: "bot reply" }),
       ],
       "tok1",
     ),
-    page([summary({ eventId: "$old", timestamp: 500 })], null),
+    page([summary({ externalId: "$old", timestamp: 500 })], null),
   ]);
   await seedAssistantRow(h.timeline, h.storage, "$f", 2000);
 
@@ -1589,9 +1586,9 @@ test("commit dedups a re-fetched same-ms bot message against its assistant: row 
   const h = await makeHarness([
     page(
       [
-        summary({ eventId: "$c", timestamp: 3000 }),
-        summary({ eventId: "$s", timestamp: 2000, sender: SELF, body: "bot reply" }),
-        summary({ eventId: "$u", timestamp: 2000 }), // the floor — exact id match
+        summary({ externalId: "$c", timestamp: 3000 }),
+        summary({ externalId: "$s", timestamp: 2000, sender: { id: SELF }, body: "bot reply" }),
+        summary({ externalId: "$u", timestamp: 2000 }), // the floor — exact id match
       ],
       null,
     ),
