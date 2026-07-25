@@ -360,6 +360,10 @@ enabled = false
 trigger_hold_ms = 2000
 trigger_group_lookback_ms = 20000
 
+[discord]
+enabled = false
+trigger_hold_ms = 0
+
 [enrichment]
 trigger_wait_timeout_ms = 30000
 

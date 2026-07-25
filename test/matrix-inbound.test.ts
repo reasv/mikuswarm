@@ -6,6 +6,7 @@ import test from "node:test";
 import { normalizeMatrixInboundEvent } from "../src/matrix/inbound.js";
 import { MatrixProvider } from "../src/matrix/provider.js";
 import type { MatrixInboundEvent } from "../src/matrix/native-types.js";
+import type { AppConfig } from "../src/config/index.js";
 import type { InboundChatEvent } from "../src/types.js";
 import { channelTypeOf } from "../src/timeline/router.js";
 
@@ -70,7 +71,9 @@ test("Matrix provider preserves body text separately when sending attachments", 
     await writeFile(filePath, "fake-image");
     const sends: unknown[] = [];
     const uploads: unknown[] = [];
-    const provider = new MatrixProvider();
+    const provider = new MatrixProvider(
+      { enabled: false, trigger_hold_ms: 0, accounts: {} } as AppConfig["matrix"],
+    );
     (provider as any).accounts.set("miku", {
       accountId: "miku",
       selfUserId: "@miku:example.org",
@@ -128,7 +131,9 @@ test("Matrix provider preserves body text separately when sending attachments", 
 
 test("Matrix provider forwards formatted HTML bodies to native text sends", async () => {
   const sends: unknown[] = [];
-  const provider = new MatrixProvider();
+  const provider = new MatrixProvider(
+    { enabled: false, trigger_hold_ms: 0, accounts: {} } as AppConfig["matrix"],
+  );
   (provider as any).accounts.set("miku", {
     accountId: "miku",
     selfUserId: "@miku:example.org",
@@ -258,12 +263,16 @@ test("Matrix provider delivers a trigger event TWICE — same event.id, trigger 
   // `event.id`. `handleInbound` runs on both, so anything non-idempotent on that
   // path (steering a reply into a live session) must dedup by event id, or the
   // interjection lands twice. See ARCHITECTURE.md §"Trigger hold".
-  const provider = new MatrixProvider();
-  // emitWithTriggerHold only reads `config` truthiness + `trigger_hold_ms`.
-  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: 5 };
-
   const deliveries: InboundChatEvent[] = [];
-  provider.subscribe((event) => deliveries.push(event));
+  const provider = new MatrixProvider(
+    { enabled: false, trigger_hold_ms: 5, accounts: {} } as AppConfig["matrix"],
+  );
+  // start() sets host synchronously (before the enabled check) so void is safe.
+  void provider.start({
+    onEvent: (event) => deliveries.push(event),
+    onError: () => {},
+    onReaction: () => {},
+  });
 
   // A DM reply is always a trigger (type "dm") — the common interjection path.
   const dmReply: MatrixInboundEvent = {
@@ -303,11 +312,16 @@ test("same-sender trigger-bearing follow-up groups into the open hold instead of
   // each reply carries its OWN mention trigger — which previously flushed the held
   // trigger and started a fresh hold, yielding two sessions. The follow-up must now
   // fold into the held trigger: one grouped trigger-bearing delivery, not two.
-  const provider = new MatrixProvider();
-  (provider as unknown as { config: { trigger_hold_ms: number } }).config = { trigger_hold_ms: 50 };
-
   const deliveries: InboundChatEvent[] = [];
-  provider.subscribe((event) => deliveries.push(event));
+  const provider = new MatrixProvider(
+    { enabled: false, trigger_hold_ms: 50, accounts: {} } as AppConfig["matrix"],
+  );
+  // start() sets host synchronously (before the enabled check) so void is safe.
+  void provider.start({
+    onEvent: (event) => deliveries.push(event),
+    onError: () => {},
+    onReaction: () => {},
+  });
 
   const base: MatrixInboundEvent = {
     roomId: "!room:example.org",

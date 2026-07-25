@@ -6,6 +6,7 @@ import type { AppConfig } from "./config/index.js";
 import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
+import type { MatrixNativeClient, MatrixNativeEvent, MatrixReactionStreamEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
 import {
   ActivationCoordinator,
@@ -111,7 +112,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, InboundChatEvent, TriggerInfo } from "./types.js";
+import type { CanonicalChatEvent, ChatProviderHost, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
@@ -757,79 +758,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger,
   });
 
-  const provider = new MatrixProvider({
-    onError: (error, context) =>
-      logger.error("matrix_provider_error", {
-        ...context,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    onNativeEvent: (event, context) =>
-      logger.info("matrix_native_event", {
-        ...context,
-        type: event.type,
-        state: "state" in event ? event.state : undefined,
-        stage: "stage" in event ? event.stage : undefined,
-        // Lifecycle stages (restore_recovery / enable_backup) carry their outcome
-        // in `detail` — the load-bearing diagnostic for key-backup restore. Log it.
-        detail: "detail" in event ? event.detail : undefined,
-      }),
-    // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
-    // store only — never wake a session. Writes are fire-and-forget through the
-    // single-writer queue; a failure is logged but must not stall the poll loop.
-    onReaction: (event, context) => {
-      // Master switch: when reactions are disabled, don't even persist (the views
-      // are gated independently in the context builder).
-      if (config.reactions?.enabled === false) return;
-      void ingestReactionEvent(storage, context.accountId, event, Date.now())
-        .then((outcome) => {
-          if (outcome.action === "skipped") {
-            logger.warn("reaction_add_incomplete", {
-              ...context,
-              reactionEventId: event.reactionEventId,
-              reason: outcome.reason,
-            });
-          }
-        })
-        .catch((error) =>
-          logger.error("reaction_ingest_failed", {
-            ...context,
-            reactionEventId: event.reactionEventId,
-            action: event.action,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
-    },
-    onDiagnostics: (diagnostics, context) =>
-      logger.info("matrix_diagnostics", {
-        ...context,
-        verificationState: diagnostics.verificationState,
-        keyBackupState: diagnostics.keyBackupState,
-        syncState: diagnostics.syncState,
-        lastSuccessfulSyncAt: diagnostics.lastSuccessfulSyncAt,
-        lastSuccessfulDecryptionAt: diagnostics.lastSuccessfulDecryptionAt,
-      }),
-    // Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). The provider asks,
-    // inside its trigger hold, whether an untriggered reply targets one of the
-    // bot's own messages with resume enabled for the context; if so it becomes a
-    // `reply` trigger and rides the normal hold/debounce/grouping. The provider
-    // stays resume-unaware — the timeline lookup and resume config live here. DMs
-    // already trigger as `dm`, so in practice this only ever fires for groups
-    // (the provider's `!inbound.trigger` guard). The resume-vs-fresh decision
-    // stays downstream in `tryReplyResume`; this only classifies the trigger.
-    resolveReplyTrigger: ({ provider, externalId, timelineKey, sender }) => {
-      const ctx = resumeContextFor(timelineKey);
-      if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;
-      const targetEvent = timeline.getByExternalId(provider, externalId, timelineKey);
-      if (!targetEvent || targetEvent.timelineKey !== timelineKey || !targetEvent.agentSessionId) {
-        return undefined;
-      }
-      return {
-        type: "reply",
-        reason: "reply to bot message",
-        triggeredBy: { id: sender.id, displayName: sender.displayName },
-      };
-    },
-  });
+  const provider = new MatrixProvider(config.matrix);
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
   // Drain cancellation for context builds (spec §7.2): a build waiting on a
@@ -1650,12 +1579,6 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     enqueueChatSearch: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
     isDraining: () => draining,
     logger: logger.child("message-backfetch"),
-  });
-
-  provider.subscribe((inbound) => {
-    void handleInbound(inbound).catch((error) => {
-      logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
-    });
   });
 
   async function handleInbound(inbound: InboundChatEvent): Promise<void> {
@@ -4925,7 +4848,90 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // gap is above it, uncommitted), so they are unaffected. No-op when disabled.
   gapBackfetch.prepare();
 
-  await provider.start(config.matrix);
+  const matrixHost: ChatProviderHost = {
+    onEvent: (inbound) => {
+      void handleInbound(inbound).catch((error) => {
+        logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
+      });
+    },
+    onError: (error, context) =>
+      logger.error("matrix_provider_error", {
+        ...context,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    onNativeEvent: (event, context) => {
+      const e = event as Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>;
+      logger.info("matrix_native_event", {
+        ...context,
+        type: e.type,
+        state: "state" in e ? e.state : undefined,
+        stage: "stage" in e ? e.stage : undefined,
+        // Lifecycle stages (restore_recovery / enable_backup) carry their outcome
+        // in `detail` — the load-bearing diagnostic for key-backup restore. Log it.
+        detail: "detail" in e ? e.detail : undefined,
+      });
+    },
+    // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
+    // store only — never wake a session. Writes are fire-and-forget through the
+    // single-writer queue; a failure is logged but must not stall the poll loop.
+    onReaction: (event, context) => {
+      // Master switch: when reactions are disabled, don't even persist (the views
+      // are gated independently in the context builder).
+      if (config.reactions?.enabled === false) return;
+      const matrixEvent = event as MatrixReactionStreamEvent;
+      void ingestReactionEvent(storage, context.accountId, matrixEvent, Date.now())
+        .then((outcome) => {
+          if (outcome.action === "skipped") {
+            logger.warn("reaction_add_incomplete", {
+              ...context,
+              reactionEventId: matrixEvent.reactionEventId,
+              reason: outcome.reason,
+            });
+          }
+        })
+        .catch((error) =>
+          logger.error("reaction_ingest_failed", {
+            ...context,
+            reactionEventId: matrixEvent.reactionEventId,
+            action: matrixEvent.action,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    },
+    onDiagnostics: (diagnostics, context) => {
+      const d = diagnostics as ReturnType<MatrixNativeClient["start"]>;
+      logger.info("matrix_diagnostics", {
+        ...context,
+        verificationState: d.verificationState,
+        keyBackupState: d.keyBackupState,
+        syncState: d.syncState,
+        lastSuccessfulSyncAt: d.lastSuccessfulSyncAt,
+        lastSuccessfulDecryptionAt: d.lastSuccessfulDecryptionAt,
+      });
+    },
+    // Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). The provider asks,
+    // inside its trigger hold, whether an untriggered reply targets one of the
+    // bot's own messages with resume enabled for the context; if so it becomes a
+    // `reply` trigger and rides the normal hold/debounce/grouping. The provider
+    // stays resume-unaware — the timeline lookup and resume config live here. DMs
+    // already trigger as `dm`, so in practice this only ever fires for groups
+    // (the provider's `!inbound.trigger` guard). The resume-vs-fresh decision
+    // stays downstream in `tryReplyResume`; this only classifies the trigger.
+    resolveReplyTrigger: ({ provider: providerId, externalId, timelineKey, sender }) => {
+      const ctx = resumeContextFor(timelineKey);
+      if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;
+      const targetEvent = timeline.getByExternalId(providerId, externalId, timelineKey);
+      if (!targetEvent || targetEvent.timelineKey !== timelineKey || !targetEvent.agentSessionId) {
+        return undefined;
+      }
+      return {
+        type: "reply",
+        reason: "reply to bot message",
+        triggeredBy: { id: sender.id, displayName: sender.displayName },
+      };
+    },
+  };
+  await provider.start(matrixHost);
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
   // shows real names without waiting for each room's next message. Throttled and

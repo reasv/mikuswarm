@@ -1,3 +1,7 @@
+import type { EnrichmentCapabilities } from "./enrichment/types.js";
+
+export type { EnrichmentCapabilities };
+
 /**
  * Type guard for Node.js system errors (ENOENT, EACCES, etc.).
  * Checks that the value is an Error with a `code` property.
@@ -22,6 +26,24 @@ export interface SenderInfo {
   displayName?: string;
   isSelf?: boolean;
 }
+
+/**
+ * A provider's own identity for one account.
+ * `id` is the stable opaque key (MXID, Discord snowflake, …).
+ */
+export interface SelfIdentity {
+  id: string;
+  username?: string;
+  displayName?: string;
+}
+
+/** Minimal cross-provider reaction event envelope. Phase 6 generalises the shape. */
+export interface ReactionStreamEvent {
+  action: "add" | "remove";
+}
+
+/** Cross-provider provider lifecycle / diagnostics event. Provider-specific shape. */
+export type ProviderLifecycleEvent = unknown;
 
 export interface CaptionResult {
   attachmentId: string;
@@ -218,10 +240,80 @@ export type Unsubscribe = () => void;
 export interface ProviderCapabilities {
   typing?: boolean;
   reactions?: boolean;
-  readReceipts?: boolean;
+  reactionKinds?: Array<"unicode" | "custom" | "text">;
+  customEmojiScoped?: boolean;
   mediaUpload?: boolean;
+  /** Maximum number of attachments per outbound message. */
+  maxAttachmentsPerMessage: number;
+  /** Safe body character budget (for chunking). */
+  maxMessageChars: number;
+  formatting: "html" | "markdown" | "plain";
+  edits: boolean;
+  deletes: boolean;
+  pollCreate: boolean;
+  /** Note: Discord has no bot vote endpoint — false there even though Discord supports polls. */
+  pollVote: boolean;
+  pins: boolean;
+  voiceMessages: boolean;
+  threads: boolean;
+  /** history = read_messages tool + backfill. */
+  history: boolean;
+  /** gates re-decryption instantiation (encrypted provider only). */
+  encrypted: boolean;
+  /** "none" → framework-level direct-HTTP preview fallback. */
+  linkPreviews: "provider" | "none";
+  singleAttachmentPerMessage: boolean;
+  membershipRoster: boolean;
 }
 
+/**
+ * Cross-provider lifecycle callbacks passed at {@link IChatProvider.start}.
+ * Replaces the constructor-options pattern for Matrix and applies to all providers.
+ */
+export interface ChatProviderHost {
+  onEvent(event: InboundChatEvent): void;
+  onReaction(event: ReactionStreamEvent, ctx: { accountId: string }): void;
+  /** Gateway/sync lifecycle + diagnostics for the console. Optional to emit. */
+  onNativeEvent?(event: ProviderLifecycleEvent, ctx: { accountId: string }): void;
+  onDiagnostics?(diagnostics: unknown, ctx: { accountId: string }): void;
+  onError(error: unknown, ctx: { accountId?: string; phase: string }): void;
+  /** Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5); provider stays resume-unaware. */
+  resolveReplyTrigger?(args: {
+    provider: string;
+    externalId: string;
+    timelineKey: string;
+    sender: SenderInfo;
+  }): TriggerInfo | undefined;
+}
+
+/**
+ * Provider contract v2 (spec DISCORD-SUPPORT-DESIGN §3.1).
+ * Implemented by MatrixProvider (Phase 2a). Discord provider (Phase 3+).
+ *
+ * Deferred members (not yet present):
+ *   - `channelClient(target)` — Phase 4, ChannelClient type not yet defined
+ *   - `history(target)` — Phase 6, HistoryClient type not yet defined
+ */
+export interface IChatProvider {
+  readonly id: string;
+  readonly capabilities: ProviderCapabilities;
+  start(host: ChatProviderHost): Promise<void>;
+  stop(): Promise<void>;
+  send(target: OutboundTarget, message: OutboundMessage): Promise<DeliveryReceipt>;
+  setTyping(target: OutboundTarget, typing: boolean): Promise<void>;
+  accountIds(): string[];
+  /** Resolved at start; undefined when the account is not running. */
+  getSelf(accountId: string): SelfIdentity | undefined;
+  /** Shape test: "is this one of my user IDs?" — used for budget enforceability. */
+  ownsUserId(id: string): boolean;
+  /** Enrichment capability object for one account; undefined when the account is foreign. */
+  enrichment(accountId: string): EnrichmentCapabilities | undefined;
+}
+
+/**
+ * Legacy provider interface — superseded by {@link IChatProvider}.
+ * @deprecated Use IChatProvider. Will be removed once all call sites are migrated (Phase 2b).
+ */
 export interface ChatProvider<ProviderConfig = unknown> {
   readonly id: string;
   capabilities: ProviderCapabilities;

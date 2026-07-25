@@ -352,15 +352,20 @@ Two defenses run together:
 
 ## 5. Chat Provider Abstraction
 
-The agent is not hardwired to Matrix. A `ChatProvider<ProviderConfig>` interface defines the contract:
+The agent is not hardwired to Matrix. The `IChatProvider` interface defines the cross-provider contract implemented by `MatrixProvider` (`src/matrix/provider.ts`):
 
-- `start(config)` / `stop()` — lifecycle
-- `subscribe(handler)` — continuous delivery of all inbound events as `InboundChatEvent`
+- `start(host: ChatProviderHost)` / `stop()` — lifecycle. `ChatProviderHost` is the callback object passed at start time: `onEvent` (inbound event delivery, replaces the old `subscribe`), `onReaction`, `onNativeEvent`, `onDiagnostics`, `onError`, `resolveReplyTrigger`.
 - `send(target, message)` — outbound messages, returns `DeliveryReceipt`
 - `setTyping(target, typing)` — typing indicators
-- `capabilities` — feature flags (typing, reactions, readReceipts, mediaUpload)
+- `accountIds()` — list of running account IDs
+- `getSelf(accountId)` — the bot's own `SelfIdentity` (`{ id, username?, displayName? }`) for one account; `undefined` if not started
+- `ownsUserId(id)` — shape test used for budget enforceability (Matrix: `id.startsWith("@")`)
+- `enrichment(accountId)` — `EnrichmentCapabilities` for one account; `undefined` when the account is not running
+- `capabilities` — `ProviderCapabilities` struct with load-bearing fields: `maxAttachmentsPerMessage`, `maxMessageChars`, `formatting`, `edits`, `deletes`, `pollCreate`, `pollVote`, `pins`, `voiceMessages`, `threads`, `history`, `encrypted`, `linkPreviews`, `singleAttachmentPerMessage`, `membershipRoster`, plus optional `typing`, `reactions`, `reactionKinds`, `customEmojiScoped`, `mediaUpload`
 
-The provider delivers **every** message as it arrives. It flags messages as triggers (mentions, DMs) but does not buffer non-trigger messages. The timeline ingests all events continuously; only triggers spawn sessions.
+The provider delivers **every** message through `host.onEvent`. It flags messages as triggers (mentions, DMs) but does not buffer non-trigger messages. The timeline ingests all events continuously; only triggers spawn sessions.
+
+A `[discord]` config block is validated at startup (peer of `[matrix]`; schema: `enabled`, `trigger_hold_ms`, `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`) but not yet consumed — the Discord provider is Phase 3+. `enabled = false` is the default.
 
 ### Canonical event model
 
@@ -727,7 +732,7 @@ At context-build time, the context builder batch-queries the enrichment tables f
 - `replyTo.linkPreviews` — from `link_previews` with `context='reply'`, with associated `reply_preview_media` assets
 - `linkPreviews` — from `link_previews` with `context='message'`, with associated `preview_media` assets
 - Character card metadata (`isCharacterCard`, `cardName`) from `detected_content` / `detected_metadata_json` on media assets
-- Reply sender as `{ id, displayName }` (no `username` field — full provider ID used everywhere)
+- Reply sender as `{ id, displayName }` (Matrix leaves `username` unset on `SenderInfo`)
 
 The renderer receives fully populated events and works unchanged.
 

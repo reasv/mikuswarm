@@ -4,14 +4,14 @@ import sharp from "sharp";
 import type { AppConfig } from "../config/index.js";
 import type { MatrixUploadMediaThumbnail } from "./native-types.js";
 import type {
-  ChatProvider,
+  ChatProviderHost,
   DeliveryReceipt,
+  IChatProvider,
   InboundChatEvent,
   OutboundMessage,
   OutboundTarget,
-  SenderInfo,
-  TriggerInfo,
-  Unsubscribe,
+  ProviderCapabilities,
+  SelfIdentity,
 } from "../types.js";
 import { MatrixNativeClient } from "./native-client.js";
 import type {
@@ -23,8 +23,6 @@ import { normalizeMatrixInboundEvent } from "./inbound.js";
 import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
-
-type Handler = (event: InboundChatEvent) => void;
 
 /**
  * Cap on how long a same-sender trigger burst can debounce-extend the trigger
@@ -51,62 +49,44 @@ interface PendingTrigger {
   timer: NodeJS.Timeout;
 }
 
-export interface MatrixProviderOptions {
-  onError?: (error: unknown, context: { accountId?: string; phase: string }) => void;
-  onNativeEvent?: (
-    event: Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>,
-    context: { accountId: string },
-  ) => void;
-  /**
-   * A passively-observed reaction (add) or un-reaction (remove). Routed here
-   * instead of through {@link onNativeEvent} so the app can persist it to the
-   * reaction store without ever waking a session (ARCHITECTURE.md §9f). Carries
-   * the account id; the room is on `event.roomId`.
-   */
-  onReaction?: (event: MatrixReactionStreamEvent, context: { accountId: string }) => void;
-  onDiagnostics?: (diagnostics: ReturnType<MatrixNativeClient["start"]>, context: { accountId: string }) => void;
-  /**
-   * Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). Called inside the
-   * trigger hold ({@link emitWithTriggerHold}) for an UNTRIGGERED reply to some
-   * other sender's message, BEFORE the strip/hold logic. The provider stays
-   * resume-UNAWARE: it only asks the app "is this a reply to one of my own
-   * messages, and are reply triggers enabled for this context?". The app owns the
-   * timeline lookup and the resume config; when it returns a {@link TriggerInfo}
-   * the reply enters the normal hold/debounce/same-sender grouping (so a bare
-   * group reply earns one held, grouped trigger-bearing delivery). Returning
-   * `undefined` leaves the reply untriggered (it stays a plain stored message).
-   */
-  resolveReplyTrigger?: (args: {
-    provider: string;
-    externalId: string;
-    timelineKey: string;
-    sender: SenderInfo;
-  }) => TriggerInfo | undefined;
-}
-
-export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
+export class MatrixProvider implements IChatProvider {
   readonly id = "matrix";
-  capabilities = {
+  readonly capabilities: ProviderCapabilities = {
     typing: true,
     reactions: true,
-    readReceipts: false,
+    reactionKinds: ["unicode", "custom", "text"],
+    customEmojiScoped: false,
     mediaUpload: true,
+    maxAttachmentsPerMessage: 1,
+    maxMessageChars: 4000,
+    formatting: "html",
+    edits: true,
+    deletes: true,
+    pollCreate: true,
+    pollVote: true,
+    pins: true,
+    voiceMessages: true,
+    threads: true,
+    history: true,
+    encrypted: true,
+    linkPreviews: "provider",
+    singleAttachmentPerMessage: true,
+    membershipRoster: true,
   };
 
-  private readonly handlers = new Set<Handler>();
   private readonly accounts = new Map<string, AccountRuntime>();
   private readonly pendingTriggers = new Map<string, PendingTrigger>();
-  private config?: AppConfig["matrix"];
+  private host?: ChatProviderHost;
   private stopped = false;
   private readonly activePolls = new Set<Promise<void>>();
 
-  constructor(private readonly options: MatrixProviderOptions = {}) {}
+  constructor(private readonly config: AppConfig["matrix"]) {}
 
-  async start(config: AppConfig["matrix"]): Promise<void> {
-    this.config = config;
+  async start(host: ChatProviderHost): Promise<void> {
+    this.host = host;
     this.stopped = false;
-    if (!config.enabled) return;
-    for (const [accountId, account] of Object.entries(config.accounts)) {
+    if (!this.config.enabled) return;
+    for (const [accountId, account] of Object.entries(this.config.accounts)) {
       const client = new MatrixNativeClient();
       const diagnostics = client.start(toNativeConfig(accountId, account));
       const runtime: AccountRuntime = {
@@ -116,7 +96,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
         attachmentDir: path.join(path.resolve(account.store_path), "msg-attach"),
       };
       this.accounts.set(accountId, runtime);
-      this.options.onDiagnostics?.(diagnostics, { accountId });
+      this.host.onDiagnostics?.(diagnostics, { accountId });
       this.schedulePoll(runtime);
     }
   }
@@ -135,9 +115,27 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     this.accounts.clear();
   }
 
-  subscribe(handler: Handler): Unsubscribe {
-    this.handlers.add(handler);
-    return () => this.handlers.delete(handler);
+  accountIds(): string[] {
+    return [...this.accounts.keys()];
+  }
+
+  getSelf(accountId: string): SelfIdentity | undefined {
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) return undefined;
+    return { id: runtime.selfUserId };
+  }
+
+  /**
+   * Matrix user ids always start with `@`. Used as a budget-enforceability
+   * shape test — not a full lookup — so it works before accounts are started.
+   */
+  ownsUserId(id: string): boolean {
+    return id.startsWith("@");
+  }
+
+  enrichment(accountId: string): EnrichmentCapabilities | undefined {
+    if (!this.accounts.has(accountId)) return undefined;
+    return this.getEnrichmentCapabilities(accountId);
   }
 
   async send(target: OutboundTarget, message: OutboundMessage): Promise<DeliveryReceipt> {
@@ -206,6 +204,10 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     await account.client.setTyping({ roomId: target.roomId, typing });
   }
 
+  /**
+   * @deprecated Use {@link enrichment} instead. Kept public for backcompat
+   * until Phase 2b replaces all external call sites.
+   */
   getEnrichmentCapabilities(accountId: string): EnrichmentCapabilities {
     const account = this.accounts.get(accountId);
     if (!account) throw new Error(`Matrix account not running: ${accountId}`);
@@ -245,11 +247,11 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     for (const nativeEvent of events) {
       if (nativeEvent.type === "reaction") {
         // Passive: persist only, never wake a session (ARCHITECTURE.md §9f).
-        this.options.onReaction?.(nativeEvent.event, { accountId: account.accountId });
+        this.host?.onReaction(nativeEvent.event, { accountId: account.accountId });
         continue;
       }
       if (nativeEvent.type !== "inbound") {
-        this.options.onNativeEvent?.(nativeEvent, { accountId: account.accountId });
+        this.host?.onNativeEvent?.(nativeEvent, { accountId: account.accountId });
         continue;
       }
       recordInboundEmojiUsage(account.client, nativeEvent.event);
@@ -265,7 +267,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     if (this.stopped) return;
     account.pollTimer = setTimeout(() => {
       const poll = this.poll(account)
-        .catch((error) => this.options.onError?.(error, { accountId: account.accountId, phase: "poll" }))
+        .catch((error) => this.host?.onError(error, { accountId: account.accountId, phase: "poll" }))
         .finally(() => {
           this.activePolls.delete(poll);
           this.schedulePoll(account);
@@ -287,9 +289,9 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
       !inbound.trigger &&
       inbound.event.replyTo?.externalId &&
       !inbound.event.sender.isSelf &&
-      this.options.resolveReplyTrigger
+      this.host?.resolveReplyTrigger
     ) {
-      const replyTrigger = this.options.resolveReplyTrigger({
+      const replyTrigger = this.host.resolveReplyTrigger({
         provider: inbound.provider,
         externalId: inbound.event.replyTo.externalId,
         timelineKey: inbound.timelineKey,
@@ -302,7 +304,7 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
     }
 
     this.emit({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
-    if (!this.config) return;
+    if (!this.host) return;
 
     const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
     const existing = this.pendingTriggers.get(key);
@@ -380,9 +382,13 @@ export class MatrixProvider implements ChatProvider<AppConfig["matrix"]> {
   }
 
   private emit(event: InboundChatEvent): void {
-    for (const handler of this.handlers) handler(event);
+    this.host?.onEvent(event);
   }
 
+  /**
+   * @deprecated External call sites will be replaced in Phase 2b once the provider
+   * registry lands and `ChannelClient` routes Matrix-specific tool calls.
+   */
   getClient(target: OutboundTarget): MatrixNativeClient {
     return this.resolveAccount(target).client;
   }

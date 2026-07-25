@@ -684,6 +684,37 @@ const MatrixAccountSchema = StrictObject({
   store_path: Type.String(),
 });
 
+/**
+ * Per-bot-account config for a Discord application. Token is auto-redacted
+ * by the existing key-name regex (`token` matches `/(api[_-]?key|token|...)/i`).
+ */
+const DiscordAccountSchema = StrictObject({
+  /** Discord bot token — sourced from ${VAR} env substitution. */
+  token: Type.String(),
+  /** Discord application id — required for application emoji lookup. */
+  application_id: Type.Optional(Type.String()),
+  /** Guild id allowlist. Absent = all joined guilds are served. */
+  guilds: Type.Optional(Type.Array(Type.String())),
+  /** Accept DMs from users sharing a guild (default true). */
+  dm_enabled: Type.Optional(Type.Boolean()),
+  /**
+   * Enable the GUILD_MEMBERS privileged intent (roster access). Off by default;
+   * requires the intent to be toggled on in the Discord Developer Portal as well.
+   */
+  member_intent: Type.Optional(Type.Boolean()),
+});
+
+/**
+ * Top-level `[discord]` block — a peer of `[matrix]`. Default: enabled = false,
+ * no accounts. Validated at startup but not yet consumed by the provider
+ * (Discord provider wired in Phase 3+).
+ */
+const DiscordSchema = StrictObject({
+  enabled: Type.Boolean(),
+  trigger_hold_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  accounts: Type.Optional(Type.Record(Type.String(), DiscordAccountSchema)),
+});
+
 const MediaImageSchema = StrictObject({
   max_total_pixels: Type.Optional(Type.Number({ minimum: 1 })),
   max_total_pixels_hard: Type.Optional(Type.Number({ minimum: 1 })),
@@ -1365,6 +1396,8 @@ export const AppConfigSchema = StrictObject({
     trigger_group_lookback_ms: Type.Optional(Type.Number({ minimum: 0 })),
     accounts: Type.Record(Type.String(), MatrixAccountSchema),
   }),
+  /** Discord provider config. Validated at startup; consumed when enabled (Phase 3+). */
+  discord: Type.Optional(DiscordSchema),
   timeline: Type.Optional(TimelineSchema),
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
