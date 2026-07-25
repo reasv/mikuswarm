@@ -5,8 +5,9 @@ import path from "node:path";
 import type { AppConfig } from "./config/index.js";
 import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
-import { MatrixProvider, RoomLabelCache, ingestReactionEvent } from "./matrix/index.js";
-import type { MatrixNativeClient, MatrixNativeEvent, MatrixReactionStreamEvent } from "./matrix/index.js";
+import { MatrixProvider, RoomLabelCache, makeBackfillReadClient } from "./matrix/index.js";
+import { ingestGenericReactionEvent } from "./timeline/index.js";
+import type { MatrixNativeClient, MatrixNativeEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
 import {
   ActivationCoordinator,
@@ -1634,9 +1635,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     storage,
     timeline,
     config: gapBackfetchConfig,
-    getClient: (accountId) => {
+    getClient: (accountId, roomId) => {
       if (!matrixProvider) throw new Error("gap backfetch requires a matrix provider");
-      return matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId });
+      return makeBackfillReadClient(
+        matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+        roomId,
+      );
     },
     selfUserIds: gapBackfetchSelfIds,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
@@ -1669,9 +1673,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     storage,
     timeline,
     config: messageBackfetchConfig,
-    getClient: (accountId) => {
+    getClient: (accountId, roomId) => {
       if (!matrixProvider) throw new Error("message backfetch requires a matrix provider");
-      return matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId });
+      return makeBackfillReadClient(
+        matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+        roomId,
+      );
     },
     selfUserIds: gapBackfetchSelfIds,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
@@ -2011,7 +2018,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     try {
       const result = await performInitialBackfill({
-        client: matrixProvider.getClient(target),
+        client: makeBackfillReadClient(matrixProvider.getClient(target), target.roomId),
         store: timeline,
         storage,
         timelineKey: inbound.timelineKey,
@@ -3377,8 +3384,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         createChannelInfoTool({ channelClient, terminology, channelClientFor }),
         createMemberInfoTool({ channelClient, terminology }),
         ...(caps.reactions ? [
-          createEmojiListTool({ channelClient, terminology, channelClientFor }),
-          createReactTool({ channelClient, terminology }),
+          createEmojiListTool({ channelClient, terminology, channelClientFor, customEmojiScoped: caps.customEmojiScoped }),
+          createReactTool({ channelClient, terminology, reactionKinds: caps.reactionKinds }),
           createListReactionsTool({ channelClient, terminology }),
         ] : []),
         ...(caps.edits ? [createEditMessageTool({ channelClient, terminology })] : []),
@@ -5072,14 +5079,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * Build the ChatProviderHost for the Matrix provider.
    *
    * Cast site — the single documented as-cast location for Matrix-specific
-   * payload types, per spec §3.2. The three narrowings below are safe because
+   * payload types, per spec §3.2. The two narrowings below are safe because
    * MatrixProvider ONLY delivers these specific payloads via these callbacks.
    * A runtime provider-id guard at the start call (below) ensures no other
    * provider is accidentally started with this Matrix-typed host.
    *
-   *   onNativeEvent : ProviderLifecycleEvent(=unknown) → MatrixNativeEvent (minus inbound/reaction)
-   *   onReaction    : ReactionStreamEvent              → MatrixReactionStreamEvent
-   *   onDiagnostics : unknown                          → ReturnType<MatrixNativeClient["start"]>
+   *   Cast 1 of 2: onNativeEvent : ProviderLifecycleEvent(=unknown) → MatrixNativeEvent (minus inbound/reaction)
+   *   Cast 2 of 2: onDiagnostics : unknown → ReturnType<MatrixNativeClient["start"]>
+   *
+   * (onReaction received an as-cast in pre-Phase-6 — removed: the provider now
+   * calls adaptMatrixReactionEvent at the boundary and emits a ReactionStreamEvent.)
    */
   function buildMatrixHost(): ChatProviderHost {
     return {
@@ -5094,7 +5103,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           error: error instanceof Error ? error.message : String(error),
         }),
       onNativeEvent: (event, context) => {
-        // Cast 1 of 3 (see §3.2 header): ProviderLifecycleEvent → Matrix-specific lifecycle shape
+        // Cast 1 of 2 (see §3.2 header): ProviderLifecycleEvent → Matrix-specific lifecycle shape
         const e = event as Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>;
         logger.info("matrix_native_event", {
           ...context,
@@ -5113,14 +5122,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // Master switch: when reactions are disabled, don't even persist (the views
         // are gated independently in the context builder).
         if (config.reactions?.enabled === false) return;
-        // Cast 2 of 3 (see §3.2 header): ReactionStreamEvent → MatrixReactionStreamEvent
-        const matrixEvent = event as MatrixReactionStreamEvent;
-        void ingestReactionEvent(storage, context.accountId, matrixEvent, Date.now())
+        // The provider already adapted MatrixReactionStreamEvent → ReactionStreamEvent
+        // at the poll boundary; no cast needed here.
+        void ingestGenericReactionEvent(storage, event, Date.now())
           .then((outcome) => {
             if (outcome.action === "skipped") {
               logger.warn("reaction_add_incomplete", {
                 ...context,
-                reactionEventId: matrixEvent.reactionEventId,
+                reactionEventId: event.reactionEventId,
                 reason: outcome.reason,
               });
             }
@@ -5128,14 +5137,34 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           .catch((error) =>
             logger.error("reaction_ingest_failed", {
               ...context,
-              reactionEventId: matrixEvent.reactionEventId,
-              action: matrixEvent.action,
+              reactionEventId: event.reactionEventId,
+              action: event.action,
               error: error instanceof Error ? error.message : String(error),
             }),
           );
       },
+      onBulkReactionClear: (args, _ctx) => {
+        if (config.reactions?.enabled === false) return;
+        const now = Date.now();
+        if (args.normalizedKey !== undefined) {
+          void storage.tombstoneReactionsByTargetAndKey(args.targetEventId, args.normalizedKey, now).catch((error) =>
+            logger.error("bulk_reaction_clear_failed", {
+              targetEventId: args.targetEventId,
+              normalizedKey: args.normalizedKey,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        } else {
+          void storage.tombstoneReactionsByTargetEvent(args.targetEventId, now).catch((error) =>
+            logger.error("bulk_reaction_clear_failed", {
+              targetEventId: args.targetEventId,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      },
       onDiagnostics: (diagnostics, context) => {
-        // Cast 3 of 3 (see §3.2 header): unknown → MatrixNativeClient diagnostics shape
+        // Cast 2 of 2 (see §3.2 header): unknown → MatrixNativeClient diagnostics shape
         const d = diagnostics as ReturnType<MatrixNativeClient["start"]>;
         logger.info("matrix_diagnostics", {
           ...context,
@@ -5173,8 +5202,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Build a minimal host for any non-Matrix provider: route all events through
   // the shared inbound pipeline and log errors. Matrix-specific callbacks
   // (onNativeEvent, onDiagnostics) are not wired — non-Matrix providers don't
-  // produce them. onReaction is required by ChatProviderHost but is a no-op
-  // here because reaction persistence is Matrix-only for now (Phase 3+).
+  // produce them.
   const genericHost: ChatProviderHost = {
     onEvent: (inbound) => {
       void handleInbound(inbound).catch((error) => {
@@ -5186,10 +5214,36 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ...context,
         error: error instanceof Error ? error.message : String(error),
       }),
-    // No-op for non-Matrix providers: reaction persistence is Matrix-specific
-    // (ingestReactionEvent requires MatrixReactionStreamEvent). Phase 3+ will
-    // add per-provider reaction support.
-    onReaction: (_event, _context) => undefined,
+    // Route non-Matrix reactions through the shared generic ingest path (§9f).
+    // Provider pre-resolves all fields (PK, normalizedKey, kind, display) before
+    // calling onReaction; the generic ingest writes directly to the reactions table.
+    onReaction: (event, _context) => {
+      void ingestGenericReactionEvent(storage, event, Date.now()).catch((error) => {
+        logger.error("reaction_ingest_error", {
+          reactionEventId: event.reactionEventId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    },
+    onBulkReactionClear: (args, _ctx) => {
+      const now = Date.now();
+      if (args.normalizedKey !== undefined) {
+        void storage.tombstoneReactionsByTargetAndKey(args.targetEventId, args.normalizedKey, now).catch((error) =>
+          logger.error("bulk_reaction_clear_failed", {
+            targetEventId: args.targetEventId,
+            normalizedKey: args.normalizedKey,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      } else {
+        void storage.tombstoneReactionsByTargetEvent(args.targetEventId, now).catch((error) =>
+          logger.error("bulk_reaction_clear_failed", {
+            targetEventId: args.targetEventId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    },
     resolveReplyTrigger: ({ provider: providerId, externalId, timelineKey, sender }) => {
       const ctx = resumeContextFor(timelineKey);
       if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;

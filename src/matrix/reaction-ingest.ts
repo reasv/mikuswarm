@@ -1,28 +1,56 @@
 import type { Storage } from "../storage/index.js";
+import type { ReactionStreamEvent } from "../types.js";
 import type { MatrixReactionStreamEvent } from "./native-types.js";
+import {
+  ingestReactionEvent as ingestGenericReactionEvent,
+  type ReactionIngestOutcome,
+} from "../timeline/reaction-ingest.js";
 
-/** What {@link ingestReactionEvent} did with a streamed reaction event. */
-export type ReactionIngestOutcome =
-  | { action: "upserted" }
-  | { action: "tombstoned"; changed: number }
-  | { action: "skipped"; reason: "incomplete_add" };
+export type { ReactionIngestOutcome };
 
 /** The slice of {@link Storage} the reaction ingest path needs. */
 export type ReactionStore = Pick<Storage, "upsertReaction" | "tombstoneReaction">;
 
 /**
- * Persist one passively-observed reaction stream event (ARCHITECTURE.md §9f).
+ * Adapt a Matrix-native reaction event to the generic {@link ReactionStreamEvent}
+ * envelope (ARCHITECTURE.md §9f). The Matrix provider's NAPI layer pre-resolves
+ * `kind`/`display`/`shortcode`/`normalizedKey`; this adapter adds the timeline
+ * key (constructed from accountId + roomId) so the generic ingest can write the
+ * locality hint. No resolution logic lives here — all transformation is from the
+ * already-resolved native fields.
  *
- * - `add` → upsert a reaction row (idempotent on duplicate delivery). The native
- *   resolver always populates `targetEventId`/`kind`/`display`/`normalizedKey` for
- *   adds; a malformed event missing any of them is skipped rather than stored
- *   half-formed.
- * - `remove` → tombstone by the reaction's own id. The native side forwards every
- *   redaction, so most removes name non-reactions and tombstone 0 rows — that is
- *   the intended stateless, self-correcting no-op.
+ * PK (reactionEventId) is the Matrix `$…` reaction event id, unchanged.
+ */
+export function adaptMatrixReactionEvent(
+  accountId: string,
+  event: MatrixReactionStreamEvent,
+): ReactionStreamEvent {
+  return {
+    action: event.action,
+    reactionEventId: event.reactionEventId,
+    // Room-level locality hint — reactions are matched by target_event_id, but
+    // the timeline_key column lets the store be partitioned by room in the future.
+    timelineKey: `matrix:${accountId}:room:${event.roomId}`,
+    senderId: event.senderId,
+    senderDisplay: event.senderDisplay,
+    reactedAtMs: event.reactedAtMs,
+    targetEventId: event.targetEventId,
+    kind: event.kind,
+    display: event.display,
+    shortcode: event.shortcode,
+    normalizedKey: event.normalizedKey,
+  };
+}
+
+/**
+ * Persist one passively-observed Matrix reaction event (ARCHITECTURE.md §9f).
  *
- * `now` (the observation time) is injected for determinism. This never wakes a
- * session: it only writes to the reaction store.
+ * Wraps {@link adaptMatrixReactionEvent} + the shared generic ingest so the
+ * Matrix host in app.ts can call a single entry point with Matrix-specific types.
+ * The resulting DB writes are byte-identical to the pre-Phase-6 path (same rows,
+ * same PK, same tombstone update on un-react).
+ *
+ * `now` (the observation time) is injected for determinism.
  */
 export async function ingestReactionEvent(
   storage: ReactionStore,
@@ -30,34 +58,5 @@ export async function ingestReactionEvent(
   event: MatrixReactionStreamEvent,
   now: number,
 ): Promise<ReactionIngestOutcome> {
-  if (event.action === "remove") {
-    const changed = await storage.tombstoneReaction(event.reactionEventId, now);
-    return { action: "tombstoned", changed };
-  }
-
-  if (
-    event.targetEventId === undefined ||
-    event.kind === undefined ||
-    event.display === undefined ||
-    event.normalizedKey === undefined
-  ) {
-    return { action: "skipped", reason: "incomplete_add" };
-  }
-
-  await storage.upsertReaction({
-    reactionEventId: event.reactionEventId,
-    // Room-level locality hint only; reactions are matched by the globally-unique
-    // target_event_id, not this key (see the reactions schema in storage).
-    timelineKey: `matrix:${accountId}:room:${event.roomId}`,
-    targetEventId: event.targetEventId,
-    senderId: event.senderId,
-    senderDisplay: event.senderDisplay ?? null,
-    kind: event.kind,
-    display: event.display,
-    shortcode: event.shortcode ?? null,
-    normalizedKey: event.normalizedKey,
-    reactedAt: event.reactedAtMs,
-    observedAt: now,
-  });
-  return { action: "upserted" };
+  return ingestGenericReactionEvent(storage, adaptMatrixReactionEvent(accountId, event), now);
 }

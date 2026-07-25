@@ -388,7 +388,8 @@ export const USER_IDENTITY_ALIAS_BOUND = 16;
 
 /**
  * One reaction (or un-reaction) to persist in the `reactions` store. Built from a
- * native MatrixReactionStreamEvent (action "add") in the provider ingest path.
+ * generic ReactionStreamEvent (action "add") by the shared reaction-ingest path;
+ * providers adapt their native reaction events to that shape at their boundary.
  */
 export interface ReactionUpsert {
   reactionEventId: string;
@@ -425,6 +426,8 @@ export interface ReactionAggregateRow {
 export interface DiscreteReactionRow {
   reactionEventId: string;
   targetEventId: string;
+  /** Timeline key for this reaction row; used to derive the provider for identity resolution. */
+  timelineKey: string;
   senderId: string;
   senderDisplay: string | null;
   normalizedKey: string;
@@ -7259,6 +7262,48 @@ export class Storage {
   }
 
   /**
+   * Bulk-tombstone all live reactions on a target message, regardless of emoji or
+   * sender. Used for Discord `MESSAGE_REACTION_REMOVE_ALL` (spec §10.1).
+   * Idempotent: a second call returns 0 changed rows but does not error.
+   * Returns the count of rows newly tombstoned (0 when none were live).
+   */
+  tombstoneReactionsByTargetEvent(targetEventId: string, redactedAt: number): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(
+            `update reactions set redacted_at = @redactedAt
+             where target_event_id = @targetEventId and redacted_at is null`,
+          )
+          .run({ targetEventId, redactedAt }).changes,
+    );
+  }
+
+  /**
+   * Bulk-tombstone all live reactions on a target message for one specific
+   * `normalized_key` (emoji). Used for Discord `MESSAGE_REACTION_REMOVE_EMOJI`
+   * (spec §10.1). Idempotent: a second call returns 0 changed rows.
+   * Returns the count of rows newly tombstoned (0 when none were live).
+   */
+  tombstoneReactionsByTargetAndKey(
+    targetEventId: string,
+    normalizedKey: string,
+    redactedAt: number,
+  ): Promise<number> {
+    return this.write(
+      (db) =>
+        db
+          .prepare(
+            `update reactions set redacted_at = @redactedAt
+             where target_event_id = @targetEventId
+               and normalized_key = @normalizedKey
+               and redacted_at is null`,
+          )
+          .run({ targetEventId, normalizedKey, redactedAt }).changes,
+    );
+  }
+
+  /**
    * View A: deduped reaction counts for a batch of target messages, keyed by
    * target event id. Each value is that message's reactions grouped by
    * `normalizedKey` with a distinct-sender count, ordered count desc then display
@@ -7329,6 +7374,7 @@ export class Storage {
           ...(db
             .prepare(
               `select reaction_event_id as reactionEventId, target_event_id as targetEventId,
+                      timeline_key as timelineKey,
                       sender_id as senderId, sender_display as senderDisplay,
                       normalized_key as normalizedKey, kind, display, shortcode,
                       reacted_at as reactedAt
@@ -7864,25 +7910,25 @@ end;
 // render time (Views A/B). Keeping reactions out of `timeline_events` keeps them
 // out of summarization, chat search, diary and recap, all of which iterate it.
 //
-// No foreign key to `timeline_events`: `target_event_id` is the *external* Matrix
+// No foreign key to `timeline_events`: `target_event_id` is the *external* provider
 // event id (== CanonicalChatEvent.externalId), not the internal `timeline_events.id`,
 // and a reaction may legitimately reference a message not (or no longer) stored.
 // `if not exists` makes this block safe to run both as the fresh-DB schema and as
 // the v14->v15 migration (which simply re-execs it), so the two cannot drift.
 const REACTIONS_SCHEMA = `
 create table if not exists reactions (
-  -- The m.reaction event's OWN id ($...). Redactions name this id, so an un-react
-  -- is a single UPDATE ... where reaction_event_id = ? — no content matching.
+  -- The reaction event's OWN provider-native id. Redactions name this id, so an
+  -- un-react is a single UPDATE ... where reaction_event_id = ? — no content matching.
   reaction_event_id text primary key,
   -- Room-level locality hint (matrix:{account}:room:{roomId}) — informational
   -- only. A reaction event carries just a room id; the target message's
   -- authoritative timeline_key (dm vs room vs :thread:root) is NOT derivable from
   -- it, and there is an ingest-vs-persist race. So reactions are matched to their
-  -- target purely by the globally-unique target_event_id (a Matrix event id is
-  -- unique across rooms); this column is for debugging/console context, never the
+  -- target purely by the globally-unique target_event_id (a provider-native event id
+  -- is unique across rooms); this column is for debugging/console context, never the
   -- join key.
   timeline_key      text not null,
-  -- The annotated message's Matrix event id (== CanonicalChatEvent.externalId).
+  -- The annotated message's provider-native event id (== CanonicalChatEvent.externalId).
   -- This, not timeline_key, is the authoritative match key for both views.
   target_event_id   text not null,
   sender_id         text not null,

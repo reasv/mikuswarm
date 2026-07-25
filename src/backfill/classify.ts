@@ -1,6 +1,4 @@
-import { mediaToAttachment } from "../matrix/inbound.js";
-import type { CanonicalChatEvent } from "../types.js";
-import type { MatrixMessageSummary } from "../matrix/native-types.js";
+import type { AttachmentMeta, CanonicalChatEvent, HistorySummary } from "../types.js";
 
 /**
  * A `readMessages` summary classified for backfill: a kept event to store/buffer,
@@ -16,7 +14,7 @@ export type ClassifiedSummary =
   | {
       kind: "edit";
       targetExternalId: string;
-      replacement: { body: string; attachments: ReturnType<typeof mediaToAttachment>[] };
+      replacement: { body: string; attachments: AttachmentMeta[] };
     };
 
 interface CommonContext {
@@ -25,6 +23,12 @@ interface CommonContext {
   accountId: string;
   selfUserId: string;
   timestamp: number;
+  /**
+   * Construct the canonical event id from a provider-scoped external id.
+   * Injected by the caller so classify.ts stays provider-agnostic (§11.3).
+   * For Matrix: `(externalId) => \`matrix:\${accountId}:\${externalId}\``.
+   */
+  buildId: (externalId: string) => string;
 }
 
 /** Context for the single-timeline classifier (first-trigger initial backfill). */
@@ -45,36 +49,34 @@ export interface RoomClassifyContext extends CommonContext {
   isDm: boolean;
 }
 
-function editReplacement(summary: MatrixMessageSummary) {
+function editReplacement(summary: HistorySummary) {
   return {
     body: summary.body,
-    attachments: (summary.media ?? []).map((media) => mediaToAttachment(summary.eventId, media)),
+    attachments: summary.attachments ?? [],
   };
 }
 
 function buildEvent(
-  summary: MatrixMessageSummary,
+  summary: HistorySummary,
   ctx: CommonContext,
   timelineKey: string,
   threadId: string | undefined,
   replyTo: { externalId: string } | undefined,
 ): CanonicalChatEvent {
-  const isSelf = summary.sender === ctx.selfUserId;
+  const isSelf = summary.sender.id === ctx.selfUserId;
   return {
-    // TODO(phase6): event id format is Matrix-specific; classify.ts will receive
-    // an injected id-constructor once HistoryClient is generalized (spec §11.3).
-    id: `matrix:${ctx.accountId}:${summary.eventId}`,
-    externalId: summary.eventId,
+    id: ctx.buildId(summary.externalId),
+    externalId: summary.externalId,
     timelineKey,
     provider: ctx.provider,
     role: isSelf ? "assistant" : "user",
-    sender: { id: summary.sender, displayName: summary.senderName, isSelf },
+    sender: { id: summary.sender.id, displayName: summary.sender.displayName, username: summary.sender.username, isSelf },
     body: summary.body,
     timestamp: ctx.timestamp,
     receivedAt: Date.now(),
     // Emit the same attachment shape as the live path so backfilled media flows
     // through the identical download + caption pipeline (keyed by event ID).
-    attachments: (summary.media ?? []).map((media) => mediaToAttachment(summary.eventId, media)),
+    attachments: summary.attachments ?? [],
     threadId,
     replyTo,
     undecryptable: undefined,
@@ -82,20 +84,18 @@ function buildEvent(
 }
 
 function buildUtdEvent(
-  summary: MatrixMessageSummary,
+  summary: HistorySummary,
   ctx: CommonContext,
   roomTimelineKey: string,
 ): CanonicalChatEvent {
-  const isSelf = summary.sender === ctx.selfUserId;
+  const isSelf = summary.sender.id === ctx.selfUserId;
   return {
-    // TODO(phase6): event id format is Matrix-specific; classify.ts will receive
-    // an injected id-constructor once HistoryClient is generalized (spec §11.3).
-    id: `matrix:${ctx.accountId}:${summary.eventId}`,
-    externalId: summary.eventId,
+    id: ctx.buildId(summary.externalId),
+    externalId: summary.externalId,
     timelineKey: roomTimelineKey,
     provider: ctx.provider,
     role: isSelf ? "assistant" : "user",
-    sender: { id: summary.sender, displayName: summary.senderName, isSelf },
+    sender: { id: summary.sender.id, displayName: summary.sender.displayName, username: summary.sender.username, isSelf },
     body: summary.body,
     timestamp: ctx.timestamp,
     receivedAt: Date.now(),
@@ -114,32 +114,31 @@ function buildUtdEvent(
  * being activated; the re-decryption sweeper re-homes it once keys arrive.
  */
 export function classifyForTimeline(
-  summary: MatrixMessageSummary,
+  summary: HistorySummary,
   ctx: TimelineClassifyContext,
 ): ClassifiedSummary | undefined {
   const threadRootId = threadRootFromKey(ctx.timelineKey);
-  const relType = summary.relatesTo?.relType ?? undefined;
-  const relEventId = summary.relatesTo?.eventId ?? undefined;
 
   if (summary.undecryptable) {
     const roomKey = threadRootId ? roomTimelineKeyFromKey(ctx.timelineKey) : ctx.timelineKey;
     return { kind: "event", event: buildUtdEvent(summary, ctx, roomKey) };
   }
 
-  if (relType === "m.replace") {
-    if (!relEventId) return undefined; // malformed edit with no target — drop.
-    return { kind: "edit", targetExternalId: relEventId, replacement: editReplacement(summary) };
+  if (summary.edited) {
+    const editTarget = summary.editTargetExternalId;
+    if (!editTarget) return undefined; // malformed edit with no target — drop.
+    return { kind: "edit", targetExternalId: editTarget, replacement: editReplacement(summary) };
   }
 
-  const isThreadMessage = relType === "m.thread";
+  const isThreadMessage = summary.threadRootExternalId != null;
   if (threadRootId) {
-    if (!isThreadMessage || relEventId !== threadRootId) return undefined;
+    if (!isThreadMessage || summary.threadRootExternalId !== threadRootId) return undefined;
   } else if (isThreadMessage) {
     return undefined;
   }
 
   const replyTo =
-    !isThreadMessage && relType == null && relEventId ? { externalId: relEventId } : undefined;
+    !isThreadMessage && summary.replyToExternalId ? { externalId: summary.replyToExternalId } : undefined;
   return {
     kind: "event",
     event: buildEvent(summary, ctx, ctx.timelineKey, threadRootId, replyTo),
@@ -154,34 +153,33 @@ export function classifyForTimeline(
  * undefined only for a malformed edit with no target.
  */
 export function classifyForRoom(
-  summary: MatrixMessageSummary,
+  summary: HistorySummary,
   ctx: RoomClassifyContext,
 ): ClassifiedSummary | undefined {
-  const relType = summary.relatesTo?.relType ?? undefined;
-  const relEventId = summary.relatesTo?.eventId ?? undefined;
-
   // A UTD event has no decryptable relation; land it on the base room/DM key
   // (mirrors the live UTD path). The sweeper re-homes it to a thread on decrypt.
   if (summary.undecryptable) {
     return { kind: "event", event: buildUtdEvent(summary, ctx, ctx.baseTimelineKey) };
   }
 
-  if (relType === "m.replace") {
-    if (!relEventId) return undefined; // malformed edit with no target — drop.
-    return { kind: "edit", targetExternalId: relEventId, replacement: editReplacement(summary) };
+  if (summary.edited) {
+    const editTarget = summary.editTargetExternalId;
+    if (!editTarget) return undefined; // malformed edit with no target — drop.
+    return { kind: "edit", targetExternalId: editTarget, replacement: editReplacement(summary) };
   }
 
-  const isThreadMessage = relType === "m.thread" && Boolean(relEventId);
+  const isThreadMessage = summary.threadRootExternalId != null;
   // DMs never get thread timeline keys (timelineKeyForMatrixEvent routes a direct
   // chat to its dm key regardless of any thread relation), so only non-DM rooms
   // split thread events into a thread key.
   if (isThreadMessage && !ctx.isDm) {
-    const timelineKey = `${ctx.baseTimelineKey}:thread:${relEventId}`;
-    return { kind: "event", event: buildEvent(summary, ctx, timelineKey, relEventId, undefined) };
+    const threadRoot = summary.threadRootExternalId!;
+    const timelineKey = `${ctx.baseTimelineKey}:thread:${threadRoot}`;
+    return { kind: "event", event: buildEvent(summary, ctx, timelineKey, threadRoot, undefined) };
   }
 
   const replyTo =
-    !isThreadMessage && relType == null && relEventId ? { externalId: relEventId } : undefined;
+    !isThreadMessage && summary.replyToExternalId ? { externalId: summary.replyToExternalId } : undefined;
   return {
     kind: "event",
     event: buildEvent(summary, ctx, ctx.baseTimelineKey, undefined, replyTo),

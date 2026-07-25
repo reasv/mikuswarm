@@ -18,3 +18,8 @@ export {
   type SetEnrichmentStatus,
 } from "./activation.js";
 export { sendViaProvider } from "./send.js";
+export {
+  ingestReactionEvent as ingestGenericReactionEvent,
+  type ReactionIngestOutcome,
+  type ReactionStore,
+} from "./reaction-ingest.js";

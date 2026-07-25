@@ -3,8 +3,7 @@ import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment, type EditReplacement } from "../timeline/index.js";
 import { parseTimelineKey, buildTimelineKey } from "../storage/timeline-key.js";
-import type { CanonicalChatEvent, InboundChatEvent, TimelineState } from "../types.js";
-import type { MatrixMessageSummary } from "../matrix/native-types.js";
+import type { CanonicalChatEvent, HistorySummary, InboundChatEvent, TimelineState } from "../types.js";
 import { classifyForRoom } from "./classify.js";
 import {
   paginateBackward,
@@ -122,8 +121,8 @@ export interface GapBackfetchCoordinatorOptions {
   storage: Storage;
   timeline: TimelineStore;
   config: GapBackfetchConfig;
-  /** Resolve the native read client for an account (provider.getClient analogue). */
-  getClient: (accountId: string) => BackfillReadClient;
+  /** Resolve the native read client for an account + room (provider boundary). */
+  getClient: (accountId: string, roomId: string) => BackfillReadClient;
   /** Bot's own Matrix user id per account, for role assignment / self-detection. */
   selfUserIds: Map<string, string>;
   /** Nudge the enrichment pool for a single committed event. */
@@ -233,8 +232,8 @@ export class GapBackfetchCoordinator {
       const isDm = baseKind === "dm";
       // Use buildTimelineKey (shared grammar) rather than a template literal so
       // key construction goes through the same module as parsing.
-      // TODO(phase6): provider hardcoded to "matrix" here — GapBackfetchCoordinator
-      // is Matrix-specific; generalizing it is Phase 6 (spec §11.3).
+      // GapBackfetchCoordinator is intentionally Matrix-specific; it is only
+      // activated when matrixProvider is non-null (see app.ts wiring).
       const baseTimelineKey = buildTimelineKey({
         provider: "matrix",
         accountId,
@@ -433,7 +432,7 @@ export class GapBackfetchCoordinator {
     const windowFloor = cfg.windowMs > 0 ? Date.now() - cfg.windowMs : Number.NEGATIVE_INFINITY;
     const floor = room.floor;
 
-    const onMessage = (summary: MatrixMessageSummary, timestamp: number): MessageDisposition => {
+    const onMessage = (summary: HistorySummary, timestamp: number): MessageDisposition => {
       // Derive provider from the room's base timeline key (shared grammar, spec §4.2).
       const provider = parseTimelineKey(room.baseTimelineKey)?.provider ?? "matrix";
       const classified = classifyForRoom(summary, {
@@ -443,6 +442,7 @@ export class GapBackfetchCoordinator {
         baseTimelineKey: room.baseTimelineKey,
         isDm: room.isDm,
         timestamp,
+        buildId: (externalId) => `matrix:${room.accountId}:${externalId}`,
       });
       if (!classified) return "skip";
 
@@ -468,11 +468,11 @@ export class GapBackfetchCoordinator {
       // is never re-fetched, the descent stops at the first strictly-older event
       // after buffering the same-ms layer.
       if (floor) {
-        const candidateId = `matrix:${room.accountId}:${summary.eventId}`;
+        const candidateId = `matrix:${room.accountId}:${summary.externalId}`;
         if (
           timestamp < floor.timestamp ||
           candidateId === floor.id ||
-          (floor.externalId != null && summary.eventId === floor.externalId)
+          (floor.externalId != null && summary.externalId === floor.externalId)
         ) {
           return "floor";
         }
@@ -495,7 +495,7 @@ export class GapBackfetchCoordinator {
     };
 
     return paginateBackward({
-      client: this.opts.getClient(room.accountId),
+      client: this.opts.getClient(room.accountId, room.roomId),
       roomId: room.roomId,
       pageSize: cfg.pageSize,
       // 0 ⇒ unbounded (the default); the floor is the natural stop (§9).

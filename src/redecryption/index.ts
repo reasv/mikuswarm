@@ -172,6 +172,19 @@ export class RedecryptionSweeper {
   }
 
   async #probe(event: CanonicalChatEvent): Promise<void> {
+    // RC8 gate: the sweeper is Matrix-only — megolm re-decryption is not a
+    // concept for other providers. An event whose canonical provider field is
+    // not "matrix" must never reach retireUndecrypted; skip with a log so the
+    // row stays for a future provider-specific reconciliation path.
+    if (event.provider !== "matrix") {
+      this.#options.logger?.warn("redecryption_skipped_non_matrix", {
+        eventId: event.id,
+        timelineKey: event.timelineKey,
+        provider: event.provider,
+      });
+      return;
+    }
+
     const roomId = roomIdFromTimelineKey(event.timelineKey);
     const eventId = event.externalId;
     if (!roomId || !eventId) {
