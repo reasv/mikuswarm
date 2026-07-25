@@ -324,6 +324,69 @@ export interface ChatIndexUpsert {
 }
 
 /**
+ * Current-identity row from `user_identities` (§6.5). Populated only for
+ * providers that supply `SenderInfo.username` (Discord in v1); Matrix events
+ * never write here, so a lookup miss is the norm for Matrix senders.
+ */
+export interface UserIdentityRow {
+  provider: string;
+  user_id: string;
+  username: string;
+  display_name: string | null;
+  first_seen: number;
+  last_seen: number;
+  updated_at: number;
+}
+
+/**
+ * Input for {@link Storage.upsertUserIdentity}. Called at ingest whenever an
+ * event's sender carries a `username` field that differs from the stored row
+ * (change detection is inside the method). Matrix senders have no `username`,
+ * so callers skip the call entirely — the Matrix path writes ZERO rows.
+ */
+export interface UserIdentityUpsertInput {
+  provider: string;
+  userId: string;
+  username: string;
+  displayName?: string | null;
+  /** Timestamp of the inbound event (ms epoch). Used for first/last_seen. */
+  observedAt: number;
+}
+
+/**
+ * Resolved current identity for render-time override (§6.5 bullet 2). Both
+ * fields may be undefined when the table has no row for the sender (the fallback
+ * is the per-event stored values — byte-identical for Matrix).
+ */
+export interface CurrentIdentity {
+  username?: string;
+  displayName?: string | null;
+}
+
+/**
+ * One alias-history row from `user_identity_aliases` (§6.5). Each row records
+ * a prior (username, display_name) pair that was demoted when the user's
+ * username changed. Bounded at {@link USER_IDENTITY_ALIAS_BOUND} per user;
+ * oldest rows (smallest rowid) are evicted when the bound is exceeded.
+ */
+export interface UserIdentityAliasRow {
+  rowid: number;
+  provider: string;
+  user_id: string;
+  username: string;
+  display_name: string | null;
+  recorded_at: number;
+}
+
+/**
+ * Maximum number of alias-history rows kept per (provider, user_id). The 17th
+ * rename evicts the oldest alias. Chosen conservatively — alias expansion in
+ * the retrieval user lane uses only the top 4 — so the table stays bounded even
+ * for bots with unusually high rename rates.
+ */
+export const USER_IDENTITY_ALIAS_BOUND = 16;
+
+/**
  * One reaction (or un-reaction) to persist in the `reactions` store. Built from a
  * native MatrixReactionStreamEvent (action "add") in the provider ingest path.
  */
@@ -7260,6 +7323,171 @@ export class Storage {
     });
   }
 
+  // ── User identity store (§6.5) ───────────────────────────────────────────────
+  // Data-presence-driven: only called by the ingest path when the sender has a
+  // `username` field. Matrix senders never have one, so the Matrix path is a
+  // guaranteed zero-write path (no config knob, no predicate — falls out of data
+  // absence). Discord (Phase 7) will write here for every username-carrying event.
+
+  /**
+   * Upsert the current identity for a known sender.
+   *
+   * Three cases:
+   * 1. No existing row → INSERT current values (first sight).
+   * 2. Existing row; `username` unchanged → UPDATE `last_seen` only (no alias row).
+   * 3. Existing row; `username` changed → demote old (username, display_name) to
+   *    `user_identity_aliases`, UPDATE current row, evict aliases beyond bound.
+   *
+   * `displayName`-only changes (username same) update the current row without
+   * creating an alias entry, since retrieval alias expansion keys on usernames.
+   * isSelf senders are included — operator-side bot renames are absorbed this way.
+   */
+  async upsertUserIdentity(input: UserIdentityUpsertInput): Promise<void> {
+    return this.write((db) => {
+      const existing = db
+        .prepare(
+          `select username, display_name from user_identities
+           where provider = ? and user_id = ?`,
+        )
+        .get(input.provider, input.userId) as
+        | { username: string; display_name: string | null }
+        | undefined;
+
+      const now = input.observedAt;
+
+      if (!existing) {
+        // Case 1: first sight — insert current values.
+        db.prepare(
+          `insert into user_identities
+             (provider, user_id, username, display_name, first_seen, last_seen, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(input.provider, input.userId, input.username, input.displayName ?? null, now, now, now);
+        return;
+      }
+
+      const usernameChanged = existing.username !== input.username;
+
+      if (usernameChanged) {
+        // Case 3: username changed — demote old identity to alias history.
+        db.prepare(
+          `insert into user_identity_aliases
+             (provider, user_id, username, display_name, recorded_at)
+           values (?, ?, ?, ?, ?)`,
+        ).run(input.provider, input.userId, existing.username, existing.display_name, now);
+
+        // Evict oldest aliases when the bound is exceeded (bound = 16).
+        // Count current aliases, delete lowest rowids beyond the cap.
+        const count = (
+          db
+            .prepare(
+              `select count(*) as n from user_identity_aliases
+               where provider = ? and user_id = ?`,
+            )
+            .get(input.provider, input.userId) as { n: number }
+        ).n;
+
+        if (count > USER_IDENTITY_ALIAS_BOUND) {
+          const excess = count - USER_IDENTITY_ALIAS_BOUND;
+          db.prepare(
+            `delete from user_identity_aliases
+             where provider = ? and user_id = ?
+               and rowid in (
+                 select rowid from user_identity_aliases
+                 where provider = ? and user_id = ?
+                 order by rowid asc
+                 limit ?
+               )`,
+          ).run(input.provider, input.userId, input.provider, input.userId, excess);
+        }
+      }
+
+      if (usernameChanged || existing.display_name !== (input.displayName ?? null)) {
+        // Username or display_name changed: update current row.
+        db.prepare(
+          `update user_identities
+           set username = ?, display_name = ?, last_seen = ?, updated_at = ?
+           where provider = ? and user_id = ?`,
+        ).run(
+          input.username,
+          input.displayName ?? null,
+          now,
+          now,
+          input.provider,
+          input.userId,
+        );
+      } else {
+        // Case 2: nothing changed — only bump last_seen.
+        db.prepare(
+          `update user_identities set last_seen = ?
+           where provider = ? and user_id = ?`,
+        ).run(now, input.provider, input.userId);
+      }
+    });
+  }
+
+  /**
+   * Batch-resolve current identities for a set of (provider, userId) pairs.
+   * Returns a `Map<"provider:userId", CurrentIdentity>` for render-time
+   * overrides (§6.5 bullet 2). Pairs with no row in `user_identities` are
+   * absent from the map — the caller falls back to per-event stored values,
+   * making Matrix (which never writes here) byte-identical with no config knob.
+   *
+   * Implemented as one query per `(provider, user_id)` batch rather than a
+   * single parameterized IN over a compound PK — SQLite's handling of multi-
+   * column IN is not concise and the typical per-window unique-sender count is
+   * small (< 20). For very large windows the per-batch overhead is negligible
+   * vs the rendering work that follows.
+   */
+  getUserIdentityMap(
+    pairs: ReadonlyArray<{ provider: string; userId: string }>,
+  ): Map<string, CurrentIdentity> {
+    if (pairs.length === 0) return new Map();
+    return this.read((db) => {
+      const result = new Map<string, CurrentIdentity>();
+      const stmt = db.prepare(
+        `select username, display_name from user_identities
+         where provider = ? and user_id = ?`,
+      );
+      for (const { provider, userId } of pairs) {
+        const row = stmt.get(provider, userId) as
+          | { username: string; display_name: string | null }
+          | undefined;
+        if (row) {
+          result.set(`${provider}:${userId}`, {
+            username: row.username,
+            displayName: row.display_name,
+          });
+        }
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Retrieve recent alias usernames for one sender, most-recent first (highest
+   * rowid first). Used by the retrieval user lane (§6.5 bullet 3) to expand
+   * the alias-history names for "history with this person" recall across renames.
+   * The alias expansion bound is: current username + up to `limit` distinct
+   * prior usernames. The caller passes limit = 4 (current + 4 ≤ 5 names total).
+   */
+  getUserIdentityAliases(
+    provider: string,
+    userId: string,
+    limit: number,
+  ): string[] {
+    return this.read((db) => {
+      const rows = db
+        .prepare(
+          `select username from user_identity_aliases
+           where provider = ? and user_id = ?
+           order by rowid desc
+           limit ?`,
+        )
+        .all(provider, userId, limit) as Array<{ username: string }>;
+      return rows.map((r) => r.username);
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -7297,6 +7525,61 @@ export class Storage {
     });
   }
 }
+
+// User-identity store (§6.5). Two tables shared between the canonical SCHEMA
+// (fresh DBs) and the v4→v5 migration (existing DBs) so the two can never drift.
+// Both uses are `create … if not exists`, so re-running is idempotent.
+//
+// user_identities: current row per (provider, user_id) — upserted at ingest
+//   whenever a sender carries a `username` field. Matrix events never set username,
+//   so the entire Matrix path is a guaranteed zero-write path (no config knob;
+//   behaviour difference falls out of data absence).
+//
+// user_identity_aliases: prior (username, display_name) values, one row per rename
+//   event. AUTOINCREMENT rowid gives natural insertion order so eviction (keep the
+//   newest 16) is a "delete lowest rowids" operation — no timestamp column needed
+//   for ordering, though `recorded_at` is carried for diagnostics. Without-rowid
+//   is intentionally avoided — the AUTOINCREMENT guarantee ("never reuse a rowid")
+//   is the ordering invariant for eviction; WITHOUT ROWID has no such guarantee.
+//
+// Migration note: purely additive DDL. No data backfill of any kind — existing
+//   rows carry no provider-shaped data that would benefit from it, and §11.2's
+//   standing rule (any migration touching provider-shaped data must carry an explicit
+//   provider predicate) is trivially satisfied here by the absence of any back-fill.
+const USER_IDENTITIES_SCHEMA = `
+create table if not exists user_identities (
+  provider     text not null,
+  user_id      text not null,
+  username     text not null,
+  display_name text,
+  first_seen   integer not null,
+  last_seen    integer not null,
+  updated_at   integer not null,
+  primary key (provider, user_id)
+) without rowid;
+
+-- For console / diagnostic lookups by provider.
+create index if not exists idx_user_identities_provider_updated
+  on user_identities(provider, updated_at desc);
+
+create table if not exists user_identity_aliases (
+  -- AUTOINCREMENT: never reuse a rowid, so "delete lowest rowid" always evicts
+  -- the oldest alias regardless of any later inserts. The eviction invariant
+  -- (keep newest 16) holds correctly even across table compaction.
+  rowid        integer primary key autoincrement,
+  provider     text not null,
+  user_id      text not null,
+  username     text not null,
+  display_name text,
+  -- Timestamp of the EVENT that observed the rename (not wall-clock at insert).
+  recorded_at  integer not null
+);
+
+-- Core access patterns: ordered alias listing for retrieval expansion and
+-- for eviction (both order by rowid, one asc one desc, both filtered by user).
+create index if not exists idx_user_identity_aliases_user
+  on user_identity_aliases(provider, user_id, rowid);
+`;
 
 // Memory-retrieval index DDL (ARCHITECTURE.md §9d). Shared verbatim by the
 // fresh-DB SCHEMA (interpolated below) and the v6→v7 migration step, so the two
@@ -8293,7 +8576,8 @@ ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
 ${REACTIONS_SCHEMA}
-${BACKFETCH_JOBS_SCHEMA}`;
+${BACKFETCH_JOBS_SCHEMA}
+${USER_IDENTITIES_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -8301,7 +8585,7 @@ ${BACKFETCH_JOBS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 4;
+export const LATEST_SCHEMA_VERSION = 5;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -8535,6 +8819,22 @@ function addUsageEventPartitions(db: Database.Database): void {
   );
 }
 
+/**
+ * v4→v5 (purely additive DDL): create `user_identities` and
+ * `user_identity_aliases` for the §6.5 identity-mutation machinery. No data
+ * backfill of any kind — the tables start empty on existing databases and
+ * populate as new events arrive. `if not exists` makes the step idempotent and
+ * harmless if SCHEMA (which also carries the DDL) already ran.
+ *
+ * Migration note §11.2: this migration reasons about NO provider-shaped data,
+ * so no provider predicate is needed. The tables are purely additive and start
+ * empty; all future writes carry an explicit `provider` column value from the
+ * calling code.
+ */
+function addUserIdentityTables(db: Database.Database): void {
+  db.exec(USER_IDENTITIES_SCHEMA);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -8544,6 +8844,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   cleanupAssistantEchoDuplicates,
   repairReplyFallbackOverstrip,
   addUsageEventPartitions,
+  addUserIdentityTables,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
