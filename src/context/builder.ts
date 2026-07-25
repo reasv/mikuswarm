@@ -13,6 +13,7 @@ import type {
   MediaAssetRow,
   Summary,
   TimelineCursor,
+  CurrentIdentity,
 } from "../storage/index.js";
 import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
 import { compactTimelineEvents } from "./compaction.js";
@@ -457,6 +458,27 @@ export class ContextBuilder {
       }
     }
 
+    // Render-time current-identity resolution (§6.5 bullet 2): collect distinct
+    // (provider, sender.id) pairs from the full event window, batch-query the
+    // user_identities table, and apply overrides so old events render under the
+    // person's CURRENT name. With an empty table (Matrix path, or any deployment
+    // before Discord events arrive) the map is empty and applyIdentityOverrides
+    // returns the events unchanged — byte-identical to pre-Phase-3b output, with
+    // no config knob. The override covers compactionInput + triggerEvents (all
+    // events that will be rendered in this build).
+    //
+    // Reaction lines: not resolved through the identity map here because the
+    // `reactions` table stores no `provider` column (only `timeline_key`) and
+    // Matrix is the only current reaction provider — its senders never populate
+    // user_identities, so the reaction sender labels are already correct via
+    // byte-identical fallback. Discord reactions (Phase 6+) will resolve here
+    // once the reaction schema carries a provider field.
+    const identityMap = this.buildIdentityMap([...compactionInput, ...triggerEvents]);
+    if (identityMap.size > 0) {
+      compactionInput = this.applyIdentityOverrides(compactionInput, identityMap);
+      triggerEvents = this.applyIdentityOverrides(triggerEvents, identityMap);
+    }
+
     // Passive reaction surfacing (ARCHITECTURE.md §9f). Both views are render-time
     // projections from the reaction store, attached now (after wait-or-omit has
     // finalized the event set) and never persisted into event_json. Off for
@@ -636,18 +658,34 @@ export class ContextBuilder {
       .filter(Boolean)
       .join("\n");
     // The user lane (§9d) keys on WHO is talking: the distinct username (or
-    // display name when username is absent) of the trigger senders, excluding the
-    // bot itself. Using `username ?? displayName` makes the key stable even when a
-    // guild nick changes (audit §3.4 finding 13). TODO(phase3b): expand with known
-    // prior names via the alias-history map (§6.5) once user_identities is built.
-    const triggerUsers = Array.from(
-      new Set(
-        triggerEvents
-          .filter((e) => !e.sender.isSelf)
-          .map((e) => (e.sender.username ?? e.sender.displayName)?.trim())
-          .filter((n): n is string => n !== undefined && n.length > 0),
-      ),
+    // display name when username is absent) of the trigger senders, excluding
+    // the bot itself. Using `username ?? displayName` makes the key stable even
+    // when a guild nick changes (audit §3.4 finding 13).
+    //
+    // Alias expansion (§6.5 bullet 3): OR the current name with the most recent
+    // prior usernames from alias history so diary/history recall survives renames.
+    // Bound: current + up to 4 prior distinct usernames (5 names total per sender).
+    // Only applies to senders with a username (Discord); Matrix senders keyed on
+    // displayName get no alias expansion — there is no alias history for them.
+    const triggerUserSenders = triggerEvents
+      .filter((e) => !e.sender.isSelf)
+      .filter((e) => {
+        const name = (e.sender.username ?? e.sender.displayName)?.trim();
+        return name !== undefined && name.length > 0;
+      });
+    const triggerUserNames = new Set(
+      triggerUserSenders
+        .map((e) => (e.sender.username ?? e.sender.displayName)!.trim()),
     );
+    // Expand with alias history for senders that have a username.
+    for (const e of triggerUserSenders) {
+      if (!e.sender.username) continue; // Matrix sender — no alias history
+      const aliases = this.storage.getUserIdentityAliases(e.provider, e.sender.id, 4);
+      for (const alias of aliases) {
+        triggerUserNames.add(alias);
+      }
+    }
+    const triggerUsers = Array.from(triggerUserNames);
     // Bound the inline auto-retrieval query-embed wait (spec LLM-FAILURE-HANDLING
     // §7.1 / §9d #7): the embed is transitively an inference wait riding inside an
     // interactive build, so it gets the SAME interactive wall-clock budget as the
@@ -1357,6 +1395,59 @@ export class ContextBuilder {
     // render path only (attachReactionAggregates) — NOT here — so search and
     // summarization builds never carry them.
     return hydrateEventsShared(this.storage, events);
+  }
+
+  /**
+   * Batch-query the `user_identities` table for every distinct (provider, sender.id)
+   * pair in `events`, returning a Map suitable for {@link applyIdentityOverrides}.
+   * An empty map means no rows exist (e.g. a Matrix-only deployment) — the caller
+   * skips the override step entirely, preserving byte-identical behaviour.
+   */
+  private buildIdentityMap(
+    events: CanonicalChatEvent[],
+  ): Map<string, CurrentIdentity> {
+    const seen = new Set<string>();
+    const pairs: Array<{ provider: string; userId: string }> = [];
+    for (const e of events) {
+      const key = `${e.provider}:${e.sender.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        pairs.push({ provider: e.provider, userId: e.sender.id });
+      }
+    }
+    return this.storage.getUserIdentityMap(pairs);
+  }
+
+  /**
+   * Apply current-identity overrides (§6.5 bullet 2): for each event whose
+   * sender has an entry in `identityMap`, replace `sender.username` and
+   * `sender.displayName` with the current values from the identity store.
+   * Returns a new array of shallow-copied events — the original `events` array
+   * and its elements are never mutated. Events with no identity-map entry are
+   * returned as-is (no-copy, same object reference).
+   *
+   * With an empty map this is a no-op that returns the same array unchanged
+   * (Matrix path guarantee: the map is always empty for Matrix-only deployments
+   * → byte-identical rendering with no config knob).
+   */
+  private applyIdentityOverrides(
+    events: CanonicalChatEvent[],
+    identityMap: Map<string, CurrentIdentity>,
+  ): CanonicalChatEvent[] {
+    return events.map((e) => {
+      const current = identityMap.get(`${e.provider}:${e.sender.id}`);
+      if (!current) return e;
+      return {
+        ...e,
+        sender: {
+          ...e.sender,
+          username: current.username ?? e.sender.username,
+          // Current identity wins outright: a NULL display_name in the store means
+          // the user cleared their nick, so the event's historical nick is dropped too.
+          displayName: current.displayName ?? undefined,
+        },
+      };
+    });
   }
 
   /**

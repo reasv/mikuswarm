@@ -1717,6 +1717,33 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
     const routed = await router.route(inbound, enrichmentStatus);
+
+    // Identity upsert (§6.5): data-presence-driven, no config knob. Only called
+    // when the sender carries a `username` field — Discord does, Matrix never does.
+    // With an empty `user_identities` table the Matrix path is GUARANTEED to be
+    // byte-identical: this branch is dead for every Matrix event (no username set).
+    // isSelf senders are included so operator-side bot renames are absorbed. Fires
+    // for both new and duplicate events (a rename may happen between two copies of
+    // the same external_id arriving on different gateways). Fire-and-forget through
+    // the single-writer queue — a failure here must never stall the ingest path.
+    if (inbound.event.sender.username) {
+      void storage
+        .upsertUserIdentity({
+          provider: inbound.provider,
+          userId: inbound.event.sender.id,
+          username: inbound.event.sender.username,
+          displayName: inbound.event.sender.displayName,
+          observedAt: inbound.event.timestamp,
+        })
+        .catch((error) =>
+          logger.warn("identity_upsert_failed", {
+            provider: inbound.provider,
+            userId: inbound.event.sender.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    }
+
     // Eager summarization (spec §7.1): events just persisted — recompute the
     // timeline's un-summarized compact-tier size off the hot path and enqueue a
     // level-1 job the moment it crosses threshold. Fire-and-forget,

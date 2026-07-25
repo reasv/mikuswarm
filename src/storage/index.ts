@@ -60,6 +60,11 @@ export {
   type ReactionUpsert,
   type ReactionAggregateRow,
   type DiscreteReactionRow,
+  type UserIdentityRow,
+  type UserIdentityUpsertInput,
+  type CurrentIdentity,
+  type UserIdentityAliasRow,
+  USER_IDENTITY_ALIAS_BOUND,
 } from "./database.js";
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";
