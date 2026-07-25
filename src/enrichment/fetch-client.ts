@@ -169,6 +169,29 @@ export class FetchClient {
     this.stopped = true;
   }
 
+  /**
+   * Channel-neutral URL download: fetch a remote URL to a caller-supplied
+   * output path, enforcing the same SSRF guard, size cap, retry, and proxy as
+   * {@link fetch}. Throws on non-2xx status after deleting the partial file.
+   * Use this for Discord CDN attachments (via `AttachmentMeta.remoteUrl`) and
+   * other cases where the download URL is known up front.
+   */
+  async downloadUrl(params: {
+    url: string;
+    outputPath: string;
+    sizeLimit?: number;
+  }): Promise<{ sizeBytes: number; contentType?: string }> {
+    const result = await this.fetch(params.url, {
+      outputPath: params.outputPath,
+      maxBytes: params.sizeLimit,
+    });
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      await unlink(result.path).catch(() => {});
+      throw new Error(`HTTP ${result.statusCode}`);
+    }
+    return { sizeBytes: result.sizeBytes, contentType: result.contentType };
+  }
+
   private async doFetch(url: string, options?: FetchOptions): Promise<FetchResult> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs);

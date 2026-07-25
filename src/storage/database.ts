@@ -3116,6 +3116,21 @@ export class Storage {
     });
   }
 
+  /**
+   * Return URLs already covered by ingest-time discord_embed link previews for
+   * this event. Called by the enrichment worker before running the
+   * DirectLinkPreviewClient fallback so it skips URLs already previewed at
+   * ingest (ingest-time previews take precedence per URL — Phase 7 populates
+   * them; the precedence logic lands here in Phase 5).
+   */
+  getIngestLinkPreviewUrls(eventId: string): string[] {
+    // TODO(phase7): the Discord ingest path must store embed URLs normalized the same way DirectLinkPreviewClient's stripTrailingPunctuation does, or exclusion matching will miss and re-scrape them.
+    const rows = this.db
+      .prepare(`select url from link_previews where event_id = ? and source_kind = 'discord_embed'`)
+      .all(eventId) as Array<{ url: string }>;
+    return rows.map((r) => r.url);
+  }
+
   persistEnrichmentResults(
     eventId: string,
     result: {
@@ -3126,7 +3141,13 @@ export class Storage {
   ): Promise<void> {
     return this.readAndWrite((db) => {
       db.prepare(`delete from media_assets where event_id = ?`).run(eventId);
-      db.prepare(`delete from link_previews where event_id = ?`).run(eventId);
+      // Preserve ingest-time discord_embed rows: they are written at ingest
+      // (Phase 7) before enrichment runs and take precedence over any rows the
+      // enrichment worker would produce for the same URLs. Deleting them here
+      // would race against Phase 7's ingest path.
+      db.prepare(
+        `delete from link_previews where event_id = ? and (source_kind is null or source_kind != 'discord_embed')`,
+      ).run(eventId);
       db.prepare(`delete from reply_contexts where event_id = ?`).run(eventId);
 
       if (result.replyContext) {
