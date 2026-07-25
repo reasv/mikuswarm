@@ -46,7 +46,14 @@ export interface NormalizeUserLimitsResult {
   warnings: string[];
 }
 
-const KNOWN_PARTITION_VARS = new Set(["user_id", "room_id", "homeserver", "space_id"]);
+/**
+ * All recognized partition variable names (canonical + aliases). Canonical:
+ * `{channel_id}` (channel scope), `{server_id}` (server/guild/space scope).
+ * Aliases: `{room_id}` = `{channel_id}`; `{space_id}` = `{server_id}`.
+ * `{homeserver}` is Matrix-only; a rule using it with no Matrix provider earns
+ * a config-load warning.
+ */
+const KNOWN_PARTITION_VARS = new Set(["user_id", "room_id", "channel_id", "homeserver", "space_id", "server_id"]);
 const DEFAULT_SHORTHAND_WINDOW: RawWindow = { type: "rolling", duration: "24h" };
 /**
  * Upper bound on DISTINCT shared-pool partition values in one rule (spec
@@ -74,6 +81,25 @@ function isStaticPartition(template: string): boolean {
 }
 
 /**
+ * Emit a warning when `varName` is a known variable that no enabled provider can
+ * supply at runtime (§6.4). Currently only `{homeserver}` is Matrix-only; all
+ * other known vars are available from any provider.
+ */
+function checkProviderVar(
+  varName: string,
+  enabledProviders: string[],
+  label: string,
+  warnings: string[],
+): void {
+  if (varName === "homeserver" && !enabledProviders.includes("matrix")) {
+    warnings.push(
+      `${label}: partition variable "{homeserver}" is Matrix-only but no Matrix provider is enabled — ` +
+        `the variable will always resolve to "" for enabled providers; consider {user_id} instead`,
+    );
+  }
+}
+
+/**
  * True when the template contains a lone, unmatched brace — a `{` or `}` that is not
  * part of a well-formed `{var}` (issue #7). Strips every well-formed `{...}` group;
  * any residual brace is malformed. Without this, `"{user_id"` (missing `}`) matches
@@ -88,10 +114,14 @@ function hasUnbalancedBrace(template: string): boolean {
  * omitted calendar tz; `knownModelIds` is the union of configured model ids — a
  * `models` / sub-cap reference outside it is FATAL (unlike §8e's soft warn: a
  * per-user model is SELECTED, so a dangling name would crash the fallback build).
+ *
+ * `enabledProviders` (optional): when supplied, a warning is emitted when a rule
+ * uses a partition variable that no enabled provider can supply at runtime (§6.4).
+ * The only such variable today is `{homeserver}`, which is Matrix-only.
  */
 export function normalizeUserLimits(
   raw: RawUserLimitRule[] | undefined,
-  opts: { defaultTz: string; knownModelIds: Set<string> },
+  opts: { defaultTz: string; knownModelIds: Set<string>; enabledProviders?: string[] },
 ): NormalizeUserLimitsResult {
   const rules: NormalizedUserLimitRule[] = [];
   const fatal: string[] = [];
@@ -181,10 +211,14 @@ export function normalizeUserLimits(
           );
         }
         // Partition template var validation (§9): only known vars (incl. {space_id},
-        // §11 second slice).
+        // §11 second slice; {channel_id}/{server_id} canonical names also accepted).
         for (const v of partitionVars(partition)) {
           if (!KNOWN_PARTITION_VARS.has(v)) {
             fatal.push(`${label} limits[${index}]: unknown partition variable "{${v}}"`);
+          } else if (opts.enabledProviders) {
+            // Provider-supply warning (§6.4): warn when no enabled provider can
+            // supply this var. Only `{homeserver}` has a provider restriction today.
+            checkProviderVar(v, opts.enabledProviders, `${label} limits[${index}]`, warnings);
           }
         }
         // Sub-cap scope must reference known + declared models (§9).

@@ -13,6 +13,12 @@ export interface UserProfileToolContext {
   workspaceRoot: string;
   provider: string;
   senderId: string;
+  /**
+   * The sender's stable-ish unique handle (§6.1 `SenderInfo.username`). Used as
+   * the `deriveProviderUsername` hint for providers where the username cannot be
+   * derived from the id alone (e.g. Discord snowflakes). Matrix leaves this unset.
+   */
+  senderUsername?: string;
   senderDisplayName?: string;
   config?: {
     root_dir?: string;
@@ -512,7 +518,9 @@ function resolveUserProfileTarget(input: {
     return {
       provider,
       senderId,
-      username: deriveProviderUsername(provider, senderId),
+      username: deriveProviderUsername(provider, senderId, {
+        senderUsername: input.context.senderUsername,
+      }),
     };
   }
 
@@ -532,10 +540,17 @@ function resolveUserProfileTarget(input: {
       );
     }
   }
+  // For explicit targets, `target.username` wins; fall back to provider derivation.
+  // Use `context.senderUsername` as the derivation hint only when the target is
+  // the same sender as the requester (cross-user explicit targets don't carry it).
+  const isSelf = (normalizeProvider(input.target?.provider ?? input.context.provider) === normalizeProvider(input.context.provider))
+    && (normalizeOptionalText(input.target?.senderId) === normalizeOptionalText(input.context.senderId));
   return {
     provider,
     senderId,
-    username: normalizeOptionalText(input.target?.username) ?? deriveProviderUsername(provider, senderId),
+    username: normalizeOptionalText(input.target?.username) ?? deriveProviderUsername(provider, senderId, {
+      senderUsername: isSelf ? input.context.senderUsername : undefined,
+    }),
     displayName: normalizeOptionalText(input.target?.displayName),
   };
 }
@@ -1014,10 +1029,27 @@ function parseUserProfileSections(raw: string): Map<string, string> {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-function deriveProviderUsername(provider: string, senderId: string): string | undefined {
+/**
+ * Derive or resolve a username for the user-profile slug / metadata.
+ *
+ * Matrix: localpart extracted from the MXID (`@alice:hs` → `alice`).
+ * Discord: username cannot be derived from a snowflake alone; the caller must
+ *   pass `opts.senderUsername` (from `SenderInfo.username`) when available.
+ * Other providers: returns undefined (caller falls back to senderId or displayName).
+ */
+function deriveProviderUsername(
+  provider: string,
+  senderId: string,
+  opts?: { senderUsername?: string },
+): string | undefined {
   if (provider === "matrix") {
     const localpart = senderId.split(":")[0]?.replace(/^@/, "").trim();
     return localpart || undefined;
+  }
+  if (provider === "discord") {
+    // Discord snowflakes carry no human-readable username; use the hint supplied
+    // by the caller (from SenderInfo.username, set by the Discord normalizer).
+    return opts?.senderUsername || undefined;
   }
   return undefined;
 }

@@ -89,6 +89,81 @@ test("homeserverOf + renderPartition", () => {
   assert.equal(renderPartition("staff", ctx), "staff");
 });
 
+// Phase 3a: {channel_id} / {server_id} canonical names + {room_id} / {space_id} aliases
+// (spec DISCORD-SUPPORT-DESIGN.md §6.4)
+test("renderPartition: {channel_id} is canonical for room scope (alias of {room_id})", () => {
+  const ctx: UserLimitContext = { userId: "@alice:hs.org", roomId: "!room:hs.org" };
+  // Canonical name and alias resolve to the same value.
+  assert.equal(renderPartition("{channel_id}", ctx), "!room:hs.org", "{channel_id} resolves to roomId");
+  assert.equal(renderPartition("{room_id}", ctx), "!room:hs.org", "{room_id} alias still works");
+  assert.equal(renderPartition("{channel_id}", ctx), renderPartition("{room_id}", ctx), "both resolve identically");
+});
+
+test("renderPartition: {server_id} is canonical for space scope (alias of {space_id})", () => {
+  const ctx: UserLimitContext = { userId: "@alice:hs.org", spaceIds: ["!guild:hs.org", "!second:hs.org"] };
+  // Canonical and alias both return the first (best) spaceId.
+  assert.equal(renderPartition("{server_id}", ctx), "!guild:hs.org", "{server_id} returns first spaceId");
+  assert.equal(renderPartition("{space_id}", ctx), "!guild:hs.org", "{space_id} alias returns same");
+  assert.equal(renderPartition("{server_id}", ctx), renderPartition("{space_id}", ctx), "both resolve identically");
+});
+
+test("renderPartition: {server_id} / {channel_id} resolve to empty string when absent", () => {
+  const ctx: UserLimitContext = { userId: "@alice:hs.org" };
+  // No roomId or spaceIds — missing → "".
+  assert.equal(renderPartition("{channel_id}", ctx), "");
+  assert.equal(renderPartition("{room_id}", ctx), "");
+  assert.equal(renderPartition("{server_id}", ctx), "");
+  assert.equal(renderPartition("{space_id}", ctx), "");
+});
+
+test("normalizeUserLimits: {channel_id} and {server_id} are valid partition vars (no fatal)", () => {
+  const channelRule = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "ch:{channel_id}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.deepEqual(channelRule.fatal, [], "{channel_id} must not be fatal");
+
+  const serverRule = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "srv:{server_id}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.deepEqual(serverRule.fatal, [], "{server_id} must not be fatal");
+});
+
+test("normalizeUserLimits: {homeserver} warns when Matrix provider is not enabled", () => {
+  const noMatrix = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "hs:{homeserver}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS, enabledProviders: ["discord"] },
+  );
+  assert.deepEqual(noMatrix.fatal, [], "not a fatal error — just a warning");
+  assert.ok(
+    noMatrix.warnings.some((w) => /homeserver.*Matrix-only/.test(w)),
+    `expected a homeserver warning, got: ${JSON.stringify(noMatrix.warnings)}`,
+  );
+});
+
+test("normalizeUserLimits: {homeserver} does NOT warn when Matrix is in enabledProviders", () => {
+  const withMatrix = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "hs:{homeserver}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS, enabledProviders: ["matrix", "discord"] },
+  );
+  assert.deepEqual(withMatrix.fatal, [], "no fatal");
+  assert.ok(
+    !withMatrix.warnings.some((w) => /homeserver/.test(w)),
+    "no homeserver warning when Matrix is enabled",
+  );
+});
+
+test("normalizeUserLimits: {homeserver} does NOT warn when enabledProviders is not supplied (pre-3a compat)", () => {
+  // If the caller omits enabledProviders (legacy call sites), no warning is emitted.
+  const noOpt = normalizeUserLimits(
+    [{ user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "hs:{homeserver}" }] }],
+    { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
+  );
+  assert.deepEqual(noOpt.fatal, []);
+  assert.ok(!noOpt.warnings.some((w) => /homeserver/.test(w)), "no warning without enabledProviders opt");
+});
+
 // ─── Normalizer ─────────────────────────────────────────────────────────────
 
 test("normalize: max_usd shorthand expands to one fungible total constraint", () => {
@@ -614,6 +689,21 @@ test("space matching (§11): matches ANY parent space; per-space pool shares acr
 test("usesSpace is false when no rule references space (skips the resolution)", () => {
   const engine = makeEngine([{ user: "*", max_usd: 5, window: ROLL24 }]);
   assert.equal(engine.usesSpace, false);
+});
+
+// Phase 3a: {server_id} / {channel_id} canonical aliases must trigger usesSpace / usesRoom.
+test("usesSpace is true when a partition uses canonical {server_id} alias", () => {
+  const engine = makeEngine([
+    { user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "srv:{server_id}" }] },
+  ]);
+  assert.equal(engine.usesSpace, true, "{server_id} partition must set usesSpace");
+});
+
+test("usesRoom is true when a partition uses canonical {channel_id} alias", () => {
+  const engine = makeEngine([
+    { user: "*", limits: [{ max_usd: 5, window: ROLL24, partition: "ch:{channel_id}" }] },
+  ]);
+  assert.equal(engine.usesRoom, true, "{channel_id} partition must set usesRoom");
 });
 
 test("seed: a meter materializes from the ledger sum on first access", () => {

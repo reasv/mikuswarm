@@ -272,6 +272,14 @@ export class ContextBuilder {
    */
   private readonly claims?: SessionClaims;
 
+  /**
+   * Resolve the bot's own user id for a given provider + account (§6.3).
+   * Injected by app wiring via `providers.get(provider)?.getSelf(accountId)?.id`.
+   * When absent, `resolveSelfUserId` falls back to `config.matrix.accounts` so
+   * tests and callers that pre-date Phase 3 continue to work unchanged.
+   */
+  getSelfUserId?: (provider: string, accountId: string) => string | undefined;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
@@ -627,15 +635,16 @@ export class ContextBuilder {
       .map((e) => e.body)
       .filter(Boolean)
       .join("\n");
-    // The user lane (§9d) keys on WHO is talking: the distinct display name(s) of the
-    // trigger senders, excluding the bot itself. This is the strongest relevance
-    // signal we have — diaries name people by display name constantly — so it drives a
-    // separate lexical "history with this person" sub-search inside auto-retrieval.
+    // The user lane (§9d) keys on WHO is talking: the distinct username (or
+    // display name when username is absent) of the trigger senders, excluding the
+    // bot itself. Using `username ?? displayName` makes the key stable even when a
+    // guild nick changes (audit §3.4 finding 13). TODO(phase3b): expand with known
+    // prior names via the alias-history map (§6.5) once user_identities is built.
     const triggerUsers = Array.from(
       new Set(
         triggerEvents
           .filter((e) => !e.sender.isSelf)
-          .map((e) => e.sender.displayName?.trim())
+          .map((e) => (e.sender.username ?? e.sender.displayName)?.trim())
           .filter((n): n is string => n !== undefined && n.length > 0),
       ),
     );
@@ -1389,18 +1398,19 @@ export class ContextBuilder {
    * targets or no live reactions on them.
    */
   /**
-   * Resolve the bot's own Matrix user id for a build from its timelineKey via
-   * `config.matrix.accounts[account].user_id` (same lookup as src/app.ts).
-   * Uses the shared grammar parser to extract the accountId so the extraction
-   * is correct for provider-generic keys. Returns undefined when it can't be
-   * resolved; the caller then falls back to the reactor's display name.
-   *
-   * NOTE: the `config.matrix.accounts` lookup is Phase-2 scope (provider registry);
-   * the key parsing is Phase-1 scope (shared grammar). Only the parsing is changed here.
+   * Resolve the bot's own user id for a build from its timelineKey. Uses the
+   * injected `getSelfUserId` callback (wired by app.ts to
+   * `providers.get(provider)?.getSelf(accountId)?.id`) when available, falling
+   * back to `config.matrix.accounts` for callers that pre-date Phase 3.
+   * Returns undefined when it can't be resolved.
    */
   private resolveSelfUserId(timelineKey: string): string | undefined {
     const parsed = parseTimelineKey(timelineKey);
     if (!parsed) return undefined;
+    if (this.getSelfUserId) {
+      return this.getSelfUserId(parsed.provider, parsed.accountId);
+    }
+    // Fallback: Matrix config read for callers / tests that haven't wired getSelfUserId.
     return this.config.matrix.accounts[parsed.accountId]?.user_id;
   }
 
@@ -1429,7 +1439,9 @@ export class ContextBuilder {
       targetInfo.set(target.externalId, {
         body: target.body,
         self: target.role === "assistant",
-        authorDisplay: target.sender.displayName ?? undefined,
+        // displayName is the friendlier human-facing label; for providers with username
+        // (Discord) but no nick, the handle backstops a missing displayName.
+        authorDisplay: target.sender.displayName ?? target.sender.username ?? undefined,
       });
     }
     // Ascending message times across the whole rendered set — the seam signal for

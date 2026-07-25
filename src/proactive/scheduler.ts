@@ -4,6 +4,7 @@ import type {
   CanonicalChatEvent,
   InboundChatEvent,
   OutboundTarget,
+  SelfIdentity,
   SenderInfo,
   TriggerInfo,
 } from "../types.js";
@@ -261,6 +262,13 @@ export interface ProactiveSchedulerOptions {
    * channel simply waits out the budget rather than posting and being refused.
    */
   budgetDeferUntil?: () => number | undefined;
+  /**
+   * Resolve the bot's own identity for a given provider + account (§6.3).
+   * Injected by app wiring via `providers.get(provider)?.getSelf(accountId)`.
+   * When absent, `buildSyntheticInbound` falls back to `config.matrix.accounts`
+   * for backward compatibility.
+   */
+  getSelf?: (provider: string, accountId: string) => SelfIdentity | undefined;
   logger: Logger;
   /** Injectable clock/RNG for deterministic tests. */
   now?: () => number;
@@ -465,12 +473,20 @@ export class ProactiveScheduler {
       });
       return null;
     }
-    // TODO(phase3): selfUserId lookup will move to provider.getSelf(accountId)
-    // via the registry (spec §6.3). For now, config.matrix.accounts is the only
-    // source for Matrix deployments (identity-related reads are Phase 3 scope).
-    const selfUserId = this.options.config.matrix.accounts[parsed.accountId]?.user_id;
-    if (!selfUserId) return null;
-    const self: SenderInfo = { id: selfUserId, isSelf: true };
+    // §6.3: resolve self identity via provider registry when available; fall back
+    // to config.matrix.accounts for callers / tests that haven't wired getSelf.
+    const selfIdentity =
+      this.options.getSelf?.(parsed.provider, parsed.accountId) ??
+      (this.options.config.matrix.accounts[parsed.accountId]?.user_id
+        ? ({ id: this.options.config.matrix.accounts[parsed.accountId].user_id! } as SelfIdentity)
+        : undefined);
+    if (!selfIdentity) return null;
+    const self: SenderInfo = {
+      id: selfIdentity.id,
+      username: selfIdentity.username,
+      displayName: selfIdentity.displayName,
+      isSelf: true,
+    };
     const target: OutboundTarget = {
       provider: parsed.provider,
       timelineKey,

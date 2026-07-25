@@ -80,9 +80,10 @@ test("coalesces reactions per (target, key) and lists senders with the message s
   ];
   const lines = synthesizeReactionLines(rows, selfTarget("$a1", "a fairly short message body"), { nameCap: 8 });
   assert.equal(lines.length, 1);
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present.
   assert.equal(
     lines[0].content,
-    `<reaction>Fleur, Alice and Bo reacted 👍 to your message [$a1]: "a fairly short message body"</reaction>`,
+    `<reaction>Fleur, Alice and Bo reacted 👍 to your message: "a fairly short message body"</reaction>`,
   );
   // Placement timestamp is the group's most recent reaction.
   assert.equal(lines[0].timestamp, 1200);
@@ -94,7 +95,8 @@ test("a single sender reads naturally", () => {
     selfTarget("$a1", "hi"),
     { nameCap: 8 },
   );
-  assert.equal(lines[0].content, `<reaction>Fleur reacted :ohman: to your message [$a1]: "hi"</reaction>`);
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present.
+  assert.equal(lines[0].content, `<reaction>Fleur reacted :ohman: to your message: "hi"</reaction>`);
 });
 
 test("more than the name cap collapses to first 4 + (and N others)", () => {
@@ -157,9 +159,10 @@ test("a non-self target reads \"<author>'s message\" (discrete_assistant_only = 
     target,
     { nameCap: 8 },
   );
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present.
   assert.equal(
     lines[0].content,
-    `<reaction>Fleur reacted 👍 to Bob's message [$u9]: "someone else said this"</reaction>`,
+    `<reaction>Fleur reacted 👍 to Bob's message: "someone else said this"</reaction>`,
   );
 });
 
@@ -170,7 +173,8 @@ test("a non-self target with no known author reads \"a message\"", () => {
     target,
     { nameCap: 8 },
   );
-  assert.match(lines[0].content, /to a message \[\$u9\]:/);
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present; snippet is "hi".
+  assert.match(lines[0].content, /to a message: "hi"/);
 });
 
 test("synthesized lines carry the target's self flag", () => {
@@ -216,7 +220,8 @@ test("a self-reactor renders as \"You\" (§9f View B polish)", () => {
     selfTarget("$a1", "hi"),
     { nameCap: 8, selfUserId: "@miku:example.org" },
   );
-  assert.equal(lines[0].content, `<reaction>You reacted 👍 to your message [$a1]: "hi"</reaction>`);
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present.
+  assert.equal(lines[0].content, `<reaction>You reacted 👍 to your message: "hi"</reaction>`);
 });
 
 test("a non-self reactor still renders its display name when selfUserId is set", () => {
@@ -237,7 +242,8 @@ test("mixed self + others: \"You\" composes with correct grammar", () => {
     nameCap: 8,
     selfUserId: "@miku:example.org",
   });
-  assert.equal(lines[0].content, `<reaction>You and Alice reacted 👍 to your message [$a1]: "hi"</reaction>`);
+  // audit §3.4 finding 12: [id] bracket omitted when snippet is present.
+  assert.equal(lines[0].content, `<reaction>You and Alice reacted 👍 to your message: "hi"</reaction>`);
 });
 
 test("without selfUserId, a self-reactor falls back to its display name (no crash)", () => {

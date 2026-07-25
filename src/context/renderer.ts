@@ -132,10 +132,13 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
 }
 
 function buildMessageAttrs(event: CanonicalChatEvent): string {
+  // §6.2 rendering rule: human-facing label is `username ?? id`; raw `id` is
+  // reserved for `external_id` only (the declared exception for tool addressing).
+  const handle = event.sender.username ?? event.sender.id;
   const pairs: [string, string][] = [
-    ["sender", event.sender.id],
+    ["sender", handle],
   ];
-  if (event.sender.displayName && event.sender.displayName !== event.sender.id) {
+  if (event.sender.displayName && event.sender.displayName !== handle) {
     pairs.push(["display_name", truncate(event.sender.displayName, MAX_DISPLAY_NAME)]);
   }
   pairs.push(["time", formatAgentTimestamp(event.timestamp)]);
@@ -148,8 +151,10 @@ function buildMessageAttrs(event: CanonicalChatEvent): string {
 function renderReply(reply: ReplyContext): string {
   const pairs: [string, string][] = [];
   if (reply.sender) {
-    pairs.push(["sender", reply.sender.id]);
-    if (reply.sender.displayName && reply.sender.displayName !== reply.sender.id) {
+    // §6.2 rendering rule: same `username ?? id` handle used here for consistency.
+    const handle = reply.sender.username ?? reply.sender.id;
+    pairs.push(["sender", handle]);
+    if (reply.sender.displayName && reply.sender.displayName !== handle) {
       pairs.push(["display_name", truncate(reply.sender.displayName, MAX_DISPLAY_NAME)]);
     }
   }
@@ -412,18 +417,25 @@ function compactMediaKind(slot: XMediaSlot): string {
 }
 
 function compactSenderLabel(event: CanonicalChatEvent): string {
-  if (event.sender.displayName && event.sender.displayName !== event.sender.id) {
-    return `${escapeCompactParens(event.sender.displayName)} (${event.sender.id})`;
+  // §6.2: human-facing label is `username ?? id`; displayName shown only when it
+  // differs from the handle (same suppression guard as the rich XML sender attr).
+  const handle = event.sender.username ?? event.sender.id;
+  if (event.sender.displayName && event.sender.displayName !== handle) {
+    return `${escapeCompactParens(event.sender.displayName)} (${handle})`;
   }
-  return event.sender.id;
+  return handle;
 }
 
 function compactReply(reply: ReplyContext): string {
+  // §6.2: reply sender label uses `username ?? id` as the handle.
+  const replyHandle = reply.sender ? (reply.sender.username ?? reply.sender.id) : undefined;
   const senderDisplay = reply.sender?.displayName
-    ? (reply.sender.displayName !== reply.sender.id
-        ? `${escapeCompactParens(reply.sender.displayName)} (${reply.sender.id})`
-        : reply.sender.id)
-    : "unknown";
+    ? (reply.sender.displayName !== replyHandle
+        ? `${escapeCompactParens(reply.sender.displayName)} (${replyHandle})`
+        : replyHandle)
+    // When there is no displayName: providers with a username (Discord) use the handle;
+    // providers without one (Matrix) fall back to "unknown", preserving pre-3a byte-identity.
+    : (reply.sender?.username != null ? replyHandle : "unknown");
   const time = reply.timestamp ? ` At: ${compactTime(reply.timestamp)}` : "";
   const body = reply.body ? `: ${truncate(normalizeWhitespace(reply.body), 4096)}` : "";
   // Reply-context media is carried at compact tier too (it was previously
