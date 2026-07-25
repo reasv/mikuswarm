@@ -213,11 +213,20 @@ export interface UserLimitEngineOptions {
   viableMinOutputTokens: number;
   logger: Logger;
   /**
-   * The agent's OWN Matrix ids (one per configured account). Per-user limits apply only
+   * True when `id` is a user identity the enabled chat providers recognize — i.e. a real
+   * human-sender id, not a synthetic/system sender (e.g. `"system"`). Used to decide
+   * whether a sender is subject to per-user limits (Gate A) and whether its partition
+   * should appear on the console. Supplied by the app at construction; the predicate is
+   * the authority for identity shape across all enabled providers.
+   */
+  isUserIdentity: (id: string) => boolean;
+  /**
+   * The agent's OWN user ids (one per configured account). Per-user limits apply only
    * to human triggers that pass Gate A — proactive / background / self / system sessions
    * skip it (ARCHITECTURE.md §8g) — so the console must not surface the bot's own accounts
-   * (or a non-MXID system sender like "system") as rate-limited "users". Seeding + the
-   * grouped console view drop any user partition that isn't a real MXID or is one of these.
+   * (or a synthetic system sender like "system") as rate-limited "users". Seeding + the
+   * grouped console view drop any user partition that isn't a real user identity or is one
+   * of these.
    */
   selfUserIds?: ReadonlySet<string>;
   now?: () => number;
@@ -478,13 +487,15 @@ export class UserLimitEngine {
    * resolves it. Aggregate reply pools always carry human spend, so this rarely bites.
    */
   /**
-   * True when `senderId` is a real Matrix user the per-user limits actually govern — a
-   * genuine MXID (`@user:hs`) that is NOT the agent's own account. Excludes non-MXID
-   * system senders (e.g. "system") and the bot itself, whose spend rides lanes that skip
+   * True when `senderId` is a real user id the enabled chat providers recognize — one that
+   * per-user limits actually govern — AND is NOT the agent's own account. Excludes synthetic
+   * system senders (e.g. `"system"`) and the bot itself, whose spend rides lanes that skip
    * Gate A (ARCHITECTURE.md §8g), so they must never appear as rate-limited "users".
+   * The shape test is delegated to the injected {@link UserLimitEngineOptions.isUserIdentity}
+   * predicate, which is the authority for user-id shape across all enabled providers.
    */
   private isEnforceableUser(senderId: string): boolean {
-    return senderId.startsWith("@") && !this.options.selfUserIds?.has(senderId);
+    return this.options.isUserIdentity(senderId) && !this.options.selfUserIds?.has(senderId);
   }
 
   seedFromLedger(): void {
@@ -508,7 +519,7 @@ export class UserLimitEngine {
       includeSpace: this.usesSpace,
     });
     for (const id of identities) {
-      // Never seed the bot itself or a non-MXID system sender — per-user limits don't
+      // Never seed the bot itself or a sender the isUserIdentity predicate rejects (synthetic/system senders) — per-user limits don't
       // govern their spend (Gate A is skipped for those lanes), so materializing a meter
       // would surface a phantom "user" the console must not show.
       if (!this.isEnforceableUser(id.senderId)) continue;
