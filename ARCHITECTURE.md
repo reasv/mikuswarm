@@ -420,7 +420,7 @@ A `[discord]` config block (peer of `[matrix]`) enables the Discord provider. Sc
 `startMikuAgent` builds a `Map<string, IChatProvider>` keyed by provider id (`"matrix"`, `"discord"`, …) from config:
 
 - `MatrixProvider` is constructed and registered as `"matrix"` iff `config.matrix.enabled !== false`.
-- `DiscordProvider` is constructed and registered as `"discord"` iff `config.discord?.enabled && config.discord.accounts` has at least one account. `DiscordProvider` takes a `DiscordProviderCallbacks` object (closed over storage) for two async storage operations: `mergeLateEmbeds` (late-embed link preview upsert — spec §8.3) and `storeIngestEmbeds` (ingest-time embed write — spec §9.3).
+- `DiscordProvider` is constructed and registered as `"discord"` iff `config.discord?.enabled && config.discord.accounts` has at least one account. `DiscordProvider` takes a `DiscordProviderCallbacks` object (closed over storage) with five callbacks: `mergeLateEmbeds`, `storeIngestEmbeds`, `upsertUserIdentity`, `setChannelMetadata`, and the optional `onSelfResolved` hook. See **§6c DiscordProviderCallbacks** for details.
 - If the `opts.providers` seam is supplied (test injection path — `StartMikuAgentOptions`), it replaces the config-derived map entirely; this lets tests inject a fake provider without touching any SDK.
 - **Zero-provider guard**: if the final registry is empty after construction (and after seam injection), `startMikuAgent` throws `"no enabled chat provider"` immediately — before any pool, storage, or validation step. This is a fatal config error; at least one provider must be enabled at startup.
 - At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers (including `DiscordProvider`) receive the generic host that wires `onEvent`, `onReaction`, `onBulkReactionClear`, `onError`, and `resolveReplyTrigger` without Matrix-typed callbacks.
@@ -743,7 +743,7 @@ Unresolvable IDs (not in the passed maps) pass through verbatim so no informatio
 
 **Reply context**: `buildReplyContext(ref)` populates `replyTo` fully at ingest time from the `referenced_message` payload included in the gateway event. Reply enrichment via REST is not needed for Discord (unlike Matrix where the SDK doesn't include it).
 
-**Emoji observations** — `extractEmojiObservations(content)`: captures `<:name:id>` and `<a:name:id>` pairs from the raw content string, deduplicated by id, and returned as `{name, id, animated}` triples. These are passed back by the provider for the emoji catalog (Phase 7b wires the catalog writes).
+**Emoji observations** — `extractEmojiObservations(content)`: captures `<:name:id>` and `<a:name:id>` pairs from the raw content string, deduplicated by id, and returned as `{name, id, animated}` triples. The provider calls `runtime.emojiCatalog.observeEmoji(obs.id, obs.name, obs.animated)` for each triple at ingest time.
 
 **`DiscordNormalizeResult`** is the return type of `normalizeDiscordMessage`: `{ inbound: InboundChatEvent, emojiObservations, embedPreviews }`.
 
@@ -759,32 +759,32 @@ Unresolvable IDs (not in the passed maps) pass through verbatim so no informatio
 | `maxAttachmentsPerMessage` | 10 | Discord API limit |
 | `formatting` | `"markdown"` | |
 | `typing` | `true` | |
-| `reactions` | `true` | Gateway events received; reaction routing is Phase 7b |
+| `reactions` | `true` | `messageReactionAdd/Remove/RemoveAll/RemoveEmoji` gateway events routed to `host.onReaction`/`host.onBulkReactionClear` |
 | `reactionKinds` | `["unicode","custom"]` | No text-shortcode reactions on Discord |
 | `customEmojiScoped` | `true` | Guild-scoped sendability |
 | `edits` | `true` | |
 | `deletes` | `true` | |
 | `threads` | `true` | |
 | `pins` | `true` | |
-| `pollCreate` | `true` | ChannelClient method is 7b; tool absent while `channelClient()` returns `undefined` |
+| `pollCreate` | `true` | `DiscordChannelClient.createPoll` |
 | `pollVote` | `false` | No bot vote endpoint in Discord API |
-| `history` | `true` | History client is 7b; tool absent while `channelClient()` returns `undefined` (Phase 4 gates on both) |
+| `history` | `true` | `DiscordHistoryClient` returned by `history()` |
 | `mediaUpload` | `false` | Local-file attach is the upload path; no Matrix-style MXC |
 | `encrypted` | `false` | |
 | `linkPreviews` | `"none"` | Embeds are handled at ingest, not via provider API |
 | `singleAttachmentPerMessage` | `false` | Discord allows up to 10 per message |
 | `membershipRoster` | computed | `true` iff any account has `member_intent = true` in config |
-| **`voiceMessages`** | **`false`** | **Temporary lie (Phase 7b)** — ogg/opus send + waveform not yet implemented; will be flipped to `true` in Phase 7b. The model does not see `as_voice` until then. |
+| `voiceMessages` | `true` | ogg/opus send via ffmpeg + 256-sample waveform; `as_voice` wired in `send()` |
 
 **`accountIds()`** returns `Object.keys(this.config.accounts ?? {})` — config keys, not the runtime map — so it works correctly before `start()` is called (e.g. for enrichment pool registration).
 
 **`ownsUserId(id)`**: `/^\d+$/.test(id)` — any all-digit string is treated as a Discord snowflake. Used by the budget predicate `isUserIdentity`.
 
-**`channelClient()`**: returns `undefined` — Phase 7b. Safe because Phase 4 tool wiring gates on `channelClient !== undefined` before consulting capability flags.
+**`channelClient(target)`**: returns a `DiscordChannelClient` when the target resolves to a running account. Resolves `guildId` from the discord.js channel cache (`runtime.client.channels.cache`), with a fallback guild-cache scan. Returns `undefined` for foreign targets (unknown accountId, channel not resolvable).
 
-**`enrichment(accountId)`**: returns an `EnrichmentCapabilities` stub when the account is running. `downloadMedia` throws (Discord attachments always have `remoteUrl`, so the enrichment worker never calls this path). `messageSummary` returns `null` (reply context is already complete at ingest). `resolveLinkPreviews` is absent (triggers `DirectLinkPreviewClient` fallback in the worker — see §7a). `memberInfo` returns a stub `{ displayName: undefined }` (Phase 7b).
+**`enrichment(accountId)`**: returns an `EnrichmentCapabilities` object when the account is running. `downloadMedia` throws (Discord attachments always have `remoteUrl`, so the enrichment worker never calls this path). `messageSummary` returns `null` (reply context is fully populated at ingest from `referenced_message`). `resolveLinkPreviews` is absent (triggers `DirectLinkPreviewClient` fallback in the worker — see §7a). `memberInfo` performs a live lookup against the guild member cache: iterates allowed guilds, calls `guild.members.cache.get(userId)`, and returns `nickname ?? globalName ?? username`; returns `{ displayName: undefined }` on cache miss.
 
-**`history()`**: returns `undefined` — Phase 7b.
+**`history(target)`**: returns a `DiscordHistoryClient` for the resolved channel. Used by both `read_messages` (via `DiscordChannelClient.readMessages`, which delegates to the same client) and the initial-activation backfill (`runInitialBackfill` in `app.ts` calls `provider.history?.(target)` for non-Matrix providers).
 
 **Gateway intents**: `Guilds`, `GuildMessages`, `DirectMessages`, `MessageContent`, `GuildMessageReactions`, `DirectMessageReactions`, `GuildExpressions`; plus `GuildMembers` iff any account has `member_intent = true`.
 
@@ -818,24 +818,120 @@ Unresolvable IDs (not in the passed maps) pass through verbatim so no informatio
 
 ### `DiscordProviderCallbacks`
 
-Two async callbacks are injected at `DiscordProvider` construction time (not via `IChatProvider.start`) because the storage layer is initialized before the providers map is built in `app.ts`:
+Five callbacks are injected at `DiscordProvider` construction time (not via `IChatProvider.start`) because the storage layer is initialized before the providers map is built in `app.ts`:
 
 - `mergeLateEmbeds(provider, externalId, timelineKey, previews)` — upserts late-embed link preview rows for an already-stored event. Called by `handleMessageUpdate` when `editedTimestamp === null`.
 - `storeIngestEmbeds(eventId, previews)` — writes `discord_embed` link preview rows at ingest time. The `link_previews.event_id → timeline_events(id)` FK (enforced with `PRAGMA foreign_keys = ON`) is satisfied on both ingest paths: on the **immediate path** (no trigger hold), `host.onEvent` synchronously enqueues the event write in the FIFO single-writer queue and `storeIngestEmbeds` then enqueues the preview writes behind it; on the **held path**, `embedPreviews` are carried inside `PendingTrigger` and `storeIngestEmbeds` is called inside the hold flush callback only after `host.onEvent` fires, so the event row is always written first.
+- `upsertUserIdentity(input)` — called from `handleMessageCreate` (for every inbound message author) and from the `guildMemberUpdate` listener (when `member_intent = true`). The call is fire-and-forget (`void … .catch(() => {})`); failures are non-fatal.
+- `setChannelMetadata(timelineKey, meta)` — called from `handleMessageCreate` to upsert `display_name`, `server_id`, and `server_name` into `room_metadata`. For guild channels, `display_name = "#channel-name (Guild Name)"`, `server_id = guild.id`, `server_name = guild.name`. For DMs, `server_id` and `server_name` are omitted. `resolved_at` is bumped only when `display_name`, `server_id`, or `server_name` actually change (SQL CASE change-guard), so the hot per-message path avoids spurious writes when nothing has changed. Also fire-and-forget.
+- `onSelfResolved?(accountId, selfId)` — optional; called from the `ready` handler after login completes and `readyClient.user.id` is known. `app.ts` uses this to mutate the pre-declared `botSelfIdsForLimits` Set and `gapBackfetchSelfIds` Map (declared before the providers IIFE so mutations are visible to downstream consumers).
 
-Both are silent no-ops when the event is not yet stored or when `previews` is empty.
+### Emoji catalog (`src/discord/emoji-catalog.ts`)
 
-### Phase 7b gaps (absent, not stubbed)
+`EmojiCatalog` is a per-account in-memory store for Discord custom emoji. It maintains three maps:
 
-The following are intentionally absent from this phase:
+- **`guildEmoji`**: `Map<guildId, Map<emojiId, CatalogEmojiInfo>>` — guild-scoped emoji. Populated at READY from every allowed guild's emoji list, updated on `guildEmojisUpdate` and `guildCreate`, cleared on `guildDelete`.
+- **`appEmoji`**: `Map<emojiId, CatalogEmojiInfo>` — application emoji (sendable in any guild). Populated at READY via `GET /applications/{id}/emojis` iff `application_id` is configured.
+- **`observedPairs`**: `Map<emojiId, CatalogEmojiInfo>` — emoji observed inline in incoming message content (`extractEmojiObservations`). NOT sendable; not returned by `getSendableEmoji`. Exists so the normalizer can render `:name:` for emoji not yet in the catalog.
 
-- `ChannelClient` implementation — `channelClient()` returns `undefined`; all channel-scoped tools (`read_messages`, `create_poll`, `react`, etc.) are absent for Discord.
-- Reaction emission — `messageReactionAdd` / `messageReactionRemove` / bulk-clear events are not yet wired to `host.onReaction` / `host.onBulkReactionClear`.
-- Emoji catalog writes — `emojiObservations` returned by the normalizer are not yet persisted.
-- History client — `history()` returns `undefined`.
-- Voice message send — `voiceMessages` capability is `false`; `as_voice` is not wired in `send()`.
-- `set_profile` — profile update RPC absent.
-- User identity / metadata upserts — `sender.username` is set on Discord events but `upsertUserIdentity` is not yet called from the Discord ingest path.
+**`getSendableEmoji(guildId?)`**: returns guild emoji (for the given guild, alphabetically) followed by app emoji (alphabetically). Observed pairs are excluded.
+
+**`resolve(token, guildId?)`**: parses the token as either a raw Unicode emoji glyph or a `:shortcode:` string. Unicode glyphs pass through directly (`kind: "unicode"`). `:shortcode:` is matched first against the target guild's emoji (priority), then against app emoji; returns `{ kind: "custom", id, name, animated }` on match, `null` on miss. Observed pairs are not resolvable (not sendable).
+
+**`nearMatches(query, guildId?)`**: substring search over sendable emoji names; returns up to 5 `:shortcode:` strings.
+
+**Static helpers**: `EmojiCatalog.formatForApi(id, name)` → `"name:id"` (Discord API reaction emoji format); `EmojiCatalog.normalizedKey(id)` → `"discord:<id>"` (normalized key stored in the reactions table).
+
+**Gateway lifecycle**: the `guildEmojisUpdate` listener signature is `(guild, _oldEmojis, newEmojis)` per discord.js v14 (the guild is always the first argument). `guildCreate` loads emoji for newly joined guilds. `guildDelete` calls `clearGuildEmoji` so stale entries don't persist.
+
+### Reaction routing
+
+Four gateway events map to `host.onReaction` and `host.onBulkReactionClear`:
+
+| Gateway event | Handler | Action |
+|---|---|---|
+| `messageReactionAdd` | `handleReactionAdd` | `host.onReaction` with `action: "add"` |
+| `messageReactionRemove` | `handleReactionRemove` | `host.onReaction` with `action: "remove"` |
+| `messageReactionRemoveAll` | inline | `host.onBulkReactionClear` with no `normalizedKey` |
+| `messageReactionRemoveEmoji` | inline | `host.onBulkReactionClear` with `normalizedKey` |
+
+All four are gated on `isAllowedByGuild(runtime, guildId)` before dispatch.
+
+**`isAllowedByGuild(runtime, guildId)`**: returns `true` if `runtime.allowedGuilds` is unset (allow all), the `guildId` is in `allowedGuilds`, or `guildId` is `null` (DM — allowed when `dmEnabled`).
+
+**Reaction primary key**: `discord:<messageId>:<normalizedKey>:<userId>`, where `normalizedKey` for custom emoji is `discord:<emojiId>` and for unicode is the emoji glyph string. This PK is deterministic: the same add and remove events for the same (message, emoji, user) tuple produce the same key, so the remove tombstones the add row in the reactions table.
+
+**`handleReactionAdd`** constructs the PK, builds the `timelineKey` from `reaction.message.channelId` + `channelType` + optional `parentId` (for threads), and calls `host.onReaction` with `action: "add"`, `kind` (`"unicode"` or `"custom"`), `display` (glyph or `:name:`), `shortcode` (for custom), `normalizedKey`, `targetEventId`, and `reactedAtMs`.
+
+**`handleReactionRemove`** reconstructs the same PK (using the same `buildReactionNormalizedKey` helper) and calls `host.onReaction` with `action: "remove"` and no `kind`/`display`/`targetEventId` (tombstone shape).
+
+### DiscordChannelClient (`src/discord/channel-client.ts`)
+
+`DiscordChannelClient` implements the `ChannelClient` interface using discord.js REST through the account's `Client.rest`.
+
+| Method | Notes |
+|---|---|
+| `react(externalId, emoji)` | `EmojiCatalog.resolve()` then `PUT /channels/{id}/messages/{msgId}/reactions/{emoji}/@me`. Unicode glyphs are URL-encoded; custom emoji use `name:id` format. |
+| `unreact(externalId, emoji)` | `DELETE /channels/{id}/messages/{msgId}/reactions/{emoji}/@me` |
+| `listReactions(externalId, limit?)` | Fetches the message to get the reaction array; then for each emoji fetches users via `GET /reactions/{emoji}`. Returns `ReactionListing` with per-emoji `{ display, users }` entries. |
+| `editMessage(externalId, body)` | `PATCH /channels/{id}/messages/{msgId}` |
+| `deleteMessage(externalId)` | `DELETE /channels/{id}/messages/{msgId}` |
+| `readMessages(req)` | Delegates to an internal `DiscordHistoryClient` instance |
+| `readMessage(externalId)` | `GET /channels/{id}/messages/{msgId}` → `HistorySummary` |
+| `memberInfo(userId)` | Guild member cache lookup; REST `GET /guilds/{id}/members/{userId}` on miss (only if `memberIntentEnabled`) |
+| `members()` | REST `GET /guilds/{id}/members` with pagination (`limit=1000`, `after` cursor); only present iff `memberIntentEnabled` |
+| `channelInfo()` | Cache hit → `channelInfoFromCached`; cache miss → `GET /channels/{id}`, result cached. Returns `ChannelInfo` with `id`, `displayName`, `isDirect: false` (always false for guild channels), `topic`, `threadCount` |
+| `pins()` | `GET /channels/{id}/pins` |
+| `pinMessage / unpinMessage` | `PUT / DELETE /channels/{id}/pins/{msgId}` |
+| `emojiList(limit?)` | `EmojiCatalog.getSendableEmoji(guildId)` → up to `limit` entries as `EmojiEntry[]` |
+| `createPoll(req)` | `POST /channels/{id}/messages` with `poll: { question, answers, duration, allow_multiselect }` Discord object |
+
+`URLSearchParams` objects are used for all REST `query` parameters (discord.js v14 requires `URLSearchParams`, not a plain object).
+
+### DiscordHistoryClient (`src/discord/history-client.ts`)
+
+`DiscordHistoryClient` implements both `HistoryClient` and `BackfillReadClient`. It uses before-snowflake backward pagination via `GET /channels/{id}/messages`.
+
+**`readMessages(req)`**: accepts `req.limit` (1–100, clamped), `req.before` (explicit snowflake), and `req.cursor` (previous page cursor — also a snowflake). `before` takes priority over `cursor`. Response messages arrive newest-first; the oldest snowflake becomes `nextCursor`. Returns `HistoryPageResult` with `messages` (as `HistorySummary[]`) and `nextCursor`.
+
+**Structural compatibility**: `DiscordHistoryClient` satisfies `BackfillReadClient` because `readMessages` shares the same signature as `BackfillReadClient.readMessages`. This lets `runInitialBackfill` in `app.ts` use the history client directly without a wrapper (non-Matrix providers use `provider.history?.(target)` as the read client; Matrix uses `makeBackfillReadClient`).
+
+### Voice message send (`src/discord/voice-message.ts`)
+
+When the outbound message has an attachment with `asVoice = true` and a `localPath`, `send()` enters the voice message path.
+
+**`encodeVoiceMessage(inputPath)`** (two ffmpeg passes):
+1. Pass 1 — `ffmpeg -i input -vn -c:a libopus output.ogg` (transcode to ogg/opus)
+2. Pass 2 — `ffmpeg -i input -vn -ar 48000 -ac 1 -f s16le pcmfile` (extract s16le PCM for waveform)
+
+**`computeWaveform(pcmBytes, targetSamples)`**: divides the s16le PCM into `min(targetSamples, totalSamples, 256)` chunks, computes the peak absolute amplitude of each chunk (interpreting 16-bit LE signed samples), normalizes all peaks relative to the global maximum (0 → 0, max → 255), and returns a `Buffer` of `Uint8` values. `WAVEFORM_SAMPLE_COUNT = 256` is the Discord-enforced maximum.
+
+The provider sends the ogg file as a multipart POST using the raw REST client (discord.js attachment builder does not expose `duration_secs`/`waveform`). The payload sets `flags: MessageFlags.IsVoiceMessage` and includes `duration_secs` and `waveform` (base64-encoded waveform buffer) on the attachment object. After send, `cleanupVoiceFile` removes the temp ogg file.
+
+### `set_profile` (`setProfile` method)
+
+`setProfile(accountId, opts)` implements the `IChatProvider.setProfile` contract for Discord:
+
+- **Avatar**: `PATCH /users/@me` with `avatar` as a `data:<contentType>;base64,<data>` URI. Returns the updated CDN URL.
+- **Display name (per-guild nick)**: `PATCH /guilds/{guildId}/members/@me` with `{ nick }` for each allowed guild the account is in. Empty string clears the nick. Non-fatal per-guild (some guilds may block nick changes). Global username rename is deliberately excluded (globally unique, rate-limited at ~2/hr, collision risk).
+
+### Identity and metadata upserts
+
+**`upsertUserIdentity`** is called from two sites:
+
+1. `handleMessageCreate` — after every inbound message, calls `callbacks.upsertUserIdentity({ provider: "discord", userId: author.id, username: author.username, displayName: <nick or globalName or username>, observedAt: message.createdTimestamp })`. The `displayName` is the most-resolved visible name: nick (from guild member cache) → `globalName` → `username`.
+2. `guildMemberUpdate` listener (gated on `memberIntentEnabled`) — calls `callbacks.upsertUserIdentity` when a member's display name or username changes, using the updated `GuildMember` data.
+
+**`setChannelMetadata`** is called from `handleMessageCreate` with `{ displayName, serverId?, serverName? }`. The `displayName` is built by `buildChannelDisplayName(message)`: `#channel-name (Guild Name)` for guild text channels, `#<channelId>` for unknown/DM channels. `serverId = message.guildId ?? undefined`; `serverName = message.guild?.name ?? undefined`. The `room_metadata` table (`server_id`, `server_name` columns — schema v6) stores the guild scope so `serverIdsFor(timelineKey)` in `app.ts` can return the Discord guild id for limits enforcement.
+
+### Self-id disposition
+
+Discord self-ids (the bot's own snowflake) are only known after the `ready` event fires asynchronously. To make them available to the `UserLimitEngine` and backfill coordinator at call time (not just at construction time):
+
+- `app.ts` declares a mutable `botSelfIdsForLimits: Set<string>` (pre-seeded with Matrix `user_id` values) and `gapBackfetchSelfIds: Map<string, string>` (pre-seeded with Matrix account self-ids) **before** the providers IIFE.
+- The `onSelfResolved(accountId, selfId)` callback mutates both containers: `botSelfIdsForLimits.add(selfId)` and `gapBackfetchSelfIds.set(accountId, selfId)`.
+- `UserLimitEngine` is constructed with `selfUserIds: botSelfIdsForLimits`; it reads the Set by reference at each `isUserIdentity` call, so READY-time additions are visible without restart.
+- `runInitialBackfill` reads `gapBackfetchSelfIds.get(accountId)` at backfill time; READY fires before the first `activating` transition, so the self-id is always available when needed.
 
 ## 7. Timeline
 
@@ -887,7 +983,7 @@ SQLite with WAL mode. Core tables:
 - **`timeline_events`** — the event log. Each row stores denormalized columns (id, timeline_key, role, sender, body, timestamps) plus `event_json` (full `CanonicalChatEvent` serialized), `enrichment_status` (`inactive` | `pending` | `processing` | `complete` | `failed` | `skipped`), and `trigger_group_id` (event ID of the trigger that owns this group, or NULL). The `inactive` status marks events stored for a not-yet-triggered timeline (see section 7b — Channel Lifecycle); the enrichment and caption pools only claim `pending`/`processing` rows, so `inactive` events are stored cheaply but never processed until activation. It also has a generated column `is_undecryptable` (VIRTUAL, derived from `event_json`'s `undecryptable` field) for cheap UTD-row lookup by the re-decryption sweeper (see section 6a) and a `redecrypt_attempts` integer (default 0) that counts failed re-decryption probes — the sweeper's candidate query excludes rows at/above `MAX_REDECRYPT_ATTEMPTS` (and a `REDECRYPT_RETIRED` sentinel for permanently-unfetchable rows) so dead UTD rows leave rotation. A nullable `last_edit_timestamp` (issue #3) holds the `origin_server_ts` of the most recently applied edit (NULL = never edited); the edit-application paths use it to enforce latest-by-timestamp wins (an older incoming edit is a no-op). Indexed on `(timeline_key, timestamp, received_at, id)`, `(provider, external_id)`, `(enrichment_status, timestamp DESC)`, `(trigger_group_id)`, and a partial `(is_undecryptable, redecrypt_attempts, timestamp) where is_undecryptable = 1` (the attempts column is in the index so the give-up filter skips exhausted rows without touching the heap).
 - **`timeline_compaction_state`** — per-timeline compaction cursors (`compact_start_event_id`, `rich_start_event_id`) plus channel-lifecycle columns: `timeline_state` (`inactive` | `activating` | `active` | `backfilling`, default `inactive`) and `backfill_fence_timestamp` (reserved for deferred operator backfill). A missing row means the timeline is implicitly `inactive`. See section 7b.
 - **`pending_edits`** — edits (`m.replace`) that arrived/decrypted before their target message was stored, parked for replay by the append path (see section 6, "Edit-before-target replay"). Keyed by `(provider, target_external_id, timeline_key)` (the PK; `timeline_key`-scoped for the same multi-account reason as the edit lookup). Stores the resolved replacement `body` + `attachments_json` and the `edit_timestamp` (origin time, for latest-wins). Rows are deleted as soon as the target lands and the edit is applied.
-- **`room_metadata`** — cached human room labels keyed by `timeline_key` (`display_name` + `resolved_at`). Populated by `RoomLabelCache` (see section 6, "Room-label resolution") so the observability console room list shows real room names instead of raw room ids; read by `listConsoleRooms`, which falls back to the `timeline_key` when no label has been resolved yet. `resolved_at` lets the cache expire stale labels (rooms can be renamed; 6-hour TTL).
+- **`room_metadata`** — cached human room labels keyed by `timeline_key` (`display_name` + `resolved_at`). Populated by `RoomLabelCache` (see section 6, "Room-label resolution") so the observability console room list shows real room names instead of raw room ids; read by `listConsoleRooms`, which falls back to the `timeline_key` when no label has been resolved yet. `resolved_at` lets the cache expire stale labels (rooms can be renamed; 6-hour TTL). Also carries `server_id` (nullable) and `server_name` (nullable) — Discord guild scope, populated by `setChannelMetadata` at ingest; used by `serverIdsFor(timelineKey)` in `app.ts` to return the Discord guild snowflake for server-scoped budget limits.
 - **`metadata`** — generic key-value store.
 - **`reactions`** — the passive reaction store (§9f). One row per reaction event (PK = the reaction's own event id — `$eventId` for Matrix; `discord:<msgId>:<emojiKey>:<userId>` synthetic key for Discord), carrying the `timeline_key` locality hint, the target message's external id, sender, resolved `kind`/`display`/`shortcode`/`normalized_key`, timestamps, and a nullable `redacted_at` tombstone. The `timeline_key` column is returned in `DiscreteReactionRow` so the context builder can derive the provider for identity resolution (§6.5). Deliberately **not** part of the timeline — reactions are injected only at render time and must stay out of summarization, search, diary, and recap. No FK to `timeline_events`: the target is matched by the globally-unique event id (Matrix or synthetic Discord PK), not the internal row id. Partial index on `(target_event_id, reacted_at) where redacted_at is null`.
 - **`user_identities`** / **`user_identity_aliases`** — the user identity store (see §6b). `user_identities` is `WITHOUT ROWID`, PK `(provider, user_id)`, current `username` + `display_name`. `user_identity_aliases` holds prior usernames, bounded at `USER_IDENTITY_ALIAS_BOUND = 16` per user.
@@ -906,7 +1002,7 @@ Enrichment tables (see section 7a):
 
 The complete schema is defined as a single canonical block (`SCHEMA` in `src/storage/database.ts`) — clean, fully-idempotent `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` statements with every constraint baked in (the `enrichment_status` CHECK including `'inactive'`, the `is_undecryptable` generated column and its partial index, `redecrypt_attempts`, `last_edit_timestamp`, the `timeline_state` / `backfill_fence_timestamp` lifecycle columns, `enrichment_retries`, `trigger_group_id`, `media_assets.caption_error`, the `summaries.diary_status`/`diary_attempts` diary-queue columns, the `media_assets.caption_attempts`/`updated_at` pipeline-monitor columns, the `agent_sessions.resume_generation`/`chat_upper_bound_ts` reply-resume columns, the `usage_events` ledger with its `logical_model_id`/per-user columns and the `usage_event_partitions` overflow-membership child table, the `user_identities`/`user_identity_aliases` identity store, etc.). It is assembled from the shared sub-schema constants (`RETRIEVAL_SCHEMA`, `CHAT_SEARCH_SCHEMA`, `SUMMARY_SEARCH_SCHEMA`, `REACTIONS_SCHEMA`, `AGENT_SESSIONS_FTS_SCHEMA`, `SESSION_INTERJECTIONS_SCHEMA`, `USAGE_EVENTS_SCHEMA`, `TOOL_INVOCATIONS_SCHEMA`, `BACKFETCH_JOBS_SCHEMA`, `USER_IDENTITIES_SCHEMA`). `SCHEMA` always builds a fresh DB directly at the final shape.
 
-Structurally the schema is still the **genesis (v1) shape**: `SCHEMA` is edited in place (it stays idempotent so re-running it on an existing DB only fills in newly-added tables/indexes via `if not exists`), and no DDL migration exists. `LATEST_SCHEMA_VERSION = 5`, with **data-only or purely-additive** `MIGRATIONS` steps (`MIGRATIONS[v]` upgrades a v→v+1 DB): **v1→v2** (`cleanupAssistantEchoDuplicates`) is the one-off cleanup of the historical assistant-echo duplicates — for every `matrix:{account}:{eventId}` row that duplicates an `assistant:{session}:{eventId}:{chunk}` sibling with the same `(provider, external_id, timeline_key)`, it remaps references onto the assistant row (`summary_events` lineage — dropped instead when the summary already lists the sibling —, `summaries.latest_event_id`, `summarization_jobs.input_start_id`/`input_end_id`, the `timeline_compaction_state` cursors), deletes the duplicate's enrichment artifacts (`media_assets`/`link_previews`/`reply_contexts`), and deletes the duplicate row itself (its `chat_index` projection cascade-deletes via the FK + FTS triggers). See "Assistant echo enrichment" and §7c for the fixes that stop new duplicates from forming. **v2→v3** (`repairReplyFallbackOverstrip`) is the one-off repair for reply bodies over-stripped by the native reply-fallback stripper before its shape gating existed (§6 "Rich-reply fallback stripping"): for every reply (`event_json.replyTo` set) whose stored `htmlBody` begins with a `<blockquote>` (the user's own quote, surviving because `<mx-reply>` stripping left it), it rebuilds the plain body — the blockquote text as `> `-prefixed lines, a blank line, then the surviving remainder — updating both the `body` column and `event_json.body`. Rows whose body still carries the quote (fallback-sending clients, compared on lowercase-alphanumeric-folded words so markdown/HTML rendering differences don't mislead) and quotes that nest another blockquote are left alone. `reply_contexts` rows quoting a repaired event get the repaired text when their stored body exactly equals the damaged one; `chat_index` self-heals via the startup `reconcileAll` sweep (`content_sig` changes); summaries generated from damaged renders are LLM output and are not recomputed. **v3→v4** (`addUsageEventPartitions`) adds the `usage_event_partitions` overflow-membership child table (see §8e). **v4→v5** (`addUserIdentityTables`) adds the `user_identities` and `user_identity_aliases` tables (purely additive DDL, no data backfill — see §6b). A future column/table rename or data transform that `create … if not exists` cannot express follows the same pattern: bump `LATEST_SCHEMA_VERSION` and append an ordered step.
+Structurally the schema is still the **genesis (v1) shape**: `SCHEMA` is edited in place (it stays idempotent so re-running it on an existing DB only fills in newly-added tables/indexes via `if not exists`), and no DDL migration exists. `LATEST_SCHEMA_VERSION = 6`, with **data-only or purely-additive** `MIGRATIONS` steps (`MIGRATIONS[v]` upgrades a v→v+1 DB): **v1→v2** (`cleanupAssistantEchoDuplicates`) is the one-off cleanup of the historical assistant-echo duplicates — for every `matrix:{account}:{eventId}` row that duplicates an `assistant:{session}:{eventId}:{chunk}` sibling with the same `(provider, external_id, timeline_key)`, it remaps references onto the assistant row (`summary_events` lineage — dropped instead when the summary already lists the sibling —, `summaries.latest_event_id`, `summarization_jobs.input_start_id`/`input_end_id`, the `timeline_compaction_state` cursors), deletes the duplicate's enrichment artifacts (`media_assets`/`link_previews`/`reply_contexts`), and deletes the duplicate row itself (its `chat_index` projection cascade-deletes via the FK + FTS triggers). See "Assistant echo enrichment" and §7c for the fixes that stop new duplicates from forming. **v2→v3** (`repairReplyFallbackOverstrip`) is the one-off repair for reply bodies over-stripped by the native reply-fallback stripper before its shape gating existed (§6 "Rich-reply fallback stripping"): for every reply (`event_json.replyTo` set) whose stored `htmlBody` begins with a `<blockquote>` (the user's own quote, surviving because `<mx-reply>` stripping left it), it rebuilds the plain body — the blockquote text as `> `-prefixed lines, a blank line, then the surviving remainder — updating both the `body` column and `event_json.body`. Rows whose body still carries the quote (fallback-sending clients, compared on lowercase-alphanumeric-folded words so markdown/HTML rendering differences don't mislead) and quotes that nest another blockquote are left alone. `reply_contexts` rows quoting a repaired event get the repaired text when their stored body exactly equals the damaged one; `chat_index` self-heals via the startup `reconcileAll` sweep (`content_sig` changes); summaries generated from damaged renders are LLM output and are not recomputed. **v3→v4** (`addUsageEventPartitions`) adds the `usage_event_partitions` overflow-membership child table (see §8e). **v4→v5** (`addUserIdentityTables`) adds the `user_identities` and `user_identity_aliases` tables (purely additive DDL, no data backfill — see §6b). **v5→v6** (`addRoomMetadataServerColumns`) adds `server_id TEXT` and `server_name TEXT` nullable columns to `room_metadata` for Discord guild scope (see §6c). The migration uses `PRAGMA table_info(room_metadata)` to check column existence before each `ALTER TABLE` — SQLite 3.45 does not support `ADD COLUMN IF NOT EXISTS`, and tests simulate downgrades on a physically-v6 database, so idempotency is required. A future column/table rename or data transform that `create … if not exists` cannot express follows the same pattern: bump `LATEST_SCHEMA_VERSION` and append an ordered step.
 
 Versioning still uses SQLite's `PRAGMA user_version`. Inside `open()`'s write callback, the runner first records whether the database is **fresh** (no `timeline_events` table yet) *before* any DDL runs (`SCHEMA` uses `if not exists`, so afterward a fresh and an existing DB look identical):
 
@@ -1109,7 +1205,7 @@ The first session runs without summaries (summarization is asynchronous and catc
 
 ### Initial backfill
 
-`performInitialBackfill` (`src/backfill/`) pages room history backward via the native client's `readMessages`. The first request omits the pagination token (starting at the room head); each subsequent page uses the previous result's `nextBatch` (the backward-continuation token — note `readMessages` returns most-recent-first). Each non-UTD message is stored with `enrichment_status='inactive'` (UTD messages with `'skipped'`, see below) — **not** `'pending'` — so a failed activation (readiness throws, or the process crashes before reaching `active`) leaves the backfilled rows `inactive` rather than stranding them `pending` and enriching them under a now-inactive timeline. The post-readiness `activateTimelineEvents` bulk-flip (`'inactive'→'pending'`) activates them together with the rest of the backlog on a successful activation. `appendIfMissing` dedups against the canonical Matrix event ID (`matrix:{accountId}:{eventId}`) — and against `(provider, external_id, timeline_key)` for a bot self-message already stored under its `assistant:` canonical id — so the trigger event, any already-stored inactive events, and the bot's own sends are not re-inserted.
+`performInitialBackfill` (`src/backfill/`) pages room history backward via the native client's `readMessages`. The first request omits the pagination token (starting at the room head); each subsequent page uses the previous result's `nextBatch` (the backward-continuation token — note `readMessages` returns most-recent-first). Each non-UTD message is stored with `enrichment_status='inactive'` (UTD messages with `'skipped'`, see below) — **not** `'pending'` — so a failed activation (readiness throws, or the process crashes before reaching `active`) leaves the backfilled rows `inactive` rather than stranding them `pending` and enriching them under a now-inactive timeline. The post-readiness `activateTimelineEvents` bulk-flip (`'inactive'→'pending'`) activates them together with the rest of the backlog on a successful activation. `appendIfMissing` dedups against the provider-specific canonical event id — `matrix:{accountId}:{eventId}` for Matrix, `discord:{accountId}:{messageId}` for Discord — constructed via the caller-injected `CommonContext.buildId` (derived from the timeline key's provider prefix, defaulting to `"matrix"` when absent) — and against `(provider, external_id, timeline_key)` for a bot self-message already stored under its `assistant:` canonical id — so the trigger event, any already-stored inactive events, and the bot's own sends are not re-inserted.
 
 It stops at the first of: `initial_backfill_messages` newly stored, a kept message older than the window floor, history exhausted, a read failure, `initial_backfill_timeout_ms` elapsed (each read is also bounded by the remaining budget so a hung homeserver can't hold the trigger indefinitely), or a long run of consecutive undecryptable (UTD) events. The window floor is enforced **per kept message, before storing**: the first message that passes the timeline filter (`classifySummary`) with a timestamp below the floor stops the run, and that message is **not** persisted — backward pages are reverse-chronological, so everything after it is older still. Per-message (rather than per-page) enforcement matters in sparse rooms, where a single page can span months: a page-granular check would store the whole page (including arbitrarily old, permanently-undecryptable stubs) before the floor was ever consulted. Only kept messages are tested — edits and room-homed UTD events count, but non-matching room traffic does not — so a page dominated by old non-matching traffic (e.g. non-thread messages on a thread timeline) below the floor does not cut thread backfill short, and a fully-filtered page keeps paging on the token. The UTD guard maintains a consecutive-UTD counter over events belonging to the activated timeline, advanced **only on newly-stored (non-duplicate) events** — a re-paged region of already-held UTD history is not new dead history and must not halt the fetch — and reset to 0 on any newly-stored non-UTD event; when it reaches `initial_backfill_utd_halt_threshold` (default 50; 0 disables it) paging halts with `haltedOnUtd: true` on the result — paging into key-less history is no useful forward progress. UTD events themselves are stored (with `enrichment_status='skipped'`) like the live path, just like a human client would show them. The window floor is anchored to the **activation moment** — the trigger event's timestamp (falling back to now) — as `activationTimestamp − initial_backfill_window_ms`. Anchoring to the trigger rather than the oldest already-stored event means `initial_backfill_window_ms` reliably caps history to "N ms before activation" even on a busy channel with months of pre-activation inactive events. History exhaustion also covers a non-advancing pagination token: if the homeserver returns the same continuation token it was just handed, backfill treats history as exhausted rather than spinning until the timeout. A non-timeout read failure mid-pagination sets `errored` (with `error`) on the result — distinct from a clean stop — and is surfaced in the `initial_backfill` log.
 

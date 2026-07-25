@@ -1,19 +1,22 @@
 /**
- * Discord provider (Phase 7a — core gateway, inbound, and send).
+ * Discord provider — full Phase 7 implementation (gateway, inbound, send, tools).
  *
  * Implements {@link IChatProvider} for Discord using discord.js v14.
  * One discord.js Client per configured account; reconnect/resume is
  * discord.js's responsibility.
  *
- * Phase 7b additions (not here):
- *   - ChannelClient implementation (channelClient() returns undefined now)
- *   - Reactions: gateway events received but emitted to host in 7b
- *   - Emoji catalog management
- *   - History client (history() returns undefined now)
- *   - Voice message send (voiceMessages capability: false until 7b)
- *   - set_profile
- *   - user_identities / metadata upserts
- *   - TODO(phase7) sites in app.ts
+ * Implemented capabilities (v1 scope, spec §14):
+ *   - Gateway inbound: messageCreate / messageUpdate / messageDelete with
+ *     trigger-hold, reply-trigger detection, and late-embed discrimination.
+ *   - Reaction events: messageReactionAdd / Remove / RemoveAll / RemoveEmoji.
+ *   - ChannelClient: full tool surface (reactions, history, members when
+ *     member_intent=true, pins, emoji, polls, channelInfo, memberInfo).
+ *   - HistoryClient: before-snowflake backward paging (read_messages + backfill).
+ *   - Voice messages: ogg/opus transcode + waveform computation via ffmpeg.
+ *   - setProfile: avatar (data URI PATCH) + per-guild nick.
+ *   - Emoji catalog: guild + app emoji at READY, updated on guild events.
+ *   - User identity upserts (handleMessageCreate + guildMemberUpdate).
+ *   - Channel metadata upserts (room_metadata: display_name, server_id, server_name).
  *
  * Spec: DISCORD-SUPPORT-DESIGN §12 (provider), §8 (inbound pipeline),
  *       §4.1 (key shapes), §5 (config), §14 (v1 scope).
@@ -25,12 +28,18 @@ import {
   Options,
   ChannelType,
   StickerFormatType,
+  Routes,
   type Message,
   type PartialMessage,
   type TextChannel,
   type DMChannel,
-  type GuildMember,
+  type MessageReaction,
+  type PartialMessageReaction,
   type User,
+  type PartialUser,
+  type GuildEmoji,
+  type GuildMember,
+  type PartialGuildMember,
   MessageFlags,
 } from "discord.js";
 import { nanoid } from "nanoid";
@@ -46,15 +55,18 @@ import type {
   OutboundMessage,
   OutboundTarget,
   ProviderCapabilities,
+  ReactionStreamEvent,
   SelfIdentity,
 } from "../types.js";
 import type { EnrichmentCapabilities } from "../enrichment/types.js";
+import type { UserIdentityUpsertInput } from "../storage/database.js";
 import {
   buildDiscordTimelineKey,
   buildDiscordEventId,
   detectDiscordTrigger,
   normalizeDiscordMessage,
   embedsToLinkPreviews,
+  extractEmojiObservations,
   type DiscordMessageData,
   type DiscordMentionedUser,
   type DiscordMentionedRole,
@@ -64,6 +76,10 @@ import {
   type DiscordEmbedData,
   type DiscordReferencedMessage,
 } from "./normalizer.js";
+import { EmojiCatalog } from "./emoji-catalog.js";
+import { DiscordHistoryClient } from "./history-client.js";
+import { DiscordChannelClient } from "./channel-client.js";
+import { encodeVoiceMessage, cleanupVoiceFile } from "./voice-message.js";
 import { chunkMarkdownText } from "../tools/chunk.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
 
@@ -99,6 +115,10 @@ interface AccountRuntime {
   allowedGuilds?: Set<string>;
   dmEnabled: boolean;
   memberIntentEnabled: boolean;
+  /** Optional application id (for app-emoji catalog fetch). */
+  applicationId?: string;
+  /** Per-account emoji catalog (guild + app + observed emoji). */
+  emojiCatalog: EmojiCatalog;
 }
 
 interface PendingTrigger {
@@ -138,6 +158,30 @@ export interface DiscordProviderCallbacks {
     eventId: string,
     previews: LinkPreviewMeta[],
   ): Promise<void>;
+
+  /**
+   * Upsert a user identity row at ingest time (spec §6.5).
+   * Called for every Discord message sender whose username is known. The storage
+   * layer handles the "only update when changed" logic.
+   */
+  upsertUserIdentity(input: UserIdentityUpsertInput): Promise<void>;
+
+  /**
+   * Upsert channel metadata (display label + guild/server scope) into
+   * room_metadata at ingest time (spec §6.6). Called on every message create.
+   */
+  setChannelMetadata(
+    timelineKey: string,
+    meta: { displayName: string; serverId?: string; serverName?: string },
+  ): Promise<void>;
+
+  /**
+   * Called when a Discord account's READY event fires and `self` is resolved.
+   * Allows app.ts to add the Discord self-id to the selfUserIds budget set and
+   * the gapBackfetchSelfIds map — both of which are built before provider.start()
+   * and cannot include Discord ids until after READY (spec §6.3 / TODO(phase7)).
+   */
+  onSelfResolved?(accountId: string, selfId: string): void;
 }
 
 export class DiscordProvider implements IChatProvider {
@@ -146,20 +190,16 @@ export class DiscordProvider implements IChatProvider {
   /**
    * Capabilities for the Discord provider (spec §3.3 Discord column).
    *
-   * Temporary lies:
-   *   - `voiceMessages: false` — Phase 7b will implement ogg/opus send + waveform.
-   *     Set to false now because `as_voice` is not wired in send() yet; the model
-   *     will not see the parameter. This will be flipped to `true` in Phase 7b.
-   *
    * Notes:
-   *   - `history: true` is safe even though `history()` returns undefined (7b):
-   *     the Phase 4 gating requires `channelClient` non-null AND `caps.history`,
-   *     so no read_messages tool is wired while channelClient() returns undefined.
-   *   - `pollCreate: true` reflects v1 scope (spec §14); the createPoll ChannelClient
-   *     method is 7b, so the tool is not wired while channelClient() is undefined.
+   *   - `voiceMessages: true` — Phase 7b ships ogg/opus send + waveform computation.
+   *     The send() method handles `attachment.asVoice === true` by transcoding via
+   *     ffmpeg and sending the resulting ogg/opus with IS_VOICE_MESSAGE flag.
+   *   - `history: true` — HistoryClient (before-snowflake paging) is implemented in 7b.
+   *   - `pollCreate: true` reflects v1 scope (spec §14) — createPoll on ChannelClient
+   *     sends a Discord poll message.
    *   - `membershipRoster` is per-account and set at construction from config.
-   *     It is advertised as `false` here (the static default); `accountCapabilities`
-   *     below carries the per-account value used for wiring.
+   *     It is advertised as `false` here (the static default); the constructor
+   *     below overrides it when any account has member_intent=true.
    */
   readonly capabilities: ProviderCapabilities = {
     typing: true,
@@ -175,7 +215,7 @@ export class DiscordProvider implements IChatProvider {
     pollCreate: true,
     pollVote: false,
     pins: true,
-    voiceMessages: false, // TODO(phase7b): flip to true once as_voice is implemented
+    voiceMessages: true,
     threads: true,
     history: true,
     encrypted: false,
@@ -238,6 +278,8 @@ export class DiscordProvider implements IChatProvider {
           : undefined,
         dmEnabled: accountConfig.dm_enabled !== false,
         memberIntentEnabled: accountConfig.member_intent === true,
+        applicationId: accountConfig.application_id,
+        emojiCatalog: new EmojiCatalog(),
       };
 
       this.accounts.set(accountId, runtime);
@@ -295,13 +337,63 @@ export class DiscordProvider implements IChatProvider {
   // ── IChatProvider: channel / enrichment / history ─────────────────────────
 
   /**
-   * Returns undefined — ChannelClient implementation is Phase 7b.
-   * Because the Phase 4 gating requires BOTH channelClient non-null AND
-   * the relevant capability flag, all channel-scoped tools are safely absent
-   * while this returns undefined.
+   * Returns a DiscordChannelClient for the resolved target channel.
+   * Returns undefined for foreign targets (unknown accountId, not in allowedGuilds).
+   *
+   * The channel client resolves the guild id from the timeline key metadata
+   * (stored at ingest), falling back to a channel-cache lookup. For DM channels
+   * `guildId` is undefined, which the client handles gracefully.
    */
-  channelClient(_target: OutboundTarget): ChannelClient | undefined {
-    return undefined; // TODO(phase7b): implement DiscordChannelClient
+  channelClient(target: OutboundTarget): ChannelClient | undefined {
+    const accountId =
+      target.accountId ?? parseTimelineKey(target.timelineKey)?.accountId;
+    if (!accountId) return undefined;
+
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) return undefined;
+
+    // Resolve channel id from target: prefer explicit roomId, fall back to key.
+    const parsed = parseTimelineKey(target.timelineKey);
+    const channelId = target.roomId
+      ?? (parsed?.threadId ?? parsed?.channelId);
+    if (!channelId) return undefined;
+
+    // Resolve guild id from the discord.js cache (set on READY and message create).
+    // For thread channels, the parent channel's guild is what we need.
+    const guildId = this.resolveGuildId(runtime, channelId, parsed?.threadId);
+
+    const selfId = runtime.self?.id ?? "";
+    return new DiscordChannelClient(
+      runtime.client,
+      channelId,
+      guildId,
+      selfId,
+      runtime.memberIntentEnabled,
+      runtime.emojiCatalog,
+      accountId,
+    );
+  }
+
+  /** Attempt to derive the guild id for a channel from the discord.js cache. */
+  private resolveGuildId(
+    runtime: AccountRuntime,
+    channelId: string,
+    threadId?: string,
+  ): string | undefined {
+    // If it's a thread, look up the thread channel (which should have guildId).
+    const ch = runtime.client.channels.cache.get(threadId ?? channelId);
+    if (ch && "guildId" in ch) return (ch as { guildId?: string }).guildId ?? undefined;
+    // Not in cache — try to derive from guild cache (for text channels).
+    for (const guild of runtime.client.guilds.cache.values()) {
+      if (
+        (runtime.allowedGuilds && !runtime.allowedGuilds.has(guild.id)) ||
+        !guild.channels.cache.has(channelId)
+      ) {
+        continue;
+      }
+      return guild.id;
+    }
+    return undefined;
   }
 
   /**
@@ -317,6 +409,8 @@ export class DiscordProvider implements IChatProvider {
    */
   enrichment(accountId: string): EnrichmentCapabilities | undefined {
     if (!this.accounts.has(accountId)) return undefined;
+    // Capture the accounts map by reference so memberInfo always uses the live runtime.
+    const accounts = this.accounts;
     return {
       async downloadMedia(_params) {
         // Discord attachments always use the remoteUrl path in the enrichment
@@ -330,19 +424,42 @@ export class DiscordProvider implements IChatProvider {
         // the enrichment worker's resolveReplyContext call is a no-op for Discord.
         return null;
       },
-      async memberInfo(_params) {
-        // Phase 7b will implement REST-backed member info lookup.
+      async memberInfo(params) {
+        // Look up displayName from the guild member cache for the given userId.
+        const rt = accounts.get(accountId);
+        if (!rt) return { displayName: undefined };
+        for (const guild of rt.client.guilds.cache.values()) {
+          const member = guild.members.cache.get(params.userId ?? "");
+          if (member) {
+            return {
+              displayName:
+                member.nickname ??
+                member.user.globalName ??
+                member.user.username,
+            };
+          }
+        }
         return { displayName: undefined };
       },
     };
   }
 
   /**
-   * History client — Phase 7b.
-   * Returns undefined so the capability-gated tool is not wired.
+   * Returns a DiscordHistoryClient for before-snowflake backward paging.
+   * Used by read_messages and the initial-activation backfill.
    */
-  history?(_target: OutboundTarget): HistoryClient | undefined {
-    return undefined; // TODO(phase7b): implement before-snowflake paging
+  history?(target: OutboundTarget): HistoryClient | undefined {
+    const accountId =
+      target.accountId ?? parseTimelineKey(target.timelineKey)?.accountId;
+    if (!accountId) return undefined;
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) return undefined;
+
+    const parsed = parseTimelineKey(target.timelineKey);
+    const channelId = target.roomId ?? (parsed?.threadId ?? parsed?.channelId);
+    if (!channelId) return undefined;
+
+    return new DiscordHistoryClient(runtime.client, channelId, accountId);
   }
 
   // ── IChatProvider: send / typing ──────────────────────────────────────────
@@ -356,6 +473,58 @@ export class DiscordProvider implements IChatProvider {
     if (!channel || !channel.isTextBased()) {
       throw new Error(`Discord send: channel ${channelId} is not a text channel`);
     }
+
+    // ── Voice message path (spec §12.4, §14) ────────────────────────────────
+    // When the first attachment has asVoice=true, send as a Discord voice message.
+    // Voice messages require: ogg/opus audio, IS_VOICE_MESSAGE flag, empty content,
+    // duration_secs and waveform fields on the attachment.
+    const voiceAttachment = message.attachments?.find((a) => a.asVoice && a.localPath);
+    if (voiceAttachment?.localPath) {
+      const encoded = await encodeVoiceMessage(voiceAttachment.localPath);
+      let voiceMessageId: string | undefined;
+      try {
+        // Use REST API directly for precise control over the multipart payload.
+        // discord.js attachment builder does not expose durationSecs/waveform directly;
+        // we post via the raw REST client with the correct field names.
+        const formData = new FormData();
+        const audioBlob = new Blob(
+          [await import("node:fs/promises").then((fs) => fs.readFile(encoded.outputPath))],
+          { type: "audio/ogg" },
+        );
+        formData.append("files[0]", audioBlob, "voice-message.ogg");
+        formData.append(
+          "payload_json",
+          JSON.stringify({
+            content: "",
+            flags: MessageFlags.IsVoiceMessage,
+            attachments: [
+              {
+                id: 0,
+                filename: "voice-message.ogg",
+                duration_secs: encoded.durationSecs,
+                waveform: encoded.waveformBase64,
+              },
+            ],
+          }),
+        );
+        const result = await client.rest.post(
+          Routes.channelMessages(channelId),
+          { body: formData, passThroughBody: true },
+        ) as { id: string };
+        voiceMessageId = result.id;
+      } finally {
+        await cleanupVoiceFile(encoded.outputPath);
+      }
+      return {
+        provider: "discord",
+        target,
+        externalId: voiceMessageId,
+        externalIds: voiceMessageId ? [voiceMessageId] : [],
+        deliveredAt: Date.now(),
+      };
+    }
+
+    // ── Regular send path ────────────────────────────────────────────────────
 
     // Resolve @username mention tokens → <@id> substitutions and collect user ids
     // for allowed_mentions. parse stays [] to block @everyone/role pings.
@@ -448,12 +617,79 @@ export class DiscordProvider implements IChatProvider {
     await sendTyping();
   }
 
+  // ── IChatProvider: setProfile ─────────────────────────────────────────────
+
+  /**
+   * Update the bot's avatar and/or per-guild nick (spec §7.1, §14).
+   *
+   * Global username rename is intentionally excluded (spec §14 deliberate exclusion):
+   * Discord usernames are globally unique and rename-rate-limited (~2/hr); a
+   * model-invocable rename risks permanently losing the handle to a snipe or
+   * failing on collision. Per-guild nick covers the visible effect.
+   *
+   * Avatar: PATCH /users/@me with `avatar` as a data: URI (base64 image).
+   * Per-guild nick: PATCH /guilds/{guildId}/members/@me (requires accountId's bot
+   * to be in the guild). We update the nick in ALL guilds the account is in.
+   * displayName here maps to the per-guild nick.
+   */
+  async setProfile(
+    accountId: string,
+    opts: {
+      displayName?: string;
+      avatarUrl?: string;
+      avatarDataBase64?: string;
+      avatarContentType?: string;
+    },
+  ): Promise<{ displayName?: string; avatarUrl?: string }> {
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) throw new Error(`Discord setProfile: account "${accountId}" is not running`);
+    const { client } = runtime;
+
+    let resultAvatarUrl: string | undefined;
+    let resultDisplayName: string | undefined;
+
+    // ── Avatar update ────────────────────────────────────────────────────────
+    if (opts.avatarDataBase64) {
+      const contentType = opts.avatarContentType ?? "image/png";
+      const dataUri = `data:${contentType};base64,${opts.avatarDataBase64}`;
+      const result = await client.rest.patch(Routes.user("@me"), {
+        body: { avatar: dataUri },
+      }) as { avatar?: string | null; id?: string };
+      // Build CDN URL for the updated avatar
+      if (result.avatar) {
+        resultAvatarUrl = `https://cdn.discordapp.com/avatars/${result.id}/${result.avatar}.png`;
+      }
+    }
+
+    // ── Per-guild nick update ─────────────────────────────────────────────────
+    if (opts.displayName !== undefined) {
+      const nick = opts.displayName.trim() || null; // empty string → clear nick
+      const guilds = client.guilds.cache;
+      for (const guild of guilds.values()) {
+        if (runtime.allowedGuilds && !runtime.allowedGuilds.has(guild.id)) continue;
+        try {
+          await client.rest.patch(Routes.guildMember(guild.id, "@me"), {
+            body: { nick },
+          });
+          resultDisplayName = nick ?? "";
+        } catch {
+          // Non-fatal: nick update may fail in a guild where bot lacks CHANGE_NICKNAME
+        }
+      }
+    }
+
+    return {
+      displayName: resultDisplayName,
+      avatarUrl: resultAvatarUrl,
+    };
+  }
+
   // ── Event listener setup ──────────────────────────────────────────────────
 
   private attachListeners(runtime: AccountRuntime): void {
     const { client, accountId } = runtime;
 
-    // Gateway ready: capture self identity and surface lifecycle event
+    // Gateway ready: capture self identity, load guild emoji, and notify app.ts.
     client.on("ready", (readyClient) => {
       runtime.self = {
         id: readyClient.user.id,
@@ -464,10 +700,41 @@ export class DiscordProvider implements IChatProvider {
         { type: "ready", selfId: readyClient.user.id, username: readyClient.user.username },
         { accountId },
       );
+      // Notify app.ts so it can add this self-id to selfUserIds + gapBackfetchSelfIds
+      // (boot-ordering constraint: getSelf() returns undefined until READY).
+      this.callbacks.onSelfResolved?.(accountId, readyClient.user.id);
+
+      // Load emoji for all guilds the bot is already in at READY time.
+      for (const guild of readyClient.guilds.cache.values()) {
+        if (runtime.allowedGuilds && !runtime.allowedGuilds.has(guild.id)) continue;
+        runtime.emojiCatalog.setGuildEmoji(guild.id, guild.emojis.cache.map((e) => ({
+          id: e.id,
+          name: e.name ?? e.id,
+          animated: e.animated ?? false,
+        })));
+      }
+
+      // Fetch application emoji if application_id is configured.
+      if (runtime.applicationId) {
+        void client.rest.get(Routes.applicationEmojis(runtime.applicationId))
+          .then((result) => {
+            const data = (result as { items?: Array<{ id?: string; name?: string; animated?: boolean }> }).items ?? [];
+            runtime.emojiCatalog.setAppEmoji(
+              data.filter((e) => e.id && e.name).map((e) => ({
+                id: e.id!,
+                name: e.name!,
+                animated: e.animated ?? false,
+              })),
+            );
+          })
+          .catch(() => {
+            // Non-fatal — app emoji are a nice-to-have
+          });
+      }
     });
 
     // USER_UPDATE: refresh self identity when the bot's own profile changes
-    client.on("userUpdate", (oldUser, newUser) => {
+    client.on("userUpdate", (_oldUser: User | PartialUser, newUser: User) => {
       const self = runtime.self;
       if (self && newUser.id === self.id) {
         runtime.self = {
@@ -477,6 +744,47 @@ export class DiscordProvider implements IChatProvider {
         };
       }
     });
+
+    // GUILD_CREATE: load emoji for newly joined guilds.
+    client.on("guildCreate", (guild) => {
+      if (runtime.allowedGuilds && !runtime.allowedGuilds.has(guild.id)) return;
+      runtime.emojiCatalog.setGuildEmoji(guild.id, guild.emojis.cache.map((e) => ({
+        id: e.id,
+        name: e.name ?? e.id,
+        animated: e.animated ?? false,
+      })));
+    });
+
+    // GUILD_DELETE: remove emoji for guilds the bot has left.
+    client.on("guildDelete", (guild) => {
+      runtime.emojiCatalog.clearGuildEmoji(guild.id);
+    });
+
+    // GUILD_EMOJIS_UPDATE: refresh emoji whenever the guild's emoji set changes.
+    // discord.js v14 signature: (guild, oldEmojis, newEmojis)
+    client.on("guildEmojisUpdate", (guild, _oldEmojis, newEmojis) => {
+      if (runtime.allowedGuilds && !runtime.allowedGuilds.has(guild.id)) return;
+      runtime.emojiCatalog.setGuildEmoji(guild.id, newEmojis.map((e: GuildEmoji) => ({
+        id: e.id,
+        name: e.name ?? e.id,
+        animated: e.animated ?? false,
+      })));
+    });
+
+    // GUILD_MEMBER_UPDATE: upsert user identity when member_intent is on (spec §6.5).
+    if (runtime.memberIntentEnabled) {
+      client.on("guildMemberUpdate", (_oldMember: GuildMember | PartialGuildMember, newMember: GuildMember) => {
+        if (!newMember.user) return;
+        if (runtime.allowedGuilds && !runtime.allowedGuilds.has(newMember.guild.id)) return;
+        void this.callbacks.upsertUserIdentity({
+          provider: "discord",
+          userId: newMember.user.id,
+          username: newMember.user.username,
+          displayName: newMember.nickname ?? newMember.user.globalName ?? newMember.user.username,
+          observedAt: Date.now(),
+        }).catch(() => {});
+      });
+    }
 
     // Resume / disconnect lifecycle events for the console
     client.on("shardResume", () => {
@@ -490,6 +798,41 @@ export class DiscordProvider implements IChatProvider {
     // Rate-limit diagnostics
     client.rest.on("rateLimited", (info) => {
       this.host?.onDiagnostics?.({ type: "rate_limited", ...info }, { accountId });
+    });
+
+    // ── Reaction events (spec §12.6, §10) ────────────────────────────────────
+
+    client.on("messageReactionAdd", (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+      if (this.stopped) return;
+      if (!this.host) return;
+      if (!this.isAllowedByGuild(runtime, reaction.message.guildId)) return;
+      this.handleReactionAdd(runtime, reaction, user);
+    });
+
+    client.on("messageReactionRemove", (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+      if (this.stopped) return;
+      if (!this.host) return;
+      if (!this.isAllowedByGuild(runtime, reaction.message.guildId)) return;
+      this.handleReactionRemove(runtime, reaction, user);
+    });
+
+    client.on("messageReactionRemoveAll", (message) => {
+      if (this.stopped) return;
+      if (!this.host) return;
+      if (!this.isAllowedByGuild(runtime, message.guildId)) return;
+      // Bulk clear: tombstone ALL reactions on this message (spec §10.1).
+      const targetEventId = buildDiscordEventId(accountId, message.id);
+      this.host.onBulkReactionClear?.({ targetEventId }, { accountId });
+    });
+
+    client.on("messageReactionRemoveEmoji", (reaction: MessageReaction | PartialMessageReaction) => {
+      if (this.stopped) return;
+      if (!this.host) return;
+      if (!this.isAllowedByGuild(runtime, reaction.message.guildId)) return;
+      // Bulk clear: tombstone all reactions with this emoji on this message (spec §10.1).
+      const targetEventId = buildDiscordEventId(accountId, reaction.message.id);
+      const normalizedKey = buildReactionNormalizedKey(reaction.emoji);
+      this.host.onBulkReactionClear?.({ targetEventId, normalizedKey }, { accountId });
     });
 
     // Error surface
@@ -547,6 +890,28 @@ export class DiscordProvider implements IChatProvider {
     const ctx = { accountId: runtime.accountId, selfUserId: selfId ?? "" };
 
     const { inbound, embedPreviews } = normalizeDiscordMessage(msgData, ctx);
+
+    // Record custom emoji observed inline so the catalog can display them later.
+    // These are NOT added to the sendable set (spec §10.2/§10.3).
+    for (const obs of extractEmojiObservations(message.content)) {
+      runtime.emojiCatalog.observeEmoji(obs.id, obs.name, obs.animated);
+    }
+
+    // Upsert the sender's user identity (spec §6.5). Non-fatal.
+    void this.callbacks.upsertUserIdentity({
+      provider: "discord",
+      userId: message.author.id,
+      username: message.author.username,
+      displayName: msgData.authorDisplayName,
+      observedAt: message.createdTimestamp,
+    }).catch(() => {});
+
+    // Upsert channel metadata (spec §6.6). Non-fatal.
+    void this.callbacks.setChannelMetadata(inbound.timelineKey, {
+      displayName: buildChannelDisplayName(message),
+      serverId: message.guildId ?? undefined,
+      serverName: message.guild?.name ?? undefined,
+    }).catch(() => {});
 
     // Self-sent message: mark isSelf and flow through for echo-merge.
     // host.onEvent first (synchronously enqueues the FIFO single-writer event insert),
@@ -704,6 +1069,96 @@ export class DiscordProvider implements IChatProvider {
     }
 
     return true;
+  }
+
+  /** Returns true if a guildId is allowed by this account's guild allowlist. */
+  private isAllowedByGuild(runtime: AccountRuntime, guildId: string | null | undefined): boolean {
+    if (!guildId) return runtime.dmEnabled; // DM reaction
+    if (runtime.allowedGuilds && !runtime.allowedGuilds.has(guildId)) return false;
+    return true;
+  }
+
+  /** Handle MESSAGE_REACTION_ADD — route to host.onReaction (spec §12.6, §10). */
+  private handleReactionAdd(
+    runtime: AccountRuntime,
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ): void {
+    const { accountId } = runtime;
+    const messageId = reaction.message.id;
+    const userId = user.id;
+    const emoji = reaction.emoji;
+
+    const normalizedKey = buildReactionNormalizedKey(emoji);
+    // Synthetic PK: `discord:<messageId>:<normalizedKey>:<userId>` (spec §10, §57-61)
+    const reactionEventId = `discord:${messageId}:${normalizedKey}:${userId}`;
+
+    const channelId = reaction.message.channelId;
+    const channelType = reaction.message.channel?.type ?? ChannelType.GuildText;
+    let parentChannelId: string | undefined;
+    if (THREAD_CHANNEL_TYPES.has(channelType as ChannelType)) {
+      const ch = reaction.message.channel as { parentId?: string | null } | null;
+      parentChannelId = ch?.parentId ?? undefined;
+    }
+    const timelineKey = buildDiscordTimelineKey(accountId, channelId, channelType, parentChannelId);
+
+    let kind: "unicode" | "custom";
+    let display: string;
+    let shortcode: string | undefined;
+    if (emoji.id) {
+      kind = "custom";
+      display = `:${emoji.name ?? emoji.id}:`;
+      shortcode = emoji.name ?? undefined;
+    } else {
+      kind = "unicode";
+      display = emoji.name ?? "";
+    }
+
+    this.host!.onReaction({
+      action: "add",
+      reactionEventId,
+      timelineKey,
+      senderId: userId,
+      senderDisplay: (user as User).username,
+      reactedAtMs: Date.now(),
+      targetEventId: buildDiscordEventId(accountId, messageId),
+      kind,
+      display,
+      shortcode,
+      normalizedKey,
+    }, { accountId });
+  }
+
+  /** Handle MESSAGE_REACTION_REMOVE — route to host.onReaction as tombstone (spec §12.6, §10). */
+  private handleReactionRemove(
+    runtime: AccountRuntime,
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ): void {
+    const { accountId } = runtime;
+    const messageId = reaction.message.id;
+    const userId = user.id;
+
+    const normalizedKey = buildReactionNormalizedKey(reaction.emoji);
+    // Reconstruct the same PK used on "add" so the storage layer can tombstone it.
+    const reactionEventId = `discord:${messageId}:${normalizedKey}:${userId}`;
+
+    const channelId = reaction.message.channelId;
+    const channelType = reaction.message.channel?.type ?? ChannelType.GuildText;
+    let parentChannelId: string | undefined;
+    if (THREAD_CHANNEL_TYPES.has(channelType as ChannelType)) {
+      const ch = reaction.message.channel as { parentId?: string | null } | null;
+      parentChannelId = ch?.parentId ?? undefined;
+    }
+    const timelineKey = buildDiscordTimelineKey(accountId, channelId, channelType, parentChannelId);
+
+    this.host!.onReaction({
+      action: "remove",
+      reactionEventId,
+      timelineKey,
+      senderId: userId,
+      reactedAtMs: Date.now(),
+    }, { accountId });
   }
 
   // ── Trigger hold (mirrors Matrix provider) ────────────────────────────────
@@ -1121,6 +1576,37 @@ function stickerFormatToContentType(format: StickerFormatType | undefined): stri
     default:
       return undefined;
   }
+}
+
+// ── Reaction helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Build the normalized reaction key for a Discord emoji.
+ *   Unicode → the glyph string (e.g. "👍").
+ *   Custom  → `discord:<emojiSnowflake>` (via EmojiCatalog.normalizedKey).
+ */
+function buildReactionNormalizedKey(
+  emoji: MessageReaction["emoji"] | PartialMessageReaction["emoji"],
+): string {
+  if (emoji.id) {
+    return EmojiCatalog.normalizedKey(emoji.id);
+  }
+  return emoji.name ?? "";
+}
+
+// ── Channel display name helper ───────────────────────────────────────────────
+
+/**
+ * Build a human-readable display name for a channel, used in room_metadata.
+ * Format: `#channel-name (Guild Name)` for guild channels; `#channel-name` for DMs.
+ */
+function buildChannelDisplayName(message: Message): string {
+  const ch = message.channel;
+  const chName = "name" in ch && typeof (ch as { name?: unknown }).name === "string"
+    ? (ch as { name: string }).name
+    : message.channelId;
+  const guildName = message.guild?.name;
+  return guildName ? `#${chName} (${guildName})` : `#${chName}`;
 }
 
 // ── Attachment file builder ───────────────────────────────────────────────────

@@ -792,3 +792,71 @@ function seedEvent(id: string, timestamp: number): CanonicalChatEvent {
     receivedAt: timestamp,
   };
 }
+
+// ── Provider-aware buildId: Discord timeline key produces discord: event ids ──
+
+const DISCORD_ACCOUNT = "botaccount";
+const DISCORD_CHANNEL = "100000000000000001";
+const DISCORD_TK = `discord:${DISCORD_ACCOUNT}:room:${DISCORD_CHANNEL}`;
+const DISCORD_SELF = "999999999999999999"; // snowflake
+
+test("Discord timeline key → backfilled rows stored as discord:<acct>:<msgId> ids, dedup against live-ingested ids", async () => {
+  await withStores(async (store, storage) => {
+    // Two Discord message summaries — externalIds are snowflakes.
+    const msgA = "200000000000000001";
+    const msgB = "200000000000000002";
+    const client = new ScriptedClient([
+      page([
+        summary({ externalId: msgA, timestamp: 5000, sender: "111111111111111111" }),
+        summary({ externalId: msgB, timestamp: 4000, sender: "222222222222222222" }),
+      ], null),
+    ]);
+
+    const result = await performInitialBackfill({
+      client,
+      store,
+      storage,
+      timelineKey: DISCORD_TK,
+      roomId: DISCORD_CHANNEL,
+      accountId: DISCORD_ACCOUNT,
+      selfUserId: DISCORD_SELF,
+      windowMs: Number.MAX_SAFE_INTEGER,
+      timeoutMs: 10_000,
+      maxMessages: 100,
+    });
+
+    assert.equal(result.stored, 2, "both Discord messages stored");
+    assert.equal(result.exhausted, true);
+
+    // Canonical ids must use the discord: scheme so they match live-ingest ids
+    // built by buildDiscordEventId (discord:<acct>:<messageId>).
+    const storedA = store.getById(`discord:${DISCORD_ACCOUNT}:${msgA}`);
+    assert.ok(storedA, `event A should be stored as discord:${DISCORD_ACCOUNT}:${msgA}`);
+    assert.equal(storedA?.externalId, msgA);
+    assert.equal(storedA?.provider, "discord");
+    assert.equal(storedA?.timelineKey, DISCORD_TK);
+
+    const storedB = store.getById(`discord:${DISCORD_ACCOUNT}:${msgB}`);
+    assert.ok(storedB, `event B should be stored as discord:${DISCORD_ACCOUNT}:${msgB}`);
+
+    // Dedup: re-running with the same messages must produce 0 new stores.
+    const client2 = new ScriptedClient([
+      page([
+        summary({ externalId: msgA, timestamp: 5000, sender: "111111111111111111" }),
+      ], null),
+    ]);
+    const result2 = await performInitialBackfill({
+      client: client2,
+      store,
+      storage,
+      timelineKey: DISCORD_TK,
+      roomId: DISCORD_CHANNEL,
+      accountId: DISCORD_ACCOUNT,
+      selfUserId: DISCORD_SELF,
+      windowMs: Number.MAX_SAFE_INTEGER,
+      timeoutMs: 10_000,
+      maxMessages: 100,
+    });
+    assert.equal(result2.stored, 0, "identical message is a duplicate — dedup works across backfill runs");
+  });
+});

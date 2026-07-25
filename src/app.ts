@@ -795,6 +795,25 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const matrixProviderInstance: MatrixProvider | undefined =
     config.matrix.enabled !== false ? new MatrixProvider(config.matrix) : undefined;
 
+  // Self-id containers populated eagerly from Matrix config and lazily from
+  // Discord's READY event (via onSelfResolved). Declared before the providers
+  // IIFE so that both the Discord callbacks (inside) and the budget/backfetch
+  // coordinators (outside) share the SAME mutable Set/Map — the Discord
+  // callback fires post-start() and adds ids to whichever objects these
+  // variables refer to at that time (boot-ordering constraint, spec §6.3).
+  const botSelfIdsForLimits = new Set<string>(
+    Object.values(config.matrix?.accounts ?? {})
+      .map((a) => (a as { user_id?: string }).user_id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  );
+  // accountId → selfUserId for backfetch coordinators. Populated with Matrix
+  // ids here; Discord ids added at READY via onSelfResolved.
+  const gapBackfetchSelfIds = new Map<string, string>();
+  for (const [accountId, account] of Object.entries(config.matrix?.accounts ?? {})) {
+    const uid = (account as { user_id?: string }).user_id;
+    if (uid) gapBackfetchSelfIds.set(accountId, uid);
+  }
+
   const providers: Map<string, IChatProvider> = opts?.providers ?? (() => {
     const map = new Map<string, IChatProvider>();
     if (matrixProviderInstance) map.set("matrix", matrixProviderInstance);
@@ -843,6 +862,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
               created_at: Date.now(),
             });
           }
+        },
+        async upsertUserIdentity(input) {
+          await storage.upsertUserIdentity(input);
+        },
+        async setChannelMetadata(timelineKey, meta) {
+          await storage.setChannelMetadata(timelineKey, meta);
+        },
+        onSelfResolved(accountId, selfId) {
+          // Add Discord self-id to the budget engine's exclusion set and the
+          // backfetch coordinators' accountId→selfUserId maps (spec §6.3 /
+          // TODO(phase7) sites in app.ts). These sets/maps are already wired
+          // into the coordinators and UserLimitEngine by reference.
+          botSelfIdsForLimits.add(selfId);
+          gapBackfetchSelfIds.set(accountId, selfId);
         },
       });
       map.set("discord", discordProvider);
@@ -1100,16 +1133,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // The bot's own user ids (one per account) — excluded (with synthetic system
         // senders) from the per-user console surface, since per-user limits don't
         // govern self/system/proactive spend (Gate A is skipped for those lanes).
-        // NOTE: built from config rather than getSelf() because this runs before
-        // provider.start() is called — getSelf() returns undefined until start().
-        // A future boot-order change could move this post-start; for now the
-        // Matrix config is the authoritative source for pre-start self-id sets.
-        // TODO(phase7): include Discord self-ids from the Discord provider's configured accounts.
-        selfUserIds: new Set(
-          Object.values(config.matrix.accounts)
-            .map((a) => a.user_id)
-            .filter((id): id is string => typeof id === "string" && id.length > 0),
-        ),
+        // Pre-seeded with Matrix ids from config; Discord ids are added to this same
+        // mutable Set at READY time via the Discord provider's onSelfResolved callback,
+        // which fires after provider.start() and before any live events arrive.
+        // Because UserLimitEngine stores the options object by reference, mutations
+        // to this Set are visible to isEnforceableUser() (spec §6.3 / TODO(phase7)).
+        selfUserIds: botSelfIdsForLimits,
         logger: logger.child("user-limits"),
       });
       userLimitEngine = ul;
@@ -1287,8 +1316,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
     }
 
-    // TODO(phase7): Discord — return [guildId] from channel metadata once the
-    // Discord normalizer upserts channel→guild mappings (§6.6 / §6.4).
+    if (parsedKey.provider === "discord") {
+      // Discord: look up the guild id from room_metadata (set at ingest by the
+      // Discord provider's setChannelMetadata callback, spec §6.6 / §6.4).
+      const guildId = storage.getChannelServerId(timelineKey);
+      return guildId ? [guildId] : [];
+    }
+
     return [];
   };
 
@@ -1673,17 +1707,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     utdHaltThreshold: config.timeline?.gap_backfetch_utd_halt_threshold ?? 50,
     concurrency: config.timeline?.gap_backfetch_concurrency ?? 3,
   };
-  // Matrix-only: gap backfetch self-ids and coordinator.
-  // TODO(phase7): extend gapBackfetchSelfIds with Discord self-ids from the Discord
-  // provider's configured accounts. Boot-ordering constraint: getSelf() is only
-  // valid after provider.start(), so Discord ids must be contributed post-start in
-  // Phase 7 rather than here at config time.
-  const gapBackfetchSelfIds = new Map<string, string>();
-  if (matrixProvider) {
-    for (const [accountId, account] of Object.entries(config.matrix.accounts)) {
-      if (account.user_id) gapBackfetchSelfIds.set(accountId, account.user_id);
-    }
-  }
+  // Gap backfetch self-ids: pre-seeded with Matrix ids (above, before providers IIFE)
+  // and extended with Discord ids post-READY via onSelfResolved. The gapBackfetchSelfIds
+  // Map is passed by reference to the coordinators below — mutations are live.
   const gapBackfetch = new GapBackfetchCoordinator({
     storage,
     timeline,
@@ -2054,24 +2080,41 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {
-    if (!matrixProvider) return; // initial backfill is Matrix-only (Phase 3+: generalize per-provider)
     const maxMessages = config.timeline?.initial_backfill_messages ?? 200;
     const target = inbound.outboundTarget;
     if (maxMessages <= 0 || !target?.roomId) return;
 
+    const providerName = inbound.event.provider;
+    const provider = providers.get(providerName);
+    if (!provider) return;
+
     const accountId = target.accountId ?? parseTimelineKey(inbound.timelineKey)?.accountId;
     if (!accountId) return; // malformed key; can't proceed
-    // §6.3: provider self identity. For Matrix, getSelf returns the configured
-    // user_id once start() has been called (initial backfill runs post-start).
-    const selfUserId = matrixProvider?.getSelf(accountId)?.id;
+
+    // §6.3: provider self identity. getSelf() is valid post-start(); for Discord
+    // this is only populated after READY fires, so initial backfill runs after READY.
+    const selfUserId = provider.getSelf(accountId)?.id;
     if (!selfUserId) {
       logger.warn("initial_backfill_skipped", { timelineKey: inbound.timelineKey, reason: "unknown_self_user", accountId });
       return;
     }
 
+    // Build the BackfillReadClient: Matrix uses the channel client adaptor;
+    // other providers (Discord) implement HistoryClient which is structurally
+    // compatible with BackfillReadClient (same readMessages signature).
+    let backfillClient: import("./backfill/paginate.js").BackfillReadClient | undefined;
+    if (provider === matrixProvider && matrixProvider) {
+      backfillClient = makeBackfillReadClient(matrixProvider.getClient(target), target.roomId);
+    } else {
+      // provider.history() returns a HistoryClient; for Discord this is also a
+      // BackfillReadClient (DiscordHistoryClient implements both).
+      backfillClient = provider.history?.(target) as import("./backfill/paginate.js").BackfillReadClient | undefined;
+    }
+    if (!backfillClient) return; // provider doesn't support paged history
+
     try {
       const result = await performInitialBackfill({
-        client: makeBackfillReadClient(matrixProvider.getClient(target), target.roomId),
+        client: backfillClient,
         store: timeline,
         storage,
         timelineKey: inbound.timelineKey,
