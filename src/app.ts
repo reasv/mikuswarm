@@ -16,6 +16,7 @@ import {
   editStatus,
   needsEnrichment,
   roomIdFromTimelineKey,
+  sendViaProvider,
   TimelineRouter,
   TimelineStore,
   TriggerCoordinator,
@@ -112,7 +113,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, ChatProviderHost, InboundChatEvent, TriggerInfo } from "./types.js";
+import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
@@ -142,7 +143,21 @@ export interface MikuAgentRuntime {
   stop(): Promise<void>;
 }
 
-export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntime> {
+/**
+ * Options for {@link startMikuAgent}. All fields are optional.
+ *
+ * `providers` is a test seam: supply a pre-built `Map<providerId, IChatProvider>`
+ * to bypass config-derived provider construction. The registry must still be
+ * non-empty (zero providers is the fatal startup error even in tests). Use this
+ * to inject a fake/stub provider when the test wants `[matrix] enabled = false`
+ * without hitting the zero-provider guard (e.g. diary-failfast, browser-failfast,
+ * and the new no-Matrix and dual-provider boot tests).
+ */
+export interface StartMikuAgentOptions {
+  providers?: Map<string, IChatProvider>;
+}
+
+export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOptions): Promise<MikuAgentRuntime> {
   const logger = createLogger("mikuswarm", config.app.log_level);
 
   // App-layer SSRF guard (defense-in-depth) for every caller-supplied outbound
@@ -758,7 +773,42 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     logger,
   });
 
-  const provider = new MatrixProvider(config.matrix);
+  // ── Provider registry (spec DISCORD-SUPPORT-DESIGN §3.2) ─────────────────────
+  // Build the provider registry from config. Each entry is keyed by provider id
+  // ("matrix", "discord", …). At least one enabled provider is required at boot.
+  //
+  // `opts.providers` is a test seam: supplying it bypasses config-derived
+  // construction entirely (the caller owns the map; it must still be non-empty).
+  //
+  // Matrix-only subsystems (re-decryption, gap/message backfetch, Matrix backfill)
+  // are gated on the "matrix" entry's presence — they are never instantiated when
+  // no matrix provider is registered (spec §5 / §11.3).
+
+  // Only construct MatrixProvider when the [matrix] block is enabled.
+  const matrixProviderInstance: MatrixProvider | undefined =
+    config.matrix.enabled !== false ? new MatrixProvider(config.matrix) : undefined;
+
+  const providers: Map<string, IChatProvider> = opts?.providers ?? (() => {
+    const map = new Map<string, IChatProvider>();
+    if (matrixProviderInstance) map.set("matrix", matrixProviderInstance);
+    return map;
+  })();
+
+  if (providers.size === 0) {
+    throw new Error(
+      "no enabled chat provider: at least one provider must be enabled at startup " +
+      "(set [matrix] enabled = true, or add a [discord] block). " +
+      "Zero enabled providers is a fatal config error.",
+    );
+  }
+
+  // Narrow to the concrete MatrixProvider for Matrix-only wiring below.
+  // This is the single instanceof-narrowing site per spec §3.2.
+  const matrixProvider: MatrixProvider | undefined = (() => {
+    const p = providers.get("matrix");
+    return p instanceof MatrixProvider ? p : undefined;
+  })();
+
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
   // Drain cancellation for context builds (spec §7.2): a build waiting on a
@@ -797,17 +847,19 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     const cached = toolDefsByType.get(sessionType);
     if (cached) return cached;
     // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2).
-    // NOTE: the config.matrix.accounts read stays — it is Phase 2 scope (provider registry).
     const parsed = parseTimelineKey(timelineKey);
     if (!parsed) return undefined;
+    // TODO(phase3): replace config.matrix.accounts read with
+    // `providers.get(parsed.provider)?.getSelf(parsed.accountId)?.id`
+    // (spec §6.3 identity / Phase 3 scope).
     const selfUserId = config.matrix.accounts[parsed.accountId]?.user_id;
     const inbound: InboundChatEvent = {
-      provider: "matrix",
+      provider: parsed.provider,
       timelineKey,
       event: {
         id: `inspector-${sessionType}`,
         timelineKey,
-        provider: "matrix",
+        provider: parsed.provider,
         role: "user",
         sender: { id: selfUserId ?? "inspector", isSelf: true },
         body: "",
@@ -815,10 +867,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         receivedAt: 0,
       },
       outboundTarget: {
-        provider: "matrix",
+        provider: parsed.provider,
         timelineKey,
         accountId: parsed.accountId,
-        roomId: parsed.channelId, // channelId = Matrix room id for this provider
+        roomId: parsed.channelId,
         threadId: parsed.threadId,
       },
     };
@@ -981,13 +1033,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         maxTokensFor: (logicalId) => config.models[logicalId]?.max_tokens,
         zeroCostModelIds,
         viableMinOutputTokens: config.agent.user_limit_min_output_tokens ?? 256,
-        // Today the only enabled provider is Matrix, so a user identity is any id
-        // that starts with the Matrix sigil "@". Later phases will generalize this to
-        // `providers.some(p => p.ownsUserId(id))` once the provider registry lands.
+        // TODO(phase3): generalize to `providers.some(p => p.ownsUserId(id))`
+        // once identity is wired via getSelf (spec §6.3 / Phase 3). Matrix "@" sigil
+        // remains correct for all current Matrix-only deployments.
         isUserIdentity: (id) => id.startsWith("@"),
         // The bot's own user ids (one per account) — excluded (with synthetic system
         // senders) from the per-user console surface, since per-user limits don't
         // govern self/system/proactive spend (Gate A is skipped for those lanes).
+        // TODO(phase3): build from `providers.flatMap(p => p.accountIds().map(id => p.getSelf(id)?.id))`
+        // (spec §6.3 identity / Phase 3 scope).
         selfUserIds: new Set(
           Object.values(config.matrix.accounts)
             .map((a) => a.user_id)
@@ -1145,12 +1199,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // lookup at Gate A — called ONLY when a rule references space. Never rejects: a
   // malformed key / lookup failure resolves to none (the room matches no space rule).
   const resolveParentSpaceIds = async (timelineKey: string): Promise<string[]> => {
+    if (!matrixProvider) return []; // no matrix provider — no space ids (Phase 3+)
     try {
       const parsedKey = parseTimelineKey(timelineKey);
       const accountId = parsedKey?.accountId;
       const roomId = parsedKey?.channelId;
       if (!roomId) return [];
-      const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+      const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
       const info = await client.channelInfo({ roomId });
       return info.parentSpaceIds ?? [];
     } catch (error) {
@@ -1437,11 +1492,12 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // malformed key; both callers retry and fall back to the room id, so a failure
   // never blocks a job.
   const resolveChannelLabel = (timelineKey: string): Promise<string> => {
+    if (!matrixProvider) throw new Error(`cannot resolve channel label without a matrix provider`);
     const parsedKey = parseTimelineKey(timelineKey);
     const accountId = parsedKey?.accountId;
     const roomId = parsedKey?.channelId;
     if (!roomId) throw new Error(`cannot resolve room id from timeline key "${timelineKey}"`);
-    const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+    const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
     return client.channelLabel({ roomId });
   };
 
@@ -1451,12 +1507,13 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // key or lookup failure resolves to null and the Channel/Type lines are simply
   // omitted (the raw timeline key still identifies the room).
   contextBuilder.resolveChannelContext = async (timelineKey) => {
+    if (!matrixProvider) return null; // no matrix provider — context unavailable (Phase 3+)
     try {
       const parsedKey = parseTimelineKey(timelineKey);
       const accountId = parsedKey?.accountId;
       const roomId = parsedKey?.channelId;
       if (!roomId) return null;
-      const client = provider.getClient({ provider: "matrix", timelineKey, accountId });
+      const client = matrixProvider.getClient({ provider: "matrix", timelineKey, accountId });
       return await client.channelContext({ roomId });
     } catch (error) {
       logger.debug("resolve_channel_context_failed", {
@@ -1530,16 +1587,23 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     utdHaltThreshold: config.timeline?.gap_backfetch_utd_halt_threshold ?? 50,
     concurrency: config.timeline?.gap_backfetch_concurrency ?? 3,
   };
+  // Matrix-only: gap backfetch self-ids and coordinator.
+  // TODO(phase3): build gapBackfetchSelfIds from provider.getSelf() once identity
+  // is wired (spec §6.3). For now, only the matrix provider contributes self-ids.
   const gapBackfetchSelfIds = new Map<string, string>();
-  for (const [accountId, account] of Object.entries(config.matrix.accounts)) {
-    if (account.user_id) gapBackfetchSelfIds.set(accountId, account.user_id);
+  if (matrixProvider) {
+    for (const [accountId, account] of Object.entries(config.matrix.accounts)) {
+      if (account.user_id) gapBackfetchSelfIds.set(accountId, account.user_id);
+    }
   }
   const gapBackfetch = new GapBackfetchCoordinator({
     storage,
     timeline,
     config: gapBackfetchConfig,
-    getClient: (accountId) =>
-      provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+    getClient: (accountId) => {
+      if (!matrixProvider) throw new Error("gap backfetch requires a matrix provider");
+      return matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId });
+    },
     selfUserIds: gapBackfetchSelfIds,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
@@ -1571,8 +1635,10 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     storage,
     timeline,
     config: messageBackfetchConfig,
-    getClient: (accountId) =>
-      provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
+    getClient: (accountId) => {
+      if (!matrixProvider) throw new Error("message backfetch requires a matrix provider");
+      return matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId });
+    },
     selfUserIds: gapBackfetchSelfIds,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
@@ -1867,12 +1933,14 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   }
 
   async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {
+    if (!matrixProvider) return; // initial backfill is Matrix-only (Phase 3+: generalize per-provider)
     const maxMessages = config.timeline?.initial_backfill_messages ?? 200;
     const target = inbound.outboundTarget;
     if (maxMessages <= 0 || !target?.roomId) return;
 
     const accountId = target.accountId ?? parseTimelineKey(inbound.timelineKey)?.accountId;
     if (!accountId) return; // malformed key; can't proceed
+    // TODO(phase3): replace with matrixProvider.getSelf(accountId)?.id once identity moves to provider
     const selfUserId = config.matrix.accounts[accountId]?.user_id;
     if (!selfUserId) {
       logger.warn("initial_backfill_skipped", { timelineKey: inbound.timelineKey, reason: "unknown_self_user", accountId });
@@ -1881,7 +1949,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
 
     try {
       const result = await performInitialBackfill({
-        client: provider.getClient(target),
+        client: matrixProvider.getClient(target),
         store: timeline,
         storage,
         timelineKey: inbound.timelineKey,
@@ -3149,9 +3217,26 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       });
     };
 
+    // Resolve the IChatProvider for this session's target by looking up the
+    // provider registry. A missing provider is an impossible state once all
+    // callers embed target.provider correctly — fail loudly rather than
+    // silently routing through a wrong provider.
+    const sessionProvider = providers.get(target.provider);
+    if (!sessionProvider) {
+      throw new Error(
+        `session ${sessionId}: provider "${target.provider}" is not registered — cannot build send_message tool`,
+      );
+    }
+    // Resolve a Matrix-native client only when the target is Matrix-bound and the
+    // Matrix provider is registered. Matrix-only tools (emoji, react, etc.) are
+    // gated on this being non-null — they silently disappear for other providers
+    // until Phase 4 adds ChannelClient abstraction.
+    const matrixClient =
+      target.provider === "matrix" && matrixProvider ? matrixProvider.getClient(target) : undefined;
+
     return [
       createSendMessageTool({
-        provider,
+        provider: sessionProvider,
         target,
         timeline,
         agentSessionId: sessionId,
@@ -3184,18 +3269,21 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       createSpawnSessionTool({
         spawnCoReply: (messageId) => spawnCoReplySession(messageId, sessionId),
       }),
-      ...(roomId ? [
-        createEmojiListTool({ client: provider.getClient(target), roomId }),
-        createReactTool({ client: provider.getClient(target), roomId }),
-        createEditMessageTool({ client: provider.getClient(target), roomId }),
-        createDeleteMessageTool({ client: provider.getClient(target), roomId }),
-        createPinsTool({ client: provider.getClient(target), roomId }),
-        createListReactionsTool({ client: provider.getClient(target), roomId }),
-        createReadMessagesTool({ client: provider.getClient(target), roomId }),
-        createMemberInfoTool({ client: provider.getClient(target), roomId }),
-        createChannelInfoTool({ client: provider.getClient(target), roomId }),
-        createCreatePollTool({ client: provider.getClient(target), roomId }),
-        createPollVoteTool({ client: provider.getClient(target), roomId }),
+      // Matrix-native room tools — gated on having both a roomId AND a resolved
+      // matrix client. Non-Matrix providers don't get these until Phase 4 adds a
+      // generic ChannelClient abstraction.
+      ...(matrixClient && roomId ? [
+        createEmojiListTool({ client: matrixClient, roomId }),
+        createReactTool({ client: matrixClient, roomId }),
+        createEditMessageTool({ client: matrixClient, roomId }),
+        createDeleteMessageTool({ client: matrixClient, roomId }),
+        createPinsTool({ client: matrixClient, roomId }),
+        createListReactionsTool({ client: matrixClient, roomId }),
+        createReadMessagesTool({ client: matrixClient, roomId }),
+        createMemberInfoTool({ client: matrixClient, roomId }),
+        createChannelInfoTool({ client: matrixClient, roomId }),
+        createCreatePollTool({ client: matrixClient, roomId }),
+        createPollVoteTool({ client: matrixClient, roomId }),
       ] : []),
       // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
       // client, so available regardless of roomId and able to span all rooms.
@@ -3229,14 +3317,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         // works correctly for any provider key, including Matrix room ids with colons.
         // Only returns members for "room" kind keys (DMs and threads always return []).
         roomMembers: async (timelineKey) => {
+          if (!matrixProvider) return []; // no matrix provider — room members unavailable (Phase 3+)
           const parsedKey = parseTimelineKey(timelineKey);
           if (!parsedKey || parsedKey.kind !== "room") return [];
-          const client = provider.getClient({ provider: "matrix", timelineKey });
+          const client = matrixProvider.getClient({ provider: "matrix", timelineKey });
           const members = await client.roomMembers({ roomId: parsedKey.channelId });
           return members.map((mem) => ({ userId: mem.userId, displayName: mem.displayName }));
         },
       }),
-      createSetProfileTool({ client: provider.getClient(target), workspaceRoot }),
+      // set_profile uses the Matrix-native client; absent on non-Matrix sessions (Phase 4)
+      ...(matrixClient ? [createSetProfileTool({ client: matrixClient, workspaceRoot })] : []),
       createWebFetchTool(),
       createWebSearchTool(),
       ...(browserSession && config.browser
@@ -3582,7 +3672,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
     if (r.template) {
       const body = renderUserLimitRefusal(r.template, r.ctx, r.binding, r.displayName);
-      void provider.send(target, { body, agentSessionId: sessionId }).catch((error) => {
+      sendViaProvider(providers, target, { body, agentSessionId: sessionId }, logger, "user_limit_refusal", (error) => {
         logger.warn("user_limit_rejection_send_failed", {
           sessionId,
           error: error instanceof Error ? error.message : String(error),
@@ -3737,7 +3827,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // where it left off. Torn down with the capture handle in the finally.
     const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
     const runner = new SessionRunner({
-      provider,
+      provider: providers.get(target.provider),
       target,
       suppressTyping: record.sessionType === (config.proactive?.session_type ?? "proactive"),
     });
@@ -3804,6 +3894,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // drain the coordinator is cleared by stop(), so the helper skips — same as
     // launchSession does.
     releaseTimelineSlot: (timelineKey) => drainNextQueuedTrigger(timelineKey),
+    // TODO(phase3): replace with matrixProvider?.getSelf(accountId)?.id once identity moves to provider
     selfUserIdForAccount: (accountId) => config.matrix.accounts[accountId]?.user_id,
     runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
     markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
@@ -3847,7 +3938,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   ): void {
     const phrase = config.recovery?.failure_notice;
     if (!phrase || phrase.length === 0 || !target) return;
-    void provider.send(target, { body: phrase, agentSessionId: sessionId }).catch((error) => {
+    sendViaProvider(providers, target, { body: phrase, agentSessionId: sessionId }, logger, "failure_notice", (error) => {
       logger.warn("failure_notice_send_failed", {
         sessionId,
         error: error instanceof Error ? error.message : String(error),
@@ -4234,7 +4325,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       logger,
     });
     const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider, target, suppressTyping: false });
+    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: false });
     const run = runner
       .run(agent, record, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(record.id))
       .then((result) => {
@@ -4464,7 +4555,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
               const resetsAt =
                 budgetHooks.engine.accurateResetsAt(admission.primary.name) ?? admission.primary.resetsAt;
               const body = message.replace(/\{resets_at\}/g, formatResetsAt(resetsAt));
-              void provider.send(target, { body, agentSessionId: session.id }).catch((error) => {
+              sendViaProvider(providers, target, { body, agentSessionId: session.id }, logger, "budget_refusal", (error) => {
                 logger.warn("usage_limit_rejection_send_failed", {
                   sessionId: session.id,
                   error: error instanceof Error ? error.message : String(error),
@@ -4582,7 +4673,7 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
     // the run's .finally alongside the capture handle.
     const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider, target, suppressTyping: proactive });
+    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: proactive });
 
     const run = runner
       .run(agent, session, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(session.id))
@@ -4756,10 +4847,17 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       // may be known to another, so we try ALL accounts and prefer a decrypted
       // result (issue #3). `resolveMultiAccountRetry` applies the outcome
       // precedence and the throw-vs-null contract the sweeper depends on (#9).
-      resolveMultiAccountRetry(Object.keys(config.matrix.accounts), (accountId) => {
-        const client = provider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}`, accountId });
-        return client.messageSummary({ roomId, eventId });
-      }),
+      resolveMultiAccountRetry(
+        // Gate: redecryptionSweeper is Matrix-only; if no matrix provider is
+        // registered (e.g. test injection without Matrix) this returns nothing and
+        // the sweeper's retry callback is never actually called (sweeper disabled).
+        matrixProvider ? Object.keys(config.matrix.accounts) : [],
+        (accountId) => {
+          // matrixProvider is guaranteed non-null here (guard above)
+          const client = matrixProvider!.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}`, accountId });
+          return client.messageSummary({ roomId, eventId });
+        },
+      ),
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
     notifyChatIndex: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
@@ -4848,75 +4946,128 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
   // gap is above it, uncommitted), so they are unaffected. No-op when disabled.
   gapBackfetch.prepare();
 
-  const matrixHost: ChatProviderHost = {
+  /**
+   * Build the ChatProviderHost for the Matrix provider.
+   *
+   * Cast site — the single documented as-cast location for Matrix-specific
+   * payload types, per spec §3.2. The three narrowings below are safe because
+   * MatrixProvider ONLY delivers these specific payloads via these callbacks.
+   * A runtime provider-id guard at the start call (below) ensures no other
+   * provider is accidentally started with this Matrix-typed host.
+   *
+   *   onNativeEvent : ProviderLifecycleEvent(=unknown) → MatrixNativeEvent (minus inbound/reaction)
+   *   onReaction    : ReactionStreamEvent              → MatrixReactionStreamEvent
+   *   onDiagnostics : unknown                          → ReturnType<MatrixNativeClient["start"]>
+   */
+  function buildMatrixHost(): ChatProviderHost {
+    return {
+      onEvent: (inbound) => {
+        void handleInbound(inbound).catch((error) => {
+          logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
+        });
+      },
+      onError: (error, context) =>
+        logger.error("matrix_provider_error", {
+          ...context,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      onNativeEvent: (event, context) => {
+        // Cast 1 of 3 (see §3.2 header): ProviderLifecycleEvent → Matrix-specific lifecycle shape
+        const e = event as Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>;
+        logger.info("matrix_native_event", {
+          ...context,
+          type: e.type,
+          state: "state" in e ? e.state : undefined,
+          stage: "stage" in e ? e.stage : undefined,
+          // Lifecycle stages (restore_recovery / enable_backup) carry their outcome
+          // in `detail` — the load-bearing diagnostic for key-backup restore. Log it.
+          detail: "detail" in e ? e.detail : undefined,
+        });
+      },
+      // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
+      // store only — never wake a session. Writes are fire-and-forget through the
+      // single-writer queue; a failure is logged but must not stall the poll loop.
+      onReaction: (event, context) => {
+        // Master switch: when reactions are disabled, don't even persist (the views
+        // are gated independently in the context builder).
+        if (config.reactions?.enabled === false) return;
+        // Cast 2 of 3 (see §3.2 header): ReactionStreamEvent → MatrixReactionStreamEvent
+        const matrixEvent = event as MatrixReactionStreamEvent;
+        void ingestReactionEvent(storage, context.accountId, matrixEvent, Date.now())
+          .then((outcome) => {
+            if (outcome.action === "skipped") {
+              logger.warn("reaction_add_incomplete", {
+                ...context,
+                reactionEventId: matrixEvent.reactionEventId,
+                reason: outcome.reason,
+              });
+            }
+          })
+          .catch((error) =>
+            logger.error("reaction_ingest_failed", {
+              ...context,
+              reactionEventId: matrixEvent.reactionEventId,
+              action: matrixEvent.action,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+      },
+      onDiagnostics: (diagnostics, context) => {
+        // Cast 3 of 3 (see §3.2 header): unknown → MatrixNativeClient diagnostics shape
+        const d = diagnostics as ReturnType<MatrixNativeClient["start"]>;
+        logger.info("matrix_diagnostics", {
+          ...context,
+          verificationState: d.verificationState,
+          keyBackupState: d.keyBackupState,
+          syncState: d.syncState,
+          lastSuccessfulSyncAt: d.lastSuccessfulSyncAt,
+          lastSuccessfulDecryptionAt: d.lastSuccessfulDecryptionAt,
+        });
+      },
+      // Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). The provider asks,
+      // inside its trigger hold, whether an untriggered reply targets one of the
+      // bot's own messages with resume enabled for the context; if so it becomes a
+      // `reply` trigger and rides the normal hold/debounce/grouping. The provider
+      // stays resume-unaware — the timeline lookup and resume config live here. DMs
+      // already trigger as `dm`, so in practice this only ever fires for groups
+      // (the provider's `!inbound.trigger` guard). The resume-vs-fresh decision
+      // stays downstream in `tryReplyResume`; this only classifies the trigger.
+      resolveReplyTrigger: ({ provider: providerId, externalId, timelineKey, sender }) => {
+        const ctx = resumeContextFor(timelineKey);
+        if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;
+        const targetEvent = timeline.getByExternalId(providerId, externalId, timelineKey);
+        if (!targetEvent || targetEvent.timelineKey !== timelineKey || !targetEvent.agentSessionId) {
+          return undefined;
+        }
+        return {
+          type: "reply",
+          reason: "reply to bot message",
+          triggeredBy: { id: sender.id, displayName: sender.displayName },
+        };
+      },
+    };
+  }
+
+  // Build a minimal host for any non-Matrix provider: route all events through
+  // the shared inbound pipeline and log errors. Matrix-specific callbacks
+  // (onNativeEvent, onDiagnostics) are not wired — non-Matrix providers don't
+  // produce them. onReaction is required by ChatProviderHost but is a no-op
+  // here because reaction persistence is Matrix-only for now (Phase 3+).
+  const genericHost: ChatProviderHost = {
     onEvent: (inbound) => {
       void handleInbound(inbound).catch((error) => {
         logger.error("pipeline_error", { error: error instanceof Error ? error.message : String(error) });
       });
     },
     onError: (error, context) =>
-      logger.error("matrix_provider_error", {
+      logger.error("provider_error", {
         ...context,
         error: error instanceof Error ? error.message : String(error),
       }),
-    onNativeEvent: (event, context) => {
-      const e = event as Exclude<MatrixNativeEvent, { type: "inbound" } | { type: "reaction" }>;
-      logger.info("matrix_native_event", {
-        ...context,
-        type: e.type,
-        state: "state" in e ? e.state : undefined,
-        stage: "stage" in e ? e.stage : undefined,
-        // Lifecycle stages (restore_recovery / enable_backup) carry their outcome
-        // in `detail` — the load-bearing diagnostic for key-backup restore. Log it.
-        detail: "detail" in e ? e.detail : undefined,
-      });
-    },
-    // Passive reaction surfacing (ARCHITECTURE.md §9f): persist to the reaction
-    // store only — never wake a session. Writes are fire-and-forget through the
-    // single-writer queue; a failure is logged but must not stall the poll loop.
-    onReaction: (event, context) => {
-      // Master switch: when reactions are disabled, don't even persist (the views
-      // are gated independently in the context builder).
-      if (config.reactions?.enabled === false) return;
-      const matrixEvent = event as MatrixReactionStreamEvent;
-      void ingestReactionEvent(storage, context.accountId, matrixEvent, Date.now())
-        .then((outcome) => {
-          if (outcome.action === "skipped") {
-            logger.warn("reaction_add_incomplete", {
-              ...context,
-              reactionEventId: matrixEvent.reactionEventId,
-              reason: outcome.reason,
-            });
-          }
-        })
-        .catch((error) =>
-          logger.error("reaction_ingest_failed", {
-            ...context,
-            reactionEventId: matrixEvent.reactionEventId,
-            action: matrixEvent.action,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
-    },
-    onDiagnostics: (diagnostics, context) => {
-      const d = diagnostics as ReturnType<MatrixNativeClient["start"]>;
-      logger.info("matrix_diagnostics", {
-        ...context,
-        verificationState: d.verificationState,
-        keyBackupState: d.keyBackupState,
-        syncState: d.syncState,
-        lastSuccessfulSyncAt: d.lastSuccessfulSyncAt,
-        lastSuccessfulDecryptionAt: d.lastSuccessfulDecryptionAt,
-      });
-    },
-    // Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5). The provider asks,
-    // inside its trigger hold, whether an untriggered reply targets one of the
-    // bot's own messages with resume enabled for the context; if so it becomes a
-    // `reply` trigger and rides the normal hold/debounce/grouping. The provider
-    // stays resume-unaware — the timeline lookup and resume config live here. DMs
-    // already trigger as `dm`, so in practice this only ever fires for groups
-    // (the provider's `!inbound.trigger` guard). The resume-vs-fresh decision
-    // stays downstream in `tryReplyResume`; this only classifies the trigger.
+    // No-op for non-Matrix providers: reaction persistence is Matrix-specific
+    // (ingestReactionEvent requires MatrixReactionStreamEvent). Phase 3+ will
+    // add per-provider reaction support.
+    onReaction: (_event, _context) => undefined,
     resolveReplyTrigger: ({ provider: providerId, externalId, timelineKey, sender }) => {
       const ctx = resumeContextFor(timelineKey);
       if (config.agent.sessions.resume?.enabled?.[ctx] !== true) return undefined;
@@ -4931,7 +5082,15 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
       };
     },
   };
-  await provider.start(matrixHost);
+
+  // Start every registered provider with the appropriate host.
+  // Runtime guard: MatrixProvider MUST receive buildMatrixHost() (not genericHost)
+  // so that the Matrix-specific onNativeEvent/onReaction/onDiagnostics casts
+  // documented in buildMatrixHost() are valid.
+  for (const [id, p] of providers) {
+    const host = id === "matrix" ? buildMatrixHost() : genericHost;
+    await p.start(host);
+  }
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
   // shows real names without waiting for each room's next message. Throttled and
@@ -4942,11 +5101,16 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
     });
   });
 
-  for (const accountId of Object.keys(config.matrix.accounts)) {
-    enrichmentPool.options.providerCapabilities.set(
-      `matrix:${accountId}`,
-      provider.getEnrichmentCapabilities(accountId),
-    );
+  // Wire per-account enrichment capabilities for every registered provider.
+  // Uses IChatProvider.enrichment() (not the Matrix-specific getEnrichmentCapabilities)
+  // so future providers wire automatically without changes here.
+  for (const p of providers.values()) {
+    for (const accountId of p.accountIds()) {
+      const caps = p.enrichment(accountId);
+      if (caps) {
+        enrichmentPool.options.providerCapabilities.set(`${p.id}:${accountId}`, caps);
+      }
+    }
   }
 
   await enrichmentPool.start();
@@ -5086,7 +5250,9 @@ export async function startMikuAgent(config: AppConfig): Promise<MikuAgentRuntim
         if (consoleServer) await consoleServer.stop();
         if (retentionTimer) clearInterval(retentionTimer);
         await redecryptionSweeper.stop();
-        await provider.stop();
+        // Stop all registered providers. MatrixProvider cleans up its sync loop;
+        // other providers perform their own teardown.
+        for (const p of providers.values()) await p.stop();
         triggerCoordinator.clear();
         // Drop any claims whose queued triggers were just discarded by the
         // coordinator clear (spec DUPLICATE-REPLY-MITIGATION §3.3 — queued claims

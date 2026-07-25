@@ -17,3 +17,4 @@ export {
   type ActivationLogger,
   type SetEnrichmentStatus,
 } from "./activation.js";
+export { sendViaProvider } from "./send.js";

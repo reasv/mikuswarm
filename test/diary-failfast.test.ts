@@ -4,12 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
-import { startMikuAgent } from "../src/app.js";
+import { startMikuAgent, type StartMikuAgentOptions } from "../src/app.js";
+import { makeFakeProvider } from "./helpers/fake-provider.js";
+
+function fakeProviderOpts(): StartMikuAgentOptions {
+  return { providers: new Map([["fake", makeFakeProvider().provider]]) };
+}
 
 // A complete, env-free config that reaches startMikuAgent's diary fail-fast block
-// (issue #3). Matrix is disabled (provider.start is a no-op) and summarization is
-// disabled, so the only runtime-level validation exercised is the diary one. The
-// diary session type is appended per-test to vary its `tools` allowlist.
+// (issue #3). Matrix is disabled and summarization is disabled, so the only
+// runtime-level validation exercised is the diary one. The diary session type is
+// appended per-test to vary its `tools` allowlist.
 const BASE_CONFIG = (workspaceRoot: string) => `
 [app]
 name = "mikuswarm"
@@ -89,7 +94,7 @@ tools = ["search_memory"]
 `;
   await withWorkspace(block, async (config) => {
     await assert.rejects(
-      () => startMikuAgent(config),
+      () => startMikuAgent(config, fakeProviderOpts()),
       /diary_tool/,
       "a diary allowlist without diary_tool must fail-fast at startup",
     );
@@ -108,7 +113,7 @@ tools = ["diary_tool"]
   await withWorkspace(block, async (config) => {
     let runtime: Awaited<ReturnType<typeof startMikuAgent>> | undefined;
     try {
-      runtime = await startMikuAgent(config);
+      runtime = await startMikuAgent(config, fakeProviderOpts());
     } catch (error) {
       assert.doesNotMatch(
         error instanceof Error ? error.message : String(error),

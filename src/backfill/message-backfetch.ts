@@ -8,7 +8,7 @@ import type {
 } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment } from "../timeline/index.js";
-import { timelineKindOf } from "../storage/timeline-key.js";
+import { timelineKindOf, parseTimelineKey } from "../storage/timeline-key.js";
 import type { CanonicalChatEvent } from "../types.js";
 import type { MatrixMessageSummary } from "../matrix/native-types.js";
 import { classifyForRoom } from "./classify.js";
@@ -344,7 +344,10 @@ export class MessageBackfetchCoordinator {
       if (job.targetKind === "date" && Number.isFinite(targetMs) && timestamp < targetMs) {
         return "window";
       }
+      // Derive provider from the job's timeline key (shared grammar, spec §4.2).
+      const provider = parseTimelineKey(job.timelineKey)?.provider ?? "matrix";
       const classified = classifyForRoom(summary, {
+        provider,
         accountId: job.accountId,
         selfUserId,
         baseTimelineKey: job.timelineKey,
@@ -358,10 +361,10 @@ export class MessageBackfetchCoordinator {
         // a standalone row. A target above the floor no-ops (already applied live);
         // a missing target parks in pending_edits and replays when it lands.
         const targetKey =
-          timeline.resolveEditTargetTimelineKey("matrix", classified.targetExternalId, job.timelineKey) ??
+          timeline.resolveEditTargetTimelineKey(provider, classified.targetExternalId, job.timelineKey) ??
           job.timelineKey;
         await timeline.applyEdit(
-          "matrix",
+          provider,
           classified.targetExternalId,
           targetKey,
           classified.replacement,
