@@ -17,6 +17,7 @@ import type {
 import { MatrixChannelClient } from "./channel-client.js";
 import { MatrixNativeClient } from "./native-client.js";
 import type {
+  MatrixMessageSummary,
   MatrixNativeConfig,
   MatrixNativeEvent,
   MatrixReactionStreamEvent,
@@ -232,7 +233,9 @@ export class MatrixProvider implements IChatProvider {
         };
       },
       async messageSummary(params) {
-        return await client.messageSummary(params);
+        const summary = await client.messageSummary(params);
+        if (!summary) return null;
+        return convertMatrixMessageSummary(summary);
       },
       async resolveLinkPreviews(params) {
         return await client.resolveLinkPreviews(params);
@@ -473,6 +476,73 @@ const THUMBNAIL_MAX_BYTES_ANIMATED = 6_000_000;
 const THUMBNAIL_SCALE_CANDIDATES = [1, 0.75, 0.5];
 const THUMBNAIL_QUALITY_CANDIDATES_STATIC = [75, 60, 45];
 const THUMBNAIL_QUALITY_CANDIDATES_ANIMATED = [65, 50, 35];
+
+/**
+ * Convert a `MatrixMessageSummary` (NAPI native type with `msgtype` + `media[]`)
+ * into the neutral `EnrichmentCapabilities.messageSummary` return shape.
+ *
+ * Matrix vocabulary (`m.image` / `m.video` / `m.audio` / `m.file`) is mapped
+ * to the neutral `mediaType` string. When the native `media` array is present
+ * (current Rust NAPI — always populated for media msgtypes), it is used
+ * directly; the `msgtype` fallback handles any older payloads that omit it.
+ * Non-media msgtypes (e.g. `m.text`) produce no attachments — identical to
+ * the old `isMediaMsgtype` gate.
+ *
+ * Matrix caps `maxAttachmentsPerMessage = 1`, so the resulting `attachments`
+ * array always has ≤ 1 element on the Matrix path. `remoteUrl` is never set
+ * (Matrix never carries the `AttachmentMeta.remoteUrl` CDN field; the field
+ * was confirmed dead for Matrix in the protocol coupling audit).
+ */
+export function convertMatrixMessageSummary(summary: MatrixMessageSummary): {
+  eventId: string;
+  sender: string;
+  senderName?: string;
+  body: string;
+  attachments?: Array<{ mediaType: string; filename?: string; mimeType?: string }>;
+  timestamp: string;
+} {
+  const attachments = matrixSummaryAttachments(summary);
+  return {
+    eventId: summary.eventId,
+    sender: summary.sender,
+    senderName: summary.senderName,
+    body: summary.body,
+    timestamp: summary.timestamp,
+    ...(attachments ? { attachments } : {}),
+  };
+}
+
+const MATRIX_MEDIA_MSGTYPES: ReadonlySet<string> = new Set([
+  "m.image", "m.video", "m.audio", "m.file",
+]);
+
+function matrixMsgtypeToMediaType(msgtype: string): string | undefined {
+  if (msgtype === "m.image") return "image";
+  if (msgtype === "m.video") return "video";
+  if (msgtype === "m.audio") return "audio";
+  if (msgtype === "m.file") return "file";
+  return undefined;
+}
+
+function matrixSummaryAttachments(
+  summary: MatrixMessageSummary,
+): Array<{ mediaType: string; filename?: string; mimeType?: string }> | undefined {
+  if (!summary.msgtype || !MATRIX_MEDIA_MSGTYPES.has(summary.msgtype)) return undefined;
+
+  if (summary.media && summary.media.length > 0) {
+    return summary.media.map((m) => ({
+      mediaType: m.kind as string,
+      filename: m.filename ?? m.body,
+      mimeType: m.contentType,
+    }));
+  }
+
+  // Fallback: msgtype set but media array absent (defensive; current Rust always
+  // populates media for msgtypes that have attachments).
+  const mediaType = matrixMsgtypeToMediaType(summary.msgtype);
+  if (!mediaType) return undefined;
+  return [{ mediaType }];
+}
 
 async function maybeBuildThumbnail(
   data: Buffer,

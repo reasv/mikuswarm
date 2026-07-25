@@ -13,6 +13,7 @@ import type { FxApiPhoto, FxApiTweet, FxTwitterConfig, XMediaSlot, XTweetPayload
 import { FX_TWITTER_SOURCE_KIND } from "../fxtwitter/types.js";
 import { buildTweetNode, renderFlatDescription } from "../fxtwitter/format.js";
 import { extractXStatusUrls, stripXStatusUrls, type XStatusRef } from "../fxtwitter/url.js";
+import { DirectLinkPreviewClient } from "./link-preview-client.js";
 import path from "node:path";
 
 export interface EnrichmentLogger {
@@ -71,9 +72,12 @@ export class EnrichmentWorker {
       replyContext: null,
     };
 
-    const downloadPromise = roomId
-      ? this.downloadAttachments(event, roomId, result)
-      : Promise.resolve();
+    // Download gate: each attachment decides its own path based on what the
+    // attachment carries (remoteUrl → FetchClient.downloadUrl; neither +
+    // roomId → Matrix RPC; neither → skip). No longer gated on roomId at
+    // this level — Discord events with remoteUrl attachments can download
+    // even when the timeline key doesn't carry a classic room/channel id.
+    const downloadPromise = this.downloadAttachments(event, roomId ?? null, result);
     const replyPromise = roomId
       ? this.resolveReplyContext(event, roomId, result)
       : Promise.resolve();
@@ -129,13 +133,21 @@ export class EnrichmentWorker {
 
   private async downloadAttachments(
     event: CanonicalChatEvent,
-    roomId: string,
+    roomId: string | null,
     result: EnrichmentResult,
   ): Promise<void> {
     const attachments = event.attachments ?? [];
     if (attachments.length === 0) return;
 
     const downloads = attachments.map(async (attachment, index) => {
+      // Per-attachment routing:
+      //   remoteUrl present → channel-neutral FetchClient.downloadUrl (Discord CDN path)
+      //   roomId present    → Matrix RPC downloadMedia
+      //   neither           → skip (no download path available; no row created)
+      const hasRemoteUrl = Boolean(attachment.remoteUrl);
+      const hasRoomId = Boolean(roomId);
+      if (!hasRemoteUrl && !hasRoomId) return; // skip as today
+
       const asset: MediaAssetRow = {
         id: `${event.id}:attach:${index}`,
         event_id: event.id,
@@ -152,24 +164,45 @@ export class EnrichmentWorker {
 
       const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
       try {
-        const downloaded = await this.options.capabilities.downloadMedia({
-          roomId,
-          eventId: event.externalId ?? event.id,
-          outputPath: tempPath,
-          sizeLimit: this.options.downloadSizeLimit,
-        });
-        const saved = await moveFileToWorkspace({
-          sourcePath: tempPath,
-          workspaceRoot: this.options.workspaceRoot,
-          originalFilename: downloaded.filename ?? attachment.filename,
-          contentType: downloaded.contentType ?? attachment.mimeType,
-        });
-        asset.local_path = saved.localPath;
-        asset.size_bytes = downloaded.sizeBytes;
-        asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
-        asset.media_type = downloaded.kind || attachment.mediaType;
-        asset.download_status = "complete";
-        if (downloaded.filename) asset.original_filename = downloaded.filename;
+        if (hasRemoteUrl) {
+          // Discord / remote-URL path: download from the CDN URL directly.
+          const downloaded = await this.options.fetchClient.downloadUrl({
+            url: attachment.remoteUrl!,
+            outputPath: tempPath,
+            sizeLimit: this.options.downloadSizeLimit,
+          });
+          const saved = await moveFileToWorkspace({
+            sourcePath: tempPath,
+            workspaceRoot: this.options.workspaceRoot,
+            originalFilename: attachment.filename,
+            contentType: downloaded.contentType ?? attachment.mimeType,
+          });
+          asset.local_path = saved.localPath;
+          asset.size_bytes = downloaded.sizeBytes;
+          asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
+          if (downloaded.contentType) asset.media_type = inferMediaType(downloaded.contentType);
+          asset.download_status = "complete";
+        } else {
+          // Matrix RPC path: the native client resolves the mxc:// URL.
+          const downloaded = await this.options.capabilities.downloadMedia({
+            roomId: roomId!,
+            eventId: event.externalId ?? event.id,
+            outputPath: tempPath,
+            sizeLimit: this.options.downloadSizeLimit,
+          });
+          const saved = await moveFileToWorkspace({
+            sourcePath: tempPath,
+            workspaceRoot: this.options.workspaceRoot,
+            originalFilename: downloaded.filename ?? attachment.filename,
+            contentType: downloaded.contentType ?? attachment.mimeType,
+          });
+          asset.local_path = saved.localPath;
+          asset.size_bytes = downloaded.sizeBytes;
+          asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
+          asset.media_type = downloaded.kind || attachment.mediaType;
+          asset.download_status = "complete";
+          if (downloaded.filename) asset.original_filename = downloaded.filename;
+        }
       } catch (error) {
         await unlink(tempPath).catch(() => {});
         asset.download_status = "failed";
@@ -222,8 +255,8 @@ export class EnrichmentWorker {
         created_at: Date.now(),
       };
 
-      if (summary.msgtype && isMediaMsgtype(summary.msgtype)) {
-        await this.downloadReplyAttachment(event.id, roomId, summary, result);
+      if (summary.attachments && summary.attachments.length > 0) {
+        await this.downloadReplyAttachments(event.id, roomId, summary, result);
       }
     } catch (error) {
       // Degrade to a stub (external_id only) but never silently: an unlogged
@@ -242,53 +275,98 @@ export class EnrichmentWorker {
     }
   }
 
-  private async downloadReplyAttachment(
+  /**
+   * Download all attachments from a replied-to message summary. Loops over
+   * every element of `summary.attachments` (fixing the audit finding that only
+   * index 0 was ever downloaded). For each attachment:
+   *   - `remoteUrl` present → channel-neutral FetchClient.downloadUrl (Discord CDN)
+   *   - otherwise           → Matrix RPC downloadMedia (roomId is non-null here;
+   *                           this method is only called from the roomId-gated path)
+   *
+   * Matrix caps maxAttachmentsPerMessage=1, so the single-element loop is
+   * byte-identical to the old single-attachment path (same asset id, same fields).
+   */
+  private async downloadReplyAttachments(
     eventId: string,
     roomId: string,
-    summary: { eventId: string; body: string; msgtype?: string },
+    summary: {
+      eventId: string;
+      body: string;
+      attachments?: Array<{
+        mediaType: string;
+        filename?: string;
+        mimeType?: string;
+        remoteUrl?: string;
+      }>;
+    },
     result: EnrichmentResult,
   ): Promise<void> {
-    const mediaType = mediaTypeForMsgtype(summary.msgtype);
-    if (!mediaType) return;
+    const attachments = summary.attachments ?? [];
 
-    const asset: MediaAssetRow = {
-      id: `${eventId}:reply_attach:0`,
-      event_id: eventId,
-      role: "reply_attachment",
-      source_index: 0,
-      media_type: mediaType,
-      original_filename: summary.body,
-      download_status: "pending",
-      caption_status: "pending",
-      created_at: Date.now(),
-    };
+    await Promise.allSettled(
+      attachments.map(async (attachment, index) => {
+        const asset: MediaAssetRow = {
+          id: `${eventId}:reply_attach:${index}`,
+          event_id: eventId,
+          role: "reply_attachment",
+          source_index: index,
+          media_type: attachment.mediaType,
+          original_filename: attachment.filename ?? summary.body,
+          download_status: "pending",
+          caption_status: "pending",
+          created_at: Date.now(),
+        };
 
-    const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
-    try {
-      const downloaded = await this.options.capabilities.downloadMedia({
-        roomId,
-        eventId: summary.eventId,
-        outputPath: tempPath,
-        sizeLimit: this.options.downloadSizeLimit,
-      });
-      const saved = await moveFileToWorkspace({
-        sourcePath: tempPath,
-        workspaceRoot: this.options.workspaceRoot,
-        originalFilename: downloaded.filename ?? summary.body,
-        contentType: downloaded.contentType,
-      });
-      asset.local_path = saved.localPath;
-      asset.size_bytes = downloaded.sizeBytes;
-      asset.mime_type = downloaded.contentType ?? null;
-      asset.media_type = downloaded.kind || mediaType;
-      asset.download_status = "complete";
-    } catch (error) {
-      await unlink(tempPath).catch(() => {});
-      asset.download_status = "failed";
-      asset.download_error = error instanceof Error ? error.message : String(error);
-    }
+        const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
+        try {
+          if (attachment.remoteUrl) {
+            // Discord / remote-URL path
+            const downloaded = await this.options.fetchClient.downloadUrl({
+              url: attachment.remoteUrl,
+              outputPath: tempPath,
+              sizeLimit: this.options.downloadSizeLimit,
+            });
+            const saved = await moveFileToWorkspace({
+              sourcePath: tempPath,
+              workspaceRoot: this.options.workspaceRoot,
+              originalFilename: attachment.filename,
+              contentType: downloaded.contentType ?? attachment.mimeType,
+            });
+            asset.local_path = saved.localPath;
+            asset.size_bytes = downloaded.sizeBytes;
+            asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
+            if (downloaded.contentType) asset.media_type = inferMediaType(downloaded.contentType);
+            asset.download_status = "complete";
+          } else {
+            // Matrix RPC path
+            const downloaded = await this.options.capabilities.downloadMedia({
+              roomId,
+              eventId: summary.eventId,
+              outputPath: tempPath,
+              sizeLimit: this.options.downloadSizeLimit,
+            });
+            const saved = await moveFileToWorkspace({
+              sourcePath: tempPath,
+              workspaceRoot: this.options.workspaceRoot,
+              originalFilename: downloaded.filename ?? attachment.filename ?? summary.body,
+              contentType: downloaded.contentType,
+            });
+            asset.local_path = saved.localPath;
+            asset.size_bytes = downloaded.sizeBytes;
+            asset.mime_type = downloaded.contentType ?? null;
+            asset.media_type = downloaded.kind || attachment.mediaType;
+            asset.download_status = "complete";
+            if (downloaded.filename) asset.original_filename = downloaded.filename;
+          }
+        } catch (error) {
+          await unlink(tempPath).catch(() => {});
+          asset.download_status = "failed";
+          asset.download_error = error instanceof Error ? error.message : String(error);
+        }
 
-    result.mediaAssets.push(asset);
+        result.mediaAssets.push(asset);
+      }),
+    );
   }
 
   private async fetchLinkPreviews(
@@ -317,21 +395,58 @@ export class EnrichmentWorker {
       if (!fx.config.enabled) xRefs = [];
     }
 
-    let sources: Awaited<ReturnType<EnrichmentCapabilities["resolveLinkPreviews"]>>["sources"] = [];
+    type PreviewSources = Array<{
+      url: string;
+      sourceKind: string;
+      siteName?: string;
+      title?: string;
+      description?: string;
+    }>;
+    type PreviewMedia = Array<{
+      sourceUrl: string;
+      filename?: string;
+      contentType?: string;
+      dataBase64: string;
+    }>;
+    let sources: PreviewSources = [];
     let textBlocks: string[] = [];
-    let synapseMedia: Awaited<ReturnType<EnrichmentCapabilities["resolveLinkPreviews"]>>["media"] = [];
+    let synapseMedia: PreviewMedia = [];
     if (synapseBody.includes("http")) {
-      try {
-        const previewResult = await this.options.capabilities.resolveLinkPreviews({
-          bodyText: synapseBody,
-          includeImages: true,
-          maxBytes: 256_000,
-        });
-        sources = previewResult.sources;
-        textBlocks = previewResult.textBlocks;
-        synapseMedia = previewResult.media;
-      } catch {
-        // Synapse preview failure is non-fatal (and must not sink the FxTwitter stage).
+      if (this.options.capabilities.resolveLinkPreviews) {
+        // Provider path (Matrix: Synapse /_matrix/media/v3/preview_url).
+        try {
+          const previewResult = await this.options.capabilities.resolveLinkPreviews({
+            bodyText: synapseBody,
+            includeImages: true,
+            maxBytes: 256_000,
+          });
+          sources = previewResult.sources;
+          textBlocks = previewResult.textBlocks;
+          synapseMedia = previewResult.media;
+        } catch {
+          // Provider preview failure is non-fatal (must not sink the FxTwitter stage).
+        }
+      } else {
+        // Direct-HTTP fallback: scrape og:/twitter: meta tags.
+        // Ingest-time discord_embed previews take precedence per URL — skip those.
+        const ingestUrls = new Set(this.options.storage.getIngestLinkPreviewUrls(eventId));
+        try {
+          const directClient = new DirectLinkPreviewClient(this.options.fetchClient);
+          const directResults = await directClient.resolve({
+            bodyText: synapseBody,
+            maxPreviews: this.options.maxPreviewsPerMessage,
+            excludeUrls: ingestUrls,
+          });
+          sources = directResults.map((r) => ({
+            url: r.url,
+            sourceKind: r.sourceKind,
+            siteName: r.siteName,
+            title: r.title,
+            description: r.description,
+          }));
+        } catch {
+          // Direct scrape failure is non-fatal.
+        }
       }
     }
 
@@ -699,18 +814,6 @@ export class EnrichmentWorker {
 
     await Promise.allSettled(downloads);
   }
-}
-
-function isMediaMsgtype(msgtype: string): boolean {
-  return ["m.image", "m.video", "m.audio", "m.file"].includes(msgtype);
-}
-
-function mediaTypeForMsgtype(msgtype?: string): string | undefined {
-  if (msgtype === "m.image") return "image";
-  if (msgtype === "m.video") return "video";
-  if (msgtype === "m.audio") return "audio";
-  if (msgtype === "m.file") return "file";
-  return undefined;
 }
 
 function inferMediaType(contentType?: string): string {
