@@ -22,12 +22,19 @@ export const MATRIX_TERMINOLOGY: ProviderTerminology = {
   providerName: "Matrix",
   mentionNote:
     "An exact Matrix user ID like @name:server in the text is turned into a real mention automatically (pill + notification) — no special markup needed.",
+  senderIdHint: "for example a Matrix mxid",
+  // Pre-Phase-8 spawn_session strings — byte-for-byte reproduction so Matrix
+  // model vocabulary is unchanged.
+  coReplyIdDescription:
+    "The Matrix event id ($…) of the co-reply message to spin off, as given in the co-reply interjection.",
+  coReplyIdRequiredError:
+    "error: message_id is required (the $… event id from the co-reply interjection).",
 };
 
 /**
- * Discord terminology bundle (Phase 7 — not yet in use).
- * Defined here so the bundle shape is validated at compile time
- * and so the Discord provider can import it without changes in Phase 7.
+ * Discord terminology bundle.
+ * Selected by `buildSessionTools` for any session whose `target.provider` is `"discord"`.
+ * All description strings are Discord-native equivalents of the Matrix ones.
  */
 export const DISCORD_TERMINOLOGY: ProviderTerminology = {
   messageIdFmt: "Discord message ID",
@@ -36,4 +43,10 @@ export const DISCORD_TERMINOLOGY: ProviderTerminology = {
   providerName: "Discord",
   mentionNote:
     "An exact @username match against known channel participants is resolved to a real mention — no special markup needed.",
+  senderIdHint: "for example a Discord user ID snowflake",
+  // Discord-native spawn_session strings.
+  coReplyIdDescription:
+    "The message id of the co-reply message to spin off, as given in the co-reply interjection.",
+  coReplyIdRequiredError:
+    "error: message_id is required (the message id from the co-reply interjection).",
 };

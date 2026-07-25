@@ -57,6 +57,15 @@
 	let timeoutMin = $state('');
 	let starting = $state(false);
 
+	// oldest_decryptable is Matrix-only (E2EE concept). Hide the option and
+	// auto-reset the selection for any non-Matrix key.
+	const isMatrixKey = $derived(timelineKey.trim().startsWith('matrix:'));
+	$effect(() => {
+		if (!isMatrixKey && targetKind === 'oldest_decryptable') {
+			targetKind = 'beginning';
+		}
+	});
+
 	const needsValue = $derived(targetKind === 'date' || targetKind === 'count');
 
 	function invalidate() {
@@ -66,7 +75,7 @@
 	async function start() {
 		if (starting) return;
 		if (!timelineKey.trim()) {
-			toast.error('Enter a base room/dm timeline key');
+			toast.error('Enter a base channel/dm timeline key');
 			return;
 		}
 		starting = true;
@@ -145,20 +154,22 @@
 		<section class="space-y-2 rounded-md border p-3">
 			<h2 class="text-sm font-medium">Start a backfetch</h2>
 			<p class="text-xs text-muted-foreground">
-				Pages history below the room's oldest stored message into the search-only region.
-				Single-flight: one active job per room.
+				Pages history below the oldest stored message into the search-only region.
+				Single-flight: one active job per channel.
 			</p>
 			<div class="flex flex-wrap items-end gap-2 text-xs">
 				<label class="flex flex-col gap-1">
-					<span class="text-muted-foreground">base room</span>
-					<RoomPicker bind:value={timelineKey} placeholder="select or type a room" />
+					<span class="text-muted-foreground">timeline key</span>
+					<RoomPicker bind:value={timelineKey} placeholder="select or type a timeline key" />
 				</label>
 				<label class="flex flex-col gap-1">
 					<span class="text-muted-foreground">target</span>
 					<select bind:value={targetKind} class="rounded border bg-background px-2 py-1">
 						<option value="beginning">beginning</option>
 						<option value="date">date</option>
-						<option value="oldest_decryptable">oldest decryptable</option>
+						{#if isMatrixKey}
+							<option value="oldest_decryptable">oldest decryptable</option>
+						{/if}
 						<option value="count">count</option>
 					</select>
 				</label>
@@ -204,7 +215,7 @@
 				<thead class="text-left text-xs text-muted-foreground">
 					<tr class="border-b">
 						<th class="py-1 pr-3 font-medium">name</th>
-						<th class="py-1 pr-3 font-medium">room</th>
+						<th class="py-1 pr-3 font-medium">channel</th>
 						<th class="py-1 pr-3 font-medium">target</th>
 						<th class="py-1 pr-3 font-medium">status</th>
 						<th class="py-1 pr-3 text-right font-medium" title="newly-stored rows">stored</th>

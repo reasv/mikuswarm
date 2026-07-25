@@ -85,7 +85,7 @@ export function createReactTool(context: ReactToolContext): AgentTool {
         const message = err instanceof Error ? err.message : String(err);
         if (message.includes("not found") || message.includes("unknown event")) {
           return {
-            content: [{ type: "text", text: `error: message_id "${args.message_id}" not found in this room. Use a valid event ID from the conversation context.` }],
+            content: [{ type: "text", text: `error: message_id "${args.message_id}" not found in this ${t.channelNoun}. Use a valid event ID from the conversation context.` }],
             details: null,
           };
         }

@@ -315,17 +315,17 @@ function inferMediaType(
  * `source_kind: "discord_embed"` is set so the enrichment worker can skip
  * re-scraping URLs already covered at ingest (spec §9.3 / §5.3).
  *
- * URL normalization note: the TODO(phase7) in src/storage/database.ts notes
- * that Discord embed URLs must be stored normalized the same way
- * DirectLinkPreviewClient's stripTrailingPunctuation does. We apply the same
- * trailing-punctuation strip here so exclusion matching works.
+ * URL normalization: Discord embed URLs are stored with trailing punctuation
+ * stripped by a regex that is a superset of DirectLinkPreviewClient's
+ * stripTrailingPunctuation (covers the same characters plus `"'{}>`), so that
+ * getIngestLinkPreviewUrls exclusion matching correctly skips them at enrichment time.
  */
 export function embedsToLinkPreviews(embeds: DiscordEmbedData[]): LinkPreviewMeta[] {
   const previews: LinkPreviewMeta[] = [];
   for (const embed of embeds) {
     const rawUrl = embed.url;
     if (!rawUrl) continue;
-    // Normalize: strip trailing punctuation matching what DirectLinkPreviewClient does.
+    // Normalize: strip trailing punctuation (superset of DirectLinkPreviewClient's set).
     const url = rawUrl.replace(/[.,;:!?)"'\]}>]+$/, "");
     if (!url) continue;
     previews.push({

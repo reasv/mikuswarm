@@ -385,11 +385,11 @@ export class EnrichmentWorker {
     // FxTwitter stage is disabled, X URLs are not previewed at all.
     const fx = this.options.fxtwitter;
     let xRefs: XStatusRef[] = [];
-    let synapseBody = bodyText;
+    let filteredBody = bodyText;
     if (fx) {
       xRefs = extractXStatusUrls(bodyText, fx.config.statusHosts);
       if (xRefs.length > 0) {
-        synapseBody = stripXStatusUrls(bodyText, fx.config.statusHosts);
+        filteredBody = stripXStatusUrls(bodyText, fx.config.statusHosts);
         for (const ref of xRefs) this.xUrlExclusions.add(ref.rawUrl);
       }
       if (!fx.config.enabled) xRefs = [];
@@ -410,19 +410,19 @@ export class EnrichmentWorker {
     }>;
     let sources: PreviewSources = [];
     let textBlocks: string[] = [];
-    let synapseMedia: PreviewMedia = [];
-    if (synapseBody.includes("http")) {
+    let previewMedia: PreviewMedia = [];
+    if (filteredBody.includes("http")) {
       if (this.options.capabilities.resolveLinkPreviews) {
         // Provider path (Matrix: Synapse /_matrix/media/v3/preview_url).
         try {
           const previewResult = await this.options.capabilities.resolveLinkPreviews({
-            bodyText: synapseBody,
+            bodyText: filteredBody,
             includeImages: true,
             maxBytes: 256_000,
           });
           sources = previewResult.sources;
           textBlocks = previewResult.textBlocks;
-          synapseMedia = previewResult.media;
+          previewMedia = previewResult.media;
         } catch {
           // Provider preview failure is non-fatal (must not sink the FxTwitter stage).
         }
@@ -433,7 +433,7 @@ export class EnrichmentWorker {
         try {
           const directClient = new DirectLinkPreviewClient(this.options.fetchClient);
           const directResults = await directClient.resolve({
-            bodyText: synapseBody,
+            bodyText: filteredBody,
             maxPreviews: this.options.maxPreviewsPerMessage,
             excludeUrls: ingestUrls,
           });
@@ -501,7 +501,7 @@ export class EnrichmentWorker {
       }
     }
 
-    for (const media of synapseMedia) {
+    for (const media of previewMedia) {
       const data = Buffer.from(media.dataBase64, "base64");
       const asset: MediaAssetRow = {
         id: nanoid(),

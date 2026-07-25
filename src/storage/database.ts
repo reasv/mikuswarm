@@ -3186,7 +3186,9 @@ export class Storage {
    * them; the precedence logic lands here in Phase 5).
    */
   getIngestLinkPreviewUrls(eventId: string): string[] {
-    // TODO(phase7): the Discord ingest path must store embed URLs normalized the same way DirectLinkPreviewClient's stripTrailingPunctuation does, or exclusion matching will miss and re-scrape them.
+    // Embed URLs are stored with trailing punctuation stripped by embedsToLinkPreviews()
+    // in the Discord normalizer, matching DirectLinkPreviewClient's normalization so
+    // exclusion matching correctly skips URLs already previewed at ingest.
     const rows = this.db
       .prepare(`select url from link_previews where event_id = ? and source_kind = 'discord_embed'`)
       .all(eventId) as Array<{ url: string }>;

@@ -568,6 +568,27 @@ export interface ProviderTerminology {
   providerName: string;
   /** mention description sentence embedded in send_message.message description */
   mentionNote: string;
+  /**
+   * Short sender-id example used in user_profile_read/edit senderId parameter description.
+   * e.g. "for example a Matrix mxid" or "for example a Discord user ID snowflake".
+   * Produces "Stable provider sender id, <senderIdHint>." — the Matrix value keeps the
+   * pre-Phase-8 string byte-identical.
+   */
+  senderIdHint: string;
+  /**
+   * spawn_session message_id parameter description string.
+   * Matrix value: byte-for-byte reproduction of the pre-Phase-8 literal
+   * ("The Matrix event id ($…) of the co-reply message…").
+   * Discord value: Discord-native equivalent.
+   */
+  coReplyIdDescription: string;
+  /**
+   * spawn_session required-error text (returned when message_id is empty).
+   * Matrix value: byte-for-byte reproduction of the pre-Phase-8 literal
+   * ("error: message_id is required (the $… event id…)").
+   * Discord value: Discord-native equivalent.
+   */
+  coReplyIdRequiredError: string;
 }
 
 /**
