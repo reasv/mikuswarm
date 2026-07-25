@@ -52,7 +52,7 @@ cited.
 | Q3 | Threads | `:thread:` sub-keys under the **parent channel** key, exactly like Matrix. Forum/media posts are threads of the forum channel. §4.2, §12.5 |
 | Q4 | Budget partitioning | Keep `room_id`/`space_id` columns; redefine semantics as channel-scope/server-scope. New partition vars `{channel_id}`/`{server_id}` (aliases of the old ones, which remain valid). Config load warns when a rule uses a var no enabled provider can supply. §6.4, §11.2 |
 | Q5 | Own-message echo | Live: the gateway delivers the bot's own `MESSAGE_CREATE`. Echo-merge by `(provider, externalId)` works as-is; the fuzzy fallback is dead for Discord. §12.7 |
-| Q6 | v1 feature scope | See the table in §14. Polls, outbound voice messages, thread creation, global username rename: gated off in v1. |
+| Q6 | v1 feature scope | See the table in §14. Everything the platform permits and the existing tool surface promises is in v1 (including poll **creation** and outbound voice messages). Excluded: poll **voting** (no bot vote endpoint exists — platform-impossible), global username rename (operational footgun; per-guild nick covers it), thread creation (not a Discord gate — no such tool exists on any provider; separate follow-up feature). |
 | Q7 | Single vs per-provider DB | Single DB. Provider-prefixed keys and event ids namespace everything; one writer queue; cross-provider queries stay possible. |
 | Q8 | `ChannelClient` scope | Tool-facing per-target action surface obtained from the provider; `ChatProvider.send` remains the only outbound-message path. §7 |
 | Q9 | Enrichment capabilities keying | Per account, registry key `<provider>:<accountId>`, derived via the shared parser; the wiring loop iterates all providers. §9.1 |
@@ -147,7 +147,8 @@ export interface ProviderCapabilities {
   maxMessageChars: number;          // chunker limit: matrix 4000 (today's constant); discord 2000
   formatting: "html" | "markdown" | "plain";
   edits: boolean; deletes: boolean;
-  polls: boolean; pins: boolean; voiceMessages: boolean; threads: boolean;
+  pollCreate: boolean; pollVote: boolean; // discord: create true, vote false (no bot vote endpoint)
+  pins: boolean; voiceMessages: boolean; threads: boolean;
   history: boolean;                 // read_messages + backfill
   encrypted: boolean;               // gates re-decryption instantiation (RC8)
   linkPreviews: "provider" | "none"; // "none" → framework direct-HTTP fallback (§9.3)
@@ -364,7 +365,8 @@ export interface ChannelClient {
   channelInfo(): Promise<ChannelInfo>;        // { label, serverName?, isDirect, topic?, … }
   pins(): Promise<PinnedMessage[]>;
   emojiList(): Promise<EmojiEntry[]>;         // sendable set only (§10.3)
-  createPoll?/votePoll?                       // present iff polls
+  createPoll?(…): Promise<…>;                 // present iff pollCreate; discord: poll object on send, plus end-poll
+  votePoll?(…): Promise<…>;                   // present iff pollVote; discord: absent (tool not offered)
 }
 ```
 
@@ -587,9 +589,16 @@ initial-activation backfill for free.
 
 ### 12.1 Library and connection
 
-**discord.js v14** (gateway + REST + rate-limit handling + caching in one
-maintained package; a raw-gateway implementation buys nothing but bugs). One
-client per configured account. Reconnect/resume is discord.js's job; state
+**discord.js v14** — the latest **stable** major as of this design (14.25.x,
+July 2026; v15 is pre-release with its milestone incomplete and is explicitly
+not production-recommended — plan a migration once it stabilizes). Alternatives
+considered and rejected: Eris/Oceanic.js (smaller ecosystems, weaker typing);
+`@discordjs/core`+`rest`+`ws` (the same team's modular low-level stack — viable,
+but we want the managed cache for thread-parent resolution, member lookup, and
+the emoji catalog, and the modular stack means hand-writing that glue for no
+gain); raw gateway (buys nothing but bugs). One client per configured account,
+with cache limits tuned down to what §12.5/§7.3/§10.2 need — the timeline
+store, not the library cache, remains the source of truth for history. Reconnect/resume is discord.js's job; state
 transitions surface via `host.onNativeEvent` (ready, resumed, disconnected,
 rate-limit warnings) so the console shows gateway health the way it shows sync
 health today.
@@ -615,13 +624,22 @@ guild with the bot).
 `externalId`. `setTyping` uses the typing endpoint, refreshed every ~8s while
 active.
 
+Voice messages (`as_voice`): Discord's format is strict — a single audio
+attachment, ogg/opus, message flag `IS_VOICE_MESSAGE` (8192), empty text
+content, and `duration_secs` + base64 `waveform` metadata on the attachment.
+The provider transcodes via the existing ffmpeg media pipeline and computes the
+waveform (peak samples, ≤256 bytes) at send. Bounded work; kept in v1 because
+`as_voice` is an existing model-facing parameter and dropping it silently would
+be a parity hole.
+
 ### 12.5 Threads
 
 Messages arriving with `channel_id` = a thread resolve the parent via the
 channel cache (REST fetch on miss) and key as
 `…:room:<parentId>:thread:<threadId>`. Replies into a thread target the thread
 channel id. Forum posts are threads of the forum channel. v1 responds within
-existing threads; creating threads is gated off.
+existing threads; *creating* threads is a new cross-provider capability (no
+such tool exists for Matrix either) and gets its own follow-up spec (§14).
 
 ### 12.6 Reactions
 
@@ -671,13 +689,20 @@ now.
 | Initial-activation backfill | ✅ | before-snowflake paging |
 | Proactive posting | ✅ | falls out of RC1/RC2 fixes |
 | Typing indicator | ✅ | |
-| `set_profile` (avatar, guild nick) | ✅ | global username rename excluded |
+| `set_profile` (avatar, guild nick) | ✅ | global rename excluded — see below |
 | Per-user budgets / partitions | ✅ | Phase 0 + §6.4 |
-| Polls (create/vote) | ❌ gated | Discord poll API differs from MSC3381; v1.1 |
-| Outbound voice messages | ❌ gated | flag+waveform upload; v1.1 if ever |
-| Thread creation | ❌ gated | |
+| Poll creation (`create_poll`, reshaped) | ✅ | poll object on send + end-poll; schema reshaped (question, ≤10 answers, duration, multiselect) |
+| Outbound voice messages (`as_voice`) | ✅ | ogg/opus + waveform via existing ffmpeg pipeline, §12.4 |
+| Poll voting (`poll_vote`) | ❌ impossible | the Discord API has no endpoint for bots to vote; tool not offered on Discord sessions (`pollVote: false`) |
+| Global username rename | ❌ deliberate | usernames globally unique + rename rate-limited (~2/hr): a model-invocable rename can permanently lose the handle to a snipe or fail on collision. Per-guild nick covers the visible effect; the global handle stays operator-controlled |
+| Thread creation | ❌ not a Discord gate | no create-thread tool exists on *any* provider (Matrix threads are only replied-into). A new cross-provider capability → its own follow-up spec |
 | Group DMs | n/a | unreachable for bots |
 | Sharding | n/a | out of scope |
+
+Scope philosophy: v1 includes everything the platform permits and the existing
+tool surface promises. The only exclusions are one API impossibility, one
+operational footgun, and one genuinely-new feature that is out of scope for a
+parity milestone.
 
 ---
 
