@@ -462,6 +462,33 @@ strictly more machinery than hosting N agents in the process whose governors
 are already singletons — the entire correctness column of §2 falls out of
 co-location for free.
 
+### 11.5 Filesystem-level dedup instead of the Phase-5 store
+
+Delegating attachment dedup (§13 Phase 5) to the host filesystem was
+considered and rejected as the *shipped* mechanism:
+
+- **FUSE deduplicating filesystems**: privileged mounts and mount-propagation
+  friction with Docker binds, real overhead, poor maturity. Rejected outright.
+- **ZFS inline dedup**: the DDT is pool-level state and `dedup=on` changes the
+  write path and is effectively irreversible until the data is rewritten — a
+  whole-pool operational commitment, disproportionate for deduplicating tens
+  of GB, and unreasonable to demand of a host serving other workloads. ZFS
+  also lacks `FIDEDUPERANGE`, so out-of-band tools cannot target it, and block
+  cloning is another sticky pool feature that still requires application-side
+  `copy_file_range`. Never a recommendation.
+- **Out-of-band `FIDEDUPERANGE` (btrfs/XFS via `duperemove`/`bees`)**: genuinely
+  free where available — userspace tool, no format commitment, CoW-safe extent
+  sharing invisible to Docker binds. This is a legitimate *operator-side
+  complement*, worth an ops-documentation note, but upstream cannot assume the
+  host filesystem, so it cannot be the mechanism.
+
+Conclusion: the app-level content-addressed store with hardlinks (Phase 5)
+remains the portable mechanism — plain POSIX, no filesystem opinions, and the
+only variant that also avoids duplicate *downloads* and yields content hashes.
+Its adoption of pre-existing files is a resumable background reconciliation
+sweep (hash → `link()` into the store, or link+`rename()` swap for
+duplicates), idempotent via inode comparison, never rewriting stored paths.
+
 ---
 
 ## 12. Implementation touchpoints
