@@ -22,6 +22,7 @@
 	import { presentRule } from '$lib/rule-status';
 	import { buildLadder, buildSegments, type LadderGroup, type CapSegment } from '$lib/user-ladder';
 	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { distinctAccounts } from '$lib/timeline-key';
 
 	// "Display Name (unique handle)" for a labeled sender — the handle is the Discord
 	// username when the BFF resolved one, else the raw id (for Matrix the id IS the
@@ -157,6 +158,16 @@
 
 	// Currently-selected model per live per-user session (spec §14).
 	const userSelections = $derived([...(budgets.data?.userSelections ?? [])]);
+
+	// Channel cells grow an account tag only when the table's rows actually span
+	// more than one (provider, account) pair — single-account views stay untagged,
+	// mirroring the Conversations room list's tabs-only-when-plural behavior.
+	const sessionsSpanAccounts = $derived(
+		distinctAccounts((sessions.data?.sessions ?? []).map((s) => s.timelineKey)) > 1
+	);
+	const toolCallsSpanAccounts = $derived(
+		distinctAccounts((toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key)) > 1
+	);
 
 	// Stable color per group. Known classes get fixed hues; models cycle a palette.
 	const CLASS_COLORS: Record<string, string> = {
@@ -972,7 +983,7 @@
 								</td>
 								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{s.status}</td>
 								<td class="py-1 pr-3 text-[10px]">
-									<ChannelCell label={s.channelLabel} id={s.timelineKey} />
+									<ChannelCell label={s.channelLabel} id={s.timelineKey} showAccount={sessionsSpanAccounts} />
 								</td>
 								<td class="py-1 text-[11px]">{s.triggerSender ?? 'N/A'}</td>
 							</tr>
@@ -1016,7 +1027,7 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtUsd(t.cost_usd)}</td>
 								<td class="py-1 text-[10px]">
 									{#if t.timeline_key}
-										<ChannelCell label={t.channel_label ?? t.timeline_key} id={t.timeline_key} />
+										<ChannelCell label={t.channel_label ?? t.timeline_key} id={t.timeline_key} showAccount={toolCallsSpanAccounts} />
 									{:else}
 										<span class="text-muted-foreground">—</span>
 									{/if}

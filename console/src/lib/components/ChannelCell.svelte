@@ -7,12 +7,19 @@
 	import { Popover } from 'bits-ui';
 	import { toast } from 'svelte-sonner';
 	import { cn } from '$lib/utils';
+	import { timelineAccount } from '$lib/timeline-key';
 
 	let {
 		label,
 		id,
+		showAccount = false,
 		class: className = ''
-	}: { label: string; id: string; class?: string } = $props();
+	}: { label: string; id: string; showAccount?: boolean; class?: string } = $props();
+
+	// Account tag (`accountId PROVIDER`), shown only when the caller opted in —
+	// the tables enable it when their rows span more than one account, mirroring
+	// the Conversations room list's tabs-only-when-plural behavior.
+	const account = $derived(showAccount ? timelineAccount(id) : undefined);
 
 	async function copyId(): Promise<void> {
 		try {
@@ -28,11 +35,16 @@
 	<Popover.Trigger
 		title={label}
 		class={cn(
-			'inline-block max-w-[12rem] truncate align-bottom text-left hover:underline',
+			'inline-flex max-w-[14rem] items-baseline gap-1 align-bottom text-left',
 			className
 		)}
 	>
-		{label}
+		<span class="min-w-0 truncate hover:underline">{label}</span>
+		{#if account}
+			<span class="shrink-0 text-[9px] text-muted-foreground">
+				{account.accountId} <span class="uppercase tracking-wide">{account.provider}</span>
+			</span>
+		{/if}
 	</Popover.Trigger>
 	<Popover.Portal>
 		<Popover.Content
