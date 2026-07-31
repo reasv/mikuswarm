@@ -19,6 +19,14 @@ files; the per-agent summarization cost (the one traffic-proportional cost,
 which alone would sink many-personas-one-community) is addressed by opt-in
 summary mirroring (§10b).
 
+**Settled in review round 2** (2026-07-31, claims code-verified):
+webhook-authored messages are always human, never bot-capped; third-party-bot
+containment is a separate default-off knob (§9); a mirrored timeline whose
+donor stops covering it falls back to native summarization automatically,
+one-way (§10b); embedding spend is excluded from agent-scoped limit rules
+(§8); the participant-naming summarization instruction ships default-on
+(§10b); account-key validation is colon-only hard error (§3).
+
 **Guiding constraint** (same as the Discord design): every change lands as a
 generic, default-off upstream feature. An existing single-agent config must be
 byte-identical in behaviour after every phase below. Multi-agent is enabled
@@ -155,10 +163,14 @@ Discord bot applications cost nothing); key churn is not.
 
 Agent names share the account-key character class (`[a-z0-9-]+`, no colon) so
 they are safe in paths and rule scopes. Today that class is only a doc
-contract — the account Records take bare strings — so Phase 1 MUST add
-`pattern` validation for both account keys and agent names: a colon-bearing
-key is schema-valid now but silently breaks `parseTimelineKey`, on which §8
-attribution and every per-event resolver in this spec depend.
+contract — the account Records take bare strings. Phase 1 adds validation
+with a deliberate back-compat asymmetry: for **account keys** (frozen;
+an existing deployment with a nonconforming key cannot rename to comply
+without orphaning its data), only a colon is a hard startup error — it
+silently breaks `parseTimelineKey`, on which §8 attribution and every
+per-event resolver in this spec depend — while other out-of-class
+characters only log a warning. **Agent names** are new identifiers with
+nothing stored under them, so they enforce the full class strictly.
 
 **Agent names, by contrast, are renameable.** Nothing durable stores them
 except `memory_chunks.agent` (re-stamped from config by the next
@@ -219,9 +231,14 @@ changing it back are both complete, side-effect-free operations (§5).
 - **`[agents]` table present** → every account's resolved agent name MUST
   match a declared `[agents.<name>]` block (strict-config: an unmatched name
   is a startup error naming the account), and every block requires
-  `workspace_root`. `[workspace].root_dir` must be absent in this mode
-  (mutually exclusive with `[agents]`; both present is a startup error — no
-  silently-ignored keys). `[sandbox]` remains the shared default; per-agent
+  `workspace_root`. `[workspace].root_dir` is mutually exclusive with
+  `[agents]` — but the shipped `00-defaults.toml` sets it and the TOML
+  merge cannot unset keys, so "absent" is not checkable as-is.
+  Prerequisite, behaviour-preserving change: make `root_dir`
+  schema-optional, remove it from `00-defaults.toml`, and apply the same
+  default in code when `[agents]` is absent. With that in place, an
+  explicitly-set `root_dir` alongside `[agents]` is a startup error — no
+  silently-ignored keys. `[sandbox]` remains the shared default; per-agent
   `[agents.<name>.sandbox]` overrides it wholesale (§10).
 - Workspace roots must be pairwise disjoint paths (no nesting), checked at
   startup. Each is seeded independently (`seedWorkspace` /
@@ -327,12 +344,23 @@ cache hits across agents are free wins). A per-agent index DB was considered
 and rejected: `index_meta`/embedding-model state is process-global settings,
 and one column is strictly less machinery.
 
+One subtlety is load-bearing: chunk identity is `id =
+sha256(<workspace-relative path>\0<chunk text>)`, so two agents whose
+workspaces contain an identically-named file with an identical chunk
+(seeded boilerplate, shared headers) collide on `id` — with a single owner
+column, each agent's reconciliation walk would re-stamp the shared row to
+itself, flapping ownership and hiding the chunk from the other agent's
+retrieval. Uniqueness therefore becomes `(agent, id)`: two rows, one per
+owner. Do NOT widen the `id` derivation itself — hashing the agent in
+would invalidate every existing row and force a full re-embed on upgrade.
+
 Migration and legacy semantics: the column is added nullable; existing rows
 stay NULL. In legacy mode nothing stamps or filters (single implicit agent,
 behaviour-identical). On first startup with `[agents]`, the reconciliation
-walk stamps rows in place: a walked file whose `path` + `content_hash`
-already match an indexed row gets its `agent` set to the walking agent's
-name — no re-chunk, no re-embed. Agents-mode queries filter `agent =
+walk stamps rows in place: a walked chunk whose `id` (the path+text
+content address the reconciler already keys on) matches an indexed row
+gets its `agent` set to the walking agent's name — no re-chunk, no
+re-embed. Agents-mode queries filter `agent =
 <requester>`, which excludes any still-NULL stragglers (safe by default);
 NULL rows whose files no longer exist under any root are deleted by the
 normal reconciliation diff. This is also the upgrade path for an existing
@@ -436,13 +464,16 @@ denormalized columns (`room_id`, `space_id`) with matching reseed indexes.
   and rejected because it makes usage attribution the one place where a relink
   is *not* a pure config edit. The seeding paths already parse timeline keys
   (that is how `room_id` is derived); the added cost is a map lookup.
-- **Background lanes must stamp `timeline_key`.** `usage_events.timeline_key`
-  and `provider` are nullable today, and background/proactive lanes write
-  NULL — rows the timeline-key parse cannot attribute. Diary, summarization,
-  enrichment and proactive work are all timeline-scoped at the job level, so
-  the stamp is available; landing the `agent` matcher includes threading it
-  into every lane's usage insert. Agent-scoped rules match only attributable
-  rows (NULL-key rows count toward global rules exactly as today); rows for
+- **Background lanes already stamp `timeline_key` — except embedding.**
+  `usage_events.timeline_key` and `provider` are nullable, but the
+  agent-session lanes (summarize, diary, proactive) stamp them via the
+  factory's usage emit, and captioning carries the key through its claim
+  query. The one NULL-writing lane is embedding — and it cannot be
+  stamped: memory-chunk embedding is workspace-file-scoped, not
+  timeline-scoped. Accepted consequence (settled): **agent-scoped rules
+  never count embedding spend** — fractions of a cent, still visible to
+  global rules as today. Agent-scoped rules match only attributable rows
+  (NULL-key rows count toward global rules exactly as today); rows for
   accounts no longer in config are likewise skipped by agent-scoped rules
   (§4.3).
 - Per-user limits: unchanged mechanics; because all agents share one
@@ -495,11 +526,24 @@ event — no startup window where a sibling triggers or is metered as a user.
     agents. Bot-to-bot spend still counts toward deployment `[[limits]]`
     (spend is spend) and never toward any per-user meter.
 
-- **Third-party bots** (not siblings): Discord exposes `author.bot`, which
-  the normalizer currently drops. Extract and store it, and apply the same
-  chain cap to flagged non-sibling bot senders — without this, any agent can
-  still ping-pong with someone else's bot regardless of sibling handling.
-  Matrix has no reliable bot marker; out of scope there (§14).
+- **Third-party bots** (not siblings): Discord exposes `author.bot` and
+  `webhook_id`, both currently dropped by the normalizer; extract and
+  store both. **Webhook-authored messages (`webhook_id` set) are always
+  treated as human** — bridge puppets relay real humans through webhooks,
+  so capping or suppressing them would mute bridged users. Genuine bot
+  senders (`author.bot` without `webhook_id`) get their own knob:
+
+  ```toml
+  [siblings]
+  third_party_bots = "unlimited"  # default; today's behaviour — no cap
+  # third_party_bots = "capped"   # apply the same max_bot_chain window
+  ```
+
+  The default is `"unlimited"` because that is the status quo (the
+  byte-identical constraint); `"capped"` opts foreign bots into the chain
+  window above — without it, an agent can still ping-pong with someone
+  else's bot regardless of sibling handling. Matrix has no reliable bot
+  marker; out of scope there (§14).
 
 **Bridged channels caveat** (documented limitation): "one persona, two doors"
 assumes the two doors see *different* conversations. If a channel is bridged
@@ -547,7 +591,11 @@ default**; shared mode exists for operators who prefer one container anyway
 and accept the hazard above.
 
 Validation: shared mode requires all participating roots to live under one
-parent directory; strict blocks must not share `container_name` or mounts.
+parent directory; strict blocks must not share `container_name` or mounts;
+and **no strict agent's workspace root may lie under the shared
+`workspace_mount` parent** — otherwise the shared container's mount
+exposes the strict agent's workspace and its isolation guarantee is
+silently void.
 
 ## 10a. Browser: per-agent Manager profiles
 
@@ -627,8 +675,10 @@ Mechanics:
   across two accounts observing one channel; only internal ids and
   `timeline_key` differ, and the `(provider, external_id)` index already
   exists. Donor lineage therefore translates row-by-row.
-- **L1 mirror**: a mirror worker watches donor summary completions and, per
-  summary, copies `content`/`token_count`/`model_id`/timestamps/status and
+- **L1 mirror**: a mirror worker watches donor summary completions (hooked
+  on the summarization pool's completion callback — the same hook that
+  feeds the condensation evaluator — plus a periodic reconciliation sweep)
+  and, per summary, copies `content`/`token_count`/`model_id`/timestamps/status and
   maps `summary_events` lineage via `external_id` into the secondary's rows
   (the donor's timeline contains the secondary's messages as ordinary
   participants, so coverage is near-total; unmatched events drop from
@@ -647,7 +697,9 @@ Mechanics:
   where the events don't exist locally (pre-join history).
 - **Wait-or-omit**: on a mirrored timeline, "reconcile" means sweep the
   mirror and escalate the *donor's* covering job priority — interactive
-  pressure crosses the link instead of spawning duplicate work.
+  pressure crosses the link instead of spawning duplicate work. If no
+  covering donor job exists yet, the sweep has the donor's indexer enqueue
+  the covering range immediately (threshold bypassed).
 - **Status propagation**: donor `superseded`/`truncated` transitions are
   propagated by the mirror sweep (idempotent reconciliation, like the other
   indexers).
@@ -658,10 +710,16 @@ Transition and failure modes:
   and the coverage cursor sits at the last mirrored summary; the indexer's
   normal threshold logic sees the un-summarized tail and starts chunking
   natively from there. No backfill, no state copy.
-- **Donor account removed from config**: mirroring for the affected
-  timelines stalls under the §4.3 rule; the operator either restores the
-  donor or drops `summaries_from`, which flips those timelines to native
-  summarization automatically (previous bullet).
+- **Donor liveness — fall back, never stall** (settled): a timeline is
+  mirrored only while the donor is actually covering it. If donor
+  summaries stop coming — donor account removed from config, donor left or
+  was kicked from the channel, or donor coverage stalls past a threshold —
+  the secondary's indexer resumes native summarization from the end of
+  mirrored coverage (mechanically the previous bullet, triggered
+  automatically). The flip is **one-way per timeline**: once a timeline
+  has native summaries it never becomes mirrored again — donor and
+  secondary tilings never align, so re-mirroring would splice misaligned
+  chunk boundaries.
 - **Sync-gap divergence** (events one account has and the other lacks —
   decryption failures, join windows): the contiguity probe stops the
   secondary's coverage cursor early and the tail renders raw. Safe
@@ -671,16 +729,22 @@ Accepted properties and requirements:
 
 - **Perspective skew, mitigated**: the summarize/condense session
   instructions gain a requirement to refer to every participant — *including
-  yourself* — by name. Generic improvement, default-on: it also makes
-  summaries relink-safe (§5), since first-person summary text is what makes
-  a summary owner-specific. Residual donor-perspective focus in mirrored
-  text is accepted by the operator choosing `summaries_from`.
+  yourself* — by name. Summaries observed in practice already do this; the
+  instruction pins the behaviour against model drift rather than changing
+  it, so it ships default-on (settled — changes nothing observable). It
+  also makes summaries relink-safe (§5), since first-person summary text is
+  what would make a summary owner-specific. Residual donor-perspective
+  focus in mirrored text is accepted by the operator choosing
+  `summaries_from`.
 - **Pre-join history**: donor summaries predating the secondary's first
   event mirror with empty lineage — renderable ancient history, no
   drill-down, diary skipped. The inverse topology (secondary has events
-  *older* than donor coverage in a mirrored channel) is unsupported in v1
-  and rejected at startup validation; the intended case is a new persona
-  joining an already-covered community.
+  *older* than the donor's coverage start) makes the timeline
+  mirror-ineligible: it summarizes natively, like any timeline that
+  already has native summaries (a per-timeline DB condition, so the mirror
+  sweep decides it — startup config validation cannot see it). The
+  intended mirroring case is a new persona joining an already-covered
+  community.
 - **Cost attribution**: mirrored rows cost ~nothing; the donor's meters
   absorb the community's whole summarization load. Visible — and
   intentionally schedulable — via the §8 `agent` matcher.
@@ -774,22 +838,22 @@ per-agent root resolver are built once at startup and injected.
 
 | Site | Change |
 |---|---|
-| `src/config/schema.ts` | `agent` field on Matrix/Discord account schemas; `[agents.*]` Record (strict values: `workspace_root`, optional `sandbox`); §4.2 validation (legacy exclusivity, unmatched names, disjoint roots) |
+| `src/config/schema.ts` | `agent` field on Matrix/Discord account schemas; `[agents.*]` Record (strict values: `workspace_root`, optional `sandbox`); §4.2 validation (legacy exclusivity, unmatched names, disjoint roots); make `workspace.root_dir` schema-optional + drop from `00-defaults.toml` with code-side default (§4.2); §3 key/name validation (colon = hard error on account keys, warn otherwise; full class on agent names) |
 | `src/app.ts` | build resolver `(provider, accountKey) → {agent, workspaceRoot, memoryWriter, sandbox}` (today's single `workspace.root_dir` resolution at app.ts is the injection point everything else inherits from); seed each workspace; construct per-agent `MemoryFileWriter`s; resolve all account self-ids eagerly before inbound starts and fold them into limit/trigger exclusion sets (§9) |
 | `src/agent/factory.ts` | both `workspace.root_dir` reads become per-session resolution from the trigger's `timeline_key` |
 | `src/workspace/` | unchanged (already parameterized by root) |
 | `src/diary/worker-pool.ts` | per-job agent resolution from the summary's `timeline_key`; write via that agent's `MemoryFileWriter`; per-agent recent-memory window + header |
-| `src/retrieval/` | `agent` column on `memory_chunks` (+ index + migration); indexer walks every agent's `memory/`, stamping owner; all query paths filter by requesting agent; `embedding_cache` untouched |
+| `src/retrieval/` | `agent` column on `memory_chunks` (+ `(agent, id)` uniqueness + index + migration, §7.1); indexer walks every agent's `memory/`, stamping owner; all query paths filter by requesting agent; `embedding_cache` untouched |
 | `src/search/` + search/recap tools | account-set filter derived from the calling session's agent (§7.2) |
 | `src/enrichment/worker*.ts` | per-event root resolution; `msg-attach/<provider>.<accountKey>/` layout (§7.4) |
 | `src/captioning/` | same per-event root resolution for media reads (takes `workspaceRoot` as a constructor option today, like enrichment) |
 | `src/summarization/` | mirror worker (donor-completion watch, `external_id` lineage mapping, condensation-tree copy, status propagation); indexer + condensation evaluator skip mirrored timelines; participant-naming tweak in summarize/condense instructions (§10b) |
 | `src/agent/recovery.ts` | per-session root resolution for media re-reads |
 | `src/tools/*` (memory, read-image, x-fetch, character card, set-profile) | already take `workspaceRoot` via context — thread the session's resolved root |
-| `src/sandbox/` | `SandboxManager` per strict agent; shared-mode parent mount + per-exec cwd (§10) |
+| `src/sandbox/` | `SandboxManager` per strict agent; shared-mode parent mount + per-exec cwd; §10 validation incl. no-strict-root-under-shared-mount |
 | `src/browser/` + factory | per-agent `BrowserSession` construction and session routing (§10a) |
-| trigger paths (`src/matrix/inbound.ts`, `src/discord/normalizer.ts`, reply-trigger resolution) | sibling self-id handling per `[siblings]` mode; extract Discord `author.bot` (§9) |
-| `src/budget/` | optional `agent` matcher on rule normalization + enforcement; attribution via timeline-key parse + config map; stamp `timeline_key`/`provider` on background-lane usage inserts (§8) |
+| trigger paths (`src/matrix/inbound.ts`, `src/discord/normalizer.ts`, reply-trigger resolution) | sibling self-id handling per `[siblings]` mode; extract Discord `author.bot` + `webhook_id` (§9) |
+| `src/budget/` | optional `agent` matcher on rule normalization + enforcement; attribution via timeline-key parse + config map (§8; embedding-lane rows have no `timeline_key` and match only global rules) |
 | console | BFF's single `workspaceRoot` dependency becomes per-session agent resolution (context/media re-reads are functional, not cosmetic); agent/account filter chips may lag all phases |
 
 ---
@@ -816,9 +880,10 @@ note.
 3. **Attachments**: account-scoped `msg-attach` subdirs + per-event root
    resolution (§7.4).
 4. **Sandbox modes** (§10) and per-agent browser profiles (§10a).
-5. **Optional, default-off**: `agent` matcher on limit rules + background-lane
-   usage stamping (§8); `[siblings] replies = "capped"` bot-to-bot
-   containment + Discord `author.bot` extraction (§9); **summary mirroring**
+5. **Optional, default-off**: `agent` matcher on limit rules (§8);
+   `[siblings] replies = "capped"` bot-to-bot containment, the
+   `third_party_bots` knob and Discord `author.bot`/`webhook_id` extraction
+   (§9); **summary mirroring**
    (§10b) with the participant-naming instruction tweak (the tweak itself is
    generic and may land in any earlier phase); shared content-addressed
    attachment store with per-agent hardlinks (the only *storage* item with
@@ -833,10 +898,11 @@ Phases 2–5 are independent of each other once 1 is in.
 
 Resolved since first draft: browser (per-agent Manager profiles, §10a),
 bot-to-bot conversation (capped mode, §9), `user_identities` scoping
-(audited; shared with a guard rule, §7.5).
+(audited; shared with a guard rule, §7.5), third-party bots and webhooks
+(§9), donor-silent mirroring fallback (§10b), embedding-spend attribution
+(excluded from agent-scoped rules, §8), shared-DB write throughput
+(non-issue: SQLite is single-writer regardless — multi-agent adds row
+volume through the same queue, not a new bottleneck).
 
-- **Shared-DB write throughput**: N agents multiply write volume through the
-  one single-writer queue; assumed fine at persona scale (single-digit N),
-  unmeasured.
 - **Matrix third-party-bot marking**: no reliable bot flag exists on Matrix;
   the §9 chain cap covers siblings and flagged Discord bots only.
