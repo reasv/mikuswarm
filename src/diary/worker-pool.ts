@@ -21,10 +21,27 @@ import { recentMemoryWindow } from "./recent-window.js";
 export interface DiaryWorkerPoolOptions {
   storage: Storage;
   factory: AgentSessionFactory;
-  /** Single-writer FIFO for the day-file append (shared with `write_memory`, §9b). */
+  /**
+   * Single-writer FIFO for the day-file append in legacy (single-agent) mode.
+   * In agents mode, `resolveJobDeps` takes precedence — the per-job writer is
+   * resolved from the summary's `timeline_key`. Both fields are present for
+   * legacy compatibility; `resolveJobDeps` short-circuits `memoryWriter` and
+   * `workspaceRoot` when agents mode is active.
+   */
   memoryWriter: MemoryFileWriter;
   config: DiaryConfig;
   workspaceRoot: string;
+  /**
+   * Per-job workspace resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
+   * Maps the summary's `timeline_key` to its owning agent's workspace root
+   * and `MemoryFileWriter`. When absent (legacy mode), the pool uses the
+   * singleton `workspaceRoot` + `memoryWriter` above.
+   *
+   * When present and the key is unresolvable (§4.3 — account no longer in
+   * config), the pool skips the job with a warning rather than guessing a
+   * default agent.
+   */
+  resolveJobDeps?: (timelineKey: string) => { workspaceRoot: string; memoryWriter: MemoryFileWriter } | undefined;
   /**
    * Resolve a human channel label for a timeline (Matrix: `Room (Space)`). May
    * throw; the worker retries a few times and falls back to the room id parsed
@@ -262,13 +279,37 @@ export class DiaryWorkerPool {
   }
 
   private async runJob(job: DiaryJob): Promise<void> {
-    const { storage, factory, memoryWriter, config, logger } = this.options;
+    const { storage, factory, config, logger } = this.options;
     const started = Date.now();
     logger.debug("diary_job_claimed", {
       summaryId: job.summaryId,
       timelineKey: job.timelineKey,
       attempt: job.attempts,
     });
+
+    // Per-job agent resolution (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
+    // When `resolveJobDeps` is present (agents mode), resolve the workspace
+    // root and memory writer for the job's owning agent. When the account is
+    // no longer in config (§4.3), skip the job with a warning.
+    let workspaceRoot: string;
+    let memoryWriter: MemoryFileWriter;
+    if (this.options.resolveJobDeps) {
+      const deps = this.options.resolveJobDeps(job.timelineKey);
+      if (!deps) {
+        logger.warn("diary_job_unresolvable_account", {
+          summaryId: job.summaryId,
+          timelineKey: job.timelineKey,
+          message: "diary job skipped: timeline key maps to an account not in config (§4.3)",
+        });
+        await storage.setDiaryStatus(job.summaryId, "skipped");
+        return;
+      }
+      workspaceRoot = deps.workspaceRoot;
+      memoryWriter = deps.memoryWriter;
+    } else {
+      workspaceRoot = this.options.workspaceRoot;
+      memoryWriter = this.options.memoryWriter;
+    }
 
     const maxRetries = config.max_retries ?? DEFAULT_MAX_RETRIES;
 
@@ -301,7 +342,7 @@ export class DiaryWorkerPool {
     // Read-only continuity context (§8/§9a): the recent-memory window anchored at
     // the range's last day, bounded by the same ceiling + header-trim as §10a.
     const continuity = await recentMemoryWindow({
-      workspaceRoot: this.options.workspaceRoot,
+      workspaceRoot,
       anchorDay: targetDate,
       ceilingTokens: config.recency_max_tokens ?? DEFAULT_RECENCY_MAX_TOKENS,
       fileCount: config.recency_file_count ?? DEFAULT_RECENCY_FILE_COUNT,

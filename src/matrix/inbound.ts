@@ -32,6 +32,12 @@ export function mediaToAttachment(eventId: string, media: MatrixInboundMedia): A
 export interface MatrixInboundContext {
   accountId: string;
   selfUserId: string;
+  /**
+   * Self-ids of all other in-process bot accounts (spec MULTI-AGENT-SUPPORT §9).
+   * A message from any of these user-ids is suppressed as a trigger in
+   * `[siblings] replies = "never"` mode (the Phase 1 default).
+   */
+  siblingUserIds?: Set<string>;
 }
 
 export function timelineKeyForMatrixEvent(accountId: string, event: MatrixInboundEvent): string {
@@ -124,6 +130,10 @@ function detectTrigger(
   mentionedSelf: boolean,
 ): TriggerInfo | undefined {
   if (event.senderId === context.selfUserId) return undefined;
+  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9): in-process sibling bot
+  // accounts never trigger a session (default "never" mode). The set is
+  // populated before inbound starts and includes all self-ids across all agents.
+  if (context.siblingUserIds?.has(event.senderId)) return undefined;
   if (event.chatType === "direct") {
     return {
       type: "dm",

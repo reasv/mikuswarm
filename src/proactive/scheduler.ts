@@ -104,6 +104,13 @@ export function evaluateGate(
   events: CanonicalChatEvent[],
   now: number,
   eff: Pick<EffectiveChannelConfig, "deadChannelBackstopMs" | "minUserMessages">,
+  /**
+   * Self-ids of all in-process bot accounts (spec MULTI-AGENT-SUPPORT §9).
+   * Events from these senders are treated as bot traffic, not human activity,
+   * so they do not count toward `minUserMessages` and do not reset the
+   * "no recent human" backstop for proactive posting.
+   */
+  siblingUserIds?: Set<string>,
 ): GateDecision {
   const newest = events[events.length - 1];
   if (!newest || now - newest.timestamp > eff.deadChannelBackstopMs) {
@@ -118,7 +125,14 @@ export function evaluateGate(
   }
   let humanCount = 0;
   for (let i = lastAssistantIdx + 1; i < events.length; i++) {
-    if (events[i]!.role !== "assistant") humanCount++;
+    const event = events[i]!;
+    if (event.role !== "assistant") {
+      // Sibling bot messages (spec MULTI-AGENT-SUPPORT §9): treat as bot
+      // traffic, not human activity — exclude from the human-message count.
+      const senderId = event.sender?.id;
+      if (senderId && siblingUserIds?.has(senderId)) continue;
+      humanCount++;
+    }
   }
   if (humanCount < eff.minUserMessages) return { ok: false, reason: "skip_sparse" };
   return { ok: true };
@@ -269,6 +283,13 @@ export interface ProactiveSchedulerOptions {
    * for backward compatibility.
    */
   getSelf?: (provider: string, accountId: string) => SelfIdentity | undefined;
+  /**
+   * Self-ids of all in-process bot accounts across all agents
+   * (spec MULTI-AGENT-SUPPORT §9). When set, sibling messages are treated as
+   * bot traffic rather than human activity in the eligibility gate, so they
+   * do not satisfy `minUserMessages` or reset the dead-channel backstop.
+   */
+  siblingUserIds?: Set<string>;
   logger: Logger;
   /** Injectable clock/RNG for deterministic tests. */
   now?: () => number;
@@ -427,7 +448,7 @@ export class ProactiveScheduler {
       timelineKey: eff.timelineKey,
       limit: proactiveGateScanLimit(eff.minUserMessages),
     });
-    const gate = evaluateGate(events, now, eff);
+    const gate = evaluateGate(events, now, eff, this.options.siblingUserIds);
     if (!gate.ok) return { decision: gate.reason, ...base };
 
     if (!this.options.triggerCoordinator.tryAcquire(eff.timelineKey)) {

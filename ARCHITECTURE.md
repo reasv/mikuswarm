@@ -189,9 +189,12 @@ media:      { download_size_limit,
                        x264_preset, cache_max_bytes, cache_target_bytes },
               audio: { max_bytes, max_duration_seconds } }
 storage:    { database_path }
-workspace:  { root_dir }
+workspace?: { root_dir? }   // optional; omit entirely in agents mode (§4c). root_dir defaults to "./workspaces/miku" in legacy single-agent mode
+agents?:    Record<string, { workspace_root }>  // agents mode (§4c): one block per agent, each with an absolute or relative workspace path
+siblings?:  { replies?: "never",                // suppress triggers from in-process sibling accounts; "never" is the only value (§4c)
+              max_bot_chain?: integer }          // max consecutive bot-to-bot exchanges (reserved; Phase 5b)
 matrix:     { enabled, trigger_hold_ms, trigger_group_lookback_ms?,
-              accounts: Record<string, MatrixAccount> }
+              accounts: Record<string, MatrixAccount & { agent?: string }> }  // agent?: which [agents.*] block this account belongs to (§4c); defaults to the account key
 timeline?:  { initial_backfill_messages?, initial_backfill_window_ms?,
               initial_backfill_timeout_ms?, initial_backfill_page_size?,
               inactive_event_retention_days?,
@@ -328,7 +331,7 @@ The shared primitive `seedDirMissing(srcDir, destDir)` recursively copies files 
 The templates root is resolved from the env override **`MIKUSWARM_TEMPLATES_DIR`**, else `<cwd>/templates`. Seeding runs in two phases, at two points in startup:
 
 - **Config seeding — PRE config load** (`seedConfigDir`, wired in `src/index.ts` *before* `loadConfig`). The loader fail-fasts on a missing/empty config dir, so this must precede it; it cannot read config and uses only the env/default templates root. Copy-missing it seeds `<configDir>/90-local.toml` from `templates/config/90-local.toml`, and `<configDir>/00-defaults.toml` from the repo's own `config/00-defaults.toml` (today's source of truth; skipped when source and destination resolve to the same path).
-- **Workspace + feature-skill seeding — POST config load** (`seedWorkspace`, `seedFeatureSkills`, wired in `startMikuAgent` once `workspaceRoot` is known). `seedWorkspace` seeds `templates/workspace/` only when the workspace is **empty**, defined conservatively as having **neither `AGENTS.md` nor `SOUL.md`** — an emptiness gate that avoids partially seeding into an established workspace (and `seedDirMissing` still never overwrites even if the gate let a populated dir through). `seedFeatureSkills` then copies `templates/features/<feature>/skills/*` into `<workspaceRoot>/skills/` for each feature whose gate is strictly `true` (`enabledFeatureNames`, §4 Feature gates) — a no-op when a skill's files already exist.
+- **Workspace + feature-skill seeding — POST config load** (`seedWorkspace`, `seedFeatureSkills`, wired in `startMikuAgent` once `workspaceRoot` is known). In **legacy mode** this runs once for the single workspace root. In **agents mode** (§4c) it runs once per declared agent, each with its own `workspace_root`. `seedWorkspace` seeds `templates/workspace/` only when the workspace is **empty**, defined conservatively as having **neither `AGENTS.md` nor `SOUL.md`** — an emptiness gate that avoids partially seeding into an established workspace (and `seedDirMissing` still never overwrites even if the gate let a populated dir through). `seedFeatureSkills` then copies `templates/features/<feature>/skills/*` into `<workspaceRoot>/skills/` for each feature whose gate is strictly `true` (`enabledFeatureNames`, §4 Feature gates) — a no-op when a skill's files already exist.
 
 ---
 
@@ -347,6 +350,68 @@ Two defenses run together:
 - **`process.env.TZ` + sandbox `TZ`** as a backstop for any unaudited path that falls back to system-local formatting (`Date#toString`, `toLocaleString`, and the Docker sandbox's `date`/`ls -l`). The configured zone is injected as `TZ` both at container creation (`src/app.ts`) and re-applied per `docker exec` (`src/sandbox/docker-exec-backend.ts`) so a long-lived container created before the zone was set still uses it.
 
 **Deliberately excluded** (these never reach a chat user or the agent): structured JSON logs (`src/observability/logger.ts`), context-dump `createdAt` metadata, and the observability console API timestamps stay UTC/epoch (operator-facing; the console UI formats in the operator's own browser). Captioning MM:SS values are media-relative *durations*, not wall-clock, so they are not a timezone concern. The Rust native layer needs no change: it emits epoch-ms or `DateTime<Utc>` across the NAPI bridge, and the TS layer is the sole formatter — UTC does not reveal the host's local zone. Internal `Date.now()` used for event ordering, queues, and DB columns is untouched (epoch is zone-agnostic).
+
+---
+
+## 4c. Agents and accounts (multi-agent Phase 1)
+
+MikuSwarm supports running **multiple bot accounts** (one per provider credential) within a single process. An **account** is a connector credential — a `(provider, accountKey)` pair. An **agent** is an identity bundle: workspace directory, diary, and memory files. Phase 1 establishes the mapping between them.
+
+### Two modes
+
+**Legacy mode** (no `[agents]` table): a single implicit agent is created. The workspace root comes from `config.workspace?.root_dir` (default `"./workspaces/miku"`). Every account — Matrix and Discord — maps to this one workspace. Behavior is byte-identical to the pre-Phase-1 code path; no existing deployment needs any config change.
+
+**Agents mode** (`[agents]` table present with at least one entry): each agent block names its own `workspace_root`. The `(provider, accountKey)` → agent mapping is:
+
+1. If the account has an `agent` field (e.g. `[matrix.accounts.miku]\nagent = "alice"`), use that as the agent name.
+2. Otherwise the account key itself is the agent name (e.g. `[matrix.accounts.alice]` → agent `alice`).
+
+Every resolved agent name must be declared in `[agents]`. Workspace roots must be **pairwise disjoint** (no nesting) — checked at startup via `path.resolve()`.
+
+### Resolver
+
+`resolveWorkspaceForTimeline(timelineKey)` (a closure in `startMikuAgent`) maps a timeline key's `provider:accountKey` prefix to an `AgentWorkspaceEntry` (`{ agentName, workspaceRoot, memoryWriter }`). This single resolver is threaded into:
+
+- **`AgentSessionFactory`** (`resolveWorkspaceRoot`) — per-session tool wiring picks up the correct `workspaceRoot`
+- **`ContextBuilder`** (`resolveWorkspaceRoot`) — diary and image layers read the per-session workspace
+- **`DiaryWorkerPool`** (`resolveJobDeps`) — diary jobs resolve workspace + `MemoryFileWriter` from the stored `timeline_key`
+- **`buildSessionTools`** — shadows the outer `workspaceRoot`/`memoryWriter` with per-session values at the top of every tool-set construction
+- Recovery paths (`resumeSessionRun`, `createManualResumeSession`, `evaluateResumeGate`) — each resolves the workspace from the session's stored `timeline_key`
+
+### §4.3 unresolvable-account rule
+
+When a timeline key's account is no longer in config (removed after rows were committed), `resolveWorkspaceForTimeline` returns `undefined` and logs `agent_unresolvable_account`. Each consumer then **skips** the identity-dependent action rather than guessing a default root. Specifically:
+
+- **Diary pool** (`DiaryWorkerPool`): marks the job `skipped` via `setDiaryStatus("skipped")`
+- **`AgentSessionFactory.create()` / `buildPreview()`**: throws a descriptive error (caught by `launchSession`'s catch block → `markDiscarded` + drain)
+- **`buildSessionTools`**: throws in agents mode (caught by the same catch blocks in `launchSession` / `runResumeSession`)
+- **`resumeSessionRun`** (manual console resume): returns `{ outcome: "fatal" }` → the console surfaces the reason to the operator
+- **Resume `loadMaterial` closures** (`evaluateFollowUpResumeGate`, `evaluateResumeGate`, `createManualResumeSession`): return `null` → the gate rejects the resume and falls through to a fresh launch or a "not resumable" outcome
+- **Enrichment, recovery, and other per-event readers** (Phases 3+): skip the identity-dependent write/read
+
+No consumer falls back to a guessed or first-agent root in agents mode. This prevents silent data contamination between workspaces. In **legacy mode** (no `[agents]` table) `resolveWorkspaceForTimeline` always returns the singleton entry, so this rule is never triggered.
+
+### Sibling suppression
+
+When multiple accounts run in one process they can see each other's messages. Without suppression a message from one bot account could trigger another. Phase 1 adds a **`siblingUserIds: Set<string>`** property to both `MatrixProvider` and `DiscordProvider`; it is populated with the combined set of all self-ids for all registered accounts (`botSelfIdsForLimits`). This set is held **by reference** — Matrix self-ids are known at startup and Discord self-ids are resolved via a REST `GET /users/@me` call **inside `DiscordProvider.start()`** (before `attachListeners`/`client.login()`) so the set is complete before the first gateway event arrives. The READY event also calls `onSelfResolved()` as a belt-and-suspenders backstop. `start()` throws if the REST call fails (fail-fast policy — a partial suppression set is worse than a clean startup failure). Consumers that check the set:
+
+- `MatrixProvider.emitWithTriggerHold` → skips the reply-trigger path if the sender is in the sibling set (prevents sibling replies from producing a trigger)
+- `MatrixProvider.normalizeMatrixInboundEvent` → `detectTrigger` skips if `event.senderId` is in the sibling set
+- `DiscordProvider.handleMessageCreate` → skips the reply-trigger path if the sender is in the sibling set; `detectDiscordTrigger` skips if `msg.authorId` is in the sibling set
+- `evaluateGate` (proactive eligibility) — messages from sibling senders are excluded from the human-message count that gates proactive posting
+
+### Config validation
+
+`validateAgentConfig(config: AppConfig)` (exported from `src/app.ts`) is the pure, synchronous cross-field guard called at the top of `startMikuAgent`:
+
+- `[matrix|discord].accounts.*` key contains `:` → hard startup error (breaks `parseTimelineKey`)
+- `[agents]` + `[workspace].root_dir` both present → hard error (mutually exclusive)
+- Agent name outside `[a-z0-9-]+` → hard error
+- Account refers to undeclared agent → hard error
+- Workspace roots overlap → hard error
+- `agent` field on account without an `[agents]` table → hard error
+
+Out-of-class account key characters (not `[a-z0-9-]` but no colon) are a logged warning only, after `validateAgentConfig` returns.
 
 ---
 
@@ -413,7 +478,7 @@ Optional return payloads: `react` returns the resolved display string the platfo
 
 All these conditions hold true for Matrix, so the Matrix session tool schema is byte-identical to what it was before Phase 4.
 
-A `[discord]` config block (peer of `[matrix]`) enables the Discord provider. Schema: `enabled` (default `false`), `trigger_hold_ms` (default 0), `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`. When `enabled = true` and at least one account is configured, `DiscordProvider` is constructed and registered in the providers map. See the **Discord Provider** section below for the full implementation details.
+A `[discord]` config block (peer of `[matrix]`) enables the Discord provider. Schema: `enabled` (default `false`), `trigger_hold_ms` (default 0), `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`, and the optional `agent` field (§4c — which `[agents.*]` block this account maps to; defaults to the account key). When `enabled = true` and at least one account is configured, `DiscordProvider` is constructed and registered in the providers map. See the **Discord Provider** section below for the full implementation details.
 
 ### Provider registry
 

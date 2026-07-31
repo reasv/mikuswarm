@@ -85,6 +85,14 @@ export class MatrixProvider implements IChatProvider {
   private stopped = false;
   private readonly activePolls = new Set<Promise<void>>();
 
+  /**
+   * Self-ids of all in-process bot accounts across all agents (spec
+   * MULTI-AGENT-SUPPORT §9). Injected by app.ts after construction. When set,
+   * sibling messages in the "never" mode (Phase 1 default) never trigger a
+   * session.
+   */
+  siblingUserIds?: Set<string>;
+
   constructor(private readonly config: AppConfig["matrix"]) {}
 
   async start(host: ChatProviderHost): Promise<void> {
@@ -268,6 +276,7 @@ export class MatrixProvider implements IChatProvider {
       const inbound = normalizeMatrixInboundEvent(nativeEvent.event, {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
+        siblingUserIds: this.siblingUserIds,
       });
       this.emitWithTriggerHold(inbound);
     }
@@ -293,12 +302,16 @@ export class MatrixProvider implements IChatProvider {
     // a resolved trigger flows through the exact same hold/debounce/same-sender
     // grouping as a native dm/mention — one held, grouped trigger-bearing
     // delivery (no late synthesis past the hold). Self-replies are excluded (a
-    // bot reply to its own message is never a trigger). The downstream
-    // resume-vs-fresh fork still happens in the app; the provider only classifies.
+    // bot reply to its own message is never a trigger). Sibling bot accounts are
+    // excluded here in parallel with detectTrigger (spec MULTI-AGENT-SUPPORT §9):
+    // the message is still ingested normally — only the trigger is suppressed.
+    // The downstream resume-vs-fresh fork still happens in the app; the provider
+    // only classifies.
     if (
       !inbound.trigger &&
       inbound.event.replyTo?.externalId &&
       !inbound.event.sender.isSelf &&
+      !this.siblingUserIds?.has(inbound.event.sender.id) &&
       this.host?.resolveReplyTrigger
     ) {
       const replyTrigger = this.host.resolveReplyTrigger({

@@ -153,6 +153,12 @@ export interface DiscordMessageData {
 export interface DiscordNormalizerContext {
   accountId: string;
   selfUserId: string;
+  /**
+   * Self-ids of all other in-process bot accounts (spec MULTI-AGENT-SUPPORT §9).
+   * A message from any of these user-ids is suppressed as a trigger in
+   * `[siblings] replies = "never"` mode (the Phase 1 default).
+   */
+  siblingUserIds?: Set<string>;
 }
 
 // ── Key construction ─────────────────────────────────────────────────────────
@@ -361,6 +367,10 @@ export function detectDiscordTrigger(
   isSelf: boolean,
 ): TriggerInfo | undefined {
   if (isSelf) return undefined;
+  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9): in-process sibling bot
+  // accounts never trigger a session (default "never" mode). The set is
+  // populated before inbound starts and includes all self-ids across all agents.
+  if (ctx.siblingUserIds?.has(msg.authorId)) return undefined;
   const sender: SenderInfo = {
     id: msg.authorId,
     username: msg.authorUsername,

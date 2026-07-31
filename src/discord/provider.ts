@@ -234,6 +234,16 @@ export class DiscordProvider implements IChatProvider {
   private host?: ChatProviderHost;
   private stopped = false;
 
+  /**
+   * Self-ids of all in-process bot accounts across all agents (spec
+   * MULTI-AGENT-SUPPORT §9). Injected by app.ts after construction so the set
+   * is shared by reference with the limit engine's exclusion set — mutations
+   * (Discord READY / eager REST resolution) are automatically visible.
+   * When set, sibling messages in the "never" mode (Phase 1 default) never
+   * trigger a session.
+   */
+  siblingUserIds?: Set<string>;
+
   constructor(
     private readonly config: NonNullable<AppConfig["discord"]>,
     private readonly callbacks: DiscordProviderCallbacks,
@@ -283,6 +293,54 @@ export class DiscordProvider implements IChatProvider {
       };
 
       this.accounts.set(accountId, runtime);
+
+      // Resolve self-id via REST BEFORE attaching listeners and connecting the
+      // gateway (spec MULTI-AGENT-SUPPORT §9 "no startup window"). A direct fetch
+      // with the bot token is used because the discord.js client is not yet
+      // authenticated at this point (authentication happens through the gateway
+      // READY event, which fires after login()). Without this pre-resolution the
+      // siblingUserIds set would be incomplete during the guild-replay burst that
+      // arrives immediately after READY, creating a window where a sibling
+      // message could erroneously trigger a session.
+      //
+      // Fail-fast policy: a REST failure throws here, propagating out of start()
+      // and failing startup. An incomplete suppression set is worse than a clean
+      // startup failure — a silent partial set would pass sibling messages as
+      // triggers until READY fires. If READY fires first (race on very fast
+      // connections) the runtime.self check below makes this call a no-op.
+      if (!runtime.self) {
+        try {
+          const response = await fetch("https://discord.com/api/v10/users/@me", {
+            headers: {
+              Authorization: `Bot ${runtime.token}`,
+              "User-Agent": "MikuSwarm (Discord self-id startup resolution)",
+            },
+          });
+          if (!response.ok) {
+            throw new Error(`Discord REST /users/@me returned HTTP ${response.status} for account "${accountId}"`);
+          }
+          const data = (await response.json()) as {
+            id: string;
+            username: string;
+            global_name?: string;
+          };
+          if (!runtime.self) {
+            runtime.self = {
+              id: data.id,
+              username: data.username,
+              displayName: data.global_name ?? data.username,
+            };
+            this.callbacks.onSelfResolved?.(accountId, data.id);
+          }
+        } catch (err) {
+          throw new Error(
+            `Discord self-id resolution failed for account "${accountId}" — ` +
+            `cannot start with an incomplete sibling suppression set (§9): ` +
+            (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
+
       this.attachListeners(runtime);
 
       // discord.js login is async; errors surface through the host
@@ -887,7 +945,11 @@ export class DiscordProvider implements IChatProvider {
 
     const parentChannelId = await this.resolveParentChannelId(runtime, message);
     const msgData = extractMessageData(message, parentChannelId);
-    const ctx = { accountId: runtime.accountId, selfUserId: selfId ?? "" };
+    const ctx = {
+      accountId: runtime.accountId,
+      selfUserId: selfId ?? "",
+      siblingUserIds: this.siblingUserIds,
+    };
 
     const { inbound, embedPreviews } = normalizeDiscordMessage(msgData, ctx);
 
@@ -935,8 +997,15 @@ export class DiscordProvider implements IChatProvider {
       return;
     }
 
-    // Check for reply-to-bot trigger (spec §8.2)
-    if (!inbound.trigger && inbound.event.replyTo?.externalId) {
+    // Check for reply-to-bot trigger (spec §8.2). Sibling bot accounts are
+    // excluded here in parallel with detectDiscordTrigger (spec
+    // MULTI-AGENT-SUPPORT §9): the message is still ingested normally — only
+    // the trigger is suppressed.
+    if (
+      !inbound.trigger &&
+      inbound.event.replyTo?.externalId &&
+      !this.siblingUserIds?.has(inbound.event.sender.id)
+    ) {
       const replyTrigger = this.host!.resolveReplyTrigger?.({
         provider: "discord",
         externalId: inbound.event.replyTo.externalId,
@@ -998,7 +1067,11 @@ export class DiscordProvider implements IChatProvider {
     }
 
     // User edit: route as InboundChatEvent with edit marker
-    const ctx = { accountId: runtime.accountId, selfUserId: selfId ?? "" };
+    const ctx = {
+      accountId: runtime.accountId,
+      selfUserId: selfId ?? "",
+      siblingUserIds: this.siblingUserIds,
+    };
     const { inbound } = normalizeDiscordMessage(msgData, ctx);
 
     // Mark as edit
