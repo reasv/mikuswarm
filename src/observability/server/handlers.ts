@@ -12,6 +12,7 @@ import type {
   AgentSessionStatus,
   ToolInvocationRow,
 } from "../../storage/index.js";
+import { parseTimelineKey } from "../../storage/timeline-key.js";
 import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
@@ -19,14 +20,21 @@ import type { RequestContext } from "./types.js";
 
 /** GET /api/rooms — timelines, reverse-chron by last activity (spec §8). */
 export function listRooms(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
-  const rooms = ctx.deps.storage.listConsoleRooms().map((row) => ({
-    timelineKey: row.timeline_key,
-    displayName: row.display_name,
-    timelineState: row.timeline_state,
-    lastActivityAt: row.last_activity_at,
-    eventCount: row.event_count,
-    sessionCount: row.session_count,
-  }));
+  const rooms = ctx.deps.storage.listConsoleRooms().map((row) => {
+    // Surface the key's provider/account segments so the console can group rooms
+    // per account without re-implementing the timeline-key grammar client-side.
+    const parsed = parseTimelineKey(row.timeline_key);
+    return {
+      timelineKey: row.timeline_key,
+      provider: parsed?.provider ?? null,
+      accountId: parsed?.accountId ?? null,
+      displayName: row.display_name,
+      timelineState: row.timeline_state,
+      lastActivityAt: row.last_activity_at,
+      eventCount: row.event_count,
+      sessionCount: row.session_count,
+    };
+  });
   sendJson(res, 200, { rooms });
 }
 

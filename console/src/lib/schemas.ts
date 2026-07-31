@@ -76,6 +76,11 @@ export type ContextMessageWire = Schema.Schema.Type<typeof ContextMessageWire>;
 /** GET /api/rooms */
 export const Room = Schema.Struct({
 	timelineKey: Schema.String,
+	// Provider/account segments of the timeline key, parsed server-side (null for a
+	// malformed key). Optional for backward compatibility with an older BFF that
+	// omits them — without them the room list simply renders untabbed.
+	provider: Schema.optional(Schema.NullOr(Schema.String)),
+	accountId: Schema.optional(Schema.NullOr(Schema.String)),
 	displayName: Schema.NullOr(Schema.String),
 	timelineState: Schema.NullOr(Schema.String),
 	lastActivityAt: Schema.NullOr(Schema.Number),

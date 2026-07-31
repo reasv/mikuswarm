@@ -25,6 +25,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Console: per-account room tabs**: when the room list spans more than one
+  chat account (e.g. a Matrix account and a Discord account), the Conversations
+  room list gains a sub-tab row — "All" plus one tab per account, each tagged
+  with its provider — filtering the list to that account's rooms. With a single
+  account the layout is unchanged. `GET /api/rooms` now carries each room's
+  `provider` and `accountId`.
+
 - **Discord provider**: first-class Discord support. A `[discord]` config block
   (peer of `[matrix]`, default `enabled = false`) wires one or more Discord bot
   accounts. All user-facing behaviour — trigger detection, context assembly, tool
