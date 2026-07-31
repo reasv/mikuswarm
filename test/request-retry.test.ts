@@ -763,8 +763,16 @@ test("withRequestRetry: a BUDGET expiry during the backoff sleep stays environme
   // semantics (parks failed-resumable) — only a CALLER abort surfaces `aborted`.
   await withPinnedRandom(0.999, async () => {
     const { fn, calls } = scriptedBase([{ events: [errorEvent("503 unavailable")] }]);
-    // backoff (200ms) outlasts the budget (25ms): the budget aborts the sleep.
-    const wrapped = withRequestRetry(fn, { maxWaitMs: 25, backoffBaseMs: 200, backoffMaxMs: 200 });
+    // The backoff (3s, pinned full) far outlasts the budget (1s): the wrapper
+    // enters the backoff sleep after the first failure and the budget expires
+    // inside it. The generous absolute values matter — with a tiny budget
+    // (formerly 25ms) a build-gate CPU stall between the first failure and its
+    // deadline check exhausts the budget BEFORE the sleep is ever entered,
+    // exiting at calls()===1 and flaking the asymmetry assert below. Now the
+    // scenario holds unless the instant scripted failure takes >1s to settle,
+    // and either deadline race (mid-sleep abort → continue, or a clean
+    // capped-sleep end) issues the second attempt first.
+    const wrapped = withRequestRetry(fn, { maxWaitMs: 1000, backoffBaseMs: 3000, backoffMaxMs: 3000 });
     const events = await drain(wrapped(MODEL, CONTEXT, undefined));
     // The budget-expiry catch `continue`s; the loop re-enters and issues at least
     // one more attempt before the now-expired budget forces the wait-exhausted

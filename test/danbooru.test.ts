@@ -1431,6 +1431,14 @@ test("limiter: API and CDN requests share one budget (preview paces JSON + asset
           config: { base_url: server.url, max_regular_tags: 3, min_request_interval_ms: 120, max_in_flight: 2 },
         }),
       );
+      // Pacing baseline taken BEFORE the tool runs (same rationale as the
+      // concurrent-starts test above): under build-gate CPU load the API hit's
+      // own timestamp can lag its reserved start instant while the CDN pacing
+      // timer stays on schedule, shrinking an apiHitAt→cdnHitAt gap below the
+      // real interval. The API start is reserved at ≥ t0 and the CDN start at
+      // ≥ that + 120, and timers never fire early, so `cdnHitAt - t0` is a
+      // load-robust lower bound on the shared-budget pacing.
+      const t0 = Date.now();
       const result = await tool.execute("t-budget", {
         action: "preview",
         postId: 99,
@@ -1439,7 +1447,7 @@ test("limiter: API and CDN requests share one budget (preview paces JSON + asset
       assert.ok(result.content.some((c: { type: string }) => c.type === "image"), "preview succeeds");
       assert.equal(calls.length, 1, "exactly one CDN asset fetch");
       assert.ok(apiHitAt > 0 && cdnHitAt > 0);
-      const gap = cdnHitAt - apiHitAt;
+      const gap = cdnHitAt - t0;
       assert.ok(
         gap >= 90,
         `the CDN fetch must be paced behind the API call by the shared budget (~120ms), got ${gap}ms`,

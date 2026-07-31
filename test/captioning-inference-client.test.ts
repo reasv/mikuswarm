@@ -65,8 +65,14 @@ test("InferenceClient: stop() aborts a queued scheduler acquire (#6)", async () 
     });
 
     const pending = client.caption({ filePath, mimeType: "image/png", filename: "test.png" });
-    // Give caption() a tick to reach the (blocking) acquire, then stop the client.
-    await new Promise((r) => setTimeout(r, 20));
+    pending.catch(() => {}); // observed via assert.rejects below; pre-arm so an early rejection is never unhandled
+    // Wait until caption() actually reaches the (blocking) acquire. A fixed short
+    // delay flakes under build-gate CPU/IO load: the file read that precedes the
+    // acquire can outlast it, leaving `acquireSignal` unset. Bounded poll instead.
+    const deadline = Date.now() + 5_000;
+    while (acquireSignal === undefined && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     assert.ok(acquireSignal !== undefined, "a signal was passed to acquire");
     assert.equal(acquireSignal!.aborted, false, "not yet aborted before stop()");
 

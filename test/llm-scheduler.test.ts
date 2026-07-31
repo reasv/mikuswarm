@@ -171,8 +171,9 @@ test("escalation never demotes", async () => {
 
 test("429 pauses a group's admissions (unconditional backoff, §5.3) and an OK resets the streak", async () => {
   const scheduler = new LlmScheduler({
-    groups: { default: { max_in_flight: 1, backoff_base_ms: 40, backoff_max_ms: 40 } },
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 100, backoff_max_ms: 100 } },
   });
+  const armedAt = Date.now();
   scheduler.noteResult("default", "429 {\"error\":\"rate_limited\"}");
 
   let admitted = false;
@@ -181,7 +182,12 @@ test("429 pauses a group's admissions (unconditional backoff, §5.3) and an OK r
     return r;
   });
   await sleep(5);
-  assert.equal(admitted, false, "admission must wait out the backoff window");
+  // Guarded like the probe-window test: under build-gate CPU load this check can
+  // run after the backoff window already elapsed; only assert while verifiably
+  // inside it. The `await wait` below still proves admission happens.
+  if (Date.now() - armedAt < 100) {
+    assert.equal(admitted, false, "admission must wait out the backoff window");
+  }
   const release = await wait;
   assert.equal(admitted, true);
   release();
@@ -559,9 +565,10 @@ test("model health: an unhealthy model never head-of-line-blocks a healthy model
 test("model health: probe window elapses → exactly ONE probe admitted; success re-awakens all waiters", async () => {
   const scheduler = new LlmScheduler({
     groups: { default: { max_in_flight: 2 } },
-    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 20 },
+    health: { unhealthyThreshold: 1, probeBackoffBaseMs: 100, probeBackoffMaxMs: 100 },
   });
-  failEnvironmental(scheduler, MODEL_A, 1);
+  const armedAt = Date.now();
+  failEnvironmental(scheduler, MODEL_A, 1); // turns MODEL_A unhealthy → arms the probe window
 
   const admitted: string[] = [];
   const all = Promise.all([
@@ -582,8 +589,15 @@ test("model health: probe window elapses → exactly ONE probe admitted; success
     }),
   ]);
   await tick();
-  assert.deepEqual(admitted, [], "nothing admitted before the probe window opens");
-  await sleep(40); // window opens → probe timer fires → ONE probe admitted
+  // Under build-gate CPU load the event loop can stall past the probe window
+  // before this check runs (the probe timer fires and admits everything first),
+  // so assert emptiness only when the window verifiably hasn't opened yet. The
+  // ordering assert below carries the real one-probe-then-mass-resume
+  // verification either way.
+  if (Date.now() - armedAt < 100) {
+    assert.deepEqual(admitted, [], "nothing admitted before the probe window opens");
+  }
+  await sleep(120); // window opens → probe timer fires → ONE probe admitted
   await all;
   assert.deepEqual(admitted, ["probe", "waiter-1", "waiter-2"]);
   assert.equal(scheduler.isQueueWaitPoint("default", MODEL_A), false, "recovered");

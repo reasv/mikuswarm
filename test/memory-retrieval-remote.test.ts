@@ -167,9 +167,10 @@ test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP tim
   // before acquire (and its controller doubled as the acquire signal), so the
   // queue wait aborted the request before the fetch ever started. Now the
   // timeout is armed only once admitted, so the request succeeds. The margins
-  // are wide (500ms timeout vs 800ms wait) because timeoutMs must still cover
-  // the real loopback fetch on a loaded runner (the Docker-build test gate) —
-  // a 50ms budget flaked there while the queue-wait invariant held.
+  // are wide (2s timeout vs 2.5s wait) because timeoutMs must still cover the
+  // real loopback fetch on a loaded runner (the Docker-build test gate / a
+  // parallel-suite stress run) — a 50ms budget flaked there, and so did 500ms
+  // under heavier contention, while the queue-wait invariant held both times.
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -183,7 +184,7 @@ test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP tim
   try {
     const scheduler = {
       acquire: async () => {
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 2_500));
         return () => {};
       },
       noteOutcome: () => {},
@@ -192,7 +193,7 @@ test("RemoteEmbeddingProvider: a scheduler queue wait does not burn the HTTP tim
       chain: [{ logicalId: "test-embed", config: { id: "test-embed", endpoint: `http://127.0.0.1:${port}`, api_key: "k", input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }],
       dim: 4,
       batchSize: 8,
-      timeoutMs: 500,
+      timeoutMs: 2_000,
       scheduler,
     });
     const vec = await provider.embedQuery("x");
