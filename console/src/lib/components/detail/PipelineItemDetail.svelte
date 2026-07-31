@@ -9,6 +9,7 @@
 	import RetryButton from '$lib/components/RetryButton.svelte';
 	import { relativeTime } from '$lib/utils';
 	import { formatTokens, formatUsd } from '$lib/format';
+	import { timelineAccount } from '$lib/timeline-key';
 
 	const queryClient = useQueryClient();
 	const detail = pipelineItemQuery(
@@ -67,7 +68,19 @@
 				</div>
 				<div class="text-xs text-foreground">{item.inputSummary}</div>
 				{#if item.room}
-					<div class="truncate font-mono text-[10px] text-muted-foreground">{item.room}</div>
+					{@const account = timelineAccount(item.room)}
+					<div class="flex items-center gap-1.5">
+						{#if account}
+							<!-- Which chat account this item belongs to (discord vs matrix at a
+							     glance); the raw key follows for exactness. -->
+							<span class="shrink-0 rounded border px-1 py-px text-[9px] text-muted-foreground">
+								{account.accountId} <span class="uppercase tracking-wide">{account.provider}</span>
+							</span>
+						{/if}
+						<span class="truncate font-mono text-[10px] text-muted-foreground" title={item.room}>
+							{item.room}
+						</span>
+					</div>
 				{/if}
 				{#if item.error}
 					<div class="rounded bg-red-500/10 px-2 py-1 text-[11px] text-red-600 dark:text-red-400">

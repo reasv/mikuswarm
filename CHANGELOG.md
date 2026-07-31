@@ -30,7 +30,10 @@ Unreleased section; it is not part of any release's notes.
   room list gains a sub-tab row — "All" plus one tab per account, each tagged
   with its provider — filtering the list to that account's rooms. With a single
   account the layout is unchanged. `GET /api/rooms` now carries each room's
-  `provider` and `accountId`.
+  `provider` and `accountId`. The remaining channel-mixing surfaces get the
+  same treatment: the Usage & Cost recent-sessions and paid-calls channel cells
+  show an account tag whenever their rows span multiple accounts, and the
+  Pipelines item detail labels its room key with the owning account.
 
 - **Console: human sender labels on per-user limits**: the Usage & Cost
   "Per-user limits" strips (and the live model-selection chips) now render each
