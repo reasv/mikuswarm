@@ -11,6 +11,8 @@ function meter(
 		meterKey: p.meterKey ?? `${p.partitionKey}:${(p.modelScope ?? ['*']).join('+')}`,
 		partitionKey: p.partitionKey,
 		isUserPartition: p.isUserPartition ?? true,
+		displayName: p.displayName,
+		username: p.username,
 		modelScope: p.modelScope,
 		orderIndex: p.orderIndex,
 		spentUsd: p.spentUsd,
@@ -116,6 +118,21 @@ describe('buildLadder', () => {
 		expect(segs[0].color).not.toBe(segs[1].color);
 		const HEALTH = ['#10b981', '#22c55e', '#f59e0b', '#ef4444', '#eab308'];
 		for (const s of segs) expect(HEALTH).not.toContain(s.color);
+	});
+
+	it('adopts BFF-resolved sender labels from any of the partition\'s meters', () => {
+		const g = buildLadder([
+			meter({ partitionKey: '191539408967565312', modelScope: ['sol'], spentUsd: 1, capUsd: 2, orderIndex: 1 }),
+			meter({ partitionKey: '191539408967565312', modelScope: ['glm'], spentUsd: 0.5, capUsd: 2, orderIndex: 2001, displayName: 'Dave', username: 'average_dave_34' })
+		]).users[0];
+		expect(g.displayName).toBe('Dave');
+		expect(g.username).toBe('average_dave_34');
+	});
+
+	it('defaults labels to null when the BFF sends none (back-compat / Matrix-no-name)', () => {
+		const g = buildLadder([meter({ partitionKey: '@a:server', modelScope: ['sol'], spentUsd: 1, capUsd: 2 })]).users[0];
+		expect(g.displayName).toBeNull();
+		expect(g.username).toBeNull();
 	});
 
 	it('does not crash when the BFF omits orderIndex (back-compat)', () => {

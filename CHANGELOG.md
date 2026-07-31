@@ -32,6 +32,14 @@ Unreleased section; it is not part of any release's notes.
   account the layout is unchanged. `GET /api/rooms` now carries each room's
   `provider` and `accountId`.
 
+- **Console: human sender labels on per-user limits**: the Usage & Cost
+  "Per-user limits" strips (and the live model-selection chips) now render each
+  sender as "Display Name (handle)" — the Discord unique username, or the MXID
+  for Matrix — instead of a raw user id / snowflake, truncating long names with
+  the full label on a hover tooltip. Names resolve from observed identities
+  (`user_identities`) with a fallback to the latest session-recorded display
+  name; unknown senders still show the bare id.
+
 - **Discord provider**: first-class Discord support. A `[discord]` config block
   (peer of `[matrix]`, default `enabled = false`) wires one or more Discord bot
   accounts. All user-facing behaviour — trigger detection, context assembly, tool
