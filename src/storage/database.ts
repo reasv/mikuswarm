@@ -7592,6 +7592,57 @@ export class Storage {
   }
 
   /**
+   * Batch-resolve human-facing labels for a set of bare sender ids (MXIDs /
+   * Discord snowflakes — no provider qualifier, matching how the per-user-limits
+   * ledger stores `trigger_sender_id`). Powers the console's per-user displays.
+   *
+   * Per id: `username` + `display_name` come from `user_identities` (Discord
+   * writes both; Matrix never writes here, so both miss), and a missing display
+   * name falls back to the most recent non-null
+   * `agent_sessions.trigger_sender_display_name` — the same unified lookup the
+   * usage leaderboard uses, covering Matrix senders. Ids with neither source
+   * resolve to `{ null, null }` and the caller renders the raw id.
+   *
+   * The id is matched WITHOUT the provider column: the two providers' id spaces
+   * cannot collide (MXIDs start with `@`, snowflakes are numeric), and the
+   * limits ledger only has the bare id. Ties (never expected) break on the
+   * most recently updated identity row.
+   */
+  getUserLabels(
+    userIds: ReadonlyArray<string>,
+  ): Map<string, { displayName: string | null; username: string | null }> {
+    if (userIds.length === 0) return new Map();
+    return this.read((db) => {
+      const result = new Map<string, { displayName: string | null; username: string | null }>();
+      const identityStmt = db.prepare(
+        `select username, display_name from user_identities
+          where user_id = ?
+          order by updated_at desc
+          limit 1`,
+      );
+      const sessionNameStmt = db.prepare(
+        `select trigger_sender_display_name as name
+           from agent_sessions
+          where trigger_sender_id = ? and trigger_sender_display_name is not null
+          order by coalesce(completed_at, updated_at) desc
+          limit 1`,
+      );
+      for (const userId of userIds) {
+        const identity = identityStmt.get(userId) as
+          | { username: string; display_name: string | null }
+          | undefined;
+        let displayName = identity?.display_name ?? null;
+        if (displayName === null) {
+          const row = sessionNameStmt.get(userId) as { name: string } | undefined;
+          displayName = row?.name ?? null;
+        }
+        result.set(userId, { displayName, username: identity?.username ?? null });
+      }
+      return result;
+    });
+  }
+
+  /**
    * Retrieve recent alias usernames for one sender, most-recent first (highest
    * rowid first). Used by the retrieval user lane (§6.5 bullet 3) to expand
    * the alias-history names for "history with this person" recall across renames.

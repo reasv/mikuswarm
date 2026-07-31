@@ -356,8 +356,11 @@ export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx
  */
 export function usageBudgets(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const rules = ctx.deps.budgetEngine?.ruleStatuses() ?? [];
-  // The currently-selected model of every live per-user session (spec §14).
-  const userSelections = ctx.deps.userLimitEngine?.activeSelections() ?? [];
+  // The currently-selected model of every live per-user session (spec §14),
+  // labeled with the sender's human name so the console needn't show a raw id.
+  const selections = ctx.deps.userLimitEngine?.activeSelections() ?? [];
+  const labels = ctx.deps.storage.getUserLabels([...new Set(selections.map((s) => s.userId))]);
+  const userSelections = selections.map((s) => ({ ...s, ...labels.get(s.userId) }));
   sendJson(res, 200, { rules, userSelections });
 }
 
@@ -378,7 +381,16 @@ export function usageUserLimits(_req: IncomingMessage, res: ServerResponse, ctx:
   const pageSize = USER_LIMITS_PAGE_SIZE;
   const pageCount = Math.max(1, Math.ceil(groups.length / pageSize));
   const page = Math.min(Math.max(Number(ctx.url.searchParams.get("page")) || 0, 0), pageCount - 1);
-  const meters = groups.slice(page * pageSize, page * pageSize + pageSize).flatMap((g) => g.meters);
+  const pageGroups = groups.slice(page * pageSize, page * pageSize + pageSize);
+  // Label the page's USER partitions (partitionKey = raw MXID / snowflake) with the
+  // sender's display name + unique username (Discord) so the console can render
+  // "Display Name (handle)" instead of a bare id. Shared pools keep their literal key.
+  const labels = ctx.deps.storage.getUserLabels([
+    ...new Set(pageGroups.filter((g) => g.isUserPartition).map((g) => g.partitionKey)),
+  ]);
+  const meters = pageGroups.flatMap((g) =>
+    g.meters.map((m) => (m.isUserPartition ? { ...m, ...labels.get(m.partitionKey) } : m)),
+  );
   sendJson(res, 200, {
     scope,
     page,

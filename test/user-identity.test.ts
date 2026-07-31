@@ -546,3 +546,92 @@ test("alias expansion: triggerUsers includes current + prior usernames", async (
     assert.equal(triggerUsers.length, 3, "three distinct names total (current + 2 aliases)");
   });
 });
+
+// ---------------------------------------------------------------------------
+// (f) Console labels: getUserLabels (bare-id lookup for per-user-limits display)
+// ---------------------------------------------------------------------------
+
+test("getUserLabels: Discord id resolves username + display name from user_identities", async () => {
+  await withTmpDb(async (storage) => {
+    await storage.upsertUserIdentity({
+      provider: "discord",
+      userId: "191539408967565312",
+      username: "average_dave_34",
+      displayName: "Dave",
+      observedAt: 1_000,
+    });
+    await storage.waitForIdle();
+
+    const labels = storage.getUserLabels(["191539408967565312"]);
+    assert.deepEqual(labels.get("191539408967565312"), {
+      displayName: "Dave",
+      username: "average_dave_34",
+    });
+  });
+});
+
+test("getUserLabels: Matrix MXID falls back to the latest agent_sessions display name", async () => {
+  await withTmpDb(async (storage) => {
+    // Matrix senders never write user_identities; the only durable name source is
+    // the sessions they triggered. The LATEST non-null name must win.
+    const base = {
+      timelineKey: "matrix:miku:room:!room:example.org",
+      sessionType: "chat",
+      status: "completed" as const,
+      triggerSenderId: "@alice:example.org",
+    };
+    await storage.insertAgentSession({
+      ...base,
+      id: "s-old",
+      triggerSenderDisplayName: "Old Alice",
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    });
+    await storage.insertAgentSession({
+      ...base,
+      id: "s-new",
+      triggerSenderDisplayName: "Alice",
+      createdAt: 2_000,
+      updatedAt: 2_000,
+    });
+    await storage.waitForIdle();
+
+    const labels = storage.getUserLabels(["@alice:example.org"]);
+    assert.deepEqual(labels.get("@alice:example.org"), {
+      displayName: "Alice",
+      username: null,
+    });
+  });
+});
+
+test("getUserLabels: identity display-name gap falls back to sessions; unknown id → nulls", async () => {
+  await withTmpDb(async (storage) => {
+    // A Discord identity row with no display name (nick never observed) still
+    // borrows the session-recorded name, keeping the username from the identity.
+    await storage.upsertUserIdentity({
+      provider: "discord",
+      userId: "999",
+      username: "no_nick",
+      observedAt: 1_000,
+    });
+    await storage.insertAgentSession({
+      id: "s-d",
+      timelineKey: "discord:bot:room:456",
+      sessionType: "chat",
+      status: "completed",
+      triggerSenderId: "999",
+      triggerSenderDisplayName: "Nick From Session",
+      createdAt: 1_500,
+      updatedAt: 1_500,
+    });
+    await storage.waitForIdle();
+
+    const labels = storage.getUserLabels(["999", "unknown-id"]);
+    assert.deepEqual(labels.get("999"), {
+      displayName: "Nick From Session",
+      username: "no_nick",
+    });
+    assert.deepEqual(labels.get("unknown-id"), { displayName: null, username: null });
+    assert.deepEqual(storage.getUserLabels([]), new Map(), "empty input short-circuits");
+  });
+});

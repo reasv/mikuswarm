@@ -21,6 +21,17 @@
 	import { buildSpendChart, isSpendChartEmpty, niceTicks } from '$lib/spend-chart';
 	import { presentRule } from '$lib/rule-status';
 	import { buildLadder, buildSegments, type LadderGroup, type CapSegment } from '$lib/user-ladder';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+
+	// "Display Name (unique handle)" for a labeled sender — the handle is the Discord
+	// username when the BFF resolved one, else the raw id (for Matrix the id IS the
+	// human-meaningful @user:server). Falls back to the bare id when no name is known.
+	function userLabel(
+		u: { displayName?: string | null; username?: string | null },
+		rawId: string
+	): string {
+		return u.displayName ? `${u.displayName} (${u.username ?? rawId})` : rawId;
+	}
 
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7): cards + a stacked spend chart,
 	// the always-shown Limits section (every configured rule + headroom), and the
@@ -698,10 +709,17 @@
 						     BFF that omits sessionId. -->
 						{#each userSelections as sel, i (sel.sessionId ?? sel.userId + sel.model + i)}
 							<span
-								class="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground"
-								title={`${sel.userId}${sel.roomId ? ' · ' + sel.roomId : ''} → ${sel.model}`}
+								class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground"
+								title={`${userLabel(sel, sel.userId)} · ${sel.userId}${sel.roomId ? ' · ' + sel.roomId : ''} → ${sel.model}`}
 							>
-								<span class="font-mono text-foreground">{sel.userId}</span>
+								<span
+									class={cn(
+										'max-w-[14rem] truncate text-foreground',
+										!sel.displayName && 'font-mono'
+									)}
+								>
+									{userLabel(sel, sel.userId)}
+								</span>
 								→ <span class="font-mono text-foreground">{sel.model}</span>
 							</span>
 						{/each}
@@ -820,10 +838,29 @@
 		{#snippet strip(g: LadderGroup)}
 			<div class="rounded-lg border p-3">
 				<div class="flex items-center gap-2">
-					<span class="truncate font-mono text-sm font-semibold" title={g.partitionKey}>
-						{g.isUserPartition ? '👤' : '👥'}
-						{g.partitionKey}
-					</span>
+					{#if g.isUserPartition && g.displayName}
+						<!-- "Display Name (handle)" — Matrix: (MXID); Discord: (unique username).
+						     Long names truncate; the tooltip carries the full label + raw id. -->
+						<Tooltip.Provider delayDuration={200}>
+							<Tooltip.Root>
+								<Tooltip.Trigger class="flex min-w-0 cursor-default items-baseline gap-1 text-left">
+									<span class="shrink-0 text-sm">👤</span>
+									<span class="truncate text-sm font-semibold">{g.displayName}</span>
+									<span class="min-w-[4rem] truncate font-mono text-xs text-muted-foreground">
+										({g.username ?? g.partitionKey})
+									</span>
+								</Tooltip.Trigger>
+								<Tooltip.Content>
+									{userLabel(g, g.partitionKey)}{g.username ? ` · ${g.partitionKey}` : ''}
+								</Tooltip.Content>
+							</Tooltip.Root>
+						</Tooltip.Provider>
+					{:else}
+						<span class="truncate font-mono text-sm font-semibold" title={g.partitionKey}>
+							{g.isUserPartition ? '👤' : '👥'}
+							{g.partitionKey}
+						</span>
+					{/if}
 				</div>
 
 				<div class="mt-1.5 space-y-1.5">

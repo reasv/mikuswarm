@@ -699,6 +699,11 @@ export const UserLimitStatus = Schema.Struct({
 	meterKey: Schema.String,
 	partitionKey: Schema.String,
 	isUserPartition: Schema.Boolean,
+	// Human label for a USER partition (BFF-resolved): the sender's display name and —
+	// Discord only — unique username. Optional for backward compatibility with an older
+	// BFF that omits them (falls back to the raw partitionKey); absent on shared pools.
+	displayName: Schema.optional(Schema.NullOr(Schema.String)),
+	username: Schema.optional(Schema.NullOr(Schema.String)),
 	modelScope: Schema.optional(Schema.Array(Schema.String)),
 	// Optional for backward compatibility with an older BFF that omits it (falls back
 	// to fill-fraction ordering); the ladder order (config constraint index).
@@ -723,6 +728,10 @@ export const UserLimitSelection = Schema.Struct({
 	// `{#each}` key falls back when absent.
 	sessionId: Schema.optional(Schema.String),
 	userId: Schema.String,
+	// Human label (BFF-resolved, same shape as UserLimitStatus): display name plus —
+	// Discord only — the unique username. Optional for an older BFF that omits them.
+	displayName: Schema.optional(Schema.NullOr(Schema.String)),
+	username: Schema.optional(Schema.NullOr(Schema.String)),
 	roomId: Schema.optional(Schema.String),
 	model: Schema.String
 });

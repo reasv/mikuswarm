@@ -71,6 +71,10 @@ export interface CapBar {
 export interface LadderGroup {
 	partitionKey: string;
 	isUserPartition: boolean;
+	/** BFF-resolved display name for a user partition; null → render the raw key. */
+	displayName: string | null;
+	/** Discord unique username; null for Matrix users (their partitionKey IS the MXID). */
+	username: string | null;
 	/** Representative reset (earliest) — the group's caps share a window in practice. */
 	resetsAt: number;
 	/** Caps in preference (ladder) order. */
@@ -114,12 +118,22 @@ export function buildLadder(statuses: readonly UserLimitStatus[]): LadderModel {
 		let entry = groups.get(gk);
 		if (!entry) {
 			entry = {
-				g: { partitionKey: s.partitionKey, isUserPartition: s.isUserPartition, resetsAt: s.resetsAt, caps: [] },
+				g: {
+					partitionKey: s.partitionKey,
+					isUserPartition: s.isUserPartition,
+					displayName: null,
+					username: null,
+					resetsAt: s.resetsAt,
+					caps: []
+				},
 				raw: []
 			};
 			groups.set(gk, entry);
 		}
 		entry.g.resetsAt = Math.min(entry.g.resetsAt, s.resetsAt);
+		// Labels ride on every meter of the partition identically; adopt the first seen.
+		entry.g.displayName ??= s.displayName ?? null;
+		entry.g.username ??= s.username ?? null;
 		entry.raw.push(s);
 	}
 
