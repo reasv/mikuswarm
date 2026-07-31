@@ -8,6 +8,17 @@ budgets, model health). Target ARCHITECTURE.md home once implemented: a new
 "Agents and accounts" section under Core Architecture, plus per-subsystem
 updates (workspace, diary, retrieval, enrichment, sandbox, budget).
 
+**Settled operator decisions** (2026-07-31): relink semantics (§5) accepted as
+specced; the feature ships only as one complete reviewed unit — no
+intermediate state is pushed or deployed (§13); bot-to-bot replies are a
+wanted feature and must be contained, not only suppressible (§9); strict
+sandboxes are the recommendation, shared mode is retained with its write
+hazard accepted by declaration (§10); browser resolved as per-agent Manager
+profiles (§10a); §7.5 resolved — shared identity map, per-agent profile
+files; the per-agent summarization cost (the one traffic-proportional cost,
+which alone would sink many-personas-one-community) is addressed by opt-in
+summary mirroring (§10b).
+
 **Guiding constraint** (same as the Discord design): every change lands as a
 generic, default-off upstream feature. An existing single-agent config must be
 byte-identical in behaviour after every phase below. Multi-agent is enabled
@@ -94,7 +105,10 @@ Efficiency (real but secondary; honest sizing):
   **attachments**: many personas in the same channels would otherwise each
   store a full copy of the channel's media. A shared attachment store is
   deliberately deferred to an optional phase (§13, Phase 5) because per-agent
-  copies are functionally correct.
+  copies are functionally correct. The one *LLM-cost* item that matters at
+  many-personas scale is **summarization** — traffic-proportional per agent
+  and independent of how much the persona is used — addressed by the opt-in
+  summary-mirroring design (§10b), likewise default-off.
 
 Management: one config tree with small per-agent blocks (vs N full config
 dirs drifting apart), one deploy, one DB, one console. Symmetric cost: shared
@@ -127,8 +141,8 @@ Ownership table — which concept each piece of state belongs to:
 | `usage_events` rows (attributed to an agent at *read* time, §8) | sandbox container / working directory (§10) |
 
 **Account keys are frozen identifiers, not labels.** The accountKey is baked
-into every stored `timeline_key` across ~20 tables plus `usage_events`
-history. Renaming one orphans the namespace: on restart the provider syncs the
+into every stored `timeline_key` across eleven tables (including
+`usage_events` history; `media_assets` joins through `timeline_events`). Renaming one orphans the namespace: on restart the provider syncs the
 same channels under new keys, the activation lifecycle treats them as
 brand-new timelines, history is re-backfilled, re-enriched, re-summarized and
 re-diaried at real LLM cost, and every budget/user-limit meter seeded from the
@@ -140,7 +154,17 @@ account, never by renaming an old one. Accounts are free (Matrix accounts and
 Discord bot applications cost nothing); key churn is not.
 
 Agent names share the account-key character class (`[a-z0-9-]+`, no colon) so
-they are safe in paths and rule scopes.
+they are safe in paths and rule scopes. Today that class is only a doc
+contract — the account Records take bare strings — so Phase 1 MUST add
+`pattern` validation for both account keys and agent names: a colon-bearing
+key is schema-valid now but silently breaks `parseTimelineKey`, on which §8
+attribution and every per-event resolver in this spec depend.
+
+**Agent names, by contrast, are renameable.** Nothing durable stores them
+except `memory_chunks.agent` (re-stamped from config by the next
+reconciliation walk, §7.1) and limit-rule scopes (config; the operator
+updates them in the same edit). A rename is a config edit plus one
+reconciliation pass, not a data migration.
 
 ---
 
@@ -203,6 +227,17 @@ changing it back are both complete, side-effect-free operations (§5).
   startup. Each is seeded independently (`seedWorkspace` /
   `seedFeatureSkills` per root).
 
+### 4.3 Unresolvable accounts — one rule
+
+Every per-event resolver in this spec (`timeline_key` → account → agent:
+factory, diary, enrichment, recovery, search filters, §8 attribution) can
+encounter an account that is no longer in config — queued jobs, backlogged
+events, or historical rows for a removed account. One shared rule, one shared
+helper: **skip the identity-dependent action and warn** (drop the diary job,
+skip the download, omit the rows from agent-scoped meters and
+account-filtered search). Global limit rules are unaffected (they never
+resolve an agent). No resolver may guess a default agent.
+
 ---
 
 ## 5. Identity semantics: history follows the account
@@ -234,10 +269,12 @@ Consequences, accepted deliberately:
   about operator intent. An operator who wants a persona with no inherited
   history creates a **new account** (§3) — that is the supported "fresh
   start", and it is free.
-- The **context floor** (the `context_floor_event_id` mechanism the
-  message-backfetch feature established) remains available as a *manual,
-  explicit* operator action to cut an account's rendered history at a chosen
-  point. It is never moved automatically by anything in this spec.
+- The **context floor** (`context_floor_event_id`, established by the
+  message-backfetch feature) remains the mechanism for cutting an account's
+  rendered history. Note its actual shape: it is set automatically (set-once)
+  by the backfetch runner when the operator triggers a backfetch job from the
+  console — there is no direct "set floor at point X" operator affordance
+  today, and this spec neither adds one nor moves the floor automatically.
 - Attachment files downloaded under the previous agent's workspace do not
   follow automatically; §7.4 defines the layout that makes moving them a
   single documented `mv`.
@@ -290,12 +327,27 @@ cache hits across agents are free wins). A per-agent index DB was considered
 and rejected: `index_meta`/embedding-model state is process-global settings,
 and one column is strictly less machinery.
 
+Migration and legacy semantics: the column is added nullable; existing rows
+stay NULL. In legacy mode nothing stamps or filters (single implicit agent,
+behaviour-identical). On first startup with `[agents]`, the reconciliation
+walk stamps rows in place: a walked file whose `path` + `content_hash`
+already match an indexed row gets its `agent` set to the walking agent's
+name — no re-chunk, no re-embed. Agents-mode queries filter `agent =
+<requester>`, which excludes any still-NULL stragglers (safe by default);
+NULL rows whose files no longer exist under any root are deleted by the
+normal reconciliation diff. This is also the upgrade path for an existing
+single-agent deployment: point one agent's `workspace_root` at the old
+`[workspace].root_dir` and the index re-owns itself on the first walk.
+
 ### 7.2 Chat-history and summary search — required
 
 `chat_index` rows are timeline-key-scoped, so the *data* is already
-partitioned; the leak is in the query. The search tools (`search_messages`,
-summary-corpus search, recap) must restrict matches to timelines owned by the
-calling session's agent's accounts. For overlapping communities this also
+partitioned, and the default query path is too: `search_messages` and `recap`
+resolve `rooms` to the current timeline unless the agent passes
+`rooms: "all"`, which drops the timeline filter entirely. That `"all"` path
+(and summary-corpus search over it) is the leak: it must restrict matches to
+timelines owned by the calling session's agent's accounts. For overlapping
+communities this also
 kills duplicate results (every message is indexed once per observing
 account); for disjoint communities it is mandatory isolation.
 
@@ -331,13 +383,29 @@ The same per-event root resolution applies to every other workspace write
 made on behalf of a timeline (x_fetch downloads, character card output), and
 to session recovery's media re-reads (`src/agent/recovery.ts`).
 
-### 7.5 User identities and profiles — shared, documented
+### 7.5 User identities and profiles — resolved: shared DB map, per-agent files
 
-`user_identities` / user profiles stay shared. For overlapping communities
-this is a feature (one identity map). For disjoint communities it is a soft
-leak (each agent's tools could surface the other community's known users);
-scoping it is deferred (§14). Not identity-shaped for the *agents*, hence not
-critical here.
+Two different stores, two different answers:
+
+- **`user_identities` / `user_identity_aliases` (DB) stay shared.** Audited:
+  the rows hold only `(provider, user_id, username, display_name, seen
+  timestamps)` plus up to 16 prior name pairs, written only by Discord ingest
+  (the Matrix path is a guaranteed zero-write). Their only agent-facing
+  consumer is the context builder, which does keyed lookups for senders
+  already present in the timeline being rendered — and timelines are
+  account-scoped, so an agent can only ever resolve identities of users its
+  own accounts observe. No tool enumerates or searches the table (the
+  provider-wide index is console-only). With current consumers the
+  cross-community leak is therefore unreachable, and the table stays shared
+  with one standing rule: **any future agent-facing consumer of
+  `user_identities` must filter to senders observed by the calling agent's
+  accounts.**
+- **User profile *files* are per-agent by construction.** The
+  `user_profile_read`/`user_profile_edit` tools operate on
+  `<workspaceRoot>/users/<provider>/…` — workspace files, not DB rows — so
+  under per-agent workspaces each persona keeps its own private notes about
+  the humans it knows. For overlapping communities this is the desired
+  no-leak behaviour, not a deficiency.
 
 ### 7.6 Sandbox — see §10
 
@@ -368,6 +436,15 @@ denormalized columns (`room_id`, `space_id`) with matching reseed indexes.
   and rejected because it makes usage attribution the one place where a relink
   is *not* a pure config edit. The seeding paths already parse timeline keys
   (that is how `room_id` is derived); the added cost is a map lookup.
+- **Background lanes must stamp `timeline_key`.** `usage_events.timeline_key`
+  and `provider` are nullable today, and background/proactive lanes write
+  NULL — rows the timeline-key parse cannot attribute. Diary, summarization,
+  enrichment and proactive work are all timeline-scoped at the job level, so
+  the stamp is available; landing the `agent` matcher includes threading it
+  into every lane's usage insert. Agent-scoped rules match only attributable
+  rows (NULL-key rows count toward global rules exactly as today); rows for
+  accounts no longer in config are likewise skipped by agent-scoped rules
+  (§4.3).
 - Per-user limits: unchanged mechanics; because all agents share one
   `usage_events`, a user's spend already counts across every agent — which is
   the correct default and previously impossible with N processes. The
@@ -376,23 +453,60 @@ denormalized columns (`room_id`, `space_id`) with matching reseed indexes.
 
 ---
 
-## 9. Sibling awareness: loop guard and self-id sets
+## 9. Sibling awareness: self-id sets and contained bot-to-bot replies
 
 Trigger detection is mention/DM/reply-to-self, with no sender-is-a-bot check;
 two agents that can mention each other are an unbounded ping-pong loop at LLM
-prices. In one process the guard is trivial because the full set of sibling
-self-ids `(provider, accountId, userId)` is known at boot:
+prices. In one process the guard is cheap because the full set of sibling
+self-ids `(provider, accountId, userId)` is knowable up front — with one
+correction to "known at boot": Discord self-ids currently resolve at gateway
+READY, not from config. Before any inbound processing starts, self-ids for
+every account must be resolved eagerly (one REST `GET /users/@me` per Discord
+account at startup), so the suppression sets are complete before the first
+event — no startup window where a sibling triggers or is metered as a user.
 
-- **Sibling messages never trigger.** A mention of / reply to agent B by
-  agent A's account is ingested and stored normally (it is visible history)
-  but is not a trigger for B. Default-on, not configurable in v1; a
-  deliberate bot-to-bot conversation feature (with depth caps) is out of
-  scope (§14).
 - **Sibling messages never count toward per-user limits**: fold every
   account's self-ids across all agents into the existing bot-self-id
-  exclusion set and the `isUserIdentity` predicate.
+  exclusion set and the `isUserIdentity` predicate. Holds in every mode
+  below.
 - Proactive eligibility and any "recent human activity" heuristics likewise
-  treat sibling messages as bot traffic, not user traffic.
+  treat sibling messages as bot traffic, not user traffic, in every mode.
+- **Sibling replies are governed by a process-global mode** (the default is
+  full suppression):
+
+  ```toml
+  [siblings]
+  replies = "never"        # default; sibling messages never trigger
+  # replies = "capped"     # bot-to-bot conversation with hard containment
+  max_bot_chain = 4        # capped mode: bot messages allowed since last human message
+  ```
+
+  - `"never"`: a mention of / reply to agent B by agent A's account is
+    ingested and stored normally (it is visible history) but is never a
+    trigger for B.
+  - `"capped"`: a sibling mention/reply triggers only while the observing
+    account's timeline contains fewer than `max_bot_chain` bot-authored
+    messages (self or any sibling) since the most recent human message in
+    that channel. Any human message resets the window; at the cap, every
+    agent goes silent until a human speaks, so a back-and-forth always
+    terminates. The counter spans *all* bots in the channel, not per-pair,
+    so K agents cannot multiply the ceiling; in-flight generations racing
+    the cap can overshoot by at most the number of concurrently-triggered
+    agents. Bot-to-bot spend still counts toward deployment `[[limits]]`
+    (spend is spend) and never toward any per-user meter.
+
+- **Third-party bots** (not siblings): Discord exposes `author.bot`, which
+  the normalizer currently drops. Extract and store it, and apply the same
+  chain cap to flagged non-sibling bot senders — without this, any agent can
+  still ping-pong with someone else's bot regardless of sibling handling.
+  Matrix has no reliable bot marker; out of scope there (§14).
+
+**Bridged channels caveat** (documented limitation): "one persona, two doors"
+assumes the two doors see *different* conversations. If a channel is bridged
+Matrix↔Discord and one agent has an account on both sides, each account
+observes every message independently and the persona replies twice. Do not
+attach two accounts of one agent to bridged views of the same conversation;
+detecting bridges automatically is out of scope.
 
 ---
 
@@ -405,17 +519,177 @@ Two modes, matching the two community regimes:
   agent's workspace root). Complete filesystem isolation between agents. Cost:
   one container per agent.
 - **Shared soft-isolation** (the many-personas-one-community case): agents
-  without a sandbox override share the `[sandbox]` container. The container
-  mounts the **common parent** of the participating agents' workspace roots,
-  and each exec runs with the calling agent's subdir as working directory.
-  Documented property, not a bug: `bash`/`search_files` in this mode can
-  technically traverse into a sibling's workspace — acceptable by declaration
-  when the operator chooses one container for many personas of one community.
-  The in-process file tools remain hard-confined per agent regardless (their
-  path-traversal guards are rooted at the session's `workspaceRoot`).
+  without a sandbox override share the `[sandbox]` container. The operator
+  sets `workspace_mount` to the **common parent** of the participating
+  agents' workspace roots (validated at startup: every participating root
+  must live under it), and each exec runs with the calling agent's subdir as
+  working directory (the exec backend's per-call `cwd` support already
+  exists). Documented property, not a bug — and stated at full strength:
+  `bash` in this mode can **read and write** sibling workspaces, including
+  their persona files and memory. Cross-agent workspace writes are
+  cross-agent prompt injection; choosing shared mode accepts that hazard by
+  declaration. The in-process file tools remain hard-confined per agent
+  regardless (their path-traversal guards are rooted at the session's
+  `workspaceRoot`). Per-exec isolation inside one container was examined and
+  rejected: `docker exec` cannot scope mount namespaces per exec, and
+  per-agent Unix users break on host-side bind-mount ownership (the node
+  process writes the same trees as itself).
+
+Sizing note: the "cost: one container per agent" of strict mode is mostly
+imagined — an idle sandbox container is a sleeping process worth a few MB,
+and the image is shared. Containers are NOT lazily created today:
+`SandboxManager.ensure` runs once at startup (fail-fast), and nothing
+re-ensures after that — under multi-agent, strict mode ensures N containers
+at startup the same way. (Compose is uninvolved either way: the sandbox is a
+sibling container the agent creates by driving the docker CLI, never a
+compose service.) At a-dozen-personas scale, **strict mode is the recommended
+default**; shared mode exists for operators who prefer one container anyway
+and accept the hazard above.
 
 Validation: shared mode requires all participating roots to live under one
 parent directory; strict blocks must not share `container_name` or mounts.
+
+## 10a. Browser: per-agent Manager profiles
+
+Resolved (previously an open question). The CloakBrowser-Manager is already a
+multi-profile service — `POST /api/profiles` creates named profiles with
+their own fingerprint seed, cookie state and launch lifecycle, and each
+profile exposes its own CDP endpoint. The one-browser limit is a mikuswarm
+choice (one `BrowserSession` bound to `[browser].profile_name`), not a
+Manager constraint. Browser access becomes per-agent and default-off:
+
+```toml
+[agents.rin.browser]
+profile_name = "rin"   # required in the block; connection settings inherited from [browser]
+```
+
+- An agent with a `browser` block gets its own `BrowserSession` (own Manager
+  profile, lazily launched on first tool use — the launch endpoint is already
+  idempotent; the session tab map is keyed by chat session id, so N sessions
+  coexist cleanly). An agent without one gets no browser tools.
+- Legacy mode: the global `[browser]` block is the implicit agent's browser —
+  byte-identical behaviour.
+- Validation: `profile_name`s must be pairwise distinct across agents (and
+  distinct from a global `[browser].profile_name` if one is also in use).
+- Sharing one profile between personas was rejected: a profile carries
+  outward identity (fingerprint, cookies, logins) — two personas sharing one
+  are the same "user" to every site they touch, and each can read sessions
+  the other logged into. The browser profile is identity-shaped, and
+  identity-shaped state never crosses agents (§1).
+- Cost is real here (unlike sandbox containers): each running profile is a
+  full stealth browser. Lazy launch bounds it to agents that actually browse.
+
+## 10b. Summary mirroring: one summarizer per community
+
+Motivation: summarization is the one **traffic-proportional per-agent LLM
+cost** — it scales with channel volume, not with how much a persona is used.
+N agents in one community pay N× for near-identical work, which on its own
+would kill the dozen-personas deployment. Every other background cost is
+already participation-gated or trigger-gated (diary skip-gates ranges with
+zero own assistant messages; captioning defaults to trigger messages only).
+Mirroring makes the whole background cost of an extra persona in a covered
+community approximately zero; what remains scales with actual participation.
+
+Two sharing shapes were considered and rejected:
+
+- **Render-time layer theft** (secondary disables summarization and renders
+  the donor's summary layer directly): summaries are not just a render
+  layer — the level-1 rows ARE the diary queue (`diary_status`), the FTS
+  corpus for `corpus:"summaries"`, recap's coverage source, and
+  `expand_summary`'s lineage anchor. Every consumer would need
+  cross-timeline redirection, diary would lose its trigger entirely, and
+  becoming independent later requires a wholesale state copy.
+- **Independent-range matching** (secondary computes its own ranges, then
+  steals a covering donor summary): unfixable misalignment. Chunk boundaries
+  are compact-token-accumulation driven and include each agent's *own*
+  assistant turns, so two accounts never compute the same boundaries even in
+  principle, and condensation (runs of `condense_fanout`) compounds the skew
+  upward.
+
+The design instead **adopts the donor's tiling**: mirrored summaries become
+real rows in the secondary's timeline, inserted through the normal path.
+
+```toml
+[agents.rin]
+workspace_root = "./workspaces/rin"
+summaries_from = "miku"   # optional; the named donor agent must not itself mirror (no chains)
+```
+
+Mechanics:
+
+- **Per-timeline, not global**: a timeline of the secondary is mirrored iff
+  the donor has an account observing the same `(provider, channel[, thread])`.
+  Every other timeline (the secondary's DMs, channels the donor is not in)
+  summarizes natively, unchanged. This falls out of the definition; there is
+  no global summarization switch.
+- **Coordinate system**: `timeline_events.external_id` (Matrix event id /
+  Discord snowflake) and `timestamp` (`origin_server_ts`) are identical
+  across two accounts observing one channel; only internal ids and
+  `timeline_key` differ, and the `(provider, external_id)` index already
+  exists. Donor lineage therefore translates row-by-row.
+- **L1 mirror**: a mirror worker watches donor summary completions and, per
+  summary, copies `content`/`token_count`/`model_id`/timestamps/status and
+  maps `summary_events` lineage via `external_id` into the secondary's rows
+  (the donor's timeline contains the secondary's messages as ordinary
+  participants, so coverage is near-total; unmatched events drop from
+  lineage). Inserting via `insertSummaryWithLineage` sets
+  `diary_status='pending'` — **diary falls out for free, and stays
+  authentic**: the diary-range build re-reads the raw events from the
+  secondary's *own* timeline (its own turns as `assistant`), and the
+  skip-gate prunes ranges where the persona never spoke.
+- **L2+ mirror**: copy the condensation tree using a donor-id → mirror-id map
+  for `summary_parents`. The condensation evaluator MUST skip mirrored
+  timelines, or it would re-condense at real LLM cost; likewise the
+  summarization indexer never enqueues level-1 jobs for them.
+- **Consumers unchanged**: coverage selection, rendering, summary FTS,
+  `recap` and `expand_summary` all operate on the secondary's own real rows
+  and lineage. Drill-down degrades to "constituents unavailable" exactly
+  where the events don't exist locally (pre-join history).
+- **Wait-or-omit**: on a mirrored timeline, "reconcile" means sweep the
+  mirror and escalate the *donor's* covering job priority — interactive
+  pressure crosses the link instead of spawning duplicate work.
+- **Status propagation**: donor `superseded`/`truncated` transitions are
+  propagated by the mirror sweep (idempotent reconciliation, like the other
+  indexers).
+
+Transition and failure modes:
+
+- **Becoming independent is the null operation**: remove `summaries_from`
+  and the coverage cursor sits at the last mirrored summary; the indexer's
+  normal threshold logic sees the un-summarized tail and starts chunking
+  natively from there. No backfill, no state copy.
+- **Donor account removed from config**: mirroring for the affected
+  timelines stalls under the §4.3 rule; the operator either restores the
+  donor or drops `summaries_from`, which flips those timelines to native
+  summarization automatically (previous bullet).
+- **Sync-gap divergence** (events one account has and the other lacks —
+  decryption failures, join windows): the contiguity probe stops the
+  secondary's coverage cursor early and the tail renders raw. Safe
+  degradation, not corruption.
+
+Accepted properties and requirements:
+
+- **Perspective skew, mitigated**: the summarize/condense session
+  instructions gain a requirement to refer to every participant — *including
+  yourself* — by name. Generic improvement, default-on: it also makes
+  summaries relink-safe (§5), since first-person summary text is what makes
+  a summary owner-specific. Residual donor-perspective focus in mirrored
+  text is accepted by the operator choosing `summaries_from`.
+- **Pre-join history**: donor summaries predating the secondary's first
+  event mirror with empty lineage — renderable ancient history, no
+  drill-down, diary skipped. The inverse topology (secondary has events
+  *older* than donor coverage in a mirrored channel) is unsupported in v1
+  and rejected at startup validation; the intended case is a new persona
+  joining an already-covered community.
+- **Cost attribution**: mirrored rows cost ~nothing; the donor's meters
+  absorb the community's whole summarization load. Visible — and
+  intentionally schedulable — via the §8 `agent` matcher.
+- **Trust**: donor session output enters the secondary's context verbatim.
+  Siblings are one operator's trust domain and already read each other's
+  messages as history; documented, not guarded.
+- **Not a neutral shared timeline** (§11.1 stands): rows, ownership and
+  every per-observer mechanism stay per-account; only summary *text* is
+  replicated, through the existing insert path.
 
 ---
 
@@ -453,7 +727,8 @@ turns a config edit into a persistent, hard-to-reverse data mutation
 state (a persisted account→agent map plus boot-time diffing) purely to detect
 the change; and it encodes an assumption about operator intent. The
 assumption-free rule is §5: relinked history is owned wholesale; a fresh
-start is a new account; the floor stays a manual operator tool.
+start is a new account; the floor stays operator-initiated (via backfetch,
+§5), never automatic.
 
 ### 11.4 A shared budget/limits sidecar for N processes
 
@@ -500,41 +775,55 @@ per-agent root resolver are built once at startup and injected.
 | Site | Change |
 |---|---|
 | `src/config/schema.ts` | `agent` field on Matrix/Discord account schemas; `[agents.*]` Record (strict values: `workspace_root`, optional `sandbox`); §4.2 validation (legacy exclusivity, unmatched names, disjoint roots) |
-| `src/app.ts` | build resolver `(provider, accountKey) → {agent, workspaceRoot, memoryWriter, sandbox}`; seed each workspace; construct per-agent `MemoryFileWriter`s; fold all self-ids into limit/trigger exclusion sets (§9) |
+| `src/app.ts` | build resolver `(provider, accountKey) → {agent, workspaceRoot, memoryWriter, sandbox}` (today's single `workspace.root_dir` resolution at app.ts is the injection point everything else inherits from); seed each workspace; construct per-agent `MemoryFileWriter`s; resolve all account self-ids eagerly before inbound starts and fold them into limit/trigger exclusion sets (§9) |
 | `src/agent/factory.ts` | both `workspace.root_dir` reads become per-session resolution from the trigger's `timeline_key` |
 | `src/workspace/` | unchanged (already parameterized by root) |
 | `src/diary/worker-pool.ts` | per-job agent resolution from the summary's `timeline_key`; write via that agent's `MemoryFileWriter`; per-agent recent-memory window + header |
 | `src/retrieval/` | `agent` column on `memory_chunks` (+ index + migration); indexer walks every agent's `memory/`, stamping owner; all query paths filter by requesting agent; `embedding_cache` untouched |
 | `src/search/` + search/recap tools | account-set filter derived from the calling session's agent (§7.2) |
 | `src/enrichment/worker*.ts` | per-event root resolution; `msg-attach/<provider>.<accountKey>/` layout (§7.4) |
+| `src/captioning/` | same per-event root resolution for media reads (takes `workspaceRoot` as a constructor option today, like enrichment) |
+| `src/summarization/` | mirror worker (donor-completion watch, `external_id` lineage mapping, condensation-tree copy, status propagation); indexer + condensation evaluator skip mirrored timelines; participant-naming tweak in summarize/condense instructions (§10b) |
 | `src/agent/recovery.ts` | per-session root resolution for media re-reads |
 | `src/tools/*` (memory, read-image, x-fetch, character card, set-profile) | already take `workspaceRoot` via context — thread the session's resolved root |
 | `src/sandbox/` | `SandboxManager` per strict agent; shared-mode parent mount + per-exec cwd (§10) |
-| trigger paths (`src/matrix/inbound.ts`, `src/discord/normalizer.ts`, reply-trigger resolution) | sibling self-id suppression (§9) |
-| `src/budget/` | optional `agent` matcher on rule normalization + enforcement; attribution via timeline-key parse + config map (§8) |
-| console | agent/account filter chips — cosmetic, may lag all phases |
+| `src/browser/` + factory | per-agent `BrowserSession` construction and session routing (§10a) |
+| trigger paths (`src/matrix/inbound.ts`, `src/discord/normalizer.ts`, reply-trigger resolution) | sibling self-id handling per `[siblings]` mode; extract Discord `author.bot` (§9) |
+| `src/budget/` | optional `agent` matcher on rule normalization + enforcement; attribution via timeline-key parse + config map; stamp `timeline_key`/`provider` on background-lane usage inserts (§8) |
+| console | BFF's single `workspaceRoot` dependency becomes per-session agent resolution (context/media re-reads are functional, not cosmetic); agent/account filter chips may lag all phases |
 
 ---
 
 ## 13. Phasing
 
 Each phase lands generic and default-off; a config without `[agents]` is
-behaviour-identical throughout.
+behaviour-identical throughout. **Phases are implementation checkpoints on
+one feature branch, not release points**: the feature merges and ships as a
+single reviewed unit after all phases, and this deployment does not rebuild
+onto any intermediate state — so no phase needs an interim-safety release
+note.
 
-1. **Agent core**: config (§4), per-agent workspace/factory/diary/recovery/
-   tool roots, per-agent seeding, sibling self-id sets + trigger suppression
-   (§9). Outcome: N personas with separate memories and shared governors.
-   Retrieval must be disabled for all-but-one agent in this phase unless the
-   operator accepts the §7.1 leak — release notes must say so.
-2. **Index scoping**: retrieval `agent` column + query scoping (§7.1); search
-   tool account filters (§7.2). Multi-agent becomes safe with retrieval on.
+1. **Agent core**: config (§4, incl. key/name pattern validation §3 and the
+   §4.3 unresolvable-account rule), per-agent workspace/factory/diary/
+   recovery/tool roots, per-agent seeding, eager self-id resolution + sibling
+   sets with default `"never"` suppression (§9). Outcome: N personas with
+   separate memories and shared governors. (Not independently shippable:
+   with retrieval enabled, Phase 1 alone has the §7.1 leak — Phase 2 closes
+   it before anything ships.)
+2. **Index scoping**: retrieval `agent` column + query scoping + legacy
+   re-stamp walk (§7.1); search tool account filters on the `rooms:"all"`
+   path (§7.2). Multi-agent becomes safe with retrieval on.
 3. **Attachments**: account-scoped `msg-attach` subdirs + per-event root
    resolution (§7.4).
-4. **Sandbox modes** (§10).
-5. **Optional, default-off**: `agent` matcher on limit rules (§8); shared
-   content-addressed attachment store with per-agent hardlinks (the only
-   cache with material savings at many-personas scale; requires same-fs and
-   a read-only or copy-on-write discipline); console filters.
+4. **Sandbox modes** (§10) and per-agent browser profiles (§10a).
+5. **Optional, default-off**: `agent` matcher on limit rules + background-lane
+   usage stamping (§8); `[siblings] replies = "capped"` bot-to-bot
+   containment + Discord `author.bot` extraction (§9); **summary mirroring**
+   (§10b) with the participant-naming instruction tweak (the tweak itself is
+   generic and may land in any earlier phase); shared content-addressed
+   attachment store with per-agent hardlinks (the only *storage* item with
+   material savings at many-personas scale; requires same-fs and a read-only
+   or copy-on-write discipline); console filters.
 
 Phases 2–5 are independent of each other once 1 is in.
 
@@ -542,13 +831,12 @@ Phases 2–5 are independent of each other once 1 is in.
 
 ## 14. Open questions
 
-- **Browser subsystem**: one persistent stealth identity by design. Whether
-  two agents can (or should) share it, or need per-agent browser sessions /
-  managers, is unverified and unscoped here. Until resolved, multi-agent
-  deployments should enable browser tools for at most one agent.
-- **Bot-to-bot conversation**: deliberately allowing sibling triggers with a
-  depth/turn cap. Out of scope; §9's suppression is the v1 stance.
-- **`user_identities` scoping for disjoint communities** (§7.5).
+Resolved since first draft: browser (per-agent Manager profiles, §10a),
+bot-to-bot conversation (capped mode, §9), `user_identities` scoping
+(audited; shared with a guard rule, §7.5).
+
 - **Shared-DB write throughput**: N agents multiply write volume through the
   one single-writer queue; assumed fine at persona scale (single-digit N),
   unmeasured.
+- **Matrix third-party-bot marking**: no reliable bot flag exists on Matrix;
+  the §9 chain cap covers siblings and flagged Discord bots only.
