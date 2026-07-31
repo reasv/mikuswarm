@@ -355,28 +355,138 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Drained into the session the moment it goes live (`launchSession`/resume
   // post-attachAgent), or reverted to native fate if the owner is abandoned.
   const pendingFollowUps = new Map<string, FollowUpDelivery[]>();
-  // Canonicalize once at the source. `config.workspace.root_dir` is commonly
-  // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
-  // means every tool downstream receives an absolute, normalized root. That
-  // keeps path-containment guards correct regardless of how they compare paths,
-  // so a tool can't reintroduce the "absolute path never string-prefixes a
-  // relative root" class of false-rejection bug. Idempotent for the sandbox,
-  // which already calls path.resolve(workspaceRoot) for its bind mount below.
-  const workspaceRoot = path.resolve(config.workspace.root_dir);
-  await mkdir(workspaceRoot, { recursive: true });
+  // ─── Workspace setup (spec MULTI-AGENT-SUPPORT §4.1/§4.2) ──────────────────
+  //
+  // Hard validation (§3 account key colons, §4.2 cross-field invariants) via the
+  // exported pure helper so it's unit-testable. Advisory warnings (out-of-class
+  // account key characters) follow, emitted with the logger.
+  validateAgentConfig(config);
 
-  // First-run workspace seeding (ARCHITECTURE.md §4 "First-run seeding"). Runs
-  // POST-config-load now that workspaceRoot is known. Copy-missing/never-overwrite:
-  // seeds templates/workspace/ only when the workspace is empty (no AGENTS.md AND
-  // no SOUL.md), then seeds skill files for every ON feature gate. A strict no-op
-  // on an established workspace (the live case) — never clobbers SOUL.md et al.
-  await seedWorkspace(workspaceRoot, logger);
-  await seedFeatureSkills(workspaceRoot, enabledFeatureNames(config.features), logger);
+  for (const accountKey of Object.keys(config.matrix?.accounts ?? {})) {
+    if (!AGENT_NAME_RE_EXPORTED.test(accountKey)) {
+      logger.warn("account_key_out_of_class", {
+        provider: "matrix",
+        accountKey,
+        message: "account key contains characters outside [a-z0-9-]; compliant keys are recommended",
+      });
+    }
+  }
+  for (const accountKey of Object.keys(config.discord?.accounts ?? {})) {
+    if (!AGENT_NAME_RE_EXPORTED.test(accountKey)) {
+      logger.warn("account_key_out_of_class", {
+        provider: "discord",
+        accountKey,
+        message: "account key contains characters outside [a-z0-9-]; compliant keys are recommended",
+      });
+    }
+  }
 
-  // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
-  // diary worker's appends and `write_memory`'s edits serialize through it so a
-  // concurrent read-modify-write can't corrupt a day file.
-  const memoryWriter = new MemoryFileWriter(workspaceRoot);
+  // Per-agent workspace entry: workspace root path + its single-writer FIFO.
+  interface AgentWorkspaceEntry {
+    agentName: string;
+    workspaceRoot: string;
+    memoryWriter: MemoryFileWriter;
+  }
+
+  // Mutable map: "provider:accountKey" → AgentWorkspaceEntry.
+  // Populated below; read by resolveWorkspaceForTimeline() (defined after).
+  const agentWorkspaceMap = new Map<string, AgentWorkspaceEntry>();
+
+  let workspaceRoot: string;
+  let memoryWriter: MemoryFileWriter;
+
+  if (config.agents && Object.keys(config.agents).length > 0) {
+    // ── Agents mode (spec §4.1/§4.2) ───────────────────────────────────────
+    // validateAgentConfig() already threw on any §4.2 violation above;
+    // here we only do the I/O (mkdir + seed) and build the resolver map.
+    const agentRoots = Object.entries(config.agents).map(([name, block]) => ({
+      name,
+      resolved: path.resolve(block.workspace_root),
+    }));
+    // Build per-agent entries and seed each workspace independently.
+    // Seeding is a no-op on an established workspace (never overwrites persona files).
+    const agentEntries = new Map<string, AgentWorkspaceEntry>();
+    for (const { name, resolved } of agentRoots) {
+      await mkdir(resolved, { recursive: true });
+      await seedWorkspace(resolved, logger);
+      await seedFeatureSkills(resolved, enabledFeatureNames(config.features), logger);
+      agentEntries.set(name, {
+        agentName: name,
+        workspaceRoot: resolved,
+        memoryWriter: new MemoryFileWriter(resolved),
+      });
+    }
+    // Build the resolver map: "provider:accountKey" → entry
+    for (const [accountKey, account] of Object.entries(config.matrix?.accounts ?? {})) {
+      const agentName = (account as { agent?: string }).agent ?? accountKey;
+      agentWorkspaceMap.set(`matrix:${accountKey}`, agentEntries.get(agentName)!);
+    }
+    for (const [accountKey, account] of Object.entries(config.discord?.accounts ?? {})) {
+      const agentName = account.agent ?? accountKey;
+      agentWorkspaceMap.set(`discord:${accountKey}`, agentEntries.get(agentName)!);
+    }
+    // Use the first agent's workspace for subsystems not yet per-agent
+    // (retrieval Phase 2, captioning/enrichment Phase 3, browser/sandbox Phase 4).
+    const firstEntry = agentEntries.values().next().value!;
+    workspaceRoot = firstEntry.workspaceRoot;
+    memoryWriter = firstEntry.memoryWriter;
+  } else {
+    // ── Legacy mode (single implicit agent, behaviour-identical to pre-Phase-1) ─
+    // validateAgentConfig() already threw on any account-level `agent` field; here
+    // we only seed and build the legacy singleton map entry.
+    // Canonicalize once at the source. `config.workspace?.root_dir` is commonly
+    // configured as a relative path (e.g. "./workspaces/miku"); resolving it here
+    // means every tool downstream receives an absolute, normalized root. That
+    // keeps path-containment guards correct regardless of how they compare paths,
+    // so a tool can't reintroduce the "absolute path never string-prefixes a
+    // relative root" class of false-rejection bug. Idempotent for the sandbox,
+    // which already calls path.resolve(workspaceRoot) for its bind mount below.
+    workspaceRoot = path.resolve(config.workspace?.root_dir ?? "./workspaces/miku");
+    await mkdir(workspaceRoot, { recursive: true });
+
+    // First-run workspace seeding (ARCHITECTURE.md §4 "First-run seeding"). Runs
+    // POST-config-load now that workspaceRoot is known. Copy-missing/never-overwrite:
+    // seeds templates/workspace/ only when the workspace is empty (no AGENTS.md AND
+    // no SOUL.md), then seeds skill files for every ON feature gate. A strict no-op
+    // on an established workspace (the live case) — never clobbers SOUL.md et al.
+    await seedWorkspace(workspaceRoot, logger);
+    await seedFeatureSkills(workspaceRoot, enabledFeatureNames(config.features), logger);
+
+    // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
+    // diary worker's appends and `write_memory`'s edits serialize through it so a
+    // concurrent read-modify-write can't corrupt a day file.
+    memoryWriter = new MemoryFileWriter(workspaceRoot);
+
+    // In legacy mode all accounts map to the single implicit workspace
+    for (const accountKey of Object.keys(config.matrix?.accounts ?? {})) {
+      agentWorkspaceMap.set(`matrix:${accountKey}`, { agentName: "__legacy__", workspaceRoot, memoryWriter });
+    }
+    for (const accountKey of Object.keys(config.discord?.accounts ?? {})) {
+      agentWorkspaceMap.set(`discord:${accountKey}`, { agentName: "__legacy__", workspaceRoot, memoryWriter });
+    }
+  }
+
+  /**
+   * Resolve the workspace entry (root + memoryWriter) for a timeline key
+   * (spec MULTI-AGENT-SUPPORT §4.1/§4.3). Returns undefined when the account
+   * is not in config (§4.3 rule: skip identity-dependent actions, warn).
+   */
+  function resolveWorkspaceForTimeline(timelineKey: string): AgentWorkspaceEntry | undefined {
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed) return undefined;
+    const entry = agentWorkspaceMap.get(`${parsed.provider}:${parsed.accountId}`);
+    if (!entry) {
+      logger.warn("agent_unresolvable_account", {
+        provider: parsed.provider,
+        accountKey: parsed.accountId,
+        timelineKey,
+        message:
+          "timeline key maps to an account not in config — skipping identity-dependent action (§4.3)",
+      });
+      return undefined;
+    }
+    return entry;
+  }
 
   // Memory retrieval (ARCHITECTURE.md §9d): a hybrid lexical+semantic index over
   // `memory/*.md`. When enabled, the indexer reconciles the corpus on startup and
@@ -586,6 +696,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // provider identity rather than the static config.matrix.accounts read.
   contextBuilder.getSelfUserId = (provider, accountId) =>
     providers.get(provider)?.getSelf(accountId)?.id;
+  // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3):
+  // the diary layer and image attachment loading resolve the workspace from the
+  // build's timeline key rather than reading config.workspace.root_dir directly.
+  contextBuilder.resolveWorkspaceRoot = (timelineKey) =>
+    resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot;
 
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
@@ -900,6 +1015,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return p instanceof MatrixProvider ? p : undefined;
   })();
 
+  // Inject sibling self-id set into each provider so it can suppress triggers
+  // from in-process sibling accounts (spec MULTI-AGENT-SUPPORT §5.2).
+  // The Set starts with Matrix self-ids and grows as Discord's READY fires via
+  // onSelfResolved — providers hold it by reference so additions are live.
+  if (matrixProvider) matrixProvider.siblingUserIds = botSelfIdsForLimits;
+  const _discordProviderRef = providers.get("discord");
+  if (_discordProviderRef instanceof DiscordProvider) {
+    _discordProviderRef.siblingUserIds = botSelfIdsForLimits;
+  }
+
   const activeRuns = new Set<Promise<void>>();
   let draining = false;
   // Drain cancellation for context builds (spec §7.2): a build waiting on a
@@ -1001,6 +1126,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     requestRing: llmRequestRing,
     budget: budgetHooks,
     buildToolDefs: resolveToolDefs,
+    // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
+    // Returns the owning agent's resolved workspace root for a timeline key.
+    resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
   });
 
   // ---------------------------------------------------------------------------
@@ -1652,6 +1780,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         memoryWriter,
         config: config.diary ?? {},
         workspaceRoot,
+        // Per-job workspace resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3):
+        // in agents mode each diary job resolves its own workspace root and
+        // MemoryFileWriter from the summary's timeline_key, so diary entries
+        // land in the correct agent's memory/ directory.
+        resolveJobDeps: config.agents
+          ? (timelineKey) => {
+              const entry = resolveWorkspaceForTimeline(timelineKey);
+              if (!entry) return undefined;
+              return { workspaceRoot: entry.workspaceRoot, memoryWriter: entry.memoryWriter };
+            }
+          : undefined,
         // The diary header needs a human room label. The worker retries this and
         // falls back to the room id, so it never blocks a job.
         resolveChannelLabel,
@@ -3165,7 +3304,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         sessionId,
         getSession: () => storage.getAgentSession(sessionId),
         resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
-        loadMaterial: (row) => loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger }),
+        // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the
+        // inbound timeline key so the follow-up resume reads the correct agent dir.
+        // In agents mode an unresolvable account returns null → gate rejects (no resume).
+        loadMaterial: (row) => {
+          const wsEntry = resolveWorkspaceForTimeline(inbound.timelineKey);
+          if (!wsEntry && config.agents) return Promise.resolve(null);
+          return loadCompletedSessionMaterial(row, {
+            media: storage,
+            workspaceRoot: wsEntry?.workspaceRoot ?? workspaceRoot,
+            logger,
+          });
+        },
         timelineKey: inbound.timelineKey,
         logger,
       });
@@ -3320,6 +3470,24 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // a fresh launch; the bumped value for a reply-resumed run.
     resumeGeneration: number = 0,
   ) {
+    // Per-session workspace (spec MULTI-AGENT-SUPPORT §4.1): in agents mode each
+    // session resolves to the workspace directory of its configured agent.
+    // In legacy mode resolveWorkspaceForTimeline always returns the singleton entry
+    // so sessionWsRoot/sessionMemWriter are identical to the outer-scope vars.
+    const _sessionWsEntry = resolveWorkspaceForTimeline(inbound.timelineKey);
+    // §4.3: in agents mode a missing entry means the account was removed from config
+    // after the event was committed. resolveWorkspaceForTimeline already logged
+    // agent_unresolvable_account; throw so the caller (launchSession's catch block or
+    // resumeSessionRun's outcome path) can discard cleanly without guessing a root.
+    if (!_sessionWsEntry && config.agents) {
+      throw new Error(
+        `§4.3: timeline "${inbound.timelineKey}" maps to an account not in config — ` +
+        "workspace unresolvable in agents mode",
+      );
+    }
+    const sessionWsRoot = _sessionWsEntry?.workspaceRoot ?? workspaceRoot;
+    const sessionMemWriter = _sessionWsEntry?.memoryWriter ?? memoryWriter;
+
     const roomId = target.roomId;
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
     // consumer 3 / §2.5 ordering shape (a)): the text-editor read budget derives
@@ -3442,7 +3610,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         timeline,
         agentSessionId: sessionId,
         agentSessionGeneration: resumeGeneration,
-        workspaceRoot,
+        workspaceRoot: sessionWsRoot,
         mediaMaxBytes: downloadSizeLimit,
         terminology,
         // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): a LIVE registry
@@ -3538,7 +3706,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // set_profile is a provider-level capability (optional on IChatProvider).
       // Present only when the provider implements it and an accountId is available.
       ...(sessionProvider.setProfile && target.accountId
-        ? [createSetProfileTool({ provider: sessionProvider, accountId: target.accountId, workspaceRoot })]
+        ? [createSetProfileTool({ provider: sessionProvider, accountId: target.accountId, workspaceRoot: sessionWsRoot })]
         : []),
       createWebFetchTool(),
       createWebSearchTool(),
@@ -3551,7 +3719,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             // screenshots respect the model's per-image budget (issue #2).
             maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
             // Upload paths resolve within (and are confined to) the workspace (§6).
-            workspaceRoot,
+            workspaceRoot: sessionWsRoot,
           })]
         : []),
       // Adaptive paging uses the session's operative context ceiling
@@ -3560,19 +3728,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // consume, not the raw physical window. Clamps in resolveMaxCharacters
       // (50KB–512KB) bound the impact, so a mismatch only shifts the cap within
       // those limits.
-      createTextEditorTool({ workspaceRoot, contextWindowTokens: contextCeiling }),
-      createSearchFilesTool({ workspaceRoot, sandbox }),
+      createTextEditorTool({ workspaceRoot: sessionWsRoot, contextWindowTokens: contextCeiling }),
+      createSearchFilesTool({ workspaceRoot: sessionWsRoot, sandbox }),
       ...(sandbox ? [createBashTool({ sandbox, defaultTimeoutMs: config.sandbox?.exec_timeout_ms })] : []),
       createMediaTool({
-        workspaceRoot,
+        workspaceRoot: sessionWsRoot,
         clients: captionClients,
         defaultPrompts,
         modelHasVision: replyModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
         fetchClient,
       }),
-      ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
-      createSearchMemoryTool({ workspaceRoot }),
+      ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
+      createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),
       ...(retrieval
         ? [
             createRecallMemoryTool({
@@ -3584,9 +3752,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             }),
           ]
         : []),
-      createWriteMemoryTool({ workspaceRoot, memoryWriter }),
+      createWriteMemoryTool({ workspaceRoot: sessionWsRoot, memoryWriter: sessionMemWriter }),
       createDanbooruTool({
-        workspaceRoot,
+        workspaceRoot: sessionWsRoot,
         downloadSizeLimit,
         inlineImageMaxBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
         inferenceImageOptions,
@@ -3600,7 +3768,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }),
       ...(fxTwitterConfig.tool.enabled
         ? [createXFetchTool({
-            workspaceRoot,
+            workspaceRoot: sessionWsRoot,
             fetchClient,
             client: fxTwitterClient,
             // Same shared per-model base64 cap + conditioning pipeline as
@@ -3614,7 +3782,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         : []),
       ...(config.image_gen
         ? [createImageGenTool({
-            workspaceRoot,
+            workspaceRoot: sessionWsRoot,
             fetchClient,
             downloadSizeLimit,
             inlineImageMaxBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
@@ -3647,7 +3815,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // process-wide per-account quota limiter.
       ...(sauceNaoConfig && sauceNaoRateLimiter
         ? [createFindSourceTool({
-            workspaceRoot,
+            workspaceRoot: sessionWsRoot,
             fetchClient,
             // Same shared per-model base64 cap + conditioning pipeline as
             // read_image / danbooru preview, for the view-thumbnail path.
@@ -3674,7 +3842,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             deepChain: resolveModelChain(config.x_search.deep_model ?? config.x_search.model, config.models),
             scheduler: llmScheduler,
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
-            workspaceRoot,
+            workspaceRoot: sessionWsRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
             // Reuse the image caption model — the exact `media`-tool path (§5).
@@ -3690,7 +3858,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           })]
         : []),
       createUserProfileReadTool({
-        workspaceRoot,
+        workspaceRoot: sessionWsRoot,
         provider: inbound.provider,
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
@@ -3699,7 +3867,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         config: config.user_profiles,
       }),
       createUserProfileEditTool({
-        workspaceRoot,
+        workspaceRoot: sessionWsRoot,
         provider: inbound.provider,
         senderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         senderUsername: (inbound.trigger?.triggeredBy ?? inbound.event.sender).username,
@@ -3707,9 +3875,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         terminology,
         config: config.user_profiles,
       }),
-      createCharacterCardCreateTool({ workspaceRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
-      createCharacterCardReadTool({ workspaceRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
-      createCharacterCardEditTool({ workspaceRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
+      createCharacterCardCreateTool({ workspaceRoot: sessionWsRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
+      createCharacterCardReadTool({ workspaceRoot: sessionWsRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
+      createCharacterCardEditTool({ workspaceRoot: sessionWsRoot, fetchClient, downloadSizeLimit, config: config.character_card }),
       ...mcpTools,
     ].filter((t) => !disabledTools.has(t.name));
   }
@@ -3926,7 +4094,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Image refs externalized at capture time are rehydrated through the media
     // store here (issue #13) — without this, an image-bearing snapshot would
     // re-issue malformed `{type:"image"}` blocks and 400 fatally.
-    const material = await loadResumeMaterial(row, { media: storage, workspaceRoot, logger });
+    // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the
+    // session's timeline key (identical to outer workspaceRoot in legacy mode).
+    // In agents mode an unresolvable account is fatal — the session cannot resume
+    // from an unknown workspace.
+    const _resumeWsEntry = resolveWorkspaceForTimeline(inbound.timelineKey);
+    if (!_resumeWsEntry && config.agents) {
+      return { outcome: "fatal", error: `§4.3: timeline "${inbound.timelineKey}" maps to an account not in config — workspace unresolvable` };
+    }
+    const _resumeWsRoot = _resumeWsEntry?.workspaceRoot ?? workspaceRoot;
+    const material = await loadResumeMaterial(row, { media: storage, workspaceRoot: _resumeWsRoot, logger });
     if (!material) return { outcome: "unresumable", error: "no resumable snapshot/transcript" };
     const target = inbound.outboundTarget;
     if (!target) return { outcome: "unresumable", error: "no outbound target" };
@@ -3974,7 +4151,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // (spec RESUMABLE-SESSIONS §6), so a session that was reply-resumed (generation
     // bumped) then parked stays reply-resumable from its newest output after a
     // manual console resume — its sends carry the live generation, not 0.
-    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, row.resume_generation);
+    // §4.3: buildSessionTools throws in agents mode when the account is unresolvable.
+    // Caught here and surfaced as a fatal outcome so the manual-resume handler can
+    // re-park / discard without leaving the session stuck as "running".
+    let tools: ReturnType<typeof buildSessionTools>;
+    try {
+      tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, row.resume_generation);
+    } catch (wsErr) {
+      return {
+        outcome: "fatal",
+        error: `workspace unresolvable (§4.3): ${wsErr instanceof Error ? wsErr.message : String(wsErr)}`,
+      };
+    }
     // Fresh mode only: the rebuilt context's kickoff turn + persistence
     // snapshot — run and persisted exactly like a launch.
     let kickoff;
@@ -4108,7 +4296,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const runManualResume = createManualResumeSession({
     isDraining: () => draining,
     getSessionRow: (id) => storage.getAgentSession(id),
-    loadMaterial: (row) => loadResumeMaterial(row, { media: storage, workspaceRoot, logger }),
+    // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the row's
+    // stored timeline key so a manual console resume lands in the correct agent dir.
+    // In agents mode an unresolvable account returns null → createManualResumeSession
+    // maps that to outcome "unresumable", which the console surfaces to the operator.
+    loadMaterial: (row) => {
+      const wsEntry = resolveWorkspaceForTimeline(row.timeline_key);
+      if (!wsEntry && config.agents) return Promise.resolve(null);
+      return loadResumeMaterial(row, {
+        media: storage,
+        workspaceRoot: wsEntry?.workspaceRoot ?? workspaceRoot,
+        logger,
+      });
+    },
     hasLiveSession: (id) => sessions.get(id) !== undefined,
     adopt: (record) => sessions.adopt(record),
     tryAcquireTimelineSlot: (timelineKey) => triggerCoordinator.tryAcquire(timelineKey),
@@ -4288,7 +4488,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         resumeCfg,
         exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
         resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
-        loadMaterial: (row) => loadCompletedSessionMaterial(row, { media: storage, workspaceRoot, logger }),
+        // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): the row's stored
+        // timeline key identifies the agent; resolve its workspace so images and
+        // memory files are loaded from the correct per-agent directory.
+        // In agents mode an unresolvable account returns null → gate rejects (no resume).
+        loadMaterial: (row) => {
+          const wsEntry = resolveWorkspaceForTimeline(row.timeline_key);
+          if (!wsEntry && config.agents) return Promise.resolve(null);
+          return loadCompletedSessionMaterial(row, {
+            media: storage,
+            workspaceRoot: wsEntry?.workspaceRoot ?? workspaceRoot,
+            logger,
+          });
+        },
         logger,
       });
       if (!verdict.resume) return false;
@@ -4450,7 +4662,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       resumeUsageSeed(row, "continue"),
       selectToolCostSeed("continue", () => storage.getSessionToolUsage(record.id).cost),
     );
-    const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, generation);
 
     // Gap backfill (§9): the caller resolved the budget + lower bound (reply-resume
     // reads it from `[agent.sessions.resume.gap]`; a follow-up resume omits it — the
@@ -4469,6 +4680,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let agent;
     let kickoff;
     try {
+      // §4.3: buildSessionTools throws in agents mode when the account is unresolvable.
+      // Placed INSIDE the try block so the existing catch handles it identically to a
+      // factory failure (markDiscarded + drain). Synchronous — no async ordering concern.
+      const tools = buildSessionTools(inbound, record.id, target, record.sessionType, usage, generation);
       // Readiness wait (spec CLAIM-VISIBILITY-SERIALIZATION §4.1/§4.2): the resumed
       // session is already visible-as-running (`adopt`/`markRunning` above) and its
       // claim attributed, so wait for the reply trigger's enrichment + caption
@@ -4508,7 +4723,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       sessions.markDiscarded(record.id, {
         error: error instanceof Error ? error.message : String(error),
       });
-      logger.error(buildTimeout ? "session_resume_build_wait_timeout" : "session_resume_factory_failed", {
+      const unresolvableAccount = error instanceof Error && error.message.startsWith("§4.3:");
+      logger.error(
+        buildTimeout
+          ? "session_resume_build_wait_timeout"
+          : unresolvableAccount
+            ? "session_resume_skipped_unresolvable_account"
+            : "session_resume_factory_failed",
+        {
         sessionId: record.id,
         timelineKey: record.timelineKey,
         error: error instanceof Error ? error.message : String(error),
@@ -4806,12 +5028,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // tool-cost feed (wired into buildSessionTools' recordToolUsage) and the
     // factory's Layer-0 agent-loop commits — the combined basis for the ceiling.
     const usage = new SessionUsageTracker();
-    const tools = buildSessionTools(inbound, session.id, target, session.sessionType, usage);
     let agent;
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
     try {
+      // §4.3: buildSessionTools throws when agents mode + unresolvable account.
+      // Placed INSIDE the try block so the existing catch handles it identically
+      // to a factory failure (markDiscarded + drain), without leaving the session
+      // stuck as "running". Synchronous — no async ordering concern with the
+      // awaitTriggerReadiness call below.
+      const tools = buildSessionTools(inbound, session.id, target, session.sessionType, usage);
       // Readiness wait (spec CLAIM-VISIBILITY-SERIALIZATION §4.1): wait for the
       // trigger group's enrichment + caption readiness HERE — the session is already
       // visible-as-running (`createPlaceholder`/`markRunning` above) and its claim
@@ -4850,7 +5077,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       sessions.markDiscarded(session.id, {
         error: error instanceof Error ? error.message : String(error),
       });
-      logger.error(buildTimeout ? "session_build_wait_timeout" : "session_factory_failed", {
+      const unresolvableAccount = error instanceof Error && error.message.startsWith("§4.3:");
+      logger.error(
+        buildTimeout
+          ? "session_build_wait_timeout"
+          : unresolvableAccount
+            ? "session_skipped_unresolvable_account"
+            : "session_factory_failed",
+        {
         sessionId: session.id,
         timelineKey: session.timelineKey,
         proactive,
@@ -5059,6 +5293,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // §6.3: wire provider self-identity so proactive synthetic inbounds carry the
     // real provider identity rather than the static config.matrix.accounts read.
     getSelf: (provider, accountId) => providers.get(provider)?.getSelf(accountId),
+    // Sibling suppression (spec MULTI-AGENT-SUPPORT §5.2): exclude messages from
+    // in-process sibling accounts when counting human activity in the gate.
+    siblingUserIds: botSelfIdsForLimits,
     logger: logger.child("proactive"),
   });
 
@@ -5367,6 +5604,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const host = id === "matrix" ? buildMatrixHost() : genericHost;
     await p.start(host);
   }
+
+  // Discord self-id resolution is now done INSIDE DiscordProvider.start() — each
+  // account's self-id is resolved via REST before attachListeners()/client.login()
+  // so the sibling suppression set (siblingUserIds / botSelfIdsForLimits) is complete
+  // before any gateway events arrive. start() throws if the REST call fails (fail-fast
+  // policy — an incomplete suppression set is worse than a failed startup).
+  // The old fire-and-forgotten resolveEagerSelfIds() call has been removed; the
+  // gateway READY event continues to call onSelfResolved() as a belt-and-suspenders
+  // backstop (e.g. when READY races the REST call on a very fast connection).
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
   // shows real names without waiting for each room's next message. Throttled and
@@ -6206,4 +6452,128 @@ function resolveReadImageMaxBytes(config: AppConfig, perModelBytes?: number): nu
     config.media?.download_size_limit,
   ].filter((v): v is number => typeof v === "number");
   return Math.min(...candidates);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent config validation (spec MULTI-AGENT-SUPPORT §3 / §4.2)
+// ---------------------------------------------------------------------------
+//
+// Pure synchronous guard — no I/O, no side effects. Throws a descriptive Error
+// on any hard violation. Silently passes (without logging) the out-of-class
+// account-key warning because that requires a logger; callers may independently
+// check account keys if they want the advisory.
+//
+// Called by startMikuAgent before any I/O, and importable for unit tests.
+
+/** Strict identifier pattern for agent names and the advisory pattern for account keys. */
+const AGENT_NAME_RE_EXPORTED = /^[a-z0-9-]+$/;
+
+/**
+ * Validate multi-agent configuration cross-field invariants (spec §3 / §4.2).
+ * Throws on any hard violation; returns `void` on a valid config.
+ *
+ * Checks:
+ * - §3: colon in any account key (matrix or discord) → fatal
+ * - §4.2 agents mode: `[workspace].root_dir` + `[agents]` mutual exclusivity
+ * - §4.2 agents mode: agent names must match `[a-z0-9-]+`
+ * - §4.2 agents mode: every account's resolved agent name must match a declared entry
+ * - §4.2 agents mode: workspace roots must be pairwise disjoint (no nesting)
+ * - §4.2 legacy mode: `agent` field on any account without an `[agents]` table → error
+ */
+export function validateAgentConfig(config: AppConfig): void {
+  // §3: colon in an account key breaks parseTimelineKey (orphans the timeline).
+  for (const accountKey of Object.keys(config.matrix?.accounts ?? {})) {
+    if (accountKey.includes(":")) {
+      throw new Error(
+        `[matrix] account key "${accountKey}" contains a colon — this breaks ` +
+          `parseTimelineKey and orphans every stored timeline. Rename the key ` +
+          `(note: renaming is NOT migration-safe if rows already exist).`,
+      );
+    }
+  }
+  for (const accountKey of Object.keys(config.discord?.accounts ?? {})) {
+    if (accountKey.includes(":")) {
+      throw new Error(
+        `[discord] account key "${accountKey}" contains a colon — this breaks ` +
+          `parseTimelineKey and orphans every stored timeline. Rename the key ` +
+          `(note: renaming is NOT migration-safe if rows already exist).`,
+      );
+    }
+  }
+
+  if (config.agents && Object.keys(config.agents).length > 0) {
+    // ── Agents mode (§4.2) ────────────────────────────────────────────────────
+    if (config.workspace?.root_dir !== undefined) {
+      throw new Error(
+        "[workspace].root_dir is mutually exclusive with [agents] — remove root_dir " +
+          "from config and set workspace_root on each [agents.*] block instead.",
+      );
+    }
+    for (const agentName of Object.keys(config.agents)) {
+      if (!AGENT_NAME_RE_EXPORTED.test(agentName)) {
+        throw new Error(
+          `[agents] name "${agentName}" contains characters outside [a-z0-9-]. ` +
+            `Agent names are path-safe identifiers: use only lowercase letters, digits, and hyphens.`,
+        );
+      }
+    }
+    for (const [accountKey, account] of Object.entries(config.matrix?.accounts ?? {})) {
+      const agentName = (account as { agent?: string }).agent ?? accountKey;
+      if (!config.agents[agentName]) {
+        throw new Error(
+          `[matrix.accounts.${accountKey}] refers to agent "${agentName}" ` +
+            `which is not declared in [agents]. Add [agents.${agentName}] or set agent = "<existing-name>".`,
+        );
+      }
+    }
+    for (const [accountKey, account] of Object.entries(config.discord?.accounts ?? {})) {
+      const agentName = account.agent ?? accountKey;
+      if (!config.agents[agentName]) {
+        throw new Error(
+          `[discord.accounts.${accountKey}] refers to agent "${agentName}" ` +
+            `which is not declared in [agents]. Add [agents.${agentName}] or set agent = "<existing-name>".`,
+        );
+      }
+    }
+    // Pairwise disjoint check
+    const agentRoots = Object.entries(config.agents).map(([name, block]) => ({
+      name,
+      resolved: path.resolve(block.workspace_root),
+    }));
+    for (let i = 0; i < agentRoots.length; i++) {
+      for (let j = i + 1; j < agentRoots.length; j++) {
+        const a = agentRoots[i]!;
+        const b = agentRoots[j]!;
+        const sep = path.sep;
+        if (
+          a.resolved === b.resolved ||
+          b.resolved.startsWith(a.resolved + sep) ||
+          a.resolved.startsWith(b.resolved + sep)
+        ) {
+          throw new Error(
+            `[agents] workspace roots must be pairwise disjoint: ` +
+              `"${a.name}" (${a.resolved}) and "${b.name}" (${b.resolved}) overlap.`,
+          );
+        }
+      }
+    }
+  } else {
+    // ── Legacy mode (§4.2): agent field on account without [agents] is an error ─
+    const matrixAgentFields = Object.entries(config.matrix?.accounts ?? {}).filter(
+      ([, a]) => (a as { agent?: string }).agent !== undefined,
+    );
+    const discordAgentFields = Object.entries(config.discord?.accounts ?? {}).filter(
+      ([, a]) => a.agent !== undefined,
+    );
+    if (matrixAgentFields.length > 0 || discordAgentFields.length > 0) {
+      const offenders = [
+        ...matrixAgentFields.map(([k]) => `[matrix.accounts.${k}].agent`),
+        ...discordAgentFields.map(([k]) => `[discord.accounts.${k}].agent`),
+      ].join(", ");
+      throw new Error(
+        `account-level \`agent\` field (${offenders}) is not valid without an ` +
+          `[agents] table — add [agents.*] blocks or remove the \`agent\` fields.`,
+      );
+    }
+  }
 }

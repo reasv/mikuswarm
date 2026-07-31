@@ -682,6 +682,12 @@ const MatrixAccountSchema = StrictObject({
   user_id: Type.String(),
   device_id: Type.Optional(Type.String()),
   store_path: Type.String(),
+  /**
+   * Agent this account belongs to (spec MULTI-AGENT-SUPPORT §4.1).
+   * Defaults to the account key when absent. Only valid when an [agents] table
+   * is present; a validation error in legacy mode (§4.2).
+   */
+  agent: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 /**
@@ -702,6 +708,39 @@ const DiscordAccountSchema = StrictObject({
    * requires the intent to be toggled on in the Discord Developer Portal as well.
    */
   member_intent: Type.Optional(Type.Boolean()),
+  /**
+   * Agent this account belongs to (spec MULTI-AGENT-SUPPORT §4.1).
+   * Defaults to the account key when absent. Only valid when an [agents] table
+   * is present; a validation error in legacy mode (§4.2).
+   */
+  agent: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+/**
+ * Per-agent identity block (spec MULTI-AGENT-SUPPORT §4.1).
+ * Each entry under `[agents.*]` declares one named agent's workspace.
+ */
+const AgentBlockSchema = StrictObject({
+  /** Absolute or relative path to this agent's workspace root directory. */
+  workspace_root: Type.String({ minLength: 1 }),
+});
+
+/**
+ * Sibling-reply suppression settings (spec MULTI-AGENT-SUPPORT §9).
+ * Controls whether one in-process bot account can trigger another.
+ * Default `replies = "never"` suppresses all sibling triggers.
+ */
+const SiblingsSchema = StrictObject({
+  /**
+   * "never" (default): sibling messages are ingested and stored but never
+   * trigger a session. Only "never" is implemented in Phase 1 (§13).
+   */
+  replies: Type.Optional(Type.Literal("never")),
+  /**
+   * In "capped" mode (Phase 5): maximum consecutive bot messages allowed
+   * since the last human message before all agents go silent.
+   */
+  max_bot_chain: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
 /**
@@ -1346,9 +1385,26 @@ export const AppConfigSchema = StrictObject({
   storage: StrictObject({
     database_path: Type.String(),
   }),
-  workspace: StrictObject({
-    root_dir: Type.String(),
-  }),
+  /**
+   * Legacy single-agent workspace. When `[agents]` is present, `root_dir` is a
+   * startup error (mutually exclusive). When absent, the code default
+   * `"./workspaces/miku"` is used (spec MULTI-AGENT-SUPPORT §4.2).
+   */
+  workspace: Type.Optional(StrictObject({
+    root_dir: Type.Optional(Type.String()),
+  })),
+  /**
+   * Per-agent identity blocks (spec MULTI-AGENT-SUPPORT §4.1). When present,
+   * every account's `agent` field (defaulting to the account key) must match a
+   * declared entry, and workspace roots must be pairwise disjoint.
+   * Mutually exclusive with `[workspace].root_dir`.
+   */
+  agents: Type.Optional(Type.Record(Type.String(), AgentBlockSchema)),
+  /**
+   * Sibling-reply suppression (spec MULTI-AGENT-SUPPORT §9). Controls whether
+   * one in-process bot account can trigger another. Default: never trigger.
+   */
+  siblings: Type.Optional(SiblingsSchema),
   // Docker sandbox: when enabled, shell-shaped tool calls (the `bash` tool and
   // `search_files`/ripgrep) execute inside a long-lived container whose
   // /workspace is the bind-mounted workspace root. Pure byte I/O and image
@@ -1490,3 +1546,7 @@ export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
+/** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1). */
+export type AgentBlockConfig = Static<typeof AgentBlockSchema>;
+/** Sibling-reply suppression config (spec MULTI-AGENT-SUPPORT §9). */
+export type SiblingsConfig = Static<typeof SiblingsSchema>;

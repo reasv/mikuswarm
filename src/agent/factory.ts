@@ -199,6 +199,18 @@ export interface AgentFactoryOptions {
    * per-request agent-loop ledger row. Absent = no period budgeting (tests).
    */
   budget?: BudgetHooks;
+  /**
+   * Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
+   * Maps a `timeline_key` to the owning agent's workspace root path.
+   * - When **absent** (legacy single-agent mode): `create`/`buildPreview` fall
+   *   back to `config.workspace?.root_dir ?? "./workspaces/miku"`.
+   * - When **present** (agents mode) and the key resolves: returns the agent's
+   *   absolute workspace root.
+   * - When **present** and the key is **unresolvable** (§4.3 — account removed
+   *   from config): `create`/`buildPreview` throw a descriptive error so
+   *   callers can log and discard the session, not fall back to a random root.
+   */
+  resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -479,7 +491,22 @@ export class AgentSessionFactory {
     tools: AgentTool[] = [],
     opts?: CreateAgentOptions,
   ): Promise<CreatedAgent> {
-    const workspaceRoot = this.options.config.workspace.root_dir;
+    // §4.3: in agents mode (resolver provided) an unresolvable account must not
+    // fall back to a guessed root — surface a descriptive error so the caller
+    // (launchSession's catch block) logs + discards cleanly.
+    let workspaceRoot: string;
+    if (this.options.resolveWorkspaceRoot) {
+      const resolved = this.options.resolveWorkspaceRoot(session.timelineKey);
+      if (resolved === undefined) {
+        throw new Error(
+          `§4.3: timeline "${session.timelineKey}" maps to an account not in config — ` +
+          "workspace root unresolvable in agents mode",
+        );
+      }
+      workspaceRoot = resolved;
+    } else {
+      workspaceRoot = this.options.config.workspace?.root_dir ?? "./workspaces/miku";
+    }
     const sessionTypeConfig = this.resolveSessionType(session.sessionType);
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
 
@@ -1472,7 +1499,20 @@ export class AgentSessionFactory {
   async buildPreview(timelineKey: string): Promise<PreviewContext> {
     const storage = this.options.storage;
     if (!storage) throw new Error("buildPreview requires a storage-backed factory");
-    const workspaceRoot = this.options.config.workspace.root_dir;
+    // §4.3: same rule as create() — agents mode must never guess a root.
+    let workspaceRoot: string;
+    if (this.options.resolveWorkspaceRoot) {
+      const resolved = this.options.resolveWorkspaceRoot(timelineKey);
+      if (resolved === undefined) {
+        throw new Error(
+          `§4.3: timeline "${timelineKey}" maps to an account not in config — ` +
+          "workspace root unresolvable in agents mode",
+        );
+      }
+      workspaceRoot = resolved;
+    } else {
+      workspaceRoot = this.options.config.workspace?.root_dir ?? "./workspaces/miku";
+    }
     const sessionTypeConfig = this.resolveSessionType("default");
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
     const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);

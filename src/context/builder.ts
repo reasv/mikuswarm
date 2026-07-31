@@ -281,6 +281,14 @@ export class ContextBuilder {
    */
   getSelfUserId?: (provider: string, accountId: string) => string | undefined;
 
+  /**
+   * Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1).
+   * Injected by app.ts after construction. Maps a `timeline_key` to the owning
+   * agent's workspace root path. When absent or when the key is unresolvable
+   * (§4.3), falls back to `config.workspace?.root_dir ?? "./workspaces/miku"`.
+   */
+  resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
@@ -637,7 +645,7 @@ export class ContextBuilder {
     // chronologically. Any cross-midnight divergence from §10a's literal "latest
     // in-context message day" wording is cosmetic: recentMemoryWindow only surfaces
     // existing files ≤ the anchor and never shows empty days.
-    const diaryLayer = generation ? null : await this.buildDiaryLayerMessage(now);
+    const diaryLayer = generation ? null : await this.buildDiaryLayerMessage(now, options.timelineKey);
 
     // Auto-retrieval (§8c): a small, cited block of relevant-but-not-recent memory,
     // riding INSIDE the final user turn (cache-safe) BEFORE the trigger messages, so
@@ -1055,10 +1063,14 @@ export class ContextBuilder {
    * nothing is surfaceable. Bounded by `diary.recency_max_tokens` and front-trimmed
    * by whole blocks; shared sparsity handling lives in `recentMemoryWindow` (§9a).
    */
-  private async buildDiaryLayerMessage(now: number): Promise<ContextMessage | null> {
+  private async buildDiaryLayerMessage(now: number, timelineKey?: string): Promise<ContextMessage | null> {
     const diaryCfg = this.config.diary ?? {};
+    const workspaceRoot =
+      (timelineKey && this.resolveWorkspaceRoot?.(timelineKey)) ??
+      this.config.workspace?.root_dir ??
+      "./workspaces/miku";
     const content = await buildRecentDiaryContent({
-      workspaceRoot: this.config.workspace.root_dir,
+      workspaceRoot,
       anchorDay: agentDateStamp(now),
       ceilingTokens: diaryCfg.recency_max_tokens ?? 6000,
       fileCount: diaryCfg.recency_file_count ?? 2,
@@ -1636,11 +1648,15 @@ export class ContextBuilder {
     const images = this.selectImageAttachments(trigger);
     const blocks: ImageBlock[] = [];
     const imageOpts = buildInferenceImageOptions(this.config.media?.image);
+    const workspaceRoot =
+      (this.resolveWorkspaceRoot?.(trigger.timelineKey)) ??
+      this.config.workspace?.root_dir ??
+      "./workspaces/miku";
     for (const { eventId, attachment } of images) {
       if (!attachment.localPath) continue;
       const absPath = attachment.localPath.startsWith("/")
         ? attachment.localPath
-        : path.join(this.config.workspace.root_dir, attachment.localPath);
+        : path.join(workspaceRoot, attachment.localPath);
       try {
         const processed = await processImageForInference(absPath, imageOpts);
         const data = await readFile(processed.path);

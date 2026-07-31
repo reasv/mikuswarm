@@ -304,9 +304,6 @@ max_duration_seconds = 300
 [storage]
 database_path = "./var/mikuswarm.db"
 
-[workspace]
-root_dir = "./workspaces/miku"
-
 # Docker sandbox (ARCHITECTURE.md §11a). Off by default; when enabled, the `bash`
 # tool and `search_files`/ripgrep run inside a long-lived container with the
 # workspace bind-mounted at workspace_mount. Enabling requires the image built
