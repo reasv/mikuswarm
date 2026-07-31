@@ -27,6 +27,17 @@ one-way (§10b); embedding spend is excluded from agent-scoped limit rules
 (§8); the participant-naming summarization instruction ships default-on
 (§10b); account-key validation is colon-only hard error (§3).
 
+**Review round 3** (2026-07-31, code-verified): factual corrections only, no
+new operator decisions — mirror-worker hook is the pool's external
+`onComplete` callback (condensation is an internal call, §10b); context
+builder added as a root-resolution touchpoint (§6, §12); proactive
+eligibility gate added as a sibling-exclusion touchpoint (§12); recent-memory
+window is file-scoped, not an index query (§7.1); self-id exclusion targets
+the user-limit engine's `selfUserIds` set (§8, §9); "sibling" includes
+same-agent accounts; chain counting is knob-independent; agents-mode global
+browser `profile_name` is a startup error; donor-account tie-break is
+deterministic (§9, §10a, §10b).
+
 **Guiding constraint** (same as the Discord design): every change lands as a
 generic, default-off upstream feature. An existing single-agent config must be
 byte-identical in behaviour after every phase below. Multi-agent is enabled
@@ -167,7 +178,9 @@ contract — the account Records take bare strings. Phase 1 adds validation
 with a deliberate back-compat asymmetry: for **account keys** (frozen;
 an existing deployment with a nonconforming key cannot rename to comply
 without orphaning its data), only a colon is a hard startup error — it
-silently breaks `parseTimelineKey`, on which §8 attribution and every
+breaks `parseTimelineKey` (a hard parse failure in most positions, a silent
+mis-parse when the segment after the colon happens to read as a valid kind),
+on which §8 attribution and every
 per-event resolver in this spec depend — while other out-of-class
 characters only log a warning. **Agent names** are new identifiers with
 nothing stored under them, so they enforce the full class strictly.
@@ -316,10 +329,11 @@ already multi-account end-to-end, and none of this spec touches them:
 - Summarization, diary *scheduling*, proactive posting, activation lifecycle,
   echo resolution and trigger claims are all timeline-key-scoped.
 
-The single point where the account axis currently collapses into "one bot" is
-session/workspace assembly: every session gets the one global
-`config.workspace.root_dir` (`src/agent/factory.ts`), every diary lands in the
-one `memory/`, and the one retrieval index spans it. §7 and §12 are the
+The account axis currently collapses into "one bot" at session/workspace
+assembly: every session gets the one global `config.workspace.root_dir` —
+read by the session factory (`src/agent/factory.ts`) and directly by the
+context builder (`src/context/builder.ts`) — every diary lands in the one
+`memory/`, and the one retrieval index spans it. §7 and §12 are the
 enumeration of exactly those convergence points.
 
 ---
@@ -336,9 +350,11 @@ pointed at. With per-agent workspaces feeding one index, agent B would
 retrieve agent A's diary verbatim.
 
 Required: an `agent` column on `memory_chunks`, stamped by the reconciliation
-indexer from the workspace root it is walking; every retrieval query
-(hybrid search, auto-retrieval, recent-memory window) filters on the
-requesting session's agent. One index, one embedding model, one
+indexer from the workspace root it is walking; every index query path
+(hybrid search and context auto-retrieval) filters on the requesting
+session's agent. (The recent-memory window is not an index query — it reads
+`memory/*.md` files straight from the workspace, so it is per-agent by
+construction once roots are per-agent, §7.3.) One index, one embedding model, one
 `embedding_cache` (content-hash keyed — safe to share by construction; shared
 cache hits across agents are free wins). A per-agent index DB was considered
 and rejected: `index_meta`/embedding-model state is process-global settings,
@@ -384,8 +400,9 @@ account); for disjoint communities it is mandatory isolation.
 One `MemoryFileWriter` per agent (keyed by workspace root); the diary pool
 resolves the owning agent from each job's summary `timeline_key` and writes to
 that agent's `memory/`. Summarize/diary/proactive sessions load the owning
-agent's workspace files, so persona files never cross. The dictated diary
-header and recent-memory window read per-agent.
+agent's workspace files, so persona files never cross. The recent-memory
+window reads per-agent (workspace files); the diary header is derived from
+job timestamps and needs nothing.
 
 ### 7.4 Attachments — required, with a relink story
 
@@ -478,13 +495,18 @@ denormalized columns (`room_id`, `space_id`) with matching reseed indexes.
   (§4.3).
 - Per-user limits: unchanged mechanics; because all agents share one
   `usage_events`, a user's spend already counts across every agent — which is
-  the correct default and previously impossible with N processes. The
-  `isUserIdentity` predicate must include **all** agents' account self-ids so
-  no sibling bot is ever metered as a user (§9).
+  the correct default and previously impossible with N processes. The user
+  limit engine's self-id exclusion set (`selfUserIds`, checked alongside the
+  `isUserIdentity` shape predicate) must include **all** agents' account
+  self-ids so no sibling bot is ever metered as a user (§9).
 
 ---
 
 ## 9. Sibling awareness: self-id sets and contained bot-to-bot replies
+
+"Sibling" throughout this section means **any other account in the process,
+including a second account of the same agent** — two doors of one persona
+must not trigger each other any more than two personas may.
 
 Trigger detection is mention/DM/reply-to-self, with no sender-is-a-bot check;
 two agents that can mention each other are an unbounded ping-pong loop at LLM
@@ -497,9 +519,9 @@ account at startup), so the suppression sets are complete before the first
 event — no startup window where a sibling triggers or is metered as a user.
 
 - **Sibling messages never count toward per-user limits**: fold every
-  account's self-ids across all agents into the existing bot-self-id
-  exclusion set and the `isUserIdentity` predicate. Holds in every mode
-  below.
+  account's self-ids across all agents into the trigger-path bot-self-id
+  exclusion sets and the user limit engine's `selfUserIds` set (§8). Holds
+  in every mode below.
 - Proactive eligibility and any "recent human activity" heuristics likewise
   treat sibling messages as bot traffic, not user traffic, in every mode.
 - **Sibling replies are governed by a process-global mode** (the default is
@@ -517,8 +539,12 @@ event — no startup window where a sibling triggers or is metered as a user.
     trigger for B.
   - `"capped"`: a sibling mention/reply triggers only while the observing
     account's timeline contains fewer than `max_bot_chain` bot-authored
-    messages (self or any sibling) since the most recent human message in
-    that channel. Any human message resets the window; at the cap, every
+    messages since the most recent human message in that channel.
+    **Counting is knob-independent**: bot-authored means self, any sibling,
+    or a flagged third-party bot (`author.bot` without `webhook_id`);
+    webhook-authored messages count as human. The `replies` /
+    `third_party_bots` knobs gate only whether a message may *trigger*,
+    never how it is counted. Any human message resets the window; at the cap, every
     agent goes silent until a human speaks, so a back-and-forth always
     terminates. The counter spans *all* bots in the channel, not per-pair,
     so K agents cannot multiply the ceiling; in-flight generations racing
@@ -616,9 +642,12 @@ profile_name = "rin"   # required in the block; connection settings inherited fr
   idempotent; the session tab map is keyed by chat session id, so N sessions
   coexist cleanly). An agent without one gets no browser tools.
 - Legacy mode: the global `[browser]` block is the implicit agent's browser —
-  byte-identical behaviour.
-- Validation: `profile_name`s must be pairwise distinct across agents (and
-  distinct from a global `[browser].profile_name` if one is also in use).
+  byte-identical behaviour. With `[agents]` present, the global `[browser]`
+  block supplies connection settings only; a global `profile_name` explicitly
+  set alongside `[agents]` is a startup error (no silently-ignored identity
+  keys — the same rule as `[workspace].root_dir`, §4.2, including the same
+  schema-optional treatment if a shipped default ever sets it).
+- Validation: `profile_name`s must be pairwise distinct across agents.
 - Sharing one profile between personas was rejected: a profile carries
   outward identity (fingerprint, cookies, logins) — two personas sharing one
   are the same "user" to every site they touch, and each can read sessions
@@ -669,15 +698,20 @@ Mechanics:
   the donor has an account observing the same `(provider, channel[, thread])`.
   Every other timeline (the secondary's DMs, channels the donor is not in)
   summarizes natively, unchanged. This falls out of the definition; there is
-  no global summarization switch.
+  no global summarization switch. If the donor has more than one account of
+  its own observing the same channel (degenerate but legal), the mirror
+  source is picked deterministically — first matching account in config
+  order — and logged.
 - **Coordinate system**: `timeline_events.external_id` (Matrix event id /
   Discord snowflake) and `timestamp` (`origin_server_ts`) are identical
   across two accounts observing one channel; only internal ids and
   `timeline_key` differ, and the `(provider, external_id)` index already
   exists. Donor lineage therefore translates row-by-row.
 - **L1 mirror**: a mirror worker watches donor summary completions (hooked
-  on the summarization pool's completion callback — the same hook that
-  feeds the condensation evaluator — plus a periodic reconciliation sweep)
+  on the summarization pool's external `onComplete` callback — already wired
+  to the indexer and diary pool; condensation itself runs as an internal
+  call inside the pool, not on this hook — plus a periodic reconciliation
+  sweep)
   and, per summary, copies `content`/`token_count`/`model_id`/timestamps/status and
   maps `summary_events` lineage via `external_id` into the secondary's rows
   (the donor's timeline contains the secondary's messages as ordinary
@@ -716,7 +750,10 @@ Transition and failure modes:
   was kicked from the channel, or donor coverage stalls past a threshold —
   the secondary's indexer resumes native summarization from the end of
   mirrored coverage (mechanically the previous bullet, triggered
-  automatically). The flip is **one-way per timeline**: once a timeline
+  automatically). The stall threshold is an implementer default defined
+  relative to `generation_threshold_tokens` — e.g. flip when the un-mirrored
+  tail exceeds the native generation threshold and a sweep escalation
+  produces no covering donor job. The flip is **one-way per timeline**: once a timeline
   has native summaries it never becomes mirrored again — donor and
   secondary tilings never align, so re-mirroring would splice misaligned
   chunk boundaries.
@@ -841,6 +878,7 @@ per-agent root resolver are built once at startup and injected.
 | `src/config/schema.ts` | `agent` field on Matrix/Discord account schemas; `[agents.*]` Record (strict values: `workspace_root`, optional `sandbox`); §4.2 validation (legacy exclusivity, unmatched names, disjoint roots); make `workspace.root_dir` schema-optional + drop from `00-defaults.toml` with code-side default (§4.2); §3 key/name validation (colon = hard error on account keys, warn otherwise; full class on agent names) |
 | `src/app.ts` | build resolver `(provider, accountKey) → {agent, workspaceRoot, memoryWriter, sandbox}` (today's single `workspace.root_dir` resolution at app.ts is the injection point everything else inherits from); seed each workspace; construct per-agent `MemoryFileWriter`s; resolve all account self-ids eagerly before inbound starts and fold them into limit/trigger exclusion sets (§9) |
 | `src/agent/factory.ts` | both `workspace.root_dir` reads become per-session resolution from the trigger's `timeline_key` |
+| `src/context/builder.ts` | its two direct `workspace.root_dir` reads become the session's resolved root (passed in, like the tools) |
 | `src/workspace/` | unchanged (already parameterized by root) |
 | `src/diary/worker-pool.ts` | per-job agent resolution from the summary's `timeline_key`; write via that agent's `MemoryFileWriter`; per-agent recent-memory window + header |
 | `src/retrieval/` | `agent` column on `memory_chunks` (+ `(agent, id)` uniqueness + index + migration, §7.1); indexer walks every agent's `memory/`, stamping owner; all query paths filter by requesting agent; `embedding_cache` untouched |
@@ -853,6 +891,7 @@ per-agent root resolver are built once at startup and injected.
 | `src/sandbox/` | `SandboxManager` per strict agent; shared-mode parent mount + per-exec cwd; §10 validation incl. no-strict-root-under-shared-mount |
 | `src/browser/` + factory | per-agent `BrowserSession` construction and session routing (§10a) |
 | trigger paths (`src/matrix/inbound.ts`, `src/discord/normalizer.ts`, reply-trigger resolution) | sibling self-id handling per `[siblings]` mode; extract Discord `author.bot` + `webhook_id` (§9) |
+| `src/proactive/scheduler.ts` | eligibility gate counts `role !== 'assistant'` as human activity today — exclude sibling senders by self-id set (§9) |
 | `src/budget/` | optional `agent` matcher on rule normalization + enforcement; attribution via timeline-key parse + config map (§8; embedding-lane rows have no `timeline_key` and match only global rules) |
 | console | BFF's single `workspaceRoot` dependency becomes per-session agent resolution (context/media re-reads are functional, not cosmetic); agent/account filter chips may lag all phases |
 
