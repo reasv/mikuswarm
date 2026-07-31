@@ -721,7 +721,14 @@ test("image_generate aborts the in-flight generation POST on agent cancel (#7)",
       assert.match(result.content[0].text, /Image generation request failed/);
       assert.match(result.content[0].text, /aborted/, "surfaces a neutral abort, not a wall-clock timeout");
       // The upstream connection was torn down by the abort (the bill stops).
-      await new Promise((r) => setTimeout(r, 100));
+      // Bounded poll: the client abort reaches the server as a socket close via
+      // TCP teardown, which under build-gate CPU load can outlast a fixed short
+      // wait (a hardcoded 100ms flaked); poll until observed, capped well below
+      // the runner timeout so a genuine leak still fails fast and clearly.
+      const closeDeadline = Date.now() + 5_000;
+      while (!reqClosed && Date.now() < closeDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
       assert.equal(reqClosed, true, "the upstream generation request socket was closed, not left billing");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

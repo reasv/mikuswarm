@@ -232,7 +232,12 @@ test("redirect hop respects the hop host's backoff (backed-off host not reachabl
 
 test("guard-disabled path records the throttle against the FINAL host, not the original", async () => {
   resetHttpLimiter();
-  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 80, backoffMaxMs: 200 });
+  // Wide window (2s base → ≥1s guaranteed wait after the partial jitter's
+  // ceiling/2 floor) so the two outcomes stay distinguishable under build-gate
+  // CPU load: with the former 80ms window a loaded run could stall the
+  // "immediate" original-host acquire past its tight upper bound (false fail) —
+  // and, conversely, let a wrongly-recorded backoff expire unnoticed.
+  configureHttpLimiter({ defaultMaxInFlightPerHost: 10, globalCeiling: 100, backoffBaseMs: 2_000, backoffMaxMs: 2_000 });
   setEgressGuardEnabled(false);
   const stub = stubFetch(() => {
     const response = new Response("", { status: 429 });
@@ -240,15 +245,17 @@ test("guard-disabled path records the throttle against the FINAL host, not the o
     return response;
   });
   try {
+    const t0 = Date.now(); // before the 429 is recorded → lower-bounds the backoff window start
     await guardedFetch("https://original.example/start");
-    // Original host: no backoff recorded → immediate acquire.
+    // Original host: no backoff recorded → acquire settles well inside the window.
     const startOriginal = Date.now();
     (await acquireHttpSlot("https://original.example/again"))();
-    assert.ok(Date.now() - startOriginal < 25, "original host must not be backed off");
-    // Final host: 429 recorded there → acquire waits out the backoff.
-    const startFinal = Date.now();
+    assert.ok(Date.now() - startOriginal < 800, "original host must not be backed off");
+    // Final host: 429 recorded there → acquire waits out the backoff (jitter
+    // floor = 1s past the note instant). Measured from t0 (the 429 was noted at
+    // ≥ t0, timers never fire early), so load can only widen this bound.
     (await acquireHttpSlot("https://final.example/again"))();
-    assert.ok(Date.now() - startFinal >= 30, "final host carries the backoff");
+    assert.ok(Date.now() - t0 >= 900, "final host carries the backoff");
   } finally {
     stub.restore();
     setEgressGuardEnabled(true);
