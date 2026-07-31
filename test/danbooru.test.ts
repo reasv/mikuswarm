@@ -1308,6 +1308,15 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("limiter: two concurrent runs start at least minIntervalMs apart", async () => {
   const limiter = new DanbooruRateLimiter({ minIntervalMs: 80, maxInFlight: 4 });
+  // Measure the paced (second) start against a baseline taken BEFORE the runs are
+  // enqueued — NOT against the first callback's own timestamp. The limiter reserves
+  // start instants synchronously at acquire time; under full-suite CPU load the
+  // first callback can execute arbitrarily late while the second's pacing timer
+  // stays on schedule, shrinking a callback-to-callback gap below the real interval
+  // (observed 33ms of a real 80) even though pacing was correct. The baseline
+  // lower-bounds the first reserved instant and timers never fire early, so
+  // `max(starts) - t0` cannot be squeezed by load.
+  const t0 = Date.now();
   const starts: number[] = [];
   await Promise.all(
     [0, 1].map(() =>
@@ -1317,7 +1326,7 @@ test("limiter: two concurrent runs start at least minIntervalMs apart", async ()
     ),
   );
   assert.equal(starts.length, 2);
-  const gap = Math.abs(starts[1]! - starts[0]!);
+  const gap = Math.max(...starts) - t0;
   assert.ok(gap >= 70, `concurrent starts must be paced >= minIntervalMs apart, got ${gap}ms`);
 });
 
