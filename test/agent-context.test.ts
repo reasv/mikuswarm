@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "../src/agent/convert.js";
-import { AgentSessionFactory, buildAgentContextMessages, splitBuiltContext, withSdkRetriesDisabled } from "../src/agent/factory.js";
+import { AgentSessionFactory, buildAgentContextMessages, estimateLiveSliceTokens, splitBuiltContext, withSdkRetriesDisabled } from "../src/agent/factory.js";
 import { SessionUsageTracker, type SessionUsageTotals } from "../src/agent/usage.js";
 import { estimateObjectTokens } from "../src/context/tokens.js";
 import type { UserLimitContext, UserLimitResolution } from "../src/budget/index.js";
@@ -699,6 +700,269 @@ test("per-user initial selection is seeded with a defensive output cap (#13)", a
     (createEstimate.newTokens ?? 0) === 0 && (createEstimate.cachedTokens ?? 0) === 0,
     "the defensive initial cap uses a zero-context estimate",
   );
+});
+
+// === spec PER-USER-LIMITS §5.3: image-aware running-input estimation ==========
+// The running counter must charge an image block a FLAT per-image cost, never its
+// serialized base64 (~1 token per ~3 chars — one 200KB screenshot ≈ 100k phantom
+// tokens vs the ≤~2k a provider bills). Un-fixed, a single image-bearing tool
+// result pushed the counter past every model's operative window and the §4.2 fits
+// check terminated healthy rollouts ("no healthy model fits the accumulated
+// context") at a real context far below any ceiling.
+
+test("estimateLiveSliceTokens: image payloads are charged flat, never as base64", () => {
+  const bigBase64 = "QUJDRElKS0xN".repeat(50_000); // ~600k chars of base64-ish payload
+  const toolResult: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "t1",
+    toolName: "read_image",
+    content: [
+      { type: "text", text: "loaded image" },
+      { type: "image", data: bigBase64, mimeType: "image/png" },
+    ],
+    details: {},
+    isError: false,
+    timestamp: 1,
+  } as any;
+
+  const rawTokens = estimateObjectTokens(convertToLlm([toolResult]));
+  const flatTokens = estimateLiveSliceTokens([toolResult]);
+  assert.ok(rawTokens > 10_000, `raw JSON tokenization counts the base64 (got ${rawTokens})`);
+  assert.ok(flatTokens < 3_000, `image must be charged flat (got ${flatTokens})`);
+
+  // Payload-size independence: a 10x-smaller payload estimates (near-)identically —
+  // only the externalized ref's sizeBytes digits differ.
+  const smaller: AgentMessage = {
+    ...(toolResult as any),
+    content: [
+      { type: "text", text: "loaded image" },
+      { type: "image", data: "QUJDRElKS0xN".repeat(5_000), mimeType: "image/png" },
+    ],
+  } as any;
+  assert.ok(
+    Math.abs(estimateLiveSliceTokens([smaller]) - flatTokens) <= 5,
+    "the estimate must not scale with the image payload size",
+  );
+
+  // The flat per-image charge IS included: an image-bearing slice costs measurably
+  // more than the same slice without the image block.
+  const textOnly: AgentMessage = {
+    ...(toolResult as any),
+    content: [{ type: "text", text: "loaded image" }],
+  } as any;
+  assert.ok(
+    flatTokens >= estimateLiveSliceTokens([textOnly]) + 1_000,
+    "each image block must still contribute its flat per-image cost",
+  );
+});
+
+test("estimateLiveSliceTokens: triggerGroup imageBlocks are charged flat too", () => {
+  const bigBase64 = "QUJDRElKS0xN".repeat(50_000);
+  const trigger: AgentMessage = {
+    type: "triggerGroup",
+    role: "user",
+    content: "<message>look at this</message>",
+    imageBlocks: [{ dataBase64: bigBase64, mediaType: "image/png" }],
+    timestamp: 1,
+  } as any;
+  const flatTokens = estimateLiveSliceTokens([trigger]);
+  assert.ok(
+    estimateObjectTokens(convertToLlm([trigger])) > 10_000,
+    "raw tokenization counts the base64",
+  );
+  assert.ok(flatTokens < 3_000, `trigger image must be charged flat (got ${flatTokens})`);
+});
+
+// Same property through the REAL factory pre-flight (mirrors #10's harness): an
+// image-bearing tool result appended mid-rollout must not balloon the running
+// estimate the per-user selector fits/affordability checks see.
+test("running counter charges a live image tool result flat (no base64 blow-up)", async () => {
+  const seenEstimates: Array<{ cachedTokens?: number; newTokens?: number }> = [];
+  const resolution = {
+    matched: true,
+    active: true,
+    banned: false,
+    models: ["default"],
+    constraints: [],
+    ledgerPartitionKeys: [],
+  } as unknown as UserLimitResolution;
+  const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+  const engine = {
+    affordable(_r: unknown, _m: string, estimate: { cachedTokens?: number; newTokens?: number }) {
+      seenEstimates.push(estimate);
+      return { ok: false, maxOutput: 0, remainingUsd: 0 };
+    },
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  } as never;
+
+  const factory = new AgentSessionFactory({
+    config: minimalConfig({ app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" } } as any),
+    contextBuilder: stubContextBuilder(triggerBuilt()),
+    getActiveSessions: () => [],
+  });
+  const seed: SessionUsageTotals = {
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 1_000,
+  };
+  const { agent } = await factory.create(chatSession(), [], {
+    resume: { snapshot: [] },
+    usage: new SessionUsageTracker(seed),
+    userLimit: { engine, resolution, ctx },
+  });
+
+  // Request 1 seeds the counter (running=1000). Terminates unaffordable.
+  await agent.prompt({ role: "user", content: "first", timestamp: 2 } as any);
+
+  // Append an image-bearing toolResult whose base64 would tokenize to >10k.
+  const imageToolResult: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "t1",
+    toolName: "read_image",
+    content: [{ type: "image", data: "QUJDRElKS0xN".repeat(50_000), mimeType: "image/png" }],
+    details: {},
+    isError: false,
+    timestamp: 3,
+  } as any;
+  const rawTokens = estimateObjectTokens(convertToLlm([imageToolResult]));
+  assert.ok(rawTokens > 10_000, "the image would dominate the estimate if counted as base64");
+  agent.state.messages.push(imageToolResult);
+
+  await agent.prompt({ role: "user", content: "second", timestamp: 5 } as any);
+  const preflight2 = seenEstimates[seenEstimates.length - 1]!;
+  const observed2 = (preflight2.cachedTokens ?? 0) + (preflight2.newTokens ?? 0);
+  assert.ok(
+    observed2 < 1_000 + 5_000,
+    `image tool result must be charged flat (observed ${observed2}, ` +
+      `would be ≥ ${1_000 + rawTokens} if base64 were tokenized)`,
+  );
+});
+
+// === spec PER-USER-LIMITS §5.3: per-commit reconciliation to actuals ==========
+// After each committed request the running estimate must SNAP to the provider-
+// reported actual context size (`usage.snapshot().contextTokens` — the same
+// authority the resume seed uses). Without it the counter only ever accumulates
+// estimator error; once the drift crossed a model's operative window, §4.2 fits
+// terminated healthy rollouts, recoverable only via manual resume (whose seed IS
+// the actual) — the exact rinse-and-repeat failure this pins.
+test("commit reconciles the running estimate to the provider-reported actual", async () => {
+  // Minimal OpenAI-completions SSE stub: every request answers a tiny assistant
+  // turn whose usage reports a FIXED small actual (prompt 1000 + completion 50 →
+  // totalTokens 1050), regardless of what the estimate thinks.
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const chunk = (obj: unknown) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "test-model",
+        choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+      });
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "test-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      });
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "test-model",
+        choices: [],
+        usage: { prompt_tokens: 1_000, completion_tokens: 50, total_tokens: 1_050 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+
+  try {
+    const seenEstimates: Array<{ cachedTokens?: number; newTokens?: number }> = [];
+    const resolution = {
+      matched: true,
+      active: true,
+      banned: false,
+      models: ["default"],
+      constraints: [],
+      ledgerPartitionKeys: [],
+    } as unknown as UserLimitResolution;
+    const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+    const engine = {
+      affordable(_r: unknown, _m: string, estimate: { cachedTokens?: number; newTokens?: number }) {
+        seenEstimates.push(estimate);
+        return { ok: true, maxOutput: 4096, remainingUsd: Infinity };
+      },
+      bindingConstraint: () => undefined,
+      noteSelection: () => {},
+    } as never;
+
+    const factory = new AgentSessionFactory({
+      config: minimalConfig({
+        app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
+        models: {
+          default: {
+            id: "test-model",
+            provider: "test",
+            api: "openai-completions",
+            endpoint: `http://127.0.0.1:${port}/v1`,
+            api_key: "key",
+            input_modalities: ["text"],
+            max_tokens: 4096,
+            context_window: 128_000,
+          },
+        },
+      } as any),
+      contextBuilder: stubContextBuilder(triggerBuilt()),
+      getActiveSessions: () => [],
+    });
+
+    const { agent } = await factory.create(chatSession(), [], {
+      resume: { snapshot: [] },
+      usage: new SessionUsageTracker(),
+      userLimit: { engine, resolution, ctx },
+    });
+
+    // Request 1 commits → the counter snaps to the actual (1050).
+    await agent.prompt({ role: "user", content: "first", timestamp: 2 } as any);
+
+    // Inject phantom weight: a huge plain-text toolResult (~>10k estimated tokens)
+    // the provider will NOT bill anywhere near that (the stub keeps reporting 1050).
+    const hugeBody = "lorem ipsum ".repeat(5_000);
+    const hugeToolResult: AgentMessage = {
+      role: "toolResult",
+      toolCallId: "t1",
+      toolName: "web_fetch",
+      content: [{ type: "text", text: hugeBody }],
+      details: {},
+      isError: false,
+      timestamp: 3,
+    } as any;
+    const hugeTokens = estimateObjectTokens(convertToLlm([hugeToolResult]));
+    assert.ok(hugeTokens > 10_000, "the phantom weight dominates the estimate if never reconciled");
+    agent.state.messages.push(hugeToolResult);
+
+    // Request 2's pre-flight sees the inflated estimate (drift present)…
+    await agent.prompt({ role: "user", content: "second", timestamp: 5 } as any);
+    const duringDrift = seenEstimates[seenEstimates.length - 1]!;
+    const observedDrift = (duringDrift.cachedTokens ?? 0) + (duringDrift.newTokens ?? 0);
+    assert.ok(observedDrift > hugeTokens, "pre-commit, the estimate carries the phantom weight");
+
+    // …but request 2's COMMIT reconciles to the actual, so request 3's pre-flight
+    // is back near 1050 + the small new turns — the drift is erased.
+    await agent.prompt({ role: "user", content: "third", timestamp: 7 } as any);
+    const afterCommit = seenEstimates[seenEstimates.length - 1]!;
+    const observedAfter = (afterCommit.cachedTokens ?? 0) + (afterCommit.newTokens ?? 0);
+    assert.ok(
+      observedAfter < 6_000,
+      `the commit must snap the estimate to the actual (observed ${observedAfter}, ` +
+        `unreconciled drift would keep it ≥ ${hugeTokens})`,
+    );
+  } finally {
+    server.close();
+  }
 });
 
 test("convertToLlm filters accidental system transcript messages", () => {

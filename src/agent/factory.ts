@@ -8,6 +8,7 @@ import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { estimateObjectTokens } from "../context/tokens.js";
+import { externalizeImages } from "./session-capture.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
   defaultPriorityForSessionType,
@@ -59,6 +60,45 @@ export function composeSessionContextCeiling(
 // at cache-read and only the new material at cache-write. Anthropic's default cache
 // retention is ~5 min; conservative outside it (cache-write throughout).
 const PROMPT_CACHE_TTL_MS = 300_000;
+
+// Flat per-image charge for the §5.3 running-input estimate: an upper-bound on
+// what providers actually bill per image block (Anthropic tiling tops out ≈1600
+// tokens; OpenAI high-detail ≈1100). Deliberately conservative — the counter is
+// a pre-flight bound, and the per-commit reconciliation against actuals erases
+// any residual error.
+const PER_IMAGE_TOKEN_ESTIMATE = 1600;
+
+/** Count the {@link externalizeImages} refs in an already-externalized tree. */
+function countImageRefs(value: unknown): number {
+  if (value === null || typeof value !== "object") return 0;
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const v of value) n += countImageRefs(v);
+    return n;
+  }
+  const obj = value as Record<string, unknown>;
+  let n = obj.__imageRef === true ? 1 : 0;
+  for (const v of Object.values(obj)) n += countImageRefs(v);
+  return n;
+}
+
+/**
+ * Tokenize a live-message slice for the §5.3 running-input counter, charging
+ * image blocks at a flat {@link PER_IMAGE_TOKEN_ESTIMATE} instead of their
+ * serialized base64. Tokenizing the raw JSON counted every base64 character
+ * (~1 token per 3 chars — ~100k phantom tokens for a single 200KB screenshot,
+ * vs the ≤~2k a provider actually bills), so one image-bearing tool result
+ * (browser screenshots, read_image, image_gen, …) blew the counter past every
+ * model's operative window and the §4.2 fits check terminated healthy rollouts
+ * ("no healthy model fits the accumulated context") at a real context far below
+ * the ceiling. `externalizeImages` (the session-capture externalizer) already
+ * replaces every base64 payload shape with a small ref marker; we tokenize the
+ * externalized tree and add the flat charge per ref.
+ */
+export function estimateLiveSliceTokens(slice: AgentMessage[]): number {
+  const externalized = externalizeImages(convertToLlm(slice));
+  return estimateObjectTokens(externalized) + PER_IMAGE_TOKEN_ESTIMATE * countImageRefs(externalized);
+}
 
 const wrapCompleteAsStream: StreamFn = (model, context, options) => {
   const stream = createAssistantMessageEventStream();
@@ -652,8 +692,10 @@ export class AgentSessionFactory {
           // the wire) rather than over-counting them (#10). `seenMsgs` still advances by
           // the full observed length — a dropped message is permanently accounted as
           // "seen, contributes nothing", never re-tokenized on a later refresh.
+          // Image blocks are charged flat, never as their base64 (see
+          // `estimateLiveSliceTokens`).
           const slice = msgs.slice(ctxCounter.seenMsgs).filter(isLiveRuntimeMessage);
-          if (slice.length > 0) ctxCounter.running += estimateObjectTokens(convertToLlm(slice));
+          if (slice.length > 0) ctxCounter.running += estimateLiveSliceTokens(slice);
         } catch {
           /* tokenization is best-effort; leave the prior running total (conservative) */
         }
@@ -828,6 +870,18 @@ export class AgentSessionFactory {
             // request's prompt is now the cached prefix for the NEXT request's
             // estimate, dated for the cache-TTL test.
             refreshRunningContext();
+            // Reconcile the running estimate against the provider-reported actual —
+            // the committed request's totalTokens, the same authority the resume
+            // seed and the (non-per-user) context gate use. Without this the counter
+            // only ever accumulates estimator error, and once the drift crossed a
+            // model's operative window the §4.2 fits check terminated a healthy
+            // rollout ("no healthy model fits") at a real context far below the
+            // ceiling — recoverable only by a manual resume (whose seed IS this
+            // actual). The committed assistant turn is not yet in `state.messages`;
+            // its later re-estimate overlaps the output already inside the actual —
+            // a small over-count (one turn's output), erased at the next commit.
+            const actual = usage.snapshot().contextTokens;
+            if (actual !== null) ctxCounter.running = actual;
             ctxCounter.cachedAtLast = ctxCounter.running;
             ctxCounter.lastRequestAtMs = Date.now();
           }
