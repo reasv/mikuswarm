@@ -316,9 +316,11 @@ test("browser docker: downloads cross the container boundary via the shared stag
     type ToolResult = { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> };
     const exec = (args: Record<string, unknown>) => tool.execute("c1", args) as Promise<ToolResult>;
 
-    // about:blank, not example.com (#25): the blob download is entirely local, so
-    // depending on an external site only adds a network flake the test doesn't need.
-    await exec({ action: "navigate", url: "about:blank" });
+    // No navigate needed (#25): a fresh tab starts at about:blank (Playwright
+    // newPage() invariant), so blob URL creation is entirely local with no external
+    // network dependency. The tool-layer URL policy rejects about: — so the old
+    // navigate call would always fail; drop it and let the first act run on the
+    // default tab instead.
 
     // Trigger a real download with no network dependency: an a[download] blob link.
     const clickRes = await exec({
