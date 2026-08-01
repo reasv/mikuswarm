@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { selection } from '$lib/stores/selection.svelte';
 	import { sessionQuery } from '$lib/query/sessions';
+	import { agentsQuery } from '$lib/query/agents';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { cn } from '$lib/utils';
+	import { buildAgentLookup, agentFor, agentAccent } from '$lib/agents';
 
 	// Col 3 — the session inspector (ARCHITECTURE.md §11). Driven by the same
 	// `?session=` selection as Col 2, it surfaces the raw record behind the rendered
@@ -17,6 +19,22 @@
 	const invocations = $derived(session.data?.toolInvocations ?? []);
 
 	let rawOpen = $state(false);
+
+	// ── Agent row in Identifiers (spec CONSOLE-MULTI-AGENT §4) ──────────────────
+	// Under the global gate, add an `agent` row derived from meta.timelineKey.
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
+	// Resolved only when gate is open and meta is available.
+	const resolvedAgent = $derived(
+		globalGate && meta?.timelineKey ? agentFor(meta.timelineKey, agentLookup) : undefined
+	);
+	const agentAccentColor = $derived(resolvedAgent ? agentAccent(resolvedAgent.agentIndex) : undefined);
 
 	function fmtTime(ts: number | null | undefined): string {
 		return ts == null ? '—' : new Date(ts).toLocaleString();
@@ -73,13 +91,35 @@
 				</div>
 			{/if}
 
-			{@render section('Identifiers', [
-				['session', meta.id],
-				['model', meta.modelId ?? '—'],
-				['timeline', meta.timelineKey],
-				['trigger event', meta.triggerEventId ?? '—'],
-				['external id', meta.triggerExternalId ?? '—']
-			])}
+			<!-- Identifiers section — modified to include the agent row when gate is open. -->
+			<div>
+				<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Identifiers</div>
+				<div class="space-y-1 font-mono text-[11px]">
+					{@render kv('session', meta.id)}
+					{@render kv('model', meta.modelId ?? '—')}
+					{#if globalGate}
+						<!-- Agent row (§4): accent-colored chip when resolvable, muted "unassigned"
+						     when the key is not in the current config (§4.3). -->
+						<div class="flex items-baseline justify-between gap-2">
+							<span class="text-muted-foreground">agent</span>
+							{#if resolvedAgent}
+								<span class="inline-flex items-baseline gap-0.5 text-right">
+									<span
+										class="relative top-px inline-block size-1.5 rounded-full"
+										style="background:{agentAccentColor}"
+									></span>
+									<span style="color:{agentAccentColor}">{resolvedAgent.agentName}</span>
+								</span>
+							{:else}
+								<span class="text-right text-muted-foreground/50">unassigned</span>
+							{/if}
+						</div>
+					{/if}
+					{@render kv('timeline', meta.timelineKey)}
+					{@render kv('trigger event', meta.triggerEventId ?? '—')}
+					{@render kv('external id', meta.triggerExternalId ?? '—')}
+				</div>
+			</div>
 
 			{@render section('Timing', [
 				['created', fmtTime(meta.createdAt)],

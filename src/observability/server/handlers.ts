@@ -447,6 +447,19 @@ export function schedulerSnapshot(
 }
 
 /**
+ * GET /api/agents — static agents meta snapshot (spec CONSOLE-MULTI-AGENT §2):
+ * the config-declared agents and their accounts in declaration order. Returns the
+ * legacy sentinel when the dep is absent (feature not wired / legacy deployment).
+ */
+export function agentsSnapshot(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  sendJson(res, 200, ctx.deps.agentsSnapshot ?? { mode: "legacy", agents: [] });
+}
+
+/**
  * GET /api/gap-backfetch — the startup gap-backfetch status snapshot
  * (ARCHITECTURE.md §7c §11): every in-scope room's phase and buffered/committed
  * counts. Returns an empty list when the feature is disabled or not wired, so the

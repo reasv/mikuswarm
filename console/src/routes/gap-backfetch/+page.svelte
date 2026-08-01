@@ -5,6 +5,8 @@
 	import { fresh } from '$lib/query/client';
 	import { keys } from '$lib/query/keys';
 	import { cn } from '$lib/utils';
+	import { agentsQuery } from '$lib/query/agents';
+	import { buildAgentLookup, agentFor, agentAccent } from '$lib/agents';
 
 	// Startup gap-backfetch panel (ARCHITECTURE.md §7c §11): per-room catch-up state
 	// after a restart — which rooms are still frozen/filling, how much is buffered,
@@ -23,6 +25,18 @@
 	);
 	const done = $derived(rooms.filter((r) => r.phase === 'done'));
 	const failed = $derived(rooms.filter((r) => r.phase === 'failed'));
+
+	// ── Agent tag (spec CONSOLE-MULTI-AGENT §4) ──────────────────────────────────
+	// Under the global gate, append an agent chip after the existing roomId (accountId)
+	// primary. Account stays primary since gap-backfetch operates on the account credential.
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
 
 	const PHASE_CLASSES: Record<string, string> = {
 		frozen: 'text-sky-500',
@@ -79,6 +93,20 @@
 							<td class="py-1 pr-3 font-mono text-[11px]" title={room.baseTimelineKey}>
 								{room.roomId}
 								<span class="text-muted-foreground">({room.accountId})</span>
+								{#if globalGate}
+									<!-- Agent tag appended after the account credential (§4). -->
+									{@const entry = agentFor(room.baseTimelineKey, agentLookup)}
+									{#if entry}
+										{@const accent = agentAccent(entry.agentIndex)}
+										<span class="ml-1 inline-flex items-baseline gap-0.5 text-[9px]">
+											<span class="relative top-px inline-block size-1.5 rounded-full" style="background:{accent}"></span>
+											<span style="color:{accent}">{entry.agentName}</span>
+										</span>
+									{:else}
+										<!-- Unresolvable: muted indicator (§4.3). -->
+										<span class="ml-1 text-[9px] text-muted-foreground/50">?</span>
+									{/if}
+								{/if}
 							</td>
 							<td class={cn('py-1 pr-3 font-medium', PHASE_CLASSES[room.phase] ?? '')}>{room.phase}</td>
 							<td class="py-1 pr-3 text-right font-mono">{room.backfillBuffered}</td>

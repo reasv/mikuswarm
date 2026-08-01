@@ -23,6 +23,9 @@
 	import { buildLadder, buildSegments, type LadderGroup, type CapSegment } from '$lib/user-ladder';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { distinctAccounts } from '$lib/timeline-key';
+	import { agentsQuery } from '$lib/query/agents';
+	import { buildAgentLookup, agentFor, distinctAgents, agentAccent, platformOf } from '$lib/agents';
+	import type { AgentEntry } from '$lib/schemas';
 
 	// "Display Name (unique handle)" for a labeled sender — the handle is the Discord
 	// username when the BFF resolved one, else the raw id (for Matrix the id IS the
@@ -148,6 +151,28 @@
 		lbUsers.slice(userPageSafe * USER_PAGE_SIZE, userPageSafe * USER_PAGE_SIZE + USER_PAGE_SIZE)
 	);
 
+	// ── Agent mode (spec CONSOLE-MULTI-AGENT §4) ────────────────────────────────
+	// Fetched once (config is stable for the process lifetime). While loading the
+	// gate is closed: all agent chrome is suppressed (no flash of wrong state).
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
+
+	// Client-side agent filter for the sessions and tool-calls tables.
+	// null = All; set to an agent name to filter that table. Resets on tab change.
+	let sessionAgentFilter = $state<string | null>(null);
+	let toolCallAgentFilter = $state<string | null>(null);
+	$effect(() => {
+		void tab;
+		sessionAgentFilter = null;
+		toolCallAgentFilter = null;
+	});
+
 	const rules = $derived(
 		// Blocked first, then near, then ok; ties by fill fraction (spec §7.1 #3).
 		[...(budgets.data?.rules ?? [])].sort((a, b) => {
@@ -159,15 +184,64 @@
 	// Currently-selected model per live per-user session (spec §14).
 	const userSelections = $derived([...(budgets.data?.userSelections ?? [])]);
 
-	// Channel cells grow an account tag only when the table's rows actually span
-	// more than one (provider, account) pair — single-account views stay untagged,
-	// mirroring the Conversations room list's tabs-only-when-plural behavior.
+	// Channel cells grow an identity tag only when the table's rows span more than
+	// one identity. Under the global gate (agents mode) the gate switches from
+	// "distinct accounts" to "distinct agents" (spec CONSOLE-MULTI-AGENT §3.1).
+	// Below the gate the existing distinctAccounts behavior is unchanged.
 	const sessionsSpanAccounts = $derived(
-		distinctAccounts((sessions.data?.sessions ?? []).map((s) => s.timelineKey)) > 1
+		globalGate
+			? distinctAgents((sessions.data?.sessions ?? []).map((s) => s.timelineKey), agentLookup) > 1
+			: distinctAccounts((sessions.data?.sessions ?? []).map((s) => s.timelineKey)) > 1
 	);
 	const toolCallsSpanAccounts = $derived(
-		distinctAccounts((toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key)) > 1
+		globalGate
+			? distinctAgents(
+					(toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key),
+					agentLookup
+				) > 1
+			: distinctAccounts((toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key)) > 1
 	);
+
+	// Filtered views for the client-side agent filter chips (§4): applied only when the
+	// filter chip is active and the gate is open. Falls back to full list otherwise.
+	const filteredSessions = $derived.by(() => {
+		const all = sessions.data?.sessions ?? [];
+		if (!globalGate || !sessionAgentFilter) return all;
+		return all.filter(
+			(s) => agentFor(s.timelineKey, agentLookup)?.agentName === sessionAgentFilter
+		);
+	});
+	const filteredToolCalls = $derived.by(() => {
+		const all = toolCalls.data?.toolCalls ?? [];
+		if (!globalGate || !toolCallAgentFilter) return all;
+		return all.filter(
+			(t) => t.timeline_key && agentFor(t.timeline_key, agentLookup)?.agentName === toolCallAgentFilter
+		);
+	});
+
+	// Budget rule §5: check whether a set of timeline-key prefixes exactly matches
+	// one agent's complete account set (both sets equal → render `agent: name` chip).
+	function prefixMatchesAgent(
+		prefixes: readonly string[] | undefined,
+		agents: readonly AgentEntry[]
+	): (AgentEntry & { idx: number }) | undefined {
+		if (!prefixes?.length) return undefined;
+		const prefixSet = new Set(prefixes);
+		for (let i = 0; i < agents.length; i++) {
+			const agent = agents[i];
+			const agentSet = new Set(agent.accounts.map((a) => `${a.provider}:${a.accountId}`));
+			if (prefixSet.size === agentSet.size && [...prefixSet].every((p) => agentSet.has(p))) {
+				return { ...agent, idx: i };
+			}
+		}
+		return undefined;
+	}
+	// Check if a prefix is in any agent's account set (for per-account chip styling).
+	function isPrefixKnown(prefix: string): boolean {
+		return (agentsData?.agents ?? []).some((a) =>
+			a.accounts.some((acc) => `${acc.provider}:${acc.accountId}` === prefix)
+		);
+	}
 
 	// Stable color per group. Known classes get fixed hues; models cycle a palette.
 	const CLASS_COLORS: Record<string, string> = {
@@ -696,6 +770,36 @@
 									{windowLabel(rule.window)} · resets {fmtResetsIn(rule.resetsAt)}
 								</span>
 							</div>
+							{#if globalGate && rule.scope.timelineKeyPrefixes?.length}
+								<!-- Agent / account scope chips (spec CONSOLE-MULTI-AGENT §5):
+								     when prefixes exactly equal one agent's account set → agent chip;
+								     otherwise one chip per prefix; unresolvable → raw + muted. -->
+								{@const matchedAgent = prefixMatchesAgent(rule.scope.timelineKeyPrefixes, agentsData?.agents ?? [])}
+								<div class="mt-1 flex flex-wrap gap-1">
+									{#if matchedAgent}
+										{@const accent = agentAccent(matchedAgent.idx)}
+										<span
+											class="inline-flex items-baseline gap-0.5 rounded border px-1.5 py-0.5 text-[9px]"
+											style="border-color:{accent}80; color:{accent}"
+										>
+											<span class="relative top-px inline-block size-1.5 rounded-full" style="background:{accent}"></span>
+											agent: {matchedAgent.name}
+										</span>
+									{:else}
+										{#each rule.scope.timelineKeyPrefixes as prefix}
+											{@const known = isPrefixKnown(prefix)}
+											<span
+												class={cn(
+													'rounded border px-1.5 py-0.5 font-mono text-[9px]',
+													known ? 'text-foreground' : 'text-muted-foreground/50'
+												)}
+											>
+												{prefix}
+											</span>
+										{/each}
+									{/if}
+								</div>
+							{/if}
 						</div>
 					{/each}
 				</div>
@@ -937,6 +1041,46 @@
 			</div>
 
 			{#if tab === 'sessions'}
+			<!-- Agent filter chips (spec CONSOLE-MULTI-AGENT §4): shown only under the
+			     global gate when the table's rows span >1 agent. Client-side filter. -->
+			{#if globalGate && sessionsSpanAccounts}
+				<div class="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
+					<button
+						class={cn(
+							'rounded px-2 py-0.5 transition-colors',
+							sessionAgentFilter === null
+								? 'bg-muted font-medium text-foreground'
+								: 'text-muted-foreground hover:text-foreground'
+						)}
+						onclick={() => (sessionAgentFilter = null)}
+					>All</button>
+					{#each agentsData?.agents ?? [] as agent, i}
+						{@const accent = agentAccent(i)}
+						{@const platform = platformOf(agent)}
+						{@const hasRows = (sessions.data?.sessions ?? []).some(
+							(s) => agentFor(s.timelineKey, agentLookup)?.agentName === agent.name
+						)}
+						{#if hasRows}
+							<button
+								class={cn(
+									'inline-flex items-baseline gap-0.5 rounded border px-2 py-0.5 transition-colors',
+									sessionAgentFilter === agent.name
+										? 'font-medium text-foreground'
+										: 'border-transparent text-muted-foreground hover:text-foreground'
+								)}
+								style={sessionAgentFilter === agent.name
+									? `border-color:${accent}; color:${accent}`
+									: ''}
+								onclick={() => (sessionAgentFilter = agent.name)}
+							>
+								<span class="relative top-px inline-block size-1.5 shrink-0 rounded-full" style="background:{accent}"></span>
+								{agent.name}
+								<span class="text-[10px] uppercase tracking-wide opacity-70">{platform}</span>
+							</button>
+						{/if}
+					{/each}
+				</div>
+			{/if}
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
@@ -959,7 +1103,7 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each sessions.data?.sessions ?? [] as s (s.sessionId)}
+						{#each filteredSessions as s (s.sessionId)}
 							<tr class="border-b border-border/50">
 								<td class="py-1 pr-3 font-mono text-[10px]" title={s.sessionId}>
 									<a href={`/?session=${s.sessionId}`} class="hover:underline">
@@ -983,7 +1127,13 @@
 								</td>
 								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{s.status}</td>
 								<td class="py-1 pr-3 text-[10px]">
-									<ChannelCell label={s.channelLabel} id={s.timelineKey} showAccount={sessionsSpanAccounts} />
+									<ChannelCell
+										label={s.channelLabel}
+										id={s.timelineKey}
+										showAccount={!globalGate && sessionsSpanAccounts}
+										agentLookup={globalGate && sessionsSpanAccounts ? agentLookup : undefined}
+										agentEntries={agentsData?.agents}
+									/>
 								</td>
 								<td class="py-1 text-[11px]">{s.triggerSender ?? 'N/A'}</td>
 							</tr>
@@ -995,6 +1145,45 @@
 			</div>
 			{:else if tab === 'paid'}
 			<!-- Recent paid tool/caption/embedding calls -->
+			<!-- Agent filter chips (spec CONSOLE-MULTI-AGENT §4). -->
+			{#if globalGate && toolCallsSpanAccounts}
+				<div class="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
+					<button
+						class={cn(
+							'rounded px-2 py-0.5 transition-colors',
+							toolCallAgentFilter === null
+								? 'bg-muted font-medium text-foreground'
+								: 'text-muted-foreground hover:text-foreground'
+						)}
+						onclick={() => (toolCallAgentFilter = null)}
+					>All</button>
+					{#each agentsData?.agents ?? [] as agent, i}
+						{@const accent = agentAccent(i)}
+						{@const platform = platformOf(agent)}
+						{@const hasRows = (toolCalls.data?.toolCalls ?? []).some(
+							(t) => t.timeline_key && agentFor(t.timeline_key, agentLookup)?.agentName === agent.name
+						)}
+						{#if hasRows}
+							<button
+								class={cn(
+									'inline-flex items-baseline gap-0.5 rounded border px-2 py-0.5 transition-colors',
+									toolCallAgentFilter === agent.name
+										? 'font-medium text-foreground'
+										: 'border-transparent text-muted-foreground hover:text-foreground'
+								)}
+								style={toolCallAgentFilter === agent.name
+									? `border-color:${accent}; color:${accent}`
+									: ''}
+								onclick={() => (toolCallAgentFilter = agent.name)}
+							>
+								<span class="relative top-px inline-block size-1.5 shrink-0 rounded-full" style="background:{accent}"></span>
+								{agent.name}
+								<span class="text-[10px] uppercase tracking-wide opacity-70">{platform}</span>
+							</button>
+						{/if}
+					{/each}
+				</div>
+			{/if}
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
@@ -1013,7 +1202,7 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each toolCalls.data?.toolCalls ?? [] as t (t.id)}
+						{#each filteredToolCalls as t (t.id)}
 							<tr class="border-b border-border/50">
 								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{fmtTime(t.ts)}</td>
 								<td class="py-1 pr-3 text-[11px]">{t.class}</td>
@@ -1027,7 +1216,13 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtUsd(t.cost_usd)}</td>
 								<td class="py-1 text-[10px]">
 									{#if t.timeline_key}
-										<ChannelCell label={t.channel_label ?? t.timeline_key} id={t.timeline_key} showAccount={toolCallsSpanAccounts} />
+										<ChannelCell
+											label={t.channel_label ?? t.timeline_key}
+											id={t.timeline_key}
+											showAccount={!globalGate && toolCallsSpanAccounts}
+											agentLookup={globalGate && toolCallsSpanAccounts ? agentLookup : undefined}
+											agentEntries={agentsData?.agents}
+										/>
 									{:else}
 										<span class="text-muted-foreground">—</span>
 									{/if}

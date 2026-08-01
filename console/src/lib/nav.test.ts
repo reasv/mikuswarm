@@ -24,6 +24,21 @@ describe('conversationsHref', () => {
 	it('allows a session-only deep link (e.g. the scheduler waiter links)', () => {
 		expect(conversationsHref({ session: 's' })).toBe('/?session=s');
 	});
+
+	it('encodes the agent tab selection (spec CONSOLE-MULTI-AGENT §3.5)', () => {
+		expect(conversationsHref({ agent: 'aria' })).toBe('/?agent=aria');
+	});
+
+	it('carries agent + room together for an agent-filtered room view', () => {
+		expect(conversationsHref({ agent: 'nova', room: 'discord:nova:room:1002' })).toBe(
+			'/?agent=nova&room=discord%3Anova%3Aroom%3A1002'
+		);
+	});
+
+	it('drops a null/empty agent (clears the filter)', () => {
+		expect(conversationsHref({ agent: null, room: 'r' })).toBe('/?room=r');
+		expect(conversationsHref({ agent: '' })).toBe('/');
+	});
 });
 
 describe('pipelinesHref', () => {

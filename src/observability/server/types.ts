@@ -11,6 +11,19 @@ import type { LlmRequestRing } from "../../agent/request-ring.js";
 import type { BudgetEngine, UserLimitEngine } from "../../budget/index.js";
 import type { BackfetchJobInput, BackfetchJobRow } from "../../storage/index.js";
 
+/**
+ * Static snapshot of the agents model served by `GET /api/agents`
+ * (spec CONSOLE-MULTI-AGENT §2). Built once at startup from config; the
+ * handler returns it verbatim from memory.
+ */
+export interface AgentsSnapshot {
+  mode: "agents" | "legacy";
+  agents: Array<{
+    name: string;
+    accounts: Array<{ provider: string; accountId: string }>;
+  }>;
+}
+
 /** The message-backfetch console surface (spec MESSAGE-BACKFETCH §8). */
 export interface BackfetchConsoleDeps {
   /** Whether the feature is enabled (start/resume are inert when false). */
@@ -99,6 +112,13 @@ export interface ConsoleServerDeps {
    * provide it (the route then 503s).
    */
   resumeSession?: (sessionId: string) => Promise<{ ok: boolean; status: string; reason?: string }>;
+  /**
+   * Static agents meta snapshot (spec CONSOLE-MULTI-AGENT §2): the config-declared
+   * agents and their accounts, built once at startup and served verbatim by
+   * `GET /api/agents`. Optional: absent = the route returns the legacy sentinel
+   * `{ mode:"legacy", agents:[] }`.
+   */
+  agentsSnapshot?: AgentsSnapshot;
   /**
    * Startup gap-backfetch status snapshot (ARCHITECTURE.md §7c §11): per-room
    * phase (frozen/filling/committing/done), buffered counts, and any capped holes,

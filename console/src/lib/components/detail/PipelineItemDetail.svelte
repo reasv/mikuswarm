@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { useQueryClient } from '@tanstack/svelte-query';
 	import { pipelineItemQuery } from '$lib/query/pipelines';
+	import { agentsQuery } from '$lib/query/agents';
 	import { keys } from '$lib/query/keys';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { pipelinesHref } from '$lib/nav';
@@ -10,6 +11,7 @@
 	import { relativeTime } from '$lib/utils';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { timelineAccount } from '$lib/timeline-key';
+	import { buildAgentLookup, agentFor, needsAccountId, agentAccent } from '$lib/agents';
 
 	const queryClient = useQueryClient();
 	const detail = pipelineItemQuery(
@@ -32,6 +34,18 @@
 	const replyContext = $derived(detail.data?.replyContext as { body?: string } | null | undefined);
 	const summary = $derived(
 		detail.data?.summary as { content?: string; eventCount?: number } | null | undefined
+	);
+
+	// ── Agent chip (spec CONSOLE-MULTI-AGENT §4) ──────────────────────────────────
+	// Under the global gate, the always-on account badge becomes a row-level agent chip.
+	// While loading, render as today's badge (no flash of wrong state).
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
 	);
 </script>
 
@@ -70,9 +84,29 @@
 				{#if item.room}
 					{@const account = timelineAccount(item.room)}
 					<div class="flex items-center gap-1.5">
-						{#if account}
-							<!-- Which chat account this item belongs to (discord vs matrix at a
-							     glance); the raw key follows for exactness. -->
+						{#if globalGate}
+							<!-- Agent chip replaces the account badge under the global gate (§4). -->
+							{@const entry = agentFor(item.room, agentLookup)}
+							{@const agentFullEntry = entry ? agentsData?.agents.find((a) => a.name === entry.agentName) : undefined}
+							{@const showAccId = agentFullEntry && account ? needsAccountId(agentFullEntry, account.provider) : false}
+							{#if entry && account}
+								{@const accent = agentAccent(entry.agentIndex)}
+								<span
+									class="inline-flex shrink-0 items-baseline gap-0.5 rounded border px-1 py-px text-[9px]"
+									style="border-color:{accent}; color:{accent}"
+								>
+									<span class="relative top-px inline-block size-1.5 rounded-full" style="background:{accent}"></span>
+									{entry.agentName}
+									<span class="uppercase tracking-wide">{account.provider}</span>{#if showAccId}&nbsp;{account.accountId}{/if}
+								</span>
+							{:else if account}
+								<!-- Unresolvable: raw badge, muted (§4.3). -->
+								<span class="shrink-0 rounded border px-1 py-px text-[9px] text-muted-foreground/50">
+									{account.accountId} <span class="uppercase tracking-wide">{account.provider}</span>
+								</span>
+							{/if}
+						{:else if account}
+							<!-- Legacy account badge (unchanged below the gate). -->
 							<span class="shrink-0 rounded border px-1 py-px text-[9px] text-muted-foreground">
 								{account.accountId} <span class="uppercase tracking-wide">{account.provider}</span>
 							</span>

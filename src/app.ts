@@ -406,6 +406,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // In legacy mode this stays empty; all sessions get agentAccountPrefixes=undefined.
   const agentAccountPrefixesMap = new Map<string, string[]>();
 
+  // Static snapshot for the observability console (spec CONSOLE-MULTI-AGENT §2).
+  // Built alongside agentAccountPrefixesMap so both share one pass over accounts.
+  let agentsSnapshot: import("./observability/server/types.js").AgentsSnapshot = {
+    mode: "legacy",
+    agents: [],
+  };
+
   if (config.agents && Object.keys(config.agents).length > 0) {
     // ── Agents mode (spec §4.1/§4.2) ───────────────────────────────────────
     // validateAgentConfig() already threw on any §4.2 violation above;
@@ -442,6 +449,25 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const prefix = `discord:${accountKey}`;
       const prev = agentAccountPrefixesMap.get(agentName) ?? [];
       agentAccountPrefixesMap.set(agentName, [...prev, prefix]);
+    }
+    // Build the console agents snapshot (spec CONSOLE-MULTI-AGENT §2): one entry per
+    // declared agent in config declaration order, with accounts in the same order as
+    // agentAccountPrefixesMap (matrix first, then discord, within each agent).
+    {
+      const agentAccounts = new Map<string, Array<{ provider: string; accountId: string }>>();
+      for (const agentName of Object.keys(config.agents!)) agentAccounts.set(agentName, []);
+      for (const [accountKey, account] of Object.entries(config.matrix?.accounts ?? {})) {
+        const agentName = (account as { agent?: string }).agent ?? accountKey;
+        agentAccounts.get(agentName)?.push({ provider: "matrix", accountId: accountKey });
+      }
+      for (const [accountKey, account] of Object.entries(config.discord?.accounts ?? {})) {
+        const agentName = account.agent ?? accountKey;
+        agentAccounts.get(agentName)?.push({ provider: "discord", accountId: accountKey });
+      }
+      agentsSnapshot = {
+        mode: "agents",
+        agents: Array.from(agentAccounts.entries()).map(([name, accounts]) => ({ name, accounts })),
+      };
     }
     // Build per-agent workspace list for the retrieval subsystem (§7.1).
     agentWorkspaces = Array.from(agentEntries.values()).map((e) => ({
@@ -6156,6 +6182,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       modelHealthAnnotations: buildModelHealthAnnotations(config.models),
       llmRequestRing,
       workspaceRoot,
+      // Static agents meta snapshot for GET /api/agents (spec CONSOLE-MULTI-AGENT §2).
+      agentsSnapshot,
       // Per-asset workspace resolver for GET /api/media/:ref (spec
       // MULTI-AGENT-SUPPORT §7.4): in agents mode the BFF resolves the owning
       // agent's workspace from the asset's timeline_key. Absent = legacy mode.

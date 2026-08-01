@@ -73,6 +73,33 @@ export const ContextMessageWire = Schema.Struct({
 });
 export type ContextMessageWire = Schema.Schema.Type<typeof ContextMessageWire>;
 
+// ── Agents meta (spec CONSOLE-MULTI-AGENT §2) ───────────────────────────────
+
+/** One account belonging to an agent (provider + accountId). */
+export const AgentAccount = Schema.Struct({
+	provider: Schema.String,
+	accountId: Schema.String
+});
+export type AgentAccount = Schema.Schema.Type<typeof AgentAccount>;
+
+/** One declared agent with its ordered account list. */
+export const AgentEntry = Schema.Struct({
+	name: Schema.String,
+	accounts: Schema.Array(AgentAccount)
+});
+export type AgentEntry = Schema.Schema.Type<typeof AgentEntry>;
+
+/**
+ * GET /api/agents — static agents snapshot. `mode` is "agents" (multi-agent
+ * deployment) or "legacy" (single implicit identity). In legacy mode `agents`
+ * is empty and the console suppresses all agent chrome.
+ */
+export const AgentsResponse = Schema.Struct({
+	mode: Schema.Literal('agents', 'legacy'),
+	agents: Schema.Array(AgentEntry)
+});
+export type AgentsResponse = Schema.Schema.Type<typeof AgentsResponse>;
+
 /** GET /api/rooms */
 export const Room = Schema.Struct({
 	timelineKey: Schema.String,
@@ -684,7 +711,11 @@ export const RuleStatus = Schema.Struct({
 		classes: Schema.optional(Schema.Array(Schema.String)),
 		sessionTypes: Schema.optional(Schema.Array(Schema.String)),
 		tools: Schema.optional(Schema.Array(Schema.String)),
-		models: Schema.optional(Schema.Array(Schema.String))
+		models: Schema.optional(Schema.Array(Schema.String)),
+		// Resolved "provider:accountKey" prefixes when the rule has an agent/account
+		// matcher (spec CONSOLE-MULTI-AGENT §5 / MULTI-AGENT-SUPPORT §8). Optional for
+		// backward compatibility with older backends and non-scoped rules.
+		timelineKeyPrefixes: Schema.optional(Schema.Array(Schema.String))
 	}),
 	// Per-model spend for a multi-model rule (§14) — lets the console segment the bar as a
 	// composite. Optional/back-compat: absent for single-model rules and older BFFs.

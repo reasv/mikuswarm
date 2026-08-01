@@ -45,19 +45,53 @@ const USERS: DemoUser[] = [
 	{ id: uid('barbara'), name: 'Barbara' }
 ];
 
+// ── Demo agents (spec CONSOLE-MULTI-AGENT §6) ────────────────────────────────
+// Two invented agents: "aria" is multi-platform (matrix + discord); "nova" is
+// discord-only. The room timeline keys below use these account IDs so agent
+// chrome (tabs, chips, accent colors) renders in demo mode without a live
+// multi-agent deployment.
+
+/** Invented account IDs used in timeline keys below. */
+const ARIA_MATRIX = 'aria';
+const ARIA_DISCORD = 'aria-dc';
+const NOVA_DISCORD = 'nova';
+
 interface DemoRoom {
+	/** Full timeline key (`provider:account:room:channelId`). */
 	key: string;
 	name: string;
 	space: string;
 }
+// Room keys are proper timeline keys so timelineAccount() parses them and the
+// agent lookup resolves them to aria or nova.
 const ROOMS: DemoRoom[] = [
-	{ key: `!general:${SERVER}`, name: 'general', space: 'Sample Server' },
-	{ key: `!art-share:${SERVER}`, name: 'art-share', space: 'Sample Server' },
-	{ key: `!off-topic:${SERVER}`, name: 'off-topic', space: 'Sample Server' },
-	{ key: `!tech-help:${SERVER}`, name: 'tech-help', space: 'Sample Server' },
-	{ key: `dm:${uid('ada')}`, name: 'Ada', space: 'DM' }
+	{ key: `matrix:${ARIA_MATRIX}:room:!general:${SERVER}`, name: 'general', space: 'Sample Server' },
+	{ key: `matrix:${ARIA_MATRIX}:room:!art-share:${SERVER}`, name: 'art-share', space: 'Sample Server' },
+	{ key: `matrix:${ARIA_MATRIX}:room:!off-topic:${SERVER}`, name: 'off-topic', space: 'Sample Server' },
+	{ key: `discord:${ARIA_DISCORD}:room:1001`, name: 'tech-help', space: 'Sample Server' },
+	{ key: `discord:${NOVA_DISCORD}:room:1002`, name: 'Ada', space: 'DM' }
 ];
 const roomLabel = (r: DemoRoom): string => `${r.name} (${r.space})`;
+
+/** GET /api/agents demo fixture (spec CONSOLE-MULTI-AGENT §6). */
+function agentsFixture(): unknown {
+	return {
+		mode: 'agents',
+		agents: [
+			{
+				name: 'aria',
+				accounts: [
+					{ provider: 'matrix', accountId: ARIA_MATRIX },
+					{ provider: 'discord', accountId: ARIA_DISCORD }
+				]
+			},
+			{
+				name: 'nova',
+				accounts: [{ provider: 'discord', accountId: NOVA_DISCORD }]
+			}
+		]
+	};
+}
 
 const MODEL_AGENT = 'anthropic/claude-sonnet-4';
 const MODEL_FAST = 'anthropic/claude-haiku-4';
@@ -484,6 +518,18 @@ function usageBudgetsFixture(now: number): unknown {
 			scope: {}
 		},
 		{
+			// Agent-scoped rule — timelineKeyPrefixes lets the console reverse-map
+			// these prefixes to the "nova" agent chip (spec CONSOLE-MULTI-AGENT §5).
+			name: 'nova-daily',
+			spentUsd: 0.34,
+			capUsd: 1.5,
+			fraction: 0.34 / 1.5,
+			state: 'ok',
+			window: calendarWindow('day', 'UTC'),
+			resetsAt: now + 9 * HOUR + 12 * MIN,
+			scope: { timelineKeyPrefixes: [`discord:${NOVA_DISCORD}`] }
+		},
+		{
 			name: 'embeddings-off',
 			spentUsd: 0,
 			capUsd: 0,
@@ -561,14 +607,23 @@ function roomsFixture(now: number): unknown {
 	const sessionCounts = [42, 27, 61, 18, 9];
 	const eventCounts = [3120, 1840, 5210, 940, 260];
 	return {
-		rooms: ROOMS.map((r, i) => ({
-			timelineKey: r.key,
-			displayName: roomLabel(r),
-			timelineState: 'joined',
-			lastActivityAt: now - (i * 11 + 3) * MIN,
-			eventCount: eventCounts[i],
-			sessionCount: sessionCounts[i]
-		}))
+		rooms: ROOMS.map((r, i) => {
+			// Parse provider/accountId from the timeline key so the console can tab by account.
+			const c1 = r.key.indexOf(':');
+			const c2 = r.key.indexOf(':', c1 + 1);
+			const provider = c1 > 0 ? r.key.slice(0, c1) : null;
+			const accountId = c1 > 0 && c2 > c1 + 1 ? r.key.slice(c1 + 1, c2) : null;
+			return {
+				timelineKey: r.key,
+				provider,
+				accountId,
+				displayName: roomLabel(r),
+				timelineState: 'joined',
+				lastActivityAt: now - (i * 11 + 3) * MIN,
+				eventCount: eventCounts[i],
+				sessionCount: sessionCounts[i]
+			};
+		})
 	};
 }
 
@@ -976,7 +1031,7 @@ function captionItem(it: CaptionItem, now: number): Record<string, unknown> {
 		attempts: 1,
 		maxRetries: 2,
 		retrying: false,
-		room: `matrix:miku:room:${room.key}`,
+		room: room.key,
 		createdAt: ts - 4000,
 		updatedAt: ts,
 		inputSummary: `${it.file} · image`,
@@ -1046,6 +1101,8 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 	const page = Number(params.get('page') ?? '0') || 0;
 
 	switch (pathname) {
+		case '/api/agents':
+			return agentsFixture();
 		case '/api/usage/summary':
 			return usageSummary(window, now);
 		case '/api/usage/timeseries':
