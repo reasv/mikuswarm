@@ -1659,9 +1659,13 @@ interface PipelineListSpec {
 }
 
 /**
- * Per-pool wiring for the unqualified (no-join) counts aggregate. Mirrors the
- * scope/status/attempts/done of {@link PIPELINE_LIST_SPECS} but with bare column
- * names, since the counts query hits the single base table directly.
+ * Per-pool wiring for the counts aggregate. Mirrors the scope/status/attempts/done
+ * of {@link PIPELINE_LIST_SPECS} but with bare column names, since the counts query
+ * hits the single base table directly. The captioning pool optionally carries
+ * join-free variants ({@link tableNoJoin} etc.) used when no eligibility split is
+ * requested — the inner join against timeline_events is then a no-op (every asset
+ * has a parent event via FK NOT NULL) and can be elided for a cheaper index-only
+ * scan over idx_media_assets_counts (ARCHITECTURE.md §11).
  */
 interface PipelineCountSpec {
   table: string;
@@ -1669,6 +1673,14 @@ interface PipelineCountSpec {
   attemptsCol: string;
   scope: string | null;
   done: string[];
+  /** Join-free table expression (captioning only, used when eligibility is absent). */
+  tableNoJoin?: string;
+  /** Join-free statusCol (captioning only). */
+  statusColNoJoin?: string;
+  /** Join-free attemptsCol (captioning only). */
+  attemptsColNoJoin?: string;
+  /** Join-free scope (captioning only). */
+  scopeNoJoin?: string | null;
 }
 
 const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
@@ -1688,6 +1700,13 @@ const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
     attemptsCol: "ma.caption_attempts",
     scope: "ma.media_type in ('image', 'video', 'audio')",
     done: ["complete"],
+    // When eligibility is absent the te.* columns are not referenced, so the join
+    // is an identity op. The join-free path hits idx_media_assets_counts instead
+    // (ARCHITECTURE.md §11).
+    tableNoJoin: "media_assets",
+    statusColNoJoin: "caption_status",
+    attemptsColNoJoin: "caption_attempts",
+    scopeNoJoin: "media_type in ('image', 'video', 'audio')",
   },
   summarization: {
     table: "summarization_jobs",
@@ -7733,24 +7752,33 @@ export class Storage {
    */
   getPipelineCounts(pool: PipelineId, eligibility?: CaptionEligibility): PipelineCounts {
     const spec = PIPELINE_COUNT_SPECS[pool];
-    const where = spec.scope ? `where ${spec.scope}` : "";
+    // For the captioning pool without eligibility the timeline_events join is an
+    // identity op (every asset has a parent event via FK NOT NULL). Elide the join
+    // so the aggregate hits idx_media_assets_counts — an index-only scan over
+    // (media_type, caption_status, caption_attempts) — instead of walking the join.
+    const useNoJoin = !eligibility && spec.tableNoJoin != null;
+    const table = useNoJoin ? spec.tableNoJoin! : spec.table;
+    const statusCol = useNoJoin ? spec.statusColNoJoin! : spec.statusCol;
+    const attemptsCol = useNoJoin ? spec.attemptsColNoJoin! : spec.attemptsCol;
+    const scope = useNoJoin ? (spec.scopeNoJoin ?? null) : spec.scope;
+    const where = scope ? `where ${scope}` : "";
     const donePlaceholders = spec.done.map(() => "?").join(", ");
     // Captioning: split the raw `pending` bucket into eligible (real backlog) and
     // `deferred` (never-claimed under the current config). Other pools — and
     // captioning when no eligibility is supplied — have no `deferred` partition.
     const eligibleSql = pool === "captioning" && eligibility ? captionEligibleSql(eligibility) : null;
-    const freshPending = `${spec.statusCol} = 'pending' and ${spec.attemptsCol} = 0`;
+    const freshPending = `${statusCol} = 'pending' and ${attemptsCol} = 0`;
     const pendingCase = eligibleSql ? `${freshPending} and ${eligibleSql}` : freshPending;
     const deferredCase = eligibleSql ? `${freshPending} and not ${eligibleSql}` : null;
     const sql = `select
         sum(case when ${pendingCase} then 1 else 0 end) as pending,
-        sum(case when ${spec.statusCol} = 'pending' and ${spec.attemptsCol} > 0 then 1 else 0 end) as retrying,
-        sum(case when ${spec.statusCol} = 'processing' then 1 else 0 end) as processing,
-        sum(case when ${spec.statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
-        sum(case when ${spec.statusCol} = 'failed' then 1 else 0 end) as failed,
-        sum(case when ${spec.statusCol} = 'skipped' then 1 else 0 end) as skipped,
+        sum(case when ${statusCol} = 'pending' and ${attemptsCol} > 0 then 1 else 0 end) as retrying,
+        sum(case when ${statusCol} = 'processing' then 1 else 0 end) as processing,
+        sum(case when ${statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
+        sum(case when ${statusCol} = 'failed' then 1 else 0 end) as failed,
+        sum(case when ${statusCol} = 'skipped' then 1 else 0 end) as skipped,
         ${deferredCase ? `sum(case when ${deferredCase} then 1 else 0 end)` : "0"} as deferred
-      from ${spec.table} ${where}`;
+      from ${table} ${where}`;
     return this.read((db) => {
       const row = db.prepare(sql).get(...spec.done) as Record<string, number | null>;
       return {
@@ -9028,10 +9056,23 @@ create index if not exists idx_media_assets_updated
 -- pre-existing partial index only covers pending/processing; a status=failed /
 -- complete / skipped list must filter+sort without a full scan, so a non-partial
 -- composite ordered to match the keyset sort (status, updated_at, id) is needed
--- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
--- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
+-- (spec §3.4; ARCHITECTURE.md §11).
 create index if not exists idx_media_assets_status_updated
   on media_assets(caption_status, updated_at, id);
+
+-- Pipeline monitor count aggregate: covering index for the no-join captioning
+-- counts path (eligibility absent). Partial index over
+-- (media_type, caption_status, caption_attempts) lets getPipelineCounts run as
+-- an index-only scan without touching the heap or joining timeline_events
+-- (ARCHITECTURE.md §11).
+create index if not exists idx_media_assets_counts
+  on media_assets(media_type, caption_status, caption_attempts)
+  where media_type in ('image', 'video', 'audio');
+
+-- Cost overview: covering index for sum(caption_cost) in getCostOverview so the
+-- aggregate is an index-only scan on the small cost column (ARCHITECTURE.md §11).
+create index if not exists idx_media_assets_caption_cost
+  on media_assets(caption_cost);
 `;
 
 // Message-only history backfetch jobs (spec MESSAGE-BACKFETCH §8.1;
@@ -9207,6 +9248,16 @@ create index if not exists idx_timeline_events_status_updated
 create index if not exists idx_timeline_events_active_updated
   on timeline_events(updated_at, id)
   where enrichment_status not in ('inactive', 'skipped');
+
+-- Pipeline monitor count aggregate: covering index for getPipelineCounts on
+-- enrichment. A partial index over the non-inactive rows carrying
+-- (enrichment_status, enrichment_retries) lets the SUM(CASE…) aggregate skip
+-- the fat body/event_json overflow pages entirely — an index-only scan over the
+-- non-inactive minority. Partial predicate mirrors the WHERE term emitted by
+-- getPipelineCounts so the planner can use it (ARCHITECTURE.md §11).
+create index if not exists idx_timeline_events_enrichment_counts
+  on timeline_events(enrichment_status, enrichment_retries)
+  where enrichment_status != 'inactive';
 
 create index if not exists idx_timeline_events_trigger_group
   on timeline_events(trigger_group_id)
@@ -9509,6 +9560,11 @@ create index if not exists idx_agent_sessions_recent
 create index if not exists idx_agent_sessions_sender_recent
   on agent_sessions(trigger_sender_id, coalesce(completed_at, updated_at) desc)
   where trigger_sender_display_name is not null;
+
+-- Cost overview: covering index for sum(usage_cost) in getCostOverview so the
+-- aggregate is an index-only scan on the small cost column (ARCHITECTURE.md §11).
+create index if not exists idx_agent_sessions_usage_cost
+  on agent_sessions(usage_cost);
 
 -- Blob side-table: holds only the heavyweight frozen context snapshot and the
 -- appended transcript, keyed by session_id (1:1 with agent_sessions). Written

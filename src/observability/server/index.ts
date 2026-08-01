@@ -5,7 +5,7 @@ import { Router } from "./router.js";
 import { sendError } from "./responses.js";
 import {
   agentsSnapshot,
-  listRooms,
+  createCachedRoomsHandler,
   roomContext,
   roomSessions,
   roomSessionFacets,
@@ -86,7 +86,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
 
   const router = new Router()
     .add("GET", "/api/agents", agentsSnapshot)
-    .add("GET", "/api/rooms", listRooms)
+    .add("GET", "/api/rooms", createCachedRoomsHandler(deps.storage))
     .add("GET", "/api/rooms/:key/context", roomContext)
     .add("GET", "/api/rooms/:key/sessions", roomSessions)
     .add("GET", "/api/rooms/:key/session-facets", roomSessionFacets)

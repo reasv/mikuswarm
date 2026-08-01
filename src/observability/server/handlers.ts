@@ -10,13 +10,15 @@ import { isFinalTurnMessage } from "../../agent/factory.js";
 import type {
   AgentSessionMetaRow,
   AgentSessionStatus,
+  RoomSummaryRow,
+  Storage,
   ToolInvocationRow,
 } from "../../storage/index.js";
 import { parseTimelineKey } from "../../storage/timeline-key.js";
 import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
-import type { RequestContext } from "./types.js";
+import type { RequestContext, RouteHandler } from "./types.js";
 
 /** GET /api/rooms — timelines, reverse-chron by last activity (spec §8). */
 export function listRooms(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
@@ -36,6 +38,46 @@ export function listRooms(_req: IncomingMessage, res: ServerResponse, ctx: Reque
     };
   });
   sendJson(res, 200, { rooms });
+}
+
+/**
+ * Build a GET /api/rooms handler with a bounded-staleness in-memory cache.
+ *
+ * `listConsoleRooms` re-aggregates the full timeline_events and agent_sessions
+ * history on every call, which at production scale costs ~190 ms and grows with
+ * history. The console polls every 5 s, so results staler than `ttlMs` are never
+ * visible for longer than one poll gap + the TTL. The cache is scoped to this
+ * handler closure (one instance per {@link createObservabilityServer} call), so
+ * direct `Storage.listConsoleRooms()` calls and `:memory:` test databases are
+ * completely unaffected. SSE live sessions read storage directly and are
+ * unaffected.
+ *
+ * Worst-case staleness: `ttlMs` (default 2 500 ms — just under the 5 s poll, so
+ * no console view is ever more than ~7.5 s behind a write). A write that lands
+ * immediately after a fill is invisible to the handler for at most one TTL window.
+ */
+export function createCachedRoomsHandler(storage: Storage, ttlMs = 2_500): RouteHandler {
+  let cached: { rows: RoomSummaryRow[]; expiresAt: number } | null = null;
+  return function listRoomsCached(_req, res, _ctx) {
+    const now = Date.now();
+    if (!cached || now >= cached.expiresAt) {
+      cached = { rows: storage.listConsoleRooms(), expiresAt: now + ttlMs };
+    }
+    const rooms = cached.rows.map((row) => {
+      const parsed = parseTimelineKey(row.timeline_key);
+      return {
+        timelineKey: row.timeline_key,
+        provider: parsed?.provider ?? null,
+        accountId: parsed?.accountId ?? null,
+        displayName: row.display_name,
+        timelineState: row.timeline_state,
+        lastActivityAt: row.last_activity_at,
+        eventCount: row.event_count,
+        sessionCount: row.session_count,
+      };
+    });
+    sendJson(res, 200, { rooms });
+  };
 }
 
 /**
