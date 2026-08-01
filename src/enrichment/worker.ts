@@ -5,6 +5,7 @@ import type { MediaAssetRow, LinkPreviewRow, ReplyContextRow, Storage } from "..
 import type { EnrichmentCapabilities, EnrichmentResult } from "./types.js";
 import type { FetchClient } from "./fetch-client.js";
 import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
+import type { AttachmentStore } from "./attachment-store.js";
 import { extractLinkedMediaUrls } from "./linked-media.js";
 import { detectCharacterCard } from "./card-detect.js";
 import { channelIdFromTimelineKey } from "../storage/timeline-key.js";
@@ -51,6 +52,12 @@ export interface EnrichmentWorkerOptions {
    * behavior, also what most tests exercise).
    */
   fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
+  /**
+   * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+   * When present and ready, downloaded files are integrated via the store
+   * (hardlinks, dedup). Absent or not-ready = byte-identical pre-Phase-5d behaviour.
+   */
+  store?: AttachmentStore;
   logger: EnrichmentLogger;
 }
 
@@ -200,8 +207,10 @@ export class EnrichmentWorker {
             originalFilename: attachment.filename,
             contentType: downloaded.contentType ?? attachment.mimeType,
             attachSubdir: this.options.attachSubdir,
+            store: this.options.store,
           });
           asset.local_path = saved.localPath;
+          asset.content_hash = saved.contentHash;
           asset.size_bytes = downloaded.sizeBytes;
           asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
           if (downloaded.contentType) asset.media_type = inferMediaType(downloaded.contentType);
@@ -220,8 +229,10 @@ export class EnrichmentWorker {
             originalFilename: downloaded.filename ?? attachment.filename,
             contentType: downloaded.contentType ?? attachment.mimeType,
             attachSubdir: this.options.attachSubdir,
+            store: this.options.store,
           });
           asset.local_path = saved.localPath;
+          asset.content_hash = saved.contentHash;
           asset.size_bytes = downloaded.sizeBytes;
           asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
           asset.media_type = downloaded.kind || attachment.mediaType;
@@ -358,8 +369,10 @@ export class EnrichmentWorker {
               originalFilename: attachment.filename,
               contentType: downloaded.contentType ?? attachment.mimeType,
               attachSubdir: this.options.attachSubdir,
+              store: this.options.store,
             });
             asset.local_path = saved.localPath;
+            asset.content_hash = saved.contentHash;
             asset.size_bytes = downloaded.sizeBytes;
             asset.mime_type = downloaded.contentType ?? attachment.mimeType ?? null;
             if (downloaded.contentType) asset.media_type = inferMediaType(downloaded.contentType);
@@ -378,8 +391,10 @@ export class EnrichmentWorker {
               originalFilename: downloaded.filename ?? attachment.filename ?? summary.body,
               contentType: downloaded.contentType,
               attachSubdir: this.options.attachSubdir,
+              store: this.options.store,
             });
             asset.local_path = saved.localPath;
+            asset.content_hash = saved.contentHash;
             asset.size_bytes = downloaded.sizeBytes;
             asset.mime_type = downloaded.contentType ?? null;
             asset.media_type = downloaded.kind || attachment.mediaType;
@@ -553,8 +568,10 @@ export class EnrichmentWorker {
             originalFilename: media.filename,
             contentType: media.contentType,
             attachSubdir: this.options.attachSubdir,
+            store: this.options.store,
           });
           asset.local_path = saved.localPath;
+          asset.content_hash = saved.contentHash;
           asset.download_status = "complete";
           asset.size_bytes = data.byteLength;
         } catch (error) {
@@ -764,9 +781,11 @@ export class EnrichmentWorker {
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
           attachSubdir: this.options.attachSubdir,
+          store: this.options.store,
         });
         fetchedPath = undefined;
         asset.local_path = saved.localPath;
+        asset.content_hash = saved.contentHash;
         asset.mime_type = fetched.contentType ?? null;
         asset.size_bytes = fetched.sizeBytes;
         asset.download_status = "complete";
@@ -832,9 +851,11 @@ export class EnrichmentWorker {
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
           attachSubdir: this.options.attachSubdir,
+          store: this.options.store,
         });
         fetchedPath = undefined;
         asset.local_path = saved.localPath;
+        asset.content_hash = saved.contentHash;
         asset.mime_type = fetched.contentType ?? null;
         asset.download_status = "complete";
         asset.size_bytes = fetched.sizeBytes;

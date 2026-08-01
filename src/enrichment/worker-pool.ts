@@ -10,6 +10,7 @@ import type { FxTwitterConfig } from "../fxtwitter/types.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
+import type { AttachmentStore } from "./attachment-store.js";
 
 export interface EnrichmentWorkerPoolOptions {
   storage: Storage;
@@ -42,6 +43,12 @@ export interface EnrichmentWorkerPoolOptions {
   downloadSizeLimit?: number;
   /** X.com enrichment via FxTwitter (ARCHITECTURE.md §7a); unset = legacy Synapse-only previews. */
   fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
+  /**
+   * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+   * When present and ready, each worker integrates downloaded files via the store.
+   * Absent → byte-identical pre-Phase-5d behaviour.
+   */
+  store?: AttachmentStore;
   config: EnrichmentConfig;
   onComplete?: (eventId: string) => void;
   onError?: (eventId: string, error: unknown) => void;
@@ -258,6 +265,7 @@ export class EnrichmentWorkerPool {
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
       downloadSizeLimit: this.options.downloadSizeLimit,
       fxtwitter: this.options.fxtwitter,
+      store: this.options.store,
       logger: this.options.logger,
     });
 

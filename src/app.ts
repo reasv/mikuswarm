@@ -119,6 +119,7 @@ import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
 import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
+import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
@@ -1025,6 +1026,33 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // fans out to `/api/pipelines/stream` SSE clients.
   const pipelineActivityBus = new PipelineActivityBus();
 
+  // Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+  // Default-off: only constructed when `[attachment_store] enabled = true`.
+  // On success, `init()` runs the cross-device link() probe against all workspace
+  // roots and sets `isReady()` true. On EXDEV the process exits with a clear message.
+  let attachmentStore: AttachmentStore | undefined;
+  if (config.attachment_store?.enabled) {
+    const storePath = path.resolve(
+      config.attachment_store.path ?? "./attachment-store",
+    );
+    attachmentStore = new AttachmentStore(storePath, logger);
+    const allRoots =
+      agentWorkspaces.length > 0
+        ? agentWorkspaces.map((w) => w.workspaceRoot)
+        : [workspaceRoot];
+    // Throws on EXDEV (cross-device) or other filesystem errors — crash-fast is
+    // correct here; a misconfigured store must not silently lose data.
+    await attachmentStore.init(allRoots);
+    // Background adoption sweep: run once at startup (delayed to let the process
+    // stabilise) and then daily. Fire-and-forget: errors are logged inside the
+    // sweep and never crash the process.
+    setTimeout(() => void attachmentStore!.adoptSweep(allRoots), 30_000);
+    setInterval(
+      () => void attachmentStore!.adoptSweep(allRoots),
+      24 * 60 * 60 * 1000,
+    );
+  }
+
   const enrichmentPool = new EnrichmentWorkerPool({
     storage,
     timeline,
@@ -1045,6 +1073,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       : undefined,
     downloadSizeLimit,
     fxtwitter: { client: fxTwitterClient, config: fxTwitterConfig },
+    store: attachmentStore,
     config: config.enrichment ?? {},
     onComplete: (eventId) => {
       enrichmentEmitter.emit(`complete:${eventId}`);

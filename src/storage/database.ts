@@ -124,6 +124,14 @@ export interface MediaAssetRow {
   height?: number | null;
   duration_seconds?: number | null;
   original_filename?: string | null;
+  /**
+   * sha256 hex hash of the file content (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+   * Always set by the enrichment write path on new rows regardless of whether the
+   * content-addressed attachment store is enabled (the hash is computed for filename
+   * generation anyway). NULL only on pre-Phase-5d rows. Enables dedup lookups and
+   * adoption-sweep verification without re-hashing files.
+   */
+  content_hash?: string | null;
   detected_content?: string | null;
   detected_metadata_json?: string | null;
   caption?: string | null;
@@ -3252,13 +3260,13 @@ export class Storage {
         `insert or replace into media_assets (
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
-          original_filename, detected_content, detected_metadata_json,
+          original_filename, content_hash, detected_content, detected_metadata_json,
           caption, caption_model, caption_status, caption_error, caption_attempts,
           download_status, download_error, created_at, updated_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
-          @originalFilename, @detectedContent, @detectedMetadataJson,
+          @originalFilename, @contentHash, @detectedContent, @detectedMetadataJson,
           @caption, @captionModel, @captionStatus, @captionError, @captionAttempts,
           @downloadStatus, @downloadError, @createdAt, @updatedAt
         )`,
@@ -3276,6 +3284,7 @@ export class Storage {
         height: row.height ?? null,
         durationSeconds: row.duration_seconds ?? null,
         originalFilename: row.original_filename ?? null,
+        contentHash: row.content_hash ?? null,
         detectedContent: row.detected_content ?? null,
         detectedMetadataJson: row.detected_metadata_json ?? null,
         caption: row.caption ?? null,
@@ -3382,13 +3391,13 @@ export class Storage {
         `insert or replace into media_assets (
           id, event_id, role, source_index, link_preview_id, local_path,
           mime_type, media_type, size_bytes, width, height, duration_seconds,
-          original_filename, detected_content, detected_metadata_json,
+          original_filename, content_hash, detected_content, detected_metadata_json,
           caption, caption_model, caption_status, caption_error, caption_attempts,
           download_status, download_error, created_at, updated_at
         ) values (
           @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
           @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
-          @originalFilename, @detectedContent, @detectedMetadataJson,
+          @originalFilename, @contentHash, @detectedContent, @detectedMetadataJson,
           @caption, @captionModel, @captionStatus, @captionError, @captionAttempts,
           @downloadStatus, @downloadError, @createdAt, @updatedAt
         )`,
@@ -3408,6 +3417,7 @@ export class Storage {
           height: ma.height ?? null,
           durationSeconds: ma.duration_seconds ?? null,
           originalFilename: ma.original_filename ?? null,
+          contentHash: ma.content_hash ?? null,
           detectedContent: ma.detected_content ?? null,
           detectedMetadataJson: ma.detected_metadata_json ?? null,
           caption: ma.caption ?? null,
@@ -8752,6 +8762,10 @@ create table if not exists media_assets (
   height integer,
   duration_seconds real,
   original_filename text,
+  -- sha256 hex hash of the file content (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+  -- Always set on new rows (store enabled or not); NULL only on pre-Phase-5d rows.
+  -- Added via the v9→v10 migration for existing DBs.
+  content_hash text,
   detected_content text,
   detected_metadata_json text,
   caption text,
@@ -9312,7 +9326,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 9;
+export const LATEST_SCHEMA_VERSION = 10;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -9722,6 +9736,25 @@ function addSummaryMirroredFrom(db: Database.Database): void {
   `);
 }
 
+/**
+ * v9 → v10: add `content_hash TEXT` to `media_assets`.
+ *
+ * Nullable; NULL only on pre-Phase-5d rows. The enrichment write path always
+ * sets it on new rows, store enabled or not — the hash is computed for
+ * filename generation anyway (spec MULTI-AGENT-SUPPORT §11.5 / §13 Phase 5d).
+ * Enables dedup lookups and adoption-sweep verification without re-hashing.
+ *
+ * SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.45; idempotency
+ * is handled via the `PRAGMA table_info` guard (same pattern as v5→v6 and
+ * v7→v8 migrations).
+ */
+function addMediaAssetsContentHash(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(media_assets)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "content_hash")) {
+    db.exec("ALTER TABLE media_assets ADD COLUMN content_hash TEXT");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -9736,6 +9769,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addMemoryChunksAgentColumn,
   addSenderBotColumns,
   addSummaryMirroredFrom,
+  addMediaAssetsContentHash,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
