@@ -573,6 +573,52 @@ test("validateAgentConfig §10a: no browser blocks in agents mode is valid (brow
 });
 
 // ---------------------------------------------------------------------------
+// §10b: summaries_from validation (Phase 5c)
+// ---------------------------------------------------------------------------
+
+test("validateAgentConfig §10b: summaries_from self-reference is rejected", () => {
+  const config = minimalConfig({
+    agents: {
+      miku: { workspace_root: "/workspaces/miku", summaries_from: "miku" } as any,
+    },
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /self-reference/i,
+    "agent that names itself as summaries_from must be rejected",
+  );
+});
+
+test("validateAgentConfig §10b: summaries_from naming an undeclared donor is rejected", () => {
+  const config = minimalConfig({
+    agents: {
+      miku: { workspace_root: "/workspaces/miku", summaries_from: "ghost" } as any,
+    },
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /not declared|ghost/i,
+    "undeclared donor in summaries_from must be rejected",
+  );
+});
+
+test("validateAgentConfig §10b: summaries_from chain (donor itself mirrors) is rejected", () => {
+  // donor has summaries_from so it is itself a secondary — a chain is forbidden.
+  const config = minimalConfig({
+    agents: {
+      donor: { workspace_root: "/workspaces/donor", summaries_from: "root" } as any,
+      root: { workspace_root: "/workspaces/root" } as any,
+      miku: { workspace_root: "/workspaces/miku", summaries_from: "donor" } as any,
+    },
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /chain/i,
+    "chained summaries_from (donor itself mirrors) must be rejected",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Legacy passthrough (§4.2) — validateAgentConfig on configs without [agents]
 // ---------------------------------------------------------------------------
 

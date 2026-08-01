@@ -6,3 +6,9 @@ export {
 export { evaluateCondensation, type CondensationEvaluatorOptions } from "./evaluator.js";
 export { SummarizationIndexer, type SummarizationIndexerOptions } from "./indexer.js";
 export { createEscalateSummary, type EscalateSummaryDeps } from "./escalation.js";
+export {
+  MirrorWorker,
+  buildMirrorTopology,
+  type MirrorWorkerOptions,
+  type AgentMirrorEntry,
+} from "./mirror-worker.js";

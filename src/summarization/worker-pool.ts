@@ -32,6 +32,11 @@ export interface SummarizationWorkerPoolOptions {
    * structurally on summarization (§2.1), a paused summarizer also gates them.
    */
   shouldPause?: () => boolean;
+  /**
+   * Optional per-timeline mirroring check (spec MULTI-AGENT-SUPPORT §10b).
+   * Threaded into evaluateCondensation so it can skip mirrored timelines.
+   */
+  isMirroredTimeline?: (timelineKey: string) => boolean;
   logger: Logger;
 }
 
@@ -674,6 +679,7 @@ export class SummarizationWorkerPool {
       timelineKey,
       level,
       logger: this.options.logger,
+      isMirroredTimeline: this.options.isMirroredTimeline,
     }).catch((error) =>
       this.options.logger.error("condensation_evaluator_error", {
         timelineKey,

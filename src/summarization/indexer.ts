@@ -40,6 +40,13 @@ export interface SummarizationIndexerOptions {
   tiers: AppConfig["context"]["tiers"];
   /** Fired after a job is inserted — wired to `SummarizationWorkerPool.notifyNewWork`. */
   onJobEnqueued?: () => void;
+  /**
+   * Optional per-timeline mirroring check (spec MULTI-AGENT-SUPPORT §10b).
+   * When set and returns true for a timeline, the indexer skips enqueueing a
+   * native L1 job — the mirror worker provides summaries from the donor instead.
+   * Absent (legacy / no mirroring configured) → never skip.
+   */
+  isMirroredTimeline?: (timelineKey: string) => boolean;
   logger?: Logger;
 }
 
@@ -141,6 +148,9 @@ export class SummarizationIndexer {
   private async reconcileTimelineInner(timelineKey: string): Promise<void> {
     const { storage, store, config } = this.options;
     if (config.enabled === false) return;
+
+    // §10b: skip mirrored timelines — the mirror worker provides summaries.
+    if (this.options.isMirroredTimeline?.(timelineKey)) return;
 
     const generationThreshold = config.generation_threshold_tokens ?? 6000;
 

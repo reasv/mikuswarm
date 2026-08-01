@@ -123,7 +123,7 @@ import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
-import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary } from "./summarization/index.js";
+import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
 import { parseTimelineKey, buildTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
@@ -1785,6 +1785,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   };
 
+  // ── Summary mirroring (spec MULTI-AGENT-SUPPORT §10b, Phase 5c) ──────────
+  // mirrorWorker is created AFTER the pool (which it hooks into), but the pool
+  // needs isMirroredTimeline and onDonorComplete at construction time. We use a
+  // mutable reference variable captured by the closures, set after mirrorWorker
+  // is constructed. This avoids any `as any` casts and keeps the pool/indexer/
+  // worker construction order straightforward.
+  let mirrorWorkerRef: MirrorWorker | null = null;
+
   const summarizationPool = summarizationEnabled
     ? new SummarizationWorkerPool({
         storage,
@@ -1798,6 +1806,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // review #2) — summarization is the worst silent omission since its pause
         // transitively halts triggered/proactive sessions via the dependency cascade.
         shouldPause: makeAgentLoopClaimGate(["summarize", "condense"]),
+        // §10b mirror check: evaluated lazily via the mutable ref so the pool
+        // can be constructed before mirrorWorker exists.
+        isMirroredTimeline: (tk) => mirrorWorkerRef?.isMirroredTimeline(tk) ?? false,
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -1808,6 +1819,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           // replacing the old implicit "the next build enqueues the next chunk".
           const job = storage.getSummarizationJobById(jobId);
           if (job) summarizationIndexer?.enqueueReconcileTimeline(job.timelineKey);
+          // §10b mirror hook: propagate L1 completions to secondary timelines
+          // immediately (sweep catches L2+; this keeps L1 latency low).
+          void mirrorWorkerRef?.onDonorComplete(summaryId).catch((err) => {
+            logger.warn("mirror_on_donor_complete_error", {
+              summaryId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           // A completed level-1 summary just queued a diary job (diary_status =
           // 'pending'); wake the diary pool so it doesn't wait for its next poll.
           diaryPool?.notifyNewWork();
@@ -1821,6 +1840,25 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       })
     : null;
 
+  // Build the mirror topology once from config. Non-empty only in agents mode
+  // with at least one agent carrying summaries_from. In legacy mode the list is
+  // empty and the mirror worker is never constructed.
+  const mirrorEntries = buildMirrorTopology(config);
+  const mirrorWorker = (summarizationPool && mirrorEntries.length > 0)
+    ? new MirrorWorker({
+        storage,
+        store: timeline,
+        config: config.summarization ?? {},
+        tiers: config.context.tiers,
+        mirrorEntries,
+        indexer: null, // injected below via setIndexer
+        notifyDiaryPool: () => diaryPool?.notifyNewWork(),
+        logger: logger.child("mirror-worker"),
+      })
+    : null;
+  // Populate the lazy reference immediately so pool closures resolve correctly.
+  mirrorWorkerRef = mirrorWorker;
+
   // Eager level-1 summarization (spec §7.1/§7.3): a per-timeline reconciliation
   // indexer owns the generation-threshold evaluation, fired off the persist seam
   // and the pool's completion callback (plus a startup sweep below). The context
@@ -1832,9 +1870,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         config: config.summarization ?? {},
         tiers: config.context.tiers,
         onJobEnqueued: () => summarizationPool.notifyNewWork(),
+        isMirroredTimeline: mirrorWorker
+          ? (tk) => mirrorWorker.isMirroredTimeline(tk)
+          : undefined,
         logger: logger.child("summarization-indexer"),
       })
     : null;
+
+  // Inject the indexer into the mirrorWorker (breaks the circular dependency:
+  // mirrorWorker must exist before indexer so its isMirroredTimeline callback can
+  // be passed as an option, but the indexer must exist before mirrorWorker can
+  // call reconcileTimeline for wait-or-omit escalation and liveness flip).
+  if (mirrorWorker && summarizationIndexer) {
+    mirrorWorker.setIndexer(summarizationIndexer);
+  }
 
   if (summarizationPool) {
     // Priority inheritance (spec §5.5): one injected callback does all three
@@ -1848,20 +1897,25 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       logger,
     });
 
-    // Wait-or-omit's coverage re-check (spec §7.2/§7.3): when an over-budget
-    // build finds no job covering its oldest events, it runs ONE awaited
-    // indexer reconcile before concluding nothing covers them — closing the
-    // race against the pool-onComplete fire-and-forget reconcile on deep
-    // multi-chunk backlogs. Job creation stays with the indexer; errors are
-    // logged here and never reach the build (the builder then proceeds as if
-    // the reconcile found nothing).
-    contextBuilder.reconcileSummaries = (timelineKey) =>
-      summarizationIndexer!.reconcileTimeline(timelineKey).catch((error) => {
+    // Wait-or-omit's coverage re-check (spec §7.2/§7.3 / §10b): for ordinary
+    // timelines, run ONE awaited indexer reconcile. For mirrored timelines,
+    // reconcile the DONOR's timeline instead — interactive pressure crosses the
+    // link so the donor produces the covering summary (spec §10b wait-or-omit).
+    contextBuilder.reconcileSummaries = (timelineKey) => {
+      // Determine which timeline to reconcile
+      let reconcileKey = timelineKey;
+      if (mirrorWorker?.isMirroredTimeline(timelineKey)) {
+        const donorKey = mirrorWorker.resolveDonorTimeline(timelineKey);
+        if (donorKey) reconcileKey = donorKey;
+      }
+      return summarizationIndexer!.reconcileTimeline(reconcileKey).catch((error) => {
         logger.error("summary_reconcile_for_build_failed", {
           timelineKey,
+          reconcileKey,
           error: error instanceof Error ? error.message : String(error),
         });
       });
+    };
   }
 
   // Diary worker pool (ARCHITECTURE.md §9c). Same fail-fast validation as
@@ -5997,6 +6051,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   await enrichmentPool.start();
   await captionPool.start();
   if (summarizationPool) await summarizationPool.start();
+  // Mirror worker starts after the pool so L1 hooks are wired; initial sweep
+  // catches any donor summaries that landed during downtime.
+  if (mirrorWorker) mirrorWorker.start();
   if (diaryPool) await diaryPool.start();
   if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
@@ -6164,6 +6221,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (diaryPool) await diaryPool.stop();
+        // Stop the mirror worker before the summarization pool so the in-flight
+        // sweep doesn't try to insert mirrored summaries after the pool stops.
+        if (mirrorWorker) mirrorWorker.stop();
         if (summarizationPool) await summarizationPool.stop();
         await enrichmentPool.stop();
         // Drain the chat-search indexer: refuse new reconciles and await the
@@ -6999,6 +7059,31 @@ export function validateAgentConfig(config: AppConfig): void {
           );
         }
         agentBrowserProfiles.set(profileName, agentName);
+      }
+    }
+
+    // ── Phase 5c: summaries_from validation (§10b) ─────────────────────────
+    for (const [agentName, block] of Object.entries(config.agents)) {
+      const donorName = block.summaries_from;
+      if (donorName === undefined) continue;
+      if (donorName === agentName) {
+        throw new Error(
+          `[agents.${agentName}] summaries_from = "${donorName}" is a self-reference — ` +
+            `an agent cannot mirror its own summaries.`,
+        );
+      }
+      if (!config.agents[donorName]) {
+        throw new Error(
+          `[agents.${agentName}] summaries_from = "${donorName}" names an agent ` +
+            `that is not declared in [agents]. Add [agents.${donorName}] or correct the name.`,
+        );
+      }
+      if (config.agents[donorName]!.summaries_from !== undefined) {
+        throw new Error(
+          `[agents.${agentName}] summaries_from = "${donorName}" would create a chain — ` +
+            `"${donorName}" itself has summaries_from = "${config.agents[donorName]!.summaries_from}". ` +
+            `Donor agents must not themselves mirror (no chains).`,
+        );
       }
     }
 

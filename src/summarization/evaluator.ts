@@ -10,6 +10,12 @@ export interface CondensationEvaluatorOptions {
   /** Level of the summary that just completed; condensation produces level + 1. */
   level: number;
   logger: Logger;
+  /**
+   * Optional per-timeline mirroring check (spec MULTI-AGENT-SUPPORT §10b).
+   * When set and returns true for the timeline, condensation is skipped —
+   * the mirror worker copies the donor's condensation tree instead.
+   */
+  isMirroredTimeline?: (timelineKey: string) => boolean;
 }
 
 /** Order key for summaries: (earliest_timestamp, id) ascending. */
@@ -28,6 +34,12 @@ function summaryAfter(a: Summary, b: Summary): boolean {
  */
 export async function evaluateCondensation(options: CondensationEvaluatorOptions): Promise<void> {
   const { storage, config, timelineKey, level, logger } = options;
+
+  // §10b: skip condensation for mirrored timelines — the mirror worker copies
+  // the donor's condensation tree; triggering native condensation would produce
+  // a duplicate, misaligned, LLM-cost condensation run.
+  if (options.isMirroredTimeline?.(timelineKey)) return;
+
   const fanout = config.condense_fanout ?? 5;
 
   // Fix A — condensation idempotency on input identity (spec
