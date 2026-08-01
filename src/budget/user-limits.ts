@@ -78,6 +78,13 @@ export interface NormalizedUserLimitRule {
   constraints: NormalizedConstraint[];
   /** Cascades INDEPENDENTLY of the budget block. */
   messageTemplate?: string;
+  /**
+   * Agent/account scope (spec MULTI-AGENT-SUPPORT §8): when set, this rule only
+   * resolves for sessions whose `timeline_key` starts with one of these prefixes.
+   * Constraints from this rule only count events from the matching accounts.
+   * Absent = global (matches all sessions).
+   */
+  timelineKeyPrefixes?: string[];
 }
 
 // ─── Resolved (per-ctx) view ──────────────────────────────────────────────────
@@ -107,6 +114,13 @@ export interface ResolvedConstraint {
    * before composites at the same rung. Encoded `maxPrefIndex*1000 + memberCount`.
    */
   orderKey: number;
+  /**
+   * Agent/account scope (spec MULTI-AGENT-SUPPORT §8): when set, only events whose
+   * `timeline_key` starts with one of these prefixes count toward this constraint.
+   * Carried from the rule through to `SeedFilter`; included in the meterKey so scoped
+   * and global constraints on the same partition/model/window get distinct counters.
+   */
+  timelineKeyPrefixes?: string[];
 }
 
 /** The cascade-resolved per-user budget + selection view for one trigger ctx. */
@@ -277,6 +291,8 @@ interface SeedFilter {
   roomIds?: string[];
   spaceIds?: string[];
   requestedModelIds?: string[];
+  /** Agent/account-scoped rule seeding (spec MULTI-AGENT-SUPPORT §8). */
+  timelineKeyPrefixes?: string[];
 }
 
 /** A live session's currently-selected model, for the console (spec §14). */
@@ -574,13 +590,26 @@ export class UserLimitEngine {
    * one (atomic — `models` + `limits` together) and the refusal message from the
    * FIRST that supplies one (independently). Returns a resolution even when no
    * rule matches (`matched=false`, inert).
+   *
+   * `timelineKey` — the session's timeline key (spec MULTI-AGENT-SUPPORT §8). When
+   * supplied, rules with `timelineKeyPrefixes` that don't match are skipped — i.e.
+   * an agent-scoped rule only applies to sessions running under that agent. When
+   * absent (e.g. `seedFromLedger` seed pass, which has no per-identity timelineKey),
+   * scoped rules are included so their meters are seeded; the meter's SeedFilter
+   * carries `timelineKeyPrefixes` and correctly counts only matching events.
    */
-  resolve(ctx: UserLimitContext): UserLimitResolution {
+  resolve(ctx: UserLimitContext, timelineKey?: string): UserLimitResolution {
     const matching = this.rules.filter(
       (r) =>
         matchDimension(r.user, ctx.userId) &&
         matchDimension(r.room, ctx.roomId) &&
-        matchMultiDimension(r.space, ctx.spaceIds),
+        matchMultiDimension(r.space, ctx.spaceIds) &&
+        // Agent/account scoping: if the rule has timelineKeyPrefixes and a timelineKey
+        // was supplied, only include the rule when the key matches one of the prefixes.
+        // When timelineKey is absent (seeding), all rules are included regardless.
+        (!r.timelineKeyPrefixes ||
+          !timelineKey ||
+          r.timelineKeyPrefixes.some((p) => timelineKey.startsWith(`${p}:`))),
     );
     if (matching.length === 0) {
       return { matched: false, active: false, banned: false, constraints: [], ledgerPartitionKeys: [] };
@@ -687,11 +716,16 @@ export class UserLimitEngine {
         ? Math.max(...modelScope.map(prefIndex)) * 1000 + modelScope.length
         : -1000
       : c.index;
+    // Carry agent/account scope from the rule to the constraint (§8 attribution).
+    const timelineKeyPrefixes = rule.timelineKeyPrefixes;
     // Unambiguous meter identity (#6): JSON-encode the structured tuple rather than
     // `#`-join it, so a literal partition or model id that itself contains `#` can
     // never collide two distinct meters or split one. The key is OPAQUE — the console
     // reads structured fields off `MeterState`, never by splitting the key — so the
     // encoding is free to change.
+    // Include `timelineKeyPrefixes` so a scoped rule (e.g. agent="alice") and a global
+    // rule with otherwise identical dimensions get DISTINCT meters — they count different
+    // subsets of events and must not share a counter.
     const meterKey = JSON.stringify([
       isUserPartition ? "u" : "p",
       partitionKey,
@@ -699,6 +733,7 @@ export class UserLimitEngine {
       windowKey(c.window),
       roomScope ?? null,
       spaceScope ?? null,
+      timelineKeyPrefixes ?? null,
     ]);
     return {
       meterKey,
@@ -711,6 +746,7 @@ export class UserLimitEngine {
       spaceScope,
       source: { ruleOrder: rule.order, index: c.index },
       orderKey,
+      timelineKeyPrefixes,
     };
   }
 
@@ -723,6 +759,7 @@ export class UserLimitEngine {
     if (c.roomScope) seed.roomIds = [c.roomScope];
     if (c.spaceScope) seed.spaceIds = [c.spaceScope];
     if (c.modelScope) seed.requestedModelIds = c.modelScope;
+    if (c.timelineKeyPrefixes) seed.timelineKeyPrefixes = c.timelineKeyPrefixes;
     return seed;
   }
 

@@ -22,6 +22,9 @@ export interface RawLimitRule {
   tools?: string[];
   models?: string[];
   trigger_rejection_message?: string;
+  /** Agent/account scope (spec MULTI-AGENT-SUPPORT §8). */
+  agent?: string;
+  account?: string;
 }
 
 /** Outcome of normalizing + validating the rule set (spec §5.2). */
@@ -40,6 +43,14 @@ export interface NormalizeResult {
  * `knownModelIds` is optional (review #11): the full set of configured model ids is
  * only assembled in app.ts, so a caller without it (tests) simply skips the model
  * warning. A rule whose duration or tz is invalid is dropped and reported as fatal.
+ *
+ * Agent/account scope options (spec MULTI-AGENT-SUPPORT §8):
+ * - `isAgentsMode`: true when the `[agents]` table is present. In legacy mode
+ *   (false/absent), any rule with an `agent` or `account` matcher is a startup error.
+ * - `agentAccountPrefixes`: agentName → ["provider:accountKey", …] map built from
+ *   config; used to resolve `agent` matchers to `timelineKeyPrefixes`.
+ * - `knownAccountPrefixes`: every configured account's prefix ("provider:accountKey"),
+ *   used to validate `account` matchers.
  */
 export function normalizeLimits(
   raw: RawLimitRule[] | undefined,
@@ -50,6 +61,12 @@ export function normalizeLimits(
     /** Every configured model id (zero-cost ∪ paid); when present, a `models`
      *  selector naming an id outside it earns a soft warning (review #11). */
     knownModelIds?: Set<string>;
+    /** True when the `[agents]` table is present (agents mode). */
+    isAgentsMode?: boolean;
+    /** agentName → ["provider:accountKey", …] — resolves `agent` matchers. */
+    agentAccountPrefixes?: Map<string, string[]>;
+    /** All configured account prefixes ("provider:accountKey") — validates `account` matchers. */
+    knownAccountPrefixes?: Set<string>;
   },
 ): NormalizeResult {
   const rules: LimitRule[] = [];
@@ -89,12 +106,62 @@ export function normalizeLimits(
       window = { type: "calendar", period: entry.window.period, tz };
     }
 
+    // ── Agent/account scope (spec MULTI-AGENT-SUPPORT §8) ────────────────────
+    // Both on same rule = always a fatal (mutually exclusive: the scope is either
+    // "all accounts of an agent" or "one specific account"). In legacy mode, either
+    // matcher = fatal (same policy as the `agent` field on an account in legacy mode —
+    // can only be a mistake since agents mode isn't active).
+    if (entry.agent !== undefined && entry.account !== undefined) {
+      fatal.push(`[[limits]] "${entry.name}": cannot set both agent and account on the same rule`);
+      continue;
+    }
+    if ((entry.agent !== undefined || entry.account !== undefined) && !opts.isAgentsMode) {
+      fatal.push(
+        `[[limits]] "${entry.name}": agent/account matcher requires agents mode ([agents] table) — not valid in legacy mode`,
+      );
+      continue;
+    }
+
+    let timelineKeyPrefixes: string[] | undefined;
+    if (entry.agent !== undefined) {
+      const prefixes = opts.agentAccountPrefixes?.get(entry.agent);
+      if (prefixes === undefined) {
+        fatal.push(`[[limits]] "${entry.name}": agent "${entry.agent}" is not a declared [agents.*] block`);
+        continue;
+      }
+      if (prefixes.length === 0) {
+        fatal.push(
+          `[[limits]] "${entry.name}": agent "${entry.agent}" is declared but has no configured accounts` +
+            ` — cannot scope a limit rule to it`,
+        );
+        continue;
+      }
+      timelineKeyPrefixes = prefixes;
+    } else if (entry.account !== undefined) {
+      // `account` must be "provider:key" — format validated here as a colon-containing string.
+      // Existence validated against knownAccountPrefixes when supplied.
+      if (!entry.account.includes(":")) {
+        fatal.push(
+          `[[limits]] "${entry.name}": account "${entry.account}" must be in "provider:key" format`,
+        );
+        continue;
+      }
+      if (opts.knownAccountPrefixes && !opts.knownAccountPrefixes.has(entry.account)) {
+        fatal.push(
+          `[[limits]] "${entry.name}": account "${entry.account}" is not a configured account`,
+        );
+        continue;
+      }
+      timelineKeyPrefixes = [entry.account];
+    }
+
     const selector: RuleSelector = {};
     if (entry.classes && entry.classes.length > 0) selector.classes = [...entry.classes];
     if (entry.session_types && entry.session_types.length > 0)
       selector.sessionTypes = [...entry.session_types];
     if (entry.tools && entry.tools.length > 0) selector.tools = [...entry.tools];
     if (entry.models && entry.models.length > 0) selector.models = [...entry.models];
+    if (timelineKeyPrefixes) selector.timelineKeyPrefixes = timelineKeyPrefixes;
 
     // Soft reference checks (§5.2): warn, never fail, so config survives renames.
     for (const t of selector.tools ?? []) {

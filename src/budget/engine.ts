@@ -27,6 +27,13 @@ export interface RuleSelector {
   sessionTypes?: string[];
   tools?: string[];
   models?: string[];
+  /**
+   * Agent/account scope (spec MULTI-AGENT-SUPPORT §8): when set, this rule only
+   * matches events whose `timeline_key` starts with one of these prefixes (format:
+   * `"provider:accountKey"`). NULL `timeline_key` events (embedding lane) never match
+   * a scoped rule. Absent = global (wildcard, exact current behaviour).
+   */
+  timelineKeyPrefixes?: string[];
 }
 
 /** A normalized budget rule (parsed from `[[limits]]`, spec §5.1). */
@@ -65,6 +72,12 @@ export interface SpendDescriptor {
    */
   logicalModelId?: string;
   provider?: string;
+  /**
+   * The session's `timeline_key` — used for agent/account-scoped rule matching
+   * (spec MULTI-AGENT-SUPPORT §8). Absent for worker-pool claim gates (no per-session
+   * context); scoped rules do NOT match when this is absent (safe).
+   */
+  timelineKey?: string;
 }
 
 /** One rule that is at or over its cap, surfaced in a block decision / log (§6.4). */
@@ -117,17 +130,22 @@ export interface RuleStatus {
   components?: { model: string; spentUsd: number }[];
 }
 
+/** The filter shape for `BudgetEngineOptions.sumUsageCost` / `minUsageTs`. */
+export interface BudgetSeedFilter {
+  since: number;
+  until?: number;
+  classes?: string[];
+  sessionTypes?: string[];
+  tools?: string[];
+  models?: string[];
+  /** Agent/account-scoped rule seeding (spec MULTI-AGENT-SUPPORT §8). */
+  timelineKeyPrefixes?: string[];
+}
+
 export interface BudgetEngineOptions {
   rules: LimitRule[];
   /** Σ `cost_usd` of the ledger rows matching a selector within a window. */
-  sumUsageCost: (filter: {
-    since: number;
-    until?: number;
-    classes?: string[];
-    sessionTypes?: string[];
-    tools?: string[];
-    models?: string[];
-  }) => number;
+  sumUsageCost: (filter: BudgetSeedFilter) => number;
   /**
    * Earliest `ts` of the ledger rows matching a selector within a window, or null
    * when none match. Used OFF the hot path (`ruleStatuses` + the refusal-message
@@ -135,14 +153,7 @@ export interface BudgetEngineOptions {
    * NEVER consulted inside `check()`'s gate loop. Optional so tests/engines without
    * a ledger fall back to the cheap `now + duration` upper bound.
    */
-  minUsageTs?: (filter: {
-    since: number;
-    until?: number;
-    classes?: string[];
-    sessionTypes?: string[];
-    tools?: string[];
-    models?: string[];
-  }) => number | null;
+  minUsageTs?: (filter: BudgetSeedFilter) => number | null;
   /** LOGICAL model ids whose configured cost rate is zero (§2.2; spec MODEL-FALLBACK §2.2). */
   zeroCostModelIds: Set<string>;
   /**
@@ -326,6 +337,16 @@ export class BudgetEngine {
     // `models` matches the LOGICAL id (spec MODEL-FALLBACK §2.2), falling back to
     // the upstream id when no logical id was supplied (block name == wire id).
     if (s.models && !s.models.includes(d.logicalModelId ?? d.modelId)) return false;
+    // Agent/account scoping (spec MULTI-AGENT-SUPPORT §8): a scoped rule only matches
+    // when the descriptor carries a `timelineKey` that starts with one of the rule's
+    // account prefixes (format: `"provider:accountKey:…"`). When `timelineKey` is
+    // absent (e.g. worker-pool claim gates have no per-session context) the rule does
+    // NOT match — safe, since worker gates check classes the scoped rule likely doesn't
+    // cover. NULL `timeline_key` events (embedding lane) also never carry a `timelineKey`.
+    if (s.timelineKeyPrefixes) {
+      if (!d.timelineKey) return false;
+      if (!s.timelineKeyPrefixes.some((p) => d.timelineKey!.startsWith(`${p}:`))) return false;
+    }
     return true;
   }
 
@@ -380,12 +401,24 @@ export class BudgetEngine {
   /**
    * Is the named LOGICAL model currently within budget (spec MODEL-FALLBACK §3/§7
    * — the per-attempt fallback resolver drops a member that fails this)?
+   *
+   * Scoped rules (non-empty `timelineKeyPrefixes`) are skipped here because this
+   * method has no `timelineKey` context — it is called by the per-attempt fallback
+   * resolver which knows only a logical model id, not which agent's session is
+   * requesting it. If a scoped rule were included, one agent's exhausted budget
+   * would make the model "unavailable" process-wide, silently degrading every other
+   * agent to a fallback model. Real enforcement of scoped rules stays at
+   * `check()`/`checkAdmissionChain`, which thread the session's `timelineKey`.
+   * A global rule (no `timelineKeyPrefixes`) still blocks correctly here.
    */
   isModelAvailable(modelId: string): boolean {
     if (this.isZeroCost(modelId)) return true;
     const now = this.now();
     for (const state of this.states) {
       this.rollIfNeeded(state, now);
+      // Skip agent/account-scoped rules — they have no timelineKey to match against
+      // here and must not influence process-wide model availability (see above).
+      if (state.rule.selector.timelineKeyPrefixes?.length) continue;
       // A rule covers this model iff it either targets it explicitly OR has no
       // `models` selector (wildcard) — symmetric with `selectorMatches`. Without
       // the wildcard arm a global over-cap rule wrongly reports every model free,
@@ -404,10 +437,13 @@ export class BudgetEngine {
    * Gates on the session's HEAD logical id only. Prefer {@link checkAdmissionChain}
    * at the launch gate so a model-scoped cap on the primary doesn't refuse a session
    * for which an in-budget fallback exists (spec MODEL-FALLBACK §6.1).
+   *
+   * `timelineKey` — the session's timeline key, for agent/account-scoped rule matching
+   * (spec MULTI-AGENT-SUPPORT §8). Absent ⇒ scoped rules never match.
    */
-  checkAdmission(sessionType: string, modelId: string): AdmissionResult {
+  checkAdmission(sessionType: string, modelId: string, timelineKey?: string): AdmissionResult {
     const head = this.options.resolveLogicalModelId?.(sessionType);
-    return this.checkAdmissionChain(sessionType, modelId, head ? [head] : []);
+    return this.checkAdmissionChain(sessionType, modelId, head ? [head] : [], timelineKey);
   }
 
   /**
@@ -426,17 +462,23 @@ export class BudgetEngine {
    * descriptor's upstream id (the no-virtual-model case). The reported `ownBlocking`
    * /`primary` come from the HEAD's check (the canonical refusal context) when the
    * whole chain is over budget.
+   *
+   * `timelineKey` — threaded into every `check()` descriptor for agent/account-scoped
+   * rule matching (spec MULTI-AGENT-SUPPORT §8). Also used in the dependency cascade
+   * so a scoped dependency (summarize/condense scoped to one agent) blocks only that
+   * agent's sessions. Absent ⇒ scoped rules never match.
    */
   checkAdmissionChain(
     sessionType: string,
     modelId: string,
     chainLogicalIds: string[],
+    timelineKey?: string,
   ): AdmissionResult {
     const logicalIds = chainLogicalIds.length > 0 ? chainLogicalIds : [undefined];
     let headCheck: CheckResult | undefined;
     let admitted = false;
     for (const logicalModelId of logicalIds) {
-      const result = this.check({ class: "agent_loop", sessionType, modelId, logicalModelId });
+      const result = this.check({ class: "agent_loop", sessionType, modelId, logicalModelId, timelineKey });
       if (headCheck === undefined) headCheck = result;
       if (result.allowed) {
         admitted = true;
@@ -469,6 +511,7 @@ export class BudgetEngine {
           sessionType: dep,
           modelId: depModel,
           logicalModelId,
+          timelineKey,
         });
         if (depHeadCheck === undefined) depHeadCheck = depCheck;
         if (depCheck.allowed) {
@@ -508,6 +551,7 @@ export class BudgetEngine {
       modelId: event.modelId,
       logicalModelId: event.logicalModelId ?? undefined,
       provider: event.provider ?? undefined,
+      timelineKey: event.timelineKey ?? undefined,
     };
     const now = this.now();
     for (const state of this.states) {
@@ -547,6 +591,11 @@ export class BudgetEngine {
                 sessionTypes: sel.sessionTypes,
                 tools: sel.tools,
                 models: [m],
+                // Scope the per-model component sum to the same agent/account
+                // prefixes as the rule itself, so the console breakdown for a
+                // scoped multi-model rule shows only that agent's spend, not
+                // all agents' combined spend on that model.
+                timelineKeyPrefixes: sel.timelineKeyPrefixes,
               }),
             }))
           : undefined;

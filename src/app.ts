@@ -1350,11 +1350,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // `models` selector naming an unknown id earns a soft validation warning,
     // symmetric with the unknown-tool / unknown-session-type warnings (review #11).
     const knownModelIds = collectKnownModelIds(config);
+    // All configured account prefixes ("provider:accountKey") for agent/account
+    // matcher validation in normalizeLimits and normalizeUserLimits.
+    const knownAccountPrefixes = new Set<string>([
+      ...Object.keys(config.matrix?.accounts ?? {}).map((k) => `matrix:${k}`),
+      ...Object.keys(config.discord?.accounts ?? {}).map((k) => `discord:${k}`),
+    ]);
+    const isAgentsMode = !!(config.agents && Object.keys(config.agents).length > 0);
     const normalized = normalizeLimits(config.limits as never, {
       defaultTz: config.agent.timezone ?? "UTC",
       knownTools,
       knownSessionTypes,
       knownModelIds,
+      isAgentsMode,
+      agentAccountPrefixes: agentAccountPrefixesMap,
+      knownAccountPrefixes,
     });
     if (normalized.fatal.length > 0) {
       throw new Error(`invalid [[limits]] config:\n  ${normalized.fatal.join("\n  ")}`);
@@ -1426,6 +1436,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         knownModelIds,
         // §6.4: warn when a partition var is used by no enabled provider.
         enabledProviders: [...providers.keys()],
+        isAgentsMode,
+        agentAccountPrefixes: agentAccountPrefixesMap,
+        knownAccountPrefixes,
       });
       if (normalizedUser.fatal.length > 0) {
         throw new Error(`invalid [[user_limits]] config:\n  ${normalizedUser.fatal.join("\n  ")}`);
@@ -4201,7 +4214,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       roomId: roomIdFromTimelineKey(inbound.timelineKey),
       spaceIds,
     };
-    const resolution = userLimitEngine.resolve(ctx);
+    const resolution = userLimitEngine.resolve(ctx, inbound.timelineKey);
     if (!resolution.active) return { active: false, denied: false };
     // Coarse admission (§6.1): the first preferred model with headroom for a minimal
     // first turn (prior context ≈ 0). Undefined ⇒ banned / fully out of budget; the
@@ -5206,6 +5219,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             logger,
             { sessionId: session.id, timelineKey: session.timelineKey },
             admissionChain,
+            session.timelineKey ?? undefined,
           )
         : undefined;
       if (admission && !admission.allowed) {
@@ -6193,11 +6207,16 @@ export function safeCheckAdmission(
    * leaves it undefined → head-only, not a leak).
    */
   chainLogicalIds?: string[],
+  /**
+   * The session's timeline key, for agent/account-scoped rule matching
+   * (spec MULTI-AGENT-SUPPORT §8). Absent ⇒ scoped rules never match (safe fail-open).
+   */
+  timelineKey?: string,
 ): AdmissionResult | undefined {
   try {
     return chainLogicalIds
-      ? engine.checkAdmissionChain(sessionType, modelId, chainLogicalIds)
-      : engine.checkAdmission(sessionType, modelId);
+      ? engine.checkAdmissionChain(sessionType, modelId, chainLogicalIds, timelineKey)
+      : engine.checkAdmission(sessionType, modelId, timelineKey);
   } catch (error) {
     logger.warn("usage_admission_check_threw", {
       ...context,
