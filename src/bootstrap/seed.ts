@@ -162,6 +162,17 @@ export async function seedWorkspace(workspaceRoot: string, logger?: SeedLogger):
 
     const templatesDir = resolveTemplatesDir();
     const src = path.join(templatesDir, "workspace");
+    if (!(await pathExists(src))) {
+      // The workspace NEEDS seeding (emptiness gate above passed) but the
+      // template source is missing — a deployment/packaging problem (e.g. an
+      // image built without templates/). Silent no-op here leaves the agent on
+      // the fallback prompt with no trace; make it loud.
+      logger?.warn?.("workspace needs seeding but templates dir is missing", {
+        workspaceRoot,
+        templatesDir: src,
+      });
+      return;
+    }
     const created = await seedDirMissing(src, workspaceRoot);
     if (created.length > 0) {
       logger?.info?.("seeded workspace from templates", { count: created.length, workspaceRoot });
