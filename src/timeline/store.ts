@@ -75,11 +75,13 @@ export class TimelineStore {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          agent_session_generation, event_json, enrichment_status, is_backfetch, created_at, updated_at
+          agent_session_generation, event_json, enrichment_status, is_backfetch,
+          sender_is_bot, sender_is_webhook, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @agentSessionGeneration, @eventJson, @enrichmentStatus, @isBackfetch, @createdAt, @updatedAt
+          @agentSessionGeneration, @eventJson, @enrichmentStatus, @isBackfetch,
+          @senderIsBot, @senderIsWebhook, @createdAt, @updatedAt
         )`,
       ).run({
         ...timelineEventParams(event, now),
@@ -548,6 +550,10 @@ function timelineEventParams(event: CanonicalChatEvent, now: number) {
     agentSessionId: event.agentSessionId ?? null,
     agentSessionGeneration: event.agentSessionGeneration ?? null,
     eventJson: JSON.stringify(event),
+    // Bot/webhook flags for chain counting (spec MULTI-AGENT-SUPPORT §9).
+    // NULL for non-Discord events and assistant (self) rows.
+    senderIsBot: event.sender.isBot != null ? (event.sender.isBot ? 1 : 0) : null,
+    senderIsWebhook: event.sender.isWebhook != null ? (event.sender.isWebhook ? 1 : 0) : null,
     createdAt: now,
     updatedAt: now,
   };

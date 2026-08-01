@@ -124,10 +124,10 @@ const hasTable = (storage: Storage, name: string): boolean =>
         .get(name) !== undefined,
   );
 
-test("fresh DB is stamped at v7 and has user_identities + user_identity_aliases", async () => {
+test("fresh DB is stamped at v8 and has user_identities + user_identity_aliases", async () => {
   await withTmpDb(async (storage) => {
     const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-    assert.equal(version, 7, "fresh DB is at LATEST_SCHEMA_VERSION (7)");
+    assert.equal(version, 8, "fresh DB is at LATEST_SCHEMA_VERSION (8)");
     assert.ok(hasTable(storage, "user_identities"), "user_identities table exists");
     assert.ok(hasTable(storage, "user_identity_aliases"), "user_identity_aliases table exists");
   });
@@ -151,11 +151,11 @@ test("v4→v5 migration creates user_identities tables on an existing v4 databas
       storage.close();
     }
 
-    // Reopen — should run v4→v5, v5→v6, v6→v7 and create the tables.
+    // Reopen — should run v4→v5, v5→v6, v6→v7, v7→v8 and create the tables.
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 7, "migration stamps latest version (v7)");
+      assert.equal(version, 8, "migration stamps latest version (v8)");
       assert.ok(hasTable(storage, "user_identities"), "user_identities table created by migration");
       assert.ok(
         hasTable(storage, "user_identity_aliases"),

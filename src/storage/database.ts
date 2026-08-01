@@ -62,6 +62,18 @@ export interface TimelineEventRow {
   event_json: string;
   created_at: number;
   updated_at: number;
+  /**
+   * 1 when the Discord sender has author.bot = true; 0 when explicitly not a bot;
+   * null for Matrix events and legacy rows (pre-Phase-5b). Used for bot-chain
+   * counting (spec MULTI-AGENT-SUPPORT §9).
+   */
+  sender_is_bot: number | null;
+  /**
+   * 1 when the Discord message was sent via a webhook (webhook_id set); 0 when
+   * explicitly not a webhook; null for Matrix events and legacy rows.
+   * Webhook-authored messages always count as human for chain-counting.
+   */
+  sender_is_webhook: number | null;
 }
 
 export interface ReplyContextRow {
@@ -1974,11 +1986,13 @@ export class Storage {
         `insert into timeline_events (
           id, external_id, timeline_key, provider, role, sender_id,
           sender_display_name, body, timestamp, received_at, agent_session_id,
-          agent_session_generation, event_json, enrichment_status, created_at, updated_at
+          agent_session_generation, event_json, enrichment_status,
+          sender_is_bot, sender_is_webhook, created_at, updated_at
         ) values (
           @id, @externalId, @timelineKey, @provider, @role, @senderId,
           @senderDisplayName, @body, @timestamp, @receivedAt, @agentSessionId,
-          @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
+          @agentSessionGeneration, @eventJson, @enrichmentStatus,
+          @senderIsBot, @senderIsWebhook, @createdAt, @updatedAt
         )
         on conflict(id) do update set
           external_id = excluded.external_id,
@@ -1994,6 +2008,8 @@ export class Storage {
           agent_session_generation = excluded.agent_session_generation,
           event_json = excluded.event_json,
           enrichment_status = excluded.enrichment_status,
+          sender_is_bot = excluded.sender_is_bot,
+          sender_is_webhook = excluded.sender_is_webhook,
           created_at = timeline_events.created_at,
           updated_at = excluded.updated_at`,
       ).run({
@@ -2011,10 +2027,59 @@ export class Storage {
         agentSessionGeneration: event.agentSessionGeneration ?? null,
         eventJson: JSON.stringify(event),
         enrichmentStatus: enrichmentStatus ?? "pending",
+        senderIsBot: event.sender.isBot != null ? (event.sender.isBot ? 1 : 0) : null,
+        senderIsWebhook: event.sender.isWebhook != null ? (event.sender.isWebhook ? 1 : 0) : null,
         createdAt: now,
         updatedAt: now,
       });
     });
+  }
+
+  /**
+   * Count bot-authored messages in a timeline since the most recent human message
+   * (spec MULTI-AGENT-SUPPORT §9 — "capped" mode chain counter).
+   *
+   * "Bot-authored" = role='assistant' (self) OR sender_id in siblingUserIds OR
+   *   (sender_is_bot=1 AND sender_is_webhook IS NOT 1) — i.e. a genuine Discord bot,
+   *   not a webhook.  Webhook-authored messages count as human (always reset the window).
+   *
+   * Scans timeline_events for the given key, newest-first, up to `scanLimit` rows.
+   * Returns the number of consecutive bot-authored messages at the tail of the channel.
+   * Stops as soon as a human message is encountered (the window resets).
+   *
+   * The query is bounded: `scanLimit` = max_bot_chain + 1 (the overshoot tolerance
+   * means one extra bot message is allowed to land; the limit bounds the scan).
+   * Uses the existing idx_timeline_events_timeline_time index (key, timestamp DESC).
+   * This method is SYNCHRONOUS (uses `read()` / the SQLite sync API) so it may be
+   * called in the no-await critical section before triggerCoordinator.accept.
+   */
+  countBotChainLength(
+    timelineKey: string,
+    siblingUserIds: ReadonlySet<string>,
+    scanLimit: number,
+  ): number {
+    type ChainRow = { role: string; sender_id: string; sender_is_bot: number | null; sender_is_webhook: number | null };
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select role, sender_id, sender_is_bot, sender_is_webhook
+           from timeline_events
+           where timeline_key = ?
+           order by timestamp desc, received_at desc, id desc
+           limit ?`,
+        )
+        .all(timelineKey, scanLimit) as ChainRow[],
+    );
+    let count = 0;
+    for (const row of rows) {
+      const isBotRow =
+        row.role === "assistant" ||
+        siblingUserIds.has(row.sender_id) ||
+        (row.sender_is_bot === 1 && row.sender_is_webhook !== 1);
+      if (!isBotRow) break; // human message — window resets here
+      count++;
+    }
+    return count;
   }
 
   getTimelineEvents(timelineKey: string, limit = 200): CanonicalChatEvent[] {
@@ -8534,6 +8599,14 @@ create table if not exists timeline_events (
   is_backfetch integer not null default 0,
   created_at integer not null,
   updated_at integer not null,
+  -- Discord bot/webhook sender flags (spec MULTI-AGENT-SUPPORT §9, Phase 5b).
+  -- NULL for Matrix events and pre-Phase-5b legacy rows; 0 or 1 for Discord.
+  -- sender_is_bot: 1 iff author.bot = true on the Discord message.
+  -- sender_is_webhook: 1 iff webhook_id is set on the Discord message.
+  -- Both stored explicitly so the chain counter can query them without JSON.
+  -- Webhook-authored messages always count as human regardless of sender_is_bot.
+  sender_is_bot integer,
+  sender_is_webhook integer,
   -- Generated from event_json so undecryptable (UTD) events are cheaply
   -- queryable by the re-decryption sweeper without scanning every row's JSON.
   -- VIRTUAL (computed on read/index): the partial index below makes lookups
@@ -8895,7 +8968,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 8;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -9239,6 +9312,26 @@ function addMemoryChunksAgentColumn(db: Database.Database): void {
   `);
 }
 
+/**
+ * v7→v8 (spec MULTI-AGENT-SUPPORT §9, Phase 5b): add `sender_is_bot` and
+ * `sender_is_webhook` columns to `timeline_events`. Both columns are nullable
+ * INTEGER; NULL means "not a Discord event" (Matrix rows, legacy rows). Fresh
+ * Discord rows written after this migration carry 0 or 1; rows written before
+ * remain NULL (they predate bot-flag extraction and are treated as "unknown",
+ * which is safe — unknown senders count as "not a third-party bot" for the
+ * chain counter, so the window is never inadvertently extended by legacy rows).
+ */
+function addSenderBotColumns(db: Database.Database): void {
+  const cols = (db.pragma("table_info(timeline_events)") as Array<{ name: string }>)
+    .map((r) => r.name);
+  if (!cols.includes("sender_is_bot")) {
+    db.exec("alter table timeline_events add column sender_is_bot integer");
+  }
+  if (!cols.includes("sender_is_webhook")) {
+    db.exec("alter table timeline_events add column sender_is_webhook integer");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -9251,6 +9344,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addUserIdentityTables,
   addRoomMetadataServerColumns,
   addMemoryChunksAgentColumn,
+  addSenderBotColumns,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

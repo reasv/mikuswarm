@@ -797,14 +797,36 @@ const AgentBlockSchema = StrictObject({
 const SiblingsSchema = StrictObject({
   /**
    * "never" (default): sibling messages are ingested and stored but never
-   * trigger a session. Only "never" is implemented in Phase 1 (§13).
+   * trigger a session.
+   * "capped": sibling mention/reply triggers only while the chain count is
+   * below max_bot_chain; all agents go silent once the cap is reached until
+   * a human speaks (spec MULTI-AGENT-SUPPORT §9).
    */
-  replies: Type.Optional(Type.Literal("never")),
+  replies: Type.Optional(
+    Type.Union([Type.Literal("never"), Type.Literal("capped")]),
+  ),
   /**
-   * In "capped" mode (Phase 5): maximum consecutive bot messages allowed
+   * In "capped" mode: maximum consecutive bot-authored messages allowed
    * since the last human message before all agents go silent.
+   * Counting is knob-independent: webhook-authored messages count as human;
+   * self, sibling, and flagged third-party bot messages count as bot.
+   * Default: 4. Minimum: 1.
    */
   max_bot_chain: Type.Optional(Type.Integer({ minimum: 1 })),
+  /**
+   * Controls whether genuine third-party Discord bot senders (author.bot set,
+   * no webhook_id) can trigger the agent without limit or are subject to the
+   * same max_bot_chain window as siblings.
+   * "unlimited" (default): today's behaviour — third-party bots trigger without
+   * any bot-chain gate, byte-identical to pre-Phase-5b.
+   * "capped": third-party bots are subject to the same chain window as siblings.
+   * Webhook-authored messages (webhook_id set) are ALWAYS treated as human
+   * regardless of this knob — they relay real humans through bridges.
+   * Matrix has no reliable bot marker; this knob is Discord-only (spec §9/§14).
+   */
+  third_party_bots: Type.Optional(
+    Type.Union([Type.Literal("unlimited"), Type.Literal("capped")]),
+  ),
 });
 
 /**

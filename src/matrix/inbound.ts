@@ -35,9 +35,16 @@ export interface MatrixInboundContext {
   /**
    * Self-ids of all other in-process bot accounts (spec MULTI-AGENT-SUPPORT §9).
    * A message from any of these user-ids is suppressed as a trigger in
-   * `[siblings] replies = "never"` mode (the Phase 1 default).
+   * `[siblings] replies = "never"` mode, or allowed through (for chain-count gating
+   * later in handleInbound) in `"capped"` mode.
    */
   siblingUserIds?: Set<string>;
+  /**
+   * Sibling reply mode from `[siblings].replies` (default "never").
+   * In "capped" mode, sibling messages are NOT suppressed here; the chain-count
+   * gate in handleInbound decides whether a session is spawned.
+   */
+  siblingRepliesMode?: "never" | "capped";
 }
 
 export function timelineKeyForMatrixEvent(accountId: string, event: MatrixInboundEvent): string {
@@ -130,10 +137,13 @@ function detectTrigger(
   mentionedSelf: boolean,
 ): TriggerInfo | undefined {
   if (event.senderId === context.selfUserId) return undefined;
-  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9): in-process sibling bot
-  // accounts never trigger a session (default "never" mode). The set is
-  // populated before inbound starts and includes all self-ids across all agents.
-  if (context.siblingUserIds?.has(event.senderId)) return undefined;
+  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9):
+  //   "never" mode (default): sibling messages never trigger.
+  //   "capped" mode: sibling messages are allowed through here; the chain-count
+  //   gate in handleInbound (after storage) decides whether to spawn.
+  const isSibling = context.siblingUserIds?.has(event.senderId) ?? false;
+  const repliesMode = context.siblingRepliesMode ?? "never";
+  if (isSibling && repliesMode === "never") return undefined;
   if (event.chatType === "direct") {
     return {
       type: "dm",
