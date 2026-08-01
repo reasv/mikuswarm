@@ -3939,7 +3939,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const replyModelSeesImages = replyModelConfig.input_modalities.includes("image");
 
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
-    // x_search). Feeds the per-session cost ceiling's combined-spend lane in-memory
+    // x_search, plus the media / danbooru tool-context caption lanes). Feeds the
+    // per-session cost ceiling's combined-spend lane in-memory
     // (spec SESSION-COST-LIMITS §4) and appends one durable `tool_invocations` row
     // (spec AUXILIARY-USAGE-TRACKING §8.2). Both lanes are separate
     // from agent_sessions.usage_* (§8c §4); a sink failure never fails the tool.
@@ -4177,6 +4178,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         modelHasVision: replyModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
         fetchClient,
+        // Auxiliary usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one
+        // tool_invocations row per captioned item, feeding the §8d cost ceiling.
+        agentSessionId: sessionId,
+        recordToolUsage,
       }),
       ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
       createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),
@@ -4202,6 +4207,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // the captioning model instead of emitting an unusable image block.
         modelHasVision: replyModelSeesImages,
         imageCaptionClient: captionClients.get("image"),
+        // Auxiliary usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one
+        // tool_invocations row per non-vision preview caption, feeding the §8d
+        // cost ceiling.
+        agentSessionId: sessionId,
+        recordToolUsage,
         fetchClient,
         httpProxyUrl: config.network?.http_proxy_url,
         config: config.danbooru,
