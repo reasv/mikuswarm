@@ -1498,13 +1498,13 @@ export interface CaptionEligibility {
  * config, never user input, so the fragment carries no bind params and composes
  * into any WHERE/CASE. Mirrors the {@link Storage.claimPendingCaptions} predicate.
  */
-function captionEligibleSql(e: CaptionEligibility): string {
+function captionEligibleSql(e: CaptionEligibility, alias = "te"): string {
   if (e.captionAll) return "1"; // every event eligible — nothing deferred
   // `te.is_backfetch = 1` mirrors the claimPendingCaptions predicate (spec
   // MESSAGE-BACKFETCH §7.3): a promoted backfetched 'pending' row IS claimable, so
   // the monitor must count it as real pending, not derived-deferred.
-  const clauses = ["te.trigger_group_id is not null", "te.is_backfetch = 1"];
-  if (e.captionAssistant) clauses.push("te.role = 'assistant'");
+  const clauses = [`${alias}.trigger_group_id is not null`, `${alias}.is_backfetch = 1`];
+  if (e.captionAssistant) clauses.push(`${alias}.role = 'assistant'`);
   return `(${clauses.join(" or ")})`;
 }
 
@@ -1692,10 +1692,15 @@ const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
     done: ["complete"],
   },
   captioning: {
-    // Joins timeline_events so the count can evaluate caption eligibility (the
-    // `deferred` partition); the join is on the indexed FK and inner (every asset
-    // has a parent event), so it does not change the scoped row set.
-    table: "media_assets ma join timeline_events te on te.id = ma.event_id",
+    // Joins timeline_events to evaluate caption eligibility (the `deferred`
+    // partition). INDEXED BY idx_te_caption_eligibility (id, trigger_group_id,
+    // is_backfetch, role) makes each probe an index-only scan — the planner uses
+    // the autoindex (id→rowid) by default and then reads the fat heap row to reach
+    // the post-event_json columns, but the explicit INDEXED BY hint forces the
+    // covering index, eliminating the overflow-page traversal (ARCHITECTURE.md §11).
+    // SQLite does not allow an alias after INDEXED BY, so timeline_events is
+    // referenced unaliased; eligibleSql is called with alias="timeline_events".
+    table: "media_assets ma join timeline_events INDEXED BY idx_te_caption_eligibility on timeline_events.id = ma.event_id",
     statusCol: "ma.caption_status",
     attemptsCol: "ma.caption_attempts",
     scope: "ma.media_type in ('image', 'video', 'audio')",
@@ -7766,7 +7771,12 @@ export class Storage {
     // Captioning: split the raw `pending` bucket into eligible (real backlog) and
     // `deferred` (never-claimed under the current config). Other pools — and
     // captioning when no eligibility is supplied — have no `deferred` partition.
-    const eligibleSql = pool === "captioning" && eligibility ? captionEligibleSql(eligibility) : null;
+    // The join path uses "timeline_events" unaliased (INDEXED BY forbids an alias),
+    // so the eligibility columns must be qualified as timeline_events.*.
+    const eligibleSql =
+      pool === "captioning" && eligibility
+        ? captionEligibleSql(eligibility, "timeline_events")
+        : null;
     const freshPending = `${statusCol} = 'pending' and ${attemptsCol} = 0`;
     const pendingCase = eligibleSql ? `${freshPending} and ${eligibleSql}` : freshPending;
     const deferredCase = eligibleSql ? `${freshPending} and not ${eligibleSql}` : null;
@@ -9258,6 +9268,16 @@ create index if not exists idx_timeline_events_active_updated
 create index if not exists idx_timeline_events_enrichment_counts
   on timeline_events(enrichment_status, enrichment_retries)
   where enrichment_status != 'inactive';
+
+-- Captioning count aggregate: covering index that lets the getPipelineCounts join
+-- probe be index-only. SQLite prefers the PK autoindex for te.id = ma.event_id
+-- lookups and then reads the full heap row, which forces traversal of the fat
+-- event_json overflow pages to reach the post-event_json columns
+-- (trigger_group_id, is_backfetch, role). This index stores those columns compactly;
+-- getPipelineCounts forces it via INDEXED BY so each probe is a covering-index scan
+-- with no heap access (ARCHITECTURE.md §11).
+create index if not exists idx_te_caption_eligibility
+  on timeline_events(id, trigger_group_id, is_backfetch, role);
 
 create index if not exists idx_timeline_events_trigger_group
   on timeline_events(trigger_group_id)
