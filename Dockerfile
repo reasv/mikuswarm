@@ -125,6 +125,12 @@ COPY npm/index.js npm/package.json ./npm/
 COPY package.json pnpm-lock.yaml tsconfig.json ./
 COPY src ./src
 
+# First-run seeding templates (ARCHITECTURE.md §4): seedWorkspace/seedFeatureSkills
+# resolve <cwd>/templates at runtime. Without this, seeding is a silent no-op in
+# the container and a fresh workspace (e.g. a new [agents.*] root) never gets its
+# AGENTS.md/SOUL.md/skills — the agent falls back to the fallback prompt.
+COPY templates ./templates
+
 # Fetched GLM-5.1 tokenizer + its MIT LICENSE/README, from the builder. Path-stable
 # at /app/native/assets/glm-5.1/ so `[tokenizer].glm_tokenizer_path` resolves under
 # the runtime CWD when a `glm` selection is active (inert under the gpt default).
