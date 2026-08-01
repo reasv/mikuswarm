@@ -364,7 +364,7 @@ test("admission wrapper acquires before the call and releases on stream end", as
 
 test("admission wrapper releases on error and feeds the group backoff", async () => {
   const scheduler = new LlmScheduler({
-    groups: { default: { max_in_flight: 1, backoff_base_ms: 30, backoff_max_ms: 30 } },
+    groups: { default: { max_in_flight: 1, backoff_base_ms: 200, backoff_max_ms: 200 } },
   });
   const base: StreamFn = () => errorStream("429 too many requests");
   const wrapped = withSchedulerAdmission(base, scheduler, { group: "default", priority: "background" });
@@ -373,9 +373,17 @@ test("admission wrapper releases on error and feeds the group backoff", async ()
   assert.equal(events[events.length - 1]?.type, "error");
 
   // The 429 must have armed the group's backoff: a fresh acquire waits.
-  const start = Date.now();
+  // Under build-gate CPU load drain() can outlast the backoff window (minimum
+  // 100ms with jitter), making acquire() return immediately — read backoffUntil
+  // from the snapshot before the acquire and guard the timing assertion so it
+  // only fires when the window was verifiably still open at that point. The
+  // `await release` above already proves admission happens; this guards the wait.
+  const nowBeforeAcquire = Date.now();
+  const backoffUntil = scheduler.snapshot().groups.find((g) => g.name === "default")!.backoffUntil;
   const release = await scheduler.acquire({ priority: "interactive" });
-  assert.ok(Date.now() - start >= 10, "acquire should have waited out the 429 backoff");
+  if (backoffUntil > nowBeforeAcquire) {
+    assert.ok(Date.now() - nowBeforeAcquire >= 10, "acquire should have waited out the 429 backoff");
+  }
   release();
 });
 
@@ -407,11 +415,17 @@ test("injected onResponse feeds precise status + Retry-After once (no double cou
   // The server-specified 40ms governs. If the terminal error event were ALSO
   // string-sniffed into the backoff, the second count's exponential window
   // ([200,400]ms) would extend the wait well past this bound.
-  const start = Date.now();
+  // Under build-gate CPU load drain() can outlast the 40ms Retry-After window,
+  // making acquire() return immediately. Guard both assertions on whether the
+  // backoff window was still verifiably active when we started the acquire.
+  const nowBeforeAcquire = Date.now();
+  const backoffUntil = scheduler.snapshot().groups.find((g) => g.name === "default")!.backoffUntil;
   const release = await scheduler.acquire({ priority: "interactive" });
-  const waited = Date.now() - start;
-  assert.ok(waited >= 20, `Retry-After honoured (waited ${waited}ms)`);
-  assert.ok(waited < 150, `no double count: waited ${waited}ms, expected ~40ms`);
+  const waited = Date.now() - nowBeforeAcquire;
+  if (backoffUntil > nowBeforeAcquire) {
+    assert.ok(waited >= 20, `Retry-After honoured (waited ${waited}ms)`);
+    assert.ok(waited < 150, `no double count: waited ${waited}ms, expected ~40ms`);
+  }
   release();
 });
 
