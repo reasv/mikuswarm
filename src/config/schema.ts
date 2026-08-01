@@ -848,6 +848,21 @@ const DiscordSchema = StrictObject({
   accounts: Type.Optional(Type.Record(Type.String(), DiscordAccountSchema)),
 });
 
+// Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / §13 Phase 5d).
+// Default-off: the block must be present AND enabled = true for the store to activate.
+// `path` is the store root; it must be on the same filesystem as every agent workspace
+// root (validated at startup via a cross-device link() probe — fail-fast with a clear
+// error if any workspace is on a different device).
+const AttachmentStoreSchema = StrictObject({
+  // Master switch. false (or block absent) = no store; behaviour is byte-identical
+  // to pre-Phase-5d. No probe runs and no extra I/O occurs when disabled.
+  enabled: Type.Optional(Type.Boolean()),
+  // Store root directory. Relative paths resolve against cwd (same convention as
+  // other dir keys). Must be on the same filesystem as all workspace roots.
+  // Default when enabled but unset: "./attachment-store".
+  path: Type.Optional(Type.String({ minLength: 1 })),
+});
+
 const MediaImageSchema = StrictObject({
   max_total_pixels: Type.Optional(Type.Number({ minimum: 1 })),
   max_total_pixels_hard: Type.Optional(Type.Number({ minimum: 1 })),
@@ -1605,6 +1620,11 @@ export const AppConfigSchema = StrictObject({
   // the HUMAN-triggered agent loop only. Unset/empty = feature off (zero behavior
   // change). Ordered: precedence is authored order (CSS-style cascade, §8.1).
   user_limits: Type.Optional(Type.Array(UserLimitRuleSchema)),
+  // Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / §13 Phase 5d).
+  // Default-off: absent block (or enabled = false) → byte-identical behaviour, no probe,
+  // no extra I/O. When enabled, the store must share a filesystem with every workspace
+  // root (validated at startup via a cross-device link() probe).
+  attachment_store: Type.Optional(AttachmentStoreSchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
@@ -1629,3 +1649,5 @@ export type SandboxBlockConfig = Static<typeof SandboxBlockSchema>;
 export type AgentBrowserBlockConfig = NonNullable<AgentBlockConfig["browser"]>;
 /** Sibling-reply suppression config (spec MULTI-AGENT-SUPPORT §9). */
 export type SiblingsConfig = Static<typeof SiblingsSchema>;
+/** Content-addressed attachment store config (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d). */
+export type AttachmentStoreConfig = Static<typeof AttachmentStoreSchema>;

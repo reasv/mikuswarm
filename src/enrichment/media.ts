@@ -3,6 +3,7 @@ import { mkdir, writeFile, rename, copyFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { hashFile } from "../media/cache.js";
+import type { AttachmentStore } from "./attachment-store.js";
 
 export function generateMediaFilename(data: Buffer, originalFilename?: string, contentType?: string): string {
   const hash = createHash("sha256").update(data).digest();
@@ -34,17 +35,43 @@ export async function saveMediaToWorkspace(params: {
    * (`msg-attach/filename`), byte-identical to pre-Phase-3 behaviour.
    */
   attachSubdir?: string;
-}): Promise<{ localPath: string; absolutePath: string }> {
-  const filename = generateMediaFilename(params.data, params.originalFilename, params.contentType);
+  /**
+   * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+   * When provided and ready, the file is inserted into the store and a hardlink
+   * is created at the workspace destination. Absent or not-ready = legacy
+   * behaviour (direct write to workspace), byte-identical to pre-Phase-5d.
+   */
+  store?: AttachmentStore;
+}): Promise<{ localPath: string; absolutePath: string; contentHash: string }> {
+  // Compute sha256 once — used for both the filename prefix and the store key.
+  const hashBuf = createHash("sha256").update(params.data).digest();
+  const contentHash = hashBuf.toString("hex");
+  const filename = generateMediaFilenameFromHash(
+    hashBuf.subarray(0, 8),
+    params.originalFilename,
+    params.contentType,
+  );
   const relDir = params.attachSubdir ? `msg-attach/${params.attachSubdir}` : "msg-attach";
   const dir = path.join(params.workspaceRoot, relDir);
-  await mkdir(dir, { recursive: true });
-  const absolutePath = path.join(dir, filename);
-  if (!existsSync(absolutePath)) {
-    await writeFile(absolutePath, params.data);
+
+  let absolutePath: string;
+  if (params.store?.isReady()) {
+    absolutePath = await params.store.integrateBuffer({
+      data: params.data,
+      hash: contentHash,
+      destDir: dir,
+      filename,
+    });
+  } else {
+    await mkdir(dir, { recursive: true });
+    absolutePath = path.join(dir, filename);
+    if (!existsSync(absolutePath)) {
+      await writeFile(absolutePath, params.data);
+    }
   }
+
   const localPath = `${relDir}/${filename}`;
-  return { localPath, absolutePath };
+  return { localPath, absolutePath, contentHash };
 }
 
 export async function moveFileToWorkspace(params: {
@@ -59,29 +86,49 @@ export async function moveFileToWorkspace(params: {
    * (`msg-attach/filename`), byte-identical to pre-Phase-3 behaviour.
    */
   attachSubdir?: string;
-}): Promise<{ localPath: string; absolutePath: string }> {
+  /**
+   * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
+   * When provided and ready, the file is inserted into the store and a hardlink
+   * is created at the workspace destination. Absent or not-ready = legacy
+   * behaviour (rename + EXDEV fallback), byte-identical to pre-Phase-5d.
+   */
+  store?: AttachmentStore;
+}): Promise<{ localPath: string; absolutePath: string; contentHash: string }> {
   const hashBuf = await hashFileForMedia(params.sourcePath);
+  const contentHash = hashBuf.toString("hex"); // full sha256 hex for store key
   const filename = generateMediaFilenameFromHash(hashBuf.subarray(0, 8), params.originalFilename, params.contentType);
   const relDir = params.attachSubdir ? `msg-attach/${params.attachSubdir}` : "msg-attach";
   const dir = path.join(params.workspaceRoot, relDir);
-  await mkdir(dir, { recursive: true });
-  const absolutePath = path.join(dir, filename);
-  if (existsSync(absolutePath)) {
-    await unlink(params.sourcePath).catch(() => {});
+
+  let absolutePath: string;
+  if (params.store?.isReady()) {
+    absolutePath = await params.store.integrateDownload({
+      sourcePath: params.sourcePath,
+      destDir: dir,
+      filename,
+      hash: contentHash,
+    });
   } else {
-    try {
-      await rename(params.sourcePath, absolutePath);
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === "EXDEV") {
-        await copyFile(params.sourcePath, absolutePath);
-        await unlink(params.sourcePath).catch(() => {});
-      } else {
-        throw err;
+    await mkdir(dir, { recursive: true });
+    absolutePath = path.join(dir, filename);
+    if (existsSync(absolutePath)) {
+      await unlink(params.sourcePath).catch(() => {});
+    } else {
+      try {
+        await rename(params.sourcePath, absolutePath);
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+          await copyFile(params.sourcePath, absolutePath);
+          await unlink(params.sourcePath).catch(() => {});
+        } else {
+          throw err;
+        }
       }
     }
   }
+
   const localPath = `${relDir}/${filename}`;
-  return { localPath, absolutePath };
+  return { localPath, absolutePath, contentHash };
 }
 
 export function generateTempDownloadPath(workspaceRoot: string): string {
