@@ -5,6 +5,7 @@ import { resolveWorkspacePath } from "./workspace.js";
 import type { InferenceClient } from "../captioning/inference-client.js";
 import type { MediaModality } from "../captioning/describe.js";
 import type { FetchClient } from "../enrichment/fetch-client.js";
+import type { ToolUsageRecord } from "./image-gen.js";
 
 export interface MediaToolContext {
   workspaceRoot: string;
@@ -13,6 +14,10 @@ export interface MediaToolContext {
   modelHasVision: boolean;
   maxFetchBytes: number;
   fetchClient: FetchClient;
+  /** Ambient agent session (ledger attribution). */
+  agentSessionId?: string | null;
+  /** Durable usage-ledger sink (spec AUXILIARY-USAGE-TRACKING §8.2); also feeds the per-session cost ceiling. */
+  recordToolUsage?: (record: ToolUsageRecord) => void;
 }
 
 export function createMediaTool(context: MediaToolContext): AgentTool {
@@ -33,7 +38,7 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
       media_items: Type.Optional(Type.Array(Type.String(), { description: "Multiple media paths or URLs (up to 20)." })),
       start_time: Type.Optional(Type.Number({ description: "Start time in seconds for video/audio analysis. Defaults to 0.", minimum: 0 })),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (toolCallId, params) => {
       const args = params as { prompt?: string; media?: string; media_items?: string[]; start_time?: number };
 
       const candidates: string[] = [];
@@ -72,6 +77,26 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
             startTime: args.start_time,
             context: "tool",
           });
+          // Caption ledger row (spec AUXILIARY-USAGE-TRACKING §8.2): the
+          // InferenceClient already computed usage + cost — one row per
+          // captioned item, feeding the per-session cost ceiling (§8d).
+          if (result.usage && context.recordToolUsage) {
+            try {
+              context.recordToolUsage({
+                agentSessionId: context.agentSessionId ?? null,
+                toolName: "media",
+                toolCallId,
+                modelId: result.model,
+                logicalModelId: result.logicalModelId,
+                provider: result.provider,
+                usage: result.usage,
+                cost: result.cost ?? 0,
+                ref: `caption:${source}`,
+              });
+            } catch {
+              /* ledger is observability — never fail the tool */
+            }
+          }
           const label = unique.length > 1 ? `[${source}]\n` : "";
           results.push(`${label}${result.caption}`);
         } catch (error) {

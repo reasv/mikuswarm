@@ -16,6 +16,7 @@ import {
   type ImageProcessingOptions,
 } from "../media/index.js";
 import type { InferenceClient } from "../captioning/inference-client.js";
+import type { ToolUsageRecord } from "./image-gen.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -247,6 +248,10 @@ export interface DanbooruToolContext {
    * URLs plus a pointer to the `media` tool rather than a description.
    */
   imageCaptionClient?: InferenceClient;
+  /** Ambient agent session (ledger attribution for the non-vision caption path). */
+  agentSessionId?: string | null;
+  /** Durable usage-ledger sink (spec AUXILIARY-USAGE-TRACKING §8.2); also feeds the per-session cost ceiling. */
+  recordToolUsage?: (record: ToolUsageRecord) => void;
   fetchClient: FetchClient;
   /**
    * Optional http(s) proxy URL applied to JSON metadata requests in this
@@ -483,7 +488,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       " Download calls save a chosen post into the agent workspace. " +
       "Prefer searching directly even when unsure of a tag: a zero-result search automatically suggests real, similar tags to retry with. The 'tags' action is a secondary lookup that resolves a guess/keyword into real tag names without running a search.",
     parameters: DanbooruToolSchema,
-    execute: async (_toolCallId, rawParams) => {
+    execute: async (toolCallId, rawParams) => {
       const params = rawParams as DanbooruToolParams;
       const action = params.action ?? "search";
 
@@ -492,7 +497,7 @@ export function createDanbooruTool(context: DanbooruToolContext): AgentTool {
       }
 
       if (action === "preview") {
-        return executePreview({ context, config, authHeader, dispatcher, limiter, params });
+        return executePreview({ context, config, authHeader, dispatcher, limiter, params, toolCallId });
       }
 
       if (action === "tags") {
@@ -630,6 +635,7 @@ async function executePreview(input: {
   dispatcher: Dispatcher | undefined;
   limiter: DanbooruRateLimiter;
   params: DanbooruToolParams;
+  toolCallId: string | null;
 }) {
   const postId = resolveTargetPostId(input.params, "preview");
   const post = await fetchJson<DanbooruPost>(
@@ -652,7 +658,7 @@ async function executePreview(input: {
   }
 
   if (!input.context.modelHasVision) {
-    return describePreview({ context: input.context, config: input.config, limiter: input.limiter, post, variant, assetUrl });
+    return describePreview({ context: input.context, config: input.config, limiter: input.limiter, post, variant, assetUrl, toolCallId: input.toolCallId });
   }
   return inlinePreview({ context: input.context, config: input.config, limiter: input.limiter, post, variant, assetUrl });
 }
@@ -766,6 +772,7 @@ async function describePreview(input: {
   post: DanbooruPost;
   variant: DanbooruAssetVariant;
   assetUrl: string;
+  toolCallId: string | null;
 }) {
   const { context, config, limiter, post, variant, assetUrl } = input;
   const pageUrl = buildPostUrl(config, post.id);
@@ -812,6 +819,25 @@ async function describePreview(input: {
       filename: `danbooru-${post.id}.${post.file_ext ?? "jpg"}`,
       context: "tool",
     });
+    // Caption ledger row (spec AUXILIARY-USAGE-TRACKING §8.2): the InferenceClient
+    // already computed usage + cost — feeds the per-session cost ceiling (§8d).
+    if (result.usage && context.recordToolUsage) {
+      try {
+        context.recordToolUsage({
+          agentSessionId: context.agentSessionId ?? null,
+          toolName: "danbooru",
+          toolCallId: input.toolCallId,
+          modelId: result.model,
+          logicalModelId: result.logicalModelId,
+          provider: result.provider,
+          usage: result.usage,
+          cost: result.cost ?? 0,
+          ref: `caption:${post.id}`,
+        });
+      } catch {
+        /* ledger is observability — never fail the tool */
+      }
+    }
     caption = result.caption;
     captionModel = result.model;
   } catch (error) {

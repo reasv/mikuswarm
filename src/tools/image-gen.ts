@@ -139,7 +139,8 @@ export interface ToolUsageRecord {
    * grouping dimension. Defaults to `modelId` when omitted (no virtual model).
    */
   logicalModelId?: string;
-  provider: string;
+  /** pi-ai provider label, or null when the billed model's config carries none. */
+  provider: string | null;
   usage: RawTokenUsage;
   /** USD total from `computeUsageCost(...).total`. */
   cost: number;
