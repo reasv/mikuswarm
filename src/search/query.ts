@@ -145,6 +145,35 @@ export function resolveRooms(
   return rooms;
 }
 
+/**
+ * Agent-aware variant of `resolveRooms` for `search_messages` and `recap` in agents
+ * mode (spec MULTI-AGENT-SUPPORT §7.2). Behaves identically to `resolveRooms` except
+ * for the `rooms:"all"` path: in legacy mode `rooms:"all"` still returns `undefined`
+ * (no filter, whole history visible); in agents mode it restricts to timeline keys
+ * whose `<provider>:<accountKey>:` prefix belongs to one of the calling agent's
+ * configured accounts. This scopes cross-room search to the agent's own event history
+ * while leaving the `rooms:["..."]` explicit-key and `rooms:"current"` paths unchanged.
+ *
+ * @param storage - Required only when `agentAccountPrefixes` is non-empty AND
+ *   `rooms === "all"`; callers in legacy mode may pass `undefined`.
+ */
+export function resolveRoomsForAgent(
+  rooms: string[] | "current" | "all" | undefined,
+  currentTimelineKey: string,
+  agentAccountPrefixes: string[] | undefined,
+  storage: { getDistinctTimelineKeysForAccountPrefixes(prefixes: string[]): string[] } | undefined,
+): string[] | undefined {
+  if (rooms !== "all") return resolveRooms(rooms, currentTimelineKey);
+  // rooms === "all":
+  if (!agentAccountPrefixes || agentAccountPrefixes.length === 0 || !storage) {
+    // Legacy mode (or no accounts configured): no filter.
+    return undefined;
+  }
+  // Agents mode: restrict to this agent's account-prefixed timeline keys.
+  const prefixes = agentAccountPrefixes.map((k) => (k.endsWith(":") ? k : `${k}:`));
+  return storage.getDistinctTimelineKeysForAccountPrefixes(prefixes);
+}
+
 /** Decode a `"<timestamp>:<rowid>"` keyset cursor; undefined if malformed. */
 export function decodeCursor(
   cursor: string | undefined,

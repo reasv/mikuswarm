@@ -17,6 +17,11 @@ export interface RecallMemoryToolContext {
   search: MemorySearch;
   /** Defaults for the optional params (resolved from `[retrieval.query]`). */
   defaults: { maxResults: number; minScore: number };
+  /**
+   * In agents mode: the owning agent's name so retrieval is scoped to its corpus
+   * (spec MULTI-AGENT-SUPPORT §7.1). Null/absent = legacy mode (no filter).
+   */
+  agentName?: string | null;
 }
 
 export interface WriteMemoryToolContext extends MemoryToolContext {
@@ -114,6 +119,7 @@ export function createRecallMemoryTool(context: RecallMemoryToolContext): AgentT
         after: args.after,
         before: args.before,
         snippetMaxChars: 700,
+        agentName: context.agentName,
       });
       return {
         content: [{ type: "text", text: renderRecallResults(outcome.results, outcome) }],

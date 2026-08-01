@@ -16,15 +16,21 @@ import { makeChainClaimGate, type BudgetHooks } from "../budget/index.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
- * indexer, the hybrid search engine behind `recall_memory` and auto-retrieval, and —
- * when embeddings are available — the background embedding worker. Owns startup
+ * indexer(s), the hybrid search engine behind `recall_memory` and auto-retrieval, and
+ * — when embeddings are available — the background embedding worker. Owns startup
  * (corpus sweep + model/dim reconciliation) and shutdown.
+ *
+ * In agents mode there is one `MemoryIndexer` per configured agent workspace; in
+ * legacy mode there is exactly one. `indexerForAgent` routes file-write hooks to the
+ * correct indexer (spec MULTI-AGENT-SUPPORT §7.1).
  */
 export interface RetrievalSubsystem {
-  indexer: MemoryIndexer;
   search: MemorySearch;
-  /** Hook for `MemoryFileWriter.onAfterWrite` — reconcile the touched file (§7). */
-  onMemoryWrite(absPath: string): void;
+  /**
+   * Return the `MemoryIndexer` that owns the given agent's workspace, or `undefined`
+   * if the name isn't known. Pass `null` for the legacy / single-agent indexer.
+   */
+  indexerForAgent(agentName: string | null): MemoryIndexer | undefined;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -35,6 +41,12 @@ export interface CreateSubsystemOptions {
   /** App data dir; the local model's ONNX weights cache under `<dataDir>/models`. */
   dataDir: string;
   config: ResolvedRetrievalConfig;
+  /**
+   * Additional per-agent workspaces for agents mode (spec MULTI-AGENT-SUPPORT §7.1).
+   * When present and non-empty, one `MemoryIndexer` is created per entry (in addition
+   * to the primary `workspaceRoot` indexer). Empty / absent = legacy mode (single indexer).
+   */
+  agentWorkspaces?: Array<{ agentName: string; workspaceRoot: string }>;
   httpProxyUrl?: string;
   /** LLM scheduler — joined only by the remote provider (spec §5.4). */
   scheduler?: LlmScheduler;
@@ -90,21 +102,37 @@ export async function createRetrievalSubsystem(
   let vectorStore: VectorStore | undefined;
   let embedWorker: EmbedWorkerPool | undefined;
 
-  const indexer = new MemoryIndexer({
-    storage,
-    workspaceRoot,
-    config,
-    tokenizer: opts.tokenizer ?? getRetrievalTokenizer(),
-    logger,
-    pruneVectors: (rowids) => {
-      for (const r of rowids) void vectorStore?.remove(r);
-    },
-    onChunksInserted: () => embedWorker?.notifyNewWork(),
-    // Lexical-only when no provider came up: stamp new chunks 'skip' so the embed
-    // queue doesn't grow unbounded (#2). Read live (closure over `provider`) so a
-    // provider that comes up below flips this without re-wiring the indexer.
-    embeddingsActive: () => provider !== undefined,
-  });
+  // Build one indexer per workspace. In agents mode `opts.agentWorkspaces` carries
+  // each agent's name+root; in legacy mode we have exactly one entry built from
+  // `workspaceRoot` (agentName = null → no stamping, no filtering).
+  const agentWorkspaceEntries: Array<{ agentName: string | null; workspaceRoot: string }> =
+    opts.agentWorkspaces && opts.agentWorkspaces.length > 0
+      ? opts.agentWorkspaces.map((w) => ({ agentName: w.agentName, workspaceRoot: w.workspaceRoot }))
+      : [{ agentName: null, workspaceRoot }];
+
+  const indexers = agentWorkspaceEntries.map(
+    (entry) =>
+      new MemoryIndexer({
+        storage,
+        workspaceRoot: entry.workspaceRoot,
+        config,
+        tokenizer: opts.tokenizer ?? getRetrievalTokenizer(),
+        logger,
+        agentName: entry.agentName,
+        pruneVectors: (rowids) => {
+          for (const r of rowids) void vectorStore?.remove(r);
+        },
+        onChunksInserted: () => embedWorker?.notifyNewWork(),
+        // Lexical-only when no provider came up: stamp new chunks 'skip' so the embed
+        // queue doesn't grow unbounded (#2). Read live (closure over `provider`) so a
+        // provider that comes up below flips this without re-wiring the indexer.
+        embeddingsActive: () => provider !== undefined,
+      }),
+  );
+  // Fast lookup: agentName → indexer. Normalized agentName (null for legacy sentinel).
+  const indexerByAgent = new Map<string | null, MemoryIndexer>(
+    indexers.map((idx) => [idx.agentName, idx]),
+  );
 
   // Is the *remote* provider the active one? `createEmbeddingProvider` returns the
   // local provider both when `provider="local"` and as the fallback when a remote
@@ -229,12 +257,15 @@ export async function createRetrievalSubsystem(
     if (skipped > 0) logger?.info("embed_skip_lexical_only", { skipped });
   }
 
-  const search = new MemorySearch(storage, indexer, config, { provider, vectorStore, logger });
+  const search = new MemorySearch(storage, indexers, config, { provider, vectorStore, logger });
 
   return {
-    indexer,
     search,
-    onMemoryWrite: (absPath) => indexer.enqueueReconcile(absPath),
+    indexerForAgent: (agentName) => {
+      // Normalize the legacy sentinel so map lookup works.
+      const key = agentName === "__legacy__" ? null : agentName;
+      return indexerByAgent.get(key);
+    },
     start: async () => {
       // Orphan-vector sweep (#8): a chunk deleted by reconcile after `pruneVectors`
       // but before the embed worker's `upsert` leaves a `memory_vec` row with no
@@ -246,15 +277,48 @@ export async function createRetrievalSubsystem(
 
       // Startup full sweep (§7): fire-and-forget — lexical reconcile is cheap and the
       // lazy on-search check covers correctness; don't block boot. Wake the embed
-      // worker once the sweep has queued pending chunks.
-      void indexer
-        .reconcileAll()
-        .then(() => embedWorker?.notifyNewWork())
-        .catch((error) =>
-          logger?.warn("memory_index_sweep_failed", {
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
+      // worker once ALL indexers have queued pending chunks.
+      //
+      // Sequential (not concurrent) in agents mode: each agent's walk stamps its
+      // NULL-agent legacy rows in-place before the next agent walks, so no agent's
+      // null-orphan sweep can delete a row that is not-yet-stamped but still on-disk
+      // under another agent's root. After all walks complete, the subsystem does the
+      // null-orphan sweep once, using the union of every agent's on-disk paths as the
+      // truth: only paths absent from ALL roots are deleted (spec §7.1). In legacy
+      // mode there is exactly one indexer (agentName=null) and no null-orphan sweep
+      // needed — its per-agent prune already handles its own NULL rows.
+      void (async () => {
+        const agentsMode = indexers.some((idx) => idx.agentName !== null);
+        const allOnDiskPaths = new Set<string>();
+        for (const idx of indexers) {
+          const onDisk = await idx.reconcileAll();
+          for (const p of onDisk) allOnDiskPaths.add(p);
+        }
+        // Subsystem-level null-orphan sweep: delete NULL-agent rows for paths that no
+        // longer exist under any walked root (spec §7.1 "NULL rows whose files no longer
+        // exist under any root are deleted by the normal reconciliation diff").
+        // Only runs in agents mode — in legacy mode the single indexer's per-agent
+        // prune above already sweeps NULL rows for its own paths.
+        if (agentsMode) {
+          const nullPaths = storage.listMemoryChunkPaths(null);
+          for (const nullPath of nullPaths) {
+            if (!allOnDiskPaths.has(nullPath)) {
+              const removed = await storage.deleteMemoryChunksForPath(nullPath, null);
+              if (removed > 0) {
+                logger?.info("memory_index_pruned_null_orphan", {
+                  path: nullPath,
+                  removed,
+                });
+              }
+            }
+          }
+        }
+        embedWorker?.notifyNewWork();
+      })().catch((error) =>
+        logger?.warn("memory_index_sweep_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
       await embedWorker?.start();
     },
     stop: async () => {

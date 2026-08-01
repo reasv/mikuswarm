@@ -42,6 +42,12 @@ export interface SearchOptions {
    * the build for minutes. Unset for the `recall_memory` tool and tests.
    */
   signal?: AbortSignal;
+  /**
+   * In agents mode: restrict retrieval to this agent's memory corpus (spec §7.1).
+   * Null / absent = legacy mode — no filter, all chunks visible. The `"__legacy__"`
+   * sentinel is treated as null (no filter).
+   */
+  agentName?: string | null;
 }
 
 /**
@@ -62,6 +68,11 @@ export interface UserLaneOptions {
   snippetMaxChars: number;
   /** Decay anchor (trigger timestamp) for cache determinism; defaults to Date.now(). */
   now?: number;
+  /**
+   * In agents mode: restrict to this agent's memory corpus (spec §7.1).
+   * Null / absent = legacy mode (no filter). `"__legacy__"` treated as null.
+   */
+  agentName?: string | null;
 }
 
 export interface SearchOutcome {
@@ -118,20 +129,32 @@ export class MemorySearch {
   private readonly provider?: EmbeddingProvider;
   private readonly vectorStore?: VectorStore;
   private readonly logger?: Logger;
+  /**
+   * All indexers managed by this search instance. In legacy mode there is exactly
+   * one; in agents mode there is one per configured agent workspace. `ensureFreshForQuery`
+   * refreshes all of them so that a multi-agent startup completes fully before any
+   * search returns. Accepts a single `MemoryIndexer` for backward compatibility with
+   * tests and legacy callers.
+   */
+  private readonly indexers: MemoryIndexer[];
 
   constructor(
     private readonly storage: Storage,
-    private readonly indexer: MemoryIndexer,
+    indexerOrIndexers: MemoryIndexer | MemoryIndexer[],
     private readonly config: ResolvedRetrievalConfig,
     deps?: MemorySearchDeps,
   ) {
+    this.indexers = Array.isArray(indexerOrIndexers) ? indexerOrIndexers : [indexerOrIndexers];
     this.provider = deps?.provider;
     this.vectorStore = deps?.vectorStore;
     this.logger = deps?.logger;
   }
 
   async search(opts: SearchOptions): Promise<SearchOutcome> {
-    await this.indexer.ensureFreshForQuery();
+    // Normalize the sentinel so it's never accidentally used as a filter.
+    const agentName =
+      opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
+    for (const idx of this.indexers) await idx.ensureFreshForQuery();
     // Temporal-decay anchor. Callers that need determinism across context rebuilds
     // and replay (auto-retrieval, diary) pass `opts.now` = the trigger timestamp so
     // the cache-stable layers stay byte-identical (review issue #15). The
@@ -177,6 +200,7 @@ export class MemorySearch {
           room: opts.room,
           afterTs,
           beforeTs,
+          agent: agentName ?? undefined,
         });
       } catch (error) {
         this.logger?.warn("memory_lexical_search_failed", {
@@ -220,6 +244,7 @@ export class MemorySearch {
             room: opts.room,
             afterTs,
             beforeTs,
+            agent: agentName ?? undefined,
           });
         }
         semanticRan = true;
@@ -363,7 +388,9 @@ export class MemorySearch {
    */
   async searchUserLane(opts: UserLaneOptions): Promise<RetrievalResult[]> {
     if (opts.maxResults <= 0) return [];
-    await this.indexer.ensureFreshForQuery();
+    const agentName =
+      opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
+    for (const idx of this.indexers) await idx.ensureFreshForQuery();
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const tokens = userLaneTokens(opts.names);
@@ -373,6 +400,7 @@ export class MemorySearch {
     const exactHits = this.userLaneLexical(
       `{text} : (${tokens.map((t) => `"${t}"`).join(" OR ")})`,
       candidateLimit,
+      agentName,
     );
     const stems = opts.prefixEnabled
       ? Array.from(
@@ -384,7 +412,11 @@ export class MemorySearch {
         )
       : [];
     const prefixHits = stems.length
-      ? this.userLaneLexical(`{text} : (${stems.map((s) => `"${s}"*`).join(" OR ")})`, candidateLimit)
+      ? this.userLaneLexical(
+          `{text} : (${stems.map((s) => `"${s}"*`).join(" OR ")})`,
+          candidateLimit,
+          agentName,
+        )
       : [];
 
     // Score a hit set with the same saturating-BM25 → temporal-decay transform the
@@ -415,9 +447,9 @@ export class MemorySearch {
   }
 
   /** FTS lookup for the user lane, degrading to empty (mirrors the topical guard, #9). */
-  private userLaneLexical(match: string, limit: number): LexicalHit[] {
+  private userLaneLexical(match: string, limit: number, agentName: string | null): LexicalHit[] {
     try {
-      return this.storage.searchMemoryLexical({ match, limit });
+      return this.storage.searchMemoryLexical({ match, limit, agent: agentName ?? undefined });
     } catch (error) {
       this.logger?.warn("memory_user_lane_search_failed", {
         error: error instanceof Error ? error.message : String(error),

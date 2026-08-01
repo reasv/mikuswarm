@@ -36,6 +36,12 @@ export interface AutoRetrievalInput {
    * already omits it on rejection.
    */
   signal?: AbortSignal;
+  /**
+   * In agents mode: the owning agent's name for this build (spec §7.1). Passed
+   * through to `MemorySearch` so retrieval is scoped to the agent's corpus.
+   * Null / absent = legacy mode (no filter). `"__legacy__"` treated as null.
+   */
+  agentName?: string | null;
 }
 
 const NOTE =
@@ -86,6 +92,7 @@ export async function buildAutoRetrievalBlock(
             snippetMaxChars: 200,
             now: input.now,
             signal: input.signal,
+            agentName: input.agentName,
           })
         ).results;
 
@@ -101,6 +108,7 @@ export async function buildAutoRetrievalBlock(
           prefixMinChars: auto.userLane.prefixMinChars,
           snippetMaxChars: 200,
           now: input.now,
+          agentName: input.agentName,
         })
       : [];
 

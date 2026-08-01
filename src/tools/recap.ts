@@ -6,7 +6,7 @@ import {
   resolveAbsence,
   resolveTimeWindow,
   selectDigest,
-  resolveRooms,
+  resolveRoomsForAgent,
 } from "../search/index.js";
 import { formatAgentTimestamp } from "../time/index.js";
 
@@ -19,6 +19,12 @@ export interface RecapToolContext {
   askerId: string;
   defaults: { budgetTokens: number; gapThresholdMs: number; defaultLookbackMs: number };
   now?: () => number;
+  /**
+   * In agents mode: the `"<provider>:<accountKey>"` strings belonging to the calling
+   * session's agent (spec MULTI-AGENT-SUPPORT §7.2). When provided, `rooms:"all"`
+   * restricts recap to timeline keys that belong to one of these accounts.
+   */
+  agentAccountPrefixes?: string[];
 }
 
 interface RecapArgs {
@@ -93,7 +99,12 @@ export function createRecapTool(context: RecapToolContext): AgentTool {
       const args = params as RecapArgs;
       const startedAt = performance.now();
       const nowMs = now();
-      const timelineKeys = resolveRooms(args.rooms, context.currentTimelineKey);
+      const timelineKeys = resolveRoomsForAgent(
+        args.rooms,
+        context.currentTimelineKey,
+        context.agentAccountPrefixes,
+        context.storage,
+      );
 
       // Resolve the window. Explicit lower bound (last/after) → window mode; otherwise
       // absence-gap mode (the default "what did I miss" path).
