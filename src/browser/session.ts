@@ -902,6 +902,50 @@ export class BrowserSession {
     });
   }
 
+  /**
+   * Inject a one-shot JavaScript-level override for the next `window.confirm`,
+   * `window.prompt`, or `window.alert` call on `page`.
+   *
+   * Why this exists alongside the CDP-based `handleDialog` / `dialogOverrides`
+   * mechanism: some Manager versions (observed in the image built 2026-05-26,
+   * sha256:27098d4b…) auto-handle JS dialogs via `Page.handleJavaScriptDialog`
+   * BEFORE forwarding `Page.javascriptDialogOpening` to connected CDP clients.
+   * When that happens, Playwright still emits the `dialog` event, but
+   * `dialog.accept()` / `dialog.dismiss()` immediately fail with
+   * "Protocol error (Page.handleJavaScriptDialog): No dialog is showing".
+   *
+   * By overriding the native dialog functions at the JavaScript level (before the
+   * triggering click), the override intercepts the call inside the page JS engine
+   * and returns the armed response directly — no native dialog ever fires, so the
+   * Manager never gets a chance to auto-dismiss it, and the page code receives the
+   * correct return value.
+   *
+   * The `dialogOverrideScript` handles install/restore/masking (see its JSDoc).
+   * On successful injection the CDP-path WeakMap entry is deleted — without this,
+   * an expired slot fires on the NEXT unrelated dialog on older Managers (silently
+   * answering it) or throws-and-swallows on current ones while consuming stale
+   * state. Errors from `page.evaluate` are caught and logged at warn (not debug):
+   * on current Manager versions the CDP fallback also fails, so a silent log
+   * would make an un-takeable arm invisible to the operator.
+   */
+  async injectPageDialogOverride(page: Page, accept: boolean, promptText: string | undefined): Promise<void> {
+    const spec = { accept, promptText: promptText ?? null };
+    try {
+      await page.evaluate(dialogOverrideScript, spec);
+      // JS injection succeeded: the CDP-path WeakMap entry is no longer needed.
+      // Delete it so an expired slot can't fire on the next unrelated dialog.
+      this.dialogOverrides.delete(page);
+    } catch (error) {
+      // Raised to warn (not debug): on current Manager versions the CDP-path
+      // fallback also fails ("No dialog is showing"), so an injection failure
+      // here means the arm will not take effect at all.
+      this.logger.warn("dialog_inject_override_failed", {
+        error: error instanceof Error ? error.message : String(error),
+        note: "on current Manager versions the CDP fallback also fails — arm will not take effect",
+      });
+    }
+  }
+
   // ── Downloads: cross-container staging pipeline (ARCHITECTURE.md §11b) ────
   //
   // connectOverCDP downloads are structurally broken in the split-container
@@ -1440,6 +1484,110 @@ export class BrowserSession {
     this.pendingDownloadEntries = [];
     this.connectPromise = undefined;
   }
+}
+
+/**
+ * Page-side JS dialog override script, serialised by Playwright's
+ * `page.evaluate` and executed in the browser context.
+ *
+ * WHY: some CloakBrowser-Manager versions auto-handle JS dialogs via
+ * `Page.handleJavaScriptDialog` BEFORE forwarding `Page.javascriptDialogOpening`
+ * to connected clients, so `dialog.accept()/dismiss()` fail with "No dialog is
+ * showing". Intercepting `window.confirm/prompt/alert` at the JS level returns
+ * the armed response directly — no native dialog fires.
+ *
+ * Install lifecycle: the wrapper is installed once per arm cycle (sentinel
+ * `__miku_dlg_wrapped__`). On first consumption by ANY of the three wrappers,
+ * `restore()` reinstates all three native functions and clears the sentinel so
+ * `window.confirm.toString()` returns to native-looking and a later re-arm
+ * re-installs cleanly.
+ *
+ * Stealth while armed: each wrapper's `.toString()` returns the native-code
+ * string, and `.name`/`.length` match the native, so fingerprint checks pass
+ * while the override is installed. Both slot globals (`__miku_dlg_ov__`,
+ * `__miku_dlg_wrapped__`) are defined non-enumerable so `Object.keys(window)`
+ * does not list them (still detectable by direct access — documented tradeoff).
+ *
+ * @internal exported for unit tests (tested via vm.runInNewContext with a fake window).
+ */
+export function dialogOverrideScript(s: { accept: boolean; promptText: string | null }): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const w = window as any;
+
+  // Define/update the one-shot slot as non-enumerable (Object.keys(window) won't
+  // list it). writable:true lets a re-arm update the value without re-defining;
+  // configurable:true lets Object.defineProperty reconfigure on re-arm.
+  Object.defineProperty(w, "__miku_dlg_ov__", {
+    value: s,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+
+  // Install wrappers once per arm cycle. `__miku_dlg_wrapped__` is reset to
+  // false by restore() on consume, so a re-arm re-enters this install path.
+  if (w.__miku_dlg_wrapped__) return;
+  Object.defineProperty(w, "__miku_dlg_wrapped__", {
+    value: true,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+
+  // Capture native references through the `any`-typed alias so the TypeScript
+  // compiler doesn't complain about assigning incompatible function types below.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origConfirm: (...a: any[]) => boolean = w.confirm.bind(w);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origPrompt: (...a: any[]) => string | null = w.prompt.bind(w);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const origAlert: (...a: any[]) => void = w.alert.bind(w);
+
+  // Restore-on-consume: reinstate all three natives + clear sentinel so
+  // confirm/prompt/alert.toString() returns to native after the one-shot fires.
+  const restore = (): void => {
+    w.confirm = origConfirm;
+    w.prompt = origPrompt;
+    w.alert = origAlert;
+    w.__miku_dlg_wrapped__ = false;
+  };
+
+  // Native-code toString template (Chrome format).
+  const nativeStr = (name: string): string => `function ${name}() { [native code] }`;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const wrappedConfirm = (...args: any[]): boolean => {
+    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
+    if (ov) { w.__miku_dlg_ov__ = null; restore(); return ov.accept; }
+    return origConfirm(...args);
+  };
+  Object.defineProperty(wrappedConfirm, "toString", { value: () => nativeStr("confirm"), configurable: true });
+  Object.defineProperty(wrappedConfirm, "name", { value: "confirm", configurable: true });
+  Object.defineProperty(wrappedConfirm, "length", { value: origConfirm.length, configurable: true });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const wrappedPrompt = (...args: any[]): string | null => {
+    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
+    if (ov) { w.__miku_dlg_ov__ = null; restore(); return ov.accept ? (ov.promptText ?? "") : null; }
+    return origPrompt(...args);
+  };
+  Object.defineProperty(wrappedPrompt, "toString", { value: () => nativeStr("prompt"), configurable: true });
+  Object.defineProperty(wrappedPrompt, "name", { value: "prompt", configurable: true });
+  Object.defineProperty(wrappedPrompt, "length", { value: origPrompt.length, configurable: true });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const wrappedAlert = (...args: any[]): void => {
+    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
+    if (ov) { w.__miku_dlg_ov__ = null; restore(); return; }
+    origAlert(...args);
+  };
+  Object.defineProperty(wrappedAlert, "toString", { value: () => nativeStr("alert"), configurable: true });
+  Object.defineProperty(wrappedAlert, "name", { value: "alert", configurable: true });
+  Object.defineProperty(wrappedAlert, "length", { value: origAlert.length, configurable: true });
+
+  w.confirm = wrappedConfirm;
+  w.prompt = wrappedPrompt;
+  w.alert = wrappedAlert;
 }
 
 /** Promise-based sleep, used by the cold-start readiness poll. */

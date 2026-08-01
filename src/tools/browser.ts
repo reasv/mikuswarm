@@ -278,7 +278,23 @@ async function dispatch(
         frameUrls: session.frameUrlsFor(page),
       });
       // evaluate/wait/dialog don't change what's worth re-snapshotting; return terse.
-      if (args.kind === "evaluate" || args.kind === "wait" || args.kind === "dialog") {
+      if (args.kind === "dialog") {
+        // After arming the CDP-path override (done synchronously inside act()),
+        // also inject a JavaScript-level override on the page. This is the fix for
+        // Manager versions that auto-handle dialogs via CDP before forwarding
+        // Page.javascriptDialogOpening to connected clients — in those versions
+        // dialog.accept()/dismiss() always fail with "No dialog is showing", so the
+        // only reliable path is to intercept window.confirm/prompt/alert in-page JS.
+        // injectPageDialogOverride is fire-and-tolerant: any evaluate failure is
+        // caught and logged; the CDP path remains as a fallback for older Managers.
+        await session.injectPageDialogOverride(page, args.accept!, args.prompt_text);
+        const downloads = session.drainDownloads(sessionId);
+        return {
+          content: [{ type: "text", text: result.detail + renderDownloads(downloads) }],
+          details: { action: "act", kind: args.kind, url: page.url(), downloads },
+        };
+      }
+      if (args.kind === "evaluate" || args.kind === "wait") {
         const downloads = session.drainDownloads(sessionId);
         return {
           content: [{ type: "text", text: result.detail + renderDownloads(downloads) }],

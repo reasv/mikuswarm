@@ -3,11 +3,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createContext, runInContext } from "node:vm";
 
 import {
   BrowserSession,
   CONSOLE_ENTRY_MAX_CHARS,
   CONSOLE_TRUNCATION_MARKER,
+  dialogOverrideScript,
   type ConnectOverCdp,
 } from "../src/browser/session.js";
 import { isBrowserError } from "../src/browser/errors.js";
@@ -735,6 +737,11 @@ type DialogPrivate = {
   dialogOverrides: WeakMap<object, { accept: boolean; promptText?: string; expiresAt: number }>;
 };
 
+type InjectPrivate = {
+  injectPageDialogOverride(page: unknown, accept: boolean, promptText: string | undefined): Promise<void>;
+  dialogOverrides: WeakMap<object, { accept: boolean; promptText?: string; expiresAt: number }>;
+};
+
 function newSession(ws: string, overrides: Partial<BrowserConfig> = {}): BrowserSession {
   return new BrowserSession({
     config: baseConfig(overrides), agentTimezone: "UTC", workspaceRoot: ws,
@@ -934,4 +941,211 @@ test("session: a down Manager surfaces backend_unavailable (graceful degradation
       await session.shutdown();
     }
   });
+});
+
+// ── injectPageDialogOverride (Amendment 1/3 tests) ────────────────────────────
+
+test("session: injectPageDialogOverride success clears the CDP WeakMap override", async () => {
+  await withWorkspace(async (ws) => {
+    const session = newSession(ws);
+    try {
+      const priv = session as unknown as InjectPrivate;
+      // Stub page with a successful evaluate.
+      const page: Record<string, unknown> = {
+        evaluate: async (_fn: unknown, _arg: unknown) => undefined,
+      };
+      // Arm the CDP-path slot first (mirrors what armDialog does before inject).
+      session.armDialog(page as never, true, "my text");
+      assert.ok(priv.dialogOverrides.has(page), "precondition: WeakMap armed");
+
+      // Inject succeeds → WeakMap entry cleared so it can't fire on a later dialog.
+      await priv.injectPageDialogOverride(page, true, "my text");
+      assert.ok(!priv.dialogOverrides.has(page), "WeakMap cleared after successful JS injection");
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+test("session: injectPageDialogOverride evaluate failure logs warn and retains WeakMap", async () => {
+  await withWorkspace(async (ws) => {
+    const warnCalls: Array<{ event: string; fields: unknown }> = [];
+    const capturingLogger: Logger = {
+      debug() {}, info() {},
+      warn(event: string, fields?: unknown) { warnCalls.push({ event, fields }); },
+      error() {},
+      child() { return capturingLogger; },
+    };
+    const session = new BrowserSession({
+      config: baseConfig(), agentTimezone: "UTC", workspaceRoot: ws,
+      logger: capturingLogger, connectOverCdp: async () => ({}) as never,
+    });
+    try {
+      const priv = session as unknown as InjectPrivate;
+      const page: Record<string, unknown> = {
+        evaluate: async (_fn: unknown, _arg: unknown) => {
+          throw new Error("execution context was destroyed");
+        },
+      };
+      session.armDialog(page as never, false, undefined);
+      assert.ok(priv.dialogOverrides.has(page), "precondition: WeakMap armed");
+
+      await priv.injectPageDialogOverride(page, false, undefined);
+
+      // CDP fallback must remain armed.
+      assert.ok(priv.dialogOverrides.has(page), "WeakMap retained after failed JS injection");
+      // Failure must be visible to the operator as a warn (not debug).
+      assert.ok(
+        warnCalls.some((c) => c.event === "dialog_inject_override_failed"),
+        "warn logged for inject failure",
+      );
+      // The note about CDP fallback also failing should be included.
+      const failWarn = warnCalls.find((c) => c.event === "dialog_inject_override_failed");
+      assert.ok(
+        (failWarn?.fields as Record<string, unknown>)?.note?.toString().includes("CDP fallback"),
+        "warn includes note that CDP fallback also fails",
+      );
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// ── dialogOverrideScript page-side logic (vm sandbox tests) ──────────────────
+//
+// The injected function runs in the browser; we test its logic by evaluating
+// its serialised source in a vm.createContext where window = fakeWindow. tsx
+// strips TypeScript before V8 sees the source, so .toString() yields plain JS.
+
+/** Build a vm context with `window` = fakeW and the built-in `Object`.
+ * Also injects esbuild's `__name` helper: when tsx compiles the module, esbuild
+ * instruments functions with `__name(fn, "name")` for devtools display. The
+ * helper is normally defined in the host bundle but absent from a bare vm sandbox,
+ * so we supply a no-op shim that just returns the function. */
+function makeDialogScriptCtx(fakeW: Record<string, unknown>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const __name = (fn: unknown, _name: string) => fn;
+  return createContext({ window: fakeW, Object, __name });
+}
+
+/** Evaluate dialogOverrideScript in a vm sandbox with the given spec. */
+function runScript(ctx: ReturnType<typeof createContext>, spec: { accept: boolean; promptText: string | null }): void {
+  const src = dialogOverrideScript.toString();
+  runInContext(`(${src})(${JSON.stringify(spec)})`, ctx);
+}
+
+test("session: dialogOverrideScript - slot consumed restores natives and clears sentinel", () => {
+  const nativeConfirmCalls: unknown[][] = [];
+  const fakeW: Record<string, unknown> = {
+    confirm: (...args: unknown[]) => { nativeConfirmCalls.push(args); return false; },
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  // Install wrappers and arm.
+  runScript(ctx, { accept: true, promptText: "ans" });
+  assert.ok(fakeW.__miku_dlg_wrapped__, "sentinel set after install");
+
+  // Call confirm — consumes the slot.
+  const result = (fakeW.confirm as (...a: unknown[]) => boolean)("sure?");
+  assert.equal(result, true, "wrapper returns armed accept=true");
+  assert.equal(fakeW.__miku_dlg_wrapped__, false, "sentinel cleared after consume");
+  assert.equal(fakeW.__miku_dlg_ov__, null, "slot cleared after consume");
+
+  // Native must be restored: calling confirm now delegates to the original.
+  (fakeW.confirm as (...a: unknown[]) => boolean)("after restore");
+  assert.equal(nativeConfirmCalls.length, 1, "native called once after restore");
+  assert.deepEqual(nativeConfirmCalls[0], ["after restore"], "native received args");
+});
+
+test("session: dialogOverrideScript - unarmed call delegates to native (slot null)", () => {
+  const nativeCalls: unknown[][] = [];
+  const fakeW: Record<string, unknown> = {
+    confirm: (...args: unknown[]) => { nativeCalls.push(args); return false; },
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  // Install wrappers.
+  runScript(ctx, { accept: true, promptText: null });
+
+  // Clear the slot (simulate no armed override).
+  fakeW.__miku_dlg_ov__ = null;
+
+  // Call confirm with no slot — must delegate to native, sentinel unchanged.
+  const result = (fakeW.confirm as (...a: unknown[]) => boolean)("msg");
+  assert.equal(result, false, "native return value passes through");
+  assert.equal(nativeCalls.length, 1, "native called");
+  assert.equal(fakeW.__miku_dlg_wrapped__, true, "sentinel not cleared (no consume)");
+});
+
+test("session: dialogOverrideScript - re-arm after consume re-installs wrappers", () => {
+  const fakeW: Record<string, unknown> = {
+    confirm: () => false,
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  // First arm + consume.
+  runScript(ctx, { accept: true, promptText: null });
+  const result1 = (fakeW.confirm as (...a: unknown[]) => boolean)("first");
+  assert.equal(result1, true, "first arm accept=true");
+  assert.equal(fakeW.__miku_dlg_wrapped__, false, "sentinel cleared after first consume");
+
+  // Second arm — re-installs because sentinel is false.
+  runScript(ctx, { accept: false, promptText: null });
+  assert.equal(fakeW.__miku_dlg_wrapped__, true, "sentinel set again after re-arm");
+  const result2 = (fakeW.confirm as (...a: unknown[]) => boolean)("second");
+  assert.equal(result2, false, "second arm accept=false");
+  assert.equal(fakeW.__miku_dlg_wrapped__, false, "sentinel cleared after second consume");
+});
+
+test("session: dialogOverrideScript - prompt returns armed text or null on dismiss", () => {
+  const fakeW: Record<string, unknown> = {
+    confirm: () => false,
+    prompt: () => "native",
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  // Arm with accept=true and promptText.
+  runScript(ctx, { accept: true, promptText: "my answer" });
+  const r1 = (fakeW.prompt as (...a: unknown[]) => string | null)("Enter value:");
+  assert.equal(r1, "my answer", "prompt returns armed text");
+
+  // Re-arm with accept=false (dismiss → null).
+  runScript(ctx, { accept: false, promptText: null });
+  const r2 = (fakeW.prompt as (...a: unknown[]) => string | null)("Enter value:");
+  assert.equal(r2, null, "prompt returns null on dismiss");
+});
+
+test("session: dialogOverrideScript - globals are non-enumerable (Object.keys check)", () => {
+  const fakeW: Record<string, unknown> = {
+    confirm: () => false,
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+  runScript(ctx, { accept: true, promptText: null });
+
+  const keys = Object.keys(fakeW);
+  assert.ok(!keys.includes("__miku_dlg_ov__"), "__miku_dlg_ov__ not in Object.keys");
+  assert.ok(!keys.includes("__miku_dlg_wrapped__"), "__miku_dlg_wrapped__ not in Object.keys");
+});
+
+test("session: dialogOverrideScript - wrappers have native-code toString", () => {
+  const fakeW: Record<string, unknown> = {
+    confirm: () => false,
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+  runScript(ctx, { accept: true, promptText: null });
+
+  const confirmStr = (fakeW.confirm as { toString(): string }).toString();
+  assert.ok(confirmStr.includes("[native code]"), "confirm.toString() contains [native code]");
+  assert.ok(confirmStr.includes("confirm"), "confirm.toString() names the function");
 });
