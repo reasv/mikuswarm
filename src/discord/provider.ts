@@ -243,6 +243,13 @@ export class DiscordProvider implements IChatProvider {
    * trigger a session.
    */
   siblingUserIds?: Set<string>;
+  /**
+   * Sibling reply mode from `[siblings].replies` (default "never").
+   * Injected from app.ts alongside siblingUserIds at startup.
+   * In "capped" mode, sibling messages are allowed through as triggers;
+   * the chain-count gate in handleInbound decides whether to spawn.
+   */
+  siblingRepliesMode?: "never" | "capped";
 
   constructor(
     private readonly config: NonNullable<AppConfig["discord"]>,
@@ -949,6 +956,7 @@ export class DiscordProvider implements IChatProvider {
       accountId: runtime.accountId,
       selfUserId: selfId ?? "",
       siblingUserIds: this.siblingUserIds,
+      siblingRepliesMode: this.siblingRepliesMode,
     };
 
     const { inbound, embedPreviews } = normalizeDiscordMessage(msgData, ctx);
@@ -997,14 +1005,16 @@ export class DiscordProvider implements IChatProvider {
       return;
     }
 
-    // Check for reply-to-bot trigger (spec §8.2). Sibling bot accounts are
-    // excluded here in parallel with detectDiscordTrigger (spec
-    // MULTI-AGENT-SUPPORT §9): the message is still ingested normally — only
-    // the trigger is suppressed.
+    // Check for reply-to-bot trigger (spec §8.2). In "never" mode sibling bot
+    // accounts are excluded here in parallel with detectDiscordTrigger (spec
+    // MULTI-AGENT-SUPPORT §9). In "capped" mode siblings are allowed through
+    // so the chain-count gate in handleInbound can decide.
+    const isSiblingReply = this.siblingUserIds?.has(inbound.event.sender.id) ?? false;
+    const shouldSuppressSiblingReply = isSiblingReply && (this.siblingRepliesMode ?? "never") === "never";
     if (
       !inbound.trigger &&
       inbound.event.replyTo?.externalId &&
-      !this.siblingUserIds?.has(inbound.event.sender.id)
+      !shouldSuppressSiblingReply
     ) {
       const replyTrigger = this.host!.resolveReplyTrigger?.({
         provider: "discord",
@@ -1071,6 +1081,7 @@ export class DiscordProvider implements IChatProvider {
       accountId: runtime.accountId,
       selfUserId: selfId ?? "",
       siblingUserIds: this.siblingUserIds,
+      siblingRepliesMode: this.siblingRepliesMode,
     };
     const { inbound } = normalizeDiscordMessage(msgData, ctx);
 
@@ -1521,6 +1532,12 @@ function extractMessageData(message: Message, parentChannelId: string | undefine
     embeds,
     referencedMessage,
     poll,
+    // Bot/webhook flags (spec MULTI-AGENT-SUPPORT §9): extract and store both.
+    // authorBot: true when Discord sets the BOT flag on the author.
+    // webhookId: the webhook snowflake when the message was sent via a webhook.
+    // Webhook-authored messages always count as human (bridge puppets relay real users).
+    authorBot: message.author.bot || undefined,
+    webhookId: message.webhookId ?? undefined,
   };
 }
 

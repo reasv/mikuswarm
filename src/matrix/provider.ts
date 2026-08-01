@@ -92,6 +92,13 @@ export class MatrixProvider implements IChatProvider {
    * session.
    */
   siblingUserIds?: Set<string>;
+  /**
+   * Sibling reply mode from `[siblings].replies` (default "never").
+   * Injected from app.ts alongside siblingUserIds at startup.
+   * In "capped" mode, sibling messages are allowed through as triggers;
+   * the chain-count gate in handleInbound decides whether to spawn.
+   */
+  siblingRepliesMode?: "never" | "capped";
 
   constructor(private readonly config: AppConfig["matrix"]) {}
 
@@ -277,6 +284,7 @@ export class MatrixProvider implements IChatProvider {
         accountId: account.accountId,
         selfUserId: account.selfUserId,
         siblingUserIds: this.siblingUserIds,
+        siblingRepliesMode: this.siblingRepliesMode,
       });
       this.emitWithTriggerHold(inbound);
     }
@@ -306,12 +314,16 @@ export class MatrixProvider implements IChatProvider {
     // excluded here in parallel with detectTrigger (spec MULTI-AGENT-SUPPORT §9):
     // the message is still ingested normally — only the trigger is suppressed.
     // The downstream resume-vs-fresh fork still happens in the app; the provider
-    // only classifies.
+    // only classifies. In "never" mode sibling bot accounts are excluded here
+    // in parallel with detectTrigger (spec MULTI-AGENT-SUPPORT §9). In "capped"
+    // mode siblings are allowed through so the chain-count gate can decide.
+    const isSiblingReply = this.siblingUserIds?.has(inbound.event.sender.id) ?? false;
+    const suppressSiblingReply = isSiblingReply && (this.siblingRepliesMode ?? "never") === "never";
     if (
       !inbound.trigger &&
       inbound.event.replyTo?.externalId &&
       !inbound.event.sender.isSelf &&
-      !this.siblingUserIds?.has(inbound.event.sender.id) &&
+      !suppressSiblingReply &&
       this.host?.resolveReplyTrigger
     ) {
       const replyTrigger = this.host.resolveReplyTrigger({

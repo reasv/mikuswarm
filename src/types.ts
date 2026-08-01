@@ -38,6 +38,19 @@ export interface SenderInfo {
   /** Room/guild-scoped nickname; freely mutable. Rendered when it differs from `username ?? id`. */
   displayName?: string;
   isSelf?: boolean;
+  /**
+   * True when the sender is a Discord bot account (author.bot = true). Absent on
+   * Matrix events and non-bot Discord senders. Stored in event_json and in the
+   * timeline_events.sender_is_bot column for chain counting (spec MULTI-AGENT-SUPPORT §9).
+   */
+  isBot?: boolean;
+  /**
+   * True when the sender is a Discord webhook author (webhook_id set). Absent on
+   * Matrix events and non-webhook Discord senders. Webhook-authored messages always
+   * count as human for chain-counting purposes — they relay real humans through bridges.
+   * Stored in event_json and in timeline_events.sender_is_webhook (spec §9).
+   */
+  isWebhook?: boolean;
 }
 
 /**

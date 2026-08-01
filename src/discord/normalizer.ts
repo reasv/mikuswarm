@@ -147,6 +147,18 @@ export interface DiscordMessageData {
   referencedMessage?: DiscordReferencedMessage;
   /** For poll messages. */
   poll?: DiscordPollData;
+  /**
+   * True when the author has the Discord bot flag set (Message.author.bot).
+   * Extracted and stored per spec MULTI-AGENT-SUPPORT §9: "extract and store both".
+   * Absent for human authors (falsy — do not write `false`).
+   */
+  authorBot?: boolean;
+  /**
+   * Non-null webhook_id from the Discord message when it was sent via a webhook.
+   * Webhook-authored messages always count as human for chain-counting purposes —
+   * they relay real humans through bridges (spec §9). Absent when not a webhook message.
+   */
+  webhookId?: string;
 }
 
 /** Context passed alongside each message for normalisation decisions. */
@@ -156,9 +168,16 @@ export interface DiscordNormalizerContext {
   /**
    * Self-ids of all other in-process bot accounts (spec MULTI-AGENT-SUPPORT §9).
    * A message from any of these user-ids is suppressed as a trigger in
-   * `[siblings] replies = "never"` mode (the Phase 1 default).
+   * `[siblings] replies = "never"` mode, or allowed through (for chain-count gating
+   * later in handleInbound) in `"capped"` mode.
    */
   siblingUserIds?: Set<string>;
+  /**
+   * Sibling reply mode from `[siblings].replies` (default "never").
+   * In "capped" mode, sibling messages are NOT suppressed here; the chain-count
+   * gate in handleInbound decides whether a session is spawned.
+   */
+  siblingRepliesMode?: "never" | "capped";
 }
 
 // ── Key construction ─────────────────────────────────────────────────────────
@@ -367,14 +386,23 @@ export function detectDiscordTrigger(
   isSelf: boolean,
 ): TriggerInfo | undefined {
   if (isSelf) return undefined;
-  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9): in-process sibling bot
-  // accounts never trigger a session (default "never" mode). The set is
-  // populated before inbound starts and includes all self-ids across all agents.
-  if (ctx.siblingUserIds?.has(msg.authorId)) return undefined;
+
+  const isSibling = ctx.siblingUserIds?.has(msg.authorId) ?? false;
+  // Sibling suppression (spec MULTI-AGENT-SUPPORT §9):
+  //   "never" mode (default): sibling messages never trigger.
+  //   "capped" mode: sibling messages are allowed through here; the chain-count
+  //   gate in handleInbound (applied after storage) decides whether to spawn.
+  const repliesMode = ctx.siblingRepliesMode ?? "never";
+  if (isSibling && repliesMode === "never") return undefined;
+
   const sender: SenderInfo = {
     id: msg.authorId,
     username: msg.authorUsername,
     displayName: msg.authorDisplayName,
+    // Populate bot/webhook flags for chain counting (spec §9). These are stored in
+    // event_json and in the timeline_events sender columns (Phase 5b).
+    isBot: msg.authorBot || undefined,
+    isWebhook: msg.webhookId ? true : undefined,
   };
   // DM channel → dm trigger
   if (msg.channelType === 1) {
@@ -469,6 +497,10 @@ export function normalizeDiscordMessage(
       username: msg.authorUsername,
       displayName: msg.authorDisplayName,
       isSelf,
+      // Bot/webhook flags — stored in event_json and in sender_is_bot/sender_is_webhook
+      // columns for chain counting (spec MULTI-AGENT-SUPPORT §9).
+      isBot: msg.authorBot || undefined,
+      isWebhook: msg.webhookId ? true : undefined,
     },
     body,
     timestamp: msg.timestamp,

@@ -1214,14 +1214,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return p instanceof MatrixProvider ? p : undefined;
   })();
 
-  // Inject sibling self-id set into each provider so it can suppress triggers
-  // from in-process sibling accounts (spec MULTI-AGENT-SUPPORT §5.2).
+  // Inject sibling self-id set and reply mode into each provider so it can
+  // suppress (never mode) or pass through (capped mode) sibling triggers
+  // (spec MULTI-AGENT-SUPPORT §5.2 / §9).
   // The Set starts with Matrix self-ids and grows as Discord's READY fires via
   // onSelfResolved — providers hold it by reference so additions are live.
-  if (matrixProvider) matrixProvider.siblingUserIds = botSelfIdsForLimits;
+  const siblingRepliesMode = (config.siblings?.replies ?? "never") as "never" | "capped";
+  if (matrixProvider) {
+    matrixProvider.siblingUserIds = botSelfIdsForLimits;
+    matrixProvider.siblingRepliesMode = siblingRepliesMode;
+  }
   const _discordProviderRef = providers.get("discord");
   if (_discordProviderRef instanceof DiscordProvider) {
     _discordProviderRef.siblingUserIds = botSelfIdsForLimits;
+    _discordProviderRef.siblingRepliesMode = siblingRepliesMode;
   }
 
   const activeRuns = new Set<Promise<void>>();
@@ -2119,6 +2125,82 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger: logger.child("message-backfetch"),
   });
 
+  /**
+   * Bot-chain cap gate (spec MULTI-AGENT-SUPPORT §9 "capped" mode, Phase 5b).
+   *
+   * Returns true (caller should return early — trigger suppressed) when:
+   *  - the trigger sender is a sibling AND siblings.replies = "capped", AND the
+   *    channel's bot-chain count has reached max_bot_chain; OR
+   *  - the trigger sender is a genuine third-party Discord bot (isBot && !isWebhook)
+   *    AND siblings.third_party_bots = "capped", AND the chain count is at the cap.
+   *
+   * Returns false in all other cases (trigger proceeds normally).
+   *
+   * Counting is knob-independent: the chain counter always counts self/sibling/
+   * third-party-bot rows regardless of which knob is active. Webhook-authored
+   * messages count as human and reset the window.
+   *
+   * Synchronous — uses storage.countBotChainLength (storage.read()) so it never
+   * yields. Must remain no-await to preserve the serialization invariant before
+   * triggerCoordinator.accept (CLAIM-VISIBILITY-SERIALIZATION §4.4).
+   */
+  function botChainCapGate(inbound: InboundChatEvent): boolean {
+    const siblings = config.siblings;
+    const repliesMode = siblings?.replies ?? "never";
+    const thirdPartyMode = siblings?.third_party_bots ?? "unlimited";
+
+    if (repliesMode !== "capped" && thirdPartyMode !== "capped") {
+      return false; // neither capped knob active
+    }
+
+    const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
+    const isSibling = botSelfIdsForLimits.has(sender.id);
+    const isThirdPartyBot = !isSibling && (sender.isBot === true) && (sender.isWebhook !== true);
+
+    const needsChainCheck =
+      (isSibling && repliesMode === "capped") ||
+      (isThirdPartyBot && thirdPartyMode === "capped");
+
+    if (!needsChainCheck) return false;
+
+    const maxBotChain = siblings?.max_bot_chain ?? 4;
+    // Scan limit: max_bot_chain + 1 gives us the worst-case row count we ever read.
+    const chainLen = storage.countBotChainLength(
+      inbound.timelineKey,
+      botSelfIdsForLimits,
+      maxBotChain + 1,
+    );
+    if (chainLen >= maxBotChain) {
+      logger.info("bot_chain_cap_reached", {
+        timelineKey: inbound.timelineKey,
+        senderId: sender.id,
+        isSibling,
+        isThirdPartyBot,
+        chainLen,
+        maxBotChain,
+      });
+      return true; // suppress trigger — at cap
+    }
+    return false;
+  }
+
+  /**
+   * True when the trigger sender is a sibling OR a third-party bot in "capped" mode.
+   * Bot-triggered sessions skip Gate A (per-user limits) entirely — their spend is
+   * attributed to deployment [[limits]] only, never to a per-user meter
+   * (spec MULTI-AGENT-SUPPORT §9). Unlimited-mode third-party bots preserve today's
+   * behaviour (Gate A runs, spend attributed). Factored out of the fresh-session and
+   * reply-resume Gate A checks (both sites must agree).
+   */
+  function isBotTriggeredSender(inbound: InboundChatEvent): boolean {
+    const triggerSender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
+    return (
+      botSelfIdsForLimits.has(triggerSender.id) ||
+      ((triggerSender.isBot === true) && (triggerSender.isWebhook !== true) &&
+       (config.siblings?.third_party_bots ?? "unlimited") === "capped")
+    );
+  }
+
   async function handleInbound(inbound: InboundChatEvent): Promise<void> {
     if (draining) return;
 
@@ -2226,6 +2308,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // launchSession then continues that session or gives a fresh response. Nothing
     // to synthesize at this point.
     if (!inbound.trigger) return;
+
+    // Bot-chain cap gate (spec MULTI-AGENT-SUPPORT §9, Phase 5b).
+    // Applied after trigger confirmation but before accept/claim so capped-out
+    // triggers are dropped without claiming a coordinator slot.
+    // Synchronous — uses storage.read() which never yields — so the no-await
+    // invariant before triggerCoordinator.accept (SERIALIZATION INVARIANT §4.4)
+    // is preserved.
+    if (botChainCapGate(inbound)) return;
 
     // Co-target coalescing (spec DUPLICATE-REPLY-MITIGATION §5): a reply that
     // targets the SAME message a running session's trigger replied to is steered
@@ -4890,12 +4980,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // budget user is refused (the reply gets the templated "out of budget" message and
     // the session stays completed), otherwise the resolution is frozen so per-request
     // selection / capping / live counter recording all apply to the continued rollout.
-    const resumeGate = await resolveUserLimitGate(inbound, record.id, record.sessionType);
-    if (resumeGate.denied) {
-      postUserLimitRefusal(target, record.id, record.timelineKey, resumeGate);
-      sessions.markDiscarded(record.id);
-      drainNextQueuedTrigger(record.timelineKey);
-      return;
+    //
+    // Bot-triggered sessions skip Gate A here too — same rule as the fresh-session
+    // path (spec MULTI-AGENT-SUPPORT §9): sibling and capped-third-party-bot spend
+    // is never metered per-user. `isBotTriggeredSender` reads trigger.triggeredBy
+    // first, which — after the resolveReplyTrigger fix — now carries isBot/isWebhook.
+    let resumeGate: UserLimitGate | undefined;
+    if (!isBotTriggeredSender(inbound)) {
+      resumeGate = await resolveUserLimitGate(inbound, record.id, record.sessionType);
+      if (resumeGate.denied) {
+        postUserLimitRefusal(target, record.id, record.timelineKey, resumeGate);
+        sessions.markDiscarded(record.id);
+        drainNextQueuedTrigger(record.timelineKey);
+        return;
+      }
     }
 
     // Usage continues accumulating from the row (continue-mode seed).
@@ -4953,9 +5051,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         },
         usage,
         // Per-user selection + dynamic ceiling apply to a resume exactly as to a
-        // fresh launch (spec PER-USER-LIMITS §6).
-        userLimit: resumeGate.userLimit,
-        costCeilingOverride: resumeGate.ceilingOverride,
+        // fresh launch (spec PER-USER-LIMITS §6). Both are undefined when bot-triggered
+        // (resumeGate is undefined — Gate A was skipped).
+        userLimit: resumeGate?.userLimit,
+        costCeilingOverride: resumeGate?.ceilingOverride,
         abortSignal: drainAbort.signal,
       }));
       if (!kickoff) throw new Error("resume continuation produced no appended turn");
@@ -4998,7 +5097,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
 
     // Effective ceiling reflects the user's remaining headroom (spec §6.3), as for a launch.
-    const costCeiling = resumeGate.ceilingOverride ?? factory.resolveSessionCostCeiling(record.sessionType);
+    // resumeGate is undefined for bot-triggered sessions (Gate A was skipped) — falls through
+    // to the static session ceiling, which is the correct behaviour (no per-user headroom cap).
+    const costCeiling = resumeGate?.ceilingOverride ?? factory.resolveSessionCostCeiling(record.sessionType);
     const captureHandle = attachSessionCapture(agent, {
       storage,
       sessionId: record.id,
@@ -5159,10 +5260,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // the optional templated reply; otherwise the resolution is frozen for
     // per-request selection + the dynamic ceiling. Identical logic runs in the resume
     // paths (`resolveUserLimitGate` is shared) — a resume is the same event.
+    //
+    // Bot-triggered sessions (siblings in capped mode, third-party bots in capped
+    // mode) skip Gate A entirely: "Bot-to-bot spend … never toward any per-user
+    // meter" (spec MULTI-AGENT-SUPPORT §9). Their spend counts toward deployment
+    // [[limits]] only — no per-user attribution. Unlimited-mode third-party bots
+    // preserve today's behaviour (Gate A runs, spend is attributed).
+    const isBotTriggered = isBotTriggeredSender(inbound);
     let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
     let initialUserModel: string | undefined;
-    if (!proactive) {
+    if (!proactive && !isBotTriggered) {
       const gate = await resolveUserLimitGate(inbound, session.id, session.sessionType);
       if (gate.denied) {
         postUserLimitRefusal(target, session.id, session.timelineKey, gate);
@@ -5781,7 +5889,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         return {
           type: "reply",
           reason: "reply to bot message",
-          triggeredBy: { id: sender.id, displayName: sender.displayName },
+          triggeredBy: sender, // forward full SenderInfo so isBot/isWebhook reach botChainCapGate and Gate A
         };
       },
     };
@@ -5842,7 +5950,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return {
         type: "reply",
         reason: "reply to bot message",
-        triggeredBy: { id: sender.id, displayName: sender.displayName },
+        triggeredBy: sender, // forward full SenderInfo so isBot/isWebhook reach botChainCapGate and Gate A
       };
     },
   };
