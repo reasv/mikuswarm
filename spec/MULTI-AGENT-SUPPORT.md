@@ -1,6 +1,6 @@
 # Multi-Agent Support — Design
 
-**Status**: PROPOSED.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §4c (Agents and accounts) and per-subsystem sections (§7a, §8e/§8f/§8g, §9b, §9d, §9e, §11a, §11b); retained for review.
 Defines first-class support for multiple disjoint agents (personas) in a single
 mikuswarm process: separate identities, workspaces, memories, and sandboxes,
 sharing one storage layer and one set of process-wide governors (rate limits,
@@ -658,7 +658,7 @@ profile_name = "rin"   # required in the block; connection settings inherited fr
 
 ## 10b. Summary mirroring: one summarizer per community
 
-> **IMPLEMENTED** — superseded by ARCHITECTURE.md §9b "Summary mirroring (Phase 5c)" and §4c "Phase 5c `summaries_from` validation"; retained for review.
+> **IMPLEMENTED** — superseded by ARCHITECTURE.md §9b "Summary mirroring" and §4c "`summaries_from` validation"; retained for review.
 
 Motivation: summarization is the one **traffic-proportional per-agent LLM
 cost** — it scales with channel volume, not with how much a persona is used.
