@@ -7595,37 +7595,56 @@ export class Storage {
    * per timeline is its max event timestamp, falling back to the latest session
    * activity (`max(created_at, updated_at)`) when no events survive, so reverse-chron
    * ordering stays sensible. Pure read.
+   *
+   * Perf shape (this is the console's 5s-poll hot query): per-timeline counts and
+   * the event max come from ONE grouped-aggregation pass over each table's covering
+   * timeline index (`idx_timeline_events_timeline_time`, `idx_agent_sessions_timeline`)
+   * — no per-anchor correlated scans. The earlier correlated-subquery form scanned
+   * the full timeline_events index twice (anchor UNION + per-anchor counts) and was
+   * the last >1s console query at production scale. The session-activity fallback
+   * stays a correlated seek deliberately: coalesce short-circuits it to event-less
+   * timelines only, so `updated_at` (not in any covering index — reading it walks
+   * each row past the fat trigger_body payload) is fetched for those few rows
+   * instead of every session.
    */
   listConsoleRooms(limit = 500): RoomSummaryRow[] {
     return this.read((db) =>
       db
         .prepare(
-          `with anchors as (
-             select timeline_key from timeline_events
-             union
-             select timeline_key from agent_sessions
+          `with per_timeline as (
+             select timeline_key,
+                    sum(event_count) as event_count,
+                    sum(session_count) as session_count,
+                    max(last_event_at) as last_event_at
+             from (
+               select timeline_key, count(*) as event_count, 0 as session_count,
+                      max(timestamp) as last_event_at
+                 from timeline_events group by timeline_key
+               union all
+               select timeline_key, 0 as event_count, count(*) as session_count,
+                      null as last_event_at
+                 from agent_sessions group by timeline_key
+             )
+             group by timeline_key
            ),
            mapped as (
              select
                -- Canonical room key: strip a :thread:<root> suffix so a room and its
                -- threads collapse to one row. ':thread:' only ever appears as the
                -- live-inserted separator (matrix/inbound.ts), never inside a room id.
-               case when anchors.timeline_key like '%:thread:%'
-                    then substr(anchors.timeline_key, 1,
-                                instr(anchors.timeline_key, ':thread:') - 1)
-                    else anchors.timeline_key end as room_key,
-               (select count(*) from timeline_events te
-                  where te.timeline_key = anchors.timeline_key) as event_count,
-               (select count(*) from agent_sessions s
-                  where s.timeline_key = anchors.timeline_key) as session_count,
+               case when timeline_key like '%:thread:%'
+                    then substr(timeline_key, 1,
+                                instr(timeline_key, ':thread:') - 1)
+                    else timeline_key end as room_key,
+               event_count,
+               session_count,
                coalesce(
-                 (select max(te.timestamp) from timeline_events te
-                    where te.timeline_key = anchors.timeline_key),
+                 last_event_at,
                  (select max(max(s.created_at, s.updated_at)) from agent_sessions s
-                    where s.timeline_key = anchors.timeline_key),
+                    where s.timeline_key = per_timeline.timeline_key),
                  0
                ) as last_activity_at
-             from anchors
+             from per_timeline
            ),
            rooms as (
              select room_key,
