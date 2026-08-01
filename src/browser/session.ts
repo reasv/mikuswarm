@@ -474,7 +474,19 @@ export class BrowserSession {
 
   /** Resolve the persistent profile by name; create it (idempotently) if absent. */
   private async resolveOrCreateProfile(): Promise<{ id: string; status: string }> {
+    // profile_name is Optional in the config schema (spec MULTI-AGENT-SUPPORT §10a):
+    // the schema accepts a [browser] block without profile_name in agents mode.
+    // At runtime it is ALWAYS populated before constructing a BrowserSession — in
+    // agents mode from [agents.<name>.browser].profile_name, in legacy mode from
+    // the code default "miku". An undefined value here is a programming error.
     const name = this.config.profile_name;
+    if (!name) {
+      throw new Error(
+        "BrowserSession: profile_name is required but was not set — " +
+          "in agents mode set [agents.<name>.browser].profile_name; " +
+          "in legacy mode the code default (\"miku\") should have been applied before constructing the session.",
+      );
+    }
     const profiles = await this.manager.listProfiles();
     const existing = profiles.find((p) => p.name === name);
     if (existing) return { id: existing.id, status: existing.status };

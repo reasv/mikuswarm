@@ -414,6 +414,12 @@ When multiple accounts run in one process they can see each other's messages. Wi
 - Account refers to undeclared agent → hard error
 - Workspace roots overlap → hard error
 - `agent` field on account without an `[agents]` table → hard error
+- **Phase 4 (§10):** `[agents.<name>.sandbox]` container_name values not pairwise distinct among strict-mode agents → hard error
+- **Phase 4 (§10):** any strict-mode agent's container_name matches the global `[sandbox].container_name` → hard error (two managers would race over the same Docker container with different mount configurations)
+- **Phase 4 (§10):** strict-mode agent workspace root lies under the shared common parent of the shared-mode agents → hard error (would expose the strict workspace via the shared container bind mount)
+- Note: `workspace_mount` is a container-side path and is **not** required to be unique across strict agents — each agent's container is independent, and host-side isolation is already guaranteed by Phase 1's pairwise workspace-root check.
+- **Phase 4 (§10a):** `[browser].profile_name` present alongside `[agents]` → hard error (in agents mode each agent declares its own `profile_name` under `[agents.<name>.browser]`)
+- **Phase 4 (§10a):** per-agent browser `profile_name` values not pairwise distinct → hard error (profiles carry cookies and fingerprint state that must not cross agents)
 
 Out-of-class account key characters (not `[a-z0-9-]`, no colon, no path-unsafe char) are a logged warning only in legacy mode.
 
@@ -3148,6 +3154,20 @@ stop_on_shutdown = false
 
 `src/config/schema.ts` makes the section optional (existing configs stay valid); `validateConfig` (`src/config/loader.ts`) rejects a relative `workspace_mount` when enabled. The image is built with `docker/build-sandbox.sh` (full dev toolchain — apt set, pnpm, uv, rust, homebrew — carried over from the OpenClaw sandbox).
 
+### Multi-agent sandbox modes (§10 / Phase 4)
+
+In **agents mode** (`[agents]` table present) each agent can elect one of two sandbox modes:
+
+**Strict mode** — the agent declares its own `[agents.<name>.sandbox]` block (same schema as the global `[sandbox]`, no per-key merge). The agent gets a dedicated `SandboxManager` with its own container. The block must specify a `container_name` that is unique across all strict agents and distinct from the global `[sandbox].container_name` (checked at startup by `validateAgentConfig`). The `workspace_mount` is a container-side path and is not required to be unique — two strict agents in separate containers can both use `/workspace` without conflict. Each strict agent's container is brought up via `SandboxManager.ensure()` at startup (same fail-fast semantics as the global sandbox), and tracked in `allSandboxManagers` for graceful shutdown (using that block's `stop_on_shutdown`). The `bash` and `search_files` tools for a strict-mode session exec into that agent's own container.
+
+**Shared mode** — agents without a per-agent `[agents.<name>.sandbox]` block share the global `[sandbox]` container. The shared container's `workspaceHostDir` is set to the **common ancestor** of all shared agents' workspace roots (computed by `computeCommonAncestor` from `src/sandbox/shared-exec.ts`). For a single shared agent this is the agent's own root (the tightest possible bind); for multiple agents it is the deepest directory that is a path-component prefix of every root. Each shared-mode agent's exec backend is wrapped by `createSharedExecBackend` (also in `src/sandbox/shared-exec.ts`), which prepends the agent's POSIX-relative subdir from the common ancestor to every exec `cwd`. For a single shared agent the subdir is empty and `mapContainerCwd` falls back to the workspace mount — correct, since the bind is the agent's own root. The `bash` and `search_files` tools land in the correct agent workspace sub-directory without any change to the tool implementation.
+
+`agentSandboxMap: Map<string, ExecBackend>` stores the per-agent backend (strict: the agent's own `SandboxManager`; shared: the cwd-routing wrapper). `buildSessionTools` calls `resolveAgentSandbox(sessionAgentName)` to pick the right backend for each session. Agents with no applicable sandbox backend (no global `[sandbox]` and no per-agent block) have no `bash` / `search_files` tools — same as legacy mode with sandbox disabled.
+
+**Isolation guard:** `validateAgentConfig` rejects any strict-mode agent whose workspace root lies under (or equals) the shared common parent — such a root would be visible to every shared-mode agent via the shared bind mount, voiding the per-agent isolation the strict container is meant to provide. Strict and shared workspace roots remain pairwise disjoint from each other by this constraint.
+
+**Legacy mode** (no `[agents]` table): the global `[sandbox]` block is used as before, creating one `SandboxManager` bound to `config.sandbox`. No `agentSandboxMap` is populated; the single `sandbox` variable is used directly.
+
 ### Testing
 
 The sandbox is split across two test commands so the default unit suite needs no Docker:
@@ -3221,7 +3241,9 @@ The **`console`** action drains a per-page ring buffer of `console` + `pageerror
 enabled = false                        # schema default; the shipped deployment sets true (90-local.toml)
 manager_url = "http://127.0.0.1:8080"  # schema default (loopback); under compose set to http://manager:8080 (internal control network)
 # auth_token: absent → token-less Manager (localhost isolation only); set to match AUTH_TOKEN (the shipped stack sets it)
-profile_name = "miku"                  # the single persistent identity (resolved by name)
+# profile_name: in LEGACY mode only — the single persistent identity (resolved by name). Default: "miku" (code-applied when absent).
+#   In AGENTS mode, profile_name is absent from [browser] (a startup error if set) and each agent
+#   declares its own profile under [agents.<name>.browser].profile_name instead (§10a / Phase 4).
 platform = "windows"                   # fingerprint platform: windows | macos | linux
 fingerprint_seed = 0                   # 0/unset → Manager picks once and persists (stable thereafter)
 humanize = true                        # Bézier mouse + per-char typing
@@ -3245,6 +3267,25 @@ session_page_idle_ms = 600000          # close a session's idle tabs
 ```
 
 `validateConfig` (`src/config/loader.ts`) rejects a **present-but-empty** `auth_token` (empty or whitespace-only) or a non-http(s) `manager_url` when enabled (fail-fast, parity with the console-auth guard). An **absent** `auth_token` is allowed — it selects the token-less Manager (localhost isolation only).
+
+### Per-agent browser profiles (§10a / Phase 4)
+
+In **agents mode** (`[agents]` table present) each agent can optionally declare its own browser profile:
+
+```toml
+[agents.rin.browser]
+profile_name = "profile-rin"   # required; must be distinct from every other agent's profile_name
+```
+
+An agent with a `[agents.<name>.browser]` block gets its own `BrowserSession` constructed at startup with the global `[browser]` connection settings (`manager_url`, `auth_token`, `platform`, …) and the agent's `profile_name`. The connection settings come from the global `[browser]` block; only `profile_name` is per-agent. All `BrowserSession` instances are stored in `agentBrowserMap: Map<string, BrowserSession>` (keyed by agent name) and in `allBrowserSessions` for coordinated shutdown.
+
+An agent **without** a `[agents.<name>.browser]` block is given no `BrowserSession` and therefore has no `browser` tool wired into its sessions — the tool is simply absent, same as legacy mode with browser disabled.
+
+`resolveAgentBrowserSession(agentName)` looks up the agent's session from `agentBrowserMap`. `buildSessionTools` calls this per-session and only wires the `browser` tool when the lookup returns a session.
+
+**Profile isolation:** `validateAgentConfig` enforces that all per-agent `profile_name` values are pairwise distinct. A profile carries cookies, logins, and a stable fingerprint seed that must never be shared between agents (shared cookies mean shared identity — cross-agent contamination). Each distinct profile is a separate identity on the Manager.
+
+**Legacy mode** (no `[agents]` table): a single global `BrowserSession` is constructed (when `[browser].enabled`) using `config.browser.profile_name ?? "miku"` — the `"miku"` fallback is applied in code at session construction time, not in `00-defaults.toml`, so the config schema treats `profile_name` as optional throughout. Behavior is identical to before Phase 4.
 
 ### Upgrade (no fork, no vendor)
 
