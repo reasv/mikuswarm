@@ -953,7 +953,9 @@ manager_url = "http://127.0.0.1:8080"  # CloakBrowser-Manager base (loopback-pub
 # auth_token is intentionally unset here: ABSENT ⇒ token-less Manager (localhost
 # isolation only). Set it in local config to "${BROWSER_AUTH_TOKEN}" to match the
 # Manager's AUTH_TOKEN. PRESENT-but-empty is rejected at load time (fail-fast).
-profile_name = "miku"                   # the single persistent identity (resolved by name)
+# profile_name is intentionally absent: in agents mode each agent sets its own
+# [agents.<name>.browser] profile_name. In legacy mode the code applies "miku"
+# as the default when absent (spec MULTI-AGENT-SUPPORT §10a / §4.2).
 platform = "windows"                    # fingerprint platform: windows | macos | linux
 fingerprint_seed = 0                    # 0/unset ⇒ Manager picks a random seed once, then persists it
 humanize = true                         # Bézier mouse + per-char typing

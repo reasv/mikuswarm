@@ -717,12 +717,76 @@ const DiscordAccountSchema = StrictObject({
 });
 
 /**
+ * Sandbox subsystem config block (spec MULTI-AGENT-SUPPORT §10).
+ * Shared shape between the top-level `[sandbox]` and per-agent
+ * `[agents.<name>.sandbox]` blocks. Extracted so both reference the same
+ * TypeBox schema and `SandboxBlockConfig` can be exported as a named type.
+ *
+ * This const is defined before the `[browser]` block (which it precedes
+ * conceptually) and referenced twice: once in `AgentBlockSchema` (per-agent
+ * strict-mode override) and once in `AppConfigSchema` (global sandbox).
+ */
+const SandboxBlockSchema = StrictObject({
+  enabled: Type.Boolean(),
+  image: Type.String(),
+  container_name: Type.String(),
+  network: Type.String(),
+  // DNS servers for the sandbox (`docker create --dns`). Unset ⇒
+  // ["1.1.1.1", "8.8.8.8"] (historical default — a bridge network where the
+  // daemon's embedded resolver is unreachable behind the egress firewall). Set
+  // to [] to emit NO --dns: REQUIRED when `network` is a namespace join
+  // ("container:…"/"host"), since Docker rejects --dns with a shared netns — the
+  // sandbox then inherits that namespace's resolver (e.g. a VPN anchor's tunnel
+  // DNS, so its egress + name resolution both ride the tunnel). Non-empty ⇒
+  // those servers verbatim.
+  dns: Type.Optional(Type.Array(Type.String())),
+  workspace_mount: Type.String(),
+  // How the sandbox bind source (`docker create -v <src>`) is derived from the
+  // workspace root. "host" (default): the resolved path is used as-is — the
+  // agent runs on the daemon's own filesystem. "container": the agent itself
+  // runs in a container, so the path is translated at startup by inspecting
+  // the agent's OWN container mounts over the socket (src/sandbox/host-path.ts)
+  // — no host path appears in any config; the compose project stays relocatable.
+  workspace_bind_source: Type.Optional(
+    Type.Union([Type.Literal("host"), Type.Literal("container")]),
+  ),
+  exec_timeout_ms: Type.Number({ minimum: 1 }),
+  max_output_bytes: Type.Number({ minimum: 1 }),
+  stop_on_shutdown: Type.Optional(Type.Boolean()),
+  // Resource/isolation knobs (room to grow; passed to `docker create`).
+  memory: Type.Optional(Type.String()),
+  cpus: Type.Optional(Type.Number({ minimum: 0 })),
+  pids_limit: Type.Optional(Type.Number({ minimum: 1 })),
+  read_only_root: Type.Optional(Type.Boolean()),
+  env: Type.Optional(Type.Record(Type.String(), Type.String())),
+  binds: Type.Optional(Type.Array(Type.String())),
+});
+
+/**
  * Per-agent identity block (spec MULTI-AGENT-SUPPORT §4.1).
- * Each entry under `[agents.*]` declares one named agent's workspace.
+ * Each entry under `[agents.*]` declares one named agent's workspace,
+ * and optionally its own sandbox (strict mode, §10) and browser profile (§10a).
  */
 const AgentBlockSchema = StrictObject({
   /** Absolute or relative path to this agent's workspace root directory. */
   workspace_root: Type.String({ minLength: 1 }),
+  /**
+   * Per-agent sandbox override (spec MULTI-AGENT-SUPPORT §10 "strict" mode).
+   * When set, this agent gets its own dedicated container. Overrides `[sandbox]`
+   * wholesale — no per-key merge. Agents without this block share the global
+   * `[sandbox]` container ("shared soft-isolation" mode).
+   */
+  sandbox: Type.Optional(SandboxBlockSchema),
+  /**
+   * Per-agent browser profile (spec MULTI-AGENT-SUPPORT §10a).
+   * When set, this agent gets its own `BrowserSession` (own Manager profile,
+   * lazily launched on first use). Agents without this block get no browser tools.
+   * Connection settings (`manager_url`, `auth_token`, timeouts, etc.) are
+   * inherited from the global `[browser]` block.
+   */
+  browser: Type.Optional(StrictObject({
+    profile_name: Type.String({ minLength: 1 }),
+  })),
 });
 
 /**
@@ -922,8 +986,11 @@ const BrowserSchema = StrictObject({
   // isolation only); PRESENT-but-empty is a misconfiguration and is rejected.
   auth_token: Type.Optional(Type.String({ minLength: 1 })),
   // The single persistent identity. Resolved by name each boot; created lazily
-  // with auto_launch=true if absent.
-  profile_name: Type.String({ minLength: 1 }),
+  // with auto_launch=true if absent. In agents mode, this is unset at the global
+  // level (a startup error if set); each agent declares its own profile_name
+  // under [agents.<name>.browser]. In legacy mode, absent ⇒ code default "miku"
+  // (spec MULTI-AGENT-SUPPORT §10a / §4.2 schema-optional treatment).
+  profile_name: Type.Optional(Type.String({ minLength: 1 })),
   // Fingerprint platform spoof. Most common / least suspicious is windows.
   platform: Type.Union([
     Type.Literal("windows"),
@@ -1411,41 +1478,9 @@ export const AppConfigSchema = StrictObject({
   // tools stay in-process on the same bind-mounted files. See ARCHITECTURE.md §11a.
   // Optional so existing configs stay valid; when enabled, startup fails fast if
   // Docker/the image/the container are unavailable.
-  sandbox: Type.Optional(StrictObject({
-    enabled: Type.Boolean(),
-    image: Type.String(),
-    container_name: Type.String(),
-    network: Type.String(),
-    // DNS servers for the sandbox (`docker create --dns`). Unset ⇒
-    // ["1.1.1.1", "8.8.8.8"] (historical default — a bridge network where the
-    // daemon's embedded resolver is unreachable behind the egress firewall). Set
-    // to [] to emit NO --dns: REQUIRED when `network` is a namespace join
-    // ("container:…"/"host"), since Docker rejects --dns with a shared netns — the
-    // sandbox then inherits that namespace's resolver (e.g. a VPN anchor's tunnel
-    // DNS, so its egress + name resolution both ride the tunnel). Non-empty ⇒
-    // those servers verbatim.
-    dns: Type.Optional(Type.Array(Type.String())),
-    workspace_mount: Type.String(),
-    // How the sandbox bind source (`docker create -v <src>`) is derived from the
-    // workspace root. "host" (default): the resolved path is used as-is — the
-    // agent runs on the daemon's own filesystem. "container": the agent itself
-    // runs in a container, so the path is translated at startup by inspecting
-    // the agent's OWN container mounts over the socket (src/sandbox/host-path.ts)
-    // — no host path appears in any config; the compose project stays relocatable.
-    workspace_bind_source: Type.Optional(
-      Type.Union([Type.Literal("host"), Type.Literal("container")]),
-    ),
-    exec_timeout_ms: Type.Number({ minimum: 1 }),
-    max_output_bytes: Type.Number({ minimum: 1 }),
-    stop_on_shutdown: Type.Optional(Type.Boolean()),
-    // Resource/isolation knobs (room to grow; passed to `docker create`).
-    memory: Type.Optional(Type.String()),
-    cpus: Type.Optional(Type.Number({ minimum: 0 })),
-    pids_limit: Type.Optional(Type.Number({ minimum: 1 })),
-    read_only_root: Type.Optional(Type.Boolean()),
-    env: Type.Optional(Type.Record(Type.String(), Type.String())),
-    binds: Type.Optional(Type.Array(Type.String())),
-  })),
+  // In agents mode (§10): acts as the shared-mode sandbox for agents without a
+  // per-agent [agents.<name>.sandbox] block. Uses SandboxBlockSchema (same shape).
+  sandbox: Type.Optional(SandboxBlockSchema),
   matrix: StrictObject({
     enabled: Type.Boolean(),
     trigger_hold_ms: Type.Number({ minimum: 0 }),
@@ -1546,7 +1581,11 @@ export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
-/** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1). */
+/** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */
 export type AgentBlockConfig = Static<typeof AgentBlockSchema>;
+/** Sandbox subsystem config block (spec MULTI-AGENT-SUPPORT §10). */
+export type SandboxBlockConfig = Static<typeof SandboxBlockSchema>;
+/** Per-agent browser profile config (spec MULTI-AGENT-SUPPORT §10a). */
+export type AgentBrowserBlockConfig = NonNullable<AgentBlockConfig["browser"]>;
 /** Sibling-reply suppression config (spec MULTI-AGENT-SUPPORT §9). */
 export type SiblingsConfig = Static<typeof SiblingsSchema>;

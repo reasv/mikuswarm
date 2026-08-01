@@ -10,6 +10,7 @@ export {
   type RawExecResult,
 } from "./docker-exec-backend.js";
 export { SandboxManager, type SandboxManagerOptions } from "./manager.js";
+export { createSharedExecBackend, computeCommonAncestor } from "./shared-exec.js";
 export {
   translateContainerPathToHost,
   resolveWorkspaceBindSource,

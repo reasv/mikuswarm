@@ -139,7 +139,7 @@ import { performInitialBackfill } from "./backfill/index.js";
 import { GapBackfetchCoordinator, type GapBackfetchConfig } from "./backfill/coordinator.js";
 import { MessageBackfetchCoordinator, type MessageBackfetchConfig } from "./backfill/message-backfetch.js";
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
-import { SandboxManager } from "./sandbox/index.js";
+import { SandboxManager, type ExecBackend, createSharedExecBackend, computeCommonAncestor } from "./sandbox/index.js";
 import { BrowserSession } from "./browser/index.js";
 import { getConfiguredTimezone } from "./time/index.js";
 
@@ -510,6 +510,28 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return entry;
   }
 
+  /**
+   * Resolve the ExecBackend for a session (spec MULTI-AGENT-SUPPORT §10).
+   * Agents mode: returns the per-agent strict ExecBackend (direct SandboxManager)
+   * or the shared-mode cwd-routing wrapper for this agent.
+   * Legacy mode: returns the global `sandbox` SandboxManager (or undefined).
+   */
+  function resolveAgentSandbox(agentName: string | null): ExecBackend | undefined {
+    if (!agentName || agentName === "__legacy__") return sandbox;
+    return agentSandboxMap.get(agentName);
+  }
+
+  /**
+   * Resolve the BrowserSession for a session (spec MULTI-AGENT-SUPPORT §10a).
+   * Agents mode: returns the per-agent BrowserSession, or undefined if this
+   * agent has no [browser] block.
+   * Legacy mode: returns the global `browserSession` (or undefined).
+   */
+  function resolveAgentBrowserSession(agentName: string | null): BrowserSession | undefined {
+    if (!agentName || agentName === "__legacy__") return browserSession;
+    return agentBrowserMap.get(agentName);
+  }
+
   // Memory retrieval (ARCHITECTURE.md §9d): a hybrid lexical+semantic index over
   // `memory/*.md`. When enabled, the indexer reconciles the corpus on startup and
   // after each memory write (hooked below), the embedding worker populates the vector
@@ -611,8 +633,84 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
   // The sandbox handle is closed over by the per-session tools builder below.
-  let sandbox: SandboxManager | undefined;
-  if (config.sandbox?.enabled) {
+  //
+  // Agents mode (§10): strict agents get their own SandboxManager; shared-mode
+  // agents share one manager with per-exec cwd routing. Per-agent sandbox and
+  // browser maps (populated in agents mode only; empty in legacy mode).
+  const agentSandboxMap = new Map<string, ExecBackend>(); // agentName → exec backend
+  const allSandboxManagers: Array<{ manager: SandboxManager; stopOnShutdown: boolean }> = [];
+  const agentBrowserMap = new Map<string, BrowserSession>(); // agentName → browser session
+  const allBrowserSessions: BrowserSession[] = [];
+
+  let sandbox: SandboxManager | undefined; // legacy mode only; undefined in agents mode
+  if (config.agents && Object.keys(config.agents).length > 0) {
+    // ── Agents mode sandbox setup (§10) ─────────────────────────────────────
+    // Strict agents: each with [agents.<name>.sandbox] gets its own container.
+    for (const [agentName, block] of Object.entries(config.agents)) {
+      if (!block.sandbox?.enabled) continue;
+      const sb = block.sandbox;
+      const manager = await SandboxManager.ensure({
+        image: sb.image,
+        containerName: sb.container_name,
+        network: sb.network,
+        dns: sb.dns,
+        workspaceHostDir: path.resolve(block.workspace_root),
+        workspaceBindSource: sb.workspace_bind_source,
+        workspaceMount: sb.workspace_mount,
+        uid: process.getuid?.() ?? 0,
+        gid: process.getgid?.() ?? 0,
+        memory: sb.memory,
+        cpus: sb.cpus,
+        pidsLimit: sb.pids_limit,
+        readOnlyRoot: sb.read_only_root,
+        env: { TZ: getConfiguredTimezone(), ...sb.env },
+        binds: sb.binds,
+        execTimeoutMs: sb.exec_timeout_ms,
+        maxOutputBytes: sb.max_output_bytes,
+        logger: logger.child(`sandbox:${agentName}`),
+      });
+      allSandboxManagers.push({ manager, stopOnShutdown: sb.stop_on_shutdown ?? false });
+      agentSandboxMap.set(agentName, manager);
+    }
+    // Shared-mode agents: agents without a per-agent sandbox block share [sandbox].
+    const sharedAgentEntries = Object.entries(config.agents).filter(([, b]) => !b.sandbox);
+    if (sharedAgentEntries.length > 0 && config.sandbox?.enabled) {
+      const sharedRoots = sharedAgentEntries.map(([, b]) => path.resolve(b.workspace_root));
+      // Mount the common ancestor of all shared agents' workspace roots so the
+      // container sees every participating workspace under one bind source.
+      const commonAncestor = computeCommonAncestor(sharedRoots);
+      const sharedManager = await SandboxManager.ensure({
+        image: config.sandbox.image,
+        containerName: config.sandbox.container_name,
+        network: config.sandbox.network,
+        dns: config.sandbox.dns,
+        workspaceHostDir: commonAncestor,
+        workspaceBindSource: config.sandbox.workspace_bind_source,
+        workspaceMount: config.sandbox.workspace_mount,
+        uid: process.getuid?.() ?? 0,
+        gid: process.getgid?.() ?? 0,
+        memory: config.sandbox.memory,
+        cpus: config.sandbox.cpus,
+        pidsLimit: config.sandbox.pids_limit,
+        readOnlyRoot: config.sandbox.read_only_root,
+        env: { TZ: getConfiguredTimezone(), ...config.sandbox.env },
+        binds: config.sandbox.binds,
+        execTimeoutMs: config.sandbox.exec_timeout_ms,
+        maxOutputBytes: config.sandbox.max_output_bytes,
+        logger: logger.child("sandbox"),
+      });
+      allSandboxManagers.push({ manager: sharedManager, stopOnShutdown: config.sandbox.stop_on_shutdown ?? false });
+      // Wire each shared-mode agent with a cwd-routing wrapper that prefixes
+      // the agent's subdir (relative to commonAncestor) onto every exec cwd.
+      for (const [agentName, block] of sharedAgentEntries) {
+        const agentRoot = path.resolve(block.workspace_root);
+        // Use posix separators — the container is always Linux.
+        const agentSubdir = agentRoot.slice(commonAncestor.length).replace(/\\/g, "/").replace(/^\//, "");
+        agentSandboxMap.set(agentName, createSharedExecBackend(sharedManager, agentSubdir));
+      }
+    }
+  } else if (config.sandbox?.enabled) {
+    // ── Legacy mode sandbox setup (unchanged) ───────────────────────────────
     sandbox = await SandboxManager.ensure({
       image: config.sandbox.image,
       containerName: config.sandbox.container_name,
@@ -647,13 +745,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // service the harness only reaches lazily on first browser-tool use, degrading
   // gracefully if it is down (§3.4). Constructing the manager here just holds
   // config + the per-session tab map; no I/O happens until a tool runs.
-  let browserSession: BrowserSession | undefined;
-  if (config.browser?.enabled) {
-    // Downloads cross-field validation (same fail-fast convention as the
-    // proactive/rate-limit checks above; ARCHITECTURE.md §11b "Downloads"): the
-    // two keys describe ONE shared staging volume from two containers'
-    // viewpoints, so setting exactly one is a broken topology, not a partial
-    // opt-in. Both unset ⇒ downloads disabled (explicit opt-in).
+  //
+  // Agents mode (§10a): each agent with [agents.<name>.browser] gets its own
+  // BrowserSession (own Manager profile). Connection settings come from [browser];
+  // profile_name is supplied per-agent. Agents without a browser block get no
+  // browser tools. Legacy mode: single global session, profile_name defaults to "miku".
+  let browserSession: BrowserSession | undefined; // legacy mode only; undefined in agents mode
+
+  /**
+   * Validate browser downloads config (shared between legacy and per-agent setup).
+   * Throws on a half-configured staging volume (exactly one of the two keys set).
+   */
+  async function validateAndProbeBrowserDownloads(): Promise<void> {
+    if (!config.browser) return;
     const hasDownloadsDir = config.browser.downloads_dir !== undefined;
     const hasDownloadsLocalDir = config.browser.downloads_local_dir !== undefined;
     if (hasDownloadsDir !== hasDownloadsLocalDir) {
@@ -710,15 +814,42 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         );
       }
     }
-    browserSession = new BrowserSession({
-      config: config.browser,
-      agentTimezone: getConfiguredTimezone(),
-      workspaceRoot,
-      // Browser downloads share the global media size cap; on breach the
-      // in-flight download is canceled (§11b).
-      downloadSizeLimit,
-      logger: logger.child("browser"),
-    });
+  }
+
+  if (config.browser?.enabled) {
+    if (config.agents && Object.keys(config.agents).length > 0) {
+      // ── Agents mode browser setup (§10a) ───────────────────────────────────
+      // Downloads validation runs once — the staging volume is shared.
+      await validateAndProbeBrowserDownloads();
+      // Create a BrowserSession for each agent that has a [browser] block.
+      // Connection settings come from [browser]; profile_name is per-agent.
+      // workspace_root is resolved from the agent block (same as workspace setup above).
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        if (!block.browser) continue;
+        const agentBrowserConfig = { ...config.browser!, profile_name: block.browser.profile_name };
+        const session = new BrowserSession({
+          config: agentBrowserConfig,
+          agentTimezone: getConfiguredTimezone(),
+          workspaceRoot: path.resolve(block.workspace_root),
+          downloadSizeLimit,
+          logger: logger.child(`browser:${agentName}`),
+        });
+        agentBrowserMap.set(agentName, session);
+        allBrowserSessions.push(session);
+      }
+    } else {
+      // ── Legacy mode browser setup (unchanged, profile_name defaults to "miku") ─
+      await validateAndProbeBrowserDownloads();
+      browserSession = new BrowserSession({
+        config: { ...config.browser!, profile_name: config.browser!.profile_name ?? "miku" },
+        agentTimezone: getConfiguredTimezone(),
+        workspaceRoot,
+        // Browser downloads share the global media size cap; on breach the
+        // in-flight download is canceled (§11b).
+        downloadSizeLimit,
+        logger: logger.child("browser"),
+      });
+    }
   }
 
   const echo = new AssistantEchoResolver(timeline);
@@ -3564,6 +3695,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const sessionAgentAccountPrefixes =
       sessionAgentName !== null ? (agentAccountPrefixesMap.get(sessionAgentName) ?? []) : undefined;
 
+    // Per-session sandbox and browser (§10/§10a): resolved from the per-agent maps
+    // in agents mode, or from the global legacy variables in legacy mode.
+    const sessionSandbox = resolveAgentSandbox(sessionAgentName);
+    const sessionBrowserSession = resolveAgentBrowserSession(sessionAgentName);
+    // The exec timeout to pass to createBashTool: per-agent sandbox config in strict
+    // mode, or the global config in shared/legacy mode.
+    const sessionSandboxTimeoutMs = (() => {
+      if (sessionAgentName && config.agents?.[sessionAgentName]?.sandbox) {
+        return config.agents[sessionAgentName]!.sandbox!.exec_timeout_ms;
+      }
+      return config.sandbox?.exec_timeout_ms;
+    })();
+
     const roomId = target.roomId;
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
     // consumer 3 / §2.5 ordering shape (a)): the text-editor read budget derives
@@ -3788,9 +3932,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         : []),
       createWebFetchTool(),
       createWebSearchTool(),
-      ...(browserSession && config.browser
+      // Per-session browser tool (§10a): use the per-agent session in agents mode
+      // or the global legacy session. config.browser provides connection settings /
+      // timeouts; profile_name is already baked into the session from construction.
+      ...(sessionBrowserSession && config.browser
         ? [createBrowserTool({
-            session: browserSession,
+            session: sessionBrowserSession,
             agentSessionId: sessionId,
             config: config.browser,
             // Same shared per-model base64 cap read_image uses, so inline
@@ -3807,8 +3954,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // (50KB–512KB) bound the impact, so a mismatch only shifts the cap within
       // those limits.
       createTextEditorTool({ workspaceRoot: sessionWsRoot, contextWindowTokens: contextCeiling }),
-      createSearchFilesTool({ workspaceRoot: sessionWsRoot, sandbox }),
-      ...(sandbox ? [createBashTool({ sandbox, defaultTimeoutMs: config.sandbox?.exec_timeout_ms })] : []),
+      // Per-session sandbox (§10): strict agents get their own manager; shared-mode
+      // agents get a cwd-routing wrapper; legacy mode gets the global manager.
+      createSearchFilesTool({ workspaceRoot: sessionWsRoot, sandbox: sessionSandbox }),
+      ...(sessionSandbox ? [createBashTool({ sandbox: sessionSandbox, defaultTimeoutMs: sessionSandboxTimeoutMs })] : []),
       createMediaTool({
         workspaceRoot: sessionWsRoot,
         clients: captionClients,
@@ -4785,7 +4934,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         resume: material,
         resumeContinuation: {
           tail: continuation.tail,
-          browserNote: browserSession ? RESUME_BROWSER_NOTE : undefined,
+          browserNote: resolveAgentBrowserSession(resolveWorkspaceForTimeline(record.timelineKey)?.agentName ?? null) ? RESUME_BROWSER_NOTE : undefined,
           gap,
           triggerPreamble: continuation.triggerPreamble,
         },
@@ -4901,8 +5050,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         captureHandle.detach();
         costWarnUnsub();
         activeRuns.delete(run);
-        if (browserSession) {
-          void browserSession.closeSession(record.id).catch((error) => {
+        // Per-session browser close (§10a): close this session's tab(s). Use the
+        // per-agent session in agents mode, or the global legacy session.
+        const recordBrowserSession = resolveAgentBrowserSession(
+          resolveWorkspaceForTimeline(record.timelineKey)?.agentName ?? null,
+        );
+        if (recordBrowserSession) {
+          void recordBrowserSession.closeSession(record.id).catch((error) => {
             logger.warn("browser_session_close_failed", {
               sessionId: record.id,
               error: error instanceof Error ? error.message : String(error),
@@ -5286,8 +5440,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         activeRuns.delete(run);
         // Close this session's browser tab(s) when the run settles (the idle
         // sweeper is only a backstop). Fire-and-forget; never block completion.
-        if (browserSession) {
-          void browserSession.closeSession(session.id).catch((error) => {
+        // Per-session browser (§10a): use the per-agent session in agents mode.
+        const sessionBrowserForClose = resolveAgentBrowserSession(
+          resolveWorkspaceForTimeline(session.timelineKey)?.agentName ?? null,
+        );
+        if (sessionBrowserForClose) {
+          void sessionBrowserForClose.closeSession(session.id).catch((error) => {
             logger.warn("browser_session_close_failed", {
               sessionId: session.id,
               error: error instanceof Error ? error.message : String(error),
@@ -5905,9 +6063,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         llmScheduler.stop();
         // After in-flight runs drain, disconnect the browser (closes our CDP link
         // and any lingering tabs; does NOT stop the operator-run Manager).
+        // Legacy mode: one global session. Agents mode: all per-agent sessions.
         if (browserSession) await browserSession.shutdown();
+        for (const bs of allBrowserSessions) await bs.shutdown();
         // After in-flight runs (and their bash execs) drain, release the sandbox.
+        // Legacy mode: one global manager. Agents mode: all per-agent managers.
         if (sandbox) await sandbox.shutdown({ stop: config.sandbox?.stop_on_shutdown ?? false });
+        for (const { manager, stopOnShutdown } of allSandboxManagers) {
+          await manager.shutdown({ stop: stopOnShutdown });
+        }
         await storage.waitForIdle();
         storage.close();
         logger.info("runtime_stopped");
@@ -6573,6 +6737,10 @@ const AGENT_NAME_RE_EXPORTED = /^[a-z0-9-]+$/;
  * - §4.2 agents mode: every account's resolved agent name must match a declared entry
  * - §4.2 agents mode: workspace roots must be pairwise disjoint (no nesting)
  * - §4.2 legacy mode: `agent` field on any account without an `[agents]` table → error
+ * - §10 sandbox mode: strict agents must have distinct container_name and workspace_mount;
+ *   no strict agent root under the shared common parent (would void isolation)
+ * - §10a browser: global profile_name with [agents] is an error; per-agent profile_names
+ *   must be pairwise distinct
  */
 export function validateAgentConfig(config: AppConfig): void {
   // §3: colon in an account key breaks parseTimelineKey (orphans the timeline).
@@ -6675,6 +6843,95 @@ export function validateAgentConfig(config: AppConfig): void {
           throw new Error(
             `[agents] workspace roots must be pairwise disjoint: ` +
               `"${a.name}" (${a.resolved}) and "${b.name}" (${b.resolved}) overlap.`,
+          );
+        }
+      }
+    }
+
+    // ── Phase 4: Browser validation (§10a) ─────────────────────────────────
+    // A global [browser].profile_name alongside [agents] is a startup error.
+    // Same rule as [workspace].root_dir + same schema-optional treatment.
+    if (config.browser?.profile_name !== undefined) {
+      throw new Error(
+        "[browser].profile_name is not valid when [agents] is present — in agents mode, " +
+          "each agent declares its own profile_name under [agents.<name>.browser]. " +
+          "Remove profile_name from the global [browser] block.",
+      );
+    }
+    // Per-agent browser profile_names must be pairwise distinct.
+    const agentBrowserProfiles = new Map<string, string>(); // profile_name → first-seen agent name
+    for (const [agentName, block] of Object.entries(config.agents)) {
+      const profileName = block.browser?.profile_name;
+      if (profileName !== undefined) {
+        const existing = agentBrowserProfiles.get(profileName);
+        if (existing !== undefined) {
+          throw new Error(
+            `[agents] browser profile_name "${profileName}" is shared between agents ` +
+              `"${existing}" and "${agentName}" — each agent's browser profile must be ` +
+              `distinct (a profile carries cookies and fingerprint state that must never cross agents).`,
+          );
+        }
+        agentBrowserProfiles.set(profileName, agentName);
+      }
+    }
+
+    // ── Phase 4: Sandbox validation (§10) ───────────────────────────────────
+    // Strict agents (those with a per-agent sandbox block) must not share container_name
+    // with each other, and must not use the shared [sandbox].container_name. Two managers
+    // ensuring the same container name with different host mounts would race and produce
+    // a confusing runtime mount-mismatch error that is hard to diagnose.
+    const strictContainerNames = new Map<string, string>(); // container_name → first-seen agent name
+    for (const [agentName, block] of Object.entries(config.agents)) {
+      if (!block.sandbox) continue;
+      const existing = strictContainerNames.get(block.sandbox.container_name);
+      if (existing !== undefined) {
+        throw new Error(
+          `[agents] sandbox container_name "${block.sandbox.container_name}" is shared between ` +
+            `agents "${existing}" and "${agentName}" — each strict-mode agent must use a distinct container_name.`,
+        );
+      }
+      strictContainerNames.set(block.sandbox.container_name, agentName);
+    }
+    // Also reject any strict agent whose container_name collides with the global
+    // [sandbox].container_name — the shared manager and the strict manager would
+    // both ensure the same Docker container but with different bind-mount sources.
+    if (config.sandbox) {
+      const sharedContainerName = config.sandbox.container_name;
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        if (!block.sandbox) continue;
+        if (block.sandbox.container_name === sharedContainerName) {
+          throw new Error(
+            `[agents] strict-mode agent "${agentName}" sandbox container_name "${sharedContainerName}" ` +
+              `matches the global [sandbox].container_name — use a distinct container_name so each ` +
+              `manager ensures a separate Docker container with its own mount configuration.`,
+          );
+        }
+      }
+    }
+    // NOTE: workspace_mount is a CONTAINER-SIDE path. Two strict-mode agents in separate
+    // containers (each with a distinct container_name) can legitimately share the same
+    // container-side mount path (e.g. "/workspace") — the containers are independent, so
+    // there is no clash. Host-side disjointness (each agent's workspace_root pointing at a
+    // different host directory) is already enforced by Phase 1's pairwise workspace-root check.
+    // We do NOT require workspace_mount to be unique across strict agents.
+
+    // Shared-mode agents share the global [sandbox] container. Validate that no
+    // strict agent's workspace root lies under the shared common parent — that
+    // would expose the strict agent's workspace to shared-mode agents (§10).
+    const sharedAgentNames = Object.entries(config.agents).filter(([, b]) => !b.sandbox).map(([n]) => n);
+    if (sharedAgentNames.length > 0 && config.sandbox?.enabled) {
+      const sharedRoots = sharedAgentNames.map((n) => path.resolve(config.agents![n]!.workspace_root));
+      const commonAncestor = computeCommonAncestor(sharedRoots);
+      const sep = path.sep;
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        if (!block.sandbox) continue; // skip shared-mode agents
+        const strictRoot = path.resolve(block.workspace_root);
+        if (strictRoot === commonAncestor || strictRoot.startsWith(commonAncestor + sep)) {
+          throw new Error(
+            `[agents] strict-mode agent "${agentName}" workspace root (${strictRoot}) lies under ` +
+              `the shared sandbox common parent (${commonAncestor}), which would expose it to ` +
+              `shared-mode agents via the shared container mount — move the strict agent's ` +
+              `workspace outside the shared parent directory (§10).`,
           );
         }
       }
