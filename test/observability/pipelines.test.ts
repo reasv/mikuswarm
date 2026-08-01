@@ -341,6 +341,46 @@ test("getPipelineCounts for summarization + diary", async () => {
   });
 });
 
+test("getPipelineCounts captioning join-free and join-with-eligibility modes are parity-exact", async () => {
+  // Verify that the no-eligibility (join-free) and with-eligibility (join) paths
+  // produce identical aggregates for every bucket except the pending/deferred split
+  // (which is the intended difference). This guards against the join-free
+  // optimisation accidentally changing row counts or bucket assignments.
+  await withStorage(async (storage) => {
+    await captionAsset(storage, "evt-trig", "m-trig", { triggerGroup: true }); // fresh pending (eligible)
+    await captionAsset(storage, "evt-user", "m-user", {}); // fresh pending (non-trigger user)
+    await captionAsset(storage, "evt-asst", "m-asst", { role: "assistant" }); // fresh pending (assistant)
+    await captionAsset(storage, "evt-retry", "m-retry", { status: "pending" }); // set retries manually
+    await storage.write((db) =>
+      db.prepare(`update media_assets set caption_attempts = 2 where id = 'm-retry'`).run(),
+    );
+    await captionAsset(storage, "evt-done", "m-done", { status: "complete" });
+    await captionAsset(storage, "evt-fail", "m-fail", { status: "failed" });
+    await captionAsset(storage, "evt-skip", "m-skip", { status: "skipped" });
+
+    // No eligibility → join-free fast path, no deferred partition.
+    const noElig = storage.getPipelineCounts("captioning");
+    assert.equal(noElig.deferred, 0, "no eligibility → deferred always 0");
+
+    // Neither flag set → join path with deferred partition.
+    const elig = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false });
+
+    // pending (no-elig) == pending (elig) + deferred (elig): split is correct.
+    assert.equal(
+      noElig.pending,
+      elig.pending + elig.deferred,
+      "total fresh-pending row count must match across both paths",
+    );
+
+    // All other buckets must be identical between the two paths.
+    assert.equal(noElig.retrying, elig.retrying, "retrying bucket parity");
+    assert.equal(noElig.processing, elig.processing, "processing bucket parity");
+    assert.equal(noElig.done, elig.done, "done bucket parity");
+    assert.equal(noElig.failed, elig.failed, "failed bucket parity");
+    assert.equal(noElig.skipped, elig.skipped, "skipped bucket parity");
+  });
+});
+
 // ── listPipelineItems ────────────────────────────────────────────────────────
 
 test("listPipelineItems projects enrichment items and derives retrying", async () => {
