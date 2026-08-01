@@ -128,7 +128,7 @@ Probe/transcript runs are cheap; downloads are the reason for the cap.
 
 | Tier | What | Cost | When |
 |---|---|---|---|
-| **T1: enriched preview** | metadata + chapters + transcript head on the link preview (automatic, default-off) | 1–2 yt-dlp runs per posted link; no LLM | passively, when a YouTube link is posted |
+| **T1: enriched preview** | metadata + chapters + transcript head on the link preview (automatic for caption-eligible messages) | 1–2 yt-dlp runs per posted link; no LLM | passively, when a YouTube link is posted on a message captioning would touch |
 | **T2: `youtube_fetch`** | full metadata + description + chapters + windowed timestamped transcript | 1–2 yt-dlp runs; no LLM | agent wants to *read* the video |
 | **T3: `media` segment analysis** | download one ≤`max_duration_seconds` segment → existing video caption lane | download + one video-caption call (~36k input tokens / 120s at default media resolution) | agent wants to *watch* a segment |
 
@@ -152,12 +152,29 @@ playlist, search URLs) is unrecognized → generic link-preview path as today.
 
 ---
 
-## 5. Enrichment stage (T1) — default OFF
+## 5. Enrichment stage (T1) — default ON for caption-eligible messages
+
+**Decision (owner, 2026-08-01 revision):** the enrichment tier follows the captioning
+gating model, not a blanket default-off. It is **on by default for exactly the
+population captioning covers** — the `captionEligibleSql` predicate
+(`src/storage/database.ts`): trigger-group messages, promoted backfetch events, and
+assistant messages when `caption_assistant_messages` is set. The non-default opt-in is
+`enrich_all` (analog of `caption_all`): enrich *every* message carrying a YouTube link
+(still no LLM cost — the exposure is YouTube traffic volume, not inference spend).
 
 Modeled directly on the FxTwitter partition (§7a): when `[youtube.enrichment].enabled`
-(default **false** — no surprise YouTube traffic from deployments that didn't opt in;
-bot-detection exposure is a per-operator choice), `fetchLinkPreviews` partitions
-recognized YouTube URLs away from the generic preview path into a YouTube stage:
+(default **true**), `fetchLinkPreviews` partitions recognized YouTube URLs away from
+the generic preview path into a YouTube stage for eligible events:
+
+- **Eligibility**: the captioning predicate above, evaluated with the same
+  trigger-wait grace captioning uses (`trigger_wait_timeout_ms`) so a link in the
+  very message that triggers a reply is enriched before context assembly, not raced.
+  `enrich_all = true` removes the gate. An **ineligible** event's YouTube URL falls
+  through to the generic preview path (og:title/description as today) — the row is
+  not parked for later upgrade; a message that enters a trigger group only later
+  keeps its generic preview (deliberate simplification — the agent covers that case
+  with `youtube_fetch`, and reply-context preview fetches run at trigger time when
+  eligibility already holds).
 
 - `probe()` + `transcript()` (transcript failure is non-fatal — metadata-only payload).
 - Store one `link_previews` row per URL: `source_kind: "youtube"`, `title`, `description`
@@ -172,8 +189,8 @@ recognized YouTube URLs away from the generic preview path into a YouTube stage:
   YouTube visuals. Note this is the one LLM cost in T1 (one image caption per link),
   governed by the existing captioning gates (trigger-group, `caption_all`, budgets);
   `[youtube.enrichment].thumbnail` (default true) turns it off entirely.
-- Disabled (default): YouTube URLs stay on the generic preview path — behavior
-  unchanged.
+- Disabled (`enabled = false`): YouTube URLs stay on the generic preview path for
+  every message — behavior as today.
 
 **Rendering** (`src/context/renderer.ts`), same two-tier scheme as tweets:
 
@@ -277,7 +294,8 @@ timeout_ms = 120000            # per-subprocess wall clock
 # cookies_file = "/path/cookies.txt"   # optional; bot-detection / age-restriction
 
 [youtube.enrichment]
-enabled = false                # T1 default OFF
+enabled = true                 # T1 on by default, gated to caption-eligible messages
+enrich_all = false             # analog of caption_all: enrich every message's links
 transcript_head_chars = 1000
 thumbnail = true               # store+caption thumbnail as preview_media
 
@@ -296,7 +314,8 @@ Validation: windowing cross-field check as in `[fxtwitter.tool]`;
 - ytdlp wrapper: arg construction per operation (snapshot), json3 → folded transcript
   with markers, error surfacing, timeout kill, semaphore.
 - Enrichment stage with a mocked wrapper: payload_json shape, transcript-failure
-  degrade, disabled-path passthrough, thumbnail asset row.
+  degrade, disabled-path passthrough, eligibility gate (trigger-group vs not,
+  `enrich_all`, assistant per captioning config), thumbnail asset row.
 - `youtube_fetch`: document layout, windowing/offset math, `t=`-anchored offset,
   no-transcript document, config validation.
 - `media` routing: recognized-URL branch, synthesized truncation warning, cache key,
@@ -312,7 +331,9 @@ Validation: windowing cross-field check as in `[fxtwitter.tool]`;
 - **Native video blocks to a `input_modalities: ["video"]` reply model** — builder +
   pi-agent-core surface work; no current deployment demand.
 - **Generic yt-dlp site support** for the `media` routing behind a config allowlist.
-- **Enabling T1 by default** once operational confidence exists.
+- **Parked-upgrade enrichment**: re-running the YouTube stage when a previously
+  ineligible message later joins a trigger group (captioning's deferred-claim model);
+  v1 deliberately evaluates eligibility once.
 
 ## 12. Sandbox escape hatch (in scope, v1)
 
