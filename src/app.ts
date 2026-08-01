@@ -395,6 +395,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   let workspaceRoot: string;
   let memoryWriter: MemoryFileWriter;
 
+  // Per-agent workspace list for the retrieval subsystem (Phase 2, spec §7.1).
+  // In agents mode: one entry per configured agent (name + absolute workspace root).
+  // In legacy mode: empty (subsystem uses `workspaceRoot` directly with agentName=null).
+  let agentWorkspaces: Array<{ agentName: string; workspaceRoot: string }> = [];
+
+  // Reverse map: agentName → list of "provider:accountKey" prefixes that belong to
+  // this agent (Phase 2 §7.2). Used to scope rooms:"all" in search_messages / recap.
+  // In legacy mode this stays empty; all sessions get agentAccountPrefixes=undefined.
+  const agentAccountPrefixesMap = new Map<string, string[]>();
+
   if (config.agents && Object.keys(config.agents).length > 0) {
     // ── Agents mode (spec §4.1/§4.2) ───────────────────────────────────────
     // validateAgentConfig() already threw on any §4.2 violation above;
@@ -417,16 +427,28 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
     }
     // Build the resolver map: "provider:accountKey" → entry
+    // Also populate agentAccountPrefixesMap (§7.2): agentName → "provider:accountKey" prefixes.
     for (const [accountKey, account] of Object.entries(config.matrix?.accounts ?? {})) {
       const agentName = (account as { agent?: string }).agent ?? accountKey;
       agentWorkspaceMap.set(`matrix:${accountKey}`, agentEntries.get(agentName)!);
+      const prefix = `matrix:${accountKey}`;
+      const prev = agentAccountPrefixesMap.get(agentName) ?? [];
+      agentAccountPrefixesMap.set(agentName, [...prev, prefix]);
     }
     for (const [accountKey, account] of Object.entries(config.discord?.accounts ?? {})) {
       const agentName = account.agent ?? accountKey;
       agentWorkspaceMap.set(`discord:${accountKey}`, agentEntries.get(agentName)!);
+      const prefix = `discord:${accountKey}`;
+      const prev = agentAccountPrefixesMap.get(agentName) ?? [];
+      agentAccountPrefixesMap.set(agentName, [...prev, prefix]);
     }
+    // Build per-agent workspace list for the retrieval subsystem (§7.1).
+    agentWorkspaces = Array.from(agentEntries.values()).map((e) => ({
+      agentName: e.agentName,
+      workspaceRoot: e.workspaceRoot,
+    }));
     // Use the first agent's workspace for subsystems not yet per-agent
-    // (retrieval Phase 2, captioning/enrichment Phase 3, browser/sandbox Phase 4).
+    // (captioning/enrichment Phase 3, browser/sandbox Phase 4).
     const firstEntry = agentEntries.values().next().value!;
     workspaceRoot = firstEntry.workspaceRoot;
     memoryWriter = firstEntry.memoryWriter;
@@ -533,11 +555,31 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ? resolveModelChain(retrievalConfig.embedding.remote.model, config.models)
         : undefined,
       isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+      // Per-agent workspaces (spec MULTI-AGENT-SUPPORT §7.1): in agents mode each
+      // agent gets its own MemoryIndexer; in legacy mode this is empty and the
+      // subsystem creates a single indexer with agentName=null.
+      agentWorkspaces: agentWorkspaces.length > 0 ? agentWorkspaces : undefined,
       logger: logger.child("retrieval"),
     });
-    // Reconcile the touched file after every memory mutation (diary append /
-    // write_memory edit), so new entries become searchable promptly (§7).
-    memoryWriter.onAfterWrite = (absPath) => retrieval!.onMemoryWrite(absPath);
+    // Wire each agent's memoryWriter to its own indexer (§7.1). In agents mode
+    // there is one indexer per agent; in legacy mode there is exactly one.
+    if (agentWorkspaces.length > 0) {
+      // Agents mode: route each writer to the matching indexer.
+      for (const [, entry] of agentWorkspaceMap) {
+        const capturedName = entry.agentName;
+        const capturedWriter = entry.memoryWriter;
+        const capturedIndexer = retrieval.indexerForAgent(capturedName);
+        if (capturedIndexer) {
+          capturedWriter.onAfterWrite = (absPath) => capturedIndexer.enqueueReconcile(absPath);
+        }
+      }
+    } else {
+      // Legacy mode: single indexer (agentName=null).
+      const legacyIndexer = retrieval.indexerForAgent(null);
+      if (legacyIndexer) {
+        memoryWriter.onAfterWrite = (absPath) => legacyIndexer.enqueueReconcile(absPath);
+      }
+    }
   }
 
   // Chat-history search index (ARCHITECTURE.md §9e): a denormalized FTS5 + metadata
@@ -701,6 +743,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // build's timeline key rather than reading config.workspace.root_dir directly.
   contextBuilder.resolveWorkspaceRoot = (timelineKey) =>
     resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot;
+  // Per-session agent name resolver (spec MULTI-AGENT-SUPPORT §7.1): scopes
+  // auto-retrieval to the calling session's agent corpus. Returns null in legacy mode.
+  contextBuilder.resolveAgentName = (timelineKey) => {
+    const entry = resolveWorkspaceForTimeline(timelineKey);
+    if (!entry) return null;
+    // Normalize the sentinel: "__legacy__" means "no scoping".
+    return entry.agentName === "__legacy__" ? null : entry.agentName;
+  };
 
   const mediaCachePath = path.join(config.app.data_dir, "media-cache");
 
@@ -3487,6 +3537,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     const sessionWsRoot = _sessionWsEntry?.workspaceRoot ?? workspaceRoot;
     const sessionMemWriter = _sessionWsEntry?.memoryWriter ?? memoryWriter;
+    // Agents mode: the real agent name (not the "__legacy__" sentinel) for §7.1/§7.2.
+    const sessionAgentName =
+      _sessionWsEntry && _sessionWsEntry.agentName !== "__legacy__"
+        ? _sessionWsEntry.agentName
+        : null;
+    // Account prefixes for this session's agent (§7.2 rooms:"all" scoping).
+    const sessionAgentAccountPrefixes =
+      sessionAgentName !== null ? (agentAccountPrefixesMap.get(sessionAgentName) ?? []) : undefined;
 
     const roomId = target.roomId;
     // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
@@ -3668,6 +3726,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         indexer: chatSearchIndexer,
         currentTimelineKey: inbound.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
+        agentAccountPrefixes: sessionAgentAccountPrefixes,
       }),
       // Summary drill-down (§9e). DB-backed (lineage tables + shared renderer), so like
       // search/recap it's available regardless of roomId and is single-id (room implicit).
@@ -3682,6 +3741,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           gapThresholdMs: chatSearchDefaults.absence.gapThresholdMs,
           defaultLookbackMs: chatSearchDefaults.absence.defaultLookbackMs,
         },
+        agentAccountPrefixes: sessionAgentAccountPrefixes,
       }),
       createUserActivityTool({
         storage,
@@ -3749,6 +3809,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
                 maxResults: retrievalConfig.query.maxResults,
                 minScore: retrievalConfig.query.minScore,
               },
+              agentName: sessionAgentName,
             }),
           ]
         : []),

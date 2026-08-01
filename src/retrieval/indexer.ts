@@ -19,7 +19,13 @@ const MD_FILE_RE = /\.md$/;
  * file are pruned on the next `reconcileAll` (the on-disk set no longer lists it).
  */
 const NON_CONTENT_FILES = new Set(["readme.md"]);
-const CORPUS_SIGNATURE_KEY = "corpus_signature";
+/**
+ * Base key for the corpus-freshness signature in `index_meta`. In legacy mode this
+ * key is used as-is. In agents mode it is namespaced per-agent (`"corpus_signature:<name>"`)
+ * so each agent's indexer has an independent freshness signal without global
+ * invalidation (spec MULTI-AGENT-SUPPORT §7.1).
+ */
+const CORPUS_SIGNATURE_KEY_BASE = "corpus_signature";
 
 export interface MemoryIndexerOptions {
   storage: Storage;
@@ -44,6 +50,14 @@ export interface MemoryIndexerOptions {
    * unbounded with work nothing will ever process. Defaults to active.
    */
   embeddingsActive?: () => boolean;
+  /**
+   * Agent name for this indexer's corpus (spec MULTI-AGENT-SUPPORT §7.1). In agents
+   * mode, chunks indexed by this instance are stamped with this name and queries are
+   * scoped to it. Null (default) = legacy mode: no stamping, no filtering.
+   * The `"__legacy__"` sentinel used by agentWorkspaceMap in app.ts is treated as
+   * null here (it is an internal map key, not a real agent name to stamp on rows).
+   */
+  agentName?: string | null;
 }
 
 /**
@@ -65,6 +79,11 @@ export class MemoryIndexer {
   private readonly pruneVectors?: (rowids: number[]) => void;
   private readonly onChunksInserted?: () => void;
   private readonly embeddingsActive?: () => boolean;
+  /**
+   * The effective agent name for this indexer: null in legacy mode, the configured
+   * agent name in agents mode. The `"__legacy__"` sentinel is normalized to null.
+   */
+  readonly agentName: string | null;
   /** Strict-FIFO tail so reconciles never overlap (low volume; mirrors the writer). */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -77,6 +96,16 @@ export class MemoryIndexer {
     this.pruneVectors = opts.pruneVectors;
     this.onChunksInserted = opts.onChunksInserted;
     this.embeddingsActive = opts.embeddingsActive;
+    // Normalize the sentinel: "__legacy__" is an internal map key, not a real agent name.
+    const raw = opts.agentName ?? null;
+    this.agentName = raw === "__legacy__" ? null : raw;
+  }
+
+  /** Per-agent corpus signature key in `index_meta` (spec §7.1). */
+  private get corpusSignatureKey(): string {
+    return this.agentName !== null
+      ? `${CORPUS_SIGNATURE_KEY_BASE}:${this.agentName}`
+      : CORPUS_SIGNATURE_KEY_BASE;
   }
 
   private get memoryDir(): string {
@@ -109,8 +138,13 @@ export class MemoryIndexer {
     });
   }
 
-  /** Reconcile every `memory/*.md` and prune index entries for vanished files (§7). */
-  reconcileAll(): Promise<void> {
+  /**
+   * Reconcile every `memory/*.md` and prune index entries for vanished files (§7).
+   * Returns the set of workspace-relative paths that are on disk in this indexer's
+   * `memory/` directory, so the subsystem can build the union across all agents and
+   * run the null-orphan sweep at the subsystem level (spec §7.1 — see subsystem.ts).
+   */
+  reconcileAll(): Promise<Set<string>> {
     return this.enqueue(() => this.reconcileAllInner());
   }
 
@@ -121,25 +155,35 @@ export class MemoryIndexer {
    */
   async ensureFreshForQuery(): Promise<void> {
     const signature = await this.corpusSignature();
-    if (signature === this.storage.getIndexMeta(CORPUS_SIGNATURE_KEY)) return;
+    if (signature === this.storage.getIndexMeta(this.corpusSignatureKey)) return;
     await this.reconcileAll();
   }
 
-  private async reconcileAllInner(): Promise<void> {
+  private async reconcileAllInner(): Promise<Set<string>> {
     const names = await this.listMemoryFiles();
     const onDisk = new Set(names.map((n) => this.relativePath(n)));
     for (const name of names) {
       await this.reconcileFileInner(this.relativePath(name));
     }
-    // Prune index entries whose file no longer exists on disk.
-    for (const indexedPath of this.storage.listMemoryChunkPaths()) {
+    // Prune index entries owned by THIS agent whose file no longer exists on disk.
+    // Scoped strictly to `this.agentName` (including NULL for legacy mode) — never
+    // touches another agent's rows or NULL rows in agents mode. The subsystem is
+    // responsible for sweeping NULL rows that are orphaned across ALL roots after
+    // all per-agent walks complete (spec §7.1 — see subsystem.ts).
+    const agentPaths = this.storage.listMemoryChunkPaths(this.agentName);
+    for (const indexedPath of agentPaths) {
       if (!onDisk.has(indexedPath)) {
-        const removed = await this.storage.deleteMemoryChunksForPath(indexedPath);
-        this.logger?.info("memory_index_pruned", { path: indexedPath, removed });
+        const removed = await this.storage.deleteMemoryChunksForPath(indexedPath, this.agentName);
+        this.logger?.info("memory_index_pruned", {
+          path: indexedPath,
+          agent: this.agentName,
+          removed,
+        });
       }
     }
     const signature = await this.corpusSignature();
-    await this.storage.setIndexMeta(CORPUS_SIGNATURE_KEY, signature);
+    await this.storage.setIndexMeta(this.corpusSignatureKey, signature);
+    return onDisk;
   }
 
   /**
@@ -157,8 +201,8 @@ export class MemoryIndexer {
       text = await readFile(abs, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        // File gone between hook and read → drop its chunks.
-        await this.storage.deleteMemoryChunksForPath(rel);
+        // File gone between hook and read → drop its chunks (this agent's only).
+        await this.storage.deleteMemoryChunksForPath(rel, this.agentName);
         return;
       }
       throw error;
@@ -177,7 +221,7 @@ export class MemoryIndexer {
     // queue doesn't grow unbounded (#2); 'pending' otherwise. `resetAllEmbeddings()`
     // re-queues 'skip' rows if a provider later becomes active (§5a).
     const newChunkStatus = this.embeddingsActive?.() === false ? "skip" : "pending";
-    const result = await this.storage.reconcileMemoryChunks(rel, chunks, newChunkStatus);
+    const result = await this.storage.reconcileMemoryChunks(rel, chunks, newChunkStatus, this.agentName);
     if (result.deletedRowids.length > 0) this.pruneVectors?.(result.deletedRowids);
     if (result.inserted || result.deleted) {
       this.logger?.debug("memory_reconciled", {

@@ -6,6 +6,7 @@ export {
   buildSnippet,
   buildSummarySnippet,
   resolveRooms,
+  resolveRoomsForAgent,
   decodeCursor,
   encodeCursor,
   queryTerms,

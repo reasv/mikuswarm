@@ -289,6 +289,14 @@ export class ContextBuilder {
    */
   resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
 
+  /**
+   * Per-session agent name resolver (spec MULTI-AGENT-SUPPORT §7.1). Injected by
+   * app.ts after construction. Maps a `timeline_key` to the owning agent's name for
+   * memory-retrieval scoping. Returns null/undefined in legacy mode or when the key
+   * is unresolvable; auto-retrieval then runs without an agent filter.
+   */
+  resolveAgentName?: (timelineKey: string) => string | null | undefined;
+
   constructor(
     private readonly store: TimelineStore,
     private readonly config: AppConfig,
@@ -730,6 +738,9 @@ export class ContextBuilder {
       // the drain signal still aborts the embed wait at shutdown.
       retrievalEmbedSignal = options.abortSignal;
     }
+    // Resolve the agent name for memory-retrieval scoping (spec §7.1): each agent's
+    // session reads only its own corpus. Returns null/undefined in legacy mode.
+    const retrievalAgentName = this.resolveAgentName?.(options.timelineKey) ?? null;
     const retrievedMemory =
       generation || !this.autoRetrieval
         ? null
@@ -739,6 +750,7 @@ export class ContextBuilder {
             recencyContent: diaryLayer?.content ?? null,
             now,
             signal: retrievalEmbedSignal,
+            agentName: retrievalAgentName,
           })
             .catch((error) => {
               this.logger?.warn("auto_retrieval_failed", {

@@ -5356,11 +5356,18 @@ export class Storage {
     path: string,
     chunks: MemoryChunkInput[],
     newChunkStatus: "pending" | "skip" = "pending",
+    // In agents mode: the owning agent's name. NULL = legacy mode (no agent stamp).
+    agent: string | null = null,
   ): Promise<ReconcileResult> {
     return this.readAndWrite((db) => {
+      // Query existing rows owned by THIS agent (including NULL for legacy mode).
+      // IS ? handles NULL correctly: "agent IS NULL" when agent = null.
       const existing = db
-        .prepare(`select rowid, id, ordinal, start_line, end_line from memory_chunks where path = ?`)
-        .all(path) as Array<{
+        .prepare(
+          `select rowid, id, ordinal, start_line, end_line from memory_chunks
+           where path = ? and agent is ?`,
+        )
+        .all(path, agent) as Array<{
         rowid: number;
         id: string;
         ordinal: number;
@@ -5371,18 +5378,31 @@ export class Storage {
       const now = Date.now();
       const insertStmt = db.prepare(
         `insert into memory_chunks (
-           id, path, ordinal, source, start_line, end_line, room, entry_ts,
+           agent, id, path, ordinal, source, start_line, end_line, room, entry_ts,
            text, token_count, content_hash, embed_status, indexed_at
          ) values (
-           @id, @path, @ordinal, @source, @startLine, @endLine, @room, @entryTs,
+           @agent, @id, @path, @ordinal, @source, @startLine, @endLine, @room, @entryTs,
            @text, @tokenCount, @contentHash, @embedStatus, @now
          )`,
       );
       const updateStmt = db.prepare(
         `update memory_chunks set ordinal = @ordinal, start_line = @startLine, end_line = @endLine
-         where id = @id`,
+         where id = @id and agent is @agent`,
       );
-      const deleteStmt = db.prepare(`delete from memory_chunks where id = ?`);
+      // Stamp-in-place (spec §7.1): in agents mode, a NULL-agent row whose id
+      // matches an incoming chunk gets its agent set to this agent's name — no
+      // re-chunk, no re-embed (embedding is preserved). Rowids are stable so the
+      // vector index remains valid. Only applicable in agents mode (agent !== null).
+      const stampNullStmt =
+        agent !== null
+          ? db.prepare(
+              `update memory_chunks set agent = ?, ordinal = ?, start_line = ?, end_line = ?
+               where path = ? and id = ? and agent is null`,
+            )
+          : null;
+      const deleteStmt = db.prepare(
+        `delete from memory_chunks where id = ? and agent is ?`,
+      );
 
       let inserted = 0;
       let updated = 0;
@@ -5398,7 +5418,18 @@ export class Storage {
         seen.add(c.id);
         const prev = existingById.get(c.id);
         if (!prev) {
+          // In agents mode: check if a NULL-agent row with this (path, id) exists —
+          // if so, stamp it in-place rather than inserting a new row (§7.1).
+          if (stampNullStmt !== null) {
+            const stamped = stampNullStmt.run(agent, c.ordinal, c.startLine, c.endLine, c.path, c.id);
+            if (stamped.changes > 0) {
+              // Stamped an existing NULL row — treat as an update (no new embedding needed).
+              updated += 1;
+              continue;
+            }
+          }
           insertStmt.run({
+            agent,
             id: c.id,
             path: c.path,
             ordinal: c.ordinal,
@@ -5421,6 +5452,7 @@ export class Storage {
         ) {
           updateStmt.run({
             id: c.id,
+            agent,
             ordinal: c.ordinal,
             startLine: c.startLine,
             endLine: c.endLine,
@@ -5430,7 +5462,7 @@ export class Storage {
       }
       for (const r of existing) {
         if (!seen.has(r.id)) {
-          deleteStmt.run(r.id);
+          deleteStmt.run(r.id, agent);
           deletedRowids.push(r.rowid);
         }
       }
@@ -5438,20 +5470,36 @@ export class Storage {
     });
   }
 
-  /** All distinct file paths currently represented in the index (for sweep pruning). */
-  listMemoryChunkPaths(): string[] {
+  /**
+   * All distinct file paths currently represented in the index (for sweep pruning).
+   * In agents mode pass the owning agent name to restrict to that agent's paths;
+   * omit (undefined) to return paths across all agents (legacy / cleanup sweeps).
+   */
+  listMemoryChunkPaths(agent?: string | null): string[] {
     return this.read((db) => {
-      const rows = db
-        .prepare(`select distinct path from memory_chunks`)
-        .all() as Array<{ path: string }>;
+      const rows =
+        agent !== undefined
+          ? (db
+              .prepare(`select distinct path from memory_chunks where agent is ?`)
+              .all(agent) as Array<{ path: string }>)
+          : (db
+              .prepare(`select distinct path from memory_chunks`)
+              .all() as Array<{ path: string }>);
       return rows.map((r) => r.path);
     });
   }
 
-  /** Drop every chunk for a path (a file deleted out from under the index). */
-  deleteMemoryChunksForPath(path: string): Promise<number> {
+  /**
+   * Drop every chunk for a path (a file deleted out from under the index). In agents
+   * mode pass the owning agent name so only that agent's rows are removed; omit
+   * (undefined) to delete across all agents (e.g. legacy-NULL orphan cleanup).
+   */
+  deleteMemoryChunksForPath(path: string, agent?: string | null): Promise<number> {
     return this.write((db) => {
-      return db.prepare(`delete from memory_chunks where path = ?`).run(path).changes;
+      return agent !== undefined
+        ? db.prepare(`delete from memory_chunks where path = ? and agent is ?`).run(path, agent)
+            .changes
+        : db.prepare(`delete from memory_chunks where path = ?`).run(path).changes;
     });
   }
 
@@ -5466,6 +5514,8 @@ export class Storage {
     room?: string;
     afterTs?: number;
     beforeTs?: number;
+    /** In agents mode: restrict results to this agent's chunks. Null/absent = no filter (legacy). */
+    agent?: string | null;
   }): LexicalHit[] {
     return this.read((db) => {
       const clauses: string[] = ["memory_chunks_fts match @match"];
@@ -5483,6 +5533,14 @@ export class Storage {
         // the `before` day is fully inclusive (review issue #12).
         clauses.push("c.entry_ts < @beforeTs");
         params.beforeTs = opts.beforeTs;
+      }
+      // In agents mode: filter to the calling session's agent so each agent only
+      // recalls its own memory corpus (spec §7.1). NULL-agent rows are excluded in
+      // agents mode (they are un-stamped legacy rows, safe-by-default). Legacy mode
+      // (agent is null/undefined): no filter, all rows visible as before.
+      if (opts.agent !== undefined && opts.agent !== null) {
+        clauses.push("c.agent = @agent");
+        params.agent = opts.agent;
       }
       const rows = db
         .prepare(
@@ -5507,7 +5565,13 @@ export class Storage {
    */
   getChunksByRowids(
     rowids: number[],
-    filters?: { room?: string; afterTs?: number; beforeTs?: number },
+    filters?: {
+      room?: string;
+      afterTs?: number;
+      beforeTs?: number;
+      /** In agents mode: restrict results to this agent's chunks. Null/absent = no filter. */
+      agent?: string | null;
+    },
   ): LexicalHit[] {
     if (rowids.length === 0) return [];
     return this.read((db) => {
@@ -5527,6 +5591,11 @@ export class Storage {
         clauses.push("entry_ts < ?");
         params.push(filters.beforeTs);
       }
+      // In agents mode: restrict to the calling agent's chunks (spec §7.1).
+      if (filters?.agent !== undefined && filters.agent !== null) {
+        clauses.push("agent = ?");
+        params.push(filters.agent);
+      }
       const rows = db
         .prepare(
           `select rowid, id, path, start_line as startLine, end_line as endLine, room,
@@ -5535,6 +5604,27 @@ export class Storage {
         )
         .all(...params) as LexicalHit[];
       return rows;
+    });
+  }
+
+  /**
+   * Return all distinct `timeline_key` values from `chat_index` whose key starts with
+   * one of the given account-prefix strings. Used by §7.2 to scope `rooms:"all"` to
+   * the accounts owned by the calling session's agent. Each prefix is
+   * `"<provider>:<accountKey>:"` (trailing colon). An empty prefix list returns [].
+   */
+  getDistinctTimelineKeysForAccountPrefixes(prefixes: string[]): string[] {
+    if (prefixes.length === 0) return [];
+    return this.read((db) => {
+      // One LIKE clause per prefix (SQLite does not support LIKE with an array).
+      // Prefix strings contain only alphanumerics and colons — no LIKE wildcards
+      // in the prefix itself — so appending '%' is safe and unambiguous.
+      const clauses = prefixes.map(() => "timeline_key like ? escape '\\'").join(" or ");
+      const params = prefixes.map((p) => `${p}%`);
+      const rows = db
+        .prepare(`select distinct timeline_key from chat_index where ${clauses}`)
+        .all(...params) as Array<{ timeline_key: string }>;
+      return rows.map((r) => r.timeline_key);
     });
   }
 
@@ -7774,7 +7864,11 @@ create table if not exists memory_chunks (
   -- stale vector to a different chunk (§9d). Orphaned vec rows are also pruned on
   -- delete, but the no-reuse guarantee makes a mismatch impossible regardless.
   rowid         integer primary key autoincrement,
-  id            text unique not null,
+  -- Owner agent (spec MULTI-AGENT-SUPPORT §7.1): NULL in legacy mode; stamped by
+  -- the reconciliation indexer in agents mode. Uniqueness is (agent, id) — not id
+  -- alone — so two agents with identical seeded files get two rows, one per owner.
+  agent         text,
+  id            text not null,
   path          text not null,
   ordinal       integer not null,
   source        text not null default 'memory',
@@ -7789,12 +7883,14 @@ create table if not exists memory_chunks (
   embed_status  text not null default 'pending'
                   check(embed_status in ('pending','processing','done','failed','skip')),
   embed_attempts integer not null default 0,
-  indexed_at    integer not null
+  indexed_at    integer not null,
+  unique(agent, id)
 );
 
 create index if not exists idx_chunks_embed on memory_chunks(embed_status)
   where embed_status in ('pending','processing');
 create index if not exists idx_chunks_path on memory_chunks(path);
+create index if not exists idx_chunks_agent on memory_chunks(agent);
 
 -- Lexical index: external-content FTS5 over memory_chunks (unicode61, English).
 create virtual table if not exists memory_chunks_fts using fts5(
@@ -8768,7 +8864,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 6;
+export const LATEST_SCHEMA_VERSION = 7;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -9044,6 +9140,74 @@ function addRoomMetadataServerColumns(db: Database.Database): void {
   }
 }
 
+/**
+ * v6→v7 (spec MULTI-AGENT-SUPPORT §7.1): add `agent` column to `memory_chunks`
+ * and change the uniqueness constraint from `UNIQUE(id)` to `UNIQUE(agent, id)`,
+ * allowing two agents to index the same chunk-id (identical seeded files) as two
+ * distinct rows, one per owner. Existing rows get `agent = NULL` (legacy /
+ * not-yet-stamped); the reconciliation indexer stamps them on the first agents-mode
+ * walk (stamp-in-place — no re-chunk, no re-embed, rowids preserved so the vector
+ * index stays valid). SQLite cannot drop an inline UNIQUE constraint, so this
+ * requires a full table rebuild: create new table, copy data with explicit rowids,
+ * drop the old table, rename, rebuild the FTS index, and recreate triggers.
+ */
+function addMemoryChunksAgentColumn(db: Database.Database): void {
+  db.exec(`
+    create table memory_chunks_new (
+      rowid          integer primary key autoincrement,
+      agent          text,
+      id             text not null,
+      path           text not null,
+      ordinal        integer not null,
+      source         text not null default 'memory',
+      start_line     integer not null,
+      end_line       integer not null,
+      room           text,
+      entry_ts       integer not null,
+      text           text not null,
+      token_count    integer not null,
+      content_hash   text not null,
+      model_id       text,
+      embed_status   text not null default 'pending'
+                       check(embed_status in ('pending','processing','done','failed','skip')),
+      embed_attempts integer not null default 0,
+      indexed_at     integer not null,
+      unique(agent, id)
+    );
+    insert into memory_chunks_new(
+      rowid, agent, id, path, ordinal, source, start_line, end_line, room, entry_ts,
+      text, token_count, content_hash, model_id, embed_status, embed_attempts, indexed_at
+    )
+    select rowid, null, id, path, ordinal, source, start_line, end_line, room, entry_ts,
+           text, token_count, content_hash, model_id, embed_status, embed_attempts, indexed_at
+    from memory_chunks;
+    drop trigger if exists memory_chunks_ai;
+    drop trigger if exists memory_chunks_ad;
+    drop trigger if exists memory_chunks_au;
+    drop table memory_chunks;
+    alter table memory_chunks_new rename to memory_chunks;
+    create index if not exists idx_chunks_embed on memory_chunks(embed_status)
+      where embed_status in ('pending','processing');
+    create index if not exists idx_chunks_path on memory_chunks(path);
+    create index if not exists idx_chunks_agent on memory_chunks(agent);
+    insert into memory_chunks_fts(memory_chunks_fts) values('rebuild');
+    create trigger memory_chunks_ai after insert on memory_chunks begin
+      insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+    end;
+    create trigger memory_chunks_ad after delete on memory_chunks begin
+      insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+        values ('delete', old.rowid, old.text, old.room);
+    end;
+    create trigger memory_chunks_au after update on memory_chunks
+      when new.text is not old.text or new.room is not old.room
+    begin
+      insert into memory_chunks_fts(memory_chunks_fts, rowid, text, room)
+        values ('delete', old.rowid, old.text, old.room);
+      insert into memory_chunks_fts(rowid, text, room) values (new.rowid, new.text, new.room);
+    end;
+  `);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -9055,6 +9219,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addUsageEventPartitions,
   addUserIdentityTables,
   addRoomMetadataServerColumns,
+  addMemoryChunksAgentColumn,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

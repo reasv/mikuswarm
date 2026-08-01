@@ -7,7 +7,7 @@ import {
   sanitizeSummaryFtsMatch,
   buildSnippet,
   buildSummarySnippet,
-  resolveRooms,
+  resolveRoomsForAgent,
   decodeCursor,
   encodeCursor,
   encodeSummaryCursor,
@@ -32,6 +32,13 @@ export interface SearchMessagesToolContext {
   absenceDefaults?: { gapThresholdMs: number; defaultLookbackMs: number };
   /** Injectable clock (tests); defaults to Date.now. */
   now?: () => number;
+  /**
+   * In agents mode: the `"<provider>:<accountKey>"` strings belonging to the calling
+   * session's agent (spec MULTI-AGENT-SUPPORT §7.2). When provided, `rooms:"all"`
+   * restricts results to timeline keys that belong to one of these accounts. Absent
+   * (or empty) = legacy mode: `rooms:"all"` spans the full chat history.
+   */
+  agentAccountPrefixes?: string[];
 }
 
 const ATTACHMENT_TYPES = ["image", "video", "audio", "file"] as const;
@@ -245,7 +252,12 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
     }),
     execute: async (_toolCallId, params) => {
       const args = params as SearchMessagesArgs;
-      const timelineKeys = resolveRooms(args.rooms, context.currentTimelineKey);
+      const timelineKeys = resolveRoomsForAgent(
+        args.rooms,
+        context.currentTimelineKey,
+        context.agentAccountPrefixes,
+        context.storage,
+      );
       if ((args.corpus ?? "messages") === "summaries") {
         return runSummaryCorpus(context, args, timelineKeys, now);
       }
