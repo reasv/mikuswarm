@@ -7,6 +7,7 @@ export {
   type AdmissionResult,
   type BlockingRule,
   type BudgetHooks,
+  type BudgetSeedFilter,
   type CheckResult,
   type LimitRule,
   type RuleSelector,

@@ -1031,6 +1031,7 @@ export class AgentSessionFactory {
               sessionType: session.sessionType,
               modelId: model.id,
               provider: model.provider ?? undefined,
+              timelineKey: session.timelineKey ?? undefined,
             };
             const result = engine.check(descriptor);
             if (!result.allowed) {

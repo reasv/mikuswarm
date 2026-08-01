@@ -1263,6 +1263,12 @@ const LimitRuleSchema = StrictObject({
   // Posted as a timeline reply when a human trigger is refused by this rule
   // (global-rule-typical). `{resets_at}` is templated. Omit to refuse silently.
   trigger_rejection_message: Type.Optional(Type.String()),
+  // Agent/account scope (spec MULTI-AGENT-SUPPORT §8): when set, the rule counts
+  // only events attributable to the named agent or account. Agents mode only —
+  // a startup error in legacy mode (same policy as `[accounts.*].agent`).
+  // Only one of `agent`/`account` may be set on a given rule.
+  agent: Type.Optional(Type.String({ minLength: 1 })),
+  account: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 // Per-user cost limits & model selection (spec PER-USER-LIMITS). A SEPARATE
@@ -1311,6 +1317,10 @@ const UserLimitRuleSchema = StrictObject({
   window: Type.Optional(LimitWindowSchema),
   // Templated refusal (§12); cascades INDEPENDENTLY of the model-budget block.
   trigger_rejection_message: Type.Optional(Type.String()),
+  // Agent/account scope (spec MULTI-AGENT-SUPPORT §8): same semantics as
+  // [[limits]].agent/account — counts only events from the named agent/account.
+  agent: Type.Optional(Type.String({ minLength: 1 })),
+  account: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 // Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). Per-consumer selection: the

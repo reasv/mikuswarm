@@ -1165,6 +1165,15 @@ export interface UsageCostFilter {
    * No caller sets both today; keep it that way.
    */
   requestedModelIds?: string[];
+  /**
+   * Agent/account-scoped rule seeding (spec MULTI-AGENT-SUPPORT §8): restrict to rows
+   * whose `timeline_key` starts with one of the given `provider:accountKey` prefixes
+   * (e.g. `["matrix:chen", "discord:bot"]`). Generates:
+   *   `(timeline_key LIKE 'matrix:chen:%' OR timeline_key LIKE 'discord:bot:%')`
+   * NULL `timeline_key` rows (embedding lane) return NULL for LIKE comparisons → excluded
+   * automatically. Rows for accounts not in config have non-matching keys → excluded.
+   */
+  timelineKeyPrefixes?: string[];
 }
 
 /**
@@ -1837,6 +1846,16 @@ export interface ChatTypeFilter {
   hasLink?: boolean;
   /** csv tokens from {image,video,audio,file}; OR-matched, and implies has_attachment=1. */
   attachmentTypes?: string[];
+}
+
+/**
+ * Escape all SQLite LIKE special characters (`\`, `%`, `_`) in `s` so the
+ * result is safe to use as a literal prefix in a `LIKE ? ESCAPE '\\'` clause.
+ * Must be paired with `ESCAPE '\\'` on the LIKE term; without it the backslash
+ * escapes are just literal backslashes and the wildcard meaning is unchanged.
+ */
+function escapeLikePattern(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 function chatTypeFilterClauses(filter: ChatTypeFilter | undefined, params: Record<string, unknown>): string[] {
@@ -3960,6 +3979,18 @@ export class Storage {
         params.push(...filter.requestedModelIds);
       }
     }
+    // Agent/account-scoped rule seeding (spec MULTI-AGENT-SUPPORT §8): generate a LIKE
+    // clause per prefix. NULL `timeline_key` rows return NULL for LIKE comparisons and
+    // are excluded automatically (embedding lane, never attributed to an agent).
+    // Spec §3 warns on out-of-class account keys but accepts them for back-compat, so
+    // account keys MAY legally contain `_` (a LIKE single-char wildcard) or `%`. We
+    // escape all three LIKE special chars (`\`, `%`, `_`) in every prefix to prevent
+    // injection across accounts whose keys differ only at those positions.
+    if (filter.timelineKeyPrefixes && filter.timelineKeyPrefixes.length > 0) {
+      const likeTerms = filter.timelineKeyPrefixes.map(() => "timeline_key LIKE ? ESCAPE '\\'").join(" OR ");
+      clauses.push(`(${likeTerms})`);
+      params.push(...filter.timelineKeyPrefixes.map((p) => `${escapeLikePattern(p)}:%`));
+    }
     return { clauses, params };
   }
 
@@ -5617,10 +5648,10 @@ export class Storage {
     if (prefixes.length === 0) return [];
     return this.read((db) => {
       // One LIKE clause per prefix (SQLite does not support LIKE with an array).
-      // Prefix strings contain only alphanumerics and colons — no LIKE wildcards
-      // in the prefix itself — so appending '%' is safe and unambiguous.
+      // Escape LIKE special chars in each prefix (spec §3 accepts out-of-class keys
+      // like underscores for back-compat, so the prefix may contain `_` wildcards).
       const clauses = prefixes.map(() => "timeline_key like ? escape '\\'").join(" or ");
-      const params = prefixes.map((p) => `${p}%`);
+      const params = prefixes.map((p) => `${escapeLikePattern(p)}%`);
       const rows = db
         .prepare(`select distinct timeline_key from chat_index where ${clauses}`)
         .all(...params) as Array<{ timeline_key: string }>;

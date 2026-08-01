@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, makeAgentLoopChainClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
 import type { UsageEventInput } from "../src/storage/database.js";
 import { normalizeLimits, type RawLimitRule } from "../src/budget/normalize.js";
+import { normalizeUserLimits, type RawUserLimitRule } from "../src/budget/normalize-user-limits.js";
+import { UserLimitEngine, type NormalizedUserLimitRule, type UserLimitContext } from "../src/budget/user-limits.js";
 import { parseDuration, resolveWindow, isValidTimeZone } from "../src/budget/window.js";
 import { collectZeroCostModelIds, collectKnownModelIds } from "../src/budget/zero-cost.js";
 
@@ -1105,4 +1107,506 @@ test("#19b a [[limits]] selector naming a virtual/fallback-member logical id doe
     !res.warnings.some((w) => /unknown model/.test(w)),
     "neither a virtual model nor a fallback member earns an unknown-model warning",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5a — agent/account matcher on [[limits]] (spec MULTI-AGENT-SUPPORT §8)
+// ---------------------------------------------------------------------------
+
+const agentsNormOpts = {
+  ...normOpts,
+  isAgentsMode: true,
+  agentAccountPrefixes: new Map([
+    ["alice", ["matrix:alice-main"]],
+    ["bob", ["matrix:bob", "discord:bob"]],
+  ]),
+  knownAccountPrefixes: new Set(["matrix:alice-main", "matrix:bob", "discord:bob"]),
+};
+
+test("§8 normalizeLimits: agent matcher resolves to timelineKeyPrefixes", () => {
+  const res = normalizeLimits(
+    [{ name: "alice-only", max_usd: 10, window: { type: "rolling", duration: "24h" }, agent: "alice" }],
+    agentsNormOpts,
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.deepEqual(res.rules[0].selector.timelineKeyPrefixes, ["matrix:alice-main"]);
+});
+
+test("§8 normalizeLimits: account matcher resolves to single prefix", () => {
+  const res = normalizeLimits(
+    [{ name: "discord-bob", max_usd: 5, window: { type: "rolling", duration: "24h" }, account: "discord:bob" }],
+    agentsNormOpts,
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.deepEqual(res.rules[0].selector.timelineKeyPrefixes, ["discord:bob"]);
+});
+
+test("§8 normalizeLimits: both agent + account on same rule = fatal", () => {
+  const res = normalizeLimits(
+    [{ name: "x", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "alice", account: "matrix:alice-main" }],
+    agentsNormOpts,
+  );
+  assert.ok(res.fatal.some((f) => /cannot set both/.test(f)));
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeLimits: undeclared agent name = fatal", () => {
+  const res = normalizeLimits(
+    [{ name: "bad", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "charlie" }],
+    agentsNormOpts,
+  );
+  assert.ok(res.fatal.some((f) => /agent "charlie"/.test(f)));
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeLimits: unknown account = fatal when knownAccountPrefixes supplied", () => {
+  const res = normalizeLimits(
+    [{ name: "bad", max_usd: 5, window: { type: "rolling", duration: "24h" }, account: "matrix:ghost" }],
+    agentsNormOpts,
+  );
+  assert.ok(res.fatal.some((f) => /not a configured account/.test(f)));
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeLimits: account without colon = fatal", () => {
+  const res = normalizeLimits(
+    [{ name: "bad", max_usd: 5, window: { type: "rolling", duration: "24h" }, account: "nocolon" }],
+    { ...agentsNormOpts, knownAccountPrefixes: undefined },
+  );
+  assert.ok(res.fatal.some((f) => /provider:key/.test(f)));
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeLimits: agent/account matcher in legacy mode = fatal", () => {
+  const legacyOpts = { ...normOpts }; // no isAgentsMode, no agentAccountPrefixes
+  const res = normalizeLimits(
+    [{ name: "agent-rule", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "alice" }],
+    legacyOpts,
+  );
+  assert.ok(res.fatal.some((f) => /legacy mode/.test(f)));
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeLimits: global rule without agent/account is unchanged", () => {
+  const res = normalizeLimits(
+    [{ name: "global", max_usd: 100, window: { type: "rolling", duration: "24h" } }],
+    agentsNormOpts,
+  );
+  assert.equal(res.fatal.length, 0);
+  assert.equal(res.rules[0].selector.timelineKeyPrefixes, undefined);
+});
+
+// BudgetEngine agent-scoped matching (§8)
+
+function engineWithScoped(rules: LimitRule[]) {
+  return new BudgetEngine({
+    rules,
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+}
+
+test("§8 selectorMatches: scoped rule only matches events from its agent's timeline_key", () => {
+  const rules: LimitRule[] = [
+    {
+      name: "alice-cap",
+      maxUsd: 5,
+      window: dayWindow,
+      selector: { timelineKeyPrefixes: ["matrix:alice"] },
+    },
+    { name: "global", maxUsd: 50, window: dayWindow, selector: {} },
+  ];
+  const engine = engineWithScoped(rules);
+
+  // Record from alice's timeline_key — alice-cap increments, global increments.
+  engine.record({
+    class: "agent_loop",
+    modelId: "m1",
+    costUsd: 5,
+    timelineKey: "matrix:alice:timeline:!room:server",
+  });
+  // Alice's cap is now at limit (5 ≥ 5); global still has headroom.
+  // Check with alice's timelineKey: both rules match.
+  const aliceCheck = engine.check({
+    class: "agent_loop",
+    modelId: "m1",
+    timelineKey: "matrix:alice:timeline:!room:server",
+  });
+  assert.equal(aliceCheck.allowed, false, "alice-cap blocks alice's session");
+  assert.ok(aliceCheck.blockingRules.some((r) => r.name === "alice-cap"));
+
+  // Check with bob's timelineKey: alice-cap does NOT match (different prefix).
+  const bobCheck = engine.check({
+    class: "agent_loop",
+    modelId: "m1",
+    timelineKey: "matrix:bob:timeline:!room:server",
+  });
+  assert.equal(bobCheck.allowed, true, "alice-cap does not block bob's sessions");
+});
+
+test("§8 selectorMatches: scoped rule does NOT match when descriptor has no timelineKey", () => {
+  // Worker-pool claim gates have no per-session context — scoped rules must not fire.
+  const rules: LimitRule[] = [
+    { name: "scoped", maxUsd: 0, window: dayWindow, selector: { timelineKeyPrefixes: ["matrix:alice"] } },
+  ];
+  const engine = engineWithScoped(rules);
+  // No timelineKey → scoped rule does not match → allowed.
+  const r = engine.check({ class: "agent_loop", modelId: "m1" });
+  assert.equal(r.allowed, true, "scoped rule with no descriptor timelineKey = no match");
+});
+
+test("§8 NULL timeline_key (embedding lane) never matches a scoped rule", () => {
+  const rules: LimitRule[] = [
+    { name: "scoped", maxUsd: 5, window: dayWindow, selector: { timelineKeyPrefixes: ["matrix:alice"] } },
+    { name: "global", maxUsd: 50, window: dayWindow, selector: {} },
+  ];
+  const engine = engineWithScoped(rules);
+  // Embedding events have timelineKey: undefined (the class is "embedding").
+  // Record an embedding event (no timelineKey = NULL lane).
+  engine.record({ class: "embedding", modelId: "m1", costUsd: 10 });
+  // The global rule accumulated 10, scoped rule still at 0 (embedding lane excluded).
+  // A check with alice's timelineKey: alice-cap still has headroom (0 < 5).
+  const r = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:alice:t:!x:hs" });
+  // global is at 10 < 50 headroom; alice-cap at 0 < 5. Both allowed.
+  assert.equal(r.allowed, true, "embedding spend does not count against alice-cap");
+});
+
+test("§8 scoped rule: account removed from config — rows still not counted for scoped rule", () => {
+  // If "matrix:ghost" was an account but is no longer in config, its rows have a
+  // non-matching timeline_key for any scoped rule prefix. Only global rules count them.
+  const rules: LimitRule[] = [
+    { name: "alice-cap", maxUsd: 5, window: dayWindow, selector: { timelineKeyPrefixes: ["matrix:alice"] } },
+    { name: "global", maxUsd: 100, window: dayWindow, selector: {} },
+  ];
+  const engine = engineWithScoped(rules);
+  // Simulate spend from a now-removed account (matrix:ghost).
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5, timelineKey: "matrix:ghost:t:!x:hs" });
+  // global absorbed it (100 cap, 5 spent → headroom). alice-cap did NOT absorb it.
+  const aliceCheck = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:alice:t:!x:hs" });
+  assert.equal(aliceCheck.allowed, true, "removed-account spend skipped by scoped rule");
+  const globalCheck = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:ghost:t:!x:hs" });
+  assert.equal(globalCheck.allowed, true, "global has headroom; ghost spend counted globally");
+});
+
+test("§8 checkAdmissionChain: scoped cap blocks only matching agent", () => {
+  const rules: LimitRule[] = [
+    { name: "alice-cap", maxUsd: 0, window: dayWindow, selector: { timelineKeyPrefixes: ["matrix:alice"] } },
+    { name: "global", maxUsd: 100, window: dayWindow, selector: {} },
+  ];
+  const engine = engineWithScoped(rules);
+  // cap 0 → always blocks alice, but only when alice's timelineKey is present.
+  const aliceAdm = engine.checkAdmissionChain("default", "m1", [], "matrix:alice:t:!x:hs");
+  assert.equal(aliceAdm.allowed, false, "alice blocked by alice-cap");
+  assert.ok(aliceAdm.ownBlocking.some((r) => r.name === "alice-cap"));
+
+  const bobAdm = engine.checkAdmissionChain("default", "m1", [], "matrix:bob:t:!x:hs");
+  assert.equal(bobAdm.allowed, true, "bob unaffected by alice-cap");
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5a — agent/account matcher on [[user_limits]] (spec §8)
+// ---------------------------------------------------------------------------
+
+const userLimitsNormOpts = {
+  defaultTz: "UTC",
+  knownModelIds: new Set(["default"]),
+  isAgentsMode: true,
+  agentAccountPrefixes: new Map([
+    ["alice", ["matrix:alice"]],
+    ["bob", ["matrix:bob"]],
+  ]),
+  knownAccountPrefixes: new Set(["matrix:alice", "matrix:bob"]),
+};
+
+test("§8 normalizeUserLimits: agent matcher resolves to timelineKeyPrefixes on rule", () => {
+  const raw: RawUserLimitRule[] = [
+    {
+      user: "@someone:hs",
+      max_usd: 1,
+      window: { type: "rolling", duration: "24h" },
+      agent: "alice",
+    },
+  ];
+  const res = normalizeUserLimits(raw, userLimitsNormOpts);
+  assert.equal(res.fatal.length, 0);
+  assert.deepEqual(res.rules[0].timelineKeyPrefixes, ["matrix:alice"]);
+});
+
+test("§8 normalizeUserLimits: agent/account in legacy mode = fatal", () => {
+  const raw: RawUserLimitRule[] = [
+    { user: "@u:hs", max_usd: 1, window: { type: "rolling", duration: "24h" }, agent: "alice" },
+  ];
+  const res = normalizeUserLimits(raw, {
+    defaultTz: "UTC",
+    knownModelIds: new Set(["default"]),
+  });
+  assert.ok(res.fatal.some((f) => /legacy mode/.test(f)));
+});
+
+test("§8 normalizeUserLimits: undeclared agent = fatal", () => {
+  const raw: RawUserLimitRule[] = [
+    { user: "@u:hs", max_usd: 1, window: { type: "rolling", duration: "24h" }, agent: "charlie" },
+  ];
+  const res = normalizeUserLimits(raw, userLimitsNormOpts);
+  assert.ok(res.fatal.some((f) => /agent "charlie"/.test(f)));
+});
+
+// UserLimitEngine agent scoping: resolve() respects timelineKey for scoped rules
+
+function userEngineWith(rules: NormalizedUserLimitRule[]) {
+  return new UserLimitEngine({
+    rules,
+    sumUsageCost: () => 0,
+    costRatesFor: () => ({ inputPerMTok: 1, outputPerMTok: 1 }),
+    maxTokensFor: () => 1000,
+    zeroCostModelIds: new Set(),
+    viableMinOutputTokens: 1,
+    isUserIdentity: (id) => id.startsWith("@"),
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+}
+
+test("§8 UserLimitEngine.resolve: scoped rule only matches when timelineKey is from that agent", () => {
+  const rules = normalizeUserLimits(
+    [
+      {
+        user: "@alice:hs",
+        max_usd: 5,
+        window: { type: "rolling", duration: "24h" },
+        agent: "alice",
+      },
+    ],
+    userLimitsNormOpts,
+  ).rules;
+  const engine = userEngineWith(rules);
+  const ctx: UserLimitContext = { userId: "@alice:hs" };
+
+  // With alice's timelineKey → rule matches.
+  const aliceRes = engine.resolve(ctx, "matrix:alice:t:!x:hs");
+  assert.equal(aliceRes.matched, true);
+  assert.equal(aliceRes.active, true);
+
+  // With bob's timelineKey → alice-scoped rule is skipped → not matched.
+  const bobRes = engine.resolve(ctx, "matrix:bob:t:!x:hs");
+  assert.equal(bobRes.matched, false);
+});
+
+test("§8 UserLimitEngine.resolve: without timelineKey, scoped rules are still included (seeding path)", () => {
+  const rules = normalizeUserLimits(
+    [
+      {
+        user: "@alice:hs",
+        max_usd: 5,
+        window: { type: "rolling", duration: "24h" },
+        agent: "alice",
+      },
+    ],
+    userLimitsNormOpts,
+  ).rules;
+  const engine = userEngineWith(rules);
+  const ctx: UserLimitContext = { userId: "@alice:hs" };
+
+  // No timelineKey (seeding path) — scoped rule is included.
+  const res = engine.resolve(ctx);
+  assert.equal(res.matched, true);
+  assert.equal(res.active, true);
+  // The constraint carries the timelineKeyPrefixes from the rule.
+  assert.deepEqual(res.constraints[0].timelineKeyPrefixes, ["matrix:alice"]);
+});
+
+test("§8 UserLimitEngine: scoped constraint has distinct meterKey from equivalent global constraint", () => {
+  // The meterKey must include timelineKeyPrefixes so a scoped rule (e.g. agent="alice")
+  // and an equivalent global rule produce DIFFERENT meter identities — they count
+  // different subsets of events and must not share a counter.
+  const aliceRules = normalizeUserLimits(
+    [{ user: "@alice:hs", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "alice" }],
+    userLimitsNormOpts,
+  ).rules;
+  const globalRules = normalizeUserLimits(
+    [{ user: "@alice:hs", max_usd: 5, window: { type: "rolling", duration: "24h" } }],
+    userLimitsNormOpts,
+  ).rules;
+  assert.equal(aliceRules.length, 1);
+  assert.equal(globalRules.length, 1);
+
+  const ctx: UserLimitContext = { userId: "@alice:hs" };
+  // Resolve both (each engine only has one rule → cascade picks that rule).
+  const aliceEngine = userEngineWith(aliceRules);
+  const globalEngine = userEngineWith(globalRules);
+
+  // Without timelineKey (seeding path), both rules resolve for this user.
+  const aliceRes = aliceEngine.resolve(ctx);
+  const globalRes = globalEngine.resolve(ctx);
+  assert.equal(aliceRes.constraints.length, 1, "alice-scoped rule yields one constraint");
+  assert.equal(globalRes.constraints.length, 1, "global rule yields one constraint");
+
+  // The meterKeys must differ because timelineKeyPrefixes is different.
+  assert.notEqual(
+    aliceRes.constraints[0].meterKey,
+    globalRes.constraints[0].meterKey,
+    "scoped and global constraints must have distinct meterKeys",
+  );
+
+  // The scoped constraint carries the agent's account prefixes.
+  assert.deepEqual(aliceRes.constraints[0].timelineKeyPrefixes, ["matrix:alice"]);
+  // The global constraint has no timelineKeyPrefixes.
+  assert.equal(globalRes.constraints[0].timelineKeyPrefixes, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Fix 1: isModelAvailable must skip scoped rules (no timelineKey context)
+// ---------------------------------------------------------------------------
+
+test("§8 isModelAvailable: scoped rule at cap does NOT block model process-wide", () => {
+  // A scoped rule (alice's cap) is exhausted. isModelAvailable has no timelineKey
+  // context, so it must skip scoped rules and report the model as available.
+  const rules: LimitRule[] = [
+    {
+      name: "alice-cap",
+      maxUsd: 5,
+      window: dayWindow,
+      selector: { timelineKeyPrefixes: ["matrix:alice"] },
+    },
+  ];
+  const engine = engineWithScoped(rules);
+  // Push alice's scoped rule over cap.
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5, timelineKey: "matrix:alice:t:!x:hs" });
+  // isModelAvailable must still be true — scoped rules have no timelineKey context here.
+  assert.equal(engine.isModelAvailable("m1"), true, "scoped rule at cap must not block isModelAvailable");
+  // But check() with alice's timelineKey still blocks.
+  const aliceCheck = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:alice:t:!x:hs" });
+  assert.equal(aliceCheck.allowed, false, "check() with alice's timelineKey is still blocked");
+  assert.ok(aliceCheck.blockingRules.some((r) => r.name === "alice-cap"));
+  // Bob's check is unaffected.
+  const bobCheck = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:bob:t:!x:hs" });
+  assert.equal(bobCheck.allowed, true, "bob's check is unaffected by alice-cap");
+});
+
+test("§8 isModelAvailable: global rule at cap still blocks model", () => {
+  // A global rule (no timelineKeyPrefixes) at cap must still make isModelAvailable false.
+  const rules: LimitRule[] = [
+    { name: "global", maxUsd: 5, window: dayWindow, selector: {} },
+  ];
+  const engine = engineWithScoped(rules);
+  engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5 });
+  assert.equal(engine.isModelAvailable("m1"), false, "global cap must still block isModelAvailable");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3: ruleStatuses components must scope to timelineKeyPrefixes
+// ---------------------------------------------------------------------------
+
+test("§8 ruleStatuses: components for a scoped multi-model rule use scoped sumUsageCost", () => {
+  // A scoped 2-model rule: the per-model component query must include
+  // timelineKeyPrefixes so the breakdown shows only that agent's spend, not
+  // all agents' combined spend on that model.
+  const calls: Array<{ models?: string[]; timelineKeyPrefixes?: string[] }> = [];
+  const rule: LimitRule = {
+    name: "alice-two-model",
+    maxUsd: 10,
+    window: dayWindow,
+    selector: { models: ["m1", "m2"], timelineKeyPrefixes: ["matrix:alice"] },
+  };
+  const engine = new BudgetEngine({
+    rules: [rule],
+    sumUsageCost: (f) => {
+      calls.push({ models: f.models, timelineKeyPrefixes: f.timelineKeyPrefixes });
+      return 0;
+    },
+    zeroCostModelIds: new Set(),
+    dependencies: {},
+    resolveModelId: () => "m1",
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+  engine.ruleStatuses();
+  // The components breakdown calls sumUsageCost once per model in the selector.
+  const componentCalls = calls.filter((c) => c.models?.length === 1);
+  assert.equal(componentCalls.length, 2, "one component call per model");
+  for (const c of componentCalls) {
+    assert.deepEqual(
+      c.timelineKeyPrefixes,
+      ["matrix:alice"],
+      "component call must carry the rule's timelineKeyPrefixes",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fix 4: distinguishing undeclared vs declared-but-no-accounts validation messages
+// ---------------------------------------------------------------------------
+
+test("§8 normalizeLimits: declared agent with no accounts = fatal (distinct message)", () => {
+  // An agent in the map but with an empty accounts list is different from
+  // an agent that's not in the map at all — the error should reflect this.
+  const opts = {
+    ...agentsNormOpts,
+    agentAccountPrefixes: new Map([
+      ["alice", ["matrix:alice-main"]],
+      ["empty-agent", [] as string[]], // declared but no accounts
+    ]),
+  };
+  const res = normalizeLimits(
+    [{ name: "x", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "empty-agent" }],
+    opts,
+  );
+  assert.ok(res.fatal.length > 0, "should produce a fatal");
+  assert.ok(
+    res.fatal.some((f) => /declared but has no configured accounts/.test(f)),
+    `expected 'declared but has no configured accounts', got: ${res.fatal.join("; ")}`,
+  );
+  // Must NOT say "not a declared [agents.*] block" since the agent IS declared.
+  assert.ok(
+    !res.fatal.some((f) => /not a declared/.test(f)),
+    "must not produce the undeclared-block message for a declared-but-empty agent",
+  );
+  assert.equal(res.rules.length, 0);
+});
+
+test("§8 normalizeUserLimits: declared agent with no accounts = fatal (distinct message)", () => {
+  const opts = {
+    ...userLimitsNormOpts,
+    agentAccountPrefixes: new Map([
+      ["alice", ["matrix:alice"]],
+      ["empty-agent", [] as string[]],
+    ]),
+  };
+  const res = normalizeUserLimits(
+    [{ user: "@x:hs", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "empty-agent" }],
+    opts,
+  );
+  assert.ok(res.fatal.length > 0, "should produce a fatal");
+  assert.ok(
+    res.fatal.some((f) => /declared but has no configured accounts/.test(f)),
+    `expected 'declared but has no configured accounts', got: ${res.fatal.join("; ")}`,
+  );
+  assert.ok(
+    !res.fatal.some((f) => /not a declared/.test(f)),
+    "must not produce the undeclared-block message for a declared-but-empty agent",
+  );
+  assert.equal(res.rules.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5: normalizeUserLimits — no double fatal when agent+account both set
+// ---------------------------------------------------------------------------
+
+test("§8 normalizeUserLimits: both agent+account set and agent unmapped = exactly one fatal", () => {
+  // Before the fix: when both agent+account are set AND isAgentsMode=true AND the
+  // agent is not in agentAccountPrefixes, two fatals would accumulate:
+  // "cannot set both" AND "not a declared [agents.*] block".
+  // After the fix: only one fatal (the "cannot set both" one).
+  const res = normalizeUserLimits(
+    [{ user: "@alice:hs", max_usd: 5, window: { type: "rolling", duration: "24h" }, agent: "ghost", account: "matrix:alice" }],
+    userLimitsNormOpts,
+  );
+  // Exactly one fatal, the canonical "cannot set both" one.
+  assert.equal(res.fatal.length, 1, `expected exactly 1 fatal, got ${res.fatal.length}: ${res.fatal.join("; ")}`);
+  assert.ok(res.fatal[0].includes("cannot set both"), `expected 'cannot set both', got: ${res.fatal[0]}`);
+  assert.equal(res.rules.length, 0);
 });

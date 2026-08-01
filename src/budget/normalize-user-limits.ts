@@ -38,6 +38,9 @@ export interface RawUserLimitRule {
   max_usd?: number;
   window?: RawWindow;
   trigger_rejection_message?: string;
+  /** Agent/account scope (spec MULTI-AGENT-SUPPORT §8). */
+  agent?: string;
+  account?: string;
 }
 
 export interface NormalizeUserLimitsResult {
@@ -118,10 +121,23 @@ function hasUnbalancedBrace(template: string): boolean {
  * `enabledProviders` (optional): when supplied, a warning is emitted when a rule
  * uses a partition variable that no enabled provider can supply at runtime (§6.4).
  * The only such variable today is `{homeserver}`, which is Matrix-only.
+ *
+ * Agent/account scope options (spec MULTI-AGENT-SUPPORT §8): same semantics as
+ * `normalizeLimits` — see that function for field documentation.
  */
 export function normalizeUserLimits(
   raw: RawUserLimitRule[] | undefined,
-  opts: { defaultTz: string; knownModelIds: Set<string>; enabledProviders?: string[] },
+  opts: {
+    defaultTz: string;
+    knownModelIds: Set<string>;
+    enabledProviders?: string[];
+    /** True when the `[agents]` table is present (agents mode). */
+    isAgentsMode?: boolean;
+    /** agentName → ["provider:accountKey", …] — resolves `agent` matchers. */
+    agentAccountPrefixes?: Map<string, string[]>;
+    /** All configured account prefixes ("provider:accountKey") — validates `account` matchers. */
+    knownAccountPrefixes?: Set<string>;
+  },
 ): NormalizeUserLimitsResult {
   const rules: NormalizedUserLimitRule[] = [];
   const fatal: string[] = [];
@@ -298,6 +314,41 @@ export function normalizeUserLimits(
       warnings.push(`${label}: rule has no budget block and no trigger_rejection_message (no effect)`);
     }
 
+    // ── Agent/account scope (spec MULTI-AGENT-SUPPORT §8) ────────────────────
+    // Single if-else-if chain: at most ONE branch fires per entry, mirroring
+    // normalizeLimits' single-fatal behavior and preventing the double-fatal where
+    // both `agent`+`account` set AND agent-not-found would push two fatals.
+    let timelineKeyPrefixes: string[] | undefined;
+    if (entry.agent !== undefined && entry.account !== undefined) {
+      fatal.push(`${label}: cannot set both agent and account on the same rule`);
+    } else if ((entry.agent !== undefined || entry.account !== undefined) && !opts.isAgentsMode) {
+      fatal.push(
+        `${label}: agent/account matcher requires agents mode ([agents] table) — not valid in legacy mode`,
+      );
+    } else if (entry.agent !== undefined) {
+      // opts.isAgentsMode is implicitly true here (both-set and !isAgentsMode handled above).
+      const prefixes = opts.agentAccountPrefixes?.get(entry.agent);
+      if (prefixes === undefined) {
+        fatal.push(`${label}: agent "${entry.agent}" is not a declared [agents.*] block`);
+      } else if (prefixes.length === 0) {
+        fatal.push(
+          `${label}: agent "${entry.agent}" is declared but has no configured accounts` +
+            ` — cannot scope a limit rule to it`,
+        );
+      } else {
+        timelineKeyPrefixes = prefixes;
+      }
+    } else if (entry.account !== undefined) {
+      // opts.isAgentsMode is implicitly true here.
+      if (!entry.account.includes(":")) {
+        fatal.push(`${label}: account "${entry.account}" must be in "provider:key" format`);
+      } else if (opts.knownAccountPrefixes && !opts.knownAccountPrefixes.has(entry.account)) {
+        fatal.push(`${label}: account "${entry.account}" is not a configured account`);
+      } else {
+        timelineKeyPrefixes = [entry.account];
+      }
+    }
+
     // Only push the rule if it introduced no fatals (a fatal rule is dropped from
     // the live set; startup fails fast on `fatal` anyway).
     if (fatal.length === fatalsBefore) {
@@ -310,6 +361,7 @@ export function normalizeUserLimits(
         models,
         constraints,
         messageTemplate: entry.trigger_rejection_message,
+        timelineKeyPrefixes,
       });
     }
   });

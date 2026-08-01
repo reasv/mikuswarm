@@ -1076,6 +1076,80 @@ test("searchAgentSessionsByTimeline: status/type filters still AND with an inter
 });
 
 // --- Issue #10: logical_model_id empty-string footgun ---
+// ---------------------------------------------------------------------------
+// Fix 2: LIKE wildcard escaping — account key with `_` must not cross-match
+// (spec MULTI-AGENT-SUPPORT §8, database.ts usageCostClauses + getDistinctTimelineKeysForAccountPrefixes)
+// ---------------------------------------------------------------------------
+
+test("sumUsageCost timelineKeyPrefixes: account key with underscore does not cross-match other accounts", async () => {
+  // An account key with `_` (a LIKE single-char wildcard) must not cross-match
+  // keys that differ at that position. Without escaping, prefix "matrix:a_ice"
+  // would match both "matrix:a_ice:t:!r:hs" (exact) and "matrix:alice:t:!r:hs"
+  // (the underscore matches 'l').
+  await withStorage(async (storage) => {
+    // Row attributed to "matrix:a_ice" (account with underscore in key).
+    await storage.insertUsageEvent({
+      class: "agent_loop",
+      modelId: "m1",
+      costUsd: 1,
+      timelineKey: "matrix:a_ice:t:!room:hs",
+    });
+    // Row attributed to "matrix:alice" (different account, 'l' where underscore was).
+    await storage.insertUsageEvent({
+      class: "agent_loop",
+      modelId: "m1",
+      costUsd: 10,
+      timelineKey: "matrix:alice:t:!room:hs",
+    });
+    await storage.waitForIdle();
+
+    // Querying for "matrix:a_ice" must find only its own $1 row, not alice's $10.
+    const cost = storage.sumUsageCost({ since: 0, timelineKeyPrefixes: ["matrix:a_ice"] });
+    assert.equal(cost, 1, "underscore in account key must not match 'l' in alice's key");
+
+    // Querying for "matrix:alice" must find only its own $10 row.
+    const aliceCost = storage.sumUsageCost({ since: 0, timelineKeyPrefixes: ["matrix:alice"] });
+    assert.equal(aliceCost, 10, "alice's scoped sum must not be cross-contaminated");
+  });
+});
+
+test("getDistinctTimelineKeysForAccountPrefixes: underscore in prefix does not cross-match", async () => {
+  // Same escaping requirement for the Phase 2 search-filter function.
+  await withStorage(async (storage) => {
+    // Seed backing timeline_events rows (FK requirement for chat_index) then minimal
+    // chat_index rows for two accounts: one with underscore, one without.
+    // getDistinctTimelineKeysForAccountPrefixes queries chat_index, not usage_events.
+    await storage.readAndWrite((db) => {
+      // Minimal timeline_events rows to satisfy the FK.
+      const evtStmt = db.prepare(
+        `insert into timeline_events
+           (id, timeline_key, provider, role, sender_id, body, timestamp,
+            received_at, event_json, enrichment_status, created_at, updated_at)
+         values (?, ?, 'matrix', 'user', '@bot:hs', '', ?, ?, '{}', 'complete', ?, ?)`,
+      );
+      evtStmt.run("e1", "matrix:a_ice:t:!room:hs", 1000, 1000, 1000, 1000);
+      evtStmt.run("e2", "matrix:alice:t:!room:hs", 2000, 2000, 2000, 2000);
+      // Minimal chat_index rows with all required non-null columns.
+      const idxStmt = db.prepare(
+        `insert into chat_index
+           (event_id, timeline_key, sender_id, role, timestamp, content_sig, indexed_at)
+         values (?, ?, '@bot:hs', 'user', ?, ?, ?)`,
+      );
+      idxStmt.run("e1", "matrix:a_ice:t:!room:hs", 1000, "sig1", 1000);
+      idxStmt.run("e2", "matrix:alice:t:!room:hs", 2000, "sig2", 2000);
+    });
+
+    // Querying for "matrix:a_ice:" prefix (with trailing colon) must return only
+    // the a_ice key, not alice's.
+    const keys = storage.getDistinctTimelineKeysForAccountPrefixes(["matrix:a_ice:"]);
+    assert.deepEqual(keys, ["matrix:a_ice:t:!room:hs"], "underscore must not match 'l' in alice's key");
+
+    // Querying for "matrix:alice:" must return only alice's key.
+    const aliceKeys = storage.getDistinctTimelineKeysForAccountPrefixes(["matrix:alice:"]);
+    assert.deepEqual(aliceKeys, ["matrix:alice:t:!room:hs"], "alice prefix must not match a_ice");
+  });
+});
+
 // `insertUsageEvent` must use `||` (not `??`) so an explicit empty-string
 // logicalModelId falls back to the upstream modelId. A stored `''` would
 // mis-scope budget (§8e) and mis-group the ledger/console (§7).
