@@ -7225,6 +7225,11 @@ export class Storage {
    * Persist the frozen context snapshot for a session (spec §3). Written ONCE,
    * when the build completes at session creation: the snapshot prefix, its
    * on-disk dump path, and the snapshot token estimate.
+   *
+   * The large snapshotJson is stored in agent_session_payloads (not
+   * agent_sessions) so list queries never read the blob. context_dump_path and
+   * token_estimate stay in agent_sessions (they are small and read by the detail
+   * path's single-row fetch).
    */
   saveAgentSessionSnapshot(
     id: string,
@@ -7239,7 +7244,6 @@ export class Storage {
       const result = db
         .prepare(
           `update agent_sessions set
-            context_snapshot_json = @snapshotJson,
             context_dump_path = @dumpPath,
             token_estimate = @tokenEstimate,
             updated_at = @updatedAt
@@ -7247,19 +7251,29 @@ export class Storage {
         )
         .run({
           id,
-          snapshotJson: snapshot.snapshotJson,
           dumpPath: snapshot.dumpPath ?? null,
           tokenEstimate: snapshot.tokenEstimate ?? null,
           updatedAt: snapshot.updatedAt ?? Date.now(),
         });
       this.warnIfNoSessionRow("saveAgentSessionSnapshot", id, result.changes);
+      if (result.changes > 0) {
+        // Upsert the snapshot blob; ON CONFLICT UPDATE touches only
+        // context_snapshot_json so an already-written transcript_json survives.
+        db.prepare(
+          `insert into agent_session_payloads (session_id, context_snapshot_json, transcript_json)
+           values (@id, @snapshotJson, null)
+           on conflict(session_id) do update set context_snapshot_json = excluded.context_snapshot_json`,
+        ).run({ id, snapshotJson: snapshot.snapshotJson });
+      }
     });
   }
 
   /**
    * Flush the session transcript (spec §3). Cheap, repeated at each turn
-   * boundary — it touches ONLY `transcript_json` + `updated_at` and never
-   * re-serializes the large immutable snapshot columns.
+   * boundary. Touches ONLY `transcript_json` (in agent_session_payloads) and
+   * `updated_at` (in agent_sessions); never re-serializes the large immutable
+   * snapshot. The ON CONFLICT UPDATE touches only transcript_json so an
+   * already-written context_snapshot_json survives intact.
    */
   saveAgentSessionTranscript(
     id: string,
@@ -7267,17 +7281,18 @@ export class Storage {
     updatedAt?: number,
   ): Promise<void> {
     return this.write((db) => {
+      const now = updatedAt ?? Date.now();
       const result = db
-        .prepare(
-          `update agent_sessions set transcript_json = @transcriptJson, updated_at = @updatedAt
-           where id = @id`,
-        )
-        .run({
-          id,
-          transcriptJson,
-          updatedAt: updatedAt ?? Date.now(),
-        });
+        .prepare(`update agent_sessions set updated_at = @updatedAt where id = @id`)
+        .run({ id, updatedAt: now });
       this.warnIfNoSessionRow("saveAgentSessionTranscript", id, result.changes);
+      if (result.changes > 0) {
+        db.prepare(
+          `insert into agent_session_payloads (session_id, context_snapshot_json, transcript_json)
+           values (@id, null, @transcriptJson)
+           on conflict(session_id) do update set transcript_json = excluded.transcript_json`,
+        ).run({ id, transcriptJson });
+      }
     });
   }
 
@@ -7361,9 +7376,14 @@ export class Storage {
   /** Read a single session record by id (spec §4), or undefined if absent. */
   getAgentSession(id: string): AgentSessionRow | undefined {
     return this.read((db) =>
-      db.prepare(`select * from agent_sessions where id = ?`).get(id) as
-        | AgentSessionRow
-        | undefined,
+      db
+        .prepare(
+          `select s.*, p.context_snapshot_json, p.transcript_json
+           from agent_sessions s
+           left join agent_session_payloads p on p.session_id = s.id
+           where s.id = ?`,
+        )
+        .get(id) as AgentSessionRow | undefined,
     );
   }
 
@@ -7388,24 +7408,32 @@ export class Storage {
   /**
    * Sessions for a room, reverse-chron by creation (spec §8,
    * `GET /api/rooms/:key/sessions`). Matches the room key AND its thread
-   * sub-timelines (`<roomKey>:thread:%`), so the room subsumes its threads exactly
-   * as `listConsoleRooms` aggregates them — a session that landed on a thread
-   * timeline stays reachable from its room. Read-only.
+   * sub-timelines (`<roomKey>:thread:<root>`), so the room subsumes its threads
+   * exactly as `listConsoleRooms` aggregates them — a session that landed on a
+   * thread timeline stays reachable from its room. Read-only.
+   *
+   * Uses a UNION ALL of two separate index range probes on
+   * idx_agent_sessions_timeline rather than an OR+LIKE, which forces a full
+   * table scan through all overflow-page blob chains. The thread arm uses a
+   * lexicographic range [key:thread:, key:thread;) — the semicolon (ASCII 59)
+   * is immediately above the colon (58), so every `key:thread:<id>` falls in
+   * this range. No LIKE metacharacter escaping is needed for range comparisons.
    */
   getAgentSessionsByTimeline(timelineKey: string, limit = 100): AgentSessionMetaRow[] {
+    const threadFrom = `${timelineKey}:thread:`;
+    const threadTo = `${timelineKey}:thread;`;
     return this.read((db) =>
       db
         .prepare(
           `select ${AGENT_SESSION_META_COLUMNS} from agent_sessions
-           where timeline_key = @key or timeline_key like @threadPrefix escape '\\'
+           where timeline_key = @key
+           union all
+           select ${AGENT_SESSION_META_COLUMNS} from agent_sessions
+           where timeline_key >= @threadFrom and timeline_key < @threadTo
            order by created_at desc
            limit @limit`,
         )
-        .all({
-          key: timelineKey,
-          threadPrefix: threadKeyLikePattern(timelineKey),
-          limit,
-        }) as AgentSessionMetaRow[],
+        .all({ key: timelineKey, threadFrom, threadTo, limit }) as AgentSessionMetaRow[],
     );
   }
 
@@ -7433,14 +7461,29 @@ export class Storage {
     } = {},
   ): AgentSessionMetaRow[] {
     const limit = opts.limit ?? 100;
+    const threadFrom = `${timelineKey}:thread:`;
+    const threadTo = `${timelineKey}:thread;`;
     return this.read((db) => {
-      // Room + its thread sub-timelines, matching `getAgentSessionsByTimeline`.
+      // Room + its thread sub-timelines — two index-range probes via a rowid
+      // IN subquery instead of an OR+LIKE, which prevents the planner from
+      // using idx_agent_sessions_timeline and causes a full table scan through
+      // all blob overflow-page chains. The subquery materialises only rowids (8
+      // bytes each) so its cost is proportional to the matching rows, not the
+      // table size. The FTS and interjection filters below then probe by s.rowid
+      // against the actual agent_sessions table (not the CTE), so the
+      // FTS external-content index's rowid mapping stays correct.
       const where: string[] = [
-        "(s.timeline_key = @timelineKey or s.timeline_key like @threadPrefix escape '\\')",
+        `s.rowid in (
+           select rowid from agent_sessions where timeline_key = @timelineKey
+           union all
+           select rowid from agent_sessions
+             where timeline_key >= @threadFrom and timeline_key < @threadTo
+         )`,
       ];
       const params: Record<string, unknown> = {
         timelineKey,
-        threadPrefix: threadKeyLikePattern(timelineKey),
+        threadFrom,
+        threadTo,
         limit,
       };
       if (opts.triggerMatch) {
@@ -7486,20 +7529,25 @@ export class Storage {
    * ARCHITECTURE.md §11). Backs the type-filter options — statuses are a fixed enum
    * the UI knows, but session types are open-ended, so the filter offers exactly the
    * types that actually occur in this room. Ordered for a stable menu. Read-only.
+   *
+   * Uses a UNION ALL of two index-range probes (same pattern as
+   * getAgentSessionsByTimeline) to avoid a full table scan.
    */
   getAgentSessionTimelineFacets(timelineKey: string): { types: string[] } {
+    const threadFrom = `${timelineKey}:thread:`;
+    const threadTo = `${timelineKey}:thread;`;
     return this.read((db) => {
-      // Room + its thread sub-timelines, matching the sessions drill-down so the
-      // type menu offers exactly the types the listed sessions can have.
       const rows = db
         .prepare(
-          `select distinct session_type from agent_sessions
-           where timeline_key = @key or timeline_key like @threadPrefix escape '\\'
+          `select distinct session_type from (
+             select session_type from agent_sessions where timeline_key = @key
+             union all
+             select session_type from agent_sessions
+               where timeline_key >= @threadFrom and timeline_key < @threadTo
+           )
            order by session_type`,
         )
-        .all({ key: timelineKey, threadPrefix: threadKeyLikePattern(timelineKey) }) as Array<{
-        session_type: string;
-      }>;
+        .all({ key: timelineKey, threadFrom, threadTo }) as Array<{ session_type: string }>;
       return { types: rows.map((r) => r.session_type) };
     });
   }
@@ -8224,30 +8272,80 @@ export class Storage {
     if (userIds.length === 0) return new Map();
     return this.read((db) => {
       const result = new Map<string, { displayName: string | null; username: string | null }>();
-      const identityStmt = db.prepare(
-        `select username, display_name from user_identities
-          where user_id = ?
-          order by updated_at desc
-          limit 1`,
-      );
-      const sessionNameStmt = db.prepare(
-        `select trigger_sender_display_name as name
-           from agent_sessions
-          where trigger_sender_id = ? and trigger_sender_display_name is not null
-          order by coalesce(completed_at, updated_at) desc
-          limit 1`,
-      );
+      // Seed every requested id with nulls so the map always has an entry per id.
       for (const userId of userIds) {
-        const identity = identityStmt.get(userId) as
-          | { username: string; display_name: string | null }
-          | undefined;
-        let displayName = identity?.display_name ?? null;
-        if (displayName === null) {
-          const row = sessionNameStmt.get(userId) as { name: string } | undefined;
-          displayName = row?.name ?? null;
-        }
-        result.set(userId, { displayName, username: identity?.username ?? null });
+        result.set(userId, { displayName: null, username: null });
       }
+
+      // Batch user_identities lookup (one query, not N per-user statements).
+      // The id spaces cannot collide (MXIDs start with '@', snowflakes are
+      // numeric), so matching by user_id alone without the provider column is
+      // safe and intentional. `order by updated_at desc` puts the most-recent
+      // row first; the loop below takes the first hit per user_id.
+      const idPlaceholders = userIds.map(() => "?").join(", ");
+      const identityRows = db
+        .prepare(
+          `select user_id, username, display_name from user_identities
+            where user_id in (${idPlaceholders})
+            order by updated_at desc`,
+        )
+        .all(...userIds) as Array<{
+        user_id: string;
+        username: string;
+        display_name: string | null;
+      }>;
+
+      const identityMap = new Map<string, { username: string; display_name: string | null }>();
+      for (const row of identityRows) {
+        if (!identityMap.has(row.user_id)) {
+          identityMap.set(row.user_id, { username: row.username, display_name: row.display_name });
+        }
+      }
+
+      // Apply identity results; collect users that still need a display name.
+      const needFallback: string[] = [];
+      for (const userId of userIds) {
+        const identity = identityMap.get(userId);
+        if (identity) {
+          result.set(userId, { displayName: identity.display_name, username: identity.username });
+          if (identity.display_name === null) needFallback.push(userId);
+        } else {
+          needFallback.push(userId);
+        }
+      }
+
+      // Batch fallback: most-recent non-null display name per user from
+      // agent_sessions. Uses idx_agent_sessions_sender_recent (partial index on
+      // trigger_sender_id, coalesce(completed_at, updated_at) desc, where
+      // trigger_sender_display_name is not null) — one index seek per user.
+      // Window function picks the first (most-recent) row per sender in one pass.
+      if (needFallback.length > 0) {
+        const fbPlaceholders = needFallback.map(() => "?").join(", ");
+        const fallbackRows = db
+          .prepare(
+            `select trigger_sender_id as userId, trigger_sender_display_name as name
+             from (
+               select trigger_sender_id, trigger_sender_display_name,
+                      row_number() over (
+                        partition by trigger_sender_id
+                        order by coalesce(completed_at, updated_at) desc
+                      ) as rn
+               from agent_sessions
+               where trigger_sender_id in (${fbPlaceholders})
+                 and trigger_sender_display_name is not null
+             )
+             where rn = 1`,
+          )
+          .all(...needFallback) as Array<{ userId: string; name: string }>;
+
+        for (const row of fallbackRows) {
+          const existing = result.get(row.userId);
+          if (existing) {
+            result.set(row.userId, { ...existing, displayName: row.name });
+          }
+        }
+      }
+
       return result;
     });
   }
@@ -9320,12 +9418,11 @@ create table if not exists pending_edits (
   primary key (provider, target_external_id, timeline_key)
 );
 
--- Durable session record (spec §3-§5): the frozen context prefix (snapshot,
--- written once at session creation) plus the appended transcript (rewritten
--- atomically at each turn boundary). Together context_snapshot_json ++
--- transcript_json reconstruct the exact sequence the model saw. The persisted
--- record outlives SessionManager's in-memory eviction; the console reads it
--- from here. See the status model in spec section 4.
+-- Durable session record (spec §3-§5): metadata and lifecycle columns. The
+-- heavyweight frozen context prefix and appended transcript live in the
+-- companion agent_session_payloads table (keyed by session id) so that
+-- list/query paths never touch the large blobs; only the single-session detail
+-- path joins against them. See the status model in spec section 4.
 create table if not exists agent_sessions (
   id text primary key,
   timeline_key text not null,
@@ -9339,9 +9436,7 @@ create table if not exists agent_sessions (
   trigger_body text,
   trigger_sender_id text,
   trigger_sender_display_name text,
-  context_snapshot_json text,
   context_dump_path text,
-  transcript_json text,
   token_estimate integer,
   -- Actuals (spec TOKEN-USAGE-TRACKING §4.2): denormalized session-level
   -- aggregate of provider-reported usage. All nullable so legacy rows read as
@@ -9382,6 +9477,31 @@ create index if not exists idx_agent_sessions_timeline
 create index if not exists idx_agent_sessions_status
   on agent_sessions(status, updated_at desc);
 
+-- Expression index for ORDER BY coalesce(completed_at, updated_at) DESC: used
+-- by getUsageRecentSessions (LIMIT walk, no full scan) and getUserLabels
+-- fallback. The expression must match the query's ORDER BY verbatim.
+create index if not exists idx_agent_sessions_recent
+  on agent_sessions(coalesce(completed_at, updated_at) desc);
+
+-- Partial index for getUserLabels per-sender fallback: covers only rows that
+-- carry a non-null display name so the index is small. The leading column is
+-- trigger_sender_id (equality probe per user), secondary key puts the most
+-- recent row first so a LIMIT 1 reads exactly one entry per user.
+create index if not exists idx_agent_sessions_sender_recent
+  on agent_sessions(trigger_sender_id, coalesce(completed_at, updated_at) desc)
+  where trigger_sender_display_name is not null;
+
+-- Blob side-table: holds only the heavyweight frozen context snapshot and the
+-- appended transcript, keyed by session_id (1:1 with agent_sessions). Written
+-- lazily (null until the session saves each payload). Cascades on delete.
+-- Keeping the blobs out of agent_sessions ensures every query that does not
+-- need them avoids traversing overflow-page chains for those columns.
+create table if not exists agent_session_payloads (
+  session_id text primary key references agent_sessions(id) on delete cascade,
+  context_snapshot_json text,
+  transcript_json text
+);
+
 ${AGENT_SESSIONS_FTS_SCHEMA}
 ${SESSION_INTERJECTIONS_SCHEMA}
 
@@ -9409,7 +9529,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 10;
+export const LATEST_SCHEMA_VERSION = 11;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -9838,6 +9958,87 @@ function addMediaAssetsContentHash(db: Database.Database): void {
   }
 }
 
+/**
+ * v10 → v11: split heavyweight blob columns out of agent_sessions.
+ *
+ * `context_snapshot_json` and `transcript_json` were stored inline in
+ * agent_sessions, causing every query that reads ANY later column (metadata,
+ * usage, timestamps) to traverse SQLite overflow-page chains for those blobs
+ * (~950 MB + ~90 MB on large deployments). Console list/search queries ran
+ * 1.5-2.3 s each and were polled every 5-8 s, saturating the event loop.
+ *
+ * Fix: move the blobs to agent_session_payloads (session_id PK + FK, cascades
+ * on delete) so all scan/filter/sort paths never read them. Add three indexes:
+ *   - idx_agent_sessions_recent: expression index on
+ *     coalesce(completed_at, updated_at) DESC for getUsageRecentSessions LIMIT
+ *     walk and getUserLabels ORDER BY.
+ *   - idx_agent_sessions_sender_recent: partial index on
+ *     (trigger_sender_id, coalesce(completed_at, updated_at) DESC) WHERE
+ *     trigger_sender_display_name IS NOT NULL for the getUserLabels fallback.
+ *
+ * The three timeline queries (getAgentSessionsByTimeline,
+ * searchAgentSessionsByTimeline, getAgentSessionTimelineFacets) are also fixed
+ * in this version by replacing OR+LIKE with UNION ALL index-range probes.
+ *
+ * Migration runtime: one INSERT..SELECT (copies blobs), then two DROP COLUMN
+ * statements. SQLite 3.35.0+ required for DROP COLUMN (runtime is 3.53.1).
+ * On a production-scale table with ~6,500 rows and ~1 GB of blob data the
+ * INSERT..SELECT reads every blob page once; expect 10-60 s depending on I/O.
+ * The three new indexes are built in the same transaction.
+ */
+function splitSessionPayloads(db: Database.Database): void {
+  // Check first: if agent_sessions was already created without the blob columns
+  // (a fresh v11 DB), skip the copy/drop steps entirely — they would fail with
+  // "no such column" on the SELECT, and there is nothing to migrate.
+  const sessionCols = (db.pragma("table_info(agent_sessions)") as Array<{ name: string }>)
+    .map((r) => r.name);
+  const hasSnapshotCol = sessionCols.includes("context_snapshot_json");
+  const hasTranscriptCol = sessionCols.includes("transcript_json");
+
+  // 1. Create the side table (idempotent — `if not exists`; it is also in SCHEMA
+  //    for fresh DBs, so it may already exist when this step runs on an
+  //    existing-then-downgraded test database).
+  db.exec(`
+    create table if not exists agent_session_payloads (
+      session_id text primary key references agent_sessions(id) on delete cascade,
+      context_snapshot_json text,
+      transcript_json text
+    )
+  `);
+
+  // 2. Copy blobs from agent_sessions to the side table; only run when the
+  //    source columns actually exist (they are absent on fresh v11 DBs).
+  if (hasSnapshotCol || hasTranscriptCol) {
+    db.exec(`
+      insert or ignore into agent_session_payloads
+        (session_id, context_snapshot_json, transcript_json)
+      select id, context_snapshot_json, transcript_json
+        from agent_sessions
+       where context_snapshot_json is not null
+          or transcript_json is not null
+    `);
+
+    // 3. Drop the two blob columns. SQLite 3.35.0+ required; production runtime
+    //    is 3.53.1. Each DROP COLUMN is O(schema rewrite), not a table copy.
+    if (hasSnapshotCol) {
+      db.exec("alter table agent_sessions drop column context_snapshot_json");
+    }
+    if (hasTranscriptCol) {
+      db.exec("alter table agent_sessions drop column transcript_json");
+    }
+  }
+
+  // 4. Add the new indexes (idempotent via `if not exists`).
+  db.exec(`
+    create index if not exists idx_agent_sessions_recent
+      on agent_sessions(coalesce(completed_at, updated_at) desc);
+
+    create index if not exists idx_agent_sessions_sender_recent
+      on agent_sessions(trigger_sender_id, coalesce(completed_at, updated_at) desc)
+      where trigger_sender_display_name is not null;
+  `);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -9853,6 +10054,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addSenderBotColumns,
   addSummaryMirroredFrom,
   addMediaAssetsContentHash,
+  splitSessionPayloads,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

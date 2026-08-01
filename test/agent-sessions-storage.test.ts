@@ -270,8 +270,8 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
   });
 });
 
-test("LATEST_SCHEMA_VERSION is 10", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 10);
+test("LATEST_SCHEMA_VERSION is 11", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 11);
 });
 
 // --- Issue #16: the memory_chunks FTS triggers round-trip insert→MATCH→delete→MATCH ---
@@ -510,7 +510,7 @@ test("resetStaleSessions strictly advances updated_at on healed rows", async () 
   });
 });
 
-test("both agent_sessions indexes exist on a fresh DB", async () => {
+test("all agent_sessions indexes exist on a fresh DB", async () => {
   await withStorage(async (storage) => {
     const names = storage.read((db) =>
       (
@@ -522,14 +522,14 @@ test("both agent_sessions indexes exist on a fresh DB", async () => {
           .all() as Array<{ name: string }>
       ).map((r) => r.name),
     );
-    assert.ok(
-      names.includes("idx_agent_sessions_timeline"),
-      `missing idx_agent_sessions_timeline; have: ${names.join(", ")}`,
-    );
-    assert.ok(
-      names.includes("idx_agent_sessions_status"),
-      `missing idx_agent_sessions_status; have: ${names.join(", ")}`,
-    );
+    for (const expected of [
+      "idx_agent_sessions_timeline",
+      "idx_agent_sessions_status",
+      "idx_agent_sessions_recent",
+      "idx_agent_sessions_sender_recent",
+    ]) {
+      assert.ok(names.includes(expected), `missing ${expected}; have: ${names.join(", ")}`);
+    }
   });
 });
 
