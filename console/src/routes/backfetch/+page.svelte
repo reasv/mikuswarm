@@ -15,6 +15,8 @@
 	import { cn } from '$lib/utils';
 	import RoomPicker from '$lib/components/RoomPicker.svelte';
 	import { roomsQuery } from '$lib/query/rooms';
+	import { agentsQuery } from '$lib/query/agents';
+	import { buildAgentLookup, agentFor, agentAccent } from '$lib/agents';
 
 	// Message-only history backfetch (ARCHITECTURE.md §7d): operator-triggered jobs
 	// that page a room's history BELOW its context floor into the SEARCH-ONLY region
@@ -38,6 +40,18 @@
 		new Map((rooms.data?.rooms ?? []).map((r) => [r.timelineKey, r.displayName]))
 	);
 	const roomNameOf = (key: string): string | null => roomNames.get(key) ?? null;
+
+	// ── Agent tag (spec CONSOLE-MULTI-AGENT §4) ──────────────────────────────────
+	// Under the global gate, append an agent chip after the existing roomId (accountId)
+	// primary. Account stays primary since backfetch operates on the account credential.
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
 
 	const STATUS_CLASSES: Record<string, string> = {
 		queued: 'text-sky-500',
@@ -238,6 +252,20 @@
 							<td class="py-1 pr-3 font-mono text-[11px]" title={job.timelineKey}>
 								{job.roomId}
 								<span class="text-muted-foreground">({job.accountId})</span>
+								{#if globalGate}
+									<!-- Agent tag appended after the account credential (§4). -->
+									{@const entry = agentFor(job.timelineKey, agentLookup)}
+									{#if entry}
+										{@const accent = agentAccent(entry.agentIndex)}
+										<span class="ml-1 inline-flex items-baseline gap-0.5 text-[9px]">
+											<span class="relative top-px inline-block size-1.5 rounded-full" style="background:{accent}"></span>
+											<span style="color:{accent}">{entry.agentName}</span>
+										</span>
+									{:else}
+										<!-- Unresolvable: muted indicator (§4.3). -->
+										<span class="ml-1 text-[9px] text-muted-foreground/50">?</span>
+									{/if}
+								{/if}
 							</td>
 							<td class="py-1 pr-3">{targetLabel(job.targetKind, job.targetValue)}</td>
 							<td class={cn('py-1 pr-3 font-medium', STATUS_CLASSES[job.status] ?? '')}>

@@ -2,6 +2,7 @@
 	import { useQueryClient } from '@tanstack/svelte-query';
 	import { toast } from 'svelte-sonner';
 	import { pipelineItemsQuery, pipelinesQuery } from '$lib/query/pipelines';
+	import { agentsQuery } from '$lib/query/agents';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { pipelinesHref } from '$lib/nav';
 	import { retryFailedPipelineItems } from '$lib/api/admin.remote';
@@ -12,6 +13,8 @@
 	import { Button } from '$lib/components/ui/button';
 	import { relativeTime } from '$lib/utils';
 	import { cn } from '$lib/utils';
+	import { buildAgentLookup, agentFor, distinctAgents, agentAccent, needsAccountId } from '$lib/agents';
+	import { timelineAccount } from '$lib/timeline-key';
 
 	// Status filter chips per pool. `pending`/`retrying` are backed by the same
 	// pseudo-filter the dashboard buckets use; `deferred` (captioning) is a derived
@@ -47,6 +50,21 @@
 	const pipelines = pipelinesQuery();
 	const failedCount = $derived(
 		pipelines.data?.pipelines.find((p) => p.pool === pipelineSelection.pool)?.counts.failed ?? 0
+	);
+
+	// ── Agent chip (spec CONSOLE-MULTI-AGENT §4 / §3) ────────────────────────────
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
+	// Per-table gate: show chip only when the loaded items span >1 agent.
+	const rowsSpanAgents = $derived(
+		globalGate &&
+			distinctAgents(allItems.map((i) => i.room), agentLookup) > 1
 	);
 
 	let bulkBusy = $state(false);
@@ -130,7 +148,7 @@
 		{:else}
 			<!-- URL-driven selection (ARCHITECTURE.md §11): an item link carries the current
 			     pool + status/room filter so it is deep-linkable / new-tab-able. The inline
-			     RetryButton is a sibling (not nested in the link). -->
+			     RetryButton is a sibling (not nested in the row button). -->
 			<ul data-sveltekit-noscroll data-sveltekit-keepfocus>
 				{#each allItems as item (item.id)}
 					<li class="relative">
@@ -168,6 +186,31 @@
 								<span class="truncate text-[11px] text-red-600 dark:text-red-400" title={item.error}>
 									⚠ {item.error}
 								</span>
+							{/if}
+							{#if rowsSpanAgents && item.room}
+								<!-- Agent chip on rows when items span >1 agent (spec §4). -->
+								{@const entry = agentFor(item.room, agentLookup)}
+								{@const rowAcc = timelineAccount(item.room)}
+								{#if entry && rowAcc}
+									{@const accent = agentAccent(entry.agentIndex)}
+									{@const fullAgent = agentsData?.agents.find((a) => a.name === entry.agentName)}
+									{@const showAccId = fullAgent ? needsAccountId(fullAgent, rowAcc.provider) : false}
+									<span
+										class="inline-flex items-baseline gap-0.5 self-start text-[9px]"
+										title={`${entry.agentName} · ${rowAcc.provider.toUpperCase()}${showAccId ? ' · ' + rowAcc.accountId : ''} · ${item.room}`}
+									>
+										<span class="relative top-px inline-block size-1.5 rounded-full" style="background:{accent}"></span>
+										<span style="color:{accent}">
+											{entry.agentName}
+											<span class="uppercase tracking-wide">{rowAcc.provider}</span>{#if showAccId}&nbsp;{rowAcc.accountId}{/if}
+										</span>
+									</span>
+								{:else if rowAcc}
+									<!-- Unresolvable: raw account tag, muted (§4.3). -->
+									<span class="self-start text-[9px] text-muted-foreground/50">
+										{rowAcc.accountId} <span class="uppercase tracking-wide">{rowAcc.provider}</span>
+									</span>
+								{/if}
 							{/if}
 						</a>
 						<!-- Inline retry on failed rows (a sibling, not nested in the row button). -->

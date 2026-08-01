@@ -22,7 +22,8 @@ import {
 	PipelinesResponse,
 	PipelineItemsResponse,
 	PipelineItemDetail,
-	CostOverview
+	CostOverview,
+	AgentsResponse
 } from '$lib/schemas';
 
 /**
@@ -36,6 +37,7 @@ const room = encodeURIComponent(DEMO_FEATURED_ROOM);
 type Case = { path: string; query?: Record<string, string>; schema: Schema.Schema<unknown, unknown> };
 
 const cases: Case[] = [
+	{ path: '/api/agents', schema: AgentsResponse as never },
 	{ path: '/api/usage/sessions', schema: UsageSessions as never },
 	{ path: '/api/usage/tool-calls', schema: UsageToolCalls as never },
 	{ path: '/api/usage/budgets', schema: UsageBudgets as never },

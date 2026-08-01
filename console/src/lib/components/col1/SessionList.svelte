@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { roomSessionsQuery, roomSessionFacetsQuery } from '$lib/query/rooms';
 	import { selection } from '$lib/stores/selection.svelte';
 	import { sessionFilters } from '$lib/stores/sessionFilters.svelte';
@@ -59,7 +60,7 @@
 				{#each sessions.data.sessions as session (session.id)}
 					<li>
 						<a
-							href={conversationsHref({ room: selection.roomKey, session: session.id })}
+							href={conversationsHref({ agent: page.url.searchParams.get('agent'), room: selection.roomKey, session: session.id })}
 							aria-current={selection.sessionId === session.id ? 'true' : undefined}
 							class={cn(
 								'flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-accent',

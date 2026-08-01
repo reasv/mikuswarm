@@ -8,6 +8,9 @@
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { pipelineSelection } from '$lib/stores/pipeline-selection.svelte';
 	import { pipelineSummary } from '$lib/stores/pipeline-summary.svelte';
+	import { agentsQuery } from '$lib/query/agents';
+	import { buildAgentLookup, agentFor, agentAccent, needsAccountId } from '$lib/agents';
+	import { timelineAccount } from '$lib/timeline-key';
 	import { cn } from '$lib/utils';
 
 	// Active area from the URL so deep-links + back/forward reflect the right view.
@@ -23,6 +26,41 @@
 						: page.url.pathname.startsWith('/usage-cost')
 							? 'usage-cost'
 							: 'conversations'
+	);
+
+	// ── Agent chip in the conversations breadcrumb (spec CONSOLE-MULTI-AGENT §4) ──
+	// Under the global gate, prefix an accent-colored agent chip before the raw
+	// timeline key so the operator can read "which agent / which provider / which room"
+	// at a glance. Raw key stays; chip is presentation only.
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
+	// Resolve agent for the currently-selected room key.
+	const roomEntry = $derived(
+		globalGate && selection.roomKey ? agentFor(selection.roomKey, agentLookup) : undefined
+	);
+	// Provider from the room's timeline key (for the row-level grammar §3.2).
+	const roomProvider = $derived(
+		selection.roomKey ? (timelineAccount(selection.roomKey)?.provider ?? null) : null
+	);
+	const roomAccentColor = $derived(roomEntry ? agentAccent(roomEntry.agentIndex) : undefined);
+	const fullRoomAgent = $derived(
+		roomEntry && agentsData
+			? (agentsData.agents.find((a) => a.name === roomEntry.agentName) ?? null)
+			: null
+	);
+	const roomAccountId = $derived(
+		selection.roomKey ? (timelineAccount(selection.roomKey)?.accountId ?? null) : null
+	);
+	const showRoomAccId = $derived(
+		fullRoomAgent != null && roomProvider != null
+			? needsAccountId(fullRoomAgent, roomProvider)
+			: false
 	);
 </script>
 
@@ -120,6 +158,21 @@
 	{:else if area === 'conversations'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			{#if selection.roomKey}
+				{#if globalGate && roomEntry && roomProvider}
+					<!-- Agent chip prefix: accent dot + name + provider [+ accountId if needed] (§3.2 row-level grammar).
+					     Raw timeline key follows unchanged (§3.3 — the key never disappears). -->
+					<span class="inline-flex shrink-0 items-baseline gap-0.5 text-[10px]">
+						<span
+							class="relative top-px inline-block size-1.5 shrink-0 rounded-full"
+							style="background:{roomAccentColor}"
+						></span>
+						<span style="color:{roomAccentColor}">
+							{roomEntry.agentName}
+							<span class="uppercase tracking-wide">{roomProvider}</span>{#if showRoomAccId && roomAccountId}&nbsp;{roomAccountId}{/if}
+						</span>
+					</span>
+					<span>·</span>
+				{/if}
 				<span class="max-w-[20rem] truncate text-foreground">{selection.roomKey}</span>
 			{:else}
 				<span>no room</span>

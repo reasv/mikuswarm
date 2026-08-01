@@ -25,6 +25,18 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Console: agent-aware labeling**: deployments with more than one configured
+  agent gain agent-primary labels across every console surface — room-list tabs
+  become per-agent ("All" plus one tab per agent, labeled `name PROVIDER` or
+  `name MULTI`) with a `?agent=` deep-link URL param, channel cells and pipeline
+  items show an `agent PROVIDER` chip instead of the raw account tag (with an
+  `accountId` disambiguator only when the agent has more than one account on that
+  provider), the top bar and session detail carry agent context, and budget rule
+  scope cards label agent-scoped limits by agent name with a deterministic accent
+  color. Legacy and single-agent deployments render identically to before. Backed
+  by a new `GET /api/agents` read-only endpoint that serves the config-declared
+  agents snapshot from memory.
+
 - **Console: per-account room tabs**: when the room list spans more than one
   chat account (e.g. a Matrix account and a Discord account), the Conversations
   room list gains a sub-tab row — "All" plus one tab per account, each tagged

@@ -7,8 +7,11 @@ import type { PipelineId } from '$lib/schemas';
  * stores (`selection.svelte.ts`, `pipeline-selection.svelte.ts`) READ these params;
  * these helpers BUILD the hrefs the list/detail components navigate with.
  *
- * Conversations (`/`):   ?room=<timelineKey>&session=<sessionId>
+ * Conversations (`/`):   ?agent=<name>&room=<timelineKey>&session=<sessionId>
  * Pipelines (`/pipelines`): ?pool=<pool>&status=<chip>&room=<roomFilter>&item=<itemId>
+ *
+ * `agent` (spec CONSOLE-MULTI-AGENT §3.5): the selected room-list agent tab; absent
+ * or unknown → "All". Carried in the URL so filtered views are deep-linkable.
  */
 
 /** Build `path` plus a querystring, dropping null/empty params (stable key order). */
@@ -19,8 +22,12 @@ function href(path: string, params: Record<string, string | null | undefined>): 
 	return qs ? `${path}?${qs}` : path;
 }
 
-export function conversationsHref(opts: { room?: string | null; session?: string | null }): string {
-	return href('/', { room: opts.room, session: opts.session });
+export function conversationsHref(opts: {
+	agent?: string | null;
+	room?: string | null;
+	session?: string | null;
+}): string {
+	return href('/', { agent: opts.agent, room: opts.room, session: opts.session });
 }
 
 export function pipelinesHref(opts: {

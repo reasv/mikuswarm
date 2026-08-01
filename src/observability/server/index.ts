@@ -4,6 +4,7 @@ import { isAuthorized } from "./auth.js";
 import { Router } from "./router.js";
 import { sendError } from "./responses.js";
 import {
+  agentsSnapshot,
   listRooms,
   roomContext,
   roomSessions,
@@ -84,6 +85,7 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
   const log = deps.logger;
 
   const router = new Router()
+    .add("GET", "/api/agents", agentsSnapshot)
     .add("GET", "/api/rooms", listRooms)
     .add("GET", "/api/rooms/:key/context", roomContext)
     .add("GET", "/api/rooms/:key/sessions", roomSessions)

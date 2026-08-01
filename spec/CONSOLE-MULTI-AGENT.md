@@ -1,9 +1,6 @@
 # Console Multi-Agent Adaptation — Design
 
-**Status**: PROPOSED. Adapts every console surface to the agents model
-introduced by MULTI-AGENT-SUPPORT (ARCHITECTURE.md §4c). Target
-ARCHITECTURE.md home once implemented: §11 "Observability console" +
-"Console frontend" sections, plus a short note in §4c.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §11 "Observability console (in-process read API + SSE)" and "Console frontend (SvelteKit BFF, `console/`)", plus the §4c note; retained for review.
 
 **Settled operator decisions** (2026-08-01): labeling is **agent-primary,
 account-secondary** (§3) — where the UI today shows account tags it shows
@@ -67,9 +64,13 @@ GET /api/agents
 - `mode` is `"agents"` or `"legacy"`. In legacy mode `agents` is `[]` and
   the console suppresses all agent chrome — it must not synthesize a
   pseudo-agent from the implicit legacy identity.
-- **Ordering is config declaration order** for both agents and their
-  accounts. It is stable across requests and drives deterministic accent
-  color assignment (§3.4).
+- **Ordering**: agents are in config declaration order. Accounts within
+  each agent are listed matrix accounts then discord accounts, each in
+  config declaration order; strict cross-provider interleaved ordering is
+  not recoverable from the parsed config, and nothing consuming the payload
+  is order-sensitive within an agent. *(Implementation amendment,
+  2026-08-01.)* The ordering is stable across requests and drives
+  deterministic accent color assignment (§3.4).
 - **Minimal scope (settled)**: no workspace roots, sandbox modes, browser
   profiles, or limit config on this payload. It exists solely so the
   client can label rows; ops-level per-agent detail is deferred (§8).
