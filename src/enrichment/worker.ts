@@ -26,7 +26,22 @@ export interface EnrichmentWorkerOptions {
   storage: Storage;
   capabilities: EnrichmentCapabilities;
   fetchClient: FetchClient;
-  workspaceRoot: string;
+  /**
+   * Resolved workspace root for this event's owning agent. `null` means the
+   * account is no longer in config (§4.3 unresolvable): all workspace writes
+   * (attachment downloads, preview-media saves, linked-media downloads) are
+   * skipped with a warning already emitted by the pool; pure-DB operations
+   * (link-preview metadata rows, reply-context text) still proceed.
+   */
+  workspaceRoot: string | null;
+  /**
+   * Account-scoped subdirectory inside `msg-attach/` (spec MULTI-AGENT-SUPPORT
+   * §7.4). In agents mode this is `"<provider>.<accountKey>"` so downloads land
+   * in `<agentRoot>/msg-attach/<provider>.<accountKey>/filename`. Absent in
+   * legacy mode — files go in the flat `msg-attach/` dir, byte-identical to
+   * pre-Phase-3 behaviour.
+   */
+  attachSubdir?: string;
   maxPreviewsPerMessage: number;
   downloadSizeLimit?: number;
   /**
@@ -72,12 +87,20 @@ export class EnrichmentWorker {
       replyContext: null,
     };
 
+    // Workspace availability gate (spec MULTI-AGENT-SUPPORT §4.3): when the
+    // account is unresolvable (workspace is null), all file downloads are
+    // skipped. Pure-DB operations (link-preview metadata, reply-context text)
+    // still proceed so the event is fully enriched on the indexable side.
+    const hasWorkspace = this.options.workspaceRoot !== null;
+
     // Download gate: each attachment decides its own path based on what the
     // attachment carries (remoteUrl → FetchClient.downloadUrl; neither +
     // roomId → Matrix RPC; neither → skip). No longer gated on roomId at
     // this level — Discord events with remoteUrl attachments can download
     // even when the timeline key doesn't carry a classic room/channel id.
-    const downloadPromise = this.downloadAttachments(event, roomId ?? null, result);
+    const downloadPromise = hasWorkspace
+      ? this.downloadAttachments(event, roomId ?? null, result)
+      : Promise.resolve();
     const replyPromise = roomId
       ? this.resolveReplyContext(event, roomId, result)
       : Promise.resolve();
@@ -103,7 +126,7 @@ export class EnrichmentWorker {
 
     for (const asset of result.mediaAssets) {
       if (asset.media_type === "image" && asset.local_path && asset.download_status === "complete") {
-        const absPath = path.join(this.options.workspaceRoot, asset.local_path);
+        const absPath = path.join(this.options.workspaceRoot!, asset.local_path);
         const detection = await detectCharacterCard(absPath);
         if (detection) {
           asset.detected_content = detection.detected;
@@ -162,7 +185,7 @@ export class EnrichmentWorker {
         created_at: Date.now(),
       };
 
-      const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
+      const tempPath = generateTempDownloadPath(this.options.workspaceRoot!);
       try {
         if (hasRemoteUrl) {
           // Discord / remote-URL path: download from the CDN URL directly.
@@ -173,9 +196,10 @@ export class EnrichmentWorker {
           });
           const saved = await moveFileToWorkspace({
             sourcePath: tempPath,
-            workspaceRoot: this.options.workspaceRoot,
+            workspaceRoot: this.options.workspaceRoot!,
             originalFilename: attachment.filename,
             contentType: downloaded.contentType ?? attachment.mimeType,
+            attachSubdir: this.options.attachSubdir,
           });
           asset.local_path = saved.localPath;
           asset.size_bytes = downloaded.sizeBytes;
@@ -192,9 +216,10 @@ export class EnrichmentWorker {
           });
           const saved = await moveFileToWorkspace({
             sourcePath: tempPath,
-            workspaceRoot: this.options.workspaceRoot,
+            workspaceRoot: this.options.workspaceRoot!,
             originalFilename: downloaded.filename ?? attachment.filename,
             contentType: downloaded.contentType ?? attachment.mimeType,
+            attachSubdir: this.options.attachSubdir,
           });
           asset.local_path = saved.localPath;
           asset.size_bytes = downloaded.sizeBytes;
@@ -255,7 +280,8 @@ export class EnrichmentWorker {
         created_at: Date.now(),
       };
 
-      if (summary.attachments && summary.attachments.length > 0) {
+      // Only download reply attachments when the workspace is available (§4.3).
+      if (summary.attachments && summary.attachments.length > 0 && this.options.workspaceRoot !== null) {
         await this.downloadReplyAttachments(event.id, roomId, summary, result);
       }
     } catch (error) {
@@ -317,7 +343,7 @@ export class EnrichmentWorker {
           created_at: Date.now(),
         };
 
-        const tempPath = generateTempDownloadPath(this.options.workspaceRoot);
+        const tempPath = generateTempDownloadPath(this.options.workspaceRoot!);
         try {
           if (attachment.remoteUrl) {
             // Discord / remote-URL path
@@ -328,9 +354,10 @@ export class EnrichmentWorker {
             });
             const saved = await moveFileToWorkspace({
               sourcePath: tempPath,
-              workspaceRoot: this.options.workspaceRoot,
+              workspaceRoot: this.options.workspaceRoot!,
               originalFilename: attachment.filename,
               contentType: downloaded.contentType ?? attachment.mimeType,
+              attachSubdir: this.options.attachSubdir,
             });
             asset.local_path = saved.localPath;
             asset.size_bytes = downloaded.sizeBytes;
@@ -347,9 +374,10 @@ export class EnrichmentWorker {
             });
             const saved = await moveFileToWorkspace({
               sourcePath: tempPath,
-              workspaceRoot: this.options.workspaceRoot,
+              workspaceRoot: this.options.workspaceRoot!,
               originalFilename: downloaded.filename ?? attachment.filename ?? summary.body,
               contentType: downloaded.contentType,
+              attachSubdir: this.options.attachSubdir,
             });
             asset.local_path = saved.localPath;
             asset.size_bytes = downloaded.sizeBytes;
@@ -516,22 +544,25 @@ export class EnrichmentWorker {
         created_at: now,
       };
 
-      try {
-        const saved = await saveMediaToWorkspace({
-          data,
-          workspaceRoot: this.options.workspaceRoot,
-          originalFilename: media.filename,
-          contentType: media.contentType,
-        });
-        asset.local_path = saved.localPath;
-        asset.download_status = "complete";
-        asset.size_bytes = data.byteLength;
-      } catch (error) {
-        asset.download_status = "failed";
-        asset.download_error = error instanceof Error ? error.message : String(error);
+      // Skip saving preview media when workspace is unavailable (§4.3).
+      if (this.options.workspaceRoot !== null) {
+        try {
+          const saved = await saveMediaToWorkspace({
+            data,
+            workspaceRoot: this.options.workspaceRoot,
+            originalFilename: media.filename,
+            contentType: media.contentType,
+            attachSubdir: this.options.attachSubdir,
+          });
+          asset.local_path = saved.localPath;
+          asset.download_status = "complete";
+          asset.size_bytes = data.byteLength;
+        } catch (error) {
+          asset.download_status = "failed";
+          asset.download_error = error instanceof Error ? error.message : String(error);
+        }
+        result.mediaAssets.push(asset);
       }
-
-      result.mediaAssets.push(asset);
     }
 
     await Promise.allSettled(fxTasks);
@@ -633,6 +664,8 @@ export class EnrichmentWorker {
     role: string,
     result: EnrichmentResult,
   ): Promise<XMediaSlot[]> {
+    // No media downloads when workspace is unavailable (§4.3).
+    if (this.options.workspaceRoot === null) return [];
     const fxConfig = this.options.fxtwitter!.config;
     const slots: XMediaSlot[] = [];
     const photos = (node.media?.photos ?? []).filter((p): p is FxApiPhoto & { url: string } => Boolean(p.url));
@@ -727,9 +760,10 @@ export class EnrichmentWorker {
       } else {
         const saved = await moveFileToWorkspace({
           sourcePath: fetched.path,
-          workspaceRoot: this.options.workspaceRoot,
+          workspaceRoot: this.options.workspaceRoot!,
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
+          attachSubdir: this.options.attachSubdir,
         });
         fetchedPath = undefined;
         asset.local_path = saved.localPath;
@@ -756,6 +790,9 @@ export class EnrichmentWorker {
     eventId: string,
     result: EnrichmentResult,
   ): Promise<void> {
+    // Workspace is required for file writes; skip entirely when unavailable (§4.3).
+    if (this.options.workspaceRoot === null) return;
+
     // Persisted preview URLs plus the raw X status matches (X preview rows
     // store the CANONICAL URL, which may differ from the body text).
     const previewUrls = new Set([
@@ -791,9 +828,10 @@ export class EnrichmentWorker {
         }
         const saved = await moveFileToWorkspace({
           sourcePath: fetched.path,
-          workspaceRoot: this.options.workspaceRoot,
+          workspaceRoot: this.options.workspaceRoot!,
           originalFilename: urlFilename(url),
           contentType: fetched.contentType,
+          attachSubdir: this.options.attachSubdir,
         });
         fetchedPath = undefined;
         asset.local_path = saved.localPath;

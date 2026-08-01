@@ -447,8 +447,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       agentName: e.agentName,
       workspaceRoot: e.workspaceRoot,
     }));
-    // Use the first agent's workspace for subsystems not yet per-agent
-    // (captioning/enrichment Phase 3, browser/sandbox Phase 4).
+    // Use the first agent's workspace as the legacy fallback root for subsystems
+    // that don't yet resolve per-agent (browser/sandbox, Phase 4).
     const firstEntry = agentEntries.values().next().value!;
     workspaceRoot = firstEntry.workspaceRoot;
     memoryWriter = firstEntry.memoryWriter;
@@ -900,6 +900,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     providerCapabilities: new Map(),
     fetchClient,
     workspaceRoot,
+    // Per-event workspace resolver (spec MULTI-AGENT-SUPPORT §7.4): in agents
+    // mode, enrichment downloads land in the owning agent's account-scoped
+    // msg-attach subdir. Absent = legacy flat layout.
+    resolveWorkspaceRoot: agentWorkspaces.length > 0
+      ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+      : undefined,
+    // All agent workspace roots for startup temp-file cleanup (Fix 3): in agents
+    // mode temps are created under every agent's msg-attach/, so cleanup must
+    // sweep all roots, not just the legacy singleton.
+    agentWorkspaceRoots: agentWorkspaces.length > 0
+      ? agentWorkspaces.map((w) => w.workspaceRoot)
+      : undefined,
     downloadSizeLimit,
     fxtwitter: { client: fxTwitterClient, config: fxTwitterConfig },
     config: config.enrichment ?? {},
@@ -919,6 +931,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     storage,
     clients: captionClients,
     workspaceRoot,
+    // Per-asset workspace resolver (spec MULTI-AGENT-SUPPORT §7.4): in agents
+    // mode, the caption worker resolves the owning agent's root from the asset's
+    // timeline_key so local_path is expanded against the correct workspace.
+    resolveWorkspaceRoot: agentWorkspaces.length > 0
+      ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+      : undefined,
     config: config.captioning ?? {},
     onComplete: (eventId) => {
       captionEmitter.emit(`complete:${eventId}`);
@@ -5772,6 +5790,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       modelHealthAnnotations: buildModelHealthAnnotations(config.models),
       llmRequestRing,
       workspaceRoot,
+      // Per-asset workspace resolver for GET /api/media/:ref (spec
+      // MULTI-AGENT-SUPPORT §7.4): in agents mode the BFF resolves the owning
+      // agent's workspace from the asset's timeline_key. Absent = legacy mode.
+      resolveWorkspaceRoot: agentWorkspaces.length > 0
+        ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+        : undefined,
       // Manual resume of a parked failed-resumable session (spec §6.2) — the
       // console's second mutating action, next to abort.
       resumeSession: manualResumeSession,
@@ -6534,7 +6558,16 @@ const AGENT_NAME_RE_EXPORTED = /^[a-z0-9-]+$/;
  * Throws on any hard violation; returns `void` on a valid config.
  *
  * Checks:
- * - §3: colon in any account key (matrix or discord) → fatal
+ * - §3: colon in any account key (matrix or discord) → fatal (all modes)
+ * - §3 agents mode: path-unsafe characters in any account key → fatal.
+ *   Rationale: agents mode is a new opt-in with no frozen data under such keys,
+ *   and §7.4 embeds the account key directly in a filesystem path
+ *   (`msg-attach/<provider>.<accountKey>/`). A key containing `/`, `\`, `..`
+ *   as a path segment, or whitespace/control characters can nest directories,
+ *   break the one-mv relink invariant, or escape the workspace root. In legacy
+ *   mode the key is never used in a path, so only the colon (which breaks
+ *   parseTimelineKey) remains a hard error there — all other out-of-class chars
+ *   stay warning-only (§3 back-compat unchanged).
  * - §4.2 agents mode: `[workspace].root_dir` + `[agents]` mutual exclusivity
  * - §4.2 agents mode: agent names must match `[a-z0-9-]+`
  * - §4.2 agents mode: every account's resolved agent name must match a declared entry
@@ -6563,6 +6596,34 @@ export function validateAgentConfig(config: AppConfig): void {
   }
 
   if (config.agents && Object.keys(config.agents).length > 0) {
+    // §3 agents mode: path-unsafe characters in account keys are a hard startup
+    // error. The key is baked into msg-attach/<provider>.<accountKey>/ (§7.4);
+    // a key with `/`, `\`, `..` as a path segment, or whitespace/control chars
+    // can nest directories or escape the workspace root.
+    const pathUnsafeRe = /[/\\]|(?:^|\.)\.\.(?:\.|$)|[\s\x00-\x1f\x7f]/;
+    for (const accountKey of Object.keys(config.matrix?.accounts ?? {})) {
+      if (pathUnsafeRe.test(accountKey)) {
+        throw new Error(
+          `[matrix] account key "${accountKey}" contains a path-unsafe character ` +
+            `(slash, backslash, ".." path segment, or whitespace/control char). ` +
+            `In agents mode the key is embedded in filesystem paths (§7.4); ` +
+            `rename the key before adding [agents] blocks (§3 back-compat: this ` +
+            `is only a hard error in agents mode where no data exists under the key yet).`,
+        );
+      }
+    }
+    for (const accountKey of Object.keys(config.discord?.accounts ?? {})) {
+      if (pathUnsafeRe.test(accountKey)) {
+        throw new Error(
+          `[discord] account key "${accountKey}" contains a path-unsafe character ` +
+            `(slash, backslash, ".." path segment, or whitespace/control char). ` +
+            `In agents mode the key is embedded in filesystem paths (§7.4); ` +
+            `rename the key before adding [agents] blocks (§3 back-compat: this ` +
+            `is only a hard error in agents mode where no data exists under the key yet).`,
+        );
+      }
+    }
+
     // ── Agents mode (§4.2) ────────────────────────────────────────────────────
     if (config.workspace?.root_dir !== undefined) {
       throw new Error(
