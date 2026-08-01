@@ -79,8 +79,19 @@ export interface ConsoleServerDeps {
    * §9.2). Optional: absent = the route 503s.
    */
   llmRequestRing?: LlmRequestRing;
-  /** Workspace root; media `local_path`s are resolved beneath it. */
+  /**
+   * Workspace root for legacy single-agent mode; media `local_path`s are
+   * resolved beneath it when `resolveWorkspaceRoot` is absent.
+   */
   workspaceRoot: string;
+  /**
+   * Per-session workspace resolver (spec MULTI-AGENT-SUPPORT §7.4). When
+   * provided (agents mode), the `GET /api/media/:ref` handler resolves the
+   * owning agent's root from the asset's event timeline_key rather than
+   * using the global `workspaceRoot`. Unresolvable account → 404 (§4.3).
+   * Absent → legacy mode, `workspaceRoot` is used for every asset.
+   */
+  resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
   /**
    * Manual resume-in-place of a parked `failed-resumable` session (spec
    * CONCURRENCY-AND-RATE-LIMITING §6.2). Injected by app wiring; optional so

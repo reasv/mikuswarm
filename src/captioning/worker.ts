@@ -45,8 +45,19 @@ export class CaptionWorker {
     this.options.recordUsage?.(result, asset);
   }
 
-  async process(asset: MediaAssetRow): Promise<string> {
-    const absolutePath = path.join(this.options.workspaceRoot, asset.local_path!);
+  /**
+   * Caption one media asset.
+   *
+   * @param asset - The asset to caption.
+   * @param workspaceRootOverride - Per-asset workspace root (spec
+   *   MULTI-AGENT-SUPPORT §7.4). When provided, used instead of the
+   *   constructor-level `workspaceRoot` — agents mode supplies the owning
+   *   agent's resolved root here so `local_path` resolves to the correct file.
+   *   Absent = legacy mode (uses `this.options.workspaceRoot`).
+   */
+  async process(asset: MediaAssetRow, workspaceRootOverride?: string): Promise<string> {
+    const root = workspaceRootOverride ?? this.options.workspaceRoot;
+    const absolutePath = path.join(root, asset.local_path!);
     const modality = asset.media_type as MediaModality;
 
     if (modality === "image" && await isAnimatedImage(absolutePath)) {

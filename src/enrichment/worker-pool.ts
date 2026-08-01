@@ -16,7 +16,29 @@ export interface EnrichmentWorkerPoolOptions {
   timeline: TimelineStore;
   providerCapabilities: Map<string, EnrichmentCapabilities>;
   fetchClient: FetchClient;
+  /**
+   * Workspace root used in legacy single-agent mode (and for startup temp
+   * cleanup). In agents mode, the per-event resolver below supersedes it at
+   * download time; the legacy root is kept so startup cleanup has a directory.
+   */
   workspaceRoot: string;
+  /**
+   * All agent workspace roots (agents mode only). Startup temp cleanup scans
+   * `.tmp-*` files under every root's `msg-attach/` subdir — not just the
+   * legacy `workspaceRoot` — because in agents mode each agent's account-scoped
+   * subdir (`msg-attach/<provider>.<accountKey>/`) is the download target.
+   * Absent → legacy single-root cleanup (legacy mode unchanged).
+   */
+  agentWorkspaceRoots?: string[];
+  /**
+   * Per-event workspace resolver (spec MULTI-AGENT-SUPPORT §7.4). When
+   * provided the pool is in agents mode: at download time it resolves the
+   * owning agent's workspace root from the event's `timeline_key` and writes
+   * to the account-scoped subdir `<agentRoot>/msg-attach/<provider>.<accountKey>/`.
+   * Absent → legacy flat layout, byte-identical to pre-Phase-3 behaviour.
+   * Unresolvable account → §4.3 skip (warn, no file downloads, DB-only ops proceed).
+   */
+  resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
   downloadSizeLimit?: number;
   /** X.com enrichment via FxTwitter (ARCHITECTURE.md §7a); unset = legacy Synapse-only previews. */
   fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
@@ -46,14 +68,22 @@ export class EnrichmentWorkerPool {
       this.options.logger.info("enrichment_reset_stale", { count: resetCount });
     }
 
-    const attachDir = path.join(this.options.workspaceRoot, "msg-attach");
-    await mkdir(attachDir, { recursive: true });
-    const tmpFiles = await readdir(attachDir).catch(() => [] as string[]);
+    // Startup temp-file cleanup: scan `.tmp-*` under every workspace root's
+    // `msg-attach/` directory.  In agents mode, temps are written under every
+    // agent's root (one per agent); in legacy mode there is exactly one root.
+    const rootsToClean = this.options.agentWorkspaceRoots?.length
+      ? this.options.agentWorkspaceRoots
+      : [this.options.workspaceRoot];
     let tmpCleaned = 0;
-    for (const f of tmpFiles) {
-      if (f.startsWith(".tmp-")) {
-        await unlink(path.join(attachDir, f)).catch(() => {});
-        tmpCleaned++;
+    for (const wsRoot of rootsToClean) {
+      const attachDir = path.join(wsRoot, "msg-attach");
+      await mkdir(attachDir, { recursive: true });
+      const tmpFiles = await readdir(attachDir).catch(() => [] as string[]);
+      for (const f of tmpFiles) {
+        if (f.startsWith(".tmp-")) {
+          await unlink(path.join(attachDir, f)).catch(() => {});
+          tmpCleaned++;
+        }
       }
     }
     if (tmpCleaned > 0) {
@@ -173,11 +203,58 @@ export class EnrichmentWorkerPool {
       return;
     }
 
+    // Per-event workspace resolution (spec MULTI-AGENT-SUPPORT §7.4):
+    // In agents mode, resolve the owning agent's workspace root from the event's
+    // timeline_key and compute the account-scoped subdir for msg-attach.
+    // In legacy mode (no resolver), use the global workspaceRoot with no subdir.
+    let effectiveWorkspaceRoot: string | null = this.options.workspaceRoot;
+    let attachSubdir: string | undefined;
+
+    if (this.options.resolveWorkspaceRoot) {
+      const parsed = parseTimelineKey(event.timelineKey);
+      const resolved = this.options.resolveWorkspaceRoot(event.timelineKey);
+      if (!resolved) {
+        // §4.3: account no longer in config — warn, skip file downloads,
+        // still process DB-only enrichment (link previews, reply context).
+        this.options.logger.warn("enrichment_workspace_unresolvable", {
+          eventId,
+          timelineKey: event.timelineKey,
+          message: "account not in config — skipping file downloads (§4.3)",
+        });
+        effectiveWorkspaceRoot = null;
+        // attachSubdir stays undefined; no file writes will occur.
+      } else {
+        effectiveWorkspaceRoot = resolved;
+        if (parsed) {
+          // "<provider>.<accountKey>" — the account-scoped subdir (§7.4).
+          const candidate = `${parsed.provider}.${parsed.accountId}`;
+          // Defense-in-depth (§1b): if the computed subdir contains a path
+          // separator or a `..` segment it could nest directories or escape
+          // msg-attach/.  Treat the event per §4.3 (skip downloads, warn)
+          // rather than write.  Primary prevention is validateAgentConfig's
+          // agents-mode hard error (§3); this guard is the secondary layer.
+          if (candidate.includes("/") || candidate.includes("\\") || candidate.includes("..")) {
+            this.options.logger.warn("enrichment_subdir_path_unsafe", {
+              eventId,
+              timelineKey: event.timelineKey,
+              candidate,
+              message: "computed msg-attach subdir contains a path-unsafe character — skipping file downloads (§4.3 §7.4)",
+            });
+            effectiveWorkspaceRoot = null;
+            // attachSubdir stays undefined; no file writes will occur.
+          } else {
+            attachSubdir = candidate;
+          }
+        }
+      }
+    }
+
     const worker = new EnrichmentWorker({
       storage: this.options.storage,
       capabilities,
       fetchClient: this.options.fetchClient,
-      workspaceRoot: this.options.workspaceRoot,
+      workspaceRoot: effectiveWorkspaceRoot,
+      attachSubdir,
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
       downloadSizeLimit: this.options.downloadSizeLimit,
       fxtwitter: this.options.fxtwitter,

@@ -662,6 +662,11 @@ export async function resumeSession(
  * GET /api/media/:ref — bytes for an externalized image ref. `:ref` is the media
  * asset id (= `attachmentId`). Resolved beneath the workspace root with a
  * path-traversal guard.
+ *
+ * In agents mode (`deps.resolveWorkspaceRoot` present), the owning agent's
+ * workspace root is resolved from the asset's event timeline_key (spec
+ * MULTI-AGENT-SUPPORT §7.4). Unresolvable account → 404 (§4.3).
+ * In legacy mode, the global `deps.workspaceRoot` is used.
  */
 export async function media(
   _req: IncomingMessage,
@@ -673,7 +678,22 @@ export async function media(
     return sendError(res, 404, `Unknown media ref: ${ctx.params.ref}`);
   }
 
-  const root = path.resolve(ctx.deps.workspaceRoot);
+  let workspaceRoot = ctx.deps.workspaceRoot;
+  if (ctx.deps.resolveWorkspaceRoot) {
+    // Agents mode: resolve per-asset workspace from the event's timeline_key.
+    const event = ctx.deps.storage.getTimelineEventById(asset.event_id);
+    const timelineKey = event?.timelineKey;
+    if (!timelineKey) {
+      return sendError(res, 404, "Media asset has no resolvable timeline");
+    }
+    const resolved = ctx.deps.resolveWorkspaceRoot(timelineKey);
+    if (!resolved) {
+      return sendError(res, 404, "Media workspace unresolvable: account no longer in config");
+    }
+    workspaceRoot = resolved;
+  }
+
+  const root = path.resolve(workspaceRoot);
   const abs = path.resolve(root, asset.local_path);
   if (abs !== root && !abs.startsWith(root + path.sep)) {
     return sendError(res, 403, "Media path escapes workspace root");

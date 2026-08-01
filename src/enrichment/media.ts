@@ -27,15 +27,23 @@ export async function saveMediaToWorkspace(params: {
   workspaceRoot: string;
   originalFilename?: string;
   contentType?: string;
+  /**
+   * Account-scoped subdirectory inside `msg-attach/` (spec MULTI-AGENT-SUPPORT
+   * §7.4). When provided the file lands in `msg-attach/<attachSubdir>/filename`
+   * and `localPath` reflects the subdir. Absent = legacy flat layout
+   * (`msg-attach/filename`), byte-identical to pre-Phase-3 behaviour.
+   */
+  attachSubdir?: string;
 }): Promise<{ localPath: string; absolutePath: string }> {
   const filename = generateMediaFilename(params.data, params.originalFilename, params.contentType);
-  const dir = path.join(params.workspaceRoot, "msg-attach");
+  const relDir = params.attachSubdir ? `msg-attach/${params.attachSubdir}` : "msg-attach";
+  const dir = path.join(params.workspaceRoot, relDir);
   await mkdir(dir, { recursive: true });
   const absolutePath = path.join(dir, filename);
   if (!existsSync(absolutePath)) {
     await writeFile(absolutePath, params.data);
   }
-  const localPath = `msg-attach/${filename}`;
+  const localPath = `${relDir}/${filename}`;
   return { localPath, absolutePath };
 }
 
@@ -44,10 +52,18 @@ export async function moveFileToWorkspace(params: {
   workspaceRoot: string;
   originalFilename?: string;
   contentType?: string;
+  /**
+   * Account-scoped subdirectory inside `msg-attach/` (spec MULTI-AGENT-SUPPORT
+   * §7.4). When provided the file lands in `msg-attach/<attachSubdir>/filename`
+   * and `localPath` reflects the subdir. Absent = legacy flat layout
+   * (`msg-attach/filename`), byte-identical to pre-Phase-3 behaviour.
+   */
+  attachSubdir?: string;
 }): Promise<{ localPath: string; absolutePath: string }> {
   const hashBuf = await hashFileForMedia(params.sourcePath);
   const filename = generateMediaFilenameFromHash(hashBuf.subarray(0, 8), params.originalFilename, params.contentType);
-  const dir = path.join(params.workspaceRoot, "msg-attach");
+  const relDir = params.attachSubdir ? `msg-attach/${params.attachSubdir}` : "msg-attach";
+  const dir = path.join(params.workspaceRoot, relDir);
   await mkdir(dir, { recursive: true });
   const absolutePath = path.join(dir, filename);
   if (existsSync(absolutePath)) {
@@ -64,11 +80,15 @@ export async function moveFileToWorkspace(params: {
       }
     }
   }
-  const localPath = `msg-attach/${filename}`;
+  const localPath = `${relDir}/${filename}`;
   return { localPath, absolutePath };
 }
 
 export function generateTempDownloadPath(workspaceRoot: string): string {
+  // Temp files live in the msg-attach root (not in any account subdir) so the
+  // rename-into-subdir stays on the same filesystem mount — EXDEV never fires
+  // for within-workspace moves, and the startup orphan-cleanup finds them at
+  // msg-attach/.tmp-* regardless of which subdir the final file lands in.
   return path.join(workspaceRoot, "msg-attach", `.tmp-${randomBytes(8).toString("hex")}`);
 }
 

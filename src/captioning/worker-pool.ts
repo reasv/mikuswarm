@@ -17,6 +17,15 @@ export interface CaptionWorkerPoolOptions {
   storage: Storage;
   clients: Map<MediaModality, InferenceClient>;
   workspaceRoot: string;
+  /**
+   * Per-asset workspace resolver (spec MULTI-AGENT-SUPPORT §7.4). When
+   * provided the pool is in agents mode: at caption time it resolves the
+   * owning agent's workspace root from the asset's `timeline_key` so the
+   * `local_path` is resolved under the correct agent's workspace.
+   * Absent → legacy mode, `workspaceRoot` is used for every asset.
+   * Unresolvable account → §4.3 skip (fail asset without retry, warn).
+   */
+  resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
   config: CaptionConfig;
   onComplete?: (eventId: string) => void;
   onError?: (assetId: string, error: unknown) => void;
@@ -195,7 +204,50 @@ export class CaptionWorkerPool {
 
     for (const asset of claimed) {
       this.emit("claimed", asset.id, "processing", asset.caption_attempts ?? 0);
-      const work = worker.process(asset)
+
+      // Per-asset workspace resolution (spec MULTI-AGENT-SUPPORT §7.4): in agents
+      // mode, resolve the owning agent's root from the asset's timeline_key so the
+      // stored local_path is expanded against the correct workspace.
+      let assetWorkspaceRoot: string | undefined;
+      if (this.options.resolveWorkspaceRoot) {
+        // In agents mode, a missing timeline_key is treated identically to an
+        // unresolvable account: no resolver may guess a default agent (§4.3).
+        // This closes the gap where a NULL join-populated timeline_key would
+        // silently fall through to worker.process(asset, undefined) and expand
+        // local_path under the first-agent fallback root — a §4.3 violation.
+        const resolved = asset.timeline_key
+          ? this.options.resolveWorkspaceRoot(asset.timeline_key)
+          : undefined;
+        if (!resolved) {
+          // §4.3: account no longer in config, or timeline_key missing —
+          // fail the asset without retry.
+          this.options.logger.warn("caption_workspace_unresolvable", {
+            assetId: asset.id,
+            timelineKey: asset.timeline_key ?? null,
+            message: asset.timeline_key
+              ? "account not in config — skipping caption (§4.3)"
+              : "timeline_key missing in agents mode — skipping caption (§4.3)",
+          });
+          const work = this.options.storage.setCaptionStatus(
+            asset.id,
+            "failed",
+            asset.timeline_key
+              ? "workspace unresolvable: account no longer in config"
+              : "workspace unresolvable: timeline_key missing in agents mode",
+          ).then(() => {
+            this.options.onError?.(asset.id, new Error("workspace unresolvable"));
+            this.emit("failed", asset.id, "failed", asset.caption_attempts ?? 0);
+          }).finally(() => {
+            this.activeWorkers.delete(work);
+            if (this.running) this.schedulePoll(0);
+          });
+          this.activeWorkers.add(work);
+          continue;
+        }
+        assetWorkspaceRoot = resolved;
+      }
+
+      const work = worker.process(asset, assetWorkspaceRoot)
         .then((eventId) => {
           this.options.onComplete?.(eventId);
           this.emit("completed", asset.id, "complete", asset.caption_attempts ?? 0);
