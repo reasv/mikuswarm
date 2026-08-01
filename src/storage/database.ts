@@ -1299,6 +1299,24 @@ export interface UsageSummary {
   total: number;
   byClass: Array<{ class: string; cost: number; events: number }>;
   byModel: Array<{ model: string; cost: number; events: number }>;
+  /**
+   * Per-timeline-key rollup, present only when requested (`includeByKey`). The
+   * observability handler folds these into a per-agent breakdown (spec
+   * CONSOLE-MULTI-AGENT §9) — agent membership is config, not schema, so the
+   * storage layer only groups by the raw key. `key` is null for rows with no
+   * timeline_key (background caption/embedding).
+   */
+  byKey?: Array<{ key: string | null; cost: number; events: number }>;
+}
+
+/**
+ * Optional timeline-key scoping for the console's usage view queries (spec
+ * CONSOLE-MULTI-AGENT §9): restrict rows to those whose `timeline_key` starts
+ * with any of the given `provider:accountId` prefixes (an agent's account set).
+ * Omitted or empty = no filter. Rows with a null `timeline_key` never match.
+ */
+export interface UsageViewScope {
+  timelineKeyPrefixes?: readonly string[];
 }
 
 /** One (bucket, group) point of the stacked spend-over-time chart (§7.1). */
@@ -4235,17 +4253,41 @@ export class Storage {
   }
 
   /**
-   * Spend + counts grouped by class and by model over `[since, now)` (spec §4 /
-   * §7.1 cards). One read, two aggregations.
+   * `AND`-fragment + params restricting `timeline_key` to an agent's account
+   * prefixes ({@link UsageViewScope}, spec CONSOLE-MULTI-AGENT §9). Returns an
+   * empty fragment when no prefixes are given. Same LIKE-escape treatment as
+   * {@link usageCostClauses}' `timelineKeyPrefixes` (account keys may legally
+   * contain `%`/`_`); `column` names the (possibly aliased) key column.
    */
-  getUsageSummary(since: number, now: number): UsageSummary {
+  private usageViewScopeClause(
+    scope: UsageViewScope | undefined,
+    column = "timeline_key",
+  ): { sql: string; params: unknown[] } {
+    const prefixes = scope?.timelineKeyPrefixes;
+    if (!prefixes || prefixes.length === 0) return { sql: "", params: [] };
+    const likeTerms = prefixes.map(() => `${column} LIKE ? ESCAPE '\\'`).join(" OR ");
+    return { sql: ` and (${likeTerms})`, params: prefixes.map((p) => `${escapeLikePattern(p)}:%`) };
+  }
+
+  /**
+   * Spend + counts grouped by class and by model over `[since, now)` (spec §4 /
+   * §7.1 cards). One read, two aggregations — plus an optional per-timeline-key
+   * rollup (`includeByKey`) the observability handler folds into a per-agent
+   * breakdown, and an optional agent scope (spec CONSOLE-MULTI-AGENT §9).
+   */
+  getUsageSummary(
+    since: number,
+    now: number,
+    opts: UsageViewScope & { includeByKey?: boolean } = {},
+  ): UsageSummary {
+    const scope = this.usageViewScopeClause(opts);
     return this.read((db) => {
       const byClass = db
         .prepare(
           `select class, coalesce(sum(cost_usd), 0) as cost, count(*) as events
-             from usage_events where ts >= ? group by class order by cost desc`,
+             from usage_events where ts >= ?${scope.sql} group by class order by cost desc`,
         )
-        .all(since) as Array<{ class: string; cost: number; events: number }>;
+        .all(since, ...scope.params) as Array<{ class: string; cost: number; events: number }>;
       // Group by the UPSTREAM wire id actually billed (`model_id`), NOT the
       // logical/virtual block name. This cost page reports what was really spent
       // on which real model: a virtual model (e.g. "default") and any legacy rows
@@ -4256,30 +4298,54 @@ export class Storage {
       const byModel = db
         .prepare(
           `select model_id as model, coalesce(sum(cost_usd), 0) as cost, count(*) as events
-             from usage_events where ts >= ? group by model_id order by cost desc`,
+             from usage_events where ts >= ?${scope.sql} group by model_id order by cost desc`,
         )
-        .all(since) as Array<{ model: string; cost: number; events: number }>;
+        .all(since, ...scope.params) as Array<{ model: string; cost: number; events: number }>;
       // Actual data start within the window — anchors the console's per-period averages to
       // the elapsed range rather than the nominal window (null ⇒ no events in window).
       const firstTs = (
-        db.prepare(`select min(ts) as firstTs from usage_events where ts >= ?`).get(since) as {
+        db
+          .prepare(`select min(ts) as firstTs from usage_events where ts >= ?${scope.sql}`)
+          .get(since, ...scope.params) as {
           firstTs: number | null;
         }
       ).firstTs;
       const total = byClass.reduce((sum, r) => sum + r.cost, 0);
-      return { since, now, firstTs, total, byClass, byModel };
+      const summary: UsageSummary = { since, now, firstTs, total, byClass, byModel };
+      if (opts.includeByKey) {
+        // Per-timeline-key rollup for the handler's per-agent fold (CONSOLE-MULTI-AGENT
+        // §9). Bounded by the number of distinct channels, not events. The null-key
+        // group (background caption/embedding) rides along as `key: null`.
+        summary.byKey = db
+          .prepare(
+            `select timeline_key as key, coalesce(sum(cost_usd), 0) as cost, count(*) as events
+               from usage_events where ts >= ?${scope.sql} group by timeline_key order by cost desc`,
+          )
+          .all(since, ...scope.params) as Array<{ key: string | null; cost: number; events: number }>;
+      }
+      return summary;
     });
   }
 
   /**
-   * Stacked spend-over-time, bucketed by `bucketMs`, grouped by class or model
-   * (spec §7.1 chart). Returns one row per (bucket, group) with summed cost.
+   * Stacked spend-over-time, bucketed by `bucketMs`, grouped by class, model, or
+   * raw timeline key (spec §7.1 chart). Returns one row per (bucket, group) with
+   * summed cost. `groupBy: "key"` groups by `timeline_key` (null keys collapse to
+   * `grp: ""`) — the observability handler folds those rows into per-agent series
+   * (spec CONSOLE-MULTI-AGENT §9); agent membership is config, not schema.
    */
-  getUsageTimeseries(since: number, bucketMs: number, groupBy: "class" | "model"): UsageTimeseriesRow[] {
+  getUsageTimeseries(
+    since: number,
+    bucketMs: number,
+    groupBy: "class" | "model" | "key",
+    opts: UsageViewScope = {},
+  ): UsageTimeseriesRow[] {
     // "model" groups by the UPSTREAM wire id actually billed (`model_id`),
     // consistent with byModel — the cost chart reports real-model spend, not
     // virtual/logical block names (budget scoping still keys on logical, §8e).
-    const groupCol = groupBy === "model" ? "model_id" : "class";
+    const groupCol =
+      groupBy === "model" ? "model_id" : groupBy === "key" ? "coalesce(timeline_key, '')" : "class";
+    const scope = this.usageViewScopeClause(opts);
     return this.read((db) => {
       // `cast(... as integer)` forces an integer FLOOR: a bound numeric parameter
       // makes `ts / ?` floating-point in SQLite, so without the cast the bucket
@@ -4288,19 +4354,22 @@ export class Storage {
       return db
         .prepare(
           `select cast(ts / ? as integer) * ? as bucket, ${groupCol} as grp, coalesce(sum(cost_usd), 0) as cost
-             from usage_events where ts >= ?
+             from usage_events where ts >= ?${scope.sql}
              group by bucket, grp order by bucket asc`,
         )
-        .all(bucketMs, bucketMs, since) as UsageTimeseriesRow[];
+        .all(bucketMs, bucketMs, since, ...scope.params) as UsageTimeseriesRow[];
     });
   }
 
   /**
    * Recent sessions joined with their per-class `usage_events` rollup (spec §7.1
    * table 5): agent-LLM cost vs tool cost per session, plus token totals and
-   * channel/type/trigger attribution from `agent_sessions`.
+   * channel/type/trigger attribution from `agent_sessions`. Optionally scoped to
+   * an agent's account prefixes (spec CONSOLE-MULTI-AGENT §9) so the filtered
+   * view returns the most recent `limit` rows OF that agent, not a thinned slice.
    */
-  getUsageRecentSessions(limit: number): UsageSessionRow[] {
+  getUsageRecentSessions(limit: number, opts: UsageViewScope = {}): UsageSessionRow[] {
+    const scope = this.usageViewScopeClause(opts, "s.timeline_key");
     return this.read((db) => {
       return db
         .prepare(
@@ -4342,18 +4411,21 @@ export class Storage {
              where class = 'tool'
              group by agent_session_id
            ) t on t.agent_session_id = s.id
+           ${scope.sql ? `where${scope.sql.slice(4)}` : ""}
            order by coalesce(s.completed_at, s.updated_at) desc
            limit ?`,
         )
-        .all(limit) as UsageSessionRow[];
+        .all(...scope.params, limit) as UsageSessionRow[];
     });
   }
 
   /**
    * Recent paid non-agent-loop events — tool / caption / embedding (spec §7.1
-   * table 6), newest first.
+   * table 6), newest first. Optionally scoped to an agent's account prefixes
+   * (spec CONSOLE-MULTI-AGENT §9).
    */
-  getUsageRecentToolCalls(limit: number): UsageEventRowWithChannel[] {
+  getUsageRecentToolCalls(limit: number, opts: UsageViewScope = {}): UsageEventRowWithChannel[] {
+    const scope = this.usageViewScopeClause(opts, "e.timeline_key");
     return this.read((db) => {
       // Left-join the cached room label so the console shows `Name (Space)` rather than
       // a raw timeline key; `channel_label` falls back to the key, and is null only when
@@ -4363,10 +4435,10 @@ export class Storage {
           `select e.*, coalesce(m.display_name, e.timeline_key) as channel_label
              from usage_events e
              left join room_metadata m on m.timeline_key = e.timeline_key
-             where e.class in ('tool', 'caption', 'embedding')
+             where e.class in ('tool', 'caption', 'embedding')${scope.sql}
              order by e.ts desc limit ?`,
         )
-        .all(limit) as UsageEventRowWithChannel[];
+        .all(...scope.params, limit) as UsageEventRowWithChannel[];
     });
   }
 
@@ -4389,7 +4461,16 @@ export class Storage {
    * sub-period card averages) is computed only for carded entries — the top
    * {@link CARD_COUNT} users plus every system actor — to keep the payload small.
    */
-  getUsageLeaderboard(since: number, now: number, bucketMs: number, limit: number): UsageLeaderboard {
+  getUsageLeaderboard(
+    since: number,
+    now: number,
+    bucketMs: number,
+    limit: number,
+    opts: UsageViewScope = {},
+  ): UsageLeaderboard {
+    // Agent scope (spec CONSOLE-MULTI-AGENT §9) — applied to every sub-query below,
+    // including `grandTotal` (the share denominator matches the filtered Total card).
+    const scope = this.usageViewScopeClause(opts);
     // Non-human/self session types, and the display label each maps to.
     const SYSTEM_TYPES = ["summarize", "condense", "diary", "proactive"] as const;
     const SYSTEM_PLACEHOLDERS = SYSTEM_TYPES.map(() => "?").join(", ");
@@ -4413,7 +4494,7 @@ export class Storage {
                     min(ts) as firstTs,
                     max(ts) as lastTs
                from usage_events
-              where ts >= ? and trigger_sender_id is not null
+              where ts >= ?${scope.sql} and trigger_sender_id is not null
                 and coalesce(session_type, '') not in (${SYSTEM_PLACEHOLDERS})
               group by trigger_sender_id
              having coalesce(sum(cost_usd), 0) > 0
@@ -4430,7 +4511,7 @@ export class Storage {
              from top
             order by top.total desc`,
         )
-        .all(since, ...SYSTEM_TYPES, limit) as Array<{
+        .all(since, ...scope.params, ...SYSTEM_TYPES, limit) as Array<{
         senderId: string;
         total: number;
         events: number;
@@ -4450,12 +4531,12 @@ export class Storage {
                   min(ts) as firstTs,
                   max(ts) as lastTs
              from usage_events
-            where ts >= ? and session_type in (${SYSTEM_PLACEHOLDERS})
+            where ts >= ?${scope.sql} and session_type in (${SYSTEM_PLACEHOLDERS})
             group by actorKey
            having coalesce(sum(cost_usd), 0) > 0
             order by total desc`,
         )
-        .all(since, ...SYSTEM_TYPES) as Array<{
+        .all(since, ...scope.params, ...SYSTEM_TYPES) as Array<{
         actorKey: string;
         total: number;
         events: number;
@@ -4467,7 +4548,9 @@ export class Storage {
       // Grand total over EVERY event in the window (incl. non-attributable) — the share
       // denominator, matching the Total-spend card.
       const grandTotal = (
-        db.prepare(`select coalesce(sum(cost_usd), 0) as t from usage_events where ts >= ?`).get(since) as {
+        db
+          .prepare(`select coalesce(sum(cost_usd), 0) as t from usage_events where ts >= ?${scope.sql}`)
+          .get(since, ...scope.params) as {
           t: number;
         }
       ).t;
@@ -4485,12 +4568,12 @@ export class Storage {
                     cast(ts / ? as integer) * ? as bucket,
                     coalesce(sum(cost_usd), 0) as cost
                from usage_events
-              where ts >= ? and trigger_sender_id in (${placeholders})
+              where ts >= ?${scope.sql} and trigger_sender_id in (${placeholders})
                 and coalesce(session_type, '') not in (${SYSTEM_PLACEHOLDERS})
               group by senderId, bucket
               order by bucket asc`,
           )
-          .all(bucketMs, bucketMs, since, ...cardSenderIds, ...SYSTEM_TYPES) as Array<{
+          .all(bucketMs, bucketMs, since, ...scope.params, ...cardSenderIds, ...SYSTEM_TYPES) as Array<{
           senderId: string;
           bucket: number;
           cost: number;
@@ -4511,11 +4594,11 @@ export class Storage {
                     cast(ts / ? as integer) * ? as bucket,
                     coalesce(sum(cost_usd), 0) as cost
                from usage_events
-              where ts >= ? and session_type in (${SYSTEM_PLACEHOLDERS})
+              where ts >= ?${scope.sql} and session_type in (${SYSTEM_PLACEHOLDERS})
               group by actorKey, bucket
               order by bucket asc`,
           )
-          .all(bucketMs, bucketMs, since, ...SYSTEM_TYPES) as Array<{
+          .all(bucketMs, bucketMs, since, ...scope.params, ...SYSTEM_TYPES) as Array<{
           actorKey: string;
           bucket: number;
           cost: number;

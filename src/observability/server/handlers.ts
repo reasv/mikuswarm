@@ -297,54 +297,147 @@ function seriesBucketMs(window: string | null, now: number, minTs: number | null
   return DAY_MS;
 }
 
-/** GET /api/usage/summary?window=… — totals by class + by model (§7.1 cards). */
+/**
+ * Resolve the `?agent=` filter of a usage endpoint (spec CONSOLE-MULTI-AGENT §9)
+ * to that agent's `provider:accountId` prefixes. An absent or unknown name — or
+ * legacy mode — means "All" (no filter), the same rule §3.5 applies to the URL
+ * parameter; the console only offers names from the snapshot, so an unknown one
+ * here is a stale hand-edited URL, never a real scope.
+ */
+function agentScopePrefixes(ctx: RequestContext): string[] | undefined {
+  const name = ctx.url.searchParams.get("agent");
+  const snapshot = ctx.deps.agentsSnapshot;
+  if (!name || snapshot?.mode !== "agents") return undefined;
+  const agent = snapshot.agents.find((a) => a.name === name);
+  return agent?.accounts.map((a) => `${a.provider}:${a.accountId}`);
+}
+
+/**
+ * `timeline_key` (or null) → owning agent's name, from the static snapshot.
+ * Returns null for null/unparseable keys and accounts not in config — the same
+ * "never guess a default agent" rule the client's `agentFor` follows (§2).
+ */
+function keyAgentResolver(snapshot: NonNullable<RequestContext["deps"]["agentsSnapshot"]>): (key: string | null) => string | null {
+  const byPrefix = new Map<string, string>();
+  for (const agent of snapshot.agents) {
+    for (const acc of agent.accounts) byPrefix.set(`${acc.provider}:${acc.accountId}`, agent.name);
+  }
+  return (key) => {
+    if (!key) return null;
+    const c1 = key.indexOf(":");
+    if (c1 <= 0) return null;
+    const c2 = key.indexOf(":", c1 + 1);
+    if (c2 === -1 || c2 === c1 + 1) return null;
+    return byPrefix.get(key.slice(0, c2)) ?? null;
+  };
+}
+
+/** GET /api/usage/summary?window=&agent= — totals by class + by model (§7.1 cards), plus a per-agent breakdown in agents mode (CONSOLE-MULTI-AGENT §9). */
 export function usageSummary(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   // One `now` for both the window boundary and the average-denominator upper bound, so the
   // console's per-period math is internally consistent (no within-request clock drift).
   const now = Date.now();
   const since = windowSince(ctx.url.searchParams.get("window"), now);
-  sendJson(res, 200, ctx.deps.storage.getUsageSummary(since, now));
+  const snapshot = ctx.deps.agentsSnapshot;
+  const timelineKeyPrefixes = agentScopePrefixes(ctx);
+  const agentsMode = snapshot?.mode === "agents";
+  const { byKey, ...summary } = ctx.deps.storage.getUsageSummary(since, now, {
+    timelineKeyPrefixes,
+    includeByKey: agentsMode,
+  });
+  if (!agentsMode || !snapshot) {
+    sendJson(res, 200, summary);
+    return;
+  }
+  // Fold the per-key rollup into per-agent buckets (CONSOLE-MULTI-AGENT §9). Spend on
+  // null keys (background caption/embedding) or accounts no longer in config lands in
+  // one residual `agent: null` bucket, so byAgent always sums to `total`. Cost-desc
+  // like byClass/byModel, residual pinned last.
+  const resolve = keyAgentResolver(snapshot);
+  const buckets = new Map<string | null, { cost: number; events: number }>();
+  for (const row of byKey ?? []) {
+    const agent = resolve(row.key);
+    const cur = buckets.get(agent) ?? { cost: 0, events: 0 };
+    cur.cost += row.cost;
+    cur.events += row.events;
+    buckets.set(agent, cur);
+  }
+  const byAgent = [...buckets.entries()]
+    .map(([agent, v]) => ({ agent, cost: v.cost, events: v.events }))
+    .sort((a, b) => (a.agent === null ? 1 : b.agent === null ? -1 : b.cost - a.cost));
+  sendJson(res, 200, { ...summary, byAgent });
 }
 
-/** GET /api/usage/timeseries?window=&bucket=&groupBy=class|model — chart series (§7.1). */
+/** GET /api/usage/timeseries?window=&groupBy=class|model|agent&agent= — chart series (§7.1). */
 export function usageTimeseries(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const window = ctx.url.searchParams.get("window");
   const now = Date.now();
   const since = windowSince(window, now);
-  const groupBy = ctx.url.searchParams.get("groupBy") === "model" ? "model" : "class";
+  const snapshot = ctx.deps.agentsSnapshot;
+  const timelineKeyPrefixes = agentScopePrefixes(ctx);
+  const groupByParam = ctx.url.searchParams.get("groupBy");
+  // "agent" grouping exists only in agents mode (CONSOLE-MULTI-AGENT §9) — without a
+  // snapshot every row would fold into the residual bucket, so coerce to "class".
+  const groupBy =
+    groupByParam === "model"
+      ? "model"
+      : groupByParam === "agent" && snapshot?.mode === "agents"
+        ? "agent"
+        : "class";
   // Bucket width scales with the range (hourly ≤24h, daily for bounded windows, and
   // day→week→month→year for "all time" so the histogram stays legible). Only "all"
   // needs the earliest-event lookup; bounded windows ignore the `minTs` argument.
-  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since }) : null;
+  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since, timelineKeyPrefixes }) : null;
   const bucketMs = seriesBucketMs(window, now, minTs);
-  sendJson(res, 200, { series: ctx.deps.storage.getUsageTimeseries(since, bucketMs, groupBy), bucketMs, groupBy });
+  if (groupBy !== "agent") {
+    const series = ctx.deps.storage.getUsageTimeseries(since, bucketMs, groupBy, { timelineKeyPrefixes });
+    sendJson(res, 200, { series, bucketMs, groupBy });
+    return;
+  }
+  // Per-agent series: group by raw timeline key in SQL, fold keys into agent names here
+  // (agent membership is config, not schema). Unattributable spend — null keys or
+  // accounts no longer in config — merges into one "unattributed" residual series.
+  const resolve = keyAgentResolver(snapshot!);
+  const merged = new Map<string, { bucket: number; grp: string; cost: number }>();
+  for (const row of ctx.deps.storage.getUsageTimeseries(since, bucketMs, "key", { timelineKeyPrefixes })) {
+    const grp = resolve(row.grp === "" ? null : row.grp) ?? "unattributed";
+    const id = `${row.bucket} ${grp}`;
+    const cur = merged.get(id) ?? { bucket: row.bucket, grp, cost: 0 };
+    cur.cost += row.cost;
+    merged.set(id, cur);
+  }
+  const series = [...merged.values()].sort((a, b) => a.bucket - b.bucket);
+  sendJson(res, 200, { series, bucketMs, groupBy });
 }
 
-/** GET /api/usage/sessions?limit=… — recent sessions with per-class rollup (§7.1 table 5). */
+/** GET /api/usage/sessions?limit=&agent= — recent sessions with per-class rollup (§7.1 table 5). */
 export function usageSessions(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 50, 1), 500);
-  sendJson(res, 200, { sessions: ctx.deps.storage.getUsageRecentSessions(limit) });
+  const timelineKeyPrefixes = agentScopePrefixes(ctx);
+  sendJson(res, 200, { sessions: ctx.deps.storage.getUsageRecentSessions(limit, { timelineKeyPrefixes }) });
 }
 
-/** GET /api/usage/tool-calls?limit=… — recent paid tool/caption/embedding events (§7.1 table 6). */
+/** GET /api/usage/tool-calls?limit=&agent= — recent paid tool/caption/embedding events (§7.1 table 6). */
 export function usageToolCalls(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 50, 1), 500);
-  sendJson(res, 200, { toolCalls: ctx.deps.storage.getUsageRecentToolCalls(limit) });
+  const timelineKeyPrefixes = agentScopePrefixes(ctx);
+  sendJson(res, 200, { toolCalls: ctx.deps.storage.getUsageRecentToolCalls(limit, { timelineKeyPrefixes }) });
 }
 
-/** GET /api/usage/leaderboard?window=&limit= — top users by spend with per-user averages (§7.1 leaderboard). */
+/** GET /api/usage/leaderboard?window=&limit=&agent= — top users by spend with per-user averages (§7.1 leaderboard). */
 export function usageLeaderboard(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const window = ctx.url.searchParams.get("window");
   const now = Date.now();
   const since = windowSince(window, now);
+  const timelineKeyPrefixes = agentScopePrefixes(ctx);
   // Same bucket granularity as the timeseries so each user's sub-period averages re-bin
   // identically to the Total card's (incl. the span-scaled "all time" width).
-  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since }) : null;
+  const minTs = window === "all" ? ctx.deps.storage.minUsageTs({ since, timelineKeyPrefixes }) : null;
   const bucketMs = seriesBucketMs(window, now, minTs);
   // The console paginates the user list client-side down to the lowest non-zero spender,
   // so return the full ranking (bounded by a generous safety cap, not a small top-N).
   const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 1000, 1), 5000);
-  sendJson(res, 200, ctx.deps.storage.getUsageLeaderboard(since, now, bucketMs, limit));
+  sendJson(res, 200, ctx.deps.storage.getUsageLeaderboard(since, now, bucketMs, limit, { timelineKeyPrefixes }));
 }
 
 /**

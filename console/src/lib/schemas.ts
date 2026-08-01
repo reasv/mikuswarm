@@ -630,6 +630,18 @@ export const UsageSummary = Schema.Struct({
 	),
 	byModel: Schema.Array(
 		Schema.Struct({ model: Schema.String, cost: Schema.Number, events: Schema.Number })
+	),
+	// Per-agent breakdown (spec CONSOLE-MULTI-AGENT §9): present only in agents mode.
+	// `agent: null` is the residual bucket — spend with no timeline key (background
+	// caption/embedding) or on accounts no longer in config; the rows sum to `total`.
+	byAgent: Schema.optional(
+		Schema.Array(
+			Schema.Struct({
+				agent: Schema.NullOr(Schema.String),
+				cost: Schema.Number,
+				events: Schema.Number
+			})
+		)
 	)
 });
 export type UsageSummary = Schema.Schema.Type<typeof UsageSummary>;

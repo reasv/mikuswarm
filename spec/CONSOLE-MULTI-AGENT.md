@@ -166,7 +166,7 @@ deep-linkable and survive reload. An unknown or absent name means "All".
 | `TopBar` (conversations) | raw timeline key breadcrumb | agent chip prefix + raw key |
 | `DetailPanel` identifiers | `timeline` row only | add an `agent` row (client-derived) |
 | `SessionList` / `SessionFilters` | room-scoped, no account dimension | **unchanged** — agent filtering happens upstream at the room list; this satisfies MULTI-AGENT-SUPPORT §12's deferred "agent/account filter chips" via tabs rather than a new chip row |
-| Usage & Cost page | `ChannelCell` gate per above | inherits the `ChannelCell` change; adds an **agent filter chip row** above the sessions and tool-calls tables (pure client-side filter over parsed keys); budget rule cards render agent scope (§5) |
+| Usage & Cost page | `ChannelCell` gate per above | inherits the `ChannelCell` change; adds an **agent filter chip row** above the sessions and tool-calls tables (pure client-side filter over parsed keys); budget rule cards render agent scope (§5). *Superseded by §9 (2026-08-01): the per-table client-side chips were replaced by a page-wide server-side agent dimension.* |
 | `backfetch` / `gap-backfetch` | `roomId (accountId)` | account stays primary — backfetch operates on the account credential — with an agent tag appended under the global gate; `RoomPicker` groups options under agent headers and matches agent names in its filter |
 | Scheduler page | session ids, no timeline keys | **unchanged** — the scheduler snapshot carries no timeline keys and per-request agent tags are not worth a core payload change (§8) |
 | `SpendSummaryCard` / leaderboard | per-user, cross-agent | **unchanged** — users span agents by design |
@@ -224,6 +224,7 @@ Deferred (compatible later additions, no rework implied):
 - **Server-side per-agent spend aggregation** on the cost overview —
   real value now that limits scope on agent, but it is a `usage_events`
   aggregation with key parsing on the core side; separable work.
+  *(Implemented 2026-08-01 — see §9.)*
 - **Scheduler per-request agent tags** — requires adding timeline keys
   to the attempt-ring payload.
 
@@ -240,3 +241,48 @@ Rejected:
   agent membership is pure config (MULTI-AGENT-SUPPORT §4.1); read-time
   derivation via one meta endpoint keeps renames free and the schema
   untouched.
+
+## 9. Usage & Cost: page-wide agent dimension (amendment, 2026-08-01)
+
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §11 "Usage & Cost";
+retained for review. Replaces the §4 "agent filter chip row" (client-side,
+per-table) and implements the §8 deferred "server-side per-agent spend
+aggregation".
+
+Operator direction: the usage page needed (a) a **cost breakdown by agent**
+alongside By-class / By-model, (b) a **page-wide agent filter** — All /
+per-agent tabs scoping the total, breakdowns, spend-over-time, both tables,
+and the user leaderboard (but *not* Limits), URL-addressable and composing
+with the window filter, (c) a dedicated **agent column** in the sessions and
+paid-calls tables (first column, omitted when a single agent is filtered),
+and (d) sessions-table column order moving channel + trigger after type,
+before model.
+
+Design, all under the existing global gate and generic/default-off rule:
+
+- **Server-side filtering** (`?agent=<name>` on
+  `/api/usage/{summary,timeseries,sessions,tool-calls,leaderboard}`): the
+  aggregates cannot be filtered client-side. The handler resolves the name
+  through the §2 snapshot to `provider:accountId` prefixes; storage scopes
+  `timeline_key` with the same escaped-LIKE prefix convention as `[[limits]]`
+  agent scoping. Absent/unknown name (or legacy mode) = All — the §3.5 rule.
+  Filtered tables return the most recent N rows *of that agent*, which the
+  client-side chips could not.
+- **`byAgent`** on the summary (agents mode only): storage returns a
+  per-`timeline_key` rollup; the handler folds keys → agents. Null-key spend
+  (background caption/embedding) and unresolvable accounts form one residual
+  `agent: null` bucket, so the rows always sum to `total`. Likewise
+  `groupBy=agent` on the timeseries (folded per-agent series + an
+  `unattributed` residual), colored by each agent's §3.4 accent.
+- **Console**: an agent tab row (All / per agent, accent dot + platform tag)
+  in the top control row; `?agent=` in query params, validated against the
+  payload; a **By agent** card; **by agent** joins the breakdown toggle; both
+  tables grow a leading agent-chip column (§3.2 row-level grammar). The card
+  and the column render only on the All view — filtered to one agent they
+  would repeat a single value, mirroring the operator's "omit when filtered"
+  rule. The previous revision's per-cell `ChannelCell` agent chips and
+  per-table filter chips are retired (identity now lives in the column);
+  below the gate `ChannelCell`'s legacy `distinctAccounts` tag is unchanged.
+- **Demo mode**: a deterministic per-agent split (aria/nova/unattributed)
+  honors `agent=` and `groupBy=agent` on every usage fixture, keeping the
+  fidelity-guard tests honest.

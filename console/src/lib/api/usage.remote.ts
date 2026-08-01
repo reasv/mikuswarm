@@ -18,38 +18,59 @@ import {
  * Effect Schema (the fidelity guard). Polled — the aggregates are cheap.
  */
 
-/** Window keyword shared by summary + timeseries. */
+/**
+ * Window keyword shared by summary + timeseries + leaderboard. `agent` is the
+ * page-wide agent filter (spec CONSOLE-MULTI-AGENT §9) — omitted means "All";
+ * the server treats an unknown name the same way (§3.5).
+ */
 const WindowArg = Schema.standardSchemaV1(
 	Schema.Struct({
 		window: Schema.String,
-		groupBy: Schema.optional(Schema.String)
+		groupBy: Schema.optional(Schema.String),
+		agent: Schema.optional(Schema.String)
 	})
 );
 
-/** GET /api/usage/summary?window= — totals by class + by model. */
-export const getUsageSummary = query(WindowArg, (arg) =>
-	apiGet(`/api/usage/summary?window=${encodeURIComponent(arg.window)}`, UsageSummary)
+/** Agent filter alone — for the recent-sessions / paid-calls tables (§9). */
+const AgentArg = Schema.standardSchemaV1(
+	Schema.Struct({ agent: Schema.optional(Schema.String) })
 );
 
-/** GET /api/usage/timeseries?window=&groupBy= — stacked spend-over-time. */
+/** GET /api/usage/summary?window=&agent= — totals by class + model (+ byAgent in agents mode). */
+export const getUsageSummary = query(WindowArg, (arg) => {
+	const q = new URLSearchParams({ window: arg.window });
+	if (arg.agent) q.set('agent', arg.agent);
+	return apiGet(`/api/usage/summary?${q.toString()}`, UsageSummary);
+});
+
+/** GET /api/usage/timeseries?window=&groupBy=&agent= — stacked spend-over-time. */
 export const getUsageTimeseries = query(WindowArg, (arg) => {
 	const q = new URLSearchParams({ window: arg.window });
 	if (arg.groupBy) q.set('groupBy', arg.groupBy);
+	if (arg.agent) q.set('agent', arg.agent);
 	return apiGet(`/api/usage/timeseries?${q.toString()}`, UsageTimeseries);
 });
 
-/** GET /api/usage/sessions — recent sessions with per-class rollup. */
-export const getUsageSessions = query(() => apiGet('/api/usage/sessions?limit=50', UsageSessions));
+/** GET /api/usage/sessions?agent= — recent sessions with per-class rollup. */
+export const getUsageSessions = query(AgentArg, (arg) => {
+	const q = new URLSearchParams({ limit: '50' });
+	if (arg.agent) q.set('agent', arg.agent);
+	return apiGet(`/api/usage/sessions?${q.toString()}`, UsageSessions);
+});
 
-/** GET /api/usage/tool-calls — recent paid tool/caption/embedding events. */
-export const getUsageToolCalls = query(() =>
-	apiGet('/api/usage/tool-calls?limit=50', UsageToolCalls)
-);
+/** GET /api/usage/tool-calls?agent= — recent paid tool/caption/embedding events. */
+export const getUsageToolCalls = query(AgentArg, (arg) => {
+	const q = new URLSearchParams({ limit: '50' });
+	if (arg.agent) q.set('agent', arg.agent);
+	return apiGet(`/api/usage/tool-calls?${q.toString()}`, UsageToolCalls);
+});
 
-/** GET /api/usage/leaderboard?window= — top users by spend (per-user equivalent of the Total card). */
-export const getUsageLeaderboard = query(WindowArg, (arg) =>
-	apiGet(`/api/usage/leaderboard?window=${encodeURIComponent(arg.window)}`, UsageLeaderboard)
-);
+/** GET /api/usage/leaderboard?window=&agent= — top users by spend (per-user equivalent of the Total card). */
+export const getUsageLeaderboard = query(WindowArg, (arg) => {
+	const q = new URLSearchParams({ window: arg.window });
+	if (arg.agent) q.set('agent', arg.agent);
+	return apiGet(`/api/usage/leaderboard?${q.toString()}`, UsageLeaderboard);
+});
 
 /** GET /api/usage/budgets — every configured rule's live status + live per-user picks. */
 export const getUsageBudgets = query(() => apiGet('/api/usage/budgets', UsageBudgets));

@@ -32,14 +32,17 @@ export const keys = {
 	// Global cost overview across the three spend lanes (spec AUXILIARY-USAGE-TRACKING §10.4).
 	costOverview: () => ['cost-overview'] as const,
 	// Usage & Cost page (spec USAGE-COST-LIMITS §7) — polled ledger views + budgets.
-	// `window` folds into the summary/timeseries keys so changing it refetches.
-	usageSummary: (window: string) => ['usage', 'summary', window] as const,
-	usageTimeseries: (window: string, groupBy: string) =>
-		['usage', 'timeseries', window, groupBy] as const,
-	usageSessions: () => ['usage', 'sessions'] as const,
-	usageToolCalls: () => ['usage', 'tool-calls'] as const,
+	// `window` (and the page-wide `agent` filter, CONSOLE-MULTI-AGENT §9 — null = All)
+	// fold into the keys so changing either refetches.
+	usageSummary: (window: string, agent: string | null) =>
+		['usage', 'summary', window, agent] as const,
+	usageTimeseries: (window: string, groupBy: string, agent: string | null) =>
+		['usage', 'timeseries', window, groupBy, agent] as const,
+	usageSessions: (agent: string | null) => ['usage', 'sessions', agent] as const,
+	usageToolCalls: (agent: string | null) => ['usage', 'tool-calls', agent] as const,
 	// `window` folds into the key so changing it refetches the leaderboard (cards + table).
-	usageLeaderboard: (window: string) => ['usage', 'leaderboard', window] as const,
+	usageLeaderboard: (window: string, agent: string | null) =>
+		['usage', 'leaderboard', window, agent] as const,
 	usageBudgets: () => ['usage', 'budgets'] as const,
 	// scope + page fold into the key so switching tab / page refetches that slice.
 	usageUserLimits: (scope: string, page: number) => ['usage', 'user-limits', scope, page] as const

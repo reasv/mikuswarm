@@ -37,6 +37,20 @@ Unreleased section; it is not part of any release's notes.
   by a new `GET /api/agents` read-only endpoint that serves the config-declared
   agents snapshot from memory.
 
+- **Console: Usage & Cost by-agent breakdown and page-wide agent filter**: in
+  multi-agent deployments the Usage & Cost page gains a per-agent cost dimension —
+  an agent tab row (All / one tab per agent, in `?agent=`, composing with the time
+  window) that filters the total-spend card, by-class / top-models breakdowns,
+  spend-over-time chart, recent-sessions and paid-calls tables, and the user
+  leaderboard server-side (Limits keep their own scope); a **By agent** summary
+  card and a **by agent** chart grouping (each agent in its accent color, plus an
+  "unattributed" residual for background spend); and a leading **agent** column in
+  both tables, shown on the All view and omitted when a single agent is filtered.
+  The recent-sessions table now orders identity columns first (session, type,
+  channel, trigger, then model and figures). The usage read endpoints accept an
+  optional `agent=` filter and the summary returns a `byAgent` breakdown in agents
+  mode; single-agent and legacy deployments are unchanged.
+
 - **Console: per-account room tabs**: when the room list spans more than one
   chat account (e.g. a Matrix account and a Discord account), the Conversations
   room list gains a sub-tab row — "All" plus one tab per account, each tagged
