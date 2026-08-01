@@ -93,6 +93,25 @@ function agentsFixture(): unknown {
 	};
 }
 
+// ── Agent split (spec CONSOLE-MULTI-AGENT §9) ───────────────────────────────
+// Deterministic per-agent share of every usage aggregate, so the page-wide agent
+// filter and the By-agent breakdown are exercised in demo mode. aria carries
+// most of the spend, nova a meaningful slice, and a small residual stays
+// unattributed (background caption/embedding has no timeline key). Sums to 1.
+const AGENT_SPLIT: Array<{ agent: string | null; frac: number }> = [
+	{ agent: 'aria', frac: 0.71 },
+	{ agent: 'nova', frac: 0.24 },
+	{ agent: null, frac: 0.05 }
+];
+const agentFrac = (agent: string | null): number =>
+	AGENT_SPLIT.find((s) => s.agent === agent)?.frac ?? 0;
+/** Coerce a raw `?agent=` param to a known demo agent, else null = All (§3.5). */
+const coerceAgent = (raw: string | null): string | null =>
+	raw != null && AGENT_SPLIT.some((s) => s.agent === raw) ? raw : null;
+/** Owning demo agent for a room key (matches the agentsFixture account sets). */
+const roomAgent = (key: string): string =>
+	key.startsWith(`discord:${NOVA_DISCORD}:`) ? 'nova' : 'aria';
+
 const MODEL_AGENT = 'anthropic/claude-sonnet-4';
 const MODEL_FAST = 'anthropic/claude-haiku-4';
 const MODEL_CAPTION = 'google/gemini-2.5-flash';
@@ -244,28 +263,55 @@ function spendModel(window: string, now: number): SpendModel {
 
 // ── Usage & Cost endpoints ──────────────────────────────────────────────────
 
-function usageSummary(window: string, now: number): unknown {
+function usageSummary(window: string, now: number, agent: string | null): unknown {
 	const m = spendModel(window, now);
+	// Page-wide agent filter (§9): scale every aggregate by the agent's share.
+	const frac = agent != null ? agentFrac(agent) : 1;
+	const scaleEvents = (e: number): number => Math.max(1, Math.round(e * frac));
+	const totalEvents = [...m.classTotals.values()].reduce((s, v) => s + v.events, 0);
 	return {
 		since: m.firstBucket,
 		now,
 		firstTs: m.firstBucket + 3 * MIN,
-		total: m.total,
+		total: usd(m.total * frac),
 		byClass: [...m.classTotals.entries()].map(([cls, v]) => ({
 			class: cls,
-			cost: v.cost,
-			events: v.events
+			cost: usd(v.cost * frac),
+			events: scaleEvents(v.events)
 		})),
 		byModel: [...m.modelTotals.entries()]
-			.map(([model, v]) => ({ model, cost: v.cost, events: v.events }))
-			.sort((a, b) => b.cost - a.cost)
+			.map(([model, v]) => ({ model, cost: usd(v.cost * frac), events: scaleEvents(v.events) }))
+			.sort((a, b) => b.cost - a.cost),
+		// Per-agent breakdown (§9): the full split on All, a single row when filtered.
+		byAgent: (agent != null ? AGENT_SPLIT.filter((s) => s.agent === agent) : AGENT_SPLIT).map(
+			(s) => ({
+				agent: s.agent,
+				cost: usd(m.total * s.frac),
+				events: Math.max(1, Math.round(totalEvents * s.frac))
+			})
+		)
 	};
 }
 
-function usageTimeseries(window: string, groupBy: string, now: number): unknown {
+function usageTimeseries(window: string, groupBy: string, now: number, agent: string | null): unknown {
 	const m = spendModel(window, now);
+	const frac = agent != null ? agentFrac(agent) : 1;
+	if (groupBy === 'agent') {
+		// Per-agent stacked series (§9): each bucket's class total split by agent share.
+		const bucketTotals = new Map<number, number>();
+		for (const r of m.classSeries) {
+			bucketTotals.set(r.bucket, usd((bucketTotals.get(r.bucket) ?? 0) + r.cost));
+		}
+		const split = agent != null ? AGENT_SPLIT.filter((s) => s.agent === agent) : AGENT_SPLIT;
+		const series = [...bucketTotals.entries()].flatMap(([bucket, total]) =>
+			split.map((s) => ({ bucket, grp: s.agent ?? 'unattributed', cost: usd(total * s.frac) }))
+		);
+		return { series, bucketMs: m.bucketMs, groupBy: 'agent' };
+	}
+	const base = groupBy === 'model' ? m.modelSeries : m.classSeries;
+	const series = frac === 1 ? base : base.map((r) => ({ ...r, cost: usd(r.cost * frac) }));
 	return {
-		series: groupBy === 'model' ? m.modelSeries : m.classSeries,
+		series,
 		bucketMs: m.bucketMs,
 		groupBy: groupBy === 'model' ? 'model' : 'class'
 	};
@@ -308,9 +354,11 @@ const SESSIONS: DemoSession[] = [
 
 const sessionTs = (s: DemoSession, now: number) => now - s.ageMin * MIN;
 
-function usageSessionsFixture(now: number): unknown {
+function usageSessionsFixture(now: number, agent: string | null): unknown {
 	return {
-		sessions: SESSIONS.map((s) => {
+		sessions: SESSIONS.filter(
+			(s) => agent == null || roomAgent(ROOMS[s.roomIdx].key) === agent
+		).map((s) => {
 			const room = ROOMS[s.roomIdx];
 			return {
 				sessionId: s.id,
@@ -334,9 +382,10 @@ function usageSessionsFixture(now: number): unknown {
 	};
 }
 
-function usageToolCallsFixture(now: number): unknown {
-	// Recent paid tool / caption / embedding events.
-	const rows: unknown[] = [];
+function usageToolCallsFixture(now: number, agent: string | null): unknown {
+	// Recent paid tool / caption / embedding events. (`timeline_key` is typed out so the
+	// agent filter below can attribute rows; the rest of the row shape stays loose.)
+	const rows: Array<Record<string, unknown> & { timeline_key: string | null }> = [];
 	const push = (
 		i: number,
 		cls: string,
@@ -381,14 +430,22 @@ function usageToolCallsFixture(now: number): unknown {
 	push(8, 'embedding', null, MODEL_EMBED, 'voyage', ROOMS[2], null, null, { input: 6400 }, 0.00064, 'chunk_513');
 	push(9, 'tool', 'search_history', MODEL_FAST, 'anthropic', ROOMS[3], 3, 'ses_zt0p5c', { input: 1200, output: 210 }, 0.014, null);
 	push(10, 'caption', null, MODEL_CAPTION, 'google', ROOMS[1], null, null, { input: 1080, output: 74 }, 0.002, 'att_c30f');
-	return { toolCalls: rows };
+	// Page-wide agent filter (§9): rows attribute by their room's agent; null-key rows
+	// (none currently, but keep the rule honest) drop out of any single-agent view.
+	const filtered =
+		agent == null
+			? rows
+			: rows.filter((r) => r.timeline_key != null && roomAgent(r.timeline_key) === agent);
+	return { toolCalls: filtered };
 }
 
-function usageLeaderboardFixture(window: string, now: number): unknown {
+function usageLeaderboardFixture(window: string, now: number, agent: string | null): unknown {
 	const { bucketMs, count } = windowCfg(window);
 	const buckets = bucketsFor(now, bucketMs, count);
-	// Descending per-user totals (invented but plausible), scaled to the window.
-	const scale = (bucketMs / HOUR) * (count / 24);
+	// Descending per-user totals (invented but plausible), scaled to the window — and to
+	// the agent's share when the page-wide filter is active (§9): every derived figure
+	// (user totals, system actors, grandTotal) shrinks consistently.
+	const scale = (bucketMs / HOUR) * (count / 24) * (agent != null ? agentFrac(agent) : 1);
 	const baseTotals = [3.42, 2.18, 1.74, 1.31, 0.96, 0.63, 0.44, 0.21];
 	const series = (total: number, phase: number) => {
 		const raw = buckets.map((b, i) => ({
@@ -1099,20 +1156,21 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 	const groupBy = params.get('groupBy') ?? 'class';
 	const scope = params.get('scope') ?? 'individuals';
 	const page = Number(params.get('page') ?? '0') || 0;
+	const agent = coerceAgent(params.get('agent'));
 
 	switch (pathname) {
 		case '/api/agents':
 			return agentsFixture();
 		case '/api/usage/summary':
-			return usageSummary(window, now);
+			return usageSummary(window, now, agent);
 		case '/api/usage/timeseries':
-			return usageTimeseries(window, groupBy, now);
+			return usageTimeseries(window, groupBy, now, agent);
 		case '/api/usage/sessions':
-			return usageSessionsFixture(now);
+			return usageSessionsFixture(now, agent);
 		case '/api/usage/tool-calls':
-			return usageToolCallsFixture(now);
+			return usageToolCallsFixture(now, agent);
 		case '/api/usage/leaderboard':
-			return usageLeaderboardFixture(window, now);
+			return usageLeaderboardFixture(window, now, agent);
 		case '/api/usage/budgets':
 			return usageBudgetsFixture(now);
 		case '/api/usage/user-limits':

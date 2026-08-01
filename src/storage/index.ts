@@ -29,6 +29,7 @@ export {
   type SessionToolUsage,
   type CaptioningUsageAggregate,
   type CostOverview,
+  type UsageViewScope,
   type RoomSummaryRow,
   type SummaryLineage,
   type TimelineCursor,

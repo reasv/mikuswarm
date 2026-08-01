@@ -22,9 +22,9 @@
 	import { presentRule } from '$lib/rule-status';
 	import { buildLadder, buildSegments, type LadderGroup, type CapSegment } from '$lib/user-ladder';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { distinctAccounts } from '$lib/timeline-key';
+	import { distinctAccounts, timelineAccount } from '$lib/timeline-key';
 	import { agentsQuery } from '$lib/query/agents';
-	import { buildAgentLookup, agentFor, distinctAgents, agentAccent, platformOf } from '$lib/agents';
+	import { buildAgentLookup, agentFor, needsAccountId, agentAccent, platformOf } from '$lib/agents';
 	import type { AgentEntry } from '$lib/schemas';
 
 	// "Display Name (unique handle)" for a labeled sender — the handle is the Discord
@@ -72,54 +72,87 @@
 		return value != null && allowed.includes(value) ? value : fallback;
 	}
 	const window = $derived(coerce(page.url.searchParams.get('window'), WINDOW_IDS, '24h'));
-	const groupBy = $derived(
-		coerce(page.url.searchParams.get('group'), ['class', 'model'], 'class') as 'class' | 'model'
-	);
 	const tab = $derived(coerce(page.url.searchParams.get('tab'), TAB_IDS, 'sessions'));
 
-	function setParam(key: string, value: string): void {
+	function setParam(key: string, value: string | null): void {
 		const url = new URL(page.url);
-		url.searchParams.set(key, value);
+		if (value === null) url.searchParams.delete(key);
+		else url.searchParams.set(key, value);
 		void goto(url, { replaceState: true, keepFocus: true, noScroll: true });
 	}
 
-	// `window`/`groupBy` fold into these query keys, so switching them is a new cache
-	// entry. `keepPreviousData` keeps the prior window's cards/chart on screen while
-	// the new window loads — without it the entry has no data and the UI blank-flashes
-	// to "$0 / no spend" for one frame before refilling. Background polls (same key)
-	// already retain data in place, so they update silently with no indicator.
+	// ── Agent mode (spec CONSOLE-MULTI-AGENT §4/§9) ─────────────────────────────
+	// Fetched once (config is stable for the process lifetime). While loading the
+	// gate is closed: all agent chrome is suppressed (no flash of wrong state).
+	const agentsQ = agentsQuery();
+	const agentsData = $derived(agentsQ.data);
+	const globalGate = $derived(
+		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
+	);
+	const agentLookup = $derived(
+		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
+	);
+	const agentNames = $derived((agentsData?.agents ?? []).map((a) => a.name));
+
+	// Page-wide agent filter (§9): `?agent=` scopes every usage view — cards, chart,
+	// tables, leaderboard — but never Limits (rules carry their own scope). Unknown or
+	// absent name means All (§3.5); validated against the payload so only real names
+	// ever reach a query. null = All.
+	const agentSel = $derived.by(() => {
+		const raw = page.url.searchParams.get('agent');
+		return globalGate && raw != null && agentNames.includes(raw) ? raw : null;
+	});
+
+	// `by agent` chart grouping exists only under the gate; a stale `?group=agent`
+	// below it coerces to `class` (same safe-default rule as every other param).
+	const groupBy = $derived(
+		coerce(
+			page.url.searchParams.get('group'),
+			globalGate ? ['class', 'model', 'agent'] : ['class', 'model'],
+			'class'
+		) as 'class' | 'model' | 'agent'
+	);
+
+	// `window`/`groupBy`/`agentSel` fold into these query keys, so switching them is a
+	// new cache entry. `keepPreviousData` keeps the prior window's cards/chart on screen
+	// while the new window loads — without it the entry has no data and the UI blank-
+	// flashes to "$0 / no spend" for one frame before refilling. Background polls (same
+	// key) already retain data in place, so they update silently with no indicator.
 	const summary = createQuery(() => ({
-		queryKey: keys.usageSummary(window),
-		queryFn: () => fresh(getUsageSummary({ window })),
+		queryKey: keys.usageSummary(window, agentSel),
+		queryFn: () => fresh(getUsageSummary({ window, agent: agentSel ?? undefined })),
 		placeholderData: keepPreviousData,
 		refetchInterval: 5000
 	}));
 	const timeseries = createQuery(() => ({
-		queryKey: keys.usageTimeseries(window, groupBy),
-		queryFn: () => fresh(getUsageTimeseries({ window, groupBy })),
+		queryKey: keys.usageTimeseries(window, groupBy, agentSel),
+		queryFn: () =>
+			fresh(getUsageTimeseries({ window, groupBy, agent: agentSel ?? undefined })),
 		placeholderData: keepPreviousData,
 		refetchInterval: 5000
 	}));
 	// The three tab-bound feeds only poll while their tab is visible (`enabled`), so the page
 	// isn't fetching all three at once; switching to a tab fetches the newly-shown one.
 	const sessions = createQuery(() => ({
-		queryKey: keys.usageSessions(),
-		queryFn: () => fresh(getUsageSessions()),
+		queryKey: keys.usageSessions(agentSel),
+		queryFn: () => fresh(getUsageSessions({ agent: agentSel ?? undefined })),
 		enabled: tab === 'sessions',
+		placeholderData: keepPreviousData,
 		refetchInterval: 8000
 	}));
 	const toolCalls = createQuery(() => ({
-		queryKey: keys.usageToolCalls(),
-		queryFn: () => fresh(getUsageToolCalls()),
+		queryKey: keys.usageToolCalls(agentSel),
+		queryFn: () => fresh(getUsageToolCalls({ agent: agentSel ?? undefined })),
 		enabled: tab === 'paid',
+		placeholderData: keepPreviousData,
 		refetchInterval: 8000
 	}));
 	// Per-user leaderboard — `window` folds into the key (cards + table both scope to the
 	// selected period); `keepPreviousData` keeps the prior window on screen while a new one
 	// loads, like the cards/chart above.
 	const leaderboard = createQuery(() => ({
-		queryKey: keys.usageLeaderboard(window),
-		queryFn: () => fresh(getUsageLeaderboard({ window })),
+		queryKey: keys.usageLeaderboard(window, agentSel),
+		queryFn: () => fresh(getUsageLeaderboard({ window, agent: agentSel ?? undefined })),
 		enabled: tab === 'leaderboard',
 		placeholderData: keepPreviousData,
 		refetchInterval: 8000
@@ -133,15 +166,24 @@
 	const total = $derived(summary.data?.total ?? 0);
 	const byClass = $derived(summary.data?.byClass ?? []);
 	const byModel = $derived(summary.data?.byModel ?? []);
+	// Per-agent breakdown card (§9). Rendered only under the gate on the All view — a
+	// single-agent view would show one trivially-total row, so (like the tables' agent
+	// column) the card is omitted when the page is filtered to one agent.
+	const byAgent = $derived(summary.data?.byAgent ?? []);
+	const showByAgentCard = $derived(globalGate && agentSel === null);
+	// Tables grow an agent column under the same rule (§9): first column, omitted when
+	// the page-wide filter already pins a single agent.
+	const showAgentCol = $derived(globalGate && agentSel === null);
 
 	// User-leaderboard pagination (client-side). The backend returns the full non-zero
 	// human ranking, so we page through it locally down to the lowest spender. The page
-	// resets to 0 whenever the window or active tab changes (a new ranking).
+	// resets to 0 whenever the window, agent filter, or active tab changes (a new ranking).
 	const USER_PAGE_SIZE = 25;
 	let userPage = $state(0);
 	$effect(() => {
 		void window;
 		void tab;
+		void agentSel;
 		userPage = 0;
 	});
 	const lbUsers = $derived(leaderboard.data?.users ?? []);
@@ -150,28 +192,6 @@
 	const pagedUsers = $derived(
 		lbUsers.slice(userPageSafe * USER_PAGE_SIZE, userPageSafe * USER_PAGE_SIZE + USER_PAGE_SIZE)
 	);
-
-	// ── Agent mode (spec CONSOLE-MULTI-AGENT §4) ────────────────────────────────
-	// Fetched once (config is stable for the process lifetime). While loading the
-	// gate is closed: all agent chrome is suppressed (no flash of wrong state).
-	const agentsQ = agentsQuery();
-	const agentsData = $derived(agentsQ.data);
-	const globalGate = $derived(
-		agentsData?.mode === 'agents' && (agentsData.agents.length ?? 0) > 1
-	);
-	const agentLookup = $derived(
-		agentsData && globalGate ? buildAgentLookup(agentsData) : new Map()
-	);
-
-	// Client-side agent filter for the sessions and tool-calls tables.
-	// null = All; set to an agent name to filter that table. Resets on tab change.
-	let sessionAgentFilter = $state<string | null>(null);
-	let toolCallAgentFilter = $state<string | null>(null);
-	$effect(() => {
-		void tab;
-		sessionAgentFilter = null;
-		toolCallAgentFilter = null;
-	});
 
 	const rules = $derived(
 		// Blocked first, then near, then ok; ties by fill fraction (spec §7.1 #3).
@@ -184,40 +204,16 @@
 	// Currently-selected model per live per-user session (spec §14).
 	const userSelections = $derived([...(budgets.data?.userSelections ?? [])]);
 
-	// Channel cells grow an identity tag only when the table's rows span more than
-	// one identity. Under the global gate (agents mode) the gate switches from
-	// "distinct accounts" to "distinct agents" (spec CONSOLE-MULTI-AGENT §3.1).
-	// Below the gate the existing distinctAccounts behavior is unchanged.
+	// Below the gate (legacy / single-agent), channel cells grow the account tag only
+	// when the table's rows span more than one account — unchanged behavior. Under the
+	// gate identity moves to the dedicated agent COLUMN (§9), so the per-cell agent
+	// chip of the previous revision is retired and ChannelCell renders plain.
 	const sessionsSpanAccounts = $derived(
-		globalGate
-			? distinctAgents((sessions.data?.sessions ?? []).map((s) => s.timelineKey), agentLookup) > 1
-			: distinctAccounts((sessions.data?.sessions ?? []).map((s) => s.timelineKey)) > 1
+		distinctAccounts((sessions.data?.sessions ?? []).map((s) => s.timelineKey)) > 1
 	);
 	const toolCallsSpanAccounts = $derived(
-		globalGate
-			? distinctAgents(
-					(toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key),
-					agentLookup
-				) > 1
-			: distinctAccounts((toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key)) > 1
+		distinctAccounts((toolCalls.data?.toolCalls ?? []).map((t) => t.timeline_key)) > 1
 	);
-
-	// Filtered views for the client-side agent filter chips (§4): applied only when the
-	// filter chip is active and the gate is open. Falls back to full list otherwise.
-	const filteredSessions = $derived.by(() => {
-		const all = sessions.data?.sessions ?? [];
-		if (!globalGate || !sessionAgentFilter) return all;
-		return all.filter(
-			(s) => agentFor(s.timelineKey, agentLookup)?.agentName === sessionAgentFilter
-		);
-	});
-	const filteredToolCalls = $derived.by(() => {
-		const all = toolCalls.data?.toolCalls ?? [];
-		if (!globalGate || !toolCallAgentFilter) return all;
-		return all.filter(
-			(t) => t.timeline_key && agentFor(t.timeline_key, agentLookup)?.agentName === toolCallAgentFilter
-		);
-	});
 
 	// Budget rule §5: check whether a set of timeline-key prefixes exactly matches
 	// one agent's complete account set (both sets equal → render `agent: name` chip).
@@ -269,6 +265,14 @@
 	];
 	function colorFor(group: string, index: number): string {
 		return CLASS_COLORS[group] ?? PALETTE[index % PALETTE.length];
+	}
+	// `by agent` series keep each agent's accent color (§3.4 — same agent, same color
+	// everywhere); the "unattributed" residual (no timeline key / account not in config)
+	// stays neutral gray.
+	function agentColorFor(group: string, index: number): string {
+		const i = agentNames.indexOf(group);
+		if (i >= 0) return agentAccent(i);
+		return group === 'unattributed' ? '#888888' : PALETTE[index % PALETTE.length];
 	}
 
 	// Per-user limits are grouped + sorted + PAGINATED server-side (spec §14) so the
@@ -351,7 +355,7 @@
 		buildSpendChart(
 			timeseries.data?.series ?? [],
 			timeseries.data?.bucketMs ?? 3_600_000,
-			colorFor
+			groupBy === 'agent' ? agentColorFor : colorFor
 		)
 	);
 	// Empty = no buckets, or buckets exist but no positive spend (zero-cost-only
@@ -454,8 +458,46 @@
 <div class="flex h-screen flex-col">
 	<TopBar />
 	<div class="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
-		<!-- 1. Window selector + breakdown toggle -->
+		<!-- 1. Agent filter (agents mode, §9) + window selector + breakdown toggle -->
 		<div class="flex flex-wrap items-center gap-3">
+			{#if globalGate}
+				<!-- Page-wide agent tabs: All (default) or one agent. Scopes every usage
+				     view below — cards, chart, tables, leaderboard — but never Limits.
+				     Lives in `?agent=` and combines with the window filter (§9). -->
+				<div class="flex items-center gap-0.5 rounded-md bg-muted p-0.5 text-xs">
+					<button
+						class={cn(
+							'rounded px-2 py-0.5 transition-colors',
+							agentSel === null
+								? 'bg-background font-medium text-foreground shadow-sm'
+								: 'text-muted-foreground hover:text-foreground'
+						)}
+						onclick={() => setParam('agent', null)}
+					>
+						All
+					</button>
+					{#each agentsData?.agents ?? [] as agent, i (agent.name)}
+						{@const accent = agentAccent(i)}
+						<button
+							class={cn(
+								'inline-flex items-baseline gap-1 rounded px-2 py-0.5 transition-colors',
+								agentSel === agent.name
+									? 'bg-background font-medium shadow-sm'
+									: 'text-muted-foreground hover:text-foreground'
+							)}
+							style={agentSel === agent.name ? `color:${accent}` : ''}
+							onclick={() => setParam('agent', agent.name)}
+						>
+							<span
+								class="relative top-px inline-block size-1.5 shrink-0 rounded-full"
+								style="background:{accent}"
+							></span>
+							{agent.name}
+							<span class="text-[8px] uppercase tracking-wide opacity-70">{platformOf(agent)}</span>
+						</button>
+					{/each}
+				</div>
+			{/if}
 			<div class="flex items-center gap-0.5 rounded-md bg-muted p-0.5 text-xs">
 				{#each WINDOWS as w (w.id)}
 					<button
@@ -473,7 +515,7 @@
 				{/each}
 			</div>
 			<div class="flex items-center gap-0.5 rounded-md bg-muted p-0.5 text-xs">
-				{#each ['class', 'model'] as g (g)}
+				{#each globalGate ? ['class', 'model', 'agent'] : ['class', 'model'] as g (g)}
 					<button
 						class={cn(
 							'rounded px-2 py-0.5 capitalize transition-colors',
@@ -494,8 +536,14 @@
 
 		<!-- 2. Cards -->
 		<!-- items-start so the taller Total card (it carries the averages breakdown) doesn't
-		     stretch the by-class / top-models cards into a column of empty space. -->
-		<div class="grid grid-cols-1 items-start gap-3 md:grid-cols-3">
+		     stretch the by-class / top-models cards into a column of empty space. The By-agent
+		     card (§9) joins only on the multi-agent All view, widening the row to 4. -->
+		<div
+			class={cn(
+				'grid grid-cols-1 items-start gap-3',
+				showByAgentCard ? 'md:grid-cols-2 xl:grid-cols-4' : 'md:grid-cols-3'
+			)}
+		>
 			<SpendSummaryCard
 				label="Total spend"
 				total={total}
@@ -524,6 +572,37 @@
 					{/each}
 				</div>
 			</div>
+			{#if showByAgentCard}
+				<!-- Per-agent spend (§9). Named agents keep their accent; the residual bucket
+				     (background caption/embedding, or accounts no longer in config) is muted. -->
+				<div class="rounded-lg border p-3">
+					<div class="text-xs text-muted-foreground">By agent</div>
+					<div class="mt-1 space-y-1">
+						{#each byAgent as a (a.agent ?? '∅')}
+							{@const idx = a.agent != null ? agentNames.indexOf(a.agent) : -1}
+							<div class="flex items-center justify-between gap-2 text-xs">
+								{#if a.agent != null && idx >= 0}
+									<span class="flex items-center gap-1.5">
+										<span
+											class="inline-block size-2 rounded-sm"
+											style={`background:${agentAccent(idx)}`}
+										></span>
+										{a.agent}
+									</span>
+								{:else}
+									<span class="flex items-center gap-1.5 text-muted-foreground">
+										<span class="inline-block size-2 rounded-sm bg-muted-foreground/40"></span>
+										{a.agent ?? 'unattributed'}
+									</span>
+								{/if}
+								<span class="font-mono">{fmtUsd(a.cost)}</span>
+							</div>
+						{:else}
+							<div class="text-xs text-muted-foreground">no spend</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
 			<div class="rounded-lg border p-3">
 				<div class="text-xs text-muted-foreground">Top models</div>
 				<div class="mt-1 space-y-1">
@@ -932,6 +1011,37 @@
 			</div>
 		{/snippet}
 
+		<!-- Agent cell for the sessions / paid-calls tables (§9): accent dot + name +
+		     the row's provider, with the accountId appended only when the agent has >1
+		     account on that provider (§3.2 row-level grammar). Unresolvable accounts
+		     (no longer in config) fall back to the raw tag, muted; null keys render a
+		     dash (background caption/embedding has no agent). -->
+		{#snippet agentChip(key: string | null | undefined)}
+			{@const resolved = key ? agentFor(key, agentLookup) : undefined}
+			{@const acc = key ? timelineAccount(key) : undefined}
+			{#if resolved && acc}
+				{@const entry = (agentsData?.agents ?? []).find((e: AgentEntry) => e.name === resolved.agentName)}
+				{@const accent = agentAccent(resolved.agentIndex)}
+				<span class="inline-flex items-baseline gap-1 whitespace-nowrap text-[10px]">
+					<span
+						class="relative top-px inline-block size-1.5 shrink-0 self-center rounded-full"
+						style="background:{accent}"
+					></span>
+					<span style="color:{accent}">
+						{resolved.agentName}
+						<span class="uppercase tracking-wide opacity-80">{acc.provider}</span>{#if entry && needsAccountId(entry, acc.provider)}&nbsp;{acc.accountId}{/if}
+					</span>
+				</span>
+			{:else if acc}
+				<span class="whitespace-nowrap text-[10px] text-muted-foreground/50">
+					{acc.accountId}
+					<span class="uppercase tracking-wide">{acc.provider}</span>
+				</span>
+			{:else}
+				<span class="text-[10px] text-muted-foreground">—</span>
+			{/if}
+		{/snippet}
+
 		<!-- Names the segment colors (a color key for the composite bar above). -->
 		{#snippet segLegend(segments: CapSegment[])}
 			<div class="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-muted-foreground">
@@ -1041,52 +1151,20 @@
 			</div>
 
 			{#if tab === 'sessions'}
-			<!-- Agent filter chips (spec CONSOLE-MULTI-AGENT §4): shown only under the
-			     global gate when the table's rows span >1 agent. Client-side filter. -->
-			{#if globalGate && sessionsSpanAccounts}
-				<div class="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
-					<button
-						class={cn(
-							'rounded px-2 py-0.5 transition-colors',
-							sessionAgentFilter === null
-								? 'bg-muted font-medium text-foreground'
-								: 'text-muted-foreground hover:text-foreground'
-						)}
-						onclick={() => (sessionAgentFilter = null)}
-					>All</button>
-					{#each agentsData?.agents ?? [] as agent, i}
-						{@const accent = agentAccent(i)}
-						{@const platform = platformOf(agent)}
-						{@const hasRows = (sessions.data?.sessions ?? []).some(
-							(s) => agentFor(s.timelineKey, agentLookup)?.agentName === agent.name
-						)}
-						{#if hasRows}
-							<button
-								class={cn(
-									'inline-flex items-baseline gap-0.5 rounded border px-2 py-0.5 transition-colors',
-									sessionAgentFilter === agent.name
-										? 'font-medium text-foreground'
-										: 'border-transparent text-muted-foreground hover:text-foreground'
-								)}
-								style={sessionAgentFilter === agent.name
-									? `border-color:${accent}; color:${accent}`
-									: ''}
-								onclick={() => (sessionAgentFilter = agent.name)}
-							>
-								<span class="relative top-px inline-block size-1.5 shrink-0 rounded-full" style="background:{accent}"></span>
-								{agent.name}
-								<span class="text-[10px] uppercase tracking-wide opacity-70">{platform}</span>
-							</button>
-						{/if}
-					{/each}
-				</div>
-			{/if}
+			<!-- Recent sessions. Filtering by agent happens page-wide via the tabs above (§9);
+			     the agent COLUMN appears only on the multi-agent All view (it is redundant
+			     when the page is pinned to one agent). -->
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
 						<tr class="border-b">
+							{#if showAgentCol}
+								<th class="py-1 pr-3 font-medium">agent</th>
+							{/if}
 							<th class="py-1 pr-3 font-medium">session</th>
 							<th class="py-1 pr-3 font-medium">type</th>
+							<th class="py-1 pr-3 font-medium">channel</th>
+							<th class="py-1 pr-3 font-medium">trigger</th>
 							<th class="py-1 pr-3 font-medium">model</th>
 							<th class="py-1 pr-3 text-right font-medium">in</th>
 							<th class="py-1 pr-3 text-right font-medium">out</th>
@@ -1097,20 +1175,29 @@
 							<th class="py-1 pr-3 text-right font-medium" title="agent-LLM cost">llm $</th>
 							<th class="py-1 pr-3 text-right font-medium" title="tool-call cost">tool $</th>
 							<th class="py-1 pr-3 text-right font-medium">total $</th>
-							<th class="py-1 pr-3 font-medium">status</th>
-							<th class="py-1 pr-3 font-medium">channel</th>
-							<th class="py-1 font-medium">trigger</th>
+							<th class="py-1 font-medium">status</th>
 						</tr>
 					</thead>
 					<tbody>
-						{#each filteredSessions as s (s.sessionId)}
+						{#each sessions.data?.sessions ?? [] as s (s.sessionId)}
 							<tr class="border-b border-border/50">
+								{#if showAgentCol}
+									<td class="py-1 pr-3">{@render agentChip(s.timelineKey)}</td>
+								{/if}
 								<td class="py-1 pr-3 font-mono text-[10px]" title={s.sessionId}>
 									<a href={`/?session=${s.sessionId}`} class="hover:underline">
 										{s.sessionId.slice(0, 10)}
 									</a>
 								</td>
 								<td class="py-1 pr-3 text-[11px]">{s.sessionType}</td>
+								<td class="py-1 pr-3 text-[10px]">
+									<ChannelCell
+										label={s.channelLabel}
+										id={s.timelineKey}
+										showAccount={!globalGate && sessionsSpanAccounts}
+									/>
+								</td>
+								<td class="py-1 pr-3 text-[11px]">{s.triggerSender ?? 'N/A'}</td>
 								<td class="py-1 pr-3 font-mono text-[10px]" title={s.modelId ?? ''}>
 									{s.modelId ?? '—'}
 								</td>
@@ -1125,69 +1212,25 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px] font-semibold">
 									{fmtUsd(s.agentCost + s.toolCost)}
 								</td>
-								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{s.status}</td>
-								<td class="py-1 pr-3 text-[10px]">
-									<ChannelCell
-										label={s.channelLabel}
-										id={s.timelineKey}
-										showAccount={!globalGate && sessionsSpanAccounts}
-										agentLookup={globalGate && sessionsSpanAccounts ? agentLookup : undefined}
-										agentEntries={agentsData?.agents}
-									/>
-								</td>
-								<td class="py-1 text-[11px]">{s.triggerSender ?? 'N/A'}</td>
+								<td class="py-1 text-[10px] text-muted-foreground">{s.status}</td>
 							</tr>
 						{:else}
-							<tr><td colspan="15" class="py-2 text-xs text-muted-foreground">no sessions</td></tr>
+							<tr><td colspan={showAgentCol ? 16 : 15} class="py-2 text-xs text-muted-foreground">no sessions</td></tr>
 						{/each}
 					</tbody>
 				</table>
 			</div>
 			{:else if tab === 'paid'}
-			<!-- Recent paid tool/caption/embedding calls -->
-			<!-- Agent filter chips (spec CONSOLE-MULTI-AGENT §4). -->
-			{#if globalGate && toolCallsSpanAccounts}
-				<div class="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
-					<button
-						class={cn(
-							'rounded px-2 py-0.5 transition-colors',
-							toolCallAgentFilter === null
-								? 'bg-muted font-medium text-foreground'
-								: 'text-muted-foreground hover:text-foreground'
-						)}
-						onclick={() => (toolCallAgentFilter = null)}
-					>All</button>
-					{#each agentsData?.agents ?? [] as agent, i}
-						{@const accent = agentAccent(i)}
-						{@const platform = platformOf(agent)}
-						{@const hasRows = (toolCalls.data?.toolCalls ?? []).some(
-							(t) => t.timeline_key && agentFor(t.timeline_key, agentLookup)?.agentName === agent.name
-						)}
-						{#if hasRows}
-							<button
-								class={cn(
-									'inline-flex items-baseline gap-0.5 rounded border px-2 py-0.5 transition-colors',
-									toolCallAgentFilter === agent.name
-										? 'font-medium text-foreground'
-										: 'border-transparent text-muted-foreground hover:text-foreground'
-								)}
-								style={toolCallAgentFilter === agent.name
-									? `border-color:${accent}; color:${accent}`
-									: ''}
-								onclick={() => (toolCallAgentFilter = agent.name)}
-							>
-								<span class="relative top-px inline-block size-1.5 shrink-0 rounded-full" style="background:{accent}"></span>
-								{agent.name}
-								<span class="text-[10px] uppercase tracking-wide opacity-70">{platform}</span>
-							</button>
-						{/if}
-					{/each}
-				</div>
-			{/if}
+			<!-- Recent paid tool/caption/embedding calls. Agent filtering is page-wide via
+			     the tabs above (§9); the agent column follows the same All-view-only rule
+			     as the sessions table. -->
 			<div class="overflow-x-auto">
 				<table class="w-full text-sm">
 					<thead class="text-left text-xs text-muted-foreground">
 						<tr class="border-b">
+							{#if showAgentCol}
+								<th class="py-1 pr-3 font-medium">agent</th>
+							{/if}
 							<th class="py-1 pr-3 font-medium">when</th>
 							<th class="py-1 pr-3 font-medium">class</th>
 							<th class="py-1 pr-3 font-medium">tool</th>
@@ -1202,8 +1245,11 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each filteredToolCalls as t (t.id)}
+						{#each toolCalls.data?.toolCalls ?? [] as t (t.id)}
 							<tr class="border-b border-border/50">
+								{#if showAgentCol}
+									<td class="py-1 pr-3">{@render agentChip(t.timeline_key)}</td>
+								{/if}
 								<td class="py-1 pr-3 text-[10px] text-muted-foreground">{fmtTime(t.ts)}</td>
 								<td class="py-1 pr-3 text-[11px]">{t.class}</td>
 								<td class="py-1 pr-3 text-[11px]">{t.tool_name ?? '—'}</td>
@@ -1220,8 +1266,6 @@
 											label={t.channel_label ?? t.timeline_key}
 											id={t.timeline_key}
 											showAccount={!globalGate && toolCallsSpanAccounts}
-											agentLookup={globalGate && toolCallsSpanAccounts ? agentLookup : undefined}
-											agentEntries={agentsData?.agents}
 										/>
 									{:else}
 										<span class="text-muted-foreground">—</span>
@@ -1229,7 +1273,7 @@
 								</td>
 							</tr>
 						{:else}
-							<tr><td colspan="11" class="py-2 text-xs text-muted-foreground">no paid calls</td></tr>
+							<tr><td colspan={showAgentCol ? 12 : 11} class="py-2 text-xs text-muted-foreground">no paid calls</td></tr>
 						{/each}
 					</tbody>
 				</table>
@@ -1395,7 +1439,7 @@
 							</div>
 						{/if}
 						<div class="mt-1.5 text-[10px] text-muted-foreground">
-							Summarization &amp; Diary are background maintenance; Proactive is Miku’s
+							Summarization &amp; Diary are background maintenance; Proactive is the agent’s
 							self-initiated posts. Each card’s rank shows where it would place among users;
 							average / median are over users who spent &gt; 0 this period. Background caption /
 							embedding has no actor and is excluded here but still counted in the total.

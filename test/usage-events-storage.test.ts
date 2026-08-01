@@ -722,3 +722,92 @@ test("getUsageLeaderboard: system actors split by session_type, comparisonRank, 
     storage.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Agent scoping of the usage view queries (spec CONSOLE-MULTI-AGENT §9): the
+// optional `timelineKeyPrefixes` UsageViewScope restricts every console view to
+// one agent's accounts, and getUsageSummary's `includeByKey` returns the
+// per-timeline-key rollup the handler folds into the byAgent breakdown.
+// ---------------------------------------------------------------------------
+
+test("usage views: timelineKeyPrefixes scope + byKey rollup (CONSOLE-MULTI-AGENT §9)", async () => {
+  const MIKU = "matrix:miku:room:!a";
+  const RIN = "discord:rin:room:123";
+  await withLedger(
+    [
+      { ts: 1_000, class: "agent_loop", timelineKey: MIKU, triggerSenderId: "@alice:x", agentSessionId: "s-1", modelId: "opus", costUsd: 1 },
+      { ts: 2_000, class: "tool", toolName: "image_generate", timelineKey: MIKU, triggerSenderId: "@alice:x", agentSessionId: "s-1", modelId: "gemini", costUsd: 2 },
+      { ts: 3_000, class: "agent_loop", timelineKey: RIN, triggerSenderId: "@bob:x", agentSessionId: "s-2", modelId: "opus", costUsd: 4 },
+      // Background embedding with no timeline key: excluded from any agent scope,
+      // present in the unscoped byKey rollup as the null-key group.
+      { ts: 4_000, class: "embedding", modelId: "voyage", costUsd: 8 },
+    ],
+    async (storage) => {
+      const scope = { timelineKeyPrefixes: ["matrix:miku"] };
+
+      // Summary: scoped totals cover only miku's rows; byKey groups per raw key.
+      const scoped = storage.getUsageSummary(0, 10_000, scope);
+      assert.equal(scoped.total, 3);
+      assert.equal(scoped.firstTs, 1_000);
+      const all = storage.getUsageSummary(0, 10_000, { includeByKey: true });
+      assert.equal(all.total, 15);
+      const byKey = new Map((all.byKey ?? []).map((r) => [r.key, r]));
+      assert.equal(byKey.get(MIKU)?.cost, 3);
+      assert.equal(byKey.get(RIN)?.cost, 4);
+      assert.equal(byKey.get(null)?.cost, 8, "null-key spend rides along for the residual bucket");
+      assert.equal(storage.getUsageSummary(0, 10_000).byKey, undefined, "byKey only when requested");
+
+      // Timeseries: scoped, and groupBy "key" groups by raw key ('' for null keys).
+      const series = storage.getUsageTimeseries(0, 1_000, "class", scope);
+      assert.equal(series.reduce((s, r) => s + r.cost, 0), 3);
+      const byKeySeries = storage.getUsageTimeseries(0, 10_000, "key");
+      const grps = new Map(byKeySeries.map((r) => [r.grp, r.cost]));
+      assert.equal(grps.get(MIKU), 3);
+      assert.equal(grps.get(RIN), 4);
+      assert.equal(grps.get(""), 8, "null keys collapse to the '' group");
+
+      // Tool calls: only miku's tool row survives the scope.
+      const calls = storage.getUsageRecentToolCalls(50, scope);
+      assert.deepEqual(calls.map((c) => c.timeline_key), [MIKU]);
+
+      // Leaderboard: scoped users + grandTotal (the share denominator shrinks too).
+      const lb = storage.getUsageLeaderboard(0, 10_000, 1_000, 10, scope);
+      assert.deepEqual(lb.users.map((u) => u.senderId), ["@alice:x"]);
+      assert.equal(lb.grandTotal, 3);
+
+      // A prefix is an exact segment match, not a LIKE substring: "matrix:mik"
+      // must not match miku's rows (the appended ':' boundary).
+      assert.equal(storage.getUsageSummary(0, 10_000, { timelineKeyPrefixes: ["matrix:mik"] }).total, 0);
+    },
+  );
+});
+
+test("getUsageRecentSessions: timelineKeyPrefixes scope keeps only the agent's sessions (§9)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.insertAgentSession(session({ id: "s-miku", timelineKey: "matrix:miku:room:!a" }));
+    await storage.updateAgentSessionStatus("s-miku", "completed", { completedAt: 9_000, updatedAt: 9_000 });
+    await storage.insertAgentSession(session({ id: "s-rin", timelineKey: "discord:rin:room:123" }));
+    await storage.updateAgentSessionStatus("s-rin", "completed", { completedAt: 8_000, updatedAt: 8_000 });
+    await storage.waitForIdle();
+
+    assert.deepEqual(
+      storage.getUsageRecentSessions(50).map((r) => r.sessionId),
+      ["s-miku", "s-rin"],
+    );
+    assert.deepEqual(
+      storage.getUsageRecentSessions(50, { timelineKeyPrefixes: ["discord:rin"] }).map((r) => r.sessionId),
+      ["s-rin"],
+    );
+    // Two prefixes OR together (a multi-account agent).
+    assert.deepEqual(
+      storage
+        .getUsageRecentSessions(50, { timelineKeyPrefixes: ["matrix:miku", "discord:rin"] })
+        .map((r) => r.sessionId),
+      ["s-miku", "s-rin"],
+    );
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});

@@ -74,7 +74,7 @@ describe('demo fixtures decode through their wire schemas', () => {
 			const f = resolveFixture('/api/usage/summary', new URLSearchParams({ window }));
 			expect(() => Schema.decodeUnknownSync(UsageSummary as never)(f)).not.toThrow();
 		});
-		for (const groupBy of ['class', 'model']) {
+		for (const groupBy of ['class', 'model', 'agent']) {
 			it(`/api/usage/timeseries?window=${window}&groupBy=${groupBy}`, () => {
 				const f = resolveFixture(
 					'/api/usage/timeseries',
@@ -88,6 +88,60 @@ describe('demo fixtures decode through their wire schemas', () => {
 			expect(() => Schema.decodeUnknownSync(UsageLeaderboard as never)(f)).not.toThrow();
 		});
 	}
+
+	// Page-wide agent filter (spec CONSOLE-MULTI-AGENT §9): agent-scoped variants of every
+	// usage endpoint still decode, aggregates shrink, and tables keep only that agent's rows.
+	describe('agent-filtered usage fixtures (§9)', () => {
+		const q = (extra: Record<string, string>) =>
+			new URLSearchParams({ window: '24h', ...extra });
+
+		it('summary scales down and reports a single byAgent bucket', () => {
+			const all = Schema.decodeUnknownSync(UsageSummary as never)(
+				resolveFixture('/api/usage/summary', q({}))
+			) as { total: number; byAgent?: Array<{ agent: string | null; cost: number }> };
+			const aria = Schema.decodeUnknownSync(UsageSummary as never)(
+				resolveFixture('/api/usage/summary', q({ agent: 'aria' }))
+			) as { total: number; byAgent?: Array<{ agent: string | null; cost: number }> };
+			expect(aria.total).toBeLessThan(all.total);
+			expect(all.byAgent?.map((b) => b.agent)).toEqual(['aria', 'nova', null]);
+			expect(aria.byAgent?.map((b) => b.agent)).toEqual(['aria']);
+		});
+
+		it('timeseries groupBy=agent stacks one series per agent plus the residual', () => {
+			const f = Schema.decodeUnknownSync(UsageTimeseries as never)(
+				resolveFixture('/api/usage/timeseries', q({ groupBy: 'agent' }))
+			) as { groupBy: string; series: Array<{ grp: string }> };
+			expect(f.groupBy).toBe('agent');
+			expect(new Set(f.series.map((r) => r.grp))).toEqual(
+				new Set(['aria', 'nova', 'unattributed'])
+			);
+		});
+
+		it('sessions and tool-calls keep only the filtered agent’s rows', () => {
+			const sess = Schema.decodeUnknownSync(UsageSessions as never)(
+				resolveFixture('/api/usage/sessions', q({ agent: 'nova' }))
+			) as { sessions: Array<{ timelineKey: string }> };
+			expect(sess.sessions.length).toBeGreaterThan(0);
+			expect(sess.sessions.every((s) => s.timelineKey.startsWith('discord:'))).toBe(true);
+			const calls = Schema.decodeUnknownSync(UsageToolCalls as never)(
+				resolveFixture('/api/usage/tool-calls', q({ agent: 'aria' }))
+			) as { toolCalls: Array<{ timeline_key: string | null }> };
+			expect(calls.toolCalls.length).toBeGreaterThan(0);
+			expect(calls.toolCalls.every((t) => t.timeline_key != null)).toBe(true);
+		});
+
+		it('leaderboard decodes and an unknown agent name means All (§3.5)', () => {
+			const f = resolveFixture('/api/usage/leaderboard', q({ agent: 'aria' }));
+			expect(() => Schema.decodeUnknownSync(UsageLeaderboard as never)(f)).not.toThrow();
+			const unknown = Schema.decodeUnknownSync(UsageSummary as never)(
+				resolveFixture('/api/usage/summary', q({ agent: 'nobody' }))
+			) as { total: number };
+			const all = Schema.decodeUnknownSync(UsageSummary as never)(
+				resolveFixture('/api/usage/summary', q({}))
+			) as { total: number };
+			expect(unknown.total).toBe(all.total);
+		});
+	});
 
 	it('returns undefined for an unknown path', () => {
 		expect(resolveFixture('/api/nope', new URLSearchParams())).toBeUndefined();
