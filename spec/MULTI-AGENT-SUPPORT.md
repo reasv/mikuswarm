@@ -658,6 +658,8 @@ profile_name = "rin"   # required in the block; connection settings inherited fr
 
 ## 10b. Summary mirroring: one summarizer per community
 
+> **IMPLEMENTED** — superseded by ARCHITECTURE.md §9b "Summary mirroring (Phase 5c)" and §4c "Phase 5c `summaries_from` validation"; retained for review.
+
 Motivation: summarization is the one **traffic-proportional per-agent LLM
 cost** — it scales with channel volume, not with how much a persona is used.
 N agents in one community pay N× for near-identical work, which on its own

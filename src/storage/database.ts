@@ -190,6 +190,8 @@ export interface Summary {
   backfillJobId: string | null;
   generatedAt: number;
   createdAt: number;
+  /** Donor summary id when this is a mirrored copy (spec §10b); null = native. */
+  mirroredFrom: string | null;
 }
 
 export type SummarizationJobStatus = "pending" | "processing" | "complete" | "failed";
@@ -689,6 +691,7 @@ interface SummaryRow {
   backfill_job_id: string | null;
   generated_at: number;
   created_at: number;
+  mirrored_from: string | null;
 }
 
 interface SummarizationJobRow {
@@ -726,6 +729,7 @@ function mapSummaryRow(row: SummaryRow): Summary {
     backfillJobId: row.backfill_job_id,
     generatedAt: row.generated_at,
     createdAt: row.created_at,
+    mirroredFrom: row.mirrored_from,
   };
 }
 
@@ -770,6 +774,31 @@ export interface SummaryInsert {
   parentIds?: string[];
   /** Job to mark complete with this summary as its result. */
   jobId: string;
+}
+
+/**
+ * Parameters for inserting a mirrored summary (no job row to update).
+ * Used by the mirror worker to copy donor summaries to secondary timelines.
+ */
+export interface MirroredSummaryInsert {
+  id: string;
+  timelineKey: string;
+  level: number;
+  content: string;
+  earliestTimestamp: number;
+  latestTimestamp: number;
+  latestEventId: string;
+  eventCount: number;
+  tokenCount: number;
+  modelId: string | null;
+  status: SummaryStatus;
+  generatedAt: number;
+  /** Donor summary id this row mirrors (spec §10b). */
+  mirroredFrom: string;
+  /** Translated secondary event IDs (level 1 only). May be empty for pre-join. */
+  eventIds?: string[];
+  /** Translated secondary parent summary IDs (level 2+ only). */
+  parentIds?: string[];
 }
 
 export interface SummarizationJobInsert {
@@ -5027,6 +5056,308 @@ export class Storage {
     return row != null;
   }
 
+  // ── Mirror worker support (spec MULTI-AGENT-SUPPORT §10b, Phase 5c) ──────
+
+  /**
+   * The earliest_timestamp of the first (oldest) summary on a donor timeline.
+   * Used for inverse-topology eligibility: if the secondary's first event is
+   * older than this, the secondary has history predating the donor's coverage
+   * start and cannot be mirrored.
+   */
+  getFirstSummaryEarliestTimestamp(timelineKey: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select min(earliest_timestamp) as ts from summaries
+           where timeline_key = ? and level = 1 and status in ('complete', 'truncated')`,
+        )
+        .get(timelineKey) as { ts: number | null } | undefined,
+    );
+    return row?.ts ?? undefined;
+  }
+
+  /**
+   * The latestTimestamp of the most recently mirrored L1 summary on the secondary
+   * (where mirrored_from IS NOT NULL). Used by the sweep to find un-mirrored
+   * donor summaries since the last mirror pass.
+   */
+  /**
+   * The maximum summary level on a timeline, or undefined if no summaries.
+   */
+  getMaxSummaryLevel(timelineKey: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select max(level) as lvl from summaries
+           where timeline_key = ? and status in ('complete', 'truncated')`,
+        )
+        .get(timelineKey) as { lvl: number | null } | undefined,
+    );
+    return row?.lvl ?? undefined;
+  }
+
+  /**
+   * All summaries on a timeline with the given status, ordered by earliest_timestamp ASC.
+   */
+  getSummariesByStatus(timelineKey: string, status: SummaryStatus): Summary[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summaries where timeline_key = ? and status = ?
+           order by earliest_timestamp asc`,
+        )
+        .all(timelineKey, status) as SummaryRow[],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /**
+   * The most recent event on a timeline with timestamp <= beforeTimestamp.
+   * Used as a latestEventId anchor for pre-join mirror summaries.
+   */
+  getLatestEventBeforeTimestamp(
+    timelineKey: string,
+    beforeTimestamp: number,
+  ): { id: string } | undefined {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select id from timeline_events
+           where timeline_key = ? and timestamp <= ?
+           order by timestamp desc, received_at desc, id desc
+           limit 1`,
+        )
+        .get(timelineKey, beforeTimestamp) as { id: string } | undefined,
+    );
+  }
+
+  /**
+   * True if the timeline has at least one native (non-mirrored) summary.
+   * Used for the one-way liveness flip: once this returns true, mirroring is
+   * permanently off for this timeline.
+   */
+  hasNativeSummaries(timelineKey: string): boolean {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select 1 from summaries where timeline_key = ? and mirrored_from is null limit 1`,
+        )
+        .get(timelineKey),
+    );
+    return row != null;
+  }
+
+  /**
+   * Return the secondary's summary id that mirrors the given donor summary, or
+   * undefined if not yet mirrored. Used for idempotency in the mirror sweep.
+   */
+  getMirroredSummaryIdByDonor(secondaryTimelineKey: string, donorSummaryId: string): string | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select id from summaries where timeline_key = ? and mirrored_from = ? limit 1`,
+        )
+        .get(secondaryTimelineKey, donorSummaryId) as { id: string } | undefined,
+    );
+    return row?.id;
+  }
+
+  /**
+   * External id + ordinal for events in a summary's lineage (`summary_events`).
+   * Used by the mirror worker to translate donor event ids into secondary event
+   * ids via `(provider, external_id)`.
+   */
+  getSummaryEventExternalIds(
+    summaryId: string,
+  ): Array<{ eventId: string; externalId: string | null; ordinal: number }> {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select se.event_id, te.external_id, se.ordinal
+             from summary_events se
+             left join timeline_events te on te.id = se.event_id
+            where se.summary_id = ?
+            order by se.ordinal asc`,
+        )
+        .all(summaryId) as Array<{ eventId: string; externalId: string | null; ordinal: number }>,
+    );
+  }
+
+  /**
+   * Find a timeline event on a specific timeline by `(provider, external_id)`.
+   * Used to translate donor lineage event ids into secondary event ids.
+   */
+  getEventByExternalIdOnTimeline(
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+  ): { id: string } | undefined {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select id from timeline_events
+           where provider = ? and external_id = ? and timeline_key = ?
+           limit 1`,
+        )
+        .get(provider, externalId, timelineKey) as { id: string } | undefined,
+    );
+  }
+
+  /**
+   * Ordered parent ids (donor-level child summaries) for a L2+ summary.
+   * Used by the mirror worker to reconstruct the condensation tree.
+   */
+  getSummaryParentIds(summaryId: string): string[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select parent_id from summary_parents where summary_id = ? order by ordinal asc`,
+        )
+        .all(summaryId) as Array<{ parent_id: string }>,
+    );
+    return rows.map((r) => r.parent_id);
+  }
+
+  /**
+   * All completed/truncated summaries on a timeline at a given level, ordered
+   * ascending. Used by the mirror sweep to find L2+ trees to copy.
+   */
+  getAllCompletedSummariesByLevel(timelineKey: string, level: number): Summary[] {
+    const rows = this.read((db) =>
+      db
+        .prepare(
+          `select * from summaries
+           where timeline_key = ? and level = ? and status in ('complete', 'truncated')
+           order by earliest_timestamp asc`,
+        )
+        .all(timelineKey, level) as SummaryRow[],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /**
+   * The earliest event timestamp on a timeline, or undefined if no events.
+   * Used for the inverse-topology eligibility check.
+   */
+  getFirstEventTimestamp(timelineKey: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select min(timestamp) as ts from timeline_events where timeline_key = ?`,
+        )
+        .get(timelineKey) as { ts: number | null } | undefined,
+    );
+    return row?.ts ?? undefined;
+  }
+
+  /**
+   * The latest summary's latestTimestamp on a timeline at level 1, or undefined
+   * if no L1 summaries. Used for liveness / coverage checks in the mirror sweep.
+   */
+  getLatestSummaryTimestamp(timelineKey: string): number | undefined {
+    const row = this.read((db) =>
+      db
+        .prepare(
+          `select max(latest_timestamp) as ts from summaries
+           where timeline_key = ? and level = 1 and status in ('complete', 'truncated')`,
+        )
+        .get(timelineKey) as { ts: number | null } | undefined,
+    );
+    return row?.ts ?? undefined;
+  }
+
+  /**
+   * Update the status of a summary row. Used by the mirror sweep to propagate
+   * donor status changes (superseded/truncated) to mirror copies.
+   */
+  updateSummaryStatus(id: string, status: SummaryStatus): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`update summaries set status = ? where id = ?`).run(status, id);
+    });
+  }
+
+  /**
+   * Insert a mirrored summary (no job row to mark complete). Like
+   * `insertSummaryWithLineage` but sets `mirrored_from` and skips the job
+   * update. For L1 mirrors: sets diary_status='pending' so the diary pool
+   * writes an authentic entry from the secondary's own timeline.
+   */
+  insertMirroredSummary(insert: MirroredSummaryInsert): Promise<void> {
+    return this.write((db) => {
+      const now = Date.now();
+      const diaryStatus = insert.level === 1 ? "pending" : null;
+      db.prepare(
+        `insert into summaries (
+          id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+          latest_event_id, event_count, token_count, model_id, status,
+          backfill_job_id, generated_at, created_at, diary_status, diary_attempts,
+          mirrored_from
+        ) values (
+          @id, @timelineKey, @level, @content, @earliestTimestamp, @latestTimestamp,
+          @latestEventId, @eventCount, @tokenCount, @modelId, @status,
+          null, @generatedAt, @createdAt, @diaryStatus, 0, @mirroredFrom
+        )`,
+      ).run({
+        id: insert.id,
+        timelineKey: insert.timelineKey,
+        level: insert.level,
+        content: insert.content,
+        earliestTimestamp: insert.earliestTimestamp,
+        latestTimestamp: insert.latestTimestamp,
+        latestEventId: insert.latestEventId,
+        eventCount: insert.eventCount,
+        tokenCount: insert.tokenCount,
+        modelId: insert.modelId,
+        status: insert.status,
+        generatedAt: insert.generatedAt,
+        createdAt: now,
+        diaryStatus,
+        mirroredFrom: insert.mirroredFrom,
+      });
+
+      if (insert.eventIds && insert.eventIds.length > 0) {
+        const stmt = db.prepare(
+          `insert into summary_events (summary_id, event_id, ordinal) values (?, ?, ?)`,
+        );
+        insert.eventIds.forEach((eventId, ordinal) => stmt.run(insert.id, eventId, ordinal));
+      }
+
+      if (insert.parentIds && insert.parentIds.length > 0) {
+        const stmt = db.prepare(
+          `insert into summary_parents (summary_id, parent_id, ordinal) values (?, ?, ?)`,
+        );
+        insert.parentIds.forEach((parentId, ordinal) => stmt.run(insert.id, parentId, ordinal));
+      }
+    });
+  }
+
+  /**
+   * Insert a summarization job for a timeline, bypassing the indexer's
+   * isMirroredTimeline check. Used by the mirror worker's liveness fallback to
+   * seed a native job when the donor is stalled (spec §10b donor-liveness).
+   * Returns the new job id.
+   */
+  insertNativeSummarizationJobForMirroredTimeline(
+    timelineKey: string,
+    inputStartId: string,
+    inputEndId: string,
+    inputTokenCount: number,
+    targetTokenCount: number,
+    maxRetries: number,
+  ): Promise<string> {
+    const jobId = `sumjob_${nanoid(10)}`;
+    return this.insertSummarizationJob({
+      id: jobId,
+      timelineKey,
+      level: 1,
+      inputStartId,
+      inputEndId,
+      inputTokenCount,
+      targetTokenCount,
+      maxRetries,
+    }).then(() => jobId);
+  }
+
   /**
    * Insert a completed/truncated summary, its lineage rows, and mark the source
    * job complete — all in one transaction. No floor is persisted (the coverage
@@ -8762,11 +9093,24 @@ create table if not exists summaries (
   -- the CHECK (level 2+ never gets a diary entry).
   diary_status text
     check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed')),
-  diary_attempts integer not null default 0
+  diary_attempts integer not null default 0,
+  -- Summary mirroring (spec MULTI-AGENT-SUPPORT §10b, Phase 5c). NULL for native
+  -- summaries; set to the donor's summary id for mirrored copies. A timeline is
+  -- "one-way flipped" to native once any row with mirrored_from IS NULL exists.
+  mirrored_from text
 );
 
 create index if not exists idx_summaries_timeline
   on summaries(timeline_key, latest_timestamp);
+
+-- Mirror bookkeeping: idempotency check (secondary timeline + donor summary id →
+-- the mirror row's id). Partial unique index: only rows that ARE mirrors.
+-- UNIQUE prevents duplicate mirror inserts racing between onDonorComplete and
+-- sweep() — both use a read-guard + async write, so both can pass the guard
+-- before either commits. The constraint makes exactly one row land.
+create unique index if not exists idx_summaries_mirrored_from
+  on summaries(timeline_key, mirrored_from)
+  where mirrored_from is not null;
 
 create index if not exists idx_summaries_level
   on summaries(timeline_key, level, earliest_timestamp);
@@ -8968,7 +9312,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 8;
+export const LATEST_SCHEMA_VERSION = 9;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -9332,6 +9676,52 @@ function addSenderBotColumns(db: Database.Database): void {
   }
 }
 
+/**
+ * v8→v9 (spec MULTI-AGENT-SUPPORT §10b, Phase 5c): add `mirrored_from` column
+ * to `summaries` and its bookkeeping index.
+ *
+ * The target index is UNIQUE on (timeline_key, mirrored_from) WHERE mirrored_from
+ * IS NOT NULL — this prevents duplicate mirror inserts racing between
+ * onDonorComplete and sweep().
+ *
+ * Migration must handle a database where this migration was run from earlier
+ * uncommitted code that created a plain (non-unique) index.  Steps:
+ *
+ *   1. Add column if absent (NULL for all pre-existing native rows).
+ *   2. Deduplicate any existing mirror rows (same timeline_key + mirrored_from),
+ *      keeping the row with the lowest SQLite rowid (earliest insert) — a dev DB
+ *      that ran the earlier plain-index version may already have duplicates.
+ *   3. Drop the plain index if it exists (so we can recreate it as UNIQUE).
+ *   4. Create the UNIQUE partial index.
+ */
+function addSummaryMirroredFrom(db: Database.Database): void {
+  const cols = (db.pragma("table_info(summaries)") as Array<{ name: string }>)
+    .map((r) => r.name);
+  if (!cols.includes("mirrored_from")) {
+    db.exec("alter table summaries add column mirrored_from text");
+  }
+  // Dedupe: for each (timeline_key, mirrored_from) group keep the earliest rowid.
+  db.exec(`
+    delete from summaries
+    where mirrored_from is not null
+      and rowid not in (
+        select min(rowid)
+        from summaries
+        where mirrored_from is not null
+        group by timeline_key, mirrored_from
+      )
+  `);
+  // Drop the plain index if it exists (created by earlier uncommitted code or a
+  // previous run of this migration that did not make it UNIQUE).
+  db.exec(`drop index if exists idx_summaries_mirrored_from`);
+  // Create the UNIQUE partial index.
+  db.exec(`
+    create unique index idx_summaries_mirrored_from
+      on summaries(timeline_key, mirrored_from)
+      where mirrored_from is not null
+  `);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -9345,6 +9735,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addRoomMetadataServerColumns,
   addMemoryChunksAgentColumn,
   addSenderBotColumns,
+  addSummaryMirroredFrom,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

@@ -13,6 +13,7 @@ export {
   type Summary,
   type SummaryStatus,
   type SummaryInsert,
+  type MirroredSummaryInsert,
   type SummarizationJob,
   type SummarizationJobStatus,
   type SummarizationJobPriority,

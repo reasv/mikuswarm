@@ -117,6 +117,7 @@ export function synthesizeFailurePlaceholders(
       backfillJobId: null,
       generatedAt: job.updatedAt,
       createdAt: job.updatedAt,
+      mirroredFrom: null,
     });
   }
   return placeholders;

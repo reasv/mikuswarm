@@ -440,6 +440,14 @@ When multiple accounts run in one process they can see each other's messages. Wi
 
 Out-of-class account key characters (not `[a-z0-9-]`, no colon, no path-unsafe char) are a logged warning only in legacy mode.
 
+**Phase 5c (§10b): `summaries_from` validation.** `validateAgentConfig` additionally enforces:
+
+- `summaries_from` names an undeclared agent → hard error.
+- `summaries_from` names itself → hard error.
+- `summaries_from` names a donor that itself has `summaries_from` set → hard error (chains are not permitted; mirroring is single-hop only).
+
+See §9b "Summary mirroring (Phase 5c)" for runtime behaviour.
+
 ### Multi-agent Phase 2 — memory scoping and search account filtering
 
 Phase 2 extends agent identity into the retrieval and search layers so each agent's memory corpus and chat-history queries stay strictly separate.
@@ -2360,6 +2368,65 @@ When a job exhausts `max_retries`, the worker salvages its `best_effort_draft`: 
 ### Lifecycle & validation
 
 The pool starts after the enrichment and caption pools and stops during shutdown (awaiting active workers). When `summarization.enabled`, startup validation fails fast unless both the `summarize` and `condense` session types resolve, their `model` keys exist in `config.models`, and — if either declares a `tools` allowlist — that allowlist includes `summary_tool` (the editor); a misconfigured summarizer must not silently fall back to the default chat agent or model, nor spawn editor-less sessions that fail every job.
+
+### Summary mirroring (Phase 5c)
+
+When multiple agents run in one process, each agent produces its own independent summaries for every timeline it observes — even when two agents are watching the same channel room, duplicating LLM cost. **Summary mirroring** lets a secondary agent borrow its summaries from a "donor" agent instead of generating them, with zero inference cost and byte-identical content across agents.
+
+#### Configuration and topology (`summaries_from`)
+
+Each `[agents.<name>]` block accepts an optional `summaries_from = "<donorAgentName>"` key. `validateAgentConfig` enforces three rules at startup:
+
+1. **Donor must be declared** — the named donor must appear in `[agents]`.
+2. **No self-reference** — an agent cannot name itself as donor.
+3. **No chains** — a donor cannot itself have `summaries_from` set (single-hop only).
+
+`buildMirrorTopology` (called once at startup, before the pool is created) walks the declared `summaries_from` keys and returns a `MirrorTopology` map: `secondaryAgentName → donorAgentName`. If no agent has `summaries_from`, the map is empty and every downstream check is a no-op — behaviour is byte-identical to a non-mirroring deployment.
+
+#### Per-timeline eligibility
+
+Mirroring is decided per timeline, not per agent. A secondary's timeline `(provider, channel, [thread])` is **eligible for mirroring** when:
+
+1. The donor has at least one account on the same `(provider, externalId)` coordinate — i.e. it is observing the same channel room, determined at runtime by `MirrorWorker.resolveDonorTimeline`.
+2. The secondary's timeline has **no existing native summaries** (`hasNativeSummaries(secondaryKey)` returns false). Once the secondary has generated a summary of its own the timeline is permanently native — the one-way flip (see below) prevents toggling.
+3. There is no inverse topology — if agent A mirrors from B, B cannot simultaneously mirror from A for the same timeline (symmetry check in `resolveDonorTimeline`).
+
+A timeline that fails any of these checks is left as native; the secondary's pool and indexer run normally for it.
+
+#### `MirrorWorker` (`src/summarization/mirror-worker.ts`)
+
+`MirrorWorker` is the gatekeeper and propagator for mirroring. It is constructed before the summarization pool (which needs `isMirroredTimeline`) and before the indexer (which is injected later via `setIndexer`). Two circular dependencies are broken by deliberate sequencing:
+
+- **Pool → mirrorWorker**: the pool is constructed with a `mirrorWorkerRef` mutable variable in a closure. The closure reads the ref at call time (not at construction time), so `mirrorWorkerRef` is null during pool construction and set to the real instance immediately after `MirrorWorker` is created.
+- **mirrorWorker → indexer**: `MirrorWorker` is created with `indexer: null`; after the indexer is constructed, `mirrorWorker.setIndexer(indexer)` wires the final dependency.
+
+**`isMirroredTimeline(secondaryKey)`** — queried by the indexer before every reconcile and by the pool's post-completion condensation evaluator. Returns true when (a) the secondary is in the topology, (b) `resolveDonorTimeline` finds a matching donor account, (c) the secondary has no native summaries, and (d) there is no inverse topology. The indexer skips enqueueing a job for a mirrored timeline; the pool threads `isMirroredTimeline` into `evaluateCondensation` post-completion so condensation is also skipped for mirrored timelines (the pool's `isMirroredTimeline` option does not affect job claiming — new jobs are never enqueued for mirrored timelines in the first place because the indexer gates enqueueing).
+
+**`onDonorComplete(donorSummaryId)`** — the pool's `onComplete` callback calls this (fire-and-forget) whenever a level-1 summary lands for a donor timeline. `onDonorComplete` iterates all secondaries whose donor resolves to the same donor timeline, inserts the mirrored summary (`insertMirroredSummary`), and translates lineage: event IDs are looked up by `(provider, external_id)` from the secondary's account perspective so the secondary's `summary_events` rows point to the correct event IDs in the secondary's timeline. `insertMirroredSummary` sets `diary_status='pending'` on the mirrored row (same as a native level-1 row, so the diary pool writes a diary entry), does **not** update any job row (no job exists on the secondary), and records `mirrored_from = <donorSummaryId>` on the secondary's `summaries` row for idempotency and audit.
+
+**`sweep()`** — a periodic task (`start()`/`stop()`) that propagates L2+ summaries and status updates that are not covered by the `onDonorComplete` hook (which fires only on L1 completion). On each tick it:
+
+1. Queries all active secondary timelines (`listActiveTimelineKeys` filtered to secondaries).
+2. For each eligible secondary, performs a full scan of the donor's completed summaries per level (`getAllCompletedSummariesByLevel(donorKey, level)`) — no progress cursor, so a summary whose earlier mirror attempt failed is always retried on the next tick.
+3. Calls `getMirroredSummaryIdByDonor` per row to skip already-mirrored rows (an indexed point lookup on the partial unique index; the per-timeline summary count is condensation-bounded, so the scan stays cheap).
+4. Inserts remaining summaries via `insertMirroredSummary` (level 2+ rows get `diary_status=NULL`; only level 1 triggers diary).
+5. Propagates status changes: if a donor summary's `status` becomes `superseded`, the corresponding secondary row is updated to match (`updateMirroredSummaryStatus`).
+
+#### One-way native flip (liveness)
+
+`MirrorWorker` includes a **liveness** check (`checkLiveness`). If `hasNativeSummaries(secondaryKey)` ever returns true (the secondary generated at least one summary of its own — e.g. it was running before mirroring was configured, or the donor went silent long enough for a backfill to run), that timeline is permanently treated as native. The `isMirroredTimeline` predicate returns false, the pool and indexer treat the timeline normally, and no further mirror inserts are attempted. This is intentional: mixed provenance in one timeline's summary chain would corrupt condensation lineage.
+
+#### Schema: `mirrored_from` column
+
+`summaries.mirrored_from` (`text`, nullable) is added in the v8→v9 schema migration. It holds the donor `summary_id` for every mirrored row and `NULL` for native summaries. A partial index (`CREATE INDEX … WHERE mirrored_from IS NOT NULL`) backs fast lookups in `getMirroredSummaryIdByDonor`. No `usage_events` row is inserted for a mirrored summary — the cost is attributed to the donor's pool run.
+
+#### Indexer and condensation skip
+
+`SummarizationIndexer.reconcileTimeline` skips mirrored timelines unconditionally — the `isMirroredTimeline` guard is checked before any threshold computation or job enqueue. `evaluateCondensation` likewise skips the timeline (called only from the pool's `onComplete` path, which already gates on the donor; the evaluator check is belt-and-suspenders). For wait-or-omit escalation on a mirrored timeline, the build's `reconcileSummaries` callback resolves the donor timeline key via `mirrorWorker.resolveDonorTimeline` and escalates the donor's indexer instead, so the donor's pool produces the summary that the secondary then mirrors.
+
+#### Participant-naming instruction
+
+The default `[agent.session_types.summarize]` and `[agent.session_types.condense]` `session_instruction` text includes a bullet directing the model to refer to participants by display name rather than by account ID or handle. This makes every summary useful to any reader — including agents running under a different account that cannot resolve the sending account's ID — without requiring any per-deployment configuration.
 
 ---
 

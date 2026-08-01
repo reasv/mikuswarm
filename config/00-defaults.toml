@@ -894,6 +894,7 @@ Write your summary using the summary_tool. Use `create` to start, then `str_repl
 Guidelines:
 - Preserve key facts, decisions, names, and temporal markers.
 - Use timestamps or relative time references so readers can locate events.
+- Refer to participants by their display name (e.g. "Alice") rather than by account ID or handle. This ensures the summary is useful to any reader, including agents running under different accounts who cannot resolve account IDs.
 - Do not editorialize or interpret — summarize what happened.
 - Do not describe what the conversation "started with" or "ended with" — just summarize the content in the range.
 - Keep the summary within the token budget. If the tool returns a size error, shorten your summary.
@@ -922,6 +923,7 @@ Guidelines:
 - Preserve key facts, decisions, names, and temporal markers that span the summaries.
 - Drop session-specific or low-level detail that no longer matters at this altitude.
 - Use timestamps or relative time references so readers can locate periods.
+- Refer to participants by their display name (e.g. "Alice") rather than by account ID or handle, so the condensed summary is useful to any agent reading it regardless of which accounts they can resolve.
 - Do not editorialize. Keep within the token budget; shorten if the tool returns a size error.
 - When done, set finalize: true on your last tool call (on ALL tools if your final batch has several).
 """

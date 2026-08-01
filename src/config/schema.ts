@@ -771,6 +771,14 @@ const AgentBlockSchema = StrictObject({
   /** Absolute or relative path to this agent's workspace root directory. */
   workspace_root: Type.String({ minLength: 1 }),
   /**
+   * Optional summary mirroring donor (spec MULTI-AGENT-SUPPORT §10b).
+   * When set, this agent's timelines that share a channel with the named donor
+   * agent receive mirrored summaries from the donor rather than generating their
+   * own. The donor agent must be declared and must not itself have summaries_from
+   * (no chains). Default off: absent → native summarization for all timelines.
+   */
+  summaries_from: Type.Optional(Type.String({ minLength: 1 })),
+  /**
    * Per-agent sandbox override (spec MULTI-AGENT-SUPPORT §10 "strict" mode).
    * When set, this agent gets its own dedicated container. Overrides `[sandbox]`
    * wholesale — no per-key merge. Agents without this block share the global
