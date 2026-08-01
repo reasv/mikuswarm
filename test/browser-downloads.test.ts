@@ -380,8 +380,12 @@ test("downloads: the page event arriving FIRST correlates the same way (either s
         guid: GUID_A, state: "completed", receivedBytes: 10, totalBytes: 10,
       });
 
-      await waitFor(() => exists(path.join(dirs.ws, "browser-downloads", "s1", "a.txt")), "finalized file");
-      assert.equal(session.drainDownloads("s1").length, 1);
+      // Poll drainDownloads directly: exists(file) fires while finalizeDownload is
+      // still in `await unlink(staging)`, before the record is pushed. The drain
+      // poll exits only once the record is on pendingDownloads — no race window.
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "finalized record");
+      assert.equal(drained.length, 1);
     } finally {
       manager.restore();
       await session.shutdown();
@@ -407,8 +411,10 @@ test("downloads: a completion racing ahead of the page event finalizes on correl
       assert.equal(session.drainDownloads("s1").length, 0, "nothing recorded before attribution exists");
 
       harness.fireDownload(metadataDownload("https://example.com/r.bin", "r.bin"));
-      await waitFor(() => exists(path.join(dirs.ws, "browser-downloads", "s1", "r.bin")), "finalized file");
-      assert.equal(session.drainDownloads("s1").length, 1);
+      // Same race as above: poll drainDownloads rather than exists(file).
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "finalized record");
+      assert.equal(drained.length, 1);
     } finally {
       manager.restore();
       await session.shutdown();
@@ -444,6 +450,10 @@ test("downloads: two same-URL same-name downloads match FIFO and both land (bump
         (await readFile(path.join(dir, "dup (2).txt"))).toString(),
       ]);
       assert.deepEqual(contents, new Set(["first", "second"]), "both payloads landed without clobbering");
+      // Two separate finalizations each go through `await unlink(staging)` before
+      // pushing their record. Wait until both staging guids are gone — that proves
+      // both `unlink` awaits have resolved and both records have been pushed.
+      await waitFor(async () => (await readdir(dirs.staging)).length === 0, "both staging guids unlinked");
       assert.equal(session.drainDownloads("s1").length, 2, "two records surface");
       assert.equal((await readdir(dirs.staging)).length, 0, "staging emptied");
     } finally {
@@ -1146,9 +1156,9 @@ test("downloads #17: reconnect re-issues the setDownloadBehavior override and cl
       harness.cdp.emit("Browser.downloadProgress", {
         guid: GUID_B, state: "completed", receivedBytes: 11, totalBytes: 11,
       });
-      const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "fresh.bin");
-      await waitFor(() => exists(finalPath), "the post-reconnect download finalized cleanly");
-      const drained = session.drainDownloads("s1");
+      // Poll drainDownloads rather than exists(file) to close the unlink-yield race.
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "the post-reconnect download finalized cleanly");
       assert.equal(drained.length, 1, "exactly the fresh download surfaces (no stale residue)");
       assert.equal(drained[0]!.filename, "fresh.bin");
       assert.ok(!drained[0]!.failed);
@@ -1235,9 +1245,11 @@ for (const { name, id } of [
         });
 
         // The dot-only id collapses to the safe sentinel, never a ".." segment.
-        const finalPath = path.join(dirs.ws, "browser-downloads", "session", "file.bin");
-        await waitFor(() => exists(finalPath), "file under the collapsed 'session' dir");
-        const drained = session.drainDownloads(id);
+        // Poll drainDownloads rather than exists(file): the file is written before
+        // `await unlink(staging)` yields, so exists() can fire before the record
+        // is pushed. The drain poll exits only once finalization is complete.
+        let drained: ReturnType<typeof session.drainDownloads> = [];
+        await waitFor(() => (drained = session.drainDownloads(id)).length > 0, "file under the collapsed 'session' dir");
         assert.equal(drained.length, 1);
         assert.equal(drained[0]!.path, path.join("browser-downloads", "session", "file.bin"));
       } finally {
@@ -1477,9 +1489,11 @@ test("downloads #10: a dot-only suggested filename collapses to \"download\"", a
         guid: GUID_A, state: "completed", receivedBytes: 9, totalBytes: 9,
       });
 
+      // Poll drainDownloads rather than exists(file) to close the unlink-yield race
+      // (#10 observed failing 0 !== 1 under build-gate CPU contention).
+      let drained: ReturnType<typeof session.drainDownloads> = [];
+      await waitFor(() => (drained = session.drainDownloads("s1")).length > 0, "the dot-only name collapsed to 'download'");
       const finalPath = path.join(dirs.ws, "browser-downloads", "s1", "download");
-      await waitFor(() => exists(finalPath), "the dot-only name collapsed to 'download'");
-      const drained = session.drainDownloads("s1");
       assert.equal(drained.length, 1);
       assert.equal(drained[0]!.filename, "download", "dot-only name collapses to the safe fallback");
       assert.equal(drained[0]!.path, path.join("browser-downloads", "s1", "download"));
