@@ -230,7 +230,17 @@ export class DiscordProvider implements IChatProvider {
 
   private readonly accounts = new Map<string, AccountRuntime>();
   private readonly pendingTriggers = new Map<string, PendingTrigger>();
-  private readonly typingTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Live typing-refresh chains by timeline key. An entry exists from the moment
+   * `setTyping(true)` accepts the request — including while the first REST send
+   * is still in flight, before any timer has been scheduled. The chain object's
+   * identity doubles as a cancellation token: `setTyping(false)` deletes the
+   * entry, and every await inside the refresh loop re-checks that the map still
+   * holds *this* chain before proceeding, so a stop landing mid-send can never
+   * be outrun by the in-flight send scheduling one more refresh (which would
+   * orphan the loop and leave the bot "typing" forever).
+   */
+  private readonly typingChains = new Map<string, { timer?: NodeJS.Timeout }>();
   private host?: ChatProviderHost;
   private stopped = false;
 
@@ -364,11 +374,12 @@ export class DiscordProvider implements IChatProvider {
       clearTimeout(pending.timer);
     }
     this.pendingTriggers.clear();
-    // Cancel typing refresh timers
-    for (const timer of this.typingTimers.values()) {
-      clearTimeout(timer);
+    // Cancel typing refresh chains (in-flight sends self-cancel on the
+    // identity check once their entry is gone)
+    for (const chain of this.typingChains.values()) {
+      if (chain.timer) clearTimeout(chain.timer);
     }
-    this.typingTimers.clear();
+    this.typingChains.clear();
     // Destroy discord.js clients
     for (const runtime of this.accounts.values()) {
       runtime.client.destroy();
@@ -647,35 +658,54 @@ export class DiscordProvider implements IChatProvider {
   }
 
   async setTyping(target: OutboundTarget, typing: boolean): Promise<void> {
-    const timerKey = target.timelineKey;
-    const existing = this.typingTimers.get(timerKey);
-    if (existing) {
-      clearTimeout(existing);
-      this.typingTimers.delete(timerKey);
+    const chainKey = target.timelineKey;
+    const existing = this.typingChains.get(chainKey);
+
+    if (!typing) {
+      if (existing) {
+        if (existing.timer) clearTimeout(existing.timer);
+        this.typingChains.delete(chainKey);
+      }
+      return;
     }
-    if (!typing) return;
+
+    // A chain is already live for this timeline (possibly with its first send
+    // still in flight). The runner keepalive polls setTyping(true) every second
+    // — tuned for matrix-sdk, which dedups internally — but Discord has no such
+    // dedup, and one chain refreshing every TYPING_REFRESH_MS is all the ~10s
+    // indicator needs. Treat repeats as a no-op instead of one REST send per
+    // poll. If the chain died (send failure removes it), the next poll revives it.
+    if (existing) return;
 
     const channelId = target.roomId ?? parseTimelineKey(target.timelineKey)?.channelId;
     if (!channelId) return;
 
-    let { client } = this.resolveAccount(target);
+    const { client } = this.resolveAccount(target);
+
+    const chain: { timer?: NodeJS.Timeout } = {};
+    this.typingChains.set(chainKey, chain);
 
     const sendTyping = async (): Promise<void> => {
       if (this.stopped) return;
       try {
         const ch = await client.channels.fetch(channelId);
+        // Cancelled (or superseded) while awaiting — do not send or reschedule
+        if (this.typingChains.get(chainKey) !== chain) return;
         if (ch && ch.isTextBased()) {
           await (ch as TextChannel | DMChannel).sendTyping();
         }
+        if (this.typingChains.get(chainKey) !== chain) return;
         // Schedule next refresh
         const timer = setTimeout(() => {
           void sendTyping();
         }, TYPING_REFRESH_MS);
         timer.unref?.();
-        this.typingTimers.set(timerKey, timer);
+        chain.timer = timer;
       } catch {
         // Non-fatal — typing failure must not disrupt the session
-        this.typingTimers.delete(timerKey);
+        if (this.typingChains.get(chainKey) === chain) {
+          this.typingChains.delete(chainKey);
+        }
       }
     };
 

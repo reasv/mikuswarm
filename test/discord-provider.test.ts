@@ -981,3 +981,129 @@ describe("DiscordChannelClient: members optional contract", () => {
     assert.equal(rosterResult, undefined, "cc.members?.() must be undefined when members is absent");
   });
 });
+
+// ── setTyping: refresh-chain lifecycle (in-flight stop race + keepalive dedup) ─
+
+/**
+ * Build an unstarted provider with a fake account runtime whose channel fetch /
+ * sendTyping can be gated on a controllable promise, to exercise the
+ * cancellation-while-in-flight windows of the typing refresh chain.
+ */
+function makeTypingProvider(opts: {
+  fetchGate?: Promise<void>;
+  sendGate?: Promise<void>;
+  onSendStart?: () => void;
+  failFetches?: number;
+} = {}) {
+  const provider = new DiscordProvider(makeDiscordConfig(), noopCallbacks);
+  let sendCount = 0;
+  let failFetches = opts.failFetches ?? 0;
+  const channel = {
+    isTextBased: () => true,
+    sendTyping: async () => {
+      opts.onSendStart?.();
+      await opts.sendGate;
+      sendCount += 1;
+    },
+  };
+  const client = {
+    channels: {
+      fetch: async () => {
+        await opts.fetchGate;
+        if (failFetches > 0) {
+          failFetches -= 1;
+          throw new Error("fetch failed");
+        }
+        return channel;
+      },
+    },
+  };
+  (provider as unknown as { accounts: Map<string, unknown> }).accounts.set("main", { client });
+  const chains = (
+    provider as unknown as { typingChains: Map<string, { timer?: NodeJS.Timeout }> }
+  ).typingChains;
+  return { provider, chains, getSendCount: () => sendCount };
+}
+
+const typingTarget: import("../src/types.js").OutboundTarget = {
+  provider: "discord",
+  timelineKey: "discord:main:room:200000000000000001",
+  accountId: "main",
+  roomId: "200000000000000001",
+};
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+describe("DiscordProvider.setTyping: refresh chain", () => {
+  it("setTyping(false) during an in-flight channel fetch cancels the chain (no orphaned loop)", async () => {
+    const gate = deferred();
+    const { provider, chains, getSendCount } = makeTypingProvider({ fetchGate: gate.promise });
+
+    const inFlight = provider.setTyping(typingTarget, true);
+    assert.equal(chains.size, 1, "chain must be registered while the first send is in flight");
+    await provider.setTyping(typingTarget, false);
+    assert.equal(chains.size, 0, "stop must remove the chain immediately");
+
+    gate.resolve();
+    await inFlight;
+
+    assert.equal(getSendCount(), 0, "cancelled chain must not send typing after the stop");
+    assert.equal(chains.size, 0, "resolved in-flight send must not re-register the chain");
+  });
+
+  it("setTyping(false) between the REST send and rescheduling cancels the chain", async () => {
+    const gate = deferred();
+    const started = deferred();
+    const { provider, chains, getSendCount } = makeTypingProvider({
+      sendGate: gate.promise,
+      onSendStart: started.resolve,
+    });
+
+    const inFlight = provider.setTyping(typingTarget, true);
+    await started.promise; // the REST send is now in flight
+    await provider.setTyping(typingTarget, false);
+    gate.resolve();
+    await inFlight;
+
+    assert.equal(getSendCount(), 1, "the send that was already in flight completes");
+    assert.equal(chains.size, 0, "but no next refresh may be scheduled after the stop");
+  });
+
+  it("repeated setTyping(true) is a no-op while a chain is live (keepalive dedup)", async () => {
+    const { provider, chains, getSendCount } = makeTypingProvider();
+
+    await provider.setTyping(typingTarget, true);
+    assert.equal(getSendCount(), 1);
+    assert.equal(chains.size, 1);
+    assert.ok(chains.get(typingTarget.timelineKey)?.timer, "refresh timer scheduled");
+
+    await provider.setTyping(typingTarget, true);
+    await provider.setTyping(typingTarget, true);
+    assert.equal(getSendCount(), 1, "keepalive repeats must not issue extra REST sends");
+    assert.equal(chains.size, 1);
+
+    await provider.setTyping(typingTarget, false);
+    assert.equal(chains.size, 0);
+  });
+
+  it("a failed send removes the chain so the next keepalive tick revives it", async () => {
+    const { provider, chains, getSendCount } = makeTypingProvider({ failFetches: 1 });
+
+    await provider.setTyping(typingTarget, true);
+    assert.equal(getSendCount(), 0);
+    assert.equal(chains.size, 0, "failed chain must deregister itself");
+
+    await provider.setTyping(typingTarget, true);
+    assert.equal(getSendCount(), 1, "next keepalive tick starts a fresh chain");
+    assert.equal(chains.size, 1);
+
+    await provider.setTyping(typingTarget, false);
+    assert.equal(chains.size, 0);
+  });
+});
