@@ -898,3 +898,74 @@ test("settle log emits maxSessionCostUsd: null when no ceiling is threaded (unli
     assert.equal(settle_!.fields?.maxSessionCostUsd, null);
   });
 });
+
+/** Minimal committed-request usage, enough for the tracker's accumulator. */
+function committedUsage(input = 10, output = 5) {
+  return {
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+  };
+}
+
+test("usage write records the BILLED model, not the session type's configured one", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-billed00001" }));
+
+    const agent = new FakeAgent();
+    const usage = new SessionUsageTracker();
+    const { logger, info } = recordingLogger();
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId: "s-billed00001",
+      usage,
+      // What the session TYPE resolves to — under per-user selection / fallback
+      // this is not what actually served the request.
+      model: "gpt-5.6-sol",
+      logger,
+    });
+
+    usage.record(committedUsage(), "together.moonshotai/Kimi-K3");
+    await settle(storage);
+
+    const row = storage.getAgentSession("s-billed00001");
+    assert.equal(
+      row?.model_id,
+      "together.moonshotai/Kimi-K3",
+      "durable model_id must agree with the ledger's agent_loop rows",
+    );
+    assert.equal(row?.llm_requests, 1);
+
+    capture.detach();
+    const settle_ = info.find((l) => l.message === "session_usage");
+    assert.equal(settle_?.fields?.model, "together.moonshotai/Kimi-K3");
+  });
+});
+
+test("before the first commit the configured model is the fallback", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(baseInsert({ id: "s-billed00002" }));
+
+    const agent = new FakeAgent();
+    const usage = new SessionUsageTracker();
+    const { logger, info } = recordingLogger();
+
+    const capture = attachSessionCapture(agent, {
+      storage,
+      sessionId: "s-billed00002",
+      usage,
+      model: "gpt-5.6-sol",
+      logger,
+    });
+    // No commit — e.g. the first request 400s at the provider.
+    capture.detach();
+    await settle(storage);
+
+    const settle_ = info.find((l) => l.message === "session_usage");
+    assert.equal(settle_?.fields?.model, "gpt-5.6-sol");
+  });
+});

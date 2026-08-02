@@ -39,6 +39,12 @@ export interface SessionCaptureContext {
    */
   timelineKey?: string;
   sessionType?: string;
+  /**
+   * The session type's CONFIGURED model, resolved once at wiring time. It is
+   * the pre-commit fallback only: once a request commits, the tracker's billed
+   * model wins for both the durable row and the settle log, because fallback
+   * and per-user selection can serve a different model than this one.
+   */
   model?: string;
   /**
    * Resolved per-session cost ceiling (USD) for this run (spec
@@ -418,11 +424,14 @@ export function attachSessionCapture(
   // on the single-writer queue; an error there is logged by the storage layer.
   const unsubscribeUsage = ctx.usage?.onUpdate((totals) => {
     // Persist the model alongside usage on every committed request (spec
-    // TOKEN-USAGE-TRACKING §4.3): `ctx.model` is the model actually billed, so
-    // the durable `agent_sessions.model_id` matches the ledger's agent_loop rows
-    // even under fallback. `coalesce` in the writer means a null here never
-    // clobbers a previously-recorded model.
-    void ctx.storage.updateAgentSessionUsage(ctx.sessionId, totals, ctx.model ?? null);
+    // TOKEN-USAGE-TRACKING §4.3). The tracker's last committed model is the one
+    // ACTUALLY billed, so the durable `agent_sessions.model_id` matches the
+    // ledger's agent_loop rows even when fallback or per-user model selection
+    // served something other than the session type's configured model — which
+    // `ctx.model` alone is, and which is therefore only the pre-commit fallback.
+    // `coalesce` in the writer means a null here never clobbers a recorded model.
+    const billedModel = ctx.usage?.lastModelId() ?? ctx.model ?? null;
+    void ctx.storage.updateAgentSessionUsage(ctx.sessionId, totals, billedModel);
   });
 
   return {
@@ -445,7 +454,10 @@ export function attachSessionCapture(
           sessionId: ctx.sessionId,
           timelineKey: ctx.timelineKey,
           sessionType: ctx.sessionType,
-          model: ctx.model,
+          // Billed model when this run committed anything, else the configured
+          // one — same precedence as the durable row above, so the settle line
+          // and `agent_sessions.model_id` never disagree.
+          model: ctx.usage.lastModelId() ?? ctx.model,
           ...ctx.usage.snapshot(),
           // Combined (agent-loop + tool) spend (spec SESSION-COST-LIMITS §6) — the
           // cost-ceiling basis; `cost` above is the agent-loop lane alone.
