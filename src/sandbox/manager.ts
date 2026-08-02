@@ -71,6 +71,13 @@ interface ContainerState {
   workspaceMountSource?: string;
   /** The `uid:gid` the existing container was created with (`.Config.User`). */
   user?: string;
+  /** `.State.StartedAt` of the existing container (RFC3339). */
+  startedAt?: string;
+  /**
+   * `.State.StartedAt` of the container named by a `container:…` network — the
+   * namespace anchor. Undefined for every other network mode.
+   */
+  networkAnchorStartedAt?: string;
 }
 
 /**
@@ -338,8 +345,9 @@ export class SandboxManager implements ExecBackend {
    * check because workspace file ownership must track the harness uid:gid — a
    * container left over from a run under a different uid (e.g. a root deployment
    * upgraded to the non-root compose user, §11c) would silently keep writing
-   * files the harness user doesn't own. Broader cap/network comparison remains
-   * intentionally out of scope (issue #6).
+   * files the harness user doesn't own. A restarted `container:…` network anchor
+   * is checked for the same reason — see below. Broader cap/network comparison
+   * remains intentionally out of scope (issue #6).
    */
   private static containerMismatch(
     options: SandboxManagerOptions,
@@ -363,6 +371,21 @@ export class SandboxManager implements ExecBackend {
       const requestedUser = `${options.uid}:${options.gid}`;
       if (state.user !== requestedUser) {
         return `runtime user changed (running ${state.user} != requested ${requestedUser})`;
+      }
+    }
+    // `--network container:X` joins the anchor's network namespace at CREATE
+    // time and is never re-bound. Restart the anchor and it gets a fresh
+    // namespace, leaving this container attached to the old one — no interfaces,
+    // no resolver, yet still "running", so every reuse check above passes and the
+    // sandbox silently serves tool calls with no network at all. The anchor
+    // having started *after* this container is exactly that condition (a restart
+    // keeps the anchor's container ID, so comparing IDs cannot detect it, and
+    // `.NetworkSettings.SandboxKey` is empty in this network mode).
+    if (state.startedAt !== undefined && state.networkAnchorStartedAt !== undefined) {
+      const started = Date.parse(state.startedAt);
+      const anchorStarted = Date.parse(state.networkAnchorStartedAt);
+      if (Number.isFinite(started) && Number.isFinite(anchorStarted) && anchorStarted > started) {
+        return `network anchor restarted (${options.network} started ${state.networkAnchorStartedAt} after container ${state.startedAt})`;
       }
     }
     return undefined;
@@ -426,10 +449,10 @@ export class SandboxManager implements ExecBackend {
     const tmpl =
       "{{.State.Running}}\t{{.Image}}\t" +
       `{{range .Mounts}}{{if eq .Destination "${options.workspaceMount}"}}{{.Source}}{{end}}{{end}}` +
-      "\t{{.Config.User}}";
+      "\t{{.Config.User}}\t{{.State.StartedAt}}";
     const result = await runDocker(["inspect", "-f", tmpl, name]);
     if (result.code !== 0) return { exists: false, running: false };
-    const [running = "", imageId = "", mountSource = "", user = ""] = result.stdout
+    const [running = "", imageId = "", mountSource = "", user = "", startedAt = ""] = result.stdout
       .replace(/\n$/, "")
       .split("\t");
     // Resolve the requested image tag to its current image ID so a retag that
@@ -443,7 +466,25 @@ export class SandboxManager implements ExecBackend {
       requestedImageId,
       workspaceMountSource: mountSource.length > 0 ? mountSource : undefined,
       user: user.trim() || undefined,
+      startedAt: startedAt.trim() || undefined,
+      networkAnchorStartedAt: await SandboxManager.anchorStartedAt(options),
     };
+  }
+
+  /**
+   * `.State.StartedAt` of the namespace anchor named by a `container:<name|id>`
+   * network, or undefined for any other network mode (and for an anchor that
+   * cannot be inspected — a missing anchor is reported by the create path with
+   * docker's own error, so it must not masquerade as a reuse mismatch here).
+   */
+  private static async anchorStartedAt(options: SandboxManagerOptions): Promise<string | undefined> {
+    const prefix = "container:";
+    if (!options.network.startsWith(prefix)) return undefined;
+    const anchor = options.network.slice(prefix.length);
+    if (anchor.length === 0) return undefined;
+    const result = await SandboxManager.runner(options)(["inspect", "-f", "{{.State.StartedAt}}", anchor]);
+    if (result.code !== 0) return undefined;
+    return result.stdout.trim() || undefined;
   }
 
   /** Defeat the start race: `docker start` returns before PID 1 is exec-able. */
