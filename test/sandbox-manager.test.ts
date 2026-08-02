@@ -201,6 +201,56 @@ test("ensure: reuse recreates on runtime-user mismatch", async () => {
   assert.match(String(recreate?.fields?.reason), /runtime user changed \(running 0:0 != requested 1000:1000\)/);
 });
 
+/**
+ * A `container:…` network is bound at create time only: restarting the anchor
+ * strands this container in the anchor's old, now-empty network namespace while
+ * it still reports as running. The anchor's `StartedAt` being later than the
+ * container's is that condition — a restart preserves the anchor's container ID,
+ * so the network string alone cannot detect it.
+ */
+test("ensure: reuse recreates when the container: network anchor restarted after the sandbox", async () => {
+  const { logger, calls } = recordingLogger();
+  const seq: string[] = [];
+  const { run } = fakeRunner((args) => {
+    seq.push(args[0]);
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    // anchor inspect — the anchor was restarted a day AFTER the sandbox started
+    if (args[0] === "inspect" && args[3] === "vpn-anchor") return ok("2026-08-02T22:38:48.780535327Z");
+    if (args[0] === "inspect") {
+      return ok(`true\t${IMAGE_ID}\t/host/workspace\t1000:1000\t2026-08-01T13:18:15.233812109Z`);
+    }
+    if (args[0] === "rm" || args[0] === "create" || args[0] === "start" || args[0] === "exec") return ok();
+    return ok();
+  });
+
+  await SandboxManager.ensure(baseOptions({ runDocker: run, logger, network: "container:vpn-anchor" }));
+  assert.ok(seq.includes("rm"), "the network-dead container is removed");
+  assert.ok(seq.includes("create"), "a fresh container is created in the anchor's current namespace");
+  const recreate = calls.find((c) => c.message === "sandbox_container_recreate");
+  assert.match(String(recreate?.fields?.reason), /network anchor restarted \(container:vpn-anchor /);
+});
+
+test("ensure: reuse keeps the container when the container: network anchor predates it", async () => {
+  const { logger, calls } = recordingLogger();
+  const seq: string[] = [];
+  const { run } = fakeRunner((args) => {
+    seq.push(args[0]);
+    if (args[0] === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    // anchor started BEFORE the sandbox — the shared namespace is still live
+    if (args[0] === "inspect" && args[3] === "vpn-anchor") return ok("2026-08-01T13:18:15.233812109Z");
+    if (args[0] === "inspect") {
+      return ok(`true\t${IMAGE_ID}\t/host/workspace\t1000:1000\t2026-08-02T22:38:48.780535327Z`);
+    }
+    if (args[0] === "exec") return ok(); // readiness
+    return ok();
+  });
+
+  await SandboxManager.ensure(baseOptions({ runDocker: run, logger, network: "container:vpn-anchor" }));
+  assert.ok(!seq.includes("rm"), "a container sharing the anchor's live namespace is not removed");
+  assert.ok(!seq.includes("create"), "a container sharing the anchor's live namespace is not recreated");
+  assert.ok(calls.some((c) => c.message === "sandbox_container_reused"), "logs reuse");
+});
+
 test("createContainer: read_only_root adds --read-only plus writable tmpfs for /tmp and home", async () => {
   let createArgs: string[] = [];
   const { run } = fakeRunner((args) => {
