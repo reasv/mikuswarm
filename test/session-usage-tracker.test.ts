@@ -165,3 +165,41 @@ test("a throwing budget listener never breaks the accounting path", () => {
   assert.doesNotThrow(() => tracker.recordToolCost(0.1));
   assert.ok(Math.abs(tracker.combinedCost() - 0.1) < 1e-9);
 });
+
+test("record stamps the billed model; a later omission keeps it", () => {
+  const tracker = new SessionUsageTracker();
+  // Before any commit there is nothing to report — the caller falls back to the
+  // session type's configured model.
+  assert.equal(tracker.lastModelId(), null);
+
+  tracker.record(usage({ input: 10, output: 5 }), "together.moonshotai/Kimi-K3");
+  assert.equal(tracker.lastModelId(), "together.moonshotai/Kimi-K3");
+
+  // Fallback served a different model on the next request — last wins.
+  tracker.record(usage({ input: 1, output: 1 }), "gpt-5.6-sol");
+  assert.equal(tracker.lastModelId(), "gpt-5.6-sol");
+
+  // A caller that supplies no model (or null) must not CLEAR the record —
+  // `updateAgentSessionUsage`'s coalesce would then leave a stale row model.
+  tracker.record(usage({ input: 1 }));
+  tracker.record(usage({ input: 1 }), null);
+  assert.equal(tracker.lastModelId(), "gpt-5.6-sol");
+});
+
+test("a seeded (resumed) tracker reports no model until this run commits", () => {
+  const seed: SessionUsageTotals = {
+    llmRequests: 4,
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0.5,
+    contextTokens: 120,
+  };
+  const tracker = new SessionUsageTracker(seed);
+  // The seed carries totals, never a model — the durable row already holds the
+  // prior run's, and coalesce protects it until this run bills something.
+  assert.equal(tracker.lastModelId(), null);
+  tracker.record(usage({ input: 1 }), "together.moonshotai/Kimi-K3");
+  assert.equal(tracker.lastModelId(), "together.moonshotai/Kimi-K3");
+});

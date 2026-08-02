@@ -77,6 +77,17 @@ export class SessionUsageTracker {
    * the enforcement gate / presentation layer.
    */
   private toolCost: number;
+  /**
+   * The LAST committed request's upstream wire model id (spec
+   * TOKEN-USAGE-TRACKING §4.3) — the model actually billed, which under model
+   * fallback or per-user model selection is NOT the session type's configured
+   * model. Kept OUT of {@link SessionUsageTotals} (whose shape maps 1:1 to the
+   * `usage_*` columns) and read separately by the persistence subscriber, so
+   * `agent_sessions.model_id` matches the ledger's `agent_loop` rows. null
+   * until the first request of THIS run commits — including on a seeded resume,
+   * whose seed carries totals but no model.
+   */
+  private lastModel: string | null = null;
   /** Persistence + agent-loop-driven subscribers; fires on `record()` only. */
   private readonly listeners = new Set<(totals: SessionUsageTotals) => void>();
   /**
@@ -96,8 +107,15 @@ export class SessionUsageTracker {
    * `totalTokens` (the new current size — never assumed monotonic, §2.1).
    * Notifies `onUpdate` listeners with a fresh snapshot and `onBudgetChange`
    * listeners with the new combined cost.
+   *
+   * `modelId` is the upstream wire id this request was actually billed against
+   * (the commit point's `message.model ?? model.id` — the same value the ledger
+   * row carries). Optional so non-agent-loop callers and tests need not supply
+   * it; omitted or null leaves the previously recorded model in place rather
+   * than clearing it.
    */
-  record(usage: Usage): void {
+  record(usage: Usage, modelId?: string | null): void {
+    if (modelId) this.lastModel = modelId;
     this.totals = {
       llmRequests: this.totals.llmRequests + 1,
       inputTokens: this.totals.inputTokens + (usage.input ?? 0),
@@ -138,6 +156,15 @@ export class SessionUsageTracker {
   /** Defensive copy of the agent-loop totals. */
   snapshot(): SessionUsageTotals {
     return { ...this.totals };
+  }
+
+  /**
+   * The last committed request's billed wire model id, or null before this run
+   * commits anything. The persistence subscriber prefers this over the session
+   * type's configured model so the durable row records what was actually used.
+   */
+  lastModelId(): string | null {
+    return this.lastModel;
   }
 
   /** Subscribe to post-record agent-loop snapshots; returns an unsubscribe fn. */

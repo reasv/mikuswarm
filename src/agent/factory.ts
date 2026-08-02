@@ -891,7 +891,13 @@ export class AgentSessionFactory {
         // ledger write is additive — the §8b `agent_sessions.usage_*` aggregate
         // is still maintained by the tracker's persistence subscriber.
         onRequestCommitted: (message: AssistantMessage) => {
-          usage.record(message.usage);
+          // Same billed-model expression the ledger row below uses (spec
+          // MODEL-FALLBACK §2.2/§6.1): the committed message's own `model` when
+          // the provider reports one, else this attempt's descriptor. Feeding it
+          // to the tracker is what lets the durable `agent_sessions.model_id`
+          // agree with the ledger under fallback / per-user model selection,
+          // instead of freezing the session type's configured model.
+          usage.record(message.usage, message.model ?? model.id);
           if (userSelectionActive) {
             // Advance the prompt-cache baseline (spec §5.3): the just-committed
             // request's prompt is now the cached prefix for the NEXT request's
