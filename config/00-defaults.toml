@@ -437,6 +437,38 @@ max_chars_limit = 16000                 # hard cap per returned window
 max_total_chars = 32768                 # cap on the assembled document (paginated via offset)
 max_view_blocks = 4                     # image blocks per call via view_media
 
+# YouTube video understanding via yt-dlp (spec/YOUTUBE-VIDEO-UNDERSTANDING.md).
+# enabled = true is the master switch; the feature is additionally gated on the
+# yt-dlp binary being present at startup (probeYtDlpBinary() probe). When the
+# binary is absent, a structured warning is logged and the tools + enrichment
+# stage are not registered — no crash, no behavior change on existing features.
+# yt_dlp_path resolves from PATH by default; the Dockerfile pins the version.
+[youtube]
+enabled = true
+yt_dlp_path = "yt-dlp"
+max_download_bytes = 209715200  # 200 MB segment cap (--max-filesize)
+concurrency = 2                 # max concurrent yt-dlp subprocesses
+timeout_ms = 120000             # per-subprocess wall clock (SIGKILL on expiry)
+# cookies_file = "/path/to/cookies.txt"  # optional; for bot-detection / age-restricted videos
+
+# T1 enrichment: on by default for caption-eligible messages (same gating as
+# captioning: trigger-group, backfetch promotions, assistant messages when
+# caption_assistant_messages is set). enrich_all = true lifts the gate to every
+# message carrying a YouTube link (no LLM cost — just YouTube traffic volume).
+[youtube.enrichment]
+enabled = true
+enrich_all = false
+transcript_head_chars = 1000
+thumbnail = true               # store + caption thumbnail as preview_media
+
+# youtube_fetch tool windowing (x_fetch conventions). Cross-field invariant:
+# default_max_chars <= max_chars_limit <= max_total_chars (fail-fast at startup).
+[youtube.tool]
+max_total_chars = 32768
+default_max_chars = 4000
+max_chars_limit = 16000
+download_max_height = 720      # default + cap for workspace file downloads (§6a)
+
 # Per-host HTTP egress limiting (spec Design D), enforced at the guardedFetch
 # chokepoint and keyed per host (shared across all callers). This is NOT a
 # cross-domain cap (the old enrichment.fetch_concurrency cap of 6 is removed): each

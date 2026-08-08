@@ -50,6 +50,7 @@ mikuswarm/
     timeline/                   Timeline store, routing, trigger coordination
     backfill/                   First-trigger initial history backfill (Matrix backward paging)
     enrichment/                 Post-persistence enrichment worker pool (downloads, link previews, reply resolution)
+    youtube/                    YouTube video understanding: URL parser (url.ts), yt-dlp subprocess wrapper (ytdlp.ts), config resolution (config.ts)
     captioning/                 Caption worker pool, describeMedia() (image/video/audio), per-modality inference clients, animated image detection + conversion
     summarization/              Hierarchical summarization worker pool + condensation evaluator (§9b)
     diary/                      Diary worker pool, dictated header, recent-memory window (§9c)
@@ -220,6 +221,22 @@ fxtwitter?: { enabled?,                              // §7a "X.com enrichment v
                        default_max_chars?, max_chars_limit?,
                        max_total_chars?, max_view_blocks? } }
                        // cross-field: default_max_chars <= max_chars_limit <= max_total_chars (fail-fast at app wiring)
+youtube?:   { enabled?,                              // master switch; default true; effective only when yt-dlp binary probe passes at startup
+              yt_dlp_path?,                          // path to yt-dlp binary; default "yt-dlp"
+              max_download_bytes?,                   // --max-filesize cap for downloads; default 209715200 (200 MB)
+              concurrency?,                          // max concurrent yt-dlp subprocesses; default 2
+              timeout_ms?,                           // per-subprocess wall-clock timeout; default 120000
+              cookies_file?,                         // path to a Netscape cookies file passed as --cookies
+              enrichment?: { enabled?,               // default true
+                             enrich_all?,            // default false
+                             transcript_head_chars?, // default 1000
+                             thumbnail? },           // default true
+              tool?:       { max_total_chars?,       // chars cap; default 32768
+                             default_max_chars?,     // default 4000
+                             max_chars_limit?,       // default 16000
+                             download_max_height? } }// height px cap for downloads; default 720
+                             // cross-field: default_max_chars <= max_chars_limit <= max_total_chars (fail-fast at app wiring)
+                             // cross-field: enrichment.enabled = true requires youtube.enabled = true
 mcp?:       { servers: Record<string, { url, transport?, headers? }> }  // ships the keyless Exa web-tools server by default (§ MCP remote tools)
 captioning: { model?,                                              // [models.*] block NAME (spec MODEL-FALLBACK §2.3 unified registry); unset → "default". Connection/cost/group/fallback live on the referenced model
               worker_count, caption_all, caption_assistant_messages?,

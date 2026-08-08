@@ -121,6 +121,7 @@ import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEv
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
+import { resolveYouTubeConfig } from "./youtube/config.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
@@ -250,6 +251,24 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (fxTwitterConfig.tool.maxCharsLimit > fxTwitterConfig.tool.maxTotalChars) {
     throw new Error(
       `fxtwitter.tool: max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit}) must be <= max_total_chars (${fxTwitterConfig.tool.maxTotalChars})`,
+    );
+  }
+  // [youtube.tool] cross-field sanity — same fail-fast convention as [fxtwitter.tool].
+  const ytCfg = resolveYouTubeConfig(config.youtube);
+  if (ytCfg.tool.defaultMaxChars > ytCfg.tool.maxCharsLimit) {
+    throw new Error(
+      `youtube.tool: default_max_chars (${ytCfg.tool.defaultMaxChars}) must be <= max_chars_limit (${ytCfg.tool.maxCharsLimit})`,
+    );
+  }
+  if (ytCfg.tool.maxCharsLimit > ytCfg.tool.maxTotalChars) {
+    throw new Error(
+      `youtube.tool: max_chars_limit (${ytCfg.tool.maxCharsLimit}) must be <= max_total_chars (${ytCfg.tool.maxTotalChars})`,
+    );
+  }
+  // [youtube.enrichment].enabled requires [youtube].enabled.
+  if (ytCfg.enrichment.enabled && !ytCfg.enabled) {
+    throw new Error(
+      "youtube.enrichment.enabled = true requires youtube.enabled = true",
     );
   }
   // [saucenao] graceful key-gated degrade (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5;
