@@ -400,7 +400,8 @@ export class SummarizationWorkerPool {
         usage,
         timelineKey: syntheticSession.timelineKey,
         sessionType: syntheticSession.sessionType,
-        model: factory.resolveModelId(syntheticSession.sessionType),
+        // Thread `syntheticSession.timelineKey` for per-agent model resolution (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+        model: factory.resolveModelId(syntheticSession.sessionType, syntheticSession.timelineKey),
         maxSessionCostUsd: costCeiling,
         logger,
       });
@@ -696,7 +697,8 @@ export class SummarizationWorkerPool {
    */
   private resolveInput(job: SummarizationJob): ResolvedInput | undefined {
     const { storage, factory } = this.options;
-    const modelId = factory.resolveModelId(job.level === 1 ? "summarize" : "condense");
+    // Thread `job.timelineKey` for per-agent model resolution (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    const modelId = factory.resolveModelId(job.level === 1 ? "summarize" : "condense", job.timelineKey);
 
     if (job.level === 1) {
       const start = storage.getEventCursor(job.timelineKey, job.inputStartId);

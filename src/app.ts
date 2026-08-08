@@ -58,6 +58,7 @@ import {
   type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
+import { buildAgentModelOverrides } from "./agent/agent-model-overrides.js";
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
@@ -1375,6 +1376,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   }
 
+  // Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §8): built once
+  // from config at startup; all four resolvers are pure O(1) lookups over the
+  // precomputed per-agent map. Passed into the factory so every session launched
+  // through the factory resolves through the chat-lane ladder (§4).
+  const agentModelOverrides = buildAgentModelOverrides(config);
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -1389,6 +1396,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
     // Returns the owning agent's resolved workspace root for a timeline key.
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
+    // Per-agent model override ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    // Only active in agents mode (agentWorkspaces.length > 0); in legacy mode the
+    // resolver is absent → factory falls back to the global-only path (§2).
+    agentModelOverrides,
+    resolveAgentName: agentWorkspaces.length > 0
+      ? (timelineKey) => {
+          const entry = resolveWorkspaceForTimeline(timelineKey);
+          if (!entry) return null;
+          // Normalize the sentinel exactly as the contextBuilder wiring (app.ts:~909):
+          // "__legacy__" means "no agent scoping" → null → global ladder.
+          return entry.agentName === "__legacy__" ? null : entry.agentName;
+        }
+      : undefined,
   });
 
   // ---------------------------------------------------------------------------
@@ -1456,18 +1476,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       minUsageTs: (filter) => storage.minUsageTs(filter),
       zeroCostModelIds,
       dependencies,
-      resolveModelId: (sessionType) => {
+      // `timelineKey` is threaded through `checkAdmissionChain` so that per-agent
+      // model overrides (spec PER-AGENT-MODEL-OVERRIDES §4) are visible when the
+      // dependency cascade resolves a prerequisite's (e.g. summarize's) model for a
+      // specific agent's session. Callers without per-session context (e.g.
+      // `isClassAvailable`, worker claim gates) omit `timelineKey` → global ladder.
+      resolveModelId: (sessionType, timelineKey) => {
         try {
-          return factory.resolveModelId(sessionType);
+          return factory.resolveModelId(sessionType, timelineKey);
         } catch {
           return undefined;
         }
       },
       // Logical id (chain-head config block name) for the session-level gates —
       // the dimension `[[limits]].models` matches (spec MODEL-FALLBACK §2.2).
-      resolveLogicalModelId: (sessionType) => {
+      resolveLogicalModelId: (sessionType, timelineKey) => {
         try {
-          return factory.resolveLogicalModelId(sessionType);
+          return factory.resolveLogicalModelId(sessionType, timelineKey);
         } catch {
           return undefined;
         }
@@ -1477,9 +1502,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // judged unavailable only when EVERY member of its chain is over budget, so a
       // model-scoped cap on the prerequisite's head (e.g. GLM) does not refuse a
       // dependent reply the prerequisite could still produce on a fallback (DeepSeek).
-      resolveModelChainLogicalIds: (sessionType) => {
+      resolveModelChainLogicalIds: (sessionType, timelineKey) => {
         try {
-          return factory.resolveModelChainLogicalIds(sessionType);
+          return factory.resolveModelChainLogicalIds(sessionType, timelineKey);
         } catch {
           return [];
         }
@@ -1801,6 +1826,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return undefined;
     }
   };
+  // NOTE (spec PER-AGENT-MODEL-OVERRIDES FIX 8): the lanes below are deliberately
+  // GLOBAL-model-based. The claim gate is a process-wide pause heuristic — it has no
+  // per-session context at evaluation time, only a set of session-type names. With
+  // per-agent model overrides, an agent whose override is within budget may still pause
+  // while the global model is over budget: a conservative over-pause, not a correctness
+  // problem. The per-session admission gates (which ARE agent-aware, threaded via
+  // timelineKey through checkAdmission/checkAdmissionChain) remain the enforcement
+  // point. Widening this gate would require threading the calling session's timeline key
+  // here, but claim gates are registered at startup and re-evaluated without session
+  // context — the tradeoff is intentional.
   const makeAgentLoopClaimGate = (sessionTypes: readonly string[]): (() => boolean) => {
     const engine = budgetHooks.engine;
     if (!engine) return () => false;
@@ -3139,9 +3174,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const eventForRender = buildReplyHydratedEvent(inbound, target, followUpHydratedEvent(inbound));
     let imageBlocks: ImageBlock[] | undefined;
     try {
+      const coReplySessionType = sessions.get(coReplySessionId)?.sessionType ?? "default";
+      // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
+      // FIX 6): use inbound.timelineKey to pick the agent, then look up the model.
+      const coReplyModelKey = factory.resolveLogicalModelId(coReplySessionType, inbound.timelineKey);
+      const coReplySeesImages =
+        (config.models[coReplyModelKey] ?? config.models.default)?.input_modalities?.includes("image") ?? false;
       const blocks = await contextBuilder.conditionEventImages(
         eventForRender,
-        factory.resolveSessionType(sessions.get(coReplySessionId)?.sessionType ?? "default"),
+        factory.resolveSessionType(coReplySessionType),
+        coReplySeesImages,
       );
       if (blocks.length > 0) {
         imageBlocks = blocks;
@@ -3508,9 +3550,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let imageBlocks: ImageBlock[] | undefined;
     if (form === "media") {
       try {
+        const followUpSessionType = sessions.get(sessionId)?.sessionType ?? "default";
+        // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
+        // FIX 6): use inbound.timelineKey to pick the agent, then look up the model.
+        const followUpModelKey = factory.resolveLogicalModelId(followUpSessionType, inbound.timelineKey);
+        const followUpSeesImages =
+          (config.models[followUpModelKey] ?? config.models.default)?.input_modalities?.includes("image") ?? false;
         const blocks = await contextBuilder.conditionEventImages(
           hydrated,
-          factory.resolveSessionType(sessions.get(sessionId)?.sessionType ?? "default"),
+          factory.resolveSessionType(followUpSessionType),
+          followUpSeesImages,
         );
         if (blocks.length > 0) {
           imageBlocks = blocks;
@@ -3714,7 +3763,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const verdict = await evaluateFollowUpResumeGate({
         sessionId,
         getSession: () => storage.getAgentSession(sessionId),
-        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
+        // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
+        resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
         // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the
         // inbound timeline key so the follow-up resume reads the correct agent dir.
         // In agents mode an unresolvable account returns null → gate rejects (no resume).
@@ -3926,16 +3977,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // from the SAME resolver call that feeds enforcement and the model descriptor,
     // never an independent `config.models.*.context_window` read — so a session
     // type's override (or a non-default model) shapes the tool budget too.
-    const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
+    // Thread inbound.timelineKey for per-agent model resolution (spec FIX 7).
+    const contextCeiling = factory.resolveSessionContextCeiling(sessionType, inbound.timelineKey);
 
-    // Whether THIS session's reply model — the session-type model, the one that
-    // actually serves the turn, NOT `[models.default]` (which may be a different,
-    // text-only model) — accepts image input (spec MODEL-FALLBACK §3). Gates
-    // vision-dependent tool wiring below (read_image inclusion, media/danbooru/
-    // find_source inline-vs-caption fallback) on the serving model's own capability,
-    // never another model's.
+    // Whether THIS session's reply model — the per-agent resolved model (spec
+    // PER-AGENT-MODEL-OVERRIDES §4 FIX 4), the one that actually serves the turn,
+    // NOT `[models.default]` or the global session-type model — accepts image input
+    // (spec MODEL-FALLBACK §3). Gates vision-dependent tool wiring below
+    // (read_image inclusion, media/danbooru/find_source inline-vs-caption fallback)
+    // on the serving model's own capability, never another model's.
     const replyModelConfig =
-      config.models[factory.resolveSessionType(sessionType)?.model ?? "default"] ?? config.models.default;
+      config.models[factory.resolveLogicalModelId(sessionType, inbound.timelineKey)] ?? config.models.default;
     const replyModelSeesImages = replyModelConfig.input_modalities.includes("image");
 
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
@@ -4432,9 +4484,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // initial pick matches Gate B's per-attempt selection — a model affordable only
     // because thinking was ignored must not be admitted as the initial model. The
     // thinking level is the session-type head's config (fixed for the rollout).
-    const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType)];
+    // Thread `inbound.timelineKey` so the per-agent ladder resolves the correct
+    // model for this agent's session (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType, inbound.timelineKey)];
     const sessionThinkingLevel =
-      config.models[factory.resolveLogicalModelId(sessionType)]?.thinking_level ?? "off";
+      config.models[factory.resolveLogicalModelId(sessionType, inbound.timelineKey)]?.thinking_level ?? "off";
     const thinkingBudgetForModel = (m: string): number => {
       const mc = config.models[m];
       return mc ? additiveThinkingBudgetTokens(mc, sessionThinkingLevel) : 0;
@@ -4680,7 +4734,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: record.timelineKey,
       sessionType: record.sessionType,
-      model: factory.resolveModelId(record.sessionType),
+      // Thread `record.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(record.sessionType, record.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -4937,7 +4992,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ctx,
         resumeCfg,
         exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
-        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
+        // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
+        resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
         // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): the row's stored
         // timeline key identifies the agent; resolve its workspace so images and
         // memory files are loaded from the correct per-agent directory.
@@ -5229,7 +5286,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: record.timelineKey,
       sessionType: record.sessionType,
-      model: factory.resolveModelId(record.sessionType),
+      // Thread `record.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(record.sessionType, record.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -5329,7 +5387,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // The §6.1 "seed with the head's logical id" obligation is therefore discharged
     // by the chain gate + per-request ledger; `agent_sessions.model_id` stays the
     // upstream id as provisional provenance until the first request rewrites it.
-    const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType));
+    // Thread `inbound.timelineKey` for per-agent model resolution (spec §4/§8).
+    const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType, inbound.timelineKey));
     sessions.markRunning(session.id);
     // Attribute the claim added at accept time to this session and release it when
     // the run settles (spec DUPLICATE-REPLY-MITIGATION §3.3). Registered before the
@@ -5415,9 +5474,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // model. Falls back to the session-type default when per-user is inactive.
       let admissionModelId: string | undefined;
       try {
+        // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
         admissionModelId = initialUserModel
           ? factory.resolveUpstreamModelId(initialUserModel)
-          : factory.resolveModelId(session.sessionType);
+          : factory.resolveModelId(session.sessionType, session.timelineKey);
       } catch {
         admissionModelId = undefined;
       }
@@ -5427,9 +5487,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // model-id resolution above — a throw leaves it undefined → head-only gate.
       let admissionChain: string[] | undefined;
       try {
+        // Thread `session.timelineKey` for per-agent chain resolution (spec §4/§8).
         admissionChain = initialUserModel
           ? factory.resolveModelChainLogicalIdsForModel(initialUserModel)
-          : factory.resolveModelChainLogicalIds(session.sessionType);
+          : factory.resolveModelChainLogicalIds(session.sessionType, session.timelineKey);
       } catch {
         admissionChain = undefined;
       }
@@ -5600,7 +5661,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: session.timelineKey,
       sessionType: session.sessionType,
-      model: factory.resolveModelId(session.sessionType),
+      // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(session.sessionType, session.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -5758,14 +5820,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // duration, §5 #5) when proactive (or its summarization dependency) is over
     // budget (spec USAGE-COST-LIMITS §6.3). Exception-isolated + fail-open
     // (review #7): an engine throw → no defer.
-    budgetDeferUntil: () => {
+    // Thread timelineKey (spec PER-AGENT-MODEL-OVERRIDES FIX 3): the callback receives
+    // the channel's timeline key from the scheduler so resolveModelId and checkAdmission
+    // apply the per-agent override for this channel's agent rather than the global model.
+    budgetDeferUntil: (timelineKey) => {
       const engine = budgetHooks.engine;
       if (!engine) return undefined;
       return safeProactiveDeferUntil(
         engine,
         config.proactive?.session_type ?? "proactive",
-        (sessionType) => factory.resolveModelId(sessionType),
+        (sessionType) => factory.resolveModelId(sessionType, timelineKey),
         logger,
+        timelineKey,
       );
     },
     // §6.3: wire provider self-identity so proactive synthetic inbounds carry the
@@ -6477,6 +6543,7 @@ export function safeProactiveDeferUntil(
   proactiveType: string,
   resolveModelId: (sessionType: string) => string | undefined,
   logger: Logger,
+  timelineKey?: string,
 ): number | undefined {
   let modelId: string | undefined;
   try {
@@ -6486,7 +6553,10 @@ export function safeProactiveDeferUntil(
   }
   if (modelId === undefined) return undefined;
   try {
-    const admission = engine.checkAdmission(proactiveType, modelId);
+    // Thread timelineKey so agent-scoped [[limits]] rules match the per-agent model
+    // (spec PER-AGENT-MODEL-OVERRIDES FIX 3). Without a timelineKey (global callers,
+    // old tests) checkAdmission falls back to process-wide scope as before.
+    const admission = engine.checkAdmission(proactiveType, modelId, timelineKey);
     if (admission.allowed || !admission.primary) return undefined;
     return engine.accurateResetsAt(admission.primary.name) ?? admission.primary.resetsAt;
   } catch (error) {
@@ -6787,7 +6857,14 @@ export async function evaluateResumeGate(args: {
   ctx: "dm" | "group";
   resumeCfg: ResumeGateConfig;
   exemptToolNames: ReadonlySet<string>;
-  resolveCeiling: (sessionType: string) => number | undefined;
+  /**
+   * Resolve the context ceiling for a session type. Optionally receives the
+   * session record's timeline key (spec PER-AGENT-MODEL-OVERRIDES FIX 7) so
+   * the ceiling is resolved against the per-agent model rather than the global
+   * session-type model. Callers that omit `timelineKey` fall back to the
+   * global-only path (backward-compatible).
+   */
+  resolveCeiling: (sessionType: string, timelineKey?: string) => number | undefined;
   loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
   logger: Pick<Logger, "warn">;
 }): Promise<ResumeGateVerdict> {
@@ -6824,7 +6901,8 @@ export async function evaluateResumeGate(args: {
     // ceiling, a resume would immediately re-park (no compaction) — FRESH instead.
     let ceiling: number | undefined;
     try {
-      ceiling = args.resolveCeiling(row.session_type);
+      // Thread the row's timeline key so the ceiling uses the per-agent model (FIX 7).
+      ceiling = args.resolveCeiling(row.session_type, row.timeline_key);
     } catch {
       ceiling = undefined;
     }
@@ -6908,7 +6986,14 @@ export function assertFollowupConfigValid(
 export async function evaluateFollowUpResumeGate(args: {
   sessionId: string;
   getSession: () => AgentSessionRow | undefined;
-  resolveCeiling: (sessionType: string) => number | undefined;
+  /**
+   * Resolve the context ceiling for a session type. Optionally receives the
+   * session record's timeline key (spec PER-AGENT-MODEL-OVERRIDES FIX 7) so
+   * the ceiling is resolved against the per-agent model rather than the global
+   * session-type model. Callers that omit `timelineKey` fall back to the
+   * global-only path (backward-compatible).
+   */
+  resolveCeiling: (sessionType: string, timelineKey?: string) => number | undefined;
   loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
   timelineKey: string;
   logger: Pick<Logger, "warn">;
@@ -6924,7 +7009,8 @@ export async function evaluateFollowUpResumeGate(args: {
     // re-park is pointless → native fate instead.
     let ceiling: number | undefined;
     try {
-      ceiling = args.resolveCeiling(row.session_type);
+      // Thread the row's timeline key so the ceiling uses the per-agent model (FIX 7).
+      ceiling = args.resolveCeiling(row.session_type, row.timeline_key);
     } catch {
       ceiling = undefined;
     }

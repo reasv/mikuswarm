@@ -334,6 +334,81 @@ test("resolveSessionTypeModelRef: null-agent passthrough equals global-only reso
 });
 
 // ---------------------------------------------------------------------------
+// §4 resolveSessionTypeModelRef — block-level fallback (FIX 1 ladder correction)
+//
+// factory.resolveSessionType semantics: `(types[T] ?? types["default"])?.model ?? "default"`.
+// When types[T] exists but has no `model` key, the fallback is the LITERAL "default"
+// (not types["default"].model), because types[T] is truthy so `??` doesn't fall through.
+// The ladder must reproduce this exactly for legacy invariance.
+// ---------------------------------------------------------------------------
+
+test("resolveSessionTypeModelRef: declared type block WITHOUT model + default WITH model → literal 'default' (block-fallback, FIX 1)", () => {
+  // types["proactive"] exists (no model key) + types["default"] has model "chat-alt".
+  // factory: (types["proactive"] ?? types["default"])?.model ?? "default"
+  //        = types["proactive"]?.model ?? "default"  (types["proactive"] is truthy)
+  //        = undefined ?? "default" = "default" (literal)
+  // NOT "chat-alt" (the default type's model).
+  const cfg = makeLegacyConfig({
+    sessionTypes: {
+      proactive: {},          // declared block, no model
+      default: { model: "chat-alt" },
+    },
+  });
+  const overrides = buildAgentModelOverrides(cfg);
+  // null agent: rung 1 = undefined, rung 2 global half = t exists → undefined, rung 3 = "default"
+  assert.equal(overrides.resolveSessionTypeModelRef(null, "proactive"), "default");
+});
+
+test("resolveSessionTypeModelRef: same config — agent overrides 'default' → agent default wins (FIX 1, case b)", () => {
+  // Same as above: types["proactive"] declared without model; types["default"] has "chat-alt".
+  // Agent overrides session_types["default"] = "chat-alt" (the agent's default override).
+  // Rung 2: agent["default"] = "chat-alt" is defined → return "chat-alt" (agent default wins
+  // over literal "default", even though the global half would have been undefined due to t).
+  const cfg = makeAgentsConfig(
+    "sidekick",
+    { session_types: { default: "chat-alt" } },
+    {
+      sessionTypes: {
+        proactive: {},          // declared block, no model
+        default: { model: "default" },
+      },
+    },
+  );
+  const overrides = buildAgentModelOverrides(cfg);
+  assert.equal(overrides.resolveSessionTypeModelRef("sidekick", "proactive"), "chat-alt");
+});
+
+test("resolveSessionTypeModelRef: same config — agent overrides type by name → that wins (FIX 1, case c)", () => {
+  // types["proactive"] declared without model; types["default"] has "default".
+  // Agent overrides session_types["proactive"] = "chat-alt" → rung 1 agent half wins.
+  const cfg = makeAgentsConfig(
+    "sidekick",
+    { session_types: { proactive: "chat-alt" } },
+    {
+      sessionTypes: {
+        proactive: {},          // declared block, no model
+        default: { model: "default" },
+      },
+    },
+  );
+  const overrides = buildAgentModelOverrides(cfg);
+  assert.equal(overrides.resolveSessionTypeModelRef("sidekick", "proactive"), "chat-alt");
+});
+
+test("resolveSessionTypeModelRef: type block ABSENT → default type's model (FIX 1, case d)", () => {
+  // types["custom"] is entirely absent. Rung 1: t = undefined, r1 = undefined.
+  // Rung 2 global half: t absent → globalSessionTypes["default"]?.model = "chat-alt" → return it.
+  const cfg = makeLegacyConfig({
+    sessionTypes: {
+      // no "custom" entry — only "default"
+      default: { model: "chat-alt" },
+    },
+  });
+  const overrides = buildAgentModelOverrides(cfg);
+  assert.equal(overrides.resolveSessionTypeModelRef(null, "custom"), "chat-alt");
+});
+
+// ---------------------------------------------------------------------------
 // §4 resolveCaptionModelRef — captioning ladder
 // ---------------------------------------------------------------------------
 

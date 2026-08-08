@@ -130,15 +130,24 @@ type-specific → `default` type → literal `"default"`. Per-agent it becomes,
 for a session owned by agent A with session type T:
 
 1. `agents.A.models.session_types[T]`, else `agent.session_types[T].model`
-2. else `agents.A.models.session_types["default"]`, else
+2. else `agents.A.models.session_types["default"]`, else — only when the
+   global type block `[agent.session_types.T]` is **absent entirely** —
    `agent.session_types["default"].model`
 3. else the literal model name `"default"`
 
+Rung 2's global half carries a deliberate subtlety: today's factory resolves
+the *block* first (`types[T] ?? types["default"]`) and only then reads
+`.model ?? "default"` — so a **declared** type block **without** a `model` key
+lands on the literal `"default"`, not the default type's model. The ladder
+reproduces that exactly (legacy invariance), while the agent's `default`
+override still substitutes at rung 2 in both cases (it means "this agent's
+default model", covering the literal-`"default"` landing too).
+
 So an agent that overrides only `default` inherits that override wherever the
-global config would have fallen through to the default type's model — but a
-session type with an explicit global model keeps it unless the agent overrides
-that type by name. Legacy sessions (agent name `null`) skip rung's agent half
-and resolve exactly as today.
+global config would have fallen through past the type-specific altitude — but
+a session type with an explicit global model keeps it unless the agent
+overrides that type by name. Legacy sessions (agent name `null`) skip each
+rung's agent half and resolve exactly as today.
 
 **Captioning**: per-asset owning agent A, modality M — strict same-rung
 shadowing (owner-decided, consistent with the chat lane):
@@ -341,6 +350,13 @@ compiling with tests green; they can ship as one PR or as sequential commits.
 - **Zero-cost / known-model collection** (`src/budget/zero-cost.ts:32`):
   iterates the global `[models.*]` registry, which overrides only reference —
   covered automatically.
+- **Worker-pool claim gates** (`makeAgentLoopClaimGate`): the process-wide
+  pause lanes remain GLOBAL-model-based — the gate has no per-session context
+  at evaluation time. Under diverging per-agent models it can over-pause
+  conservatively (an agent whose override is in-budget waits while the global
+  model is over budget); the per-session admission gates, which are
+  agent-aware, remain the enforcement point. Per-agent lanes are a possible
+  follow-up, not v1.
 - **Scheduler, health tracking, rate-limit groups, per-member fits**: all keyed
   on registry blocks / resolved chains; no awareness of who selected the chain.
 - **Legacy mode**: `null` agent short-circuits every ladder to the global

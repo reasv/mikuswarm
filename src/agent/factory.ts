@@ -3,6 +3,7 @@ import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent
 import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import { streamSimple, completeSimple } from "@earendil-works/pi-ai/compat";
 import type { AppConfig } from "../config/index.js";
+import type { AgentModelOverrides } from "./agent-model-overrides.js";
 import { dumpBuiltContext, CACHE_BOUNDARIES, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
@@ -178,6 +179,22 @@ export interface AgentFactoryOptions {
    *   callers can log and discard the session, not fall back to a random root.
    */
   resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
+  /**
+   * Resolve the owning agent name for a timeline key (spec PER-AGENT-MODEL-OVERRIDES §8).
+   * Mirrors {@link resolveWorkspaceRoot} — the "__legacy__" sentinel must be normalized
+   * to `null` at the wiring site (app.ts:~909), so this resolver always returns either a
+   * real agent name or `null`. `null` = legacy/no-scoping: resolvers fall through to the
+   * global-only ladder, byte-identical to today's behavior.
+   * Absent (legacy single-agent mode) → all sessions resolve as `null`-agent (global-only).
+   */
+  resolveAgentName?: (timelineKey: string) => string | null;
+  /**
+   * Per-agent model override table, built once at startup from `AppConfig`
+   * (spec PER-AGENT-MODEL-OVERRIDES §8, via {@link buildAgentModelOverrides}).
+   * When absent (legacy mode or tests without the override module), the three factory
+   * helpers and `create()` fall back to the global-only path (today's behavior).
+   */
+  agentModelOverrides?: AgentModelOverrides;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -397,10 +414,17 @@ export class AgentSessionFactory {
     return types[sessionType] ?? types["default"];
   }
 
-  /** Resolve the upstream model id used by a session type (for summary record provenance). */
-  resolveModelId(sessionType: string): string {
-    const cfg = this.resolveSessionType(sessionType);
-    const modelKey = cfg?.model ?? "default";
+  /**
+   * Resolve the upstream model id used by a session type (for summary record provenance).
+   *
+   * When `timelineKey` is provided and the factory has both {@link AgentFactoryOptions.resolveAgentName}
+   * and {@link AgentFactoryOptions.agentModelOverrides} wired, the resolution runs through
+   * the per-agent chat-lane ladder (spec PER-AGENT-MODEL-OVERRIDES §4). Without a `timelineKey`
+   * (or when either wired option is absent) the global-only path is used — backward-compatible
+   * for all legacy callers.
+   */
+  resolveModelId(sessionType: string, timelineKey?: string): string {
+    const modelKey = this.resolveModelKey(sessionType, timelineKey);
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     return modelConfig.id;
@@ -411,11 +435,14 @@ export class AgentSessionFactory {
    * spend is scoped under (spec MODEL-FALLBACK §2.2) — the chain head's name, what
    * a `[[limits]].models` selector matches and what the ledger stamps. Distinct
    * from {@link resolveModelId} (the upstream wire id) when block name != wire id.
+   *
+   * When `timelineKey` is provided and per-agent overrides are wired, resolves through
+   * the chat-lane ladder (spec PER-AGENT-MODEL-OVERRIDES §4). Without a `timelineKey`
+   * the global-only path is used — backward-compatible for legacy callers.
    */
-  resolveLogicalModelId(sessionType: string): string {
-    return this.resolveSessionType(sessionType)?.model ?? "default";
+  resolveLogicalModelId(sessionType: string, timelineKey?: string): string {
+    return this.resolveModelKey(sessionType, timelineKey);
   }
-
 
   /**
    * Resolve a session type's effective fallback chain as LOGICAL ids (config block
@@ -423,10 +450,35 @@ export class AgentSessionFactory {
    * on the WHOLE chain — admit when ANY member is in-budget — rather than the bare
    * head, so a model-scoped cap on the primary doesn't wrongly refuse a session for
    * which an in-budget fallback exists. Mirrors `create`'s `resolveModelChain` call.
+   *
+   * When `timelineKey` is provided and per-agent overrides are wired, resolves through
+   * the chat-lane ladder (spec PER-AGENT-MODEL-OVERRIDES §4). Without a `timelineKey`
+   * the global-only path is used — backward-compatible for legacy callers.
    */
-  resolveModelChainLogicalIds(sessionType: string): string[] {
-    const modelKey = this.resolveSessionType(sessionType)?.model ?? "default";
+  resolveModelChainLogicalIds(sessionType: string, timelineKey?: string): string[] {
+    const modelKey = this.resolveModelKey(sessionType, timelineKey);
     return resolveModelChain(modelKey, this.options.config.models).map((m) => m.logicalId);
+  }
+
+  /**
+   * Internal: resolve the logical model key (config block name) for a session type.
+   *
+   * When `agentModelOverrides` is wired, always resolves through the per-agent
+   * chat-lane ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8): the agent name is
+   * obtained from `resolveAgentName(timelineKey)` when both `timelineKey` and the
+   * resolver are available, and `null` otherwise (null-agent = global-only path,
+   * byte-identical to today's behavior after the rung-2 correction). When
+   * `agentModelOverrides` is absent (legacy mode or tests without the module),
+   * falls back to `resolveSessionType(sessionType)?.model ?? "default"` directly.
+   */
+  private resolveModelKey(sessionType: string, timelineKey?: string): string {
+    const agentName =
+      timelineKey !== undefined && this.options.resolveAgentName
+        ? this.options.resolveAgentName(timelineKey)
+        : null;
+    return this.options.agentModelOverrides
+      ? this.options.agentModelOverrides.resolveSessionTypeModelRef(agentName, sessionType)
+      : this.resolveSessionType(sessionType)?.model ?? "default";
   }
 
   /**
@@ -478,7 +530,10 @@ export class AgentSessionFactory {
     const sessionTypeConfig = this.resolveSessionType(session.sessionType);
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
 
-    const modelKey = sessionTypeConfig?.model ?? "default";
+    // Per-agent model override (spec PER-AGENT-MODEL-OVERRIDES §4/§8): resolve via
+    // the shared private helper so create() and the public resolvers are always
+    // one code path — no divergence in guarding logic.
+    const modelKey = this.resolveModelKey(session.sessionType, session.timelineKey);
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
     // Extended-thinking level for this session (the head model's config, default off).
@@ -534,21 +589,23 @@ export class AgentSessionFactory {
     let servedModelForAttempt: string | undefined = undefined;
     const budgetEngine = this.options.budget?.engine;
     // Capability pre-filter (spec MODEL-FALLBACK §3 #1): pixels are shipped for a
-    // session ONLY when its own reply model (`modelConfig` — the session-type model,
-    // resolved above) accepts image input; the builder gates pixel-block creation on
-    // exactly that (`ContextBuilder.replyModelCanSeeImages`). So the requirement is
-    // "the reply model can see images AND the raw inputs carry one" — a model's own
-    // capability, never `[models.default]`'s or a fallback's. When it holds, every
-    // viable chain member must also accept image input so a fall-over never ships
-    // pixels to a text-only member (the head is never dropped). Derived from the raw
-    // inputs (trigger attachments / resume snapshot imageBlocks) because this runs
-    // BEFORE buildContext — a SAFE over-approximation (any raw image ⇒ require
-    // multimodal). The head-never-dropped rule ensures every surviving member in
-    // `memberWindows` is capability-compatible. Per-member fits are enforced at
-    // select time by `chooseChainMember` using each member's individual
-    // `operativeWindow`; the planning ceiling is the head's own window
-    // (`fallback.memberWindows[modelKey]`, used at `contextCeiling` below), not
-    // the chain min.
+    // session ONLY when its own reply model (`modelConfig` — the per-agent resolved
+    // model key above) accepts image input. `replyModelCanSeeImages` is threaded
+    // explicitly to both `buildContext` (fresh) and `buildResumeTurn` (resume) so
+    // the builder's pixel-block gate uses the per-agent model's actual capability
+    // rather than re-deriving from the global session-type config
+    // (spec PER-AGENT-MODEL-OVERRIDES FIX 5). So the requirement is "the reply model
+    // can see images AND the raw inputs carry one" — a model's own capability, never
+    // `[models.default]`'s or a fallback's. When it holds, every viable chain member
+    // must also accept image input so a fall-over never ships pixels to a text-only
+    // member (the head is never dropped). Derived from the raw inputs (trigger
+    // attachments / resume snapshot imageBlocks) because this runs BEFORE buildContext
+    // — a SAFE over-approximation (any raw image ⇒ require multimodal). The
+    // head-never-dropped rule ensures every surviving member in `memberWindows` is
+    // capability-compatible. Per-member fits are enforced at select time by
+    // `chooseChainMember` using each member's individual `operativeWindow`; the
+    // planning ceiling is the head's own window (`fallback.memberWindows[modelKey]`,
+    // used at `contextCeiling` below), not the chain min.
     const replyModelCanSeeImages = modelConfig.input_modalities.includes("image");
     const requiresMultimodal = replyModelCanSeeImages && rawInputsRequireMultimodal(session, opts);
     const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
@@ -1267,6 +1324,8 @@ export class AgentSessionFactory {
           browserNote: opts.resumeContinuation.browserNote,
           gap: opts.resumeContinuation.gap,
           triggerPreamble: opts.resumeContinuation.triggerPreamble,
+          // Thread the per-agent model's vision capability (spec FIX 5 — resume path).
+          replyModelCanSeeImages,
         });
       }
     } else {
@@ -1294,6 +1353,9 @@ export class AgentSessionFactory {
         // class), and the drain signal cancels a waiting build cleanly (§7.2).
         priority,
         abortSignal: opts?.abortSignal,
+        // Thread the per-agent model's vision capability so the builder's
+        // pixel-block gate reflects the actual serving model (spec FIX 5).
+        replyModelCanSeeImages,
       });
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
@@ -1474,9 +1536,12 @@ export class AgentSessionFactory {
    * (in `create`'s `checkContextBudget`) uses `fallback.maxOperativeContextWindow`
    * (the largest member's window) and terminates only when NO member can serve.
    */
-  resolveSessionContextCeiling(sessionType: string): number {
+  resolveSessionContextCeiling(sessionType: string, timelineKey?: string): number {
     const cfg = this.resolveSessionType(sessionType);
-    const modelKey = cfg?.model ?? "default";
+    // Model key resolved via the per-agent ladder when timelineKey is provided
+    // (spec PER-AGENT-MODEL-OVERRIDES §4/§8 FIX 7). Behavioral session-type settings
+    // (cfg.max_context_tokens) remain global per the spec non-goal.
+    const modelKey = this.resolveModelKey(sessionType, timelineKey);
     const modelConfig = this.options.config.models[modelKey];
     const contextWindow = modelConfig?.context_window;
     if (contextWindow === undefined) {
@@ -1533,6 +1598,12 @@ export class AgentSessionFactory {
     proactive?: boolean;
     priority?: PriorityClass;
     abortSignal?: AbortSignal;
+    /**
+     * Per-agent vision capability override (spec PER-AGENT-MODEL-OVERRIDES FIX 5).
+     * Threaded from `create()` where the per-agent model key is already resolved —
+     * the builder must not re-derive from the global `sessionType.model`.
+     */
+    replyModelCanSeeImages?: boolean;
   }): Promise<BuiltContext> {
     const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({
@@ -1551,6 +1622,7 @@ export class AgentSessionFactory {
       proactive: args.proactive,
       priority: args.priority,
       abortSignal: args.abortSignal,
+      replyModelCanSeeImages: args.replyModelCanSeeImages,
     });
   }
 
@@ -1582,6 +1654,12 @@ export class AgentSessionFactory {
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
     const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
 
+    // Per-agent model override (spec PER-AGENT-MODEL-OVERRIDES §4): mirror
+    // create()'s vision derivation so the preview's image-block inclusion matches
+    // what the next real session for this timeline would send.
+    const previewModelKey = this.resolveModelKey("default", timelineKey);
+    const previewModelConfig = this.options.config.models[previewModelKey];
+
     // Synthetic trigger = most recent timeline event (spec §9). `getTimelineEvents`
     // returns ascending order, so the last element is the newest. When the timeline
     // has no events, a minimal placeholder lets the builder still render the prefix
@@ -1596,6 +1674,7 @@ export class AgentSessionFactory {
       workspace,
       sessionType: sessionTypeConfig,
       fallbackPrompt,
+      replyModelCanSeeImages: previewModelConfig?.input_modalities.includes("image"),
       // The default session type's tool set, so the preview's estimate + tool
       // block match what the next real session would send. Absent hook (tests) →
       // no tool block, identical to the prior preview behaviour.

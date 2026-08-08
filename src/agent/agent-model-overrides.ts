@@ -31,12 +31,23 @@ export interface AgentModelOverrides {
    *
    * Three-rung ladder — rung wins at the first defined value:
    *   1. `agents.A.models.session_types[T]`, else `agent.session_types[T].model`
-   *   2. `agents.A.models.session_types["default"]`, else `agent.session_types["default"].model`
+   *   2. `agents.A.models.session_types["default"]`, else (only when T's type block is
+   *      absent) `agent.session_types["default"].model`
    *   3. literal `"default"`
    *
    * The agent override shadows the global at the SAME rung; a type with an
    * explicit global model keeps it unless the agent overrides that type by name.
    * `null` agentName resolves rungs 1-2 against the global only (no agent half).
+   *
+   * **Block-level fallback subtlety (rung 2 global half)**: when a declared type
+   * block exists in `agent.session_types` but carries no `model` key, the factory's
+   * `resolveSessionType` returns that block (not the default block), yielding the
+   * literal `"default"` — NOT the default type's model. This module reproduces that
+   * invariant exactly: when the type-specific block `t` is present (even without
+   * a `model` key), the global half of rung 2 is `undefined` rather than
+   * `globalSessionTypes["default"]?.model`. This preserves legacy invariance —
+   * `null`-agent resolution is byte-identical to `factory.resolveSessionType`'s
+   * own `(types[T] ?? types["default"])?.model ?? "default"` chain.
    */
   resolveSessionTypeModelRef(agentName: string | null, sessionType: string): string;
 
@@ -96,19 +107,24 @@ export function buildAgentModelOverrides(config: AppConfig): AgentModelOverrides
     // ── Chat lane (§4 session-type ladder) ──────────────────────────────────
     resolveSessionTypeModelRef(agentName, sessionType) {
       const agentOverrides = agentName !== null ? agents[agentName]?.models : undefined;
-      const agentSessionTypes = agentOverrides?.session_types;
+      // The type-specific global block (may exist without a `model` key — see JSDoc).
+      const t = globalSessionTypes?.[sessionType];
 
-      // Rung 1: agent session_types[T] (if set), else global session_types[T].model (if set).
-      const rung1 =
-        agentSessionTypes?.[sessionType] ??
-        globalSessionTypes[sessionType]?.model;
-      if (rung1 !== undefined) return rung1;
+      // Rung 1 — type-specific altitude: agent override, else the global type block's
+      // own model. If t exists but has no model, t?.model is undefined → rung 1 falls.
+      const r1 = agentOverrides?.session_types?.[sessionType] ?? t?.model;
+      if (r1 !== undefined) return r1;
 
-      // Rung 2: agent session_types["default"] (if set), else global session_types["default"].model (if set).
-      const rung2 =
-        agentSessionTypes?.["default"] ??
-        globalSessionTypes["default"]?.model;
-      if (rung2 !== undefined) return rung2;
+      // Rung 2 — default altitude: agent "default" override substitutes wherever the
+      // type-specific altitude yielded nothing. The global half preserves factory's
+      // block-level fallback: when `t` (the type-specific block) EXISTS, resolveSessionType
+      // returns it (not the default block), so the chain resolves to
+      // `t.model ?? "default"` = literal "default", NOT globalSessionTypes["default"].model.
+      // We reproduce this exactly: if `t` is present, the global half is `undefined`.
+      const r2 =
+        agentOverrides?.session_types?.["default"] ??
+        (t ? undefined : globalSessionTypes?.["default"]?.model);
+      if (r2 !== undefined) return r2;
 
       // Rung 3: the literal model name "default" (the registry's always-present fallback).
       return "default";

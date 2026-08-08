@@ -290,6 +290,64 @@ test("#1 checkAdmission delegates to the head-only chain (back-compat)", () => {
   assert.equal(engine.checkAdmission("default", "wire").allowed, false);
 });
 
+test("checkAdmissionChain threads timelineKey to resolveModelId/resolveLogicalModelId/resolveModelChainLogicalIds callbacks (spec PER-AGENT-MODEL-OVERRIDES §4)", () => {
+  // Verify that the per-agent model override wiring works end-to-end through the
+  // dependency cascade: when a session's checkAdmissionChain is called with a
+  // timelineKey, that key reaches the resolver callbacks so they can apply the
+  // per-agent ladder. The test captures every (sessionType, timelineKey) pair
+  // the callbacks observe.
+  const seenModelId: Array<[string, string | undefined]> = [];
+  const seenLogicalId: Array<[string, string | undefined]> = [];
+  const seenChainIds: Array<[string, string | undefined]> = [];
+  const engine = new BudgetEngine({
+    rules: [],
+    sumUsageCost: () => 0,
+    zeroCostModelIds: new Set(),
+    dependencies: { "chat": ["summarize"] },
+    resolveModelId: (sessionType, timelineKey) => {
+      seenModelId.push([sessionType, timelineKey]);
+      return "wire";
+    },
+    resolveLogicalModelId: (sessionType, timelineKey) => {
+      seenLogicalId.push([sessionType, timelineKey]);
+      return "head";
+    },
+    resolveModelChainLogicalIds: (sessionType, timelineKey) => {
+      seenChainIds.push([sessionType, timelineKey]);
+      return ["head"];
+    },
+    logger: noopLogger,
+    now: () => 1_000_000,
+  });
+
+  const tk = "matrix:sidekick:!room:server";
+  // checkAdmission threads timelineKey to resolveLogicalModelId
+  engine.checkAdmission("chat", "wire", tk);
+  assert.ok(
+    seenLogicalId.some(([, key]) => key === tk),
+    `resolveLogicalModelId must receive the timelineKey "${tk}"`,
+  );
+
+  // Reset to isolate the dependency-cascade check
+  seenModelId.length = 0;
+  seenLogicalId.length = 0;
+  seenChainIds.length = 0;
+
+  // checkAdmissionChain with a dependency — dep resolution must also carry the timelineKey
+  engine.checkAdmissionChain("chat", "wire", ["head"], tk);
+  // The dep "summarize" must be resolved with the timelineKey
+  const depModelIdSeen = seenModelId.filter(([st]) => st === "summarize");
+  const depChainSeen = seenChainIds.filter(([st]) => st === "summarize");
+  assert.ok(
+    depModelIdSeen.some(([, key]) => key === tk),
+    `resolveModelId("summarize", ...) must receive the timelineKey "${tk}"`,
+  );
+  assert.ok(
+    depChainSeen.some(([, key]) => key === tk),
+    `resolveModelChainLogicalIds("summarize", ...) must receive the timelineKey "${tk}"`,
+  );
+});
+
 test("ruleStatuses: one entry per rule with state + fraction", () => {
   const rules: LimitRule[] = [
     { name: "a", maxUsd: 10, window: dayWindow, selector: {} },
