@@ -1,6 +1,6 @@
 # Per-Agent Model Overrides — `[agents.<name>.models]`
 
-**Status**: PROPOSED — design signed off, ready for implementation planning.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §4c "Agents and accounts" (config surface, validation, startup log), §8 "Per-agent model resolution" (chat-lane ladder, resolveModelKey, widened helpers, threading), §7a "Caption worker pool" (per-agent clients, ladder semantics), and the §10 image_gen/x_search tool sections; retained for review.
 
 **Author**: design session 2026-08-08.
 
@@ -343,7 +343,9 @@ compiling with tests green; they can ship as one PR or as sequential commits.
     factory ladder, §7a captioning chain selection, and the image_gen/x_search
     tool sections. Flip this spec's status to IMPLEMENTED; CHANGELOG entry.
 13. Optional follow-up (not gating): effective per-role model map in
-    `GET /api/agents` for the console.
+    `GET /api/agents` for the console. **NOT built** — explicitly deferred as
+    the spec allows; the startup `agent_model_overrides` log covers the
+    observability requirement for v1.
 
 ### Non-changes (verified)
 

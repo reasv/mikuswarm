@@ -25,6 +25,18 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Per-agent model overrides**: each agent can now declare an optional `[agents.<name>.models]` block to
+  selectively override model role assignments for that agent only. Chat session types (including `proactive`,
+  `summarize`, `condense`, `diary`) are overridden via `[agents.<name>.models.session_types]` (flat map of
+  type name → `[models.*]` logical name); captioning per-modality via `[agents.<name>.models.captioning]`
+  (same two-level shadowing as the global config, with strict same-rung precedence); image generation tiers
+  via `[agents.<name>.models.image_gen]`; and X search tiers via `[agents.<name>.models.x_search]`. All
+  values are references into the shared global `[models.*]` registry — connection details, fallback chains,
+  cost, and health tracking remain centralized. Absent = all roles resolve exactly as before. Fail-fast
+  validation at startup rejects unknown model names, overrides for unconfigured subsystems, and
+  `summaries_from` + summarization-override conflicts, with path-precise error messages. A startup info log
+  (`agent_model_overrides`) lists each agent's effective overrides.
+
 - **Console: agent-aware labeling**: deployments with more than one configured
   agent gain agent-primary labels across every console surface — room-list tabs
   become per-agent ("All" plus one tab per agent, labeled `name PROVIDER` or

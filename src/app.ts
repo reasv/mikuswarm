@@ -1099,6 +1099,41 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   }
 
+  // Startup observability — per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §9).
+  // One info log per agent that has ANY model override, emitted once after the override
+  // table and per-agent caption clients are fully built. `overrides` is a flat map of
+  // role key → raw config value (not ladder result), so operators can see exactly what
+  // they configured without having to trace through the resolution ladder.
+  if (config.agents) {
+    for (const [agentName, agentBlock] of Object.entries(config.agents)) {
+      const m = agentBlock.models;
+      if (!m) continue;
+      const overrides: Record<string, string> = {};
+      if (m.session_types) {
+        for (const [k, v] of Object.entries(m.session_types)) {
+          overrides[`session_types.${k}`] = v;
+        }
+      }
+      if (m.captioning) {
+        if (m.captioning.model !== undefined) overrides["captioning.model"] = m.captioning.model;
+        for (const mod of ["image", "video", "audio"] as const) {
+          if (m.captioning[mod] !== undefined) overrides[`captioning.${mod}`] = m.captioning[mod]!;
+        }
+      }
+      if (m.image_gen) {
+        if (m.image_gen.pro !== undefined) overrides["image_gen.pro"] = m.image_gen.pro;
+        if (m.image_gen.flash !== undefined) overrides["image_gen.flash"] = m.image_gen.flash;
+      }
+      if (m.x_search) {
+        if (m.x_search.model !== undefined) overrides["x_search.model"] = m.x_search.model;
+        if (m.x_search.deep_model !== undefined) overrides["x_search.deep_model"] = m.x_search.deep_model;
+      }
+      if (Object.keys(overrides).length > 0) {
+        logger.info("agent_model_overrides", { agent: agentName, overrides });
+      }
+    }
+  }
+
   // Caption client resolver: returns the per-agent client when the agent has an
   // override that differs from the baseline chain; baseline otherwise.
   // null agentName → always baseline (legacy mode or unresolvable → treated as global).
