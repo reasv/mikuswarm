@@ -1165,3 +1165,151 @@ test("withRequestRetry: a committed done LACKING usage does not call the capture
   assert.equal(rows[0]!.outcome, "done");
   assert.equal(rows[0]!.usage, undefined, "no usage recorded on the ring either");
 });
+
+// ---------------------------------------------------------------------------
+// Served-model attribution (per-attempt ring, served-model attribution):
+// getRequestedModel / getServedModel / resetServedModel getters let the factory
+// populate requestedModel / servedModel on each ring record so an operator can
+// see at a glance whether an attempt ran on the requested head or a fallback.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a StreamFn that simulates buildModelFallback's onResolve: calls
+ * `onResolve(memberId)` synchronously as part of base(), then succeeds.
+ * This is the execution order in the real composite: onResolve fires BEFORE
+ * the inner stream is returned, so `servedModelForAttempt` is set at settle time.
+ */
+function makeFallbackFn(
+  scripts: Array<{ events: AssistantMessageEvent[]; resolvedMemberId: string }>,
+  onResolve: (id: string) => void,
+): { fn: StreamFn; calls: () => number } {
+  let calls = 0;
+  const fn: StreamFn = () => {
+    const script = scripts[Math.min(calls, scripts.length - 1)]!;
+    calls += 1;
+    onResolve(script.resolvedMemberId);
+    return scriptedStream(script.events);
+  };
+  return { fn, calls: () => calls };
+}
+
+test("withRequestRetry: served-model attribution — composite dispatching a fallback member records requestedModel + servedModel", async () => {
+  // Simulates a two-member chain [head, fallback]: attempt 1 resolves to "head"
+  // (fails), attempt 2 resolves to "floor" (succeeds). Ring must show:
+  //   attempt 1: requestedModel="head", servedModel="head", outcome=error
+  //   attempt 2: requestedModel="head", servedModel="floor", outcome=done
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(16);
+  const { fn } = makeFallbackFn(
+    [
+      { events: [errorEvent("503 unavailable")], resolvedMemberId: "head" },
+      { events: [startEvent(), textDeltaEvent("ok"), doneEvent()], resolvedMemberId: "floor" },
+    ],
+    (id) => { servedModelForAttempt = id; },
+  );
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    getRequestedModel: () => "head",
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => { servedModelForAttempt = undefined; },
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+
+  const rows = ring.list(); // newest-first: attempt 2, attempt 1
+  assert.equal(rows.length, 2);
+  // Attempt 2 (newest): dispatched to "floor"
+  assert.equal(rows[0]!.attempt, 2);
+  assert.equal(rows[0]!.outcome, "done");
+  assert.equal(rows[0]!.requestedModel, "head");
+  assert.equal(rows[0]!.servedModel, "floor", "fallback member correctly attributed");
+  // Attempt 1 (older): dispatched to "head"
+  assert.equal(rows[1]!.attempt, 1);
+  assert.equal(rows[1]!.outcome, "error");
+  assert.equal(rows[1]!.requestedModel, "head");
+  assert.equal(rows[1]!.servedModel, "head", "head's own attempt attributed to head");
+});
+
+test("withRequestRetry: single-member chain — servedModel equals requestedModel (no degradation)", async () => {
+  // onResolve always fires with the head's logical id for single-member chains.
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(4);
+  const { fn } = makeFallbackFn(
+    [{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()], resolvedMemberId: "default" }],
+    (id) => { servedModelForAttempt = id; },
+  );
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    getRequestedModel: () => "default",
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => { servedModelForAttempt = undefined; },
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  const row = ring.list()[0]!;
+  assert.equal(row.requestedModel, "default");
+  assert.equal(row.servedModel, "default", "single-member: served == requested");
+});
+
+test("withRequestRetry: never-dispatched attempt (budget violation) yields no servedModel", async () => {
+  // The budget-violation pre-flight calls recordAttempt before the retry loop starts.
+  // resetServedModel is never called for this path, and servedModelForAttempt
+  // starts undefined, so getServedModel() returns undefined → no servedModel on the row.
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(4);
+  const { fn, calls } = scriptedBase([{ events: [doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    getRequestedModel: () => "default",
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => { servedModelForAttempt = undefined; },
+    checkContextBudget: () => "context token limit exceeded: observed context 90000 tokens >= limit 80000",
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  assert.equal(calls(), 0, "base never called — pre-flight blocked the request");
+  const row = ring.list()[0]!;
+  assert.equal(row.outcome, "error");
+  assert.equal(row.requestedModel, "default", "requestedModel still stamped from getter");
+  assert.equal(row.servedModel, undefined, "no servedModel — dispatch never happened");
+});
+
+test("withRequestRetry: absent getters — requestedModel and servedModel absent from ring (non-agent callers)", async () => {
+  // Worker pools and other callers that pass no getter must see no behavioral change:
+  // the ring records are identical to pre-fix, just missing the two new optional fields.
+  const ring = new LlmRequestRing(4);
+  const { fn } = scriptedBase([{ events: [startEvent(), textDeltaEvent("hi"), doneEvent()] }]);
+  const wrapped = withRequestRetry(fn, { ...FAST }, { ring });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  const row = ring.list()[0]!;
+  assert.equal(row.requestedModel, undefined, "no requestedModel when getter not wired");
+  assert.equal(row.servedModel, undefined, "no servedModel when getter not wired");
+  assert.equal(row.outcome, "done", "existing fields unaffected");
+});
+
+test("withRequestRetry: resetServedModel clears stale servedModel between attempts", async () => {
+  // Attempt 1: resolves to "head" (fails). Before attempt 2: resetServedModel called.
+  // Attempt 2: resolves to "floor" (succeeds). Must NOT see "head" from attempt 1.
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(16);
+  const resolvedIds: string[] = [];
+  const { fn } = makeFallbackFn(
+    [
+      { events: [errorEvent("503 unavailable")], resolvedMemberId: "head" },
+      { events: [startEvent(), doneEvent()], resolvedMemberId: "floor" },
+    ],
+    (id) => {
+      resolvedIds.push(id);
+      servedModelForAttempt = id;
+    },
+  );
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    getRequestedModel: () => "head",
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => { servedModelForAttempt = undefined; },
+  });
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+  // Verify reset happened: attempt 2 would have read "head" without the reset
+  assert.deepEqual(resolvedIds, ["head", "floor"]);
+  const rows = ring.list();
+  assert.equal(rows[0]!.servedModel, "floor", "attempt 2 correctly attributed, not stale 'head'");
+  assert.equal(rows[1]!.servedModel, "head", "attempt 1 still attributed correctly");
+});

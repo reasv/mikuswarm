@@ -18,7 +18,28 @@ export interface LlmRequestRecord {
   sessionId?: string;
   sessionType?: string;
   group?: string;
+  /**
+   * Wire id of the REQUESTED (head) model descriptor — unchanged from before;
+   * kept for backward compat with ring consumers that pre-date served-model
+   * attribution. Under transparent fallback this is the head, not the member
+   * that actually served the attempt.
+   */
   model: string;
+  /**
+   * Logical id (config block name) of the REQUESTED model for this attempt
+   * (head or per-user selected). Absent when the retry context is not wired
+   * (non-agent callers, worker pools that pass no getter).
+   */
+  requestedModel?: string;
+  /**
+   * Logical id (config block name) of the chain member that ACTUALLY served
+   * this attempt (from `buildModelFallback`'s `onResolve`). Absent for
+   * attempts that never dispatched a wire call (budget-violation pre-flight,
+   * admission-wait exhaustion before any dispatch) or when the getter is not
+   * wired. When present and different from `requestedModel`, the attempt ran
+   * on a fallback member rather than the requested head.
+   */
+  servedModel?: string;
   priority?: PriorityClass;
   /** 1-based attempt number within its Layer-0 retry loop. */
   attempt: number;

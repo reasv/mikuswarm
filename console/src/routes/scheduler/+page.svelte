@@ -231,6 +231,11 @@
 					</thead>
 					<tbody>
 						{#each requests.data!.requests as request, i (i)}
+							<!-- Model attribution: requestedModel (logical id) preferred; falls back to
+							     model (wire id). When served differs from requested, show both as
+							     "requested → served" highlighted in amber to surface fallback degradation. -->
+							{@const reqLabel = request.requestedModel ?? request.model}
+							{@const degraded = request.servedModel != null && request.servedModel !== request.requestedModel}
 							<tr class="border-t border-border/50">
 								<td class="py-0.5 pr-3 whitespace-nowrap">{fmtTime(request.ts)}</td>
 								<td class="pr-3">
@@ -244,7 +249,18 @@
 									{:else}—{/if}
 								</td>
 								<td class="pr-3">{request.sessionType ?? '—'}</td>
-								<td class="max-w-40 truncate pr-3" title={request.model}>{request.model}</td>
+								<td
+									class="max-w-40 truncate pr-3"
+									title={degraded
+										? `requested: ${reqLabel}, served: ${request.servedModel}`
+										: reqLabel}
+								>
+									{#if degraded}
+										<span class="text-amber-400">{reqLabel} → {request.servedModel}</span>
+									{:else}
+										{reqLabel}
+									{/if}
+								</td>
 								<td class={cn('pr-3', PRIORITY_CLASSES[request.priority ?? ''] ?? '')}>
 									{request.priority ?? '—'}
 								</td>

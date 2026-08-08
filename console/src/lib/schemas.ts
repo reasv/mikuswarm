@@ -571,7 +571,15 @@ export const LlmRequestRecord = Schema.Struct({
 	sessionId: Schema.optional(Schema.String),
 	sessionType: Schema.optional(Schema.String),
 	group: Schema.optional(Schema.String),
+	// Wire id of the REQUESTED (head) model — kept for backward compat.
 	model: Schema.String,
+	// Logical id (config block name) of the requested model (head or per-user
+	// selected). Absent when the retry context is not wired (non-agent callers).
+	requestedModel: Schema.optional(Schema.String),
+	// Logical id (config block name) of the chain member that actually served
+	// this attempt. Absent for never-dispatched attempts or non-agent callers.
+	// When present and different from requestedModel, the attempt hit a fallback.
+	servedModel: Schema.optional(Schema.String),
 	priority: Schema.optional(Schema.String),
 	attempt: Schema.Number,
 	admissionWaitMs: Schema.optional(Schema.Number),

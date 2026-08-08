@@ -525,6 +525,13 @@ export class AgentSessionFactory {
     // composite chose for the in-flight attempt, so the ledger row is attributed
     // to the member actually billed even when the head fell to a fallback.
     const resolvedMember: { logicalId: string } = { logicalId: modelKey };
+    // Per-attempt served-model tracker for the request ring (served-model
+    // attribution). Starts undefined; set by onResolve when the fallback fn
+    // dispatches; reset to undefined at the start of each retry-loop iteration
+    // by ctx.resetServedModel so a stale value is never carried forward. The
+    // budget-violation pre-flight calls recordAttempt before the loop runs, so
+    // getServedModel() returns undefined there (no dispatch happened). ✓
+    let servedModelForAttempt: string | undefined = undefined;
     const budgetEngine = this.options.budget?.engine;
     // Capability pre-filter (spec MODEL-FALLBACK §3 #1): pixels are shipped for a
     // session ONLY when its own reply model (`modelConfig` — the session-type model,
@@ -586,6 +593,7 @@ export class AgentSessionFactory {
         sessionId: session.id,
         onResolve: (id) => {
           resolvedMember.logicalId = id;
+          servedModelForAttempt = id;
         },
         // Feed the §5.3 running counter for per-member fits gating per attempt
         // (spec PER-MEMBER-CONTEXT-FITS §2.1). Guard: return undefined before the
@@ -875,6 +883,19 @@ export class AgentSessionFactory {
           admissionWait.last = undefined;
           return waited;
         },
+        // Served-model attribution (per-attempt ring, served-model attribution):
+        // getRequestedModel reads requestedMember.logicalId (modelKey for
+        // non-per-user; per-user selected id for per-user sessions — set by
+        // admittedStreamFn before dispatch). getServedModel reads
+        // servedModelForAttempt, which onResolve sets synchronously inside
+        // base() BEFORE the attempt stream is returned, so the value at settle
+        // time always belongs to THIS attempt. resetServedModel clears it at the
+        // start of each loop iteration so no stale value from a prior attempt
+        // survives (budget-violation pre-flight never calls resetServedModel →
+        // getServedModel() returns undefined there as desired).
+        getRequestedModel: () => requestedMember.logicalId,
+        getServedModel: () => servedModelForAttempt,
+        resetServedModel: () => { servedModelForAttempt = undefined; },
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
         // events → per-session tentative bus → console SSE. Observe-only.
         ...(this.options.liveEvents

@@ -149,6 +149,29 @@ export interface RequestRetryContext {
    * Only wired for per-user sessions; bounded by the wrapper to avoid loops.
    */
   onBudgetTruncation?: (committed: AssistantMessage) => "reselect" | "accept";
+  /**
+   * Returns the LOGICAL id (config block name) of the chain member that
+   * `buildModelFallback`'s `onResolve` resolved for the current attempt —
+   * i.e., the model that actually dispatched the wire call. Absent getter or
+   * `undefined` return = attempt never dispatched (budget violation, never
+   * reached the fallback fn) or getter not wired (non-agent callers). Reset
+   * between attempts via {@link resetServedModel}.
+   */
+  getServedModel?: () => string | undefined;
+  /**
+   * Called at the START of each retry-loop iteration to clear the per-attempt
+   * served-model state, so a stale value from a prior attempt is never
+   * accidentally read at the next attempt's settle (race-free within a session
+   * because attempts are sequential, but the guard is cheap and explicit).
+   */
+  resetServedModel?: () => void;
+  /**
+   * Returns the LOGICAL id (config block name) of the REQUESTED model for
+   * the current attempt (head or per-user selected). Absent getter = not
+   * wired (non-agent callers); the ring record's `requestedModel` field is
+   * then absent.
+   */
+  getRequestedModel?: () => string | undefined;
 }
 
 /**
@@ -451,6 +474,8 @@ export function withRequestRetry(
           sessionType: ctx.sessionType,
           group: ctx.group,
           model: (model as { id?: string }).id ?? "unknown",
+          requestedModel: ctx.getRequestedModel?.(),
+          servedModel: ctx.getServedModel?.(),
           priority: ctx.priority,
           attempt,
           admissionWaitMs: ctx.takeAdmissionWaitMs?.(),
@@ -527,6 +552,10 @@ export function withRequestRetry(
         let budgetReselects = 0;
         const maxBudgetReselects = 16;
         for (let attempt = 0; ; attempt++) {
+          // Reset per-attempt served-model tracking so a stale value from a
+          // prior attempt is never read at this attempt's settle (§ served-model
+          // attribution). Safe: attempts within a session are sequential.
+          ctx.resetServedModel?.();
           const attemptStart = Date.now();
           const buffered: AssistantMessageEvent[] = [];
           let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
