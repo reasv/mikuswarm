@@ -50,16 +50,15 @@ function makeTurnBudgetMarker(shownTokens: number, totalTokens: number): string 
  * preferring the last newline within the final 5% of the budget.
  *
  * Returns only the truncated text — the caller appends the marker.
- * The 5% window is approximated as 5% × 4 chars/token of the token budget,
- * giving a generous but bounded search range without a second encode call.
+ * The newline search window (20% of allowance in UTF-16 chars) is approximate;
+ * actual token coverage varies by script density.
  */
 function truncateTextToAllowance(text: string, allowance: number): string {
   // truncateToTokens already performs a tokenizer round-trip so the result is
   // valid UTF-8 (the tokenizer encodes/decodes at real codepoint boundaries).
   let truncated = truncateToTokens(text, allowance);
 
-  // Search for the last newline within the final 5% of the budget (as chars).
-  // 5% of `allowance` tokens × 4 chars/token ≈ 20% of allowance chars from the end.
+  // Search the trailing 20%-of-allowance UTF-16 chars for a newline; the factor is approximate and coverage varies by script density.
   const charWindow = Math.max(1, Math.floor(allowance * 0.2));
   const searchFrom = Math.max(0, truncated.length - charWindow);
   const nlIdx = truncated.lastIndexOf("\n", truncated.length - 1);
@@ -179,8 +178,9 @@ export function shapeContentBlocks(
       const sliced = truncateTextToAllowance(block.text, remaining);
       const slicedTokens = estimateTokens(sliced);
       const marker = makeMarker(slicedTokens, totalTextTokens);
-      out.push({ type: "text", text: sliced + marker });
-      textShown += slicedTokens;
+      const emitted = sliced + marker;
+      out.push({ type: "text", text: emitted });
+      textShown += estimateTokens(emitted); // charge the full emitted block (marker included)
       didSlice = true;
     }
   }

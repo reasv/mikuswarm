@@ -82,11 +82,9 @@ test("shapeContentBlocks: over-cap text is sliced with a visible per-result mark
   // The shaped text should be shorter than the original.
   assert.ok(resultText.length < bigText.length, "shaped text must be shorter than original");
 
-  // textTokensShown should be at most the allowance.
-  assert.ok(
-    r.textTokensShown <= allowance,
-    `textTokensShown (${r.textTokensShown}) must be <= allowance (${allowance})`,
-  );
+  // textTokensShown is charged for the full emitted block (sliced content + marker),
+  // so it exceeds the allowance — see the dedicated "marker overshoot" test below.
+  assert.ok(r.textTokensShown > 0, "textTokensShown must be positive");
 });
 
 test("shapeContentBlocks: over-cap uses turn-budget marker for layer=turn-budget", () => {
@@ -172,8 +170,9 @@ test("shapeContentBlocks: multi-block — fitting blocks kept, first overflow sl
     `marker M must equal total text tokens (${totalTextTokens}); got text: ${allText.slice(0, 200)}`,
   );
 
-  // textTokensShown must be <= allowance.
-  assert.ok(r.textTokensShown <= allowance, "textTokensShown must be <= allowance");
+  // textTokensShown charges the full emitted block (sliced content + marker) and
+  // therefore exceeds the allowance — see the dedicated "marker overshoot" test below.
+  assert.ok(r.textTokensShown > 0, "textTokensShown must be positive");
 });
 
 test("shapeContentBlocks: multi-block — all blocks fit returns unchanged content", () => {
@@ -357,7 +356,76 @@ test("shapeContentBlocks integration: the tighter of two allowances wins when ca
 
   const r = shapeContentBlocks([txt(bigText)], effectiveCap, "turn-budget", false);
   assert.equal(r.truncated, true);
-  assert.ok(r.textTokensShown <= effectiveCap);
+  // textTokensShown includes the marker, so it exceeds effectiveCap — see "marker overshoot" test.
+  assert.ok(r.textTokensShown > 0);
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3a — marker overshoot is expected
+// ---------------------------------------------------------------------------
+
+test("shapeContentBlocks: marker overshoot is expected — emitted block exceeds allowance, shown-count reflects full emission", () => {
+  const bigText = makeText(100);
+  const allowance = 20;
+
+  const r = shapeContentBlocks([txt(bigText)], allowance, "per-result", false);
+
+  assert.equal(r.truncated, true);
+  assert.equal(r.content.length, 1);
+  const emittedText = (r.content[0] as { type: "text"; text: string }).text;
+  const emittedTokens = estimateTokens(emittedText);
+
+  // The emitted block is sliced content + marker. The marker is deliberately NOT
+  // counted against the caller's allowance (it does not compete with tool output),
+  // but it IS counted in the shown-token charge so the accumulator reflects what
+  // was actually appended to the context (spec §4).
+  assert.ok(
+    emittedTokens > allowance,
+    `emitted block (${emittedTokens} tokens) must exceed allowance (${allowance}); marker causes deliberate overshoot`,
+  );
+
+  // shown-count must equal the full emitted block estimate, marker included.
+  assert.equal(
+    r.textTokensShown,
+    emittedTokens,
+    `textTokensShown (${r.textTokensShown}) must equal full emitted block tokens (${emittedTokens})`,
+  );
+
+  // Sanity: since textTokensShown = emittedTokens > allowance, this also holds.
+  assert.ok(r.textTokensShown > allowance, "textTokensShown must exceed allowance (marker is charged)");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3b — emoji-dense truncation: no orphaned surrogate
+// ---------------------------------------------------------------------------
+
+test("shapeContentBlocks: emoji-dense text truncated mid-stream yields no orphaned surrogate", () => {
+  // Emoji are surrogate pairs in UTF-16 (U+D800–U+DBFF + U+DC00–U+DFFF).
+  // A naive char-offset slice could leave an orphaned high surrogate at the end.
+  const emoji = "😀".repeat(500);
+  const allowance = 20;
+
+  const r = shapeContentBlocks([txt(emoji)], allowance, "per-result", false);
+
+  assert.equal(r.truncated, true, "emoji string must trigger truncation");
+  const emittedText = (r.content[0] as { type: "text"; text: string }).text;
+
+  // Isolate the sliced portion (before the truncation marker).
+  const markerStart = emittedText.indexOf("\n[tool result truncated");
+  const slicedPart = markerStart >= 0 ? emittedText.slice(0, markerStart) : emittedText;
+
+  // Must not end in an orphaned high surrogate.
+  assert.ok(
+    !/[\uD800-\uDBFF]$/.test(slicedPart),
+    `sliced portion must not end in unpaired high surrogate; got: ${JSON.stringify(slicedPart.slice(-4))}`,
+  );
+
+  // Must survive a UTF-8 round-trip losslessly (unpaired surrogates corrupt the encoding).
+  assert.equal(
+    Buffer.from(slicedPart, "utf8").toString("utf8"),
+    slicedPart,
+    "sliced portion must be valid UTF-8 (no unpaired surrogates)",
+  );
 });
 
 // ---------------------------------------------------------------------------
