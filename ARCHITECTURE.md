@@ -193,7 +193,8 @@ workspace?: { root_dir? }   // optional; omit entirely in agents mode (§4c). ro
 agents?:    Record<string, { workspace_root,                   // agents mode (§4c): one block per agent, each with an absolute or relative workspace path
                              summaries_from?,                  // optional summary mirroring donor agent name (§9b); absent = native summarization for all timelines
                              sandbox?:   SandboxBlockShape,   // per-agent strict sandbox (§11a); absent = agent shares global [sandbox] container
-                             browser?:  { profile_name } }>   // per-agent browser profile name (§11b); absent = no browser tool for this agent
+                             browser?:  { profile_name },     // per-agent browser profile name (§11b); absent = no browser tool for this agent
+                             mcp_servers?: string[] }>        // per-agent MCP server allowlist (§ MCP remote tools); absent = all servers; [] = none
 siblings?:  { replies?: "never" | "capped",      // sibling trigger mode (§4c); "never" (default) suppresses; "capped" allows up to max_bot_chain
               max_bot_chain?: integer,           // max consecutive bot-authored messages before the cap gate fires (default 4)
               third_party_bots?: "unlimited" | "capped" }  // third-party Discord bots (§4c); "unlimited" (default) preserves legacy metering; "capped" subjects them to the chain window
@@ -3006,6 +3007,8 @@ Remote MCP (Model Context Protocol) HTTP servers provide additional tools withou
 **Secret registration**: All header values are registered as secrets via `registerSecret()` during pool startup, ensuring auth tokens are redacted in logs regardless of header key name. This explicit registration is load-bearing — the config loader's key-name regex does not match common HTTP header names like `Authorization`.
 
 **No SSRF validation**: MCP server URLs come from TOML config (a trusted source, not user input) and are not validated against internal/metadata IP ranges. This is intentional — unlike `web_fetch` which processes untrusted user-supplied URLs, MCP server URLs are operator-configured infrastructure endpoints.
+
+**Per-agent server scoping**: In agents mode each `[agents.<name>]` block may carry an optional `mcp_servers` key — an array of `[mcp.servers.*]` keys. When absent (the default), the agent sees all configured servers' tools, exactly the legacy behavior. When present, only tools from those servers (`mcp_<server>_*`) are exposed to every session type of that agent; `[]` = no MCP tools at all for that agent. The `McpClientPool` is global and unchanged — scoping is a per-session visibility filter applied in `AgentSessionFactory.create()` via `filterMcpToolsByAllowlist()`, immediately before the session-type `tools` allowlist filter (`filterTools`). The two filters compose as an intersection: a session type that allowlists an MCP tool excluded by the agent's `mcp_servers` simply doesn't get it (silent no-op). Server keys can contain underscores; the filter matches against the actual configured key set so `mcp_foo_bar_*` resolves without ambiguity. Config-time cross-field validation (in `validateAgentConfig`) requires every listed key to name a configured `[mcp.servers.<key>]` block — an unknown key is a startup error. At startup, one `mcp_agent_scoping { agent, servers }` info log is emitted per agent with an explicit `mcp_servers`.
 
 ---
 

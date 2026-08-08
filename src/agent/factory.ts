@@ -178,6 +178,15 @@ export interface AgentFactoryOptions {
    *   callers can log and discard the session, not fall back to a random root.
    */
   resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
+  /**
+   * Per-session agent name resolver (spec PER-AGENT-MCP-SCOPING).
+   * Maps a `timeline_key` to the owning agent's config name, used to apply the
+   * per-agent `mcp_servers` allowlist at session creation. Returns `null` for
+   * the legacy sentinel (`__legacy__`) and unresolvable entries. When absent
+   * (legacy mode or tests without multi-agent wiring), MCP scoping is skipped
+   * and all tools remain visible — identical to the absent-`mcp_servers` case.
+   */
+  resolveAgentName?: (timelineKey: string) => string | null;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -1201,8 +1210,18 @@ export class AgentSessionFactory {
     // Load workspace files from disk at session creation time
     const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
 
-    // Filter tools if the session type specifies a tool allowlist
-    const filteredTools = filterTools(tools, sessionTypeConfig);
+    // Per-agent MCP server allowlist (spec PER-AGENT-MCP-SCOPING): drop tools
+    // from MCP servers not in this agent's allowlist, then apply the session-type
+    // tool allowlist. Both filters compose as an intersection: a session type
+    // that allowlists an MCP tool excluded by the agent's mcp_servers simply
+    // doesn't get it (silent no-op, same as allowlisting a server the deploy
+    // doesn't configure). Non-MCP tools are never affected.
+    const agentName = this.options.resolveAgentName?.(session.timelineKey) ?? null;
+    const agentMcpServers =
+      agentName !== null ? this.options.config.agents?.[agentName]?.mcp_servers : undefined;
+    const configuredServerKeys = new Set(Object.keys(this.options.config.mcp?.servers ?? {}));
+    const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, configuredServerKeys);
+    const filteredTools = filterTools(mcpFilteredTools, sessionTypeConfig);
 
     // NOTE: System prompt is rendered identically here and in ContextBuilder.build().
     // Both are required: this one sets initialState.systemPrompt (used by pi-agent-core
@@ -1818,6 +1837,48 @@ export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig)
   if (!sessionType?.tools) return tools;
   const allowed = new Set(sessionType.tools);
   return tools.filter((tool) => allowed.has(tool.name));
+}
+
+/**
+ * Apply a per-agent MCP server allowlist to a tool array (spec PER-AGENT-MCP-SCOPING).
+ *
+ * Drops any tool whose name matches `mcp_<server>_*` for a server NOT in the
+ * agent's `mcp_servers` allowlist. Non-MCP tools (those not prefixed with
+ * `mcp_<configuredServerKey>_` for any configured server) are never affected.
+ *
+ * - `agentMcpServers` undefined → absent in config → keep all (default behavior,
+ *   identical to pre-feature mode and legacy single-agent mode).
+ * - `agentMcpServers` is an array → only tools from those servers pass through.
+ *   An empty array is valid: this agent gets no MCP tools at all.
+ *
+ * Server keys can contain underscores; the filter matches against the actual
+ * configured key set rather than trying to parse tool names, so `mcp_foo_bar_*`
+ * resolves correctly whether the server key is `foo` or `foo_bar`.
+ *
+ * Composes with `filterTools` (session-type allowlist) as an intersection: apply
+ * this filter first, then `filterTools`, so only tools that survive BOTH gates
+ * reach the session.
+ */
+export function filterMcpToolsByAllowlist(
+  tools: AgentTool[],
+  agentMcpServers: string[] | undefined,
+  configuredServerKeys: Set<string>,
+): AgentTool[] {
+  if (agentMcpServers === undefined) return tools; // absent → no filter
+  const allowedPrefixes = new Set(agentMcpServers.map((key) => `mcp_${key}_`));
+  return tools.filter((tool) => {
+    // Scan the configured server key set to decide if this tool belongs to
+    // any MCP server. We check against configured keys (not by splitting the
+    // name) so keys containing underscores resolve without ambiguity.
+    for (const serverKey of configuredServerKeys) {
+      if (tool.name.startsWith(`mcp_${serverKey}_`)) {
+        // This tool belongs to a configured MCP server — keep only if allowed.
+        return allowedPrefixes.has(`mcp_${serverKey}_`);
+      }
+    }
+    // Not prefixed by any configured server key → not an MCP tool → keep.
+    return true;
+  });
 }
 
 /**

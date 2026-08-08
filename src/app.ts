@@ -1389,6 +1389,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
     // Returns the owning agent's resolved workspace root for a timeline key.
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
+    // Per-session agent name resolver (spec PER-AGENT-MCP-SCOPING): used to
+    // apply per-agent MCP server allowlists. Only wired in agents mode; absent
+    // in legacy mode (all MCP tools remain visible, no scoping). Returns null
+    // for the __legacy__ sentinel and for unresolvable entries.
+    resolveAgentName: agentWorkspaces.length > 0
+      ? (timelineKey) => {
+          const entry = resolveWorkspaceForTimeline(timelineKey);
+          if (!entry || entry.agentName === "__legacy__") return null;
+          return entry.agentName;
+        }
+      : undefined,
   });
 
   // ---------------------------------------------------------------------------
@@ -2150,6 +2161,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const mcpTools = mcpPool.getEntries().flatMap((entry) =>
     adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp")),
   );
+  // Per-agent MCP scoping observability (spec PER-AGENT-MCP-SCOPING §5):
+  // one info log per agent with an explicit mcp_servers allowlist.
+  if (config.agents) {
+    for (const [agentName, block] of Object.entries(config.agents)) {
+      if (block.mcp_servers !== undefined) {
+        logger.info("mcp_agent_scoping", { agent: agentName, servers: block.mcp_servers });
+      }
+    }
+  }
 
   // Caches resolved human room labels in `room_metadata` so the observability
   // console shows real room names instead of raw room ids. Populated lazily on
@@ -7151,6 +7171,25 @@ export function validateAgentConfig(config: AppConfig): void {
             `"${donorName}" itself has summaries_from = "${config.agents[donorName]!.summaries_from}". ` +
             `Donor agents must not themselves mirror (no chains).`,
         );
+      }
+    }
+
+    // ── Per-agent MCP server allowlist validation (spec PER-AGENT-MCP-SCOPING) ─
+    // Every key in mcp_servers must name a configured [mcp.servers.<key>] block.
+    // An unknown key is a startup error (strict-config philosophy: catches typos
+    // and stale entries when a server is removed from config).
+    {
+      const configuredServers = new Set(Object.keys(config.mcp?.servers ?? {}));
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        if (block.mcp_servers === undefined) continue;
+        for (const serverKey of block.mcp_servers) {
+          if (!configuredServers.has(serverKey)) {
+            throw new Error(
+              `[agents.${agentName}].mcp_servers: "${serverKey}" does not name a configured ` +
+                `[mcp.servers.*] block; add [mcp.servers.${serverKey}] or remove the entry.`,
+            );
+          }
+        }
       }
     }
 

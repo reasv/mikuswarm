@@ -795,6 +795,19 @@ const AgentBlockSchema = StrictObject({
   browser: Type.Optional(StrictObject({
     profile_name: Type.String({ minLength: 1 }),
   })),
+  /**
+   * Per-agent MCP server allowlist (spec PER-AGENT-MCP-SCOPING).
+   * When absent (default), this agent sees tools from ALL configured
+   * `[mcp.servers.*]` — identical to today's behavior. When present, only
+   * tools from the listed servers (`mcp_<server>_*`) are visible to every
+   * session of this agent (chat and worker types alike). An empty array `[]`
+   * is valid: this agent gets no MCP tools at all. Only meaningful under an
+   * `[agents]` table (no legacy-mode variant). Cross-field validated at
+   * startup: every listed key must name a configured `[mcp.servers.<key>]`
+   * block — a missing key is a startup error (catches typos and stale entries
+   * when a server is removed from config).
+   */
+  mcp_servers: Type.Optional(Type.Array(Type.String())),
 });
 
 /**

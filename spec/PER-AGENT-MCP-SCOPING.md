@@ -1,6 +1,6 @@
 # Per-Agent MCP Server Scoping — `[agents.<name>].mcp_servers`
 
-**Status**: PROPOSED.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §MCP remote tools; retained for review.
 
 **Author**: design session 2026-08-08.
 
