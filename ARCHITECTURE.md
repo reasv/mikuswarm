@@ -3438,7 +3438,7 @@ stop_on_shutdown = false
 #   both ride the tunnel with no IP leak). A non-empty list is used verbatim.
 ```
 
-`src/config/schema.ts` makes the section optional (existing configs stay valid); `validateConfig` (`src/config/loader.ts`) rejects a relative `workspace_mount` when enabled. The image is built with `docker/build-sandbox.sh` (full dev toolchain — apt set, pnpm, uv, rust, homebrew — carried over from the OpenClaw sandbox).
+`src/config/schema.ts` makes the section optional (existing configs stay valid); `validateConfig` (`src/config/loader.ts`) rejects a relative `workspace_mount` when enabled. The image is built with `docker/build-sandbox.sh` (full dev toolchain — apt set, pnpm, uv, rust, homebrew — carried over from the OpenClaw sandbox). It also includes a pinned `yt-dlp` standalone binary at `/usr/local/bin/yt-dlp` (no Python runtime required), installed at image-build time via the `YT_DLP_VERSION` build-arg in `docker/Dockerfile.sandbox`. This makes yt-dlp available for agent `bash` calls that hand-drive YouTube or other yt-dlp-supported downloads outside the app-layer YouTube subsystem — useful for exotic sources or scripted workflows. **Egress note for yt-dlp in the sandbox**: deployments with outbound filtering beyond the base RFC1918 drops (e.g. allowlist-only policies) must permit the relevant video CDN hosts for downloads to succeed; the standard `docker/sandbox-egress-rules.sh` already allows all public internet destinations and requires no changes for yt-dlp.
 
 ### Multi-agent sandbox modes
 
