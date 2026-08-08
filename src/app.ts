@@ -4248,6 +4248,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // tool_invocations row per captioned item, feeding the §8d cost ceiling.
         agentSessionId: sessionId,
         recordToolUsage,
+        // YouTube segment routing (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3):
+        // when the subsystem is available, recognized YouTube URLs are downloaded
+        // as segments instead of fetched via FetchClient.
+        youtube: youtubeSubsystemAvailable
+          ? {
+              maxDownloadBytes: ytConfig.maxDownloadBytes,
+              maxResolution: mediaVideoConfig.max_resolution ?? 480,
+              maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
+              cachePath: mediaCachePath,
+              cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
+              cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
+            }
+          : undefined,
       }),
       ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
       createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),

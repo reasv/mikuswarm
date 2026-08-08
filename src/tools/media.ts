@@ -1,4 +1,7 @@
 import { open, unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
@@ -6,6 +9,29 @@ import type { InferenceClient } from "../captioning/inference-client.js";
 import type { MediaModality } from "../captioning/describe.js";
 import type { FetchClient } from "../enrichment/fetch-client.js";
 import type { ToolUsageRecord } from "./image-gen.js";
+import { parseYouTubeUrl } from "../youtube/url.js";
+import { probe, download } from "../youtube/ytdlp.js";
+import { MediaCache } from "../media/cache.js";
+
+/**
+ * YouTube segment download context — present only when [youtube].enabled and the
+ * yt-dlp binary probe passed at startup. Absence means YouTube URLs fall through
+ * to the existing FetchClient path unchanged.
+ */
+export interface YoutubeMediaContext {
+  /** Max bytes for segment downloads ([youtube].max_download_bytes). */
+  maxDownloadBytes: number;
+  /** Max video height for format selection (media.video.max_resolution). */
+  maxResolution: number;
+  /** Max segment duration in seconds (media.video.max_duration_seconds). */
+  maxDurationSeconds: number;
+  /** Media cache directory path (shared with the video lane's content-hash cache). */
+  cachePath: string;
+  /** LRU eviction ceiling in bytes (media.video.cache_max_bytes). */
+  cacheMaxBytes: number;
+  /** LRU eviction target in bytes (media.video.cache_target_bytes). */
+  cacheTargetBytes: number;
+}
 
 export interface MediaToolContext {
   workspaceRoot: string;
@@ -18,12 +44,18 @@ export interface MediaToolContext {
   agentSessionId?: string | null;
   /** Durable usage-ledger sink (spec AUXILIARY-USAGE-TRACKING §8.2); also feeds the per-session cost ceiling. */
   recordToolUsage?: (record: ToolUsageRecord) => void;
+  /**
+   * YouTube subsystem context (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3).
+   * When set, recognized YouTube URLs are routed through yt-dlp segment download
+   * instead of FetchClient. Absent → YouTube URLs fall through to FetchClient.
+   */
+  youtube?: YoutubeMediaContext;
 }
 
 export function createMediaTool(context: MediaToolContext): AgentTool {
   const description = context.modelHasVision
-    ? "Analyze one or more media files (images, videos, audio) with a vision/multimodal model. Use media for a single path/URL, or media_items for multiple (up to 20). Only use this tool when media was NOT already provided in the user's message. Images mentioned in the prompt are automatically visible to you."
-    : "Analyze one or more media files (images, videos, audio) with the configured multimodal model. Use media for a single path/URL, or media_items for multiple (up to 20). Provide a prompt describing what to analyze.";
+    ? "Analyze one or more media files (images, videos, audio) with a vision/multimodal model. Use media for a single path/URL, or media_items for multiple (up to 20). Only use this tool when media was NOT already provided in the user's message. Images mentioned in the prompt are automatically visible to you. YouTube URLs are accepted and analyzed segment-wise via start_time."
+    : "Analyze one or more media files (images, videos, audio) with the configured multimodal model. Use media for a single path/URL, or media_items for multiple (up to 20). Provide a prompt describing what to analyze. YouTube URLs are accepted and analyzed segment-wise via start_time.";
 
   return {
     name: "media",
@@ -57,7 +89,7 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
       for (const source of unique) {
         let loaded: LoadedMedia | undefined;
         try {
-          loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient);
+          loaded = await loadMedia(context.workspaceRoot, source, context.maxFetchBytes, context.fetchClient, context.youtube, args.start_time);
           const modality = await inferModality(loaded.mimeType, source, loaded.path);
           if (!modality) {
             results.push(`[${source}]\nError: could not determine media type`);
@@ -74,7 +106,11 @@ export function createMediaTool(context: MediaToolContext): AgentTool {
             mimeType: loaded.mimeType,
             filename: source,
             prompt,
-            startTime: args.start_time,
+            // For YouTube pre-cut segments, omit start_time (segment already starts at 0)
+            // and pass youtubeSegment so the truncation-warning machinery sees the real
+            // video position (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3).
+            startTime: loaded.youtubeSegment ? undefined : args.start_time,
+            youtubeSegment: loaded.youtubeSegment,
             context: "tool",
           });
           // Caption ledger row (spec AUXILIARY-USAGE-TRACKING §8.2): the
@@ -119,11 +155,52 @@ interface LoadedMedia {
   path: string;
   mimeType: string;
   cleanup?: () => Promise<void>;
+  /**
+   * YouTube segment metadata — set only for YouTube-routed sources (spec §7 T3).
+   * When present, start_time is NOT passed to processVideoForInference (double-seek
+   * prevention), and these values override the processedRange/totalDuration/truncated
+   * computed from the segment file so the truncation warning reflects the real video.
+   */
+  youtubeSegment?: {
+    processedRange: [number, number];
+    totalDuration: number;
+    truncated: boolean;
+  };
 }
 
 const ALLOWED_MEDIA_PREFIXES = ["image/", "video/", "audio/"];
 
-async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: number, fetchClient: FetchClient): Promise<LoadedMedia> {
+// Module-level cache instance map: mirrors the pattern in src/media/video.ts so
+// MediaCache is not reconstructed on every loadYouTubeMedia call.
+const ytCacheInstances = new Map<string, MediaCache>();
+
+function getYouTubeCache(cachePath: string): MediaCache {
+  let cache = ytCacheInstances.get(cachePath);
+  if (!cache) {
+    cache = new MediaCache(cachePath);
+    ytCacheInstances.set(cachePath, cache);
+  }
+  return cache;
+}
+
+async function loadMedia(
+  workspaceRoot: string,
+  source: string,
+  maxFetchBytes: number,
+  fetchClient: FetchClient,
+  youtube?: YoutubeMediaContext,
+  toolStartTime?: number,
+): Promise<LoadedMedia> {
+  // YouTube routing branch (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3):
+  // when the URL is a recognized YouTube video URL and the subsystem is available,
+  // resolve via yt-dlp segment download instead of FetchClient.
+  if (youtube && isUrl(source)) {
+    const ytRef = parseYouTubeUrl(source);
+    if (ytRef) {
+      return await loadYouTubeMedia(ytRef, youtube, toolStartTime);
+    }
+  }
+
   if (isUrl(source)) {
     const fetched = await fetchClient.fetch(source, { maxBytes: maxFetchBytes });
     if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
@@ -145,6 +222,101 @@ async function loadMedia(workspaceRoot: string, source: string, maxFetchBytes: n
   const absolute = resolveWorkspacePath(workspaceRoot, source);
   const mimeType = mimeFromExtension(source);
   return { path: absolute, mimeType };
+}
+
+/**
+ * YouTube segment download + caching (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3).
+ *
+ * Downloads one ≤max_duration_seconds segment via yt-dlp (cut at download via
+ * --download-sections), caches the raw segment file in the shared MediaCache keyed
+ * on (videoId, startSec, durationSec, resolution), and returns the metadata needed
+ * to synthesize the correct truncation warning for the full video.
+ */
+async function loadYouTubeMedia(
+  ytRef: { videoId: string; startSec?: number },
+  youtube: YoutubeMediaContext,
+  toolStartTime?: number,
+): Promise<LoadedMedia> {
+  const { videoId, startSec: urlStartSec } = ytRef;
+
+  // start_time precedence: tool param ?? URL t= ?? 0
+  const startSec = toolStartTime ?? urlStartSec ?? 0;
+
+  // Probe to get totalDuration and live status.
+  const meta = await probe(videoId);
+
+  // Refuse live and upcoming content (same policy as youtube_fetch).
+  if (meta.isLive || meta.liveStatus === "is_live" || meta.liveStatus === "upcoming") {
+    const kind = meta.liveStatus === "upcoming" ? "scheduled premiere" : "live stream";
+    throw new Error(
+      `Cannot analyze this YouTube video via media: it is a ${kind}. ` +
+        "Live and upcoming content cannot be downloaded. Try again after the stream ends.",
+    );
+  }
+
+  const totalDuration = meta.duration;
+  if (!totalDuration || totalDuration <= 0) {
+    throw new Error("Could not determine YouTube video duration");
+  }
+
+  if (startSec >= totalDuration) {
+    throw new Error(
+      `start_time (${startSec}s) is at or beyond video duration (${totalDuration}s)`,
+    );
+  }
+
+  const maxDuration = youtube.maxDurationSeconds;
+  const effectiveDuration = Math.min(maxDuration, Math.max(0, totalDuration - startSec));
+  // Truncated when more video remains after the segment than we're downloading.
+  const truncated = (totalDuration - startSec) > maxDuration;
+
+  // Synthetic cache key: (videoId, startSec, durationSec, resolution).
+  // No content hash — source is remote. Must be filename-safe; videoId is
+  // [A-Za-z0-9_-]{11}, so underscores and alphanumerics are sufficient.
+  const cacheKey = `yt_${videoId}_s${startSec}_d${maxDuration}_r${youtube.maxResolution}`;
+
+  const cache = getYouTubeCache(youtube.cachePath);
+  await cache.init();
+
+  const cached = await cache.get(cacheKey);
+  if (cached) {
+    return {
+      path: cached,
+      mimeType: "video/mp4",
+      youtubeSegment: {
+        processedRange: [startSec, startSec + effectiveDuration],
+        totalDuration,
+        truncated,
+      },
+    };
+  }
+
+  // Cache miss — download the segment to a temp file, then move to the cache.
+  const tmpPath = join(tmpdir(), `miku-yt-dl-${randomBytes(8).toString("hex")}.mp4`);
+  try {
+    await download(videoId, {
+      startSec,
+      durationSec: maxDuration,
+      maxHeight: youtube.maxResolution,
+      maxBytes: youtube.maxDownloadBytes,
+      outPath: tmpPath,
+    });
+
+    const cachedPath = await cache.put(cacheKey, tmpPath);
+    await cache.evictIfNeeded(youtube.cacheMaxBytes, youtube.cacheTargetBytes);
+
+    return {
+      path: cachedPath,
+      mimeType: "video/mp4",
+      youtubeSegment: {
+        processedRange: [startSec, startSec + effectiveDuration],
+        totalDuration,
+        truncated,
+      },
+    };
+  } finally {
+    await unlink(tmpPath).catch(() => {});
+  }
 }
 
 function inferModalityFromMimeOrExt(mimeType: string, source: string): MediaModality | null {
