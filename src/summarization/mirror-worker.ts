@@ -634,6 +634,12 @@ export function buildMirrorTopology(config: AppConfig): AgentMirrorEntry[] {
     list.push({ provider: "discord", accountKey });
     agentAccounts.set(agentName, list);
   }
+  for (const [accountKey, account] of Object.entries(config.irc?.accounts ?? {})) {
+    const agentName = account.agent ?? accountKey;
+    const list = agentAccounts.get(agentName) ?? [];
+    list.push({ provider: "irc", accountKey });
+    agentAccounts.set(agentName, list);
+  }
 
   const entries: AgentMirrorEntry[] = [];
   for (const [agentName, block] of Object.entries(agents)) {

@@ -1069,6 +1069,13 @@ function deriveProviderUsername(
     // by the caller (from SenderInfo.username, set by the Discord normalizer).
     return opts?.senderUsername || undefined;
   }
+  if (provider === "irc") {
+    // IRC sender ids are the services account name or casemapped nick — both are
+    // already human-readable and serve directly as the username (spec §5.1 / §10).
+    // Use the hint when available (e.g. current nick from SenderInfo.username);
+    // fall back to the id itself (which is already the stable-ish display handle).
+    return opts?.senderUsername || senderId || undefined;
+  }
   return undefined;
 }
 

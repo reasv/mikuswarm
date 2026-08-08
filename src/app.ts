@@ -113,6 +113,7 @@ import {
   createFindSourceTool,
   MATRIX_TERMINOLOGY,
   DISCORD_TERMINOLOGY,
+  IRC_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -1281,6 +1282,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         async upsertUserIdentity(input) {
           await storage.upsertUserIdentity(input);
         },
+        async setChannelMetadata(timelineKey, meta) {
+          await storage.setChannelMetadata(timelineKey, meta);
+        },
       };
       const ircProvider = new IrcProvider(config.irc, ircCallbacks);
       map.set("irc", ircProvider);
@@ -1759,6 +1763,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // Discord provider's setChannelMetadata callback, spec §6.6 / §6.4).
       const guildId = storage.getChannelServerId(timelineKey);
       return guildId ? [guildId] : [];
+    }
+
+    if (parsedKey.provider === "irc") {
+      // IRC: the server-scope id is the network identity — the NETWORK ISUPPORT token
+      // lowercased when advertised, else the configured host (spec IRC-SUPPORT-DESIGN §7.4).
+      // Read from room_metadata (set by the IRC provider's setChannelMetadata callback
+      // on first ingest, same pattern as Discord).
+      const networkId = storage.getChannelServerId(timelineKey);
+      return networkId ? [networkId] : [];
     }
 
     return [];
@@ -4047,8 +4060,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // parse correctly, or a provider that hasn't implemented channelClient yet).
     const channelClient = sessionProvider.channelClient(target);
     // Terminology bundle for provider-aware tool description strings (spec §7.1).
-    // Matrix keeps its pre-Phase-4 strings byte-identical; Discord gets its own bundle.
-    const terminology = target.provider === "discord" ? DISCORD_TERMINOLOGY : MATRIX_TERMINOLOGY;
+    // Matrix keeps its pre-Phase-4 strings byte-identical; Discord and IRC get their own bundles.
+    const TERMINOLOGY_MAP: Record<string, import("./types.js").ProviderTerminology> = {
+      discord: DISCORD_TERMINOLOGY,
+      irc: IRC_TERMINOLOGY,
+    };
+    const terminology = TERMINOLOGY_MAP[target.provider] ?? MATRIX_TERMINOLOGY;
     // Per-provider capabilities — used for individual tool gates below (spec §7.1/§3.3).
     const caps = sessionProvider.capabilities;
 

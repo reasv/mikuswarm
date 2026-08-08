@@ -1,5 +1,5 @@
 /**
- * IrcProvider — Phase 1 + Phase 2 implementation.
+ * IrcProvider — Phase 1 + Phase 2 + Phase 3 implementation.
  *
  * Implements {@link IChatProvider} for IRC using irc-framework v4.
  * One irc-framework Client per configured account; reconnect with exponential
@@ -16,9 +16,15 @@
  *   - QUIT pruning of tracked state.
  *   - Self-identity: SASL account name when configured, else casemapped nick.
  *
+ * Phase 3 additions (spec IRC-SUPPORT-DESIGN §7.6, §10):
+ *   - Per-channel roster tracking via RosterTracker (join/part/quit/nick/away/back/kick).
+ *   - Per-channel topic/mode tracking in `channelData` map.
+ *   - Full ChannelClient: membersFn (roster), memberInfoFn (WHOIS), channelInfoFn (tracked state).
+ *   - setChannelMetadata callback: upserts room_metadata on every inbound message.
+ *
  * Spec: IRC-SUPPORT-DESIGN
  *   §3 (caps), §4 (timeline keys), §5 (identity), §6 (capabilities),
- *   §7 (send/echo/reconnect), §7.5 (inbound pipeline), §8 (config).
+ *   §7 (send/echo/reconnect), §7.5 (inbound pipeline), §7.6 (ChannelClient), §8 (config), §10.
  */
 
 import IrcFramework from "irc-framework";
@@ -26,14 +32,17 @@ import { nanoid } from "nanoid";
 import { parseTimelineKey } from "../storage/timeline-key.js";
 import type {
   ChannelClient,
+  ChannelInfo,
   ChatProviderHost,
   DeliveryReceipt,
   EnrichmentCapabilities,
   IChatProvider,
+  MemberInfo,
   OutboundMessage,
   OutboundTarget,
   ProviderCapabilities,
   SelfIdentity,
+  SenderInfo,
 } from "../types.js";
 import type { IrcAccountConfig, IrcConfig } from "../config/schema.js";
 import type { UserIdentityUpsertInput } from "../storage/database.js";
@@ -47,8 +56,9 @@ import {
   syntheticMsgId,
   type IrcNormalizerContext,
 } from "./normalizer.js";
-import { IrcChannelClient } from "./channel-client.js";
+import { IrcChannelClient, type IrcWhoisResult } from "./channel-client.js";
 import { AccountTracker } from "./account-tracker.js";
+import { RosterTracker } from "./roster-tracker.js";
 
 // ── IrcProviderCallbacks ──────────────────────────────────────────────────────
 
@@ -59,10 +69,9 @@ import { AccountTracker } from "./account-tracker.js";
  * constructed before storage is available, and the callbacks bridge that gap.
  * All callbacks are fire-and-forget (void) from the provider's perspective.
  *
- * Phase 2: only `upsertUserIdentity` is needed. Per-message identity upserts
- * flow automatically via the generic `handleInbound` path in app.ts (which checks
- * `sender.username`); this callback is only invoked for out-of-band identity
- * events such as NICK renames (where no message event fires).
+ * Phase 2: `upsertUserIdentity` — per-NICK-event identity writes.
+ * Phase 3: `setChannelMetadata` — upsert room_metadata so serverIdsFor() (spec §7.4 / §10)
+ *          can return the network id for per-user-limits partitioning.
  */
 export interface IrcProviderCallbacks {
   /**
@@ -71,6 +80,15 @@ export interface IrcProviderCallbacks {
    * Per-message upserts are handled by the generic ingest path in app.ts.
    */
   upsertUserIdentity(input: UserIdentityUpsertInput): Promise<void>;
+  /**
+   * Upsert room_metadata for a timeline key (spec §7.4, §10 serverIdsFor touch point).
+   * Called on every inbound message so the network id (serverId) is kept current.
+   * Non-fatal: errors are swallowed by the caller.
+   */
+  setChannelMetadata(
+    timelineKey: string,
+    meta: { displayName: string; serverId?: string; serverName?: string },
+  ): Promise<void>;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -84,6 +102,9 @@ const TRIGGER_HOLD_MAX_MULTIPLIER = 4;
 
 /** Timeout for awaiting an echo before falling back to the synthetic id. */
 const ECHO_TIMEOUT_MS = 5_000;
+
+/** Timeout for a WHOIS reply before memberInfo gives up (connection drop mid-query). */
+const WHOIS_TIMEOUT_MS = 10_000;
 
 /**
  * Set message_max_length to this value so irc-framework does NOT chunk.
@@ -175,6 +196,17 @@ interface AccountRuntime {
    * and WHOX bulk updates. Used by the identity ladder when no per-message tag.
    */
   accountTracker: AccountTracker;
+  /**
+   * Per-channel member roster (Phase 3).
+   * Tracks join/part/quit/nick/away/back/kick transitions.
+   * Cleared on socket close (stale membership must not bleed across reconnects).
+   */
+  rosterTracker: RosterTracker;
+  /**
+   * Per-channel topic and mode summary (Phase 3).
+   * Key: casemapped channel name. Updated by TOPIC and RPL_TOPIC events.
+   */
+  channelData: Map<string, { topic?: string; modes?: string }>;
 }
 
 // ── IrcProvider ────────────────────────────────────────────────────────────────
@@ -403,12 +435,104 @@ export class IrcProvider implements IChatProvider {
     if (!rt) return undefined;
 
     const isDirect = parsed.kind === "dm";
+    const channelTarget = parsed.channelId;
+
+    // ── membersFn (roster-backed, Phase 3) ───────────────────────────────────
+    // Returns the current channel roster enriched with account ids via AccountTracker.
+    // Only defined for channels (not DMs); absent for DMs (consistent with Discord).
+    const membersFn = isDirect
+      ? undefined
+      : (): Promise<SenderInfo[]> => {
+          const entries = rt.rosterTracker.getMembers(channelTarget, rt.casemapping);
+          const selfId = rt.self?.id;
+          const result: SenderInfo[] = entries.map((entry) => {
+            // Identity ladder (spec §5.1): account if known, else casemapped nick.
+            const account = rt.accountTracker.getAccount(entry.nick, rt.casemapping);
+            const id = account ?? casefold(entry.nick, rt.casemapping);
+            return {
+              id,
+              username: entry.nick,
+              isSelf: id === selfId || casefold(entry.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping),
+            };
+          });
+          return Promise.resolve(result);
+        };
+
+    // ── memberInfoFn (WHOIS-backed, Phase 3) ─────────────────────────────────
+    // Resolves id (account name or nick) → nick → WHOIS → MemberInfo.
+    const memberInfoFn = async (id: string): Promise<MemberInfo | undefined> => {
+      // Resolution: if registered, try to find the nick for this id.
+      // The id may be a services account name or a direct nick.
+      let nick: string = id;
+
+      if (!isDirect) {
+        // Try to find a roster member whose account matches `id`.
+        const byAccount = rt.rosterTracker.findNickByAccount(
+          channelTarget,
+          id,
+          (n) => rt.accountTracker.getAccount(n, rt.casemapping),
+          rt.casemapping,
+        );
+        if (byAccount) {
+          nick = byAccount;
+        }
+        // If not found by account, treat id as a nick directly.
+      }
+
+      // Issue WHOIS when registered; fall back to a minimal static entry when not.
+      if (!rt.registered || !rt.client) {
+        return { userId: id, isSelf: id === rt.self?.id, isDirect };
+      }
+
+      const whoisResult = await this.doWhois(rt, nick);
+      if (!whoisResult || whoisResult.error === "not_found") {
+        return undefined;
+      }
+
+      const selfId = rt.self?.id;
+      const account = whoisResult.account;
+      const resolvedId = account ?? casefold(nick, rt.casemapping);
+      const isSelf = resolvedId === selfId ||
+        casefold(whoisResult.nick ?? nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
+
+      return {
+        userId: resolvedId,
+        displayName: whoisResult.nick ?? nick,
+        isSelf,
+        isDirect,
+      };
+    };
+
+    // ── channelInfoFn (tracked state, Phase 3) ────────────────────────────────
+    const channelInfoFn = (): Promise<ChannelInfo> => {
+      const key = casefold(channelTarget, rt.casemapping);
+      const data = rt.channelData.get(key);
+      const topic = data?.topic;
+
+      const label = isDirect
+        ? `${channelTarget} (${rt.networkName} DM)`
+        : `${channelTarget} (${rt.networkName})`;
+
+      return Promise.resolve({
+        label,
+        displayName: channelTarget,
+        channelId: channelTarget,
+        serverName: rt.networkName,
+        isDirect,
+        topic,
+        memberCount: isDirect ? undefined : rt.rosterTracker.getMemberCount(channelTarget, rt.casemapping),
+        joined: !isDirect,
+      });
+    };
 
     return new IrcChannelClient({
       accountId: parsed.accountId,
-      target: parsed.channelId,
+      target: channelTarget,
       isDirect,
       networkName: rt.networkName,
+      membersFn,
+      memberInfoFn,
+      channelInfoFn,
     });
   }
 
@@ -476,6 +600,8 @@ export class IrcProvider implements IChatProvider {
       echoQueues: new Map(),
       pendingByLabel: new Map(),
       accountTracker: new AccountTracker(),
+      rosterTracker: new RosterTracker(),
+      channelData: new Map(),
     };
 
     this.accounts.set(accountKey, rt);
@@ -550,6 +676,9 @@ export class IrcProvider implements IChatProvider {
       // WHOX-on-self-join repopulates channel members; per-message account-tag
       // repopulates on first message — correct per spec §5.1 ladder.
       rt.accountTracker.clear();
+      // Clear stale roster: membership seen before the disconnect is invalid after
+      // reconnect (users may have parted while we were gone; NAMES re-populates on join).
+      rt.rosterTracker.clear();
       this.drainPendingEchoes(rt);
     });
 
@@ -624,6 +753,10 @@ export class IrcProvider implements IChatProvider {
         ctx,
       );
       this.applyTriggerHoldOrEmit(inbound);
+      // Phase 3: upsert room_metadata so serverIdsFor returns the network id.
+      if (!isDm) {
+        this.emitChannelMetadata(rt, inbound.timelineKey, event.target);
+      }
     });
 
     // ── action ────────────────────────────────────────────────────────────────
@@ -671,6 +804,10 @@ export class IrcProvider implements IChatProvider {
         ctx,
       );
       this.applyTriggerHoldOrEmit(inbound);
+      // Phase 3: upsert room_metadata so serverIdsFor returns the network id.
+      if (!isDm) {
+        this.emitChannelMetadata(rt, inbound.timelineKey, event.target);
+      }
     });
 
     // ── notice ────────────────────────────────────────────────────────────────
@@ -717,6 +854,8 @@ export class IrcProvider implements IChatProvider {
         ctx,
       );
       this.host?.onEvent(inbound);
+      // Phase 3: channel notices are always channel-targeted (DMs filtered above).
+      this.emitChannelMetadata(rt, inbound.timelineKey, event.target);
     });
 
     // ── cap del (cap withdrawn mid-connection) ────────────────────────────────
@@ -757,6 +896,8 @@ export class IrcProvider implements IChatProvider {
 
       // 1. Move tracked account association from old nick to new nick (Phase 2).
       rt.accountTracker.renameNick(event.nick, event.new_nick, rt.casemapping);
+      // 2. Move roster entries across all channels (Phase 3).
+      rt.rosterTracker.renameNick(event.nick, event.new_nick, rt.casemapping);
 
       if (isOwnNick) {
         // Own nick change (server rename, e.g. Guest12345): update rt.nick and
@@ -799,7 +940,7 @@ export class IrcProvider implements IChatProvider {
       }
     });
 
-    // ── join (extended-join account tracking + WHOX on self-join) ────────────
+    // ── join (extended-join account tracking + roster update + WHOX on self-join) ──
     // extended-join: when the cap is enabled, JOIN carries an account field.
     // The library maps the protocol's "*" (not identified) → JavaScript false.
     // When the cap is absent, the field is undefined — no information; skip.
@@ -824,6 +965,9 @@ export class IrcProvider implements IChatProvider {
         }
       }
 
+      // Update roster: add the joining member (Phase 3).
+      rt.rosterTracker.addMember(event.channel, event.nick, rt.casemapping);
+
       if (isSelfJoin) {
         // Issue WHO for the channel: bulk-populate account tracker from WHOX
         // (or plain WHO — the library handles both; WHOX is used when supported).
@@ -833,6 +977,54 @@ export class IrcProvider implements IChatProvider {
           rt.accountTracker.bulkUpdateFromWhox(whoEvent.users, rt.casemapping);
         });
       }
+    });
+
+    // ── userlist (NAMES reply, Phase 3) ──────────────────────────────────────
+    // Fires when RPL_ENDOFNAMES arrives. Reinitialises the roster for the channel
+    // from the full member list (including mode prefixes stripped by the library).
+    client.on("userlist", (event) => {
+      if (!rt.registered) return;
+      rt.rosterTracker.initChannel(event.channel, event.users, rt.casemapping);
+    });
+
+    // ── part (Phase 3 roster update) ─────────────────────────────────────────
+    // Remove the parting user from this channel's roster.
+    // Per AccountTracker pruning docs: PART does NOT prune nick→account (user may
+    // still be in other served channels). Roster tracker removes from this channel only.
+    client.on("part", (event) => {
+      if (!rt.registered) return;
+      rt.rosterTracker.removeMember(event.channel, event.nick, rt.casemapping);
+    });
+
+    // ── kick (Phase 3 roster update) ─────────────────────────────────────────
+    // Remove the kicked user from the channel roster. Also check if we were kicked
+    // (self-kick): irc-framework auto-rejoins by default on KICK? No — it does NOT
+    // auto-rejoin on KICK; that's the operator's job. Simply remove from roster.
+    client.on("kick", (event) => {
+      if (!rt.registered) return;
+      rt.rosterTracker.removeMember(event.channel, event.kicked, rt.casemapping);
+    });
+
+    // ── topic (Phase 3 channel info tracking) ────────────────────────────────
+    // Fired for: RPL_TOPIC (332, on channel join), RPL_NOTOPIC (331), TOPIC command.
+    // Update the per-channel topic cache.
+    client.on("topic", (event) => {
+      const key = casefold(event.channel, rt.casemapping);
+      const existing = rt.channelData.get(key) ?? {};
+      rt.channelData.set(key, { ...existing, topic: event.topic || undefined });
+    });
+
+    // ── away / back (away-notify, Phase 3 roster freshness) ──────────────────
+    // When away-notify is active, the server sends AWAY messages when visible
+    // users change their away state. Update roster tracker accordingly.
+    client.on("away", (event) => {
+      if (!rt.registered) return;
+      rt.rosterTracker.setAway(event.nick, rt.casemapping);
+    });
+
+    client.on("back", (event) => {
+      if (!rt.registered) return;
+      rt.rosterTracker.setBack(event.nick, rt.casemapping);
     });
 
     // ── account (account-notify: user logged in or out of services) ───────────
@@ -855,6 +1047,8 @@ export class IrcProvider implements IChatProvider {
     client.on("quit", (event) => {
       if (!rt.registered) return;
       rt.accountTracker.removeNick(event.nick, rt.casemapping);
+      // Phase 3: remove from all channel rosters.
+      rt.rosterTracker.removeNick(event.nick, rt.casemapping);
     });
 
     // ── socket error ──────────────────────────────────────────────────────────
@@ -922,6 +1116,49 @@ export class IrcProvider implements IChatProvider {
     }
 
     return true;
+  }
+
+  // ── WHOIS helper (Phase 3) ────────────────────────────────────────────────────
+
+  /**
+   * Issue a WHOIS for `nick` and return the result when RPL_ENDOFWHOIS arrives.
+   * Returns `undefined` on error (socket not connected, library throws, etc.).
+   * Resolves with the event object from irc-framework; `event.error === "not_found"`
+   * when the nick does not exist on the network.
+   */
+  private doWhois(rt: AccountRuntime, nick: string): Promise<IrcWhoisResult | undefined> {
+    // The library's whois() listener only fires on RPL_ENDOFWHOIS; if the
+    // connection drops mid-query the reply never arrives and the promise would
+    // never settle, hanging the awaiting tool call. Bound it with a timeout.
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(undefined), WHOIS_TIMEOUT_MS);
+      try {
+        rt.client.whois(nick, (event) => {
+          clearTimeout(timer);
+          resolve(event as IrcWhoisResult);
+        });
+      } catch {
+        clearTimeout(timer);
+        resolve(undefined);
+      }
+    });
+  }
+
+  // ── Channel metadata upsert helper (Phase 3) ───────────────────────────────────
+
+  /**
+   * Fire-and-forget upsert of room_metadata for an IRC channel.
+   * Called from the inbound privmsg/action/notice paths so the network id
+   * (rt.networkName → serverId) lands in room_metadata, making serverIdsFor()
+   * return the correct value for per-user-limits partitioning (spec §7.4 / §10).
+   */
+  private emitChannelMetadata(rt: AccountRuntime, timelineKey: string, channelName: string): void {
+    if (!this.callbacks?.setChannelMetadata) return;
+    void this.callbacks.setChannelMetadata(timelineKey, {
+      displayName: channelName,
+      serverId: rt.networkName,
+      serverName: rt.networkName,
+    }).catch(() => {});
   }
 
   // ── Hostmask learning ─────────────────────────────────────────────────────────

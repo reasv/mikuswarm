@@ -16,6 +16,7 @@ import test, { describe } from "node:test";
 import { EventEmitter } from "node:events";
 
 import { AccountTracker } from "../src/irc/account-tracker.js";
+import { RosterTracker } from "../src/irc/roster-tracker.js";
 import {
   resolveIrcSenderId,
   normalizeIrcMessage,
@@ -469,6 +470,8 @@ function injectRuntime(opts: {
     echoQueues: new Map(),
     pendingByLabel: new Map(),
     accountTracker: new AccountTracker(),
+    rosterTracker: new RosterTracker(),
+    channelData: new Map<string, { topic?: string; modes?: string }>(),
   };
 
   const accounts = (provider as unknown as Record<string, unknown>).accounts as Map<string, unknown>;

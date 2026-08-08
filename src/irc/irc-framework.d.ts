@@ -213,6 +213,101 @@ declare module "irc-framework" {
       users: WholistUser[];
     }
 
+    /**
+     * Emitted as `userlist` when RPL_ENDOFNAMES arrives (after RPL_NAMEREPLY
+     * lines have been collected for the channel).
+     * Source: handlers/channel.js:84–93.
+     */
+    interface UserlistEvent {
+      channel: string;
+      users: Array<{
+        nick: string;
+        ident: string;
+        hostname: string;
+        /** Mode letters active for this user in this channel (e.g. ['o', 'v']). */
+        modes: string[];
+        tags: Record<string, string>;
+      }>;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * Emitted for TOPIC command, RPL_TOPIC (332), and RPL_NOTOPIC (331).
+     * `nick` is present only for live TOPIC changes (absent for 332/331).
+     * Source: handlers/channel.js:179–295.
+     */
+    interface TopicEvent {
+      channel: string;
+      topic: string;
+      nick?: string;
+      time?: number;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * Emitted when a user is kicked from a channel.
+     * Source: handlers/channel.js:249–263.
+     */
+    interface KickEvent {
+      /** Nick that was kicked. */
+      kicked: string;
+      /** Nick that did the kicking. */
+      nick: string;
+      channel: string;
+      message: string;
+      time: number;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * Emitted by the `away` event when a user goes away (AWAY command with a message,
+     * or RPL_NOWAWAY 306 for self). The `self` field is true when this is the bot's
+     * own away confirmation. Source: handlers/user.js:75–108.
+     */
+    interface AwayEvent {
+      self: boolean;
+      nick: string;
+      message: string;
+      time: number;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * Emitted by the `back` event when a user comes back (AWAY with no message,
+     * or RPL_UNAWAY 305 for self). Source: handlers/user.js:75–122.
+     */
+    interface BackEvent {
+      self: boolean;
+      nick: string;
+      message: string;
+      time: number;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * Assembled WHOIS result emitted as the `whois` event when RPL_ENDOFWHOIS
+     * arrives. Fields are populated piecemeal by the numeric handlers; absent
+     * means the server did not send the corresponding numeric.
+     * Source: handlers/user.js:147–158, 185–311.
+     */
+    interface WhoisResult {
+      nick: string;
+      ident?: string;
+      hostname?: string;
+      real_name?: string;
+      /** Away message when the user is away (from RPL_AWAY 301 during WHOIS). */
+      away?: string;
+      /**
+       * Raw RPL_WHOISCHANNELS (319) string: e.g. "@#general +#other".
+       * Each space-separated token is `<prefixes><#channel>`.
+       */
+      channels?: string;
+      /** Services account name from RPL_WHOISACCOUNT (330). */
+      account?: string;
+      /** Set to "not_found" when the nick does not exist on the network. */
+      error?: string;
+    }
+
     /** Emitted for cap ls / cap ack / cap nak / cap del / cap new events. */
     interface CapEvent {
       command: string;
@@ -318,7 +413,7 @@ declare module "irc-framework" {
       who(target: string, cb?: (event: WholistEvent) => void): void;
 
       /** Send WHOIS and fire `cb` when the `whois` event for `target` arrives. */
-      whois(target: string, cb?: (event: unknown) => void): void;
+      whois(target: string, cb?: (event: WhoisResult) => void): void;
 
       // ── Event emitter ─────────────────────────────────────────────────
 
@@ -340,6 +435,12 @@ declare module "irc-framework" {
       /** ACCOUNT message (account-notify cap) — user logged in/out of services. */
       on(event: "account", listener: (event: AccountEvent) => void): this;
       on(event: "wholist", listener: (event: WholistEvent) => void): this;
+      on(event: "userlist", listener: (event: UserlistEvent) => void): this;
+      on(event: "topic", listener: (event: TopicEvent) => void): this;
+      on(event: "kick", listener: (event: KickEvent) => void): this;
+      on(event: "away", listener: (event: AwayEvent) => void): this;
+      on(event: "back", listener: (event: BackEvent) => void): this;
+      on(event: "whois", listener: (event: WhoisResult) => void): this;
       on(event: "cap del", listener: (event: CapEvent) => void): this;
       on(event: "cap ack", listener: (event: CapEvent) => void): this;
       on(event: "cap ls", listener: (event: CapEvent) => void): this;

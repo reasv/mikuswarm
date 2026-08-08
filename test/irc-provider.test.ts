@@ -28,6 +28,7 @@ import test, { mock } from "node:test";
 import { EventEmitter } from "node:events";
 import { IrcProvider } from "../src/irc/provider.js";
 import { AccountTracker } from "../src/irc/account-tracker.js";
+import { RosterTracker } from "../src/irc/roster-tracker.js";
 import type { IrcConfig } from "../src/config/schema.js";
 
 function makeProvider(accounts: IrcConfig["accounts"] = {}): IrcProvider {
@@ -346,6 +347,8 @@ function injectRuntime(
     echoQueues: new Map(),
     pendingByLabel: new Map(),
     accountTracker: new AccountTracker(),
+    rosterTracker: new RosterTracker(),
+    channelData: new Map<string, { topic?: string; modes?: string }>(),
   };
 
   // Inject the runtime into the accounts map and wire listeners.

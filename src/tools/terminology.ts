@@ -50,3 +50,23 @@ export const DISCORD_TERMINOLOGY: ProviderTerminology = {
   coReplyIdRequiredError:
     "error: message_id is required (the message id from the co-reply interjection).",
 };
+
+/**
+ * IRC terminology bundle (spec IRC-SUPPORT-DESIGN §10).
+ * Selected by `buildSessionTools` for any session whose `target.provider` is `"irc"`.
+ * IRC mentions work by bare-nick word-boundary occurrence — no markup exists.
+ */
+export const IRC_TERMINOLOGY: ProviderTerminology = {
+  messageIdFmt: "message ID",
+  userIdFmt: "IRC nick or services account",
+  channelNoun: "channel",
+  providerName: "IRC",
+  mentionNote:
+    "A bare nick occurring anywhere in the message text is treated as a mention by IRC clients — no special markup exists or is needed.",
+  senderIdHint: "for example an IRC nick or services account name",
+  // IRC-native spawn_session strings.
+  coReplyIdDescription:
+    "The message id of the co-reply message to spin off, as given in the co-reply interjection.",
+  coReplyIdRequiredError:
+    "error: message_id is required (the message id from the co-reply interjection).",
+};
