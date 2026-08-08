@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 import { EventEmitter } from "node:events";
 import { IrcProvider } from "../src/irc/provider.js";
+import { AccountTracker } from "../src/irc/account-tracker.js";
 import type { IrcConfig } from "../src/config/schema.js";
 
 function makeProvider(accounts: IrcConfig["accounts"] = {}): IrcProvider {
@@ -344,6 +345,7 @@ function injectRuntime(
     hasMsgid: false,
     echoQueues: new Map(),
     pendingByLabel: new Map(),
+    accountTracker: new AccountTracker(),
   };
 
   // Inject the runtime into the accounts map and wire listeners.
@@ -410,6 +412,35 @@ test("F1: send() rejects after 'socket close' (not-registered error)", async () 
       ),
     /not registered/i,
     "send() must reject fast when !registered, not fabricate a receipt",
+  );
+});
+
+test("F1: 'socket close' clears accountTracker (stale mappings must not survive reconnect)", () => {
+  const client = new MockClient();
+  client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
+  const { rt } = injectRuntime("acc", client);
+  rt.registered = true;
+
+  // Seed the tracker via an account-notify event (as if user was identified).
+  client.emit("account", {
+    nick: "alice",
+    ident: "alice",
+    hostname: "h",
+    account: "alice_services",
+    tags: {},
+    time: Date.now(),
+  });
+
+  const tracker = rt.accountTracker as AccountTracker;
+  assert.equal(tracker.getAccount("alice", "rfc1459"), "alice_services", "pre-condition: tracker seeded");
+
+  // Disconnect.
+  client.emit("socket close");
+
+  assert.equal(
+    tracker.getAccount("alice", "rfc1459"),
+    undefined,
+    "socket close must clear stale nick→account mappings",
   );
 });
 

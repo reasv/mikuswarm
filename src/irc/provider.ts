@@ -1,5 +1,5 @@
 /**
- * IrcProvider — Phase 1 implementation (schema + provider core).
+ * IrcProvider — Phase 1 + Phase 2 implementation.
  *
  * Implements {@link IChatProvider} for IRC using irc-framework v4.
  * One irc-framework Client per configured account; reconnect with exponential
@@ -7,9 +7,18 @@
  *   - Floor cap validation (§3.1) — hard error and quit on missing cap.
  *   - Channel rejoin and self-WHO for hostmask learning (§7.1).
  *
+ * Phase 2 additions (spec IRC-SUPPORT-DESIGN §5):
+ *   - Identity ladder: account-tag > tracked account > casemapped nick.
+ *   - Account↔nick tracking via AccountTracker: extended-join, account-notify,
+ *     opportunistic account-tag refresh, WHOX on channel join.
+ *   - Ladder-keyed DM timelines (spec §4).
+ *   - user_identities writes via IrcProviderCallbacks.upsertUserIdentity on NICK.
+ *   - QUIT pruning of tracked state.
+ *   - Self-identity: SASL account name when configured, else casemapped nick.
+ *
  * Spec: IRC-SUPPORT-DESIGN
- *   §3 (caps), §4 (timeline keys), §6 (capabilities), §7 (send/echo/reconnect),
- *   §7.5 (inbound pipeline), §8 (config).
+ *   §3 (caps), §4 (timeline keys), §5 (identity), §6 (capabilities),
+ *   §7 (send/echo/reconnect), §7.5 (inbound pipeline), §8 (config).
  */
 
 import IrcFramework from "irc-framework";
@@ -27,6 +36,7 @@ import type {
   SelfIdentity,
 } from "../types.js";
 import type { IrcAccountConfig, IrcConfig } from "../config/schema.js";
+import type { UserIdentityUpsertInput } from "../storage/database.js";
 import {
   casefold,
   chunkIrcMessage,
@@ -38,6 +48,30 @@ import {
   type IrcNormalizerContext,
 } from "./normalizer.js";
 import { IrcChannelClient } from "./channel-client.js";
+import { AccountTracker } from "./account-tracker.js";
+
+// ── IrcProviderCallbacks ──────────────────────────────────────────────────────
+
+/**
+ * Callbacks injected at construction time for operations that need storage access.
+ *
+ * Follows the same pattern as {@link DiscordProviderCallbacks}: the provider is
+ * constructed before storage is available, and the callbacks bridge that gap.
+ * All callbacks are fire-and-forget (void) from the provider's perspective.
+ *
+ * Phase 2: only `upsertUserIdentity` is needed. Per-message identity upserts
+ * flow automatically via the generic `handleInbound` path in app.ts (which checks
+ * `sender.username`); this callback is only invoked for out-of-band identity
+ * events such as NICK renames (where no message event fires).
+ */
+export interface IrcProviderCallbacks {
+  /**
+   * Upsert a user identity row (spec §5.3).
+   * Called on NICK renames to record the old nick as an alias.
+   * Per-message upserts are handled by the generic ingest path in app.ts.
+   */
+  upsertUserIdentity(input: UserIdentityUpsertInput): Promise<void>;
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -135,6 +169,12 @@ interface AccountRuntime {
    * available. Each key is the nanoid label sent with the PRIVMSG.
    */
   pendingByLabel: Map<string, PendingEcho>;
+  /**
+   * Account↔nick tracking state (Phase 2).
+   * Populated by extended-join, account-notify, account-tag (opportunistic),
+   * and WHOX bulk updates. Used by the identity ladder when no per-message tag.
+   */
+  accountTracker: AccountTracker;
 }
 
 // ── IrcProvider ────────────────────────────────────────────────────────────────
@@ -164,6 +204,7 @@ export class IrcProvider implements IChatProvider {
   };
 
   private readonly config: IrcConfig;
+  private readonly callbacks?: IrcProviderCallbacks;
   private readonly accounts = new Map<string, AccountRuntime>();
   private readonly typingChains = new Map<string, { token: object; timer?: NodeJS.Timeout }>();
   private readonly pendingTriggers = new Map<string, PendingTrigger>();
@@ -171,8 +212,9 @@ export class IrcProvider implements IChatProvider {
   private host?: ChatProviderHost;
   private stopped = false;
 
-  constructor(config: IrcConfig) {
+  constructor(config: IrcConfig, callbacks?: IrcProviderCallbacks) {
     this.config = config;
+    this.callbacks = callbacks;
   }
 
   // ── IChatProvider.start ───────────────────────────────────────────────────
@@ -433,6 +475,7 @@ export class IrcProvider implements IChatProvider {
       hasMsgid: false,
       echoQueues: new Map(),
       pendingByLabel: new Map(),
+      accountTracker: new AccountTracker(),
     };
 
     this.accounts.set(accountKey, rt);
@@ -475,8 +518,10 @@ export class IrcProvider implements IChatProvider {
         rt.networkName = networkName.toLowerCase();
       }
 
-      // Self identity (Phase 1: nick-based).
-      const selfId = casefold(rt.nick, rt.casemapping);
+      // Self identity (Phase 2 ladder §5.1): SASL account name when configured
+      // (stable across nick changes), else casemapped nick.
+      const selfAccount = rt.config.sasl_user;
+      const selfId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
       rt.self = { id: selfId, username: rt.nick };
 
       // Learn hostmask via WHO.
@@ -500,6 +545,11 @@ export class IrcProvider implements IChatProvider {
     // timeout a synthetic receipt is fabricated for a never-delivered message.
     client.on("socket close", () => {
       rt.registered = false;
+      // Clear stale nick→account mappings: a user may have logged out of services
+      // while we were disconnected, and no WHOX fires for absent nicks on reconnect.
+      // WHOX-on-self-join repopulates channel members; per-message account-tag
+      // repopulates on first message — correct per spec §5.1 ladder.
+      rt.accountTracker.clear();
       this.drainPendingEchoes(rt);
     });
 
@@ -539,10 +589,24 @@ export class IrcProvider implements IChatProvider {
       const isDm = !isChannelTarget(event.target);
       if (isDm && rt.config.dm_enabled === false) return;
 
+      // Opportunistic account-tag refresh (Phase 2 §5.1): if account-tag is present
+      // on this message, update the tracker so future messages (which may lack the tag)
+      // still benefit from the known account. The tracker is updated BEFORE normalization
+      // so the normalizer reads the freshest state.
+      if (event.account) {
+        if (event.account !== "*") {
+          rt.accountTracker.setAccount(event.nick, event.account, rt.casemapping);
+        } else {
+          rt.accountTracker.clearAccount(event.nick, rt.casemapping);
+        }
+      }
+
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
+        accountTracker: rt.accountTracker,
+        selfAccount: rt.config.sasl_user,
       };
       const inbound = normalizeIrcMessage(
         {
@@ -575,10 +639,21 @@ export class IrcProvider implements IChatProvider {
       const isDm = !isChannelTarget(event.target);
       if (isDm && rt.config.dm_enabled === false) return;
 
+      // Opportunistic account-tag refresh (same as privmsg path above).
+      if (event.account) {
+        if (event.account !== "*") {
+          rt.accountTracker.setAccount(event.nick, event.account, rt.casemapping);
+        } else {
+          rt.accountTracker.clearAccount(event.nick, rt.casemapping);
+        }
+      }
+
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
+        accountTracker: rt.accountTracker,
+        selfAccount: rt.config.sasl_user,
       };
       const inbound = normalizeIrcMessage(
         {
@@ -608,10 +683,23 @@ export class IrcProvider implements IChatProvider {
       //   Query notices (DM) → do NOT ingest.
       if (!isChannelTarget(event.target)) return;
 
+      // Opportunistic account-tag refresh (same as privmsg/action paths): update
+      // tracker before ctx construction so future messages without account-tag
+      // resolve to the same identity (spec §5.1 "per-message tag ALWAYS wins").
+      if (event.account) {
+        if (event.account !== "*") {
+          rt.accountTracker.setAccount(event.nick, event.account, rt.casemapping);
+        } else {
+          rt.accountTracker.clearAccount(event.nick, rt.casemapping);
+        }
+      }
+
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
+        accountTracker: rt.accountTracker,
+        selfAccount: rt.config.sasl_user,
       };
       const inbound = normalizeIrcMessage(
         {
@@ -661,17 +749,40 @@ export class IrcProvider implements IChatProvider {
       }
     });
 
-    // ── nick (our own nick change) ────────────────────────────────────────────
+    // ── nick (NICK rename — any user, including our own) ─────────────────────
     client.on("nick", (event) => {
-      if (
-        rt.registered &&
-        casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping)
-      ) {
+      if (!rt.registered) return;
+      const isOwnNick =
+        casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
+
+      // 1. Move tracked account association from old nick to new nick (Phase 2).
+      rt.accountTracker.renameNick(event.nick, event.new_nick, rt.casemapping);
+
+      if (isOwnNick) {
+        // Own nick change (server rename, e.g. Guest12345): update rt.nick and
+        // self-identity. Self-id remains the SASL account name when configured
+        // (stable across renames), or switches to the new casemapped nick.
         rt.nick = event.new_nick;
-        const selfId = casefold(rt.nick, rt.casemapping);
+        const selfAccount = rt.config.sasl_user;
+        const selfId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
         rt.self = { id: selfId, username: rt.nick };
-        // Re-learn hostmask.
+        // Re-learn hostmask (budget recomputed for new nick length).
         this.learnHostmask(rt);
+      } else {
+        // Other user's rename: upsert their identity row so the new nick is
+        // recorded as username (spec §5.4 / §5.3 alias history). The identity key
+        // is their account name when known, else the old casemapped nick.
+        const identityKey =
+          rt.accountTracker.getAccount(event.new_nick, rt.casemapping) ??
+          casefold(event.nick, rt.casemapping);
+        void this.callbacks
+          ?.upsertUserIdentity({
+            provider: "irc",
+            userId: identityKey,
+            username: event.new_nick,
+            observedAt: event.time ?? Date.now(),
+          })
+          .catch(() => {});
       }
     });
 
@@ -686,6 +797,64 @@ export class IrcProvider implements IChatProvider {
       if (casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping)) {
         this.learnHostmask(rt);
       }
+    });
+
+    // ── join (extended-join account tracking + WHOX on self-join) ────────────
+    // extended-join: when the cap is enabled, JOIN carries an account field.
+    // The library maps the protocol's "*" (not identified) → JavaScript false.
+    // When the cap is absent, the field is undefined — no information; skip.
+    //
+    // On our OWN join: issue WHO for the channel to bulk-populate accounts via
+    // WHOX (the library uses WHOX automatically when the server advertises the
+    // WHOX ISUPPORT token). Non-WHOX WHO responses will have account=undefined
+    // in the user objects and AccountTracker.bulkUpdateFromWhox will skip them.
+    client.on("join", (event) => {
+      if (!rt.registered) return;
+
+      const isSelfJoin =
+        casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
+
+      // Update account tracker from extended-join (any user, including self).
+      if (event.account !== undefined) {
+        if (event.account && event.account !== "*") {
+          rt.accountTracker.setAccount(event.nick, event.account, rt.casemapping);
+        } else {
+          // false (or defensive "*") → not identified; clear any stale entry.
+          rt.accountTracker.clearAccount(event.nick, rt.casemapping);
+        }
+      }
+
+      if (isSelfJoin) {
+        // Issue WHO for the channel: bulk-populate account tracker from WHOX
+        // (or plain WHO — the library handles both; WHOX is used when supported).
+        // who() is a synchronous enqueue and never throws; server rejections arrive
+        // as numerics and simply produce no callback.
+        rt.client.who(event.channel, (whoEvent) => {
+          rt.accountTracker.bulkUpdateFromWhox(whoEvent.users, rt.casemapping);
+        });
+      }
+    });
+
+    // ── account (account-notify: user logged in or out of services) ───────────
+    // The library maps "*" → false; a string is the account name on login.
+    client.on("account", (event) => {
+      if (!rt.registered) return;
+      if (event.account && event.account !== "*") {
+        // User identified to services.
+        rt.accountTracker.setAccount(event.nick, event.account, rt.casemapping);
+      } else {
+        // User logged out (account === false from library, or defensive "*").
+        rt.accountTracker.clearAccount(event.nick, rt.casemapping);
+      }
+    });
+
+    // ── quit (prune tracked state) ────────────────────────────────────────────
+    // QUIT means the user has disconnected from the network entirely — definitely
+    // no longer visible in any served channel. Per AccountTracker pruning docs:
+    // PART does NOT prune (user may still be in other served channels).
+    client.on("quit", (event) => {
+      if (!rt.registered) return;
+      rt.accountTracker.removeNick(event.nick, rt.casemapping);
     });
 
     // ── socket error ──────────────────────────────────────────────────────────
@@ -823,6 +992,8 @@ export class IrcProvider implements IChatProvider {
       accountId: rt.accountId,
       selfNick: rt.nick,
       casemapping: rt.casemapping,
+      accountTracker: rt.accountTracker,
+      selfAccount: rt.config.sasl_user,
     };
     const msgid = event.tags["msgid"];
     const externalId = resolvedId ?? msgid ?? syntheticMsgId(rt.accountId, event.time, rt.nick);

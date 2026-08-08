@@ -7,7 +7,7 @@ import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, makeBackfillReadClient } from "./matrix/index.js";
 import { DiscordProvider } from "./discord/index.js";
-import { IrcProvider } from "./irc/index.js";
+import { IrcProvider, type IrcProviderCallbacks } from "./irc/index.js";
 import { ingestGenericReactionEvent } from "./timeline/index.js";
 import type { MatrixNativeClient, MatrixNativeEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
@@ -1277,7 +1277,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     // Construct IrcProvider when [irc] is enabled and has accounts.
     if (config.irc?.enabled && config.irc.accounts && Object.keys(config.irc.accounts).length > 0) {
-      const ircProvider = new IrcProvider(config.irc);
+      const ircCallbacks: IrcProviderCallbacks = {
+        async upsertUserIdentity(input) {
+          await storage.upsertUserIdentity(input);
+        },
+      };
+      const ircProvider = new IrcProvider(config.irc, ircCallbacks);
       map.set("irc", ircProvider);
     }
 

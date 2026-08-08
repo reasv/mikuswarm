@@ -215,6 +215,17 @@ username, with alias history capturing NICK changes observed while connected.
 This is exactly the "display name changes, identity persists" shape the table
 was designed for.
 
+**Accepted limitation — multi-network deployments.** `user_identities` rows
+are keyed `(provider, user_id)`, and IRC user ids (services account name or
+casemapped nick) are unique only within a single IRC network. A deployment
+running bot accounts on two *different* networks that happen to share a
+services account name (e.g. `alice` on both Libera and OFTC) will map to the
+same `user_identities` row and share per-user budget aggregation across those
+networks. This is accepted for v1: it is consistent with the protocol's
+network-scoped identity model and with the §4 accepted DM-key consequence for
+unidentified users; same-network multi-account deployments (the common case)
+are wholly unaffected.
+
 ### 5.4 Renames
 
 Inbound `NICK` changes are observed and applied the same way Discord renames

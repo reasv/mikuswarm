@@ -5,7 +5,7 @@
  * so they can be exercised by unit tests without a socket.
  *
  * Spec: IRC-SUPPORT-DESIGN §7.5 (inbound pipeline), §7.2 (id scheme),
- *       §4 (timeline keys), §5.1 (identity — nick-only Phase 1 simplification),
+ *       §4 (timeline keys), §5.1 (identity ladder — Phase 2),
  *       §7.1 (byte budget + chunking), §3 (casemapping for trigger detection).
  */
 
@@ -17,6 +17,7 @@ import type {
   TriggerInfo,
 } from "../types.js";
 import { buildTimelineKey } from "../storage/timeline-key.js";
+import type { AccountTracker } from "./account-tracker.js";
 
 // ── Control-code stripping ─────────────────────────────────────────────────
 
@@ -130,6 +131,10 @@ export function detectMention(body: string, nick: string, casemapping: string): 
  *   - `dm` for any query message (target === selfNick, case-insensitive).
  *   - `mention` for a channel message containing an exact nick-token match.
  *   - NOTICEs: ingested but NEVER trigger (returns undefined for notice events).
+ *
+ * `resolvedSenderId` is the ladder result (account name or casemapped nick) used
+ * for `TriggerInfo.triggeredBy.id` — ensures downstream trigger routing uses the
+ * stable identity, not the mutable nick.
  */
 export function detectIrcTrigger(
   body: string,
@@ -139,11 +144,13 @@ export function detectIrcTrigger(
   channelType: "group" | "dm",
   casemapping: string,
   isNotice: boolean,
+  resolvedSenderId?: string,
 ): TriggerInfo | undefined {
   // Notices never trigger (spec §7.5)
   if (isNotice) return undefined;
 
-  const sender: SenderInfo = { id: senderNick, username: senderNick };
+  const triggeredById = resolvedSenderId ?? casefold(senderNick, casemapping);
+  const sender: SenderInfo = { id: triggeredById, username: senderNick };
 
   if (channelType === "dm") {
     return {
@@ -371,6 +378,19 @@ export interface IrcNormalizerContext {
   selfNick: string;
   /** Network casemapping (rfc1459 / strict-rfc1459 / ascii). */
   casemapping: string;
+  /**
+   * In-memory account tracking state (Phase 2).
+   * Used as the fallback rung of the identity ladder when no per-message account-tag
+   * is present. The tracker is read-only from the normalizer's perspective — updates
+   * happen in the provider before normalizeIrcMessage is called.
+   */
+  accountTracker?: AccountTracker;
+  /**
+   * The bot's own services account name (Phase 2).
+   * Set to `sasl_user` when SASL is configured. Used for self-identity: the bot's
+   * `SenderInfo.id` uses the account name (stable across nick changes) when known.
+   */
+  selfAccount?: string;
 }
 
 export interface IrcInboundMessage {
@@ -382,12 +402,51 @@ export interface IrcInboundMessage {
   tags: Record<string, string>;
   /** Server-time as ms-epoch. */
   time: number;
-  /** Services account from account-tag (Phase 2 will promote to identity). */
+  /**
+   * Services account from the account-tag on this specific message.
+   * Present as a non-empty string when account-tag cap is enabled and the sender
+   * is identified. Absent (undefined) when the cap is not enabled or user is not
+   * identified (the account-tag is simply not sent in that case — unlike ACCOUNT
+   * messages which use `"*"` for logged-out, account-tags are omitted when absent).
+   */
   account?: string;
   /** True when this PRIVMSG was identified as a CTCP ACTION. */
   isAction?: boolean;
   /** True when this is a NOTICE. */
   isNotice?: boolean;
+}
+
+/**
+ * Apply the identity ladder (spec §5.1) to a single message sender.
+ *
+ * Deterministic, per-message:
+ *   1. Per-message account-tag (wins when present and non-empty)
+ *   2. Tracked state from extended-join/account-notify/WHOX (fallback)
+ *   3. Casemapped nick (final fallback)
+ *
+ * Per spec §5.1: "per-message tag ALWAYS wins".
+ *
+ * `msg.account` is the account-tag value from the message. The tag is absent
+ * (undefined) when the user is not identified or the cap is not enabled; it is
+ * never `"*"` on PRIVMSG (that's only for ACCOUNT messages). Defensive `"*"`
+ * handling is included for safety.
+ */
+export function resolveIrcSenderId(
+  nick: string,
+  msgAccount: string | undefined,
+  accountTracker: AccountTracker | undefined,
+  casemapping: string,
+): string {
+  // Rung 1: per-message account-tag (defensive: treat "*" as absent)
+  const tag = msgAccount && msgAccount !== "*" ? msgAccount : undefined;
+  if (tag) return tag;
+
+  // Rung 2: tracked state (extended-join, account-notify, WHOX)
+  const tracked = accountTracker?.getAccount(nick, casemapping);
+  if (tracked) return tracked;
+
+  // Rung 3: casemapped nick
+  return casefold(nick, casemapping);
 }
 
 /**
@@ -401,7 +460,12 @@ export interface IrcInboundMessage {
  *   - NOTICE in queries → NOT called from provider (provider skips them)
  *   - mIRC control codes stripped
  *
- * Phase 1 identity: SenderInfo.id = casemapped nick (Phase 2 will add account-tag ladder).
+ * Identity (Phase 2): SenderInfo.id = ladder result (account-tag > tracked account > casemapped nick).
+ * SenderInfo.username = current nick (display identity, always the nick).
+ *
+ * DM key (Phase 2): uses the ladder result as identity (account name when known,
+ * casemapped nick otherwise). Per spec §4: one accepted consequence is that a user
+ * who DMs while logged out and later registers gets a new DM timeline.
  */
 export function normalizeIrcMessage(
   msg: IrcInboundMessage,
@@ -414,17 +478,27 @@ export function normalizeIrcMessage(
   const channelIsChannel = isChannelTarget(msg.target);
   const channelType: "group" | "dm" = channelIsChannel ? "group" : "dm";
 
-  // Build timeline key
+  // ── Identity ladder (spec §5.1) ──────────────────────────────────────────────
+  const isSelf =
+    casefold(msg.nick, ctx.casemapping) === casefold(ctx.selfNick, ctx.casemapping);
+
+  let senderId: string;
+  if (isSelf) {
+    // Self: use SASL account name when configured (stable across nick changes),
+    // else casemapped nick.
+    senderId = ctx.selfAccount ?? casefold(msg.nick, ctx.casemapping);
+  } else {
+    senderId = resolveIrcSenderId(msg.nick, msg.account, ctx.accountTracker, ctx.casemapping);
+  }
+
+  // Build timeline key — DM key uses the ladder result (spec §4).
   const timelineKey = channelIsChannel
     ? buildIrcChannelKey(ctx.accountId, msg.target, ctx.casemapping)
-    : buildIrcDmKey(ctx.accountId, casefold(msg.nick, ctx.casemapping));
-
-  // Identity (Phase 1: casemapped nick)
-  const senderId = casefold(msg.nick, ctx.casemapping);
-  const isSelf = casefold(msg.nick, ctx.casemapping) === casefold(ctx.selfNick, ctx.casemapping);
+    : buildIrcDmKey(ctx.accountId, senderId);
 
   const sender: SenderInfo = {
     id: senderId,
+    // username = current nick (display identity; always mutable, always the nick)
     username: msg.nick,
     isSelf,
   };
@@ -445,7 +519,7 @@ export function normalizeIrcMessage(
     body = stripControlCodes(msg.message);
   }
 
-  // Trigger detection (spec §7.5)
+  // Trigger detection (spec §7.5) — pass resolved senderId so triggeredBy.id is stable.
   const trigger = detectIrcTrigger(
     body,
     msg.nick,
@@ -454,6 +528,7 @@ export function normalizeIrcMessage(
     channelType,
     ctx.casemapping,
     msg.isNotice === true,
+    senderId,
   );
 
   const event: CanonicalChatEvent = {

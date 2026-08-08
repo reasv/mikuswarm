@@ -11,12 +11,27 @@
  *   node_modules/irc-framework/src/networkinfo.js
  *   node_modules/irc-framework/src/commands/handlers/registration.js
  *   node_modules/irc-framework/src/commands/handlers/messaging.js
+ *   node_modules/irc-framework/src/commands/handlers/user.js   (ACCOUNT, CHGHOST)
+ *   node_modules/irc-framework/src/commands/handlers/channel.js (extended-join)
+ *   node_modules/irc-framework/src/commands/handlers/misc.js    (RPL_WHOSPCRPL → wholist)
  *   node_modules/irc-framework/src/index.js
  *
  * Export shape: irc-framework exports `{ Client, ... }` via `module.exports.X = …`.
  * With `esModuleInterop: true`, `import IrcFramework from "irc-framework"` gives
  * you the module.exports object. All types are placed in the `IrcFramework`
  * namespace so `IrcFramework.Client`, `IrcFramework.IrcConnectOptions`, etc. work.
+ *
+ * Account field semantics across events:
+ *   - JoinEvent.account / AccountEvent.account: the library maps the IRC protocol
+ *     value `"*"` (not identified) to JavaScript `false`, and a real account name
+ *     remains a string. The field is `undefined` when the relevant cap is not enabled
+ *     (extended-join for JOIN events; account-notify for ACCOUNT messages).
+ *     Source: handlers/user.js and handlers/channel.js:
+ *       `const account = command.params[0] === '*' ? false : command.params[0];`
+ *       `data.account = command.params[1] === '*' ? false : command.params[1];`
+ *   - WholistUser.account (WHOX): library maps `"0"` → `""` (empty string).
+ *     Source: misc.js line 173: `account: params[9] === '0' ? '' : params[9]`
+ *     Non-WHOX WHO responses have no account field (undefined).
  */
 
 declare module "irc-framework" {
@@ -103,7 +118,8 @@ declare module "irc-framework" {
       ident: string;
       hostname: string;
       tags: Record<string, string>;
-      time: number;
+      /** Undefined when no server-time tag (library returns undefined explicitly). */
+      time?: number;
     }
 
     interface QuitEvent {
@@ -112,7 +128,8 @@ declare module "irc-framework" {
       hostname: string;
       message: string;
       tags: Record<string, string>;
-      time: number;
+      /** Undefined when no server-time tag (library returns undefined explicitly). */
+      time?: number;
     }
 
     /**
@@ -137,12 +154,41 @@ declare module "irc-framework" {
       ident: string;
       hostname: string;
       channel: string;
-      /** Services account name from extended-join, if present. */
-      account?: string;
+      /**
+       * Services account from extended-join cap (when the cap is enabled).
+       *   - `string` → user is identified with this account name.
+       *   - `false` → user is NOT identified (library maps protocol `"*"` → JS `false`).
+       *   - `undefined` → extended-join cap not enabled; account information unavailable.
+       *
+       * Source: handlers/channel.js line 219:
+       *   `data.account = command.params[1] === '*' ? false : command.params[1];`
+       */
+      account?: string | false;
       /** Real name from extended-join, if present. */
       gecos?: string;
       tags: Record<string, string>;
       time: number;
+    }
+
+    /**
+     * Emitted for the ACCOUNT message (account-notify cap).
+     * Sent by the server when a visible user logs into or out of services.
+     *
+     * Source: handlers/user.js lines 25–40:
+     *   `const account = command.params[0] === '*' ? false : command.params[0];`
+     *   `handler.emit('account', { nick, ident, hostname, account, time, tags })`
+     */
+    interface AccountEvent {
+      nick: string;
+      ident: string;
+      hostname: string;
+      /**
+       *   - `string` → user logged in with this account name.
+       *   - `false` → user logged out (library maps protocol `"*"` → JS `false`).
+       */
+      account: string | false;
+      time: number;
+      tags: Record<string, string>;
     }
 
     interface PartEvent {
@@ -291,6 +337,8 @@ declare module "irc-framework" {
       on(event: "quit", listener: (event: QuitEvent) => void): this;
       on(event: "join", listener: (event: JoinEvent) => void): this;
       on(event: "part", listener: (event: PartEvent) => void): this;
+      /** ACCOUNT message (account-notify cap) — user logged in/out of services. */
+      on(event: "account", listener: (event: AccountEvent) => void): this;
       on(event: "wholist", listener: (event: WholistEvent) => void): this;
       on(event: "cap del", listener: (event: CapEvent) => void): this;
       on(event: "cap ack", listener: (event: CapEvent) => void): this;
