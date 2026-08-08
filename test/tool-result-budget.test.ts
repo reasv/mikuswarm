@@ -19,8 +19,12 @@ import test from "node:test";
 
 import { shapeContentBlocks, TurnResultBudget } from "../src/agent/tool-result-budget.js";
 import type { ShapedContent } from "../src/agent/tool-result-budget.js";
+import { wrapToolsWithResultBudget } from "../src/agent/tool-result-wrap.js";
+import { PER_IMAGE_TOKEN_ESTIMATE } from "../src/agent/live-token-estimate.js";
 import { estimateTokens } from "../src/context/tokens.js";
 import { loadConfig } from "../src/config/index.js";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -638,4 +642,338 @@ store_path = "./var/matrix/miku"
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Integration: wrapToolsWithResultBudget wiring
+// ---------------------------------------------------------------------------
+// These tests exercise the REAL wrapper code path (not a reimplementation).
+// They use small synthetic AgentTool objects with fixed content returns.
+
+/** Minimal AgentTool that returns the given content blocks. */
+function makeTool(
+  name: string,
+  content: AgentToolResult<null>["content"],
+): AgentTool {
+  return {
+    name,
+    label: name,
+    description: name,
+    parameters: Type.Object({}),
+    execute: async () => ({ content, details: null }),
+  } as AgentTool;
+}
+
+/** Minimal AgentTool that always throws an error. */
+function makeErrorTool(name: string, message: string): AgentTool {
+  return {
+    name,
+    label: name,
+    description: name,
+    parameters: Type.Object({}),
+    execute: async () => {
+      throw new Error(message);
+    },
+  } as AgentTool;
+}
+
+test("wrapToolsWithResultBudget: small result passes through unchanged (under Layer-1 cap)", async () => {
+  const budget = new TurnResultBudget(200_000, 32_768, 1024);
+  const smallText = txt(makeText(10));
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [smallText])], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+  const result = await wrapped!.execute("id", {});
+  assert.deepEqual(result.content, [smallText]);
+  assert.ok(budget.accumulated > 0, "budget should have been charged");
+});
+
+test("wrapToolsWithResultBudget: over-cap result is truncated (Layer 1)", async () => {
+  const budget = new TurnResultBudget(200_000, 1000, 100);
+  const bigText = makeText(500);
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 50,   // Layer 1: very tight
+    turnBudget: budget,
+    getRunningContext: () => 100, // leaves huge Layer-2 room
+  });
+  const result = await wrapped!.execute("id", {});
+  assert.equal(result.content.length, 1);
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+  assert.ok(text.length < bigText.length, "result must be shorter than original");
+  assert.ok(text.includes("per-result cap"), "Layer-1 marker must be present");
+});
+
+test("wrapToolsWithResultBudget: over-budget result is truncated (Layer 2)", async () => {
+  // Layer-1 cap is large; Layer-2 is tiny.
+  const budget = new TurnResultBudget(
+    /* servingWindow */ 10_100,
+    /* reserve       */ 10_000,
+    /* min           */ 100,
+  );
+  // budget = 10100 - 5000 - 10000 = -4900 → allowance = min = 100
+  const bigText = makeText(500);
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 5_000,
+  });
+  const result = await wrapped!.execute("id", {});
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+  assert.ok(text.includes("context budget"), "Layer-2 marker must be present");
+  assert.ok(text.length < bigText.length, "result must be shorter");
+});
+
+test("wrapToolsWithResultBudget: accumulator resets on turnBudget.reset()", async () => {
+  const budget = new TurnResultBudget(100_000, 10_000, 1024);
+  const bigText = makeText(200);
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 0,   // Layer 1 disabled; Layer 2 applies
+    turnBudget: budget,
+    getRunningContext: () => 80_000,
+  });
+
+  await wrapped!.execute("id1", {});
+  const accumulatedBefore = budget.accumulated;
+  assert.ok(accumulatedBefore > 0, "budget must have been charged");
+
+  // Simulate commit (onRequestCommitted calls turnBudget.reset()).
+  budget.reset();
+  assert.equal(budget.accumulated, 0, "accumulated must be 0 after reset");
+
+  // Next turn gets a fresh allowance.
+  const allowanceAfterReset = budget.allowance(80_000);
+  const allowanceBeforeReset = budget.allowance(80_000) - accumulatedBefore;
+  assert.ok(allowanceAfterReset > allowanceBeforeReset, "fresh allowance after reset must be larger");
+});
+
+test("wrapToolsWithResultBudget: sequential settlement — later results get smaller allowance", async () => {
+  // budget = 50000 - 20000 - 10000 = 20000 tokens for the whole turn.
+  // Each tool returns ~8000 tokens:
+  //   t1: allowance = 20000, 8000 fits   → charged ~8000
+  //   t2: allowance = 12000, 8000 fits   → charged ~8000
+  //   t3: allowance = ~4000, 8000 > 4000 → truncated with turn-budget marker
+  const budget = new TurnResultBudget(50_000, 10_000, 1024);
+  const runningCtx = 20_000;
+  const bigText = makeText(8_000); // ~8000 tokens each — exceeds what t3 gets
+  const tools = [
+    makeTool("t1", [txt(bigText)]),
+    makeTool("t2", [txt(bigText)]),
+    makeTool("t3", [txt(bigText)]),
+  ];
+  const wrapped = wrapToolsWithResultBudget(tools, {
+    resultMaxTokens: 0,
+    turnBudget: budget,
+    getRunningContext: () => runningCtx,
+  });
+
+  // Execute sequentially (settlement order = execution order here).
+  const r1 = await wrapped[0]!.execute("id1", {});
+  const r2 = await wrapped[1]!.execute("id2", {});
+  const r3 = await wrapped[2]!.execute("id3", {});
+
+  // Each successive result must have less or equal text than the previous.
+  const len1 = (r1.content[0] as { type: "text"; text: string }).text.length;
+  const len2 = (r2.content[0] as { type: "text"; text: string }).text.length;
+  const len3 = (r3.content[0] as { type: "text"; text: string }).text.length;
+  assert.ok(len3 <= len1 && len3 <= len2, "third result must be shortest (exhausted budget)");
+
+  // The third result must be truncated by Layer 2.
+  const text3 = (r3.content[0] as { type: "text"; text: string }).text;
+  assert.ok(text3.includes("context budget"), "third result must carry a turn-budget marker");
+});
+
+test("wrapToolsWithResultBudget: floor is respected when budget exhausted", async () => {
+  // Set reserve > servingWindow - runningCtx → budget = negative → allowance = min
+  const min = 512;
+  const budget = new TurnResultBudget(
+    /* servingWindow */ 10_000,
+    /* reserve       */ 15_000, // reserve > remaining → budget goes negative
+    /* min           */ min,
+  );
+  const bigText = makeText(1000);
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 0,
+    turnBudget: budget,
+    getRunningContext: () => 5_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+  // Result should still carry content (the min floor).
+  assert.equal(result.content.length, 1);
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+  // The text should be present (floor guarantees a useful head).
+  assert.ok(text.length > 0, "floor guarantees a non-empty result");
+  assert.ok(text.includes("context budget"), "truncation marker must be present");
+});
+
+test("wrapToolsWithResultBudget: Layer-1 vs Layer-2 — tighter one wins", async () => {
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const bigText = makeText(500);
+  // Layer-1 cap = 30, Layer-2 allowance = 200000 - 50000 - 1000 = 149000 → Layer 1 is tighter
+  const [wrappedL1] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 30,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+  const r1 = await wrappedL1!.execute("id", {});
+  const t1 = (r1.content[0] as { type: "text"; text: string }).text;
+  assert.ok(t1.includes("per-result cap"), "Layer-1 must win when tighter");
+
+  // Layer-1 cap = 150000, Layer-2 = 100 (reserve=199900 → very tight) → Layer 2 is tighter
+  const budget2 = new TurnResultBudget(200_000, 199_900, 100);
+  const [wrappedL2] = wrapToolsWithResultBudget([makeTool("t2", [txt(bigText)])], {
+    resultMaxTokens: 150_000,
+    turnBudget: budget2,
+    getRunningContext: () => 50,
+  });
+  const r2 = await wrappedL2!.execute("id", {});
+  const t2 = (r2.content[0] as { type: "text"; text: string }).text;
+  assert.ok(t2.includes("context budget"), "Layer-2 must win when tighter");
+});
+
+test("wrapToolsWithResultBudget: error results pass through unchanged (execute throws)", async () => {
+  const budget = new TurnResultBudget(100_000, 10_000, 1024);
+  const [wrapped] = wrapToolsWithResultBudget([makeErrorTool("t", "tool failure")], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  await assert.rejects(
+    () => wrapped!.execute("id", {}),
+    /tool failure/,
+    "thrown error must propagate unchanged",
+  );
+  // Budget must not have been charged (consume is never reached on a throw).
+  assert.equal(budget.accumulated, 0, "budget must not be charged for error results");
+});
+
+test("wrapToolsWithResultBudget: image blocks pass through but charge Layer-2 budget", async () => {
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const image = img("base64payload", "image/png");
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [image])], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+
+  // Image must pass through untouched.
+  assert.equal(result.content.length, 1);
+  assert.equal(result.content[0]!.type, "image");
+  assert.equal(
+    (result.content[0] as { type: "image"; data: string }).data,
+    "base64payload",
+  );
+
+  // Image is flat-charged against Layer 2.
+  assert.equal(budget.accumulated, PER_IMAGE_TOKEN_ESTIMATE, "image charges PER_IMAGE_TOKEN_ESTIMATE");
+});
+
+test("wrapToolsWithResultBudget: multi-result turn stays within servingWindow − reserve", async () => {
+  const servingWindow = 100_000;
+  const reserve = 10_000;
+  const min = 1024;
+  // Leaves budget = 100000 - 80000 - 10000 = 10000 for the whole turn
+  const runningCtx = 80_000;
+  const budget = new TurnResultBudget(servingWindow, reserve, min);
+
+  // Three tools each returning ~5000 tokens — far more than the 10000 turn budget.
+  const tools = [
+    makeTool("t1", [txt(makeText(5000))]),
+    makeTool("t2", [txt(makeText(5000))]),
+    makeTool("t3", [txt(makeText(5000))]),
+  ];
+  const wrapped = wrapToolsWithResultBudget(tools, {
+    resultMaxTokens: 0, // Layer 1 disabled
+    turnBudget: budget,
+    getRunningContext: () => runningCtx,
+  });
+
+  const results = await Promise.all(
+    wrapped.map((w, i) => w!.execute(`id${i}`, {})),
+  );
+
+  // Every result must carry a visible truncation marker.
+  let truncatedCount = 0;
+  for (const r of results) {
+    const t = (r.content[0] as { type: "text"; text: string }).text;
+    if (t.includes("context budget")) truncatedCount++;
+  }
+  assert.ok(truncatedCount > 0, "at least one result must be truncated");
+
+  // Total tokens charged must not exceed budget + (N−1)×min (floor-overshoot bound).
+  const N = tools.length;
+  const maxAllowed = (servingWindow - runningCtx - reserve) + (N - 1) * min;
+  assert.ok(
+    budget.accumulated <= maxAllowed,
+    `accumulated (${budget.accumulated}) must be ≤ budget + (N-1)×min = ${maxAllowed}`,
+  );
+});
+
+test("wrapToolsWithResultBudget: resultMaxTokens=0 disables Layer 1, Layer 2 still active", async () => {
+  // Layer 1 off, Layer 2 gives only 2000 tokens.
+  const budget = new TurnResultBudget(
+    /* servingWindow */ 50_000,
+    /* reserve       */ 47_000,
+    /* min           */ 1024,
+  );
+  // budget = 50000 - 1000 - 47000 = 2000
+  const bigText = makeText(5000);
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 0,  // Layer 1 disabled
+    turnBudget: budget,
+    getRunningContext: () => 1_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+
+  // Must be truncated by Layer 2 (not Layer 1 which is off).
+  assert.ok(text.includes("context budget"), "Layer-2 marker must fire when Layer 1 is disabled");
+  // Must NOT carry a per-result-cap marker (Layer 1 is off).
+  assert.ok(!text.includes("per-result cap"), "Layer-1 marker must NOT fire when disabled");
+});
+
+test("wrapToolsWithResultBudget: onTruncation callback fires for truncated results", async () => {
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const bigText = makeText(500);
+  let callbackFired = false;
+  let capturedInfo: { tool: string; layer: string; fromTokens: number; toTokens: number } | undefined;
+
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt(bigText)])], {
+    resultMaxTokens: 30,  // Layer 1 fires
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+    onTruncation: (info) => {
+      callbackFired = true;
+      capturedInfo = info;
+    },
+  });
+
+  await wrapped!.execute("id", {});
+
+  assert.ok(callbackFired, "onTruncation must fire when a result is truncated");
+  assert.equal(capturedInfo!.tool, "t");
+  assert.equal(capturedInfo!.layer, "per-result");
+  assert.ok(capturedInfo!.fromTokens > capturedInfo!.toTokens, "fromTokens must exceed toTokens");
+  assert.ok(capturedInfo!.toTokens > 0, "toTokens must be positive");
+});
+
+test("wrapToolsWithResultBudget: onTruncation does not fire for non-truncated results", async () => {
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  let callbackFired = false;
+
+  const [wrapped] = wrapToolsWithResultBudget([makeTool("t", [txt("tiny")])], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+    onTruncation: () => { callbackFired = true; },
+  });
+
+  await wrapped!.execute("id", {});
+  assert.equal(callbackFired, false, "onTruncation must not fire for non-truncated results");
 });

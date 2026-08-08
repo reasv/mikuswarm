@@ -231,7 +231,7 @@ export function shapeContentBlocks(
  * `result_min_tokens` guarantees every result keeps a useful head.
  */
 export class TurnResultBudget {
-  private accumulated = 0;
+  private _accumulated = 0;
 
   constructor(
     /**
@@ -255,6 +255,11 @@ export class TurnResultBudget {
     readonly minTokens: number,
   ) {}
 
+  /** Total tokens charged against the current turn so far. Read by the wiring for observability. */
+  get accumulated(): number {
+    return this._accumulated;
+  }
+
   /**
    * Compute the allowance for the NEXT result given the current running-context
    * estimate.
@@ -266,7 +271,7 @@ export class TurnResultBudget {
    */
   allowance(runningContext: number): number {
     const budget = this.servingWindow - runningContext - this.reserveTokens;
-    return Math.max(budget - this.accumulated, this.minTokens);
+    return Math.max(budget - this._accumulated, this.minTokens);
   }
 
   /**
@@ -274,7 +279,7 @@ export class TurnResultBudget {
    * Call once per settled result: `textTokensShown + imageCount × PER_IMAGE_TOKEN_ESTIMATE`.
    */
   consume(tokens: number): void {
-    this.accumulated += tokens;
+    this._accumulated += tokens;
   }
 
   /**
@@ -283,6 +288,6 @@ export class TurnResultBudget {
    * start counting from zero again.
    */
   reset(): void {
-    this.accumulated = 0;
+    this._accumulated = 0;
   }
 }

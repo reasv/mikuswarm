@@ -35,6 +35,8 @@ import type {
   UserLimitEngine,
   UserLimitResolution,
 } from "../budget/index.js";
+import { TurnResultBudget } from "./tool-result-budget.js";
+import { wrapToolsWithResultBudget } from "./tool-result-wrap.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -599,6 +601,18 @@ export class AgentSessionFactory {
     // Fed to enforcement (below), the head model descriptor, and the text-editor
     // read budget (app.ts buildSessionTools, via the chain-aware resolver).
     const contextCeiling = fallback.operativeContextWindow;
+    // Tool-result budget knobs (spec TOOL-RESULT-BUDGET §7).
+    // Defaults match 00-defaults.toml; resolved once per session at creation.
+    const _toolsConfig = this.options.config.agent.tools;
+    const resultMaxTokens = _toolsConfig?.result_max_tokens ?? 16384;
+    const resultReserveTokens = _toolsConfig?.result_reserve_tokens ?? 32768;
+    const resultMinTokens = _toolsConfig?.result_min_tokens ?? 1024;
+    // servingWindow binding (spec TOOL-RESULT-BUDGET §4): the largest operative
+    // window any serving member offers. Until PER-MEMBER-CONTEXT-FITS lands, this
+    // is the composite operativeContextWindow. That branch swaps this one line to
+    // the max-member window at merge time; keep the swap surface to a single line.
+    const servingWindow = contextCeiling; // FITS-SWAP: replace with max-member window
+    const turnBudget = new TurnResultBudget(servingWindow, resultReserveTokens, resultMinTokens);
     // Representative (head) descriptor — initialState.model, the isQueueWaitPoint
     // key, and the ledger-fallback model id. The composite substitutes the chosen
     // member's descriptor + key per attempt.
@@ -863,6 +877,10 @@ export class AgentSessionFactory {
           // agree with the ledger under fallback / per-user model selection,
           // instead of freezing the session type's configured model.
           usage.record(message.usage, message.model ?? model.id);
+          // Tool-result budget reset (spec TOOL-RESULT-BUDGET §4): each committed
+          // LLM request starts a fresh tool-result turn; the accumulator resets so
+          // the next batch of tool calls gets the full per-turn budget again.
+          turnBudget.reset();
           if (userSelectionActive) {
             // Advance the prompt-cache baseline (spec §5.3): the just-committed
             // request's prompt is now the cached prefix for the NEXT request's
@@ -1267,11 +1285,42 @@ export class AgentSessionFactory {
     let toolCallCount = 0;
     const logger = this.options.logger;
 
+    // Wrap each filtered tool with the result-shaping layer (spec TOOL-RESULT-BUDGET §2).
+    // Simple per-session counter cap for truncation log rate-limiting: no existing
+    // rate-limited helper in this codebase fits this use case; 20 events/session
+    // prevents log floods while still catching the first burst (spec §6).
+    let _truncationLogCount = 0;
+    const wrappedTools = wrapToolsWithResultBudget(filteredTools, {
+      resultMaxTokens,
+      turnBudget,
+      getRunningContext: () => {
+        // refreshRunningContext() is synchronous; calling it here ensures the
+        // counter reflects any live messages appended since the last LLM request.
+        refreshRunningContext();
+        return ctxCounter.running;
+      },
+      onTruncation: logger
+        ? (info) => {
+            _truncationLogCount++;
+            if (_truncationLogCount <= 20) {
+              logger.info("tool_result_truncated", {
+                sessionId: session.id,
+                tool: info.tool,
+                layer: info.layer,
+                fromTokens: info.fromTokens,
+                toTokens: info.toTokens,
+                turnAccumulated: info.turnAccumulated,
+              });
+            }
+          }
+        : undefined,
+    });
+
     const agent = new Agent({
       initialState: {
         systemPrompt,
         model,
-        tools: filteredTools,
+        tools: wrappedTools,
         // Extended thinking (config `thinking_level`, default off): flows per
         // request as pi-ai `options.reasoning` through the whole streamFn chain
         // (retry → admission → streamSimple). The model descriptor's
