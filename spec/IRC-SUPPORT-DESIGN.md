@@ -156,8 +156,10 @@ already accepts any `[a-z0-9-]+` provider prefix:
 
 - Channel: `irc:<accountKey>:room:<#channel>` — channel name lowercased per
   the network's advertised `CASEMAPPING` for key stability. Channel names
-  containing `:` are rejected at key build (they do not occur in practice;
-  validated, per the §13 design check in the Discord spec).
+  containing `:` are rejected at key build — a belt-and-braces check: the
+  RFC 2812 channel grammar already excludes `:` (along with space, comma,
+  and ^G), so such names cannot occur on a conforming server (validated,
+  per the §13 design check in the Discord spec).
 - DM (query): `irc:<accountKey>:dm:<identity>` — where `<identity>` is the
   ladder result (§5): the services account name when known at first contact,
   else the casemapped nick.
@@ -197,8 +199,13 @@ else its nick).
 The budget-enforceability shape test: an IRC id is a services account name or
 nick — by RFC grammar it cannot begin with a digit and never begins with `@`.
 This is disjoint from Matrix ids (`@`-prefixed) and Discord ids (all-digit
-snowflakes), so the existing predicate style extends cleanly with a
-nick-grammar test.
+snowflakes), so the existing predicate style extends cleanly. The predicate
+must be **permissive**, not a strict RFC1459 grammar check: on
+`CASEMAPPING=precis` networks (Ergo) nicks and account names may be
+non-ASCII, so the test is "non-empty, no whitespace/NUL, not `@`-prefixed,
+not all-digit" — disjointness from Matrix and Discord is preserved either
+way. (A hypothetical all-digit precis nick would simply fail the shape test
+and not be recognized as a user identity — a safe, accepted edge.)
 
 ### 5.3 `user_identities`
 
@@ -257,9 +264,12 @@ field, as it is for Discord.
 
 ### 7.1 Library, connection, outbound
 
-- **Library**: `irc-framework` (the mature TS-friendly client The Lounge is
-  built on) — handles CAP negotiation, SASL PLAIN, line parsing/tags, and
-  reconnection primitives. Pure TypeScript; no NAPI module, unlike Matrix.
+- **Library**: `irc-framework` (the mature client Kiwi IRC and The Lounge
+  are built on) — handles CAP negotiation, SASL PLAIN, line parsing/tags,
+  and reconnection primitives. Plain JavaScript with no published type
+  definitions (no `types` field, no `@types/irc-framework`); the provider
+  ships a local `.d.ts` module declaration covering only the surface it
+  uses. No NAPI module, unlike Matrix.
 - **Connection**: one TCP/TLS connection per account. TLS default on
   (port 6697). On connect: CAP LS 302 → validate floor (§3.1) → SASL if
   configured → REQ floor + advertised opportunistic caps → register → join
@@ -269,7 +279,9 @@ field, as it is for Discord.
   payload per PRIVMSG is `512 − len("​:<own-hostmask> PRIVMSG <target> :\r\n")`.
   The provider learns its own hostmask post-registration (from the
   registration burst or a self-WHO) and computes the real per-target byte
-  budget, splitting on UTF-8 boundaries, preferring whitespace. The static
+  budget, recomputing it if the server later changes the bot's hostmask
+  (cloak application, `CHGHOST`), splitting on UTF-8 boundaries, preferring
+  whitespace. The static
   `maxMessageChars: 400` is the conservative tool-visible number; the
   byte-accurate splitter is the enforcement. Multi-line model output becomes
   multiple PRIVMSGs; `DeliveryReceipt.externalIds` carries all of them
@@ -330,9 +342,14 @@ provider pattern:
   (`* <nick> <action>`); it is a normal message event otherwise.
 - Other CTCP requests (VERSION, PING, …) are ignored — the bot is a chat
   participant, not a CTCP responder.
-- `NOTICE` → ingested into the timeline as a normal event but **never
-  triggers** (IRC convention: notices must not provoke automated responses).
-  Server notices (from the server itself, not a user) are not ingested.
+- `NOTICE` → in channels: ingested into the timeline as a normal event but
+  **never triggers** (IRC convention: notices must not provoke automated
+  responses; expressible as-is — the provider populates `trigger` on
+  `InboundChatEvent`, so it simply never sets one). In queries: **not
+  ingested** — query notices are overwhelmingly services chatter
+  (NickServ/ChanServ login and info notices), and ingesting them would mint
+  a junk DM timeline per pseudoclient on every connect. Server notices
+  (from the server itself, not a user) are never ingested anywhere.
 - `TAGMSG` → not ingested (`+typing` is ephemeral presence, not content).
 - `NICK` / `ACCOUNT` / `AWAY` / `CHGHOST` / `QUIT` / `JOIN` / `PART` →
   tracked-state and `user_identities` updates only; not timeline events.
@@ -507,6 +524,7 @@ type-checks and passes tests:
 - **Phase 2 — identity + DMs.** The ladder, `user_identities` writes, NICK
   tracking, WHOX account resolution, query timelines.
 - **Phase 3 — tool surface + touch points.** `ChannelClient`,
-  `IRC_TERMINOLOGY`, the five sites in §10.
+  `IRC_TERMINOLOGY`, the four code sites in §10 (the console row is
+  Phase 4).
 - **Phase 4 — polish.** Console chip/labels, ARCHITECTURE.md Providers
   section, this spec's status header flipped to IMPLEMENTED.
