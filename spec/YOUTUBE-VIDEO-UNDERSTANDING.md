@@ -88,11 +88,13 @@ operations, each a separate `yt-dlp` run:
    30–60s of video / at caption-group boundaries) so the agent can map transcript
    positions to `start_time` values for segment analysis. This synergy is the point of
    the two-tier design.
-3. **`download(videoId, startSec, durationSec)`** → one MP4 segment:
-   `yt-dlp --no-playlist --download-sections "*<start>-<end>" -f "bv*[height<=?<res>]+ba/b[height<=?<res>]" --merge-output-format mp4 --max-filesize <cap> -o <tmp>` —
-   `<res>` from `media.video.max_resolution` (the pipeline re-encodes to that anyway;
-   downloading more is waste), `<end> = start + media.video.max_duration_seconds`,
-   `<cap>` from `[youtube].max_download_bytes`. ffmpeg is already in the image
+3. **`download(videoId, opts)`** → one media file. `opts`: `startSec?`/`durationSec?`
+   (→ `--download-sections "*<start>-<end>"`; omitted = whole video), `maxHeight`
+   (→ `-f "bv*[height<=?<h>]+ba/b[height<=?<h>]" --merge-output-format mp4`),
+   `audioOnly?` (→ `-f ba -x --audio-format m4a`), `maxBytes` (→ `--max-filesize`),
+   `outPath`. One implementation serves both callers: the `media` analysis lane (§7:
+   segment cut at `media.video.max_resolution`/`max_duration_seconds`) and the
+   workspace file download (§6a). ffmpeg is already in the image
    (`--download-sections` requires it).
 
 Common flags on every run: `--no-playlist`, `--proxy <network.http_proxy_url>` (when
@@ -206,8 +208,9 @@ the generic preview path into a YouTube stage for eligible events:
 
 ## 6. `youtube_fetch` tool (T2)
 
-An `x_fetch`-family tool (`src/tools/youtube-fetch.ts`): ephemeral, windowed canonical
-text document, no DB writes.
+An `x_fetch`-family tool (`src/tools/youtube-fetch.ts`): ephemeral in the `x_fetch`
+sense — windowed canonical text document, no DB writes; downloads (§6a) are ordinary
+workspace files.
 
 - **Params**: `url` (any recognized form or bare 11-char id), `offset` (default 0),
   `max_chars` (default `[youtube.tool].default_max_chars` 4000, cap `max_chars_limit`
@@ -235,6 +238,30 @@ text document, no DB writes.
 - **Registration**: when `[youtube].enabled` and the binary probe passed. Persona docs
   (TOOLS.md/AGENTS.md) get the standard entry in the implementing change.
 - **Billing**: no LLM calls → nothing to bill. Subprocess runs are free.
+
+### 6a. Workspace file downloads
+
+**Decision (owner, 2026-08-01):** the agent can download YouTube videos as ordinary
+workspace files — useful for re-sharing via `send_message`, archiving, sandbox
+processing — without hand-driving yt-dlp over `bash`. This is `youtube_fetch`'s
+escalation step, mirroring `x_fetch`'s `download_media`:
+
+- **Params** (on `youtube_fetch`): `download: "video" | "audio"` switches the call
+  from document mode to download mode; optional `max_height` (default and cap
+  `[youtube.tool].download_max_height`, default 720), optional `clip_start` /
+  `clip_duration` (seconds → `--download-sections`) to save just a clip; omitted =
+  full video. `audio` grabs the best audio track as M4A (music use case).
+- **Destination**: `downloads/youtube/{videoId}/{sanitized-title-slug}[-<start>-<end>].{mp4|m4a}`
+  under the workspace — exclusive-create with collision suffixes, exactly the
+  `x_fetch` convention. Files are ordinary workspace files (agent/operator manage
+  cleanup, as with `downloads/x/`).
+- **Return**: metadata header + one line per saved file (workspace-relative path,
+  bytes, duration/resolution) — ready to pass to `send_message`, `media`, or sandbox
+  `bash`. No transcript document in download mode.
+- **Bounds**: `--max-filesize` from `[youtube].max_download_bytes` still applies; on
+  abort the error suggests lowering `max_height`, using `download: "audio"`, or
+  clipping. Same refusals as document mode (live/upcoming/playlists). No LLM cost;
+  disk is the only spend.
 
 ---
 
@@ -275,8 +302,9 @@ segment flows through `processVideoForInference` → video caption lane → capt
 - Visual analysis is agent-initiated, one ≤`max_duration_seconds` segment per call,
   billed to `tool_invocations`, inside the per-session cost ceiling and period budgets.
 - Downloads bounded: resolution-capped format selection, `--max-filesize`,
-  `--download-sections` (never the whole file), subprocess timeout, concurrency
-  semaphore.
+  subprocess timeout, concurrency semaphore; the analysis lane (§7) additionally
+  fetches only the needed `--download-sections` segment — whole-file downloads
+  happen only on explicit agent request (§6a) and land as ordinary workspace files.
 - Egress: confined to recognized YouTube URLs; proxy honored via `--proxy`; the
   partition means yt-dlp is never handed an arbitrary user URL.
 - Live/playlists/premieres refused; age-restricted fails with a clear message unless
@@ -303,6 +331,7 @@ thumbnail = true               # store+caption thumbnail as preview_media
 max_total_chars = 32768
 default_max_chars = 4000
 max_chars_limit = 16000
+download_max_height = 720      # default + cap for workspace file downloads (§6a)
 ```
 
 Validation: windowing cross-field check as in `[fxtwitter.tool]`;
@@ -317,7 +346,9 @@ Validation: windowing cross-field check as in `[fxtwitter.tool]`;
   degrade, disabled-path passthrough, eligibility gate (trigger-group vs not,
   `enrich_all`, assistant per captioning config), thumbnail asset row.
 - `youtube_fetch`: document layout, windowing/offset math, `t=`-anchored offset,
-  no-transcript document, config validation.
+  no-transcript document, config validation; download mode — arg mapping
+  (video/audio/clip/max_height clamp), title-slug sanitization + collision
+  suffixes, size-abort error text.
 - `media` routing: recognized-URL branch, synthesized truncation warning, cache key,
   billing row.
 - Renderer: full + compact tiers, untrusted wrapping.
