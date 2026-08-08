@@ -19,6 +19,13 @@
  *   - validateAgentConfig: path-unsafe account key → hard error in agents mode, warn-only in legacy
  *   - EnrichmentWorkerPool: defense-in-depth subdir guard skips download (§4.3) when subdir is unsafe
  *   - CaptionWorkerPool: missing timeline_key in agents mode → fail without retry, no fallback root
+ *
+ * Phase 2 per-agent captioning (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+ *   - CaptionWorker.process: clientsOverride used over constructor clients
+ *   - CaptionWorker.process: clientsOverride used on the animated-image fallback path
+ *   - CaptionWorkerPool: resolveClient + resolveAgentName routes per-agent clients
+ *   - CaptionWorkerPool: without resolveClient — legacy static clients map unchanged
+ *   - Teardown: all distinct clients stopped exactly once
  */
 
 import assert from "node:assert/strict";
@@ -573,6 +580,43 @@ const TINY_PNG = Buffer.from(
   "base64",
 );
 
+// Minimal 2-frame 1×1 animated GIF (white then black, 10 cs/frame, loop forever).
+// Constructed from raw GIF89a bytes; sharp 0.34+ / libvips detect metadata.pages = 2,
+// which triggers CaptionWorker's isAnimatedImage → processAnimatedImage path.
+const TINY_ANIMATED_GIF = Buffer.from([
+  // Header
+  0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+  // Logical Screen Descriptor
+  0x01, 0x00, // width = 1
+  0x01, 0x00, // height = 1
+  0x80,       // GCT present (1 bit), color res = 0, sort = 0, GCT size = 0 (2 colors)
+  0x00,       // background color index = 0
+  0x00,       // pixel aspect ratio = 0
+  // Global Color Table (2 entries × 3 bytes)
+  0xFF, 0xFF, 0xFF, // color 0: white
+  0x00, 0x00, 0x00, // color 1: black
+  // Netscape Application Extension (infinite loop)
+  0x21, 0xFF, 0x0B,
+  0x4E, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45, 0x32, 0x2E, 0x30, // NETSCAPE2.0
+  0x03, 0x01, 0x00, 0x00, // sub-block: size=3, id=1, loop count=0 (forever)
+  0x00,       // block terminator
+  // Frame 1 — Graphic Control Extension
+  0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00,
+  // Frame 1 — Image Descriptor (1×1 at 0,0, no local color table)
+  0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+  // Frame 1 — Image Data: LZW min code size=2, 2-byte block (pixel index 0 = white)
+  // LZW stream (3-bit codes, LSB-first): Clear(4) Pixel0(0) EOI(5) → 0x44 0x01
+  0x02, 0x02, 0x44, 0x01, 0x00,
+  // Frame 2 — Graphic Control Extension
+  0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00,
+  // Frame 2 — Image Descriptor
+  0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+  // Frame 2 — Image Data: LZW stream: Clear(4) Pixel1(1) EOI(5) → 0x4C 0x01
+  0x02, 0x02, 0x4C, 0x01, 0x00,
+  // Trailer
+  0x3B,
+]);
+
 // ---------------------------------------------------------------------------
 // CaptionWorker.process — workspaceRootOverride resolves pre-existing flat paths
 // ---------------------------------------------------------------------------
@@ -1045,4 +1089,415 @@ test("CaptionWorkerPool §4.3: missing timeline_key in agents mode fails without
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 per-agent captioning: CaptionWorker.process clientsOverride
+// ---------------------------------------------------------------------------
+
+test("CaptionWorker.process: clientsOverride takes precedence over constructor clients", async () => {
+  const root = await makeWorkspace();
+  try {
+    const flatFilename = "PERAGT01.png";
+    const flatPath = path.join(root, "msg-attach", flatFilename);
+    await writeFile(flatPath, TINY_PNG);
+
+    const asset: MediaAssetRow = {
+      id: "asset-clientsoverride",
+      event_id: "matrix:miku:$evt",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/png",
+      size_bytes: TINY_PNG.length,
+      original_filename: flatFilename,
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: `msg-attach/${flatFilename}`,
+      created_at: Date.now(),
+    };
+
+    const constructorCalls: string[] = [];
+    const overrideCalls: string[] = [];
+
+    const constructorClient = {
+      caption: async (_params: { filePath: string }) => {
+        constructorCalls.push("constructor");
+        return { caption: "from-constructor", model: "m", logicalModelId: "m", provider: null, usage: null, cost: null };
+      },
+    };
+    const overrideClient = {
+      caption: async (_params: { filePath: string }) => {
+        overrideCalls.push("override");
+        return { caption: "from-override", model: "m-override", logicalModelId: "m-override", provider: null, usage: null, cost: null };
+      },
+    };
+
+    const mockStorage = { updateCaptionResult: async () => {} } as unknown as Storage;
+
+    const worker = new CaptionWorker({
+      storage: mockStorage,
+      clients: new Map([["image" as const, constructorClient as never]]),
+      workspaceRoot: root,
+    });
+
+    // Without override: constructor client used
+    await worker.process(asset, root);
+    assert.equal(constructorCalls.length, 1, "constructor client called without override");
+    assert.equal(overrideCalls.length, 0, "override client NOT called without override");
+
+    // With override: override client must be used
+    await worker.process(asset, root, new Map([["image" as const, overrideClient as never]]));
+    assert.equal(constructorCalls.length, 1, "constructor client NOT called with override");
+    assert.equal(overrideCalls.length, 1, "override client called when clientsOverride provided");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CaptionWorker.process: clientsOverride used on animated-image fallback path", async () => {
+  // Pin the animated-image code path: an asset whose file sharp detects as
+  // multi-frame (metadata.pages > 1) triggers processAnimatedImage, which selects
+  // its caption client from the effective (override) clients map, not the
+  // constructor's.  The test uses image+video clients in both maps so it is
+  // robust regardless of whether ffmpeg is available at test time (video client
+  // used when ffmpeg converts the GIF to MP4; image client used via first-frame
+  // fallback when ffmpeg is absent).
+  const root = await makeWorkspace();
+  try {
+    const animatedFilename = "ANIM0001.gif";
+    const animatedPath = path.join(root, "msg-attach", animatedFilename);
+    await writeFile(animatedPath, TINY_ANIMATED_GIF);
+
+    const asset: MediaAssetRow = {
+      id: "asset-animated-clientsoverride",
+      event_id: "matrix:miku:$evt-anim",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/gif",
+      size_bytes: TINY_ANIMATED_GIF.length,
+      original_filename: animatedFilename,
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: `msg-attach/${animatedFilename}`,
+      created_at: Date.now(),
+    };
+
+    // Four distinct stub clients — identity-distinguishable by the string they push.
+    const calledFrom: string[] = [];
+    function makeStubClient(id: string) {
+      return {
+        caption: async (_params: { filePath: string }) => {
+          calledFrom.push(id);
+          return { caption: `from-${id}`, model: id, logicalModelId: id, provider: null, usage: null, cost: null };
+        },
+      };
+    }
+
+    const constructorImageClient = makeStubClient("constructor-image");
+    const constructorVideoClient = makeStubClient("constructor-video");
+    const overrideImageClient  = makeStubClient("override-image");
+    const overrideVideoClient  = makeStubClient("override-video");
+
+    const constructorClients = new Map<"image" | "video" | "audio", ReturnType<typeof makeStubClient>>([
+      ["image", constructorImageClient],
+      ["video", constructorVideoClient],
+    ]);
+    const overrideClients = new Map<"image" | "video" | "audio", ReturnType<typeof makeStubClient>>([
+      ["image", overrideImageClient],
+      ["video", overrideVideoClient],
+    ]);
+
+    const mockStorage = { updateCaptionResult: async () => {} } as unknown as Storage;
+
+    const worker = new CaptionWorker({
+      storage: mockStorage,
+      clients: constructorClients as never,
+      workspaceRoot: root,
+    });
+
+    await worker.process(asset, root, overrideClients as never);
+
+    // processAnimatedImage must have been invoked (the animated branch was taken).
+    // The caption call must land on an override client — either override-video
+    // (if ffmpeg converted the GIF to MP4) or override-image (first-frame fallback
+    // when ffmpeg is absent) — never on either constructor client.
+    assert.equal(calledFrom.length, 1, "exactly one caption call should be made on the animated path");
+    assert.ok(
+      calledFrom[0] === "override-image" || calledFrom[0] === "override-video",
+      `caption must land on an override client (got: "${calledFrom[0]}")`,
+    );
+    assert.ok(
+      !calledFrom.includes("constructor-image") && !calledFrom.includes("constructor-video"),
+      "constructor clients must never be used when clientsOverride is provided",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 per-agent captioning: CaptionWorkerPool resolveClient + resolveAgentName
+// ---------------------------------------------------------------------------
+
+test("CaptionWorkerPool: resolveClient routes different clients to different agent assets", async () => {
+  const base = await makeTempDir();
+  try {
+    const wsAlice = await makeWorkspace(base);
+    const wsBob = await makeWorkspace(base);
+
+    // Write PNG files in agents' workspaces
+    const aliceSubdir = path.join(wsAlice, "msg-attach", "matrix.alice");
+    const bobSubdir = path.join(wsBob, "msg-attach", "matrix.bob");
+    await mkdir(aliceSubdir, { recursive: true });
+    await mkdir(bobSubdir, { recursive: true });
+
+    const aliceFile = path.join(aliceSubdir, "ALICE0002.png");
+    const bobFile = path.join(bobSubdir, "BOB00002.png");
+    await writeFile(aliceFile, TINY_PNG);
+    await writeFile(bobFile, TINY_PNG);
+
+    const aliceAsset: MediaAssetRow = {
+      id: "asset-alice-p2",
+      event_id: "matrix:alice:$evt1",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/png",
+      size_bytes: TINY_PNG.length,
+      original_filename: "ALICE0002.png",
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: "msg-attach/matrix.alice/ALICE0002.png",
+      timeline_key: "matrix:alice:room:!room:example.org",
+      created_at: Date.now(),
+    };
+    const bobAsset: MediaAssetRow = {
+      id: "asset-bob-p2",
+      event_id: "matrix:bob:$evt2",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/png",
+      size_bytes: TINY_PNG.length,
+      original_filename: "BOB00002.png",
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: "msg-attach/matrix.bob/BOB00002.png",
+      timeline_key: "matrix:bob:room:!room:example.org",
+      created_at: Date.now(),
+    };
+
+    // Track which client was used for each asset
+    const clientUsed: string[] = [];
+
+    // Alice gets a custom client; Bob gets the baseline client
+    const aliceClient = {
+      caption: async (_params: { filePath: string }) => {
+        clientUsed.push("alice-custom");
+        return { caption: "alice-caption", model: "alice-model", logicalModelId: "alice-model", provider: null, usage: null, cost: null };
+      },
+    };
+    const baselineClient = {
+      caption: async (_params: { filePath: string }) => {
+        clientUsed.push("baseline");
+        return { caption: "baseline-caption", model: "baseline-model", logicalModelId: "baseline-model", provider: null, usage: null, cost: null };
+      },
+    };
+
+    const storage = makeCaptionStorage({ assets: [aliceAsset, bobAsset] });
+
+    const pool = new CaptionWorkerPool({
+      storage: storage as unknown as Storage,
+      // Static clients map (not used — resolveClient takes precedence when set)
+      clients: new Map([["image" as const, baselineClient as never]]),
+      workspaceRoot: "/nonexistent/legacy-root",
+      resolveWorkspaceRoot: (timelineKey: string) => {
+        if (timelineKey.startsWith("matrix:alice:")) return wsAlice;
+        if (timelineKey.startsWith("matrix:bob:")) return wsBob;
+        return undefined;
+      },
+      resolveAgentName: (timelineKey: string) => {
+        if (timelineKey.startsWith("matrix:alice:")) return "alice";
+        if (timelineKey.startsWith("matrix:bob:")) return "bob";
+        return null;
+      },
+      resolveClient: (agentName, modality) => {
+        if (agentName === "alice" && modality === "image") return aliceClient as never;
+        return baselineClient as never;
+      },
+      config: { worker_count: 1, caption_all: true } as CaptionConfig,
+      logger: noopLogger(),
+    });
+
+    await pool.start();
+    await new Promise<void>((resolve) => setTimeout(resolve, 800));
+    await pool.stop();
+
+    assert.equal(clientUsed.length, 2, "both assets captioned");
+    assert.ok(clientUsed.includes("alice-custom"), "alice asset used alice-custom client");
+    assert.ok(clientUsed.includes("baseline"), "bob asset used baseline client (no override)");
+    assert.equal(storage._updates.length, 2, "both captions persisted");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("CaptionWorkerPool: resolveClient called with null agentName for __legacy__-sentinel entries", async () => {
+  // When resolveAgentName returns null (e.g. a __legacy__ sentinel entry), resolveClient
+  // must be called with null — the baseline client is returned and the asset is captioned.
+  const root = await makeWorkspace();
+  try {
+    const testFile = path.join(root, "msg-attach", "LEGACY01.png");
+    await writeFile(testFile, TINY_PNG);
+
+    const asset: MediaAssetRow = {
+      id: "asset-legacy-sentinel",
+      event_id: "matrix:miku:$evt",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/png",
+      size_bytes: TINY_PNG.length,
+      original_filename: "LEGACY01.png",
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: "msg-attach/LEGACY01.png",
+      timeline_key: "matrix:miku:room:!room:example.org",
+      created_at: Date.now(),
+    };
+
+    const agentNamesReceived: Array<string | null> = [];
+    const baselineClient = {
+      caption: async (_params: { filePath: string }) => {
+        return { caption: "x", model: "m", logicalModelId: "m", provider: null, usage: null, cost: null };
+      },
+    };
+
+    const storage = makeCaptionStorage({ assets: [asset] });
+
+    const pool = new CaptionWorkerPool({
+      storage: storage as unknown as Storage,
+      clients: new Map([["image" as const, baselineClient as never]]),
+      workspaceRoot: root,
+      resolveWorkspaceRoot: (_timelineKey: string) => root,
+      resolveAgentName: (_timelineKey: string) => null, // __legacy__ sentinel → null
+      resolveClient: (agentName, _modality) => {
+        agentNamesReceived.push(agentName);
+        return baselineClient as never;
+      },
+      config: { worker_count: 1, caption_all: true } as CaptionConfig,
+      logger: noopLogger(),
+    });
+
+    await pool.start();
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    await pool.stop();
+
+    assert.ok(agentNamesReceived.length > 0, "resolveClient was called");
+    assert.ok(
+      agentNamesReceived.every((n) => n === null),
+      `resolveClient must be called with null for __legacy__ sentinel (got: ${JSON.stringify(agentNamesReceived)})`,
+    );
+    assert.equal(storage._updates.length, 1, "asset captioned via baseline client");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CaptionWorkerPool: without resolveClient — static clients map used (legacy invariance)", async () => {
+  // When resolveClient and resolveAgentName are both absent, the static clients map
+  // is used for every asset — legacy and no-override invariance.
+  const root = await makeWorkspace();
+  try {
+    const testFile = path.join(root, "msg-attach", "STATIC01.png");
+    await writeFile(testFile, TINY_PNG);
+
+    const asset: MediaAssetRow = {
+      id: "asset-static-clients",
+      event_id: "matrix:miku:$evt",
+      role: "attachment",
+      source_index: 0,
+      media_type: "image",
+      mime_type: "image/png",
+      size_bytes: TINY_PNG.length,
+      original_filename: "STATIC01.png",
+      download_status: "complete",
+      caption_status: "pending",
+      local_path: "msg-attach/STATIC01.png",
+      created_at: Date.now(),
+    };
+
+    let staticClientCalled = false;
+    const staticClient = {
+      caption: async (_params: { filePath: string }) => {
+        staticClientCalled = true;
+        return { caption: "x", model: "m", logicalModelId: "m", provider: null, usage: null, cost: null };
+      },
+    };
+
+    const storage = makeCaptionStorage({ assets: [asset] });
+
+    const pool = new CaptionWorkerPool({
+      storage: storage as unknown as Storage,
+      clients: new Map([["image" as const, staticClient as never]]),
+      workspaceRoot: root,
+      // resolveClient and resolveAgentName intentionally absent
+      config: { worker_count: 1, caption_all: true } as CaptionConfig,
+      logger: noopLogger(),
+    });
+
+    await pool.start();
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    await pool.stop();
+
+    assert.ok(staticClientCalled, "static clients map used when resolveClient is absent");
+    assert.equal(storage._updates.length, 1, "asset captioned via static client");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 per-agent captioning: teardown covers all distinct clients once
+// ---------------------------------------------------------------------------
+
+test("Phase 2 teardown: allCaptionClients Set stops each distinct client exactly once", () => {
+  // Simulates the allCaptionClients Set behaviour: baseline + per-agent instances,
+  // with reference deduplication (same instance added twice → stopped once).
+  const stopCounts = new Map<string, number>();
+
+  function makeStoppableClient(id: string) {
+    return {
+      stop() { stopCounts.set(id, (stopCounts.get(id) ?? 0) + 1); },
+    };
+  }
+
+  const baselineImage = makeStoppableClient("baseline-image");
+  const baselineVideo = makeStoppableClient("baseline-video");
+  const baselineAudio = makeStoppableClient("baseline-audio");
+  const agentImageOverride = makeStoppableClient("agent-image-override");
+
+  // allCaptionClients: baseline clients + the distinct per-agent override.
+  // When same-ref, the baseline instance is already in the Set → no duplicate.
+  const allCaptionClients = new Set([
+    baselineImage,
+    baselineVideo,
+    baselineAudio,
+    agentImageOverride,
+  ]);
+
+  for (const client of allCaptionClients) client.stop();
+
+  assert.equal(stopCounts.get("baseline-image"), 1, "baseline-image stopped exactly once");
+  assert.equal(stopCounts.get("baseline-video"), 1, "baseline-video stopped exactly once");
+  assert.equal(stopCounts.get("baseline-audio"), 1, "baseline-audio stopped exactly once");
+  assert.equal(stopCounts.get("agent-image-override"), 1, "agent-image-override stopped exactly once");
+
+  // Set deduplication: adding the same instance twice → still stopped only once.
+  const shared = makeStoppableClient("shared");
+  const setWithDup = new Set([shared, shared]);
+  for (const c of setWithDup) c.stop();
+  assert.equal(stopCounts.get("shared"), 1, "same instance added twice to Set → stopped exactly once");
 });

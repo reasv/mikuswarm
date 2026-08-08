@@ -992,52 +992,123 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // image-block path all use the same defaults.
   const inferenceImageOptions = buildInferenceImageOptions(mediaImageConfig);
 
-  const captionClients = new Map<MediaModality, InferenceClient>([
-    ["image", new InferenceClient({
-      modality: "image",
-      chain: resolveModalityChain(imageConfig),
-      prompt: imageConfig.prompt ?? "Describe the image.",
-      maxChars: imageConfig.max_chars ?? 500,
-      maxTokens: imageConfig.max_tokens ?? 2048,
-      scheduler: llmScheduler,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
-      imageProcessing: inferenceImageOptions,
-    })],
-    ["video", new InferenceClient({
-      modality: "video",
-      chain: resolveModalityChain(videoConfig),
-      prompt: videoConfig.prompt ?? "Describe the video.",
-      maxChars: videoConfig.max_chars ?? 500,
-      maxTokens: videoConfig.max_tokens ?? 2048,
-      scheduler: llmScheduler,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
-      timeoutMs: videoConfig.timeout_ms,
-      videoProcessing: {
-        maxResolution: mediaVideoConfig.max_resolution ?? 480,
-        maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
-        maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
-        gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
-        x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
-        cachePath: mediaCachePath,
-        cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
-        cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
-      },
-    })],
-    ["audio", new InferenceClient({
+  // Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §8): built once
+  // from config at startup; all four resolvers are pure O(1) lookups over the
+  // precomputed per-agent map. Moved here (before the captionClients block) so the
+  // captioning ladder resolvers are available during per-agent client construction;
+  // still passed into the factory below for the chat-lane ladder (§4).
+  const agentModelOverrides = buildAgentModelOverrides(config);
+
+  // Per-modality processing options — extracted so they can be reused verbatim
+  // when building per-agent InferenceClients (spec PER-AGENT-MODEL-OVERRIDES §3:
+  // "only the model *reference* is overridable — never the surrounding behavioral
+  // settings"). Prompt, maxChars, maxTokens, and media-processing options all
+  // come from the GLOBAL captioning config; only the chain differs per agent.
+  const captionVideoProcessing = {
+    maxResolution: mediaVideoConfig.max_resolution ?? 480,
+    maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
+    maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
+    gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
+    x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
+    cachePath: mediaCachePath,
+    cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
+    cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
+  };
+  const captionAudioProcessing = {
+    maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
+    maxDurationSeconds: mediaAudioConfig.max_duration_seconds ?? 300,
+  };
+
+  // Build an InferenceClient for the given modality and chain. All behavioral
+  // options (prompt, maxChars, maxTokens, scheduler, media processing) come from
+  // the global captioning config; only `chain` varies per-agent (§3).
+  function buildCaptionClient(modality: MediaModality, chain: ReturnType<typeof resolveModalityChain>): InferenceClient {
+    if (modality === "image") {
+      return new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: imageConfig.prompt ?? "Describe the image.",
+        maxChars: imageConfig.max_chars ?? 500,
+        maxTokens: imageConfig.max_tokens ?? 2048,
+        scheduler: llmScheduler,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        imageProcessing: inferenceImageOptions,
+      });
+    }
+    if (modality === "video") {
+      return new InferenceClient({
+        modality: "video",
+        chain,
+        prompt: videoConfig.prompt ?? "Describe the video.",
+        maxChars: videoConfig.max_chars ?? 500,
+        maxTokens: videoConfig.max_tokens ?? 2048,
+        scheduler: llmScheduler,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        timeoutMs: videoConfig.timeout_ms,
+        videoProcessing: captionVideoProcessing,
+      });
+    }
+    // audio
+    return new InferenceClient({
       modality: "audio",
-      chain: resolveModalityChain(audioConfig),
+      chain,
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
       isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: audioConfig.timeout_ms,
-      audioProcessing: {
-        maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
-        maxDurationSeconds: mediaAudioConfig.max_duration_seconds ?? 300,
-      },
-    })],
+      audioProcessing: captionAudioProcessing,
+    });
+  }
+
+  // Baseline (global) per-modality clients — identical to today's construction.
+  const captionClients = new Map<MediaModality, InferenceClient>([
+    ["image", buildCaptionClient("image", resolveModalityChain(imageConfig))],
+    ["video", buildCaptionClient("video", resolveModalityChain(videoConfig))],
+    ["audio", buildCaptionClient("audio", resolveModalityChain(audioConfig))],
   ]);
+
+  // All distinct InferenceClients for teardown (baseline + any per-agent).
+  // Clients sharing a chain ref with the baseline reuse the SAME instance and
+  // must not be stopped twice — this Set enforces exactly-once teardown.
+  const allCaptionClients = new Set<InferenceClient>(captionClients.values());
+
+  // Per-agent client map (spec PER-AGENT-MODEL-OVERRIDES Phase 2): built only for
+  // agents that have a [agents.<name>.models.captioning] override AND whose
+  // resolved model ref for at least one modality differs from the baseline.
+  // Same ref → reuse the baseline client (no allocation, no duplicate teardown).
+  // Agents with no captioning override section are not entered here; the resolver
+  // below falls through to the baseline for them (correct — see §4 subtlety note).
+  const perAgentCaptionClients = new Map<string, Map<MediaModality, InferenceClient>>();
+  if (agentWorkspaces.length > 0 && config.agents) {
+    const captionModalities: readonly MediaModality[] = ["image", "video", "audio"] as const;
+    for (const agentName of Object.keys(config.agents)) {
+      if (!config.agents[agentName]?.models?.captioning) continue;
+      const agentMap = new Map<MediaModality, InferenceClient>();
+      for (const modality of captionModalities) {
+        const agentRef = agentModelOverrides.resolveCaptionModelRef(agentName, modality);
+        const baselineRef = agentModelOverrides.resolveCaptionModelRef(null, modality);
+        if (agentRef === baselineRef) continue; // same chain → reuse baseline
+        const agentChain = resolveModelChain(agentRef, config.models);
+        const agentClient = buildCaptionClient(modality, agentChain);
+        agentMap.set(modality, agentClient);
+        allCaptionClients.add(agentClient);
+      }
+      if (agentMap.size > 0) perAgentCaptionClients.set(agentName, agentMap);
+    }
+  }
+
+  // Caption client resolver: returns the per-agent client when the agent has an
+  // override that differs from the baseline chain; baseline otherwise.
+  // null agentName → always baseline (legacy mode or unresolvable → treated as global).
+  function resolveAgentCaptionClient(agentName: string | null, modality: MediaModality): InferenceClient {
+    if (agentName !== null) {
+      const agentClient = perAgentCaptionClients.get(agentName)?.get(modality);
+      if (agentClient) return agentClient;
+    }
+    return captionClients.get(modality)!;
+  }
 
   const defaultPrompts = new Map<MediaModality, string>([
     ["image", imageConfig.prompt ?? "Describe the image."],
@@ -1123,6 +1194,22 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // timeline_key so local_path is expanded against the correct workspace.
     resolveWorkspaceRoot: agentWorkspaces.length > 0
       ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+      : undefined,
+    // Per-asset agent-name resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // companion to resolveWorkspaceRoot — provided in agents mode so the pool
+    // can forward the agentName to resolveClient for per-agent client selection.
+    resolveAgentName: agentWorkspaces.length > 0
+      ? (timelineKey) => {
+          const entry = resolveWorkspaceForTimeline(timelineKey);
+          if (!entry) return null;
+          return entry.agentName === "__legacy__" ? null : entry.agentName;
+        }
+      : undefined,
+    // Per-asset caption client resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // only injected in agents mode so the pool picks the correct InferenceClient
+    // per (agentName, modality). Absent in legacy mode → static clients map used.
+    resolveClient: agentWorkspaces.length > 0
+      ? resolveAgentCaptionClient
       : undefined,
     config: config.captioning ?? {},
     onComplete: (eventId) => {
@@ -1375,12 +1462,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return undefined;
     }
   }
-
-  // Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §8): built once
-  // from config at startup; all four resolvers are pure O(1) lookups over the
-  // precomputed per-agent map. Passed into the factory so every session launched
-  // through the factory resolves through the chat-lane ladder (§4).
-  const agentModelOverrides = buildAgentModelOverrides(config);
 
   const factory = new AgentSessionFactory({
     config,
@@ -4088,6 +4169,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           })
       : undefined;
 
+    // Per-session caption client map (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // routes each modality to the session's agent's override client, or baseline.
+    // In legacy mode (agentWorkspaces.length === 0), sessionAgentName is always null
+    // and resolveAgentCaptionClient returns the baseline → use captionClients directly.
+    const sessionCaptionClients = agentWorkspaces.length > 0
+      ? new Map<MediaModality, InferenceClient>([
+          ["image", resolveAgentCaptionClient(sessionAgentName, "image")],
+          ["video", resolveAgentCaptionClient(sessionAgentName, "video")],
+          ["audio", resolveAgentCaptionClient(sessionAgentName, "audio")],
+        ] as Array<[MediaModality, InferenceClient]>)
+      : captionClients;
+
     return [
       createSendMessageTool({
         provider: sessionProvider,
@@ -4225,7 +4318,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       ...(sessionSandbox ? [createBashTool({ sandbox: sessionSandbox, defaultTimeoutMs: sessionSandboxTimeoutMs })] : []),
       createMediaTool({
         workspaceRoot: sessionWsRoot,
-        clients: captionClients,
+        // Per-session caption clients (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+        // routes each modality to the session's agent's override, or baseline.
+        clients: sessionCaptionClients,
         defaultPrompts,
         modelHasVision: replyModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
@@ -4258,7 +4353,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // When the default model lacks vision, `preview` describes the asset via
         // the captioning model instead of emitting an unusable image block.
         modelHasVision: replyModelSeesImages,
-        imageCaptionClient: captionClients.get("image"),
+        // Per-session caption client (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+        imageCaptionClient: resolveAgentCaptionClient(sessionAgentName, "image"),
         // Auxiliary usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one
         // tool_invocations row per non-vision preview caption, feeding the §8d
         // cost ceiling.
@@ -4348,7 +4444,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
             // Reuse the image caption model — the exact `media`-tool path (§5).
-            imageCaptionClient: captionClients.get("image"),
+            // Per-session caption client (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+            imageCaptionClient: resolveAgentCaptionClient(sessionAgentName, "image"),
             fetchClient,
             downloadSizeLimit,
             httpProxyUrl: config.network?.http_proxy_url,
@@ -6350,7 +6447,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // probe during a caption-model outage would otherwise block until the
         // far-later `llmScheduler.stop()` rejects it (a capped-backoff probe
         // window stall). Stopping the clients first rejects those queued waiters now.
-        for (const client of captionClients.values()) client.stop();
+        // allCaptionClients is a Set of all DISTINCT clients (baseline + per-agent),
+        // so each client is stopped exactly once even when agents share a baseline
+        // instance (spec PER-AGENT-MODEL-OVERRIDES Phase 2 teardown).
+        for (const client of allCaptionClients) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (diaryPool) await diaryPool.stop();
