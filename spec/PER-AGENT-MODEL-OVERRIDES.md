@@ -250,7 +250,103 @@ All three open design decisions were resolved by owner sign-off on 2026-08-08
 (recorded in the status header): full role coverage in v1, strict same-rung
 shadowing for the captioning ladder, and the `[agents.<name>.models]` key name.
 
-## 11. Testing
+## 11. Implementation plan
+
+Verified seams (line refs at `2a2547a`). Phases are ordered so each lands
+compiling with tests green; they can ship as one PR or as sequential commits.
+
+### Phase 0 — schema, ladder module, validation
+
+1. **Schema** (`src/config/schema.ts`): add `AgentModelsSchema` (StrictObject)
+   with optional sub-tables — `session_types: Record<string, string>`,
+   `captioning: { model?, image?, video?, audio? }`,
+   `image_gen: { pro?, flash? }`, `x_search: { model?, deep_model? }` — and add
+   `models: Type.Optional(AgentModelsSchema)` to `AgentBlockSchema`
+   (schema.ts:770–798).
+2. **Ladder module** (`src/agent/agent-model-overrides.ts`, new): a pure module
+   that precomputes a per-agent override table from `AppConfig` and exposes the
+   §4 ladders — `resolveSessionTypeModelRef(agentName | null, sessionType)`,
+   `resolveCaptionModelRef(agentName | null, modality)`,
+   `resolveImageGenRef(agentName | null, tier)`,
+   `resolveXSearchRef(agentName | null, tier)`. `null` agent = legacy/global
+   passthrough. Every consumer goes through this module — the ladder semantics
+   live in exactly one place and are unit-testable in isolation.
+3. **Validation**: extend `validateAgentConfig` (app.ts, §4c cross-field guard)
+   with all §7 checks — `resolveModelChain` per override value, session-type
+   key existence, unconfigured-subsystem rejection, `summaries_from` conflict —
+   and run the per-role capability/`context_window` fail-fasts (today at
+   app.ts:1764/1984 for the global roles) across every agent's overrides.
+
+### Phase 1 — chat lane (the bulk)
+
+4. **Factory injection**: add `resolveAgentName?: (timelineKey) => string | null`
+   to `AgentFactoryOptions` (mirroring the existing `resolveWorkspaceRoot`
+   member, factory.ts:466) plus the precomputed override table. In `create()`,
+   the model pick at factory.ts:481 becomes a ladder call with the session's
+   agent; `resolveSessionType` itself stays untouched (behavioral session-type
+   config remains global).
+5. **Helper widening** — the mechanical sweep. `resolveModelId`,
+   `resolveLogicalModelId`, `resolveModelChainLogicalIds` (factory.ts:401–430)
+   gain an optional timeline-key/agent argument; without it they resolve the
+   global ladder (legacy callers unchanged). Thread the timeline key at every
+   agents-mode call site — each already has it in scope:
+   - placeholder seeding + admission gates: app.ts:5320–5432, 4435–4437, 4683,
+     5232, 5603, 5767
+   - proactive model resolution: app.ts:6478–6483
+   - diary provenance stamps: `src/diary/worker-pool.ts:380, 442` (job deps
+     already carry the timeline key)
+   - **budget-engine callbacks**: widen the three callback signatures in
+     `BudgetEngineOptions` (src/budget/engine.ts:165–181), thread the timeline
+     key through the engine's internal gate call sites, and update the wiring
+     at app.ts:1459–1490 and the dependency-cascade resolver at
+     app.ts:1792–1825. This is the largest diff surface; it must be exhaustive
+     (grep for the three method names) or an agent-scoped `[[limits]].models`
+     rule would gate against the wrong model.
+6. No change to `resolveUserSelection` / per-user composites (§4: the metered
+   lane is untouched).
+
+### Phase 2 — captioning
+
+7. **Per-agent clients**: the per-modality `InferenceClient` map
+   (app.ts:994–1004) becomes baseline clients plus per-agent clients built only
+   for agents with captioning overrides (the client is a thin wrapper over the
+   shared scheduler; count is small). Chain per client comes from the Phase 0
+   ladder. Teardown loop (app.ts:6287) covers all of them.
+8. **Enrichment-time pool**: inject a `(agentName | null, modality) => client`
+   resolver into `CaptionWorkerPool` (app.ts:1118) — the pool already resolves
+   the owning agent per asset for workspace paths (§4c); reuse that resolution.
+9. **Session-tool sites**: the `media` tool (app.ts:4176), danbooru preview
+   (app.ts:4209), and x_search's `imageCaptionClient` (app.ts:4299) pick the
+   session agent's client inside `buildSessionTools`.
+
+### Phase 3 — image_gen / x_search
+
+10. Both tools already resolve chains inline per session inside
+    `buildSessionTools` (`resolveModelChain` at app.ts:4255–4256 and
+    4291–4292). Swap the hardcoded global refs for Phase 0 ladder calls with
+    the session's agent (`deep_model` keeps its fall-through to `model` after
+    per-key shadowing). No tool-internal changes.
+
+### Phase 4 — observability + docs (landing commit)
+
+11. Startup info log `agent_model_overrides { agent, overrides }` (§9).
+12. ARCHITECTURE.md in the same commit: §4c per-agent config list, the §8
+    factory ladder, §7a captioning chain selection, and the image_gen/x_search
+    tool sections. Flip this spec's status to IMPLEMENTED; CHANGELOG entry.
+13. Optional follow-up (not gating): effective per-role model map in
+    `GET /api/agents` for the console.
+
+### Non-changes (verified)
+
+- **Zero-cost / known-model collection** (`src/budget/zero-cost.ts:32`):
+  iterates the global `[models.*]` registry, which overrides only reference —
+  covered automatically.
+- **Scheduler, health tracking, rate-limit groups, per-member fits**: all keyed
+  on registry blocks / resolved chains; no awareness of who selected the chain.
+- **Legacy mode**: `null` agent short-circuits every ladder to the global
+  value; invariance is by construction and pinned by test (§12).
+
+## 12. Testing
 
 - Unit: the chat-lane ladder (all rungs, agent × global combinations, legacy
   `null`-agent passthrough); captioning ladder incl. the decided rung order;
