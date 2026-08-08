@@ -187,6 +187,14 @@ export interface AgentFactoryOptions {
    * and all tools remain visible — identical to the absent-`mcp_servers` case.
    */
   resolveAgentName?: (timelineKey: string) => string | null;
+  /**
+   * Exact tool-name → server-name attribution map built from `adaptMcpTools`
+   * at startup. Used by `filterMcpToolsByAllowlist` for O(1) server lookup
+   * instead of prefix inference — immune to any server-key naming collision.
+   * When absent (tests without MCP wiring), the filter receives an empty map
+   * and treats every tool as a non-MCP tool (safe: no scoping applied).
+   */
+  mcpToolServerMap?: Map<string, string>;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -1219,8 +1227,8 @@ export class AgentSessionFactory {
     const agentName = this.options.resolveAgentName?.(session.timelineKey) ?? null;
     const agentMcpServers =
       agentName !== null ? this.options.config.agents?.[agentName]?.mcp_servers : undefined;
-    const configuredServerKeys = new Set(Object.keys(this.options.config.mcp?.servers ?? {}));
-    const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, configuredServerKeys);
+    const mcpToolServerMap = this.options.mcpToolServerMap ?? new Map<string, string>();
+    const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, mcpToolServerMap);
     const filteredTools = filterTools(mcpFilteredTools, sessionTypeConfig);
 
     // NOTE: System prompt is rendered identically here and in ContextBuilder.build().
@@ -1842,18 +1850,19 @@ export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig)
 /**
  * Apply a per-agent MCP server allowlist to a tool array (spec PER-AGENT-MCP-SCOPING).
  *
- * Drops any tool whose name matches `mcp_<server>_*` for a server NOT in the
- * agent's `mcp_servers` allowlist. Non-MCP tools (those not prefixed with
- * `mcp_<configuredServerKey>_` for any configured server) are never affected.
+ * Drops any tool whose server is NOT in the agent's `mcp_servers` allowlist.
+ * Server attribution is exact: `mcpToolServerMap` maps each adapted tool name
+ * (e.g. `mcp_foo_bar_action`) to the server name that produced it (e.g. `foo_bar`)
+ * — built at startup from `adaptMcpTools` call sites where the true server name
+ * is always known. This avoids all prefix-inference ambiguity (e.g. when `foo`
+ * and `foo_bar` are both configured, `mcp_foo_bar_action` cannot be attributed
+ * to `foo` by any prefix rule alone). Tools absent from the map are not MCP tools
+ * and are never filtered.
  *
  * - `agentMcpServers` undefined → absent in config → keep all (default behavior,
  *   identical to pre-feature mode and legacy single-agent mode).
  * - `agentMcpServers` is an array → only tools from those servers pass through.
  *   An empty array is valid: this agent gets no MCP tools at all.
- *
- * Server keys can contain underscores; the filter matches against the actual
- * configured key set rather than trying to parse tool names, so `mcp_foo_bar_*`
- * resolves correctly whether the server key is `foo` or `foo_bar`.
  *
  * Composes with `filterTools` (session-type allowlist) as an intersection: apply
  * this filter first, then `filterTools`, so only tools that survive BOTH gates
@@ -1862,22 +1871,14 @@ export function filterTools(tools: AgentTool[], sessionType?: SessionTypeConfig)
 export function filterMcpToolsByAllowlist(
   tools: AgentTool[],
   agentMcpServers: string[] | undefined,
-  configuredServerKeys: Set<string>,
+  mcpToolServerMap: Map<string, string>,
 ): AgentTool[] {
   if (agentMcpServers === undefined) return tools; // absent → no filter
-  const allowedPrefixes = new Set(agentMcpServers.map((key) => `mcp_${key}_`));
+  const allowedServers = new Set(agentMcpServers);
   return tools.filter((tool) => {
-    // Scan the configured server key set to decide if this tool belongs to
-    // any MCP server. We check against configured keys (not by splitting the
-    // name) so keys containing underscores resolve without ambiguity.
-    for (const serverKey of configuredServerKeys) {
-      if (tool.name.startsWith(`mcp_${serverKey}_`)) {
-        // This tool belongs to a configured MCP server — keep only if allowed.
-        return allowedPrefixes.has(`mcp_${serverKey}_`);
-      }
-    }
-    // Not prefixed by any configured server key → not an MCP tool → keep.
-    return true;
+    const serverName = mcpToolServerMap.get(tool.name);
+    if (serverName === undefined) return true; // not an MCP tool → keep
+    return allowedServers.has(serverName);
   });
 }
 

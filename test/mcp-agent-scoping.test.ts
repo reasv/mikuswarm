@@ -15,7 +15,7 @@ import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config/index.js";
 import { validateAgentConfig } from "../src/app.ts";
-import { filterMcpToolsByAllowlist, filterTools } from "../src/agent/factory.ts";
+import { filterMcpToolsByAllowlist, filterTools } from "../src/agent/factory.js";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { SessionTypeConfig } from "../src/workspace/types.js";
 
@@ -120,7 +120,13 @@ workspace_root = "./workspaces/bob"
 // filterMcpToolsByAllowlist — unit tests
 // ---------------------------------------------------------------------------
 
-const SERVER_KEYS = new Set(["exa", "medialib", "foo_bar"]);
+// Exact tool-name → server-name map (mirrors what adaptMcpTools builds at runtime).
+const MCP_TOOL_SERVER_MAP = new Map<string, string>([
+  ["mcp_exa_web_search", "exa"],
+  ["mcp_exa_web_fetch", "exa"],
+  ["mcp_medialib_list", "medialib"],
+  ["mcp_foo_bar_action", "foo_bar"],
+]);
 
 const TOOLS = [
   makeTool("mcp_exa_web_search"),
@@ -132,7 +138,7 @@ const TOOLS = [
 ];
 
 test("filterMcpToolsByAllowlist: absent list keeps all tools unchanged", () => {
-  const result = filterMcpToolsByAllowlist(TOOLS, undefined, SERVER_KEYS);
+  const result = filterMcpToolsByAllowlist(TOOLS, undefined, MCP_TOOL_SERVER_MAP);
   assert.deepEqual(
     result.map((t) => t.name),
     TOOLS.map((t) => t.name),
@@ -140,7 +146,7 @@ test("filterMcpToolsByAllowlist: absent list keeps all tools unchanged", () => {
 });
 
 test("filterMcpToolsByAllowlist: allowlist with one server keeps only that server's MCP tools + non-MCP", () => {
-  const result = filterMcpToolsByAllowlist(TOOLS, ["exa"], SERVER_KEYS);
+  const result = filterMcpToolsByAllowlist(TOOLS, ["exa"], MCP_TOOL_SERVER_MAP);
   assert.deepEqual(result.map((t) => t.name), [
     "mcp_exa_web_search",
     "mcp_exa_web_fetch",
@@ -150,7 +156,7 @@ test("filterMcpToolsByAllowlist: allowlist with one server keeps only that serve
 });
 
 test("filterMcpToolsByAllowlist: allowlist with multiple servers keeps all listed servers' tools", () => {
-  const result = filterMcpToolsByAllowlist(TOOLS, ["exa", "medialib"], SERVER_KEYS);
+  const result = filterMcpToolsByAllowlist(TOOLS, ["exa", "medialib"], MCP_TOOL_SERVER_MAP);
   assert.deepEqual(result.map((t) => t.name), [
     "mcp_exa_web_search",
     "mcp_exa_web_fetch",
@@ -161,13 +167,13 @@ test("filterMcpToolsByAllowlist: allowlist with multiple servers keeps all liste
 });
 
 test("filterMcpToolsByAllowlist: empty allowlist drops all MCP tools, keeps non-MCP", () => {
-  const result = filterMcpToolsByAllowlist(TOOLS, [], SERVER_KEYS);
+  const result = filterMcpToolsByAllowlist(TOOLS, [], MCP_TOOL_SERVER_MAP);
   assert.deepEqual(result.map((t) => t.name), ["send_message", "recall_memory"]);
 });
 
 test("filterMcpToolsByAllowlist: non-MCP tools are never dropped regardless of allowlist", () => {
   const nativesOnly = [makeTool("send_message"), makeTool("read_image"), makeTool("bash")];
-  const result = filterMcpToolsByAllowlist(nativesOnly, [], SERVER_KEYS);
+  const result = filterMcpToolsByAllowlist(nativesOnly, [], MCP_TOOL_SERVER_MAP);
   assert.deepEqual(
     result.map((t) => t.name),
     ["send_message", "read_image", "bash"],
@@ -175,9 +181,9 @@ test("filterMcpToolsByAllowlist: non-MCP tools are never dropped regardless of a
 });
 
 test("filterMcpToolsByAllowlist: underscore-containing server key matched correctly", () => {
-  // Key "foo_bar" → prefix "mcp_foo_bar_". Must not match "mcp_foo_" (a shorter key
-  // that is NOT in the configured set) or be confused with a hypothetical "foo" server.
-  const result = filterMcpToolsByAllowlist(TOOLS, ["foo_bar"], SERVER_KEYS);
+  // Server "foo_bar" owns "mcp_foo_bar_action" — must not be mis-attributed to a
+  // hypothetical shorter key ("foo").
+  const result = filterMcpToolsByAllowlist(TOOLS, ["foo_bar"], MCP_TOOL_SERVER_MAP);
   assert.deepEqual(result.map((t) => t.name), [
     "mcp_foo_bar_action",
     "send_message",
@@ -185,14 +191,45 @@ test("filterMcpToolsByAllowlist: underscore-containing server key matched correc
   ]);
 });
 
-test("filterMcpToolsByAllowlist: tool with name matching no configured server prefix is kept", () => {
-  // A tool whose name starts with "mcp_" but does not match any configured server key
-  // is treated as a non-MCP tool (or from a server we don't know about) → kept.
+test("filterMcpToolsByAllowlist: tool absent from map is kept (not an MCP tool)", () => {
+  // A tool not present in the attribution map is treated as a non-MCP tool → kept
+  // even with an empty allowlist.
   const tools = [makeTool("mcp_unknown_tool"), makeTool("send_message")];
-  const result = filterMcpToolsByAllowlist(tools, [], SERVER_KEYS);
-  // "mcp_unknown_tool" starts with "mcp_" but "unknown" is not in SERVER_KEYS →
-  // treated as not belonging to any configured server → kept even with empty allowlist.
+  const result = filterMcpToolsByAllowlist(tools, [], MCP_TOOL_SERVER_MAP);
+  // "mcp_unknown_tool" is not in MCP_TOOL_SERVER_MAP → treated as non-MCP → kept.
   assert.deepEqual(result.map((t) => t.name), ["mcp_unknown_tool", "send_message"]);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: prefix-collision between servers "foo" and "foo_bar"
+//
+// Before the exact-map fix, Set iteration could attribute mcp_foo_bar_* to
+// server "foo" (if "foo" appeared first), giving foo-only agents unwanted
+// access to foo_bar's tools and denying foo_bar-only agents their own tools.
+// ---------------------------------------------------------------------------
+
+// Servers "foo" (tool "bar_something") and "foo_bar" (tool "action").
+// Note: mcp_foo_bar_something belongs to server "foo"; mcp_foo_bar_action to "foo_bar".
+const COLLISION_MAP = new Map<string, string>([
+  ["mcp_foo_bar_something", "foo"],
+  ["mcp_foo_bar_action", "foo_bar"],
+]);
+const COLLISION_TOOLS = [
+  makeTool("mcp_foo_bar_something"),
+  makeTool("mcp_foo_bar_action"),
+  makeTool("send_message"),
+];
+
+test("filterMcpToolsByAllowlist: foo-only agent does not receive foo_bar's tools (collision regression)", () => {
+  // An agent allowed only "foo" must NOT see mcp_foo_bar_action (owned by "foo_bar").
+  const result = filterMcpToolsByAllowlist(COLLISION_TOOLS, ["foo"], COLLISION_MAP);
+  assert.deepEqual(result.map((t) => t.name), ["mcp_foo_bar_something", "send_message"]);
+});
+
+test("filterMcpToolsByAllowlist: foo_bar-only agent receives its own tools and not foo's (collision regression)", () => {
+  // An agent allowed only "foo_bar" must NOT see mcp_foo_bar_something (owned by "foo").
+  const result = filterMcpToolsByAllowlist(COLLISION_TOOLS, ["foo_bar"], COLLISION_MAP);
+  assert.deepEqual(result.map((t) => t.name), ["mcp_foo_bar_action", "send_message"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -202,7 +239,7 @@ test("filterMcpToolsByAllowlist: tool with name matching no configured server pr
 test("filterMcpToolsByAllowlist composes with filterTools: intersection of both filters", () => {
   // Agent allows only "exa"; session type allows only "mcp_exa_web_search" and "send_message".
   // Result must be the intersection: only "mcp_exa_web_search" and "send_message".
-  const afterMcp = filterMcpToolsByAllowlist(TOOLS, ["exa"], SERVER_KEYS);
+  const afterMcp = filterMcpToolsByAllowlist(TOOLS, ["exa"], MCP_TOOL_SERVER_MAP);
   const sessionType: SessionTypeConfig = { tools: ["mcp_exa_web_search", "send_message"] };
   const result = filterTools(afterMcp, sessionType);
   assert.deepEqual(result.map((t) => t.name), ["mcp_exa_web_search", "send_message"]);
@@ -212,7 +249,7 @@ test("filterTools + filterMcpToolsByAllowlist: session allowlist naming an MCP-s
   // Agent allows only "exa". Session type allowlists "mcp_medialib_list" (excluded by
   // agent scope). The tool is absent from the final set — same silent behavior as
   // allowlisting a tool from a server the deploy doesn't configure at all.
-  const afterMcp = filterMcpToolsByAllowlist(TOOLS, ["exa"], SERVER_KEYS);
+  const afterMcp = filterMcpToolsByAllowlist(TOOLS, ["exa"], MCP_TOOL_SERVER_MAP);
   const sessionType: SessionTypeConfig = { tools: ["mcp_medialib_list", "send_message"] };
   const result = filterTools(afterMcp, sessionType);
   assert.deepEqual(result.map((t) => t.name), ["send_message"]);

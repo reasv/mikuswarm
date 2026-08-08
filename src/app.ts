@@ -50,6 +50,7 @@ import {
   loadCompletedSessionMaterial,
   SYNTHETIC_SESSION_TYPES,
   filterTools,
+  filterMcpToolsByAllowlist,
   additiveThinkingBudgetTokens,
   hasResumableWork,
   type ResumeMaterial,
@@ -1306,21 +1307,37 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     config.observability?.llm_request_ring_size ?? DEFAULT_LLM_REQUEST_RING_SIZE,
   );
 
+  // Exact tool-name → server-name attribution map, populated after mcpPool.start()
+  // below. Declared here so the resolveToolDefs closure (Fix 2) and the factory
+  // options both reference the same Map object — by the time either consumer calls
+  // into it at runtime, the map is fully populated.
+  const mcpToolServerMap = new Map<string, string>();
+
   // Tool-definition resolver for the console inspector (ARCHITECTURE.md §10a). The
   // room-context preview and session-detail views show the tool-definition block
   // (its estimate + per-tool breakdown) above the system prompt. Tool definitions
   // are config-static within a process run, so we build the set ON DEMAND from the
   // real `buildSessionTools` (synthesizing the inbound from the timeline key) and
-  // apply the session type's allowlist (`filterTools`) so the displayed block
-  // matches the SAME set `create()` froze the estimate from — then memoize per type
-  // so the build happens at most once per type. A timeline that doesn't parse, an
+  // apply both the MCP server scoping filter (`filterMcpToolsByAllowlist`) and the
+  // session type's allowlist (`filterTools`) so the displayed block matches the SAME
+  // set `create()` froze the estimate from — then memoize per agent+type pair so
+  // the build happens at most once per combination. A timeline that doesn't parse, an
   // account that isn't configured, or a construction failure → no block (graceful).
   const toolDefsByType = new Map<string, import("./context/index.js").ToolDefinitionLike[]>();
   function resolveToolDefs(
     timelineKey: string,
     sessionType: string,
   ): import("./context/index.js").ToolDefinitionLike[] | undefined {
-    const cached = toolDefsByType.get(sessionType);
+    // Derive agent identity for per-agent MCP scoping. Null in legacy mode.
+    const agentEntry = resolveWorkspaceForTimeline(timelineKey);
+    const agentName =
+      agentEntry?.agentName === "__legacy__" ? null : (agentEntry?.agentName ?? null);
+    const agentMcpServers =
+      agentName !== null ? config.agents?.[agentName]?.mcp_servers : undefined;
+    // Memo key must include the agent name: two agents with different mcp_servers
+    // but the same session type would otherwise share a wrong cached block.
+    const memoKey = `${agentName ?? ""}:${sessionType}`;
+    const cached = toolDefsByType.get(memoKey);
     if (cached) return cached;
     // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2).
     const parsed = parseTimelineKey(timelineKey);
@@ -1357,13 +1374,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         sessionType,
         new SessionUsageTracker(),
       );
-      const filtered = filterTools(full, factory.resolveSessionType(sessionType));
+      // Apply the same two-stage filter as create(): MCP scoping first, then
+      // the session-type allowlist. Both compose as an intersection so the
+      // displayed tool block matches exactly what the agent can call.
+      const mcpFiltered = filterMcpToolsByAllowlist(full, agentMcpServers, mcpToolServerMap);
+      const filtered = filterTools(mcpFiltered, factory.resolveSessionType(sessionType));
       const defs = filtered.map((t) => ({
         name: t.name,
         description: t.description,
         parameters: t.parameters,
       }));
-      toolDefsByType.set(sessionType, defs);
+      toolDefsByType.set(memoKey, defs);
       return defs;
     } catch (error) {
       logger.warn("tool_defs_inspector_build_failed", {
@@ -1400,6 +1421,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           return entry.agentName;
         }
       : undefined,
+    // Exact tool-name → server-name attribution map. Populated after
+    // mcpPool.start() below (same Map object reference — by the time create()
+    // runs at runtime it is fully populated).
+    mcpToolServerMap,
   });
 
   // ---------------------------------------------------------------------------
@@ -2158,9 +2183,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger: logger.child("mcp"),
   });
   await mcpPool.start();
-  const mcpTools = mcpPool.getEntries().flatMap((entry) =>
-    adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp")),
-  );
+  // Build adapted tools and the exact tool-name → server-name attribution map
+  // together so both are derived from the same source of truth. The map is
+  // declared above (before the factory) so the factory and resolveToolDefs
+  // closures both reference the same object and see it populated here.
+  const mcpTools = [] as ReturnType<typeof adaptMcpTools>;
+  for (const entry of mcpPool.getEntries()) {
+    for (const tool of adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp"))) {
+      mcpTools.push(tool);
+      mcpToolServerMap.set(tool.name, entry.name);
+    }
+  }
   // Per-agent MCP scoping observability (spec PER-AGENT-MCP-SCOPING §5):
   // one info log per agent with an explicit mcp_servers allowlist.
   if (config.agents) {
