@@ -235,7 +235,7 @@
 							     model (wire id). When served differs from requested, show both as
 							     "requested → served" highlighted in amber to surface fallback degradation. -->
 							{@const reqLabel = request.requestedModel ?? request.model}
-							{@const degraded = request.servedModel != null && request.servedModel !== request.requestedModel}
+							{@const degraded = request.servedModel != null && request.requestedModel != null && request.servedModel !== request.requestedModel}
 							<tr class="border-t border-border/50">
 								<td class="py-0.5 pr-3 whitespace-nowrap">{fmtTime(request.ts)}</td>
 								<td class="pr-3">

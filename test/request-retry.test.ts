@@ -1313,3 +1313,116 @@ test("withRequestRetry: resetServedModel clears stale servedModel between attemp
   assert.equal(rows[0]!.servedModel, "floor", "attempt 2 correctly attributed, not stale 'head'");
   assert.equal(rows[1]!.servedModel, "head", "attempt 1 still attributed correctly");
 });
+
+test("withRequestRetry: §5.4 re-drive ring attribution — attempt 1 row sealed before attempt 2 mutates getters", async () => {
+  // Pin that the re-drive mutation cannot leak into the prior attempt's ring record.
+  // Attempt 1 dispatches "modelA", gets budget-truncated (stopReason "length"); its ring
+  // row is written BEFORE onBudgetTruncation fires. onBudgetTruncation simulates the
+  // factory's re-select by updating requestedModelId to "modelB" then returns "reselect".
+  // Attempt 2 dispatches "modelB" and succeeds. Both ring records must show the model
+  // that was actually dispatched for that specific attempt.
+  //
+  // Note: because the onBudgetTruncation hook is what drives model re-selection in the
+  // real factory (it mutates the session's model-selection state before returning
+  // "reselect"), we emulate the same ordering here — update the backing value inside the
+  // hook, matching the production timing exactly. The real withRequestRetry loop writes
+  // the ring record in recordAttempt() BEFORE calling onBudgetTruncation, so the record
+  // snapshot captures the pre-reselect values.
+  let requestedModelId = "modelA";
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(16);
+
+  const { fn } = makeFallbackFn(
+    [
+      {
+        events: [startEvent(), textDeltaEvent("truncated..."), lengthDone("truncated...")],
+        resolvedMemberId: "modelA",
+      },
+      {
+        events: [startEvent(), textDeltaEvent("full answer"), doneEvent()],
+        resolvedMemberId: "modelB",
+      },
+    ],
+    (id) => {
+      servedModelForAttempt = id;
+    },
+  );
+
+  const wrapped = withRequestRetry(fn, { ...FAST }, {
+    ring,
+    getRequestedModel: () => requestedModelId,
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => {
+      servedModelForAttempt = undefined;
+    },
+    onRequestCommitted: () => {
+      /* required for the commit path to fire */
+    },
+    onBudgetTruncation: () => {
+      // Simulate the factory's re-select: update the backing model id before
+      // returning "reselect", exactly as the real per-user selector does.
+      requestedModelId = "modelB";
+      return "reselect";
+    },
+  });
+
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+
+  const rows = ring.list(); // newest-first: attempt 2, attempt 1
+  assert.equal(rows.length, 2, "both attempts recorded on the ring");
+  // Attempt 2 (newest): dispatched to "modelB"
+  assert.equal(rows[0]!.attempt, 2);
+  assert.equal(rows[0]!.requestedModel, "modelB", "attempt 2 requested the re-selected model");
+  assert.equal(rows[0]!.servedModel, "modelB", "attempt 2 served by the re-selected model");
+  // Attempt 1 (older): must be sealed with "modelA" — not overwritten by attempt 2
+  assert.equal(rows[1]!.attempt, 1);
+  assert.equal(rows[1]!.requestedModel, "modelA", "attempt 1 requestedModel sealed at record time");
+  assert.equal(rows[1]!.servedModel, "modelA", "re-drive mutation does not leak into prior attempt's row");
+});
+
+test("withRequestRetry: abort during admission — ring record has requestedModel but no servedModel", async () => {
+  // When the budget timer fires while the base fn is blocked in its admission-queue
+  // wait (before any event and before onResolve fires), the per-attempt abort reaches
+  // the blocked await and it throws an AbortError. The resulting ring row must have
+  // requestedModel stamped (the getter was wired before the attempt started) but
+  // servedModel absent (the fallback onResolve never ran, so getServedModel returns
+  // undefined).
+  let servedModelForAttempt: string | undefined = undefined;
+  const ring = new LlmRequestRing(4);
+
+  const fn: StreamFn = (_model, _context, streamOptions) => {
+    const signal = (streamOptions as { signal?: AbortSignal } | undefined)?.signal;
+    return (async function* () {
+      // Block until aborted — simulates the scheduler/acquire await that precedes
+      // any wire call (the earliest pre-dispatch await in the composed base fn).
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            const e = new Error("admission acquire aborted");
+            e.name = "AbortError";
+            reject(e);
+          },
+          { once: true },
+        );
+      });
+      // onResolve is never called — servedModelForAttempt stays undefined.
+      yield doneEvent();
+    })() as unknown as AssistantMessageEventStream;
+  };
+
+  const wrapped = withRequestRetry(fn, { maxWaitMs: 15, ...FAST }, {
+    ring,
+    getRequestedModel: () => "default",
+    getServedModel: () => servedModelForAttempt,
+    resetServedModel: () => {
+      servedModelForAttempt = undefined;
+    },
+  });
+
+  await drain(wrapped(MODEL, CONTEXT, undefined));
+
+  const row = ring.list()[0]!;
+  assert.equal(row.requestedModel, "default", "requestedModel stamped from getter even on admission abort");
+  assert.equal(row.servedModel, undefined, "servedModel absent — onResolve never ran before the abort");
+});

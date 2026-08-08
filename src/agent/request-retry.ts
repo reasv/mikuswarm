@@ -168,8 +168,9 @@ export interface RequestRetryContext {
   /**
    * Returns the LOGICAL id (config block name) of the REQUESTED model for
    * the current attempt (head or per-user selected). Absent getter = not
-   * wired (non-agent callers); the ring record's `requestedModel` field is
-   * then absent.
+   * wired (callers that construct the retry context without wiring the getter;
+   * no current production caller omits it); the ring record's `requestedModel`
+   * field is then absent.
    */
   getRequestedModel?: () => string | undefined;
 }

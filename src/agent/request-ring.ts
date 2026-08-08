@@ -28,7 +28,8 @@ export interface LlmRequestRecord {
   /**
    * Logical id (config block name) of the REQUESTED model for this attempt
    * (head or per-user selected). Absent when the retry context is not wired
-   * (non-agent callers, worker pools that pass no getter).
+   * (callers that construct the retry context without wiring the getter; no
+   * current production caller omits it).
    */
   requestedModel?: string;
   /**
