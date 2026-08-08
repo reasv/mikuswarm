@@ -7215,6 +7215,136 @@ export function validateAgentConfig(config: AppConfig): void {
         }
       }
     }
+
+    // ── Per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §7) ────────
+    // All checks run for every agent that carries a `models` block. Mirror the
+    // fail-fast philosophy of the global role checks (app.ts ~1764/~1984):
+    // unknown model names, broken chains, missing context_window on session-type
+    // models, overrides for unconfigured subsystems, and summaries_from conflicts
+    // all throw a path-precise error naming the agent and key.
+    {
+      // §7: the role-designated session type names are always valid override keys —
+      // the process may launch these types regardless of explicit configuration.
+      const proactiveTypeName = config.proactive?.session_type ?? "proactive";
+      const roleDesignatedTypes = new Set<string>([
+        "summarize",
+        "condense",
+        "diary",
+        proactiveTypeName,
+      ]);
+      // Any key explicitly declared under [agent.session_types] is also valid.
+      const declaredSessionTypeKeys = new Set<string>(
+        Object.keys(config.agent?.session_types ?? {}),
+      );
+      // "default" is always a valid override key (§7 / spec §4 rung 2).
+      const isValidSessionTypeKey = (key: string): boolean =>
+        key === "default" || declaredSessionTypeKeys.has(key) || roleDesignatedTypes.has(key);
+
+      // Helper: resolve model chain or throw with path-precise context.
+      const requireChain = (modelRef: string, keyPath: string): void => {
+        try {
+          resolveModelChain(modelRef, config.models);
+        } catch (err) {
+          throw new Error(
+            `${keyPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+
+      // Helper: require context_window on the chain head — same check as
+      // validateContextTokenCeilings for session-type models (the factory's
+      // resolveSessionContextCeiling requires it for enforcement).
+      const requireContextWindow = (modelRef: string, keyPath: string): void => {
+        // requireChain above already rejected unknown refs
+        const model = config.models[modelRef]!;
+        if (model.context_window === undefined) {
+          throw new Error(
+            `${keyPath}: model "${modelRef}" must declare context_window — ` +
+              `it is required for session-type enforcement`,
+          );
+        }
+      };
+
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        const overrides = block.models;
+        if (!overrides) continue;
+
+        // §7: session_types key existence and model chain validation.
+        if (overrides.session_types) {
+          for (const [typeKey, modelRef] of Object.entries(overrides.session_types)) {
+            if (!isValidSessionTypeKey(typeKey)) {
+              const validExtra = [...roleDesignatedTypes].filter(
+                (k) => !declaredSessionTypeKeys.has(k),
+              );
+              throw new Error(
+                `[agents.${agentName}].models.session_types: key "${typeKey}" does not name ` +
+                  `a launchable session type — valid keys are declared [agent.session_types] ` +
+                  `names, "default", or role-designated type names (${validExtra.join(", ")})`,
+              );
+            }
+            const keyPath = `[agents.${agentName}].models.session_types.${typeKey}`;
+            requireChain(modelRef, keyPath);
+            requireContextWindow(modelRef, keyPath);
+          }
+        }
+
+        // §7: summaries_from + summarize/condense override is dead config (§6).
+        if (block.summaries_from !== undefined && overrides.session_types) {
+          const deadKeys = (["summarize", "condense"] as const).filter(
+            (k) => overrides.session_types![k] !== undefined,
+          );
+          if (deadKeys.length > 0) {
+            throw new Error(
+              `[agents.${agentName}]: summaries_from = "${block.summaries_from}" is set AND ` +
+                `models.session_types has override(s) for ${deadKeys.map((k) => `"${k}"`).join(", ")} — ` +
+                `agents with summaries_from never run summarization sessions, so these overrides are dead config`,
+            );
+          }
+        }
+
+        // §7: captioning overrides require a global [captioning] table.
+        if (overrides.captioning) {
+          if (!config.captioning) {
+            throw new Error(
+              `[agents.${agentName}].models.captioning: overrides require a global [captioning] ` +
+                `table — add [captioning] to config or remove the agent captioning overrides`,
+            );
+          }
+          for (const [modalityKey, modelRef] of Object.entries(overrides.captioning)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.captioning.${modalityKey}`);
+          }
+        }
+
+        // §7: image_gen overrides require a global [image_gen] table.
+        if (overrides.image_gen) {
+          if (!config.image_gen) {
+            throw new Error(
+              `[agents.${agentName}].models.image_gen: overrides require a global [image_gen] ` +
+                `table — add [image_gen] to config or remove the agent image_gen overrides`,
+            );
+          }
+          for (const [tierKey, modelRef] of Object.entries(overrides.image_gen)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.image_gen.${tierKey}`);
+          }
+        }
+
+        // §7: x_search overrides require a global [x_search] table.
+        if (overrides.x_search) {
+          if (!config.x_search) {
+            throw new Error(
+              `[agents.${agentName}].models.x_search: overrides require a global [x_search] ` +
+                `table — add [x_search] to config or remove the agent x_search overrides`,
+            );
+          }
+          for (const [keyName, modelRef] of Object.entries(overrides.x_search)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.x_search.${keyName}`);
+          }
+        }
+      }
+    }
   } else {
     // ── Legacy mode (§4.2): agent field on account without [agents] is an error ─
     const matrixAgentFields = Object.entries(config.matrix?.accounts ?? {}).filter(

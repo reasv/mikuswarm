@@ -763,6 +763,90 @@ const SandboxBlockSchema = StrictObject({
 });
 
 /**
+ * Per-agent captioning model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+ * Mirrors the global `[captioning]` two-level shape: `model` is the per-agent
+ * shared default; `image`/`video`/`audio` are per-agent per-modality overrides.
+ * Strict same-rung shadowing (§4): per-modality wins over per-agent shared, which
+ * wins over the corresponding global level — never reorders the existing ladder.
+ * All values are `[models.*]` logical names.
+ */
+const AgentModelsCaptioningSchema = StrictObject({
+  /**
+   * Per-agent shared caption model — shadows `captioning.model` at rung 2.
+   * Rung 1 (per-modality) still wins when the same agent also sets e.g. `image`.
+   */
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent image caption model — shadows `captioning.image.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global image model.
+   */
+  image: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent video caption model — shadows `captioning.video.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global video model.
+   */
+  video: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent audio caption model — shadows `captioning.audio.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global audio model.
+   */
+  audio: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+/**
+ * Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §3).
+ * All values are `[models.*]` logical names — references into the shared registry,
+ * never inline model definitions (§2 design principle 1: the registry stays global).
+ * All sub-tables are optional; absent → the role resolves exactly as the global-only
+ * behavior (§2 design principle 2: absent = today's behavior, exactly).
+ * The override surface mirrors the global role-bearing keys so each knob is
+ * discoverable by analogy (§2 design principle 3: per-role, mirroring global keys).
+ */
+const AgentModelsSchema = StrictObject({
+  /**
+   * Per-session-type model overrides — chat lane (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * Flat map: session-type name → `[models.*]` logical name. The agent override
+   * shadows the global value at the SAME rung; it never reorders the ladder (§4):
+   * rung 1 = type-specific, rung 2 = "default" type, rung 3 = literal "default".
+   * Valid keys: declared `[agent.session_types]` keys, the literal `"default"`,
+   * or a role-designated type name (`proactive`, `summarize`, `condense`, `diary`).
+   * Unknown keys are a startup error (§7 typo/stale-entry protection).
+   */
+  session_types: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ minLength: 1 }))),
+  /**
+   * Per-agent captioning model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * See `AgentModelsCaptioningSchema` for the two-level shadowing semantics.
+   * Overrides for an unconfigured global `[captioning]` table are a startup error (§7).
+   */
+  captioning: Type.Optional(AgentModelsCaptioningSchema),
+  /**
+   * Per-agent image-generation model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * `pro` shadows `image_gen.models.pro`; `flash` shadows `image_gen.models.flash`.
+   * Overrides when no global `[image_gen]` table exists are a startup error (§7).
+   */
+  image_gen: Type.Optional(StrictObject({
+    /** Per-agent pro-tier image-gen model — shadows `image_gen.models.pro`. */
+    pro: Type.Optional(Type.String({ minLength: 1 })),
+    /** Per-agent flash-tier image-gen model — shadows `image_gen.models.flash`. */
+    flash: Type.Optional(Type.String({ minLength: 1 })),
+  })),
+  /**
+   * Per-agent x_search model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * `model` shadows `x_search.model`; `deep_model` shadows `x_search.deep_model`.
+   * The deep→fast fall-through is evaluated after per-agent/global shadowing of each
+   * key (§4): when both agent and global `deep_model` are absent, the resolved fast
+   * value (the agent's `model` override, if set, else the global `x_search.model`)
+   * serves the deep tier. Overrides when no global `[x_search]` table → startup error (§7).
+   */
+  x_search: Type.Optional(StrictObject({
+    /** Per-agent fast x_search model — shadows `x_search.model`. */
+    model: Type.Optional(Type.String({ minLength: 1 })),
+    /** Per-agent deep x_search model — shadows `x_search.deep_model`. */
+    deep_model: Type.Optional(Type.String({ minLength: 1 })),
+  })),
+});
+
+/**
  * Per-agent identity block (spec MULTI-AGENT-SUPPORT §4.1).
  * Each entry under `[agents.*]` declares one named agent's workspace,
  * and optionally its own sandbox (strict mode, §10) and browser profile (§10a).
@@ -778,6 +862,15 @@ const AgentBlockSchema = StrictObject({
    * (no chains). Default off: absent → native summarization for all timelines.
    */
   summaries_from: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §3).
+   * When set, each sub-table selectively overrides the global model role assignments
+   * for this agent — the `[models.*]` registry stays shared. Absent → all roles
+   * resolve exactly as today's global-only behavior (§2 design principle 2).
+   * Cross-field validated at startup (§7): unknown model names, broken chains,
+   * overrides for unconfigured subsystems, and `summaries_from` conflicts all fail.
+   */
+  models: Type.Optional(AgentModelsSchema),
   /**
    * Per-agent sandbox override (spec MULTI-AGENT-SUPPORT §10 "strict" mode).
    * When set, this agent gets its own dedicated container. Overrides `[sandbox]`
