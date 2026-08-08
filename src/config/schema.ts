@@ -1385,6 +1385,29 @@ const TokenizerSchema = StrictObject({
   glm_tokenizer_path: Type.Optional(Type.String({ minLength: 1 })),
 });
 
+// Tool-result context budget (spec TOOL-RESULT-BUDGET). Generic result-shaping
+// layer applied at the per-session tool-assembly seam (buildSessionTools).
+// Two layers guard against unbounded tool results:
+//   Layer 1 — per-result cap: individual results whose text tokens exceed
+//     result_max_tokens are truncated. 0 = disabled.
+//   Layer 2 — per-turn aggregate clamp: the sum of a turn's result tokens may
+//     not exceed (servingWindow − runningContext − result_reserve_tokens).
+//     result_min_tokens is the floor each result keeps regardless of the
+//     accumulator, so even a late result in an over-budget batch stays useful.
+// All three ship in 00-defaults.toml (defaults ON — owner sign-off §2).
+const AgentToolsSchema = StrictObject({
+  // Layer 1 per-result cap. Any individual result whose estimated text-token
+  // count exceeds this is truncated with a visible marker. 0 = disabled.
+  result_max_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Layer 2 headroom the turn budget must always hold back — covers the next
+  // request's output (max_tokens) plus room for subsequent turns.
+  result_reserve_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Layer 2 per-result floor: minimum allowance kept for any single result
+  // regardless of how much the turn accumulator has consumed. Must be ≥ 1
+  // (a floor of 0 would defeat the purpose of keeping a useful head).
+  result_min_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
 // Message-only history backfetch (spec MESSAGE-BACKFETCH §9; ARCHITECTURE.md §7d).
 // Console/operator-triggered jobs that page a room's history BELOW its context
 // floor into the search-only region (indexed + enriched, never summarized/diaried/
@@ -1482,6 +1505,9 @@ export const AppConfigSchema = StrictObject({
     // real named zone at load time — bare numeric offsets like "+09:00" are
     // rejected (see configureAgentTimezone in src/time).
     timezone: Type.Optional(Type.String({ minLength: 1 })),
+    // Tool-result context budget (spec TOOL-RESULT-BUDGET §7). All three knobs
+    // ship in 00-defaults.toml; see AgentToolsSchema above for per-key docs.
+    tools: Type.Optional(AgentToolsSchema),
   }),
   // NOT StrictObject: `models` is a dictionary (arbitrary model names) with a
   // required `default` entry. A strict `{ default }` arm would reject every
@@ -1651,3 +1677,5 @@ export type AgentBrowserBlockConfig = NonNullable<AgentBlockConfig["browser"]>;
 export type SiblingsConfig = Static<typeof SiblingsSchema>;
 /** Content-addressed attachment store config (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d). */
 export type AttachmentStoreConfig = Static<typeof AttachmentStoreSchema>;
+/** Tool-result context budget config (spec TOOL-RESULT-BUDGET §7). */
+export type AgentToolsConfig = Static<typeof AgentToolsSchema>;

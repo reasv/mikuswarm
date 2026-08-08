@@ -137,6 +137,53 @@ wall_clock_ms = 12000
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and use NO_REPLY when no response is needed."
 
+# Tool-result context budget (spec TOOL-RESULT-BUDGET). A generic result-shaping
+# layer applied at the per-session tool-assembly seam — every tool (native and MCP
+# alike) passes through it before the result is handed to the agent runtime.
+# Two layers, both defaulting ON (owner sign-off):
+#
+#   Layer 1 — per-result cap: any individual result whose estimated TEXT tokens
+#   exceed result_max_tokens is truncated with a visible "[tool result truncated]"
+#   marker telling the model how much survived and how to recover (refine the call,
+#   paginate, filter). 0 disables Layer 1 entirely.
+#
+#   Layer 2 — per-turn aggregate clamp: the enforced invariant. A per-session
+#   accumulator tracks total result tokens since the last committed LLM request;
+#   each result's allowance is max(budget − accumulated, result_min_tokens) where
+#   budget = servingWindow − runningContext − result_reserve_tokens. When a result
+#   exceeds its allowance it is truncated with a distinct "exceeded the remaining
+#   context budget" marker.
+#
+# Image blocks are exempt from truncation (slicing base64 corrupts them) but are
+# flat-charged against the Layer-2 accumulator. Tool errors are exempt entirely.
+# Settlement order, not fair-share: in a parallel batch, the first result to
+# settle consumes first; result_min_tokens guarantees every result keeps a useful
+# head regardless of order.
+[agent.tools]
+# Layer 1 per-result cap. Any result whose text-token count exceeds this is
+# truncated. The default matches the shipped max_tokens (16384) — a single
+# result this large is already near the output budget; beyond it the model
+# rarely reads further anyway. Set 0 to disable. Deployments with very large
+# context windows may raise this; deployments wanting tighter hygiene may lower
+# it.
+result_max_tokens = 16384
+
+# Layer 2 headroom to hold back from the available context for the next
+# request's output (max_tokens) plus room for the turn's own overhead. The
+# default covers the shipped max_tokens (16384) twice — enough headroom for the
+# model to reply in full after a single large tool result, with a safety margin.
+# Raise this on deployments where the output budget is larger than the default
+# max_tokens.
+result_reserve_tokens = 32768
+
+# Layer 2 per-result floor: the minimum number of tokens each result keeps
+# regardless of how much the turn accumulator has consumed. Ensures a late
+# result in an over-budget parallel batch still carries a useful head — the
+# model gets at least this many tokens of every result even when the session is
+# near capacity. result_min_tokens × (max parallel calls) is the maximum budget
+# overshoot the floor can cause; the §8b context-limit enforcement absorbs it.
+result_min_tokens = 1024
+
 # Recovery — request-level resilience (spec LLM-FAILURE-HANDLING).
 # Layer 0: transparent per-request retry for ENVIRONMENTAL LLM failures
 # (connection reset, timeout, 5xx, 429, mid-stream deaths — partials discarded).

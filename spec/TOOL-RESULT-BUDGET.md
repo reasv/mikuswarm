@@ -1,9 +1,6 @@
 # Tool-Result Context Budget — per-result cap + per-turn aggregate clamp
 
-**Status**: DRAFT — proposed, nothing implemented.
-Target ARCHITECTURE.md home once implemented: §10 (a "Tool-result shaping"
-subsection) plus a cross-reference from §8b (context limits) and §11c (MCP —
-the adapter inherits the generic layer).
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §10 ("Tool-result shaping") with cross-reference from §8b; retained for review.
 
 **Owner sign-offs (2026-08-08)**:
 - Both layers: a context-aware per-turn aggregate clamp as the enforced
