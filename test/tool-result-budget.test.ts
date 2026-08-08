@@ -977,3 +977,143 @@ test("wrapToolsWithResultBudget: onTruncation does not fire for non-truncated re
   await wrapped!.execute("id", {});
   assert.equal(callbackFired, false, "onTruncation must not fire for non-truncated results");
 });
+
+// ---------------------------------------------------------------------------
+// Fix 2 — terminate/details pass-through and non-throw isError contract
+// ---------------------------------------------------------------------------
+
+test("wrapToolsWithResultBudget: terminate+details intact through wrapper (non-truncated)", async () => {
+  // Pins the worker-session finalize protocol and console/ledger consumers:
+  // { ...result, content: shaped.content } must carry all fields from result.
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const content = [txt("small")];
+  const testDetails = { action: "finalize", tokens: 42 };
+  const tool: AgentTool = {
+    name: "t",
+    label: "t",
+    description: "t",
+    parameters: Type.Object({}),
+    execute: async () => ({ content, details: testDetails, terminate: true }),
+  } as AgentTool;
+
+  const [wrapped] = wrapToolsWithResultBudget([tool], {
+    resultMaxTokens: 16_384,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+  assert.deepEqual(result.content, content, "content must pass through unchanged");
+  assert.equal(result.terminate, true, "terminate must pass through");
+  assert.deepEqual(result.details, testDetails, "details must pass through");
+});
+
+test("wrapToolsWithResultBudget: terminate+details intact through wrapper (truncated)", async () => {
+  // Same field-preservation assertion under truncation: shaping must not drop
+  // terminate or details from the spread result even when content is resized.
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const bigText = makeText(500);
+  const testDetails = { action: "finalize", tokens: 99 };
+  const tool: AgentTool = {
+    name: "t",
+    label: "t",
+    description: "t",
+    parameters: Type.Object({}),
+    execute: async () => ({ content: [txt(bigText)], details: testDetails, terminate: true }),
+  } as AgentTool;
+
+  const [wrapped] = wrapToolsWithResultBudget([tool], {
+    resultMaxTokens: 30,  // Layer-1 fires → truncation
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+  assert.ok(text.length < bigText.length, "content must be shaped (truncated)");
+  assert.ok(text.includes("per-result cap"), "Layer-1 marker must be present");
+  assert.equal(result.terminate, true, "terminate must survive truncation");
+  assert.deepEqual(result.details, testDetails, "details must survive truncation");
+});
+
+test("wrapToolsWithResultBudget: isError:true returned without throwing — preserved, content shaped", async () => {
+  // Contract gap documented in ARCHITECTURE.md §10 "Exemptions and pass-throughs":
+  // the wrapper always passes isError=false to shapeContentBlocks, so tools that
+  // return { isError: true } without throwing (e.g. summary_tool draft-error paths)
+  // are shaped as ordinary successes — not exempt like a thrown error.
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const bigText = makeText(500);
+  const tool: AgentTool = {
+    name: "t",
+    label: "t",
+    description: "t",
+    parameters: Type.Object({}),
+    execute: async () =>
+      ({ content: [txt(bigText)], details: null, isError: true } as unknown as AgentToolResult<null>),
+  } as AgentTool;
+
+  const [wrapped] = wrapToolsWithResultBudget([tool], {
+    resultMaxTokens: 30,
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+  // isError is preserved via { ...result, content: shaped.content }.
+  assert.equal(
+    (result as unknown as { isError: boolean }).isError,
+    true,
+    "isError must be preserved in the spread output",
+  );
+  // Shaping ran (wrapper does not exempt non-throwing returns with isError:true).
+  const text = (result.content[0] as { type: "text"; text: string }).text;
+  assert.ok(text.length < bigText.length, "content must be shaped even when isError:true is returned");
+  assert.ok(text.includes("per-result cap"), "truncation marker must be present");
+});
+
+test("wrapToolsWithResultBudget: multi-block — first fits, second sliced+marked, third dropped into ~M", async () => {
+  // Integration path (through the real wrapper, not just shapeContentBlocks directly).
+  const budget = new TurnResultBudget(200_000, 1_000, 100);
+  const blockA = txt(makeText(10));  // fits whole
+  const blockB = txt(makeText(50));  // first overflower: 10+50 > 30, gets sliced+marked
+  const blockC = txt(makeText(20));  // dropped; token count counted into ~M in marker
+  const cap = 30;
+
+  const tool: AgentTool = {
+    name: "t",
+    label: "t",
+    description: "t",
+    parameters: Type.Object({}),
+    execute: async () => ({ content: [blockA, blockB, blockC], details: null }),
+  } as AgentTool;
+
+  const [wrapped] = wrapToolsWithResultBudget([tool], {
+    resultMaxTokens: cap,  // Layer-1 cap; Layer-2 has plenty of room
+    turnBudget: budget,
+    getRunningContext: () => 50_000,
+  });
+
+  const result = await wrapped!.execute("id", {});
+
+  // blockA must be present verbatim.
+  assert.ok(
+    result.content.some((b) => b.type === "text" && b.text === blockA.text),
+    "blockA must be kept intact",
+  );
+
+  // blockC is dropped: at most 2 text blocks in output (blockA + sliced blockB).
+  const textBlocks = result.content.filter((b) => b.type === "text");
+  assert.ok(
+    textBlocks.length <= 2,
+    `output must have ≤2 text blocks (blockC dropped); got ${textBlocks.length}`,
+  );
+
+  // Marker must cite total ~M (tokens across all three blocks).
+  const totalM =
+    estimateTokens(blockA.text) + estimateTokens(blockB.text) + estimateTokens(blockC.text);
+  const allText = textBlocks.map((b) => (b as { type: "text"; text: string }).text).join("");
+  assert.ok(
+    allText.includes(`~${totalM}`),
+    `marker must cite total M=${totalM}; got: ${allText.slice(0, 200)}`,
+  );
+});
