@@ -615,12 +615,6 @@ export class AgentSessionFactory {
     const resultMaxTokens = _toolsConfig?.result_max_tokens ?? 16384;
     const resultReserveTokens = _toolsConfig?.result_reserve_tokens ?? 32768;
     const resultMinTokens = _toolsConfig?.result_min_tokens ?? 1024;
-    // servingWindow binding (spec TOOL-RESULT-BUDGET §4): the largest operative
-    // window any serving member offers. Until PER-MEMBER-CONTEXT-FITS lands, this
-    // is the composite operativeContextWindow. That branch swaps this one line to
-    // the max-member window at merge time; keep the swap surface to a single line.
-    const servingWindow = contextCeiling; // FITS-SWAP: replace with max-member window
-    const turnBudget = new TurnResultBudget(servingWindow, resultReserveTokens, resultMinTokens);
     // Representative (head) descriptor — initialState.model, the isQueueWaitPoint
     // key, and the ledger-fallback model id. The composite substitutes the chosen
     // member's descriptor + key per attempt.
@@ -678,6 +672,17 @@ export class AgentSessionFactory {
     // The capability filter emptied an ACTIVE per-user preference set (#3): a terminal
     // per-user deny, distinct from "no per-user rule" — never an ungated default path.
     const userSelectionCapabilityDenied = userSelection && selectables.length === 0;
+    // servingWindow (spec TOOL-RESULT-BUDGET §4): the largest operative window any
+    // serving member offers — the bound that matters for tool-result shaping, because
+    // the agent may land on ANY member within the candidate set. When per-user
+    // selection is active, the candidate set spans all preferred-model composites and
+    // the bound is their maximum; otherwise the single default composite governs.
+    // maxOperativeContextWindow is the largest context_window (after session-type
+    // override) across ALL surviving members of a given composite's chain.
+    const servingWindow = userSelectionActive
+      ? Math.max(...selectables.map((s) => s.fallback.maxOperativeContextWindow))  // §4: max across all preferred-model composites
+      : fallback.maxOperativeContextWindow;
+    const turnBudget = new TurnResultBudget(servingWindow, resultReserveTokens, resultMinTokens);
     // Initial context-token estimate for the FIRST request (the built context size;
     // §5.3). Assigned after buildContext; seeds the exact running counter below.
     const initialContextEstimate = { value: 0 };

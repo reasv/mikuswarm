@@ -23,7 +23,9 @@ import { wrapToolsWithResultBudget } from "../src/agent/tool-result-wrap.js";
 import { PER_IMAGE_TOKEN_ESTIMATE } from "../src/agent/live-token-estimate.js";
 import { estimateTokens } from "../src/context/tokens.js";
 import { loadConfig } from "../src/config/index.js";
-import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import { buildModelFallback } from "../src/agent/model-fallback.js";
+import type { AgentTool, AgentToolResult, StreamFn } from "@earendil-works/pi-agent-core";
+import type { Model, Api } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
@@ -1115,5 +1117,95 @@ test("wrapToolsWithResultBudget: multi-block — first fits, second sliced+marke
   assert.ok(
     allText.includes(`~${totalM}`),
     `marker must cite total M=${totalM}; got: ${allText.slice(0, 200)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// servingWindow rule §4 (spec TOOL-RESULT-BUDGET §4 + PER-MEMBER-CONTEXT-FITS)
+// ---------------------------------------------------------------------------
+
+// Per-user-active: servingWindow = max across selectables' maxOperativeContextWindow.
+// This pins the factory's binding rule: the turn budget's serving window is NOT the
+// head's planning ceiling (contextCeiling = memberWindows[headId]) but the largest
+// window any serving member in ANY preferred-model composite can offer. When per-user
+// selection is active, the selectables set spans multiple preferred-model composites;
+// TurnResultBudget must be sized to the widest one so a result acceptable for the
+// largest-window selectable is never erroneously truncated.
+test("servingWindow §4: per-user-active uses max across selectables' maxOperativeContextWindows", () => {
+  // Build two single-member composites to represent two preferred models with
+  // different context windows, mirroring what factory.create's buildFor() produces.
+  const noOpStream: StreamFn = () => { throw new Error("stream not called in this test"); };
+  const noOpModel = (cw: number): Model<Api> =>
+    ({ id: "m", api: "anthropic" as Api, contextWindow: cw, maxTokens: 4096 } as unknown as Model<Api>);
+
+  const buildComposite = (cw: number, logicalId: string) =>
+    buildModelFallback(
+      [{
+        logicalId,
+        config: {
+          id: logicalId,
+          provider: "test",
+          endpoint: "http://localhost",
+          api_key: "test-key",
+          input_modalities: ["text"],
+          max_tokens: 4096,
+          context_window: cw,
+        } as any,
+      }],
+      {
+        consumer: "test",
+        makeBase: () => noOpStream,
+        makeModel: (_cfg, contextWindow) => noOpModel(contextWindow),
+      },
+    );
+
+  // Two preferred-model composites: narrow (80k) and wide (200k).
+  const compositeNarrow = buildComposite(80_000, "model-narrow");
+  const compositeWide   = buildComposite(200_000, "model-wide");
+
+  // Verify maxOperativeContextWindow is what we expect (single-member chain → window = cw).
+  assert.equal(compositeNarrow.maxOperativeContextWindow, 80_000);
+  assert.equal(compositeWide.maxOperativeContextWindow, 200_000);
+
+  // Simulate the factory's servingWindow formula (spec TOOL-RESULT-BUDGET §4).
+  const selectables = [
+    { fallback: compositeNarrow },
+    { fallback: compositeWide },
+  ];
+  const defaultFallback = compositeNarrow; // the session-type default (smaller)
+
+  // Per-user-active: max over all selectables.
+  const servingWindowActive = Math.max(...selectables.map((s) => s.fallback.maxOperativeContextWindow));
+  // Per-user-inactive: default composite's maxOperativeContextWindow.
+  const servingWindowInactive = defaultFallback.maxOperativeContextWindow;
+
+  assert.equal(servingWindowActive, 200_000,
+    "per-user-active servingWindow must be max(80k, 200k) = 200k");
+  assert.equal(servingWindowInactive, 80_000,
+    "per-user-inactive servingWindow is the default composite's max-member window (80k)");
+
+  // TurnResultBudget constructed with the two different windows and reserve=0,
+  // minTokens=1 so allowance(0) = servingWindow exactly (no reserve, no accumulated).
+  const reserve = 0;
+  const minTokens = 1;
+  const budgetActive   = new TurnResultBudget(servingWindowActive,   reserve, minTokens);
+  const budgetInactive = new TurnResultBudget(servingWindowInactive, reserve, minTokens);
+
+  // With runningContext=0, accumulated=0, reserve=0:
+  //   allowance = max(servingWindow − 0 − 0 − 0, 1) = servingWindow.
+  assert.equal(budgetActive.allowance(0), 200_000,
+    "active budget's allowance at empty context equals the serving window (200k)");
+  assert.equal(budgetInactive.allowance(0), 80_000,
+    "inactive budget's allowance at empty context equals the serving window (80k)");
+
+  // A result between 80k and 200k tokens: passes only under the correct (active) budget.
+  const resultSize = 150_000; // between the two windows
+  assert.ok(
+    resultSize <= budgetActive.allowance(0),
+    "result of 150k fits within the per-user-active window (200k): not truncated",
+  );
+  assert.ok(
+    resultSize > budgetInactive.allowance(0),
+    "result of 150k does NOT fit within the per-user-inactive window (80k): would be truncated",
   );
 });

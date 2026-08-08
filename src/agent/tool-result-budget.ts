@@ -236,8 +236,10 @@ export class TurnResultBudget {
   constructor(
     /**
      * The session's serving window — the largest operative context window across
-     * all selectable models. With PER-MEMBER-CONTEXT-FITS, this is the max member
-     * window; until that lands, the composite `operativeContextWindow`.
+     * all selectable models (spec TOOL-RESULT-BUDGET §4). When per-user selection
+     * is active, this is the max of `maxOperativeContextWindow` across all preferred-
+     * model composites; otherwise it is the default composite's
+     * `maxOperativeContextWindow`.
      */
     readonly servingWindow: number,
     /**
