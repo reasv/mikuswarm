@@ -285,11 +285,10 @@ segment flows through `processVideoForInference` → video caption lane → capt
 - **Cost**: identical to any 120s/480p video today (~36k input tokens at default media
   resolution ≈ $0.05 at current deployment caption pricing) plus the bounded download.
   The per-call item cap (20) already bounds fan-out; each YouTube item is one segment.
-- **Billing prerequisite**: the `media` tool currently discards
-  `CaptionResponse.usage/cost` (no `recordToolUsage` — a pre-existing ledger gap,
-  tracked separately). The YouTube lane must land on a `media` tool that records
-  `tool_invocations` rows per captioned item (x_search inline-caption pattern), so
-  that fix is a prerequisite or is folded into this implementation.
+- **Billing**: already in place — the `media` tool records a `tool_invocations` row
+  per captioned item (`recordToolUsage`, x_search inline-caption pattern), so YouTube
+  segment captions are billed with no additional work. (This was a prerequisite when
+  the spec was first drafted; it has since landed.)
 - The tool description gains one line: YouTube URLs are accepted and analyzed
   segment-wise via `start_time`.
 
