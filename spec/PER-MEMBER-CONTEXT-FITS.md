@@ -1,6 +1,6 @@
 # Per-Member Context Fits — replacing the min-over-chain ceiling
 
-**Status**: DRAFT — proposed, nothing implemented.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §8a/§8b; retained for review.
 Target ARCHITECTURE.md home once implemented: §8a "Model fallback — transparent
 composite models" (member selection + the ceiling paragraph), §8b "Context-size
 limits" (enforcement + `resolveSessionContextCeiling`), and the PER-USER-LIMITS

@@ -449,6 +449,7 @@ export class AgentSessionFactory {
     return this.resolveSessionType(sessionType)?.model ?? "default";
   }
 
+
   /**
    * Resolve a session type's effective fallback chain as LOGICAL ids (config block
    * names), head first (spec MODEL-FALLBACK §6.1). The launch-admission gate gates
@@ -620,6 +621,13 @@ export class AgentSessionFactory {
         onResolve: (id) => {
           resolvedMember.logicalId = id;
         },
+        // Feed the §5.3 running counter for per-member fits gating per attempt
+        // (spec PER-MEMBER-CONTEXT-FITS §2.1). Guard: return undefined before the
+        // counter is seeded (ctxCounter.seenMsgs starts at -1; first observation
+        // sets it ≥ 0). Fetch consumers (captioning/embedding) omit this option
+        // and always receive undefined → fits skipped, preserving their behavior.
+        getObservedContextTokens: () =>
+          ctxCounter.seenMsgs < 0 ? undefined : ctxCounter.running,
       });
       builtFallbacks.set(logicalId, built);
       return built;
@@ -627,13 +635,14 @@ export class AgentSessionFactory {
     // The default (session-type head) composite — also the representative descriptor
     // source and the dispatch when per-user selection is inactive or collapses.
     const fallback = buildFor(modelKey);
-    // Operative per-session context ceiling (spec CONTEXT-LIMIT-UNIFICATION §2.4
-    // + MODEL-FALLBACK §3 #2): the MINIMUM `context_window` across the surviving
-    // chain (min'd with the session-type override), valid for whichever member
-    // serves a given attempt — so the "ceiling resolved once" invariant holds.
-    // Fed to enforcement (below), the head model descriptor, and the text-editor
-    // read budget (app.ts buildSessionTools, via the chain-aware resolver).
-    const contextCeiling = fallback.operativeContextWindow;
+    // Planning ceiling (spec PER-MEMBER-CONTEXT-FITS §2.3): the head's own operative
+    // window — min(head.context_window, session_type.max_context_tokens). The chain
+    // min is gone: fallback members are fits-checked per attempt by chooseChainMember
+    // (which uses their individual operativeWindow). Enforcement uses
+    // fallback.maxOperativeContextWindow (the largest member's window) so termination
+    // occurs only when NO member can serve. Fed to the head model descriptor so any
+    // window-keyed SDK mechanism sees the head's real ceiling, not the fallback floor.
+    const contextCeiling = fallback.memberWindows[modelKey] ?? fallback.operativeContextWindow;
     // Representative (head) descriptor — initialState.model, the isQueueWaitPoint
     // key, and the ledger-fallback model id. The composite substitutes the chosen
     // member's descriptor + key per attempt.
@@ -778,29 +787,38 @@ export class AgentSessionFactory {
     // The §4.2 resolver (affordable ∧ healthy ∧ fits). Builds the §5.3 estimate from
     // the exact running counter: the cache-read prior prompt + the cache-write new
     // material, split at the prompt-cache TTL (PROMPT_CACHE_TTL_MS).
-    const resolveUserSelection = (): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean } => {
+    // Fits+health is delegated uniformly to chooseChainMember with observedContextTokens
+    // (spec PER-MEMBER-CONTEXT-FITS §2.4) — the independent fits comparison is removed.
+    // Terminal-cause attribution is extended (§2.4): "nothing fits context" is now
+    // distinguished from "nothing healthy" in the parked-session error message.
+    const resolveUserSelection = (): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
       refreshRunningContext();
       const observed = ctxCounter.running;
       const newTokens = Math.max(0, observed - ctxCounter.cachedAtLast);
       const withinCacheTtl =
         ctxCounter.lastRequestAtMs > 0 && Date.now() - ctxCounter.lastRequestAtMs < PROMPT_CACHE_TTL_MS;
       const estimate = { cachedTokens: ctxCounter.cachedAtLast, newTokens, withinCacheTtl };
-      let sawHealthyFit = false;
+      let sawHealthyFit = false; // found a fits+healthy selectable (unaffordable) → budget cause
+      let sawFit = false;        // found a selectable whose chain can fit the context at all
       for (const s of selectables) {
-        const fits = s.fallback.operativeContextWindow >= observed;
-        const healthy = scheduler
-          ? chooseChainMember(s.fallback.survivorMembers, {
-              scheduler,
-              isModelAvailable: isModelAvailableFn,
-            }).reason !== "all-unhealthy"
-          : true;
+        // Fits-any check (ignoring health): the largest member's window accommodates the context?
+        if (s.fallback.maxOperativeContextWindow >= observed) sawFit = true;
+        // Delegate fits+health jointly to chooseChainMember with the observed context size.
+        // A result of anything other than "all-unhealthy" means the chain has a viable
+        // member (healthy ∧ in-budget ∧ fits).
+        const probe = chooseChainMember(s.fallback.survivorMembers, {
+          scheduler,
+          isModelAvailable: isModelAvailableFn,
+          observedContextTokens: observed,
+        });
+        const viable = probe.reason !== "all-unhealthy";
         const aff = userLimit!.engine.affordable(
           userLimit!.resolution,
           s.requestedLogicalId,
           estimate,
           s.thinkingBudgetTokens,
         );
-        if (fits && healthy && aff.ok) {
+        if (viable && aff.ok) {
           return {
             ok: true,
             selection: {
@@ -810,9 +828,9 @@ export class AgentSessionFactory {
             },
           };
         }
-        if (fits && healthy) sawHealthyFit = true; // usable but unaffordable ⇒ budget cause
+        if (viable) sawHealthyFit = true; // fits+healthy but unaffordable → budget cause
       }
-      return { ok: false, budget: sawHealthyFit };
+      return { ok: false, budget: sawHealthyFit, contextDenied: !sawFit };
     };
     // The admitted stream fn: when per-user selection is active, an OUTER selector
     // that dispatches the per-request-chosen composite with the budget-derived output
@@ -971,33 +989,39 @@ export class AgentSessionFactory {
           }
         },
         // Pre-flight context-budget enforcement (spec CONTEXT-LIMIT-UNIFICATION
-        // §2.3). The operative ceiling is never null (context_window is always
-        // present), so enforcement is ALWAYS wired — interactive sessions now
-        // gain the model's `context_window` ceiling where they previously had
-        // none. Compares the LAST committed request's actual context size against
-        // the ceiling; the first request is never blocked (no actuals yet — the
-        // provider is authority on an oversized seed). D3 from TOKEN-USAGE-TRACKING
-        // is preserved verbatim.
+        // §2.3 / PER-MEMBER-CONTEXT-FITS §2.3). Terminates only when the observed
+        // context fits NO surviving member (observed > maxOperativeContextWindow —
+        // the largest member's window). Until then, per-member fits in
+        // chooseChainMember routes to a larger member as needed. The first request
+        // is never blocked (no actuals yet — the provider is authority on an
+        // oversized seed). D3 from TOKEN-USAGE-TRACKING is preserved verbatim.
         checkContextBudget: () => {
           // Per-user selection owns the context "fits" check per attempt (spec §6.2):
-          // the chosen model's OWN operative ceiling governs, which may exceed the
-          // head's (an upgrade) — so defer to the selector below rather than the head's
-          // ceiling here. A context that fits no selectable model terminates via
-          // `checkCostBudget`'s resolver, not this head-only gate.
+          // resolveUserSelection delegates to chooseChainMember with observedContextTokens,
+          // and terminates via checkCostBudget when no selectable fits. Defer here.
           if (userSelectionActive) return undefined;
           const observed = usage.snapshot().contextTokens;
-          if (observed === null || observed < contextCeiling) return undefined;
+          const maxWindow = fallback.maxOperativeContextWindow;
+          // Block only when the context exceeds EVERY member's window (fits no member).
+          if (observed === null || observed <= maxWindow) return undefined;
+          // At this point: observed > maxWindow → no surviving member can serve.
+          const skipped = fallback.survivorMembers
+            .filter((m) => m.operativeWindow < observed)
+            .map((m) => m.logicalId);
           this.options.logger?.warn("session_context_limit_exceeded", {
             sessionId: session.id,
             timelineKey: session.timelineKey,
             sessionType: session.sessionType,
             model: model.id,
             observed,
-            limit: contextCeiling,
+            limit: maxWindow,
+            membersSkippedOnFits: skipped,
           });
+          const skipNote =
+            skipped.length > 0 ? `; members skipped on fits: ${skipped.join(", ")}` : "";
           return (
-            `context token limit exceeded: observed context ${observed} tokens >= ` +
-            `limit ${contextCeiling} (model ${model.id}, session type ${session.sessionType})`
+            `context token limit exceeded: observed context ${observed} tokens > ` +
+            `max member window ${maxWindow} (model ${model.id}, session type ${session.sessionType}${skipNote})`
           );
         },
         // Per-request hard-cap pre-flight for the per-session cost ceiling (spec
@@ -1091,19 +1115,25 @@ export class AgentSessionFactory {
               );
             } else {
               const binding = userLimit!.engine.bindingConstraint(userLimit!.resolution);
+              // Distinguish terminal cause: budget (fits+healthy but unaffordable),
+              // context (no selectable fits the accumulated context at all), or
+              // outage (something fits context-wise but all healthy members are down).
+              const terminalCause = picked.budget ? "budget" : picked.contextDenied ? "context" : "outage";
               this.options.logger?.warn("usage_limit_blocked", {
                 gate: "user_preflight",
                 sessionId: session.id,
                 timelineKey: session.timelineKey,
                 userId: userLimit!.ctx.userId,
-                cause: picked.budget ? "budget" : "outage_or_context",
+                cause: terminalCause,
                 binding: binding
                   ? { partitionKey: binding.partitionKey, capUsd: binding.cap, models: binding.modelScope }
                   : undefined,
               });
               return picked.budget
                 ? `per-user budget exhausted: no affordable model remains for ${userLimit!.ctx.userId}`
-                : `per-user selection: no healthy model fits the accumulated context for ${userLimit!.ctx.userId}`;
+                : picked.contextDenied
+                ? `per-user selection: context exceeds all model windows for ${userLimit!.ctx.userId}`
+                : `per-user selection: no healthy model is available for ${userLimit!.ctx.userId}`;
             }
           }
           return undefined;
@@ -1389,14 +1419,21 @@ export class AgentSessionFactory {
 
   /**
    * Resolve a session's operative context-token ceiling from CURRENT config
-   * (spec CONTEXT-LIMIT-UNIFICATION §2.4; D7 from TOKEN-USAGE-TRACKING preserved):
-   * `min(context_window, session_type.max_context_tokens)`. The limit is operator
-   * config and is NOT persisted per session, so the console shows today's config
-   * for a given session type. The single resolver feeding enforcement, the model
-   * descriptor, and the text-editor read budget (U3) — always returns a number
-   * (context_window is mandatory for session-resolved models, §2.5). Throws (a
+   * (spec CONTEXT-LIMIT-UNIFICATION §2.4 / PER-MEMBER-CONTEXT-FITS §2.3):
+   * `min(context_window, session_type.max_context_tokens)` for the HEAD model —
+   * the planning number used by the text-editor read budget, the console's
+   * `maxContextTokens` display, and the resume-gate capability check. The limit
+   * is operator config and is NOT persisted per session. Always returns a number
+   * (`context_window` is mandatory for session-resolved models, §2.5). Throws (a
    * defensive backstop, never reached in normal operation since app-wiring
    * validation requires the window) if the resolved model has no `context_window`.
+   *
+   * The former min-over-chain behavior (spec MODEL-FALLBACK §3 #2) is replaced by
+   * per-member fits at selection time (PER-MEMBER-CONTEXT-FITS §2.3): each member
+   * is checked against its OWN window inside `chooseChainMember`, so the planning
+   * ceiling is now the HEAD's own window, not the fallback floor. Enforcement
+   * (in `create`'s `checkContextBudget`) uses `fallback.maxOperativeContextWindow`
+   * (the largest member's window) and terminates only when NO member can serve.
    */
   resolveSessionContextCeiling(sessionType: string): number {
     const cfg = this.resolveSessionType(sessionType);
@@ -1409,27 +1446,9 @@ export class AgentSessionFactory {
           `it is required to resolve the session context ceiling`,
       );
     }
-    // Min-over-chain ceiling (spec MODEL-FALLBACK §3 #2): the operative ceiling
-    // must be valid for WHICHEVER fallback member serves an attempt, so it is the
-    // minimum `context_window` across the chain. This is the FULL-chain min — the
-    // conservative value used by the text-editor read budget and the console,
-    // which have no per-session image-presence info. The create-path enforcement
-    // ceiling (`buildModelFallback`'s `operativeContextWindow`, computed in `create`
-    // above where `requiresMultimodal` is known) is instead the min over the
-    // capability-SURVIVING chain: for an image-bearing session a text-only member
-    // is dropped from selection, so that ceiling can only be EQUAL OR LARGER than
-    // this one (never smaller). The two ceilings differ deliberately; see the
-    // `requiresMultimodal` comment in `create` above for the matching half of this
-    // cross-reference. Both are resolved once and both stay ≤ the `context_window`
-    // of every member that can actually serve, so neither can overflow a serving
-    // model — the "ceiling resolved once" invariant holds.
-    const chain = resolveModelChain(modelKey, this.options.config.models);
-    let minWindow = contextWindow;
-    for (const entry of chain) {
-      const w = entry.config.context_window;
-      if (typeof w === "number") minWindow = Math.min(minWindow, w);
-    }
-    return composeSessionContextCeiling(minWindow, cfg?.max_context_tokens);
+    // Head's own operative ceiling: min(context_window, override). The chain min
+    // is removed — fallback members are fits-checked per attempt by chooseChainMember.
+    return composeSessionContextCeiling(contextWindow, cfg?.max_context_tokens);
   }
 
   /**

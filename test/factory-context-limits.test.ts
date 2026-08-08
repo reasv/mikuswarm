@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AgentSessionFactory, additiveThinkingBudgetTokens, composeSessionContextCeiling } from "../src/agent/factory.js";
+import { buildModelFallback, resolveModelChain, type ModelChainEntry } from "../src/agent/model-fallback.js";
 import { validateContextTokenCeilings } from "../src/app.js";
+import { createAssistantMessageEventStream, type Model, type Api } from "@earendil-works/pi-ai";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { SessionUsageTracker } from "../src/agent/usage.js";
 import type { AppConfig } from "../src/config/index.js";
+import type { UserLimitContext, UserLimitResolution } from "../src/budget/index.js";
+import type { BuiltContext } from "../src/context/index.js";
+import { ContextBuilder } from "../src/context/builder.js";
+import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 
 // === spec CONTEXT-LIMIT-UNIFICATION ===========================================
 // `context_window` is the sole model-level ceiling and the always-on enforcement
@@ -537,4 +545,569 @@ test("additiveThinkingBudgetTokens: additive portion never exceeds the model's o
   // wire cap to modelMax too).
   const m = modelCfg({ id: "claude-3-5-haiku", api: "anthropic-messages", max_tokens: 4_000 });
   assert.equal(additiveThinkingBudgetTokens(m, "high"), 4_000);
+});
+
+// === spec PER-MEMBER-CONTEXT-FITS §2.3: resolveSessionContextCeiling no chain min =
+
+test("resolveSessionContextCeiling §2.3: head window only — a small fallback member does not shrink the planning ceiling", () => {
+  // Before this spec: resolveSessionContextCeiling took the min over the chain, so a
+  // 64k fallback member silently shrank the planning ceiling of a 256k head to 64k.
+  // After: the head's own window governs; per-member fits are checked at selection time.
+  const factory = makeFactory({
+    models: {
+      default: { context_window: 256_000, fallback: ["small"] } as any,
+      small: { context_window: 64_000 },
+    },
+  });
+  // Must return the HEAD's 256k — not the chain min 64k.
+  assert.equal(factory.resolveSessionContextCeiling("default"), 256_000);
+});
+
+test("resolveSessionContextCeiling §2.3: session-type override still applied to head window", () => {
+  const factory = makeFactory({
+    models: {
+      default: { context_window: 256_000, fallback: ["small"] } as any,
+      small: { context_window: 64_000 },
+    },
+    sessionTypes: { default: { max_context_tokens: 128_000 } },
+  });
+  // Override tightens the head's 256k to 128k (not the min-over-chain 64k).
+  assert.equal(factory.resolveSessionContextCeiling("default"), 128_000);
+});
+
+// === spec PER-MEMBER-CONTEXT-FITS §2.3: per-member model descriptor ============
+
+// Shared helpers for buildModelFallback descriptor tests.
+function descModelCfg(id: string, context_window: number): any {
+  return {
+    id,
+    provider: "test",
+    endpoint: `https://gw/${id}`,
+    api_key: "k",
+    input_modalities: ["text"],
+    max_tokens: 4096,
+    context_window,
+  };
+}
+
+const capturedContextWindows: Record<string, number> = {};
+function recordingMakeModel(cfg: any, cw: number): Model<Api> {
+  capturedContextWindows[cfg.id] = cw;
+  return {
+    id: cfg.id,
+    name: cfg.id,
+    api: "anthropic-messages",
+    provider: cfg.provider,
+    baseUrl: cfg.endpoint,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: cw,
+    maxTokens: cfg.max_tokens,
+  } as Model<Api>;
+}
+
+test("per-member descriptor §2.3: each member's Model descriptor carries its OWN window, not the chain min", () => {
+  const captured: Record<string, number> = {};
+  const headCfg = descModelCfg("head-256k", 256_000);
+  const smallCfg = descModelCfg("small-64k", 64_000);
+  const X: ModelChainEntry = { logicalId: "X", config: headCfg };
+  const Y: ModelChainEntry = { logicalId: "Y", config: smallCfg };
+
+  buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: () => (() => { throw new Error("unused"); }) as any,
+    makeModel: (cfg, cw) => {
+      captured[cfg.id] = cw;
+      return recordingMakeModel(cfg, cw);
+    },
+  });
+
+  // Head gets its own 256k, not the chain min 64k.
+  assert.equal(captured["head-256k"], 256_000, "head descriptor carries its own window");
+  // Small member gets its own 64k.
+  assert.equal(captured["small-64k"], 64_000, "small member descriptor carries its own window");
+});
+
+test("per-member descriptor §2.3: contextOverride applied per member, not as a shared floor", () => {
+  const captured: Record<string, number> = {};
+  const headCfg = descModelCfg("head-256k", 256_000);
+  const smallCfg = descModelCfg("small-64k", 64_000);
+  const X: ModelChainEntry = { logicalId: "X", config: headCfg };
+  const Y: ModelChainEntry = { logicalId: "Y", config: smallCfg };
+
+  buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: () => (() => { throw new Error("unused"); }) as any,
+    makeModel: (cfg, cw) => {
+      captured[cfg.id] = cw;
+      return recordingMakeModel(cfg, cw);
+    },
+    contextOverride: 128_000, // tightens X to 128k, Y stays 64k (already smaller)
+  });
+
+  // Override tightens X from 256k to 128k (min(256k, 128k)).
+  assert.equal(captured["head-256k"], 128_000, "head is tightened by the override");
+  // Y is already smaller than the override; its own 64k governs.
+  assert.equal(captured["small-64k"], 64_000, "small member uses its own window when < override");
+});
+
+// === spec PER-MEMBER-CONTEXT-FITS §2.3/§4 factory integration: enforcement ====
+//
+// These tests use a fake per-user engine that captures affordability probes and
+// terminates content-class without touching any real HTTP endpoint, following
+// the pattern established in agent-context.test.ts.
+
+/** Minimal AppConfig with a two-member chain (head 256k, fallback 64k). */
+function perMemberConfig(overrides?: Partial<AppConfig>): AppConfig {
+  return {
+    app: { name: "test", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
+    agent: {
+      sessions: { max_concurrent: 1, max_concurrent_dm: 1, forced_completion_retries: 0 },
+      system: {},
+    },
+    models: {
+      default: {
+        id: "head-model",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 256_000,
+      },
+      fallback: {
+        id: "fallback-model",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+      },
+    },
+    context: {
+      tiers: { rich_target_tokens: 2000, rich_max_tokens: 4000, compact_target_tokens: 4000, compact_max_tokens: 8000 },
+    },
+    storage: { database_path: ":memory:" },
+    workspace: { root_dir: "/tmp" },
+    matrix: { enabled: false, trigger_hold_ms: 0, accounts: {} },
+    ...overrides,
+  } as AppConfig;
+}
+
+/** Minimal BuiltContext with a triggerGroup final turn. */
+function minimalBuilt(): BuiltContext {
+  return {
+    messages: [
+      { type: "system", role: "system", content: "sys", tier: "system", tokenEstimate: 1 },
+      { type: "triggerGroup", role: "user", content: "hi", tier: "trigger", tokenEstimate: 1, timestamp: 10 },
+    ],
+    tokenEstimate: 2,
+    compactTokens: 0,
+    richTokens: 0,
+    imageBlocks: [],
+  } as BuiltContext;
+}
+
+function stubCtxBuilder(built: BuiltContext): ContextBuilder {
+  return { build: async () => built } as unknown as ContextBuilder;
+}
+
+function perMemberSession(): AgentSessionRecord {
+  return {
+    id: "s-pm",
+    timelineKey: "matrix:miku:room:!r",
+    sessionType: "default",
+    status: "running",
+    trigger: {
+      provider: "matrix",
+      timelineKey: "matrix:miku:room:!r",
+      event: {
+        id: "ev1",
+        timelineKey: "matrix:miku:room:!r",
+        provider: "matrix",
+        role: "user",
+        sender: { id: "@u:hs" },
+        body: "hi",
+        timestamp: 10,
+        receivedAt: 10,
+      },
+    } as any,
+    createdAt: 0,
+  };
+}
+
+/** A fake engine that always says "affordable" — lets us observe selection without blocking. */
+function affordableEngine(): any {
+  return {
+    affordable: () => ({ ok: true, maxOutput: 4096, remainingUsd: Infinity }),
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  };
+}
+
+/** A fake engine that always says "unaffordable" — terminates content-class on first request. */
+function unaffordableEngine(): any {
+  return {
+    affordable: () => ({ ok: false, maxOutput: 0, remainingUsd: 0 }),
+    bindingConstraint: () => undefined,
+    noteSelection: () => {},
+  };
+}
+
+function perUserResolution(models: string[]): UserLimitResolution {
+  return {
+    matched: true,
+    active: true,
+    banned: false,
+    models,
+    constraints: [],
+    ledgerPartitionKeys: [],
+  } as unknown as UserLimitResolution;
+}
+
+const perUserCtx: UserLimitContext = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+
+// § Per-member fits §2.3: head doesn't fit but fallback DOES — Gate B selects
+// the fallback member and proceeds (blocked by budget, NOT by context).
+// This tests the mirror of the incident shape: here the HEAD is the small member,
+// the big fallback carries the context. chooseChainMember must skip the head and
+// use the large fallback when observed > head.window but observed <= big.window.
+test("Gate B §2.4 fits: context above head window but below fallback window — budget-denied, NOT context-denied", async () => {
+  // head = 64k, big = 256k → maxOperativeContextWindow = 256k.
+  // At 100k: head (64k) doesn't fit, big (256k) does → Gate B skips head, picks big.
+  const config = perMemberConfig({
+    models: {
+      default: {
+        id: "head-64k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+        fallback: ["big"],
+      },
+      big: {
+        id: "big-256k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 256_000,
+      },
+    },
+  } as any);
+
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const resolution = perUserResolution(["default"]);
+  const engine = unaffordableEngine(); // always blocks; we use it to observe the cause
+
+  // Seed 100k context via resume so ctxCounter.running = 100k.
+  const seed = new SessionUsageTracker({
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 100_000,
+  });
+
+  const { agent } = await factory.create(perMemberSession(), [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any] },
+    usage: seed,
+    userLimit: { engine, resolution, ctx: perUserCtx },
+  });
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  // big member (256k) accommodates 100k → Gate B finds viable-healthy member.
+  // Unaffordable engine blocks on budget — NOT on context.
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /budget exhausted/,
+    "big fallback (256k) fits 100k; Gate B budget-denied not context-denied",
+  );
+  assert.ok(
+    !(agent.state.errorMessage ?? "").includes("context exceeds"),
+    "must NOT be context-denied when the fallback member window accommodates the context",
+  );
+});
+
+// § Enforcement: past maxOperativeContextWindow terminates with the max-window message.
+test("checkContextBudget §2.3: context past max member window terminates with max-window + skipped members", async () => {
+  // head = 64k, big = 256k → maxOperativeContextWindow = 256k.
+  const config = perMemberConfig({
+    models: {
+      default: {
+        id: "head-64k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+        fallback: ["big"],
+      },
+      big: {
+        id: "big-256k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 256_000,
+      },
+    },
+  } as any);
+
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const { agent, usage } = await factory.create(perMemberSession(), []);
+
+  // Simulate 300k — exceeds ALL member windows (max = 256k).
+  usage.record(
+    { input: 240_000, output: 60_000, cacheRead: 0, cacheWrite: 0, totalTokens: 300_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    "head-64k",
+  );
+  assert.equal(usage.snapshot().contextTokens, 300_000);
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  const err = agent.state.errorMessage ?? "";
+  assert.match(err, /context token limit exceeded/, "must produce context-limit error");
+  assert.match(err, /max member window 256000/, "must report the max member window");
+  assert.match(err, /members skipped on fits/, "must list the members skipped");
+});
+
+// § Gate B: terminal message distinguishes context vs budget vs outage
+test("Gate B §2.4 terminal: 'context exceeds all model windows' when context too large for all preferences", async () => {
+  // Both preferred models have small windows; context is seeded to exceed both.
+  const config = perMemberConfig({
+    models: {
+      default: {
+        id: "def-model",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 128_000,
+      },
+      small: {
+        id: "small-model",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+      },
+    },
+  } as any);
+
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  // Per-user set: both preferred models have small windows.
+  const resolution = perUserResolution(["default", "small"]);
+  const engine = affordableEngine(); // would be affordable, but context doesn't fit
+
+  // Seed a large context (larger than ALL preferred model windows: 128k and 64k).
+  const seed = new SessionUsageTracker({
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 200_000, // > max(128k, 64k)
+  });
+
+  const { agent } = await factory.create(perMemberSession(), [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any] },
+    usage: seed,
+    userLimit: { engine, resolution, ctx: perUserCtx },
+  });
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /context exceeds all model windows/,
+    "context-denied terminal must be distinguished from outage",
+  );
+});
+
+test("Gate B §2.4 terminal: 'no healthy model is available' when models healthy but no context issue", async () => {
+  // Models have large windows, but the engine always says unaffordable.
+  // When nothing is affordable but context fits → budget exhausted.
+  const config = perMemberConfig();
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const resolution = perUserResolution(["default"]);
+  const engine = unaffordableEngine(); // always says unaffordable → budget cause
+
+  const { agent } = await factory.create(perMemberSession(), [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any] },
+    usage: new SessionUsageTracker(),
+    userLimit: { engine, resolution, ctx: perUserCtx },
+  });
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  // With context fitting (small running counter) but unaffordable → budget exhausted.
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /budget exhausted/,
+    "unaffordable + fits should be 'budget exhausted', not 'no healthy model'",
+  );
+});
+
+// § Gate B §2.4: single-member selectable is fits-gated by Gate B even though
+// dispatch keeps the single-member fast path.
+test("Gate B §2.4: single-member selectable is context-gated (context-denied when window exceeded)", async () => {
+  // Single preferred model with a small window; context seeded above it.
+  const config = perMemberConfig({
+    models: {
+      default: {
+        id: "small-single",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+        // No fallback — single-member chain.
+      },
+    },
+  } as any);
+
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const resolution = perUserResolution(["default"]);
+  const engine = affordableEngine();
+
+  // Seed context above the single model's window.
+  const seed = new SessionUsageTracker({
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 100_000, // > 64k window
+  });
+
+  const { agent } = await factory.create(perMemberSession(), [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any] },
+    usage: seed,
+    userLimit: { engine, resolution, ctx: perUserCtx },
+  });
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  // Gate B should deny: context exceeds the single model's window.
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /context exceeds all model windows/,
+    "single-member selectable must be context-gated by Gate B",
+  );
+});
+
+// § Gate B §2.4 (incident shape): preferred model head has a small fallback member,
+// but the head's OWN window fits → Gate B should pass (it checks per member, not chain min).
+test("Gate B §2.4 incident shape: preferred head serves when ITS window fits, even if chain has smaller member", async () => {
+  // This is the incident that motivated the spec:
+  // head window 256k, fallback member window 64k, observed context 150k.
+  // Old behavior: operativeContextWindow = min = 64k → fits check fails → wrong terminal.
+  // New behavior: chooseChainMember with observed=150k → head (256k) fits → proceeds.
+  const config = perMemberConfig({
+    models: {
+      default: {
+        id: "head-256k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 256_000,
+        fallback: ["floor"],
+      },
+      floor: {
+        id: "floor-64k",
+        provider: "test",
+        endpoint: "http://localhost",
+        api_key: "key",
+        input_modalities: ["text"],
+        max_tokens: 4096,
+        context_window: 64_000,
+      },
+    },
+  } as any);
+
+  const factory = new AgentSessionFactory({
+    config,
+    contextBuilder: stubCtxBuilder(minimalBuilt()),
+    getActiveSessions: () => [],
+  });
+
+  const resolution = perUserResolution(["default"]);
+  // Engine terminates immediately (unaffordable) once Gate B passes — we just want to
+  // confirm the run was blocked by BUDGET (passed fits) not CONTEXT.
+  const engine = unaffordableEngine();
+
+  // Seed context at 150k — between floor 64k and head 256k.
+  const seed = new SessionUsageTracker({
+    llmRequests: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    contextTokens: 150_000,
+  });
+
+  const { agent } = await factory.create(perMemberSession(), [], {
+    resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any] },
+    usage: seed,
+    userLimit: { engine, resolution, ctx: perUserCtx },
+  });
+
+  await agent.prompt({ role: "user", content: "test", timestamp: 20 } as any);
+
+  // With per-member fits: head (256k) accommodates 150k → Gate B passes fits →
+  // unaffordable engine blocks → "budget exhausted", NOT "context exceeds all windows".
+  assert.match(
+    agent.state.errorMessage ?? "",
+    /budget exhausted/,
+    "incident shape: head window fits 150k context; gate passes fits → budget-denied, not context-denied",
+  );
+  assert.ok(
+    !(agent.state.errorMessage ?? "").includes("context exceeds"),
+    "must NOT say 'context exceeds' when the head's own window fits the context",
+  );
 });

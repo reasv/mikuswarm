@@ -217,13 +217,12 @@ export function buildModelFallback(
 
   // Per-candidate dispatch pipelines (§3 #3).
   const candidates: Candidate[] = survivors.map((entry) => {
-    // Member's own operative window for fits gating (§2.1). Falls back to the
-    // shared min for any member that lacks a declared context_window (defensive).
+    // Member's own operative window for fits gating (§2.1) and for the Model
+    // descriptor (spec PER-MEMBER-CONTEXT-FITS §2.3): each member's descriptor
+    // carries ITS OWN window so any window-keyed SDK mechanism sees the number
+    // that is true for the model actually serving the attempt.
     const memberWindow = memberWindowMap.get(entry.logicalId) ?? operativeContextWindow;
-    // makeModel still receives the shared min-over-chain window for backward
-    // compatibility — the model descriptor's contextWindow is not yet per-member
-    // (that substitution is step 2 of PER-MEMBER-CONTEXT-FITS).
-    const model = options.makeModel(entry.config, operativeContextWindow);
+    const model = options.makeModel(entry.config, memberWindow);
     const base = options.makeBase(entry.config);
     const group = entry.config.rate_limit_group ?? "default";
     const dispatch: StreamFn =
