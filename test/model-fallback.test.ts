@@ -7,6 +7,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { LlmScheduler } from "../src/agent/scheduler.js";
 import {
   buildModelFallback,
+  chooseChainMember,
   resolveModelChain,
   runFetchWithFallback,
   type ModelChainEntry,
@@ -518,4 +519,296 @@ test("#19b runFetchWithFallback: model_fallback_resolved logs for a NON-primary 
   assert.equal(resolved[0]?.data?.chosen, "Y");
   assert.equal(resolved[0]?.data?.reason, "budget-fallback");
   assert.equal(resolved[0]?.data?.consumer, "captioning");
+});
+
+// =============================================================================
+// PER-MEMBER-CONTEXT-FITS §2.1–§2.3: per-member fits predicate + new fields
+// =============================================================================
+
+// ─── chooseChainMember: direct unit tests ────────────────────────────────────
+
+/**
+ * Helper: a bare ChooseMember object (no scheduler needed for the simple cases).
+ * TypeScript structural typing lets us pass these directly to chooseChainMember.
+ */
+function member(logicalId: string, operativeWindow: number, healthKey = `ep::${logicalId}`) {
+  return { logicalId, healthKey, operativeWindow };
+}
+
+test("fits §2.1: undefined observed → fits is skipped (regression — identical to before)", () => {
+  // Head window = 128k, Y window = 256k. No observed → primary (head always chosen when healthy).
+  const m = [member("X", 128_000), member("Y", 256_000)];
+  assert.deepEqual(chooseChainMember(m, {}), { index: 0, reason: "primary" });
+});
+
+test("fits §2.1: observed <= head window → primary", () => {
+  const m = [member("X", 128_000), member("Y", 256_000)];
+  assert.deepEqual(chooseChainMember(m, { observedContextTokens: 100_000 }), { index: 0, reason: "primary" });
+  // Exact boundary: observed === window → fits (<=)
+  assert.deepEqual(chooseChainMember(m, { observedContextTokens: 128_000 }), { index: 0, reason: "primary" });
+});
+
+test("fits §2.1: context-fallback — head healthy+in-budget but observed > head window, Y is larger", () => {
+  // X window = 128k, Y window = 256k, observed = 150k → X doesn't fit, Y does.
+  const m = [member("X", 128_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, { observedContextTokens: 150_000 });
+  assert.equal(result.index, 1, "falls to Y (the larger member)");
+  assert.equal(result.reason, "context-fallback");
+});
+
+test("fits §2.1: context-fallback — upgrade path, downstream member has larger window", () => {
+  // X = 64k, Y = 512k, Z = 128k. Observed = 100k → X and Z don't fit; Y is the first that does.
+  const m = [member("X", 64_000), member("Y", 512_000), member("Z", 128_000)];
+  const result = chooseChainMember(m, { observedContextTokens: 100_000 });
+  assert.equal(result.index, 1, "Y is the first member whose window fits");
+  assert.equal(result.reason, "context-fallback");
+});
+
+test("fits §2.1: all members too small → all-unhealthy (no viable member)", () => {
+  // Observed = 300k; all windows smaller → all skipped → falls to head as "all-unhealthy".
+  const m = [member("X", 128_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, { observedContextTokens: 300_000 });
+  assert.equal(result.index, 0, "routes to head when no member fits");
+  assert.equal(result.reason, "all-unhealthy");
+});
+
+test("fits §2.2: canary NOT fired when observed > head window (context doesn't fit the probe)", async () => {
+  // Head unhealthy + probe-due + in-budget, but observed > head.operativeWindow.
+  // Spec §2.2: probing with an oversized context wastes the probe slot.
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", "ep::X", "environmental");
+  await new Promise((r) => setTimeout(r, 10)); // let the probe window open
+  assert.equal(scheduler.isProbeDue("ep::X"), true);
+
+  // X window = 64k, Y window = 256k, observed = 100k → X doesn't fit (no canary), Y fits.
+  const m = [member("X", 64_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, {
+    scheduler,
+    observedContextTokens: 100_000,
+  });
+  // Head is unhealthy so the reason is health-fallback (even though context also doesn't fit).
+  assert.equal(result.index, 1, "Y serves; no wasted canary probe on a context the head can't serve");
+  assert.equal(result.reason, "health-fallback");
+});
+
+test("fits §2.2: canary IS fired when observed fits the head (normal canary path)", async () => {
+  // Head unhealthy + probe-due + in-budget AND context fits → canary proceeds.
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", "ep::X", "environmental");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(scheduler.isProbeDue("ep::X"), true);
+
+  // X window = 256k, observed = 100k → head fits → canary fires.
+  const m = [member("X", 256_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, {
+    scheduler,
+    observedContextTokens: 100_000,
+  });
+  assert.equal(result.index, 0, "head is canaried when context fits");
+  assert.equal(result.reason, "canary");
+});
+
+test("fits §2.1: health-fallback reason when head unhealthy (fits is a secondary concern)", () => {
+  // Head unhealthy, NOT probe-due, Y fits: reason is health-fallback regardless of fits.
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 } });
+  scheduler.noteOutcome("default", "ep::X", "environmental");
+  // X window = 256k — context FITS the head, but head is unhealthy → health-fallback.
+  const m = [member("X", 256_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, {
+    scheduler,
+    observedContextTokens: 100_000,
+  });
+  assert.equal(result.index, 1);
+  assert.equal(result.reason, "health-fallback");
+});
+
+test("fits §2.1: budget-fallback reason when head healthy but over budget", () => {
+  // Head healthy + in-budget false (budget exhausted) + context fits → budget-fallback.
+  const m = [member("X", 256_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, {
+    isModelAvailable: (id) => id !== "X",
+    observedContextTokens: 100_000,
+  });
+  assert.equal(result.index, 1);
+  assert.equal(result.reason, "budget-fallback");
+});
+
+// ─── buildModelFallback: memberWindows / maxOperativeContextWindow ────────────
+
+test("memberWindows §2.3: per-survivor operative windows, no contextOverride", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }) };
+  const Y: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }) };
+  const fb = buildModelFallback([X, Y], { consumer: "test", makeBase: recordingBase([]), makeModel });
+  assert.deepEqual(fb.memberWindows, { X: 128_000, Y: 256_000 });
+  assert.equal(fb.maxOperativeContextWindow, 256_000);
+  // Backward compat: operativeContextWindow still = min.
+  assert.equal(fb.operativeContextWindow, 128_000);
+});
+
+test("memberWindows §2.3: contextOverride mins each member's window", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }) };
+  const Y: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }) };
+  const fb = buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: recordingBase([]),
+    makeModel,
+    contextOverride: 100_000,
+  });
+  assert.deepEqual(fb.memberWindows, { X: 100_000, Y: 100_000 });
+  assert.equal(fb.maxOperativeContextWindow, 100_000);
+  assert.equal(fb.operativeContextWindow, 100_000);
+});
+
+test("memberWindows §2.3: contextOverride larger than all windows → member's window wins", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 64_000 }) };
+  const Y: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 128_000 }) };
+  const fb = buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: recordingBase([]),
+    makeModel,
+    contextOverride: 200_000, // larger than all windows — member windows govern
+  });
+  assert.deepEqual(fb.memberWindows, { X: 64_000, Y: 128_000 });
+  assert.equal(fb.maxOperativeContextWindow, 128_000);
+  assert.equal(fb.operativeContextWindow, 64_000);
+});
+
+test("memberWindows §2.3: capability filter drops a member — only survivors in memberWindows", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }) };
+  const textOnlyY: ModelChainEntry = {
+    logicalId: "Y",
+    config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000, input_modalities: ["text"] }),
+  };
+  const Z: ModelChainEntry = { logicalId: "Z", config: modelCfg({ id: "wire-Z", endpoint: "https://gw/z", context_window: 512_000 }) };
+  const fb = buildModelFallback([X, textOnlyY, Z], {
+    consumer: "test",
+    makeBase: recordingBase([]),
+    makeModel,
+    capability: (cfg) => cfg.input_modalities.includes("image"),
+  });
+  // Y is dropped (no image capability); X and Z survive.
+  assert.deepEqual(fb.memberWindows, { X: 128_000, Z: 512_000 });
+  assert.equal(fb.maxOperativeContextWindow, 512_000);
+  assert.equal(fb.operativeContextWindow, 128_000); // min over survivors X + Z
+});
+
+test("memberWindows §2.3: single-member chain also exposes memberWindows / maxOperativeContextWindow", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 200_000 }) };
+  const fb = buildModelFallback([X], { consumer: "test", makeBase: recordingBase([]), makeModel });
+  assert.deepEqual(fb.memberWindows, { X: 200_000 });
+  assert.equal(fb.maxOperativeContextWindow, 200_000);
+  assert.equal(fb.operativeContextWindow, 200_000);
+});
+
+test("survivorMembers §2.3: each entry carries operativeWindow", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }) };
+  const Y: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }) };
+  const fb = buildModelFallback([X, Y], { consumer: "test", makeBase: recordingBase([]), makeModel });
+  assert.equal(fb.survivorMembers.length, 2);
+  assert.equal(fb.survivorMembers[0]!.logicalId, "X");
+  assert.equal(fb.survivorMembers[0]!.operativeWindow, 128_000);
+  assert.equal(fb.survivorMembers[1]!.logicalId, "Y");
+  assert.equal(fb.survivorMembers[1]!.operativeWindow, 256_000);
+});
+
+test("survivorMembers §2.3: contextOverride is applied to the operativeWindow", () => {
+  const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 256_000 }) };
+  const fb = buildModelFallback([X], {
+    consumer: "test",
+    makeBase: recordingBase([]),
+    makeModel,
+    contextOverride: 100_000,
+  });
+  assert.equal(fb.survivorMembers[0]!.operativeWindow, 100_000);
+});
+
+test("context-fallback via streamFn E2E: getObservedContextTokens wires fits into per-attempt selection", async () => {
+  // X window = 128k, Y window = 256k. observed = 150k → X skipped, Y serves (context-fallback).
+  const smallX: ModelChainEntry = {
+    logicalId: "X",
+    config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }),
+  };
+  const largeY: ModelChainEntry = {
+    logicalId: "Y",
+    config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }),
+  };
+
+  const calls: string[] = [];
+  const resolved: string[] = [];
+  const reasons: string[] = [];
+  let observedTokens = 150_000; // over X's window
+
+  const fb = buildModelFallback([smallX, largeY], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    getObservedContextTokens: () => observedTokens,
+    onResolve: (id, reason) => {
+      resolved.push(id);
+      reasons.push(reason);
+    },
+  });
+
+  // First drive: observed = 150k → X doesn't fit → Y serves.
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-Y"], "Y serves when observed > X.window");
+  assert.deepEqual(resolved, ["Y"]);
+  assert.deepEqual(reasons, ["context-fallback"]);
+
+  // Second drive with observed = 100k → X fits again → primary.
+  observedTokens = 100_000;
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-Y", "wire-X"], "X is primary again when context fits");
+  assert.equal(reasons[1], "primary");
+});
+
+test("context-fallback via streamFn: all members too small → all-unhealthy routes to head", async () => {
+  const X: ModelChainEntry = {
+    logicalId: "X",
+    config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 64_000 }),
+  };
+  const Y: ModelChainEntry = {
+    logicalId: "Y",
+    config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 128_000 }),
+  };
+  const calls: string[] = [];
+  const reasons: string[] = [];
+
+  const fb = buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    getObservedContextTokens: () => 200_000, // exceeds both windows
+    onResolve: (_id, reason) => reasons.push(reason),
+  });
+
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-X"], "routes to head as all-unhealthy when no member fits");
+  assert.deepEqual(reasons, ["all-unhealthy"]);
+});
+
+test("context-fallback: undefined getObservedContextTokens → no fits check, behavior identical to today", async () => {
+  // No getObservedContextTokens → fits always skipped → primary regardless of any window relationship.
+  const X: ModelChainEntry = {
+    logicalId: "X",
+    config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 1_000 }),
+  };
+  const Y: ModelChainEntry = {
+    logicalId: "Y",
+    config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }),
+  };
+  const calls: string[] = [];
+  const reasons: string[] = [];
+
+  const fb = buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: recordingBase(calls),
+    makeModel,
+    // no getObservedContextTokens — current callers don't set this
+    onResolve: (_id, reason) => reasons.push(reason),
+  });
+
+  await drive(fb.streamFn);
+  assert.deepEqual(calls, ["wire-X"], "head serves (primary) even though its window is tiny");
+  assert.deepEqual(reasons, ["primary"]);
 });

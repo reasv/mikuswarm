@@ -42,6 +42,11 @@ export type FallbackReason =
   | "budget-fallback"
   | "health-fallback"
   | "canary"
+  /**
+   * Head healthy and in-budget but the observed context exceeds the head's window;
+   * a larger downstream member serves (spec PER-MEMBER-CONTEXT-FITS §4).
+   */
+  | "context-fallback"
   | "all-unhealthy";
 
 export interface BuildModelFallbackOptions {
@@ -96,24 +101,49 @@ export interface BuildModelFallbackOptions {
    * to the member actually about to be billed — exact even when `X` fell to `Y`.
    */
   onResolve?: (logicalId: string, reason: FallbackReason) => void;
+  /**
+   * Provider of the current observed context token count for per-member fits
+   * gating (spec PER-MEMBER-CONTEXT-FITS §2.1). Called per attempt inside the
+   * composed streamFn; returns undefined → fits is skipped (all current callers
+   * omit this; step 2 of the spec wires it from the §5.3 running counter).
+   */
+  getObservedContextTokens?: () => number | undefined;
 }
 
 export interface BuiltModelFallback {
   /** The per-attempt-resolving stream fn (wrap with `withRequestRetry`). */
   streamFn: StreamFn;
-  /** Operative context ceiling valid for WHICHEVER member serves (min-over-chain, §3 #2). */
+  /**
+   * Operative context ceiling valid for WHICHEVER member serves (min-over-chain, §3 #2).
+   * KEPT for backward compatibility — still consumed by enforcement and the representative
+   * model descriptor. Use `memberWindows` / `maxOperativeContextWindow` for per-member fits.
+   */
   operativeContextWindow: number;
   /** Head logical id (placeholder/ledger seed; the per-attempt billed id is exact). */
   headLogicalId: string;
   /** Surviving members' logical ids, head-first — for the chain-availability budget gate (§6.1). */
   survivorLogicalIds: string[];
   /**
-   * Surviving members (logical id + health failure-domain key), head-first — for the
-   * per-user selection HEALTH predicate (spec PER-USER-LIMITS §4.2 #2): the outer
-   * selector reuses {@link chooseChainMember} over these to ask "is any member of
-   * this model's chain up?" without dispatching.
+   * Surviving members (logical id + health failure-domain key + per-member operative window),
+   * head-first — for the per-user selection HEALTH predicate (spec PER-USER-LIMITS §4.2 #2):
+   * the outer selector reuses {@link chooseChainMember} over these to ask "is any member of
+   * this model's chain up?" without dispatching. The `operativeWindow` enables step 2 to feed
+   * per-attempt observed context sizes without further model-fallback surgery.
    */
-  survivorMembers: { logicalId: string; healthKey: string }[];
+  survivorMembers: { logicalId: string; healthKey: string; operativeWindow: number }[];
+  /**
+   * Per-surviving-member operative windows (spec PER-MEMBER-CONTEXT-FITS §2.3):
+   * `min(member.context_window, contextOverride?)` for each survivor. Keyed by logicalId.
+   * Used by Gate B (step 2) and by §8b enforcement to check fits per member rather than
+   * against the shared min.
+   */
+  memberWindows: Record<string, number>;
+  /**
+   * Maximum operative window over all surviving members (spec PER-MEMBER-CONTEXT-FITS §2.3).
+   * For §8b enforcement: terminate ("context token limit exceeded") only when the observed
+   * context exceeds this — i.e., fits NO surviving member.
+   */
+  maxOperativeContextWindow: number;
 }
 
 interface Candidate {
@@ -123,6 +153,8 @@ interface Candidate {
   healthKey: string;
   supportsThinking: boolean;
   dispatch: StreamFn;
+  /** Member's own operative window for the fits predicate (spec PER-MEMBER-CONTEXT-FITS §2.1). */
+  operativeWindow: number;
 }
 
 /**
@@ -144,7 +176,7 @@ export function buildModelFallback(
   );
 
   // Min-over-chain context ceiling (§3 #2): one conservative value valid for
-  // whichever member serves a given attempt.
+  // whichever member serves a given attempt. KEPT for backward compatibility.
   let minWindow = Infinity;
   for (const entry of survivors) {
     const w = entry.config.context_window;
@@ -166,8 +198,31 @@ export function buildModelFallback(
       ? Math.min(minWindow, options.contextOverride)
       : minWindow;
 
+  // Per-member operative windows (spec PER-MEMBER-CONTEXT-FITS §2.3): each member's
+  // OWN window, resolved once at build (config is immutable per process). Only the
+  // fits comparison moves to attempt time. Members without a declared context_window
+  // are skipped here — in practice all members have one (the build-time throw above is
+  // a backstop for the chain-wide case).
+  const memberWindowMap = new Map<string, number>();
+  let maxOperativeContextWindow = 0;
+  for (const entry of survivors) {
+    const w = entry.config.context_window;
+    if (typeof w === "number") {
+      const mw = options.contextOverride !== undefined ? Math.min(w, options.contextOverride) : w;
+      memberWindowMap.set(entry.logicalId, mw);
+      maxOperativeContextWindow = Math.max(maxOperativeContextWindow, mw);
+    }
+  }
+  const memberWindows: Record<string, number> = Object.fromEntries(memberWindowMap);
+
   // Per-candidate dispatch pipelines (§3 #3).
   const candidates: Candidate[] = survivors.map((entry) => {
+    // Member's own operative window for fits gating (§2.1). Falls back to the
+    // shared min for any member that lacks a declared context_window (defensive).
+    const memberWindow = memberWindowMap.get(entry.logicalId) ?? operativeContextWindow;
+    // makeModel still receives the shared min-over-chain window for backward
+    // compatibility — the model descriptor's contextWindow is not yet per-member
+    // (that substitution is step 2 of PER-MEMBER-CONTEXT-FITS).
     const model = options.makeModel(entry.config, operativeContextWindow);
     const base = options.makeBase(entry.config);
     const group = entry.config.rate_limit_group ?? "default";
@@ -190,11 +245,16 @@ export function buildModelFallback(
       healthKey: modelHealthKey(model),
       supportsThinking: entry.config.reasoning ?? true,
       dispatch,
+      operativeWindow: memberWindow,
     };
   });
 
   const survivorLogicalIds = candidates.map((c) => c.logicalId);
-  const survivorMembers = candidates.map((c) => ({ logicalId: c.logicalId, healthKey: c.healthKey }));
+  const survivorMembers = candidates.map((c) => ({
+    logicalId: c.logicalId,
+    healthKey: c.healthKey,
+    operativeWindow: c.operativeWindow,
+  }));
 
   // Single-member chain → no fallback machinery; dispatch the head directly.
   if (candidates.length === 1) {
@@ -208,6 +268,8 @@ export function buildModelFallback(
       headLogicalId: head.logicalId,
       survivorLogicalIds,
       survivorMembers,
+      memberWindows,
+      maxOperativeContextWindow,
     };
   }
 
@@ -217,6 +279,9 @@ export function buildModelFallback(
     const { index, reason } = chooseChainMember(candidates, {
       scheduler: options.scheduler,
       isModelAvailable: options.isModelAvailable,
+      // Per-attempt observed context size for fits gating (§2.1). Undefined until
+      // step 2 wires getObservedContextTokens from the factory's §5.3 counter.
+      observedContextTokens: options.getObservedContextTokens?.(),
     });
     const candidate = candidates[index]!;
     options.onResolve?.(candidate.logicalId, reason);
@@ -263,6 +328,8 @@ export function buildModelFallback(
     headLogicalId: head.logicalId,
     survivorLogicalIds,
     survivorMembers,
+    memberWindows,
+    maxOperativeContextWindow,
   };
 }
 
@@ -299,13 +366,20 @@ export function resolveModelChain(
 interface ChooseMember {
   logicalId: string;
   healthKey: string;
+  /**
+   * Member's own operative window for the fits predicate (spec PER-MEMBER-CONTEXT-FITS §2.1).
+   * `min(member.context_window, sessionType.max_context_tokens?)`, resolved at build.
+   */
+  operativeWindow: number;
 }
 
 /**
  * Choose one chain member for an attempt (spec §3), shared by the StreamFn
  * resolver and the fetch-shaped one. Chain order, head special-cased for the
  * canary. A member is viable iff its model is healthy (untracked / no scheduler =
- * healthy) AND in-budget. Returns the index into `members` and the reason.
+ * healthy) AND fits (observedContextTokens <= operativeWindow; skipped when
+ * observedContextTokens is undefined) AND in-budget. Returns the index into
+ * `members` and the reason.
  */
 export function chooseChainMember(
   members: ChooseMember[],
@@ -320,39 +394,75 @@ export function chooseChainMember(
      * Layer-0 retry re-resolves across whole attempts and §8a health drives reuse.
      */
     tried?: Set<string>;
+    /**
+     * Observed context size for per-member fits gating (spec PER-MEMBER-CONTEXT-FITS §2.1).
+     * When defined, a member is viable only if `observedContextTokens <= member.operativeWindow`.
+     * Undefined (the default for all current callers) → fits is skipped entirely, preserving
+     * existing behavior. Step 2 wires this from the §5.3 running counter.
+     */
+    observedContextTokens?: number;
   },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
   const tried = deps.tried;
+  const observed = deps.observedContextTokens;
   const head = members[0]!;
-  const headState = scheduler ? scheduler.modelHealth(head.healthKey) : "healthy";
+
+  /** Fits predicate (§2.1): true when observed is undefined (skip) or within the member's window. */
+  const fits = (m: ChooseMember): boolean =>
+    observed === undefined || observed <= m.operativeWindow;
+
+  /**
+   * A member is viable iff: not already tried, healthy (§8a), fits its own
+   * operative window (§2.1; skipped when observed is undefined), and in-budget.
+   */
   const viable = (m: ChooseMember): boolean => {
     if (tried?.has(m.logicalId)) return false;
     const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
     if (!healthy) return false;
+    if (!fits(m)) return false;
     return !deps.isModelAvailable || deps.isModelAvailable(m.logicalId);
   };
+
   if (viable(head)) return { index: 0, reason: "primary" };
+
+  // Compute head predicates individually to name the fallback reason and to gate
+  // the canary (which requires healthy + in-budget + fits all hold separately).
+  const headState = scheduler ? scheduler.modelHealth(head.healthKey) : "healthy";
+  const headInBudget = !deps.isModelAvailable || deps.isModelAvailable(head.logicalId);
+  const headFits = fits(head);
+
   // Head unhealthy with an open probe window → this attempt is the canary (§4).
   // Gated on budget: an over-budget head must not be canaried — a successful probe
   // can't lead to use while over budget (`viable()` requires in-budget), so the
-  // probe would be wasted spend on a model deliberately shut off for cost. No
-  // stranding: `nextProbeAt` only advances when a probe fires, so the head becomes
-  // probe-due again as soon as the budget window resets and recovers then.
+  // probe would be wasted spend on a model deliberately shut off for cost.
+  // Gated on fits (§2.2): probing with a context the head cannot serve wastes the
+  // probe slot on a failure that is not a health signal (provider overflow is
+  // content-class — inconclusive). No stranding: `nextProbeAt` only advances when
+  // a probe fires, so the head is probe-due again when a fitting request arrives.
   if (
     !tried?.has(head.logicalId) &&
     headState === "unhealthy" &&
     scheduler?.isProbeDue(head.healthKey) &&
-    (!deps.isModelAvailable || deps.isModelAvailable(head.logicalId))
+    headInBudget &&
+    headFits
   ) {
     return { index: 0, reason: "canary" };
   }
+
   for (let i = 0; i < members.length; i++) {
     if (viable(members[i]!)) {
-      return { index: i, reason: headState === "unhealthy" ? "health-fallback" : "budget-fallback" };
+      // Name the reason by WHY the head wasn't used (priority: health > budget > context).
+      const reason: FallbackReason =
+        headState === "unhealthy"
+          ? "health-fallback"
+          : !headInBudget
+          ? "budget-fallback"
+          : "context-fallback"; // healthy + in-budget, but context exceeds head's window
+      return { index: i, reason };
     }
   }
-  // Nothing healthy + in-budget — route to the head so it fails and the caller's
+  // Nothing healthy + in-budget + fits — route to the head so it fails and the caller's
   // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter.
   return { index: 0, reason: "all-unhealthy" };
 }
@@ -374,6 +484,12 @@ export interface FetchChainMember {
   healthKey: string;
   /** Rate-limit group (`rate_limit_group` ?? "default"). */
   group: string;
+  /**
+   * Member's own operative window for the fits predicate (spec PER-MEMBER-CONTEXT-FITS §2.1).
+   * Raw `context_window` (no session-type override) since fetch consumers always pass
+   * `observedContextTokens: undefined` → fits is skipped for them.
+   */
+  operativeWindow: number;
 }
 
 /** Outcome of one per-member fetch, mapped to the §3 failure taxonomy. */
@@ -398,6 +514,13 @@ export interface RunFetchFallbackOptions {
   sessionId?: string;
   /** Rate-limit gate for the resolution log (high-frequency consumers). */
   rateLimitLog?: () => boolean;
+  /**
+   * Observed context size for per-member fits gating (spec PER-MEMBER-CONTEXT-FITS §2.1).
+   * Fetch consumers (captioning, image-gen, x_search, embedding) always pass undefined
+   * here — their inputs are small and self-bounded, so fits is skipped for them.
+   * Plumbed through for API completeness and future use.
+   */
+  observedContextTokens?: number;
 }
 
 /** Build the per-member runtime (capability-filtered, head retained) from a chain. */
@@ -412,6 +535,10 @@ export function buildFetchChain(
       config: entry.config,
       healthKey: `${entry.config.endpoint ?? "unknown"}::${entry.config.id}`,
       group: entry.config.rate_limit_group ?? "default",
+      // Raw context_window; no session-type override since fetch consumers pass
+      // undefined observed → fits is always skipped for them (§2.1).
+      operativeWindow:
+        typeof entry.config.context_window === "number" ? entry.config.context_window : Infinity,
     }));
 }
 
@@ -447,7 +574,12 @@ export async function runFetchWithFallback<T>(
     const { index, reason } =
       members.length === 1
         ? { index: 0, reason: "primary" as FallbackReason }
-        : chooseChainMember(members, { scheduler, isModelAvailable: options.isModelAvailable, tried });
+        : chooseChainMember(members, {
+            scheduler,
+            isModelAvailable: options.isModelAvailable,
+            tried,
+            observedContextTokens: options.observedContextTokens,
+          });
     const member = members[index]!;
     // No fresh member left (the resolver fell back to an already-tried head) → stop.
     if (tried.has(member.logicalId)) break;
