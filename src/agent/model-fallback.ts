@@ -20,7 +20,7 @@ import {
 // per-class wall-clock budgets now bound the COMPOSITE (§1).
 //
 // This module is the one shared helper (spec §3/§6): build time does only what
-// must be fixed once (capability pre-filter, min-over-chain context ceiling,
+// must be fixed once (capability pre-filter, per-member operative windows + max,
 // per-candidate dispatch pipelines), and the returned `streamFn` chooses one
 // member per attempt. It builds NO new circuit breaker — it consumes §8a's
 // per-model health (the breaker) via the two read-only methods `modelHealth` /
@@ -67,7 +67,7 @@ export interface BuildModelFallbackOptions {
   capability?: (config: ModelConfig) => boolean;
   /**
    * Per-session context override (`session_type.max_context_tokens`) min'd with
-   * the min-over-chain `context_window` to form the operative ceiling (§3 #2).
+   * each member's OWN `context_window` to form that member's operative window (§3 #2).
    */
   contextOverride?: number;
   /** §8a scheduler — consumed for health reads + per-candidate admission. Absent = no scheduling. */
@@ -114,9 +114,10 @@ export interface BuiltModelFallback {
   /** The per-attempt-resolving stream fn (wrap with `withRequestRetry`). */
   streamFn: StreamFn;
   /**
-   * Operative context ceiling valid for WHICHEVER member serves (min-over-chain, §3 #2).
-   * KEPT for backward compatibility — still consumed by enforcement and the representative
-   * model descriptor. Use `memberWindows` / `maxOperativeContextWindow` for per-member fits.
+   * Min-over-chain operative ceiling — BACKWARD-COMPAT ONLY. Enforcement uses
+   * `maxOperativeContextWindow` (max over survivors); the head descriptor and planning
+   * ceiling use `memberWindows[headLogicalId]`. This field survives as a defensive
+   * fallback for any call site that has not yet migrated to the per-member API.
    */
   operativeContextWindow: number;
   /** Head logical id (placeholder/ledger seed; the per-attempt billed id is exact). */

@@ -569,13 +569,12 @@ export class AgentSessionFactory {
     // pixels to a text-only member (the head is never dropped). Derived from the raw
     // inputs (trigger attachments / resume snapshot imageBlocks) because this runs
     // BEFORE buildContext — a SAFE over-approximation (any raw image ⇒ require
-    // multimodal). The head-never-dropped rule keeps the enforcement ceiling
-    // (`buildModelFallback`'s `operativeContextWindow`, used at `contextCeiling`
-    // below) resolved ONCE over the capability-SURVIVING chain; it can only be EQUAL
-    // OR LARGER than the FULL-chain min computed by `resolveSessionContextCeiling`
-    // (which has no per-session image info), so both stay ≤ every serving member's
-    // window — the "ceiling resolved once" invariant holds. The two ceilings differ
-    // deliberately; see `resolveSessionContextCeiling` for the matching half.
+    // multimodal). The head-never-dropped rule ensures every surviving member in
+    // `memberWindows` is capability-compatible. Per-member fits are enforced at
+    // select time by `chooseChainMember` using each member's individual
+    // `operativeWindow`; the planning ceiling is the head's own window
+    // (`fallback.memberWindows[modelKey]`, used at `contextCeiling` below), not
+    // the chain min.
     const replyModelCanSeeImages = modelConfig.input_modalities.includes("image");
     const requiresMultimodal = replyModelCanSeeImages && rawInputsRequireMultimodal(session, opts);
     const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
@@ -588,7 +587,7 @@ export class AgentSessionFactory {
     const userSelection = userLimit?.resolution.active === true;
     const requestedMember: { logicalId: string } = { logicalId: modelKey };
     // Shared builder so the default + each preferred composite are built identically
-    // (spec MODEL-FALLBACK §3): capability pre-filter + min-over-chain ceiling fixed
+    // (spec MODEL-FALLBACK §3): capability pre-filter + per-member windows fixed
     // once per chain, member chosen per attempt inside the composed fn. Memoized so a
     // preferred model that equals the default key is not built twice (§4.2 build
     // structure: one BuiltModelFallback per preferred model, ceiling resolved once each).
