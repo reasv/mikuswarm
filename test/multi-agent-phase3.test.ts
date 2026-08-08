@@ -841,6 +841,26 @@ test("validateAgentConfig: discord account key with .. segment is hard error in 
   );
 });
 
+test("validateAgentConfig: irc account key with slash is hard error in agents mode (F6c)", () => {
+  const config = minimalAgentsConfig({
+    agents: { miku: { workspace_root: "/tmp/miku" } },
+    matrix: {
+      enabled: false,
+      trigger_hold_ms: 0,
+      accounts: { miku: { homeserver: "h", user_id: "@x:h", store_path: "./v" } },
+    } as any,
+    irc: {
+      enabled: true,
+      accounts: { "bad/key": { host: "irc.example.net", nick: "bot" } },
+    } as any,
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /path-unsafe|slash|backslash|filesystem path/i,
+    "irc account key with slash must throw in agents mode",
+  );
+});
+
 test("validateAgentConfig: account key with whitespace is hard error in agents mode (finding 1a)", () => {
   // Whitespace in a key can break filesystem path assumptions.
   const config = minimalAgentsConfig({

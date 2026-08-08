@@ -298,6 +298,19 @@ test("validateAgentConfig: discord account key with colon throws", () => {
   );
 });
 
+test("validateAgentConfig: irc account key with colon throws", () => {
+  const config = minimalConfig({
+    irc: {
+      enabled: true,
+      accounts: { "bad:key": { host: "irc.example.net", nick: "bot" } },
+    } as any,
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /irc.*bad:key.*colon|colon.*parseTimelineKey/i,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // validateAgentConfig: §4.2 agents-mode invariants
 // ---------------------------------------------------------------------------
@@ -425,6 +438,46 @@ test("validateAgentConfig: valid two-agent config with disjoint roots does not t
   assert.doesNotThrow(() => validateAgentConfig(config));
 });
 
+test("validateAgentConfig: irc account pointing to undeclared agent throws", () => {
+  const config = minimalConfig({
+    agents: { miku: { workspace_root: "/tmp/miku" } },
+    matrix: {
+      enabled: false,
+      trigger_hold_ms: 0,
+      accounts: { miku: { homeserver: "h", user_id: "@x:h", store_path: "./v" } },
+    } as any,
+    irc: {
+      enabled: true,
+      accounts: { ircthing: { host: "irc.example.net", nick: "bot", agent: "ghost" } },
+    } as any,
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /ghost.*not declared|agents\.ghost/i,
+  );
+});
+
+test("validateAgentConfig: irc account key defaulting to undeclared agent throws", () => {
+  // Account key 'ircthing' but no agent field — defaults to agentName = 'ircthing',
+  // which is not in [agents]. Only 'miku' is declared.
+  const config = minimalConfig({
+    agents: { miku: { workspace_root: "/tmp/miku" } },
+    matrix: {
+      enabled: false,
+      trigger_hold_ms: 0,
+      accounts: { miku: { homeserver: "h", user_id: "@x:h", store_path: "./v" } },
+    } as any,
+    irc: {
+      enabled: true,
+      accounts: { ircthing: { host: "irc.example.net", nick: "bot" } },
+    } as any,
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /ircthing.*not declared|agents\.ircthing/i,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // validateAgentConfig: §4.2 legacy-mode invariants
 // ---------------------------------------------------------------------------
@@ -435,6 +488,19 @@ test("validateAgentConfig: agent field on matrix account without [agents] throws
       enabled: false,
       trigger_hold_ms: 0,
       accounts: { test: { homeserver: "h", user_id: "@t:h", store_path: "./v", agent: "miku" } },
+    } as any,
+  });
+  assert.throws(
+    () => validateAgentConfig(config),
+    /agent.*field.*not valid without|agents.*table/i,
+  );
+});
+
+test("validateAgentConfig: agent field on irc account without [agents] throws", () => {
+  const config = minimalConfig({
+    irc: {
+      enabled: true,
+      accounts: { bot: { host: "irc.example.net", nick: "bot", agent: "miku" } },
     } as any,
   });
   assert.throws(

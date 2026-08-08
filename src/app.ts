@@ -7,6 +7,7 @@ import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, makeBackfillReadClient } from "./matrix/index.js";
 import { DiscordProvider } from "./discord/index.js";
+import { IrcProvider } from "./irc/index.js";
 import { ingestGenericReactionEvent } from "./timeline/index.js";
 import type { MatrixNativeClient, MatrixNativeEvent } from "./matrix/index.js";
 import { Storage, MemoryFileWriter, type AgentSessionRow } from "./storage/index.js";
@@ -381,6 +382,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
     }
   }
+  for (const accountKey of Object.keys(config.irc?.accounts ?? {})) {
+    if (!AGENT_NAME_RE_EXPORTED.test(accountKey)) {
+      logger.warn("account_key_out_of_class", {
+        provider: "irc",
+        accountKey,
+        message: "account key contains characters outside [a-z0-9-]; compliant keys are recommended",
+      });
+    }
+  }
 
   // Per-agent workspace entry: workspace root path + its single-writer FIFO.
   interface AgentWorkspaceEntry {
@@ -450,6 +460,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const prev = agentAccountPrefixesMap.get(agentName) ?? [];
       agentAccountPrefixesMap.set(agentName, [...prev, prefix]);
     }
+    for (const [accountKey, account] of Object.entries(config.irc?.accounts ?? {})) {
+      const agentName = account.agent ?? accountKey;
+      agentWorkspaceMap.set(`irc:${accountKey}`, agentEntries.get(agentName)!);
+      const prefix = `irc:${accountKey}`;
+      const prev = agentAccountPrefixesMap.get(agentName) ?? [];
+      agentAccountPrefixesMap.set(agentName, [...prev, prefix]);
+    }
     // Build the console agents snapshot (spec CONSOLE-MULTI-AGENT §2): one entry per
     // declared agent in config declaration order, with accounts in the same order as
     // agentAccountPrefixesMap (matrix first, then discord, within each agent).
@@ -463,6 +480,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       for (const [accountKey, account] of Object.entries(config.discord?.accounts ?? {})) {
         const agentName = account.agent ?? accountKey;
         agentAccounts.get(agentName)?.push({ provider: "discord", accountId: accountKey });
+      }
+      for (const [accountKey, account] of Object.entries(config.irc?.accounts ?? {})) {
+        const agentName = account.agent ?? accountKey;
+        agentAccounts.get(agentName)?.push({ provider: "irc", accountId: accountKey });
       }
       agentsSnapshot = {
         mode: "agents",
@@ -512,6 +533,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     for (const accountKey of Object.keys(config.discord?.accounts ?? {})) {
       agentWorkspaceMap.set(`discord:${accountKey}`, { agentName: "__legacy__", workspaceRoot, memoryWriter });
+    }
+    for (const accountKey of Object.keys(config.irc?.accounts ?? {})) {
+      agentWorkspaceMap.set(`irc:${accountKey}`, { agentName: "__legacy__", workspaceRoot, memoryWriter });
     }
   }
 
@@ -1251,13 +1275,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       map.set("discord", discordProvider);
     }
 
+    // Construct IrcProvider when [irc] is enabled and has accounts.
+    if (config.irc?.enabled && config.irc.accounts && Object.keys(config.irc.accounts).length > 0) {
+      const ircProvider = new IrcProvider(config.irc);
+      map.set("irc", ircProvider);
+    }
+
     return map;
   })();
 
   if (providers.size === 0) {
     throw new Error(
       "no enabled chat provider: at least one provider must be enabled at startup " +
-      "(set [matrix] enabled = true, or add a [discord] block). " +
+      "(set [matrix] enabled = true, add a [discord] block, or add an [irc] block). " +
       "Zero enabled providers is a fatal config error.",
     );
   }
@@ -1416,6 +1446,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const knownAccountPrefixes = new Set<string>([
       ...Object.keys(config.matrix?.accounts ?? {}).map((k) => `matrix:${k}`),
       ...Object.keys(config.discord?.accounts ?? {}).map((k) => `discord:${k}`),
+      ...Object.keys(config.irc?.accounts ?? {}).map((k) => `irc:${k}`),
     ]);
     const isAgentsMode = !!(config.agents && Object.keys(config.agents).length > 0);
     const normalized = normalizeLimits(config.limits as never, {
@@ -7016,6 +7047,15 @@ export function validateAgentConfig(config: AppConfig): void {
       );
     }
   }
+  for (const accountKey of Object.keys(config.irc?.accounts ?? {})) {
+    if (accountKey.includes(":")) {
+      throw new Error(
+        `[irc] account key "${accountKey}" contains a colon — this breaks ` +
+          `parseTimelineKey and orphans every stored timeline. Rename the key ` +
+          `(note: renaming is NOT migration-safe if rows already exist).`,
+      );
+    }
+  }
 
   if (config.agents && Object.keys(config.agents).length > 0) {
     // §3 agents mode: path-unsafe characters in account keys are a hard startup
@@ -7038,6 +7078,17 @@ export function validateAgentConfig(config: AppConfig): void {
       if (pathUnsafeRe.test(accountKey)) {
         throw new Error(
           `[discord] account key "${accountKey}" contains a path-unsafe character ` +
+            `(slash, backslash, ".." path segment, or whitespace/control char). ` +
+            `In agents mode the key is embedded in filesystem paths (§7.4); ` +
+            `rename the key before adding [agents] blocks (§3 back-compat: this ` +
+            `is only a hard error in agents mode where no data exists under the key yet).`,
+        );
+      }
+    }
+    for (const accountKey of Object.keys(config.irc?.accounts ?? {})) {
+      if (pathUnsafeRe.test(accountKey)) {
+        throw new Error(
+          `[irc] account key "${accountKey}" contains a path-unsafe character ` +
             `(slash, backslash, ".." path segment, or whitespace/control char). ` +
             `In agents mode the key is embedded in filesystem paths (§7.4); ` +
             `rename the key before adding [agents] blocks (§3 back-compat: this ` +
@@ -7075,6 +7126,15 @@ export function validateAgentConfig(config: AppConfig): void {
       if (!config.agents[agentName]) {
         throw new Error(
           `[discord.accounts.${accountKey}] refers to agent "${agentName}" ` +
+            `which is not declared in [agents]. Add [agents.${agentName}] or set agent = "<existing-name>".`,
+        );
+      }
+    }
+    for (const [accountKey, account] of Object.entries(config.irc?.accounts ?? {})) {
+      const agentName = account.agent ?? accountKey;
+      if (!config.agents[agentName]) {
+        throw new Error(
+          `[irc.accounts.${accountKey}] refers to agent "${agentName}" ` +
             `which is not declared in [agents]. Add [agents.${agentName}] or set agent = "<existing-name>".`,
         );
       }
@@ -7223,10 +7283,14 @@ export function validateAgentConfig(config: AppConfig): void {
     const discordAgentFields = Object.entries(config.discord?.accounts ?? {}).filter(
       ([, a]) => a.agent !== undefined,
     );
-    if (matrixAgentFields.length > 0 || discordAgentFields.length > 0) {
+    const ircAgentFields = Object.entries(config.irc?.accounts ?? {}).filter(
+      ([, a]) => a.agent !== undefined,
+    );
+    if (matrixAgentFields.length > 0 || discordAgentFields.length > 0 || ircAgentFields.length > 0) {
       const offenders = [
         ...matrixAgentFields.map(([k]) => `[matrix.accounts.${k}].agent`),
         ...discordAgentFields.map(([k]) => `[discord.accounts.${k}].agent`),
+        ...ircAgentFields.map(([k]) => `[irc.accounts.${k}].agent`),
       ].join(", ");
       throw new Error(
         `account-level \`agent\` field (${offenders}) is not valid without an ` +

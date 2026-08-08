@@ -848,6 +848,62 @@ const DiscordSchema = StrictObject({
   accounts: Type.Optional(Type.Record(Type.String(), DiscordAccountSchema)),
 });
 
+/**
+ * Per-account config for an IRC connection (spec IRC-SUPPORT-DESIGN §8).
+ * `sasl_password` and `server_password` are auto-redacted by the existing
+ * secret-key regex (`/(api[_-]?key|token|password|secret|access[_-]?token)/i`).
+ */
+const IrcAccountSchema = StrictObject({
+  /** IRC server hostname or IP address. */
+  host: Type.String({ minLength: 1 }),
+  /** Server port. Defaults to 6697 (TLS) or 6667 (plaintext) when absent. */
+  port: Type.Optional(Type.Integer({ minimum: 1, maximum: 65535 })),
+  /** Connect over TLS. Defaults to true when port is 6697 or absent. */
+  tls: Type.Optional(Type.Boolean()),
+  /** Requested nick. */
+  nick: Type.String({ minLength: 1 }),
+  /** IRC username (ident). Defaults to nick when absent. */
+  username: Type.Optional(Type.String({ minLength: 1 })),
+  /** IRC real name / gecos. Defaults to nick when absent. */
+  realname: Type.Optional(Type.String({ minLength: 1 })),
+  /** SASL PLAIN username. When set alongside sasl_password, SASL is required. */
+  sasl_user: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * SASL PLAIN password. Redacted by the existing secret-key regex.
+   * When set alongside sasl_user, the library requests the `sasl` cap.
+   */
+  sasl_password: Type.Optional(Type.String()),
+  /**
+   * Server password (PASS command). Redacted by the existing secret-key regex.
+   * Used for server-level authentication independent of SASL.
+   */
+  server_password: Type.Optional(Type.String()),
+  /**
+   * Channels to join on connect and rejoin on reconnect.
+   * Each entry must start with a channel-prefix character (e.g. `#general`).
+   */
+  channels: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  /** Accept private messages (queries) from users (default true). */
+  dm_enabled: Type.Optional(Type.Boolean()),
+  /**
+   * Agent this account belongs to (spec MULTI-AGENT-SUPPORT §4.1).
+   * Defaults to the account key when absent. Only valid when an [agents] table
+   * is present; a validation error in legacy mode.
+   */
+  agent: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+/**
+ * Top-level `[irc]` block (spec IRC-SUPPORT-DESIGN §8). Default-off: absent
+ * block or `enabled = false` produces byte-identical behaviour to pre-IRC builds.
+ */
+const IrcSchema = StrictObject({
+  enabled: Type.Boolean(),
+  /** Trigger debounce window in ms (same semantics as matrix.trigger_hold_ms). */
+  trigger_hold_ms: Type.Optional(Type.Number({ minimum: 0 })),
+  accounts: Type.Optional(Type.Record(Type.String(), IrcAccountSchema)),
+});
+
 // Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / §13 Phase 5d).
 // Default-off: the block must be present AND enabled = true for the store to activate.
 // `path` is the store root; it must be on the same filesystem as every agent workspace
@@ -1570,6 +1626,8 @@ export const AppConfigSchema = StrictObject({
   }),
   /** Discord provider config. Validated at startup; consumed when enabled (Phase 3+). */
   discord: Type.Optional(DiscordSchema),
+  /** IRC provider config (spec IRC-SUPPORT-DESIGN §8). Default-off. */
+  irc: Type.Optional(IrcSchema),
   timeline: Type.Optional(TimelineSchema),
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
@@ -1679,3 +1737,7 @@ export type SiblingsConfig = Static<typeof SiblingsSchema>;
 export type AttachmentStoreConfig = Static<typeof AttachmentStoreSchema>;
 /** Tool-result context budget config (spec TOOL-RESULT-BUDGET §7). */
 export type AgentToolsConfig = Static<typeof AgentToolsSchema>;
+/** Per-account IRC connection config (spec IRC-SUPPORT-DESIGN §8). */
+export type IrcAccountConfig = Static<typeof IrcAccountSchema>;
+/** Top-level IRC provider config (spec IRC-SUPPORT-DESIGN §8). */
+export type IrcConfig = Static<typeof IrcSchema>;
