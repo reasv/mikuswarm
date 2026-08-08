@@ -1129,7 +1129,7 @@ Enrichment tables (see section 7a):
 
 - **`reply_contexts`** — resolved reply snapshots, one per event (keyed by the replying event's ID)
 - **`media_assets`** — all downloaded media: attachments, reply attachments, link preview media, linked media in body text. Tracks download status, caption status, detected content (character cards), workspace-relative file paths, and `content_hash TEXT` (nullable sha256 hex — set by the enrichment write path when the content-addressed attachment store is enabled, NULL otherwise; see §7a "Content-addressed attachment store").
-- **`link_previews`** — fetched link preview metadata (title, description, site name, source kind), plus the nullable `payload_json` structured payload for `source_kind = 'fx_twitter'` rows (§7a "X.com enrichment via FxTwitter"). Media associated with previews lives in `media_assets` with a `link_preview_id` FK.
+- **`link_previews`** — fetched link preview metadata (title, description, site name, source kind), plus the nullable `payload_json` structured payload for `source_kind = 'fx_twitter'` rows (§7a "X.com enrichment via FxTwitter") and `source_kind = 'youtube'` rows (§7e "YouTube Enrichment"). Media associated with previews lives in `media_assets` with a `link_preview_id` FK.
 
 ### Single-writer invariant
 
@@ -1545,6 +1545,110 @@ The trigger surface is **console/operator only** (no agent tool): `GET /api/back
 | `default_timeout_ms` | 0 | Default per-run wall-clock budget. 0 ⇒ none. |
 | `utd_halt_threshold` | 50 | Consecutive-UTD halt for the `oldest_decryptable` target. 0 disables. |
 | `caption_backfetched` | false | Default for a new job's `caption_after` toggle. Never auto-captions under `caption_all`. |
+
+---
+
+## 7e. YouTube Enrichment (T1)
+
+YouTube video URLs get a dedicated enrichment stage (`src/youtube/`) that produces structured metadata and transcript previews — distinct from the Synapse og: scraper (which yields only a title and thumbnail) and the `youtube_fetch` tool (which is agent-initiated, T2). The `src/youtube/` module is pure TS with no Matrix/native imports: `url.ts` (URL detection and canonicalization), `ytdlp.ts` (subprocess wrapper for yt-dlp — probe, transcript, download), `config.ts` (config resolution), `payload.ts` (payload types and format helpers).
+
+### URL detection and partitioning
+
+`url.ts` recognizes YouTube video URLs on `youtube.com`, `youtu.be`, and their `www.`/`m.`/`music.` subdomains in the forms `/watch?v=<id>` (+ `t=`/`start=` → `startSec`), `youtu.be/<id>` (+ `t=`), `/shorts/<id>`, `/live/<id>`, `/embed/<id>`. The canonical 11-character video id must match `[A-Za-z0-9_-]{11}` exactly. Channel, playlist, search, and @handle URLs are unrecognized and stay on the generic path.
+
+Inside the enrichment worker's `fetchLinkPreviews`, YouTube URLs of **eligible** events are partitioned out of `filteredBody` before the generic link-preview stage runs. **Eligibility** mirrors the `captionEligibleSql` predicate (`src/storage/database.ts`):
+
+- `trigger_group_id IS NOT NULL` — the message is in an active trigger group
+- `is_backfetch = 1` — promoted backfetch event
+- `role = 'assistant'` AND `captionAssistant` flag set — assistant message when `caption_all || caption_assistant_messages` is configured
+
+A fresh DB read (`getEventCaptionEligibilityFields`) is used for the eligibility check — not the in-memory event — so that `setTriggerGroup()`, which may be called after the enrichment pool initially loaded the event (trigger-wait grace), is visible. This read is not racy because `handleInbound` calls `notifyNewEvent` (which wakes the enrichment poll) before `await resolveTriggerGroup`, and `setTriggerGroup` commits via `queueMicrotask` (storage drainQueue) which drains before the poll's `setTimeout` macrotask ever claims the event.
+
+`enrich_all = true` (`[youtube.enrichment].enrich_all`) bypasses the gate and enriches every YouTube URL regardless of trigger membership — the exposure is yt-dlp subprocess traffic, not inference spend.
+
+**Ineligible** events' YouTube URLs are left in `filteredBody` and fall through to the generic Synapse/scraper path unchanged. There is no parked-upgrade path (deliberate v1 simplification): a message whose trigger group is set only later keeps its generic og: preview; the agent can cover that case with `youtube_fetch`.
+
+Eligible YouTube URLs are stripped from `filteredBody` so the Synapse/scraper stage never produces a duplicate og: card for them. `processLinkedMedia` additionally excludes the raw YouTube URL matches (preview rows store the canonical watch URL, which may differ from the body text).
+
+### yt-dlp subprocess wrapper
+
+`src/youtube/ytdlp.ts` owns all subprocess invocation and is the only module that runs yt-dlp. Three operations:
+
+1. **`probe(videoId)`** — `yt-dlp --dump-json --skip-download --no-playlist <url>`: returns `YouTubeProbeMetadata` (title, channel, duration, uploadDate, viewCount, chapters, available subtitle tracks, isLive, thumbnailUrl). All fields optional/tolerant. Throws on non-zero exit with the bounded stderr.
+2. **`transcript(videoId, lang?, meta?)`** — `yt-dlp --skip-download --write-subs --write-auto-subs --sub-format json3 --sub-langs <lang> -o <tmpdir/%(id)s.%(ext)s>`: fetches and folds the json3 subtitle file into plain text with periodic `[m:ss]` timestamp markers (one marker per ~30 s of video). Track selection prefers manual tracks over auto-generated, optionally filtered to the requested language. Returns `TranscriptResult { text, lang, kind: "manual"|"auto"|"none" }`. **Transcript failure is always non-fatal** — the caller receives `kind: "none"` rather than a thrown error, so metadata-only payloads are possible.
+3. **`download(videoId, opts)`** — downloads a media file; serves both the media analysis lane (§T3) and workspace downloads (§T2). Not part of Phase 2 (T1).
+
+Common flags on every run: `--no-playlist`, `--proxy <network.http_proxy_url>` (when set — yt-dlp does **not** ride `FetchClient`/`guardedFetch`, so the proxy must be passed explicitly; this is the one egress path in the app that bypasses the shared fetch stack, confined to YouTube URLs by the §7e partition), `--socket-timeout 30`, `--cookies <file>` (when `[youtube].cookies_file` is set). Stderr is bounded (8192 bytes, tail-trimmed) and surfaced in error messages — yt-dlp's error text ("Video unavailable", geo errors, age-restriction messages) is exactly what the agent should see.
+
+A module-level semaphore caps concurrent yt-dlp subprocesses at `[youtube].concurrency` (default 2) across all callers.
+
+### Graceful degradation
+
+At app startup, `probeYtDlpBinary()` runs `yt-dlp --version` with a short timeout. On success, `configureYtDlp()` applies the resolved config and `youtubeSubsystemAvailable` is set true; `youtube_subsystem_ready` is logged with the version and path. On failure, exactly one `youtube_subsystem_unavailable` structured warning is logged (with the error message and a hint to install yt-dlp or configure `[youtube].yt_dlp_path`), and `youtubeSubsystemAvailable` stays false — no crash. `[youtube].enabled = false` skips the probe entirely and logs `youtube_subsystem_disabled`.
+
+The enrichment partition (`EnrichmentWorkerOptions.youtube`) is only set when `youtubeSubsystemAvailable && ytConfig.enrichment.enabled` — so a missing binary or `enabled = false` leaves YouTube URLs on the generic path for every event, with no YouTube enrichment rows ever produced.
+
+### Payload and link_previews row
+
+Per recognized URL of an eligible event, the enrichment worker:
+
+1. Calls `probe(videoId)` — on failure, records a `fetch_status: "failed"` row (`source_kind: "youtube"`, `site_name: "YouTube"`) with the error, logs `enrichment_youtube_probe_failed`, and returns. The event-level retry machinery is **not** triggered (same policy as FxTwitter failures).
+2. Calls `transcript(videoId, undefined, meta)` (passing the probed meta to skip a second probe call). Transcript failure → `kind: "none"`, non-fatal.
+3. Builds a `YouTubePreviewPayload` and stores one `link_previews` row:
+   - `source_kind: "youtube"`, `site_name: "YouTube"`
+   - `title`: video title
+   - `description`: `"ChannelName · M:SS"` — the compact flat fallback, also what the chat-search FTS indexes
+   - `url`: canonical watch URL `https://www.youtube.com/watch?v=<id>`
+   - `payload_json`: `{ v: 1, videoId, title?, channel?, durationSeconds?, uploadDate?, viewCount?, chapters[], transcriptHead?, transcriptLang?, transcriptKind: "manual"|"auto"|"none" }`. `transcriptHead` is the first `[youtube.enrichment].transcript_head_chars` (default 1000) characters of the folded transcript.
+4. When `[youtube.enrichment].thumbnail` (default true) and probe yields a `thumbnailUrl`: downloads via the shared `FetchClient` (shared egress guard, proxy, `media.download_size_limit` cap) and stores as a `preview_media` `media_assets` row with `caption_status: "pending"` — parity with the Synapse og:image path, so the existing caption worker handles it under existing captioning gates with no changes. `thumbnail = false` skips the download entirely.
+
+### Rendering
+
+YouTube previews (`source_kind = "youtube"` with a parseable `payload_json`) branch into the YouTube-specific renderer (`src/context/renderer.ts`); without a payload they fall back to the generic `<link_preview>`.
+
+**Full tier** (`renderRichMessage`):
+```
+<link_preview url="…" kind="youtube">
+<youtube_video title="…" channel="…" duration="M:SS" uploaded="YYYY-MM-DD" views="1,500,000,000">
+[0:00] Chapter title
+[5:30] Another chapter
+[1:02:34] Long chapter (H:MM:SS when ≥ 1 hour)
+
+<transcript kind="manual|auto" lang="en" partial="true">
+…first transcript_head_chars of folded transcript…
+[partial — full transcript available via the youtube_fetch tool]
+</transcript>
+</youtube_video>
+</link_preview>
+```
+- `<youtube_video>` attributes omit any field that is absent in the payload.
+- Chapter timestamps use H:MM:SS when ≥ 3600 s, otherwise M:SS; the bracketed form is `formatChapterTimestamp`.
+- Transcript content and chapter titles are externally-sourced text and are XML-escaped (`escapeXml`) — untrusted-content convention, same as tweet bodies. The transcript partial marker is a trusted structural string, not escaped.
+- Thumbnail media (if downloaded) is rendered via the existing `renderPreviewMedia` helper, identical to og:image treatment.
+
+**Compact tier** (`renderCompactMessage`):
+```
+ [youtube: "Title" · Channel · M:SS · transcript head…]
+```
+Bounded by `MAX_COMPACT_MEDIA_CAPTION` (200 chars); absent optional fields are omitted from the `·`-joined list; transcript head whitespace is normalized (`normalizeWhitespace`).
+
+### Configuration
+
+`[youtube]` table (§4):
+- `enabled = true` — master switch; effective only when the yt-dlp binary probe passes
+- `yt_dlp_path = "yt-dlp"` — path to the binary
+- `max_download_bytes = 209715200` — 200 MB cap on downloads (Phase 3+)
+- `concurrency = 2` — max concurrent yt-dlp subprocesses
+- `timeout_ms = 120000` — per-subprocess wall-clock timeout
+- `cookies_file` — optional; passed as `--cookies` for age-restriction / bot-detection walls
+
+`[youtube.enrichment]` table:
+- `enabled = true` — T1 enrichment on/off; requires `[youtube].enabled`
+- `enrich_all = false` — enrich every message's YouTube links (not just caption-eligible)
+- `transcript_head_chars = 1000` — characters of transcript head in the T1 preview payload
+- `thumbnail = true` — download and store the video thumbnail as a `preview_media` asset
+
+Cross-field validation at app wiring: `[youtube.enrichment].enabled = true` requires `[youtube].enabled = true`; `[youtube.tool]` windowing cross-fields (Phase 3+).
 
 ---
 

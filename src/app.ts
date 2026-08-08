@@ -948,6 +948,41 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     httpProxyUrl: config.network?.http_proxy_url,
   });
 
+  // YouTube subsystem wiring (ARCHITECTURE.md §7e / spec §2 graceful degradation).
+  // Probe the yt-dlp binary once at startup. On success: configureYtDlp so the
+  // module-level subprocess wrapper is ready. On failure (binary absent or broken):
+  // log ONE structured warning and mark the subsystem unavailable; the enrichment
+  // partition and future tool registrations consult this flag before doing anything.
+  // enabled=false skips the probe entirely and marks the subsystem unavailable.
+  const ytConfig = resolveYouTubeConfig(config.youtube);
+  let youtubeSubsystemAvailable = false;
+  if (ytConfig.enabled) {
+    try {
+      const { probeYtDlpBinary, configureYtDlp } = await import("./youtube/ytdlp.js");
+      const version = await probeYtDlpBinary();
+      configureYtDlp({
+        ytDlpPath: ytConfig.ytDlpPath,
+        timeoutMs: ytConfig.timeoutMs,
+        concurrency: ytConfig.concurrency,
+        httpProxyUrl: config.network?.http_proxy_url,
+        cookiesFile: ytConfig.cookiesFile,
+        maxDownloadBytes: ytConfig.maxDownloadBytes,
+      });
+      youtubeSubsystemAvailable = true;
+      logger.info("youtube_subsystem_ready", { version, ytDlpPath: ytConfig.ytDlpPath });
+    } catch (err) {
+      logger.warn("youtube_subsystem_unavailable", {
+        ytDlpPath: ytConfig.ytDlpPath,
+        error: err instanceof Error ? err.message : String(err),
+        message:
+          "yt-dlp binary not found or not executable — YouTube enrichment and tools will be disabled. " +
+          "Install yt-dlp into PATH or set [youtube].yt_dlp_path.",
+      });
+    }
+  } else {
+    logger.info("youtube_subsystem_disabled", { reason: "[youtube].enabled = false" });
+  }
+
   // Shared, cross-session Grok-result cache for x_search: one
   // instance so a reactive and a proactive session hitting the same topic in a
   // busy channel dampen to a single Grok call. Only the expensive synthesis is
@@ -1118,6 +1153,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       : undefined,
     downloadSizeLimit,
     fxtwitter: { client: fxTwitterClient, config: fxTwitterConfig },
+    // YouTube enrichment partition (ARCHITECTURE.md §7e): only passed when the
+    // subsystem is available AND [youtube.enrichment].enabled is true.
+    youtube:
+      youtubeSubsystemAvailable && ytConfig.enrichment.enabled
+        ? {
+            config: ytConfig.enrichment,
+            captionAssistant:
+              (config.captioning?.caption_all ?? false) ||
+              (config.captioning?.caption_assistant_messages ?? false),
+          }
+        : undefined,
     store: attachmentStore,
     config: config.enrichment ?? {},
     onComplete: (eventId) => {

@@ -16,6 +16,10 @@ import { buildTweetNode, renderFlatDescription } from "../fxtwitter/format.js";
 import { extractXStatusUrls, stripXStatusUrls, type XStatusRef } from "../fxtwitter/url.js";
 import { DirectLinkPreviewClient } from "./link-preview-client.js";
 import path from "node:path";
+import type { YouTubeEnrichmentConfig } from "../youtube/config.js";
+import { YOUTUBE_SOURCE_KIND, formatDuration, type YouTubePreviewPayload } from "../youtube/payload.js";
+import { extractYouTubeUrls, type YouTubeVideoUrlMatch } from "../youtube/url.js";
+import { probe, transcript } from "../youtube/ytdlp.js";
 
 export interface EnrichmentLogger {
   info(msg: string, data?: Record<string, unknown>): void;
@@ -53,6 +57,22 @@ export interface EnrichmentWorkerOptions {
    */
   fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
   /**
+   * YouTube T1 enrichment (ARCHITECTURE.md §7e). When set and the subsystem is
+   * available, recognized YouTube URLs are partitioned away from the generic
+   * preview path for caption-eligible events and enriched here (probe +
+   * transcript + optional thumbnail). Ineligible events' YouTube URLs fall
+   * through to the generic preview path unchanged. Unset = legacy behavior.
+   */
+  youtube?: {
+    config: YouTubeEnrichmentConfig;
+    /**
+     * Mirror of `caption_all || caption_assistant_messages` from captioning
+     * config: when true, `role = 'assistant'` events are also eligible for
+     * YouTube enrichment (mirrors the captionEligible predicate exactly).
+     */
+    captionAssistant: boolean;
+  };
+  /**
    * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
    * When present and ready, downloaded files are integrated via the store
    * (hardlinks, dedup). Absent or not-ready = byte-identical pre-Phase-5d behaviour.
@@ -71,6 +91,14 @@ export class EnrichmentWorker {
    * state is safe.
    */
   private readonly xUrlExclusions = new Set<string>();
+
+  /**
+   * Raw YouTube video URLs seen by the YouTube enrichment partition (message +
+   * reply bodies). `processLinkedMedia` excludes these (they were already
+   * partitioned into the YouTube stage and must not be double-counted as
+   * generic linked media).
+   */
+  private readonly ytUrlExclusions = new Set<string>();
 
   constructor(private readonly options: EnrichmentWorkerOptions) {}
 
@@ -438,6 +466,33 @@ export class EnrichmentWorker {
       if (!fx.config.enabled) xRefs = [];
     }
 
+    // Partition (ARCHITECTURE.md §7e): YouTube URLs for eligible events go to
+    // the YouTube enrichment stage. Eligibility mirrors the captioning predicate
+    // (trigger_group_id IS NOT NULL / is_backfetch / role=assistant when
+    // captionAssistant) evaluated with a fresh DB read so setTriggerGroup() is
+    // visible even when it was called after the event was initially loaded.
+    // enrich_all=true bypasses the gate. Ineligible events' YouTube URLs fall
+    // through to the generic Synapse path unchanged (no strip, no parked upgrade).
+    const yt = this.options.youtube;
+    let ytRefs: YouTubeVideoUrlMatch[] = [];
+    if (yt && yt.config.enabled) {
+      const allYtRefs = extractYouTubeUrls(filteredBody);
+      if (allYtRefs.length > 0) {
+        // Eligibility check (fresh DB read for trigger_group_id).
+        const isEligible = this._isYouTubeEligible(eventId, yt);
+        if (isEligible) {
+          ytRefs = allYtRefs;
+          // Strip eligible YouTube URLs from filteredBody so Synapse never
+          // produces a bare og-card for them.
+          for (const ref of ytRefs) {
+            filteredBody = filteredBody.replace(ref.rawUrl, "");
+            this.ytUrlExclusions.add(ref.rawUrl);
+          }
+        }
+        // Ineligible: leave YouTube URLs in filteredBody → generic Synapse path.
+      }
+    }
+
     type PreviewSources = Array<{
       url: string;
       sourceKind: string;
@@ -493,15 +548,17 @@ export class EnrichmentWorker {
       }
     }
 
-    // Shared cap across both kinds, allocated by order of first appearance in
+    // Shared cap across all kinds, allocated by order of first appearance in
     // the body. A Synapse source whose URL isn't literally in the body
     // (normalized by the scraper) sorts last rather than being dropped.
     const maxPreviews = this.options.maxPreviewsPerMessage;
     type Candidate =
       | { kind: "x"; order: number; ref: XStatusRef }
+      | { kind: "yt"; order: number; ref: YouTubeVideoUrlMatch }
       | { kind: "synapse"; order: number; sourceIndex: number };
     const candidates: Candidate[] = [
       ...xRefs.map((ref) => ({ kind: "x" as const, order: ref.bodyIndex, ref })),
+      ...ytRefs.map((ref) => ({ kind: "yt" as const, order: ref.bodyIndex, ref })),
       ...sources.map((source, sourceIndex) => {
         const at = bodyText.indexOf(source.url);
         return { kind: "synapse" as const, order: at >= 0 ? at : Number.MAX_SAFE_INTEGER, sourceIndex };
@@ -512,6 +569,7 @@ export class EnrichmentWorker {
 
     const now = Date.now();
     const fxTasks: Promise<void>[] = [];
+    const ytTasks: Promise<void>[] = [];
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
       if (candidate.kind === "synapse") {
@@ -531,8 +589,10 @@ export class EnrichmentWorker {
           created_at: now,
         };
         result.linkPreviews.push(preview);
-      } else {
+      } else if (candidate.kind === "x") {
         fxTasks.push(this.enrichXStatus(candidate.ref, context, eventId, i, result));
+      } else {
+        ytTasks.push(this.enrichYouTubeVideo(candidate.ref, context, eventId, i, result));
       }
     }
 
@@ -582,7 +642,39 @@ export class EnrichmentWorker {
       }
     }
 
-    await Promise.allSettled(fxTasks);
+    await Promise.allSettled([...fxTasks, ...ytTasks]);
+  }
+
+  /**
+   * Evaluate whether an event qualifies for YouTube enrichment (ARCHITECTURE.md §7e).
+   *
+   * Uses a fresh DB read for `trigger_group_id` to avoid a race with
+   * `setTriggerGroup()`, which may be called after the event was initially
+   * loaded by the enrichment pool.
+   *
+   * Predicate:
+   *   enrich_all=true  → always eligible
+   *   trigger_group_id IS NOT NULL → trigger-group message
+   *   is_backfetch=1   → promoted backfetch event
+   *   role='assistant' AND captionAssistant → assistant message
+   */
+  private _isYouTubeEligible(
+    eventId: string,
+    yt: NonNullable<EnrichmentWorkerOptions["youtube"]>,
+  ): boolean {
+    if (yt.config.enrichAll) return true;
+    // Safe to read `trigger_group_id` here even though `setTriggerGroup` is
+    // called after `notifyNewEvent` in `handleInbound`: the enrichment poll
+    // runs in a `setTimeout(0)` macrotask, while `setTriggerGroup` commits via
+    // `queueMicrotask` (storage drainQueue) — microtasks always drain before
+    // the next macrotask. Reordering those two call sites would reintroduce
+    // the race; this read relies on that call order being preserved.
+    const fields = this.options.storage.getEventCaptionEligibilityFields(eventId);
+    if (!fields) return false;
+    if (fields.triggerGroupId !== null) return true;
+    if (fields.isBackfetch) return true;
+    if (yt.captionAssistant && fields.role === "assistant") return true;
+    return false;
   }
 
   /**
@@ -662,6 +754,188 @@ export class EnrichmentWorker {
       payload_json: JSON.stringify(payload),
       created_at: now,
     });
+  }
+
+  /**
+   * YouTube enrichment stage for one recognized YouTube video URL
+   * (ARCHITECTURE.md §7e / spec §5).
+   *
+   * 1. probe() + transcript() (transcript failure non-fatal → kind "none").
+   * 2. Build YouTubePreviewPayload and persist one link_previews row:
+   *    source_kind "youtube", title, description = channel + duration line,
+   *    payload_json = full structured payload.
+   * 3. When thumbnail=true and probe yields a thumbnailUrl, download via
+   *    FetchClient and store as a preview_media asset (caption_status "pending").
+   * 4. probe/network failure → fetch_status "failed" row (never throws, mirrors
+   *    the FxTwitter failure policy).
+   */
+  private async enrichYouTubeVideo(
+    ref: YouTubeVideoUrlMatch,
+    context: "message" | "reply",
+    eventId: string,
+    previewIndex: number,
+    result: EnrichmentResult,
+  ): Promise<void> {
+    const ytCfg = this.options.youtube!.config;
+    const now = Date.now();
+    const previewId = nanoid();
+    const mediaRole = context === "message" ? "preview_media" : "reply_preview_media";
+
+    // The canonical URL for the stored row is the watch URL (normalized form).
+    const canonicalUrl = `https://www.youtube.com/watch?v=${ref.videoId}`;
+
+    // ── Probe ────────────────────────────────────────────────────────────────
+    let meta: Awaited<ReturnType<typeof probe>>;
+    try {
+      meta = await probe(ref.videoId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.options.logger.warn("enrichment_youtube_probe_failed", {
+        eventId,
+        videoId: ref.videoId,
+        error: message,
+      });
+      result.linkPreviews.push({
+        id: previewId,
+        event_id: eventId,
+        context,
+        url: canonicalUrl,
+        site_name: "YouTube",
+        source_kind: YOUTUBE_SOURCE_KIND,
+        preview_index: previewIndex,
+        fetched_at: now,
+        fetch_status: "failed",
+        error: message,
+        created_at: now,
+      });
+      return;
+    }
+
+    // ── Transcript (non-fatal) ───────────────────────────────────────────────
+    let txResult: Awaited<ReturnType<typeof transcript>>;
+    try {
+      txResult = await transcript(ref.videoId, undefined, meta);
+    } catch {
+      txResult = { text: "", lang: "", kind: "none" };
+    }
+
+    // ── Build payload ────────────────────────────────────────────────────────
+    const transcriptHead =
+      txResult.text.length > 0
+        ? txResult.text.slice(0, ytCfg.transcriptHeadChars)
+        : undefined;
+
+    const payload: YouTubePreviewPayload = {
+      v: 1,
+      videoId: ref.videoId,
+      title: meta.title,
+      channel: meta.channel,
+      durationSeconds: meta.duration,
+      uploadDate: meta.uploadDate,
+      viewCount: meta.viewCount,
+      chapters: meta.chapters.map((ch) => ({
+        title: ch.title,
+        startTime: ch.startTime,
+      })),
+      transcriptHead,
+      transcriptLang: txResult.lang || undefined,
+      transcriptKind: txResult.kind,
+    };
+
+    // ── description = "ChannelName · M:SS" (flat fallback + compact tier) ────
+    const durationStr =
+      meta.duration !== undefined ? formatDuration(meta.duration) : undefined;
+    const descParts: string[] = [];
+    if (meta.channel) descParts.push(meta.channel);
+    if (durationStr) descParts.push(durationStr);
+    const description = descParts.length > 0 ? descParts.join(" · ") : null;
+
+    result.linkPreviews.push({
+      id: previewId,
+      event_id: eventId,
+      context,
+      url: canonicalUrl,
+      title: meta.title ?? null,
+      description,
+      site_name: "YouTube",
+      source_kind: YOUTUBE_SOURCE_KIND,
+      preview_index: previewIndex,
+      fetched_at: Date.now(),
+      fetch_status: "complete",
+      payload_json: JSON.stringify(payload),
+      created_at: now,
+    });
+
+    // ── Thumbnail (optional, §5 D) ───────────────────────────────────────────
+    if (ytCfg.thumbnail && meta.thumbnailUrl && this.options.workspaceRoot !== null) {
+      await this.downloadYouTubeThumbnail(
+        meta.thumbnailUrl,
+        eventId,
+        previewId,
+        mediaRole,
+        result,
+      );
+    }
+  }
+
+  /**
+   * Download the YouTube thumbnail via the shared FetchClient and store as a
+   * preview_media asset with caption_status "pending" (parity with the Synapse
+   * og:image path — the existing caption worker picks it up under existing
+   * captioning gates).
+   */
+  private async downloadYouTubeThumbnail(
+    thumbnailUrl: string,
+    eventId: string,
+    previewId: string,
+    role: string,
+    result: EnrichmentResult,
+  ): Promise<void> {
+    const asset: MediaAssetRow = {
+      id: nanoid(),
+      event_id: eventId,
+      role,
+      link_preview_id: previewId,
+      media_type: "image",
+      original_filename: "thumbnail.jpg",
+      download_status: "pending",
+      caption_status: "pending",
+      created_at: Date.now(),
+    };
+
+    let fetchedPath: string | undefined;
+    try {
+      const fetched = await this.options.fetchClient.fetch(thumbnailUrl);
+      fetchedPath = fetched.path;
+      if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+        await unlink(fetched.path).catch(() => {});
+        fetchedPath = undefined;
+        asset.download_status = "failed";
+        asset.download_error = `HTTP ${fetched.statusCode}`;
+      } else {
+        const saved = await moveFileToWorkspace({
+          sourcePath: fetched.path,
+          workspaceRoot: this.options.workspaceRoot!,
+          originalFilename: "thumbnail.jpg",
+          contentType: fetched.contentType ?? "image/jpeg",
+          attachSubdir: this.options.attachSubdir,
+          store: this.options.store,
+        });
+        fetchedPath = undefined;
+        asset.local_path = saved.localPath;
+        asset.content_hash = saved.contentHash;
+        asset.mime_type = fetched.contentType ?? "image/jpeg";
+        asset.size_bytes = fetched.sizeBytes;
+        asset.download_status = "complete";
+        asset.media_type = inferMediaType(fetched.contentType) || "image";
+      }
+    } catch (error) {
+      if (fetchedPath) await unlink(fetchedPath).catch(() => {});
+      asset.download_status = "failed";
+      asset.download_error = error instanceof Error ? error.message : String(error);
+    }
+
+    result.mediaAssets.push(asset);
   }
 
   /**
@@ -812,11 +1086,12 @@ export class EnrichmentWorker {
     // Workspace is required for file writes; skip entirely when unavailable (§4.3).
     if (this.options.workspaceRoot === null) return;
 
-    // Persisted preview URLs plus the raw X status matches (X preview rows
-    // store the CANONICAL URL, which may differ from the body text).
+    // Persisted preview URLs plus the raw X/YouTube URL matches (preview rows
+    // store CANONICAL URLs, which may differ from the body text).
     const previewUrls = new Set([
       ...result.linkPreviews.map((lp) => lp.url),
       ...this.xUrlExclusions,
+      ...this.ytUrlExclusions,
     ]);
     const urls = extractLinkedMediaUrls(bodyText, previewUrls);
     if (urls.length === 0) return;

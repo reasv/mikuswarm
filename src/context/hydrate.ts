@@ -1,6 +1,7 @@
 import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta } from "../types.js";
 import type { LinkPreviewRow, MediaAssetRow, ReplyContextRow, Storage } from "../storage/index.js";
 import { parseXTweetPayload } from "../fxtwitter/types.js";
+import { YOUTUBE_SOURCE_KIND, parseYouTubePreviewPayload } from "../youtube/payload.js";
 
 /**
  * Merge the enrichment side-tables (reply context, link previews, media assets +
@@ -115,6 +116,10 @@ export function linkPreviewRowToMeta(lp: LinkPreviewRow, allMedia: MediaAssetRow
     media: media.length > 0 ? media.map(mediaAssetToAttachmentMeta) : undefined,
     fetchedAt: lp.fetched_at ?? undefined,
     payload: parseXTweetPayload(lp.payload_json) ?? undefined,
+    ytPayload:
+      lp.source_kind === YOUTUBE_SOURCE_KIND
+        ? (parseYouTubePreviewPayload(lp.payload_json) ?? undefined)
+        : undefined,
   };
 }
 
