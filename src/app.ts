@@ -108,6 +108,7 @@ import {
   createWriteMemoryTool,
   createXFetchTool,
   createXSearchTool,
+  createYoutubeFetchTool,
   GrokResultCache,
   createFindSourceTool,
   MATRIX_TERMINOLOGY,
@@ -4370,6 +4371,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
             checkBudget: makeToolBudgetCheck("x_search"),
+          })]
+        : []),
+      // youtube_fetch: YouTube metadata + transcript + workspace download tool
+      // (spec/YOUTUBE-VIDEO-UNDERSTANDING.md §6/§6a; ARCHITECTURE.md §7e/§10).
+      // Gated on the subsystem availability flag set at startup by the binary probe.
+      ...(youtubeSubsystemAvailable && ytConfig.enabled
+        ? [createYoutubeFetchTool({
+            workspaceRoot: sessionWsRoot,
+            config: ytConfig.tool,
           })]
         : []),
       createUserProfileReadTool({
