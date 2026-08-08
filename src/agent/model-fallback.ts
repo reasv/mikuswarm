@@ -104,8 +104,9 @@ export interface BuildModelFallbackOptions {
   /**
    * Provider of the current observed context token count for per-member fits
    * gating (spec PER-MEMBER-CONTEXT-FITS §2.1). Called per attempt inside the
-   * composed streamFn; returns undefined → fits is skipped (all current callers
-   * omit this; step 2 of the spec wires it from the §5.3 running counter).
+   * composed streamFn; returns undefined → fits is skipped (the agent path wires
+   * it from factory.create's §5.3 running counter; fetch consumers omit it →
+   * fits skipped).
    */
   getObservedContextTokens?: () => number | undefined;
 }
@@ -279,8 +280,8 @@ export function buildModelFallback(
     const { index, reason } = chooseChainMember(candidates, {
       scheduler: options.scheduler,
       isModelAvailable: options.isModelAvailable,
-      // Per-attempt observed context size for fits gating (§2.1). Undefined until
-      // step 2 wires getObservedContextTokens from the factory's §5.3 counter.
+      // Per-attempt observed context size for fits gating (§2.1). Fed from
+      // factory.create's §5.3 running counter; fetch consumers omit it → fits skipped.
       observedContextTokens: options.getObservedContextTokens?.(),
     });
     const candidate = candidates[index]!;

@@ -6,8 +6,8 @@ import { estimateTokens, truncateToTokens } from "../context/tokens.js";
  * (spec TOOL-RESULT-BUDGET §2–§4)
  *
  * This module is the PURE result-shaping layer. It has no knowledge of sessions,
- * runners, or config loading. The wiring (step 2) imports from here and composes
- * the two layers inside buildSessionTools.
+ * runners, or config loading. The wiring imports from here and composes the two
+ * layers inside AgentSessionFactory.create().
  *
  * Two exported surfaces:
  *   - `shapeContentBlocks` — truncates one result's content array to a token
@@ -207,9 +207,9 @@ export function shapeContentBlocks(
  * Per-turn context budget accumulator (spec TOOL-RESULT-BUDGET §4).
  *
  * One instance per session, constructed once at wiring time (inside
- * `buildSessionTools`, step 2). The three knobs come from `config.agent.tools`.
+ * `AgentSessionFactory.create()`). The three knobs come from `config.agent.tools`.
  *
- * ### Usage lifecycle (step 2 wiring)
+ * ### Usage lifecycle (factory wiring)
  * ```
  * // at wiring time:
  * const turnBudget = new TurnResultBudget(servingWindow, reserveTokens, minTokens);
