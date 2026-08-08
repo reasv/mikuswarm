@@ -700,6 +700,36 @@ test("memberWindows §2.3: single-member chain also exposes memberWindows / maxO
   assert.equal(fb.operativeContextWindow, 200_000);
 });
 
+test("fits §2.2: canary fires on absurdly-small-window head when observed is undefined (fits skipped entirely)", async () => {
+  // Spec §2.2 canary gate: when observedContextTokens is undefined the fits predicate
+  // is skipped entirely. A head with window=1 (would never fit any real context) must
+  // still be canaried when its probe window is open and observed is undefined.
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 1, probeBackoffMaxMs: 1 } });
+  scheduler.noteOutcome("default", "ep::X", "environmental");
+  await new Promise((r) => setTimeout(r, 10)); // let the probe window open
+  assert.equal(scheduler.isProbeDue("ep::X"), true);
+
+  // window=1: absurdly small — no real context would fit. But observed is undefined.
+  const m = [member("X", 1), member("Y", 256_000)];
+  const result = chooseChainMember(m, { scheduler }); // no observedContextTokens
+  assert.equal(result.index, 0, "canary fires on head even with window=1 when observed is undefined");
+  assert.equal(result.reason, "canary");
+});
+
+test("Fix 1: tried-exclusion yields budget-fallback (not context-fallback) when head is healthy + in-budget + fits", () => {
+  // Head healthy, in-budget, context fits the head — BUT already in `tried`.
+  // Before Fix 1, the else-arm of the reason ternary emitted "context-fallback" spuriously.
+  // After Fix 1, the !headFits arm is explicit; the tried-only case falls to "budget-fallback".
+  const tried = new Set(["X"]);
+  const m = [member("X", 256_000), member("Y", 256_000)];
+  const result = chooseChainMember(m, {
+    tried,
+    observedContextTokens: 100_000, // fits both X and Y
+  });
+  assert.equal(result.index, 1, "Y is chosen since X is in tried");
+  assert.equal(result.reason, "budget-fallback", "tried-exclusion must not emit context-fallback");
+});
+
 test("survivorMembers §2.3: each entry carries operativeWindow", () => {
   const X: ModelChainEntry = { logicalId: "X", config: modelCfg({ id: "wire-X", endpoint: "https://gw/x", context_window: 128_000 }) };
   const Y: ModelChainEntry = { logicalId: "Y", config: modelCfg({ id: "wire-Y", endpoint: "https://gw/y", context_window: 256_000 }) };

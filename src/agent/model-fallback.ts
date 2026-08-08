@@ -452,13 +452,15 @@ export function chooseChainMember(
 
   for (let i = 0; i < members.length; i++) {
     if (viable(members[i]!)) {
-      // Name the reason by WHY the head wasn't used (priority: health > budget > context).
+      // Name the reason by WHY the head wasn't used (priority: health > budget > context > tried).
       const reason: FallbackReason =
         headState === "unhealthy"
           ? "health-fallback"
           : !headInBudget
           ? "budget-fallback"
-          : "context-fallback"; // healthy + in-budget, but context exceeds head's window
+          : !headFits
+          ? "context-fallback" // healthy + in-budget, but context exceeds head's window
+          : "budget-fallback"; // head excluded by `tried` (environmental retry below unhealthy threshold); "budget-fallback" is imprecise but preserves the pre-change reason for this case
       return { index: i, reason };
     }
   }
