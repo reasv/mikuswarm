@@ -25,6 +25,8 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **IRC provider**: MikuSwarm now supports IRC as a third chat provider alongside Matrix and Discord. Enable with `[irc] enabled = true` and one or more `[irc.accounts.*]` blocks. Requires a modern IRCv3 server (Solanum, InspIRCd, UnrealIRCd, Ergo) — hard startup error when `server-time`, `message-tags`, or `echo-message` caps are absent. Full identity ladder (services account > tracked account > casemapped nick), byte-accurate UTF-8 chunking, echo-merge via `labeled-response` or FIFO fallback, per-channel roster (`members`, `member_info`, `channel_info` tools), and the `{server_id}` per-user-limit partition variable keyed to the network identity.
+
 - **Console: agent-aware labeling**: deployments with more than one configured
   agent gain agent-primary labels across every console surface — room-list tabs
   become per-agent ("All" plus one tab per agent, labeled `name PROVIDER` or

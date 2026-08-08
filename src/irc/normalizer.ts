@@ -92,7 +92,8 @@ function escapeRegExp(s: string): string {
  * Detect an IRC mention trigger in `body`.
  *
  * Two forms are recognized (spec §7.5):
- *   1. Addressing prefix: `nick: …` or `nick, …` at the start of the line.
+ *   1. Addressing prefix: `nick: …`, `nick, …`, or `nick …` at the start of
+ *      the line (the space separator overlaps with form 2).
  *   2. Bare-nick word-boundary occurrence anywhere in the message.
  *
  * Matching is case-insensitive per the network's advertised casemapping.

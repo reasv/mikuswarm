@@ -8,7 +8,7 @@ Last updated: 2026-05-27.
 
 ## 1. Background
 
-MikuSwarm is a multi-provider chatbot (Matrix, Discord) built on `@earendil-works/pi-agent-core` — the minimal agentic loop library.
+MikuSwarm is a multi-provider chatbot (Matrix, Discord, IRC) built on `@earendil-works/pi-agent-core` — the minimal agentic loop library.
 
 The core thesis is a conceptual shift about what an agent *is* in a chatroom. Most agent runtimes (OpenClaw among them) are built for back-and-forth assistant interactions with a single user, where the **session is the conversation**: one long-lived agentic loop that owns the dialogue from turn to turn. That model fits an assistant; it does not fit a shared, busy, many-user room, where dozens of overlapping conversations happen at once and no single loop can coherently own them all.
 
@@ -429,8 +429,8 @@ When multiple accounts run in one process they can see each other's messages. Wi
 
 `validateAgentConfig(config: AppConfig)` (exported from `src/app.ts`) is the pure, synchronous cross-field guard called at the top of `startMikuAgent`:
 
-- `[matrix|discord].accounts.*` key contains `:` → hard startup error (breaks `parseTimelineKey`; all modes)
-- `[matrix|discord].accounts.*` key contains a path-unsafe character (`/`, `\`, `..` as a path segment, whitespace/control char) → hard startup error **in agents mode only** (the key is embedded in `msg-attach/<provider>.<accountKey>/`, §7.4; a path-unsafe key can nest directories or escape the workspace root; legacy mode keeps warning-only per §3 back-compat)
+- `[matrix|discord|irc].accounts.*` key contains `:` → hard startup error (breaks `parseTimelineKey`; all modes)
+- `[matrix|discord|irc].accounts.*` key contains a path-unsafe character (`/`, `\`, `..` as a path segment, whitespace/control char) → hard startup error **in agents mode only** (the key is embedded in `msg-attach/<provider>.<accountKey>/`, §7.4; a path-unsafe key can nest directories or escape the workspace root; legacy mode keeps warning-only per §3 back-compat)
 - `[agents]` + `[workspace].root_dir` both present → hard error (mutually exclusive)
 - Agent name outside `[a-z0-9-]+` → hard error
 - Account refers to undeclared agent → hard error
@@ -520,9 +520,9 @@ Optional return payloads: `react` returns the resolved display string the platfo
 { messageIdFmt, userIdFmt, channelNoun, providerName, mentionNote, senderIdHint, coReplyIdDescription, coReplyIdRequiredError }
 ```
 
-`MATRIX_TERMINOLOGY` (`src/tools/terminology.ts`) substitutes the exact strings that the Matrix tool schemas have always shown, so the model's vocabulary is unchanged. `DISCORD_TERMINOLOGY` provides the Discord-native equivalents.
+`MATRIX_TERMINOLOGY` (`src/tools/terminology.ts`) substitutes the exact strings that the Matrix tool schemas have always shown, so the model's vocabulary is unchanged. `DISCORD_TERMINOLOGY` provides the Discord-native equivalents. `IRC_TERMINOLOGY` provides the IRC equivalents (nick/services-account user id format, bare-nick mention note, IRC-native `spawn_session` strings).
 
-`buildSessionTools` selects the bundle from `target.provider` (`DISCORD_TERMINOLOGY` for `"discord"`, `MATRIX_TERMINOLOGY` otherwise) and passes it to all 12 provider-aware tools — the 11 `ChannelClient`-gated tools (emoji_list, react, edit_message, delete_message, pins, list_reactions, read_messages, member_info, channel_info, create_poll, poll_vote) plus `send_message`. The `user_profile_read`, `user_profile_edit`, and `spawn_session` tools also receive the bundle (for provider-specific description strings). All Matrix tool schemas are byte-identical to their pre-Phase-4 values.
+`buildSessionTools` selects the bundle via a `TERMINOLOGY_MAP` keyed by `target.provider` (`DISCORD_TERMINOLOGY` for `"discord"`, `IRC_TERMINOLOGY` for `"irc"`, `MATRIX_TERMINOLOGY` for everything else — the default) and passes it to all 12 provider-aware tools — the 11 `ChannelClient`-gated tools (emoji_list, react, edit_message, delete_message, pins, list_reactions, read_messages, member_info, channel_info, create_poll, poll_vote) plus `send_message`. The `user_profile_read`, `user_profile_edit`, and `spawn_session` tools also receive the bundle (for provider-specific description strings). All Matrix tool schemas are byte-identical to their pre-Phase-4 values.
 
 `send_message` parameter schema adapts to `ProviderCapabilities`:
 - `html` parameter: present iff `capabilities.formatting === "html"` (Matrix: always included)
@@ -535,17 +535,20 @@ All these conditions hold true for Matrix, so the Matrix session tool schema is 
 
 A `[discord]` config block (peer of `[matrix]`) enables the Discord provider. Schema: `enabled` (default `false`), `trigger_hold_ms` (default 0), `accounts.*` with `token`, `application_id`, `guilds`, `dm_enabled`, `member_intent`, and the optional `agent` field (§4c — which `[agents.*]` block this account maps to; defaults to the account key). When `enabled = true` and at least one account is configured, `DiscordProvider` is constructed and registered in the providers map. See the **Discord Provider** section below for the full implementation details.
 
+An `[irc]` config block (peer of `[matrix]` and `[discord]`) enables the IRC provider. Schema: `enabled`, `trigger_hold_ms` (optional), `accounts.*` where each account key maps to an `IrcAccountConfig` — see **§6d IRC Provider** for the full per-account field reference. When `enabled = true` and at least one account is configured, `IrcProvider` is constructed and registered in the providers map.
+
 ### Provider registry
 
-`startMikuAgent` builds a `Map<string, IChatProvider>` keyed by provider id (`"matrix"`, `"discord"`, …) from config:
+`startMikuAgent` builds a `Map<string, IChatProvider>` keyed by provider id (`"matrix"`, `"discord"`, `"irc"`, …) from config:
 
 - `MatrixProvider` is constructed and registered as `"matrix"` iff `config.matrix.enabled !== false`.
 - `DiscordProvider` is constructed and registered as `"discord"` iff `config.discord?.enabled && config.discord.accounts` has at least one account. `DiscordProvider` takes a `DiscordProviderCallbacks` object (closed over storage) with five callbacks: `mergeLateEmbeds`, `storeIngestEmbeds`, `upsertUserIdentity`, `setChannelMetadata`, and the optional `onSelfResolved` hook. See **§6c DiscordProviderCallbacks** for details.
+- `IrcProvider` is constructed and registered as `"irc"` iff `config.irc?.enabled && config.irc.accounts` has at least one account. `IrcProvider` takes an optional `IrcProviderCallbacks` object with two callbacks: `upsertUserIdentity` and `setChannelMetadata`. See **§6d IRC Provider** for details.
 - If the `opts.providers` seam is supplied (test injection path — `StartMikuAgentOptions`), it replaces the config-derived map entirely; this lets tests inject a fake provider without touching any SDK.
 - **Zero-provider guard**: if the final registry is empty after construction (and after seam injection), `startMikuAgent` throws `"no enabled chat provider"` immediately — before any pool, storage, or validation step. This is a fatal config error; at least one provider must be enabled at startup.
-- At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers (including `DiscordProvider`) receive the generic host that wires `onEvent`, `onReaction`, `onBulkReactionClear`, `onError`, and `resolveReplyTrigger` without Matrix-typed callbacks.
+- At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers (including `DiscordProvider` and `IrcProvider`) receive the generic host that wires `onEvent`, `onReaction`, `onBulkReactionClear`, `onError`, and `resolveReplyTrigger` without Matrix-typed callbacks.
 - On `runtime.stop()`, every registered provider's `stop()` is called in registry iteration order.
-- **`isUserIdentity` predicate** (spec §6.4 / Phase 0): the budget engine's predicate is `providers.some(p => p.ownsUserId(id))`. For Matrix-only configs this is byte-identical to the old `id.startsWith("@")`; with Discord registered it also accepts numeric snowflakes (`/^\d+$/.test(id)`).  
+- **`isUserIdentity` predicate** (spec §6.4 / Phase 0): the budget engine's predicate is `providers.some(p => p.ownsUserId(id))`. For Matrix-only configs this is byte-identical to the old `id.startsWith("@")`; with Discord registered it also accepts numeric snowflakes (`/^\d+$/.test(id)`); with IRC registered it accepts any non-empty string free of whitespace and NUL that is not `@`-prefixed and not all-digit (nick or services account).  
 
 ### Outbound send routing
 
@@ -1053,6 +1056,159 @@ Discord self-ids (the bot's own snowflake) are only known after the `ready` even
 - `UserLimitEngine` is constructed with `selfUserIds: botSelfIdsForLimits`; it reads the Set by reference at each `isUserIdentity` call, so READY-time additions are visible without restart.
 - `runInitialBackfill` reads `gapBackfetchSelfIds.get(accountId)` at backfill time; READY fires before the first `activating` transition, so the self-id is always available when needed.
 
+## 6d. IRC Provider
+
+`src/irc/` implements the IRC provider using the `irc-framework` v4 library. It splits into a pure normalizer module (`normalizer.ts`), the live provider class (`provider.ts`), a per-channel roster tracker (`roster-tracker.ts`), a nick-to-account tracker (`account-tracker.ts`), and a `ChannelClient` implementation (`channel-client.ts`).
+
+### IRCv3 capability policy
+
+**Required floor** (hard error when absent): the provider requires `server-time`, `message-tags`, and `echo-message` — all three must appear in the server's CAP LS response. `sasl` is additionally required whenever `sasl_user` + `sasl_password` are configured. On a missing required cap, the account emits a structured error naming the cap and the server host (`"irc account "<key>": server <host> does not advertise required capability "<cap>" — mikuswarm requires a modern IRCv3 server (Solanum, InspIRCd, UnrealIRCd, Ergo or equivalent)"`) and then `QUIT`s. The `capFailed` flag suppresses repeated error logging on auto-reconnect attempts; the account is permanently unusable until the process restarts with a cap-capable server.
+
+If a required cap is **withdrawn mid-connection** (`CAP DEL`), the provider logs an error, clears `registered`, and calls `QUIT` with `capDelReconnect = true`. The library's `close` event then fires (because `QUIT` sets `requested_disconnect = true`, preventing the library's own auto-reconnect) and the provider's `close` handler explicitly calls `client.connect()` after a 1 s delay — implementing a clean reconnect loop that repeats cap validation on the fresh connection.
+
+**Opportunistic caps** (auto-detected, never config knobs): `msgid`, `labeled-response`, `batch`, `account-tag`, `account-notify`, `extended-join`, `away-notify`, `chghost`, `setname`. These are requested unconditionally; the server grants only the ones it advertises. Their presence silently improves internal fidelity (better message ids, identity resolution, echo correlation, roster freshness) but never changes the tool-visible capability surface.
+
+### Key grammar
+
+| Context | Timeline key |
+|---|---|
+| Channel | `irc:<accountId>:room:<casemapped_channel_name>` |
+| DM (query) | `irc:<accountId>:dm:<identity>` |
+
+Channel names are casemapped for key stability using the network's `CASEMAPPING` ISUPPORT token (default `rfc1459`). DM keys use the identity ladder result (services account name when known, else casemapped nick) so a user who DMs while unauthenticated gets a separate timeline from their authenticated sessions — the accepted consequence documented in the spec.
+
+Event id: `irc:<accountId>:<externalId>:<nanoid8>`. `externalId` is the `msgid` tag value when the server assigns one (preferred) or a synthetic id — `syn:<serverTimeMs>:<senderNick>:<counter>` — where the counter is a per-account monotonic integer. Synthetic ids serve dedup and echo-merge; no stable referenceability is required.
+
+### Identity ladder
+
+Per-message identity is resolved deterministically in three rungs:
+
+1. **Per-message `account` tag** (wins unconditionally when present and non-empty) — the sender's services account name from the `account-tag` cap. Never `"*"` on PRIVMSG (that form only appears on `ACCOUNT` messages; handled defensively).
+2. **Tracked state** (`AccountTracker`) — populated by `extended-join` (account field in JOIN), `account-notify` (ACCOUNT messages), per-message `account` tag (opportunistic refresh), and WHOX WHO responses on self-join.
+3. **Casemapped nick** — final fallback when no account information is available.
+
+`SenderInfo.id` is the ladder result (stable across nick changes when the user is identified to services). `SenderInfo.username` is always the current nick (the display identity). The bot's own identity (`SelfIdentity.id`) is the configured `sasl_user` when SASL is active, else the casemapped nick at registration time.
+
+**Account-identity sharing limitation** (spec §5.3): a user with the same services account name on two different IRC networks maps to the same `userId` across both networks' timelines. Per-network disambiguation requires an operator-level approach (e.g. distinct account keys per network in config) — the protocol offers no cross-network identity scoping.
+
+### Capabilities
+
+| Capability | Value |
+|---|---|
+| `maxMessageChars` | 400 (static conservative budget; actual per-send budget is computed from the bot's real hostmask — see "Send") |
+| `maxAttachmentsPerMessage` | 0 |
+| `formatting` | `"plain"` |
+| `typing` | `true` (via `TAGMSG +typing=active/done`) |
+| `reactions` | `false` |
+| `edits` | `false` |
+| `deletes` | `false` |
+| `pins` | `false` |
+| `pollCreate` | `false` |
+| `pollVote` | `false` |
+| `voiceMessages` | `false` |
+| `threads` | `false` |
+| `history` | `false` (initial-activation backfill is skipped; `chathistory` is a deferred follow-up) |
+| `encrypted` | `false` |
+| `linkPreviews` | `"none"` |
+| `singleAttachmentPerMessage` | `false` |
+| `membershipRoster` | `true` (backed by `RosterTracker`) |
+| `mediaUpload` | `false` |
+
+IRC has no attachment or media capability; `enrichment()` returns `undefined`.
+
+### Inbound pipeline
+
+Events handled: `privmsg` (PRIVMSG + CTCP ACTION via the library's `action` event), `notice`, `cap del`, `nick`, `user updated` (CHGHOST/SETNAME), `join` (+ WHOX WHO on self-join), `userlist` (RPL_ENDOFNAMES), `part`, `kick`, `topic`, `away`, `back`, `account`, `quit`, `socket close`, `close`, `socket error`.
+
+**PRIVMSG / ACTION**: inbound messages from other users are normalized via `normalizeIrcMessage()` — a pure function with no live client references — and routed through `applyTriggerHoldOrEmit()`. `account` tag (if present) is used to refresh `AccountTracker` before normalization so the identity ladder reads the freshest state. DMs to a disabled (`dm_enabled = false`) account are dropped.
+
+**NOTICE**: channel NOTICEs are ingested (trigger forced to `undefined`). Query NOTICEs (DMs) are dropped entirely. This is the only inbound suppression that is not a config option.
+
+**Control code stripping**: mIRC color codes (`\x03`, `\x04` hex-color), bold/italic/underline/strikethrough/monospace/reverse/reset control characters are stripped from every inbound body at normalization time. `CTCP ACTION` bodies are rendered as `* nick action text`.
+
+**Trigger detection**: `dm` for any query message; `mention` for a channel message that matches the bot's nick (recognized as a `nick: text` / `nick, text` / `nick text` addressing prefix at line start — the space separator overlaps with the bare-nick form — OR a bare-nick word-boundary occurrence anywhere in the message, casemapped per the network's CASEMAPPING). Notices never trigger.
+
+**Trigger hold**: mirrors the Matrix/Discord hold mechanism — `trigger_hold_ms` (optional config field) delays dispatch; a second trigger in the same timeline (from any sender — the hold is keyed by timeline, with no per-sender discriminant) resets the timer, capped at `4 × trigger_hold_ms` from the first trigger's `holdStartedAt`.
+
+### Send and byte-accurate chunking
+
+`send(target, message)` computes the actual PRIVMSG byte budget from the bot's known hostmask (`nick!user@host`): `budget = 498 - byteLen(hostmask) - byteLen(ircTarget)` (the 512-byte wire limit minus CRLF/prefix/command/target overhead), with a minimum of 50 bytes and a fallback to the static 400-byte budget before the hostmask is learned.
+
+`chunkIrcMessage(text, maxBytes)` splits on embedded newlines first (matching the library's own newline handling — without this, a single `PendingEcho` for a multi-line body would never match the N separate echoes and every multi-line send would time out at 5 s then fabricate a receipt). Each line is then split into chunks ≤ `maxBytes` UTF-8 bytes using UTF-8-code-point iteration with whitespace-preferring split (preferring the last space in the latter half of the window). Empty / whitespace-only segments are skipped.
+
+### Echo-merge
+
+`echo-message` is a required cap. Every outbound PRIVMSG is echoed back by the server, and the provider merges the echo to learn the server-assigned `msgid` (preferred when `msgid` cap is enabled).
+
+Two merge strategies depending on available caps:
+
+- **`labeled-response` + `batch` present**: each chunk is sent with a `label` tag (`nanoid(12)`); the server echoes the PRIVMSG inside a `BATCH` tagged with that label. The provider looks up the label in `pendingByLabel` to resolve the corresponding echo promise.
+- **`labeled-response` absent**: FIFO queue per target (`echoQueues`). IRC guarantees ordered per-target delivery, so the first pending entry for a (target, body) pair is the matching echo. After 5 s (`ECHO_TIMEOUT_MS`) without an echo, the pending promise resolves with the synthetic id and the entry is cleaned up.
+
+The echo event is always delivered to `host.onEvent` with `isSelf: true` for timeline storage, regardless of how the external id was resolved.
+
+### RosterTracker and AccountTracker
+
+**`RosterTracker`** (`src/irc/roster-tracker.ts`) tracks per-channel membership. It is initialised from `userlist` (RPL_ENDOFNAMES) and kept current by `join`, `part`, `quit`, `nick`, `kick`, `away`, and `back` events. Cleared on `socket close` so stale membership from before a disconnect never bleeds into the reconnected session. Internally it stores `RosterEntry { nick, modes, away }` keyed by casemapped nick; the `members()` method on `IrcChannelClient` exposes the roster as `SenderInfo[]` (`{ id, username, isSelf }`, with the identity-ladder result as `id`).
+
+**`AccountTracker`** (`src/irc/account-tracker.ts`) maps casemapped nicks to services account names. Updated by `extended-join` (per-JOIN account field), `account-notify` (ACCOUNT messages), per-message `account` tag (opportunistic refresh), and WHOX bulk responses on self-join. QUIT events prune the entry; PART does not (the user may still be in other served channels). Cleared on `socket close`.
+
+### IrcChannelClient
+
+`IrcChannelClient` (`src/irc/channel-client.ts`) implements `ChannelClient`. Unsupported operations (`react`, `unreact`, `listReactions`, `editMessage`, `deleteMessage`, `pins`, `pinMessage`, `unpinMessage`) throw immediately with `"IRC does not support <op>"` — the session tool-gate on `ProviderCapabilities` flags means these methods are never called from normal tool paths. `emojiList()` returns an empty array (IRC has no custom emoji concept). `readMessages()` returns an empty result (history cap is `false`).
+
+Three live operations:
+
+- **`members()`** — delegates to `membersFn` (the roster-backed closure over `RosterTracker.getMembers()` enriched with `AccountTracker`). Each entry's `id` follows the identity ladder (account name when known, casemapped nick otherwise). Absent for DMs.
+- **`memberInfo(id)`** — delegates to `memberInfoFn`: resolves the nick for the given id (trying account→nick reverse lookup via `RosterTracker.findNickByAccount()` first, then treating `id` as a nick directly), then issues WHOIS (10 s timeout; resolves `undefined` on timeout or socket drop). Returns `{ userId, displayName, isSelf, isDirect }`.
+- **`channelInfo()`** — delegates to `channelInfoFn`: returns tracked topic and member count from `RosterTracker`. Label is `"<channelName> (<networkName>)"` for channels, `"<nick> (<networkName> DM)"` for DMs. `serverName` is set to `rt.networkName`.
+
+### IrcProviderCallbacks
+
+Two callbacks injected at construction, following the same pattern as `DiscordProviderCallbacks`:
+
+- **`upsertUserIdentity(input)`** — called from the NICK event handler to record the old nick as an alias under the stable identity key (account name when known, else old casemapped nick). Per-message upserts are handled by the generic ingest path in `app.ts`.
+- **`setChannelMetadata(timelineKey, meta)`** — called on every inbound channel PRIVMSG/ACTION/NOTICE to upsert `display_name`, `server_id`, and `server_name` into `room_metadata`. `displayName = channelName` (the `#channel` string); `serverId = rt.networkName`; `serverName = rt.networkName`. Used by `serverIdsFor(timelineKey)` to return the network identity for server-scoped per-user-limit partitioning (`{server_id}` template variable). Fire-and-forget; errors are swallowed.
+
+### Config block reference
+
+```
+[irc]
+enabled         = true
+trigger_hold_ms = 0                        # optional; debounce ms (same semantics as matrix.trigger_hold_ms)
+
+[irc.accounts.<key>]
+host            = "irc.example.org"        # required; server hostname or IP
+port            = 6697                     # optional; defaults to 6697 (TLS) or 6667 (plaintext)
+tls             = true                     # optional; defaults to true when port is 6697 or absent
+nick            = "botname"               # required; requested nick
+username        = "botname"               # optional; IRC username (ident); defaults to nick
+realname        = "botname"               # optional; gecos / real name; defaults to nick
+sasl_user       = "..."                   # optional; SASL PLAIN username; when set with sasl_password, sasl cap is required
+sasl_password   = "..."                   # optional; SASL PLAIN password (redacted in logs)
+server_password = "..."                   # optional; PASS command password (redacted in logs)
+channels        = ["#general", "#other"]  # optional; channels to join and rejoin on reconnect
+dm_enabled      = true                    # optional; accept private messages (queries) from users; default true
+agent           = "alice"                 # optional; which [agents.*] block this account belongs to (§4c)
+```
+
+The account key (the `<key>` in `[irc.accounts.<key>]`) must not contain `:` (breaks `parseTimelineKey`) and must not contain path-unsafe characters in agents mode.
+
+### Terminology map
+
+| IRC concept | MikuSwarm field |
+|---|---|
+| Nick | `SenderInfo.username` (mutable display identity) |
+| Services account name | `SenderInfo.id` (stable identity, rung 1/2) |
+| Casemapped nick | `SenderInfo.id` (fallback identity, rung 3) |
+| `NETWORK` ISUPPORT token | `rt.networkName` / `server_id` in `room_metadata` |
+| Channel (e.g. `#general`) | timeline key kind `"room"` |
+| Query (DM) | timeline key kind `"dm"` |
+| PRIVMSG msgid tag | `externalId` (preferred over synthetic) |
+| CTCP ACTION | body prefix `* nick ` |
+
+---
+
 ## 7. Timeline
 
 ### Core concept
@@ -1103,7 +1259,7 @@ SQLite with WAL mode. Core tables:
 - **`timeline_events`** — the event log. Each row stores denormalized columns (id, timeline_key, role, sender, body, timestamps) plus `event_json` (full `CanonicalChatEvent` serialized), `enrichment_status` (`inactive` | `pending` | `processing` | `complete` | `failed` | `skipped`), and `trigger_group_id` (event ID of the trigger that owns this group, or NULL). The `inactive` status marks events stored for a not-yet-triggered timeline (see section 7b — Channel Lifecycle); the enrichment and caption pools only claim `pending`/`processing` rows, so `inactive` events are stored cheaply but never processed until activation. It also has a generated column `is_undecryptable` (VIRTUAL, derived from `event_json`'s `undecryptable` field) for cheap UTD-row lookup by the re-decryption sweeper (see section 6a) and a `redecrypt_attempts` integer (default 0) that counts failed re-decryption probes — the sweeper's candidate query excludes rows at/above `MAX_REDECRYPT_ATTEMPTS` (and a `REDECRYPT_RETIRED` sentinel for permanently-unfetchable rows) so dead UTD rows leave rotation. A nullable `last_edit_timestamp` (issue #3) holds the `origin_server_ts` of the most recently applied edit (NULL = never edited); the edit-application paths use it to enforce latest-by-timestamp wins (an older incoming edit is a no-op). Indexed on `(timeline_key, timestamp, received_at, id)`, `(provider, external_id)`, `(enrichment_status, timestamp DESC)`, `(trigger_group_id)`, and a partial `(is_undecryptable, redecrypt_attempts, timestamp) where is_undecryptable = 1` (the attempts column is in the index so the give-up filter skips exhausted rows without touching the heap).
 - **`timeline_compaction_state`** — per-timeline compaction cursors (`compact_start_event_id`, `rich_start_event_id`) plus channel-lifecycle columns: `timeline_state` (`inactive` | `activating` | `active` | `backfilling`, default `inactive`) and `backfill_fence_timestamp` (reserved for deferred operator backfill). A missing row means the timeline is implicitly `inactive`. See section 7b.
 - **`pending_edits`** — edits (`m.replace`) that arrived/decrypted before their target message was stored, parked for replay by the append path (see section 6, "Edit-before-target replay"). Keyed by `(provider, target_external_id, timeline_key)` (the PK; `timeline_key`-scoped for the same multi-account reason as the edit lookup). Stores the resolved replacement `body` + `attachments_json` and the `edit_timestamp` (origin time, for latest-wins). Rows are deleted as soon as the target lands and the edit is applied.
-- **`room_metadata`** — cached human room labels keyed by `timeline_key` (`display_name` + `resolved_at`). Populated by `RoomLabelCache` (see section 6, "Room-label resolution") so the observability console room list shows real room names instead of raw room ids; read by `listConsoleRooms`, which falls back to the `timeline_key` when no label has been resolved yet. `resolved_at` lets the cache expire stale labels (rooms can be renamed; 6-hour TTL). Also carries `server_id` (nullable) and `server_name` (nullable) — Discord guild scope, populated by `setChannelMetadata` at ingest; used by `serverIdsFor(timelineKey)` in `app.ts` to return the Discord guild snowflake for server-scoped budget limits.
+- **`room_metadata`** — cached human room labels keyed by `timeline_key` (`display_name` + `resolved_at`). Populated by `RoomLabelCache` (see section 6, "Room-label resolution") so the observability console room list shows real room names instead of raw room ids; read by `listConsoleRooms`, which falls back to the `timeline_key` when no label has been resolved yet. `resolved_at` lets the cache expire stale labels (rooms can be renamed; 6-hour TTL). Also carries `server_id` (nullable) and `server_name` (nullable) — Discord guild scope and IRC network scope both use these columns, each populated by their provider's `setChannelMetadata` callback at ingest (Discord: guild id + guild name; IRC: network name from NETWORK ISUPPORT, else configured host); used by `serverIdsFor(timelineKey)` in `app.ts` to return the server-scope id for server-scoped budget limits.
 - **`metadata`** — generic key-value store.
 - **`reactions`** — the passive reaction store (§9f). One row per reaction event (PK = the reaction's own event id — `$eventId` for Matrix; `discord:<msgId>:<emojiKey>:<userId>` synthetic key for Discord), carrying the `timeline_key` locality hint, the target message's external id, sender, resolved `kind`/`display`/`shortcode`/`normalized_key`, timestamps, and a nullable `redacted_at` tombstone. The `timeline_key` column is returned in `DiscreteReactionRow` so the context builder can derive the provider for identity resolution (§6.5). Deliberately **not** part of the timeline — reactions are injected only at render time and must stay out of summarization, search, diary, and recap. No FK to `timeline_events`: the target is matched by the globally-unique event id (Matrix or synthetic Discord PK), not the internal row id. Partial index on `(target_event_id, reacted_at) where redacted_at is null`.
 - **`user_identities`** / **`user_identity_aliases`** — the user identity store (see §6b). `user_identities` is `WITHOUT ROWID`, PK `(provider, user_id)`, current `username` + `display_name`. `user_identity_aliases` holds prior usernames, bounded at `USER_IDENTITY_ALIAS_BOUND = 16` per user.

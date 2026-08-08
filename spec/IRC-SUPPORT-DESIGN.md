@@ -1,12 +1,11 @@
 # IRCv3 Support — Implementation Design
 
-**Status**: DRAFT — proposed, nothing implemented.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §6d; retained for review.
 Builds directly on `spec/DISCORD-SUPPORT-DESIGN.md` (the provider contract,
 key grammar, identity model, `ChannelClient`/tool gating, and enrichment
 capability registry established there are treated as settled and cited without
 re-arguing them; its §13 is the design check this document expands into a full
-design). Target ARCHITECTURE.md home once implemented: the Providers section
-(a new IRC provider subsection), plus per-subsystem notes where marked below.
+design).
 
 **Guiding constraint** (unchanged from the Discord work): every change lands
 as a generic, default-off upstream feature. Matrix-only and Discord-only
@@ -538,4 +537,4 @@ type-checks and passes tests:
   `IRC_TERMINOLOGY`, the four code sites in §10 (the console row is
   Phase 4).
 - **Phase 4 — polish.** Console chip/labels, ARCHITECTURE.md Providers
-  section, this spec's status header flipped to IMPLEMENTED.
+  section, this spec's status header flipped to IMPLEMENTED. ✓ Done.
