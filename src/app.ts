@@ -4399,9 +4399,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
             // [models.*] chain (head + fallback members); pricing lives on the model.
+            // Per-agent ladder (spec PER-AGENT-MODEL-OVERRIDES Phase 3): the ref is
+            // resolved via the override ladder before building the chain. null agent →
+            // ladder returns the global ref → byte-identical to the pre-Phase-3 path.
+            // resolveModelChain cannot throw here: Phase 0 validateAgentConfig already
+            // validated every override ref, and the global refs were validated at startup.
             chains: {
-              pro: resolveModelChain(config.image_gen.models.pro, config.models),
-              flash: resolveModelChain(config.image_gen.models.flash, config.models),
+              pro: resolveModelChain(agentModelOverrides.resolveImageGenRef(sessionAgentName, "pro"), config.models),
+              flash: resolveModelChain(agentModelOverrides.resolveImageGenRef(sessionAgentName, "flash"), config.models),
             },
             config: config.image_gen,
           })]
@@ -4436,8 +4441,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             config: config.x_search,
             // Unified registry (spec MODEL-FALLBACK §2.3): resolve the fast/deep
             // tiers to their `[models.*]` chains (head + fallback members).
-            fastChain: resolveModelChain(config.x_search.model, config.models),
-            deepChain: resolveModelChain(config.x_search.deep_model ?? config.x_search.model, config.models),
+            // Per-agent ladder (spec PER-AGENT-MODEL-OVERRIDES Phase 3): the deep→fast
+            // fall-through is resolved INSIDE resolveXSearchRef (§4) so the call site
+            // must NOT re-apply `?? config.x_search.model`. null agent → global refs.
+            fastChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "fast"), config.models),
+            deepChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "deep"), config.models),
             scheduler: llmScheduler,
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             workspaceRoot: sessionWsRoot,

@@ -19,6 +19,7 @@ import type { AppConfig } from "../src/config/index.js";
 import { loadConfig } from "../src/config/index.js";
 import { validateAgentConfig } from "../src/app.ts";
 import { buildAgentModelOverrides } from "../src/agent/agent-model-overrides.js";
+import { resolveModelChain } from "../src/agent/model-fallback.js";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1264,4 +1265,152 @@ test("unknown-agent passthrough: unrecognized agentName resolves identically to 
       `resolveXSearchRef("${phantom}", "deep") must equal null-agent result`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3 — resolver-to-chain composition (spec PER-AGENT-MODEL-OVERRIDES §11 step 10)
+//
+// buildSessionTools is not practical to unit-drive (requires a full app context),
+// so these tests pin the composition resolveModelChain(resolve{ImageGen,XSearch}Ref(...))
+// — the exact expression used at the call site after Phase 3 — verifying that the
+// right chain head is selected and that resolveModelChain succeeds for every case.
+// ---------------------------------------------------------------------------
+
+/** Shared models registry used in composition tests — same names as makeLegacyConfig. */
+const COMPOSITION_MODELS: AppConfig["models"] = {
+  default: {
+    id: "default-id",
+    provider: "test",
+    endpoint: "http://localhost",
+    api_key: "k",
+    input_modalities: ["text"],
+    max_tokens: 1024,
+    context_window: 128000,
+  },
+  "imagegen-alt": {
+    id: "imagegen-alt-id",
+    provider: "test",
+    endpoint: "http://localhost",
+    api_key: "k",
+    input_modalities: ["text"],
+    max_tokens: 4096,
+  },
+  "grok-alt": {
+    id: "grok-alt-id",
+    provider: "test",
+    endpoint: "http://localhost",
+    api_key: "k",
+    input_modalities: ["text"],
+    max_tokens: 2048,
+  },
+};
+
+// ── image_gen composition ─────────────────────────────────────────────────
+
+test("Phase 3 composition: agent image_gen override → overridden chain head", () => {
+  // Agent overrides pro to "imagegen-alt"; global pro is "default".
+  const cfg = makeAgentsConfig(
+    "main",
+    { image_gen: { pro: "imagegen-alt" } },
+    { imageGen: { pro: "default", flash: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const proChain = resolveModelChain(ov.resolveImageGenRef("main", "pro"), COMPOSITION_MODELS);
+  const flashChain = resolveModelChain(ov.resolveImageGenRef("main", "flash"), COMPOSITION_MODELS);
+  // pro: agent override wins → "imagegen-alt" is the chain head
+  assert.equal(proChain[0]!.logicalId, "imagegen-alt");
+  // flash: no agent override → global "default" is the chain head
+  assert.equal(flashChain[0]!.logicalId, "default");
+});
+
+test("Phase 3 composition: agent without image_gen override → global chain head", () => {
+  // Agent has no image_gen overrides; global pro = "imagegen-alt".
+  const cfg = makeAgentsConfig(
+    "sidekick",
+    {},
+    { imageGen: { pro: "imagegen-alt", flash: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const proChain = resolveModelChain(ov.resolveImageGenRef("sidekick", "pro"), COMPOSITION_MODELS);
+  assert.equal(proChain[0]!.logicalId, "imagegen-alt");
+});
+
+test("Phase 3 composition: null agent image_gen → global chain head (legacy invariance)", () => {
+  // Null agent must yield the same chain as the global refs: no agent half.
+  const cfg = makeAgentsConfig(
+    "main",
+    { image_gen: { pro: "imagegen-alt" } },
+    { imageGen: { pro: "default", flash: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const proChain = resolveModelChain(ov.resolveImageGenRef(null, "pro"), COMPOSITION_MODELS);
+  // null → global pro = "default"
+  assert.equal(proChain[0]!.logicalId, "default");
+});
+
+// ── x_search composition ──────────────────────────────────────────────────
+
+test("Phase 3 composition: agent x_search fast override → overridden fast chain head", () => {
+  const cfg = makeAgentsConfig(
+    "main",
+    { x_search: { model: "grok-alt" } },
+    { xSearch: { model: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const fastChain = resolveModelChain(ov.resolveXSearchRef("main", "fast"), COMPOSITION_MODELS);
+  assert.equal(fastChain[0]!.logicalId, "grok-alt");
+});
+
+test("Phase 3 composition: agent x_search deep override → overridden deep chain head", () => {
+  const cfg = makeAgentsConfig(
+    "main",
+    { x_search: { model: "default", deep_model: "grok-alt" } },
+    { xSearch: { model: "default", deep_model: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const deepChain = resolveModelChain(ov.resolveXSearchRef("main", "deep"), COMPOSITION_MODELS);
+  assert.equal(deepChain[0]!.logicalId, "grok-alt");
+});
+
+test("Phase 3 composition: agent fast override + no deep_model anywhere → deep chain uses agent fast head", () => {
+  // §4: when both agent and global deep_model are absent, the agent's fast override
+  // wins for the deep tier (the fall-through lands on the resolved fast value).
+  const cfg = makeAgentsConfig(
+    "main",
+    { x_search: { model: "grok-alt" } }, // agent fast, no deep
+    { xSearch: { model: "default" } },   // global fast, no global deep
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const deepChain = resolveModelChain(ov.resolveXSearchRef("main", "deep"), COMPOSITION_MODELS);
+  // deep falls through to the agent's fast → "grok-alt"
+  assert.equal(deepChain[0]!.logicalId, "grok-alt");
+});
+
+test("Phase 3 composition: agent fast override + global deep_model present → deep chain uses global deep", () => {
+  // Global deep_model is set → it wins over the fall-through to fast.
+  // This verifies the call site does NOT re-apply the fall-through after resolveXSearchRef.
+  const cfg = makeAgentsConfig(
+    "main",
+    { x_search: { model: "grok-alt" } }, // agent fast override only
+    { xSearch: { model: "default", deep_model: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const deepChain = resolveModelChain(ov.resolveXSearchRef("main", "deep"), COMPOSITION_MODELS);
+  // deep: no agent deep → global deep = "default" (not the fall-through grok-alt)
+  assert.equal(deepChain[0]!.logicalId, "default");
+});
+
+test("Phase 3 composition: null agent x_search → global chain heads (legacy invariance)", () => {
+  // Null agent (legacy mode): both tiers must use global refs.
+  const cfg = makeAgentsConfig(
+    "main",
+    { x_search: { model: "grok-alt", deep_model: "grok-alt" } },
+    { xSearch: { model: "default" } },
+  );
+  const ov = buildAgentModelOverrides(cfg);
+  const fastChain = resolveModelChain(ov.resolveXSearchRef(null, "fast"), COMPOSITION_MODELS);
+  const deepChain = resolveModelChain(ov.resolveXSearchRef(null, "deep"), COMPOSITION_MODELS);
+  // null: global fast = "default", no global deep → falls through to global fast = "default"
+  assert.equal(fastChain[0]!.logicalId, "default");
+  assert.equal(deepChain[0]!.logicalId, "default");
 });
