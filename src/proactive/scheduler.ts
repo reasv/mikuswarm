@@ -274,8 +274,12 @@ export interface ProactiveSchedulerOptions {
    * (or blocked by its summarization dependency), else undefined. The next
    * scheduled attempt is clamped to `max(normal_schedule, resets_at)`, so a
    * channel simply waits out the budget rather than posting and being refused.
+   *
+   * `timelineKey` is the channel's timeline key (spec PER-AGENT-MODEL-OVERRIDES
+   * FIX 3): threaded so the resolver and the admission gate apply the per-agent
+   * model override for this channel's agent, not the global proactive model.
    */
-  budgetDeferUntil?: () => number | undefined;
+  budgetDeferUntil?: (timelineKey: string) => number | undefined;
   /**
    * Resolve the bot's own identity for a given provider + account (§6.3).
    * Injected by app wiring via `providers.get(provider)?.getSelf(accountId)`.
@@ -383,7 +387,9 @@ export class ProactiveScheduler {
     // Budget defer (spec USAGE-COST-LIMITS §6.3): when proactive is over budget,
     // clamp the next attempt to the window reset so the channel waits instead of
     // posting into a refusal. Self-reschedule already re-arms after this instant.
-    const deferUntil = this.options.budgetDeferUntil?.();
+    // Thread eff.timelineKey so the callback can apply the per-agent model override
+    // for this channel's agent (spec PER-AGENT-MODEL-OVERRIDES FIX 3).
+    const deferUntil = this.options.budgetDeferUntil?.(eff.timelineKey);
     if (deferUntil !== undefined && deferUntil > next) {
       this.options.logger.info("proactive_deferred_budget", {
         timelineKey: eff.timelineKey,

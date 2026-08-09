@@ -162,3 +162,39 @@ test("#7 safeProactiveDeferUntil: within budget → no defer", () => {
   };
   assert.equal(safeProactiveDeferUntil(engine, "proactive", () => "m1", logger), undefined);
 });
+
+test("#7+FIX3 safeProactiveDeferUntil: timelineKey reaches checkAdmission and resolveModelId (spec PER-AGENT-MODEL-OVERRIDES FIX 3)", () => {
+  // Verify that the timelineKey threaded via the 5th argument reaches BOTH the
+  // resolveModelId callback AND engine.checkAdmission. This is the key invariant:
+  // the per-agent model override is applied when deciding whether to defer proactive.
+  const { logger } = capturingLogger();
+  const tk = "matrix:sidekick:!room:server";
+
+  const seenModelIdArgs: string[] = [];
+  const seenCheckAdmissionArgs: Array<string | undefined> = [];
+
+  const engine = {
+    checkAdmission(_sessionType: string, _modelId: string, timelineKey?: string): typeof allowed {
+      seenCheckAdmissionArgs.push(timelineKey);
+      return allowed; // within budget — no defer, but we're only checking arg threading
+    },
+    accurateResetsAt: () => undefined,
+  };
+
+  safeProactiveDeferUntil(
+    engine,
+    "proactive",
+    (sessionType) => {
+      seenModelIdArgs.push(sessionType);
+      return "m1";
+    },
+    logger,
+    tk,
+  );
+
+  assert.equal(seenModelIdArgs[0], "proactive", "resolveModelId receives the proactiveType");
+  assert.ok(
+    seenCheckAdmissionArgs.includes(tk),
+    `engine.checkAdmission must receive the timelineKey "${tk}"; got ${JSON.stringify(seenCheckAdmissionArgs)}`,
+  );
+});

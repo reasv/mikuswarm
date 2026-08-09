@@ -1,6 +1,6 @@
 # YouTube Video Understanding — `youtube_fetch` tool + `media` routing + link enrichment
 
-**Status**: PROPOSED.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §7e; retained for review.
 
 **Author**: design session 2026-08-01.
 

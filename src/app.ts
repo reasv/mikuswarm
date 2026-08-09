@@ -59,6 +59,7 @@ import {
   type ManualResumeResult,
 } from "./agent/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
+import { buildAgentModelOverrides } from "./agent/agent-model-overrides.js";
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
 import { makeCostWarnDecider, selectToolCostSeed } from "./agent/cost-budget.js";
@@ -109,6 +110,7 @@ import {
   createWriteMemoryTool,
   createXFetchTool,
   createXSearchTool,
+  createYoutubeFetchTool,
   GrokResultCache,
   createFindSourceTool,
   MATRIX_TERMINOLOGY,
@@ -122,6 +124,7 @@ import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEv
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
+import { resolveYouTubeConfig } from "./youtube/config.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
@@ -251,6 +254,24 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (fxTwitterConfig.tool.maxCharsLimit > fxTwitterConfig.tool.maxTotalChars) {
     throw new Error(
       `fxtwitter.tool: max_chars_limit (${fxTwitterConfig.tool.maxCharsLimit}) must be <= max_total_chars (${fxTwitterConfig.tool.maxTotalChars})`,
+    );
+  }
+  // [youtube.tool] cross-field sanity — same fail-fast convention as [fxtwitter.tool].
+  const ytCfg = resolveYouTubeConfig(config.youtube);
+  if (ytCfg.tool.defaultMaxChars > ytCfg.tool.maxCharsLimit) {
+    throw new Error(
+      `youtube.tool: default_max_chars (${ytCfg.tool.defaultMaxChars}) must be <= max_chars_limit (${ytCfg.tool.maxCharsLimit})`,
+    );
+  }
+  if (ytCfg.tool.maxCharsLimit > ytCfg.tool.maxTotalChars) {
+    throw new Error(
+      `youtube.tool: max_chars_limit (${ytCfg.tool.maxCharsLimit}) must be <= max_total_chars (${ytCfg.tool.maxTotalChars})`,
+    );
+  }
+  // [youtube.enrichment].enabled requires [youtube].enabled.
+  if (ytCfg.enrichment.enabled && !ytCfg.enabled) {
+    throw new Error(
+      "youtube.enrichment.enabled = true requires youtube.enabled = true",
     );
   }
   // [saucenao] graceful key-gated degrade (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5;
@@ -930,6 +951,41 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     httpProxyUrl: config.network?.http_proxy_url,
   });
 
+  // YouTube subsystem wiring (ARCHITECTURE.md §7e / spec §2 graceful degradation).
+  // Probe the yt-dlp binary once at startup. On success: configureYtDlp so the
+  // module-level subprocess wrapper is ready. On failure (binary absent or broken):
+  // log ONE structured warning and mark the subsystem unavailable; the enrichment
+  // partition and future tool registrations consult this flag before doing anything.
+  // enabled=false skips the probe entirely and marks the subsystem unavailable.
+  const ytConfig = resolveYouTubeConfig(config.youtube);
+  let youtubeSubsystemAvailable = false;
+  if (ytConfig.enabled) {
+    try {
+      const { probeYtDlpBinary, configureYtDlp } = await import("./youtube/ytdlp.js");
+      const version = await probeYtDlpBinary();
+      configureYtDlp({
+        ytDlpPath: ytConfig.ytDlpPath,
+        timeoutMs: ytConfig.timeoutMs,
+        concurrency: ytConfig.concurrency,
+        httpProxyUrl: config.network?.http_proxy_url,
+        cookiesFile: ytConfig.cookiesFile,
+        maxDownloadBytes: ytConfig.maxDownloadBytes,
+      });
+      youtubeSubsystemAvailable = true;
+      logger.info("youtube_subsystem_ready", { version, ytDlpPath: ytConfig.ytDlpPath });
+    } catch (err) {
+      logger.warn("youtube_subsystem_unavailable", {
+        ytDlpPath: ytConfig.ytDlpPath,
+        error: err instanceof Error ? err.message : String(err),
+        message:
+          "yt-dlp binary not found or not executable — YouTube enrichment and tools will be disabled. " +
+          "Install yt-dlp into PATH or set [youtube].yt_dlp_path.",
+      });
+    }
+  } else {
+    logger.info("youtube_subsystem_disabled", { reason: "[youtube].enabled = false" });
+  }
+
   // Shared, cross-session Grok-result cache for x_search: one
   // instance so a reactive and a proactive session hitting the same topic in a
   // busy channel dampen to a single Grok call. Only the expensive synthesis is
@@ -992,52 +1048,158 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // image-block path all use the same defaults.
   const inferenceImageOptions = buildInferenceImageOptions(mediaImageConfig);
 
-  const captionClients = new Map<MediaModality, InferenceClient>([
-    ["image", new InferenceClient({
-      modality: "image",
-      chain: resolveModalityChain(imageConfig),
-      prompt: imageConfig.prompt ?? "Describe the image.",
-      maxChars: imageConfig.max_chars ?? 500,
-      maxTokens: imageConfig.max_tokens ?? 2048,
-      scheduler: llmScheduler,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
-      imageProcessing: inferenceImageOptions,
-    })],
-    ["video", new InferenceClient({
-      modality: "video",
-      chain: resolveModalityChain(videoConfig),
-      prompt: videoConfig.prompt ?? "Describe the video.",
-      maxChars: videoConfig.max_chars ?? 500,
-      maxTokens: videoConfig.max_tokens ?? 2048,
-      scheduler: llmScheduler,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
-      timeoutMs: videoConfig.timeout_ms,
-      videoProcessing: {
-        maxResolution: mediaVideoConfig.max_resolution ?? 480,
-        maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
-        maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
-        gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
-        x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
-        cachePath: mediaCachePath,
-        cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
-        cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
-      },
-    })],
-    ["audio", new InferenceClient({
+  // Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §8): built once
+  // from config at startup; all four resolvers are pure O(1) lookups over the
+  // precomputed per-agent map. Moved here (before the captionClients block) so the
+  // captioning ladder resolvers are available during per-agent client construction;
+  // still passed into the factory below for the chat-lane ladder (§4).
+  const agentModelOverrides = buildAgentModelOverrides(config);
+
+  // Per-modality processing options — extracted so they can be reused verbatim
+  // when building per-agent InferenceClients (spec PER-AGENT-MODEL-OVERRIDES §3:
+  // "only the model *reference* is overridable — never the surrounding behavioral
+  // settings"). Prompt, maxChars, maxTokens, and media-processing options all
+  // come from the GLOBAL captioning config; only the chain differs per agent.
+  const captionVideoProcessing = {
+    maxResolution: mediaVideoConfig.max_resolution ?? 480,
+    maxBytes: mediaVideoConfig.max_bytes ?? 52_428_800,
+    maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
+    gpuAcceleration: mediaVideoConfig.gpu_acceleration ?? false,
+    x264Preset: mediaVideoConfig.x264_preset ?? "veryfast",
+    cachePath: mediaCachePath,
+    cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
+    cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
+  };
+  const captionAudioProcessing = {
+    maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
+    maxDurationSeconds: mediaAudioConfig.max_duration_seconds ?? 300,
+  };
+
+  // Build an InferenceClient for the given modality and chain. All behavioral
+  // options (prompt, maxChars, maxTokens, scheduler, media processing) come from
+  // the global captioning config; only `chain` varies per-agent (§3).
+  function buildCaptionClient(modality: MediaModality, chain: ReturnType<typeof resolveModalityChain>): InferenceClient {
+    if (modality === "image") {
+      return new InferenceClient({
+        modality: "image",
+        chain,
+        prompt: imageConfig.prompt ?? "Describe the image.",
+        maxChars: imageConfig.max_chars ?? 500,
+        maxTokens: imageConfig.max_tokens ?? 2048,
+        scheduler: llmScheduler,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        imageProcessing: inferenceImageOptions,
+      });
+    }
+    if (modality === "video") {
+      return new InferenceClient({
+        modality: "video",
+        chain,
+        prompt: videoConfig.prompt ?? "Describe the video.",
+        maxChars: videoConfig.max_chars ?? 500,
+        maxTokens: videoConfig.max_tokens ?? 2048,
+        scheduler: llmScheduler,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        timeoutMs: videoConfig.timeout_ms,
+        videoProcessing: captionVideoProcessing,
+      });
+    }
+    // audio
+    return new InferenceClient({
       modality: "audio",
-      chain: resolveModalityChain(audioConfig),
+      chain,
       prompt: audioConfig.prompt ?? "Transcribe and describe the audio.",
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
       isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: audioConfig.timeout_ms,
-      audioProcessing: {
-        maxBytes: mediaAudioConfig.max_bytes ?? 20_971_520,
-        maxDurationSeconds: mediaAudioConfig.max_duration_seconds ?? 300,
-      },
-    })],
+      audioProcessing: captionAudioProcessing,
+    });
+  }
+
+  // Baseline (global) per-modality clients — identical to today's construction.
+  const captionClients = new Map<MediaModality, InferenceClient>([
+    ["image", buildCaptionClient("image", resolveModalityChain(imageConfig))],
+    ["video", buildCaptionClient("video", resolveModalityChain(videoConfig))],
+    ["audio", buildCaptionClient("audio", resolveModalityChain(audioConfig))],
   ]);
+
+  // All distinct InferenceClients for teardown (baseline + any per-agent).
+  // Clients sharing a chain ref with the baseline reuse the SAME instance and
+  // must not be stopped twice — this Set enforces exactly-once teardown.
+  const allCaptionClients = new Set<InferenceClient>(captionClients.values());
+
+  // Per-agent client map (spec PER-AGENT-MODEL-OVERRIDES Phase 2): built only for
+  // agents that have a [agents.<name>.models.captioning] override AND whose
+  // resolved model ref for at least one modality differs from the baseline.
+  // Same ref → reuse the baseline client (no allocation, no duplicate teardown).
+  // Agents with no captioning override section are not entered here; the resolver
+  // below falls through to the baseline for them (correct — see §4 subtlety note).
+  const perAgentCaptionClients = new Map<string, Map<MediaModality, InferenceClient>>();
+  if (agentWorkspaces.length > 0 && config.agents) {
+    const captionModalities: readonly MediaModality[] = ["image", "video", "audio"] as const;
+    for (const agentName of Object.keys(config.agents)) {
+      if (!config.agents[agentName]?.models?.captioning) continue;
+      const agentMap = new Map<MediaModality, InferenceClient>();
+      for (const modality of captionModalities) {
+        const agentRef = agentModelOverrides.resolveCaptionModelRef(agentName, modality);
+        const baselineRef = agentModelOverrides.resolveCaptionModelRef(null, modality);
+        if (agentRef === baselineRef) continue; // same chain → reuse baseline
+        const agentChain = resolveModelChain(agentRef, config.models);
+        const agentClient = buildCaptionClient(modality, agentChain);
+        agentMap.set(modality, agentClient);
+        allCaptionClients.add(agentClient);
+      }
+      if (agentMap.size > 0) perAgentCaptionClients.set(agentName, agentMap);
+    }
+  }
+
+  // Startup observability — per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §9).
+  // One info log per agent that has ANY model override, emitted once after the override
+  // table and per-agent caption clients are fully built. `overrides` is a flat map of
+  // role key → raw config value (not ladder result), so operators can see exactly what
+  // they configured without having to trace through the resolution ladder.
+  if (config.agents) {
+    for (const [agentName, agentBlock] of Object.entries(config.agents)) {
+      const m = agentBlock.models;
+      if (!m) continue;
+      const overrides: Record<string, string> = {};
+      if (m.session_types) {
+        for (const [k, v] of Object.entries(m.session_types)) {
+          overrides[`session_types.${k}`] = v;
+        }
+      }
+      if (m.captioning) {
+        if (m.captioning.model !== undefined) overrides["captioning.model"] = m.captioning.model;
+        for (const mod of ["image", "video", "audio"] as const) {
+          if (m.captioning[mod] !== undefined) overrides[`captioning.${mod}`] = m.captioning[mod]!;
+        }
+      }
+      if (m.image_gen) {
+        if (m.image_gen.pro !== undefined) overrides["image_gen.pro"] = m.image_gen.pro;
+        if (m.image_gen.flash !== undefined) overrides["image_gen.flash"] = m.image_gen.flash;
+      }
+      if (m.x_search) {
+        if (m.x_search.model !== undefined) overrides["x_search.model"] = m.x_search.model;
+        if (m.x_search.deep_model !== undefined) overrides["x_search.deep_model"] = m.x_search.deep_model;
+      }
+      if (Object.keys(overrides).length > 0) {
+        logger.info("agent_model_overrides", { agent: agentName, overrides });
+      }
+    }
+  }
+
+  // Caption client resolver: returns the per-agent client when the agent has an
+  // override that differs from the baseline chain; baseline otherwise.
+  // null agentName → always baseline (legacy mode or unresolvable → treated as global).
+  function resolveAgentCaptionClient(agentName: string | null, modality: MediaModality): InferenceClient {
+    if (agentName !== null) {
+      const agentClient = perAgentCaptionClients.get(agentName)?.get(modality);
+      if (agentClient) return agentClient;
+    }
+    return captionClients.get(modality)!;
+  }
 
   const defaultPrompts = new Map<MediaModality, string>([
     ["image", imageConfig.prompt ?? "Describe the image."],
@@ -1100,6 +1262,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       : undefined,
     downloadSizeLimit,
     fxtwitter: { client: fxTwitterClient, config: fxTwitterConfig },
+    // YouTube enrichment partition (ARCHITECTURE.md §7e): only passed when the
+    // subsystem is available AND [youtube.enrichment].enabled is true.
+    youtube:
+      youtubeSubsystemAvailable && ytConfig.enrichment.enabled
+        ? {
+            config: ytConfig.enrichment,
+            captionAssistant:
+              (config.captioning?.caption_all ?? false) ||
+              (config.captioning?.caption_assistant_messages ?? false),
+          }
+        : undefined,
     store: attachmentStore,
     config: config.enrichment ?? {},
     onComplete: (eventId) => {
@@ -1123,6 +1296,22 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // timeline_key so local_path is expanded against the correct workspace.
     resolveWorkspaceRoot: agentWorkspaces.length > 0
       ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+      : undefined,
+    // Per-asset agent-name resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // companion to resolveWorkspaceRoot — provided in agents mode so the pool
+    // can forward the agentName to resolveClient for per-agent client selection.
+    resolveAgentName: agentWorkspaces.length > 0
+      ? (timelineKey) => {
+          const entry = resolveWorkspaceForTimeline(timelineKey);
+          if (!entry) return null;
+          return entry.agentName === "__legacy__" ? null : entry.agentName;
+        }
+      : undefined,
+    // Per-asset caption client resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // only injected in agents mode so the pool picks the correct InferenceClient
+    // per (agentName, modality). Absent in legacy mode → static clients map used.
+    resolveClient: agentWorkspaces.length > 0
+      ? resolveAgentCaptionClient
       : undefined,
     config: config.captioning ?? {},
     onComplete: (eventId) => {
@@ -1410,15 +1599,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
     // Returns the owning agent's resolved workspace root for a timeline key.
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
-    // Per-session agent name resolver (spec PER-AGENT-MCP-SCOPING): used to
-    // apply per-agent MCP server allowlists. Only wired in agents mode; absent
-    // in legacy mode (all MCP tools remain visible, no scoping). Returns null
-    // for the __legacy__ sentinel and for unresolvable entries.
+    // Per-agent model override ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    // Only active in agents mode (agentWorkspaces.length > 0); in legacy mode the
+    // resolver is absent → factory falls back to the global-only path (§2).
+    agentModelOverrides,
+    // ONE resolver, two consumers: the model-override ladder above and the
+    // per-agent MCP server allowlist (spec PER-AGENT-MCP-SCOPING). Both need the
+    // same timeline-key → agent-name mapping, so they share it rather than
+    // wiring two identical closures.
     resolveAgentName: agentWorkspaces.length > 0
       ? (timelineKey) => {
           const entry = resolveWorkspaceForTimeline(timelineKey);
-          if (!entry || entry.agentName === "__legacy__") return null;
-          return entry.agentName;
+          if (!entry) return null;
+          // Normalize the sentinel exactly as the contextBuilder wiring (app.ts:~909):
+          // "__legacy__" means "no agent scoping" → null → global ladder.
+          return entry.agentName === "__legacy__" ? null : entry.agentName;
         }
       : undefined,
     // Exact tool-name → server-name attribution map. Populated after
@@ -1492,18 +1687,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       minUsageTs: (filter) => storage.minUsageTs(filter),
       zeroCostModelIds,
       dependencies,
-      resolveModelId: (sessionType) => {
+      // `timelineKey` is threaded through `checkAdmissionChain` so that per-agent
+      // model overrides (spec PER-AGENT-MODEL-OVERRIDES §4) are visible when the
+      // dependency cascade resolves a prerequisite's (e.g. summarize's) model for a
+      // specific agent's session. Callers without per-session context (e.g.
+      // `isClassAvailable`, worker claim gates) omit `timelineKey` → global ladder.
+      resolveModelId: (sessionType, timelineKey) => {
         try {
-          return factory.resolveModelId(sessionType);
+          return factory.resolveModelId(sessionType, timelineKey);
         } catch {
           return undefined;
         }
       },
       // Logical id (chain-head config block name) for the session-level gates —
       // the dimension `[[limits]].models` matches (spec MODEL-FALLBACK §2.2).
-      resolveLogicalModelId: (sessionType) => {
+      resolveLogicalModelId: (sessionType, timelineKey) => {
         try {
-          return factory.resolveLogicalModelId(sessionType);
+          return factory.resolveLogicalModelId(sessionType, timelineKey);
         } catch {
           return undefined;
         }
@@ -1513,9 +1713,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // judged unavailable only when EVERY member of its chain is over budget, so a
       // model-scoped cap on the prerequisite's head (e.g. GLM) does not refuse a
       // dependent reply the prerequisite could still produce on a fallback (DeepSeek).
-      resolveModelChainLogicalIds: (sessionType) => {
+      resolveModelChainLogicalIds: (sessionType, timelineKey) => {
         try {
-          return factory.resolveModelChainLogicalIds(sessionType);
+          return factory.resolveModelChainLogicalIds(sessionType, timelineKey);
         } catch {
           return [];
         }
@@ -1837,6 +2037,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return undefined;
     }
   };
+  // NOTE (spec PER-AGENT-MODEL-OVERRIDES FIX 8): the lanes below are deliberately
+  // GLOBAL-model-based. The claim gate is a process-wide pause heuristic — it has no
+  // per-session context at evaluation time, only a set of session-type names. With
+  // per-agent model overrides, an agent whose override is within budget may still pause
+  // while the global model is over budget: a conservative over-pause, not a correctness
+  // problem. The per-session admission gates (which ARE agent-aware, threaded via
+  // timelineKey through checkAdmission/checkAdmissionChain) remain the enforcement
+  // point. Widening this gate would require threading the calling session's timeline key
+  // here, but claim gates are registered at startup and re-evaluated without session
+  // context — the tradeoff is intentional.
   const makeAgentLoopClaimGate = (sessionTypes: readonly string[]): (() => boolean) => {
     const engine = budgetHooks.engine;
     if (!engine) return () => false;
@@ -3192,9 +3402,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const eventForRender = buildReplyHydratedEvent(inbound, target, followUpHydratedEvent(inbound));
     let imageBlocks: ImageBlock[] | undefined;
     try {
+      const coReplySessionType = sessions.get(coReplySessionId)?.sessionType ?? "default";
+      // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
+      // FIX 6): use inbound.timelineKey to pick the agent, then look up the model.
+      const coReplyModelKey = factory.resolveLogicalModelId(coReplySessionType, inbound.timelineKey);
+      const coReplySeesImages =
+        (config.models[coReplyModelKey] ?? config.models.default)?.input_modalities?.includes("image") ?? false;
       const blocks = await contextBuilder.conditionEventImages(
         eventForRender,
-        factory.resolveSessionType(sessions.get(coReplySessionId)?.sessionType ?? "default"),
+        factory.resolveSessionType(coReplySessionType),
+        coReplySeesImages,
       );
       if (blocks.length > 0) {
         imageBlocks = blocks;
@@ -3561,9 +3778,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let imageBlocks: ImageBlock[] | undefined;
     if (form === "media") {
       try {
+        const followUpSessionType = sessions.get(sessionId)?.sessionType ?? "default";
+        // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
+        // FIX 6): use inbound.timelineKey to pick the agent, then look up the model.
+        const followUpModelKey = factory.resolveLogicalModelId(followUpSessionType, inbound.timelineKey);
+        const followUpSeesImages =
+          (config.models[followUpModelKey] ?? config.models.default)?.input_modalities?.includes("image") ?? false;
         const blocks = await contextBuilder.conditionEventImages(
           hydrated,
-          factory.resolveSessionType(sessions.get(sessionId)?.sessionType ?? "default"),
+          factory.resolveSessionType(followUpSessionType),
+          followUpSeesImages,
         );
         if (blocks.length > 0) {
           imageBlocks = blocks;
@@ -3767,7 +3991,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const verdict = await evaluateFollowUpResumeGate({
         sessionId,
         getSession: () => storage.getAgentSession(sessionId),
-        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
+        // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
+        resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
         // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the
         // inbound timeline key so the follow-up resume reads the correct agent dir.
         // In agents mode an unresolvable account returns null → gate rejects (no resume).
@@ -3979,16 +4205,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // from the SAME resolver call that feeds enforcement and the model descriptor,
     // never an independent `config.models.*.context_window` read — so a session
     // type's override (or a non-default model) shapes the tool budget too.
-    const contextCeiling = factory.resolveSessionContextCeiling(sessionType);
+    // Thread inbound.timelineKey for per-agent model resolution (spec FIX 7).
+    const contextCeiling = factory.resolveSessionContextCeiling(sessionType, inbound.timelineKey);
 
-    // Whether THIS session's reply model — the session-type model, the one that
-    // actually serves the turn, NOT `[models.default]` (which may be a different,
-    // text-only model) — accepts image input (spec MODEL-FALLBACK §3). Gates
-    // vision-dependent tool wiring below (read_image inclusion, media/danbooru/
-    // find_source inline-vs-caption fallback) on the serving model's own capability,
-    // never another model's.
+    // Whether THIS session's reply model — the per-agent resolved model (spec
+    // PER-AGENT-MODEL-OVERRIDES §4 FIX 4), the one that actually serves the turn,
+    // NOT `[models.default]` or the global session-type model — accepts image input
+    // (spec MODEL-FALLBACK §3). Gates vision-dependent tool wiring below
+    // (read_image inclusion, media/danbooru/find_source inline-vs-caption fallback)
+    // on the serving model's own capability, never another model's.
     const replyModelConfig =
-      config.models[factory.resolveSessionType(sessionType)?.model ?? "default"] ?? config.models.default;
+      config.models[factory.resolveLogicalModelId(sessionType, inbound.timelineKey)] ?? config.models.default;
     const replyModelSeesImages = replyModelConfig.input_modalities.includes("image");
 
     // Shared auxiliary usage-ledger sink for the LLM-calling tools (image_generate,
@@ -4088,6 +4315,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             accountId: target.accountId,
           })
       : undefined;
+
+    // Per-session caption client map (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+    // routes each modality to the session's agent's override client, or baseline.
+    // In legacy mode (agentWorkspaces.length === 0), sessionAgentName is always null
+    // and resolveAgentCaptionClient returns the baseline → use captionClients directly.
+    const sessionCaptionClients = agentWorkspaces.length > 0
+      ? new Map<MediaModality, InferenceClient>([
+          ["image", resolveAgentCaptionClient(sessionAgentName, "image")],
+          ["video", resolveAgentCaptionClient(sessionAgentName, "video")],
+          ["audio", resolveAgentCaptionClient(sessionAgentName, "audio")],
+        ] as Array<[MediaModality, InferenceClient]>)
+      : captionClients;
 
     return [
       createSendMessageTool({
@@ -4226,7 +4465,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       ...(sessionSandbox ? [createBashTool({ sandbox: sessionSandbox, defaultTimeoutMs: sessionSandboxTimeoutMs })] : []),
       createMediaTool({
         workspaceRoot: sessionWsRoot,
-        clients: captionClients,
+        // Per-session caption clients (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+        // routes each modality to the session's agent's override, or baseline.
+        clients: sessionCaptionClients,
         defaultPrompts,
         modelHasVision: replyModelSeesImages,
         maxFetchBytes: downloadSizeLimit,
@@ -4235,6 +4476,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // tool_invocations row per captioned item, feeding the §8d cost ceiling.
         agentSessionId: sessionId,
         recordToolUsage,
+        // YouTube segment routing (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3):
+        // when the subsystem is available, recognized YouTube URLs are downloaded
+        // as segments instead of fetched via FetchClient.
+        youtube: youtubeSubsystemAvailable
+          ? {
+              maxDownloadBytes: ytConfig.maxDownloadBytes,
+              maxResolution: mediaVideoConfig.max_resolution ?? 480,
+              maxDurationSeconds: mediaVideoConfig.max_duration_seconds ?? 120,
+              cachePath: mediaCachePath,
+              cacheMaxBytes: mediaVideoConfig.cache_max_bytes ?? 21_474_836_480,
+              cacheTargetBytes: mediaVideoConfig.cache_target_bytes ?? 16_106_127_360,
+            }
+          : undefined,
       }),
       ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
       createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),
@@ -4259,7 +4513,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // When the default model lacks vision, `preview` describes the asset via
         // the captioning model instead of emitting an unusable image block.
         modelHasVision: replyModelSeesImages,
-        imageCaptionClient: captionClients.get("image"),
+        // Per-session caption client (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+        imageCaptionClient: resolveAgentCaptionClient(sessionAgentName, "image"),
         // Auxiliary usage ledger (spec AUXILIARY-USAGE-TRACKING §8.2): one
         // tool_invocations row per non-vision preview caption, feeding the §8d
         // cost ceiling.
@@ -4304,9 +4559,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
             // [models.*] chain (head + fallback members); pricing lives on the model.
+            // Per-agent ladder (spec PER-AGENT-MODEL-OVERRIDES Phase 3): the ref is
+            // resolved via the override ladder before building the chain. null agent →
+            // ladder returns the global ref → byte-identical to the pre-Phase-3 path.
+            // resolveModelChain cannot throw here: Phase 0 validateAgentConfig already
+            // validated every override ref, and the global refs were validated at startup.
             chains: {
-              pro: resolveModelChain(config.image_gen.models.pro, config.models),
-              flash: resolveModelChain(config.image_gen.models.flash, config.models),
+              pro: resolveModelChain(agentModelOverrides.resolveImageGenRef(sessionAgentName, "pro"), config.models),
+              flash: resolveModelChain(agentModelOverrides.resolveImageGenRef(sessionAgentName, "flash"), config.models),
             },
             config: config.image_gen,
           })]
@@ -4341,15 +4601,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             config: config.x_search,
             // Unified registry (spec MODEL-FALLBACK §2.3): resolve the fast/deep
             // tiers to their `[models.*]` chains (head + fallback members).
-            fastChain: resolveModelChain(config.x_search.model, config.models),
-            deepChain: resolveModelChain(config.x_search.deep_model ?? config.x_search.model, config.models),
+            // Per-agent ladder (spec PER-AGENT-MODEL-OVERRIDES Phase 3): the deep→fast
+            // fall-through is resolved INSIDE resolveXSearchRef (§4) so the call site
+            // must NOT re-apply `?? config.x_search.model`. null agent → global refs.
+            fastChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "fast"), config.models),
+            deepChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "deep"), config.models),
             scheduler: llmScheduler,
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             workspaceRoot: sessionWsRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
             // Reuse the image caption model — the exact `media`-tool path (§5).
-            imageCaptionClient: captionClients.get("image"),
+            // Per-session caption client (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+            imageCaptionClient: resolveAgentCaptionClient(sessionAgentName, "image"),
             fetchClient,
             downloadSizeLimit,
             httpProxyUrl: config.network?.http_proxy_url,
@@ -4358,6 +4622,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
             checkBudget: makeToolBudgetCheck("x_search"),
+          })]
+        : []),
+      // youtube_fetch: YouTube metadata + transcript + workspace download tool
+      // (spec/YOUTUBE-VIDEO-UNDERSTANDING.md §6/§6a; ARCHITECTURE.md §7e/§10).
+      // Gated on the subsystem availability flag set at startup by the binary probe.
+      ...(youtubeSubsystemAvailable && ytConfig.enabled
+        ? [createYoutubeFetchTool({
+            workspaceRoot: sessionWsRoot,
+            config: ytConfig.tool,
           })]
         : []),
       createUserProfileReadTool({
@@ -4485,9 +4758,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // initial pick matches Gate B's per-attempt selection — a model affordable only
     // because thinking was ignored must not be admitted as the initial model. The
     // thinking level is the session-type head's config (fixed for the rollout).
-    const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType)];
+    // Thread `inbound.timelineKey` so the per-agent ladder resolves the correct
+    // model for this agent's session (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    const preferred = resolution.models ?? [factory.resolveLogicalModelId(sessionType, inbound.timelineKey)];
     const sessionThinkingLevel =
-      config.models[factory.resolveLogicalModelId(sessionType)]?.thinking_level ?? "off";
+      config.models[factory.resolveLogicalModelId(sessionType, inbound.timelineKey)]?.thinking_level ?? "off";
     const thinkingBudgetForModel = (m: string): number => {
       const mc = config.models[m];
       return mc ? additiveThinkingBudgetTokens(mc, sessionThinkingLevel) : 0;
@@ -4733,7 +5008,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: record.timelineKey,
       sessionType: record.sessionType,
-      model: factory.resolveModelId(record.sessionType),
+      // Thread `record.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(record.sessionType, record.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -4990,7 +5266,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ctx,
         resumeCfg,
         exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
-        resolveCeiling: (sessionType) => factory.resolveSessionContextCeiling(sessionType),
+        // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
+        // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
+        resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
         // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): the row's stored
         // timeline key identifies the agent; resolve its workspace so images and
         // memory files are loaded from the correct per-agent directory.
@@ -5282,7 +5560,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: record.timelineKey,
       sessionType: record.sessionType,
-      model: factory.resolveModelId(record.sessionType),
+      // Thread `record.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(record.sessionType, record.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -5382,7 +5661,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // The §6.1 "seed with the head's logical id" obligation is therefore discharged
     // by the chain gate + per-request ledger; `agent_sessions.model_id` stays the
     // upstream id as provisional provenance until the first request rewrites it.
-    const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType));
+    // Thread `inbound.timelineKey` for per-agent model resolution (spec §4/§8).
+    const session = sessions.createPlaceholder(inbound, sessionType, factory.resolveModelId(sessionType, inbound.timelineKey));
     sessions.markRunning(session.id);
     // Attribute the claim added at accept time to this session and release it when
     // the run settles (spec DUPLICATE-REPLY-MITIGATION §3.3). Registered before the
@@ -5468,9 +5748,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // model. Falls back to the session-type default when per-user is inactive.
       let admissionModelId: string | undefined;
       try {
+        // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
         admissionModelId = initialUserModel
           ? factory.resolveUpstreamModelId(initialUserModel)
-          : factory.resolveModelId(session.sessionType);
+          : factory.resolveModelId(session.sessionType, session.timelineKey);
       } catch {
         admissionModelId = undefined;
       }
@@ -5480,9 +5761,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // model-id resolution above — a throw leaves it undefined → head-only gate.
       let admissionChain: string[] | undefined;
       try {
+        // Thread `session.timelineKey` for per-agent chain resolution (spec §4/§8).
         admissionChain = initialUserModel
           ? factory.resolveModelChainLogicalIdsForModel(initialUserModel)
-          : factory.resolveModelChainLogicalIds(session.sessionType);
+          : factory.resolveModelChainLogicalIds(session.sessionType, session.timelineKey);
       } catch {
         admissionChain = undefined;
       }
@@ -5653,7 +5935,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       usage,
       timelineKey: session.timelineKey,
       sessionType: session.sessionType,
-      model: factory.resolveModelId(session.sessionType),
+      // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
+      model: factory.resolveModelId(session.sessionType, session.timelineKey),
       maxSessionCostUsd: costCeiling,
       logger,
     });
@@ -5811,14 +6094,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // duration, §5 #5) when proactive (or its summarization dependency) is over
     // budget (spec USAGE-COST-LIMITS §6.3). Exception-isolated + fail-open
     // (review #7): an engine throw → no defer.
-    budgetDeferUntil: () => {
+    // Thread timelineKey (spec PER-AGENT-MODEL-OVERRIDES FIX 3): the callback receives
+    // the channel's timeline key from the scheduler so resolveModelId and checkAdmission
+    // apply the per-agent override for this channel's agent rather than the global model.
+    budgetDeferUntil: (timelineKey) => {
       const engine = budgetHooks.engine;
       if (!engine) return undefined;
       return safeProactiveDeferUntil(
         engine,
         config.proactive?.session_type ?? "proactive",
-        (sessionType) => factory.resolveModelId(sessionType),
+        (sessionType) => factory.resolveModelId(sessionType, timelineKey),
         logger,
+        timelineKey,
       );
     },
     // §6.3: wire provider self-identity so proactive synthetic inbounds carry the
@@ -6337,7 +6624,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // probe during a caption-model outage would otherwise block until the
         // far-later `llmScheduler.stop()` rejects it (a capped-backoff probe
         // window stall). Stopping the clients first rejects those queued waiters now.
-        for (const client of captionClients.values()) client.stop();
+        // allCaptionClients is a Set of all DISTINCT clients (baseline + per-agent),
+        // so each client is stopped exactly once even when agents share a baseline
+        // instance (spec PER-AGENT-MODEL-OVERRIDES Phase 2 teardown).
+        for (const client of allCaptionClients) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (diaryPool) await diaryPool.stop();
@@ -6530,6 +6820,7 @@ export function safeProactiveDeferUntil(
   proactiveType: string,
   resolveModelId: (sessionType: string) => string | undefined,
   logger: Logger,
+  timelineKey?: string,
 ): number | undefined {
   let modelId: string | undefined;
   try {
@@ -6539,7 +6830,10 @@ export function safeProactiveDeferUntil(
   }
   if (modelId === undefined) return undefined;
   try {
-    const admission = engine.checkAdmission(proactiveType, modelId);
+    // Thread timelineKey so agent-scoped [[limits]] rules match the per-agent model
+    // (spec PER-AGENT-MODEL-OVERRIDES FIX 3). Without a timelineKey (global callers,
+    // old tests) checkAdmission falls back to process-wide scope as before.
+    const admission = engine.checkAdmission(proactiveType, modelId, timelineKey);
     if (admission.allowed || !admission.primary) return undefined;
     return engine.accurateResetsAt(admission.primary.name) ?? admission.primary.resetsAt;
   } catch (error) {
@@ -6840,7 +7134,14 @@ export async function evaluateResumeGate(args: {
   ctx: "dm" | "group";
   resumeCfg: ResumeGateConfig;
   exemptToolNames: ReadonlySet<string>;
-  resolveCeiling: (sessionType: string) => number | undefined;
+  /**
+   * Resolve the context ceiling for a session type. Optionally receives the
+   * session record's timeline key (spec PER-AGENT-MODEL-OVERRIDES FIX 7) so
+   * the ceiling is resolved against the per-agent model rather than the global
+   * session-type model. Callers that omit `timelineKey` fall back to the
+   * global-only path (backward-compatible).
+   */
+  resolveCeiling: (sessionType: string, timelineKey?: string) => number | undefined;
   loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
   logger: Pick<Logger, "warn">;
 }): Promise<ResumeGateVerdict> {
@@ -6877,7 +7178,8 @@ export async function evaluateResumeGate(args: {
     // ceiling, a resume would immediately re-park (no compaction) — FRESH instead.
     let ceiling: number | undefined;
     try {
-      ceiling = args.resolveCeiling(row.session_type);
+      // Thread the row's timeline key so the ceiling uses the per-agent model (FIX 7).
+      ceiling = args.resolveCeiling(row.session_type, row.timeline_key);
     } catch {
       ceiling = undefined;
     }
@@ -6961,7 +7263,14 @@ export function assertFollowupConfigValid(
 export async function evaluateFollowUpResumeGate(args: {
   sessionId: string;
   getSession: () => AgentSessionRow | undefined;
-  resolveCeiling: (sessionType: string) => number | undefined;
+  /**
+   * Resolve the context ceiling for a session type. Optionally receives the
+   * session record's timeline key (spec PER-AGENT-MODEL-OVERRIDES FIX 7) so
+   * the ceiling is resolved against the per-agent model rather than the global
+   * session-type model. Callers that omit `timelineKey` fall back to the
+   * global-only path (backward-compatible).
+   */
+  resolveCeiling: (sessionType: string, timelineKey?: string) => number | undefined;
   loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
   timelineKey: string;
   logger: Pick<Logger, "warn">;
@@ -6977,7 +7286,8 @@ export async function evaluateFollowUpResumeGate(args: {
     // re-park is pointless → native fate instead.
     let ceiling: number | undefined;
     try {
-      ceiling = args.resolveCeiling(row.session_type);
+      // Thread the row's timeline key so the ceiling uses the per-agent model (FIX 7).
+      ceiling = args.resolveCeiling(row.session_type, row.timeline_key);
     } catch {
       ceiling = undefined;
     }
@@ -7284,6 +7594,136 @@ export function validateAgentConfig(config: AppConfig): void {
               `shared-mode agents via the shared container mount — move the strict agent's ` +
               `workspace outside the shared parent directory (§10).`,
           );
+        }
+      }
+    }
+
+    // ── Per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §7) ────────
+    // All checks run for every agent that carries a `models` block. Mirror the
+    // fail-fast philosophy of the global role checks (app.ts ~1764/~1984):
+    // unknown model names, broken chains, missing context_window on session-type
+    // models, overrides for unconfigured subsystems, and summaries_from conflicts
+    // all throw a path-precise error naming the agent and key.
+    {
+      // §7: the role-designated session type names are always valid override keys —
+      // the process may launch these types regardless of explicit configuration.
+      const proactiveTypeName = config.proactive?.session_type ?? "proactive";
+      const roleDesignatedTypes = new Set<string>([
+        "summarize",
+        "condense",
+        "diary",
+        proactiveTypeName,
+      ]);
+      // Any key explicitly declared under [agent.session_types] is also valid.
+      const declaredSessionTypeKeys = new Set<string>(
+        Object.keys(config.agent?.session_types ?? {}),
+      );
+      // "default" is always a valid override key (§7 / spec §4 rung 2).
+      const isValidSessionTypeKey = (key: string): boolean =>
+        key === "default" || declaredSessionTypeKeys.has(key) || roleDesignatedTypes.has(key);
+
+      // Helper: resolve model chain or throw with path-precise context.
+      const requireChain = (modelRef: string, keyPath: string): void => {
+        try {
+          resolveModelChain(modelRef, config.models);
+        } catch (err) {
+          throw new Error(
+            `${keyPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+
+      // Helper: require context_window on the chain head — same check as
+      // validateContextTokenCeilings for session-type models (the factory's
+      // resolveSessionContextCeiling requires it for enforcement).
+      const requireContextWindow = (modelRef: string, keyPath: string): void => {
+        // requireChain above already rejected unknown refs
+        const model = config.models[modelRef]!;
+        if (model.context_window === undefined) {
+          throw new Error(
+            `${keyPath}: model "${modelRef}" must declare context_window — ` +
+              `it is required for session-type enforcement`,
+          );
+        }
+      };
+
+      for (const [agentName, block] of Object.entries(config.agents)) {
+        const overrides = block.models;
+        if (!overrides) continue;
+
+        // §7: session_types key existence and model chain validation.
+        if (overrides.session_types) {
+          for (const [typeKey, modelRef] of Object.entries(overrides.session_types)) {
+            if (!isValidSessionTypeKey(typeKey)) {
+              const validExtra = [...roleDesignatedTypes].filter(
+                (k) => !declaredSessionTypeKeys.has(k),
+              );
+              throw new Error(
+                `[agents.${agentName}].models.session_types: key "${typeKey}" does not name ` +
+                  `a launchable session type — valid keys are declared [agent.session_types] ` +
+                  `names, "default", or role-designated type names (${validExtra.join(", ")})`,
+              );
+            }
+            const keyPath = `[agents.${agentName}].models.session_types.${typeKey}`;
+            requireChain(modelRef, keyPath);
+            requireContextWindow(modelRef, keyPath);
+          }
+        }
+
+        // §7: summaries_from + summarize/condense override is dead config (§6).
+        if (block.summaries_from !== undefined && overrides.session_types) {
+          const deadKeys = (["summarize", "condense"] as const).filter(
+            (k) => overrides.session_types![k] !== undefined,
+          );
+          if (deadKeys.length > 0) {
+            throw new Error(
+              `[agents.${agentName}]: summaries_from = "${block.summaries_from}" is set AND ` +
+                `models.session_types has override(s) for ${deadKeys.map((k) => `"${k}"`).join(", ")} — ` +
+                `agents with summaries_from never run summarization sessions, so these overrides are dead config`,
+            );
+          }
+        }
+
+        // §7: captioning overrides require a global [captioning] table.
+        if (overrides.captioning) {
+          if (!config.captioning) {
+            throw new Error(
+              `[agents.${agentName}].models.captioning: overrides require a global [captioning] ` +
+                `table — add [captioning] to config or remove the agent captioning overrides`,
+            );
+          }
+          for (const [modalityKey, modelRef] of Object.entries(overrides.captioning)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.captioning.${modalityKey}`);
+          }
+        }
+
+        // §7: image_gen overrides require a global [image_gen] table.
+        if (overrides.image_gen) {
+          if (!config.image_gen) {
+            throw new Error(
+              `[agents.${agentName}].models.image_gen: overrides require a global [image_gen] ` +
+                `table — add [image_gen] to config or remove the agent image_gen overrides`,
+            );
+          }
+          for (const [tierKey, modelRef] of Object.entries(overrides.image_gen)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.image_gen.${tierKey}`);
+          }
+        }
+
+        // §7: x_search overrides require a global [x_search] table.
+        if (overrides.x_search) {
+          if (!config.x_search) {
+            throw new Error(
+              `[agents.${agentName}].models.x_search: overrides require a global [x_search] ` +
+                `table — add [x_search] to config or remove the agent x_search overrides`,
+            );
+          }
+          for (const [keyName, modelRef] of Object.entries(overrides.x_search)) {
+            if (modelRef === undefined) continue;
+            requireChain(modelRef, `[agents.${agentName}].models.x_search.${keyName}`);
+          }
         }
       }
     }

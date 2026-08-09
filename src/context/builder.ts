@@ -169,6 +169,15 @@ export interface BuildContextOptions {
    * stops.
    */
   abortSignal?: AbortSignal;
+  /**
+   * Explicit reply-model vision capability override (spec PER-AGENT-MODEL-OVERRIDES
+   * FIX 5). When provided, takes precedence over the builder's internal derivation
+   * (`replyModelCanSeeImages(options.sessionType)`). Thread from the factory whenever
+   * the per-agent model key is already resolved via the chat-lane ladder so the
+   * pixel-block gate reflects the actual serving model rather than the global
+   * session-type config's model field.
+   */
+  replyModelCanSeeImages?: boolean;
 }
 
 export interface BuiltContext {
@@ -567,10 +576,15 @@ export class ContextBuilder {
     // consume summaries and wait on / escalate jobs (spec §7.1/§7.3).
 
     // Proactive's synthetic trigger carries no attachments — no image blocks.
+    // Use the explicit override when provided (spec PER-AGENT-MODEL-OVERRIDES FIX 5);
+    // fall back to internal derivation for legacy/non-overriding callers.
     const imageBlocks =
       generation || proactive
         ? []
-        : await this.selectImageBlocks(options.trigger, this.replyModelCanSeeImages(options.sessionType));
+        : await this.selectImageBlocks(
+            options.trigger,
+            options.replyModelCanSeeImages ?? this.replyModelCanSeeImages(options.sessionType),
+          );
     const imageBlockIds = new Set(imageBlocks.map((b) => b.attachmentId));
 
     this.markImageBlocks(triggerEvents, imageBlockIds);
@@ -861,6 +875,13 @@ export class ContextBuilder {
      * an ordinary reply-resume — the reply itself is the address.
      */
     triggerPreamble?: string;
+    /**
+     * Explicit reply-model vision capability override (spec PER-AGENT-MODEL-OVERRIDES
+     * FIX 5 — resume path). When provided, takes precedence over the internal
+     * derivation from `sessionType.model`. Thread from the factory so the pixel-block
+     * gate in the resume appended turn uses the per-agent model's actual capability.
+     */
+    replyModelCanSeeImages?: boolean;
   }): Promise<AgentMessage> {
     const now = options.trigger.timestamp;
 
@@ -874,9 +895,10 @@ export class ContextBuilder {
       if (event) triggerEvents.push(event);
     }
     triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+    // Use explicit override when provided (spec PER-AGENT-MODEL-OVERRIDES FIX 5).
     const imageBlocks = await this.selectImageBlocks(
       options.trigger,
-      this.replyModelCanSeeImages(options.sessionType),
+      options.replyModelCanSeeImages ?? this.replyModelCanSeeImages(options.sessionType),
     );
     this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
     const renderedTrigger = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
@@ -1619,8 +1641,16 @@ export class ContextBuilder {
   async conditionEventImages(
     event: CanonicalChatEvent,
     sessionType?: SessionTypeConfig,
+    replyModelCanSeeImages?: boolean,
   ): Promise<ImageBlock[]> {
-    return this.selectImageBlocks(event, this.replyModelCanSeeImages(sessionType));
+    // Use explicit override when provided (spec PER-AGENT-MODEL-OVERRIDES FIX 6):
+    // the steer/co-reply paths thread the per-agent model's vision capability so
+    // the in-flight conditioning reflects the actual serving model, not the global
+    // session-type config's model field.
+    return this.selectImageBlocks(
+      event,
+      replyModelCanSeeImages ?? this.replyModelCanSeeImages(sessionType),
+    );
   }
 
   /**

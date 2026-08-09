@@ -25,6 +25,18 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Per-agent model overrides**: each agent can now declare an optional `[agents.<name>.models]` block to
+  selectively override model role assignments for that agent only. Chat session types (including `proactive`,
+  `summarize`, `condense`, `diary`) are overridden via `[agents.<name>.models.session_types]` (flat map of
+  type name → `[models.*]` logical name); captioning per-modality via `[agents.<name>.models.captioning]`
+  (same two-level shadowing as the global config, with strict same-rung precedence); image generation tiers
+  via `[agents.<name>.models.image_gen]`; and X search tiers via `[agents.<name>.models.x_search]`. All
+  values are references into the shared global `[models.*]` registry — connection details, fallback chains,
+  cost, and health tracking remain centralized. Absent = all roles resolve exactly as before. Fail-fast
+  validation at startup rejects unknown model names, overrides for unconfigured subsystems, and
+  `summaries_from` + summarization-override conflicts, with path-precise error messages. A startup info log
+  (`agent_model_overrides`) lists each agent's effective overrides.
+
 - **Console: agent-aware labeling**: deployments with more than one configured
   agent gain agent-primary labels across every console surface — room-list tabs
   become per-agent ("All" plus one tab per agent, labeled `name PROVIDER` or
@@ -100,6 +112,25 @@ Unreleased section; it is not part of any release's notes.
   Discord channels. The console backfetch form hides the `oldest_decryptable`
   target (a Matrix E2EE concept) and uses provider-neutral wording for non-Matrix
   timeline keys.
+
+- **YouTube video understanding**: posted YouTube links receive structured
+  enrichment automatically for caption-eligible messages — title, channel,
+  duration, chapter list, and a transcript preview with `[m:ss]` markers — at
+  no LLM cost (one yt-dlp probe + transcript fetch per link). Thumbnail download
+  and captioning follow the existing captioning gates. Full enrichment can be
+  extended to every message's links via `[youtube.enrichment].enrich_all`.
+  New `youtube_fetch` tool lets the agent retrieve the full timestamped
+  transcript and metadata on demand (`offset`/`max_chars` windowing identical
+  to `x_fetch`), or download the video or audio as a workspace file
+  (`download: "video"|"audio"`, with optional clip and resolution bounds). The
+  `media` tool now accepts YouTube URLs and analyzes a segment (`start_time`
+  semantics preserved, segment pre-cut by yt-dlp and cached in `MediaCache`).
+  The yt-dlp standalone binary is preinstalled in both the agent and sandbox
+  images; the sandbox binary additionally lets the agent hand-drive exotic
+  downloads via `bash`. Controlled by `[youtube]` config (master switch +
+  proxy + concurrency + timeout + optional `cookies_file`),
+  `[youtube.enrichment]`, and `[youtube.tool]` (windowing caps and download
+  height limit).
 
 ### Changed
 

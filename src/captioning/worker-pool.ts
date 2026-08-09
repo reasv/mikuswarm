@@ -26,6 +26,30 @@ export interface CaptionWorkerPoolOptions {
    * Unresolvable account → §4.3 skip (fail asset without retry, warn).
    */
   resolveWorkspaceRoot?: (timelineKey: string) => string | undefined;
+  /**
+   * Per-asset agent-name resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+   * Companion to `resolveWorkspaceRoot`: provided together in agents mode,
+   * absent in legacy mode. Returns the owning agent's name from the asset's
+   * `timeline_key`, or null when the entry is the __legacy__ sentinel (treated
+   * as the global / baseline path). The §4.3 unresolvable-account failure is
+   * already handled by `resolveWorkspaceRoot` before this resolver is called —
+   * if the workspace resolved, the timeline_key is valid and this returns a
+   * meaningful name (or null for legacy-sentinel entries).
+   */
+  resolveAgentName?: (timelineKey: string) => string | null;
+  /**
+   * Per-asset caption client resolver (spec PER-AGENT-MODEL-OVERRIDES Phase 2).
+   * Provided together with `resolveAgentName` in agents mode. Given the owning
+   * agent name and a modality, returns the InferenceClient configured for that
+   * agent + modality (which may be the baseline global client for agents with
+   * no captioning override). Absent → the static `clients` map is used for
+   * every asset (legacy / no per-agent-override behavior, unchanged).
+   *
+   * The §4.3 unresolvable case never reaches here — those assets are already
+   * marked failed in the workspace resolution step. For a resolvable agent with
+   * NO captioning override, the resolver correctly returns the baseline client.
+   */
+  resolveClient?: (agentName: string | null, modality: MediaModality) => InferenceClient;
   config: CaptionConfig;
   onComplete?: (eventId: string) => void;
   onError?: (assetId: string, error: unknown) => void;
@@ -247,7 +271,25 @@ export class CaptionWorkerPool {
         assetWorkspaceRoot = resolved;
       }
 
-      const work = worker.process(asset, assetWorkspaceRoot)
+      // Per-asset client resolution (spec PER-AGENT-MODEL-OVERRIDES Phase 2):
+      // when a client resolver is injected (agents mode with per-agent caption
+      // overrides), resolve the owning agent's client map for this asset. The
+      // §4.3 failure path above already handled unresolvable accounts — reaching
+      // here means the workspace resolved and the agentName lookup is safe.
+      // For agents with no captioning override the resolver returns the baseline
+      // client, which is correct and distinct from the unresolvable case.
+      let assetClients: Map<MediaModality, InferenceClient> | undefined;
+      if (this.options.resolveClient && this.options.resolveAgentName && asset.timeline_key) {
+        const agentName = this.options.resolveAgentName(asset.timeline_key);
+        const resolveClient = this.options.resolveClient;
+        assetClients = new Map<MediaModality, InferenceClient>([
+          ["image", resolveClient(agentName, "image")],
+          ["video", resolveClient(agentName, "video")],
+          ["audio", resolveClient(agentName, "audio")],
+        ] as Array<[MediaModality, InferenceClient]>);
+      }
+
+      const work = worker.process(asset, assetWorkspaceRoot, assetClients)
         .then((eventId) => {
           this.options.onComplete?.(eventId);
           this.emit("completed", asset.id, "complete", asset.caption_attempts ?? 0);
