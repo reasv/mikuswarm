@@ -8,6 +8,8 @@ import type {
 import type { XMediaSlot, XTweetNode } from "../fxtwitter/types.js";
 import { FX_TWITTER_SOURCE_KIND } from "../fxtwitter/types.js";
 import { formatStatsLine } from "../fxtwitter/format.js";
+import { YOUTUBE_SOURCE_KIND, formatDuration, formatChapterTimestamp, formatUploadDate } from "../youtube/payload.js";
+import type { YouTubePreviewPayload } from "../youtube/payload.js";
 import { escapeAttr, escapeXml } from "./xml.js";
 import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
 
@@ -216,6 +218,12 @@ function renderLinkPreview(preview: LinkPreviewMeta): string {
     return renderXPreview(preview);
   }
 
+  // YouTube previews with a parseable payload get the structured rendering
+  // (ARCHITECTURE.md §7e); without a payload they fall through to the flat form.
+  if (preview.sourceKind === YOUTUBE_SOURCE_KIND && preview.ytPayload) {
+    return renderYouTubePreview(preview, preview.ytPayload);
+  }
+
   const pairs: [string, string][] = [
     ["url", truncate(preview.url, MAX_URL)],
   ];
@@ -234,6 +242,68 @@ function renderXPreview(preview: LinkPreviewMeta): string {
   const tweet = renderXTweetNode(preview.payload!.tweet, assetById, "tweet");
   const urlAttr = `url="${escapeAttr(truncate(preview.url, MAX_URL))}"`;
   return `<link_preview ${urlAttr} kind="x.com">\n${tweet}\n</link_preview>`;
+}
+
+/**
+ * Full-tier renderer for YouTube enriched previews (ARCHITECTURE.md §7e).
+ *
+ * Structure inside <link_preview kind="youtube">:
+ *   - <youtube_video> element with title/channel/duration/uploaded/views attrs
+ *   - Chapter list: one "[M:SS] Title" line per chapter
+ *   - <transcript> element (untrusted, escaped) with partial marker pointing at
+ *     the youtube_fetch tool
+ *   - Preview-media thumbnail (if available, same as the generic path)
+ */
+function renderYouTubePreview(preview: LinkPreviewMeta, payload: YouTubePreviewPayload): string {
+  const urlAttr = `url="${escapeAttr(truncate(preview.url, MAX_URL))}"`;
+  const innerParts: string[] = [renderYouTubeVideoNode(payload)];
+  for (const m of preview.media ?? []) innerParts.push(renderPreviewMedia(m));
+  return `<link_preview ${urlAttr} kind="youtube">\n${innerParts.join("\n\n")}\n</link_preview>`;
+}
+
+function renderYouTubeVideoNode(payload: YouTubePreviewPayload): string {
+  const pairs: [string, string][] = [];
+  if (payload.title) pairs.push(["title", truncate(payload.title, MAX_DISPLAY_NAME)]);
+  if (payload.channel) pairs.push(["channel", truncate(payload.channel, MAX_DISPLAY_NAME)]);
+  if (payload.durationSeconds !== undefined) {
+    pairs.push(["duration", formatDuration(payload.durationSeconds)]);
+  }
+  const uploadedStr = formatUploadDate(payload.uploadDate);
+  if (uploadedStr) pairs.push(["uploaded", uploadedStr]);
+  if (payload.viewCount !== undefined) {
+    pairs.push(["views", payload.viewCount.toLocaleString("en-US")]);
+  }
+
+  const bodyParts: string[] = [];
+
+  // Chapter list (one per line: "[M:SS] Chapter title"). Capped at 20 to
+  // avoid unbounded context growth on heavily-chaptered videos.
+  const MAX_CHAPTERS = 20;
+  if (payload.chapters.length > 0) {
+    const visible = payload.chapters.slice(0, MAX_CHAPTERS);
+    const lines = visible
+      .map((ch) => `${formatChapterTimestamp(ch.startTime)} ${escapeXml(ch.title)}`)
+      .join("\n");
+    const remaining = payload.chapters.length - visible.length;
+    const elision = remaining > 0 ? `\n[… and ${remaining} more chapters]` : "";
+    bodyParts.push(`${lines}${elision}`);
+  }
+
+  // Transcript head (externally-sourced text — escaped, untrusted envelope).
+  if (payload.transcriptKind !== "none" && payload.transcriptHead) {
+    const kindAttr = `kind="${escapeAttr(payload.transcriptKind)}"`;
+    const langAttr = payload.transcriptLang ? ` lang="${escapeAttr(payload.transcriptLang)}"` : "";
+    const partialLine =
+      "\n[partial — full transcript available via the youtube_fetch tool]";
+    bodyParts.push(
+      `<transcript ${kindAttr}${langAttr} partial="true">\n${escapeXml(payload.transcriptHead)}${partialLine}\n</transcript>`,
+    );
+  }
+
+  const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
+  const open = attrStr ? `<youtube_video ${attrStr}>` : `<youtube_video>`;
+  if (bodyParts.length === 0) return `${open}\n</youtube_video>`;
+  return `${open}\n${bodyParts.join("\n\n")}\n</youtube_video>`;
 }
 
 function renderXTweetNode(
@@ -346,7 +416,29 @@ function compactLinkPreview(lp: LinkPreviewMeta): string {
       : "";
     return ` [tweet: ${main}${quote}]`;
   }
+
+  // YouTube previews: [youtube: "Title" · Channel · M:SS · transcript head…]
+  // Bounded by MAX_COMPACT_MEDIA_CAPTION (200 chars), same cap as media captions
+  // (ARCHITECTURE.md §7e).
+  if (lp.sourceKind === YOUTUBE_SOURCE_KIND && lp.ytPayload) {
+    return compactYouTubePreview(lp.ytPayload);
+  }
+
   return ` [link: ${truncate(lp.title ?? lp.url, MAX_FILENAME)} — ${truncate(lp.description ?? "", 1000)}]`;
+}
+
+/** Compact inline YouTube preview: [youtube: "Title" · Channel · M:SS · head…] */
+function compactYouTubePreview(payload: YouTubePreviewPayload): string {
+  const parts: string[] = [];
+  if (payload.title) parts.push(`"${payload.title}"`);
+  if (payload.channel) parts.push(payload.channel);
+  if (payload.durationSeconds !== undefined) parts.push(formatDuration(payload.durationSeconds));
+  if (payload.transcriptHead) {
+    // Append normalized transcript head text.
+    parts.push(normalizeWhitespace(payload.transcriptHead));
+  }
+  const joined = parts.join(" · ");
+  return ` [youtube: ${truncate(joined, MAX_COMPACT_MEDIA_CAPTION)}]`;
 }
 
 function compactTweetPart(

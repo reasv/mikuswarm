@@ -1045,6 +1045,54 @@ const FxTwitterSchema = StrictObject({
   })),
 });
 
+// YouTube video understanding via yt-dlp (spec/YOUTUBE-VIDEO-UNDERSTANDING.md §9).
+// Three sections mirror the three-tier design: [youtube] (master + subprocess
+// knobs), [youtube.enrichment] (T1 automatic enrichment), [youtube.tool]
+// (T2 youtube_fetch windowing). Cross-field sanity validated at app wiring:
+// [youtube.tool]: default_max_chars <= max_chars_limit <= max_total_chars;
+// [youtube.enrichment].enabled requires [youtube].enabled.
+const YouTubeEnrichmentSchema = StrictObject({
+  // T1 enrichment: on by default, gated to caption-eligible messages (analog of
+  // captioning.caption_all / caption_assistant_messages gating). `enrich_all`
+  // lifts the gate to every message carrying a YouTube link (no LLM cost).
+  enabled: Type.Optional(Type.Boolean()),
+  enrich_all: Type.Optional(Type.Boolean()),
+  // Characters of the folded transcript shown in the T1 link preview head.
+  transcript_head_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  // When true, download + store + caption the video thumbnail as a preview_media
+  // asset (one image-caption call per link, governed by existing captioning gates).
+  thumbnail: Type.Optional(Type.Boolean()),
+});
+
+const YouTubeToolSchema = StrictObject({
+  // Windowing — identical mechanics and cross-field constraints as [fxtwitter.tool].
+  max_total_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  default_max_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_chars_limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Default + cap for workspace file downloads (§6a).
+  download_max_height: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
+const YouTubeSchema = StrictObject({
+  // Master switch; effective only when yt-dlp binary probe succeeds at startup.
+  enabled: Type.Optional(Type.Boolean()),
+  // Path to the yt-dlp binary (default "yt-dlp", resolved from PATH).
+  yt_dlp_path: Type.Optional(Type.String({ minLength: 1 })),
+  // Maximum file size for downloads passed as --max-filesize (bytes).
+  max_download_bytes: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Max concurrent yt-dlp subprocesses across all callers.
+  concurrency: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Per-subprocess wall-clock timeout (ms); the process is SIGKILL'd on expiry.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Optional cookies file (--cookies) for bot-detection / age-restricted videos.
+  // Intentionally not templated here — set it in local config. The field name
+  // does not match the secret regex so it is NOT auto-redacted (it is a path,
+  // not a secret value).
+  cookies_file: Type.Optional(Type.String({ minLength: 1 })),
+  enrichment: Type.Optional(YouTubeEnrichmentSchema),
+  tool: Type.Optional(YouTubeToolSchema),
+});
+
 // Unified registry (spec MODEL-FALLBACK §2.3): captioning models are NAMED
 // references into `[models.*]` (connection / provider / cost / rate_limit_group /
 // any `fallback` chain live on the referenced block) — the old inline caption
@@ -1667,6 +1715,7 @@ export const AppConfigSchema = StrictObject({
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   fxtwitter: Type.Optional(FxTwitterSchema),
+  youtube: Type.Optional(YouTubeSchema),
   captioning: Type.Optional(CaptioningSchema),
   summarization: Type.Optional(SummarizationSchema),
   diary: Type.Optional(DiarySchema),
@@ -1758,6 +1807,7 @@ export type SauceNaoConfig = Static<typeof SauceNaoSchema>;
 export type BackfetchConfig = Static<typeof BackfetchSchema>;
 export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
+export type YouTubeRawConfig = Static<typeof YouTubeSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
 /** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */

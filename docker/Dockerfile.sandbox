@@ -11,6 +11,19 @@
 # the runtime uid is arbitrary (not necessarily the build-time `sandbox` user),
 # /home/sandbox is made group/world-writable so cargo/uv/brew installs still
 # work at runtime, and WORKDIR is /workspace (the bind mount).
+#
+# yt-dlp (see §12 of spec/YOUTUBE-VIDEO-UNDERSTANDING.md and ARCHITECTURE.md
+# §11a) is preinstalled as a standalone binary at /usr/local/bin/yt-dlp so the
+# agent can hand-drive YouTube and other yt-dlp-supported downloads via bash.
+# Deployments with outbound egress filtering (beyond the base RFC1918 drops)
+# must allow the relevant CDN hosts for yt-dlp downloads to succeed; the
+# standard sandbox egress rules (docker/sandbox-egress-rules.sh) permit all
+# public internet and require no changes.
+#
+# Bump YT_DLP_VERSION to update the pinned yt-dlp release; YT_DLP_SHA256 is the
+# official yt-dlp_linux digest from that release's SHA2-256SUMS — bump together.
+ARG YT_DLP_VERSION=2026.07.04
+ARG YT_DLP_SHA256=6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae
 
 FROM ubuntu:24.04
 
@@ -116,6 +129,15 @@ USER root
 RUN chmod -R a+rwX /home/sandbox \
   && mkdir -p /workspace \
   && chmod 0777 /workspace
+
+# yt-dlp standalone binary. Pinned via YT_DLP_VERSION (declared at top of file).
+ARG YT_DLP_VERSION
+ARG YT_DLP_SHA256
+RUN curl -fsSL \
+      "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp_linux" \
+      -o /usr/local/bin/yt-dlp \
+  && echo "${YT_DLP_SHA256}  /usr/local/bin/yt-dlp" | sha256sum -c - \
+  && chmod +x /usr/local/bin/yt-dlp
 
 # HOME stays /home/sandbox so CARGO_HOME/RUSTUP_HOME/HOMEBREW and the rust/uv/brew
 # toolchains resolve exactly as they did at build time, regardless of runtime uid.

@@ -44,6 +44,15 @@ export interface EnrichmentWorkerPoolOptions {
   /** X.com enrichment via FxTwitter (ARCHITECTURE.md §7a); unset = legacy Synapse-only previews. */
   fxtwitter?: { client: FxTwitterClient; config: FxTwitterConfig };
   /**
+   * YouTube T1 enrichment (ARCHITECTURE.md §7e). When set and the subsystem is
+   * available, the worker partition enriches YouTube URLs for eligible events.
+   * Unset = YouTube URLs ride the generic Synapse path (no enrichment).
+   */
+  youtube?: {
+    config: import("../youtube/config.js").YouTubeEnrichmentConfig;
+    captionAssistant: boolean;
+  };
+  /**
    * Content-addressed attachment store (spec MULTI-AGENT-SUPPORT §11.5 / Phase 5d).
    * When present and ready, each worker integrates downloaded files via the store.
    * Absent → byte-identical pre-Phase-5d behaviour.
@@ -265,6 +274,7 @@ export class EnrichmentWorkerPool {
       maxPreviewsPerMessage: this.options.config.max_previews_per_message ?? 3,
       downloadSizeLimit: this.options.downloadSizeLimit,
       fxtwitter: this.options.fxtwitter,
+      youtube: this.options.youtube,
       store: this.options.store,
       logger: this.options.logger,
     });
