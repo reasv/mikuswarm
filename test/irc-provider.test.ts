@@ -24,7 +24,7 @@
  */
 
 import assert from "node:assert/strict";
-import test, { mock } from "node:test";
+import test, { describe, mock } from "node:test";
 import { EventEmitter } from "node:events";
 import { IrcProvider } from "../src/irc/provider.js";
 import { AccountTracker } from "../src/irc/account-tracker.js";
@@ -680,4 +680,56 @@ test("F7: echo timeout produces synthetic id (syn: prefix)", async () => {
   } finally {
     mock.timers.reset();
   }
+});
+
+// ── Enrichment capabilities (merge-review fix) ────────────────────────────────
+
+describe("IrcProvider enrichment capabilities", () => {
+  test("enrichment() returns capabilities for a known account, undefined otherwise", () => {
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+    assert.ok(provider.enrichment("acc"), "known account must get enrichment capabilities");
+    assert.equal(provider.enrichment("nope"), undefined, "unknown account must get undefined");
+  });
+
+  test("enrichment() omits resolveLinkPreviews so the direct-HTTP fallback runs (§7.7)", () => {
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+    const caps = provider.enrichment("acc");
+    assert.ok(caps);
+    assert.equal(caps.resolveLinkPreviews, undefined, "linkPreviews 'none' → method must be absent");
+  });
+
+  test("enrichment().messageSummary returns null and downloadMedia rejects", async () => {
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+    const caps = provider.enrichment("acc");
+    assert.ok(caps);
+    assert.equal(await caps.messageSummary({ roomId: "#general", eventId: "e1" }), null);
+    await assert.rejects(
+      caps.downloadMedia({ roomId: "#general", eventId: "e1", outputPath: "/dev/null" }),
+      /no attachments/,
+    );
+  });
+
+  test("enrichment().memberInfo resolves account id to current nick via roster", async () => {
+    const client = new MockClient();
+    const { provider, rt } = injectRuntime("acc", client);
+    const roster = rt.rosterTracker as InstanceType<typeof RosterTracker>;
+    const tracker = rt.accountTracker as AccountTracker;
+    roster.addMember("#general", "Alice", "rfc1459");
+    tracker.setAccount("Alice", "alice_svc", "rfc1459");
+
+    const caps = provider.enrichment("acc");
+    assert.ok(caps);
+    // By services account → current nick.
+    const byAccount = await caps.memberInfo({ roomId: "#general", userId: "alice_svc" });
+    assert.equal(byAccount.displayName, "Alice");
+    // By nick (ladder rung 3 id) → roster nick.
+    const byNick = await caps.memberInfo({ roomId: "#general", userId: "alice" });
+    assert.equal(byNick.displayName, "Alice");
+    // Unknown → undefined displayName.
+    const missing = await caps.memberInfo({ roomId: "#general", userId: "ghost" });
+    assert.equal(missing.displayName, undefined);
+  });
 });

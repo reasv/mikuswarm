@@ -1146,7 +1146,13 @@ Per-message identity is resolved deterministically in three rungs:
 | `membershipRoster` | `true` (backed by `RosterTracker`) |
 | `mediaUpload` | `false` |
 
-IRC has no attachment or media capability; `enrichment()` returns `undefined`.
+IRC has no attachment or media capability, but `enrichment()` still returns a
+capabilities object (attachment download rejects, reply-context summary is
+`null`, `memberInfo` resolves display nicks from the roster) with
+`resolveLinkPreviews` omitted — registering IRC accounts with the enrichment
+pool so link previews run through the framework-level `DirectLinkPreviewClient`
+fallback (and body-URL stages like YouTube apply), exactly as Discord uses it
+for non-embedded links.
 
 ### Inbound pipeline
 

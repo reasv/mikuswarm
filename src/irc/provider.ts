@@ -538,9 +538,43 @@ export class IrcProvider implements IChatProvider {
 
   // ── IChatProvider.enrichment ──────────────────────────────────────────────
 
-  enrichment(_accountId: string): EnrichmentCapabilities | undefined {
-    // IRC has no media upload or attachment capability; no enrichment.
-    return undefined;
+  enrichment(accountId: string): EnrichmentCapabilities | undefined {
+    if (!this.accounts.has(accountId)) return undefined;
+    // Capture by reference so callbacks always see the live runtime.
+    const accounts = this.accounts;
+    return {
+      async downloadMedia(_params) {
+        // IRC messages carry no attachments (spec §1 non-goals); the enrichment
+        // worker never has an attachment to download for an IRC event.
+        throw new Error("IrcProvider.enrichment.downloadMedia: IRC messages carry no attachments");
+      },
+      async messageSummary(_params) {
+        // No reply concept in IRC v1 (spec §7.5) — reply-context enrichment
+        // never applies.
+        return null;
+      },
+      // resolveLinkPreviews omitted: linkPreviews "none" → the enrichment
+      // worker falls back to DirectLinkPreviewClient (spec §7.7), exactly as
+      // Discord does for non-embedded links. This registration is what routes
+      // IRC events through the link-preview and YouTube enrichment stages.
+      async memberInfo(params) {
+        const rt = accounts.get(accountId);
+        if (!rt) return { displayName: undefined };
+        const id = params.userId ?? "";
+        if (!id) return { displayName: undefined };
+        // The id is a ladder result (services account or casemapped nick).
+        // Prefer the roster: account → current nick; else treat id as a nick.
+        const byAccount = rt.rosterTracker.findNickByAccount(
+          params.roomId,
+          id,
+          (n) => rt.accountTracker.getAccount(n, rt.casemapping),
+          rt.casemapping,
+        );
+        if (byAccount) return { displayName: byAccount };
+        const entry = rt.rosterTracker.getMember(params.roomId, id, rt.casemapping);
+        return { displayName: entry?.nick };
+      },
+    };
   }
 
   // ── Account lifecycle ─────────────────────────────────────────────────────
