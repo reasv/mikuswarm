@@ -8,8 +8,9 @@ import { createContext, runInContext } from "node:vm";
 import {
   BrowserSession,
   CONSOLE_ENTRY_MAX_CHARS,
+  CONSOLE_HOOK_SOURCE,
   CONSOLE_TRUNCATION_MARKER,
-  dialogOverrideScript,
+  DIALOG_OVERRIDE_SOURCE,
   type ConnectOverCdp,
 } from "../src/browser/session.js";
 import { isBrowserError } from "../src/browser/errors.js";
@@ -950,9 +951,10 @@ test("session: injectPageDialogOverride success clears the CDP WeakMap override"
     const session = newSession(ws);
     try {
       const priv = session as unknown as InjectPrivate;
-      // Stub page with a successful evaluate.
+      // Stub page recording what evaluate is asked to run.
+      const evaluated: unknown[] = [];
       const page: Record<string, unknown> = {
-        evaluate: async (_fn: unknown, _arg: unknown) => undefined,
+        evaluate: async (src: unknown) => { evaluated.push(src); },
       };
       // Arm the CDP-path slot first (mirrors what armDialog does before inject).
       session.armDialog(page as never, true, "my text");
@@ -961,6 +963,12 @@ test("session: injectPageDialogOverride success clears the CDP WeakMap override"
       // Inject succeeds → WeakMap entry cleared so it can't fire on a later dialog.
       await priv.injectPageDialogOverride(page, true, "my text");
       assert.ok(!priv.dialogOverrides.has(page), "WeakMap cleared after successful JS injection");
+      // Transport guard: the override must ship as a raw source string (a
+      // compiled function picks up esbuild keepNames `__name(...)` helper
+      // calls that throw in the page — the bug this shape exists to prevent).
+      assert.equal(typeof evaluated[0], "string", "override ships as a source string, not a function");
+      assert.ok(!(evaluated[0] as string).includes("__name("), "shipped source has no compile-time helper references");
+      assert.match(evaluated[0] as string, /"expiresAt":\d+/, "spec embeds an absolute expiry deadline");
     } finally {
       await session.shutdown();
     }
@@ -1011,30 +1019,34 @@ test("session: injectPageDialogOverride evaluate failure logs warn and retains W
   });
 });
 
-// ── dialogOverrideScript page-side logic (vm sandbox tests) ──────────────────
+// ── DIALOG_OVERRIDE_SOURCE page-side logic (vm sandbox tests) ─────────────────
 //
-// The injected function runs in the browser; we test its logic by evaluating
-// its serialised source in a vm.createContext where window = fakeWindow. tsx
-// strips TypeScript before V8 sees the source, so .toString() yields plain JS.
+// The override ships to the browser as a raw source string (never a compiled
+// function — see its JSDoc: esbuild's keepNames `__name(...)` helper calls made
+// the serialised-function transport throw ReferenceError in the page). These
+// tests evaluate that string BYTE-FOR-BYTE in a vm sandbox with NO helper
+// shims, so the harness executes exactly what the page executes and any
+// reintroduced compile-artifact dependency fails here, not only in the docker
+// suite.
 
-/** Build a vm context with `window` = fakeW and the built-in `Object`.
- * Also injects esbuild's `__name` helper: when tsx compiles the module, esbuild
- * instruments functions with `__name(fn, "name")` for devtools display. The
- * helper is normally defined in the host bundle but absent from a bare vm sandbox,
- * so we supply a no-op shim that just returns the function. */
+/** Build a vm context with `window` = fakeW and the host `Object` (so the
+ * host-side Object.keys/getOwnPropertyDescriptor assertions see the same
+ * realm's descriptors the script defined). Deliberately NO other injections. */
 function makeDialogScriptCtx(fakeW: Record<string, unknown>) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const __name = (fn: unknown, _name: string) => fn;
-  return createContext({ window: fakeW, Object, __name });
+  return createContext({ window: fakeW, Object });
 }
 
-/** Evaluate dialogOverrideScript in a vm sandbox with the given spec. */
-function runScript(ctx: ReturnType<typeof createContext>, spec: { accept: boolean; promptText: string | null }): void {
-  const src = dialogOverrideScript.toString();
-  runInContext(`(${src})(${JSON.stringify(spec)})`, ctx);
+/** Evaluate DIALOG_OVERRIDE_SOURCE in a vm sandbox with the given spec.
+ * `expiresAt` is optional here (the wrapper treats a missing deadline as
+ * non-expiring); injectPageDialogOverride always sends one in production. */
+function runScript(
+  ctx: ReturnType<typeof createContext>,
+  spec: { accept: boolean; promptText: string | null; expiresAt?: number },
+): void {
+  runInContext(`(${DIALOG_OVERRIDE_SOURCE})(${JSON.stringify(spec)})`, ctx);
 }
 
-test("session: dialogOverrideScript - slot consumed restores natives and clears sentinel", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - slot consumed restores natives and clears sentinel", () => {
   const nativeConfirmCalls: unknown[][] = [];
   const fakeW: Record<string, unknown> = {
     confirm: (...args: unknown[]) => { nativeConfirmCalls.push(args); return false; },
@@ -1059,7 +1071,7 @@ test("session: dialogOverrideScript - slot consumed restores natives and clears 
   assert.deepEqual(nativeConfirmCalls[0], ["after restore"], "native received args");
 });
 
-test("session: dialogOverrideScript - unarmed call delegates to native (slot null)", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - unarmed call delegates to native (slot null)", () => {
   const nativeCalls: unknown[][] = [];
   const fakeW: Record<string, unknown> = {
     confirm: (...args: unknown[]) => { nativeCalls.push(args); return false; },
@@ -1081,7 +1093,7 @@ test("session: dialogOverrideScript - unarmed call delegates to native (slot nul
   assert.equal(fakeW.__miku_dlg_wrapped__, true, "sentinel not cleared (no consume)");
 });
 
-test("session: dialogOverrideScript - re-arm after consume re-installs wrappers", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - re-arm after consume re-installs wrappers", () => {
   const fakeW: Record<string, unknown> = {
     confirm: () => false,
     prompt: () => null,
@@ -1103,7 +1115,7 @@ test("session: dialogOverrideScript - re-arm after consume re-installs wrappers"
   assert.equal(fakeW.__miku_dlg_wrapped__, false, "sentinel cleared after second consume");
 });
 
-test("session: dialogOverrideScript - prompt returns armed text or null on dismiss", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - prompt returns armed text or null on dismiss", () => {
   const fakeW: Record<string, unknown> = {
     confirm: () => false,
     prompt: () => "native",
@@ -1122,7 +1134,7 @@ test("session: dialogOverrideScript - prompt returns armed text or null on dismi
   assert.equal(r2, null, "prompt returns null on dismiss");
 });
 
-test("session: dialogOverrideScript - globals are non-enumerable (Object.keys check)", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - globals are non-enumerable (Object.keys check)", () => {
   const fakeW: Record<string, unknown> = {
     confirm: () => false,
     prompt: () => null,
@@ -1136,7 +1148,7 @@ test("session: dialogOverrideScript - globals are non-enumerable (Object.keys ch
   assert.ok(!keys.includes("__miku_dlg_wrapped__"), "__miku_dlg_wrapped__ not in Object.keys");
 });
 
-test("session: dialogOverrideScript - wrappers have native-code toString", () => {
+test("session: DIALOG_OVERRIDE_SOURCE - wrappers have native-code toString", () => {
   const fakeW: Record<string, unknown> = {
     confirm: () => false,
     prompt: () => null,
@@ -1148,4 +1160,141 @@ test("session: dialogOverrideScript - wrappers have native-code toString", () =>
   const confirmStr = (fakeW.confirm as { toString(): string }).toString();
   assert.ok(confirmStr.includes("[native code]"), "confirm.toString() contains [native code]");
   assert.ok(confirmStr.includes("confirm"), "confirm.toString() names the function");
+});
+
+test("session: DIALOG_OVERRIDE_SOURCE - expired slot delegates to native, restores, and re-arms", () => {
+  const nativeCalls: unknown[][] = [];
+  const fakeW: Record<string, unknown> = {
+    confirm: (...args: unknown[]) => { nativeCalls.push(args); return false; },
+    prompt: () => null,
+    alert: () => {},
+  };
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  // Arm with an already-past deadline (the CDP slot's act_timeout_ms parity).
+  runScript(ctx, { accept: true, promptText: null, expiresAt: Date.now() - 1 });
+  const r = (fakeW.confirm as (...a: unknown[]) => boolean)("late?");
+  assert.equal(r, false, "expired slot falls through to the native return value");
+  assert.equal(nativeCalls.length, 1, "native was called for the expired slot");
+  assert.equal(fakeW.__miku_dlg_wrapped__, false, "natives restored on expired consume");
+  assert.equal(fakeW.__miku_dlg_ov__, null, "expired slot cleared");
+
+  // A re-arm with a live deadline installs and answers.
+  runScript(ctx, { accept: true, promptText: null, expiresAt: Date.now() + 60_000 });
+  assert.equal((fakeW.confirm as (...a: unknown[]) => boolean)("now?"), true, "re-arm after expiry answers");
+});
+
+test("session: DIALOG_OVERRIDE_SOURCE - failed install leaves the page re-armable (sentinel set last)", () => {
+  // Regression for the compiled-function era's partial-install lockout: a
+  // throw mid-install (here: a poisoned confirm setter, standing in for any
+  // mid-script failure) must leave the sentinel unset so a later arm retries,
+  // instead of early-returning against a page with no wrappers.
+  const nativeConfirm = () => false;
+  const fakeW: Record<string, unknown> = { prompt: () => null, alert: () => {} };
+  Object.defineProperty(fakeW, "confirm", {
+    get: () => nativeConfirm,
+    set: () => { throw new Error("poisoned setter"); },
+    configurable: true,
+  });
+  const ctx = makeDialogScriptCtx(fakeW);
+
+  assert.throws(() => runScript(ctx, { accept: true, promptText: null }), /poisoned setter/);
+  assert.notEqual(fakeW.__miku_dlg_wrapped__, true, "sentinel must not be set by a failed install");
+
+  // Page becomes assignable again (e.g. after navigation) — the re-arm installs.
+  Object.defineProperty(fakeW, "confirm", { value: nativeConfirm, configurable: true, writable: true });
+  runScript(ctx, { accept: true, promptText: null });
+  assert.equal(fakeW.__miku_dlg_wrapped__, true, "re-arm installs after recovery");
+  assert.equal((fakeW.confirm as (...a: unknown[]) => boolean)("q?"), true, "re-arm answers after recovery");
+});
+
+// ── CONSOLE_HOOK_SOURCE page-side logic (vm sandbox tests) ────────────────────
+//
+// Same contract as the DIALOG_OVERRIDE_SOURCE block above: the hook ships to the
+// browser as a raw source string, so these tests evaluate it BYTE-FOR-BYTE in a
+// vm sandbox with NO helper shims — a reintroduced compile artifact (esbuild's
+// `__name`) fails here rather than only in the docker suite.
+
+const HOOK_SENTINEL = "\u0000miku-pageerror\u0000";
+
+/** A minimal fake window: addEventListener records handlers, console.error
+ * records emitted text. Mirrors only what the hook actually touches. */
+function makeHookCtx() {
+  const listeners = new Map<string, Array<(event: unknown) => void>>();
+  const errors: string[] = [];
+  const fakeW: Record<string, unknown> = {
+    addEventListener(type: string, fn: (event: unknown) => void) {
+      const list = listeners.get(type) ?? [];
+      list.push(fn);
+      listeners.set(type, list);
+    },
+  };
+  const ctx = createContext({
+    window: fakeW,
+    Object,
+    String,
+    console: { error: (text: string) => errors.push(text) },
+  });
+  const install = () =>
+    runInContext(`(${CONSOLE_HOOK_SOURCE})(${JSON.stringify(HOOK_SENTINEL)})`, ctx);
+  const fire = (type: string, event: unknown) => {
+    for (const fn of listeners.get(type) ?? []) fn(event);
+  };
+  return { fakeW, listeners, errors, install, fire };
+}
+
+test("session: CONSOLE_HOOK_SOURCE - uncaught error emits the RAW message, sentinel-tagged", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  // An ErrorEvent decorates `message` ("Uncaught Error: boom") but carries the
+  // Error itself in `error`. The hook must report error.message, because that is
+  // byte-identical to what native pageerror yields — the basis of the dedup.
+  fire("error", { target: undefined, message: "Uncaught Error: boom", error: { message: "boom" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}boom`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - unhandled rejection reports reason.message", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  fire("unhandledrejection", { reason: { message: "nope" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}nope`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - non-Error throw falls back to the event message", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  fire("error", { target: undefined, message: "Uncaught oops", error: null });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}Uncaught oops`]);
+  errors.length = 0;
+  fire("unhandledrejection", { reason: "plain string" });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}plain string`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - resource-load errors are ignored", () => {
+  const { fakeW, install, fire, errors } = makeHookCtx();
+  install();
+  // A 404 <img> fires a window `error` event whose target is the ELEMENT.
+  // Native pageerror does not report those, so neither may the hook.
+  fire("error", { target: { tagName: "IMG" }, message: "", error: null });
+  assert.deepEqual(errors, [], "resource error not reported");
+  // Sanity: a genuine window-targeted error still is.
+  fire("error", { target: fakeW, message: "x", error: { message: "real" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}real`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - install is idempotent and sentinel non-enumerable", () => {
+  const { fakeW, listeners, install, fire, errors } = makeHookCtx();
+  install();
+  install();
+  install();
+  assert.equal(listeners.get("error")?.length, 1, "error listener attached once");
+  assert.equal(listeners.get("unhandledrejection")?.length, 1, "rejection listener attached once");
+  fire("error", { target: undefined, message: "m", error: { message: "once" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}once`], "no duplicate emission");
+  assert.ok(fakeW.__miku_con_hook__, "install sentinel set");
+  assert.equal(
+    Object.keys(fakeW).includes("__miku_con_hook__"),
+    false,
+    "sentinel hidden from Object.keys(window)",
+  );
 });

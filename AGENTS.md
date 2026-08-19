@@ -42,11 +42,12 @@ src/
   search/           Chat-history search: chat_index reconciliation indexer, FTS5 query builder, summary-content FTS search (corpus:"summaries"), absence-gap resolver, summary coverage selection (see ARCHITECTURE.md §9e)
   proactive/        Proactive posting: per-channel self-rescheduling scheduler, eligibility gate, cadence math, synthetic-inbound builder (see ARCHITECTURE.md §9g)
   saucenao/         SauceNAO reverse-image lookup: shared per-account short-window rate limiter backing the find_source tool (see ARCHITECTURE.md §10)
+  youtube/          YouTube video understanding: URL parser (url.ts), yt-dlp subprocess wrapper (ytdlp.ts), config resolution (config.ts), payload types and format helpers (payload.ts) (see ARCHITECTURE.md §7e)
   budget/           Period cost limits: BudgetEngine + window math + [[limits]] normalization + zero-cost model collection; seeded from usage_events, six enforcement gates (see ARCHITECTURE.md §8e/§8f)
   agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a)
   context/          Context builder, renderer, compaction
   matrix/           Matrix provider, inbound normalization, native client
-  tools/            Agent tool implementations (39 tools)
+  tools/            Agent tool implementations (43 tools: the 41 default-session tools of §10 plus the background-session summary_tool and diary_tool)
   sandbox/          Docker sandbox: ExecBackend + SandboxManager (bash & search_files run in-container; see ARCHITECTURE.md §11a)
   browser/          Browser-use control layer: Manager REST client + BrowserSession (connectOverCDP) + snapshot/act over one persistent stealth identity (see ARCHITECTURE.md §11b)
   storage/          SQLite persistence (single-writer queue) + MemoryFileWriter (memory/*.md single-writer)

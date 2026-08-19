@@ -763,6 +763,90 @@ const SandboxBlockSchema = StrictObject({
 });
 
 /**
+ * Per-agent captioning model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+ * Mirrors the global `[captioning]` two-level shape: `model` is the per-agent
+ * shared default; `image`/`video`/`audio` are per-agent per-modality overrides.
+ * Strict same-rung shadowing (§4): per-modality wins over per-agent shared, which
+ * wins over the corresponding global level — never reorders the existing ladder.
+ * All values are `[models.*]` logical names.
+ */
+const AgentModelsCaptioningSchema = StrictObject({
+  /**
+   * Per-agent shared caption model — shadows `captioning.model` at rung 2.
+   * Rung 1 (per-modality) still wins when the same agent also sets e.g. `image`.
+   */
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent image caption model — shadows `captioning.image.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global image model.
+   */
+  image: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent video caption model — shadows `captioning.video.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global video model.
+   */
+  video: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent audio caption model — shadows `captioning.audio.model` at rung 1.
+   * Takes priority over both the per-agent shared `model` and the global audio model.
+   */
+  audio: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+/**
+ * Per-agent model override table (spec PER-AGENT-MODEL-OVERRIDES §3).
+ * All values are `[models.*]` logical names — references into the shared registry,
+ * never inline model definitions (§2 design principle 1: the registry stays global).
+ * All sub-tables are optional; absent → the role resolves exactly as the global-only
+ * behavior (§2 design principle 2: absent = today's behavior, exactly).
+ * The override surface mirrors the global role-bearing keys so each knob is
+ * discoverable by analogy (§2 design principle 3: per-role, mirroring global keys).
+ */
+const AgentModelsSchema = StrictObject({
+  /**
+   * Per-session-type model overrides — chat lane (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * Flat map: session-type name → `[models.*]` logical name. The agent override
+   * shadows the global value at the SAME rung; it never reorders the ladder (§4):
+   * rung 1 = type-specific, rung 2 = "default" type, rung 3 = literal "default".
+   * Valid keys: declared `[agent.session_types]` keys, the literal `"default"`,
+   * or a role-designated type name (`proactive`, `summarize`, `condense`, `diary`).
+   * Unknown keys are a startup error (§7 typo/stale-entry protection).
+   */
+  session_types: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ minLength: 1 }))),
+  /**
+   * Per-agent captioning model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * See `AgentModelsCaptioningSchema` for the two-level shadowing semantics.
+   * Overrides for an unconfigured global `[captioning]` table are a startup error (§7).
+   */
+  captioning: Type.Optional(AgentModelsCaptioningSchema),
+  /**
+   * Per-agent image-generation model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * `pro` shadows `image_gen.models.pro`; `flash` shadows `image_gen.models.flash`.
+   * Overrides when no global `[image_gen]` table exists are a startup error (§7).
+   */
+  image_gen: Type.Optional(StrictObject({
+    /** Per-agent pro-tier image-gen model — shadows `image_gen.models.pro`. */
+    pro: Type.Optional(Type.String({ minLength: 1 })),
+    /** Per-agent flash-tier image-gen model — shadows `image_gen.models.flash`. */
+    flash: Type.Optional(Type.String({ minLength: 1 })),
+  })),
+  /**
+   * Per-agent x_search model overrides (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
+   * `model` shadows `x_search.model`; `deep_model` shadows `x_search.deep_model`.
+   * The deep→fast fall-through is evaluated after per-agent/global shadowing of each
+   * key (§4): when both agent and global `deep_model` are absent, the resolved fast
+   * value (the agent's `model` override, if set, else the global `x_search.model`)
+   * serves the deep tier. Overrides when no global `[x_search]` table → startup error (§7).
+   */
+  x_search: Type.Optional(StrictObject({
+    /** Per-agent fast x_search model — shadows `x_search.model`. */
+    model: Type.Optional(Type.String({ minLength: 1 })),
+    /** Per-agent deep x_search model — shadows `x_search.deep_model`. */
+    deep_model: Type.Optional(Type.String({ minLength: 1 })),
+  })),
+});
+
+/**
  * Per-agent identity block (spec MULTI-AGENT-SUPPORT §4.1).
  * Each entry under `[agents.*]` declares one named agent's workspace,
  * and optionally its own sandbox (strict mode, §10) and browser profile (§10a).
@@ -778,6 +862,15 @@ const AgentBlockSchema = StrictObject({
    * (no chains). Default off: absent → native summarization for all timelines.
    */
   summaries_from: Type.Optional(Type.String({ minLength: 1 })),
+  /**
+   * Per-agent model overrides (spec PER-AGENT-MODEL-OVERRIDES §3).
+   * When set, each sub-table selectively overrides the global model role assignments
+   * for this agent — the `[models.*]` registry stays shared. Absent → all roles
+   * resolve exactly as today's global-only behavior (§2 design principle 2).
+   * Cross-field validated at startup (§7): unknown model names, broken chains,
+   * overrides for unconfigured subsystems, and `summaries_from` conflicts all fail.
+   */
+  models: Type.Optional(AgentModelsSchema),
   /**
    * Per-agent sandbox override (spec MULTI-AGENT-SUPPORT §10 "strict" mode).
    * When set, this agent gets its own dedicated container. Overrides `[sandbox]`
@@ -795,6 +888,19 @@ const AgentBlockSchema = StrictObject({
   browser: Type.Optional(StrictObject({
     profile_name: Type.String({ minLength: 1 }),
   })),
+  /**
+   * Per-agent MCP server allowlist (spec PER-AGENT-MCP-SCOPING).
+   * When absent (default), this agent sees tools from ALL configured
+   * `[mcp.servers.*]` — identical to today's behavior. When present, only
+   * tools from the listed servers (`mcp_<server>_*`) are visible to every
+   * session of this agent (chat and worker types alike). An empty array `[]`
+   * is valid: this agent gets no MCP tools at all. Only meaningful under an
+   * `[agents]` table (no legacy-mode variant). Cross-field validated at
+   * startup: every listed key must name a configured `[mcp.servers.<key>]`
+   * block — a missing key is a startup error (catches typos and stale entries
+   * when a server is removed from config).
+   */
+  mcp_servers: Type.Optional(Type.Array(Type.String())),
 });
 
 /**
@@ -1006,6 +1112,54 @@ const FxTwitterSchema = StrictObject({
     // Image blocks per call via view_media.
     max_view_blocks: Type.Optional(Type.Integer({ minimum: 1 })),
   })),
+});
+
+// YouTube video understanding via yt-dlp (spec/YOUTUBE-VIDEO-UNDERSTANDING.md §9).
+// Three sections mirror the three-tier design: [youtube] (master + subprocess
+// knobs), [youtube.enrichment] (T1 automatic enrichment), [youtube.tool]
+// (T2 youtube_fetch windowing). Cross-field sanity validated at app wiring:
+// [youtube.tool]: default_max_chars <= max_chars_limit <= max_total_chars;
+// [youtube.enrichment].enabled requires [youtube].enabled.
+const YouTubeEnrichmentSchema = StrictObject({
+  // T1 enrichment: on by default, gated to caption-eligible messages (analog of
+  // captioning.caption_all / caption_assistant_messages gating). `enrich_all`
+  // lifts the gate to every message carrying a YouTube link (no LLM cost).
+  enabled: Type.Optional(Type.Boolean()),
+  enrich_all: Type.Optional(Type.Boolean()),
+  // Characters of the folded transcript shown in the T1 link preview head.
+  transcript_head_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  // When true, download + store + caption the video thumbnail as a preview_media
+  // asset (one image-caption call per link, governed by existing captioning gates).
+  thumbnail: Type.Optional(Type.Boolean()),
+});
+
+const YouTubeToolSchema = StrictObject({
+  // Windowing — identical mechanics and cross-field constraints as [fxtwitter.tool].
+  max_total_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  default_max_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_chars_limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Default + cap for workspace file downloads (§6a).
+  download_max_height: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
+const YouTubeSchema = StrictObject({
+  // Master switch; effective only when yt-dlp binary probe succeeds at startup.
+  enabled: Type.Optional(Type.Boolean()),
+  // Path to the yt-dlp binary (default "yt-dlp", resolved from PATH).
+  yt_dlp_path: Type.Optional(Type.String({ minLength: 1 })),
+  // Maximum file size for downloads passed as --max-filesize (bytes).
+  max_download_bytes: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Max concurrent yt-dlp subprocesses across all callers.
+  concurrency: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Per-subprocess wall-clock timeout (ms); the process is SIGKILL'd on expiry.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Optional cookies file (--cookies) for bot-detection / age-restricted videos.
+  // Intentionally not templated here — set it in local config. The field name
+  // does not match the secret regex so it is NOT auto-redacted (it is a path,
+  // not a secret value).
+  cookies_file: Type.Optional(Type.String({ minLength: 1 })),
+  enrichment: Type.Optional(YouTubeEnrichmentSchema),
+  tool: Type.Optional(YouTubeToolSchema),
 });
 
 // Unified registry (spec MODEL-FALLBACK §2.3): captioning models are NAMED
@@ -1632,6 +1786,7 @@ export const AppConfigSchema = StrictObject({
   mcp: Type.Optional(McpSchema),
   enrichment: Type.Optional(EnrichmentSchema),
   fxtwitter: Type.Optional(FxTwitterSchema),
+  youtube: Type.Optional(YouTubeSchema),
   captioning: Type.Optional(CaptioningSchema),
   summarization: Type.Optional(SummarizationSchema),
   diary: Type.Optional(DiarySchema),
@@ -1723,6 +1878,7 @@ export type SauceNaoConfig = Static<typeof SauceNaoSchema>;
 export type BackfetchConfig = Static<typeof BackfetchSchema>;
 export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
+export type YouTubeRawConfig = Static<typeof YouTubeSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
 /** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */

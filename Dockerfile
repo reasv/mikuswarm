@@ -11,6 +11,13 @@
 #
 # See ARCHITECTURE.md "Running in Docker" and docker-compose.yml.
 
+# yt-dlp standalone binary version (single file, no Python runtime required).
+# Bump this ARG to update; the default is the pinned known-good release.
+# The SHA256 is the official yt-dlp_linux digest from the release's
+# SHA2-256SUMS file — bump both ARGs together (supply-chain integrity).
+ARG YT_DLP_VERSION=2026.07.04
+ARG YT_DLP_SHA256=6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae
+
 # -----------------------------------------------------------------------------
 # Builder — toolchains + compile native artifacts. None of this ships to runtime.
 # -----------------------------------------------------------------------------
@@ -112,6 +119,17 @@ RUN apt-get update \
   && apt-get update \
   && apt-get install -y --no-install-recommends docker-ce-cli \
   && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp standalone binary (no Python runtime required). Used by src/youtube/
+# for YouTube enrichment (T1), youtube_fetch (T2), and media YouTube routing
+# (T3). Pinned via YT_DLP_VERSION build-arg above so bumps are deliberate.
+ARG YT_DLP_VERSION
+ARG YT_DLP_SHA256
+RUN curl -fsSL \
+      "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp_linux" \
+      -o /usr/local/bin/yt-dlp \
+  && echo "${YT_DLP_SHA256}  /usr/local/bin/yt-dlp" | sha256sum -c - \
+  && chmod +x /usr/local/bin/yt-dlp
 
 # Compiled deps + native matrix module from the builder (same glibc/Node ABI).
 COPY --from=builder /app/node_modules ./node_modules

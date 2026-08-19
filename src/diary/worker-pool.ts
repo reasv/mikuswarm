@@ -377,7 +377,8 @@ export class DiaryWorkerPool {
       createdAt: Date.now(),
     };
 
-    const modelId = factory.resolveModelId("diary");
+    // Thread `job.timelineKey` for per-agent model resolution (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+    const modelId = factory.resolveModelId("diary", job.timelineKey);
     const sessionStartedAt = Date.now();
     await storage.insertAgentSession({
       id: syntheticSession.id,
@@ -439,7 +440,8 @@ export class DiaryWorkerPool {
         usage,
         timelineKey: syntheticSession.timelineKey,
         sessionType: syntheticSession.sessionType,
-        model: factory.resolveModelId(syntheticSession.sessionType),
+        // Thread `syntheticSession.timelineKey` for per-agent model resolution (spec §4/§8).
+        model: factory.resolveModelId(syntheticSession.sessionType, syntheticSession.timelineKey),
         maxSessionCostUsd: costCeiling,
         logger,
       });

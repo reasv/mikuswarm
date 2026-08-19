@@ -4,9 +4,35 @@ import http from "node:http";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { InferenceClient } from "../src/captioning/inference-client.js";
+import { InferenceClient, effectiveStartTime } from "../src/captioning/inference-client.js";
 import { LlmScheduler, type LlmScheduler as LlmSchedulerType } from "../src/agent/scheduler.js";
 import type { ModelChainEntry } from "../src/agent/model-fallback.js";
+
+// ---------------------------------------------------------------------------
+// effectiveStartTime — double-seek guard (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3)
+// ---------------------------------------------------------------------------
+
+// (i) youtubeSegment set + startTime accidentally present → no start offset applied.
+test("effectiveStartTime: youtubeSegment present → returns undefined (no double-seek)", () => {
+  const result = effectiveStartTime({
+    startTime: 300,
+    youtubeSegment: {
+      processedRange: [300, 420],
+      totalDuration: 2832,
+      truncated: true,
+    },
+  });
+  assert.equal(result, undefined, "startTime must be suppressed for a pre-cut YouTube segment");
+});
+
+// (ii) no youtubeSegment → startTime forwarded as-is.
+test("effectiveStartTime: no youtubeSegment → returns startTime", () => {
+  assert.equal(effectiveStartTime({ startTime: 60 }), 60, "startTime forwarded when no youtubeSegment");
+  assert.equal(effectiveStartTime({ startTime: 0 }), 0, "zero startTime is forwarded (not treated as absent)");
+  assert.equal(effectiveStartTime({ startTime: undefined }), undefined, "undefined startTime stays undefined");
+});
+
+// ---------------------------------------------------------------------------
 
 async function withImageFile(run: (filePath: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-caption-"));

@@ -75,6 +75,18 @@ export interface CaptionRequest {
   prompt?: string;
   startTime?: number;
   context?: "tool" | "pipeline";
+  /**
+   * YouTube segment override (spec YOUTUBE-VIDEO-UNDERSTANDING §7 T3): when set,
+   * the file at `filePath` is a pre-cut segment — `startTime` is NOT applied to
+   * `processVideoForInference` (preventing double-seek), and these values replace
+   * the values computed by `processVideoForInference` so the existing truncation-
+   * warning machinery reflects the real position in the full video.
+   */
+  youtubeSegment?: {
+    processedRange: [number, number];
+    totalDuration: number;
+    truncated: boolean;
+  };
 }
 
 export interface CaptionResponse {
@@ -92,6 +104,26 @@ export interface CaptionResponse {
    * unknown. May be 0 when usage is known but no cost rates are configured.
    */
   cost: number | null;
+}
+
+/**
+ * Returns the startTime value that should be forwarded to processVideoForInference,
+ * or undefined when none should be applied.
+ *
+ * For pre-cut YouTube segments the segment file already begins at the requested
+ * offset, so re-applying startTime would double-seek (spec YOUTUBE-VIDEO-
+ * UNDERSTANDING §7 T3 double-seek prevention).  In all other cases startTime is
+ * forwarded as-is.
+ *
+ * Exported as a pure helper so the double-seek guard can be unit-tested without
+ * spinning up an actual InferenceClient or real video files.
+ */
+export function effectiveStartTime(
+  request: Pick<CaptionRequest, "startTime" | "youtubeSegment">,
+): number | undefined {
+  return request.startTime != null && !request.youtubeSegment
+    ? request.startTime
+    : undefined;
 }
 
 /**
@@ -158,8 +190,25 @@ export class InferenceClient {
       }
     } else if (this.options.modality === "video" && this.options.videoProcessing) {
       const videoOpts = { ...this.options.videoProcessing };
-      if (request.startTime != null) videoOpts.startTime = request.startTime;
+      // For pre-cut YouTube segments, do NOT apply start_time: the segment file
+      // already begins at the requested offset (double-seek prevention, §7 T3).
+      const effStart = effectiveStartTime(request);
+      if (effStart !== undefined) {
+        videoOpts.startTime = effStart;
+      }
       processed = await processVideoForInference(request.filePath, videoOpts);
+      // For YouTube segments, override the processVideoForInference-computed
+      // processedRange/totalDuration/truncated with synthesized values that reflect
+      // the real position in the full video, so the truncation-warning machinery
+      // (formatTruncationWarning below) emits the correct "47:12 … 5:00-7:00" form.
+      if (request.youtubeSegment) {
+        processed = {
+          ...processed,
+          processedRange: request.youtubeSegment.processedRange,
+          totalDuration: request.youtubeSegment.totalDuration,
+          truncated: request.youtubeSegment.truncated,
+        };
+      }
       try {
         data = await readFile(processed.path);
         mimeType = processed.mimeType;

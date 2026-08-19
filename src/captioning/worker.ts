@@ -54,17 +54,22 @@ export class CaptionWorker {
    *   constructor-level `workspaceRoot` — agents mode supplies the owning
    *   agent's resolved root here so `local_path` resolves to the correct file.
    *   Absent = legacy mode (uses `this.options.workspaceRoot`).
+   * @param clientsOverride - Per-asset client map (spec PER-AGENT-MODEL-OVERRIDES
+   *   Phase 2). When provided, used instead of the constructor-level `clients` —
+   *   agents mode supplies the owning agent's resolved clients here. Absent =
+   *   all assets share the constructor-level map (legacy / no-override behavior).
    */
-  async process(asset: MediaAssetRow, workspaceRootOverride?: string): Promise<string> {
+  async process(asset: MediaAssetRow, workspaceRootOverride?: string, clientsOverride?: Map<MediaModality, InferenceClient>): Promise<string> {
     const root = workspaceRootOverride ?? this.options.workspaceRoot;
     const absolutePath = path.join(root, asset.local_path!);
     const modality = asset.media_type as MediaModality;
+    const effectiveClients = clientsOverride ?? this.options.clients;
 
     if (modality === "image" && await isAnimatedImage(absolutePath)) {
-      return this.processAnimatedImage(asset, absolutePath);
+      return this.processAnimatedImage(asset, absolutePath, effectiveClients);
     }
 
-    const client = this.options.clients.get(modality);
+    const client = effectiveClients.get(modality);
     if (!client) {
       throw new Error(`No inference client configured for modality: ${modality}`);
     }
@@ -80,8 +85,8 @@ export class CaptionWorker {
     return asset.event_id;
   }
 
-  private async processAnimatedImage(asset: MediaAssetRow, absolutePath: string): Promise<string> {
-    const videoClient = this.options.clients.get("video");
+  private async processAnimatedImage(asset: MediaAssetRow, absolutePath: string, clients: Map<MediaModality, InferenceClient>): Promise<string> {
+    const videoClient = clients.get("video");
     if (videoClient) {
       const converted = await convertAnimatedToVideo(absolutePath);
       if (converted) {
@@ -103,7 +108,7 @@ export class CaptionWorker {
       }
     }
 
-    const imageClient = this.options.clients.get("image");
+    const imageClient = clients.get("image");
     if (!imageClient) {
       throw new Error("No inference client configured for image fallback");
     }

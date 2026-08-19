@@ -161,15 +161,27 @@ export interface BudgetEngineOptions {
    * types that must be available for it to be admitted.
    */
   dependencies: Record<string, string[]>;
-  /** Resolve a session type's upstream model id (provenance on dependency descriptors). */
-  resolveModelId: (sessionType: string) => string | undefined;
+  /**
+   * Resolve a session type's upstream model id (provenance on dependency descriptors).
+   *
+   * `timelineKey` is threaded from {@link checkAdmissionChain} so an agent-scoped
+   * override (spec PER-AGENT-MODEL-OVERRIDES §4) is visible when checking whether a
+   * session type's dependency (e.g. summarize) is in budget for a specific agent's
+   * session. Callers without per-session context (e.g. `isClassAvailable`, worker claim
+   * gates) omit `timelineKey` and receive the global-ladder value — correct for those
+   * process-wide checks.
+   */
+  resolveModelId: (sessionType: string, timelineKey?: string) => string | undefined;
   /**
    * Resolve a session type's LOGICAL model id — the config block name a
    * `[[limits]].models` selector matches (spec MODEL-FALLBACK §2.2). Used by the
    * session-level gates so they scope on the same dimension the ledger records.
    * Absent → the session gate's logical dimension falls back to the upstream id.
+   *
+   * `timelineKey` semantics: same as {@link resolveModelId} — threaded from
+   * `checkAdmission`/`checkAdmissionChain` for per-agent override awareness.
    */
-  resolveLogicalModelId?: (sessionType: string) => string | undefined;
+  resolveLogicalModelId?: (sessionType: string, timelineKey?: string) => string | undefined;
   /**
    * Resolve a session type's FULL fallback chain as logical ids, head-first (spec
    * MODEL-FALLBACK §6.1). Used by the dependency cascade so a prerequisite is judged
@@ -177,8 +189,10 @@ export interface BudgetEngineOptions {
    * the prerequisite's head must not refuse a dependent session that the prerequisite
    * could still serve on a fallback. Absent (or empty result) → the cascade falls
    * back to the head-only `resolveLogicalModelId` behavior.
+   *
+   * `timelineKey` semantics: same as {@link resolveModelId}.
    */
-  resolveModelChainLogicalIds?: (sessionType: string) => string[];
+  resolveModelChainLogicalIds?: (sessionType: string, timelineKey?: string) => string[];
   logger: Logger;
   now?: () => number;
   /** Fraction at which a rule is "near" its cap in the console (default 0.8). */
@@ -442,7 +456,9 @@ export class BudgetEngine {
    * (spec MULTI-AGENT-SUPPORT §8). Absent ⇒ scoped rules never match.
    */
   checkAdmission(sessionType: string, modelId: string, timelineKey?: string): AdmissionResult {
-    const head = this.options.resolveLogicalModelId?.(sessionType);
+    // Thread timelineKey so the logical-id resolver can apply per-agent overrides when
+    // checking the session's own head (spec PER-AGENT-MODEL-OVERRIDES §4).
+    const head = this.options.resolveLogicalModelId?.(sessionType, timelineKey);
     return this.checkAdmissionChain(sessionType, modelId, head ? [head] : [], timelineKey);
   }
 
@@ -491,7 +507,11 @@ export class BudgetEngine {
     }
     const deps = this.options.dependencies[sessionType] ?? [];
     for (const dep of deps) {
-      const depModel = this.options.resolveModelId(dep);
+      // Thread timelineKey: the dependency's model may be per-agent overridden — e.g.
+      // agent "sidekick" overrides "summarize" to a different model; its chat sessions
+      // should gate on that overridden chain, not the global summarize chain
+      // (spec PER-AGENT-MODEL-OVERRIDES §4/§6).
+      const depModel = this.options.resolveModelId(dep, timelineKey);
       if (depModel === undefined) continue;
       // Chain-aware (spec MODEL-FALLBACK §6.1): the prerequisite is available iff ANY
       // of ITS chain members has headroom — the prerequisite's own worker pool serves
@@ -500,9 +520,9 @@ export class BudgetEngine {
       // reply the prerequisite could still produce on a fallback (e.g. DeepSeek). A
       // WILDCARD rule covers every member and still refuses (global exhaustion has no
       // escape). Falls back to head-only when no chain resolver / empty chain.
-      const depChain = this.options.resolveModelChainLogicalIds?.(dep) ?? [];
+      const depChain = this.options.resolveModelChainLogicalIds?.(dep, timelineKey) ?? [];
       const depLogicalIds: (string | undefined)[] =
-        depChain.length > 0 ? depChain : [this.options.resolveLogicalModelId?.(dep)];
+        depChain.length > 0 ? depChain : [this.options.resolveLogicalModelId?.(dep, timelineKey)];
       let depHeadCheck: CheckResult | undefined;
       let depAdmitted = false;
       for (const logicalModelId of depLogicalIds) {

@@ -28,6 +28,7 @@ export {
   AgentSessionFactory,
   createModel,
   filterTools,
+  filterMcpToolsByAllowlist,
   additiveThinkingBudgetTokens,
   assertRunSettledCleanly,
   wasRunAborted,

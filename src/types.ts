@@ -167,6 +167,13 @@ export interface LinkPreviewMeta {
    * `description` when absent/malformed.
    */
   payload?: import("./fxtwitter/types.js").XTweetPayload;
+  /**
+   * Structured YouTube payload for `sourceKind === "youtube"` previews
+   * (ARCHITECTURE.md §7e). Parsed from `link_previews.payload_json` at hydrate
+   * time; the rich renderer branches on it, falling back to the flat
+   * `description` when absent/malformed.
+   */
+  ytPayload?: import("./youtube/payload.js").YouTubePreviewPayload;
 }
 
 export interface MentionInfo {

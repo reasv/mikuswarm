@@ -2249,6 +2249,42 @@ export class Storage {
   }
 
   /**
+   * Read the three eligibility fields used by the YouTube enrichment partition
+   * (spec YOUTUBE-VIDEO-UNDERSTANDING.md §5, ARCHITECTURE.md §7e) to determine
+   * whether an event qualifies for YouTube T1 enrichment.
+   *
+   * These mirror the `captionEligibleSql` predicate:
+   *   trigger_group_id IS NOT NULL  ← in a trigger group
+   *   is_backfetch = 1              ← promoted backfetch
+   *   role = 'assistant'            ← assistant message (gated on captionAssistant)
+   *
+   * A fresh DB read is used (not the in-memory event object) because
+   * `setTriggerGroup` may be called AFTER the enrichment worker initially
+   * loaded the event, and we want the most current value.
+   *
+   * Returns null when the event row is absent.
+   */
+  getEventCaptionEligibilityFields(id: string): {
+    triggerGroupId: string | null;
+    isBackfetch: boolean;
+    role: string;
+  } | null {
+    const row = this.read((db) =>
+      db
+        .prepare(`select trigger_group_id, is_backfetch, role from timeline_events where id = ?`)
+        .get(id) as
+        | { trigger_group_id: string | null; is_backfetch: number; role: string }
+        | undefined,
+    );
+    if (!row) return null;
+    return {
+      triggerGroupId: row.trigger_group_id ?? null,
+      isBackfetch: (row.is_backfetch ?? 0) === 1,
+      role: row.role ?? "user",
+    };
+  }
+
+  /**
    * Count of backfetched events still awaiting/under enrichment (spec
    * MESSAGE-BACKFETCH §6.4 drain-aware pacing): `is_backfetch=1` with
    * enrichment_status in pending/processing. The coordinator pauses paging while
