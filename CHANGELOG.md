@@ -23,6 +23,19 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Fixed
+
+- **Browser `act:dialog` overrides now actually take effect.** The JS-level one-shot
+  override for `window.confirm`/`prompt`/`alert` (the workaround for CloakBrowser-Manager
+  versions whose resident client auto-dismisses every JS dialog) was shipped as a compiled
+  function whose esbuild `keepNames` helper calls threw `ReferenceError: __name is not
+  defined` in the page, so it never installed — and the failed install left the page
+  sentinel-locked against re-arming until the next navigation. The override now ships as a
+  raw source string (immune to compiler transforms), sets its install sentinel last (a
+  failed install leaves the page re-armable), and carries the same `act_timeout_ms` expiry
+  as the CDP-path slot so a never-triggered arm can't answer a later, unrelated dialog.
+  (spec/BROWSER-DIALOG-OVERRIDE-INJECTION-FIX.md)
+
 ### Added
 
 - **Per-agent model overrides**: each agent can now declare an optional `[agents.<name>.models]` block to

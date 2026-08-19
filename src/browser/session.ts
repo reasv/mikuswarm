@@ -920,7 +920,10 @@ export class BrowserSession {
    * Manager never gets a chance to auto-dismiss it, and the page code receives the
    * correct return value.
    *
-   * The `dialogOverrideScript` handles install/restore/masking (see its JSDoc).
+   * The override is shipped as a raw SOURCE STRING (`DIALOG_OVERRIDE_SOURCE` —
+   * see its JSDoc for why a compiled function cannot be transferred under tsx)
+   * with the spec embedded via JSON.stringify; `expiresAt` gives the injected
+   * slot the same act_timeout_ms one-shot window as the CDP slot.
    * On successful injection the CDP-path WeakMap entry is deleted — without this,
    * an expired slot fires on the NEXT unrelated dialog on older Managers (silently
    * answering it) or throws-and-swallows on current ones while consuming stale
@@ -929,9 +932,13 @@ export class BrowserSession {
    * would make an un-takeable arm invisible to the operator.
    */
   async injectPageDialogOverride(page: Page, accept: boolean, promptText: string | undefined): Promise<void> {
-    const spec = { accept, promptText: promptText ?? null };
+    const spec = {
+      accept,
+      promptText: promptText ?? null,
+      expiresAt: Date.now() + this.config.act_timeout_ms,
+    };
     try {
-      await page.evaluate(dialogOverrideScript, spec);
+      await page.evaluate(`(${DIALOG_OVERRIDE_SOURCE})(${JSON.stringify(spec)})`);
       // JS injection succeeded: the CDP-path WeakMap entry is no longer needed.
       // Delete it so an expired slot can't fire on the next unrelated dialog.
       this.dialogOverrides.delete(page);
@@ -1487,108 +1494,95 @@ export class BrowserSession {
 }
 
 /**
- * Page-side JS dialog override script, serialised by Playwright's
- * `page.evaluate` and executed in the browser context.
+ * Page-side JS dialog override script — a plain-JS arrow function shipped as a
+ * SOURCE STRING and evaluated in the browser as
+ * `page.evaluate(\`(${DIALOG_OVERRIDE_SOURCE})(<spec JSON>)\`)`.
  *
- * WHY: some CloakBrowser-Manager versions auto-handle JS dialogs via
- * `Page.handleJavaScriptDialog` BEFORE forwarding `Page.javascriptDialogOpening`
- * to connected clients, so `dialog.accept()/dismiss()` fail with "No dialog is
- * showing". Intercepting `window.confirm/prompt/alert` at the JS level returns
- * the armed response directly — no native dialog fires.
+ * WHY a string and not a function: `page.evaluate(fn, arg)` transfers the
+ * function via `Function.prototype.toString()`, which under tsx serialises the
+ * esbuild-COMPILED body — and esbuild's `keepNames` transform wraps inner
+ * function definitions in `__name(...)` helper calls whose helper is defined at
+ * module scope, not inside the function. The re-evaluated body then throws
+ * `ReferenceError: __name is not defined` in the page, so the override never
+ * installed (spec/BROWSER-DIALOG-OVERRIDE-INJECTION-FIX.md §2). A raw source
+ * string reaches the browser verbatim — immune to keepNames and to any future
+ * compiler/minifier transform.
  *
- * Install lifecycle: the wrapper is installed once per arm cycle (sentinel
- * `__miku_dlg_wrapped__`). On first consumption by ANY of the three wrappers,
- * `restore()` reinstates all three native functions and clears the sentinel so
- * `window.confirm.toString()` returns to native-looking and a later re-arm
- * re-installs cleanly.
+ * WHY the override exists: some CloakBrowser-Manager versions auto-handle JS
+ * dialogs via `Page.handleJavaScriptDialog` BEFORE forwarding
+ * `Page.javascriptDialogOpening` to connected clients, so
+ * `dialog.accept()/dismiss()` fail with "No dialog is showing". Intercepting
+ * `window.confirm/prompt/alert` at the JS level returns the armed response
+ * directly — no native dialog fires.
+ *
+ * Contract: applied with `{ accept, promptText, expiresAt }`. The slot
+ * (`__miku_dlg_ov__`) is one-shot: the first confirm/prompt/alert call consumes
+ * it, and `restore()` reinstates all three natives + clears the sentinel
+ * (`__miku_dlg_wrapped__`) so `window.confirm.toString()` returns to
+ * native-looking and a later re-arm re-installs cleanly. A slot past
+ * `expiresAt` is consumed the same way but the call falls through to the native
+ * function — parity with the CDP slot's `act_timeout_ms` expiry, so an
+ * armed-but-never-triggered override can't answer a later, unrelated dialog.
+ * The sentinel is assigned LAST, after all three wrappers: a mid-install throw
+ * must leave the page re-armable, never sentinel-locked with no wrappers (the
+ * exact failure mode of the compiled-function era).
  *
  * Stealth while armed: each wrapper's `.toString()` returns the native-code
  * string, and `.name`/`.length` match the native, so fingerprint checks pass
- * while the override is installed. Both slot globals (`__miku_dlg_ov__`,
- * `__miku_dlg_wrapped__`) are defined non-enumerable so `Object.keys(window)`
- * does not list them (still detectable by direct access — documented tradeoff).
+ * while the override is installed. Both slot globals are defined non-enumerable
+ * so `Object.keys(window)` does not list them (still detectable by direct
+ * access — documented tradeoff).
  *
- * @internal exported for unit tests (tested via vm.runInNewContext with a fake window).
+ * @internal exported for unit tests, which evaluate this string byte-for-byte
+ * in `vm.runInNewContext` with a fake window and NO helper shims — so a
+ * reintroduced compile-artifact dependency fails the unit suite, not only the
+ * docker suite.
  */
-export function dialogOverrideScript(s: { accept: boolean; promptText: string | null }): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const w = window as any;
-
-  // Define/update the one-shot slot as non-enumerable (Object.keys(window) won't
-  // list it). writable:true lets a re-arm update the value without re-defining;
-  // configurable:true lets Object.defineProperty reconfigure on re-arm.
+export const DIALOG_OVERRIDE_SOURCE = `(spec) => {
+  const w = window;
+  // Re-arm updates the slot value in place; non-enumerable hides it from
+  // Object.keys(window).
   Object.defineProperty(w, "__miku_dlg_ov__", {
-    value: s,
-    enumerable: false,
-    configurable: true,
-    writable: true,
+    value: spec, enumerable: false, configurable: true, writable: true,
   });
-
-  // Install wrappers once per arm cycle. `__miku_dlg_wrapped__` is reset to
-  // false by restore() on consume, so a re-arm re-enters this install path.
   if (w.__miku_dlg_wrapped__) return;
-  Object.defineProperty(w, "__miku_dlg_wrapped__", {
-    value: true,
-    enumerable: false,
-    configurable: true,
-    writable: true,
-  });
 
-  // Capture native references through the `any`-typed alias so the TypeScript
-  // compiler doesn't complain about assigning incompatible function types below.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const origConfirm: (...a: any[]) => boolean = w.confirm.bind(w);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const origPrompt: (...a: any[]) => string | null = w.prompt.bind(w);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const origAlert: (...a: any[]) => void = w.alert.bind(w);
-
-  // Restore-on-consume: reinstate all three natives + clear sentinel so
-  // confirm/prompt/alert.toString() returns to native after the one-shot fires.
-  const restore = (): void => {
+  const origConfirm = w.confirm.bind(w);
+  const origPrompt = w.prompt.bind(w);
+  const origAlert = w.alert.bind(w);
+  const restore = () => {
     w.confirm = origConfirm;
     w.prompt = origPrompt;
     w.alert = origAlert;
     w.__miku_dlg_wrapped__ = false;
   };
-
-  // Native-code toString template (Chrome format).
-  const nativeStr = (name: string): string => `function ${name}() { [native code] }`;
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const wrappedConfirm = (...args: any[]): boolean => {
-    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
-    if (ov) { w.__miku_dlg_ov__ = null; restore(); return ov.accept; }
-    return origConfirm(...args);
+  // Consume the slot: null when unarmed (delegate, wrappers stay installed);
+  // restore + null when expired (delegate — the same outcome the CDP path
+  // gives an expired slot); restore + the spec when armed and live.
+  const take = () => {
+    const ov = w.__miku_dlg_ov__;
+    if (!ov) return null;
+    w.__miku_dlg_ov__ = null;
+    restore();
+    if (typeof ov.expiresAt === "number" && Date.now() > ov.expiresAt) return null;
+    return ov;
   };
-  Object.defineProperty(wrappedConfirm, "toString", { value: () => nativeStr("confirm"), configurable: true });
-  Object.defineProperty(wrappedConfirm, "name", { value: "confirm", configurable: true });
-  Object.defineProperty(wrappedConfirm, "length", { value: origConfirm.length, configurable: true });
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const wrappedPrompt = (...args: any[]): string | null => {
-    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
-    if (ov) { w.__miku_dlg_ov__ = null; restore(); return ov.accept ? (ov.promptText ?? "") : null; }
-    return origPrompt(...args);
+  const mask = (fn, name, orig) => {
+    Object.defineProperty(fn, "toString", { value: () => "function " + name + "() { [native code] }", configurable: true });
+    Object.defineProperty(fn, "name", { value: name, configurable: true });
+    Object.defineProperty(fn, "length", { value: orig.length, configurable: true });
+    return fn;
   };
-  Object.defineProperty(wrappedPrompt, "toString", { value: () => nativeStr("prompt"), configurable: true });
-  Object.defineProperty(wrappedPrompt, "name", { value: "prompt", configurable: true });
-  Object.defineProperty(wrappedPrompt, "length", { value: origPrompt.length, configurable: true });
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const wrappedAlert = (...args: any[]): void => {
-    const ov: { accept: boolean; promptText: string | null } | null = w.__miku_dlg_ov__;
-    if (ov) { w.__miku_dlg_ov__ = null; restore(); return; }
-    origAlert(...args);
-  };
-  Object.defineProperty(wrappedAlert, "toString", { value: () => nativeStr("alert"), configurable: true });
-  Object.defineProperty(wrappedAlert, "name", { value: "alert", configurable: true });
-  Object.defineProperty(wrappedAlert, "length", { value: origAlert.length, configurable: true });
+  w.confirm = mask((...a) => { const ov = take(); return ov ? ov.accept : origConfirm(...a); }, "confirm", origConfirm);
+  w.prompt = mask((...a) => { const ov = take(); return ov ? (ov.accept ? (ov.promptText ?? "") : null) : origPrompt(...a); }, "prompt", origPrompt);
+  w.alert = mask((...a) => { if (!take()) origAlert(...a); }, "alert", origAlert);
 
-  w.confirm = wrappedConfirm;
-  w.prompt = wrappedPrompt;
-  w.alert = wrappedAlert;
-}
+  // Sentinel LAST: only a fully-installed override marks the page wrapped.
+  Object.defineProperty(w, "__miku_dlg_wrapped__", {
+    value: true, enumerable: false, configurable: true, writable: true,
+  });
+}`;
 
 /** Promise-based sleep, used by the cold-start readiness poll. */
 function delay(ms: number): Promise<void> {

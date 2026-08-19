@@ -1,6 +1,6 @@
 # Spec: Browser dialog override injection fix — ship the page script as string source
 
-**Status**: PROPOSED.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §11b (act:dialog dual override mechanism); retained for review.
 
 **Author**: design session 2026-08-09.
 
