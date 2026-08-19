@@ -8,6 +8,7 @@ import { createContext, runInContext } from "node:vm";
 import {
   BrowserSession,
   CONSOLE_ENTRY_MAX_CHARS,
+  CONSOLE_HOOK_SOURCE,
   CONSOLE_TRUNCATION_MARKER,
   DIALOG_OVERRIDE_SOURCE,
   type ConnectOverCdp,
@@ -1205,4 +1206,95 @@ test("session: DIALOG_OVERRIDE_SOURCE - failed install leaves the page re-armabl
   runScript(ctx, { accept: true, promptText: null });
   assert.equal(fakeW.__miku_dlg_wrapped__, true, "re-arm installs after recovery");
   assert.equal((fakeW.confirm as (...a: unknown[]) => boolean)("q?"), true, "re-arm answers after recovery");
+});
+
+// ── CONSOLE_HOOK_SOURCE page-side logic (vm sandbox tests) ────────────────────
+//
+// Same contract as the DIALOG_OVERRIDE_SOURCE block above: the hook ships to the
+// browser as a raw source string, so these tests evaluate it BYTE-FOR-BYTE in a
+// vm sandbox with NO helper shims — a reintroduced compile artifact (esbuild's
+// `__name`) fails here rather than only in the docker suite.
+
+const HOOK_SENTINEL = "\u0000miku-pageerror\u0000";
+
+/** A minimal fake window: addEventListener records handlers, console.error
+ * records emitted text. Mirrors only what the hook actually touches. */
+function makeHookCtx() {
+  const listeners = new Map<string, Array<(event: unknown) => void>>();
+  const errors: string[] = [];
+  const fakeW: Record<string, unknown> = {
+    addEventListener(type: string, fn: (event: unknown) => void) {
+      const list = listeners.get(type) ?? [];
+      list.push(fn);
+      listeners.set(type, list);
+    },
+  };
+  const ctx = createContext({
+    window: fakeW,
+    Object,
+    String,
+    console: { error: (text: string) => errors.push(text) },
+  });
+  const install = () =>
+    runInContext(`(${CONSOLE_HOOK_SOURCE})(${JSON.stringify(HOOK_SENTINEL)})`, ctx);
+  const fire = (type: string, event: unknown) => {
+    for (const fn of listeners.get(type) ?? []) fn(event);
+  };
+  return { fakeW, listeners, errors, install, fire };
+}
+
+test("session: CONSOLE_HOOK_SOURCE - uncaught error emits the RAW message, sentinel-tagged", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  // An ErrorEvent decorates `message` ("Uncaught Error: boom") but carries the
+  // Error itself in `error`. The hook must report error.message, because that is
+  // byte-identical to what native pageerror yields — the basis of the dedup.
+  fire("error", { target: undefined, message: "Uncaught Error: boom", error: { message: "boom" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}boom`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - unhandled rejection reports reason.message", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  fire("unhandledrejection", { reason: { message: "nope" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}nope`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - non-Error throw falls back to the event message", () => {
+  const { install, fire, errors } = makeHookCtx();
+  install();
+  fire("error", { target: undefined, message: "Uncaught oops", error: null });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}Uncaught oops`]);
+  errors.length = 0;
+  fire("unhandledrejection", { reason: "plain string" });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}plain string`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - resource-load errors are ignored", () => {
+  const { fakeW, install, fire, errors } = makeHookCtx();
+  install();
+  // A 404 <img> fires a window `error` event whose target is the ELEMENT.
+  // Native pageerror does not report those, so neither may the hook.
+  fire("error", { target: { tagName: "IMG" }, message: "", error: null });
+  assert.deepEqual(errors, [], "resource error not reported");
+  // Sanity: a genuine window-targeted error still is.
+  fire("error", { target: fakeW, message: "x", error: { message: "real" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}real`]);
+});
+
+test("session: CONSOLE_HOOK_SOURCE - install is idempotent and sentinel non-enumerable", () => {
+  const { fakeW, listeners, install, fire, errors } = makeHookCtx();
+  install();
+  install();
+  install();
+  assert.equal(listeners.get("error")?.length, 1, "error listener attached once");
+  assert.equal(listeners.get("unhandledrejection")?.length, 1, "rejection listener attached once");
+  fire("error", { target: undefined, message: "m", error: { message: "once" } });
+  assert.deepEqual(errors, [`${HOOK_SENTINEL}once`], "no duplicate emission");
+  assert.ok(fakeW.__miku_con_hook__, "install sentinel set");
+  assert.equal(
+    Object.keys(fakeW).includes("__miku_con_hook__"),
+    false,
+    "sentinel hidden from Object.keys(window)",
+  );
 });

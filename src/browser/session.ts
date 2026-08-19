@@ -74,6 +74,35 @@ export const CONSOLE_DRAIN_MAX_CHARS = 16384;
 /** Appended when an entry or the drained block is truncated. */
 export const CONSOLE_TRUNCATION_MARKER = "… [truncated]";
 
+/**
+ * Prefix the page-side error hook (CONSOLE_HOOK_SOURCE) stamps onto the
+ * `console.error` it uses to smuggle uncaught errors out to us, and which the
+ * Node side strips again on decode. NUL-delimited because no ordinary page log
+ * contains NUL, so a page cannot forge (or accidentally collide with) it.
+ */
+const CONSOLE_PAGEERROR_SENTINEL = "\u0000miku-pageerror\u0000";
+
+/**
+ * Window in which the SAME `level|text` fingerprint arriving on the OTHER
+ * transport is treated as a duplicate of one already-buffered occurrence
+ * (§4.3). Generous because matching is one-shot AND cross-transport only: the
+ * two transports report the same event within milliseconds of each other, and
+ * repeated identical logs on a single live transport can never match, so a wide
+ * window costs nothing.
+ */
+const CONSOLE_DEDUP_WINDOW_MS = 2000;
+
+/** Hard cap on distinct fingerprints tracked per page for dedup (memory bound). */
+const CONSOLE_DEDUP_MAX_KEYS = 256;
+
+/**
+ * Which channel delivered a console entry. Only cross-transport pairs are
+ * de-duplicated, so this distinction is what preserves genuinely repeated logs.
+ * `native` = Playwright's `console`/`pageerror` events (CDP `Runtime` domain);
+ * `cdp` = our own `Console.messageAdded` subscription (legacy `Console` domain).
+ */
+type ConsoleTransport = "native" | "cdp";
+
 interface SessionState {
   /** Tabs owned by this chat session, in open order. */
   pages: Page[];
@@ -268,6 +297,11 @@ export class BrowserSession {
    * WeakMap → buffers are GC'd with their page, no explicit cleanup.
    */
   private readonly consoleBuffers = new WeakMap<Page, ConsoleEntry[]>();
+  /**
+   * Per-page, per-fingerprint record of console arrivals not yet matched by the
+   * other transport — the state behind isDuplicateConsoleArrival().
+   */
+  private readonly consoleDedup = new WeakMap<Page, Map<string, Array<{ transport: ConsoleTransport; ts: number }>>>();
   /**
    * Per-page snapshot-time frame URLs (index → URL), the `frameUrls` map from the
    * most recent `aiSnapshot` of that page. Recorded by recordFrameUrls() after
@@ -624,7 +658,7 @@ export class BrowserSession {
     const state = this.getOrCreateState(sessionId);
     state.lastUsed = Date.now();
     const page = await context.newPage();
-    this.trackPage(sessionId, state, page);
+    await this.trackPage(sessionId, state, page);
     state.pages.push(page);
     state.activeIndex = state.pages.length - 1;
     return state.activeIndex;
@@ -774,7 +808,7 @@ export class BrowserSession {
    * (spec §5.1). Without the dialog handler an unhandled alert/confirm/prompt
    * deadlocks the page, so this is not optional.
    */
-  private trackPage(sessionId: string, state: SessionState, page: Page): void {
+  private async trackPage(sessionId: string, state: SessionState, page: Page): Promise<void> {
     page.on("dialog", (dialog: Dialog) => {
       void this.handleDialog(page, dialog);
     });
@@ -799,13 +833,90 @@ export class BrowserSession {
     // Console + uncaught page errors → a bounded per-page buffer the agent can
     // drain via the `console` action to self-diagnose a silently-failing page.
     this.consoleBuffers.set(page, []);
-    page.on("console", (msg) => this.pushConsole(page, { level: msg.type(), text: msg.text() }));
-    page.on("pageerror", (err: Error) => this.pushConsole(page, { level: "error", text: err?.message ?? String(err) }));
+    page.on("console", (msg) => {
+      const text = msg.text();
+      // Rule 1 of the dedup contract: a sentinel line reaching us on the NATIVE
+      // transport means the Runtime event stream is alive — so native
+      // `pageerror` already reported this throw and the bridged copy (which we
+      // ourselves caused the page to emit) is pure duplication. Drop it.
+      if (text.startsWith(CONSOLE_PAGEERROR_SENTINEL)) return;
+      this.pushConsole(page, { level: msg.type(), text }, "native");
+    });
+    page.on("pageerror", (err: Error) =>
+      this.pushConsole(page, { level: "error", text: err?.message ?? String(err) }, "native"),
+    );
+    // Fallback transports for backends that suppress the Runtime event stream.
+    // Best-effort: a failure leaves the native listeners above as the only
+    // source, i.e. exactly the pre-existing behaviour.
+    await this.instrumentConsoleFallback(page);
   }
 
-  private pushConsole(page: Page, entry: ConsoleEntry): void {
+  /**
+   * Install the two fallback console transports on `page`
+   * (spec/BROWSER-CONSOLE-CAPTURE-STEALTH-FALLBACK.md §4).
+   *
+   * WHY this exists: stealth Chromium builds — CloakBrowser among them —
+   * suppress the CDP `Runtime` event stream (`Runtime.consoleAPICalled`,
+   * `Runtime.exceptionThrown`), because an observable `Runtime.enable` feed is a
+   * well-known automation-detection vector. Playwright derives BOTH `console`
+   * and `pageerror` exclusively from those two events, so on such a backend the
+   * native listeners above never fire even once and the `console` action can
+   * only ever report an empty buffer. Measured on `cloakhq/cloakbrowser-manager`
+   * (image 27098d4b…): zero `Runtime.*` console/exception events, while the
+   * legacy `Console` domain and page-side script injection both work normally.
+   *
+   * Transport 2 — `Console.messageAdded`: the deprecated `Console` domain still
+   * reports `console.*` calls. It survives navigation without re-arming, so no
+   * per-navigation hook is required. It does NOT carry uncaught exceptions.
+   *
+   * Transport 3 — page-side hook: since no CDP channel reports uncaught errors,
+   * CONSOLE_HOOK_SOURCE re-emits them through `console.error` (sentinel-tagged)
+   * so they ride transport 2, and we decode them back on arrival. Installed for
+   * future documents via `addInitScript` AND evaluated once for the current one;
+   * the script is idempotent, so the overlap is a no-op.
+   *
+   * Both are additive and default-on: on a standard backend all transports are
+   * live and pushConsole's cross-transport matching collapses the duplicates.
+   */
+  private async instrumentConsoleFallback(page: Page): Promise<void> {
+    const hook = `(${CONSOLE_HOOK_SOURCE})(${JSON.stringify(CONSOLE_PAGEERROR_SENTINEL)})`;
+    try {
+      const cdp = await page.context().newCDPSession(page);
+      cdp.on("Console.messageAdded", (event: { message?: { level?: string; text?: string } }) => {
+        const text = event.message?.text;
+        if (typeof text !== "string") return;
+        // Decode a bridged page error back into a pageerror-shaped entry. The
+        // hook emits the bare message (no decoration) precisely so this is
+        // byte-identical to what native `pageerror` yields for the same throw —
+        // that identity is what lets the two be recognised as one occurrence.
+        if (text.startsWith(CONSOLE_PAGEERROR_SENTINEL)) {
+          this.pushConsole(page, { level: "error", text: text.slice(CONSOLE_PAGEERROR_SENTINEL.length) }, "cdp");
+          return;
+        }
+        this.pushConsole(page, { level: event.message?.level ?? "log", text }, "cdp");
+      });
+      await cdp.send("Console.enable");
+    } catch (error) {
+      this.logger.debug("browser_console_cdp_fallback_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    try {
+      await page.addInitScript(hook);
+      // The init script only runs for documents loaded from here on; cover the
+      // document the page is already showing too.
+      await page.evaluate(hook).catch(() => {});
+    } catch (error) {
+      this.logger.debug("browser_console_hook_install_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private pushConsole(page: Page, entry: ConsoleEntry, transport: ConsoleTransport): void {
     const buf = this.consoleBuffers.get(page);
     if (!buf) return;
+    if (this.isDuplicateConsoleArrival(page, entry, transport)) return;
     // Bound the per-entry text HERE (not just at drain) so the buffer itself can
     // never retain an unbounded string — this is the real memory bound.
     if (entry.text.length > CONSOLE_ENTRY_MAX_CHARS) {
@@ -816,6 +927,56 @@ export class BrowserSession {
     }
     buf.push(entry);
     if (buf.length > CONSOLE_BUFFER_MAX) buf.splice(0, buf.length - CONSOLE_BUFFER_MAX);
+  }
+
+  /**
+   * Cross-transport duplicate filter (§4.3 of the console-capture spec).
+   *
+   * On a standard backend BOTH transports report every `console.*` call, so
+   * without this every message would be buffered twice. The filter suppresses an
+   * arrival only when an UNMATCHED arrival with the same `level|text`
+   * fingerprint, FROM THE OTHER TRANSPORT, is already on record inside
+   * CONSOLE_DEDUP_WINDOW_MS; the match is one-shot and consumes that record.
+   *
+   * Restricting matches to *different* transports is the whole point: a page
+   * that logs the same string in a loop reports N times on each live transport,
+   * and same-transport arrivals never cancel each other, so all N survive.
+   * Pairing is therefore 1:1 and a real repeat is never swallowed.
+   */
+  private isDuplicateConsoleArrival(page: Page, entry: ConsoleEntry, transport: ConsoleTransport): boolean {
+    let seen = this.consoleDedup.get(page);
+    if (!seen) {
+      seen = new Map();
+      this.consoleDedup.set(page, seen);
+    }
+    const now = Date.now();
+    // Prune expired records first so a long-lived page cannot accumulate them
+    // (on a suppressed backend only ONE transport ever reports, so records
+    // routinely expire unmatched — this is their only exit).
+    for (const [key, arrivals] of seen) {
+      const live = arrivals.filter((a) => now - a.ts < CONSOLE_DEDUP_WINDOW_MS);
+      if (live.length === 0) seen.delete(key);
+      else seen.set(key, live);
+    }
+    const fingerprint = `${entry.level}\u0000${entry.text}`;
+    const arrivals = seen.get(fingerprint);
+    if (arrivals) {
+      const index = arrivals.findIndex((a) => a.transport !== transport);
+      if (index >= 0) {
+        arrivals.splice(index, 1);
+        if (arrivals.length === 0) seen.delete(fingerprint);
+        return true;
+      }
+    }
+    // Not a duplicate: record it so the other transport's copy can match it.
+    // The key cap bounds worst-case memory; dropping the oldest key only risks
+    // one extra duplicate line, never a lost message.
+    if (!arrivals && seen.size >= CONSOLE_DEDUP_MAX_KEYS) {
+      const oldest = seen.keys().next();
+      if (!oldest.done) seen.delete(oldest.value);
+    }
+    (arrivals ?? seen.set(fingerprint, []).get(fingerprint)!).push({ transport, ts: now });
+    return false;
   }
 
   /**
@@ -1492,6 +1653,76 @@ export class BrowserSession {
     this.connectPromise = undefined;
   }
 }
+
+/**
+ * Page-side uncaught-error hook — a plain-JS arrow function shipped as a SOURCE
+ * STRING and evaluated as
+ * `page.evaluate(\`(${CONSOLE_HOOK_SOURCE})(<sentinel JSON>)\`)`.
+ *
+ * WHY a string and not a function: identical to DIALOG_OVERRIDE_SOURCE — under
+ * tsx, `page.evaluate(fn)` transfers the esbuild-COMPILED body, whose
+ * `keepNames` `__name(...)` wrappers reference a module-scope helper that does
+ * not exist in the page, so the script throws `ReferenceError: __name is not
+ * defined` and silently never installs
+ * (spec/BROWSER-DIALOG-OVERRIDE-INJECTION-FIX.md §2).
+ *
+ * WHY it exists: on a stealth backend no CDP channel reports uncaught errors —
+ * `Runtime.exceptionThrown` is suppressed and the legacy `Console` domain only
+ * carries `console-api` messages. So the page reports its own errors through the
+ * one channel that does survive: a sentinel-tagged `console.error`, decoded and
+ * stripped by instrumentConsoleFallback.
+ *
+ * Contract: the emitted text is the RAW error message — `error.message` for a
+ * throw, `reason.message` for a rejection — never the `ErrorEvent`'s decorated
+ * `message` ("Uncaught Error: …"). That makes a bridged entry byte-identical to
+ * the native `pageerror` entry for the same throw, which is exactly what lets
+ * the cross-transport dedup recognise them as one occurrence rather than two.
+ *
+ * Resource-load failures (a 404 `<img>`) also fire a window `error` event but
+ * are NOT reported by native `pageerror`; they are filtered out by the
+ * `event.target !== window` check so the two backends agree on what counts as a
+ * page error.
+ *
+ * The install sentinel (`__miku_con_hook__`) is assigned LAST, after both
+ * listeners are attached, mirroring DIALOG_OVERRIDE_SOURCE: a mid-install throw
+ * must leave the page re-installable, never sentinel-locked with no listeners.
+ * It is non-enumerable so `Object.keys(window)` does not list it.
+ *
+ * @internal exported for unit tests, which evaluate this string byte-for-byte in
+ * `vm.runInNewContext` with a fake window and NO helper shims — so a
+ * reintroduced compile-artifact dependency fails the unit suite, not only the
+ * docker suite.
+ */
+export const CONSOLE_HOOK_SOURCE = `(sentinel) => {
+  const w = window;
+  if (w.__miku_con_hook__) return;
+
+  // Prefer the thrown value's own message so the text matches native pageerror
+  // byte-for-byte; fall back only when there is no Error object to read.
+  const describe = (value, fallback) => {
+    if (value && typeof value.message === "string") return value.message;
+    if (typeof value === "string") return value;
+    if (typeof fallback === "string" && fallback) return fallback;
+    try { return String(value); } catch (e) { return "unknown error"; }
+  };
+  const emit = (text) => {
+    try { console.error(sentinel + text); } catch (e) { /* console unavailable */ }
+  };
+
+  w.addEventListener("error", (event) => {
+    // Resource-load errors (img/script 404) target the ELEMENT, not the window,
+    // and are not page errors — native pageerror ignores them, so do we.
+    if (event && event.target && event.target !== w) return;
+    emit(describe(event && event.error, event && event.message));
+  });
+  w.addEventListener("unhandledrejection", (event) => {
+    emit(describe(event && event.reason, undefined));
+  });
+
+  Object.defineProperty(w, "__miku_con_hook__", {
+    value: true, enumerable: false, configurable: true, writable: true,
+  });
+}`;
 
 /**
  * Page-side JS dialog override script — a plain-JS arrow function shipped as a

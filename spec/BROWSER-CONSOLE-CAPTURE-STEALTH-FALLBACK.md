@@ -1,7 +1,7 @@
 # Browser `console` action: capture path for stealth Chromium backends
 
-**Status**: PROPOSED — target section once implemented: ARCHITECTURE.md §11b
-(Browser control layer).
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §11b ("Three capture
+transports…" under Connection & identity model); retained for review.
 
 ## 1. Problem
 
