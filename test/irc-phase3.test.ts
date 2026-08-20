@@ -333,12 +333,13 @@ function injectRuntime(opts: {
     accountId: accountKey,
     config: { host: networkName, nick, channels: [] },
     client,
-    self: { id: nick, nick },
+    self: { id: `${networkName}/${nick}`, username: nick },
     capFailed: false,
     registered: true,
     capDelReconnect: false,
     casemapping: "ascii",
     networkName,
+    networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice/action) pass the gate
     nick,
     username: nick,
     host: "",
@@ -429,7 +430,7 @@ describe("IrcProvider channelInfo: topic tracking", () => {
 // ── E. memberInfo WHOIS mapping ───────────────────────────────────────────────
 
 describe("IrcProvider memberInfo: WHOIS mapping", () => {
-  test("memberInfo returns userId=account when WHOIS provides account", async () => {
+  test("memberInfo returns network-scoped userId=account when WHOIS provides account", async () => {
     const client = new MockClient();
     const { provider } = injectRuntime({ client });
 
@@ -440,14 +441,15 @@ describe("IrcProvider memberInfo: WHOIS mapping", () => {
 
     const ch = provider.channelClient({ provider: "irc", timelineKey: "irc:acc:room:#general" });
     assert.ok(ch);
-    const info = await ch.memberInfo("alice");
+    // memberInfo accepts a network-scoped id; it strips the prefix before WHOIS.
+    const info = await ch.memberInfo("irc.example.net/alice");
     assert.ok(info, "memberInfo must return a result");
-    assert.equal(info.userId, "alice_services", "userId must be the services account from WHOIS");
+    assert.equal(info.userId, "irc.example.net/alice_services", "userId must be the network-scoped services account from WHOIS");
     assert.equal(info.displayName, "alice", "displayName must be the nick");
     assert.equal(info.isDirect, false);
   });
 
-  test("memberInfo falls back to casemapped nick when WHOIS has no account", async () => {
+  test("memberInfo falls back to network-scoped casemapped nick when WHOIS has no account", async () => {
     const client = new MockClient();
     const { provider } = injectRuntime({ client });
 
@@ -457,10 +459,10 @@ describe("IrcProvider memberInfo: WHOIS mapping", () => {
 
     const ch = provider.channelClient({ provider: "irc", timelineKey: "irc:acc:room:#general" });
     assert.ok(ch);
-    const info = await ch.memberInfo("bob");
+    const info = await ch.memberInfo("irc.example.net/bob");
     assert.ok(info, "memberInfo must return a result");
-    // No account → id is casemapped nick
-    assert.equal(info.userId, "bob", "userId must be casemapped nick when no account");
+    // No account → id is network-scoped casemapped nick
+    assert.equal(info.userId, "irc.example.net/bob", "userId must be network-scoped casemapped nick when no account");
   });
 
   test("memberInfo resolves undefined when WHOIS never replies (timeout)", async () => {
@@ -474,7 +476,7 @@ describe("IrcProvider memberInfo: WHOIS mapping", () => {
 
       const ch = provider.channelClient({ provider: "irc", timelineKey: "irc:acc:room:#general" });
       assert.ok(ch);
-      const infoPromise = ch.memberInfo("ghost");
+      const infoPromise = ch.memberInfo("irc.example.net/ghost");
 
       // Advance past WHOIS_TIMEOUT_MS (10 000 ms).
       mock.timers.tick(10_001);
@@ -496,7 +498,7 @@ describe("IrcProvider memberInfo: WHOIS mapping", () => {
 
     const ch = provider.channelClient({ provider: "irc", timelineKey: "irc:acc:room:#general" });
     assert.ok(ch);
-    const info = await ch.memberInfo("nobody");
+    const info = await ch.memberInfo("irc.example.net/nobody");
     assert.equal(info, undefined, "not_found WHOIS must return undefined");
   });
 
@@ -516,12 +518,12 @@ describe("IrcProvider memberInfo: WHOIS mapping", () => {
 
     const ch = provider.channelClient({ provider: "irc", timelineKey: "irc:acc:room:#general" });
     assert.ok(ch);
-    // Look up by account name (not nick).
-    const info = await ch.memberInfo("alice_services");
+    // Look up by scoped account name (network-prefix + account).
+    const info = await ch.memberInfo("irc.example.net/alice_services");
     assert.ok(info);
     // WHOIS was issued for the nick (resolved from account→nick lookup).
     assert.deepEqual(whoisCalls, ["alice"], "WHOIS must be issued for the nick, not the account name");
-    assert.equal(info.userId, "alice_services");
+    assert.equal(info.userId, "irc.example.net/alice_services");
   });
 });
 
@@ -577,8 +579,8 @@ describe("IrcProvider members(): shape matches tool-layer expectations", () => {
     const members = await ch.members();
     const alice = members.find((m) => m.username === "alice");
     assert.ok(alice, "alice must appear in members");
-    // Identity ladder: account known → id = account name.
-    assert.equal(alice.id, "alice_services", "id must be the services account name");
+    // Identity ladder: account known → id = network-scoped account name.
+    assert.equal(alice.id, "irc.example.net/alice_services", "id must be the network-scoped services account name");
     // Username is always the current nick.
     assert.equal(alice.username, "alice", "username is the IRC nick (used as deriveProviderUsername hint)");
   });
@@ -598,8 +600,8 @@ describe("IrcProvider members(): shape matches tool-layer expectations", () => {
     const members = await ch.members();
     const bob = members.find((m) => m.username === "Bob");
     assert.ok(bob, "Bob must appear");
-    // No account → id is casemapped nick (ascii casemapping: lowercase).
-    assert.equal(bob.id, "bob", "id must be casemapped nick when no account");
+    // No account → id is network-scoped casemapped nick (ascii casemapping: lowercase).
+    assert.equal(bob.id, "irc.example.net/bob", "id must be network-scoped casemapped nick when no account");
   });
 
   test("members() returns empty array for DM targets", async () => {

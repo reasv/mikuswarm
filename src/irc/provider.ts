@@ -52,6 +52,8 @@ import {
   computeByteBudget,
   isChannelTarget,
   normalizeIrcMessage,
+  scopeIrcId,
+  unscopeIrcId,
   STATIC_MAX_CHARS,
   syntheticMsgId,
   type IrcNormalizerContext,
@@ -171,6 +173,18 @@ interface AccountRuntime {
   casemapping: string;
   /** NETWORK ISUPPORT token lowercased, or configured host when absent. */
   networkName: string;
+  /**
+   * Set to `true` after the first `server options` (RPL_ISUPPORT / 005) event fires.
+   * The 005 burst always arrives after RPL_WELCOME (001) — the library emits
+   * `registered` on 001 and `server options` on each 005, and within any single
+   * TCP data event irc-framework processes lines synchronously in order, so
+   * `registered` always fires before `server options`.  Between those two events,
+   * inbound DMs could theoretically arrive (if they land in a separate TCP packet);
+   * we gate all inbound processing on this flag so the network-scoped identity
+   * prefix is frozen before any id is minted.  In practice the 001→005 burst is
+   * sent atomically by every modern ircd and the window never opens.
+   */
+  networkIdFrozen: boolean;
   /** Hostmask components (learned from WHO after registration). */
   nick: string;
   username: string;
@@ -315,8 +329,10 @@ export class IrcProvider implements IChatProvider {
       throw new Error(`IrcProvider.send: account "${parsed.accountId}" failed floor cap validation`);
     }
 
-    // Determine IRC target string: channel name or DM nick from channelId.
-    const ircTarget = parsed.channelId;
+    // Determine IRC target string: channel name, or for DMs the bare nick /
+    // account — the channelId of a DM key is the network-scoped identity
+    // (`<network>/<identity>`, spec §4) and the wire target must be bare.
+    const ircTarget = parsed.kind === "dm" ? unscopeIrcId(parsed.channelId) : parsed.channelId;
 
     // Compute byte budget: use real hostmask when known, conservative fallback otherwise.
     const byteBudget = rt.host
@@ -360,7 +376,8 @@ export class IrcProvider implements IChatProvider {
     const rt = this.accounts.get(parsed.accountId);
     if (!rt || !rt.registered || rt.capFailed) return;
 
-    const ircTarget = parsed.channelId;
+    // DM keys carry the network-scoped identity; the wire target must be bare.
+    const ircTarget = parsed.kind === "dm" ? unscopeIrcId(parsed.channelId) : parsed.channelId;
     const chainKey = `${parsed.accountId}:${ircTarget}`;
 
     if (!typing) {
@@ -414,15 +431,20 @@ export class IrcProvider implements IChatProvider {
   // ── IChatProvider.ownsUserId ──────────────────────────────────────────────
 
   /**
-   * Permissive shape test for IRC user ids.
-   * Per spec §5.1 Phase 1: id = casemapped nick.
-   * A valid IRC user id is: non-empty, no whitespace or NUL, not @-prefixed, not all-digit.
+   * Permissive shape test for network-scoped IRC user ids.
+   * Format: `<networkId>/<identity>` — the `/` separator is mandatory and
+   * disambiguates IRC ids from Matrix ids (`@`-prefixed) and Discord ids (all-digit).
+   *
+   * Rules: non-empty, no whitespace/NUL, not `@`-prefixed, not all-digit, and
+   * must contain at least one `/` (the scope separator).
    */
   ownsUserId(id: string): boolean {
     if (!id) return false;
     if (/[\s\0]/.test(id)) return false;
     if (id.startsWith("@")) return false;
     if (/^\d+$/.test(id)) return false;
+    const slash = id.indexOf("/");
+    if (slash <= 0 || slash === id.length - 1) return false; // requires non-empty <network>/<identity>
     return true;
   }
 
@@ -439,6 +461,7 @@ export class IrcProvider implements IChatProvider {
 
     // ── membersFn (roster-backed, Phase 3) ───────────────────────────────────
     // Returns the current channel roster enriched with account ids via AccountTracker.
+    // Each entry's id is network-scoped: scopeIrcId(rt.networkName, ladderResult).
     // Only defined for channels (not DMs); absent for DMs (consistent with Discord).
     const membersFn = isDirect
       ? undefined
@@ -446,9 +469,11 @@ export class IrcProvider implements IChatProvider {
           const entries = rt.rosterTracker.getMembers(channelTarget, rt.casemapping);
           const selfId = rt.self?.id;
           const result: SenderInfo[] = entries.map((entry) => {
-            // Identity ladder (spec §5.1): account if known, else casemapped nick.
+            // Identity ladder (spec §5.1): account if known, else casemapped nick;
+            // then scoped to the network.
             const account = rt.accountTracker.getAccount(entry.nick, rt.casemapping);
-            const id = account ?? casefold(entry.nick, rt.casemapping);
+            const bareId = account ?? casefold(entry.nick, rt.casemapping);
+            const id = scopeIrcId(rt.networkName, bareId);
             return {
               id,
               username: entry.nick,
@@ -459,24 +484,29 @@ export class IrcProvider implements IChatProvider {
         };
 
     // ── memberInfoFn (WHOIS-backed, Phase 3) ─────────────────────────────────
-    // Resolves id (account name or nick) → nick → WHOIS → MemberInfo.
+    // Resolves a network-scoped id (e.g. "libera.chat/alice_services") to a
+    // MemberInfo.  The scoped id is stripped to its bare ladder result before
+    // roster/WHOIS resolution.  A mismatched network prefix returns undefined.
     const memberInfoFn = async (id: string): Promise<MemberInfo | undefined> => {
-      // Resolution: if registered, try to find the nick for this id.
-      // The id may be a services account name or a direct nick.
-      let nick: string = id;
+      // Strip the network prefix — only our network's prefix is accepted.
+      const prefix = rt.networkName + "/";
+      if (!id.startsWith(prefix)) return undefined; // mismatched network
+      const bareId = id.slice(prefix.length);
+
+      let nick: string = bareId;
 
       if (!isDirect) {
-        // Try to find a roster member whose account matches `id`.
+        // Try to find a roster member whose account matches the bare ladder result.
         const byAccount = rt.rosterTracker.findNickByAccount(
           channelTarget,
-          id,
+          bareId,
           (n) => rt.accountTracker.getAccount(n, rt.casemapping),
           rt.casemapping,
         );
         if (byAccount) {
           nick = byAccount;
         }
-        // If not found by account, treat id as a nick directly.
+        // If not found by account, treat bareId as a nick directly.
       }
 
       // Issue WHOIS when registered; fall back to a minimal static entry when not.
@@ -491,7 +521,8 @@ export class IrcProvider implements IChatProvider {
 
       const selfId = rt.self?.id;
       const account = whoisResult.account;
-      const resolvedId = account ?? casefold(nick, rt.casemapping);
+      const resolvedBareId = account ?? casefold(nick, rt.casemapping);
+      const resolvedId = scopeIrcId(rt.networkName, resolvedBareId);
       const isSelf = resolvedId === selfId ||
         casefold(whoisResult.nick ?? nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
 
@@ -509,13 +540,16 @@ export class IrcProvider implements IChatProvider {
       const data = rt.channelData.get(key);
       const topic = data?.topic;
 
+      // DM channelIds are network-scoped (`<network>/<identity>`); display the
+      // bare identity — the scoped form is redundant next to the network label.
+      const displayTarget = isDirect ? unscopeIrcId(channelTarget) : channelTarget;
       const label = isDirect
-        ? `${channelTarget} (${rt.networkName} DM)`
-        : `${channelTarget} (${rt.networkName})`;
+        ? `${displayTarget} (${rt.networkName} DM)`
+        : `${displayTarget} (${rt.networkName})`;
 
       return Promise.resolve({
         label,
-        displayName: channelTarget,
+        displayName: displayTarget,
         channelId: channelTarget,
         serverName: rt.networkName,
         isDirect,
@@ -562,16 +596,20 @@ export class IrcProvider implements IChatProvider {
         if (!rt) return { displayName: undefined };
         const id = params.userId ?? "";
         if (!id) return { displayName: undefined };
-        // The id is a ladder result (services account or casemapped nick).
-        // Prefer the roster: account → current nick; else treat id as a nick.
+        // The id is network-scoped (e.g. "libera.chat/alice_services").
+        // Strip the network prefix — only our network's prefix is accepted.
+        const prefix = rt.networkName + "/";
+        if (!id.startsWith(prefix)) return { displayName: undefined };
+        const bareId = id.slice(prefix.length);
+        // Prefer the roster: account → current nick; else treat bareId as a nick.
         const byAccount = rt.rosterTracker.findNickByAccount(
           params.roomId,
-          id,
+          bareId,
           (n) => rt.accountTracker.getAccount(n, rt.casemapping),
           rt.casemapping,
         );
         if (byAccount) return { displayName: byAccount };
-        const entry = rt.rosterTracker.getMember(params.roomId, id, rt.casemapping);
+        const entry = rt.rosterTracker.getMember(params.roomId, bareId, rt.casemapping);
         return { displayName: entry?.nick };
       },
     };
@@ -626,6 +664,7 @@ export class IrcProvider implements IChatProvider {
       capDelReconnect: false,
       casemapping: "rfc1459",
       networkName: config.host,
+      networkIdFrozen: false,
       nick: config.nick,
       username: config.username ?? config.nick,
       host: "",
@@ -666,23 +705,18 @@ export class IrcProvider implements IChatProvider {
         enabled.includes("labeled-response") && enabled.includes("batch");
       rt.hasMsgid = enabled.includes("msgid");
 
-      // Casemapping from ISUPPORT.
-      const casemapping = rt.client.network.supports("CASEMAPPING");
-      if (typeof casemapping === "string" && casemapping) {
-        rt.casemapping = casemapping.toLowerCase();
-      }
+      // Note: CASEMAPPING and NETWORK ISUPPORT tokens arrive in 005 (RPL_ISUPPORT),
+      // which is sent AFTER 001 (RPL_WELCOME). Since this handler fires on 001,
+      // those values are not yet available here. The `server options` listener below
+      // reads them once 005 has been processed, updates networkName/casemapping, and
+      // sets networkIdFrozen = true.  Until that happens, networkName stays as
+      // config.host (the default) and rt.self is set provisionally below.
 
-      // Network name from ISUPPORT.
-      const networkName = rt.client.network.supports("NETWORK");
-      if (typeof networkName === "string" && networkName) {
-        rt.networkName = networkName.toLowerCase();
-      }
-
-      // Self identity (Phase 2 ladder §5.1): SASL account name when configured
-      // (stable across nick changes), else casemapped nick.
+      // Self identity (provisional — scoped with current networkName = config.host;
+      // the `server options` listener overwrites rt.self once the NETWORK token arrives).
       const selfAccount = rt.config.sasl_user;
-      const selfId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
-      rt.self = { id: selfId, username: rt.nick };
+      const selfBareId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
+      rt.self = { id: scopeIrcId(rt.networkName, selfBareId), username: rt.nick };
 
       // Learn hostmask via WHO.
       this.learnHostmask(rt);
@@ -697,6 +731,40 @@ export class IrcProvider implements IChatProvider {
       }
     });
 
+    // ── server options (RPL_ISUPPORT / 005) ──────────────────────────────────────
+    // The library fires `registered` on 001 (RPL_WELCOME) and `server options` on
+    // each 005 (RPL_ISUPPORT). Because 005 always follows 001 in the IRC protocol
+    // handshake, the `registered` listener above cannot read ISUPPORT tokens — they
+    // are not yet stored in handler.network when 001 is dispatched. This listener
+    // reads them on the FIRST 005, freezes the network id, and overwrites rt.self
+    // with the correctly scoped value. Subsequent 005 lines (servers may send
+    // multiple) are ignored once frozen.
+    //
+    // Inbound event handlers gate on `rt.networkIdFrozen` so no user id is minted
+    // until the prefix is final. In practice the 001→005 burst is always atomic
+    // (same TCP packet / same onSocketData call) and the gate closes instantly.
+    client.on("server options", () => {
+      if (rt.networkIdFrozen) return; // already frozen on a prior 005 line
+
+      // Read CASEMAPPING and NETWORK from ISUPPORT (now available).
+      const casemapping = rt.client.network.supports("CASEMAPPING");
+      if (typeof casemapping === "string" && casemapping) {
+        rt.casemapping = casemapping.toLowerCase();
+      }
+      const networkToken = rt.client.network.supports("NETWORK");
+      if (typeof networkToken === "string" && networkToken) {
+        rt.networkName = networkToken.toLowerCase();
+      }
+      // else: networkName stays as config.host (already set in initAccount).
+
+      // Recompute self identity with the now-final networkName and casemapping.
+      const selfAccount = rt.config.sasl_user;
+      const selfBareId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
+      rt.self = { id: scopeIrcId(rt.networkName, selfBareId), username: rt.nick };
+
+      rt.networkIdFrozen = true;
+    });
+
     // ── socket close (every disconnect, including auto-reconnect windows) ────────
     // The library emits 'socket close' on EVERY disconnect; 'close' is emitted only
     // when it gives up reconnecting (connection.js:111/141). Without this handler,
@@ -705,6 +773,7 @@ export class IrcProvider implements IChatProvider {
     // timeout a synthetic receipt is fabricated for a never-delivered message.
     client.on("socket close", () => {
       rt.registered = false;
+      rt.networkIdFrozen = false; // re-freeze on next reconnect's 005
       // Clear stale nick→account mappings: a user may have logged out of services
       // while we were disconnected, and no WHOX fires for absent nicks on reconnect.
       // WHOX-on-self-join repopulates channel members; per-message account-tag
@@ -736,7 +805,7 @@ export class IrcProvider implements IChatProvider {
 
     // ── privmsg ──────────────────────────────────────────────────────────────
     client.on("privmsg", (event) => {
-      if (this.stopped || !rt.registered) return;
+      if (this.stopped || !rt.registered || !rt.networkIdFrozen) return;
       if (event.from_server) return;
 
       const isSelfEcho =
@@ -766,6 +835,7 @@ export class IrcProvider implements IChatProvider {
 
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
+        networkId: rt.networkName,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
         accountTracker: rt.accountTracker,
@@ -795,7 +865,7 @@ export class IrcProvider implements IChatProvider {
 
     // ── action ────────────────────────────────────────────────────────────────
     client.on("action", (event) => {
-      if (this.stopped || !rt.registered) return;
+      if (this.stopped || !rt.registered || !rt.networkIdFrozen) return;
       if (event.from_server) return;
 
       const isSelfEcho =
@@ -817,6 +887,7 @@ export class IrcProvider implements IChatProvider {
 
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
+        networkId: rt.networkName,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
         accountTracker: rt.accountTracker,
@@ -846,7 +917,7 @@ export class IrcProvider implements IChatProvider {
 
     // ── notice ────────────────────────────────────────────────────────────────
     client.on("notice", (event) => {
-      if (this.stopped || !rt.registered) return;
+      if (this.stopped || !rt.registered || !rt.networkIdFrozen) return;
       if (event.from_server) return;
 
       // Per spec §7.5:
@@ -867,6 +938,7 @@ export class IrcProvider implements IChatProvider {
 
       const ctx: IrcNormalizerContext = {
         accountId: rt.accountId,
+        networkId: rt.networkName,
         selfNick: rt.nick,
         casemapping: rt.casemapping,
         accountTracker: rt.accountTracker,
@@ -924,7 +996,9 @@ export class IrcProvider implements IChatProvider {
 
     // ── nick (NICK rename — any user, including our own) ─────────────────────
     client.on("nick", (event) => {
-      if (!rt.registered) return;
+      // networkIdFrozen gate: a rename in the 001→005 window would otherwise
+      // mint a user_identities row scoped to the pre-freeze host value.
+      if (!rt.registered || !rt.networkIdFrozen) return;
       const isOwnNick =
         casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
 
@@ -939,17 +1013,18 @@ export class IrcProvider implements IChatProvider {
         // (stable across renames), or switches to the new casemapped nick.
         rt.nick = event.new_nick;
         const selfAccount = rt.config.sasl_user;
-        const selfId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
-        rt.self = { id: selfId, username: rt.nick };
+        const selfBareId = selfAccount ? selfAccount : casefold(rt.nick, rt.casemapping);
+        rt.self = { id: scopeIrcId(rt.networkName, selfBareId), username: rt.nick };
         // Re-learn hostmask (budget recomputed for new nick length).
         this.learnHostmask(rt);
       } else {
         // Other user's rename: upsert their identity row so the new nick is
         // recorded as username (spec §5.4 / §5.3 alias history). The identity key
-        // is their account name when known, else the old casemapped nick.
-        const identityKey =
+        // is their scoped account name when known, else the scoped old casemapped nick.
+        const bareKey =
           rt.accountTracker.getAccount(event.new_nick, rt.casemapping) ??
           casefold(event.nick, rt.casemapping);
+        const identityKey = scopeIrcId(rt.networkName, bareKey);
         void this.callbacks
           ?.upsertUserIdentity({
             provider: "irc",
@@ -1261,6 +1336,7 @@ export class IrcProvider implements IChatProvider {
     // Deliver the echo event to the host for timeline storage (isSelf: true).
     const ctx: IrcNormalizerContext = {
       accountId: rt.accountId,
+      networkId: rt.networkName,
       selfNick: rt.nick,
       casemapping: rt.casemapping,
       accountTracker: rt.accountTracker,

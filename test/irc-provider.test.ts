@@ -154,13 +154,24 @@ test("IrcProvider.getSelf: undefined for any accountId before start", () => {
 
 // ── ownsUserId ────────────────────────────────────────────────────────────────
 
-test("ownsUserId: accepts typical IRC nick", () => {
+test("ownsUserId: accepts network-scoped IRC id (<networkId>/<identity>)", () => {
   const p = makeProvider();
-  assert.ok(p.ownsUserId("miku"));
-  assert.ok(p.ownsUserId("bot-user"));
-  assert.ok(p.ownsUserId("Bot_123"));
-  assert.ok(p.ownsUserId("[miku]"));
-  assert.ok(p.ownsUserId("a"));
+  assert.ok(p.ownsUserId("libera.chat/miku"));
+  assert.ok(p.ownsUserId("irc.example.net/bot-user"));
+  assert.ok(p.ownsUserId("efnet/Bot_123"));
+  assert.ok(p.ownsUserId("undernet/[miku]"));
+  assert.ok(p.ownsUserId("test.net/a"));
+  assert.ok(p.ownsUserId("irc.net/alice_services")); // services account
+});
+
+test("ownsUserId: rejects bare IRC nick (not network-scoped)", () => {
+  const p = makeProvider();
+  // Bare nicks have no '/' separator — not a valid scoped IRC id.
+  assert.ok(!p.ownsUserId("miku"));
+  assert.ok(!p.ownsUserId("bot-user"));
+  assert.ok(!p.ownsUserId("Bot_123"));
+  assert.ok(!p.ownsUserId("[miku]"));
+  assert.ok(!p.ownsUserId("a"));
 });
 
 test("ownsUserId: rejects empty string", () => {
@@ -333,12 +344,13 @@ function injectRuntime(
     accountId: accountKey,
     config: { host: "irc.example.net", nick: "testbot", channels: [] },
     client,
-    self: undefined,
+    self: { id: "irc.example.net/testbot", username: "testbot" },
     capFailed: false,
     registered: false,
     capDelReconnect: false,
     casemapping: "rfc1459",
     networkName: "irc.example.net",
+    networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice/action) pass the gate
     nick: "testbot",
     username: "testbot",
     host: "",
@@ -712,7 +724,7 @@ describe("IrcProvider enrichment capabilities", () => {
     );
   });
 
-  test("enrichment().memberInfo resolves account id to current nick via roster", async () => {
+  test("enrichment().memberInfo resolves network-scoped account id to current nick via roster", async () => {
     const client = new MockClient();
     const { provider, rt } = injectRuntime("acc", client);
     const roster = rt.rosterTracker as InstanceType<typeof RosterTracker>;
@@ -722,14 +734,101 @@ describe("IrcProvider enrichment capabilities", () => {
 
     const caps = provider.enrichment("acc");
     assert.ok(caps);
-    // By services account → current nick.
-    const byAccount = await caps.memberInfo({ roomId: "#general", userId: "alice_svc" });
+    // By network-scoped services account → current nick.
+    const byAccount = await caps.memberInfo({ roomId: "#general", userId: "irc.example.net/alice_svc" });
     assert.equal(byAccount.displayName, "Alice");
-    // By nick (ladder rung 3 id) → roster nick.
-    const byNick = await caps.memberInfo({ roomId: "#general", userId: "alice" });
+    // By network-scoped nick (ladder rung 3 id) → roster nick.
+    const byNick = await caps.memberInfo({ roomId: "#general", userId: "irc.example.net/alice" });
     assert.equal(byNick.displayName, "Alice");
-    // Unknown → undefined displayName.
-    const missing = await caps.memberInfo({ roomId: "#general", userId: "ghost" });
+    // Unknown → undefined displayName (scoped ghost not in roster).
+    const missing = await caps.memberInfo({ roomId: "#general", userId: "irc.example.net/ghost" });
     assert.equal(missing.displayName, undefined);
+    // Bare (unscoped) id → mismatched prefix → undefined displayName.
+    const bare = await caps.memberInfo({ roomId: "#general", userId: "alice_svc" });
+    assert.equal(bare.displayName, undefined, "bare unscoped id must not match");
+  });
+});
+
+// ── Network-scoped id round-trips (scoped-id verifier fixes) ──────────────────
+
+describe("network-scoped ids: outbound round-trips", () => {
+  test("DM send strips the network scope from the wire target", async () => {
+    const client = new MockClient();
+    client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
+    const { provider, rt } = injectRuntime("acc", client);
+    rt.registered = true;
+
+    const sayTargets: string[] = [];
+    client.say = (target: string, body: string) => {
+      sayTargets.push(target);
+      setImmediate(() => {
+        client.emit("privmsg", {
+          from_server: false,
+          nick: "testbot",
+          ident: "testbot",
+          hostname: "example.net",
+          target, // real servers echo the bare nick target
+          message: body,
+          tags: { msgid: "dm-echo-msgid" },
+          time: Date.now(),
+        });
+      });
+    };
+
+    const receipt = await provider.send(
+      { provider: "irc", timelineKey: "irc:acc:dm:irc.example.net/alice" },
+      { body: "hi alice", attachments: [] },
+    );
+
+    assert.deepEqual(sayTargets, ["alice"], "PRIVMSG target must be the bare nick, not the scoped id");
+    assert.equal(receipt.externalId, "dm-echo-msgid", "echo must correlate without timing out");
+  });
+
+  test("setTyping strips the network scope from the TAGMSG target", async () => {
+    const client = new MockClient();
+    client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
+    const { provider, rt } = injectRuntime("acc", client);
+    rt.registered = true;
+
+    const tagmsgTargets: string[] = [];
+    client.tagmsg = (target: string) => {
+      tagmsgTargets.push(target);
+    };
+
+    await provider.setTyping(
+      { provider: "irc", timelineKey: "irc:acc:dm:irc.example.net/alice" },
+      true,
+    );
+    await provider.setTyping(
+      { provider: "irc", timelineKey: "irc:acc:dm:irc.example.net/alice" },
+      false,
+    );
+
+    assert.ok(tagmsgTargets.length >= 1, "tagmsg must fire");
+    for (const t of tagmsgTargets) {
+      assert.equal(t, "alice", "TAGMSG target must be the bare nick");
+    }
+  });
+
+  test("channelInfo on a DM shows the bare identity, not the scoped id", async () => {
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+
+    const ch = provider.channelClient({
+      provider: "irc",
+      timelineKey: "irc:acc:dm:irc.example.net/alice",
+    });
+    assert.ok(ch);
+    const info = await ch.channelInfo({ roomId: "irc.example.net/alice" });
+    assert.equal(info.displayName, "alice");
+    assert.match(info.label ?? "", /^alice /, "label must lead with the bare identity");
+  });
+
+  test("ownsUserId requires non-empty network and identity components", () => {
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+    assert.equal(provider.ownsUserId("libera.chat/alice"), true);
+    assert.equal(provider.ownsUserId("/alice"), false, "empty network component");
+    assert.equal(provider.ownsUserId("libera.chat/"), false, "empty identity component");
   });
 });

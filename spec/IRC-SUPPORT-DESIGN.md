@@ -86,6 +86,16 @@ Decisions settled by the operator for this design:
   and echo correlation internally. Per-connection dynamic capabilities are
   explicitly deferred until something tool-visible (like chathistory) would
   need them.
+- **D6 — Network-scoped user ids.** All IRC `SenderInfo.id` values are
+  `<networkId>/<ladderResult>`, where `networkId` is the `NETWORK` ISUPPORT
+  token lowercased when advertised, else the configured host lowercased. The
+  `/` separator is safe because neither IRC nick/account names nor hostname
+  tokens can contain `/`. This makes cross-network id collisions impossible
+  in `user_identities`, closes the multi-network limitation noted in §5.3,
+  and makes `ownsUserId` require a `/` (see §5.2). The networkId is frozen
+  on the first `server options` event (RPL_ISUPPORT / 005); inbound handlers
+  gate on the freeze flag so no id is minted before the network name is
+  final.
 
 ---
 
@@ -159,9 +169,11 @@ already accepts any `[a-z0-9-]+` provider prefix:
   RFC 2812 channel grammar already excludes `:` (along with space, comma,
   and ^G), so such names cannot occur on a conforming server (validated,
   per the §13 design check in the Discord spec).
-- DM (query): `irc:<accountKey>:dm:<identity>` — where `<identity>` is the
-  ladder result (§5): the services account name when known at first contact,
-  else the casemapped nick.
+- DM (query): `irc:<accountKey>:dm:<networkId>/<identity>` — where the
+  `<networkId>/<identity>` pair is the network-scoped id (D6, §5): the
+  `NETWORK` ISUPPORT token (lowercased) followed by `/` and the ladder result
+  (services account name when known at first contact, else the casemapped
+  nick). Example: `irc:myaccount:dm:libera.chat/alice`.
 
 `channelType` is `"group"` for channels and `"dm"` for queries; there are no
 threads. One accepted consequence of the DM key rule: a user who first DMs
@@ -176,14 +188,16 @@ the trail auditable.
 
 ### 5.1 The ladder
 
-Deterministic, applied per message:
+Deterministic, applied per message. The bare result of each rung is then
+**network-scoped** (D6): `SenderInfo.id = <networkId>/<bare>`.
 
 1. **Services account** — when the message carries `account-tag` (or the
    sender's account is known from `extended-join`/`account-notify` tracking):
-   `SenderInfo.id` = the account name. Stable across nick changes, renames,
-   and reconnects.
-2. **Nick** — otherwise: `SenderInfo.id` = the nick, casemapped per
-   `CASEMAPPING`.
+   bare result = the account name. Stable across nick changes, renames,
+   and reconnects. Example: `libera.chat/alice`.
+2. **Nick** — otherwise: bare result = the nick, casemapped per
+   `CASEMAPPING`. Example: nick `Alice` under ascii casemapping →
+   `libera.chat/alice`.
 
 In both cases `SenderInfo.username` = the current nick (the display
 identity), so rendering always shows what channel members see, while identity
@@ -191,39 +205,35 @@ follows the account when one exists. This is the `SenderInfo` absorption
 anticipated by the Discord spec §13, made concrete.
 
 Self-identity follows the same ladder (the bot's own account name via SASL,
-else its nick).
+else its nick), also scoped to the network.
 
 ### 5.2 `ownsUserId`
 
-The budget-enforceability shape test: an IRC id is a services account name or
-nick — by RFC grammar it cannot begin with a digit and never begins with `@`.
-This is disjoint from Matrix ids (`@`-prefixed) and Discord ids (all-digit
-snowflakes), so the existing predicate style extends cleanly. The predicate
-must be **permissive**, not a strict RFC1459 grammar check: on
-`CASEMAPPING=precis` networks (Ergo) nicks and account names may be
-non-ASCII, so the test is "non-empty, no whitespace/NUL, not `@`-prefixed,
-not all-digit" — disjointness from Matrix and Discord is preserved either
-way. (A hypothetical all-digit precis nick would simply fail the shape test
-and not be recognized as a user identity — a safe, accepted edge.)
+The budget-enforceability shape test for **network-scoped** IRC ids (D6):
+`<networkId>/<identity>`. The `/` separator is mandatory — bare nicks or
+account names (without a network prefix) are rejected so the predicate is
+disjoint from Matrix ids (`@`-prefixed), Discord ids (all-digit snowflakes),
+and legacy bare IRC nicks that predate network scoping.
+
+Test rules: non-empty, no whitespace/NUL, not `@`-prefixed, not all-digit,
+**must contain at least one `/`**. The test remains permissive on character
+set: on `CASEMAPPING=precis` networks (Ergo) nicks and account names may be
+non-ASCII, so the check avoids strict RFC1459 grammar. Disjointness from
+Matrix and Discord is preserved either way.
 
 ### 5.3 `user_identities`
 
 IRC ingest upserts into the existing `user_identities` table (built in
-Discord Phase 3, no DDL change): identity key per the ladder, current nick as
-username, with alias history capturing NICK changes observed while connected.
-This is exactly the "display name changes, identity persists" shape the table
-was designed for.
+Discord Phase 3, no DDL change): identity key is the network-scoped id (D6,
+§5.1), current nick as username, with alias history capturing NICK changes
+observed while connected. This is exactly the "display name changes, identity
+persists" shape the table was designed for.
 
-**Accepted limitation — multi-network deployments.** `user_identities` rows
-are keyed `(provider, user_id)`, and IRC user ids (services account name or
-casemapped nick) are unique only within a single IRC network. A deployment
-running bot accounts on two *different* networks that happen to share a
-services account name (e.g. `alice` on both Libera and OFTC) will map to the
-same `user_identities` row and share per-user budget aggregation across those
-networks. This is accepted for v1: it is consistent with the protocol's
-network-scoped identity model and with the §4 accepted DM-key consequence for
-unidentified users; same-network multi-account deployments (the common case)
-are wholly unaffected.
+**Multi-network id isolation (resolved by D6).** Because every id is prefixed
+with the `NETWORK` token (e.g. `libera.chat/alice` vs `efnet/alice`), two
+deployments on different networks that share a services account name produce
+distinct `user_identities` rows and distinct per-user budget aggregates. The
+limitation noted in earlier drafts of this spec is closed.
 
 ### 5.4 Renames
 

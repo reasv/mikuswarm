@@ -1070,11 +1070,14 @@ function deriveProviderUsername(
     return opts?.senderUsername || undefined;
   }
   if (provider === "irc") {
-    // IRC sender ids are the services account name or casemapped nick — both are
-    // already human-readable and serve directly as the username (spec §5.1 / §10).
-    // Use the hint when available (e.g. current nick from SenderInfo.username);
-    // fall back to the id itself (which is already the stable-ish display handle).
-    return opts?.senderUsername || senderId || undefined;
+    // IRC sender ids are network-scoped: "<networkId>/<nick-or-account>".
+    // Use the hint (current nick from SenderInfo.username) when available — it is
+    // already the bare, human-readable display name. When falling back to the id,
+    // strip the network prefix so the derived username is a bare nick/account name.
+    if (opts?.senderUsername) return opts.senderUsername;
+    if (!senderId) return undefined;
+    const slashIdx = senderId.indexOf("/");
+    return slashIdx !== -1 ? senderId.slice(slashIdx + 1) : senderId;
   }
   return undefined;
 }

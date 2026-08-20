@@ -183,13 +183,14 @@ describe("resolveIrcSenderId (identity ladder §5.1)", () => {
 // ── C. normalizeIrcMessage — ladder + DM key ────────────────────────────────────
 
 describe("normalizeIrcMessage: identity ladder integration", () => {
-  test("account-tag present → sender.id = account name, username = nick", () => {
+  test("account-tag present → sender.id = scoped account name, username = nick", () => {
     _resetCounters();
     const tracker = new AccountTracker();
     const ctx = {
       accountId: "acc",
       selfNick: "bot",
       casemapping: "ascii",
+      networkId: "test.net",
       accountTracker: tracker,
     };
     const msg = {
@@ -203,11 +204,11 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       account: "alice_services",
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.event.sender.id, "alice_services");
+    assert.equal(inbound.event.sender.id, "test.net/alice_services");
     assert.equal(inbound.event.sender.username, "alice");
   });
 
-  test("no account-tag but tracked account → sender.id = tracked account", () => {
+  test("no account-tag but tracked account → sender.id = scoped tracked account", () => {
     _resetCounters();
     const tracker = new AccountTracker();
     tracker.setAccount("bob", "bob_services", "ascii");
@@ -215,6 +216,7 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       accountId: "acc",
       selfNick: "bot",
       casemapping: "ascii",
+      networkId: "test.net",
       accountTracker: tracker,
     };
     const msg = {
@@ -228,13 +230,13 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.event.sender.id, "bob_services");
+    assert.equal(inbound.event.sender.id, "test.net/bob_services");
     assert.equal(inbound.event.sender.username, "bob");
   });
 
-  test("no account-tag, no tracker → sender.id = casemapped nick", () => {
+  test("no account-tag, no tracker → sender.id = scoped casemapped nick", () => {
     _resetCounters();
-    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii" };
+    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii", networkId: "test.net" };
     const msg = {
       nick: "Carol",
       ident: "c",
@@ -246,15 +248,16 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.event.sender.id, "carol");
+    assert.equal(inbound.event.sender.id, "test.net/carol");
   });
 
-  test("self message with sasl_user configured → sender.id = SASL account", () => {
+  test("self message with sasl_user configured → sender.id = scoped SASL account", () => {
     _resetCounters();
     const ctx = {
       accountId: "acc",
       selfNick: "bot",
       casemapping: "ascii",
+      networkId: "test.net",
       selfAccount: "bot_services",
     };
     const msg = {
@@ -268,14 +271,14 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.event.sender.id, "bot_services");
+    assert.equal(inbound.event.sender.id, "test.net/bot_services");
     assert.equal(inbound.event.sender.username, "bot");
     assert.equal(inbound.event.sender.isSelf, true);
   });
 
-  test("self message without sasl_user → sender.id = casemapped nick", () => {
+  test("self message without sasl_user → sender.id = scoped casemapped nick", () => {
     _resetCounters();
-    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii" };
+    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii", networkId: "test.net" };
     const msg = {
       nick: "bot",
       ident: "b",
@@ -287,15 +290,15 @@ describe("normalizeIrcMessage: identity ladder integration", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.event.sender.id, "bot");
+    assert.equal(inbound.event.sender.id, "test.net/bot");
     assert.equal(inbound.event.sender.isSelf, true);
   });
 });
 
 describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
-  test("DM with account-tag → key uses account name", () => {
+  test("DM with account-tag → key uses network-scoped account name", () => {
     _resetCounters();
-    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii" };
+    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii", networkId: "test.net" };
     const msg = {
       nick: "alice",
       ident: "a",
@@ -307,10 +310,10 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       account: "alice_acct",
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.timelineKey, "irc:acc:dm:alice_acct");
+    assert.equal(inbound.timelineKey, "irc:acc:dm:test.net/alice_acct");
   });
 
-  test("DM with tracked account → key uses tracked account", () => {
+  test("DM with tracked account → key uses network-scoped tracked account", () => {
     _resetCounters();
     const tracker = new AccountTracker();
     tracker.setAccount("bob", "bob_acct", "ascii");
@@ -318,6 +321,7 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       accountId: "acc",
       selfNick: "bot",
       casemapping: "ascii",
+      networkId: "test.net",
       accountTracker: tracker,
     };
     const msg = {
@@ -331,12 +335,12 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.timelineKey, "irc:acc:dm:bob_acct");
+    assert.equal(inbound.timelineKey, "irc:acc:dm:test.net/bob_acct");
   });
 
-  test("DM with no account/tracker → key uses casemapped nick", () => {
+  test("DM with no account/tracker → key uses network-scoped casemapped nick", () => {
     _resetCounters();
-    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii" };
+    const ctx = { accountId: "acc", selfNick: "bot", casemapping: "ascii", networkId: "test.net" };
     const msg = {
       nick: "Carol",
       ident: "c",
@@ -348,10 +352,10 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.timelineKey, "irc:acc:dm:carol");
+    assert.equal(inbound.timelineKey, "irc:acc:dm:test.net/carol");
   });
 
-  test("trigger.triggeredBy.id uses ladder result (account, not nick)", () => {
+  test("trigger.triggeredBy.id uses network-scoped ladder result (account, not nick)", () => {
     _resetCounters();
     const tracker = new AccountTracker();
     tracker.setAccount("dave", "dave_acct", "ascii");
@@ -359,6 +363,7 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       accountId: "acc",
       selfNick: "bot",
       casemapping: "ascii",
+      networkId: "test.net",
       accountTracker: tracker,
     };
     const msg = {
@@ -372,7 +377,7 @@ describe("normalizeIrcMessage: DM key is ladder-aware (spec §4)", () => {
       account: undefined,
     };
     const inbound = normalizeIrcMessage(msg, ctx);
-    assert.equal(inbound.trigger?.triggeredBy.id, "dave_acct");
+    assert.equal(inbound.trigger?.triggeredBy.id, "test.net/dave_acct");
     assert.equal(inbound.trigger?.triggeredBy.username, "dave");
   });
 });
@@ -462,6 +467,7 @@ function injectRuntime(opts: {
     capDelReconnect: false,
     casemapping: "ascii",
     networkName: "irc.example.net",
+    networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice) pass the gate
     nick,
     username: nick,
     host: "",
@@ -708,9 +714,31 @@ describe("IrcProvider: nick (rename tracking §5.4)", () => {
     assert.equal(captured.length, 1, "upsertUserIdentity must be called");
     const call = captured[0]!;
     assert.equal(call.provider, "irc");
-    assert.equal(call.userId, "alice_acct", "userId must be the stable account name");
+    assert.equal(call.userId, "irc.example.net/alice_acct", "userId must be the network-scoped stable account name");
     assert.equal(call.username, "alice_away", "username must be the new nick");
     assert.equal(call.observedAt, 1_700_000_000_000);
+  });
+
+  test("NICK rename before networkIdFrozen is ignored (no pre-freeze identity rows)", async () => {
+    const captured: UserIdentityUpsertInput[] = [];
+    const callbacks: IrcProviderCallbacks = {
+      async upsertUserIdentity(input) { captured.push({ ...input }); },
+    };
+    const { client, rt } = injectRuntime({ callbacks });
+    // Simulate the 001->005 window: registered but network id not yet frozen.
+    rt.networkIdFrozen = false;
+
+    client.emit("nick", {
+      nick: "alice",
+      new_nick: "alice2",
+      ident: "alice",
+      hostname: "h",
+      tags: {},
+      time: 1_700_000_000_000,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(captured.length, 0, "no identity row may be minted with a pre-freeze network id");
   });
 
   test("NICK rename without tracked account: identity key = old casemapped nick", async () => {
@@ -733,7 +761,7 @@ describe("IrcProvider: nick (rename tracking §5.4)", () => {
 
     assert.equal(captured.length, 1);
     const call = captured[0]!;
-    assert.equal(call.userId, "frank", "userId must be casemapped old nick when no account known");
+    assert.equal(call.userId, "irc.example.net/frank", "userId must be network-scoped casemapped old nick when no account known");
     assert.equal(call.username, "frank_");
   });
 
@@ -753,7 +781,7 @@ describe("IrcProvider: nick (rename tracking §5.4)", () => {
 
     assert.equal(rt.nick, "Guest12345", "rt.nick must be updated to new nick");
     const self = rt.self as { id: string; username: string } | undefined;
-    assert.equal(self?.id, "botaccount", "self.id must remain the SASL account (stable)");
+    assert.equal(self?.id, "irc.example.net/botaccount", "self.id must be network-scoped SASL account (stable)");
     assert.equal(self?.username, "Guest12345", "self.username must be updated to new nick");
   });
 
@@ -772,7 +800,7 @@ describe("IrcProvider: nick (rename tracking §5.4)", () => {
 
     assert.equal(rt.nick, "Guest12345");
     const self = rt.self as { id: string; username: string } | undefined;
-    assert.equal(self?.id, "guest12345", "self.id must be casemapped new nick when no SASL");
+    assert.equal(self?.id, "irc.example.net/guest12345", "self.id must be network-scoped casemapped new nick when no SASL");
     assert.equal(self?.username, "Guest12345");
   });
 });
@@ -840,6 +868,7 @@ describe("IrcProvider: notice handler account-tag refresh (F2)", () => {
       capDelReconnect: false,
       casemapping: "ascii",
       networkName: "irc.example.net",
+      networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice) pass the gate
       nick,
       username: nick,
       host: "",
@@ -912,8 +941,56 @@ describe("IrcProvider: notice handler account-tag refresh (F2)", () => {
     const ev = events[1] as { event: { sender: { id: string } } };
     assert.equal(
       ev.event.sender.id,
-      "alice_services",
-      "sender.id must resolve to account via tracker seeded by prior NOTICE",
+      "irc.example.net/alice_services",
+      "sender.id must resolve to network-scoped account via tracker seeded by prior NOTICE",
     );
+  });
+});
+
+// ── D7. Cross-network isolation ───────────────────────────────────────────────
+
+describe("network-scoped ids: cross-network isolation", () => {
+  test("same nick on two networks produces distinct scoped ids", () => {
+    // Alice on libera.chat and Alice on efnet are different identities.
+    _resetCounters();
+    const makeMsg = () => ({
+      nick: "alice",
+      ident: "alice",
+      hostname: "h",
+      target: "#chan",
+      message: "hello",
+      tags: {},
+      time: 1_000_000,
+      account: undefined,
+    });
+
+    const inboundLibera = normalizeIrcMessage(makeMsg(), {
+      accountId: "acc",
+      selfNick: "bot",
+      casemapping: "ascii",
+      networkId: "libera.chat",
+    });
+    const inboundEfnet = normalizeIrcMessage(makeMsg(), {
+      accountId: "acc",
+      selfNick: "bot",
+      casemapping: "ascii",
+      networkId: "efnet",
+    });
+
+    assert.equal(inboundLibera.event.sender.id, "libera.chat/alice");
+    assert.equal(inboundEfnet.event.sender.id, "efnet/alice");
+    assert.notEqual(
+      inboundLibera.event.sender.id,
+      inboundEfnet.event.sender.id,
+      "Ids from different networks must be distinct even for the same nick",
+    );
+    // DM timeline keys are also distinct
+    const mkDm = (networkId: string) =>
+      normalizeIrcMessage(
+        { ...makeMsg(), target: "bot" },
+        { accountId: "acc", selfNick: "bot", casemapping: "ascii", networkId },
+      );
+    assert.equal(mkDm("libera.chat").timelineKey, "irc:acc:dm:libera.chat/alice");
+    assert.equal(mkDm("efnet").timelineKey, "irc:acc:dm:efnet/alice");
   });
 });

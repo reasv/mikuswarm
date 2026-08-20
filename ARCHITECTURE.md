@@ -580,7 +580,7 @@ An `[irc]` config block (peer of `[matrix]` and `[discord]`) enables the IRC pro
 - **Zero-provider guard**: if the final registry is empty after construction (and after seam injection), `startMikuAgent` throws `"no enabled chat provider"` immediately — before any pool, storage, or validation step. This is a fatal config error; at least one provider must be enabled at startup.
 - At boot, every registered provider is started (`p.start(host)`). `MatrixProvider` receives a specialized host (`buildMatrixHost()`) that narrows Matrix-specific event payloads. All other providers (including `DiscordProvider` and `IrcProvider`) receive the generic host that wires `onEvent`, `onReaction`, `onBulkReactionClear`, `onError`, and `resolveReplyTrigger` without Matrix-typed callbacks.
 - On `runtime.stop()`, every registered provider's `stop()` is called in registry iteration order.
-- **`isUserIdentity` predicate** (spec §6.4 / Phase 0): the budget engine's predicate is `providers.some(p => p.ownsUserId(id))`. For Matrix-only configs this is byte-identical to the old `id.startsWith("@")`; with Discord registered it also accepts numeric snowflakes (`/^\d+$/.test(id)`); with IRC registered it accepts any non-empty string free of whitespace and NUL that is not `@`-prefixed and not all-digit (nick or services account).  
+- **`isUserIdentity` predicate** (spec §6.4 / Phase 0): the budget engine's predicate is `providers.some(p => p.ownsUserId(id))`. For Matrix-only configs this is byte-identical to the old `id.startsWith("@")`; with Discord registered it also accepts numeric snowflakes (`/^\d+$/.test(id)`); with IRC registered it accepts any non-empty string that is non-empty, free of whitespace/NUL, not `@`-prefixed, not all-digit, and shaped `<network>/<identity>` with **both components non-empty** around the first `/` (the network-scope separator, e.g. `libera.chat/alice`).  
 
 ### Outbound send routing
 
@@ -1105,23 +1105,23 @@ If a required cap is **withdrawn mid-connection** (`CAP DEL`), the provider logs
 | Context | Timeline key |
 |---|---|
 | Channel | `irc:<accountId>:room:<casemapped_channel_name>` |
-| DM (query) | `irc:<accountId>:dm:<identity>` |
+| DM (query) | `irc:<accountId>:dm:<networkId>/<identity>` |
 
-Channel names are casemapped for key stability using the network's `CASEMAPPING` ISUPPORT token (default `rfc1459`). DM keys use the identity ladder result (services account name when known, else casemapped nick) so a user who DMs while unauthenticated gets a separate timeline from their authenticated sessions — the accepted consequence documented in the spec.
+Channel names are casemapped for key stability using the network's `CASEMAPPING` ISUPPORT token (default `rfc1459`). DM keys use the network-scoped identity (see **Identity ladder** below) — e.g. `irc:myaccount:dm:libera.chat/alice` — so a user who DMs while unauthenticated gets a separate timeline from their authenticated sessions (the accepted consequence) and users on different networks with the same nick are always distinct.
 
 Event id: `irc:<accountId>:<externalId>:<nanoid8>`. `externalId` is the `msgid` tag value when the server assigns one (preferred) or a synthetic id — `syn:<serverTimeMs>:<senderNick>:<counter>` — where the counter is a per-account monotonic integer. Synthetic ids serve dedup and echo-merge; no stable referenceability is required.
 
 ### Identity ladder
 
-Per-message identity is resolved deterministically in three rungs:
+Per-message identity is resolved deterministically in three rungs, then **network-scoped**:
 
 1. **Per-message `account` tag** (wins unconditionally when present and non-empty) — the sender's services account name from the `account-tag` cap. Never `"*"` on PRIVMSG (that form only appears on `ACCOUNT` messages; handled defensively).
 2. **Tracked state** (`AccountTracker`) — populated by `extended-join` (account field in JOIN), `account-notify` (ACCOUNT messages), per-message `account` tag (opportunistic refresh), and WHOX WHO responses on self-join.
 3. **Casemapped nick** — final fallback when no account information is available.
 
-`SenderInfo.id` is the ladder result (stable across nick changes when the user is identified to services). `SenderInfo.username` is always the current nick (the display identity). The bot's own identity (`SelfIdentity.id`) is the configured `sasl_user` when SASL is active, else the casemapped nick at registration time.
+`SenderInfo.id` = `<networkId>/<ladderResult>` — network-scoped via `scopeIrcId(networkId, bareId)` (`src/irc/normalizer.ts`). `networkId` is the `NETWORK` ISUPPORT token lowercased when advertised, else the configured host lowercased; it is frozen on the first `server options` event (RPL_ISUPPORT / 005) so that ids are never minted before the name is final. `SenderInfo.username` is always the current nick (the display identity). The bot's own identity (`SelfIdentity.id`) follows the same scoping.
 
-**Account-identity sharing limitation** (spec §5.3): a user with the same services account name on two different IRC networks maps to the same `userId` across both networks' timelines. Per-network disambiguation requires an operator-level approach (e.g. distinct account keys per network in config) — the protocol offers no cross-network identity scoping.
+`ownsUserId` requires the `/` separator — bare nicks are rejected, making IRC ids disjoint from Matrix (`@`-prefixed) and Discord (all-digit) ids. Cross-network collision between two networks sharing a services account name is impossible: `libera.chat/alice` and `efnet/alice` are distinct ids in `user_identities` and independent budget aggregates.
 
 ### Capabilities
 
@@ -1197,8 +1197,8 @@ The echo event is always delivered to `host.onEvent` with `isSelf: true` for tim
 
 Three live operations:
 
-- **`members()`** — delegates to `membersFn` (the roster-backed closure over `RosterTracker.getMembers()` enriched with `AccountTracker`). Each entry's `id` follows the identity ladder (account name when known, casemapped nick otherwise). Absent for DMs.
-- **`memberInfo(id)`** — delegates to `memberInfoFn`: resolves the nick for the given id (trying account→nick reverse lookup via `RosterTracker.findNickByAccount()` first, then treating `id` as a nick directly), then issues WHOIS (10 s timeout; resolves `undefined` on timeout or socket drop). Returns `{ userId, displayName, isSelf, isDirect }`.
+- **`members()`** — delegates to `membersFn` (the roster-backed closure over `RosterTracker.getMembers()` enriched with `AccountTracker`). Each entry's `id` is network-scoped: `<networkId>/<ladderResult>` (account name when known, casemapped nick otherwise). Absent for DMs.
+- **`memberInfo(id)`** — delegates to `memberInfoFn`: strips the `<networkId>/` prefix from the input (returns `undefined` for mismatched network prefix), resolves the nick for the bare id (account→nick reverse lookup via `RosterTracker.findNickByAccount()` first, then treating the bare id as a nick directly), then issues WHOIS (10 s timeout; resolves `undefined` on timeout or socket drop). Returns `{ userId: <networkId>/<resolvedBareId>, displayName, isSelf, isDirect }`.
 - **`channelInfo()`** — delegates to `channelInfoFn`: returns tracked topic and member count from `RosterTracker`. Label is `"<channelName> (<networkName>)"` for channels, `"<nick> (<networkName> DM)"` for DMs. `serverName` is set to `rt.networkName`.
 
 ### IrcProviderCallbacks
@@ -1237,9 +1237,10 @@ The account key (the `<key>` in `[irc.accounts.<key>]`) must not contain `:` (br
 | IRC concept | MikuSwarm field |
 |---|---|
 | Nick | `SenderInfo.username` (mutable display identity) |
-| Services account name | `SenderInfo.id` (stable identity, rung 1/2) |
-| Casemapped nick | `SenderInfo.id` (fallback identity, rung 3) |
-| `NETWORK` ISUPPORT token | `rt.networkName` / `server_id` in `room_metadata` |
+| Services account name | bare ladder result (rung 1/2); scoped → `<networkId>/<account>` in `SenderInfo.id` |
+| Casemapped nick | bare ladder result (rung 3); scoped → `<networkId>/<casemappedNick>` in `SenderInfo.id` |
+| `NETWORK` ISUPPORT token | `rt.networkName` (the `networkId` scope prefix) / `server_id` in `room_metadata` |
+| Network-scoped user id | `<networkId>/<ladderResult>` (e.g. `libera.chat/alice`) — format of every `SenderInfo.id` |
 | Channel (e.g. `#general`) | timeline key kind `"room"` |
 | Query (DM) | timeline key kind `"dm"` |
 | PRIVMSG msgid tag | `externalId` (preferred over synthetic) |

@@ -373,12 +373,53 @@ export function syntheticMsgId(
 
 // ── Inbound message normalization ─────────────────────────────────────────
 
+// ── Network-scoped id helper ───────────────────────────────────────────────
+
+/**
+ * Scope a bare IRC identity to its network, producing a stable `SenderInfo.id`.
+ *
+ * Format: `<networkId>/<identity>`
+ *
+ * The separator `/` is safe because:
+ *   - IRC hostnames and ISUPPORT NETWORK tokens never contain `/`
+ *     (the ABNF in RFC 2812 §2.3.1 and the ISUPPORT spec both prohibit it).
+ *   - IRC nick characters (RFC 2812 §2.3.1 nick grammar) and services account
+ *     names (which must be valid nicks) likewise cannot contain `/`.
+ *
+ * Therefore the first `/` is always and unambiguously the scope separator,
+ * and splitting on it unambiguously recovers networkId and identity.
+ *
+ * Use this helper everywhere an IRC user id is minted — never ad-hoc string
+ * concatenation at call sites.
+ */
+export function scopeIrcId(networkId: string, identity: string): string {
+  return `${networkId}/${identity}`;
+}
+
+/**
+ * Inverse of {@link scopeIrcId}: strip the `<networkId>/` prefix, returning
+ * the bare identity (nick or services account). The first `/` is the
+ * separator; a string with no `/` is returned unchanged (defensive — scoped
+ * ids always carry one).
+ */
+export function unscopeIrcId(scopedId: string): string {
+  const slash = scopedId.indexOf("/");
+  return slash === -1 ? scopedId : scopedId.slice(slash + 1);
+}
+
 export interface IrcNormalizerContext {
   accountId: string;
   /** The bot's current nick (for self-detection and trigger matching). */
   selfNick: string;
   /** Network casemapping (rfc1459 / strict-rfc1459 / ascii). */
   casemapping: string;
+  /**
+   * Network identity prefix for scoped user ids.
+   * The NETWORK ISUPPORT token lowercased when advertised, else the configured
+   * host lowercased. Frozen once per connection before any inbound event is
+   * normalized (see provider.ts `networkIdFrozen`).
+   */
+  networkId: string;
   /**
    * In-memory account tracking state (Phase 2).
    * Used as the fallback rung of the identity ladder when no per-message account-tag
@@ -461,12 +502,13 @@ export function resolveIrcSenderId(
  *   - NOTICE in queries → NOT called from provider (provider skips them)
  *   - mIRC control codes stripped
  *
- * Identity (Phase 2): SenderInfo.id = ladder result (account-tag > tracked account > casemapped nick).
+ * Identity (network-scoped, spec §5.1): SenderInfo.id = scopeIrcId(ctx.networkId, ladderResult)
+ * where ladderResult = account-tag > tracked account > casemapped nick.
  * SenderInfo.username = current nick (display identity, always the nick).
  *
- * DM key (Phase 2): uses the ladder result as identity (account name when known,
- * casemapped nick otherwise). Per spec §4: one accepted consequence is that a user
- * who DMs while logged out and later registers gets a new DM timeline.
+ * DM key: uses the scoped sender id as the channelId component so the key
+ * encodes both the network and the identity.
+ * Format: `irc:<accountId>:dm:<networkId>/<identity>`
  */
 export function normalizeIrcMessage(
   msg: IrcInboundMessage,
@@ -483,16 +525,19 @@ export function normalizeIrcMessage(
   const isSelf =
     casefold(msg.nick, ctx.casemapping) === casefold(ctx.selfNick, ctx.casemapping);
 
-  let senderId: string;
+  let bareId: string;
   if (isSelf) {
     // Self: use SASL account name when configured (stable across nick changes),
     // else casemapped nick.
-    senderId = ctx.selfAccount ?? casefold(msg.nick, ctx.casemapping);
+    bareId = ctx.selfAccount ?? casefold(msg.nick, ctx.casemapping);
   } else {
-    senderId = resolveIrcSenderId(msg.nick, msg.account, ctx.accountTracker, ctx.casemapping);
+    bareId = resolveIrcSenderId(msg.nick, msg.account, ctx.accountTracker, ctx.casemapping);
   }
 
-  // Build timeline key — DM key uses the ladder result (spec §4).
+  // Network-scope the bare ladder result.
+  const senderId = scopeIrcId(ctx.networkId, bareId);
+
+  // Build timeline key — DM key uses the scoped sender id (spec §4).
   const timelineKey = channelIsChannel
     ? buildIrcChannelKey(ctx.accountId, msg.target, ctx.casemapping)
     : buildIrcDmKey(ctx.accountId, senderId);
@@ -520,7 +565,7 @@ export function normalizeIrcMessage(
     body = stripControlCodes(msg.message);
   }
 
-  // Trigger detection (spec §7.5) — pass resolved senderId so triggeredBy.id is stable.
+  // Trigger detection (spec §7.5) — pass the network-scoped senderId so triggeredBy.id is stable.
   const trigger = detectIrcTrigger(
     body,
     msg.nick,
@@ -529,7 +574,7 @@ export function normalizeIrcMessage(
     channelType,
     ctx.casemapping,
     msg.isNotice === true,
-    senderId,
+    senderId, // already scoped: <networkId>/<identity>
   );
 
   const event: CanonicalChatEvent = {

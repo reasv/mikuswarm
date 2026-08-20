@@ -58,12 +58,12 @@ export const DISCORD_TERMINOLOGY: ProviderTerminology = {
  */
 export const IRC_TERMINOLOGY: ProviderTerminology = {
   messageIdFmt: "message ID",
-  userIdFmt: "IRC nick or services account",
+  userIdFmt: "network-scoped IRC id (<network>/<nick-or-services-account>)",
   channelNoun: "channel",
   providerName: "IRC",
   mentionNote:
     "A bare nick occurring anywhere in the message text is treated as a mention by IRC clients — no special markup exists or is needed.",
-  senderIdHint: "for example an IRC nick or services account name",
+  senderIdHint: "for example a network-scoped IRC id like libera.chat/alice",
   // IRC-native spawn_session strings.
   coReplyIdDescription:
     "The message id of the co-reply message to spin off, as given in the co-reply interjection.",

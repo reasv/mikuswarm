@@ -26,6 +26,7 @@ import {
   chunkIrcMessage,
   syntheticMsgId,
   normalizeIrcMessage,
+  scopeIrcId,
   STATIC_MAX_CHARS,
   _resetCounters,
 } from "../src/irc/normalizer.js";
@@ -468,11 +469,30 @@ test("syntheticMsgId: ids are unique across calls", () => {
   assert.equal(ids.size, 100, "All 100 synthetic ids should be unique");
 });
 
+// ── scopeIrcId ────────────────────────────────────────────────────────────────
+
+test("scopeIrcId: produces <networkId>/<identity>", () => {
+  assert.equal(scopeIrcId("libera.chat", "alice"), "libera.chat/alice");
+  assert.equal(scopeIrcId("test.net", "bob"), "test.net/bob");
+  assert.equal(scopeIrcId("efnet", "myaccount"), "efnet/myaccount");
+});
+
+test("scopeIrcId: '/' separator is safe (nicks/accounts cannot contain /)", () => {
+  // Verifies the grammar proof: networkId = lowercase hostname/token (no slash),
+  // identity = nick or services account (no slash). So the first '/' is always
+  // the separator and roundtrip is unambiguous.
+  const scoped = scopeIrcId("irc.example.org", "some_nick");
+  const slash = scoped.indexOf("/");
+  assert.ok(slash !== -1, "must contain slash");
+  assert.equal(scoped.slice(0, slash), "irc.example.org");
+  assert.equal(scoped.slice(slash + 1), "some_nick");
+});
+
 // ── normalizeIrcMessage ───────────────────────────────────────────────────────
 
 test("normalizeIrcMessage: basic privmsg from another user in a channel", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "alice",
     ident: "alice",
@@ -489,7 +509,7 @@ test("normalizeIrcMessage: basic privmsg from another user in a channel", () => 
   assert.equal(inbound.provider, "irc");
   assert.equal(inbound.channelType, "group");
   assert.equal(inbound.event.body, "Hello everyone!");
-  assert.equal(inbound.event.sender.id, "alice");
+  assert.equal(inbound.event.sender.id, "test.net/alice");
   assert.equal(inbound.event.sender.isSelf, false);
   assert.equal(inbound.event.externalId, "server-id-123");
   assert.ok(inbound.event.trigger === undefined, "No mention → no trigger");
@@ -497,7 +517,7 @@ test("normalizeIrcMessage: basic privmsg from another user in a channel", () => 
 
 test("normalizeIrcMessage: channel privmsg with mention triggers", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "bob",
     ident: "bob",
@@ -513,12 +533,12 @@ test("normalizeIrcMessage: channel privmsg with mention triggers", () => {
   const inbound = normalizeIrcMessage(msg, ctx);
   assert.ok(inbound.event.trigger, "Mention should set trigger");
   assert.equal(inbound.event.trigger?.type, "mention");
-  assert.equal(inbound.event.trigger?.triggeredBy.id, "bob");
+  assert.equal(inbound.event.trigger?.triggeredBy.id, "test.net/bob");
 });
 
 test("normalizeIrcMessage: DM from a user triggers with type='dm'", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "carol",
     ident: "carol",
@@ -539,7 +559,7 @@ test("normalizeIrcMessage: DM from a user triggers with type='dm'", () => {
 
 test("normalizeIrcMessage: CTCP ACTION prefixes body with '* nick'", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "dave",
     ident: "dave",
@@ -558,7 +578,7 @@ test("normalizeIrcMessage: CTCP ACTION prefixes body with '* nick'", () => {
 
 test("normalizeIrcMessage: channel NOTICE is ingested but has no trigger", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "service",
     ident: "service",
@@ -578,7 +598,7 @@ test("normalizeIrcMessage: channel NOTICE is ingested but has no trigger", () =>
 
 test("normalizeIrcMessage: strips control codes from body before storing", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "alice",
     ident: "alice",
@@ -597,7 +617,7 @@ test("normalizeIrcMessage: strips control codes from body before storing", () =>
 
 test("normalizeIrcMessage: self-echo has isSelf: true on sender", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "miku", // same as selfNick
     ident: "miku",
@@ -616,7 +636,7 @@ test("normalizeIrcMessage: self-echo has isSelf: true on sender", () => {
 
 test("normalizeIrcMessage: uses synthetic id when no msgid tag present", () => {
   _resetCounters();
-  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "alice",
     ident: "alice",
@@ -638,7 +658,7 @@ test("normalizeIrcMessage: uses synthetic id when no msgid tag present", () => {
 
 test("normalizeIrcMessage: timeline key is irc:<accountId>:room:<channel> for channel", () => {
   _resetCounters();
-  const ctx = { accountId: "acc1", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "acc1", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "alice",
     ident: "a",
@@ -655,9 +675,9 @@ test("normalizeIrcMessage: timeline key is irc:<accountId>:room:<channel> for ch
   assert.equal(inbound.timelineKey, "irc:acc1:room:#general");
 });
 
-test("normalizeIrcMessage: timeline key is irc:<accountId>:dm:<nick> for DM", () => {
+test("normalizeIrcMessage: timeline key is irc:<accountId>:dm:<networkId>/<nick> for DM", () => {
   _resetCounters();
-  const ctx = { accountId: "acc1", selfNick: "miku", casemapping: "ascii" };
+  const ctx = { accountId: "acc1", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
   const msg = {
     nick: "Alice",
     ident: "a",
@@ -671,6 +691,6 @@ test("normalizeIrcMessage: timeline key is irc:<accountId>:dm:<nick> for DM", ()
     isNotice: false,
   };
   const inbound = normalizeIrcMessage(msg, ctx);
-  // DM key uses casemapped sender nick
-  assert.equal(inbound.timelineKey, "irc:acc1:dm:alice");
+  // DM key uses network-scoped sender id (casemapped nick under ascii mapping)
+  assert.equal(inbound.timelineKey, "irc:acc1:dm:test.net/alice");
 });
