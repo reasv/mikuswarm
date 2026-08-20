@@ -51,7 +51,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 
 - `search_messages` hits cite an `event_id` you can hand to `read_messages`; use `format:"snippet"` to scan many hits cheaply rather than dumping history.
 - `recall_memory` is semantic (meaning + recency); `search_memory` is exact-match. Reach for `recall_memory` first on "what do I know about…" questions.
-- Catch-up phrasings ("what did I miss", "did anyone ping me") map to `recap` / `search_messages` — people won't name the tool; infer it.
+- Catch-up phrasings ("what did I miss", "did anyone ping me") map to `recap` / `search_messages` — people won't name the tool; infer it. See **Catching People Up** in `AGENTS.md`.
 
 ## Memory Writing
 

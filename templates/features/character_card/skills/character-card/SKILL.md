@@ -1,6 +1,6 @@
 ---
 name: character-card
-description: Create, read, and edit Character Card V2 PNGs via the `character_card_create` / `character_card_read` / `character_card_edit` tools. Use bounded reads and file-based long-field rewrites; do not hand-roll PNG metadata.
+description: Create, read, and edit Character Card V2 PNGs via the `character_card_create` / `character_card_read` / `character_card_edit` tools — including turning a posted image's character or vibe into a card on request. Use bounded reads and file-based long-field rewrites; do not hand-roll PNG metadata.
 tools:
   - character_card_create
   - character_card_read
@@ -192,3 +192,7 @@ In one sentence: **inspect inline, rewrite from files**.
 - Read summaries first. Do not ask for a long field inline unless you truly need a slice of it.
 - If a field looks large, export it to a file immediately and edit the file instead of scrolling forever.
 - PNG cards preserve their existing image unless you explicitly use `replace_image`.
+
+## Recognizing cards in chat
+
+Card PNGs posted in chat are tagged in the message XML: `is_character_card="true"` with a `card_name="..."` attribute on the attachment. When you see one, the file's workspace `path` can be handed straight to `character_card_read`.

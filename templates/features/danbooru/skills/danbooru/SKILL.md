@@ -1,6 +1,6 @@
 ---
 name: danbooru
-description: Structured search, inline preview, and workspace download against danbooru.donmai.us via the `danbooru` tool. Use when picking, previewing, or saving anime images.
+description: Structured search, inline preview, and workspace download against danbooru.donmai.us via the `danbooru` tool. Use when picking, previewing, or saving anime images — a natural first option when sharing existing anime art; learn each user's tag preferences over time.
 tools:
   - danbooru
 ---
