@@ -77,6 +77,9 @@ export async function scanSkills(
       alwaysLoaded,
     };
 
+    const tools = frontmatterToolPatterns(frontmatter);
+    if (tools) meta.tools = tools;
+
     if (alwaysLoaded) {
       meta.content = body;
       inlined.push(meta);
@@ -89,18 +92,41 @@ export async function scanSkills(
 }
 
 
-interface ParsedFrontmatter {
+export interface ParsedFrontmatter {
   frontmatter: Record<string, unknown>;
   body: string;
 }
 
 /**
- * Parse YAML frontmatter from a markdown file.
- * Handles the simple case: `---` delimited block at the start of the file
- * with `key: value` lines. Supports string values (optionally quoted),
- * boolean `true`/`false`, and ignores everything else.
+ * Extract the skill's `tools` frontmatter as a pattern list (spec
+ * DYNAMIC-TOOL-LOADING §4): exact tool names or trailing-`*` globs. Accepts a
+ * parsed block-sequence / inline-flow list (string[]) or a single scalar string
+ * (one pattern). Returns undefined when absent or empty after trimming.
  */
-function parseFrontmatter(raw: string): ParsedFrontmatter | null {
+export function frontmatterToolPatterns(
+  frontmatter: Record<string, unknown>,
+): string[] | undefined {
+  const raw = frontmatter["tools"];
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" && raw !== "" ? [raw] : [];
+  const patterns = list
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return patterns.length > 0 ? patterns : undefined;
+}
+
+/**
+ * Parse YAML frontmatter from a markdown file.
+ * Handles the simple cases: `---` delimited block at the start of the file with
+ * `key: value` lines. Supports string values (optionally quoted), boolean
+ * `true`/`false`, inline flow lists (`key: [a, b]`), block sequences (`key:`
+ * followed by `- item` lines), and ignores everything else.
+ *
+ * Exported for the text-editor skill-activation hook (spec DYNAMIC-TOOL-LOADING
+ * §5), which parses viewed markdown files with the SAME parser the skills scan
+ * uses so the two can never disagree on what counts as a skill file.
+ */
+export function parseFrontmatter(raw: string): ParsedFrontmatter | null {
   const trimmed = raw.trimStart();
   if (!trimmed.startsWith("---")) return null;
 
@@ -111,28 +137,70 @@ function parseFrontmatter(raw: string): ParsedFrontmatter | null {
   const body = trimmed.slice(endIndex + 4).replace(/^[\r\n]+/, "");
 
   const frontmatter: Record<string, unknown> = {};
-  for (const line of fmBlock.split("\n")) {
+  const lines = fmBlock.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Block-sequence items are consumed by their owning key below; a stray item
+    // line without a preceding `key:` line is ignored.
+    if (/^\s*-\s/.test(line)) continue;
     const colonIndex = line.indexOf(":");
     if (colonIndex === -1) continue;
     const key = line.slice(0, colonIndex).trim();
-    let value: string | boolean = line.slice(colonIndex + 1).trim();
+    const rawValue = line.slice(colonIndex + 1).trim();
 
     if (!key) continue;
 
-    // Strip quotes
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    } else if (value === "true") {
-      value = true;
-    } else if (value === "false") {
-      value = false;
+    // Block sequence: `key:` with nothing after the colon, followed by `- item`
+    // lines. Collect until the first non-item line.
+    if (rawValue === "") {
+      const items: string[] = [];
+      let j = i + 1;
+      while (j < lines.length) {
+        const itemMatch = /^\s*-\s+(.*)$/.exec(lines[j]);
+        if (!itemMatch) break;
+        items.push(unquote(itemMatch[1].trim()));
+        j++;
+      }
+      if (items.length > 0) {
+        frontmatter[key] = items;
+        i = j - 1;
+      }
+      continue;
     }
+
+    // Inline flow list: `key: [a, b]`.
+    if (rawValue.startsWith("[") && rawValue.endsWith("]")) {
+      const items = rawValue
+        .slice(1, -1)
+        .split(",")
+        .map((item) => unquote(item.trim()))
+        .filter((item) => item.length > 0);
+      frontmatter[key] = items;
+      continue;
+    }
+
+    // Quote-stripping and boolean coercion are mutually exclusive, matching the
+    // original parser: a quoted "true" stays the string `true`.
+    let value: string | boolean;
+    const unquoted = unquote(rawValue);
+    if (unquoted !== rawValue) value = unquoted;
+    else if (rawValue === "true") value = true;
+    else if (rawValue === "false") value = false;
+    else value = rawValue;
 
     frontmatter[key] = value;
   }
 
   return { frontmatter, body };
+}
+
+/** Strip one layer of matching single or double quotes. */
+function unquote(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
 }

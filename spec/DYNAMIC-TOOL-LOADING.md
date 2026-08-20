@@ -1,6 +1,6 @@
 # Dynamic Session-Time Tool Loading — deferred catalog, skill-bound loading, tool search
 
-**Status**: PROPOSAL — decisions resolved (§11), ready for implementation.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §10 "Dynamic tool loading" (+ §9a skills additions, §14 invariant 10); retained for review. Implementation notes: loading-tool results carry names/descriptions only (full definitions travel via the provider tools channel — cheaper than the §5/§6 sketch); the `"orphans"` index mode shipped as designed.
 
 **Author**: design session 2026-08-20.
 

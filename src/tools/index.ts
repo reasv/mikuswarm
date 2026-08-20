@@ -74,3 +74,5 @@ export { createSummaryTool, SummaryDraft } from "./summary-tool.js";
 export { createDiaryTool } from "./diary-tool.js";
 export { createBashTool, type BashToolContext } from "./bash.js";
 export { MATRIX_TERMINOLOGY, DISCORD_TERMINOLOGY, IRC_TERMINOLOGY } from "./terminology.js";
+export { createLoadSkillTool, loadSkillToolDefinition, type LoadSkillContext } from "./load-skill.js";
+export { createToolSearchTool, toolSearchToolDefinition, type ToolSearchContext } from "./tool-search.js";

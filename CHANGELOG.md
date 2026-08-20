@@ -23,6 +23,14 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Added
+
+- Dynamic session-time tool loading (default off, `[agent.tools.dynamic]`): sessions start with a configurable immediate tool core; all other tools are deferred and loadable mid-session via the new `load_skill` and `tool_search` tools (or by viewing a tools-declaring markdown file), cache-safely per provider through pi-ai's `addedToolNames` contract. Skills gain a frontmatter `tools` list; under dynamic loading the skills index hides file paths and a `<deferred_tools>` discovery index is rendered (`index = "orphans" | "names" | "descriptions" | "none"`).
+
+### Changed
+
+- Updated `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core` to 0.84.2.
+
 ## [v0.3.0] - 2026-08-20
 
 ### Added

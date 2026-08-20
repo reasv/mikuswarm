@@ -2605,16 +2605,16 @@ If `AGENTS.md` does not exist, the optional `agent.system.fallback_prompt` confi
 
 Skills are task-specific instruction sets in `<workspace>/skills/<name>/SKILL.md`, listed compactly in the system prompt and read on demand by the agent via file tools.
 
-Each `SKILL.md` has YAML frontmatter with `name` (required), `description` (required), and `always_loaded` (optional boolean, default `false`). The frontmatter is parsed by a minimal built-in parser (no external YAML dependency).
+Each `SKILL.md` has YAML frontmatter with `name` (required), `description` (required), `always_loaded` (optional boolean, default `false`), and `tools` (optional list — exact tool names or trailing-`*` globs, spec DYNAMIC-TOOL-LOADING §4). The frontmatter is parsed by a minimal built-in parser (no external YAML dependency; scalars, quoted strings, booleans, inline flow lists, and block sequences).
 
-- **Listed skills** (`always_loaded: false`): appear in an `<available_skills>` section in the system prompt with name, description, and relative path. The agent reads the full file when needed.
-- **Inlined skills** (`always_loaded: true`): their full body content is rendered in the system prompt as `<skill_instructions>` sections.
+- **Listed skills** (`always_loaded: false`): appear in an `<available_skills>` section in the system prompt. In legacy mode the entry carries name, description, and relative path, and the agent reads the full file when needed. Under dynamic tool loading (§10 "Dynamic tool loading") the **path is hidden** — entries are name + description only, the block instructs the agent to call `load_skill`, and a footer names the `skills/<name>/SKILL.md` convention for *authoring* new skills (writing and activating are deliberately separate surfaces).
+- **Inlined skills** (`always_loaded: true`): their full body content is rendered in the system prompt as `<skill_instructions>` sections. Under dynamic loading their `tools` matches are promoted to the immediate set (inlined instructions imply present tools).
 
 ### Session types
 
 Session types control per-session configuration: which workspace files to load, which tools to provide, tail file override, session instruction, and skill filtering.
 
-Defined in TOML under `agent.session_types.<name>`. Fields (all optional): `workspace_files` (string array), `tail_file` (string or null), `session_instruction` (string), `tools` (string array), `skills` ("all", "none", or string array), `model` (string — a key into `config.models`, defaulting to `"default"`; lets a session type run on a different model than the main chat agent).
+Defined in TOML under `agent.session_types.<name>`. Fields (all optional): `workspace_files` (string array), `tail_file` (string or null), `session_instruction` (string), `tools` (string array), `tools_dynamic` (boolean — per-type stance on dynamic tool loading, §10; unset default: dynamic applies only to types WITHOUT an explicit `tools` allowlist), `skills` ("all", "none", or string array), `model` (string — a key into `config.models`, defaulting to `"default"`; lets a session type run on a different model than the main chat agent).
 
 The `AgentSessionRecord` carries a `sessionType` string (default `"default"`). The factory resolves the session type config, loads workspace content accordingly, and filters tools before creating the agent.
 
@@ -2625,6 +2625,7 @@ The `AgentSessionRecord` carries a `sessionType` string (default `"default"`). T
 3. `<tools_guide source="TOOLS.md">`
 4. `<skill_instructions>` — for each `always_loaded` skill
 5. `<available_skills>` — index of listed skills
+6. `<deferred_tools>` — dynamic-loading deferred index (§10), only when dynamic loading is on and the index is non-empty
 
 ### Loading invariant
 
@@ -3129,7 +3130,26 @@ An external impulse source (e.g. an X.com timeline scraper that feeds the bot th
 
 ## 10. Tools
 
-Up to 41 tools are available to default sessions (the `bash` tool exists only when the Docker sandbox is enabled — see §11a; `recall_memory` only when `[retrieval].enabled` — see §9d; `browser` only when `[browser].enabled` — see §11b; `image_generate` only when `[image_gen]` is configured — see below; `x_fetch` only when `[fxtwitter.tool].enabled` — see below; `x_search` only when `[x_search].enabled` (default true when the block exists) — see below; `find_source` only when `[saucenao].enabled` **and** a non-empty `api_key` is set (the default ships `enabled = true` but no key, so it soft-disables until a key is configured) — see below; `youtube_fetch` only when `[youtube].enabled` (default true) **and** the yt-dlp binary probe passed at startup — see §7e/below; the chat-search tools `search_messages`/`expand_summary`/`recap`/`user_activity` are always present — see §9e). Session types may specify a `tools` allowlist to restrict which tools are provided (e.g. the summarization session types only expose `summary_tool`). Each tool is a factory function returning an `AgentTool` with TypeBox schema and async execute.
+Up to 41 tools are available to default sessions (plus `load_skill`/`tool_search` under dynamic tool loading, below; the `bash` tool exists only when the Docker sandbox is enabled — see §11a; `recall_memory` only when `[retrieval].enabled` — see §9d; `browser` only when `[browser].enabled` — see §11b; `image_generate` only when `[image_gen]` is configured — see below; `x_fetch` only when `[fxtwitter.tool].enabled` — see below; `x_search` only when `[x_search].enabled` (default true when the block exists) — see below; `find_source` only when `[saucenao].enabled` **and** a non-empty `api_key` is set (the default ships `enabled = true` but no key, so it soft-disables until a key is configured) — see below; `youtube_fetch` only when `[youtube].enabled` (default true) **and** the yt-dlp binary probe passed at startup — see §7e/below; the chat-search tools `search_messages`/`expand_summary`/`recap`/`user_activity` are always present — see §9e). Session types may specify a `tools` allowlist to restrict which tools are provided (e.g. the summarization session types only expose `summary_tool`). Each tool is a factory function returning an `AgentTool` with TypeBox schema and async execute.
+
+### Dynamic tool loading (spec DYNAMIC-TOOL-LOADING)
+
+Default-off (`[agent.tools.dynamic] enabled = false` ⇒ byte-identical legacy behavior). When enabled, a session's post-filter tool catalog is split by `AgentSessionFactory.create()` into an **immediate** set — config `immediate` patterns (exact names or trailing-`*` globs) ∪ the two loading tools ∪ any `always_loaded` skill's `tools` matches — and a **deferred** remainder, withheld from `Context.tools` until loaded. Gate: the global switch AND the session type's stance (`tools_dynamic`, unset default = dynamic only for types WITHOUT an explicit `tools` allowlist — a hand-picked set is already the operator's chosen full set).
+
+**Transport — pi-ai's `addedToolNames` contract.** The app implements no per-provider logic. A loading tool's `AgentToolResult` carries `addedToolNames`; pi-agent-core stamps it onto the transcript `ToolResultMessage`; each pi-ai driver serializes the load point in the most cache-friendly way its wire API allows (Anthropic `defer_loading`/`tool_reference` behind `supportsToolReferences`; OpenAI Responses `tool_search_call/output` behind `supportsToolSearch`; Kimi in-transcript system tools message behind `deferredToolsMode`; plain openai-completions and the rest simply grow `params.tools` — a one-time prefix-cache re-write per load event, re-cached from the next request).
+
+**Registry** (`src/agent/dynamic-tools.ts`, `DynamicToolRegistry`): one per created agent, holding the result-budget-**wrapped** catalog (loaded tools get result shaping identically to immediate ones; the wrapper spreads results so `addedToolNames` survives). `initialState.tools` is the immediate set. Mid-run load events reach the current run via the `prepareNextTurnWithContext` hook (the loaded set only grows, so a length comparison detects change); the registry's `onChange` reasserts `agent.state.tools` for the next run's snapshot and charges the running-context counter (`ctxCounter`) with the added definitions' `renderToolBlock` estimate — per-member context fits see loads exactly like organic growth. The frozen build estimate uses the initial set only.
+
+**The loaded set is derived from the transcript**: (immediate ∪ every `addedToolNames` on any tool result). Resume recomputes it via `seedFromTranscript` (silent — resumed usage actuals already cover accounting) rather than persisting parallel state — definitionally consistent with what pi-ai's `splitDeferredTools` derives from the same messages. A model calling a deferred tool it never loaded gets pi-agent-core's synthesized `Tool <name> not found` error result and the loop continues; the index plus the loaders make recovery one call away.
+
+**Load triggers**:
+- `load_skill` (`src/tools/load-skill.ts`) — THE sanctioned way to use a skill: returns the skill's full body and loads its frontmatter `tools` matches. The skill index is the session-creation scan; the body + tools list are read live from disk at call time. Unknown skill ⇒ error listing valid names; re-load is idempotent. Logs `skill_loaded { sessionId, skill, tools }`.
+- `tool_search` (`src/tools/tool-search.ts`) — universal fallback: `select:name_a,name_b` loads exact names; any other query keyword-matches deferred names (weight 3) and descriptions (weight 1), loading the top `max_results` (default 5). Results carry names + clamped descriptions only — full definitions travel via the provider tools channel.
+- **Editor backstop** (`wrapEditorWithSkillActivation`): after a successful text-editor `view` of any `.md` file whose frontmatter carries a `tools` key, the same load path runs and the view result is stamped — keyed on CONTENT, not path, so a skill authored mid-session activates when the agent proofreads it. Best-effort: hook failures never break the view. Sandbox shell reads remain a residual backchannel (instructions only; tools stay unloaded — and nothing in context suggests that route, since skill paths are hidden, §9a).
+
+**Discovery**: skill descriptions (the always-visible entry point) plus the `<deferred_tools>` index (`index` mode: `"orphans"` default — only tools no skill covers, empty ⇒ omitted; `"names"` — all deferred, grouped by owning skill, first-alphabetical wins ties; `"descriptions"` — plus ≤80-char clamps; `"none"`). Rendered by the factory into `workspace.dynamicTools` BEFORE either system-prompt render (the field rides the shared workspace object, so the factory's render and the ContextBuilder's stay byte-identical) — a pure function of catalog + skills scan, preserving the deterministic-rendering invariant. A skill whose patterns match nothing in the session catalog logs `skill_tools_unmatched` once per session (not an error — catalogs vary per agent/session type).
+
+**Console**: the inspector/preview tool block (`resolveToolDefs`) mirrors the INITIAL wire set — config-immediate subset + the loaders. Known limitation: `always_loaded`-skill promotions are workspace state and are not reflected there (the resolver is sync and workspace-independent).
 
 ### Tool-result shaping (spec TOOL-RESULT-BUDGET)
 
@@ -3930,7 +3950,7 @@ These are properties the codebase must maintain. Violations are bugs.
 7. **Secret redaction**: all registered secrets are redacted in all log output and context dumps.
 8. **Role alternation**: rendered LLM context always has strict user/assistant turn alternation.
 9. **Explicit send only**: the runner has no implicit send path. All message delivery goes through the `send_message` tool.
-10. **Workspace read-once**: workspace files and skills are read from disk once at session creation. A running session never re-reads workspace files. Changes take effect on the next session.
+10. **Workspace read-once**: workspace files and the skills *index* are read from disk once at session creation. A running session never re-reads workspace files into its prompt. Skill *bodies* are read live at call time (`load_skill` and the text-editor read path — the semantics the editor path always had); the prompt-visible index/instructions still change only on the next session.
 11. **Summary coverage is derived**: the summary/compact boundary is never persisted. It is recomputed each build from the `latest_event_id` of the selected summaries, and all summary/event range logic uses `(timestamp, received_at, id)` cursors — never `id BETWEEN` (nanoids are not chronologically sortable).
 
 ---

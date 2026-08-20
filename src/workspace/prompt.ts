@@ -114,19 +114,44 @@ export function renderSystemPromptWithSegments(
     });
   }
 
-  // Available skills index (always_loaded: false)
+  // Available skills index (always_loaded: false).
+  //
+  // Dynamic mode (spec DYNAMIC-TOOL-LOADING §5, D2): skill PATHS are hidden so
+  // `load_skill` is the only visible activation route — reading the file would
+  // yield instructions without the tools, so no path is offered to read. The
+  // skills DIRECTORY is still named once (authoring footer): writing skills and
+  // activating them are deliberately separate surfaces.
+  const dynamic = workspace.dynamicTools !== undefined;
   if (workspace.skills.listed.length > 0) {
     const skillEntries = workspace.skills.listed
-      .map(
-        (skill) =>
-          `<skill name="${escapeAttr(skill.name)}" path="${escapeAttr(skill.path)}">${escapeXml(skill.description)}</skill>`,
+      .map((skill) =>
+        dynamic
+          ? `<skill name="${escapeAttr(skill.name)}">${escapeXml(skill.description)}</skill>`
+          : `<skill name="${escapeAttr(skill.name)}" path="${escapeAttr(skill.path)}">${escapeXml(skill.description)}</skill>`,
       )
       .join("\n");
+    const header = dynamic
+      ? "Load a skill with the load_skill tool: it returns the skill's instructions and enables the tools it declares. Skills are not usable until loaded.\n"
+      : "";
+    const footer = dynamic
+      ? "\nTo author a NEW skill (or edit one), write skills/<name>/SKILL.md — YAML frontmatter with name, description, and optionally a tools list — then load it with load_skill."
+      : "";
     blocks.push({
       tag: "available_skills",
       label: "available_skills",
       source: null,
-      text: `<available_skills>\n${skillEntries}\n</available_skills>`,
+      text: `<available_skills>\n${header}${skillEntries}${footer}\n</available_skills>`,
+    });
+  }
+
+  // Deferred-tools index (spec DYNAMIC-TOOL-LOADING §8): pre-rendered by the
+  // factory from the session catalog, deterministic, omitted when empty/"none".
+  if (workspace.dynamicTools?.indexText) {
+    blocks.push({
+      tag: "deferred_tools",
+      label: "deferred_tools",
+      source: null,
+      text: workspace.dynamicTools.indexText,
     });
   }
 

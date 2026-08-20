@@ -1,5 +1,5 @@
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, PrepareNextTurnContext, StreamFn } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
 import { streamSimple, completeSimple } from "@earendil-works/pi-ai/compat";
 import type { AppConfig } from "../config/index.js";
@@ -38,6 +38,14 @@ import type {
 } from "../budget/index.js";
 import { TurnResultBudget } from "./tool-result-budget.js";
 import { wrapToolsWithResultBudget } from "./tool-result-wrap.js";
+import {
+  DynamicToolRegistry,
+  matchToolPatterns,
+  renderDeferredToolsIndex,
+  wrapEditorWithSkillActivation,
+} from "./dynamic-tools.js";
+import { createLoadSkillTool } from "../tools/load-skill.js";
+import { createToolSearchTool } from "../tools/tool-search.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -1284,6 +1292,128 @@ export class AgentSessionFactory {
     const mcpToolServerMap = this.options.mcpToolServerMap ?? new Map<string, string>();
     const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, mcpToolServerMap);
     const filteredTools = filterTools(mcpFilteredTools, sessionTypeConfig);
+    const logger = this.options.logger;
+
+    // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING). Gate: the global config
+    // switch AND the session type's stance — unset defaults to "dynamic only
+    // for session types WITHOUT an explicit tools allowlist" (a hand-picked set
+    // is already the operator's chosen full set; deferring it would only strand
+    // tools they explicitly asked for, §4).
+    const dynCfg = this.options.config.agent.tools?.dynamic;
+    const dynamicEnabled =
+      (dynCfg?.enabled ?? false) &&
+      (sessionTypeConfig?.tools_dynamic ?? sessionTypeConfig?.tools === undefined);
+    // Late-bound registry holder: the loading tools close over it, but the
+    // registry itself wraps the WRAPPED catalog (which includes those tools).
+    const dynRef: { registry?: DynamicToolRegistry } = {};
+    const sessionCatalog: AgentTool[] = dynamicEnabled
+      ? [
+          ...filteredTools.map((tool) =>
+            tool.name === "str_replace_based_edit_tool"
+              ? wrapEditorWithSkillActivation(tool, {
+                  workspaceRoot,
+                  getRegistry: () => dynRef.registry,
+                  logger,
+                  sessionId: session.id,
+                })
+              : tool,
+          ),
+          createLoadSkillTool({
+            workspaceRoot,
+            skills: workspace.skills,
+            getRegistry: () => dynRef.registry,
+            logger,
+            sessionId: session.id,
+          }),
+          createToolSearchTool({
+            getRegistry: () => dynRef.registry,
+            logger,
+            sessionId: session.id,
+          }),
+        ]
+      : filteredTools;
+
+    // Wrap each catalog tool with the result-shaping layer (spec TOOL-RESULT-BUDGET
+    // §2) BEFORE the dynamic split, so dynamically loaded tools get result shaping
+    // identically to immediate ones (the wrapper spreads the result, preserving
+    // `addedToolNames`). Simple per-session counter cap for truncation log
+    // rate-limiting: 20 events/session prevents log floods while still catching
+    // the first burst (spec §6).
+    let _truncationLogCount = 0;
+    const wrappedTools = wrapToolsWithResultBudget(sessionCatalog, {
+      resultMaxTokens,
+      turnBudget,
+      getRunningContext: () => {
+        // refreshRunningContext() is synchronous; calling it here ensures the
+        // counter reflects any live messages appended since the last LLM request.
+        refreshRunningContext();
+        return ctxCounter.running;
+      },
+      onTruncation: logger
+        ? (info) => {
+            _truncationLogCount++;
+            if (_truncationLogCount <= 20) {
+              logger.info("tool_result_truncated", {
+                sessionId: session.id,
+                tool: info.tool,
+                layer: info.layer,
+                fromTokens: info.fromTokens,
+                toTokens: info.toTokens,
+                turnAccumulated: info.turnAccumulated,
+              });
+            }
+          }
+        : undefined,
+    });
+
+    // The per-session registry (spec §7): immediate = config patterns ∪ the
+    // loading tools ∪ any always_loaded skill's declared tools. Resume recomputes
+    // the loaded set from the persisted transcript — the transcript is the single
+    // source of truth (immediate ∪ every addedToolNames on any tool result),
+    // definitionally consistent with what pi-ai's serializers derive from the
+    // same messages.
+    let registry: DynamicToolRegistry | undefined;
+    if (dynamicEnabled) {
+      const catalogNames = wrappedTools.map((t) => t.name);
+      const immediate = new Set(matchToolPatterns(catalogNames, dynCfg?.immediate ?? []));
+      immediate.add("load_skill");
+      immediate.add("tool_search");
+      for (const skill of workspace.skills.inlined) {
+        if (!skill.tools) continue;
+        for (const name of matchToolPatterns(catalogNames, skill.tools)) immediate.add(name);
+      }
+      // §4: a skill whose tools patterns match nothing in this session's catalog —
+      // not an error (catalogs legitimately vary per agent/session type), but
+      // worth one warning per session.
+      for (const skill of [...workspace.skills.listed, ...workspace.skills.inlined]) {
+        if (skill.tools && matchToolPatterns(catalogNames, skill.tools).length === 0) {
+          logger?.warn("skill_tools_unmatched", {
+            sessionId: session.id,
+            skill: skill.name,
+            patterns: skill.tools,
+          });
+        }
+      }
+      registry = new DynamicToolRegistry(wrappedTools, immediate);
+      dynRef.registry = registry;
+      if (opts?.resume?.transcript?.length) {
+        registry.seedFromTranscript(opts.resume.transcript);
+      }
+      // §5/§8 prompt state: hidden skill paths + the deferred-tools index. Set on
+      // the shared `workspace` object BEFORE either system-prompt render (here and
+      // inside ContextBuilder.build) so both stay byte-identical.
+      const deferred = registry.deferredTools();
+      workspace.dynamicTools = {
+        indexText: renderDeferredToolsIndex(
+          deferred,
+          [...workspace.skills.listed, ...workspace.skills.inlined],
+          dynCfg?.index ?? "orphans",
+        ),
+      };
+    }
+    // The session's initial wire tool set: immediate-only under dynamic loading,
+    // the full wrapped catalog otherwise.
+    const initialTools = registry ? registry.current : wrappedTools;
 
     // NOTE: System prompt is rendered identically here and in ContextBuilder.build().
     // Both are required: this one sets initialState.systemPrompt (used by pi-agent-core
@@ -1359,11 +1489,13 @@ export class AgentSessionFactory {
         workspace,
         sessionType: sessionTypeConfig,
         fallbackPrompt,
-        // The session's real, post-allowlist tool set — so the frozen estimate
-        // accounts for the tool-definition block the provider charges for (the
-        // dominant estimate-vs-actual gap). `filteredTools` (AgentTool[])
-        // structurally satisfies the wire subset.
-        tools: filteredTools,
+        // The session's real, post-allowlist INITIAL tool set — so the frozen
+        // estimate accounts for the tool-definition block the provider charges
+        // for (the dominant estimate-vs-actual gap). Under dynamic loading this
+        // is the immediate set (deferred definitions are charged at load time by
+        // the registry's onChange hook, spec DYNAMIC-TOOL-LOADING §9).
+        // `initialTools` (AgentTool[]) structurally satisfies the wire subset.
+        tools: initialTools,
         // The building session's id, for claim markers + the coordination gate
         // (spec DUPLICATE-REPLY-MITIGATION §4). `buildContext` drops it for the
         // generation modes (cutoff/condense/diary), which have no live answering.
@@ -1424,44 +1556,12 @@ export class AgentSessionFactory {
     const maxTurns = sessionTypeConfig?.max_turns;
     const agentRef: { agent?: Agent } = {};
     let toolCallCount = 0;
-    const logger = this.options.logger;
-
-    // Wrap each filtered tool with the result-shaping layer (spec TOOL-RESULT-BUDGET §2).
-    // Simple per-session counter cap for truncation log rate-limiting: no existing
-    // rate-limited helper in this codebase fits this use case; 20 events/session
-    // prevents log floods while still catching the first burst (spec §6).
-    let _truncationLogCount = 0;
-    const wrappedTools = wrapToolsWithResultBudget(filteredTools, {
-      resultMaxTokens,
-      turnBudget,
-      getRunningContext: () => {
-        // refreshRunningContext() is synchronous; calling it here ensures the
-        // counter reflects any live messages appended since the last LLM request.
-        refreshRunningContext();
-        return ctxCounter.running;
-      },
-      onTruncation: logger
-        ? (info) => {
-            _truncationLogCount++;
-            if (_truncationLogCount <= 20) {
-              logger.info("tool_result_truncated", {
-                sessionId: session.id,
-                tool: info.tool,
-                layer: info.layer,
-                fromTokens: info.fromTokens,
-                toTokens: info.toTokens,
-                turnAccumulated: info.turnAccumulated,
-              });
-            }
-          }
-        : undefined,
-    });
 
     const agent = new Agent({
       initialState: {
         systemPrompt,
         model,
-        tools: wrappedTools,
+        tools: initialTools,
         // Extended thinking (config `thinking_level`, default off): flows per
         // request as pi-ai `options.reasoning` through the whole streamFn chain
         // (retry → admission → streamSimple). The model descriptor's
@@ -1498,8 +1598,36 @@ export class AgentSessionFactory {
       onPayload: (payload) => payload,
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
+      // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING §7): a load event mid-run
+      // must reach the CURRENT run's next provider request — the loop snapshots
+      // tools at run start, so this hook swaps in the registry's current array.
+      // The loaded set only grows, so a length comparison detects change.
+      ...(registry
+        ? {
+            prepareNextTurnWithContext: (ctx: PrepareNextTurnContext) => {
+              const current = registry.current;
+              if ((ctx.context.tools?.length ?? 0) >= current.length) return undefined;
+              return { context: { ...ctx.context, tools: current } };
+            },
+          }
+        : {}),
     });
     agentRef.agent = agent;
+    if (registry) {
+      // Between-run pickup + accounting (spec §7/§9): reassert `agent.state.tools`
+      // so the NEXT run's snapshot sees the loaded set (steering/follow-up/forced-
+      // completion runs), and charge the running context counter with the added
+      // definitions — they enter the wire tools channel from the next request on.
+      // Assigned here (after `agent` exists) so the closure never touches the
+      // binding before initialization; load events only fire during tool
+      // execution, which is always after this point.
+      registry.onChange = (added) => {
+        agent.state.tools = registry.current;
+        if (ctxCounter.seenMsgs >= 0) {
+          ctxCounter.running += renderToolBlock(added).tokenEstimate;
+        }
+      };
+    }
 
     // Turn-count loop-breaker (§8c): NOT a wall-clock timeout — purely a guard
     // against a degenerate loop. We count completed turns (`turn_end`) and abort the

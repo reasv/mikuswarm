@@ -26,6 +26,12 @@ const SessionTypeSchema = StrictObject({
   tail_file: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   session_instruction: Type.Optional(Type.String()),
   tools: Type.Optional(Type.Array(Type.String())),
+  // Per-session-type opt-in/out of dynamic tool loading (spec
+  // DYNAMIC-TOOL-LOADING §4). Unset default: dynamic applies only to session
+  // types WITHOUT an explicit `tools` allowlist (a hand-picked set is already
+  // the operator's chosen full set). true forces deferral on; false forces the
+  // full catalog immediate. Inert while [agent.tools.dynamic].enabled is false.
+  tools_dynamic: Type.Optional(Type.Boolean()),
   skills: Type.Optional(
     Type.Union([
       Type.Literal("all"),
@@ -1616,6 +1622,32 @@ const AgentToolsSchema = StrictObject({
   // regardless of how much the turn accumulator has consumed. Must be ≥ 1
   // (a floor of 0 would defeat the purpose of keeping a useful head).
   result_min_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Dynamic session-time tool loading (spec DYNAMIC-TOOL-LOADING). Default OFF:
+  // every session gets its full catalog immediately, byte-identical to legacy
+  // behavior. When enabled, only `immediate`-matched tools (plus load_skill /
+  // tool_search and any always_loaded skill's declared tools) are in the
+  // provider tools[] at session start; everything else is deferred — loadable
+  // mid-session via load_skill (skills declare tools in frontmatter) or
+  // tool_search, cache-safely per provider via pi-ai's addedToolNames contract.
+  dynamic: Type.Optional(StrictObject({
+    enabled: Type.Optional(Type.Boolean()),
+    // Always-loaded core: exact tool names or trailing-`*` globs (e.g.
+    // "mcp_medialib_*"). Everything else in the session's catalog starts
+    // deferred. Unmatched patterns are inert (catalogs vary per agent/session
+    // type). The loading tools are implicitly immediate.
+    immediate: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+    // Deferred-tool discovery index in the system prompt (spec §8):
+    //   "orphans" (default) — only deferred tools NO skill covers; empty ⇒ omitted
+    //   "names" — every deferred tool, grouped by owning skill
+    //   "descriptions" — as "names" plus truncated per-tool descriptions
+    //   "none" — no block (skill descriptions + tool_search only)
+    index: Type.Optional(Type.Union([
+      Type.Literal("orphans"),
+      Type.Literal("names"),
+      Type.Literal("descriptions"),
+      Type.Literal("none"),
+    ])),
+  })),
 });
 
 // Message-only history backfetch (spec MESSAGE-BACKFETCH §9; ARCHITECTURE.md §7d).

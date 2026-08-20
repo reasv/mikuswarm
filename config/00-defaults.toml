@@ -184,6 +184,21 @@ result_reserve_tokens = 32768
 # overshoot the floor can cause; the §8b context-limit enforcement absorbs it.
 result_min_tokens = 1024
 
+# Dynamic session-time tool loading (spec DYNAMIC-TOOL-LOADING). Default OFF —
+# every session carries its full tool catalog in the provider tools[] on every
+# request, exactly the legacy behavior. When enabled, only `immediate`-matched
+# tools (plus load_skill / tool_search, always present) are sent at session
+# start; every other tool is deferred and loadable mid-session via load_skill
+# (skills declare their tools in SKILL.md frontmatter) or tool_search. Loading
+# is cache-safe per provider via pi-ai's addedToolNames contract; providers
+# without a native mechanism pay a one-time prefix-cache re-write per load
+# event. Session types with an explicit `tools` allowlist keep their full set
+# immediate unless they set `tools_dynamic = true`.
+# [agent.tools.dynamic]
+# enabled = false
+# immediate = ["send_message", "read_messages", "search_messages"]  # exact names or trailing-* globs (e.g. "mcp_someserver_*")
+# index = "orphans"   # deferred index in the system prompt: "orphans" (only tools no skill covers) | "names" | "descriptions" | "none"
+
 # Recovery — request-level resilience (spec LLM-FAILURE-HANDLING).
 # Layer 0: transparent per-request retry for ENVIRONMENTAL LLM failures
 # (connection reset, timeout, 5xx, 429, mid-stream deaths — partials discarded).

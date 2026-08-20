@@ -59,6 +59,19 @@ export interface WorkspaceContent {
   tailContent: string | null;
   /** Scanned skill metadata. */
   skills: SkillIndex;
+  /**
+   * Dynamic tool loading prompt state (spec DYNAMIC-TOOL-LOADING §5/§8). Set by
+   * the session factory AFTER the per-session tool catalog is resolved, BEFORE
+   * either system-prompt render — the field rides the shared `workspace` object
+   * so the factory's render and the ContextBuilder's render stay byte-identical.
+   * Presence means dynamic loading is ON for this session: `<available_skills>`
+   * hides skill paths and instructs `load_skill`, and `indexText` (when set)
+   * is appended as the `<deferred_tools>` block. Absent = legacy rendering.
+   */
+  dynamicTools?: {
+    /** Rendered `<deferred_tools>` block, or undefined to omit (empty index). */
+    indexText?: string;
+  };
 }
 
 export interface SkillMeta {
@@ -72,6 +85,13 @@ export interface SkillMeta {
   alwaysLoaded: boolean;
   /** Full body content (frontmatter stripped). Only populated for always_loaded skills. */
   content?: string;
+  /**
+   * Tool patterns from frontmatter `tools` (spec DYNAMIC-TOOL-LOADING §4): exact
+   * names or trailing-`*` globs. Loading the skill loads every cataloged tool the
+   * list matches; for `always_loaded` skills the matches are promoted to the
+   * immediate set at session build. Absent = pure-instructions skill.
+   */
+  tools?: string[];
 }
 
 export interface SkillIndex {
@@ -94,6 +114,16 @@ export interface SessionTypeConfig {
   session_instruction?: string;
   /** Which tools to provide. When undefined, all tools are provided. */
   tools?: string[];
+  /**
+   * Per-session-type opt-in/out of dynamic tool loading (spec
+   * DYNAMIC-TOOL-LOADING §4). Unset default: dynamic applies only to session
+   * types WITHOUT an explicit `tools` allowlist — a type that hand-picks its
+   * tools has already chosen its full set, so deferral would only strand tools
+   * the operator explicitly asked for. `true` forces deferral on despite an
+   * allowlist; `false` forces the full catalog immediate. Ignored entirely when
+   * `[agent.tools.dynamic].enabled` is false.
+   */
+  tools_dynamic?: boolean;
   /** Which skills to surface. "all" = all, "none" = none, string[] = named subset. */
   skills?: "all" | "none" | string[];
   /** Model key from the `models` record in config. Defaults to "default". */
