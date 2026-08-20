@@ -20,7 +20,7 @@ Grouped tools for acting ON the channel rather than just talking in it.
 
 - **Your own messages**: `edit_message` fixes a message you already sent
   (typos, corrections — keep edits meaningful, not fidgety); `delete_message`
-  removes one. Both work only on your own messages.
+  removes one (irreversible). Both work only on your own messages.
 - **Pins**: `pins` lists, adds, or removes pinned messages — use for genuinely
   reference-worthy content, and unpin stale entries when asked.
 - **Polls**: `create_poll` starts a poll; `poll_vote` casts your own vote in an
