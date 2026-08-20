@@ -1,6 +1,8 @@
 ---
 name: image-gen
 description: Generate and edit images with Google's "nano banana" (Gemini Image) models via the `image_generate` tool, plus prompt craft for getting good results. Use when drawing, illustrating, or editing an original image.
+tools:
+  - image_generate
 ---
 
 # Image Generation Workflow

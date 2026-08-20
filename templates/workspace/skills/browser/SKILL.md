@@ -1,6 +1,8 @@
 ---
 name: browser
 description: Drive a real stealth web browser (one persistent identity — shared cookies/logins) via the `browser` tool to read and interact with JS-heavy, login-gated, or bot-checked sites. Use when web_fetch is not enough — for clicking, typing, forms, multi-step flows, or pages that need a real browser to render.
+tools:
+  - browser
 ---
 
 # Browser Workflow

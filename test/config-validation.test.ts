@@ -253,6 +253,46 @@ test("config: shipped [retrieval] defaults pass schema validation (issue #10)", 
   });
 });
 
+// Mirrors the [agent.tools.dynamic] block 00-defaults.toml ships (spec
+// DYNAMIC-TOOL-LOADING). Must pass validation and round-trip its values.
+const DYNAMIC_TOOLS_DEFAULTS_BLOCK = `
+[agent.tools.dynamic]
+enabled = true
+immediate = [
+  "send_message",
+  "react",
+  "read_messages",
+  "search_messages",
+  "web_fetch",
+  "web_search",
+  "str_replace_based_edit_tool",
+  "search_files",
+  "recall_memory",
+  "search_memory",
+  "read_memory",
+  "write_memory",
+]
+index = "orphans"
+`;
+
+test("config: shipped [agent.tools.dynamic] defaults pass schema validation", async () => {
+  await withConfigDir(`${BASE_CONFIG}${DYNAMIC_TOOLS_DEFAULTS_BLOCK}`, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.agent.tools?.dynamic?.enabled, true);
+    assert.equal(config.agent.tools?.dynamic?.index, "orphans");
+    assert.ok(config.agent.tools?.dynamic?.immediate?.includes("send_message"));
+  });
+});
+
+test("config: [agent.tools.dynamic] rejects an unknown index mode", async () => {
+  await withConfigDir(
+    `${BASE_CONFIG}\n[agent.tools.dynamic]\nindex = "everything"\n`,
+    async (dir) => {
+      await assert.rejects(() => loadConfig(dir, { env: false }));
+    },
+  );
+});
+
 // Each case fat-fingers ONE knob out of its bound; the schema must reject the load.
 const OUT_OF_BOUNDS_CASES: Array<{ name: string; block: string }> = [
   { name: "candidate_multiplier above max", block: `[retrieval.query]\ncandidate_multiplier = 9999\n` },

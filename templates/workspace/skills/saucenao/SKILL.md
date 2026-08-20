@@ -1,6 +1,8 @@
 ---
 name: saucenao
 description: Reverse-image search via the `find_source` tool — find the source/artist of an image someone posted ("source?", "sauce?", "who drew this?", "where's this from?").
+tools:
+  - find_source
 ---
 
 # SauceNAO Source Lookup

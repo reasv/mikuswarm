@@ -1,6 +1,10 @@
 ---
 name: character-card
 description: Create, read, and edit Character Card V2 PNGs via the `character_card_create` / `character_card_read` / `character_card_edit` tools. Use bounded reads and file-based long-field rewrites; do not hand-roll PNG metadata.
+tools:
+  - character_card_create
+  - character_card_read
+  - character_card_edit
 ---
 
 # Character Card Workflow

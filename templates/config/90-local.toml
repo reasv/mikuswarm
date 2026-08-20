@@ -177,3 +177,13 @@ cache_write = 0
 # enabled = true
 # [[proactive.channels]]
 # room_id = "!yourRoomId:example.org"
+
+# --- Dynamic tool loading ---------------------------------------------------
+# Shipped ON with a lean immediate core (see 00-defaults.toml [agent.tools.dynamic]).
+# Other tools load mid-session via skills (load_skill) or tool_search. To change
+# the always-loaded core, override the WHOLE list here (arrays replace on merge)
+# — e.g. add your MCP servers' tools with a trailing-* glob — or disable the
+# feature entirely to keep every tool always loaded:
+# [agent.tools.dynamic]
+# enabled = false
+# immediate = ["send_message", "react", "read_messages", "search_messages", "mcp_yourserver_*"]

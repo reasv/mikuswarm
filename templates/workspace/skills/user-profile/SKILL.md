@@ -1,6 +1,9 @@
 ---
 name: user-profile
 description: Read and patch per-user markdown profiles under `users/<provider>/<slug>--<hash>.md` via the `user_profile_read` / `user_profile_edit` tools. Use when learning durable facts about a sender or another named user.
+tools:
+  - user_profile_read
+  - user_profile_edit
 ---
 
 # User Profile Workflow

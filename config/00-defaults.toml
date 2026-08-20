@@ -184,20 +184,46 @@ result_reserve_tokens = 32768
 # overshoot the floor can cause; the §8b context-limit enforcement absorbs it.
 result_min_tokens = 1024
 
-# Dynamic session-time tool loading (spec DYNAMIC-TOOL-LOADING). Default OFF —
-# every session carries its full tool catalog in the provider tools[] on every
-# request, exactly the legacy behavior. When enabled, only `immediate`-matched
-# tools (plus load_skill / tool_search, always present) are sent at session
-# start; every other tool is deferred and loadable mid-session via load_skill
-# (skills declare their tools in SKILL.md frontmatter) or tool_search. Loading
-# is cache-safe per provider via pi-ai's addedToolNames contract; providers
-# without a native mechanism pay a one-time prefix-cache re-write per load
-# event. Session types with an explicit `tools` allowlist keep their full set
-# immediate unless they set `tools_dynamic = true`.
-# [agent.tools.dynamic]
-# enabled = false
-# immediate = ["send_message", "read_messages", "search_messages"]  # exact names or trailing-* globs (e.g. "mcp_someserver_*")
-# index = "orphans"   # deferred index in the system prompt: "orphans" (only tools no skill covers) | "names" | "descriptions" | "none"
+# Dynamic session-time tool loading (spec DYNAMIC-TOOL-LOADING; ARCHITECTURE.md
+# §10 "Dynamic tool loading"). Shipped ON: sessions start with only the
+# `immediate` core in the provider tools[] block; every other tool is deferred —
+# discoverable through skill descriptions and the <deferred_tools> index, and
+# loadable mid-session via load_skill (skills declare their tools in SKILL.md
+# frontmatter; the seeded default skills all do) or tool_search. Loading is
+# cache-safe per provider via pi-ai's addedToolNames contract; providers without
+# a native mechanism pay a one-time prefix-cache re-write per load event.
+# Session types with an explicit `tools` allowlist keep their full set immediate
+# unless they set `tools_dynamic = true`. Set `enabled = false` to restore the
+# legacy everything-always-loaded behavior.
+[agent.tools.dynamic]
+enabled = true
+# The always-loaded core: the tools a chat reply reaches for with no discovery
+# step — sending/reacting, reading and searching history, basic web access,
+# workspace files (also the skill-authoring surface), and memory continuity.
+# Entries are exact names or trailing-* globs (e.g. "mcp_someserver_*"); ones
+# matching nothing in a deployment's catalog are inert. load_skill and
+# tool_search are implicitly immediate. Deployments override this list
+# wholesale (arrays replace on config merge, they do not concatenate).
+immediate = [
+  "send_message",
+  "react",
+  "read_messages",
+  "search_messages",
+  "web_fetch",
+  "web_search",
+  "str_replace_based_edit_tool",
+  "search_files",
+  "recall_memory",
+  "search_memory",
+  "read_memory",
+  "write_memory",
+]
+# Deferred index in the system prompt: "orphans" lists only deferred tools NO
+# skill covers (empty ⇒ omitted — the frugal default, since skill descriptions
+# already advertise their tools); "names" lists every deferred tool grouped by
+# skill; "descriptions" adds truncated per-tool descriptions; "none" disables
+# the block (discovery via skills + tool_search only).
+index = "orphans"
 
 # Recovery — request-level resilience (spec LLM-FAILURE-HANDLING).
 # Layer 0: transparent per-request retry for ENVIRONMENTAL LLM failures
