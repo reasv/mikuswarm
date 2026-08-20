@@ -1,8 +1,15 @@
 # Dynamic Session-Time Tool Loading — deferred catalog, skill-bound loading, tool search
 
-**Status**: PROPOSAL — pending owner sign-off on §11.
+**Status**: PROPOSAL — decisions resolved (§11), ready for implementation.
 
 **Author**: design session 2026-08-20.
+
+**Owner sign-off (2026-08-20)**: `immediate`-allowlist direction approved. Skill
+file paths are to be hidden from session context so `load_skill` is the only
+natural activation path — "make it impossible for the agent to make a mistake",
+not incentive-aligned-but-optional; the skills folder is still named separately
+for authoring. Prerequisite completed the same day: pi-ai/pi-agent-core updated
+0.80.10 → 0.84.2 (contract of §2 verified unchanged; tsc + full unit suite green).
 
 Target ARCHITECTURE.md home once implemented: §10 Tools (new subsection "Dynamic
 tool loading"), §9a Workspace & Prompt System (skills additions), §8 (loop
@@ -104,8 +111,8 @@ immediate = [          # always-loaded core; everything else in the session's
   "load_skill",        # the loading tools are implicitly immediate; listing
   "tool_search",       #   them is allowed but redundant
 ]
-index = "names"        # deferred-tool index in the system prompt:
-                       #   "names" | "descriptions" | "none"
+index = "orphans"      # deferred-tool index in the system prompt (§8):
+                       #   "orphans" | "names" | "descriptions" | "none"
 ```
 
 - **Direction**: an `immediate` allowlist, not a `deferred` denylist. New tools
@@ -163,18 +170,32 @@ listed skill.
 - **Idempotence**: re-loading a loaded skill returns the body again with a "tools
   already loaded" note and empty `addedToolNames`.
 - **Errors**: unknown name → error listing valid skill names.
-- **Prompting**: the `<available_skills>` index gains an instruction line: skills
-  are loaded by calling `load_skill`, which also enables the tools they describe.
-  (Reading the file through the text editor still works but yields instructions
-  without the tools — self-defeating, which is exactly the incentive we want.)
+- **Hidden paths — `load_skill` is the only natural route.** When dynamic loading
+  is enabled, the `<available_skills>` index renders each skill as **name +
+  description only**: the `path` attribute is dropped, and the block's
+  instruction line says skills are used by calling `load_skill` (nothing in
+  context points at a file to read instead). This is a robustness stance, not an
+  incentive: the agent should have no visible alternative to get a skill wrong
+  with. With dynamic loading disabled, the index keeps today's `path` attribute
+  (file reading remains the only mechanism there).
+- **Authoring note**: skill *content* is hidden per-skill, but the skills
+  *directory* is still named once in the index footer — skills live at
+  `skills/<name>/SKILL.md` and the agent may create new ones or edit existing
+  ones there (via the ordinary file tools). Authoring and activation are
+  deliberately separate surfaces: you write files; you activate via `load_skill`.
+- **Editor interception (backstop + runtime authoring)**: the text editor `view`
+  command, after producing its result for any markdown file, parses the file's
+  YAML frontmatter; if it carries a `tools` key, the same load path runs — newly
+  matched cataloged tools are loaded and the view result is stamped with
+  `addedToolNames` (plus an appended note naming the tools enabled). Keying on
+  *content* rather than the `skills/` path means a skill the agent just authored
+  mid-session activates naturally when it proofreads it, and stray copies behave
+  identically to originals. Sandbox shell reads remain a residual backchannel;
+  they yield instructions only and the tools stay unloaded — acceptable, since
+  nothing in context suggests that route.
 - **Detectability**: loading is a first-class tool call — transcript event,
   `skill_loaded { sessionId, skill, tools }` log, console-visible. This replaces
   today's undetectable file-read path as the sanctioned way to use a skill.
-- Optionally (Decision D2), the text editor `view` command on a
-  `skills/*/SKILL.md` path triggers the same load path (result stamped with
-  `addedToolNames`), closing the main backchannel rather than fighting it. Sandbox
-  shell reads remain a residual backchannel; they yield instructions only, and the
-  tools stay unloaded.
 
 ## 6. The `tool_search` tool
 
@@ -219,8 +240,22 @@ and the recovery path when it remembers a tool name the index shows as deferred.
 
 ## 8. Discovery index (`index` mode)
 
-When `index = "names"`, the system prompt gains a compact deterministic block after
-`<available_skills>`:
+The index answers one question: how does the model know a *deferred* tool exists
+at all? Skill descriptions cover every tool a skill declares; the index covers the
+rest. Modes, from lightest to heaviest:
+
+- `"orphans"` (**default when enabled**) — list only deferred tools **not**
+  covered by any skill's `tools` globs. In a well-skilled workspace this block is
+  empty (and omitted entirely); it self-heals when a tool ships before anyone
+  writes its skill, instead of silently stranding it behind `tool_search` guesses.
+- `"names"` — list every deferred tool by name, grouped by owning skill (a tool
+  matched by several skills lists under the first, alphabetically; unmatched tools
+  under a fixed label). ~5–8 tokens per tool versus ~150–450 for a full schema.
+- `"descriptions"` — as `"names"` plus a ≤80-char truncated description per tool
+  (for deployments prioritizing discoverability over minimalism).
+- `"none"` — no block; discovery is purely skill descriptions + `tool_search`.
+
+Rendered as a compact deterministic block after `<available_skills>`:
 
 ```
 <deferred_tools>
@@ -229,13 +264,6 @@ medialib: mcp_medialib_play, mcp_medialib_queue_list, …
 (unskilled): danbooru, find_source, …
 </deferred_tools>
 ```
-
-Grouped by owning skill (a tool matched by several skills lists under the first,
-alphabetically), with unmatched tools under a fixed label. `"descriptions"` adds a
-≤80-char truncated description per tool (heavier; for deployments prioritizing
-discoverability over minimalism). `"none"` relies purely on skill descriptions +
-`tool_search`. Names-only costs roughly 5–8 tokens per tool versus ~150–450 for a
-full schema.
 
 Determinism: the block is a pure function of the session catalog and skills scan —
 byte-identical across sessions of the same config/workspace state (invariant 4
@@ -267,16 +295,19 @@ preserved).
 - Defaults preserve current behavior byte-for-byte: `enabled = false` renders no
   index, adds no tools, and defers nothing.
 
-## 11. Decisions
+## 11. Decisions (resolved)
 
-- **D1 — Config direction**: `immediate` allowlist with trailing-`*` globs
-  (recommended, §4) vs a `deferred` denylist. Allowlist keeps new tools
-  token-frugal by default.
-- **D2 — Editor interception**: should text-editor `view` of a `SKILL.md` path
-  trigger the same load path as `load_skill` (recommended: yes), or is the
-  instruction + incentive alignment of §5 sufficient for v1?
-- **D3 — Index default**: `index = "names"` (recommended) vs `"none"` when the
-  operator enables dynamic loading. (`"descriptions"` exists either way.)
+- **D1 — Config direction** (owner, 2026-08-20): `immediate` allowlist with
+  trailing-`*` globs. New tools default to deferred — token-frugal by default.
+- **D2 — Skill activation robustness** (owner, 2026-08-20): incentives are not
+  enough; mistakes must be structurally impossible. Resolved as §5: skill paths
+  hidden from the index (`load_skill` is the only visible route), the skills
+  directory named separately for authoring only, and frontmatter-keyed editor
+  interception as backstop — which also gives runtime-authored skills a natural
+  activation path.
+- **D3 — Index default**: `"orphans"` (§8) — skill descriptions are the primary
+  discovery surface; the index exists to catch tools no skill covers yet, and
+  costs nothing when there are none.
 
 ## 12. Implementation plan
 
@@ -284,7 +315,8 @@ preserved).
    frontmatter `tools`; validation + defaults in `00-defaults.toml` (commented).
 2. Registry + glob matcher + transcript-derived loaded-set recomputation
    (pure functions; unit-testable without a loop).
-3. `load_skill` + `tool_search` tools; `<available_skills>` instruction line;
+3. `load_skill` + `tool_search` tools; `<available_skills>` path-hiding +
+   instruction line + authoring footer; frontmatter-keyed editor interception;
    `<deferred_tools>` renderer.
 4. Factory wiring: registry construction, `prepareNextTurn` hook, between-run
    reassertion, resume/retry recomputation.
