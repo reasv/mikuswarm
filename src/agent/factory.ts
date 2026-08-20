@@ -43,9 +43,10 @@ import {
   matchToolPatterns,
   renderDeferredToolsIndex,
   wrapEditorWithSkillActivation,
+  type DeferredIndexMode,
 } from "./dynamic-tools.js";
-import { createLoadSkillTool } from "../tools/load-skill.js";
-import { createToolSearchTool } from "../tools/tool-search.js";
+import { createLoadSkillTool, loadSkillToolDefinition } from "../tools/load-skill.js";
+import { createToolSearchTool, toolSearchToolDefinition } from "../tools/tool-search.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -780,13 +781,20 @@ export class AgentSessionFactory {
     // prior request's prompt size (cache-read within the TTL); `lastRequestAtMs` dates
     // the prior request for the cache-TTL test. O(delta) per request, not O(context).
     const ctxCounter = { running: 0, seenMsgs: -1, cachedAtLast: 0, lastRequestAtMs: 0 };
+    // Dynamic-tool-loading charge parking (spec DYNAMIC-TOOL-LOADING §9): a load
+    // event that fires BEFORE the counter's first observation (load_skill as the
+    // session's first tool call) parks its definition-token charge here; the
+    // seeding branch below folds it in. Without this, the charge would be lost
+    // permanently on the non-per-user path (no actuals reconciliation).
+    const pendingToolDefTokens = { value: 0 };
     const refreshRunningContext = (): void => {
       const msgs = agentRef.agent?.state.messages;
       if (!msgs) return;
       if (ctxCounter.seenMsgs < 0) {
         // First observation: the built context (incl. the kickoff turn already in
         // state) is `initialContextEstimate`; do not re-tokenize it.
-        ctxCounter.running = initialContextEstimate.value;
+        ctxCounter.running = initialContextEstimate.value + pendingToolDefTokens.value;
+        pendingToolDefTokens.value = 0;
         ctxCounter.seenMsgs = msgs.length;
         return;
       }
@@ -1318,13 +1326,19 @@ export class AgentSessionFactory {
                 })
               : tool,
           ),
-          createLoadSkillTool({
-            workspaceRoot,
-            skills: workspace.skills,
-            getRegistry: () => dynRef.registry,
-            logger,
-            sessionId: session.id,
-          }),
+          // load_skill only when the skill filter yields at least one listed
+          // skill (spec §5) — with none, the tool could only ever error.
+          ...(workspace.skills.listed.length > 0
+            ? [
+                createLoadSkillTool({
+                  workspaceRoot,
+                  skills: workspace.skills,
+                  getRegistry: () => dynRef.registry,
+                  logger,
+                  sessionId: session.id,
+                }),
+              ]
+            : []),
           createToolSearchTool({
             getRegistry: () => dynRef.registry,
             logger,
@@ -1623,8 +1637,13 @@ export class AgentSessionFactory {
       // execution, which is always after this point.
       registry.onChange = (added) => {
         agent.state.tools = registry.current;
+        const estimate = renderToolBlock(added).tokenEstimate;
         if (ctxCounter.seenMsgs >= 0) {
-          ctxCounter.running += renderToolBlock(added).tokenEstimate;
+          ctxCounter.running += estimate;
+        } else {
+          // Counter not yet seeded (load event during the very first turn): park
+          // the charge; the seeding branch of refreshRunningContext folds it in.
+          pendingToolDefTokens.value += estimate;
         }
       };
     }
@@ -1820,6 +1839,29 @@ export class AgentSessionFactory {
     const latest = recent[recent.length - 1];
     const trigger = latest ?? syntheticPlaceholderEvent(timelineKey);
 
+    // The default session type's tool set, so the preview's estimate + tool
+    // block match what the next real session would send. Absent hook (tests) →
+    // no tool block, identical to the prior preview behaviour. Under dynamic
+    // tool loading, mirror create(): the wire set is the initial (immediate)
+    // split and `workspace.dynamicTools` drives the same prompt rendering —
+    // the preview has the workspace in hand, so always_loaded promotions and
+    // the load_skill gate are exact here.
+    const previewDefs = this.options.buildToolDefs?.(timelineKey, "default");
+    let previewTools = previewDefs;
+    if (previewDefs) {
+      const split = this.splitDefsForDynamic(previewDefs, sessionTypeConfig, workspace);
+      if (split) {
+        previewTools = split.initial;
+        workspace.dynamicTools = {
+          indexText: renderDeferredToolsIndex(
+            split.deferred,
+            [...workspace.skills.listed, ...workspace.skills.inlined],
+            split.index,
+          ),
+        };
+      }
+    }
+
     const built = await this.buildContext({
       timelineKey,
       trigger,
@@ -1827,10 +1869,7 @@ export class AgentSessionFactory {
       sessionType: sessionTypeConfig,
       fallbackPrompt,
       replyModelCanSeeImages: previewModelConfig?.input_modalities.includes("image"),
-      // The default session type's tool set, so the preview's estimate + tool
-      // block match what the next real session would send. Absent hook (tests) →
-      // no tool block, identical to the prior preview behaviour.
-      tools: this.options.buildToolDefs?.(timelineKey, "default"),
+      tools: previewTools,
     });
 
     return {
@@ -1850,7 +1889,51 @@ export class AgentSessionFactory {
    */
   toolBlockFor(timelineKey: string, sessionType: string): ToolBlockSummary | undefined {
     const tools = this.options.buildToolDefs?.(timelineKey, sessionType);
-    return tools && tools.length > 0 ? renderToolBlock(tools) : undefined;
+    if (!tools || tools.length === 0) return undefined;
+    // Under dynamic loading show the INITIAL wire set (spec DYNAMIC-TOOL-LOADING
+    // §9). No workspace here (sync path): always_loaded promotions are skipped
+    // and load_skill is assumed present — a documented display approximation.
+    const split = this.splitDefsForDynamic(tools, this.resolveSessionType(sessionType));
+    return renderToolBlock(split ? split.initial : tools);
+  }
+
+  /**
+   * Dynamic-loading split for tool DEFINITIONS (spec DYNAMIC-TOOL-LOADING §9):
+   * the initial wire set + the deferred remainder for a session type, given the
+   * full post-filter catalog. Returns undefined when dynamic loading is off for
+   * the type (the same gate `create()` applies). `workspace`, when provided,
+   * enables always_loaded-skill promotion and the listed-skills `load_skill`
+   * gate; without it (the sync inspector path) promotions are skipped and
+   * `load_skill` is assumed present.
+   */
+  private splitDefsForDynamic(
+    defs: ToolDefinitionLike[],
+    sessionTypeConfig: SessionTypeConfig | undefined,
+    workspace?: WorkspaceContent,
+  ):
+    | { initial: ToolDefinitionLike[]; deferred: ToolDefinitionLike[]; index: DeferredIndexMode }
+    | undefined {
+    const dynCfg = this.options.config.agent.tools?.dynamic;
+    const enabled =
+      (dynCfg?.enabled ?? false) &&
+      (sessionTypeConfig?.tools_dynamic ?? sessionTypeConfig?.tools === undefined);
+    if (!enabled) return undefined;
+    const names = defs.map((d) => d.name);
+    const immediate = new Set(matchToolPatterns(names, dynCfg?.immediate ?? []));
+    if (workspace) {
+      for (const skill of workspace.skills.inlined) {
+        if (!skill.tools) continue;
+        for (const name of matchToolPatterns(names, skill.tools)) immediate.add(name);
+      }
+    }
+    const loaders: ToolDefinitionLike[] = [];
+    if (!workspace || workspace.skills.listed.length > 0) loaders.push(loadSkillToolDefinition());
+    loaders.push(toolSearchToolDefinition());
+    return {
+      initial: [...defs.filter((d) => immediate.has(d.name)), ...loaders],
+      deferred: defs.filter((d) => !immediate.has(d.name)),
+      index: dynCfg?.index ?? "orphans",
+    };
   }
 }
 

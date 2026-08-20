@@ -114,14 +114,11 @@ import {
   createYoutubeFetchTool,
   GrokResultCache,
   createFindSourceTool,
-  loadSkillToolDefinition,
-  toolSearchToolDefinition,
   MATRIX_TERMINOLOGY,
   DISCORD_TERMINOLOGY,
   IRC_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
-import { matchToolPatterns } from "./agent/dynamic-tools.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
@@ -1608,34 +1605,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // Apply the same two-stage filter as create(): MCP scoping first, then
       // the session-type allowlist. Both compose as an intersection so the
       // displayed tool block matches exactly what the agent can call.
+      // NOTE: returns the FULL post-filter catalog. Dynamic-tool-loading
+      // consumers (factory.toolBlockFor, factory.buildPreview) apply the
+      // immediate/deferred split themselves — they own the session-type gate.
       const mcpFiltered = filterMcpToolsByAllowlist(full, agentMcpServers, mcpToolServerMap);
-      const sessionTypeConfig = factory.resolveSessionType(sessionType);
-      const filtered = filterTools(mcpFiltered, sessionTypeConfig);
-      let defs = filtered.map((t) => ({
+      const filtered = filterTools(mcpFiltered, factory.resolveSessionType(sessionType));
+      const defs = filtered.map((t) => ({
         name: t.name,
         description: t.description,
         parameters: t.parameters,
       }));
-      // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING §9): the inspector/preview
-      // block mirrors the INITIAL wire tool set — the config-immediate subset plus
-      // the two loading tools — matching what a fresh session of this type sends
-      // on its first request. Same gate as factory.create(). Known limitation:
-      // always_loaded-skill tool promotions are workspace state and are not
-      // reflected here (this resolver is sync and workspace-independent).
-      const dynCfg = config.agent.tools?.dynamic;
-      const dynamicEnabled =
-        (dynCfg?.enabled ?? false) &&
-        (sessionTypeConfig?.tools_dynamic ?? sessionTypeConfig?.tools === undefined);
-      if (dynamicEnabled) {
-        const immediate = new Set(
-          matchToolPatterns(defs.map((d) => d.name), dynCfg?.immediate ?? []),
-        );
-        defs = [
-          ...defs.filter((d) => immediate.has(d.name)),
-          loadSkillToolDefinition(),
-          toolSearchToolDefinition(),
-        ];
-      }
       toolDefsByType.set(memoKey, defs);
       return defs;
     } catch (error) {

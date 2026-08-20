@@ -2,6 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { DynamicToolRegistry } from "../agent/dynamic-tools.js";
 import type { Logger } from "../observability/logger.js";
+import { renderToolBlock } from "../context/tool-block.js";
 
 /**
  * `tool_search` (spec DYNAMIC-TOOL-LOADING §6): the universal fallback for
@@ -43,8 +44,10 @@ export interface ToolSearchContext {
 
 function clampDescription(description: string): string {
   const oneLine = description.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= RESULT_DESCRIPTION_MAX_CHARS) return oneLine;
-  return `${oneLine.slice(0, RESULT_DESCRIPTION_MAX_CHARS - 1)}…`;
+  // Code-point iteration: a UTF-16 slice could split a surrogate pair.
+  const chars = Array.from(oneLine);
+  if (chars.length <= RESULT_DESCRIPTION_MAX_CHARS) return oneLine;
+  return `${chars.slice(0, RESULT_DESCRIPTION_MAX_CHARS - 1).join("")}…`;
 }
 
 export function createToolSearchTool(context: ToolSearchContext): AgentTool {
@@ -97,14 +100,17 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
       const { added, alreadyLoaded } = registry.load(toLoad);
       const addedNames = added.map((tool) => tool.name);
 
-      context.logger?.info("tools_loaded", {
-        sessionId: context.sessionId,
-        source: "tool_search",
-        query,
-        names: addedNames,
-        alreadyLoaded,
-        unknown,
-      });
+      if (addedNames.length > 0) {
+        context.logger?.info("tools_loaded", {
+          sessionId: context.sessionId,
+          source: "tool_search",
+          query,
+          names: addedNames,
+          tokenEstimate: renderToolBlock(added).tokenEstimate,
+          alreadyLoaded,
+          unknown,
+        });
+      }
 
       const parts: string[] = [];
       if (added.length > 0) {

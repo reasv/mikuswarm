@@ -151,7 +151,8 @@ export function parseFrontmatter(raw: string): ParsedFrontmatter | null {
     if (!key) continue;
 
     // Block sequence: `key:` with nothing after the colon, followed by `- item`
-    // lines. Collect until the first non-item line.
+    // lines. Collect until the first non-item line. A bare `key:` with no items
+    // stores "" — the original scalar parser's behavior for an empty value.
     if (rawValue === "") {
       const items: string[] = [];
       let j = i + 1;
@@ -164,6 +165,8 @@ export function parseFrontmatter(raw: string): ParsedFrontmatter | null {
       if (items.length > 0) {
         frontmatter[key] = items;
         i = j - 1;
+      } else {
+        frontmatter[key] = "";
       }
       continue;
     }

@@ -6,6 +6,7 @@ import { frontmatterToolPatterns, parseFrontmatter } from "../workspace/skills.j
 import type { SkillIndex } from "../workspace/types.js";
 import type { DynamicToolRegistry } from "../agent/dynamic-tools.js";
 import type { Logger } from "../observability/logger.js";
+import { renderToolBlock } from "../context/tool-block.js";
 
 /**
  * `load_skill` (spec DYNAMIC-TOOL-LOADING §5): THE sanctioned way to use a
@@ -53,11 +54,16 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
       const registry = context.getRegistry();
       if (!registry) throw new Error("Dynamic tool loading is not active for this session.");
 
-      const allSkills = [...context.skills.listed, ...context.skills.inlined];
-      const meta = allSkills.find((skill) => skill.name === name);
+      // Listed skills only (spec §5): inlined (always_loaded) skills are already
+      // in the system prompt with their tools promoted — offering them here would
+      // only invite pointless re-loads.
+      const meta = context.skills.listed.find((skill) => skill.name === name);
       if (!meta) {
-        const available = allSkills.map((skill) => skill.name).sort().join(", ") || "(none)";
-        throw new Error(`Unknown skill "${name}". Available skills: ${available}`);
+        const available = context.skills.listed.map((skill) => skill.name).sort().join(", ") || "(none)";
+        const inlinedNote = context.skills.inlined.some((skill) => skill.name === name)
+          ? ` ("${name}" is an always-loaded skill — its instructions and tools are already active.)`
+          : "";
+        throw new Error(`Unknown skill "${name}". Available skills: ${available}.${inlinedNote}`);
       }
 
       // Body + tools list read LIVE from disk (freshest content; matches the
@@ -92,6 +98,15 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
         alreadyLoaded,
         unmatched: unknown,
       });
+      if (addedNames.length > 0) {
+        context.logger?.info("tools_loaded", {
+          sessionId: context.sessionId,
+          source: "load_skill",
+          skill: name,
+          names: addedNames,
+          tokenEstimate: renderToolBlock(added).tokenEstimate,
+        });
+      }
 
       const parts: string[] = [`<skill name="${name}">\n${body}\n</skill>`];
       if (addedNames.length > 0) {

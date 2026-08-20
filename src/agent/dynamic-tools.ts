@@ -4,6 +4,7 @@ import type { Logger } from "../observability/logger.js";
 import type { SkillMeta } from "../workspace/types.js";
 import { frontmatterToolPatterns, parseFrontmatter } from "../workspace/skills.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
+import { renderToolBlock } from "../context/tool-block.js";
 
 /**
  * Dynamic session-time tool loading (spec DYNAMIC-TOOL-LOADING).
@@ -188,8 +189,10 @@ const INDEX_DESCRIPTION_MAX_CHARS = 80;
 
 function truncateDescription(description: string): string {
   const oneLine = description.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= INDEX_DESCRIPTION_MAX_CHARS) return oneLine;
-  return `${oneLine.slice(0, INDEX_DESCRIPTION_MAX_CHARS - 1)}…`;
+  // Code-point iteration: a UTF-16 slice could split a surrogate pair.
+  const chars = Array.from(oneLine);
+  if (chars.length <= INDEX_DESCRIPTION_MAX_CHARS) return oneLine;
+  return `${chars.slice(0, INDEX_DESCRIPTION_MAX_CHARS - 1).join("")}…`;
 }
 
 /**
@@ -315,6 +318,7 @@ export function wrapEditorWithSkillActivation(
         source: "editor_view",
         path: args.path,
         names,
+        tokenEstimate: renderToolBlock(added).tokenEstimate,
       });
       return {
         ...result,

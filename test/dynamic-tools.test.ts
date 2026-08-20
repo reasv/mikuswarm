@@ -150,6 +150,17 @@ describe("renderDeferredToolsIndex", () => {
     assert.match(text, /…/);
   });
 
+  it("truncation never splits a surrogate pair", () => {
+    const emojiDesc = `${"x".repeat(78)}🎵 and more text beyond the limit`;
+    const text = renderDeferredToolsIndex(
+      [makeTool("emoji_tool", emojiDesc)],
+      [],
+      "descriptions",
+    )!;
+    assert.doesNotMatch(text, /\ud83c(?!\udfb5)/u);
+    assert.equal(text.includes("�"), false);
+  });
+
   it("none mode and empty deferred set render nothing", () => {
     assert.equal(renderDeferredToolsIndex(deferred, skills, "none"), undefined);
     assert.equal(renderDeferredToolsIndex([], skills, "names"), undefined);
@@ -175,6 +186,13 @@ describe("skills frontmatter tools parsing", () => {
 
     const none = parseFrontmatter(`---\nname: x\ndescription: d\n---\nBody`);
     assert.equal(frontmatterToolPatterns(none!.frontmatter), undefined);
+  });
+
+  it("stores empty string for a bare key with no value or items (legacy contract)", () => {
+    const parsed = parseFrontmatter(`---\nname: x\ntools:\ndescription: d\n---\nBody`);
+    assert.equal(parsed!.frontmatter.tools, "");
+    assert.equal(parsed!.frontmatter.description, "d");
+    assert.equal(frontmatterToolPatterns(parsed!.frontmatter), undefined);
   });
 
   it("keeps scalar key parsing intact around block sequences", () => {
@@ -268,6 +286,57 @@ describe("dynamic prompt rendering + tools scan", () => {
     const again = await tool.execute("t2", { name: "medialib" });
     assert.equal(again.addedToolNames, undefined);
     assert.match((again.content[0] as { type: "text"; text: string }).text, /Already loaded/);
+  });
+
+  it("load_skill rejects always_loaded skills with an explanatory note", async () => {
+    await writeSkill("medialib");
+    const inlinedDir = path.join(tmpDir, "skills", "core");
+    await mkdir(inlinedDir, { recursive: true });
+    await writeFile(
+      path.join(inlinedDir, "SKILL.md"),
+      `---\nname: core\ndescription: core things\nalways_loaded: true\n---\n\nCore body.\n`,
+    );
+    const workspace = await loadWorkspace(tmpDir);
+    assert.equal(workspace.skills.inlined.length, 1);
+    const registry = new DynamicToolRegistry([makeTool("send_message")], ["send_message"]);
+    const tool = createLoadSkillTool({
+      workspaceRoot: tmpDir,
+      skills: workspace.skills,
+      getRegistry: () => registry,
+      sessionId: "s1",
+    });
+    await assert.rejects(
+      () => tool.execute("t1", { name: "core" }),
+      /always-loaded skill — its instructions and tools are already active/,
+    );
+  });
+
+  it("load_skill emits a tools_loaded event with a tokenEstimate", async () => {
+    await writeSkill("medialib", "tools:\n  - mcp_medialib_*\n");
+    const workspace = await loadWorkspace(tmpDir);
+    const registry = new DynamicToolRegistry([makeTool("mcp_medialib_play")], []);
+    const events: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, fields: Record<string, unknown>) => events.push({ event, fields }),
+      warn: () => undefined,
+      error: () => undefined,
+      debug: () => undefined,
+    } as unknown as import("../src/observability/logger.js").Logger;
+    const tool = createLoadSkillTool({
+      workspaceRoot: tmpDir,
+      skills: workspace.skills,
+      getRegistry: () => registry,
+      logger,
+      sessionId: "s1",
+    });
+    await tool.execute("t1", { name: "medialib" });
+    const loaded = events.find((e) => e.event === "tools_loaded");
+    assert.ok(loaded, "tools_loaded event emitted");
+    assert.equal(loaded!.fields.source, "load_skill");
+    assert.deepEqual(loaded!.fields.names, ["mcp_medialib_play"]);
+    assert.equal(typeof loaded!.fields.tokenEstimate, "number");
+    assert.ok((loaded!.fields.tokenEstimate as number) > 0);
+    assert.ok(events.some((e) => e.event === "skill_loaded"));
   });
 
   it("load_skill rejects unknown skills with the available list", async () => {
