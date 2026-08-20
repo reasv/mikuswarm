@@ -265,6 +265,8 @@ immediate = [
   "search_messages",
   "web_fetch",
   "web_search",
+  "mcp_exa_web_search_exa",
+  "mcp_exa_web_fetch_exa",
   "str_replace_based_edit_tool",
   "search_files",
   "recall_memory",

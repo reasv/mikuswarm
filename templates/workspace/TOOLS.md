@@ -23,7 +23,10 @@ fails with "not found", the tool exists but isn't loaded yet: load its skill
 
 ## Web
 
-- `web_search`: web search (title/URL/snippet results). `web_fetch`: fetch a URL's readable text.
+The default deployment serves web access through the Exa tools (always loaded):
+
+- `mcp_exa_web_search_exa`: web search (title/URL/snippet results). `mcp_exa_web_fetch_exa`: fetch a URL's readable text. `mcp_exa_web_search_advanced_exa` (deferred — `tool_search` it) adds filters and more results when plain search isn't enough.
+- Deployments using the native tools instead have `web_search` / `web_fetch` in the same roles.
 - X/Twitter blocks generic fetchers — use the x-twitter skill for x.com content. For recent/breaking news, its `x_search` is usually fresher than web search.
 - JS-heavy, login-gated, or bot-checked pages need the browser skill.
 
