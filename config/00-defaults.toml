@@ -207,6 +207,7 @@ enabled = true
 immediate = [
   "send_message",
   "react",
+  "emoji_list",
   "read_messages",
   "search_messages",
   "web_fetch",

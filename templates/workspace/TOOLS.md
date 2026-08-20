@@ -18,8 +18,8 @@ fails with "not found", the tool exists but isn't loaded yet: load its skill
 
 ## Reactions & Custom Emoji
 
-- `react` adds/removes reactions. Accepts unicode emoji or `:shortcode:` (case-sensitive). Prefer custom emoji; one reaction per message is usually enough.
-- Shortcodes also render inline in message text. The current ranked shortcode list is `emoji_list` (channel-ops skill).
+- `react` adds/removes reactions. Accepts unicode emoji or `:shortcode:` (case-sensitive).
+- `emoji_list` lists the room's custom emoji, ranked by usage — check it before assuming a shortcode exists.
 
 ## Web
 
@@ -53,8 +53,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | How much someone posts / who's gone quiet | `user_activity` — chat-history skill |
 
 - `search_messages` hits cite an `event_id` you can hand to `read_messages`; use `format:"snippet"` to scan many hits cheaply rather than dumping history.
-- `recall_memory` is semantic (meaning + recency); `search_memory` is exact-match. Reach for `recall_memory` first on "what do I know about…" questions.
-- Catch-up phrasings ("what did I miss", "did anyone ping me") map to `recap` / `search_messages` — people won't name the tool; infer it. See **Catching People Up** in `AGENTS.md`.
+- People won't name these tools ("what did I miss?" is a `recap` request) — recognize the intent; see **Catching People Up** in `AGENTS.md`.
 
 ## Memory Writing
 
@@ -63,9 +62,8 @@ something is gone. Entries marked with a skill live behind it; load it first.
 ## Media
 
 Images attached to the trigger message are already visible to you as image
-blocks (`image_block="true"` on the attachment). For everything else —
-analyzing other files or URLs, viewing an older image yourself, YouTube
-transcripts/downloads — load the media skill.
+blocks (`image_block="true"`). For everything else — other files or URLs,
+older images, YouTube — load the media skill.
 
 ## Context Format
 
