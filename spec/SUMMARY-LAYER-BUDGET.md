@@ -118,7 +118,9 @@ live at the bottom: the over-budget mass is the recent fine band (§1), where
 runs are long and blocks numerous. Level-ascending order therefore takes the
 lowest-information-loss, highest-saving jobs first, and escalates to coarser
 merges only when the budget cannot be met below. Within a level, oldest run
-first (equal destructiveness — age decides). A produced parent may later
+first (equal destructiveness — age decides): a single level can hold several
+disjoint runs, because contiguity breaks at failed ranges, at spans excluded
+by an active condense job, and at gaps left by already-condensed children. A produced parent may later
 become contiguous with same-level neighbors; once such a run reaches
 `fanout`, the ordinary trigger takes it — eager and lazy condensation cascade
 together.
