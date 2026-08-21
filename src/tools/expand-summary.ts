@@ -43,16 +43,16 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
     name: "expand_summary",
     label: "Expand summary",
     description:
-      "Drill a summary one or more tiers DOWN into the finer summaries — and ultimately the raw " +
-      "messages — it was condensed from. Pass a summary id (the id=... shown on summaries in your " +
+      "Recover the real history beneath a <summary> block. The summaries in your context are lossy " +
+      "approximations that grow coarser with age — one can compress weeks of chat. Whenever your " +
+      "answer rests on a period you hold only as a summary, expand it BEFORE answering instead of " +
+      "answering from the approximation. Pass a summary id (the id=... shown on summaries in your " +
       "context, in recap, or in search_messages corpus:\"summaries\" results). A level-1 summary " +
       "expands to its raw source messages (hydrated with caption/reply/link context, same as " +
       "search_messages); a higher-level summary expands to the finer summaries underneath it, each " +
-      "with its own id you can expand again. Most recall goes: search_messages for an exact phrase " +
-      "in the transcript → recap for what happened in a window → expand_summary when you hold only a " +
-      "COARSE summary (high level / many msgs) and need the detail beneath a specific period. Output " +
-      "is depth- and token-bounded; if it overflows, it says how many constituents were omitted (drill " +
-      "a specific child instead of widening depth).",
+      "with its own id you can expand again. Prefer expanding the one relevant summary over paging " +
+      "raw history. Output is depth- and token-bounded; if it overflows, it says how many " +
+      "constituents were omitted (drill a specific child instead of widening depth).",
     parameters: Type.Object({
       id: Type.String({ description: "The summary id to expand (from context, recap, or summary search)." }),
       depth: Type.Optional(

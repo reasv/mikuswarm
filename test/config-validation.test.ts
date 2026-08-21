@@ -262,6 +262,7 @@ immediate = [
   "send_message",
   "react",
   "emoji_list",
+  "expand_summary",
   "read_messages",
   "search_messages",
   "web_fetch",

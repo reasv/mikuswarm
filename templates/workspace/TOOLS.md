@@ -49,7 +49,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | An exact string in your diary (a URL, exact phrase) | `search_memory` (ripgrep) |
 | Raw room history, or one event by id | `read_messages` (paginate with `limit` + `before`/`after` tokens, or pass `message_id`) |
 | Catch up an absence ("what did I miss") | `recap` — chat-history skill (no args = the asker's own gap) |
-| Detail beneath a coarse `<summary>` block | `expand_summary` with the summary's `id` — chat-history skill |
+| The real history beneath a `<summary>` block | `expand_summary` with the summary's `id` |
 | How much someone posts / who's gone quiet | `user_activity` — chat-history skill |
 
 - `search_messages` hits cite an `event_id` you can hand to `read_messages`; use `format:"snippet"` to scan many hits cheaply rather than dumping history.
@@ -69,7 +69,7 @@ older images, YouTube — load the media skill.
 
 Your chat history is layered, oldest to newest:
 
-- **Summaries** (oldest): `<summary>` blocks — condensed, lossy recaps. Each carries an `id`; `expand_summary` (chat-history skill) recovers the detail. Older history is summarized, not deleted.
+- **Summaries** (oldest): `<summary>` blocks — lossy approximations that grow coarser with age (one can compress weeks of chat). Each carries an `id`; `expand_summary` recovers the real history beneath it. When an answer rests on a period you hold only as a summary, expand it first — answering from the summary text alone is guessing. Older history is summarized, not deleted.
 - **Compact**: one-line format with timestamps, sender IDs, and body text.
 - **Rich** (recent): full XML with `<message>` tags, structured `<attachment>`, `<reply_to>`, `<link_preview>`, `<linked_media>` elements.
 
