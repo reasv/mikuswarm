@@ -154,7 +154,7 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
             startResolved: !!jobStart,
             endResolved: !!jobEnd,
             timelineKey,
-            level: level + 1,
+            summaryLevel: level + 1,
           });
           // Unresolvable ACTIVE range: treat as overlapping — be conservative
           // and never enqueue a possible duplicate. Unresolvable FAILED range:
@@ -186,7 +186,7 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
       logger.info("summarization_job_enqueued", {
         jobId,
         timelineKey,
-        level: level + 1,
+        summaryLevel: level + 1,
         inputTokens: inputTokenCount,
       });
     }

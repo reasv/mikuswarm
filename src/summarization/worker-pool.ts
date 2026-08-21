@@ -282,7 +282,7 @@ export class SummarizationWorkerPool {
     logger.debug("summarization_job_claimed", {
       jobId: job.id,
       timelineKey: job.timelineKey,
-      level: job.level,
+      summaryLevel: job.level,
       attempt: job.attempts,
     });
 
@@ -484,7 +484,7 @@ export class SummarizationWorkerPool {
       await storage.returnSummarizationJobToPending(job.id);
       logger.info("summarization_drain_requeued", {
         jobId: job.id,
-        level: job.level,
+        summaryLevel: job.level,
         attempt: job.attempts,
       });
       this.emit(job, "retried", "pending");
@@ -535,7 +535,7 @@ export class SummarizationWorkerPool {
       logger.info("summarization_complete", {
         jobId: job.id,
         summaryId,
-        level: job.level,
+        summaryLevel: job.level,
         tokenCount,
         elapsed: Date.now() - started,
       });
@@ -561,7 +561,7 @@ export class SummarizationWorkerPool {
 
     logger.error("summarization_failed", {
       jobId: job.id,
-      level: job.level,
+      summaryLevel: job.level,
       attempt: job.attempts,
       error: errMsg,
     });
@@ -659,7 +659,7 @@ export class SummarizationWorkerPool {
     logger.warn("summarization_truncated", {
       jobId: job.id,
       summaryId,
-      level: job.level,
+      summaryLevel: job.level,
       originalTokens,
       truncatedTokens,
     });

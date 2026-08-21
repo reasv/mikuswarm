@@ -257,7 +257,7 @@ export class SummarizationIndexer {
               this.options.logger?.info("summarization_job_enqueued", {
                 jobId,
                 timelineKey,
-                level: 1,
+                summaryLevel: 1,
                 inputTokens: running,
               });
               this.options.onJobEnqueued?.();
@@ -590,7 +590,7 @@ export class SummarizationIndexer {
         logger?.info("summarization_job_enqueued", {
           jobId,
           timelineKey,
-          level: level + 1,
+          summaryLevel: level + 1,
           inputTokens: inputTokenCount,
         });
         this.options.onJobEnqueued?.();
@@ -663,7 +663,7 @@ export class SummarizationIndexer {
       logger?.info("summarization_job_enqueued", {
         jobId,
         timelineKey,
-        level: level + 1,
+        summaryLevel: level + 1,
         inputTokens: inputTokenCount,
       });
       this.options.onJobEnqueued?.();

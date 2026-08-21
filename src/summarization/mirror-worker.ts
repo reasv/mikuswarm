@@ -346,7 +346,7 @@ export class MirrorWorker {
           logger.info("mirror_l2plus_inserted", {
             donorSummaryId: donorSummary.id,
             mirrorId,
-            level: donorSummary.level,
+            summaryLevel: donorSummary.level,
             secondaryTimelineKey: secondaryKey,
           });
         }).catch((err: unknown) => {
@@ -355,13 +355,13 @@ export class MirrorWorker {
             logger.debug("mirror_l2plus_already_mirrored", {
               donorSummaryId: donorSummary.id,
               secondaryTimelineKey: secondaryKey,
-              level: donorSummary.level,
+              summaryLevel: donorSummary.level,
             });
           } else {
             logger.warn("mirror_l2plus_failed", {
               donorSummaryId: donorSummary.id,
               secondaryTimelineKey: secondaryKey,
-              level: donorSummary.level,
+              summaryLevel: donorSummary.level,
               error: err instanceof Error ? err.message : String(err),
             });
           }
