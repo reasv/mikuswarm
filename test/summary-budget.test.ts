@@ -9,6 +9,7 @@ import { TimelineStore } from "../src/timeline/index.js";
 import { SummarizationIndexer } from "../src/summarization/index.js";
 import { estimateTokens } from "../src/context/index.js";
 import { loadConfig } from "../src/config/loader.js";
+import { createExpandSummaryTool } from "../src/tools/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -679,6 +680,198 @@ test("budget: superseded rows excluded from summary search", async () => {
       limit: 10,
     });
     assert.ok(primeSearch.hits.some((h) => h.id === "P_prime"), "P_prime is searchable");
+  } finally {
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §9.4 continued — expand_summary after absorption (Finding 1 regression tests)
+// ---------------------------------------------------------------------------
+
+test("budget: expand superseded P by id works after absorption (no error, returns its children)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "s1", "child1", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s2", "child2", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s3", "runmember", 1, 1004, 1005, "j3", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "old parent", 2, 1000, 1003, "jP", { parentIds: ["s1", "s2"] });
+
+    // Simulate absorption: P_prime replaces P.
+    await storage.insertSummarizationJob({
+      id: "j_abs",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "s1",
+      inputEndId: "s3",
+      inputTokenCount: 100,
+      targetTokenCount: 800,
+      maxRetries: 2,
+      absorbedParentId: "P",
+    });
+    await storage.insertSummaryWithLineage({
+      id: "P_prime",
+      timelineKey: TK,
+      level: 2,
+      content: "combined parent",
+      earliestTimestamp: 1000,
+      latestTimestamp: 1005,
+      latestEventId: "j3",
+      eventCount: 3,
+      tokenCount: 10,
+      modelId: "test-model",
+      status: "complete",
+      generatedAt: Date.now(),
+      parentIds: ["s1", "s2", "s3"],
+      jobId: "j_abs",
+      absorbedParentId: "P",
+    });
+
+    assert.equal(storage.getSummaryById("P")?.status, "superseded", "P is superseded");
+
+    const tool = createExpandSummaryTool({ storage, defaults: { tokenCap: 4000, maxDepth: 3 } });
+    const res = await tool.execute("c1", { id: "P" });
+    const text = (res.content[0] as { text: string }).text;
+
+    // Must not return an error — superseded root should expand normally.
+    assert.doesNotMatch(text, /cannot be expanded/, "no hard error on superseded root");
+    assert.doesNotMatch(text, /^error:/, "no error message");
+    // P's children (s1, s2) should be present.
+    assert.match(text, /id=s1/, "s1 is in expanded output");
+    assert.match(text, /id=s2/, "s2 is in expanded output");
+    // The root P is superseded but it still expands — output contains child summaries.
+    assert.match(text, /Finer summaries/, "finer summaries section present");
+  } finally {
+    storage.close();
+  }
+});
+
+test("budget: expand P_prime includes absorbed run members (superseded children visible)", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "s1", "child1", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s2", "child2", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s3", "runmember unique", 1, 1004, 1005, "j3", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "old parent", 2, 1000, 1003, "jP", { parentIds: ["s1", "s2"] });
+
+    await storage.insertSummarizationJob({
+      id: "j_abs",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "s1",
+      inputEndId: "s3",
+      inputTokenCount: 100,
+      targetTokenCount: 800,
+      maxRetries: 2,
+      absorbedParentId: "P",
+    });
+    await storage.insertSummaryWithLineage({
+      id: "P_prime",
+      timelineKey: TK,
+      level: 2,
+      content: "combined parent",
+      earliestTimestamp: 1000,
+      latestTimestamp: 1005,
+      latestEventId: "j3",
+      eventCount: 3,
+      tokenCount: 10,
+      modelId: "test-model",
+      status: "complete",
+      generatedAt: Date.now(),
+      parentIds: ["s1", "s2", "s3"],
+      jobId: "j_abs",
+      absorbedParentId: "P",
+    });
+
+    assert.equal(storage.getSummaryById("s3")?.status, "superseded", "s3 is superseded");
+
+    const tool = createExpandSummaryTool({ storage, defaults: { tokenCap: 4000, maxDepth: 3 } });
+    const res = await tool.execute("c2", { id: "P_prime" });
+    const text = (res.content[0] as { text: string }).text;
+
+    // P_prime's children = [s1, s2, s3]; all must appear including superseded s3.
+    assert.match(text, /id=s1/, "s1 in P_prime expansion");
+    assert.match(text, /id=s2/, "s2 in P_prime expansion");
+    assert.match(text, /id=s3/, "s3 (superseded run member) in P_prime expansion");
+  } finally {
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §9.4 continued — condensed parent is not an absorption target (Finding 2)
+// ---------------------------------------------------------------------------
+
+test("budget: condensed parent excluded from absorption — run falls through to bootstrap", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const content = "word ".repeat(100);
+
+    // Build: s1, s2 (L1) → P (L2, parentIds=[s1,s2]) → G (L3, parentIds=[P]).
+    // P is condensed into G, so P is NOT resident in the summary layer.
+    await insertSummary(storage, "s1", content, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s2", content, 1, 1002, 1003, "j_s2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent condensed", 2, 1000, 1003, "j_P", {
+      parentIds: ["s1", "s2"],
+    });
+    await insertSummary(storage, "G", "grandparent", 3, 1000, 1003, "j_G", {
+      parentIds: ["P"],
+    });
+    // Uncondensed L1 run [s3, s4] adjacent to P (which is condensed).
+    await insertSummary(storage, "s3", content, 1, 1004, 1005, "j_s3", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s4", content, 1, 1006, 1007, "j_s4", { eventIds: ["ev0"] });
+    // Sentinel: newestLatestTs above test data. Also raises maxLevel to 3 via G,
+    // but se_P_full is also L3 so it doesn't add a new level.
+    // Use a dedicated L1+L2 sentinel to avoid level conflicts.
+    const sentinelParentIds: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const id = `se2_l1_${i}`;
+      sentinelParentIds.push(id);
+      await insertSummary(storage, id, "x", 1, 5000 + i, 5001 + i, `j_se2_l1_${i}`, {
+        eventIds: ["ev0"],
+      });
+    }
+    await insertSummary(storage, "se2_P_full", "sentinel", 2, 5000, 5010, "j_se2_P_full", {
+      parentIds: sentinelParentIds,
+    });
+
+    const logs: Array<Record<string, unknown>> = [];
+    const indexer = makeIndexer(
+      storage,
+      store,
+      { summary_target_tokens: 100, summary_max_tokens: 150 },
+      {
+        condense_fanout: 5,
+        condense_target_tokens: 5,
+        eager_condense_min_children: 2,
+        eager_absorb_max_children: 10,
+        max_retries: 2,
+      },
+      {
+        logger: {
+          info: (event: string, data?: unknown) =>
+            logs.push({ event, ...(data as any) }),
+          warn: () => {},
+          error: () => {},
+          debug: () => {},
+        } as any,
+      },
+    );
+    indexer.enqueueReconcileTimeline(TK);
+    await indexer.stop();
+
+    const enq = logs.find((l) => l.event === "summary_budget_condense_enqueued");
+    assert.ok(enq, "a job was enqueued for the run");
+    // P is condensed (into G), so absorption into P must NOT happen.
+    // The run [s3,s4] falls through to bootstrap (no resident parent).
+    assert.equal(enq!.shape, "bootstrap", "bootstrap (condensed P excluded from candidates)");
+    assert.notEqual(enq!.parentId, "P", "job does not absorb into the condensed parent P");
   } finally {
     storage.close();
   }

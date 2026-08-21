@@ -466,7 +466,15 @@ export class SummarizationIndexer {
       // Find adjacent level-(level+1) parents.
       const prevRunEnd = ri > 0 ? runs[ri - 1]![runs[ri - 1]!.length - 1]!.latestTimestamp : 0;
       const nextRunStart = ri < runs.length - 1 ? runs[ri + 1]![0]!.earliestTimestamp : Infinity;
-      const parents = storage.getSummariesByLevel(timelineKey, level + 1);
+      // Only consider parents that are resident in the summary layer — i.e. not already
+      // condensed into a level-(level+2) summary. A condensed parent contributes zero tokens
+      // to the rendered layer; absorbing into it reduces cost by nothing, wastes inference,
+      // and can orphan the replacement outside the grandparent's child list (spec §5).
+      const allParents = storage.getSummariesByLevel(timelineKey, level + 1);
+      const condensedParentIds = storage.getCondensedSummaryIds(timelineKey, level + 1);
+      const parents = condensedParentIds.size === 0
+        ? allParents
+        : allParents.filter((p) => !condensedParentIds.has(p.id));
 
       // Left-adjacent: parent's coverage ends in the gap before this run.
       const leftCandidates = parents.filter(

@@ -33,7 +33,9 @@ function fmtTs(ms: number): string {
 
 /** Header line for a child summary, mirroring recap's format (carries its expandable id). */
 function summaryHeader(s: Summary): string {
-  const statusTag = s.status === "truncated" ? " · truncated" : "";
+  const statusTag =
+    s.status === "truncated" ? " · truncated" :
+    s.status === "superseded" ? " · superseded" : "";
   return `— [L${s.level} · ${fmtTs(s.earliestTimestamp)} → ${fmtTs(s.latestTimestamp)} · ${s.eventCount} msgs${statusTag} · id=${s.id}]`;
 }
 
@@ -93,15 +95,6 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
           details: { error: "not_found", id },
         };
       }
-      if (root.status === "superseded") {
-        return {
-          content: [
-            { type: "text", text: `error: summary "${id}" is superseded and cannot be expanded.` },
-          ],
-          details: { error: "superseded", id },
-        };
-      }
-
       const maxDepth = context.defaults.maxDepth;
       const requestedDepth = args.depth ?? 1;
       const depth = Math.max(1, Math.min(requestedDepth, maxDepth));
@@ -121,10 +114,9 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
           return;
         }
         for (const child of lineage.children) {
-          // A superseded child is never expandable (§9e) — skip it rather than emit a
-          // drill affordance that would error. (Forward-compat: no path writes that
-          // status today.)
-          if (child.status === "superseded") continue;
+          // Superseded children (written by same-level absorption, §9b) remain in storage
+          // and carry their own lineage — include them so the full absorbed history is
+          // reachable. summaryHeader annotates them " · superseded" for clarity.
           if (remainingDepth > 1) {
             walk(child.id, remainingDepth - 1);
           } else if (includeMessages && child.level === 1) {
@@ -194,7 +186,7 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
 
       let text: string;
       if (sections.length === 0) {
-        // Should not happen for a valid non-superseded summary, but be explicit.
+        // Should not happen for a valid summary, but be explicit.
         text = `Summary ${id} (L${root.level}) has no expandable constituents.`;
       } else {
         // Two distinct over-budget signals that never co-occur:

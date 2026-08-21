@@ -242,27 +242,36 @@ test("depth above the configured max is capped with a note", async () => {
   });
 });
 
-test("a superseded child is skipped during a drill", async () => {
+test("a superseded child is included during a drill (annotated, not silently dropped)", async () => {
   await withHierarchy(async (storage, tool) => {
     await insertSummary(storage, { id: "L1c", content: "superseded child summary", level: 1, earliest: 5000, latest: 6000, eventIds: ["e1"], status: "superseded" });
     await insertSummary(storage, { id: "L2b", content: "coarse summary with a superseded child", level: 2, earliest: 1000, latest: 6000, parentIds: ["L1a", "L1c"] });
     const res = await tool.execute("c9", { id: "L2b" });
-    const details = res.details as { children: Array<{ id: string }> };
-    // L1c (superseded) is skipped; only the live child is offered as a drill affordance.
-    assert.deepEqual(details.children.map((c) => c.id), ["L1a"]);
-    assert.doesNotMatch((res.content[0] as { text: string }).text, /id=L1c/);
+    const details = res.details as { children: Array<{ id: string; status: string }> };
+    // L1c (superseded) is now included (absorption writes this status; hiding it would hide
+    // absorbed history from the agent). Both children appear in the output.
+    assert.ok(details.children.map((c) => c.id).includes("L1a"), "L1a present");
+    assert.ok(details.children.map((c) => c.id).includes("L1c"), "L1c present");
+    const text = (res.content[0] as { text: string }).text;
+    assert.match(text, /id=L1c/, "L1c id in output");
+    assert.match(text, /superseded/, "superseded annotation present in header");
   });
 });
 
-test("unknown and superseded ids return clear errors", async () => {
+test("unknown id returns a clear not-found error; superseded id expands normally", async () => {
   await withHierarchy(async (storage, tool) => {
     const missing = await tool.execute("c7", { id: "nope" });
     assert.match((missing.content[0] as { text: string }).text, /not found/);
     assert.equal((missing.details as { error: string }).error, "not_found");
 
+    // A superseded summary (written by absorption) must expand normally — it remains in
+    // storage with its own lineage and the agent needs to be able to inspect it by id.
     await insertSummary(storage, { id: "dead", content: "gone", level: 1, earliest: 1000, latest: 2000, eventIds: ["e1"], status: "superseded" });
     const sup = await tool.execute("c8", { id: "dead" });
-    assert.match((sup.content[0] as { text: string }).text, /superseded/);
-    assert.equal((sup.details as { error: string }).error, "superseded");
+    const supText = (sup.content[0] as { text: string }).text;
+    assert.doesNotMatch(supText, /cannot be expanded/, "no hard error on superseded root");
+    assert.doesNotMatch(supText, /^error:/, "no error: prefix");
+    // A level-1 superseded summary expands to its raw events.
+    assert.match(supText, /Raw messages/, "raw messages section present");
   });
 });
