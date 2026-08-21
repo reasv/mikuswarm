@@ -70,14 +70,16 @@ One new knob, one new enqueue rule, zero selection changes.
 rendered summary layer for a timeline exceeds the target, the summarization
 subsystem **eagerly condenses short runs** — the same level+1 condense jobs the
 fanout trigger produces, just allowed to fire on runs shorter than `fanout`,
-oldest-first. The layer shrinks because real, LLM-written coarser summaries
-replace their children in the (unchanged) greedy highest-level selection.
+lowest level first. The layer shrinks because real, LLM-written coarser
+summaries replace their children in the (unchanged) greedy highest-level
+selection.
 
 Everything the agent sees remains a genuine summary. Precision degrades
-exactly the way it already does for the deep past — one rung coarser, one
-condensation earlier — starting from the oldest fine material and moving
-toward the present only as far as the budget requires. The freshest band is
-never touched (live-edge guard, §5).
+exactly the way it already does — one rung coarser, one condensation earlier —
+starting at the bottom of the ladder with the same merges the fanout trigger
+would soon run anyway, and climbing to coarser rungs only when the budget
+cannot be met below (§4). The freshest band is never touched (live-edge
+guard, §5).
 
 ## 4. Mechanism
 
@@ -92,11 +94,12 @@ threshold logic:
    the rendered block; the primary tokenizer). Approximation is fine — the
    target is soft.
 3. If cost ≤ target → done.
-4. Otherwise find the **oldest eligible run** and enqueue **one** condense job
-   for it (at most `fanout` members, oldest-first within the run). One job per
-   reconcile pass, mirroring the level-1 rule; the worker pool's completion
-   callback re-reconciles, so an over-budget layer converges stepwise — no
-   thundering burst, natural backpressure through the single worker.
+4. Otherwise find the **lowest-level eligible run** (oldest within a level)
+   and enqueue **one** condense job for it (at most `fanout` members,
+   oldest-first within the run). One job per reconcile pass, mirroring the
+   level-1 rule; the worker pool's completion callback re-reconciles, so an
+   over-budget layer converges stepwise — no thundering burst, natural
+   backpressure through the single worker.
 
 Run discovery reuses `evaluateCondensation`'s exact machinery — condensed-id
 exclusion (P4 idempotency), contiguity, failed-range interruption at every
@@ -106,10 +109,19 @@ explicit declared child list (input-integrity P3), same session type, same
 worker pool, same lineage writes, same diary queue ride-along. Nothing
 downstream can tell the difference.
 
-"Oldest eligible run": among all levels' candidate runs, the one whose newest
-member has the earliest `latest_timestamp`. This naturally coarsens L1 leaves
-under an old L2 band before touching anything newer, and cascades upward as
-produced parents themselves form runs.
+**Ordering — lowest level first, oldest within a level.** Destructiveness
+grows with level: each rung multiplies a block's time span by ~`fanout`, so a
+partial merge at L4/L5 collapses months of history into one block for a small
+saving, while a partial merge at L1/L2 is the very merge the fanout trigger
+would run within hours anyway — just a sibling or two early. Savings also
+live at the bottom: the over-budget mass is the recent fine band (§1), where
+runs are long and blocks numerous. Level-ascending order therefore takes the
+lowest-information-loss, highest-saving jobs first, and escalates to coarser
+merges only when the budget cannot be met below. Within a level, oldest run
+first (equal destructiveness — age decides). A produced parent may later
+become contiguous with same-level neighbors; once such a run reaches
+`fanout`, the ordinary trigger takes it — eager and lazy condensation cascade
+together.
 
 ## 5. Guards
 
@@ -117,6 +129,11 @@ produced parents themselves form runs.
   summary is never eagerly condensed. The most recent band always stays at its
   current finest level; only fanout-triggered condensation (unchanged) ever
   coarsens it.
+- **Top-level guard** (no knob): an eager job never mints a new abstraction
+  level — only runs whose level is strictly below the timeline's current
+  maximum summary level are eligible. A new top rung (e.g. an L6 spanning
+  months) can only come from the fanout trigger deciding the history has
+  genuinely earned it, never from budget pressure.
 - **Minimum run**: `[summarization] eager_condense_min_children` (default 2,
   schema-bounded 2..`condense_fanout`). Runs of one are never condensed (a
   1-child "condensation" is a paraphrase, not a reduction).
@@ -188,8 +205,12 @@ deployments see byte-identical behavior.
   existing evaluator tests pass verbatim).
 - Over-budget timeline with an interior short run → exactly one eager job,
   oldest run first, declared children correct.
+- Ordering: with eligible runs at several levels, the lowest level wins;
+  oldest first within a level.
 - Live-edge guard: newest-summary run never selected even when it is the only
   candidate.
+- Top-level guard: a run at the timeline's maximum level is never selected —
+  no eager job creates a previously nonexistent level.
 - Guaranteed-saving guard: small-run skip; soft-target outcome (over budget,
   no eligible run → no job, no loop).
 - Convergence: repeated reconcile passes with a stubbed worker drive the layer
