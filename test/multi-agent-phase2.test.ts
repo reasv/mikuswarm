@@ -136,7 +136,7 @@ test("v6→v7 migration: memory_chunks gets agent column (NULL for existing rows
         const version = storage.read((db) =>
           Number(db.pragma("user_version", { simple: true })),
         );
-        assert.equal(version, 12, "migration stamps to latest (v12)");
+        assert.equal(version, 13, "migration stamps to latest (v13)");
 
         // The existing row must have agent=NULL with rowid preserved.
         const row = storage.read((db) =>

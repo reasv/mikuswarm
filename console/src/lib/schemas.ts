@@ -286,7 +286,11 @@ export const PipelineCounts = Schema.Struct({
 	// Captioning-only: pending assets the pool would never claim under the current
 	// config (the derived `deferred` status), carved out of `pending`. 0 elsewhere.
 	// Optional so a pre-feature backend still decodes (defaults to 0).
-	deferred: Schema.optionalWith(Schema.Number, { default: () => 0 })
+	deferred: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+	// Diary-only: rows terminalized as `excluded` by channel visibility config
+	// (ARCHITECTURE.md §9h). Terminal — not retryable. 0 on all other pools.
+	// Optional so a pre-feature backend still decodes (defaults to 0).
+	excluded: Schema.optionalWith(Schema.Number, { default: () => 0 })
 });
 export type PipelineCounts = Schema.Schema.Type<typeof PipelineCounts>;
 

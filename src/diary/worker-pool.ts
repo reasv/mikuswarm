@@ -17,6 +17,7 @@ import { attachSessionCapture } from "../agent/session-capture.js";
 import { agentDateStamp } from "../time/index.js";
 import { buildDiaryHeader, draftBeginsWithHeader } from "./header.js";
 import { recentMemoryWindow } from "./recent-window.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
 
 export interface DiaryWorkerPoolOptions {
   storage: Storage;
@@ -58,6 +59,13 @@ export interface DiaryWorkerPoolOptions {
    * rolls. Diary depends on nothing, so a paused diary blocks only diary (§2.1).
    */
   shouldPause?: () => boolean;
+  /**
+   * Channel visibility resolver (ARCHITECTURE.md §9h). When provided, diary
+   * jobs for channels whose resolved mode is not "shared" are terminalized as
+   * `excluded` rather than spawning a session. When absent, all channels are
+   * treated as "shared" (zero behaviour change).
+   */
+  visibilityResolver?: ChannelVisibilityResolver;
   logger: Logger;
 }
 
@@ -312,6 +320,24 @@ export class DiaryWorkerPool {
     }
 
     const maxRetries = config.max_retries ?? DEFAULT_MAX_RETRIES;
+
+    // Exclusion gate (ARCHITECTURE.md §9h): if the channel's resolved visibility
+    // mode is not "shared", the range is excluded from the diary — no session, no
+    // lineage load. `excluded` is a distinct terminal from `skipped` so the
+    // console pipelines monitor can differentiate "excluded by operator config"
+    // from "bot didn't participate". Evaluated at claim time so a config change
+    // applies on the next poll without restart-order coupling.
+    const visibilityMode = this.options.visibilityResolver?.modeFor(job.timelineKey, logger) ?? "shared";
+    if (visibilityMode !== "shared") {
+      await storage.setDiaryStatus(job.summaryId, "excluded");
+      logger.info("diary_job_excluded", {
+        summaryId: job.summaryId,
+        timelineKey: job.timelineKey,
+        mode: visibilityMode,
+      });
+      this.emit(job, "skipped", "excluded");
+      return;
+    }
 
     // Load the range's events via lineage — consulted ONLY for the skip-gate
     // below; the session's context comes from the diary-range build, not from

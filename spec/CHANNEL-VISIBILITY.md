@@ -1,10 +1,9 @@
 # Channel Visibility — Design
 
-**Status**: PROPOSED — not implemented. Target ARCHITECTURE.md home once
-implemented: `[visibility]` entry in the §4 config schema, a new "Channel
-visibility" section (suggested §9h, after search), plus touchpoints in §9c
-(diary skip gates, `diary_status` vocabulary) and §9e (room resolution and
-per-tool filtering).
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §9h; retained for
+review. Original target sections were §4 (config schema), §9h (new section),
+§9c (diary gate), and §9e (room resolution and per-tool filtering) — all
+implemented as designed.
 
 **Settled operator decisions** (2026-08-21): unified `[visibility]` block
 (not feature-scoped lists split across `[diary]` and a privacy table); mode

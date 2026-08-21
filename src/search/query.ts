@@ -1,5 +1,6 @@
 import type { Storage, ChatSearchHit, ChatSearchResult } from "../storage/index.js";
 import type { ChatSearchIndexer } from "./indexer.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
 
 export type SearchScope = "text" | "text+captions" | "all";
 
@@ -172,6 +173,91 @@ export function resolveRoomsForAgent(
   // Agents mode: restrict to this agent's account-prefixed timeline keys.
   const prefixes = agentAccountPrefixes.map((k) => (k.endsWith(":") ? k : `${k}:`));
   return storage.getDistinctTimelineKeysForAccountPrefixes(prefixes);
+}
+
+/**
+ * Apply the channel-visibility isolation filter to a resolved timeline-key list
+ * (ARCHITECTURE.md §9h). Called at the **tool layer** (not inside storage methods)
+ * so Storage stays policy-free.
+ *
+ * Rules:
+ * - `rooms:"current"` is always allowed (viewer's own channel) — callers must
+ *   have already resolved to `[currentTimelineKey]` via `resolveRooms`.
+ * - When `hasIsolation()` is false, returns the list unchanged (fast path).
+ * - An isolated key that is NOT the viewer's channel is dropped.
+ * - For the `rooms:"all"` path (`undefined` = no filter / legacy), materializes
+ *   the key list and drops isolated non-viewer keys; when no isolation is
+ *   configured, preserves the `undefined` fast path bit-for-bit.
+ * - For explicit lists, drops isolated non-viewer keys and appends a note
+ *   `note: N room(s) excluded by operator visibility config` when any were dropped.
+ *
+ * @param timelineKeys - The resolved key list from `resolveRoomsForAgent`.
+ *   `undefined` means "all rooms" (legacy no-filter path).
+ * @param viewerTimelineKey - The session's own timeline key.
+ * @param resolver - The visibility resolver; when undefined behaves as all-shared.
+ * @param storage - Required when `timelineKeys` is `undefined` (all-rooms path)
+ *   and `hasIsolation()` is true; used to materialize the distinct key list.
+ * @param isExplicitList - True when the caller passed an explicit room list (not
+ *   `"all"`). Controls whether the exclusion note is appended.
+ * @returns `{ keys, note, excludedCount }` — `keys` is the filtered list (or
+ *   `undefined` to preserve the no-filter path); `note` is an empty string or
+ *   the exclusion note; `excludedCount` is the number of rooms dropped (non-zero
+ *   only on the explicit-list path, for structured-log emission at the tool layer).
+ */
+export function applyVisibilityToRooms(
+  timelineKeys: string[] | undefined,
+  viewerTimelineKey: string,
+  resolver: ChannelVisibilityResolver | undefined,
+  storage: { getDistinctTimelineKeys(): string[] } | undefined,
+  isExplicitList: boolean,
+): { keys: string[] | undefined; note: string; excludedCount: number } {
+  if (!resolver?.hasIsolation()) {
+    // No isolation configured anywhere — preserve the legacy fast path exactly.
+    return { keys: timelineKeys, note: "", excludedCount: 0 };
+  }
+
+  if (timelineKeys === undefined) {
+    // `rooms:"all"` path: materialize all distinct keys and filter.
+    const allKeys = storage?.getDistinctTimelineKeys() ?? [];
+    const filtered = allKeys.filter((k) => {
+      const mode = resolver.modeFor(k);
+      return mode !== "isolated" || resolver.sameChannel(viewerTimelineKey, k);
+    });
+    // IMPORTANT: always return the array (never undefined) when isolation is configured,
+    // even when the list is empty — this ensures the storage layer's empty-array guard
+    // fires ("match nothing") rather than falling through to an unfiltered query.
+    // Filtering here is silent (no note, no excludedCount) — the agent asked for "all"
+    // and operators expect hidden channels to simply not appear, with no note.
+    return { keys: filtered, note: "", excludedCount: 0 };
+  }
+
+  // Explicit list or already-resolved rooms:"current" / agents-mode list.
+  // rooms:"current" resolves to [currentTimelineKey] which is always the viewer's
+  // own channel — it can't be isolated-from-self, so filter is a no-op for that case.
+  if (!isExplicitList) {
+    // Non-explicit (current/agents-mode already-filtered): apply isolation filter
+    // but produce no note (the caller didn't name specific rooms).
+    const filtered = timelineKeys.filter((k) => {
+      const mode = resolver.modeFor(k);
+      return mode !== "isolated" || resolver.sameChannel(viewerTimelineKey, k);
+    });
+    return { keys: filtered, note: "", excludedCount: 0 };
+  }
+
+  // Explicit list: report excluded rooms with a trailing note and structured log.
+  let excludedCount = 0;
+  const filtered = timelineKeys.filter((k) => {
+    const mode = resolver.modeFor(k);
+    if (mode === "isolated" && !resolver.sameChannel(viewerTimelineKey, k)) {
+      excludedCount++;
+      return false;
+    }
+    return true;
+  });
+  const note = excludedCount > 0
+    ? `note: ${excludedCount} room(s) excluded by operator visibility config`
+    : "";
+  return { keys: filtered, note, excludedCount };
 }
 
 /** Decode a `"<timestamp>:<rowid>"` keyset cursor; undefined if malformed. */

@@ -25,7 +25,7 @@
 		enrichment: ['processing', 'pending', 'retrying', 'complete', 'failed', 'skipped'],
 		captioning: ['processing', 'pending', 'retrying', 'complete', 'deferred', 'failed', 'skipped'],
 		summarization: ['processing', 'pending', 'retrying', 'complete', 'failed'],
-		diary: ['processing', 'pending', 'retrying', 'done', 'skipped', 'failed']
+		diary: ['processing', 'pending', 'retrying', 'done', 'skipped', 'excluded', 'failed']
 	};
 
 	const queryClient = useQueryClient();

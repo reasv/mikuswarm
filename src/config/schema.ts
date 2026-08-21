@@ -1687,6 +1687,39 @@ const BackfetchSchema = StrictObject({
   caption_backfetched: Type.Optional(Type.Boolean()),
 });
 
+const VisibilityModeEnum = Type.Union([
+  Type.Literal("shared"),
+  Type.Literal("no_diary"),
+  Type.Literal("isolated"),
+]);
+
+// Per-channel visibility entry — exact timeline_key (no :thread: suffix) + mode.
+const VisibilityChannelSchema = StrictObject({
+  // Required; exact match. Must parse via the shared grammar (room/dm kind, no thread
+  // suffix). Keys for channels the bot has not yet seen are valid — config routinely
+  // predates channel activation.
+  timeline_key: Type.String({ minLength: 1 }),
+  // Required; one of the three visibility modes.
+  mode: VisibilityModeEnum,
+});
+
+/**
+ * Channel visibility config (ARCHITECTURE.md §9h). All-optional, default-absent block;
+ * an unconfigured deployment behaves identically to today (all-shared, zero overhead).
+ *
+ * Validation rules enforced at app wiring (too dynamic for TypeBox):
+ *   - every `timeline_key` must parse with kind room/dm and no :thread: suffix;
+ *   - no duplicate `timeline_key` entries.
+ */
+const VisibilitySchema = StrictObject({
+  // Blanket mode for every dm-kind timeline (any provider/account). Defaults to
+  // "shared". An exact `[[visibility.channels]]` entry overrides this in either
+  // direction for a specific DM.
+  dms: Type.Optional(VisibilityModeEnum),
+  // Per-channel overrides; exact timeline keys. More specific than `dms`.
+  channels: Type.Optional(Type.Array(VisibilityChannelSchema)),
+});
+
 export const AppConfigSchema = StrictObject({
   app: StrictObject({
     name: Type.String(),
@@ -1844,6 +1877,9 @@ export const AppConfigSchema = StrictObject({
   search: Type.Optional(SearchSchema),
   reactions: Type.Optional(ReactionsSchema),
   proactive: Type.Optional(ProactiveSchema),
+  // Channel visibility (ARCHITECTURE.md §9h). Default-absent = all-shared; zero
+  // behavior change for deployments that never touch this block.
+  visibility: Type.Optional(VisibilitySchema),
   backfetch: Type.Optional(BackfetchSchema),
   character_card: Type.Optional(StrictObject({
     output_subdir: Type.Optional(Type.String()),
@@ -1947,3 +1983,5 @@ export type AgentToolsConfig = Static<typeof AgentToolsSchema>;
 export type IrcAccountConfig = Static<typeof IrcAccountSchema>;
 /** Top-level IRC provider config (spec IRC-SUPPORT-DESIGN §8). */
 export type IrcConfig = Static<typeof IrcSchema>;
+/** Channel visibility config (ARCHITECTURE.md §9h). */
+export type VisibilityConfig = Static<typeof VisibilitySchema>;

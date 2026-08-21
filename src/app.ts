@@ -132,6 +132,7 @@ import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
+import { ChannelVisibilityResolver, validateVisibilityChannels, type VisibilityConfig } from "./visibility/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
 import { parseTimelineKey, buildTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
 import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
@@ -2398,6 +2399,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   };
 
+  // Channel visibility resolver (ARCHITECTURE.md §9h). Fail-fast validation
+  // is delegated to validateVisibilityChannels (defined in visibility/index.ts
+  // so it's independently testable). Throws with a descriptive message on any
+  // malformed key, :thread: suffix, or duplicate entry.
+  const visibilityCfg = config.visibility as VisibilityConfig | undefined;
+  validateVisibilityChannels(visibilityCfg);
+  const visibilityResolver = new ChannelVisibilityResolver(visibilityCfg, logger.child("visibility"));
+
   const diaryPool = diaryEnabled
     ? new DiaryWorkerPool({
         storage,
@@ -2426,6 +2435,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // class is over budget. Diary depends on nothing, so this gates only diary.
         // Emits a rate-limited `usage_limit_blocked` log on pause (§6.4, review #2).
         shouldPause: makeAgentLoopClaimGate(["diary"]),
+        // Channel visibility resolver (ARCHITECTURE.md §9h): terminalize jobs
+        // for channels whose mode is not "shared" as `excluded`.
+        visibilityResolver,
         logger: logger.child("diary"),
       })
     : null;
@@ -4450,10 +4462,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         currentTimelineKey: inbound.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
         agentAccountPrefixes: sessionAgentAccountPrefixes,
+        visibilityResolver,
+        logger: logger.child("search"),
       }),
       // Summary drill-down (§9e). DB-backed (lineage tables + shared renderer), so like
       // search/recap it's available regardless of roomId and is single-id (room implicit).
-      createExpandSummaryTool({ storage, defaults: chatSearchDefaults.expand }),
+      createExpandSummaryTool({
+        storage,
+        defaults: chatSearchDefaults.expand,
+        currentTimelineKey: inbound.timelineKey,
+        visibilityResolver,
+      }),
       createRecapTool({
         storage,
         indexer: chatSearchIndexer,
@@ -4465,6 +4484,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           defaultLookbackMs: chatSearchDefaults.absence.defaultLookbackMs,
         },
         agentAccountPrefixes: sessionAgentAccountPrefixes,
+        visibilityResolver,
+        logger: logger.child("search"),
       }),
       createUserActivityTool({
         storage,
@@ -4485,6 +4506,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           const members = await client.members();
           return members.map((m) => ({ userId: m.id, displayName: m.displayName }));
         },
+        visibilityResolver,
+        logger: logger.child("search"),
       }),
       // set_profile is a provider-level capability (optional on IChatProvider).
       // Present only when the provider implements it and an accountId is available.

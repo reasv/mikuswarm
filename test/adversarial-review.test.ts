@@ -55,7 +55,7 @@ test("adversarial/migration: all blob variants migrate without OR IGNORE data lo
       const storage = await Storage.open({ databasePath: dbPath });
       try {
         const ver = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-        assert.equal(ver, LATEST_SCHEMA_VERSION, "version stamped to 12");
+        assert.equal(ver, LATEST_SCHEMA_VERSION, "version stamped to 13");
 
         const cols = storage.read((db) =>
           (db.pragma("table_info(agent_sessions)") as Array<{ name: string }>).map((r) => r.name),
@@ -524,8 +524,8 @@ test("adversarial/migration: re-open + forced user_version=10 re-run is safe (no
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTACK 10: schema version constant and indexes present in fresh DB
 // ─────────────────────────────────────────────────────────────────────────────
-test("adversarial/schema: LATEST_SCHEMA_VERSION = 12; all four expected indexes present on fresh DB", async () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 12, "LATEST_SCHEMA_VERSION is 12");
+test("adversarial/schema: LATEST_SCHEMA_VERSION = 13; all four expected indexes present on fresh DB", async () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 13, "LATEST_SCHEMA_VERSION is 13");
 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

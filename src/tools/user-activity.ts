@@ -1,9 +1,11 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ChatTypeFilter, Storage } from "../storage/index.js";
-import { type ChatSearchIndexer, resolveRooms, resolveTimeWindow } from "../search/index.js";
+import { type ChatSearchIndexer, resolveRooms, resolveTimeWindow, applyVisibilityToRooms } from "../search/index.js";
 import { roomIdFromTimelineKey } from "../timeline/index.js";
 import { formatAgentTimestamp } from "../time/index.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
+import type { Logger } from "../observability/index.js";
 
 /** Attachment kinds the message-type filter understands (mirrors `search_messages`). */
 const ATTACHMENT_TYPES = ["image", "video", "audio", "file"] as const;
@@ -26,6 +28,17 @@ export interface UserActivityToolContext {
    * Optional: when absent (e.g. no live client), the silent union degrades to a note.
    */
   roomMembers?: (timelineKey: string) => Promise<RoomMemberLite[]>;
+  /**
+   * Channel visibility resolver (ARCHITECTURE.md §9h). When provided and isolation
+   * is configured, isolated non-viewer channels are excluded from activity results.
+   */
+  visibilityResolver?: ChannelVisibilityResolver;
+  /**
+   * Structured logger for `search_rooms_excluded` observability events (§8).
+   * When provided, emits one log per call where explicit rooms were dropped by
+   * the visibility policy. Absent = no log (behavior unchanged).
+   */
+  logger?: Logger;
 }
 
 interface UserActivityArgs {
@@ -278,7 +291,31 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
       const nowMs = now();
       await context.indexer.ensureFreshForQuery();
 
-      const timelineKeys = resolveRooms(args.rooms ?? "all", context.currentTimelineKey);
+      const rawKeys = resolveRooms(args.rooms ?? "all", context.currentTimelineKey);
+      const isExplicitList = Array.isArray(args.rooms);
+      const { keys: timelineKeys, note: visibilityNote, excludedCount } = applyVisibilityToRooms(
+        rawKeys,
+        context.currentTimelineKey,
+        context.visibilityResolver,
+        context.storage,
+        isExplicitList,
+      );
+      // Structured log: operator-side answer to "why can't the bot see that room?" (§8).
+      if (excludedCount > 0 && context.logger) {
+        context.logger.info("search_rooms_excluded", {
+          tool: "user_activity",
+          viewerKey: context.currentTimelineKey,
+          excludedCount,
+        });
+      }
+      // Short-circuit: all requested rooms were excluded — no storage queries needed.
+      if (timelineKeys !== undefined && timelineKeys.length === 0) {
+        const text = visibilityNote || "Activity in 0 room(s) — all requested rooms excluded by operator visibility config.";
+        return {
+          content: [{ type: "text", text }],
+          details: { rooms: 0, excluded: excludedCount },
+        };
+      }
       // Window. all_time removes the lower bound entirely (an upper `before` may still apply).
       // Otherwise inject the 30d default ONLY when no bound at all is given — a lone `before`
       // must leave the lower bound OPEN, else the default afterTs could invert the window.
@@ -475,10 +512,13 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
       const shownMessages = shown.reduce((n, s) => n + s.total, 0);
       const shownPct = pct(shownMessages, scopeTotals.totalMessages);
 
+      const visNote = visibilityNote ? `\n${visibilityNote}` : "";
       let text: string;
-      if (shown.length === 0) {
+      if (shown.length === 0 && visibilityNote && !timelineKeys?.length) {
+        text = visibilityNote;
+      } else if (shown.length === 0) {
         const none = filterLabel ? `No "${filterLabel}" activity` : "No activity";
-        text = `${none} in ${windowLabel} (${scope})${silentNote}.${suffixBlock}\n\n(${trailer})`;
+        text = `${none} in ${windowLabel} (${scope})${silentNote}.${suffixBlock}\n\n(${trailer})${visNote}`;
       } else {
         const lines = shown.map((s, i) => {
           const lastSeen = s.neverPosted ? "never posted" : `last ${fmtTs(s.lastAt)}`;
@@ -502,7 +542,7 @@ export function createUserActivityTool(context: UserActivityToolContext): AgentT
         const subtotal = shownPct
           ? `\nThese ${shown.length} sender(s) account for ${shownMessages} of ${scopeTotals.totalMessages} message(s) (${shownPct}).`
           : "";
-        text = `${header} (${totalSenders} sender(s))${silentNote}:\n${lines.join("\n")}${more}${subtotal}${suffixBlock}\n\n(${trailer})`;
+        text = `${header} (${totalSenders} sender(s))${silentNote}:\n${lines.join("\n")}${more}${subtotal}${suffixBlock}\n\n(${trailer})${visNote}`;
       }
 
       return {

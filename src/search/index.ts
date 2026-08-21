@@ -7,6 +7,7 @@ export {
   buildSummarySnippet,
   resolveRooms,
   resolveRoomsForAgent,
+  applyVisibilityToRooms,
   decodeCursor,
   encodeCursor,
   queryTerms,

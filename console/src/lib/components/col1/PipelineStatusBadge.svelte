@@ -13,6 +13,7 @@
 		truncated: 'border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400',
 		failed: 'border-transparent bg-red-500/15 text-red-600 dark:text-red-400',
 		skipped: 'border-transparent bg-zinc-500/10 text-zinc-500 dark:text-zinc-500',
+		excluded: 'border-transparent bg-orange-500/10 text-orange-600 dark:text-orange-400',
 		deferred: 'border-transparent bg-violet-500/10 text-violet-600 dark:text-violet-400'
 	};
 </script>

@@ -277,6 +277,8 @@ reactions?:     { enabled?, show_aggregates?, show_discrete?,  // see §9f
                   discrete_other_horizon_messages?,           // inter-user only
                   discrete_split_messages?, discrete_split_minutes?,
                   discrete_name_cap? }
+visibility?:    { dms?: "shared" | "no_diary" | "isolated",   // see §9h; default shared; blanket for all DM timelines
+                  channels?: Array<{ timeline_key, mode: "shared" | "no_diary" | "isolated" }> }
 proactive?:     { enabled?, session_type?, kickoff_prompt?,    // see §9g; opt-in
                   daily_posts?, min_user_messages?,           // global defaults,
                   dead_channel_backstop_ms?, min_gap_ms?,     //   overridable per channel
@@ -3162,6 +3164,59 @@ The per-tick `proactive_tick` log plus the existing `session_started`/`session_c
 ### Future hook (not implemented)
 
 An external impulse source (e.g. an X.com timeline scraper that feeds the bot things to post about) fits as an *additional producer* of proactive sessions: it would build the same synthetic inbound, optionally inject its payload as extra context, and call the same `launchSession(..., { proactive: true })`. Keeping the launch path producer-agnostic (nothing hardcodes the *reason* a proactive session exists beyond `trigger.type = "timer"` and the session type) is what makes that purely additive. It is not built.
+
+---
+
+## 9h. Channel Visibility
+
+Operators can mark individual channels (or all DMs) with a **visibility mode** that controls whether diary entries are written and whether search/recap results cross channel boundaries.
+
+### Mode vocabulary
+
+- **`shared`** (default) — the channel participates in the diary and is visible to search/recap across all rooms. No behavior change from pre-feature deployments.
+- **`no_diary`** — search/recap see the channel normally, but diary ranges from it are excluded (`diary_status = 'excluded'`). Use this when a channel's content should not appear in the bot's first-person memory journal.
+- **`isolated`** — both the diary gate AND search/recap filtering apply. An agent in a different channel cannot see messages or summaries from this channel; `expand_summary` blocks cross-channel expansion. The channel is fully self-contained from the bot's perspective.
+
+### Configuration
+
+```
+[visibility]
+dms = "no_diary"                          # blanket for all DM timelines (optional)
+
+[[visibility.channels]]
+timeline_key = "matrix:bot:room:!xyz:s"
+mode = "isolated"
+```
+
+`timeline_key` must be a valid room or dm key (no `:thread:` suffix — threads inherit the parent room's mode). Duplicate keys and unknown kinds are a fail-fast startup error. Thread-stripped lookup (`parseTimelineKey` + `buildTimelineKey`) means a thread in a configured room automatically inherits its parent's mode.
+
+Precedence: exact `timeline_key` entry → `dms` blanket (dm-kind only) → `"shared"`.
+
+### Implementation
+
+`src/visibility/index.ts` — `ChannelVisibilityResolver` is the single authority. Constructed once at wiring from `config.visibility`, injected into the pools and tools that need it. Never read `config.visibility` directly from other modules. `validateVisibilityChannels(cfg)` (exported from the same module) is the canonical startup validation entry point called in `app.ts` before any provider starts; it validates every `channels` entry (valid key format, room/dm kind only, no `:thread:` suffix, no duplicates) and throws a descriptive `Error` on the first violation — unit-testable in isolation without a full application wiring.
+
+**Diary gate** (`src/diary/worker-pool.ts`): after claiming a job, before the zero-assistant skip-gate, the resolver's `modeFor(timelineKey)` is called. When the mode is not `"shared"` the job is immediately set to `'excluded'` (`DiaryStatus`), logged `diary_job_excluded`, and the slot is released without spawning a session. `'excluded'` is terminal — it is not in `PIPELINE_SAFE_RETRY` and does not appear in the default pipeline monitor list view (hidden alongside `'skipped'`).
+
+**Search layer** (`src/search/query.ts` — `applyVisibilityToRooms`): called by `search_messages`, `recap`, and `user_activity` after `resolveRoomsForAgent`. When `hasIsolation()` is false (no `"isolated"` mode configured anywhere) the function is a zero-cost identity — it returns the input unchanged, preserving the `undefined` no-filter legacy path exactly. When isolation is configured, isolated non-viewer channels are dropped from the key list; explicit-list requests append a `"note: N room(s) excluded by operator visibility config"` note to the tool output. The return value includes `excludedCount` (number of rooms removed by the policy); when the all-rooms path produces an empty filtered list, the function always returns the empty array (never `undefined`) so the storage-layer guard fires rather than falling through to an unfiltered query.
+
+**Storage defense-in-depth**: all eight storage functions that accept `timelineKeys` (`searchChatIndex`, `searchSummaries`, `getSummariesInWindow`, `getChatSenderTimestamps`, `aggregateChatActivity`, `topChatActivity`, `chatActivityScope`, `countChatIndex`) treat an empty array as "match nothing" and return immediately with an empty/zero result — identical to the `getHighWaterMark` precedent. This is a second layer of safety so an empty key list can never fall through to an unfiltered full-corpus query regardless of how the caller arrived at it.
+
+**Structured log** (`search_rooms_excluded`): when `excludedCount > 0`, each of `search_messages`, `recap`, and `user_activity` emits one structured log entry via a `logger?: Logger` field on their tool context (the same pattern as `load-skill.ts` / `tool-search.ts`). Fields: `tool` (tool name), `viewerKey` (current timeline key), `excludedCount`. Provides an operator-side answer to "why can't the bot see that room?" without surfacing policy details to the agent. When `logger` is absent (existing call sites that don't pass it) no log is emitted — behavior unchanged.
+
+**Tool short-circuit**: before calling any storage function, each of the three tools checks `timelineKeys !== undefined && timelineKeys.length === 0` and returns a terse "0 rooms — all excluded" result immediately, so no storage query runs when the visibility policy eliminates every candidate room.
+
+**`expand_summary`** (`src/tools/expand-summary.ts`): checks the requested summary's `timeline_key` against the resolver before expanding. If the mode is `"isolated"` and the viewer is not in that channel (`sameChannel(viewerKey, summaryKey)` returns false), the tool returns an error rather than the summary content.
+
+**`hasIsolation()` fast path**: the resolver tracks whether any `"isolated"` mode is configured at all. When `false`, every search path preserves its exact current shape — no-op for deployments that never touch `[visibility]`.
+
+### Schema
+
+`summaries.diary_status` CHECK constraint widened (v11→v12 migration) to include `'excluded'`. Migration uses the table-rebuild pattern (same as v6→v7 `memory_chunks`) with explicit save/restore of `summary_events` and `summary_parents` rows to avoid SQLite FK cascade deletion on `DROP TABLE`. `getDistinctTimelineKeys()` on `Storage` materializes the distinct `timeline_key` set from `chat_index` for the `rooms:"all"` isolation-filter path.
+
+### Console
+
+`PipelineCounts.excluded` (optional, defaults to 0 on pre-feature backends) tracks the diary pool's excluded count. The status chip (`'excluded'`) is added to the diary pool's `STATUS_CHIPS` list (hidden from the default view, reachable via the chip filter). `PipelineStatusBadge` maps `excluded` to an orange tone.
 
 ---
 

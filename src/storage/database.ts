@@ -238,8 +238,14 @@ export interface SummarizationJob {
   absorbedParentId: string | null;
 }
 
-/** Diary queue state on a level-1 summary row (ARCHITECTURE.md §9c). */
-export type DiaryStatus = "pending" | "processing" | "done" | "skipped" | "failed";
+/**
+ * Diary queue state on a level-1 summary row (ARCHITECTURE.md §9c/§9h).
+ * `excluded` is terminal — set when the channel's resolved visibility mode is
+ * not "shared" (§9h diary gate); distinct from `skipped` (zero-assistant-message
+ * range) so the console can answer "is my visibility config working?" from the
+ * pipelines monitor.
+ */
+export type DiaryStatus = "pending" | "processing" | "done" | "skipped" | "failed" | "excluded";
 
 /**
  * A claimed diary job: the level-1 summary whose participation range the diary
@@ -1492,6 +1498,14 @@ export interface PipelineCounts {
    * {@link Storage.getPipelineCounts}).
    */
   deferred: number;
+  /**
+   * Diary-only: summary ranges excluded by operator channel-visibility config
+   * (ARCHITECTURE.md §9h). Always 0 for the other pools. The `excluded` terminal
+   * is distinct from `skipped` (zero-assistant-message ranges) so the console
+   * pipelines monitor can answer "is my visibility config working?" separately
+   * from "why did the bot skip this?" (zero participation).
+   */
+  excluded: number;
 }
 
 /**
@@ -4988,6 +5002,9 @@ export class Storage {
     start: number;
     end: number;
   }): Summary[] {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return empty immediately rather than running an unfiltered query.
+    if (opts.timelineKeys !== undefined && opts.timelineKeys.length === 0) return [];
     const rows = this.read((db) => {
       const where: string[] = [
         "status in ('complete', 'truncated')",
@@ -6256,6 +6273,23 @@ export class Storage {
     });
   }
 
+  /**
+   * Return all distinct `timeline_key` values present in `chat_index`.
+   * Used by the channel-visibility isolation filter (ARCHITECTURE.md §9h) to
+   * materialize the key list for the `rooms:"all"` path when isolation is
+   * configured, so isolated non-viewer keys can be dropped before the query.
+   * This mirrors the `resolveRoomsForAgent` idiom but without an account-prefix
+   * restriction.
+   */
+  getDistinctTimelineKeys(): string[] {
+    return this.read((db) => {
+      const rows = db
+        .prepare("select distinct timeline_key from chat_index")
+        .all() as Array<{ timeline_key: string }>;
+      return rows.map((r) => r.timeline_key);
+    });
+  }
+
   /** Read a single `index_meta` value (active model id/dim, corpus signature). */
   getIndexMeta(key: string): string | undefined {
     return this.read((db) => {
@@ -6415,6 +6449,9 @@ export class Storage {
 
   /** Count indexed events (optionally within a room set) — for the search trailer. */
   countChatIndex(timelineKeys?: string[]): number {
+    // An empty array (all rooms filtered by visibility) means "match nothing", not "all
+    // rooms" — the same safety guarantee as getHighWaterMark's empty-list early return.
+    if (timelineKeys !== undefined && timelineKeys.length === 0) return 0;
     return this.read((db) => {
       if (timelineKeys && timelineKeys.length > 0) {
         const keys = timelineKeys.map((_, i) => `@k${i}`);
@@ -6457,6 +6494,11 @@ export class Storage {
    * relevance (bm25) returns the first page only (the tool documents this).
    */
   searchChatIndex(q: ChatSearchQuery): ChatSearchResult {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return zero hits immediately rather than running an unfiltered query.
+    if (q.timelineKeys !== undefined && q.timelineKeys.length === 0) {
+      return { hits: [], total: 0 };
+    }
     return this.read((db) => {
       const where: string[] = [];
       const params: Record<string, unknown> = {};
@@ -6574,6 +6616,11 @@ export class Storage {
    * before the query, so it can never be returned. Pure read.
    */
   searchSummaries(q: SummarySearchQuery): SummarySearchResult {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return zero hits immediately rather than running an unfiltered query.
+    if (q.timelineKeys !== undefined && q.timelineKeys.length === 0) {
+      return { hits: [], total: 0 };
+    }
     return this.read((db) => {
       const where: string[] = [];
       const params: Record<string, unknown> = {};
@@ -6730,6 +6777,9 @@ export class Storage {
     sinceTs?: number;
     limit?: number;
   }): number[] {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return empty immediately rather than running an unfiltered query.
+    if (opts.timelineKeys !== undefined && opts.timelineKeys.length === 0) return [];
     return this.read((db) => {
       const where: string[] = ["sender_id = @senderId"];
       const params: Record<string, unknown> = {
@@ -6770,6 +6820,9 @@ export class Storage {
     untilTs?: number;
     filter?: ChatTypeFilter;
   }): Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }> {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return empty immediately rather than running an unfiltered query.
+    if (opts.timelineKeys !== undefined && opts.timelineKeys.length === 0) return [];
     return this.read((db) => {
       const where: string[] = [];
       const params: Record<string, unknown> = {};
@@ -6842,6 +6895,11 @@ export class Storage {
     rows: Array<{ senderId: string; timelineKey: string; count: number; firstAt: number; lastAt: number }>;
     totalSenders: number;
   } {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return empty immediately rather than running an unfiltered query.
+    if (opts.timelineKeys !== undefined && opts.timelineKeys.length === 0) {
+      return { rows: [], totalSenders: 0 };
+    }
     return this.read((db) => {
       const where: string[] = [];
       const params: Record<string, unknown> = {};
@@ -6946,6 +7004,11 @@ export class Storage {
     corpusFirstAt: number | null;
     corpusLastAt: number | null;
   } {
+    // An empty timelineKeys array means "match nothing" — visibility has excluded every
+    // requested room. Return zero/null immediately rather than running an unfiltered query.
+    if (opts.timelineKeys !== undefined && opts.timelineKeys.length === 0) {
+      return { totalMessages: 0, distinctSenders: 0, firstAt: null, lastAt: null, corpusFirstAt: null, corpusLastAt: null };
+    }
     return this.read((db) => {
       const where: string[] = [];
       const params: Record<string, unknown> = {};
@@ -7864,6 +7927,8 @@ export class Storage {
     const freshPending = `${statusCol} = 'pending' and ${attemptsCol} = 0`;
     const pendingCase = eligibleSql ? `${freshPending} and ${eligibleSql}` : freshPending;
     const deferredCase = eligibleSql ? `${freshPending} and not ${eligibleSql}` : null;
+    // The `excluded` bucket is diary-only (channel visibility gate, §9h).
+    const excludedCase = pool === "diary" ? `${statusCol} = 'excluded'` : null;
     const sql = `select
         sum(case when ${pendingCase} then 1 else 0 end) as pending,
         sum(case when ${statusCol} = 'pending' and ${attemptsCol} > 0 then 1 else 0 end) as retrying,
@@ -7871,7 +7936,8 @@ export class Storage {
         sum(case when ${statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
         sum(case when ${statusCol} = 'failed' then 1 else 0 end) as failed,
         sum(case when ${statusCol} = 'skipped' then 1 else 0 end) as skipped,
-        ${deferredCase ? `sum(case when ${deferredCase} then 1 else 0 end)` : "0"} as deferred
+        ${deferredCase ? `sum(case when ${deferredCase} then 1 else 0 end)` : "0"} as deferred,
+        ${excludedCase ? `sum(case when ${excludedCase} then 1 else 0 end)` : "0"} as excluded
       from ${table} ${where}`;
     return this.read((db) => {
       const row = db.prepare(sql).get(...spec.done) as Record<string, number | null>;
@@ -7883,6 +7949,7 @@ export class Storage {
         failed: row.failed ?? 0,
         skipped: row.skipped ?? 0,
         deferred: row.deferred ?? 0,
+        excluded: row.excluded ?? 0,
       };
     });
   }
@@ -7938,11 +8005,12 @@ export class Storage {
     } else {
       // Default (unfiltered) view: hide the terminal-noise that otherwise drowns
       // the list into an all-message timeline — `skipped` (nothing to do) for every
-      // pool, plus captioning's config-`deferred` pending. Both stay reachable via
-      // their explicit chip. `defaultScope` (enrichment) folds the `skipped` + scope
-      // exclusion into the one index-matching predicate; pools without it fall back
-      // to `scope` (pushed above) + a plain `!= 'skipped'`.
-      where.push(spec.defaultScope ?? `${spec.statusCol} != 'skipped'`);
+      // pool, `excluded` (visibility-gated, diary-only) and captioning's
+      // config-`deferred` pending. All stay reachable via their explicit chip.
+      // `defaultScope` (enrichment) folds the `skipped` + scope exclusion into the
+      // one index-matching predicate; pools without it fall back to `scope` (pushed
+      // above) + plain inequality filters.
+      where.push(spec.defaultScope ?? `${spec.statusCol} not in ('skipped', 'excluded')`);
       if (deferredSql) where.push(`not (${deferredSql})`);
     }
     if (query.room) {
@@ -9461,7 +9529,7 @@ create table if not exists summaries (
   -- enrichment_status/caption_status/summarization_jobs.status idiom. NULL passes
   -- the CHECK (level 2+ never gets a diary entry).
   diary_status text
-    check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed')),
+    check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed', 'excluded')),
   diary_attempts integer not null default 0,
   -- Summary mirroring (spec MULTI-AGENT-SUPPORT §10b, Phase 5c). NULL for native
   -- summaries; set to the donor's summary id for mirrored copies. A timeline is
@@ -9713,7 +9781,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 12;
+export const LATEST_SCHEMA_VERSION = 13;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10240,6 +10308,107 @@ function addAbsorbedParentIdColumn(db: Database.Database): void {
   }
 }
 
+/**
+ * v12 → v13 (spec CHANNEL-VISIBILITY §6.1, ARCHITECTURE.md §9h): widen the
+ * `summaries.diary_status` CHECK constraint to include the new `'excluded'`
+ * terminal status, which the diary gate sets for channels whose resolved
+ * visibility mode is not "shared".
+ *
+ * SQLite cannot ALTER a CHECK constraint in place, so this requires a full
+ * table rebuild — the same pattern as the v6→v7 `memory_chunks` rebuild:
+ *   1. CREATE TABLE summaries_new with the widened CHECK.
+ *   2. INSERT…SELECT preserving explicit rowids (external-content `summaries_fts`
+ *      addresses by rowid — mismatched rowids would corrupt the FTS index).
+ *   3. DROP the old table and RENAME the new one.
+ *   4. Recreate the `summaries_ai`/`summaries_ad` triggers and all indexes.
+ *   5. Rebuild the FTS index (`INSERT INTO summaries_fts … VALUES('rebuild')`).
+ */
+function widenDiaryStatusConstraint(db: Database.Database): void {
+  // SQLite with foreign_keys=ON cascade-deletes child rows on DROP TABLE of the
+  // parent (confirmed empirically). `summary_events` and `summary_parents` both
+  // reference `summaries(id) ON DELETE CASCADE`, so we must save their contents
+  // to temp tables, clear them before the drop (safe — deleting from children
+  // never triggers parent cascade), then restore after the rename.
+  db.exec(`
+    create temp table _summary_events_bak as select * from summary_events;
+    create temp table _summary_parents_bak as select * from summary_parents;
+    delete from summary_events;
+    delete from summary_parents;
+
+    create table summaries_new (
+      id text primary key,
+      timeline_key text not null,
+      level integer not null,
+      content text not null,
+      earliest_timestamp integer not null,
+      latest_timestamp integer not null,
+      latest_event_id text not null,
+      event_count integer not null,
+      token_count integer not null,
+      model_id text,
+      status text not null default 'complete'
+        check(status in ('complete', 'truncated', 'superseded')),
+      backfill_job_id text,
+      generated_at integer not null,
+      created_at integer not null,
+      diary_status text
+        check(diary_status in ('pending', 'processing', 'done', 'skipped', 'failed', 'excluded')),
+      diary_attempts integer not null default 0,
+      mirrored_from text
+    );
+
+    insert into summaries_new(
+      rowid, id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+      latest_event_id, event_count, token_count, model_id, status, backfill_job_id,
+      generated_at, created_at, diary_status, diary_attempts, mirrored_from
+    )
+    select
+      rowid, id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+      latest_event_id, event_count, token_count, model_id, status, backfill_job_id,
+      generated_at, created_at, diary_status, diary_attempts, mirrored_from
+    from summaries;
+
+    drop trigger if exists summaries_ai;
+    drop trigger if exists summaries_ad;
+    drop table summaries;
+    alter table summaries_new rename to summaries;
+
+    -- Restore FK child tables (now safe — summaries IDs are fully in place).
+    insert into summary_events(summary_id, event_id, ordinal)
+      select summary_id, event_id, ordinal from _summary_events_bak;
+    insert into summary_parents(summary_id, parent_id, ordinal)
+      select summary_id, parent_id, ordinal from _summary_parents_bak;
+    drop table _summary_events_bak;
+    drop table _summary_parents_bak;
+
+    create index if not exists idx_summaries_timeline
+      on summaries(timeline_key, latest_timestamp);
+    create unique index if not exists idx_summaries_mirrored_from
+      on summaries(timeline_key, mirrored_from)
+      where mirrored_from is not null;
+    create index if not exists idx_summaries_level
+      on summaries(timeline_key, level, earliest_timestamp);
+    create index if not exists idx_summaries_diary
+      on summaries(diary_status, latest_timestamp)
+      where diary_status in ('pending', 'processing');
+    create index if not exists idx_summaries_diary_list
+      on summaries(latest_timestamp, id)
+      where diary_status is not null;
+    create index if not exists idx_summaries_diary_status_updated
+      on summaries(diary_status, latest_timestamp, id)
+      where diary_status is not null;
+
+    create trigger summaries_ai after insert on summaries begin
+      insert into summaries_fts(rowid, content) values (new.rowid, new.content);
+    end;
+    create trigger summaries_ad after delete on summaries begin
+      insert into summaries_fts(summaries_fts, rowid, content) values ('delete', old.rowid, old.content);
+    end;
+
+    insert into summaries_fts(summaries_fts) values('rebuild');
+  `);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10257,6 +10426,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addMediaAssetsContentHash,
   splitSessionPayloads,
   addAbsorbedParentIdColumn,
+  widenDiaryStatusConstraint,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

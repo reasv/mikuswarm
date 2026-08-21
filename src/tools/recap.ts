@@ -7,8 +7,11 @@ import {
   resolveTimeWindow,
   selectDigest,
   resolveRoomsForAgent,
+  applyVisibilityToRooms,
 } from "../search/index.js";
 import { formatAgentTimestamp } from "../time/index.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
+import type { Logger } from "../observability/index.js";
 
 export interface RecapToolContext {
   storage: Storage;
@@ -25,6 +28,17 @@ export interface RecapToolContext {
    * restricts recap to timeline keys that belong to one of these accounts.
    */
   agentAccountPrefixes?: string[];
+  /**
+   * Channel visibility resolver (ARCHITECTURE.md §9h). When provided and isolation
+   * is configured, isolated non-viewer channels are excluded from recap results.
+   */
+  visibilityResolver?: ChannelVisibilityResolver;
+  /**
+   * Structured logger for `search_rooms_excluded` observability events (§8).
+   * When provided, emits one log per call where explicit rooms were dropped by
+   * the visibility policy. Absent = no log (behavior unchanged).
+   */
+  logger?: Logger;
 }
 
 interface RecapArgs {
@@ -99,12 +113,36 @@ export function createRecapTool(context: RecapToolContext): AgentTool {
       const args = params as RecapArgs;
       const startedAt = performance.now();
       const nowMs = now();
-      const timelineKeys = resolveRoomsForAgent(
+      const rawKeys = resolveRoomsForAgent(
         args.rooms,
         context.currentTimelineKey,
         context.agentAccountPrefixes,
         context.storage,
       );
+      const isExplicitList = Array.isArray(args.rooms);
+      const { keys: timelineKeys, note: visibilityNote, excludedCount } = applyVisibilityToRooms(
+        rawKeys,
+        context.currentTimelineKey,
+        context.visibilityResolver,
+        context.storage,
+        isExplicitList,
+      );
+      // Structured log: operator-side answer to "why can't the bot see that room?" (§8).
+      if (excludedCount > 0 && context.logger) {
+        context.logger.info("search_rooms_excluded", {
+          tool: "recap",
+          viewerKey: context.currentTimelineKey,
+          excludedCount,
+        });
+      }
+      // Short-circuit: all requested rooms were excluded — no storage queries needed.
+      if (timelineKeys !== undefined && timelineKeys.length === 0) {
+        const text = visibilityNote || "Recapped 0 room(s) — all requested rooms excluded by operator visibility config.";
+        return {
+          content: [{ type: "text", text }],
+          details: { rooms: 0, excluded: excludedCount },
+        };
+      }
 
       // Resolve the window. Explicit lower bound (last/after) → window mode; otherwise
       // absence-gap mode (the default "what did I miss" path).
@@ -156,13 +194,16 @@ export function createRecapTool(context: RecapToolContext): AgentTool {
       const showRoom = nRooms !== 1;
       const totalSelected = rooms.reduce((n, r) => n + r.sel.summaries.length, 0);
 
+      const visNote = visibilityNote ? `\n${visibilityNote}` : "";
       let text: string;
-      if (totalSelected === 0) {
+      if (totalSelected === 0 && visibilityNote && !timelineKeys?.length) {
+        text = visibilityNote;
+      } else if (totalSelected === 0) {
         text =
           `Nothing summarized for ${basis} (${fmtTs(start)} → ${fmtTs(end)}). ` +
           "That period may still be in your live context (too recent to have been summarized), " +
           "or there was no activity. Use search_messages or read_messages for raw messages.\n" +
-          `(recap in ${elapsedMs} ms)`;
+          `(recap in ${elapsedMs} ms)${visNote}`;
       } else {
         const sections: string[] = [];
         for (const { room, sel, tailMs } of rooms) {
@@ -188,7 +229,7 @@ export function createRecapTool(context: RecapToolContext): AgentTool {
         }
         text =
           `Recap — ${basis} (${fmtTs(start)} → ${fmtTs(end)})` +
-          `${showRoom ? `, ${nRooms} rooms` : ""}:\n\n${sections.join("\n\n")}\n\n(recap in ${elapsedMs} ms)`;
+          `${showRoom ? `, ${nRooms} rooms` : ""}:\n\n${sections.join("\n\n")}\n\n(recap in ${elapsedMs} ms)${visNote}`;
       }
 
       return {

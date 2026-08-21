@@ -6,11 +6,23 @@ import { renderCompactMessage } from "../context/renderer.js";
 import { estimateTokens } from "../context/tokens.js";
 import { formatAgentTimestamp } from "../time/index.js";
 import type { CanonicalChatEvent } from "../types.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
 
 export interface ExpandSummaryToolContext {
   storage: Storage;
   /** Output bounds (from `[search.summaries]`, §9e). */
   defaults: { tokenCap: number; maxDepth: number };
+  /**
+   * The timeline key the viewing agent is currently in (for isolation check).
+   * Required when visibilityResolver is provided.
+   */
+  currentTimelineKey?: string;
+  /**
+   * Channel visibility resolver (ARCHITECTURE.md §9h). When provided and the
+   * requested summary's channel has mode "isolated", access is denied unless
+   * the viewer is in the same channel.
+   */
+  visibilityResolver?: ChannelVisibilityResolver;
 }
 
 interface ExpandSummaryArgs {
@@ -95,6 +107,23 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
           details: { error: "not_found", id },
         };
       }
+      // Isolation check (ARCHITECTURE.md §9h): if the summary's channel has mode
+      // "isolated", deny access unless the viewer is already in that channel.
+      if (context.visibilityResolver && context.currentTimelineKey) {
+        const mode = context.visibilityResolver.modeFor(root.timelineKey);
+        if (mode === "isolated" && !context.visibilityResolver.sameChannel(context.currentTimelineKey, root.timelineKey)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `error: summary "${id}" is from an isolated channel and cannot be expanded outside it.`,
+              },
+            ],
+            details: { error: "isolated", id, timelineKey: root.timelineKey },
+          };
+        }
+      }
+
       const maxDepth = context.defaults.maxDepth;
       const requestedDepth = args.depth ?? 1;
       const depth = Math.max(1, Math.min(requestedDepth, maxDepth));

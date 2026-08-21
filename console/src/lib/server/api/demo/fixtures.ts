@@ -1039,7 +1039,7 @@ function pipelinesFixture(): unknown {
 				workerCount: 1,
 				maxRetries: 3,
 				inFlight: 0,
-				counts: { pending: 0, processing: 0, retrying: 0, done: 612, failed: 0, skipped: 8, deferred: 0 },
+				counts: { pending: 0, processing: 0, retrying: 0, done: 612, failed: 0, skipped: 8, excluded: 0, deferred: 0 },
 				usage: null
 			}
 		]

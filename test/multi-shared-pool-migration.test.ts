@@ -49,7 +49,7 @@ test("v3→v4 recreates the overflow child table and preserves pre-v4 pooled spe
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 12, "migration stamps the latest version (v12)");
+      assert.equal(version, 13, "migration stamps the latest version (v13 with channel visibility exclusion)");
       assert.ok(hasTable(storage, "usage_event_partitions"), "the child table is (re)created");
 
       // The pre-v4 scalar pooled row is still summed by the pool reseed (scalar half of

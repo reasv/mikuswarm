@@ -8,6 +8,7 @@ import {
   buildSnippet,
   buildSummarySnippet,
   resolveRoomsForAgent,
+  applyVisibilityToRooms,
   decodeCursor,
   encodeCursor,
   encodeSummaryCursor,
@@ -22,6 +23,8 @@ import { hydrateEvents } from "../context/hydrate.js";
 import { renderCompactMessage, renderRichMessage } from "../context/renderer.js";
 import { formatAgentTimestamp } from "../time/index.js";
 import type { CanonicalChatEvent } from "../types.js";
+import type { ChannelVisibilityResolver } from "../visibility/index.js";
+import type { Logger } from "../observability/index.js";
 
 export interface SearchMessagesToolContext {
   storage: Storage;
@@ -39,6 +42,18 @@ export interface SearchMessagesToolContext {
    * (or empty) = legacy mode: `rooms:"all"` spans the full chat history.
    */
   agentAccountPrefixes?: string[];
+  /**
+   * Channel visibility resolver (ARCHITECTURE.md §9h). When provided and isolation
+   * is configured, isolated channels that are not the viewer's channel are dropped
+   * from search results. Absent = all-shared (zero behavior change).
+   */
+  visibilityResolver?: ChannelVisibilityResolver;
+  /**
+   * Structured logger for `search_rooms_excluded` observability events (§8).
+   * When provided, emits one log per call where explicit rooms were dropped by
+   * the visibility policy. Absent = no log (behavior unchanged).
+   */
+  logger?: Logger;
 }
 
 const ATTACHMENT_TYPES = ["image", "video", "audio", "file"] as const;
@@ -252,14 +267,38 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
     }),
     execute: async (_toolCallId, params) => {
       const args = params as SearchMessagesArgs;
-      const timelineKeys = resolveRoomsForAgent(
+      const rawKeys = resolveRoomsForAgent(
         args.rooms,
         context.currentTimelineKey,
         context.agentAccountPrefixes,
         context.storage,
       );
+      const isExplicitList = Array.isArray(args.rooms);
+      const { keys: timelineKeys, note: visibilityNote, excludedCount } = applyVisibilityToRooms(
+        rawKeys,
+        context.currentTimelineKey,
+        context.visibilityResolver,
+        context.storage,
+        isExplicitList,
+      );
+      // Structured log: operator-side answer to "why can't the bot see that room?" (§8).
+      if (excludedCount > 0 && context.logger) {
+        context.logger.info("search_rooms_excluded", {
+          tool: "search_messages",
+          viewerKey: context.currentTimelineKey,
+          excludedCount,
+        });
+      }
+      // Short-circuit: all requested rooms were excluded — no storage query needed.
+      if (timelineKeys !== undefined && timelineKeys.length === 0) {
+        const text = visibilityNote || "Searched 0 room(s) — all requested rooms excluded by operator visibility config.";
+        return {
+          content: [{ type: "text", text }],
+          details: { hits: 0, total: 0, rooms: 0, excluded: excludedCount },
+        };
+      }
       if ((args.corpus ?? "messages") === "summaries") {
-        return runSummaryCorpus(context, args, timelineKeys, now);
+        return runSummaryCorpus(context, args, timelineKeys, now, visibilityNote);
       }
       // Fail-fast: reject summary-only filters under corpus:"messages" rather than
       // silently ignoring them (mirror of the summaries-branch rejection). See §5.1.
@@ -397,9 +436,13 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
         `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`} ` +
         `(${outcome.scanned} indexed events in scope), ${outcome.total} match(es) in ${outcome.elapsedMs} ms`;
 
+      const visNote = visibilityNote ? `\n${visibilityNote}` : "";
       let text: string;
-      if (outcome.hits.length === 0) {
-        text = `No matching messages${orderNote}${dateNote}${absenceNote}.\n(${trailer})`;
+      if (outcome.hits.length === 0 && visibilityNote && !timelineKeys?.length) {
+        // Every requested room was excluded and nothing was searched.
+        text = visibilityNote;
+      } else if (outcome.hits.length === 0) {
+        text = `No matching messages${orderNote}${dateNote}${absenceNote}.\n(${trailer})${visNote}`;
       } else {
         const more =
           outcome.total > outcome.hits.length
@@ -407,7 +450,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
               (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
             : "";
         text =
-          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}:\n\n${lines.join(lineSep)}${more}${truncationNote}\n\n(${trailer})`;
+          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}:\n\n${lines.join(lineSep)}${more}${truncationNote}\n\n(${trailer})${visNote}`;
       }
 
       return {
@@ -451,6 +494,7 @@ function runSummaryCorpus(
   args: SearchMessagesArgs,
   timelineKeys: string[] | undefined,
   now: () => number,
+  visibilityNote = "",
 ): AgentToolResult<unknown> {
   // Fail-fast: reject any message-only / inapplicable filter rather than ignoring it.
   const rejected = SUMMARY_INAPPLICABLE_FIELDS.filter(
@@ -516,10 +560,13 @@ function runSummaryCorpus(
   const trailer =
     `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`}, ` +
     `${outcome.total} summary match(es) in ${outcome.elapsedMs} ms`;
+  const visNote = visibilityNote ? `\n${visibilityNote}` : "";
 
   let text: string;
-  if (outcome.hits.length === 0) {
-    text = `No matching summaries${orderNote}${dateNote}.\n(${trailer})`;
+  if (outcome.hits.length === 0 && visibilityNote && !timelineKeys?.length) {
+    text = visibilityNote;
+  } else if (outcome.hits.length === 0) {
+    text = `No matching summaries${orderNote}${dateNote}.\n(${trailer})${visNote}`;
   } else {
     const more =
       outcome.total > outcome.hits.length
@@ -528,7 +575,7 @@ function runSummaryCorpus(
         : "";
     text =
       `${outcome.total} summary match(es)${orderNote}${dateNote} ` +
-      `(pass any id to expand_summary to drill into it):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})`;
+      `(pass any id to expand_summary to drill into it):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})${visNote}`;
   }
 
   return {

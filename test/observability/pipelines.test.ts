@@ -270,6 +270,7 @@ test("getPipelineCounts buckets enrichment statuses; excludes inactive", async (
       failed: 1,
       skipped: 1,
       deferred: 0,
+      excluded: 0,
     });
   });
 });
@@ -329,7 +330,7 @@ test("getPipelineCounts for summarization + diary", async () => {
     await summarizationJob(storage, "j-done", "complete");
     await summarizationJob(storage, "j-fail", "failed");
     const sc = storage.getPipelineCounts("summarization");
-    assert.deepEqual(sc, { pending: 1, retrying: 1, processing: 0, done: 1, failed: 1, skipped: 0, deferred: 0 });
+    assert.deepEqual(sc, { pending: 1, retrying: 1, processing: 0, done: 1, failed: 1, skipped: 0, deferred: 0, excluded: 0 });
 
     await diarySummary(storage, "d-pending", "pending");
     await diarySummary(storage, "d-done", "done");
@@ -337,7 +338,7 @@ test("getPipelineCounts for summarization + diary", async () => {
     await diarySummary(storage, "d-fail", "failed");
     await diarySummary(storage, "d-l2", null, { level: 2 }); // level-2: not a diary item
     const dc = storage.getPipelineCounts("diary");
-    assert.deepEqual(dc, { pending: 1, retrying: 0, processing: 0, done: 1, failed: 1, skipped: 1, deferred: 0 });
+    assert.deepEqual(dc, { pending: 1, retrying: 0, processing: 0, done: 1, failed: 1, skipped: 1, deferred: 0, excluded: 0 });
   });
 });
 
