@@ -2817,7 +2817,7 @@ When `context.tiers.summary_target_tokens > 0` (disabled by default), the `Summa
 
 **Observability.** Two structured log events are emitted:
 - `summary_budget_episode` with `phase` (`start` | `end`), `layerTokens`, `targetTokens`, `maxTokens`.
-- `summary_budget_condense_enqueued` with `shape` (`absorb` | `bootstrap`), `level`, `runLength`, `childCount`, `parentId` (absorb only), `layerTokens`, `jobId`.
+- `summary_budget_condense_enqueued` with `shape` (`absorb` | `bootstrap`), `summaryLevel` (named to avoid colliding with the logger's own `level` field), `runLength`, `childCount`, `parentId` (absorb only), `layerTokens`, `jobId`.
 
 ---
 

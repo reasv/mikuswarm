@@ -580,7 +580,7 @@ export class SummarizationIndexer {
         logger?.info("summary_budget_condense_enqueued", {
           timelineKey,
           shape: "absorb",
-          level: level + 1,
+          summaryLevel: level + 1,
           runLength: runToAbsorb.length,
           parentId: parent.id,
           childCount: allChildren.length,
@@ -654,7 +654,7 @@ export class SummarizationIndexer {
       logger?.info("summary_budget_condense_enqueued", {
         timelineKey,
         shape: "bootstrap",
-        level: level + 1,
+        summaryLevel: level + 1,
         runLength: chunk.length,
         childCount: chunk.length,
         layerTokens,

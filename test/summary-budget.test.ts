@@ -931,7 +931,7 @@ test("budget: lowest level wins — L1 run processed before L2 run", async () =>
     const enq = logs.find((l) => l.event === "summary_budget_condense_enqueued");
     assert.ok(enq, "a job was enqueued");
     // The first job must be at level 2 (L1→L2), not level 3 (L2→L3).
-    assert.equal(enq!.level, 2, "job is at level 2 (L1 run wins over L2 run)");
+    assert.equal(enq!.summaryLevel, 2, "job is at level 2 (L1 run wins over L2 run)");
   } finally {
     storage.close();
   }
