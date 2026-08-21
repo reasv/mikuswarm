@@ -577,6 +577,18 @@ ssrf_guard = true
 # this default works out-of-box on a fresh deploy. The `?tools=...` query restricts
 # the server to the three web tools. Add credentialed MCP servers (with a `headers`
 # Authorization bearer) only in local config, where the secret lives in .env.
+#
+# A server whose initial connection fails at startup (commonly a boot-order
+# artifact: the process comes up before its network egress or DNS is ready) is
+# retried in the background with exponential backoff; on a late success its
+# tools are registered and reach every session created afterwards. The delay
+# doubles per attempt from the initial value up to the cap; 0 attempts
+# disables the retry entirely.
+[mcp]
+startup_retry_max_attempts = 5
+startup_retry_initial_delay_ms = 5000
+startup_retry_max_delay_ms = 60000
+
 [mcp.servers.exa]
 url = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa"
 

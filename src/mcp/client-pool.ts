@@ -21,9 +21,51 @@ export interface McpServerEntry {
   tools: McpToolDef[];
 }
 
+/**
+ * Startup-retry tuning for servers whose initial connection fails. Resolved
+ * from the `[mcp]` config keys `startup_retry_max_attempts`,
+ * `startup_retry_initial_delay_ms`, and `startup_retry_max_delay_ms`; every
+ * field is optional and falls back to {@link DEFAULT_STARTUP_RETRY}.
+ */
+export interface McpStartupRetryOptions {
+  /** Background retry attempts after the initial startup failure; 0 disables. */
+  maxAttempts?: number;
+  /** Delay before the first retry; doubles on each subsequent attempt. */
+  initialDelayMs?: number;
+  /** Upper bound on the between-attempt delay. */
+  maxDelayMs?: number;
+}
+
+export const DEFAULT_STARTUP_RETRY = {
+  maxAttempts: 5,
+  initialDelayMs: 5_000,
+  maxDelayMs: 60_000,
+} as const;
+
+/**
+ * Exponential backoff for startup retries: `initial * 2^(attempt - 1)`, capped
+ * at `max`. `attempt` is 1-based — the first background retry is attempt 1.
+ */
+export function startupRetryDelayMs(
+  attempt: number,
+  initialDelayMs: number,
+  maxDelayMs: number,
+): number {
+  return Math.min(initialDelayMs * 2 ** (attempt - 1), maxDelayMs);
+}
+
 export interface McpClientPoolOptions {
   servers: Record<string, McpServerConfig>;
   logger: Logger;
+  /** Startup-retry tuning; absent fields fall back to {@link DEFAULT_STARTUP_RETRY}. */
+  retry?: McpStartupRetryOptions;
+  /**
+   * Fired when a server that failed at startup connects on a background retry.
+   * The app wires this to adapt + register the server's tools, so sessions
+   * created after the late connect can call them (sessions already running
+   * keep the tool set they started with).
+   */
+  onLateConnect?: (entry: McpServerEntry) => void;
 }
 
 /**
@@ -59,10 +101,19 @@ export class McpClientPool {
   private readonly entries = new Map<string, McpServerEntry>();
   /** Coalesces concurrent reconnect attempts for the same server to one. */
   private readonly reconnecting = new Map<string, Promise<void>>();
+  /** Pending startup-retry timers, keyed by server name. */
+  private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly retry: Required<McpStartupRetryOptions>;
   private readonly logger: Logger;
+  private stopped = false;
 
   constructor(private readonly options: McpClientPoolOptions) {
     this.logger = options.logger;
+    this.retry = {
+      maxAttempts: options.retry?.maxAttempts ?? DEFAULT_STARTUP_RETRY.maxAttempts,
+      initialDelayMs: options.retry?.initialDelayMs ?? DEFAULT_STARTUP_RETRY.initialDelayMs,
+      maxDelayMs: options.retry?.maxDelayMs ?? DEFAULT_STARTUP_RETRY.maxDelayMs,
+    };
   }
 
   async start(): Promise<void> {
@@ -98,12 +149,110 @@ export class McpClientPool {
           url: config.url,
           error: error instanceof Error ? error.message : String(error),
         });
+        this.scheduleStartupRetry(name, config, 1);
       }
     }
   }
 
-  /** Establish a fresh client + transport and run the `initialize` handshake. */
-  private async connectServer(
+  /**
+   * Schedule background retry `attempt` (1-based) for a server whose startup
+   * connection failed. Startup failures are often boot-order artifacts — the
+   * process comes up before its network egress or DNS is ready — so a bounded
+   * retry keeps a transient failure from disabling the server's tools for the
+   * whole process lifetime. Backoff doubles from `initialDelayMs` up to
+   * `maxDelayMs`; after `maxAttempts` failed retries the pool gives up
+   * (`mcp_server_startup_retries_exhausted`) and only a process restart brings
+   * the server back.
+   */
+  private scheduleStartupRetry(
+    name: string,
+    config: McpServerConfig,
+    attempt: number,
+  ): void {
+    if (this.stopped || this.retry.maxAttempts <= 0) return;
+    if (attempt > this.retry.maxAttempts) {
+      this.logger.error("mcp_server_startup_retries_exhausted", {
+        server: name,
+        url: config.url,
+        attempts: this.retry.maxAttempts,
+      });
+      return;
+    }
+    const delayMs = startupRetryDelayMs(
+      attempt,
+      this.retry.initialDelayMs,
+      this.retry.maxDelayMs,
+    );
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(name);
+      void this.attemptStartupRetry(name, config, attempt);
+    }, delayMs);
+    // Never hold the process open for a retry: shutdown must not wait on us.
+    timer.unref?.();
+    this.retryTimers.set(name, timer);
+    this.logger.debug("mcp_server_retry_scheduled", {
+      server: name,
+      attempt,
+      maxAttempts: this.retry.maxAttempts,
+      delayMs,
+    });
+  }
+
+  private async attemptStartupRetry(
+    name: string,
+    config: McpServerConfig,
+    attempt: number,
+  ): Promise<void> {
+    if (this.stopped) return;
+    let connected: { client: Client; tools: McpToolDef[] };
+    try {
+      connected = await this.connectServer(config);
+    } catch (error) {
+      this.logger.warn("mcp_server_retry_failed", {
+        server: name,
+        url: config.url,
+        attempt,
+        maxAttempts: this.retry.maxAttempts,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.scheduleStartupRetry(name, config, attempt + 1);
+      return;
+    }
+    if (this.stopped) {
+      // stop() ran while the handshake was in flight — don't register into a
+      // stopped pool; close the fresh client best-effort instead.
+      try {
+        await connected.client.close();
+      } catch {
+        // Best-effort close of a client we never used.
+      }
+      return;
+    }
+    const entry: McpServerEntry = { name, config, ...connected };
+    this.entries.set(name, entry);
+    this.logger.info("mcp_server_connected", {
+      server: name,
+      url: config.url,
+      transport: config.transport ?? "streamable-http",
+      toolCount: entry.tools.length,
+      tools: entry.tools.map((t) => t.name),
+      retryAttempt: attempt,
+    });
+    try {
+      this.options.onLateConnect?.(entry);
+    } catch (error) {
+      this.logger.error("mcp_late_connect_hook_failed", {
+        server: name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Establish a fresh client + transport and run the `initialize` handshake.
+   * Protected so tests can stub the network handshake.
+   */
+  protected async connectServer(
     config: McpServerConfig,
   ): Promise<{ client: Client; tools: McpToolDef[] }> {
     const client = new Client({ name: "mikuswarm", version: "1.0.0" });
@@ -198,6 +347,9 @@ export class McpClientPool {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
     for (const [name, entry] of this.entries) {
       try {
         await entry.client.close();

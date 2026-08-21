@@ -244,7 +244,8 @@ youtube?:   { enabled?,                              // master switch; default t
                              download_max_height? } }// height px cap for downloads; default 720
                              // cross-field: default_max_chars <= max_chars_limit <= max_total_chars (fail-fast at app wiring)
                              // cross-field: enrichment.enabled = true requires youtube.enabled = true
-mcp?:       { servers: Record<string, { url, transport?, headers? }> }  // ships the keyless Exa web-tools server by default (§ MCP remote tools)
+mcp?:       { servers: Record<string, { url, transport?, headers? }>,
+              startup_retry_max_attempts?, startup_retry_initial_delay_ms?, startup_retry_max_delay_ms? }  // ships the keyless Exa web-tools server by default; bounded startup-connect retry (§ MCP remote tools)
 captioning: { model?,                                              // [models.*] block NAME (spec MODEL-FALLBACK §2.3 unified registry); unset → "default". Connection/cost/group/fallback live on the referenced model
               worker_count, caption_all, caption_assistant_messages?,
               trigger_wait_timeout_ms, max_retries,
@@ -3421,11 +3422,13 @@ MCP server URLs are exempt (operator-configured infrastructure, not user input �
 
 Remote MCP (Model Context Protocol) HTTP servers provide additional tools without requiring custom tool implementations. Servers are defined in TOML config and tools are discovered at startup.
 
-**Config**: `[mcp.servers.<name>]` with `url` (required), `transport` (`"streamable-http"` default or `"sse"`), and `headers` (key-value pairs, supports env var substitution).
+**Config**: `[mcp.servers.<name>]` with `url` (required), `transport` (`"streamable-http"` default or `"sse"`), and `headers` (key-value pairs, supports env var substitution). The `[mcp]` table itself carries the startup-retry knobs `startup_retry_max_attempts` (default 5; `0` disables), `startup_retry_initial_delay_ms` (default 5000), and `startup_retry_max_delay_ms` (default 60000) — see **Startup retry** below.
 
 **Shipped default — keyless Exa web tools**: `00-defaults.toml` ships `[mcp.servers.exa]` pointing at the public Exa endpoint (`https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa`), so a fresh deploy gets live web search/fetch out-of-box. The Exa public endpoint needs **no API key** (no `headers`/env var), so it never trips the loader's missing-env fail-fast. These Exa tools are the intended replacement for the native `web_search`/`web_fetch`, which are in `[agent].disabled_tools` by default — the generation session types reference `mcp_exa_web_fetch_exa` directly (§ generation sessions). Credentialed MCP servers (with an `Authorization` bearer `headers`) are added only in local config, where the secret lives in `.env`.
 
-**Client pool**: `McpClientPool` in `src/mcp/client-pool.ts`. One `Client` per configured server. The initial connection (and `initialize` handshake) for every server happens at startup and is shared across all sessions. If a server fails to connect, it is logged and skipped — the agent starts without that server's tools (and they cannot be added later, since the agent's tool set is fixed at startup).
+**Client pool**: `McpClientPool` in `src/mcp/client-pool.ts`. One `Client` per configured server. The initial connection (and `initialize` handshake) for every server happens at startup and is shared across all sessions. If a server fails to connect, it is logged (`mcp_server_connect_failed`) and skipped — the agent starts without that server's tools — and the pool schedules a bounded background retry for it (next paragraph).
+
+**Startup retry**: a startup connect failure is often a boot-order artifact — the process comes up before its network egress or DNS is ready — so a startup-failed server is retried in the background with exponential backoff: delay `startup_retry_initial_delay_ms · 2^(attempt−1)`, capped at `startup_retry_max_delay_ms`, for at most `startup_retry_max_attempts` retries (`startupRetryDelayMs` is the exported pure helper). Retry timers are `unref`'d (never hold the process open) and cancelled by `stop()`; a handshake that resolves after `stop()` is closed and discarded, never registered. On a late success the pool creates the normal entry, logs `mcp_server_connected` with a `retryAttempt` field, and fires the `onLateConnect` hook. `app.ts` wires that hook to the same registration path startup uses (`registerMcpServerTools`: `adaptMcpTools` + push into the shared `mcpTools` array + `mcpToolServerMap` attribution entries) and additionally clears the console inspector's memoized per-agent/session-type tool blocks (`toolDefsByType`), which were built without the late server's tools. Because every session builds its catalog at `create()` from that shared array, sessions created after the late connect see the new tools through all the normal filters — per-agent `mcp_servers` scoping, the session-type allowlist, and the dynamic-loading immediate/deferred split; **sessions already running keep the frozen tool set they started with**. Each failed retry logs `mcp_server_retry_failed` (warn) and each scheduling `mcp_server_retry_scheduled` (debug); exhaustion logs `mcp_server_startup_retries_exhausted` (error), after which only a process restart brings the server back. `reconnect()` still rejects a server with no entry — until its first successful connect a server has no registered tools, so nothing can invoke it.
 
 **Session recovery**: Streamable HTTP MCP sessions are *stateful* — the server mints an `Mcp-Session-Id` during `initialize` that the SDK replays on every request, and the SDK never re-initializes on its own. A server restart, session timeout, or a non-sticky load balancer routing to a replica that never saw the handshake makes the cached session stale, and every subsequent call returns `Bad Request: Server not initialized` (HTTP 400) or a 404. To keep a transient server blip from permanently disabling a server's tools, the pool supports reconnection:
 - `getClient(name)` returns the **live** client; the adapter resolves it per call rather than capturing a reference, so a swapped-in client takes effect immediately.
@@ -3956,7 +3959,7 @@ The bridge egress rules (`docker/egress-rules.sh`) live in the **host kernel's**
    - Create assistant echo resolver, context builder
    - Create shared clients: `FetchClient`, `InferenceClient`
    - Create enrichment and caption worker pools with event emitters for trigger-path awaiting
-   - Create and start MCP client pool (connect to remote servers, discover tools)
+   - Create and start MCP client pool (connect to remote servers, discover tools; a server that fails keeps retrying in the background with bounded backoff — § MCP remote tools)
    - Create Matrix provider with logging callbacks
    - Subscribe to inbound events
    - Start Matrix provider (connects to homeserver, begins sync loop)
@@ -3977,7 +3980,7 @@ The bridge egress rules (`docker/egress-rules.sh`) live in the **host kernel's**
    - Stop enrichment worker pool (await active workers)
    - Drain the chat-search indexer (`ChatSearchIndexer.stop()`: refuse new reconciles, await the in-flight FIFO tail) — after the pools/sweeper whose hooks enqueue into it, before `storage.close()` (§9e)
    - Drain the eager-summarization indexer (`SummarizationIndexer.stop()`, same contract) — after the summarization pool whose completion hook enqueues into it (§9b)
-   - Stop MCP client pool (close all server connections)
+   - Stop MCP client pool (cancel pending startup retries, close all server connections)
    - Stop fetch and inference clients (reject queued requests)
    - Wait for active session runs to settle (10-second timeout)
    - Stop the LLM scheduler (reject any requests still queued for admission; after runs drain, so a queued waiter belonging to a finishing run isn't surfaced a synthetic error; §8a)
@@ -4027,7 +4030,7 @@ The observability server's mutating routes are console-BFF-only (server-to-serve
 
 ### App-level MCP clients, not per-session
 
-A single `Client` per server handles concurrent requests over HTTP; creating per-session connections would add latency and connection churn for no benefit, and tool definitions are discovered once at startup and reused across all sessions. The connection is *not* stateless, though: Streamable HTTP carries a server-minted `Mcp-Session-Id`, so a single long-lived client cannot assume its session survives forever. The pool therefore owns session recovery — `reconnect()` re-runs `initialize` on a lost session and the adapter retries once — rather than tying a connection's lifetime to one agent session (see "Session recovery" under §"MCP remote tools"). An earlier version of this design assumed the servers were stateless and never reconnected; a single medialib restart then disabled all of its tools until the agent process itself was restarted.
+A single `Client` per server handles concurrent requests over HTTP; creating per-session connections would add latency and connection churn for no benefit, and tool definitions are discovered once at startup and reused across all sessions. The connection is *not* stateless, though: Streamable HTTP carries a server-minted `Mcp-Session-Id`, so a single long-lived client cannot assume its session survives forever. The pool therefore owns session recovery — `reconnect()` re-runs `initialize` on a lost session and the adapter retries once — rather than tying a connection's lifetime to one agent session (see "Session recovery" under §"MCP remote tools"). An earlier version of this design assumed the servers were stateless and never reconnected; a single medialib restart then disabled all of its tools until the agent process itself was restarted. Startup failures get the same treatment in the other direction: the bounded background startup retry (§ MCP remote tools) exists because a server that is merely slow to become reachable at boot — egress or DNS not yet up — would otherwise stay tool-less for the entire process lifetime.
 
 ---
 

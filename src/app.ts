@@ -129,7 +129,7 @@ import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { resolveYouTubeConfig } from "./youtube/config.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
-import { McpClientPool, adaptMcpTools } from "./mcp/index.js";
+import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
 import { DiaryWorkerPool } from "./diary/index.js";
 import { ChannelVisibilityResolver, validateVisibilityChannels, type VisibilityConfig } from "./visibility/index.js";
@@ -2452,21 +2452,40 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     disabledTools.add(tool);
   }
 
-  const mcpPool = new McpClientPool({
-    servers: config.mcp?.servers ?? {},
-    logger: logger.child("mcp"),
-  });
-  await mcpPool.start();
   // Build adapted tools and the exact tool-name → server-name attribution map
   // together so both are derived from the same source of truth. The map is
   // declared above (before the factory) so the factory and resolveToolDefs
   // closures both reference the same object and see it populated here.
+  // `mcpTools` is spread into every buildSessionTools call, so tools a
+  // late-connecting server registers via onLateConnect (below) reach every
+  // session created afterwards; already-running sessions keep the frozen tool
+  // set they started with.
   const mcpTools = [] as ReturnType<typeof adaptMcpTools>;
-  for (const entry of mcpPool.getEntries()) {
+  const registerMcpServerTools = (entry: McpServerEntry) => {
     for (const tool of adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp"))) {
       mcpTools.push(tool);
       mcpToolServerMap.set(tool.name, entry.name);
     }
+  };
+  const mcpPool: McpClientPool = new McpClientPool({
+    servers: config.mcp?.servers ?? {},
+    retry: {
+      maxAttempts: config.mcp?.startup_retry_max_attempts,
+      initialDelayMs: config.mcp?.startup_retry_initial_delay_ms,
+      maxDelayMs: config.mcp?.startup_retry_max_delay_ms,
+    },
+    // A server that failed its startup connection came up on a background
+    // retry: register its tools, and drop the console inspector's memoized
+    // tool-definition blocks — they were built without this server's tools.
+    onLateConnect: (entry) => {
+      registerMcpServerTools(entry);
+      toolDefsByType.clear();
+    },
+    logger: logger.child("mcp"),
+  });
+  await mcpPool.start();
+  for (const entry of mcpPool.getEntries()) {
+    registerMcpServerTools(entry);
   }
   // Per-agent MCP scoping observability (spec PER-AGENT-MCP-SCOPING §5):
   // one info log per agent with an explicit mcp_servers allowlist.

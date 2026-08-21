@@ -1082,6 +1082,15 @@ const McpServerSchema = StrictObject({
 
 const McpSchema = StrictObject({
   servers: Type.Record(Type.String(), McpServerSchema),
+  // Bounded background retry for servers whose initial startup connection
+  // fails (typically a boot-order artifact: the process is up before its
+  // network egress or DNS is ready). On a late success the server's tools are
+  // registered and reach every session created afterwards. Defaults
+  // (DEFAULT_STARTUP_RETRY in src/mcp/client-pool.ts): 5 attempts, 5s initial
+  // delay doubling per attempt, capped at 60s. 0 attempts disables the retry.
+  startup_retry_max_attempts: Type.Optional(Type.Integer({ minimum: 0 })),
+  startup_retry_initial_delay_ms: Type.Optional(Type.Number({ minimum: 100 })),
+  startup_retry_max_delay_ms: Type.Optional(Type.Number({ minimum: 100 })),
 });
 
 const EnrichmentSchema = StrictObject({
