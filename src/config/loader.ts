@@ -271,4 +271,49 @@ function validateConfig(config: AppConfig): void {
       );
     }
   }
+
+  // Budget-driven eager condensation (spec SUMMARY-LAYER-BUDGET §7).
+  const tiers = config.context.tiers;
+  const summaryTarget = tiers.summary_target_tokens ?? 0;
+  const summaryMax = tiers.summary_max_tokens ?? 0;
+  const SUMMARY_TOKEN_RANGE_MIN = 2000;
+  const SUMMARY_TOKEN_RANGE_MAX = 200_000;
+  if (summaryTarget !== 0 && (summaryTarget < SUMMARY_TOKEN_RANGE_MIN || summaryTarget > SUMMARY_TOKEN_RANGE_MAX)) {
+    throw new Error(
+      `Invalid config: context.tiers.summary_target_tokens must be 0 (disabled) or in [${SUMMARY_TOKEN_RANGE_MIN}, ${SUMMARY_TOKEN_RANGE_MAX}] (got ${summaryTarget}).`,
+    );
+  }
+  if (summaryMax !== 0 && (summaryMax < SUMMARY_TOKEN_RANGE_MIN || summaryMax > SUMMARY_TOKEN_RANGE_MAX)) {
+    throw new Error(
+      `Invalid config: context.tiers.summary_max_tokens must be 0 (same as target) or in [${SUMMARY_TOKEN_RANGE_MIN}, ${SUMMARY_TOKEN_RANGE_MAX}] (got ${summaryMax}).`,
+    );
+  }
+  if (summaryMax !== 0 && summaryTarget !== 0 && summaryMax < summaryTarget) {
+    throw new Error(
+      `Invalid config: context.tiers.summary_max_tokens (${summaryMax}) must be ≥ summary_target_tokens (${summaryTarget}).`,
+    );
+  }
+  const summarization = config.summarization;
+  if (summarization) {
+    const fanout = summarization.condense_fanout ?? 5;
+    const minChildren = summarization.eager_condense_min_children;
+    const maxChildren = summarization.eager_absorb_max_children;
+    if (minChildren !== undefined && minChildren > fanout) {
+      throw new Error(
+        `Invalid config: summarization.eager_condense_min_children (${minChildren}) must be ≤ condense_fanout (${fanout}).`,
+      );
+    }
+    if (maxChildren !== undefined && maxChildren !== 0) {
+      if (maxChildren < fanout) {
+        throw new Error(
+          `Invalid config: summarization.eager_absorb_max_children (${maxChildren}) must be ≥ condense_fanout (${fanout}) or 0 (auto).`,
+        );
+      }
+      if (maxChildren > 4 * fanout) {
+        throw new Error(
+          `Invalid config: summarization.eager_absorb_max_children (${maxChildren}) must be ≤ 4 × condense_fanout (${4 * fanout}).`,
+        );
+      }
+    }
+  }
 }

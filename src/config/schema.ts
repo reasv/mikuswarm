@@ -114,6 +114,16 @@ const SummarizationSchema = StrictObject({
   // job is terminal — bounded by the job's own retries, not a wall clock.
   max_retries: Type.Optional(Type.Integer({ minimum: 0 })),
   label_cache_ttl_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Budget-driven eager condensation (spec SUMMARY-LAYER-BUDGET §7).
+  // eager_condense_min_children: bootstrap only — minimum run length before a
+  // partial-fanout parent is minted (absorption can absorb a single block). 2
+  // (default) rejects 1-child "condensations" that are just paraphrases. Bounded
+  // 2..condense_fanout; relative upper bound validated at load.
+  eager_condense_min_children: Type.Optional(Type.Integer({ minimum: 2 })),
+  // eager_absorb_max_children: cap on how many level-n children a regenerated
+  // parent P′ may have. 0 = auto (2 × condense_fanout). Bounded
+  // condense_fanout..4 × condense_fanout (relative bounds at load).
+  eager_absorb_max_children: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
 // Chat-history search & recap tools (ARCHITECTURE.md §9e). The FTS index is always
@@ -1766,6 +1776,14 @@ export const AppConfigSchema = StrictObject({
       rich_max_tokens: Type.Number({ minimum: 1 }),
       compact_target_tokens: Type.Number({ minimum: 1 }),
       compact_max_tokens: Type.Number({ minimum: 1 }),
+      // Budget-driven eager condensation (spec SUMMARY-LAYER-BUDGET). The split
+      // trigger/goal for the summary layer: when rendered > max, a condensation
+      // episode fires until rendered ≤ target. 0 (default) disables the feature
+      // entirely — byte-identical behavior; summary_max_tokens = 0 means same as
+      // target (no hysteresis band). Cross-field relative bounds validated in
+      // loader.ts validateConfig.
+      summary_target_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
+      summary_max_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
     }),
   }),
   // Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). Optional so existing configs

@@ -1,6 +1,6 @@
 # Summary-Layer Token Budget — absorption-based eager condensation
 
-**Status**: PROPOSED.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §9b "Budget-driven eager condensation"; retained for review.
 
 **Author**: design session 2026-08-21. Revision 2 (same day, owner review):
 absorb-and-regenerate replaces partial-fanout parents as the primary

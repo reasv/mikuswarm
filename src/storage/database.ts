@@ -234,6 +234,8 @@ export interface SummarizationJob {
   resultSummaryId: string | null;
   createdAt: number;
   updatedAt: number;
+  /** Same-level supersession: id of the parent P this absorption job replaces (§9b). Null for ordinary jobs. */
+  absorbedParentId: string | null;
 }
 
 /** Diary queue state on a level-1 summary row (ARCHITECTURE.md §9c). */
@@ -719,6 +721,8 @@ interface SummarizationJobRow {
   result_summary_id: string | null;
   created_at: number;
   updated_at: number;
+  /** Same-level supersession: id of the parent P this absorption job replaces (§9b). Null for ordinary condense/summarize jobs. */
+  absorbed_parent_id: string | null;
 }
 
 function mapSummaryRow(row: SummaryRow): Summary {
@@ -759,6 +763,7 @@ function mapJobRow(row: SummarizationJobRow): SummarizationJob {
     resultSummaryId: row.result_summary_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    absorbedParentId: row.absorbed_parent_id,
   };
 }
 
@@ -782,6 +787,13 @@ export interface SummaryInsert {
   parentIds?: string[];
   /** Job to mark complete with this summary as its result. */
   jobId: string;
+  /**
+   * Same-level supersession (spec SUMMARY-LAYER-BUDGET §4): when set, this
+   * summary P′ replaces the existing parent P (same level). The transaction
+   * atomically marks P and the absorbed run members (parentIds − P's original
+   * children from summary_parents) as superseded.
+   */
+  absorbedParentId?: string;
 }
 
 /**
@@ -820,6 +832,13 @@ export interface SummarizationJobInsert {
   maxRetries: number;
   /** Scheduler class (spec §5.5). Unset = `background` (the normal case). */
   priority?: SummarizationJobPriority;
+  /**
+   * Same-level supersession (spec SUMMARY-LAYER-BUDGET §4): id of the existing
+   * parent P this absorption job replaces. On completion, P and the absorbed
+   * run members (new parentIds − P's original children) are marked superseded
+   * atomically with P′'s insertion. Null for ordinary condense/summarize jobs.
+   */
+  absorbedParentId?: string;
 }
 
 /**
@@ -5577,6 +5596,33 @@ export class Storage {
         insert.parentIds.forEach((parentId, ordinal) => stmt.run(insert.id, parentId, ordinal));
       }
 
+      // Same-level supersession (spec SUMMARY-LAYER-BUDGET §4): absorption job
+      // landing P′ atomically supersedes the old parent P and the absorbed run
+      // members (parentIds − P's original children). All three writes are inside
+      // this transaction so selection, candidacy, and search exclusion are
+      // immediate and consistent.
+      if (insert.absorbedParentId) {
+        const absorbedParentId = insert.absorbedParentId;
+        // Get P's original children (the level-n summaries P was condensed from).
+        const originalChildIds = new Set<string>(
+          (db
+            .prepare(`select parent_id from summary_parents where summary_id = ? order by ordinal asc`)
+            .all(absorbedParentId) as Array<{ parent_id: string }>
+          ).map((r) => r.parent_id),
+        );
+        // Run members = parentIds that are NOT P's original children.
+        const runMemberIds = (insert.parentIds ?? []).filter((pid) => !originalChildIds.has(pid));
+        // Mark P as superseded.
+        db.prepare(`update summaries set status = 'superseded' where id = ?`).run(absorbedParentId);
+        // Mark absorbed run members as superseded.
+        if (runMemberIds.length > 0) {
+          const placeholders = runMemberIds.map(() => "?").join(", ");
+          db.prepare(`update summaries set status = 'superseded' where id in (${placeholders})`).run(
+            ...runMemberIds,
+          );
+        }
+      }
+
       const jobUpdate = db.prepare(
         `update summarization_jobs set status = 'complete', result_summary_id = ?, updated_at = ?
          where id = ?`,
@@ -5599,10 +5645,11 @@ export class Storage {
         `insert into summarization_jobs (
           id, timeline_key, level, status, priority, input_start_id, input_end_id,
           input_token_count, target_token_count, attempts, max_retries,
-          created_at, updated_at
+          absorbed_parent_id, created_at, updated_at
         ) values (
           @id, @timelineKey, @level, 'pending', @priority, @inputStartId, @inputEndId,
-          @inputTokenCount, @targetTokenCount, 0, @maxRetries, @createdAt, @updatedAt
+          @inputTokenCount, @targetTokenCount, 0, @maxRetries,
+          @absorbedParentId, @createdAt, @updatedAt
         )`,
       ).run({
         id: job.id,
@@ -5614,6 +5661,7 @@ export class Storage {
         inputTokenCount: job.inputTokenCount,
         targetTokenCount: job.targetTokenCount,
         maxRetries: job.maxRetries,
+        absorbedParentId: job.absorbedParentId ?? null,
         createdAt: now,
         updatedAt: now,
       });
@@ -9495,6 +9543,11 @@ create table if not exists summarization_jobs (
   best_effort_draft text,
   error text,
   result_summary_id text references summaries(id) on delete set null,
+  -- Same-level supersession (spec SUMMARY-LAYER-BUDGET §4): id of the parent P
+  -- this absorption job replaces. On completion, P and the absorbed run members
+  -- (parentIds − P's original children) are marked superseded atomically with
+  -- P′'s insertion. NULL for ordinary condense/summarize jobs.
+  absorbed_parent_id text,
   created_at integer not null,
   updated_at integer not null
 );
@@ -9660,7 +9713,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 11;
+export const LATEST_SCHEMA_VERSION = 12;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10170,6 +10223,23 @@ function splitSessionPayloads(db: Database.Database): void {
   `);
 }
 
+/**
+ * v11 → v12: add `absorbed_parent_id TEXT` to `summarization_jobs`.
+ *
+ * Nullable; NULL on all pre-existing rows (they are ordinary condense/summarize
+ * jobs). Set by the eager-condensation path (spec SUMMARY-LAYER-BUDGET §4) to
+ * track which existing parent P an absorption job replaces, so that on job
+ * completion the landing transaction can atomically mark P and the absorbed run
+ * members as superseded. Pure additive DDL; uses PRAGMA table_info idempotency
+ * guard (same pattern as v5→v6, v7→v8, v9→v10 migrations).
+ */
+function addAbsorbedParentIdColumn(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(summarization_jobs)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "absorbed_parent_id")) {
+    db.exec("ALTER TABLE summarization_jobs ADD COLUMN absorbed_parent_id TEXT");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10186,6 +10256,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addSummaryMirroredFrom,
   addMediaAssetsContentHash,
   splitSessionPayloads,
+  addAbsorbedParentIdColumn,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

@@ -353,6 +353,15 @@ rich_target_tokens = 4000
 rich_max_tokens = 8000
 compact_target_tokens = 16000
 compact_max_tokens = 24000
+# Budget-driven eager condensation (spec SUMMARY-LAYER-BUDGET). The summary
+# layer has no size knob; these two values add one. When the rendered layer
+# exceeds summary_max_tokens, an episode fires that enqueues eager condense
+# jobs (one per reconcile pass) until the layer is ≤ summary_target_tokens.
+# summary_target_tokens = 0 disables the feature entirely (default — existing
+# deployments see byte-identical behavior). summary_max_tokens = 0 means same
+# as target (no hysteresis band). Typical pair: 8000/12000 averages ~10k.
+# summary_target_tokens = 0
+# summary_max_tokens = 0
 
 # Pluggable tokenizer (spec/TOKENIZER-SWAP.md §5.4). `primary` is the chat/context/
 # summarization estimator (everything that bounds what we send the chat model);
@@ -774,6 +783,18 @@ condense_target_tokens = 800
 summary_max_overage_factor = 2.5
 max_retries = 2
 label_cache_ttl_ms = 600000
+# Budget-driven eager condensation (spec SUMMARY-LAYER-BUDGET §7).
+# eager_condense_min_children: bootstrap fallback only — the minimum number
+# of same-level summaries that must be present before a partial-fanout parent
+# is minted. 2 prevents a single-summary "condensation" (paraphrase); bounded
+# 2..condense_fanout. Absorption is exempt (absorbing one block into an
+# existing parent is a genuine reduction, not a paraphrase).
+# eager_absorb_max_children: cap on the total child count of a regenerated
+# parent P′. 0 = auto (2 × condense_fanout). When a parent reaches this cap
+# it stops absorbing and the next run bootstraps a new parent beside it;
+# bounded condense_fanout..4 × condense_fanout when set explicitly.
+eager_condense_min_children = 2
+eager_absorb_max_children = 0
 
 # Diary memory (ARCHITECTURE.md §9c). The agent's durable, first-person journal of
 # its own participation, written automatically from each level-1 summary range and
