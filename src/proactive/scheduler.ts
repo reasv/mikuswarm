@@ -457,6 +457,27 @@ export class ProactiveScheduler {
     const gate = evaluateGate(events, now, eff, this.options.siblingUserIds);
     if (!gate.ok) return { decision: gate.reason, ...base };
 
+    // DM opt-out gate (spec CROSS-CHANNEL-MESSAGING §7, enforcement point 2):
+    // skip proactive runs on dm-kind timelines whose peer has opted out.
+    // Checked after the eligibility gate so the cheap dead/sparse short-circuits
+    // fire first; an opt-out row is present only for known users, so a missing
+    // peer (no events yet) is treated as non-opted-out (nothing to block).
+    const parsedForOptout = parseTimelineKey(eff.timelineKey);
+    if (parsedForOptout?.kind === "dm") {
+      // Identify the DM peer from recent timeline events: the most recent
+      // non-assistant sender who is not the bot itself.
+      const selfId = this.options.getSelf?.(parsedForOptout.provider, parsedForOptout.accountId)?.id;
+      const peerEvent = events.slice().reverse().find(
+        (e) => e.role === "user" && e.sender?.id && e.sender.id !== selfId,
+      );
+      if (peerEvent?.sender?.id) {
+        const optout = this.options.storage.getDmOptout(parsedForOptout.provider, peerEvent.sender.id);
+        if (optout) {
+          return { decision: "skip_dm_optout", ...base };
+        }
+      }
+    }
+
     if (!this.options.triggerCoordinator.tryAcquire(eff.timelineKey)) {
       return { decision: "skip_busy_slot", ...base };
     }
