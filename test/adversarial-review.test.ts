@@ -524,8 +524,8 @@ test("adversarial/migration: re-open + forced user_version=10 re-run is safe (no
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTACK 10: schema version constant and indexes present in fresh DB
 // ─────────────────────────────────────────────────────────────────────────────
-test("adversarial/schema: LATEST_SCHEMA_VERSION = 16; all four expected indexes present on fresh DB", async () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 16, "LATEST_SCHEMA_VERSION is 16");
+test("adversarial/schema: LATEST_SCHEMA_VERSION = 17; all four expected indexes present on fresh DB", async () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 17, "LATEST_SCHEMA_VERSION is 17");
 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

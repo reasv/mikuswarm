@@ -295,17 +295,6 @@ function createSendDmTool(
         };
       }
 
-      // Check provider supports openDm.
-      if (!ctx.provider.openDm) {
-        return {
-          content: [{
-            type: "text",
-            text: `error: the "${ctx.target.provider}" provider does not support opening DMs from the agent.`,
-          }],
-          details: null,
-        };
-      }
-
       const accountId = ctx.target.accountId;
       if (!accountId) {
         return {
@@ -317,6 +306,9 @@ function createSendDmTool(
       // Fuzzy resolution check: if userId is NOT an exact match for this provider
       // (heuristic: Matrix MXIDs start with @, Discord snowflakes are numeric,
       // IRC scoped ids contain /), search the corpus.
+      // This runs BEFORE the openDm capability check so that a fuzzy input
+      // gets a resolution-error (with message_ref) regardless of whether the
+      // provider supports openDm.
       const isExactId = isLikelyExactId(ctx.target.provider, userId);
       if (!isExactId) {
         const candidates = ctx.storage.searchUserIdentities(userId, {
@@ -324,12 +316,14 @@ function createSendDmTool(
           limit: 5,
         });
         if (candidates.length === 0) {
+          const ref = stash.store(body);
           return {
             content: [{
               type: "text",
               text: `No user found matching "${userId}" in the identity corpus. ` +
                 "They may not have posted in any channel this account has been in. " +
-                "Use an exact stable id (@user:server / snowflake / network/nick) to address them directly.",
+                `Use an exact stable id (@user:server / snowflake / network/nick) to address them directly ` +
+                `(message_ref: "${ref}" re-sends your text without retyping it once you have the right id).`,
             }],
             details: null,
           };
@@ -355,6 +349,17 @@ function createSendDmTool(
         const ref = stash.store(body);
         return {
           content: [{ type: "text", text: buildOptoutError(userId, optout.createdAt, optout.originTimelineKey, ref) }],
+          details: null,
+        };
+      }
+
+      // Check provider supports openDm (now that we have a confirmed exact id).
+      if (!ctx.provider.openDm) {
+        return {
+          content: [{
+            type: "text",
+            text: `error: the "${ctx.target.provider}" provider does not support opening DMs from the agent.`,
+          }],
           details: null,
         };
       }

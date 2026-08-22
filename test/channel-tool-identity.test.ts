@@ -251,7 +251,7 @@ test("read_messages description with MATRIX_TERMINOLOGY is byte-identical to pre
 
   assert.strictEqual(
     tool.description,
-    "Read message history from the current room, or look up a single message by event ID. Use for retrieving messages outside your current context window.",
+    "Read message history from the current room, or look up a single message by event ID. Use for retrieving messages outside your current context window. Pass `room` to read a different channel or DM. Pass `anchor: \"last_self\"` to center the window on your most recent message there (useful for checking on an errand).",
   );
 });
 
