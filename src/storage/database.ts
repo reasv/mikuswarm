@@ -4984,8 +4984,13 @@ export class Storage {
 
   /**
    * Candidate summaries for context selection: status in (complete,
-   * truncated), ordered by earliest_timestamp ASC. When beforeTimestamp is
-   * set, only summaries whose coverage ends at or before it (inclusive).
+   * truncated), ordered by earliest_timestamp ASC, level DESC, id ASC. The
+   * level DESC tie-break matters: a level-N summary inherits earliest_timestamp
+   * from its first child, so the greedy highest-level selection must see the
+   * parent before its same-timestamp children or the children win coverage and
+   * the parent is skipped (nondeterministically, since SQLite tie order is
+   * unstable). id ASC makes the order fully deterministic. When beforeTimestamp
+   * is set, only summaries whose coverage ends at or before it (inclusive).
    * The inclusive bound prevents a coverage gap when a summary's
    * latestTimestamp exactly equals an event's timestamp (millisecond
    * collision from Matrix batch sends — §6).
@@ -4998,7 +5003,7 @@ export class Storage {
             `select * from summaries
              where timeline_key = ? and status in ('complete', 'truncated')
                and latest_timestamp <= ?
-             order by earliest_timestamp asc`,
+             order by earliest_timestamp asc, level desc, id asc`,
           )
           .all(timelineKey, beforeTimestamp) as SummaryRow[];
       }
@@ -5006,7 +5011,7 @@ export class Storage {
         .prepare(
           `select * from summaries
            where timeline_key = ? and status in ('complete', 'truncated')
-           order by earliest_timestamp asc`,
+           order by earliest_timestamp asc, level desc, id asc`,
         )
         .all(timelineKey) as SummaryRow[];
     });
@@ -5017,7 +5022,8 @@ export class Storage {
    * All summaries (every level, status complete/truncated) overlapping the inclusive
    * window [start, end] across a room set (undefined = all rooms), for `recap`'s
    * coverage selection (§9e). Overlap = latest_timestamp >= start AND
-   * earliest_timestamp <= end. Ordered by timeline_key then earliest_timestamp.
+   * earliest_timestamp <= end. Ordered by timeline_key then earliest_timestamp
+   * (ties broken by level DESC, id ASC for deterministic coverage selection).
    */
   getSummariesInWindow(opts: {
     timelineKeys?: string[];
@@ -5044,7 +5050,7 @@ export class Storage {
       return db
         .prepare(
           `select * from summaries where ${where.join(" and ")}
-           order by timeline_key asc, earliest_timestamp asc`,
+           order by timeline_key asc, earliest_timestamp asc, level desc, id asc`,
         )
         .all(params) as SummaryRow[];
     });
@@ -5094,14 +5100,14 @@ export class Storage {
     return new Set(rows.map((r) => r.id));
   }
 
-  /** Summaries at a given level, status in (complete, truncated), ordered by earliest_timestamp ASC. */
+  /** Summaries at a given level, status in (complete, truncated), ordered by earliest_timestamp ASC (ties broken by id). */
   getSummariesByLevel(timelineKey: string, level: number): Summary[] {
     const rows = this.read((db) =>
       db
         .prepare(
           `select * from summaries
            where timeline_key = ? and level = ? and status in ('complete', 'truncated')
-           order by earliest_timestamp asc`,
+           order by earliest_timestamp asc, id asc`,
         )
         .all(timelineKey, level) as SummaryRow[],
     );
@@ -5308,14 +5314,15 @@ export class Storage {
   }
 
   /**
-   * All summaries on a timeline with the given status, ordered by earliest_timestamp ASC.
+   * All summaries on a timeline with the given status, ordered by
+   * earliest_timestamp ASC (ties broken by level DESC, id ASC).
    */
   getSummariesByStatus(timelineKey: string, status: SummaryStatus): Summary[] {
     const rows = this.read((db) =>
       db
         .prepare(
           `select * from summaries where timeline_key = ? and status = ?
-           order by earliest_timestamp asc`,
+           order by earliest_timestamp asc, level desc, id asc`,
         )
         .all(timelineKey, status) as SummaryRow[],
     );
@@ -5439,7 +5446,7 @@ export class Storage {
         .prepare(
           `select * from summaries
            where timeline_key = ? and level = ? and status in ('complete', 'truncated')
-           order by earliest_timestamp asc`,
+           order by earliest_timestamp asc, id asc`,
         )
         .all(timelineKey, level) as SummaryRow[],
     );

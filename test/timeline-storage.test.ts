@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Storage, type Summary, type TimelineCursor } from "../src/storage/index.js";
+import { selectSummaryCoverage } from "../src/context/summary-layer.js";
 import { AssistantEchoResolver, TimelineStore } from "../src/timeline/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
@@ -388,6 +389,59 @@ test("getSummaryCandidates includes summaries whose latestTimestamp equals befor
     assert.ok(ids.includes("s_exact"), "summary at exactly beforeTimestamp should be included");
     assert.ok(ids.includes("s_before"), "summary before beforeTimestamp should be included");
     assert.ok(!ids.includes("s_after"), "summary after beforeTimestamp should be excluded");
+  } finally {
+    storage.close();
+  }
+});
+
+// ── getSummaryCandidates tie-break: parent before same-timestamp child ──
+
+test("getSummaryCandidates orders a parent before its same-earliest_timestamp child and selection picks the parent", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  const TK = "matrix:miku:room:!room";
+  try {
+    // A level-2 parent inherits earliest_timestamp from its first child, so the
+    // tie is the NORMAL case, not an edge case. Insert the children first so
+    // that without the `level desc` tie-break the parent would sort after its
+    // first child (SQLite tie order follows the scan, here rowid order), seed
+    // coverage from the child chain, and arrive with latestTimestamp <=
+    // coverageEnd — skipped, leaving a lower-level selection.
+    await insertSummary(storage, {
+      id: "s_child1",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 100,
+      latestTimestamp: 200,
+    });
+    await insertSummary(storage, {
+      id: "s_child2",
+      timelineKey: TK,
+      level: 1,
+      earliestTimestamp: 200,
+      latestTimestamp: 300,
+    });
+    await insertSummary(storage, {
+      id: "s_parent",
+      timelineKey: TK,
+      level: 2,
+      earliestTimestamp: 100,
+      latestTimestamp: 300,
+      eventCount: 2,
+    });
+
+    const candidates = storage.getSummaryCandidates(TK);
+    assert.deepEqual(
+      candidates.map((s) => s.id),
+      ["s_parent", "s_child1", "s_child2"],
+      "parent must precede its same-earliest_timestamp child",
+    );
+
+    const selection = selectSummaryCoverage(storage, TK);
+    assert.deepEqual(
+      selection.summaries.map((s) => s.id),
+      ["s_parent"],
+      "coverage selection must pick the parent, not the child chain",
+    );
   } finally {
     storage.close();
   }

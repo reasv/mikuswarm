@@ -159,7 +159,14 @@ export function selectSummaryCoverage(
   let merged =
     placeholders.length === 0
       ? candidates
-      : [...candidates, ...placeholders].sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
+      : [...candidates, ...placeholders].sort(
+          // Same ordering contract as getSummaryCandidates: earliest ASC,
+          // level DESC (parents before same-timestamp children), id ASC.
+          (a, b) =>
+            a.earliestTimestamp - b.earliestTimestamp ||
+            b.level - a.level ||
+            (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+        );
   if (excludeRange) {
     const { earliestTimestamp: rangeStart, latestTimestamp: rangeEnd } = excludeRange;
     merged = merged.filter((s) => {
@@ -182,8 +189,12 @@ export function selectSummaryCoverage(
  * Greedy highest-level coverage selection (§4 step 2-5).
  *
  * `candidates` must already be filtered to status in (complete, truncated) and
- * ordered by earliest_timestamp ASC (the `getSummaryCandidates` query does this,
- * optionally applying the summarization `beforeTimestamp` filter).
+ * ordered by earliest_timestamp ASC with level DESC as the tie-break (the
+ * `getSummaryCandidates` query does this, optionally applying the summarization
+ * `beforeTimestamp` filter). The tie-break is load-bearing: a level-N summary
+ * inherits earliest_timestamp from its first child, and if the child sorts
+ * first it seeds coverage, its siblings extend it, and the parent arrives with
+ * latestTimestamp <= coverageEnd — skipped, leaving a lower-level selection.
  *
  * Selection ordering uses timestamps (not unique under Matrix collisions), but the
  * returned cut cursor is always an event ID — so a borderline selection can never
