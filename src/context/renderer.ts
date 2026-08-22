@@ -105,6 +105,18 @@ export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOp
   // rich suffix.
   if (event.reactions && event.reactions.length > 0) parts.push(renderReactions(event.reactions));
 
+  // Cross-channel context note (spec CROSS-CHANNEL-MESSAGING §6): render as a
+  // child element so the fresh DM session sees intent + relay instructions.
+  // Stored locally only — never transmitted on the wire.
+  if (event.crossChannel) {
+    const cc = event.crossChannel;
+    parts.push(
+      `<cross_channel_note origin="${escapeAttr(cc.originTimelineKey)}" ` +
+        `sender="${escapeAttr(cc.originSenderId)}" ` +
+        `session="${escapeAttr(cc.originSessionId)}">${escapeXml(cc.note)}</cross_channel_note>`,
+    );
+  }
+
   return `<message ${attrs}>\n${parts.join("\n\n")}\n</message>`;
 }
 
@@ -130,7 +142,12 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
   const attachments = (event.attachments ?? []).map(compactAttachmentPart).join("");
   const linked = (event.linkedMedia ?? []).map(compactLinkedMediaPart).join("");
   const links = (event.linkPreviews ?? []).map(compactLinkPreview).join("");
-  return `[${time}] ${sender}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${linked}${links}`;
+  // Cross-channel note suffix (spec CROSS-CHANNEL-MESSAGING §6): compact form is
+  // a bracketed annotation appended after the body.
+  const crossNote = event.crossChannel
+    ? ` [→ from ${event.crossChannel.originTimelineKey}: ${event.crossChannel.note}]`
+    : "";
+  return `[${time}] ${sender}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${linked}${links}${crossNote}`;
 }
 
 function buildMessageAttrs(event: CanonicalChatEvent): string {
