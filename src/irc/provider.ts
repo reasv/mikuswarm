@@ -615,6 +615,46 @@ export class IrcProvider implements IChatProvider {
     };
   }
 
+  // ── IChatProvider: openDm / listJoinedChannels ────────────────────────────
+
+  /**
+   * Construct the DM timeline key for an IRC user (spec CROSS-CHANNEL-MESSAGING §8.3).
+   *
+   * IRC DMs require no server-side handshake — you address a nick directly.
+   * `userId` must be a network-scoped id of the form `<networkId>/<nick>`.
+   * If the account is not running, an error is thrown so the tool surface can
+   * report it cleanly to the agent.
+   */
+  openDm(accountId: string, userId: string): Promise<{
+    timelineKey: string;
+    status: "delivered" | "pending_invite";
+  }> {
+    const rt = this.accounts.get(accountId);
+    if (!rt) {
+      return Promise.reject(new Error(`IRC openDm: account "${accountId}" is not running`));
+    }
+    // userId is already the scoped id; use it as the channelId segment of the
+    // timeline key so that send() / unscopeIrcId() can recover the bare nick.
+    const timelineKey = `irc:${accountId}:dm:${userId}`;
+    return Promise.resolve({ timelineKey, status: "delivered" });
+  }
+
+  /**
+   * List timeline keys for all currently-joined IRC channels on an account
+   * (spec CROSS-CHANNEL-MESSAGING §8.3). Uses the configured channel list;
+   * dynamically-joined channels that are not in the config are not returned.
+   */
+  listJoinedChannels(
+    accountId: string,
+    _opts?: { includeDms?: boolean },
+  ): string[] | undefined {
+    const rt = this.accounts.get(accountId);
+    if (!rt) return undefined;
+    return (rt.config.channels ?? []).map(
+      (ch) => `irc:${accountId}:channel:${ch}`,
+    );
+  }
+
   // ── Account lifecycle ─────────────────────────────────────────────────────
 
   private initAccount(accountKey: string, config: IrcAccountConfig): void {

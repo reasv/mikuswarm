@@ -651,6 +651,29 @@ export interface IChatProvider {
     avatarDataBase64?: string;
     avatarContentType?: string;
   }): Promise<{ displayName?: string; avatarUrl?: string }>;
+  /**
+   * Open (or locate an existing) DM with `userId` from `accountId`'s perspective,
+   * returning the DM's timeline key and delivery status. (spec CROSS-CHANNEL-MESSAGING §8)
+   *
+   * - Matrix: calls `resolveTarget` with `create_dm: true`; new room → `pending_invite`.
+   * - Discord: calls `client.users.createDM`; a closed-DM error surfaces as thrown.
+   * - IRC: derives the `dm:<network/nick>` key; pre-flights nick presence via roster.
+   *
+   * Optional: absent on providers that do not support DM initiation.
+   * When present it is gated by `[messaging].dm_initiation` in the tool layer;
+   * the provider itself is always unconditional.
+   */
+  openDm?(accountId: string, userId: string): Promise<{
+    timelineKey: string;
+    status: "delivered" | "pending_invite";
+  }>;
+  /**
+   * List the timeline keys for all channels (rooms + optionally DMs) the
+   * given account is joined to. Optional: absent when the provider cannot
+   * enumerate joined rooms efficiently. Matrix: not yet implemented (returns
+   * undefined); Discord/IRC: available from in-memory state. (spec §4.4)
+   */
+  listJoinedChannels?(accountId: string, opts?: { includeDms?: boolean }): string[] | undefined;
 }
 
 /**

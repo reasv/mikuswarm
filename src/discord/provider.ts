@@ -1399,6 +1399,69 @@ export class DiscordProvider implements IChatProvider {
     return ChannelType.GuildText; // default fallback
   }
 
+  // ── IChatProvider: openDm ─────────────────────────────────────────────────
+
+  /**
+   * Open (or locate) a DM with the given user snowflake from the given account
+   * (spec CROSS-CHANNEL-MESSAGING §8.2). Uses `client.users.createDM`.
+   * "Cannot send messages to this user" throws with a clear message the tool layer
+   * surfaces; the tool never pretends delivery.
+   */
+  async openDm(accountId: string, userId: string): Promise<{
+    timelineKey: string;
+    status: "delivered" | "pending_invite";
+  }> {
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) throw new Error(`Discord openDm: account "${accountId}" is not running`);
+    let dmChannel: import("discord.js").DMChannel;
+    try {
+      const user = await runtime.client.users.fetch(userId);
+      dmChannel = await user.createDM();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Distinguish a closed-DM error from other failures for a clearer tool message.
+      if (msg.includes("Cannot send messages to this user") || msg.includes("50007")) {
+        throw new Error(
+          `Cannot open DM with ${userId}: their DMs are closed to bots (Discord error: ${msg}).`,
+        );
+      }
+      throw err;
+    }
+    const timelineKey = `discord:${accountId}:dm:${dmChannel.id}`;
+    return { timelineKey, status: "delivered" };
+  }
+
+  /**
+   * Enumerate guild text channels visible to this account (spec CROSS-CHANNEL-MESSAGING §8.2).
+   * Iterates every guild in the client cache; threads and voice channels are
+   * excluded — only sendable text and announcement channels are returned.
+   * When `includeDms` is true, cached open DM channels are appended.
+   */
+  listJoinedChannels(
+    accountId: string,
+    opts?: { includeDms?: boolean },
+  ): string[] | undefined {
+    const runtime = this.accounts.get(accountId);
+    if (!runtime) return undefined;
+    const keys: string[] = [];
+    // Guild text channels.
+    for (const guild of runtime.client.guilds.cache.values()) {
+      for (const ch of guild.channels.cache.values()) {
+        if (!ch.isTextBased() || THREAD_CHANNEL_TYPES.has(ch.type as ChannelType)) continue;
+        keys.push(`discord:${accountId}:channel:${ch.id}`);
+      }
+    }
+    // Cached DM channels (e.g. recently opened DMs that stayed in the cache).
+    if (opts?.includeDms) {
+      for (const ch of runtime.client.channels.cache.values()) {
+        if (ch.type === ChannelType.DM) {
+          keys.push(`discord:${accountId}:dm:${ch.id}`);
+        }
+      }
+    }
+    return keys;
+  }
+
   // ── Account resolution ────────────────────────────────────────────────────
 
   private resolveAccount(target: OutboundTarget): { accountId: string; client: Client } {

@@ -465,6 +465,27 @@ export class MatrixProvider implements IChatProvider {
   }
 
   /**
+   * Open (or locate) a DM with `userId` from `accountId`'s perspective
+   * (spec CROSS-CHANNEL-MESSAGING §8.1). Wraps the native `resolveTarget` with
+   * `create_dm: true`. A newly created room returns `pending_invite` because the
+   * invite has not yet been accepted; an existing room returns `delivered`.
+   */
+  async openDm(accountId: string, userId: string): Promise<{
+    timelineKey: string;
+    status: "delivered" | "pending_invite";
+  }> {
+    const account = this.accounts.get(accountId);
+    if (!account) throw new Error(`Matrix account not running: ${accountId}`);
+    const result = await account.client.resolveTarget({ target: userId, createDm: true });
+    const roomId = result.resolvedRoomId;
+    // resolveTarget with createDm: true already checks get_dm_room and creates
+    // if absent. The result isDirect flag indicates an existing DM room.
+    const status: "delivered" | "pending_invite" = result.isDirect ? "delivered" : "pending_invite";
+    const timelineKey = `matrix:${accountId}:dm:${roomId}`;
+    return { timelineKey, status };
+  }
+
+  /**
    * @deprecated Use {@link channelClient} instead. Kept for callers that still
    * need the raw native client (enrichment wiring, serverIdsFor) until those
    * sites are migrated in later phases.
