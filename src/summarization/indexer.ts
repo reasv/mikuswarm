@@ -563,6 +563,18 @@ export class SummarizationIndexer {
         allChildren.sort((a, b) => a.earliestTimestamp - b.earliestTimestamp);
         const first = allChildren[0]!;
         const last = allChildren[allChildren.length - 1]!;
+        const declaredChildIds = allChildren.map((c) => c.id);
+
+        // Span-integrity guard (§9b post-deployment fix P4): verify that the
+        // timestamp-span query over [first..last] returns EXACTLY the declared
+        // child set. If it returns more (phantom invisible summaries hidden by
+        // getCondensedSummaryIds but visible to the span query) or fewer, skip
+        // this candidate and log. This prevents monster requests from ancient
+        // lineage gaps AND semantically wrong absorptions whose parent would
+        // claim coverage over a gulf it doesn't contain.
+        if (!spanIntegrityOk(storage, timelineKey, level, first.id, last.id, declaredChildIds, logger, "absorb")) {
+          continue;
+        }
 
         const inputTokenCount = allChildren.reduce((sum, s) => sum + s.tokenCount, 0);
         const jobId = `sumjob_${nanoid(10)}`;
@@ -576,6 +588,7 @@ export class SummarizationIndexer {
           targetTokenCount: condenseTarget,
           maxRetries: config.max_retries ?? 2,
           absorbedParentId: parent.id,
+          inputChildIds: declaredChildIds,
         });
         logger?.info("summary_budget_condense_enqueued", {
           timelineKey,
@@ -629,6 +642,7 @@ export class SummarizationIndexer {
       const chunk = run.slice(0, fanout);
       const chunkFirst = chunk[0]!;
       const chunkLast = chunk[chunk.length - 1]!;
+      const chunkChildIds = chunk.map((s) => s.id);
 
       // Guaranteed-saving guard for bootstrap:
       // Σ rendered(run) ≥ 2 × condense_target
@@ -637,6 +651,14 @@ export class SummarizationIndexer {
         0,
       );
       if (renderedBootstrap < 2 * condenseTarget) continue;
+
+      // Span-integrity guard (§9b post-deployment fix P4): verify that the
+      // timestamp-span query over [chunkFirst..chunkLast] returns exactly the
+      // chunk. A bootstrap is over a contiguous run so this should always pass,
+      // but ancient lineage gaps can hide condensed-but-parentless summaries.
+      if (!spanIntegrityOk(storage, timelineKey, level, chunkFirst.id, chunkLast.id, chunkChildIds, logger, "bootstrap")) {
+        continue;
+      }
 
       const inputTokenCount = chunk.reduce((sum, s) => sum + s.tokenCount, 0);
       const jobId = `sumjob_${nanoid(10)}`;
@@ -650,6 +672,7 @@ export class SummarizationIndexer {
         targetTokenCount: condenseTarget,
         maxRetries: config.max_retries ?? 2,
         // No absorbedParentId — this is a new parent
+        inputChildIds: chunkChildIds,
       });
       logger?.info("summary_budget_condense_enqueued", {
         timelineKey,
@@ -698,4 +721,57 @@ function cursorAfter(a: TimelineCursor, b: TimelineCursor): boolean {
   if (a.timestamp !== b.timestamp) return a.timestamp > b.timestamp;
   if (a.receivedAt !== b.receivedAt) return a.receivedAt > b.receivedAt;
   return a.id > b.id;
+}
+
+/**
+ * Span-integrity guard (§9b post-deployment fix P4). Verifies that the
+ * timestamp-span query over [startId..endId] at `level` returns EXACTLY the
+ * declared child set — same ids, same count. If it returns more (phantom
+ * invisible summaries that slipped through the condensed-exclusion filter) or
+ * fewer, skip the candidate and log `summary_budget_span_integrity_skip`.
+ *
+ * Returns true when the span is clean (safe to enqueue), false when it should
+ * be skipped.
+ */
+function spanIntegrityOk(
+  storage: Storage,
+  timelineKey: string,
+  level: number,
+  startId: string,
+  endId: string,
+  declaredChildIds: string[],
+  logger: Logger | undefined,
+  shape: "absorb" | "bootstrap",
+): boolean {
+  let materialized: string[];
+  try {
+    materialized = storage.getSummariesBetween(timelineKey, startId, endId, level).map((s) => s.id);
+  } catch {
+    // Boundary summary missing or bad status — skip conservatively.
+    logger?.warn("summary_budget_span_integrity_skip", {
+      timelineKey,
+      level,
+      shape,
+      startId,
+      endId,
+      declaredCount: declaredChildIds.length,
+      materializedCount: -1,
+      reason: "boundary_unresolvable",
+    });
+    return false;
+  }
+  if (materialized.length === declaredChildIds.length) {
+    const declaredSet = new Set(declaredChildIds);
+    if (materialized.every((id) => declaredSet.has(id))) return true;
+  }
+  logger?.warn("summary_budget_span_integrity_skip", {
+    timelineKey,
+    level,
+    shape,
+    startId,
+    endId,
+    declaredCount: declaredChildIds.length,
+    materializedCount: materialized.length,
+  });
+  return false;
 }

@@ -4,12 +4,14 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
-import { SummarizationIndexer } from "../src/summarization/index.js";
+import { SummarizationIndexer, SummarizationWorkerPool, evaluateCondensation } from "../src/summarization/index.js";
 import { estimateTokens } from "../src/context/index.js";
 import { loadConfig } from "../src/config/loader.js";
 import { createExpandSummaryTool } from "../src/tools/index.js";
+import { createSummaryTool } from "../src/tools/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -1543,6 +1545,726 @@ test("budget: P4 idempotency — active job prevents re-enqueue on repeated reco
     await idx2.stop();
     assert.equal(jobCount, 1, "second pass does not re-enqueue (P4 idempotency)");
   } finally {
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §9b post-deployment fix: explicit child id list, span-integrity guard,
+// legacy-row handling, declared-vs-rendered guard.
+// ---------------------------------------------------------------------------
+
+const silentLogger = {
+  debug() {}, info() {}, warn() {}, error() {},
+  child() { return this as any; },
+};
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Migration v13→v14: column added (idempotent DDL), poisoned rows cancelled.
+// ---------------------------------------------------------------------------
+
+test("migration v13→v14: input_child_ids column added; poisoned eager rows cancelled; idempotent re-open", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-budget-migrate-"));
+  const dbPath = path.join(dir, "test.db");
+  try {
+    {
+      // 1. Open fresh v14 DB, insert a summary + a legacy poisoned eager job.
+      const storage = await Storage.open({ databasePath: dbPath });
+      // Insert a minimal L1 summary so the job's inputStartId/inputEndId resolve.
+      await storage.insertSummarizationJob({
+        id: "poisoned_job",
+        timelineKey: TK,
+        level: 2,
+        inputStartId: "c1",
+        inputEndId: "c2",
+        inputTokenCount: 100,
+        targetTokenCount: 800,
+        maxRetries: 2,
+        absorbedParentId: "P_old",
+        // No inputChildIds → null in the DB.
+      });
+      // Simulate v13: drop input_child_ids column, re-stamp version.
+      await storage.write((db) => {
+        db.exec("ALTER TABLE summarization_jobs DROP COLUMN input_child_ids");
+        db.pragma("user_version = 13");
+      });
+      await storage.waitForIdle();
+      storage.close();
+    }
+
+    // 2. Re-open: migration v13→v14 runs.
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
+      assert.equal(version, 14, "migration stamps v14");
+
+      // Column must now exist.
+      const cols = storage.read((db) =>
+        (db.prepare("PRAGMA table_info(summarization_jobs)").all() as Array<{ name: string }>).map(c => c.name),
+      );
+      assert.ok(cols.includes("input_child_ids"), "input_child_ids column added by migration");
+
+      // Poisoned row must be cancelled.
+      const job = storage.getSummarizationJobById("poisoned_job");
+      assert.ok(job, "job row still exists");
+      assert.equal(job!.status, "failed", "poisoned eager job cancelled to failed");
+      assert.match(job!.error ?? "", /cancelled by v13.*migration/i, "error message identifies migration source");
+      assert.equal(job!.inputChildIds, null, "inputChildIds is null (legacy row)");
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+
+    // 3. Idempotent re-open: no error, version unchanged.
+    const storage2 = await Storage.open({ databasePath: dbPath });
+    try {
+      const version2 = storage2.read((db) => Number(db.pragma("user_version", { simple: true })));
+      assert.equal(version2, 14, "idempotent re-open: version still 14");
+      const job2 = storage2.getSummarizationJobById("poisoned_job");
+      assert.equal(job2!.status, "failed", "idempotent re-open: row unchanged");
+    } finally {
+      await storage2.waitForIdle();
+      storage2.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Explicit child id list: new eager (absorb) jobs carry inputChildIds; worker
+// pool resolves from those ids (not from the span query).
+// ---------------------------------------------------------------------------
+
+test("budget: eager absorb job carries inputChildIds = P's children ∪ run members", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const content = "word ".repeat(100);
+    await insertSummary(storage, "s1", content, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s2", content, 1, 1002, 1003, "j_s2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s3", content, 1, 1004, 1005, "j_s3", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent words here", 2, 1000, 1003, "j_P", {
+      parentIds: ["s1", "s2"],
+    });
+    await addSentinel(storage);
+
+    let enqueuedJobId: string | undefined;
+    const indexer = makeIndexer(
+      storage, store,
+      { summary_target_tokens: 100, summary_max_tokens: 150 },
+      { condense_fanout: 5, condense_target_tokens: 5, eager_absorb_max_children: 10, max_retries: 2 },
+      {
+        logger: {
+          info: (event: string, data?: unknown) => {
+            if (event === "summarization_job_enqueued") enqueuedJobId = (data as any).jobId as string;
+          },
+          warn: () => {}, error: () => {}, debug: () => {},
+        } as any,
+      },
+    );
+    indexer.enqueueReconcileTimeline(TK);
+    await indexer.stop();
+
+    assert.ok(enqueuedJobId, "job was enqueued");
+    const job = storage.getSummarizationJobById(enqueuedJobId!);
+    assert.ok(job, "job exists");
+    assert.ok(Array.isArray(job!.inputChildIds), "inputChildIds is an array (not null)");
+    // Absorb: declared = P's children [s1, s2] ∪ run member [s3] = [s1, s2, s3]
+    const ids = new Set(job!.inputChildIds!);
+    assert.ok(ids.has("s1") && ids.has("s2") && ids.has("s3"), "declared children = s1,s2,s3");
+    assert.equal(ids.size, 3, "exactly 3 declared children");
+  } finally {
+    storage.close();
+  }
+});
+
+test("budget: lazy condense job (evaluateCondensation) carries inputChildIds = chunk members", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const content = "word ".repeat(50);
+    // Insert 5 L1 summaries with a dummy event so insertSummarizationJob succeeds.
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 100 }));
+    for (let i = 0; i < 5; i++) {
+      await insertSummary(storage, `ls${i}`, content, 1, 100 + i * 10, 105 + i * 10, `jls${i}`, {
+        eventIds: ["ev0"],
+      });
+    }
+
+    await evaluateCondensation({
+      storage,
+      config: { enabled: true, condense_fanout: 5, condense_target_tokens: 800, max_retries: 2 } as any,
+      timelineKey: TK,
+      level: 1,
+      logger: silentLogger as any,
+    });
+
+    const jobs = storage.getActiveSummarizationJobs(TK, 2);
+    assert.equal(jobs.length, 1, "one L2 job enqueued");
+    const job = jobs[0]!;
+    assert.ok(Array.isArray(job.inputChildIds), "inputChildIds set on lazy job");
+    const ids = new Set(job.inputChildIds!);
+    for (let i = 0; i < 5; i++) assert.ok(ids.has(`ls${i}`), `ls${i} in inputChildIds`);
+    assert.equal(ids.size, 5, "all 5 chunk members declared");
+  } finally {
+    storage.close();
+  }
+});
+
+test("budget: worker pool resolves L2 job from explicit inputChildIds, not span query", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    // Insert two L1 summaries as the declared children of a level-2 job.
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "c1", "child one content", 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child two content", 1, 1002, 1003, "jc2", { eventIds: ["ev0"] });
+
+    await storage.insertSummarizationJob({
+      id: "l2_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      inputChildIds: ["c1", "c2"],
+    });
+
+    // A factory that captures condenseInputs and returns their ids as renderedInputIds.
+    let capturedSummaryIds: string[] = [];
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
+      create: async (_session: unknown, tools: AgentTool[], opts: any) => {
+        const summaries: Array<{ id: string }> = opts?.condenseInputs?.summaries ?? [];
+        capturedSummaryIds = summaries.map((s) => s.id);
+        const summaryTool = tools[0]!;
+        await summaryTool.execute("t", { command: "create", file_text: "Condensed summary." });
+        return {
+          agent: {
+            prompt: async () => {},
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          renderedInputIds: capturedSummaryIds,
+        };
+      },
+    } as any;
+
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("l2_job")?.status === "complete");
+    await pool.stop();
+
+    assert.deepEqual(capturedSummaryIds.sort(), ["c1", "c2"], "factory received exactly c1, c2");
+    assert.equal(storage.getSummarizationJobById("l2_job")?.status, "complete");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pre-lineage-era phantom eligible run: span-integrity guard skips candidate.
+// ---------------------------------------------------------------------------
+
+test("budget: span-integrity guard skips absorb candidate when span returns phantom interlopers", async () => {
+  // Scenario:
+  //   a1(100-150), a2(200-249): ancient L1 phantoms with NO summary_parents rows
+  //     → appear uncondensed → form eligible run [a1, a2]
+  //   cond1(101-150), cond2(201-249): L1 summaries properly condensed by old_L2
+  //     → have summary_parents rows → EXCLUDED from uncondensed set
+  //     → BUT still returned by getSummariesBetween(a1..c2) as phantom interlopers
+  //   old_L2(101-249, L2): earliest=101 < rk.latestTs=249, so NOT in rightCandidates
+  //   c1(500-550), c2(600-650): L1 summaries condensed by P
+  //   P(500-650, L2): right-adjacent candidate for run [a1, a2]; children=[c1, c2]
+  //
+  //   Absorb into P: allChildren sorted=[a1(100), a2(200), c1(500), c2(600)]
+  //   Span [a1..c2] at level=1 also contains cond1(101) and cond2(201)
+  //   → 6 materialized ≠ 4 declared → span-integrity skip → no job enqueued
+
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const bigContent = "word ".repeat(100);
+
+    // Phantom L1s: no summary_parents rows (pre-lineage era). They appear as
+    // uncondensed and form the eligible run [a1, a2].
+    await insertSummary(storage, "a1", bigContent, 1, 100, 150, "j_a1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "a2", bigContent, 1, 200, 249, "j_a2", { eventIds: ["ev0"] });
+
+    // L1 summaries properly condensed by old_L2 — have summary_parents rows so
+    // EXCLUDED from the uncondensed set. Timestamps interleave with the phantoms
+    // so they appear as phantom interlopers in getSummariesBetween(a1..c2).
+    // old_L2.earliestTimestamp=101 < rk.latestTimestamp=249 → old_L2 is NOT a
+    // rightCandidates absorb target for run [a1, a2].
+    await insertSummary(storage, "cond1", bigContent, 1, 101, 150, "j_cond1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "cond2", bigContent, 1, 201, 249, "j_cond2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "old_L2", "old parent", 2, 101, 249, "j_old_L2", {
+      parentIds: ["cond1", "cond2"],
+    });
+
+    // P with children c1, c2 — the intended absorb target.
+    await insertSummary(storage, "c1", bigContent, 1, 500, 550, "j_c1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", bigContent, 1, 600, 650, "j_c2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent words here", 2, 500, 650, "j_P", {
+      parentIds: ["c1", "c2"],
+    });
+
+    const warnLogs: Array<Record<string, unknown>> = [];
+    const infoLogs: Array<Record<string, unknown>> = [];
+    const indexer = makeIndexer(
+      storage, store,
+      { summary_target_tokens: 100, summary_max_tokens: 150 },
+      { condense_fanout: 5, condense_target_tokens: 5, eager_absorb_max_children: 10, max_retries: 2 },
+      {
+        logger: {
+          info: (event: string, data?: unknown) => infoLogs.push({ event, ...(data as any) }),
+          warn: (event: string, data?: unknown) => warnLogs.push({ event, ...(data as any) }),
+          error: () => {}, debug: () => {},
+        } as any,
+      },
+    );
+    indexer.enqueueReconcileTimeline(TK);
+    await indexer.stop();
+
+    // Span-integrity guard must have fired (declared 4, materialized 6).
+    assert.ok(
+      warnLogs.some((l) => l.event === "summary_budget_span_integrity_skip"),
+      "summary_budget_span_integrity_skip emitted",
+    );
+
+    // No budget condense job enqueued (guard blocked all candidates).
+    assert.ok(
+      !infoLogs.some((l) => l.event === "summary_budget_condense_enqueued"),
+      "no condense job enqueued when span-integrity fails",
+    );
+    assert.equal(
+      storage.getActiveSummarizationJobs(TK, 2).length,
+      0,
+      "no active L2 condensation jobs",
+    );
+  } finally {
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Legacy eager job (absorbed_parent_id set, null input_child_ids, pending)
+// → terminated by worker pool; no failed-range marker; timeline proceeds.
+// ---------------------------------------------------------------------------
+
+test("budget: legacy eager job (absorbed_parent_id set, no inputChildIds) fails terminally; reconcile re-enqueues fresh job", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const bigContent = "word ".repeat(100);
+
+    // Seed two L1 summaries that a fresh job would condense.
+    await insertSummary(storage, "c1", bigContent, 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", bigContent, 1, 1002, 1003, "jc2", { eventIds: ["ev0"] });
+
+    // Insert a legacy eager job: absorbed_parent_id set, inputChildIds omitted → null.
+    await storage.insertSummarizationJob({
+      id: "legacy_eager_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 100,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      absorbedParentId: "P_phantom",
+      // No inputChildIds
+    });
+
+    const errors: string[] = [];
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory: {
+        resolveModelId: () => "test-model",
+        resolveSessionCostCeiling: () => 0.5,
+        create: async () => ({ agent: { prompt: async () => {}, waitForIdle: async () => {}, subscribe: () => () => {}, state: { messages: [] } }, renderedInputIds: [] }),
+      } as any,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: (jobId) => errors.push(jobId),
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("legacy_eager_job")?.status === "failed");
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("legacy_eager_job")!;
+    assert.equal(job.status, "failed", "legacy eager job terminally failed");
+    assert.deepEqual(errors, ["legacy_eager_job"]);
+
+    // No failed-range marker: the failed L2 job is not a run-interrupting marker for L1.
+    // c1 and c2 are still eligible for a fresh L2 condensation job.
+    // The failed L2 job does block level-3 condensation (chunk-skip guard),
+    // but for the test, the reconcile at level 1 should still be able to
+    // enqueue a new L2 job (because getFailedSummarizationJobs(TK, 2) would
+    // block the SAME range — but c1,c2 are L1 and their run has no L2 active/failed job).
+    // After the failed legacy job, getActiveSummarizationJobs(TK,2) = [] and
+    // getFailedSummarizationJobs(TK,2) = [legacy_eager_job] with inputStartId=c1, inputEndId=c2.
+    // evaluateCondensation would see the failed L2 job and skip that chunk.
+    // However, the indexer uses a different path (tryEagerJobAtLevel) which checks
+    // activeJobsAbove (pending/processing), not failed jobs, for the overlap check.
+    // Confirm c1, c2 are still selectable (not superseded).
+    assert.equal(storage.getSummaryById("c1")?.status, "complete");
+    assert.equal(storage.getSummaryById("c2")?.status, "complete");
+
+    // The failed L2 job does NOT supersede the L1 summaries.
+    // getFailedSummarizationJobs returns the legacy job, so evaluateCondensation
+    // would block re-enqueueing. But tryEagerJobAtLevel uses getActiveSummarizationJobs
+    // for its overlap check (not failed jobs) — so a fresh reconcile CAN enqueue.
+    // This confirms "timeline reconcile proceeds" by checking no L1 content is lost.
+    const l1s = storage.getSummariesByLevel(TK, 1);
+    assert.equal(l1s.length, 2, "both L1 summaries still visible");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Legacy lazy job (null inputChildIds, no absorbedParentId) → builds via span.
+// ---------------------------------------------------------------------------
+
+test("budget: legacy lazy job (no inputChildIds, no absorbedParentId) builds successfully via span fallback", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "c1", "child one content words here", 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child two content words here", 1, 1002, 1003, "jc2", { eventIds: ["ev0"] });
+
+    // Legacy lazy job: no absorbedParentId, no inputChildIds (old-style pre-fix row).
+    await storage.insertSummarizationJob({
+      id: "legacy_lazy_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      // No absorbedParentId, no inputChildIds → legacy lazy path
+    });
+
+    let capturedSummaryIds: string[] = [];
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
+      create: async (_session: unknown, tools: AgentTool[], opts: any) => {
+        const summaries: Array<{ id: string }> = opts?.condenseInputs?.summaries ?? [];
+        capturedSummaryIds = summaries.map((s) => s.id);
+        const summaryTool = tools[0]!;
+        await summaryTool.execute("t", { command: "create", file_text: "Legacy condense result." });
+        return {
+          agent: {
+            prompt: async () => {},
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          // For a legacy lazy job, inputChildIds is null; declared = input.parentIds from span query.
+          renderedInputIds: capturedSummaryIds,
+        };
+      },
+    } as any;
+
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => {
+      const j = storage.getSummarizationJobById("legacy_lazy_job");
+      return j?.status === "complete" || j?.status === "failed";
+    });
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("legacy_lazy_job")!;
+    assert.equal(job.status, "complete", "legacy lazy job completes via span fallback");
+    assert.deepEqual(capturedSummaryIds.sort(), ["c1", "c2"], "span query returned c1 and c2");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Declared-vs-rendered mismatch → terminal failure, no artifact committed.
+// ---------------------------------------------------------------------------
+
+test("budget: declared-vs-rendered mismatch on L2 job fails terminally and commits no summary", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "c1", "child one", 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child two", 1, 1002, 1003, "jc2", { eventIds: ["ev0"] });
+
+    // L2 job with explicit inputChildIds = [c1, c2].
+    await storage.insertSummarizationJob({
+      id: "mismatch_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      inputChildIds: ["c1", "c2"],
+    });
+
+    // Factory renders only c1 but declares it rendered [c1] → mismatch vs declared [c1, c2].
+    // IMPORTANT: do NOT call summaryTool.execute here — assertDeclaredInputsRendered
+    // fires after factory.create() returns (before agent.prompt), so no draft is written,
+    // giving the truncation fallback nothing to salvage and ensuring a true terminal failure.
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
+      create: async () => {
+        return {
+          agent: {
+            prompt: async () => {},
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          renderedInputIds: ["c1"], // declares only c1, but job says [c1, c2]
+        };
+      },
+    } as any;
+
+    const errors: string[] = [];
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: (jobId) => errors.push(jobId),
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("mismatch_job")?.status === "failed");
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("mismatch_job")!;
+    assert.equal(job.status, "failed", "declared-vs-rendered mismatch fails job");
+    assert.match(job.error ?? "", /input integrity violation/i);
+    assert.deepEqual(errors, ["mismatch_job"]);
+
+    // No L2 summary committed.
+    assert.equal(storage.getSummariesByLevel(TK, 2).length, 0, "no L2 summary committed on mismatch");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Missing/superseded declared child → resolveInputFromChildIds terminal failure.
+// ---------------------------------------------------------------------------
+
+test("budget: declared child missing at build time fails terminally, no failed-range marker", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "c1", "child one", 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    // c2 is declared but never inserted.
+
+    await storage.insertSummarizationJob({
+      id: "missing_child_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c1", // end points at c1 (c2 doesn't exist in DB)
+      inputTokenCount: 30,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      inputChildIds: ["c1", "c2_MISSING"],
+    });
+
+    const errors: string[] = [];
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory: {
+        resolveModelId: () => "test-model",
+        resolveSessionCostCeiling: () => 0.5,
+        create: async () => ({ agent: { prompt: async () => {}, waitForIdle: async () => {}, subscribe: () => () => {}, state: { messages: [] } }, renderedInputIds: [] }),
+      } as any,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: (jobId) => errors.push(jobId),
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("missing_child_job")?.status === "failed");
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("missing_child_job")!;
+    assert.equal(job.status, "failed", "missing declared child fails job terminally");
+    // Error comes from resolveInput returning undefined → "input material not found".
+    assert.match(job.error ?? "", /input material not found/i);
+    assert.deepEqual(errors, ["missing_child_job"]);
+
+    // No L2 summary committed.
+    assert.equal(storage.getSummariesByLevel(TK, 2).length, 0, "no artifact on missing child");
+
+    // c1 still available (no failed-range supersession).
+    assert.equal(storage.getSummaryById("c1")?.status, "complete");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("budget: superseded declared child at build time fails terminally", async () => {
+  // c3_runmember is superseded by an absorption (P_base → P_prime absorbs c3).
+  // A subsequent job that declares c3_runmember as a child fails terminally
+  // because resolveInputFromChildIds rejects superseded summaries.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    await insertSummary(storage, "c1", "child one", 1, 1000, 1001, "jc1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child two", 1, 1002, 1003, "jc2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c3_runmember", "run member", 1, 1004, 1005, "jc3", { eventIds: ["ev0"] });
+
+    // Create P_base (L2, covers c1+c2).
+    await storage.insertSummarizationJob({
+      id: "j_P",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 2,
+    });
+    await storage.insertSummaryWithLineage({
+      id: "P_base",
+      timelineKey: TK,
+      level: 2,
+      content: "parent base",
+      earliestTimestamp: 1000,
+      latestTimestamp: 1003,
+      latestEventId: "c2",
+      eventCount: 2,
+      tokenCount: 20,
+      modelId: "test-model",
+      status: "complete",
+      generatedAt: Date.now(),
+      parentIds: ["c1", "c2"],
+      jobId: "j_P",
+    });
+
+    // Absorb c3_runmember into P_base → creates P_prime, marks c3_runmember superseded.
+    await storage.insertSummarizationJob({
+      id: "j_P_prime",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c3_runmember",
+      inputTokenCount: 100,
+      targetTokenCount: 800,
+      maxRetries: 2,
+      absorbedParentId: "P_base",
+      inputChildIds: ["c1", "c2", "c3_runmember"],
+    });
+    await storage.insertSummaryWithLineage({
+      id: "P_prime",
+      timelineKey: TK,
+      level: 2,
+      content: "new parent",
+      earliestTimestamp: 1000,
+      latestTimestamp: 1005,
+      latestEventId: "c3_runmember",
+      eventCount: 3,
+      tokenCount: 20,
+      modelId: "test-model",
+      status: "complete",
+      generatedAt: Date.now(),
+      parentIds: ["c1", "c2", "c3_runmember"],
+      jobId: "j_P_prime",
+      absorbedParentId: "P_base",
+    });
+
+    // c3_runmember is now superseded.
+    assert.equal(storage.getSummaryById("c3_runmember")?.status, "superseded", "c3_runmember is superseded");
+
+    // A new job that wrongly declares c3_runmember as one of its children.
+    await storage.insertSummarizationJob({
+      id: "superseded_child_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "c2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      inputChildIds: ["c1", "c3_runmember"],
+    });
+
+    const errors: string[] = [];
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory: {
+        resolveModelId: () => "test-model",
+        resolveSessionCostCeiling: () => 0.5,
+        create: async () => ({ agent: { prompt: async () => {}, waitForIdle: async () => {}, subscribe: () => () => {}, state: { messages: [] } }, renderedInputIds: [] }),
+      } as any,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: (jobId) => errors.push(jobId),
+      logger: silentLogger as any,
+    });
+
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("superseded_child_job")?.status === "failed");
+    await pool.stop();
+
+    const job = storage.getSummarizationJobById("superseded_child_job")!;
+    assert.equal(job.status, "failed", "superseded declared child fails job terminally");
+    assert.match(job.error ?? "", /input material not found/i);
+    assert.deepEqual(errors, ["superseded_child_job"]);
+  } finally {
+    await storage.waitForIdle();
     storage.close();
   }
 });

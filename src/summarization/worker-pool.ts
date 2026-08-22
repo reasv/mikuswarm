@@ -382,7 +382,15 @@ export class SummarizationWorkerPool {
       // committing NO artifact) rather than persist a mislabeled summary. This
       // converts the entire Defect-B class from silent corruption into a loud,
       // attributable failure.
-      const declaredInputIds = job.level === 1 ? input.eventIds ?? [] : input.parentIds ?? [];
+      //
+      // For level≥2 jobs with an explicit child id list (post-fix rows) we use
+      // the stored `inputChildIds` as the canonical declared set — this is the
+      // defence-in-depth guard (§9b post-deployment fix P5): even if the builder
+      // somehow loaded a different set of summaries, we catch it here.
+      const declaredInputIds =
+        job.level === 1
+          ? (input.eventIds ?? [])
+          : (job.inputChildIds ?? input.parentIds ?? []);
       assertDeclaredInputsRendered(job, declaredInputIds, renderedInputIds ?? []);
       // Attach snapshot + transcript capture so summarization sessions are
       // inspectable too (spec §5), plus usage actuals (spec TOKEN-USAGE-TRACKING
@@ -718,8 +726,81 @@ export class SummarizationWorkerPool {
       };
     }
 
+    // Level 2+: prefer the explicit child id list when available (post-fix
+    // jobs written by the eager and lazy fanout paths). This is the correct
+    // path — it loads exactly the declared summaries without any span-based
+    // re-derivation that could expand to phantom/invisible children.
+    if (job.inputChildIds != null) {
+      return this.resolveInputFromChildIds(job, job.inputChildIds, modelId);
+    }
+
+    // Legacy fallback: no explicit child list AND no absorbed_parent_id → a
+    // pre-fix lazy fanout job where the contiguous-run invariant makes span-
+    // based loading safe (the evaluator only enqueues over genuinely contiguous
+    // runs; phantom-eligible runs can't form in the lazy path). Pre-fix eager
+    // jobs (absorbed_parent_id set, inputChildIds null) are cancelled by the
+    // v13→v14 migration and will never reach this branch; if somehow they do
+    // (test downgrade, manual row insertion) fail them terminally by returning
+    // undefined so the worker treats them as unresolvable and calls failJob.
+    if (job.absorbedParentId != null) {
+      this.options.logger.warn("summarization_legacy_eager_job_unresolvable", {
+        jobId: job.id,
+        absorbedParentId: job.absorbedParentId,
+      });
+      return undefined;
+    }
+
     const summaries = storage.getSummariesBetween(job.timelineKey, job.inputStartId, job.inputEndId, job.level - 1);
     if (summaries.length === 0) return undefined;
+    const latestTimestamp = Math.max(...summaries.map((s) => s.latestTimestamp));
+    const last = summaries[summaries.length - 1]!;
+    return {
+      cutoffTimestamp: latestTimestamp,
+      earliestTimestamp: summaries[0]!.earliestTimestamp,
+      latestTimestamp,
+      latestEventId: last.latestEventId,
+      eventCount: summaries.reduce((sum, s) => sum + s.eventCount, 0),
+      modelId,
+      parentIds: summaries.map((s) => s.id),
+      summaries,
+    };
+  }
+
+  /**
+   * Resolve a level≥2 job's input from the explicit child id list. Each id must
+   * exist and have status complete or truncated — a missing or superseded child
+   * causes a terminal failure (returns undefined, no failed-range marker).
+   */
+  private resolveInputFromChildIds(
+    job: { id: string; timelineKey: string; level: number },
+    childIds: string[],
+    modelId: string,
+  ): ResolvedInput | undefined {
+    const { storage, logger } = this.options;
+    if (childIds.length === 0) {
+      logger.warn("summarization_explicit_children_empty", { jobId: job.id });
+      return undefined;
+    }
+    const summaries: Summary[] = [];
+    for (const cid of childIds) {
+      const s = storage.getSummaryById(cid);
+      if (!s) {
+        logger.warn("summarization_declared_child_missing", {
+          jobId: job.id,
+          childId: cid,
+        });
+        return undefined;
+      }
+      if (s.status !== "complete" && s.status !== "truncated") {
+        logger.warn("summarization_declared_child_bad_status", {
+          jobId: job.id,
+          childId: cid,
+          status: s.status,
+        });
+        return undefined;
+      }
+      summaries.push(s);
+    }
     const latestTimestamp = Math.max(...summaries.map((s) => s.latestTimestamp));
     const last = summaries[summaries.length - 1]!;
     return {

@@ -236,6 +236,13 @@ export interface SummarizationJob {
   updatedAt: number;
   /** Same-level supersession: id of the parent P this absorption job replaces (§9b). Null for ordinary jobs. */
   absorbedParentId: string | null;
+  /**
+   * Explicit ordered child summary id list for level≥2 condense jobs (§9b
+   * post-deployment fix). Null for level-1 jobs and for pre-fix legacy rows
+   * enqueued before this column existed. When non-null, the worker builds from
+   * exactly these ids rather than re-deriving via a timestamp-span query.
+   */
+  inputChildIds: string[] | null;
 }
 
 /**
@@ -729,6 +736,12 @@ interface SummarizationJobRow {
   updated_at: number;
   /** Same-level supersession: id of the parent P this absorption job replaces (§9b). Null for ordinary condense/summarize jobs. */
   absorbed_parent_id: string | null;
+  /**
+   * Explicit ordered child summary id list for level≥2 condense jobs (§9b
+   * post-deployment fix). JSON-encoded string[]. Null for level-1 jobs and for
+   * pre-fix legacy level≥2 rows enqueued before this column existed.
+   */
+  input_child_ids: string | null;
 }
 
 function mapSummaryRow(row: SummaryRow): Summary {
@@ -770,6 +783,7 @@ function mapJobRow(row: SummarizationJobRow): SummarizationJob {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     absorbedParentId: row.absorbed_parent_id,
+    inputChildIds: row.input_child_ids != null ? (JSON.parse(row.input_child_ids) as string[]) : null,
   };
 }
 
@@ -845,6 +859,14 @@ export interface SummarizationJobInsert {
    * atomically with P′'s insertion. Null for ordinary condense/summarize jobs.
    */
   absorbedParentId?: string;
+  /**
+   * Explicit ordered child summary id list for level≥2 condense jobs (§9b
+   * post-deployment fix). Required for ALL newly enqueued level≥2 jobs (both
+   * eager absorb/bootstrap and lazy fanout paths). Null for level-1 jobs.
+   * When set, the worker builds from exactly these ids rather than re-deriving
+   * via a timestamp-span query, preventing phantom-eligible-run explosions.
+   */
+  inputChildIds?: string[];
 }
 
 /**
@@ -5662,11 +5684,11 @@ export class Storage {
         `insert into summarization_jobs (
           id, timeline_key, level, status, priority, input_start_id, input_end_id,
           input_token_count, target_token_count, attempts, max_retries,
-          absorbed_parent_id, created_at, updated_at
+          absorbed_parent_id, input_child_ids, created_at, updated_at
         ) values (
           @id, @timelineKey, @level, 'pending', @priority, @inputStartId, @inputEndId,
           @inputTokenCount, @targetTokenCount, 0, @maxRetries,
-          @absorbedParentId, @createdAt, @updatedAt
+          @absorbedParentId, @inputChildIds, @createdAt, @updatedAt
         )`,
       ).run({
         id: job.id,
@@ -5679,6 +5701,7 @@ export class Storage {
         targetTokenCount: job.targetTokenCount,
         maxRetries: job.maxRetries,
         absorbedParentId: job.absorbedParentId ?? null,
+        inputChildIds: job.inputChildIds != null ? JSON.stringify(job.inputChildIds) : null,
         createdAt: now,
         updatedAt: now,
       });
@@ -9616,6 +9639,10 @@ create table if not exists summarization_jobs (
   -- (parentIds − P's original children) are marked superseded atomically with
   -- P′'s insertion. NULL for ordinary condense/summarize jobs.
   absorbed_parent_id text,
+  -- Explicit ordered child summary id list for level≥2 condense jobs (§9b
+  -- post-deployment fix, v13→v14). JSON-encoded text[]. NULL for level-1 jobs
+  -- and for pre-fix legacy rows enqueued before this column existed.
+  input_child_ids text,
   created_at integer not null,
   updated_at integer not null
 );
@@ -9781,7 +9808,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 13;
+export const LATEST_SCHEMA_VERSION = 14;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10409,6 +10436,45 @@ function widenDiaryStatusConstraint(db: Database.Database): void {
   `);
 }
 
+/**
+ * v13→v14: add `input_child_ids TEXT` to `summarization_jobs` (§9b
+ * post-deployment fix). Purely additive DDL; uses PRAGMA table_info idempotency
+ * guard (same pattern as v5→v6, v7→v8, v9→v10, v11→v12 migrations).
+ *
+ * After adding the column, cancel any non-terminal row that has
+ * `absorbed_parent_id` set and `input_child_ids` null — these are the live
+ * poisoned eager jobs from the pre-fix deployment that used span-based input
+ * re-derivation and could expand to 600+ summaries. Cancelling terminally
+ * (status='failed') without creating a failed-range marker lets the next
+ * reconcile re-evaluate the timeline from scratch, enqueuing a fresh job that
+ * will carry the explicit child id list and pass the span-integrity guard.
+ */
+function addInputChildIdsColumn(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(summarization_jobs)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "input_child_ids")) {
+    db.exec("ALTER TABLE summarization_jobs ADD COLUMN input_child_ids TEXT");
+  }
+  // Cancel poisoned legacy eager rows — absorbed_parent_id set, input_child_ids
+  // null, status not yet terminal. Terminal-fail WITHOUT creating a failed-range
+  // marker: the job row flips to 'failed', which is terminal but does NOT appear
+  // in getFailedSummarizationJobs(level-1) or block the evaluator for level-2+
+  // (failed level-N+1 rows are consulted by the evaluator's chunk-skip guard, not
+  // run-split guard — and these jobs are at level≥2 so their failure is a chunk-
+  // level termination, not a run-interruption; the run members remain uncondensed
+  // and re-eligible after the next reconcile enqueues a fresh job with an
+  // explicit child list). The error message is set so operators can identify
+  // these rows in the pipeline monitor.
+  db.exec(`
+    update summarization_jobs
+    set status = 'failed',
+        error  = 'cancelled by v13→v14 migration: poisoned eager job (absorbed_parent_id set, no input_child_ids)',
+        updated_at = ${Date.now()}
+    where absorbed_parent_id is not null
+      and input_child_ids is null
+      and status not in ('complete', 'failed')
+  `);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10427,6 +10493,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   splitSessionPayloads,
   addAbsorbedParentIdColumn,
   widenDiaryStatusConstraint,
+  addInputChildIdsColumn,
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

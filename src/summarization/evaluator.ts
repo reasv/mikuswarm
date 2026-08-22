@@ -177,6 +177,9 @@ export async function evaluateCondensation(options: CondensationEvaluatorOptions
         inputTokenCount,
         targetTokenCount: config.condense_target_tokens ?? 800,
         maxRetries: config.max_retries ?? 2,
+        // Explicit child id list (§9b post-deployment fix): record the exact
+        // ordered set so the worker can load by id without span re-derivation.
+        inputChildIds: chunk.map((s) => s.id),
       });
       logger.info("condensation_triggered", {
         timelineKey,
