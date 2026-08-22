@@ -1136,3 +1136,8 @@ session_page_idle_ms = 600000           # close a session's tab after this idle 
 # Set both in local config to the shared staging volume's two views: downloads_dir
 # as the browser container sees it, downloads_local_dir as the agent sees it
 # (see config/90-local.toml). Setting exactly one is a startup error.
+
+# Cross-channel messaging (spec CROSS-CHANNEL-MESSAGING §10). Default-on.
+[messaging]
+enabled = true            # master switch: send_dm + send_to_channel
+dm_initiation = true      # DM-open leg of send_dm (send_to_channel unaffected)

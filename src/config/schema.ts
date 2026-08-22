@@ -1959,6 +1959,16 @@ export const AppConfigSchema = StrictObject({
   // no extra I/O. When enabled, the store must share a filesystem with every workspace
   // root (validated at startup via a cross-device link() probe).
   attachment_store: Type.Optional(AttachmentStoreSchema),
+  // Cross-channel messaging (spec CROSS-CHANNEL-MESSAGING §10). Default-on. Absent
+  // block = both sub-flags true (full feature active). `enabled` is the master
+  // switch for send_dm and send_to_channel; `dm_initiation` additionally gates
+  // the DM-open leg of send_dm (send_to_channel unaffected). Per-account inbound
+  // DM flags (IRC dm_enabled, Discord dmEnabled) also gate outbound initiation
+  // on their respective accounts when those flags are false.
+  messaging: Type.Optional(StrictObject({
+    enabled: Type.Optional(Type.Boolean()),
+    dm_initiation: Type.Optional(Type.Boolean()),
+  })),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
@@ -1994,3 +2004,5 @@ export type IrcAccountConfig = Static<typeof IrcAccountSchema>;
 export type IrcConfig = Static<typeof IrcSchema>;
 /** Channel visibility config (ARCHITECTURE.md §9h). */
 export type VisibilityConfig = Static<typeof VisibilitySchema>;
+/** Cross-channel messaging config (spec CROSS-CHANNEL-MESSAGING §10). */
+export type MessagingConfig = NonNullable<AppConfig["messaging"]>;
