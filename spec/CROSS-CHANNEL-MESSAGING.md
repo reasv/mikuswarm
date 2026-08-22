@@ -1,7 +1,6 @@
 # Cross-Channel Messaging — DMs, directory tools, and the context-note bridge
 
-**Status**: DRAFT — design settled with operator 2026-08-22; pending
-implementation review.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §10 (Cross-channel messaging tools), §9g (proactive DM opt-out gate), §9h (cross-channel reads gate), §6b (dm_optouts table, cross-channel query methods), §4 (messaging config), §5 (openDm/listJoinedChannels on IChatProvider); retained for review.
 
 **Settled operator decisions** (2026-08-22): feature ships **on by default**
 (core capability, opt-out via config — not a default-off knob); a mandatory

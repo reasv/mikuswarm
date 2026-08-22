@@ -328,6 +328,8 @@ rate_limits?:   { http?: { default_max_in_flight_per_host?,  // §7a "Egress gua
                                           backoff_base_ms?, backoff_max_ms? }> }
 attachment_store?: { enabled?,  // content-addressed cross-agent dedup store (§7a); default off
                     path? }     // store root directory; default "./attachment-store"
+messaging?:         { enabled?,          // master switch; default true; false disables send_dm + send_to_channel (list tools still work)
+                      dm_initiation? }   // default true; false disables new DM opens (only dm_optout, list tools, send_to_channel remain)
 ```
 
 `agent.sessions.max_tool_calls` is an **optional** cap on tool-call iterations within a single session run. It is **unset by default → agent work is unbounded** (the loop runs as long as the model emits tool calls). When a number is configured, the factory's `beforeToolCall` hook blocks further calls and aborts the run once the cap is exceeded (logged `agent_tool_call_cap_reached`); the run settles as a discarded/no-reply session and the timeline slot is released. A `SessionType` may set its own `max_tool_calls` (overriding the global) and a `max_turns` cap (the factory counts `turn_end` events and aborts when the cap is hit, logged `agent_turn_cap_reached`) — these are loop-breakers, **not** wall-clock timeouts. The worker session types (`summarize`, `condense`, `diary`) set both (defaults 30/15) so a degenerate worker session can't loop unbounded; chat sessions leave them unset. Other defaults: see `config/00-defaults.toml`; `summarization.*` defaults are documented in §9b, `diary.*` in §9c.
@@ -524,6 +526,8 @@ The agent is not hardwired to Matrix. The `IChatProvider` interface defines the 
 - `channelClient(target: OutboundTarget): ChannelClient | undefined` — returns a `ChannelClient` scoped to the target's channel; `undefined` when the target is foreign to this provider or the channel is unresolvable (§ChannelClient below)
 - `history?(target: OutboundTarget): HistoryClient | undefined` — optional; returns a neutral `HistoryClient` for paged history access (§11.3). `HistoryClient.readMessages(req: HistoryPageRequest)` returns `HistoryPageResult`; an optional `downloadRoomKeys?()` covers E2EE key backup. Matrix exposes this via `MatrixChannelClient`; providers without history capability return `undefined`. The internal `BackfillReadClient` (also neutral — `readMessages(req: HistoryPageRequest): Promise<HistoryPageResult>`) is the backfill engine's own interface; it is room-scoped via `makeBackfillReadClient(nativeClient, roomId)` which captures the room id in a closure so the neutral request carries no room id.
 - `setProfile?(accountId, opts): Promise<{…}>` — optional; update the bot's display name and/or avatar for one account. Matrix uploads avatar data via the native client; absent on providers that don't support profile edits
+- `openDm?(accountId, userId): Promise<{ timelineKey: string; status: "delivered" | "pending_invite" }>` — optional; open (or reuse) a DM channel with a user. Returns the DM timeline key and a delivery status. Discord creates or reuses a `DMChannel` synchronously (`user.createDM()`); IRC synthesises the key immediately from the user id (DMs are stateless on IRC). Matrix does not implement this (provider returns `undefined` for the method); attempting `send_dm` to a Matrix account returns an error. Absent = provider does not support agent-initiated DMs.
+- `listJoinedChannels?(accountId, opts?): string[] | undefined` — optional; return the timeline keys of all channels (and optionally DMs, when `opts.includeDms = true`) the given account is currently joined to. Discord iterates `guild.channels.cache` for text-based non-thread channels, plus `channels.cache` DM channels when `includeDms`. IRC returns `(config.channels ?? []).map(ch => 'irc:<accountId>:channel:<ch>')` — the bot's configured channel list. Matrix does not implement this (provider returns `undefined`). Absent = provider has no in-memory join registry.
 
 The provider delivers **every** message through `host.onEvent`. It flags messages as triggers (mentions, DMs) but does not buffer non-trigger messages. The timeline ingests all events continuously; only triggers spawn sessions.
 
@@ -856,6 +860,18 @@ Matrix events never carry `sender.username` (the `SenderInfo` field is absent fo
 - `getUserIdentityAliases` returns `[]` → no extra names are added to the retrieval query
 
 The resulting context and retrieval output are byte-identical to what they would have been before this feature was added.
+
+### Cross-channel query methods
+
+Three additional `Storage` methods support the cross-channel messaging tools (§10 Cross-channel messaging):
+
+- **`searchUserIdentities(query, opts?)`** — fuzzy LIKE search over `user_identities`. Matches the query substring against both `username` and `display_name` (case-insensitive via SQLite's `LIKE`). Optional `opts.provider` narrows to one provider; `opts.limit` caps results (default 10). Returns `Array<{ provider, userId, username, displayName, lastSeen }>`. Used by `send_dm` to resolve display names to stable user IDs.
+- **`findDmTimelineKeysForUser(userId, opts?)`** — returns timeline keys for DM channels where `userId` has posted (i.e. rows in `timeline_events` whose `sender` matches and whose timeline key contains `:dm:`). `opts.provider` filters by provider. Used by `read_messages` to accept a bare user ID in place of a DM timeline key.
+- **`getLastAssistantEvent(timelineKey)`** — returns the most recent `timeline_events` row with `role = "assistant"` for the given timeline. Used by `read_messages` with `anchor: "last_self"` to centre the history window on the bot's most recent message in a channel.
+
+### DM opt-out table
+
+**`dm_optouts`** — added by the **v13→v14** migration. Primary key `(provider, user_id)`. Columns: `created_at` (unix ms), `origin_timeline_key` (the channel where the opt-out was recorded). Row present = user has opted out of agent-initiated DMs. Methods: `getDmOptout(provider, userId)`, `setDmOptout(provider, userId, originTimelineKey)`, `clearDmOptout(provider, userId)`. The `dm_optout` tool writes/deletes these rows; the `send_dm` tool and the proactive scheduler check them.
 
 ## 6c. Discord Provider
 
@@ -3121,10 +3137,11 @@ Per tick (`evaluate`), in order:
 1. **Budget.** `remaining = daily_posts − consumed`, where `consumed = storage.countSessionsByType(timelineKey, sessionType, dayStart(now))`. If `remaining <= 0` → `skip_budget`.
 2. **Self-concurrency.** If `sessions.activeForTimeline` is non-empty (the bot is already engaged here) → `skip_active`.
 3. **Eligibility gate** (below). On failure → `skip_dead` / `skip_sparse`.
-4. **No-queue slot.** `triggerCoordinator.tryAcquire(timelineKey)` (below). On miss → `skip_busy_slot`.
-5. **Pass:** build a synthetic inbound and call the existing `launchSession(inbound, false, { proactive: true })`. This consumes one budget unit via the `agent_sessions` row it inserts.
+4. **DM opt-out gate.** For DM timeline keys only (`parseTimelineKey` returns `kind = "dm"`): scan recent events for the most recent non-self `user` message to identify the DM peer, then check `storage.getDmOptout(provider, peerId)`. If the peer has opted out → `skip_dm_optout`. This prevents the proactive scheduler from re-contacting a user who asked not to be DMed.
+5. **No-queue slot.** `triggerCoordinator.tryAcquire(timelineKey)` (below). On miss → `skip_busy_slot`.
+6. **Pass:** build a synthetic inbound and call the existing `launchSession(inbound, false, { proactive: true })`. This consumes one budget unit via the `agent_sessions` row it inserts.
 
-The tick **always reschedules** afterward (unless stopped/drained mid-tick) and emits one structured `proactive_tick` log: `{ timelineKey, decision, consumed, remaining, nextAttemptInMs, reason? }` with `decision ∈ { run, skip_budget, skip_active, skip_dead, skip_sparse, skip_busy_slot, skip_unresolved, error }`.
+The tick **always reschedules** afterward (unless stopped/drained mid-tick) and emits one structured `proactive_tick` log: `{ timelineKey, decision, consumed, remaining, nextAttemptInMs, reason? }` with `decision ∈ { run, skip_budget, skip_active, skip_dead, skip_sparse, skip_busy_slot, skip_unresolved, skip_dm_optout, error }`.
 
 ### Budget is derived, not stored
 
@@ -3218,6 +3235,8 @@ Precedence: exact `timeline_key` entry → `dms` blanket (dm-kind only) → `"sh
 
 **`hasIsolation()` fast path**: the resolver tracks whether any `"isolated"` mode is configured at all. When `false`, every search path preserves its exact current shape — no-op for deployments that never touch `[visibility]`.
 
+**Cross-channel reads gate** (`src/tools/read-messages.ts`): when `read_messages` is called with a `room` param that resolves to a channel different from the current session's channel, the visibility resolver checks the target. An isolated room where the current session is not active is refused with an error ("that conversation is private"). This enforces the principle that visibility gates reads and enumeration, never sends — a `send_dm` or `send_to_channel` call is never blocked by isolation, only the subsequent read-back is.
+
 ### Schema
 
 `summaries.diary_status` CHECK constraint widened (v11→v12 migration) to include `'excluded'`. Migration uses the table-rebuild pattern (same as v6→v7 `memory_chunks`) with explicit save/restore of `summary_events` and `summary_parents` rows to avoid SQLite FK cascade deletion on `DROP TABLE`. `getDistinctTimelineKeys()` on `Storage` materializes the distinct `timeline_key` set from `chat_index` for the `rooms:"all"` isolation-filter path.
@@ -3230,7 +3249,7 @@ Precedence: exact `timeline_key` entry → `dms` blanket (dm-kind only) → `"sh
 
 ## 10. Tools
 
-Up to 41 tools are available to default sessions (plus `load_skill`/`tool_search` under dynamic tool loading, below; the `bash` tool exists only when the Docker sandbox is enabled — see §11a; `recall_memory` only when `[retrieval].enabled` — see §9d; `browser` only when `[browser].enabled` — see §11b; `image_generate` only when `[image_gen]` is configured — see below; `x_fetch` only when `[fxtwitter.tool].enabled` — see below; `x_search` only when `[x_search].enabled` (default true when the block exists) — see below; `find_source` only when `[saucenao].enabled` **and** a non-empty `api_key` is set (the default ships `enabled = true` but no key, so it soft-disables until a key is configured) — see below; `youtube_fetch` only when `[youtube].enabled` (default true) **and** the yt-dlp binary probe passed at startup — see §7e/below; the chat-search tools `search_messages`/`expand_summary`/`recap`/`user_activity` are always present — see §9e). Session types may specify a `tools` allowlist to restrict which tools are provided (e.g. the summarization session types only expose `summary_tool`). Each tool is a factory function returning an `AgentTool` with TypeBox schema and async execute.
+Up to 46 tools are available to default sessions (the 41 original tools, plus the 5 cross-channel messaging tools behind the contacts/chat-history skills — see §10 Cross-channel messaging tools; plus `load_skill`/`tool_search` under dynamic tool loading, below; the `bash` tool exists only when the Docker sandbox is enabled — see §11a; `recall_memory` only when `[retrieval].enabled` — see §9d; `browser` only when `[browser].enabled` — see §11b; `image_generate` only when `[image_gen]` is configured — see below; `x_fetch` only when `[fxtwitter.tool].enabled` — see below; `x_search` only when `[x_search].enabled` (default true when the block exists) — see below; `find_source` only when `[saucenao].enabled` **and** a non-empty `api_key` is set (the default ships `enabled = true` but no key, so it soft-disables until a key is configured) — see below; `youtube_fetch` only when `[youtube].enabled` (default true) **and** the yt-dlp binary probe passed at startup — see §7e/below; the chat-search tools `search_messages`/`expand_summary`/`recap`/`user_activity` are always present — see §9e). Session types may specify a `tools` allowlist to restrict which tools are provided (e.g. the summarization session types only expose `summary_tool`). Each tool is a factory function returning an `AgentTool` with TypeBox schema and async execute.
 
 ### Dynamic tool loading (spec DYNAMIC-TOOL-LOADING)
 
@@ -3293,7 +3312,7 @@ result_min_tokens     = 1024    # Layer 2 floor per result
 | `delete_message` | Redact (delete) a message. Irreversible. Own messages freely; others require moderator power level. |
 | `pins` | Pin, unpin, or list pinned messages. Action discriminator: `pin`, `unpin`, `list`. Pinning/unpinning requires room permissions. |
 | `list_reactions` | List all reactions on a message with counts and user attribution. |
-| `read_messages` | Read room message history (paginated with before/after tokens) or look up a single message by event ID. For retrieving messages outside the current context window. |
+| `read_messages` | Read room message history (paginated with before/after tokens) or look up a single message by event ID. For retrieving messages outside the current context window. Extended by cross-channel messaging: `room` param accepts a timeline key or a bare user ID (resolved to a DM via `findDmTimelineKeysForUser`); `anchor: "last_self"` centres the window on the bot's most recent message in that room (via `getLastAssistantEvent`). Visibility gates cross-channel reads: isolated rooms are refused unless the current session is already in them. |
 | `search_messages` | FTS5 + metadata search over chat history across rooms (§9e): text `query` (scope: body / +captions / all), filters (`from`, `mentions`, `quoted_user`, `is_reply`, `has_attachment`, `attachment_type`, `has_link`), time window (`after`/`before`/`last`/`since_user_absence`), keyset pagination, newest/oldest/relevance order. Each hit is the **full message** (`format`: compact default / snippet / rich) rendered via the shared context renderer + hydration, with an `event_id` reference; plus total + an `elapsedMs` latency trailer. `corpus:"summaries"` switches to keyword search over the rolling **summaries** (§9b) instead — each hit cites a summary `id` for `expand_summary`; message-only filters are rejected, `level`/`min_level`/`status` apply. |
 | `expand_summary` | Drill a summary one or more tiers DOWN into the finer summaries — and ultimately the raw messages — it was condensed from (§9e/§9b). A level-1 `id` expands to its raw source messages (hydrated like `search_messages`); a higher-level `id` to the level-(N−1) summaries beneath it, each with its own `id` to drill again. `depth` (default 1, capped by config) auto-recurses; `include_messages` drills leaves to raw events; `token_cap` bounds the output and reports how many constituents were omitted. Unknown/superseded id → error. |
 | `recap` | "What did I miss" — returns the finest existing **summaries** (§9b) for a window, from absence-gap detection (`since_user_absence`, default the asker) or an explicit `last`/`after`/`before`, coarsening to higher levels under a token budget (§9e). `rooms:"current"` default, `"all"` to span channels. O(1) inference; more detailed than the in-context summary layer. Each summary's `id` is cited in the visible body for follow-up. |
@@ -3424,6 +3443,33 @@ MCP server URLs are exempt (operator-configured infrastructure, not user input �
 **Untrusted content labeling**: `character_card_read`'s text-excerpt views (`field_excerpt`, `alternate_greeting_excerpt`, `book_entry_excerpt`) wrap externally-sourced card text in `<untrusted_card_field name="...">…</untrusted_card_field>` blocks (attribute escaped via `escapeAttr`, body via `escapeXml`). This mirrors the rich-XML message pattern in section 9: structural strings the tool emits itself (paths, counts, headings) are trusted; the card text that landed in those fields from external uploads is wrapped so the system prompt can teach the agent to treat content like `system_prompt` / `post_history_instructions` as data, not instructions.
 
 **PNG hardening**: card decode/encode paths run a pre-check (`validatePngChunkSizes`) before invoking `png-chunks-extract`, rejecting any chunk whose declared length exceeds 16 MiB or whose record extends past the buffer. This blocks a DoS where a 100-byte hostile PNG declares a 4 GiB chunk length and triggers the library to allocate against the declaration before the CRC fails. Sharp pipelines apply the same format-aware `limitInputPixels` split as the captioning path (`SVG_MAX_INPUT_PIXELS` for SVG input, `RASTER_MAX_INPUT_PIXELS` for raster) so a legitimate large avatar isn't rejected by the tight SVG decode budget, and `imageUrl` fetches route through `FetchClient`'s shared egress guard to defeat SSRF to RFC1918 / metadata services. Sibling tEXt-chunk decode failures no longer abort `chara` lookups — only the `chara` chunk's own decode failure is fatal.
+
+### Cross-channel messaging tools (`src/tools/cross-channel.ts`)
+
+Five tools that let the agent reach outside the current channel — DM a user, post in another channel, query rosters, or manage DM consent. All five are deferred behind the **contacts** skill (`templates/workspace/skills/contacts/SKILL.md`). `list_members` and `list_channels` are also dual-homed in the **chat-history** skill for roster/enumeration use-cases that do not involve sending. No new immediate-core tools are added.
+
+**Config**: `[messaging]` block, with two boolean flags:
+
+```toml
+[messaging]
+enabled          = true   # master switch: false disables send_dm + send_to_channel (list tools still work)
+dm_initiation    = true   # false: only dm_optout and list tools; no new DM opens; send_to_channel still works
+```
+
+| Tool | Purpose |
+|------|---------|
+| `send_dm` | Open (or reuse) a DM with a user and send a message. Requires `user` (exact stable id or fuzzy display name) and `message` (or `message_ref` to re-use a stashed body). Enforces the DM opt-out table before and after id resolution. Exact-id detection (`isLikelyExactId`) is provider-aware: Matrix = `@` prefix, Discord = 15–20 digit snowflake, IRC = `<network>/<nick>` with `/`. Fuzzy input triggers `searchUserIdentities` and returns up to 5 candidate lines with `message_ref` stash so the caller can retry without retyping the body. Calls `IChatProvider.openDm()` to open the channel, then `send()` with an embedded cross-channel context note. Absent `openDm` on the provider → error. |
+| `send_to_channel` | Post a message to another channel by timeline key. Validates the key against `listJoinedChannels()` (provider-provided join registry). On an unknown key, returns the valid list and stashes a `message_ref`. Sends with an embedded cross-channel context note. `[messaging].enabled = false` → error. Visibility gates do not apply to sends (spec principle: visibility gates reads and enumeration, never sends). |
+| `list_members` | Roster listing and set operations. `rooms: "current"` / array of keys / `"all"` (requires `query`). Fuzzy `query` searches the identity corpus via `searchUserIdentities`. `op: "intersection"` / `"difference"` for cross-room membership comparisons. Returns stable user ids + display names + last-seen timestamps. Visibility gates: isolated rooms not owned by this session are silently excluded. |
+| `list_channels` | Enumerate channels the bot is joined to via `listJoinedChannels()` across all registered providers. `include_dms: true` also lists open DM channels. Returns timeline keys with provider/kind annotations. Respects visibility: isolated channels that the current session is not in are filtered. |
+| `dm_optout` | Write or clear a `dm_optouts` row for a user (§6b DM opt-out table). Authorization is structural: only the trigger sender of the current session can flip their own bit — proxy requests ("opt out for alice") are returned with a relay-back prompt rather than executed. `action: "opt_out"` (default) sets the row; `action: "opt_in"` clears it. The opt-out persists across sessions and is checked by `send_dm` and the proactive scheduler. |
+
+**Cross-channel context note**: Every message sent via `send_dm` or `send_to_channel` carries an internal `crossChannel?` field on the stored `CanonicalChatEvent` — `{ originTimelineKey, originSenderId, originSessionId, note }` — derived from the caller-supplied `context_note`. This field is stored inside `event_json` alongside `agentSessionId` and is **never transmitted to the chat platform**. The context renderer surfaces it in each format:
+- **Rich** (`renderRichMessage`): a `<cross_channel_note origin="…" sender="…" session="…">` element is inserted after the reaction block.
+- **Compact** (`renderCompactMessage`): a `[→ from <originTimelineKey>: <note>]` suffix is appended to the message line.
+The note tells the agent (in the target channel's session) why it is here and who asked it to come, closing the intent loop across channels.
+
+**Message stash** (`makeMessageStash`): a session-scoped `Map<string, string>` that stashes message bodies under auto-incremented refs (`m1`, `m2`, …). The stash is closed over inside the session's tool context and dies with the session. When resolution fails (fuzzy name → candidates; openDm error; channel unknown), the body is stashed and the ref is included in the error so the caller can retry the exact same call with `message_ref` instead of `message`.
 
 ### MCP remote tools
 
