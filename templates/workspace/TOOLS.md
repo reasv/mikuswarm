@@ -8,7 +8,10 @@ fails with "not found", the tool exists but isn't loaded yet: load its skill
 
 ## Message Delivery
 
-`send_message` is the only way to talk. Key parameters:
+`send_message` only reaches the current channel. DMing a user or messaging
+another channel goes through the **contacts skill**.
+
+`send_message` key parameters:
 
 - `message`: the text body. `:shortcode:` patterns resolve to custom emoji automatically.
 - `is_reply` + `reply_to_id`: you must explicitly choose whether to reply. Use `external_id` from message XML attributes as the `reply_to_id`.
@@ -47,7 +50,10 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | Messages that pinged a user while they were gone | `search_messages` with `mentions:[id]` + `since_user_absence:[id]` |
 | Your own past thoughts/decisions (meaning-based) | `recall_memory` |
 | An exact string in your diary (a URL, exact phrase) | `search_memory` (ripgrep) |
-| Raw room history, or one event by id | `read_messages` (paginate with `limit` + `before`/`after` tokens, or pass `message_id`) |
+| Raw room history, or one event by id | `read_messages` (paginate with `limit` + `before`/`after` tokens, or pass `message_id`; `room` = another channel/DM; `anchor:"last_self"` = window around your last message there) |
+| DM someone / deliver a message privately | `send_dm` — contacts skill |
+| Say something in another channel | `send_to_channel` — contacts skill |
+| Who's in a channel / member overlap between channels | `list_members` — contacts skill |
 | Catch up an absence ("what did I miss") | `recap` — chat-history skill (no args = the asker's own gap) |
 | The real history beneath a `<summary>` block | `expand_summary` with the summary's `id` |
 | How much someone posts / who's gone quiet | `user_activity` — chat-history skill |
