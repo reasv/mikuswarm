@@ -8626,6 +8626,71 @@ export class Storage {
     });
   }
 
+  // ── DM opt-out store (§7) ────────────────────────────────────────────────────
+
+  /**
+   * Return the opt-out row for (provider, userId), or undefined when not set.
+   */
+  getDmOptout(
+    provider: string,
+    userId: string,
+  ): { createdAt: number; originTimelineKey: string | null; originSessionId: string | null } | undefined {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select created_at, origin_timeline_key, origin_session_id
+           from dm_optouts where provider = ? and user_id = ?`,
+        )
+        .get(provider, userId) as
+        | { created_at: number; origin_timeline_key: string | null; origin_session_id: string | null }
+        | undefined;
+      if (!row) return undefined;
+      return {
+        createdAt: row.created_at,
+        originTimelineKey: row.origin_timeline_key,
+        originSessionId: row.origin_session_id,
+      };
+    });
+  }
+
+  /**
+   * Record a DM opt-out for (provider, userId). Idempotent — an existing row is
+   * left unchanged (the original request timestamp and provenance are preserved).
+   */
+  async setDmOptout(input: {
+    provider: string;
+    userId: string;
+    createdAt: number;
+    originTimelineKey?: string | null;
+    originSessionId?: string | null;
+  }): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into dm_optouts
+           (provider, user_id, created_at, origin_timeline_key, origin_session_id)
+         values (?, ?, ?, ?, ?)
+         on conflict(provider, user_id) do nothing`,
+      ).run(
+        input.provider,
+        input.userId,
+        input.createdAt,
+        input.originTimelineKey ?? null,
+        input.originSessionId ?? null,
+      );
+    });
+  }
+
+  /**
+   * Clear a DM opt-out (opt-in). No-op when no row exists.
+   */
+  async clearDmOptout(provider: string, userId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `delete from dm_optouts where provider = ? and user_id = ?`,
+      ).run(provider, userId);
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -9330,6 +9395,21 @@ create index if not exists idx_backfetch_jobs_room
   on backfetch_jobs(room_id, created_at desc);
 `;
 
+// DM opt-out store (spec CROSS-CHANNEL-MESSAGING §7). DDL shared between
+// fresh-DB SCHEMA (interpolated below) and the v13→v14 migration step.
+const DM_OPTOUTS_SCHEMA = `
+create table if not exists dm_optouts (
+  provider             text not null,
+  user_id              text not null,
+  -- epoch-ms when the opt-out was requested.
+  created_at           integer not null,
+  -- Provenance: where/when the request was made (for the §5.4 error message).
+  origin_timeline_key  text,
+  origin_session_id    text,
+  primary key (provider, user_id)
+) without rowid;
+`;
+
 // Canonical schema. This is the COMPLETE current schema with every constraint
 // baked in from the start, expressed entirely with idempotent
 // `create … if not exists` DDL: a fresh database executes this block, is built
@@ -9819,7 +9899,8 @@ ${CHAT_SEARCH_SCHEMA}
 ${SUMMARY_SEARCH_SCHEMA}
 ${REACTIONS_SCHEMA}
 ${BACKFETCH_JOBS_SCHEMA}
-${USER_IDENTITIES_SCHEMA}`;
+${USER_IDENTITIES_SCHEMA}
+${DM_OPTOUTS_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -9827,7 +9908,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 16;
+export const LATEST_SCHEMA_VERSION = 17;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10560,6 +10641,11 @@ function supersedeOrphanedAbsorbedParents(db: Database.Database): void {
   }
 }
 
+/** v16→v17: create dm_optouts table (spec CROSS-CHANNEL-MESSAGING §7). Purely additive DDL. */
+function addDmOptoutsTable(db: Database.Database): void {
+  db.exec(DM_OPTOUTS_SCHEMA);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10581,6 +10667,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addInputChildIdsColumn,
   deleteCancelledPoisonedJobs,          // v14→v15
   supersedeOrphanedAbsorbedParents,     // v15→v16
+  addDmOptoutsTable,                    // v16→v17
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
